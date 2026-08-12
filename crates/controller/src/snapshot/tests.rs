@@ -3885,3 +3885,195 @@ mod repository_shaped_failure_gate {
         );
     }
 }
+
+// --- M5 (#382): missing-source-PVC bounded outcome --------------------------
+//
+// A Snapshot whose DIRECT source PVC vanished used to retry every 30-60s
+// forever. It now parks behind the SourcePvcAvailable=False structural gate
+// (stable status bytes, transition-gated Warning Event) and flips to terminal
+// Failed once the deadline — anchored on the gate condition's
+// lastTransitionTime, stamped once — expires. Every decision here is a pure
+// function over fixtures.
+
+mod missing_source_pvc {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+
+    fn cond(type_: &str, status: &str, transition_rfc3339: &str) -> Condition {
+        Condition {
+            type_: type_.to_string(),
+            status: status.to_string(),
+            reason: "r".to_string(),
+            message: "m".to_string(),
+            last_transition_time: Time(transition_rfc3339.parse().expect("fixture timestamp")),
+            observed_generation: None,
+        }
+    }
+
+    fn gate_false(at: &str) -> Condition {
+        cond(crate::consts::SOURCE_PVC_AVAILABLE_CONDITION, "False", at)
+    }
+
+    #[test]
+    fn message_contains_only_the_pvc_identity_and_is_byte_stable() {
+        // Stable status bytes: no timestamps, no attempt counters — volatile
+        // text self-triggers the primary watch and hot-loops the reconciler.
+        let a = source_pvc_missing_message("app", "data");
+        let b = source_pvc_missing_message("app", "data");
+        assert_eq!(a, b, "two renders must be byte-identical");
+        assert!(a.contains("app/data"), "names the PVC: {a}");
+        assert!(a.contains("recreate"), "says how to fix: {a}");
+        assert!(a.contains("spec.sources"), "offers the policy lever: {a}");
+        assert!(
+            !a.chars().any(|c| c.is_ascii_digit()),
+            "no volatile numerals (timestamps/counters): {a}"
+        );
+    }
+
+    #[test]
+    fn per_caller_mapping_staged_is_transient_direct_is_structural() {
+        // The same 404 means different things per claim kind (the gap-audit
+        // fix): a vanished operator-staged claim is a restage race (transient,
+        // message names the staged claim — never "recreate your PVC"), while a
+        // vanished DIRECT source PVC is the parked structural outcome.
+        let staged = absent_claim_error(true, "app", "data-stage-abc");
+        assert!(matches!(&staged, Error::MissingDependency(_)), "{staged:?}");
+        assert_eq!(staged.class(), crate::error::ErrorClass::Transient);
+        assert!(staged.to_string().contains("app/data-stage-abc"));
+        assert!(staged.to_string().contains("staged"));
+        assert!(!staged.to_string().contains("recreate the PVC"));
+
+        let direct = absent_claim_error(false, "app", "data");
+        assert!(matches!(&direct, Error::MissingSourcePvc(_)), "{direct:?}");
+        assert_eq!(direct.class(), crate::error::ErrorClass::Structural);
+        assert!(direct.to_string().contains("app/data"));
+    }
+
+    #[test]
+    fn missing_since_reads_the_false_gate_transition_time_only() {
+        // Anchor = the gate condition's lastTransitionTime, which
+        // upsert_condition stamps ONCE (preserved while the status and message
+        // stay unchanged) — the preflight `preflightSince` pattern without a
+        // new status field.
+        assert_eq!(source_pvc_missing_since(&[]), None, "no condition");
+        let t = "2026-08-12T10:00:00Z";
+        assert_eq!(
+            source_pvc_missing_since(&[gate_false(t)]).as_deref(),
+            Some(t),
+            "False → its transition time"
+        );
+        let cleared = cond(crate::consts::SOURCE_PVC_AVAILABLE_CONDITION, "True", t);
+        assert_eq!(
+            source_pvc_missing_since(&[cleared]),
+            None,
+            "True (cleared) is not an anchor"
+        );
+        let other = cond("Ready", "False", t);
+        assert_eq!(source_pvc_missing_since(&[other]), None, "other conditions");
+    }
+
+    #[test]
+    fn deadline_expiry_is_a_pure_function_of_anchor_now_and_duration() {
+        let deadline = Some(std::time::Duration::from_secs(1800));
+        let anchor = "2026-08-12T10:00:00Z";
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("fixture")
+                .with_timezone(&chrono::Utc)
+        };
+        // Not yet.
+        assert!(!source_pvc_deadline_expired(
+            Some(anchor),
+            deadline,
+            at("2026-08-12T10:29:59Z")
+        ));
+        // Exactly at the boundary → expired (>=, matching preflight_expired).
+        assert!(source_pvc_deadline_expired(
+            Some(anchor),
+            deadline,
+            at("2026-08-12T10:30:00Z")
+        ));
+        assert!(source_pvc_deadline_expired(
+            Some(anchor),
+            deadline,
+            at("2026-08-12T11:00:00Z")
+        ));
+        // No anchor yet (first failing pass): never expired.
+        assert!(!source_pvc_deadline_expired(
+            None,
+            deadline,
+            at("2026-08-12T11:00:00Z")
+        ));
+        // Deadline disabled (`0` → None): park forever, never flip.
+        assert!(!source_pvc_deadline_expired(
+            Some(anchor),
+            None,
+            at("2036-08-12T11:00:00Z")
+        ));
+        // An unparseable anchor never expires (fail-safe: no spurious Failed).
+        assert!(!source_pvc_deadline_expired(
+            Some("not-a-timestamp"),
+            deadline,
+            at("2026-08-12T11:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn warning_event_fires_only_on_the_false_transition() {
+        let t = "2026-08-12T10:00:00Z";
+        // First sighting: no condition yet → publish.
+        assert!(should_publish_source_pvc_missing_event(&[]));
+        // Already False → steady-state park, do NOT republish every pass.
+        assert!(!should_publish_source_pvc_missing_event(&[gate_false(t)]));
+        // Recovered (True) then vanished again → a fresh transition → publish.
+        let cleared = cond(crate::consts::SOURCE_PVC_AVAILABLE_CONDITION, "True", t);
+        assert!(should_publish_source_pvc_missing_event(&[cleared]));
+        // Unrelated conditions don't gate it.
+        assert!(should_publish_source_pvc_missing_event(&[cond(
+            "Ready", "False", t
+        )]));
+    }
+
+    #[test]
+    fn gate_clears_only_when_the_condition_already_exists() {
+        let t = "2026-08-12T10:00:00Z";
+        // Healthy wire: the condition never existed → no write, byte-identical
+        // status for every Snapshot that never hit the gate.
+        assert!(!source_pvc_gate_clear_needed(&[]));
+        // Parked then recovered → flip it True exactly once.
+        assert!(source_pvc_gate_clear_needed(&[gate_false(t)]));
+        // Already cleared → no further writes (stable bytes).
+        let cleared = cond(crate::consts::SOURCE_PVC_AVAILABLE_CONDITION, "True", t);
+        assert!(!source_pvc_gate_clear_needed(&[cleared]));
+    }
+
+    #[test]
+    fn missing_source_pvc_status_write_matches_the_gate_row() {
+        // Pins the GATE_WRITERS contract (io/tests.rs): the park/Failed status
+        // write carries exactly the registry row's type/polarity/reason, so
+        // `kubectl kopiur doctor` sees the park (#359).
+        let gate = &kopiur_api::gates::SOURCE_PVC_MISSING_GATE;
+        assert_eq!(
+            gate.condition,
+            crate::consts::SOURCE_PVC_AVAILABLE_CONDITION
+        );
+        assert_eq!(gate.reason, crate::consts::SOURCE_PVC_MISSING_REASON);
+        assert!(!gate.blocked_is_true(), "SourcePvcAvailable=False blocks");
+        let backup = super::dummy_backup();
+        let status = snapshot_ready_status_with_condition(
+            &backup,
+            SnapshotPhase::Pending,
+            crate::consts::SOURCE_PVC_MISSING_REASON,
+            &source_pvc_missing_message("app", "data"),
+            crate::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+            false,
+        );
+        let conds = status["conditions"].as_array().expect("conditions");
+        let written = conds
+            .iter()
+            .find(|c| c["type"] == gate.condition)
+            .expect("the gate condition is in the write");
+        assert_eq!(written["status"], gate.blocked_status);
+        assert_eq!(written["reason"], gate.reason);
+    }
+}

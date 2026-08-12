@@ -97,6 +97,27 @@ pub enum ColocationDecision {
     RwopHeld(String),
 }
 
+/// What [`resolve_source_colocation`] found: a co-location decision, or the
+/// typed fact that the PVC does not exist. Absence is deliberately NOT an
+/// `Error` here — the same read serves three different PVC kinds (a Snapshot's
+/// direct source, an operator-staged claim, a Restore target), and only the
+/// caller knows which one vanished and what that means (issue #382: flattening
+/// absence into `Error::MissingDependency` inside this helper condemned the
+/// permanently-deleted-source case to a 30-60s retry-forever loop). Callers
+/// `match` exhaustively — no `_ =>`. Not `Eq`: embeds [`ColocationDecision`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColocationOutcome {
+    /// The PVC exists; act on the decision ([`apply_colocation`]).
+    Resolved(ColocationDecision),
+    /// The PVC does not exist (a live-confirmed 404, never a read error).
+    SourcePvcAbsent {
+        /// The namespace the PVC was looked up in.
+        namespace: String,
+        /// The PVC name that does not exist.
+        name: String,
+    },
+}
+
 /// Decide co-location from the (pure) facts. Exhaustive `match` over the mode + access
 /// class — the type-safety thesis (ADR §5.5): a new mode/class cannot compile until it
 /// is handled. `pvc` is the `namespace/name` used in the actionable failure messages.
@@ -205,30 +226,42 @@ pub fn attached_node_from_list(attachments: &[VolumeAttachment], pv_name: &str) 
 
 /// Resolve the co-location decision for the PVC `pvc_name` in `pvc_ns`, under `mode`.
 ///
-/// `Disabled` short-circuits (no reads). Otherwise: read the PVC and classify its access
-/// modes; for RWO/RWOP, find the holder pod (its `nodeName` + tolerations); if no node
-/// yet and RWO, fall back to the bound PV's `nodeAffinity` then a `VolumeAttachment`.
-/// The decision itself is the pure [`decide_colocation`].
+/// `Disabled` short-circuits (no reads). Otherwise: read the PVC — a 404 is the
+/// typed [`ColocationOutcome::SourcePvcAbsent`], for the CALLER to classify —
+/// and classify its access modes; for RWO/RWOP, find the holder pod (its
+/// `nodeName` + tolerations); if no node yet and RWO, fall back to the bound
+/// PV's `nodeAffinity` then a `VolumeAttachment`. The decision itself is the
+/// pure [`decide_colocation`]. A read ERROR (not a 404) keeps today's transient
+/// `MissingDependency` shape: the apiserver may be blipping, so absence is
+/// never inferred from a failed read.
 pub async fn resolve_source_colocation(
     client: &kube::Client,
     pvc_ns: &str,
     pvc_name: &str,
     mode: SourceColocationMode,
-) -> Result<ColocationDecision> {
+) -> Result<ColocationOutcome> {
     if matches!(mode, SourceColocationMode::Disabled) {
-        return Ok(ColocationDecision::Free);
+        return Ok(ColocationOutcome::Resolved(ColocationDecision::Free));
     }
     let id = format!("{pvc_ns}/{pvc_name}");
 
-    let pvc: PersistentVolumeClaim = Api::namespaced(client.clone(), pvc_ns)
-        .get(pvc_name)
+    let pvc: PersistentVolumeClaim = match Api::namespaced(client.clone(), pvc_ns)
+        .get_opt(pvc_name)
         .await
         .map_err(|e| {
             Error::MissingDependency(format!(
                 "cannot read source PVC `{id}` to resolve its node for co-location \
                  (RWO Multi-Attach avoidance): {e}"
             ))
-        })?;
+        })? {
+        Some(pvc) => pvc,
+        None => {
+            return Ok(ColocationOutcome::SourcePvcAbsent {
+                namespace: pvc_ns.to_string(),
+                name: pvc_name.to_string(),
+            });
+        }
+    };
 
     let modes = pvc
         .status
@@ -240,7 +273,7 @@ pub async fn resolve_source_colocation(
 
     // Shareable volumes never need a node — skip the pod/PV/VA reads entirely.
     if access == AccessClass::Shareable {
-        return Ok(decide_colocation(
+        return Ok(ColocationOutcome::Resolved(decide_colocation(
             mode,
             &SourceFacts {
                 access,
@@ -249,7 +282,7 @@ pub async fn resolve_source_colocation(
                 held_by_pod: false,
             },
             &id,
-        ));
+        )));
     }
 
     // Primary: the consuming pod's nodeName (and tolerations).
@@ -303,7 +336,7 @@ pub async fn resolve_source_colocation(
         }
     }
 
-    Ok(decide_colocation(
+    Ok(ColocationOutcome::Resolved(decide_colocation(
         mode,
         &SourceFacts {
             access,
@@ -312,7 +345,7 @@ pub async fn resolve_source_colocation(
             held_by_pod,
         },
         &id,
-    ))
+    )))
 }
 
 /// Convert a [`ColocationDecision`] into the merged `(affinity, tolerations)` for the
@@ -678,6 +711,113 @@ mod tests {
             apply_colocation(ColocationDecision::RwopHeld("m".into()), None, None),
             Err(Error::Validation(_))
         ));
+    }
+
+    // --- resolve_source_colocation: the 404 → typed-absence mapping ---------
+    //
+    // A missing PVC used to be flattened into `Error::MissingDependency`
+    // (Transient) INSIDE this helper, so every caller inherited a 30-60s
+    // retry-forever loop (issue #382). The helper now returns a typed
+    // [`ColocationOutcome::SourcePvcAbsent`] and each caller decides. Mock kube
+    // client via the repo's `tower::service_fn` pattern (context.rs).
+
+    use std::sync::{Arc, Mutex};
+
+    use http::{Request, Response, StatusCode};
+    use kube::Client;
+    use kube::client::Body;
+
+    /// A kube `Client` that records request paths and answers PVC GETs with
+    /// `pvc_response` (status, body); everything else 200 `{}`.
+    fn pvc_client(
+        log: Arc<Mutex<Vec<String>>>,
+        pvc_status: StatusCode,
+        pvc_body: serde_json::Value,
+    ) -> Client {
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            let pvc_body = pvc_body.clone();
+            async move {
+                let path = req.uri().path().to_string();
+                log.lock().unwrap().push(path.clone());
+                let (status, body) = if path.contains("/persistentvolumeclaims/") {
+                    (pvc_status, pvc_body.to_string().into_bytes())
+                } else {
+                    (StatusCode::OK, b"{\"items\":[]}".to_vec())
+                };
+                let resp = Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        Client::new(svc, "test-ns")
+    }
+
+    fn not_found_status() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "reason": "NotFound",
+            "code": 404
+        })
+    }
+
+    #[tokio::test]
+    async fn a_404_on_the_pvc_maps_to_the_typed_absence_not_an_error() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = pvc_client(log, StatusCode::NOT_FOUND, not_found_status());
+        let outcome = resolve_source_colocation(&client, "app", "data", SourceColocationMode::Auto)
+            .await
+            .expect("absence is an OUTCOME for the caller to map, never an Err here");
+        assert_eq!(
+            outcome,
+            ColocationOutcome::SourcePvcAbsent {
+                namespace: "app".into(),
+                name: "data".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_mode_short_circuits_with_zero_cluster_io() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = pvc_client(log.clone(), StatusCode::NOT_FOUND, not_found_status());
+        let outcome =
+            resolve_source_colocation(&client, "app", "data", SourceColocationMode::Disabled)
+                .await
+                .expect("Disabled never errors");
+        assert_eq!(
+            outcome,
+            ColocationOutcome::Resolved(ColocationDecision::Free)
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "Disabled must not read the cluster at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_present_shareable_pvc_resolves_free() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "data", "namespace": "app" },
+            "spec": { "accessModes": ["ReadWriteMany"] },
+            "status": { "accessModes": ["ReadWriteMany"] }
+        });
+        let client = pvc_client(log, StatusCode::OK, pvc);
+        let outcome = resolve_source_colocation(&client, "app", "data", SourceColocationMode::Auto)
+            .await
+            .expect("a healthy read resolves");
+        assert_eq!(
+            outcome,
+            ColocationOutcome::Resolved(ColocationDecision::Free)
+        );
     }
 
     #[test]

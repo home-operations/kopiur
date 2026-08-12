@@ -385,6 +385,22 @@ pub const SCHEDULE_FANOUT_CAPPED_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Fail,
 };
 
+/// A backup whose DIRECT source PVC (`spec.sources[].pvc`) does not exist at
+/// launch time. The `Snapshot` parks at `phase: Pending` on the slow
+/// structural cadence and, once the controller's missing-source deadline
+/// passes, flips terminally `Failed` — a PVC that never reappears never
+/// self-heals, and only recreating it (or repointing the policy's sources) can
+/// clear the block. Written on the Snapshot only for the direct-source case: a
+/// vanished operator-staged claim (copyMethod Snapshot/Clone) is a restage
+/// race and stays a plain transient retry, never this gate.
+pub const SOURCE_PVC_MISSING_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Snapshot,
+    condition: consts::SOURCE_PVC_AVAILABLE_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::SOURCE_PVC_MISSING_REASON,
+    severity: GateSeverity::Fail,
+};
+
 /// Every human-actionable structural gate kopiur's reconcilers can park an
 /// object on.
 ///
@@ -415,6 +431,7 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     SCHEDULE_BLOCKED_GATE,
     SCHEDULE_FANOUT_CAPPED_GATE,
     POLICY_REPOSITORY_NOT_READY_GATE,
+    SOURCE_PVC_MISSING_GATE,
 ];
 
 #[cfg(test)]
@@ -634,6 +651,13 @@ mod tests {
                 consts::REPOSITORY_NOT_READY_REASON,
                 GateScope::SnapshotPolicy,
                 GateSeverity::Warn,
+            ),
+            (
+                consts::SOURCE_PVC_AVAILABLE_CONDITION,
+                CONDITION_FALSE,
+                consts::SOURCE_PVC_MISSING_REASON,
+                GateScope::Snapshot,
+                GateSeverity::Fail,
             ),
         ];
         assert_eq!(

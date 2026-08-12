@@ -1755,18 +1755,48 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     });
     let (mover_affinity, mover_tolerations) = match colo_claim {
         Some(claim) => {
-            let decision = io::resolve_source_colocation(
+            // Exhaustive over the outcome (no `_ =>`): the same 404 means
+            // different things per claim kind, and only THIS caller knows which
+            // kind `claim` is (#382 M5).
+            match io::resolve_source_colocation(
                 &ctx.client,
                 &namespace,
                 &claim,
                 resolved_mover.source_colocation,
             )
-            .await?;
-            io::apply_colocation(
-                decision,
-                resolved_mover.affinity.clone(),
-                resolved_mover.tolerations.clone(),
-            )?
+            .await?
+            {
+                io::ColocationOutcome::Resolved(decision) => {
+                    // A previous launch attempt may have parked this Snapshot on
+                    // the SourcePvcAvailable gate; flip it True now that the claim
+                    // resolved — ONLY when the condition already exists, so the
+                    // healthy wire stays byte-identical.
+                    clear_source_pvc_gate_if_parked(&api, backup, &name, &namespace, &claim)
+                        .await?;
+                    io::apply_colocation(
+                        decision,
+                        resolved_mover.affinity.clone(),
+                        resolved_mover.tolerations.clone(),
+                    )?
+                }
+                io::ColocationOutcome::SourcePvcAbsent {
+                    namespace: pvc_ns,
+                    name: pvc_name,
+                } => {
+                    // The staged claim (copyMethod Snapshot/Clone) is an
+                    // operator-created PVC: its absence is a restage race, a
+                    // transient retry — never the user-facing structural gate.
+                    if staged_claim.is_some() {
+                        return Err(absent_claim_error(true, &pvc_ns, &pvc_name));
+                    }
+                    // The DIRECT source PVC is gone: park behind the
+                    // SourcePvcAvailable gate, fail terminally after the deadline.
+                    return handle_missing_source_pvc(
+                        ctx, &api, backup, &name, &namespace, &pvc_ns, &pvc_name,
+                    )
+                    .await;
+                }
+            }
         }
         None => (
             resolved_mover.affinity.clone(),
@@ -1825,6 +1855,214 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     tracing::info!(backup = %name, "created mover Job for backup");
 
     Ok(Action::requeue(Duration::from_secs(30)))
+}
+
+// --- Missing-source-PVC bounded outcome (#382 M5) ---------------------------
+//
+// A Snapshot whose DIRECT source PVC was deleted used to map to
+// `Error::MissingDependency` (Transient) inside the colocation helper and
+// retry every 30-60s forever. It now parks behind the registered
+// `SourcePvcAvailable=False` structural gate (stable status bytes, a
+// transition-gated Warning Event, the slow 300s cadence) and flips to terminal
+// `Failed` once the deadline — anchored on the gate condition's
+// `lastTransitionTime`, which `upsert_condition` stamps ONCE and preserves
+// while status+message stay unchanged (the `preflightSince` pattern without a
+// new status field) — expires. Every decision below is a pure fn over
+// condition fixtures.
+
+/// The gate/Event message for a missing DIRECT source PVC. Contains ONLY the
+/// PVC identity — no timestamps or attempt counters: volatile status bytes
+/// re-trigger the primary watch and hot-loop the reconciler.
+pub(super) fn source_pvc_missing_message(pvc_ns: &str, pvc_name: &str) -> String {
+    format!(
+        "source PVC `{pvc_ns}/{pvc_name}` does not exist, so the backup cannot mount its \
+         source; the backup is parked until the missing-source deadline, then failed — \
+         recreate the PVC, or update the SnapshotPolicy's spec.sources to name an existing PVC"
+    )
+}
+
+/// The transient message when the OPERATOR-STAGED claim (copyMethod
+/// Snapshot/Clone) vanished mid-launch: a restage race, not a user error —
+/// deliberately never "recreate your PVC".
+fn staged_claim_missing_message(pvc_ns: &str, claim: &str) -> String {
+    format!(
+        "operator-staged source PVC `{pvc_ns}/{claim}` vanished before the mover launched \
+         (a restage race); staging re-runs automatically on the next reconcile"
+    )
+}
+
+/// Map an absent colocation claim to its per-caller error (the M5 mapping
+/// table): the operator-staged claim is a transient restage race
+/// ([`Error::MissingDependency`]); the DIRECT source PVC is the structural
+/// parked outcome ([`Error::MissingSourcePvc`]).
+pub(super) fn absent_claim_error(staged: bool, pvc_ns: &str, pvc_name: &str) -> Error {
+    if staged {
+        Error::MissingDependency(staged_claim_missing_message(pvc_ns, pvc_name))
+    } else {
+        Error::MissingSourcePvc(source_pvc_missing_message(pvc_ns, pvc_name))
+    }
+}
+
+/// Whether the `SourcePvcAvailable` gate is currently at its blocked polarity
+/// (`False`) in `conditions` — the single polarity read the transition-gating
+/// and clear decisions below both derive from.
+fn source_pvc_gate_is_false(
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> bool {
+    conditions
+        .iter()
+        .any(|c| c.type_ == crate::consts::SOURCE_PVC_AVAILABLE_CONDITION && c.status == "False")
+}
+
+/// The deadline ANCHOR: the `SourcePvcAvailable=False` condition's
+/// `lastTransitionTime` (RFC 3339), stamped once by the first parking write and
+/// preserved by `upsert_condition` while the park persists. `None` when the
+/// gate is absent or cleared (`True`) — no anchor, no expiry.
+pub(super) fn source_pvc_missing_since(
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> Option<String> {
+    conditions
+        .iter()
+        .find(|c| c.type_ == crate::consts::SOURCE_PVC_AVAILABLE_CONDITION && c.status == "False")
+        .map(|c| c.last_transition_time.0.to_string())
+}
+
+/// PURE deadline→Failed decision: has the parked-since anchor been missing
+/// longer than the configured deadline? `None` deadline (the `0` escape hatch)
+/// or no/unparseable anchor → never expired (fail-safe: no spurious terminal
+/// `Failed`). Mirrors [`plan::preflight_expired`]'s `>=` boundary.
+pub(super) fn source_pvc_deadline_expired(
+    since: Option<&str>,
+    deadline: Option<std::time::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let (Some(d), Some(since)) = (
+        deadline,
+        since.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()),
+    ) else {
+        return false;
+    };
+    let elapsed = now - since.with_timezone(&chrono::Utc);
+    elapsed >= chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
+}
+
+/// Transition gate for the Warning Event: publish ONLY when the gate is not
+/// already `False` (first sighting, or a recover-then-vanish re-transition) —
+/// a steady-state park must not republish every 300s pass.
+pub(super) fn should_publish_source_pvc_missing_event(
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> bool {
+    !source_pvc_gate_is_false(conditions)
+}
+
+/// Whether a successful colocation resolution must flip the gate `True`: ONLY
+/// when the condition currently sits at `False`. Absent (the healthy wire — the
+/// condition never grows on Snapshots that never hit the gate) or already
+/// `True` (cleared) → no write, byte-identical status.
+pub(super) fn source_pvc_gate_clear_needed(
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> bool {
+    source_pvc_gate_is_false(conditions)
+}
+
+/// Clear the `SourcePvcAvailable` gate (upsert `True`) after a successful
+/// colocation resolution — a no-op unless a previous launch attempt parked this
+/// Snapshot on the gate ([`source_pvc_gate_clear_needed`]).
+async fn clear_source_pvc_gate_if_parked(
+    api: &Api<Snapshot>,
+    backup: &Snapshot,
+    name: &str,
+    pvc_ns: &str,
+    pvc_name: &str,
+) -> Result<()> {
+    let existing = backup
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    if !source_pvc_gate_clear_needed(&existing) {
+        return Ok(());
+    }
+    let conditions = io::upsert_condition(
+        &existing,
+        crate::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+        true,
+        crate::consts::SOURCE_PVC_FOUND_REASON,
+        &format!("source PVC `{pvc_ns}/{pvc_name}` found; the backup can launch"),
+        backup.meta().generation,
+    );
+    io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
+    Ok(())
+}
+
+/// The DIRECT source PVC does not exist: fold the `SourcePvcAvailable=False`
+/// gate into the park (`Pending`) or — once [`source_pvc_deadline_expired`] —
+/// terminal `Failed` status write, publish the transition-gated Warning Event,
+/// and hold on the structural cadence via [`Error::MissingSourcePvc`].
+///
+/// Terminal safety mirrors the preflight-timeout arm: the `Failed` write
+/// carries `Stalled=True` (so `TerminalFailed` never re-counts it), the
+/// completion metric increments only on the real transition (`wrote`), and the
+/// Failed-no-artifact finalizer path (`execute_delete_snapshot`: no
+/// `status.snapshot` → release the finalizer, nothing to delete) already
+/// handles the row's eventual pruning.
+async fn handle_missing_source_pvc(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    backup: &Snapshot,
+    name: &str,
+    namespace: &str,
+    pvc_ns: &str,
+    pvc_name: &str,
+) -> Result<Action> {
+    let msg = source_pvc_missing_message(pvc_ns, pvc_name);
+    let existing = backup
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let newly_missing = should_publish_source_pvc_missing_event(&existing);
+    // Anchor BEFORE this pass's write: a first sighting has no anchor (this
+    // write stamps it), so it can never expire on the same pass it was seen.
+    let since = source_pvc_missing_since(&existing);
+    let expired = source_pvc_deadline_expired(
+        since.as_deref(),
+        ctx.source_pvc_deadline,
+        chrono::Utc::now(),
+    );
+    let phase = if expired {
+        SnapshotPhase::Failed
+    } else {
+        SnapshotPhase::Pending
+    };
+    let status = snapshot_ready_status_with_condition(
+        backup,
+        phase,
+        crate::consts::SOURCE_PVC_MISSING_REASON,
+        &msg,
+        crate::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+        false,
+    );
+    let current = serde_json::to_value(&backup.status).ok();
+    let wrote = io::patch_status_if_changed(api, name, current.as_ref(), status).await?;
+    if newly_missing {
+        io::publish_warning_event(
+            ctx,
+            backup,
+            crate::consts::SOURCE_PVC_MISSING_REASON,
+            crate::consts::RECREATE_SOURCE_PVC_ACTION,
+            &msg,
+        )
+        .await;
+    }
+    if expired {
+        if wrote {
+            ctx.metrics
+                .inc_snapshot_completed("failed", namespace, backup_policy(backup));
+        }
+        return Ok(Action::await_change());
+    }
+    Err(absent_claim_error(false, pvc_ns, pvc_name))
 }
 
 /// Best-effort nudge asking this backup's pinned repository to re-verify its

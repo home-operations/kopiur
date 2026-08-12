@@ -3292,6 +3292,17 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         crate::consts::REPOSITORY_NOT_READY_REASON,
         "snapshot_policy::policy_ready_conditions (upsert_gate)",
     ),
+    // `snapshot::handle_missing_source_pvc`, which folds the gate into the
+    // park/Failed status write (`snapshot_ready_status_with_condition` carries
+    // the row's exact type/polarity/reason); the successful-resolution path
+    // clears it (True) only when the condition already exists. Pinned by
+    // `snapshot::tests::missing_source_pvc_status_write_matches_the_gate_row`.
+    (
+        crate::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+        false,
+        crate::consts::SOURCE_PVC_MISSING_REASON,
+        "snapshot::handle_missing_source_pvc (computed polarity)",
+    ),
 ];
 
 #[test]

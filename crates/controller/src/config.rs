@@ -226,6 +226,15 @@ pub const RECONCILE_CONCURRENCY_ENV: &str = "KOPIUR_RECONCILE_CONCURRENCY";
 /// [`ControllerConfig::reconcile_concurrency`]`: None`.
 pub const DEFAULT_RECONCILE_CONCURRENCY: u16 = 8;
 
+/// Deadline (seconds) for a `Snapshot` parked on a missing DIRECT source PVC
+/// (`SourcePvcAvailable=False`, issue #382): measured from the gate
+/// condition's `lastTransitionTime`, after which the backup flips to terminal
+/// `Failed` so `failedJobsHistoryLimit` bounds it and a `concurrencyPolicy:
+/// Forbid` schedule is released. `0` disables the flip (park indefinitely).
+/// Defaults to [`crate::consts::DEFAULT_SOURCE_PVC_DEADLINE`] (30 min).
+/// Reachable via the chart's `controller.extraEnv`.
+pub const SOURCE_PVC_DEADLINE_ENV: &str = "KOPIUR_SOURCE_PVC_DEADLINE_SECONDS";
+
 /// Read timeout for the shared kube client. kube 4.0 defaults `read_timeout`
 /// to `None`, so a connection that stalls after establishing (the OOM-flapping
 /// apiserver's signature) held its fd until TCP gave up. MUST exceed the watch
@@ -469,6 +478,16 @@ pub struct ControllerArgs {
           default_value_t = DEFAULT_RECONCILE_CONCURRENCY,
           value_parser = parse_reconcile_concurrency)]
     pub reconcile_concurrency: u16,
+
+    /// Seconds a Snapshot parked on a missing DIRECT source PVC waits before
+    /// flipping to terminal Failed. `0` disables the flip (park indefinitely).
+    /// Raw seconds, `0`-sentinel — resolved to
+    /// [`ControllerConfig::source_pvc_deadline`]`: Option<Duration>` in
+    /// [`ControllerArgs::resolve`].
+    #[arg(long, env = SOURCE_PVC_DEADLINE_ENV,
+          default_value_t = crate::consts::DEFAULT_SOURCE_PVC_DEADLINE.as_secs(),
+          value_parser = parse_source_pvc_deadline)]
+    pub source_pvc_deadline_seconds: u64,
 
     /// Cluster-scoped install: watch every namespace and reconcile
     /// ClusterRepository. The chart stamps it for `installScope: cluster`.
@@ -792,6 +811,12 @@ pub struct ControllerConfig {
     /// [`DEFAULT_RECONCILE_CONCURRENCY`]. `Option<NonZeroU16>` so "no cap"
     /// can't be mistaken for "cap of zero" at any call site.
     pub reconcile_concurrency: Option<std::num::NonZeroU16>,
+    /// How long a `Snapshot` parked on a missing DIRECT source PVC waits (from
+    /// the `SourcePvcAvailable=False` condition's `lastTransitionTime`) before
+    /// flipping to terminal `Failed`. `None` = the explicit `0` escape hatch:
+    /// park indefinitely, never flip. `Option<Duration>` so "no deadline" can't
+    /// be mistaken for "deadline of zero" at any call site.
+    pub source_pvc_deadline: Option<std::time::Duration>,
 }
 
 impl ControllerArgs {
@@ -887,6 +912,9 @@ impl ControllerArgs {
                 self.max_concurrent_delete_jobs,
             ),
             reconcile_concurrency: std::num::NonZeroU16::new(self.reconcile_concurrency),
+            // `0` ⇔ `None` (park indefinitely, never flip to Failed).
+            source_pvc_deadline: (self.source_pvc_deadline_seconds > 0)
+                .then(|| std::time::Duration::from_secs(self.source_pvc_deadline_seconds)),
         })
     }
 }
@@ -973,6 +1001,23 @@ fn parse_reconcile_concurrency(value: &str) -> Result<u16, String> {
     })
 }
 
+/// Value parser for [`SOURCE_PVC_DEADLINE_ENV`]. Empty means "unset" (→ the
+/// bounded default); `0` is explicitly valid and means "park indefinitely,
+/// never flip to Failed" — the repo's `0`-disables idiom. Only garbage is
+/// rejected, loudly.
+fn parse_source_pvc_deadline(value: &str) -> Result<u64, String> {
+    if value.is_empty() {
+        return Ok(crate::consts::DEFAULT_SOURCE_PVC_DEADLINE.as_secs());
+    }
+    value.parse::<u64>().map_err(|_| {
+        format!(
+            "{SOURCE_PVC_DEADLINE_ENV}='{value}' is not a valid deadline; use a number of \
+             seconds (0 = park indefinitely, never fail); unset it to use the default {}",
+            crate::consts::DEFAULT_SOURCE_PVC_DEADLINE.as_secs()
+        )
+    })
+}
+
 /// Value parser for [`WORKER_THREADS_ENV`]/`--worker-threads`: empty ≡ unset
 /// (→ the default, matching the pre-clap tolerance for a blanked env var);
 /// garbage still fails loudly with the what/why/fix.
@@ -1055,6 +1100,41 @@ mod tests {
             cfg.reconcile_concurrency,
             std::num::NonZeroU16::new(DEFAULT_RECONCILE_CONCURRENCY)
         );
+        // A missing DIRECT source PVC parks the Snapshot, then fails it
+        // terminally after 30 minutes by default (issue #382).
+        assert_eq!(
+            cfg.source_pvc_deadline,
+            Some(crate::consts::DEFAULT_SOURCE_PVC_DEADLINE)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn source_pvc_deadline_resolves_seconds_and_zero_means_indefinite() {
+        // Explicit seconds → the bounded deadline.
+        let cfg = resolve(&["--source-pvc-deadline-seconds", "90"]);
+        assert_eq!(
+            cfg.source_pvc_deadline,
+            Some(std::time::Duration::from_secs(90))
+        );
+        // `0` disables the terminal flip (park indefinitely) — the repo's
+        // `0`-disables idiom (preflight `resolve_timeout`, the sweep interval).
+        let cfg = resolve(&["--source-pvc-deadline-seconds", "0"]);
+        assert_eq!(cfg.source_pvc_deadline, None);
+    }
+
+    #[test]
+    #[serial]
+    fn source_pvc_deadline_rejects_garbage_actionably() {
+        let err = ControllerArgs::try_parse_from([
+            "kopiur-controller",
+            "--source-pvc-deadline-seconds",
+            "soon",
+        ])
+        .expect_err("garbage must fail loudly");
+        let msg = err.to_string();
+        assert!(msg.contains(SOURCE_PVC_DEADLINE_ENV), "{msg}");
+        assert!(msg.contains("seconds"), "{msg}");
     }
 
     #[test]
