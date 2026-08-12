@@ -496,32 +496,47 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     let sched_name = schedule.name_any();
     let api: Api<SnapshotSchedule> = Api::namespaced(ctx.client.clone(), &namespace);
 
-    // Bound failure history: prune this schedule's oldest `Failed` Snapshots beyond
-    // `failedJobsHistoryLimit` (GFS retention only prunes successes). Runs every
-    // reconcile — a cheap labeled list — so a persistently-failing precondition or
-    // backend can't accumulate `Failed` CRs without limit. Best-effort: a transient
-    // list/delete error here must NOT block firing the due backup, so log and proceed
-    // (the next reconcile retries the prune) rather than short-circuiting the slot.
-    if let Err(e) = prune_failed_history(
-        ctx,
-        &namespace,
-        &sched_name,
-        schedule.spec.failed_jobs_history_limit,
-    )
-    .await
-    {
-        tracing::warn!(schedule = %sched_name, error = %e, "failed-history prune errored; continuing to schedule");
-    }
-
-    // Propagate a `spec.deletion.onScheduleDelete` edit to existing produced
-    // children whose stamped cascade value has drifted (so an edit to Delete
-    // actually cascades already-created Snapshots, not just future ones).
-    // Best-effort — must not block firing the due backup.
-    let desired_cascade = kopiur_api::snapshot_schedule::effective_on_schedule_delete(
-        schedule.spec.deletion.as_ref(),
-    );
-    if let Err(e) = propagate_cascade_stamp(ctx, &namespace, &sched_name, desired_cascade).await {
-        tracing::warn!(schedule = %sched_name, error = %e, "onScheduleDelete propagation errored; continuing to schedule");
+    // ONE `SCHEDULE_LABEL` population per reconcile (#382 M1): the same slice
+    // serves the failed-history prune, the `onScheduleDelete` propagation, and
+    // the concurrency gate further down — these were three byte-identical LISTs.
+    // Prune and propagation stay best-effort (a transient list/delete error must
+    // NOT block firing the due backup; the next reconcile retries), but the
+    // concurrency gate below keeps failing CLOSED: when this list errored, the
+    // gate read propagates that error exactly as its own list did before.
+    let snap_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
+    let children = schedule_children(ctx, &namespace, &sched_name).await;
+    match &children {
+        Ok(items) => {
+            // Bound failure history: prune this schedule's oldest `Failed`
+            // Snapshots beyond `failedJobsHistoryLimit` (GFS retention only
+            // prunes successes), so a persistently-failing precondition or
+            // backend can't accumulate `Failed` CRs without limit.
+            if let Err(e) = prune_failed_history(
+                &snap_api,
+                &sched_name,
+                items,
+                schedule.spec.failed_jobs_history_limit,
+            )
+            .await
+            {
+                tracing::warn!(schedule = %sched_name, error = %e, "failed-history prune errored; continuing to schedule");
+            }
+            // Propagate a `spec.deletion.onScheduleDelete` edit to existing
+            // produced children whose stamped cascade value has drifted (so an
+            // edit to Delete actually cascades already-created Snapshots, not
+            // just future ones).
+            let desired_cascade = kopiur_api::snapshot_schedule::effective_on_schedule_delete(
+                schedule.spec.deletion.as_ref(),
+            );
+            if let Err(e) =
+                propagate_cascade_stamp(&snap_api, &sched_name, items, desired_cascade).await
+            {
+                tracing::warn!(schedule = %sched_name, error = %e, "onScheduleDelete propagation errored; continuing to schedule");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(schedule = %sched_name, error = %e, "listing Snapshot children failed; failed-history prune and onScheduleDelete propagation skipped this pass");
+        }
     }
 
     let seed = schedule.uid().unwrap_or_else(|| schedule.name_any());
@@ -596,8 +611,13 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
             return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
         }
-        // Is a run currently active (an unfinished Snapshot owned by this schedule)?
-        let runs = active_runs(ctx, &namespace, &sched_name).await?;
+        // Is a run currently active (an unfinished Snapshot owned by this
+        // schedule)? Classified from the children slice fetched once above; a
+        // list failure fails CLOSED here (propagates), never "no active runs".
+        let runs = match children {
+            Ok(ref items) => classify_active_runs(items),
+            Err(e) => return Err(e),
+        };
         let disposition = slot_disposition(&schedule.spec.schedule, slot, now, runs.active);
         // The blocker only MATTERS when it is actually holding a due slot shut:
         // under `concurrencyPolicy: Allow` an unreadable run does not block, and
@@ -901,12 +921,18 @@ pub fn classify_active_runs(items: &[Snapshot]) -> ActiveRuns {
     out
 }
 
-/// Whether an unfinished Snapshot created by this schedule still exists, and
-/// whether the blocker is one this build cannot interpret.
-async fn active_runs(ctx: &Context, namespace: &str, schedule: &str) -> Result<ActiveRuns> {
+/// This schedule's produced `Snapshot` children (the `SCHEDULE_LABEL` list),
+/// fetched ONCE per reconcile and shared by the failed-history prune, the
+/// `onScheduleDelete` propagation, and the concurrency gate (#382 M1 — these
+/// were previously three byte-identical LISTs per reconcile).
+async fn schedule_children(
+    ctx: &Context,
+    namespace: &str,
+    schedule: &str,
+) -> Result<Vec<Snapshot>> {
     let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
     let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
-    Ok(classify_active_runs(&api.list(&lp).await?.items))
+    Ok(api.list(&lp).await?.items)
 }
 
 /// The terminal time used to order Failed snapshots for pruning: `status.timing.endTime`
@@ -993,24 +1019,22 @@ pub(crate) fn failed_snapshots_to_prune(snapshots: &[Snapshot], limit: u32) -> V
 }
 
 /// Enforce `failedJobsHistoryLimit`: prune the schedule's oldest `Failed` Snapshots
-/// beyond the limit. Reuses the `SCHEDULE_LABEL` list and the GFS-prune delete idiom
-/// (delete the CR → its finalizer + `deletionPolicy` handle any kopia cleanup).
+/// beyond the limit. Consumes the shared per-reconcile children slice (#382 M1)
+/// and the GFS-prune delete idiom (delete the CR → its finalizer +
+/// `deletionPolicy` handle any kopia cleanup).
 async fn prune_failed_history(
-    ctx: &Context,
-    namespace: &str,
+    api: &Api<Snapshot>,
     schedule: &str,
+    children: &[Snapshot],
     limit: Option<u32>,
 ) -> Result<()> {
     let limit = kopiur_api::consts::effective_failed_jobs_history_limit(limit);
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
-    let items = api.list(&lp).await?.items;
-    for name in failed_snapshots_to_prune(&items, limit) {
+    for name in failed_snapshots_to_prune(children, limit) {
         // Stamp `pruned-by: failed-history` THEN delete, so the finalizer treats
         // this as an operator prune (bypassing the mass-deletion breaker), never
         // an external deletion. `failed_snapshots_to_prune` already excludes
         // terminating CRs, so there is no stamp-only partition here.
-        io::annotate_then_delete_snapshot(&api, &name, PrunedBy::FailedHistory).await?;
+        io::annotate_then_delete_snapshot(api, &name, PrunedBy::FailedHistory).await?;
         tracing::info!(schedule = %schedule, snapshot = %name, "pruned Failed Snapshot (failedJobsHistoryLimit)");
     }
     Ok(())
@@ -1019,20 +1043,18 @@ async fn prune_failed_history(
 /// Propagate a `spec.deletion.onScheduleDelete` edit to this schedule's existing
 /// produced `Snapshot` children (labelled `SCHEDULE_LABEL`) whose stamped value
 /// has drifted from `desired` ([`children_needing_cascade_stamp`]). One targeted
-/// merge-patch per child under the controller field manager. Best-effort exactly
-/// like [`prune_failed_history`]: a per-child (or list) error is logged and the
-/// reconcile continues — propagation must never block firing the due backup.
+/// merge-patch per child under the controller field manager. Consumes the shared
+/// per-reconcile children slice (#382 M1). Best-effort exactly like
+/// [`prune_failed_history`]: a per-child error is logged and the reconcile
+/// continues — propagation must never block firing the due backup.
 async fn propagate_cascade_stamp(
-    ctx: &Context,
-    namespace: &str,
+    api: &Api<Snapshot>,
     schedule: &str,
+    children: &[Snapshot],
     desired: ScheduleDeletePolicy,
 ) -> Result<()> {
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
-    let items = api.list(&lp).await?.items;
     let value = serde_json::to_value(desired).unwrap_or(serde_json::Value::Null);
-    for name in children_needing_cascade_stamp(&items, desired) {
+    for name in children_needing_cascade_stamp(children, desired) {
         let patch = serde_json::json!({ "spec": { "onScheduleDelete": value } });
         match api
             .patch(
@@ -2337,6 +2359,62 @@ mod tests {
         );
         // Limit ≥ count → no-op.
         assert!(failed_snapshots_to_prune(&all, 10).is_empty());
+    }
+
+    /// One SCHEDULE_LABEL population per reconcile (#382 M1): the same slice
+    /// must coherently serve BOTH the concurrency gate and the failed-history
+    /// prune — an unfinished run keeps `active=true` while the prune set from
+    /// the very same slice still selects the artifact-less older failures.
+    /// (Previously each consumer issued its own byte-identical LIST.)
+    #[test]
+    fn one_children_slice_serves_gate_and_prune_coherently() {
+        use kopiur_api::snapshot::{SnapshotPhase, SnapshotStatus, SnapshotTiming};
+
+        fn snap(name: &str, phase: SnapshotPhase, end: &str) -> Snapshot {
+            let mut s = Snapshot::new(
+                name,
+                SnapshotSpec {
+                    repository: None,
+                    source: None,
+                    policy_ref: None,
+                    tags: None,
+                    failure_policy: None,
+                    deletion_policy: None,
+                    on_schedule_delete: None,
+                    pin: false,
+                    description: None,
+                },
+            );
+            s.status = Some(SnapshotStatus {
+                phase: Some(phase),
+                timing: Some(SnapshotTiming {
+                    end_time: Some(end.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            s
+        }
+
+        let slice = vec![
+            snap("running", SnapshotPhase::Running, "2026-01-01T04:00:00Z"),
+            snap("fail-old", SnapshotPhase::Failed, "2026-01-01T01:00:00Z"),
+            snap("fail-new", SnapshotPhase::Failed, "2026-01-01T02:00:00Z"),
+        ];
+
+        let runs = classify_active_runs(&slice);
+        assert!(
+            runs.active,
+            "the Running row must hold the Forbid gate shut"
+        );
+        assert!(runs.unreadable.is_none());
+
+        let prune = failed_snapshots_to_prune(&slice, 1);
+        assert_eq!(
+            prune,
+            vec!["fail-old".to_string()],
+            "the same slice must still bound failure history (keep the newest Failed)"
+        );
     }
 
     /// Multi-repo fan-out (#368): the failure-history bound is PER REPOSITORY

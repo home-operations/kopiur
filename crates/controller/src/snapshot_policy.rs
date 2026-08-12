@@ -986,8 +986,10 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
 
     // §3: surface the most recent successful child Snapshot timestamp (backs the
     // LAST-SNAPSHOT column + the staleness alert). Deterministic (the max endTime
-    // over this policy's Succeeded Snapshots), so an unchanged value is a no-op patch.
-    let last_successful = latest_successful_snapshot(&ctx.client, &namespace, &name).await?;
+    // over this policy's Succeeded Snapshots), so an unchanged value is a no-op
+    // patch. Computed from the `backups` slice fetched once above (#382 M1 —
+    // this was a second, byte-identical CONFIG_LABEL LIST).
+    let last_successful = latest_successful_end_time(&backups);
     // Does this policy have a verifiable backup yet? Backs the #168 verification gate
     // below (captured before `last_successful` is consumed by the status patch).
     let has_successful_snapshot = last_successful.is_some();
@@ -2019,22 +2021,9 @@ async fn write_adoption_status(
     Ok(())
 }
 
-/// The RFC3339 `endTime` of the most recent `Succeeded` `Snapshot` produced by
-/// this policy (backs `status.lastSuccessfulSnapshot`, §3), or `None` if there is
-/// none yet. Reads the policy's Snapshots via the `CONFIG_LABEL` selector.
-async fn latest_successful_snapshot(
-    client: &kube::Client,
-    namespace: &str,
-    config_name: &str,
-) -> Result<Option<String>> {
-    let api: Api<Snapshot> = Api::namespaced(client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("{CONFIG_LABEL}={config_name}"));
-    let backups = api.list(&lp).await?.items;
-    Ok(latest_successful_end_time(&backups))
-}
-
-/// Pure: the max `status.timing.endTime` over `Succeeded` Snapshots, as RFC3339.
-/// Pulled out so the selection is unit-tested without a cluster.
+/// Pure: the max `status.timing.endTime` over `Succeeded` Snapshots, as RFC3339
+/// (backs `status.lastSuccessfulSnapshot`, §3). Fed the per-reconcile `backups`
+/// slice — unit-tested without a cluster.
 pub fn latest_successful_end_time(backups: &[Snapshot]) -> Option<String> {
     backups
         .iter()
