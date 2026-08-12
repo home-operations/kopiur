@@ -617,7 +617,7 @@ pub(crate) async fn spawn_all(
         // watch streams for nothing (the primary reflector keeps the only full one;
         // `.owns(Snapshot)` on the schedule controller is already metadata via kube).
         .watches_stream(
-            referent_meta::<Snapshot>(scoped_api(&client, &scope), &cfg),
+            referent_meta::<Snapshot>(scoped_api(&client, &scope), &cfg, &ctx.metrics),
             |s| watch::snapshot_meta_to_policy(&s),
         )
         // Watch the backing repository: when it becomes Ready (e.g. a credential was
