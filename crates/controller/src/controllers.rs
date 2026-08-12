@@ -92,9 +92,17 @@ where
 /// Takes the `Api` (rather than building `Api::all` itself) so the caller
 /// scopes it to the install scope — a namespaced install must not register a
 /// cluster-wide (Role-RBAC-forbidden) referent watch.
+///
+/// Watch errors are counted (`kopiur_watcher_restarts_total{kind}`) and warned
+/// before the stream hands them to the `Controller`'s fan-in, which otherwise
+/// swallows them silently (issue #382: watch churn had to be attributed from
+/// the apiserver side). These self-driven referent streams and the standalone
+/// Maintenance informer are the only interceptable ones — the `Controller`'s
+/// internal trigger streams expose no error hook.
 fn referent_meta<K>(
     api: Api<PartialObjectMeta<K>>,
     cfg: &WatcherConfig,
+    metrics: &crate::metrics::Metrics,
 ) -> impl Stream<Item = Result<PartialObjectMeta<K>, watcher::Error>> + Send + use<K>
 where
     K: kube::Resource<DynamicType = ()>
@@ -104,12 +112,24 @@ where
         + Send
         + 'static,
 {
+    let kind = K::kind(&()).into_owned();
+    let metrics = metrics.clone();
     watcher(api, cfg.clone())
         .modify(|m| {
             m.metadata.managed_fields = None;
             m.metadata.annotations = None;
         })
         .touched_objects()
+        .inspect(move |ev| {
+            if let Err(e) = ev {
+                metrics.inc_watcher_restart(&kind);
+                tracing::warn!(
+                    error = %e,
+                    kind = %kind,
+                    "referent watch error; backing off and restarting the watch"
+                );
+            }
+        })
 }
 
 /// Map a kopia web-UI server child (Deployment/Service) to its owning
@@ -265,7 +285,7 @@ pub(crate) async fn spawn_all(
     // opt-in check fails open anyway (io::namespace_allows_privileged_movers).
     if cluster_wide {
         snapshot_ctrl = snapshot_ctrl.watches_stream(
-            referent_meta::<Namespace>(Api::all(client.clone()), &cfg),
+            referent_meta::<Namespace>(Api::all(client.clone()), &cfg, &ctx.metrics),
             {
                 let store = snapshot_store.clone();
                 move |n: PartialObjectMeta<Namespace>| watch::namespace_to_snapshots(&store, &n)
@@ -436,14 +456,14 @@ pub(crate) async fn spawn_all(
             owned_cfg.clone(),
         )
         .watches_stream(
-            referent_meta::<Secret>(scoped_api(&client, &scope), &cfg),
+            referent_meta::<Secret>(scoped_api(&client, &scope), &cfg, &ctx.metrics),
             {
                 let store = repo_store.clone();
                 move |s: PartialObjectMeta<Secret>| watch::secret_to_repositories(&store, &s)
             },
         )
         .watches_stream(
-            referent_meta::<ConfigMap>(scoped_api(&client, &scope), &cfg),
+            referent_meta::<ConfigMap>(scoped_api(&client, &scope), &cfg, &ctx.metrics),
             {
                 let store = repo_store.clone();
                 move |cm: PartialObjectMeta<ConfigMap>| {
@@ -454,7 +474,7 @@ pub(crate) async fn spawn_all(
         // Workload identity: creating the `auth.workloadIdentity` ServiceAccount
         // un-sticks a repository blocked on the SA preflight immediately.
         .watches_stream(
-            referent_meta::<ServiceAccount>(scoped_api(&client, &scope), &cfg),
+            referent_meta::<ServiceAccount>(scoped_api(&client, &scope), &cfg, &ctx.metrics),
             {
                 let store = repo_store.clone();
                 move |sa: PartialObjectMeta<ServiceAccount>| {
@@ -510,14 +530,17 @@ pub(crate) async fn spawn_all(
                 owned_cfg.clone(),
                 map_to_cluster_repository,
             )
-            .watches_stream(referent_meta::<Secret>(Api::all(client.clone()), &cfg), {
-                let store = crepo_store.clone();
-                move |s: PartialObjectMeta<Secret>| {
-                    watch::secret_to_cluster_repositories(&store, &s)
-                }
-            })
             .watches_stream(
-                referent_meta::<ConfigMap>(Api::all(client.clone()), &cfg),
+                referent_meta::<Secret>(Api::all(client.clone()), &cfg, &ctx.metrics),
+                {
+                    let store = crepo_store.clone();
+                    move |s: PartialObjectMeta<Secret>| {
+                        watch::secret_to_cluster_repositories(&store, &s)
+                    }
+                },
+            )
+            .watches_stream(
+                referent_meta::<ConfigMap>(Api::all(client.clone()), &cfg, &ctx.metrics),
                 {
                     let store = crepo_store.clone();
                     move |cm: PartialObjectMeta<ConfigMap>| {
@@ -528,7 +551,7 @@ pub(crate) async fn spawn_all(
             // Workload identity: same SA-preflight un-stick as the Repository
             // controller (name-only match; movers run in many namespaces).
             .watches_stream(
-                referent_meta::<ServiceAccount>(Api::all(client.clone()), &cfg),
+                referent_meta::<ServiceAccount>(Api::all(client.clone()), &cfg, &ctx.metrics),
                 {
                     let store = crepo_store.clone();
                     move |sa: PartialObjectMeta<ServiceAccount>| {
@@ -654,7 +677,7 @@ pub(crate) async fn spawn_all(
             // Same privileged-mover opt-in delivery as the Snapshot controller
             // (Namespace is cluster-scoped; see the note there).
             .watches_stream(
-                referent_meta::<Namespace>(Api::all(client.clone()), &cfg),
+                referent_meta::<Namespace>(Api::all(client.clone()), &cfg, &ctx.metrics),
                 {
                     let store = restore_store.clone();
                     move |n: PartialObjectMeta<Namespace>| watch::namespace_to_restores(&store, &n)
@@ -717,7 +740,7 @@ pub(crate) async fn spawn_all(
             owned_cfg.clone(),
         )
         .watches_stream(
-            referent_meta::<Secret>(scoped_api(&client, &scope), &cfg),
+            referent_meta::<Secret>(scoped_api(&client, &scope), &cfg, &ctx.metrics),
             {
                 let store = repl_store.clone();
                 move |s: PartialObjectMeta<Secret>| watch::secret_to_replications(&store, &s)
@@ -727,7 +750,7 @@ pub(crate) async fn spawn_all(
         // fixing) the CA bundle re-triggers a replication blocked on it, the
         // same shape as the destination credential Secret watch above.
         .watches_stream(
-            referent_meta::<ConfigMap>(scoped_api(&client, &scope), &cfg),
+            referent_meta::<ConfigMap>(scoped_api(&client, &scope), &cfg, &ctx.metrics),
             {
                 let store = repl_store.clone();
                 move |cm: PartialObjectMeta<ConfigMap>| {
@@ -779,7 +802,7 @@ pub(crate) async fn spawn_all(
             move |r: Repository| watch::repository_to_snapshot_replications(&store, &r)
         })
         .watches_stream(
-            referent_meta::<Secret>(scoped_api(&client, &scope), &cfg),
+            referent_meta::<Secret>(scoped_api(&client, &scope), &cfg, &ctx.metrics),
             {
                 let srepl = srepl_store.clone();
                 let repos = repo_store.clone();
@@ -796,7 +819,7 @@ pub(crate) async fn spawn_all(
             },
         )
         .watches_stream(
-            referent_meta::<ConfigMap>(scoped_api(&client, &scope), &cfg),
+            referent_meta::<ConfigMap>(scoped_api(&client, &scope), &cfg, &ctx.metrics),
             {
                 let srepl = srepl_store.clone();
                 let repos = repo_store.clone();

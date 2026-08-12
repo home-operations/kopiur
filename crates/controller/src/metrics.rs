@@ -55,6 +55,11 @@ pub struct Metrics {
     reconcile_duration: Histogram<f64>,
     failure_events_dropped: Counter<u64>,
 
+    // Kube client + watch plumbing (issue #382: the apiserver load had to be
+    // attributed from the apiserver's own metrics; these make it self-reported).
+    kube_client_requests: Counter<u64>,
+    watcher_restarts: Counter<u64>,
+
     // Snapshot business metrics.
     //
     // Per-resource phase (`kopiur_resource_phase`), the per-Snapshot
@@ -250,6 +255,34 @@ impl Metrics {
             .f64_histogram("kopiur_controller_reconcile_duration_seconds")
             .with_description("Reconcile duration in seconds per CRD kind.")
             .with_boundaries(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
+            .build();
+
+        // --- kube client + watch plumbing (issue #382) ---
+        let kube_client_requests = m
+            .u64_counter("kopiur_kube_client_requests")
+            .with_description(
+                "Every HTTP request the controller's kube clients send to the apiserver, by \
+                 verb (get|list|watch|create|update|patch|apply|delete|deletecollection|other), \
+                 group ('' = the core group, matching apiserver_request_total so the two join), \
+                 kind (the resource plural, plus '/subresource' for subresource requests, or \
+                 'other' for non-resource paths), and client (main = watches + reconcilers, \
+                 exec = workloadExec attaches, election = the leader Lease). Counted at send \
+                 time via a tower layer under ClientBuilder, so Controller-internal trigger \
+                 streams are covered too. This is the controller's self-reported apiserver \
+                 footprint — the signal issue #382 had to reconstruct server-side.",
+            )
+            .build();
+        let watcher_restarts = m
+            .u64_counter("kopiur_watcher_restarts")
+            .with_description(
+                "Watch-stream errors on the streams kopiur drives itself (the referent \
+                 metadata trigger streams and the shared Maintenance informer), by the \
+                 watched kind. Each error makes the watcher back off and restart its watch; \
+                 a sustained rate means watch churn (and re-LIST load) that is otherwise \
+                 invisible below the default log level. Controller-internal trigger streams \
+                 (primary reflectors, .owns(), .watches()) expose no error hook and are NOT \
+                 counted here — kopiur_kube_client_requests_total covers their traffic.",
+            )
             .build();
 
         // Process RSS, sampled at scrape time. The returned handle is a phantom
@@ -533,6 +566,8 @@ impl Metrics {
             reconcile_errors,
             failure_events_dropped,
             reconcile_duration,
+            kube_client_requests,
+            watcher_restarts,
             backup_verified_timestamp,
             snapshots_completed,
             snapshot_deletion_failures,
@@ -595,6 +630,30 @@ impl Metrics {
     pub fn record_failure_event_dropped(&self, cause: &'static str) {
         self.failure_events_dropped
             .add(1, &[KeyValue::new("cause", cause)]);
+    }
+
+    // ---- kube client + watch plumbing ---------------------------------------
+
+    /// Build the tower [`crate::kube_metrics::KubeClientMetricsLayer`] that
+    /// stamps `kopiur_kube_client_requests_total{..., client}` on every request
+    /// of one kube client. `client` is a closed set at the call sites
+    /// (`main`/`exec`/`election` in `startup::run`) — a `&'static str` so a new
+    /// pool can't mint an unbounded label value at runtime.
+    pub fn kube_client_layer(
+        &self,
+        client: &'static str,
+    ) -> crate::kube_metrics::KubeClientMetricsLayer {
+        crate::kube_metrics::KubeClientMetricsLayer::new(self.kube_client_requests.clone(), client)
+    }
+
+    /// Count one watch-stream error (→ backoff + watch restart) on a stream
+    /// kopiur drives itself, labeled by the watched `kind`. `&str` (not
+    /// `&'static`) because the referent streams derive the kind from
+    /// `K::kind()` at runtime — still bounded: it is always a Kubernetes kind
+    /// name, never free text.
+    pub fn inc_watcher_restart(&self, kind: &str) {
+        self.watcher_restarts
+            .add(1, &[KeyValue::new("kind", kind.to_string())]);
     }
 
     // ---- store-backed observable gauges ------------------------------------
