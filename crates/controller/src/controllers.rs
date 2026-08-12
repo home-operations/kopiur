@@ -589,15 +589,13 @@ pub(crate) async fn spawn_all(
         // Snapshots so GFS retention (ADR §4.4) reconciles PROMPTLY when one is created
         // or deleted — without this the policy only re-runs on its periodic requeue, so
         // a new snapshot's prune (and a pinned snapshot's exemption) lags by minutes.
-        .watches(
-            scoped_api::<Snapshot>(&client, &scope),
-            cfg.clone(),
-            |s: Snapshot| match (s.labels().get(crate::consts::CONFIG_LABEL), s.namespace()) {
-                (Some(policy), Some(ns)) => {
-                    Some(ObjectRef::<SnapshotPolicy>::new(policy).within(&ns))
-                }
-                _ => None,
-            },
+        // Metadata-only (#382 M4): the mapper reads just the label + namespace, so
+        // decoding full Snapshot objects here tripled the full-collection Snapshot
+        // watch streams for nothing (the primary reflector keeps the only full one;
+        // `.owns(Snapshot)` on the schedule controller is already metadata via kube).
+        .watches_stream(
+            referent_meta::<Snapshot>(scoped_api(&client, &scope), &cfg),
+            |s| watch::snapshot_meta_to_policy(&s),
         )
         // Watch the backing repository: when it becomes Ready (e.g. a credential was
         // fixed) the policy re-reconciles at once instead of waiting out its requeue.
