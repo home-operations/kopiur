@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
 use futures::StreamExt;
+use kube::client::ClientBuilder;
 use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::{WatchStreamExt, reflector, watcher};
 use kube::{Api, Client};
@@ -186,9 +187,16 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     // if a provider is already installed (e.g. the webhook installed it).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // One inferred config, three clients (`Client::try_default` is exactly
-    // infer + try_from, so behavior is otherwise identical). Each `Client` gets
-    // its own hyper connection pool, which is the whole point of splitting them:
+    // Metrics first: the three kube clients below each carry a
+    // `kopiur_kube_client_requests_total` tower layer built from these
+    // instruments (issue #382 — the apiserver load had to be attributed from
+    // the apiserver's own metrics; now the controller self-reports it).
+    let metrics = Metrics::new();
+
+    // One inferred config, three clients (`ClientBuilder::try_from` is the
+    // builder form of `Client::try_from`, so behavior is otherwise identical;
+    // the only addition is the per-client request-metrics layer). Each `Client`
+    // gets its own hyper connection pool, which is the whole point of splitting them:
     // - `client`: read/connect timeouts hardened (see the config consts — the
     //   apiserver-outage fd fix). Every watch and reconcile rides this one.
     // - `exec_client`: same connect timeout but NO read timeout, used ONLY for
@@ -204,14 +212,19 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
     let mut kube_config = kube::Config::infer().await?;
     kube_config.connect_timeout = Some(config::KUBE_CLIENT_CONNECT_TIMEOUT);
     kube_config.read_timeout = Some(config::KUBE_CLIENT_READ_TIMEOUT);
-    let client = Client::try_from(kube_config.clone())?;
+    let client = ClientBuilder::try_from(kube_config.clone())?
+        .with_layer(&metrics.kube_client_layer("main"))
+        .build();
     let mut exec_config = kube_config.clone();
     exec_config.read_timeout = None;
-    let exec_client = Client::try_from(exec_config)?;
+    let exec_client = ClientBuilder::try_from(exec_config)?
+        .with_layer(&metrics.kube_client_layer("exec"))
+        .build();
     let mut election_config = kube_config;
     election_config.read_timeout = Some(config::KUBE_CLIENT_ELECTION_READ_TIMEOUT);
-    let election_client = Client::try_from(election_config)?;
-    let metrics = Metrics::new();
+    let election_client = ClientBuilder::try_from(election_config)?
+        .with_layer(&metrics.kube_client_layer("election"))
+        .build();
 
     // The HTTP server (probes + /metrics) starts BEFORE the leader-election
     // gate: a standby replica must pass its liveness/readiness probes while it
@@ -302,6 +315,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         let synced = maintenance_synced.clone();
         let api: Api<Maintenance> = scoped_api(&client, &config.watch_scope);
         let informer_cfg = watcher_config(streaming_lists);
+        let informer_metrics = metrics.clone();
         tokio::spawn(async move {
             // Flip the flag as soon as the reflector reports its first sync.
             let mark_ready = async move {
@@ -320,7 +334,15 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
                 futures::pin_mut!(stream);
                 while let Some(ev) = stream.next().await {
                     if let Err(e) = ev {
-                        tracing::debug!(error = %e, "maintenance informer watch error");
+                        // Loud + counted (issue #382): a watch error means this
+                        // watcher backs off and restarts — sustained churn here
+                        // used to be invisible below the debug log level, with
+                        // no /metrics signal at all.
+                        informer_metrics.inc_watcher_restart("Maintenance");
+                        tracing::warn!(
+                            error = %e,
+                            "maintenance informer watch error; backing off and restarting the watch"
+                        );
                     }
                 }
             };
