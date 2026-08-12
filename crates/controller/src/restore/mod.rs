@@ -3307,24 +3307,13 @@ async fn resolve_restore_repository(
         } else {
             cfg_ns
         };
-        return io::resolve_repository_ref(
-            &ctx.client,
-            &selected,
-            base_ns,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await;
+        // Launch-side (restore mover inputs) — store-backed point read (#382 M2).
+        return io::resolve_repository_ref_cached(ctx, &selected, base_ns).await;
     }
     // Explicit `spec.repository` wins for the other sources. Honors `kind`
     // (namespaced vs. ClusterRepository) via the shared resolver (ADR §5.5).
     if let Some(rref) = &restore.spec.repository {
-        return io::resolve_repository_ref(
-            &ctx.client,
-            rref,
-            namespace,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await;
+        return io::resolve_repository_ref_cached(ctx, rref, namespace).await;
     }
     // SnapshotRef: derive from the referenced Snapshot (pinned resolved
     // repository for produced, owning repository for discovered).
@@ -3345,13 +3334,7 @@ async fn resolve_restore_repository(
         })?;
         // Resolved relative to the SNAPSHOT's namespace (an absent ref
         // namespace means "same as the snapshot", not "same as the restore").
-        return io::resolve_repository_ref(
-            &ctx.client,
-            &rref,
-            snap_ns,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await;
+        return io::resolve_repository_ref_cached(ctx, &rref, snap_ns).await;
     }
     Err(Error::Validation(
         "restore with source.identity requires spec.repository (snapshotRef and fromPolicy \
@@ -3455,7 +3438,7 @@ async fn gate_on_repository_readiness(
     let Some((rref, base_ns)) = restore_repository_ref(ctx, restore, namespace).await? else {
         return Ok(None);
     };
-    match io::repository_ready(&ctx.client, &rref, &base_ns).await {
+    match io::repository_ready_cached(ctx, &rref, &base_ns).await {
         Ok(true) => Ok(None),
         Ok(false) => {
             // patch-if-changed for byte-stability: the parked status is identical

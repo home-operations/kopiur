@@ -904,7 +904,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // CredentialsAvailable gate (MISSING_CA_BUNDLE_GATE): the retry is
     // transient, but a ConfigMap nobody creates never self-heals, and the park
     // at `Pending` must be visible to doctor (#359).
-    let (config, effective_repo, repo) = match resolve_recipe(ctx, backup, &namespace).await {
+    let (config, effective_repo, repo) = match resolve_recipe_cached(ctx, backup, &namespace).await
+    {
         Ok(resolved) => resolved,
         Err(Error::MissingCaBundle(msg)) => {
             let existing = backup
@@ -992,9 +993,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the pod would only fail on `kopia repository connect`. Hold the Snapshot in
     // `Pending` and requeue until the repository's own reconcile marks it `Ready`.
     // Same gate Maintenance, `SnapshotPolicy`, and `RepositoryReplication` apply.
-    // A cheap single GET — independent of preflight, so it's evaluated FIRST and the
-    // repository-not-ready reason is always surfaced before any preflight machinery.
-    if !io::repository_ready(&ctx.client, repo_ref, &namespace).await? {
+    // A store-backed point read (#382 M2) — independent of preflight, so it's
+    // evaluated FIRST and the repository-not-ready reason is always surfaced
+    // before any preflight machinery. A stale not-Ready hit heals at this
+    // gate's own 15s requeue below (see `io::repository_ready_cached`).
+    if !io::repository_ready_cached(ctx, repo_ref, &namespace).await? {
         let current = serde_json::to_value(&backup.status).ok();
         io::patch_status_if_changed(
             &api,
@@ -1051,14 +1054,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         }
         // The gather (which clones the Maintenance store for recency) runs only here,
         // so the common no-preflight backup never pays for it.
-        let (pf_inputs, _ready) = io::gather_preflight_inputs(
-            &ctx.client,
-            repo_ref,
-            &namespace,
-            &ctx.maintenance_store,
-            now,
-        )
-        .await?;
+        let (pf_inputs, _ready) =
+            io::gather_preflight_inputs(ctx, repo_ref, &namespace, now).await?;
         // First failing check (AND semantics). Distinguish a check that returned
         // `false` (precondition unmet) from one that ERRORED (couldn't be evaluated
         // against live state) — the latter is a config/transient fault, surfaced
@@ -2711,6 +2708,12 @@ async fn orphan_snapshot(
 /// never ran. The namespace-deletion cascade depends on this — resolving via the
 /// recipe alone silently degraded an opted-in `onNamespaceDelete: Delete` to an
 /// orphan whenever the namespace reaper got to the `SnapshotPolicy` first.
+///
+/// DELIBERATELY live-API (audit C7, #382 M2): this is the deletion/finalizer
+/// path feeding the mass-deletion breaker (`mass_deletion_ack`,
+/// `deletionProtection`), so it calls the live [`io::resolve_repository_ref`] /
+/// [`resolve_recipe`] — never the `_cached` variants — or an ack drain could
+/// regress from immediate to the reflector's staleness window.
 async fn resolve_repo_for_deletion(
     ctx: &Context,
     backup: &Snapshot,
@@ -3629,7 +3632,9 @@ async fn reconcile_pin(
     };
 
     // Create the SnapshotPin Job (mirrors the SnapshotDelete one-shot path).
-    let (config, effective_repo, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    // Launch-side (pin/unpin spawn), so the store-backed recipe read is safe
+    // (audit C7: only the deletion path must stay on the live original).
+    let (config, effective_repo, repo) = resolve_recipe_cached(ctx, backup, namespace).await?;
     // The child's effective repository (pin-aware — a pinned child of a
     // multi-repo policy pins/unpins in ITS repository).
     let repo_ref = &effective_repo;
@@ -4003,7 +4008,7 @@ async fn resolve_succeeded_snapshot(
     backup: &Snapshot,
     namespace: &str,
 ) -> Result<Option<(String, serde_json::Value)>> {
-    let (config, _effective_repo, repo) = resolve_recipe(ctx, backup, namespace).await?;
+    let (config, _effective_repo, repo) = resolve_recipe_cached(ctx, backup, namespace).await?;
     let identity = resolve_identity_for(
         &config,
         namespace,
@@ -4088,6 +4093,43 @@ async fn resolve_recipe(
         ctx.operator_namespace.as_deref(),
     )
     .await?;
+    Ok((config, repo_ref, repo))
+}
+
+/// Store-backed [`resolve_recipe`] for the **launch/pin** callers only (#382
+/// M2): the policy comes from the [`crate::io::fetch_policy`] kernel (one
+/// clone from the store `Arc` keeps the owned return type) and the repository
+/// from [`crate::io::resolve_repository_ref_cached`] — a store hit costs zero
+/// GETs; a miss/cold store is live-confirmed, so behavior (including the
+/// `MissingDependency` shapes) is identical to the live original.
+///
+/// **Must NOT be used by deletion/finalizer/breaker paths** (audit C7):
+/// [`resolve_repo_for_deletion`] — and through it every finalizer caller that
+/// feeds the mass-deletion breaker (`mass_deletion_ack`, `deletionProtection`)
+/// — keeps calling the live [`resolve_recipe`], because the ack-drain trigger
+/// fires from the Snapshot controller's watch stream and a cached repository
+/// annotation read would regress an ack release from immediate to minutes.
+async fn resolve_recipe_cached(
+    ctx: &Context,
+    backup: &Snapshot,
+    namespace: &str,
+) -> Result<(SnapshotPolicy, RepositoryRef, ResolvedRepository)> {
+    let policy_ref = backup
+        .spec
+        .policy_ref
+        .as_ref()
+        .ok_or_else(|| Error::Invariant("produced Snapshot has no policyRef".into()))?;
+    let cfg_ns = policy_ref.namespace.as_deref().unwrap_or(namespace);
+    let config = io::fetch_policy(ctx, cfg_ns, &policy_ref.name)
+        .await?
+        .ok_or_else(|| {
+            Error::MissingDependency(format!("SnapshotPolicy {cfg_ns}/{}", policy_ref.name))
+        })?;
+    let config = (*config).clone();
+
+    let repo_ref = kopiur_api::snapshot::effective_repository_ref(backup, &config.spec, cfg_ns)
+        .map_err(|e| Error::Validation(e.to_string()))?;
+    let repo = io::resolve_repository_ref_cached(ctx, &repo_ref, cfg_ns).await?;
     Ok((config, repo_ref, repo))
 }
 

@@ -785,6 +785,11 @@ pub(crate) fn rfc3339_unix_secs(s: &str) -> Option<i64> {
 /// Reconcile a `SnapshotPolicy`.
 #[tracing::instrument(skip(config, ctx), fields(kind = "SnapshotPolicy", namespace = %config.namespace().unwrap_or_default(), name = %config.name_any()))]
 pub async fn reconcile(config: Arc<SnapshotPolicy>, ctx: Arc<Context>) -> Result<Action> {
+    // A dispatched reconcile is proof the SnapshotPolicy reflector completed its
+    // initial LIST (the applier gates reconciles on `store.wait_until_ready()`),
+    // so the `fetch_policy` point-read kernel may serve from `ctx.config_store`
+    // from here on. The RELIABLE synced signal — see `Context::mark_config_synced`.
+    ctx.mark_config_synced();
     let start = std::time::Instant::now();
     let result = reconcile_inner(&config, &ctx).await;
     ctx.metrics
@@ -891,13 +896,10 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     //    `RepositoryIdentityWouldFork`), not this pin.
     let mut targets: Vec<PolicyRepoTarget> = Vec::with_capacity(repo_targets.len());
     for rref in &repo_targets {
-        let repo = io::resolve_repository_ref(
-            &ctx.client,
-            rref,
-            &namespace,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await?;
+        // Launch-side resolution (identity/retention/verification inputs) —
+        // store-backed point read (#382 M2); the deletion cascade keeps the
+        // live resolver.
+        let repo = io::resolve_repository_ref_cached(ctx, rref, &namespace).await?;
         let resolved =
             resolve_config_identity(config, &namespace, repo.identity_defaults.as_ref())?;
         targets.push(PolicyRepoTarget {
@@ -946,7 +948,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     let mut ready: Vec<&PolicyRepoTarget> = Vec::new();
     let mut not_ready_keys: Vec<String> = Vec::new();
     for t in &targets {
-        if io::repository_ready(&ctx.client, &t.rref, &namespace).await? {
+        if io::repository_ready_cached(ctx, &t.rref, &namespace).await? {
             ready.push(t);
         } else {
             not_ready_keys.push(kopiur_api::common::repo_key(&t.rref, &namespace));

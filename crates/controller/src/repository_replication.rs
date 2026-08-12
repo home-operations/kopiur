@@ -112,17 +112,12 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     }
 
     let source_ref = &repl.spec.source_ref;
-    let repo = io::resolve_repository_ref(
-        &ctx.client,
-        source_ref,
-        &namespace,
-        ctx.operator_namespace.as_deref(),
-    )
-    .await?;
+    // Launch-side (mirror Job inputs) — store-backed point read (#382 M2).
+    let repo = io::resolve_repository_ref_cached(ctx, source_ref, &namespace).await?;
 
     // Gate on the source repository being Ready (an object-store repo must be
     // bootstrapped before `sync-to` can reach it) — mirrors maintenance's G7.
-    if !io::repository_ready(&ctx.client, source_ref, &namespace).await? {
+    if !io::repository_ready_cached(ctx, source_ref, &namespace).await? {
         patch_ready_if_changed(
             &api,
             &name,

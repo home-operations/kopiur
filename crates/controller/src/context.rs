@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use kopiur_api::{Maintenance, Snapshot, SnapshotSchedule};
+use kopiur_api::{
+    ClusterRepository, Maintenance, Repository, Snapshot, SnapshotPolicy, SnapshotSchedule,
+};
 use kopiur_kopia::{KopiaClient, KopiaClientBuilder, env as kopia_env};
 use kube::Client;
 use kube::runtime::events::Recorder;
@@ -233,6 +235,42 @@ pub struct Context {
     /// `true` once [`schedule_store`](Self::schedule_store) has completed its
     /// initial list. Same fail-safe contract as [`snapshot_synced`](Self::snapshot_synced).
     pub schedule_synced: Arc<AtomicBool>,
+    /// Shared informer cache of all `SnapshotPolicy` CRs, reused from the
+    /// `SnapshotPolicy` controller's own reflector (`Controller::store()`). Same
+    /// `OnceLock` construction-order rationale as
+    /// [`snapshot_store`](Self::snapshot_store). Consumed by the
+    /// [`crate::io::fetch_policy`] point-read kernel (#382 M2): a store HIT is
+    /// served from cache, a MISS — or an unset/unsynced store — falls through to
+    /// a live `get_opt`, so a stale negative is impossible by construction.
+    pub config_store: Arc<OnceLock<Store<SnapshotPolicy>>>,
+    /// `true` once [`config_store`](Self::config_store) has completed its
+    /// initial list. Flipped ONLY by [`mark_config_synced`](Self::mark_config_synced)
+    /// from the `SnapshotPolicy` reconcile — never by a spawned
+    /// `wait_until_ready()` getter, which races the Controller applier's own
+    /// getter on kube-rs's single-waker `DelayedInit` and can hang forever (see
+    /// [`snapshot_synced`](Self::snapshot_synced)).
+    pub config_synced: Arc<AtomicBool>,
+    /// Shared informer cache of all `Repository` CRs, reused from the
+    /// `Repository` controller's own reflector. Same construction-order
+    /// rationale and miss-goes-live consumption contract as
+    /// [`config_store`](Self::config_store) (the [`crate::io::fetch_repository`]
+    /// kernel).
+    pub repo_store: Arc<OnceLock<Store<Repository>>>,
+    /// `true` once [`repo_store`](Self::repo_store) has completed its initial
+    /// list. Same flip-from-reconcile contract as
+    /// [`config_synced`](Self::config_synced) (single-waker hazard).
+    pub repo_synced: Arc<AtomicBool>,
+    /// Shared informer cache of all `ClusterRepository` CRs, reused from the
+    /// `ClusterRepository` controller's own reflector. Published ONLY in a
+    /// cluster-scope install — a namespaced install has no ClusterRepository
+    /// controller, so this cell stays UNSET there and every read falls through
+    /// to the live API (preserving the namespaced-install 403 behavior exactly;
+    /// the [`crate::io::fetch_cluster_repository`] kernel).
+    pub crepo_store: Arc<OnceLock<Store<ClusterRepository>>>,
+    /// `true` once [`crepo_store`](Self::crepo_store) has completed its initial
+    /// list. Same flip-from-reconcile contract as
+    /// [`config_synced`](Self::config_synced) (single-waker hazard).
+    pub crepo_synced: Arc<AtomicBool>,
 }
 
 impl Context {
@@ -280,6 +318,12 @@ impl Context {
             snapshot_synced: Arc::new(AtomicBool::new(false)),
             schedule_store: Arc::new(OnceLock::new()),
             schedule_synced: Arc::new(AtomicBool::new(false)),
+            config_store: Arc::new(OnceLock::new()),
+            config_synced: Arc::new(AtomicBool::new(false)),
+            repo_store: Arc::new(OnceLock::new()),
+            repo_synced: Arc::new(AtomicBool::new(false)),
+            crepo_store: Arc::new(OnceLock::new()),
+            crepo_synced: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -299,6 +343,30 @@ impl Context {
     /// [`mark_snapshot_synced`](Self::mark_snapshot_synced).
     pub fn mark_schedule_synced(&self) {
         mark_synced(&self.schedule_synced, "SnapshotSchedule");
+    }
+
+    /// Mark the SnapshotPolicy informer synced, from the SnapshotPolicy
+    /// reconcile. Same reliable-signal rationale as
+    /// [`mark_snapshot_synced`](Self::mark_snapshot_synced) — a running
+    /// reconcile is proof the reflector synced; never a spawned
+    /// `wait_until_ready()` (single-waker `DelayedInit` hang).
+    pub fn mark_config_synced(&self) {
+        mark_synced(&self.config_synced, "SnapshotPolicy");
+    }
+
+    /// Mark the Repository informer synced, from the Repository reconcile.
+    /// Same reliable-signal rationale as
+    /// [`mark_snapshot_synced`](Self::mark_snapshot_synced).
+    pub fn mark_repo_synced(&self) {
+        mark_synced(&self.repo_synced, "Repository");
+    }
+
+    /// Mark the ClusterRepository informer synced, from the ClusterRepository
+    /// reconcile (which exists only in a cluster-scope install). Same
+    /// reliable-signal rationale as
+    /// [`mark_snapshot_synced`](Self::mark_snapshot_synced).
+    pub fn mark_crepo_synced(&self) {
+        mark_synced(&self.crepo_synced, "ClusterRepository");
     }
 
     /// The `imagePullPolicy` to stamp on mover `Job` pods: the explicit

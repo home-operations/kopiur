@@ -2,7 +2,6 @@ use chrono::{DateTime, Utc};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, OwnerReference};
 use kube::Api;
 use kube::api::{Patch, PatchParams};
-use kube::runtime::reflector::Store;
 
 use kopiur_api::backend::Backend;
 use kopiur_api::common::{
@@ -219,30 +218,10 @@ pub async fn resolve_repository_ref(
             let repo = api.get_opt(&name).await?.ok_or_else(|| {
                 Error::MissingDependency(format!("Repository {namespace}/{name}"))
             })?;
-            let owner_ref = super::owner_ref_for(&repo, "Repository")?;
-            let mass_deletion_ack = mass_deletion_ack(&repo);
             let ca_bundle_pem =
                 resolve_backend_ca(client, &repo.spec.backend, Some(&namespace), operator_ns)
                     .await?;
-            Ok(ResolvedRepository {
-                repo_namespace: Some(namespace),
-                backend: repo.spec.backend,
-                encryption: repo.spec.encryption,
-                mover_defaults: repo.spec.mover_defaults,
-                identity_defaults: repo.spec.identity_defaults,
-                schedule_defaults: repo.spec.schedule_defaults,
-                on_namespace_delete: repo.spec.on_namespace_delete,
-                // A namespaced Repository has no owner-side projection gate: its
-                // credential Secret co-resides with the consumer, so projection is a
-                // same-namespace no-op. Treat the gate as not-applicable (false).
-                credential_projection_allowed: false,
-                mode: repo.spec.mode,
-                owner_ref,
-                deletion_protection: repo.spec.deletion_protection,
-                mass_deletion_ack,
-                catalog: repo.spec.catalog,
-                ca_bundle_pem,
-            })
+            resolved_from_namespaced(repo, namespace, ca_bundle_pem)
         }
         RepoLookup::Cluster { name } => {
             let api: Api<ClusterRepository> = Api::all(client.clone());
@@ -250,32 +229,75 @@ pub async fn resolve_repository_ref(
                 .get_opt(&name)
                 .await?
                 .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
-            let owner_ref = super::owner_ref_for(&repo, "ClusterRepository")?;
-            let mass_deletion_ack = mass_deletion_ack(&repo);
             let ca_bundle_pem =
                 resolve_backend_ca(client, &repo.spec.backend, None, operator_ns).await?;
-            Ok(ResolvedRepository {
-                repo_namespace: None,
-                backend: repo.spec.backend,
-                encryption: repo.spec.encryption,
-                mover_defaults: repo.spec.mover_defaults,
-                identity_defaults: repo.spec.identity_defaults,
-                schedule_defaults: repo.spec.schedule_defaults,
-                on_namespace_delete: repo.spec.on_namespace_delete,
-                credential_projection_allowed: repo
-                    .spec
-                    .credential_projection
-                    .map(|p| p.allowed)
-                    .unwrap_or(false),
-                mode: repo.spec.mode,
-                owner_ref,
-                deletion_protection: repo.spec.deletion_protection,
-                mass_deletion_ack,
-                catalog: repo.spec.catalog,
-                ca_bundle_pem,
-            })
+            resolved_from_cluster(repo, ca_bundle_pem)
         }
     }
+}
+
+/// **Pure projection.** Normalize a fetched namespaced [`Repository`] (+ its
+/// already-resolved CA bundle PEM) into the [`ResolvedRepository`] surface.
+/// Shared by the live resolver ([`resolve_repository_ref`]) and the
+/// store-backed one ([`super::resolve_repository_ref_cached`]) so the two can
+/// never drift on which spec fields flow through.
+pub(crate) fn resolved_from_namespaced(
+    repo: Repository,
+    namespace: String,
+    ca_bundle_pem: Option<String>,
+) -> Result<ResolvedRepository> {
+    let owner_ref = super::owner_ref_for(&repo, "Repository")?;
+    let mass_deletion_ack = mass_deletion_ack(&repo);
+    Ok(ResolvedRepository {
+        repo_namespace: Some(namespace),
+        backend: repo.spec.backend,
+        encryption: repo.spec.encryption,
+        mover_defaults: repo.spec.mover_defaults,
+        identity_defaults: repo.spec.identity_defaults,
+        schedule_defaults: repo.spec.schedule_defaults,
+        on_namespace_delete: repo.spec.on_namespace_delete,
+        // A namespaced Repository has no owner-side projection gate: its
+        // credential Secret co-resides with the consumer, so projection is a
+        // same-namespace no-op. Treat the gate as not-applicable (false).
+        credential_projection_allowed: false,
+        mode: repo.spec.mode,
+        owner_ref,
+        deletion_protection: repo.spec.deletion_protection,
+        mass_deletion_ack,
+        catalog: repo.spec.catalog,
+        ca_bundle_pem,
+    })
+}
+
+/// **Pure projection.** Normalize a fetched [`ClusterRepository`] into the
+/// [`ResolvedRepository`] surface — the cluster-scoped peer of
+/// [`resolved_from_namespaced`], shared by the live and store-backed resolvers.
+pub(crate) fn resolved_from_cluster(
+    repo: ClusterRepository,
+    ca_bundle_pem: Option<String>,
+) -> Result<ResolvedRepository> {
+    let owner_ref = super::owner_ref_for(&repo, "ClusterRepository")?;
+    let mass_deletion_ack = mass_deletion_ack(&repo);
+    Ok(ResolvedRepository {
+        repo_namespace: None,
+        backend: repo.spec.backend,
+        encryption: repo.spec.encryption,
+        mover_defaults: repo.spec.mover_defaults,
+        identity_defaults: repo.spec.identity_defaults,
+        schedule_defaults: repo.spec.schedule_defaults,
+        on_namespace_delete: repo.spec.on_namespace_delete,
+        credential_projection_allowed: repo
+            .spec
+            .credential_projection
+            .map(|p| p.allowed)
+            .unwrap_or(false),
+        mode: repo.spec.mode,
+        owner_ref,
+        deletion_protection: repo.spec.deletion_protection,
+        mass_deletion_ack,
+        catalog: repo.spec.catalog,
+        ca_bundle_pem,
+    })
 }
 
 /// Resolve the PEM content of a backend's `tls.caBundleRef` ConfigMap, or
@@ -523,24 +545,28 @@ pub fn maintenance_recency(
     }
 }
 
-/// Gather the live [`PreflightInputs`] for a repository plus its readiness — one
-/// `Repository`/`ClusterRepository` GET for status, and the shared `Maintenance`
-/// informer for recency. Returns `(inputs, ready)` so the caller derives the
-/// readiness gate from the same fetch (no second lookup). `MissingDependency` if
-/// the repository is absent (mirrors [`repository_ready`]).
+/// Gather the [`PreflightInputs`] for a repository plus its readiness — one
+/// `Repository`/`ClusterRepository` point read (the store-backed
+/// [`super::fetch_repository`]/[`super::fetch_cluster_repository`] kernel,
+/// #382 M2 — every caller is launch-side, so no live original is kept) for
+/// status, and the shared `Maintenance` informer for recency. Returns
+/// `(inputs, ready)` so the caller derives the readiness gate from the same
+/// fetch (no second lookup). `MissingDependency` if the repository is absent
+/// (mirrors [`repository_ready`]; a store miss is live-confirmed, so this is
+/// never a stale negative).
 pub async fn gather_preflight_inputs(
-    client: &kube::Client,
+    ctx: &crate::context::Context,
     repo_ref: &RepositoryRef,
     default_ns: &str,
-    maintenance_store: &Store<Maintenance>,
     now: DateTime<Utc>,
 ) -> Result<(PreflightInputs, bool)> {
     let (mut inputs, kind, name, match_ns) = match repo_lookup(repo_ref, default_ns) {
         RepoLookup::Namespaced { namespace, name } => {
-            let api: Api<Repository> = Api::namespaced(client.clone(), &namespace);
-            let repo = api.get_opt(&name).await?.ok_or_else(|| {
-                Error::MissingDependency(format!("Repository {namespace}/{name}"))
-            })?;
+            let repo = super::fetch_repository(ctx, &namespace, &name)
+                .await?
+                .ok_or_else(|| {
+                    Error::MissingDependency(format!("Repository {namespace}/{name}"))
+                })?;
             let st = repo.status.as_ref();
             let inputs = repo_status_to_inputs(
                 st.and_then(|s| s.phase.as_ref()),
@@ -553,9 +579,7 @@ pub async fn gather_preflight_inputs(
             (inputs, RepositoryKind::Repository, name, Some(namespace))
         }
         RepoLookup::Cluster { name } => {
-            let api: Api<ClusterRepository> = Api::all(client.clone());
-            let repo = api
-                .get_opt(&name)
+            let repo = super::fetch_cluster_repository(ctx, &name)
                 .await?
                 .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
             let st = repo.status.as_ref();
@@ -574,7 +598,7 @@ pub async fn gather_preflight_inputs(
     // Best-effort recency from the shared informer; a cold store ⇒ fail-closed
     // (has_run=false, UNKNOWN_AGE), bounded by the preflight timeout.
     let (has_run, age) = maintenance_recency(
-        maintenance_store.state().iter().map(|m| (**m).clone()),
+        ctx.maintenance_store.state().iter().map(|m| (**m).clone()),
         kind,
         &name,
         match_ns.as_deref(),

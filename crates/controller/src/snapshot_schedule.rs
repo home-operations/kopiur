@@ -1112,13 +1112,49 @@ async fn target_policy_refs(
     // Fan-out: read SnapshotPolicies in the schedule's namespace and filter by the
     // selector. (The schedule fires policies in its own namespace; a policyRef may
     // still cross namespaces, but the selector form is namespace-local by design.)
+    // Prefer the shared SnapshotPolicy reflector store when published AND synced
+    // (#382 M2) — this runs twice per reconcile (timezone default + fire loop),
+    // so serving it in-process removes two LISTs. A cold store falls back to the
+    // live LIST: an unset/unsynced store read as "no targets" would silently
+    // skip firing (design rule R2 — live fallback, never deferral-as-empty).
+    if let Some(store) = ctx.config_store.get()
+        && io::read_from_store(
+            true,
+            ctx.config_synced.load(std::sync::atomic::Ordering::Acquire),
+        )
+    {
+        let state = store.state();
+        return Ok(select_policy_targets(
+            state.iter().map(Arc::as_ref),
+            namespace,
+            selector,
+        ));
+    }
     let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), namespace);
     let policies = api.list(&ListParams::default()).await?.items;
-    let refs = policies
+    Ok(select_policy_targets(policies.iter(), namespace, selector))
+}
+
+/// **Pure.** The `policySelector` fan-out target set: every policy **in
+/// `namespace`** matching `selector`, skipping suspended policies (§14(e)),
+/// sorted by name (parity with the apiserver's name-ordered LIST, so the fire
+/// loop's per-policy child naming is order-stable however the set was read).
+///
+/// The namespace filter is INSIDE this kernel deliberately (audit C4): the
+/// reflector store is install-scope-wide, so an in-process replacement for a
+/// namespaced label-selector LIST must filter namespace AND label — a
+/// label-only filter would merge a matching policy from ANOTHER namespace into
+/// this schedule's fan-out.
+fn select_policy_targets<'a>(
+    policies: impl IntoIterator<Item = &'a SnapshotPolicy>,
+    namespace: &str,
+    selector: &k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector,
+) -> Vec<PolicyRef> {
+    let mut refs: Vec<PolicyRef> = policies
         .into_iter()
         .filter(|p| {
-            // Skip suspended policies (§14(e)) and apply the selector match.
-            !p.spec.suspend
+            p.metadata.namespace.as_deref() == Some(namespace)
+                && !p.spec.suspend
                 && policy_matches_selector(
                     p.metadata.labels.as_ref().unwrap_or(&BTreeMap::new()),
                     selector,
@@ -1129,7 +1165,8 @@ async fn target_policy_refs(
             namespace: None,
         })
         .collect();
-    Ok(refs)
+    refs.sort_by(|a, b| a.name.cmp(&b.name));
+    refs
 }
 
 /// Resolve the effective cron timezone for this reconcile (see
@@ -1203,19 +1240,17 @@ async fn policy_repo_timezone_default(
     schedule_ns: &str,
 ) -> Result<Vec<Option<String>>> {
     let policy_ns = policy_ref.namespace.as_deref().unwrap_or(schedule_ns);
-    let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), policy_ns);
-    let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
-        Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
-    })?;
+    // Store-backed point reads (#382 M2): policy + repository both come from
+    // the fetch kernel — a miss/cold store is live-confirmed, so the error
+    // shapes (and the caller's Degraded handling) are unchanged.
+    let policy = io::fetch_policy(ctx, policy_ns, &policy_ref.name)
+        .await?
+        .ok_or_else(|| {
+            Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
+        })?;
     let mut defaults = Vec::new();
     for rref in kopiur_api::repository_refs(&policy.spec) {
-        let repo = io::resolve_repository_ref(
-            &ctx.client,
-            rref,
-            policy_ns,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await?;
+        let repo = io::resolve_repository_ref_cached(ctx, rref, policy_ns).await?;
         defaults.push(repo.schedule_defaults.and_then(|d| d.timezone));
     }
     Ok(defaults)
@@ -1338,15 +1373,18 @@ fn policy_usable(policy: &SnapshotPolicy) -> bool {
 /// the apply in [`create_scheduled_backup`] — the policy could start terminating
 /// in between, and a late-fired child dangles, bounded by `failedJobsHistoryLimit`.
 async fn policy_default_deletion_policy(
-    client: &kube::Client,
+    ctx: &Context,
     policy_ref: &PolicyRef,
     schedule_ns: &str,
 ) -> Result<Option<DeletionPolicy>> {
     let policy_ns = policy_ref.namespace.as_deref().unwrap_or(schedule_ns);
-    let api: Api<SnapshotPolicy> = Api::namespaced(client.clone(), policy_ns);
-    let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
-        Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
-    })?;
+    // Store-backed point read (#382 M2): a miss/cold store is live-confirmed
+    // (`fetch_policy`), so the fail-the-fire error contract above is unchanged.
+    let policy = io::fetch_policy(ctx, policy_ns, &policy_ref.name)
+        .await?
+        .ok_or_else(|| {
+            Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
+        })?;
     if !policy_usable(&policy) {
         return Err(Error::MissingDependency(format!(
             "SnapshotPolicy {policy_ns}/{} is being deleted",
@@ -1513,7 +1551,6 @@ async fn fire_for_targets(
     let targets = target_policy_refs(ctx, schedule, namespace).await?;
     let single = schedule.spec.policy_ref.is_some();
     let sched_name = schedule.name_any();
-    let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(ctx.client.clone(), namespace);
     for pref in &targets {
         let base_name = if single {
             scheduled_backup_name(&sched_name, slot)
@@ -1523,7 +1560,12 @@ async fn fire_for_targets(
         // Expand `pvcSelector` sources into one child per matched PVC. A policy
         // with no selector yields `None` — mint exactly one unpinned child,
         // byte-for-byte the pre-#346 behavior.
-        let policy = policies.get(&pref.name).await?;
+        // Store-backed point read (#382 M2); a vanished policy maps to the
+        // EXACT 404 error a bare `Api::get` used to raise here, so error
+        // classification and the fire's skip/retry cadence are unchanged.
+        let policy = io::fetch_policy(ctx, namespace, &pref.name)
+            .await?
+            .ok_or_else(|| fire_policy_not_found(&pref.name))?;
         let matched = crate::expand::match_pvcs(&ctx.client, &policy).await?;
         let members = crate::expand::expand_sources(&policy, &base_name, &matched)
             .map_err(|e| Error::Validation(e.to_string()))?;
@@ -1561,7 +1603,7 @@ async fn fire_for_targets(
                 // skipped and retried, never firing with a wrong (destructive)
                 // default.
                 let default_deletion_policy =
-                    policy_default_deletion_policy(&ctx.client, pref, namespace).await?;
+                    policy_default_deletion_policy(ctx, pref, namespace).await?;
                 if cells.len() != 1 || cells[0].name != base_name {
                     outcome.fanned_out = true;
                 }
@@ -1580,6 +1622,34 @@ async fn fire_for_targets(
         }
     }
     Ok(outcome)
+}
+
+/// **Pure.** The error the fire loop raises when a targeted policy vanished
+/// between `target_policy_refs` and the fire — byte-identical to the 404 a
+/// bare `Api::<SnapshotPolicy>::get` used to raise there (#382 M2), so the
+/// [`Error::Kube`] classification, requeue cadence, and event text are
+/// preserved now that the read goes through the miss-is-live-confirmed
+/// [`io::fetch_policy`] kernel (whose `None` IS a confirmed 404).
+fn fire_policy_not_found(name: &str) -> Error {
+    use kube::Resource;
+    use kube::core::response::{StatusDetails, StatusSummary};
+    let plural = SnapshotPolicy::plural(&());
+    let group = SnapshotPolicy::group(&());
+    Error::Kube(kube::Error::Api(Box::new(kube::core::Status {
+        status: Some(StatusSummary::Failure),
+        code: 404,
+        message: format!("{plural}.{group} \"{name}\" not found"),
+        reason: "NotFound".to_string(),
+        details: Some(StatusDetails {
+            name: name.to_string(),
+            group: group.into_owned(),
+            kind: plural.into_owned(),
+            uid: String::new(),
+            causes: Vec::new(),
+            retry_after_seconds: 0,
+        }),
+        metadata: None,
+    })))
 }
 
 /// `error_policy` for the `SnapshotSchedule` controller.
@@ -1860,7 +1930,8 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 status_body(500, "InternalError"),
             );
-            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            let ctx = Context::test_context(client);
+            let r = policy_default_deletion_policy(&ctx, &pref(), "default").await;
             assert!(
                 r.is_err(),
                 "a failing policy read must propagate, got {r:?}"
@@ -1872,7 +1943,8 @@ mod tests {
             // A genuinely-absent policy is an error too (mirrors the timezone
             // resolver) — the fire has nothing to inherit from, so skip/retry.
             let client = mock_client(StatusCode::NOT_FOUND, status_body(404, "NotFound"));
-            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            let ctx = Context::test_context(client);
+            let r = policy_default_deletion_policy(&ctx, &pref(), "default").await;
             assert!(
                 matches!(r, Err(Error::MissingDependency(_))),
                 "a missing policy must be MissingDependency, got {r:?}"
@@ -1895,7 +1967,8 @@ mod tests {
                 "spec": { "repository": { "name": "repo" } },
             });
             let client = mock_client(StatusCode::OK, body);
-            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            let ctx = Context::test_context(client);
+            let r = policy_default_deletion_policy(&ctx, &pref(), "default").await;
             assert!(
                 matches!(r, Err(Error::MissingDependency(_))),
                 "a terminating policy must be MissingDependency, got {r:?}"
@@ -2271,6 +2344,89 @@ mod tests {
             ..Default::default()
         };
         assert!(!policy_matches_selector(&labels, &not_in));
+    }
+
+    /// A minimal labeled policy in a namespace, for [`select_policy_targets`]
+    /// (parsed the cluster's way: JSON value → typed).
+    fn selectable_policy(
+        ns: &str,
+        name: &str,
+        tier: Option<&str>,
+        suspend: bool,
+    ) -> SnapshotPolicy {
+        let mut labels = serde_json::Map::new();
+        if let Some(t) = tier {
+            labels.insert("tier".to_string(), serde_json::Value::String(t.into()));
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": name, "namespace": ns, "labels": labels },
+            "spec": { "repository": { "name": "repo" }, "suspend": suspend },
+        }))
+        .expect("valid SnapshotPolicy fixture")
+    }
+
+    // --- select_policy_targets: the in-process replacement for the namespaced
+    // selector LIST (#382 M2). The namespace filter INSIDE the kernel is the
+    // audit-C4 guard: the reflector store is install-scope-wide, so a
+    // label-only filter would merge another namespace's same-labeled policy
+    // into this schedule's fan-out. ---
+    #[test]
+    fn select_policy_targets_filters_namespace_label_and_suspend() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+        let selector = LabelSelector {
+            match_labels: Some(BTreeMap::from([(
+                "tier".to_string(),
+                "critical".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let policies = [
+            selectable_policy("team-a", "zz-match", Some("critical"), false),
+            selectable_policy("team-a", "aa-match", Some("critical"), false),
+            // C4: same labels, OTHER namespace — must be excluded.
+            selectable_policy("team-b", "intruder", Some("critical"), false),
+            // §14(e): suspended — must be excluded even when matching.
+            selectable_policy("team-a", "paused", Some("critical"), true),
+            // Label mismatch / unlabeled — excluded by the selector.
+            selectable_policy("team-a", "wrong-tier", Some("low"), false),
+            selectable_policy("team-a", "unlabeled", None, false),
+        ];
+        let refs = select_policy_targets(policies.iter(), "team-a", &selector);
+        let names: Vec<_> = refs.iter().map(|r| r.name.as_str()).collect();
+        // Sorted by name (parity with the apiserver's name-ordered LIST).
+        assert_eq!(names, vec!["aa-match", "zz-match"]);
+        assert!(
+            refs.iter().all(|r| r.namespace.is_none()),
+            "selector targets are namespace-local by design"
+        );
+        // An empty selector still honors namespace + suspend.
+        let all = select_policy_targets(policies.iter(), "team-a", &LabelSelector::default());
+        let all_names: Vec<_> = all.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            all_names,
+            vec!["aa-match", "unlabeled", "wrong-tier", "zz-match"]
+        );
+    }
+
+    // --- fire_policy_not_found: the store-miss → live-confirmed-404 mapping
+    // must keep the EXACT error shape a bare `Api::get` raised (#382 M2), so
+    // classification (Transient via Error::Kube) and messages are unchanged. ---
+    #[test]
+    fn fire_policy_not_found_matches_bare_get_404_shape() {
+        let err = fire_policy_not_found("pg");
+        match err {
+            Error::Kube(kube::Error::Api(status)) => {
+                assert_eq!(status.code, 404);
+                assert_eq!(status.reason, "NotFound");
+                assert_eq!(
+                    status.message,
+                    "snapshotpolicies.kopiur.home-operations.com \"pg\" not found"
+                );
+            }
+            other => panic!("must be the kube Api 404 shape, got {other:?}"),
+        }
     }
 
     #[test]

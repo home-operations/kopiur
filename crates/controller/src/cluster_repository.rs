@@ -198,6 +198,10 @@ fn cluster_secret_namespace(
 /// Reconcile a `ClusterRepository`.
 #[tracing::instrument(skip(repo, ctx), fields(kind = "ClusterRepository", name = %repo.name_any()))]
 pub async fn reconcile(repo: Arc<ClusterRepository>, ctx: Arc<Context>) -> Result<Action> {
+    // A dispatched reconcile is proof the ClusterRepository reflector completed
+    // its initial LIST, so the `fetch_cluster_repository` point-read kernel may
+    // serve from `ctx.crepo_store` from here on — see `Context::mark_crepo_synced`.
+    ctx.mark_crepo_synced();
     let start = std::time::Instant::now();
     let result = reconcile_inner(&repo, &ctx).await;
     ctx.metrics

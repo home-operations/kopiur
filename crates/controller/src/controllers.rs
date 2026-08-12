@@ -408,6 +408,7 @@ pub(crate) async fn spawn_all(
     let repo_ctx = ctx.clone();
     let repo_ctrl = Controller::new(repo_api, cfg.clone()).with_config(ctrl_cfg.clone());
     let repo_store = repo_ctrl.store();
+    publish_store(&ctx.repo_store, repo_store.clone());
     let repo_ctrl = repo_ctrl
         // Own the bootstrap Job (carries a controller ownerRef already): its
         // terminal state arrives as an EVENT instead of hoping a 15s poll lands
@@ -492,6 +493,11 @@ pub(crate) async fn spawn_all(
         let crepo_ctx = ctx.clone();
         let crepo_ctrl = Controller::new(crepo_api, cfg.clone()).with_config(ctrl_cfg.clone());
         let crepo_store = crepo_ctrl.store();
+        // Cluster scope only: a namespaced install has no ClusterRepository
+        // controller, so `ctx.crepo_store` stays UNSET there and every
+        // ClusterRepository point read falls through to the live API
+        // (preserving the namespaced-install 403 behavior — never "missing").
+        publish_store(&ctx.crepo_store, crepo_store.clone());
         let crepo_ctrl = crepo_ctrl
             // Own the bootstrap Job — same prompt-terminal-observation rationale as
             // the Repository controller above.
@@ -571,6 +577,7 @@ pub(crate) async fn spawn_all(
     let config_ctx = ctx.clone();
     let config_ctrl = Controller::new(config_api, cfg.clone()).with_config(ctrl_cfg.clone());
     let config_store = config_ctrl.store();
+    publish_store(&ctx.config_store, config_store.clone());
     let mut config_ctrl = config_ctrl
         .owns_with(scoped_api::<Job>(&client, &scope), (), owned_cfg.clone())
         .owns_with(
