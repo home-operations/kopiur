@@ -137,6 +137,19 @@ pub fn backups_to_delete(
     // exactly one bucket and behaves byte-for-byte as before.
     let mut buckets: BTreeMap<String, Vec<SnapshotRetentionView>> = BTreeMap::new();
     for b in backups {
+        // #382 C1: a terminating row is excluded from the kept-set computation
+        // INPUT — with the population served from the reflector store, an
+        // externally-deleted-but-still-cached NEWER snapshot must not claim a
+        // keep slot and push a LIVE row into the delete set (the one true
+        // data-loss race). Excluding it here only removes a bucket competitor
+        // (survivors are promoted, never demoted). The exclusion is scoped to
+        // THIS boundary: the shared `backups` slice stays INCLUSIVE of
+        // terminating rows so `own_snapshot_ids_and_history` keeps seeing a
+        // terminating adopted row's kopia id (or `plan_adoption` could
+        // re-adopt an id whose CR is mid-finalizer).
+        if b.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
         if let Some(v) = retention_view(b) {
             buckets
                 .entry(retention_group_key(b, policy_is_multi))
@@ -924,17 +937,21 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     )
     .await?;
 
-    // LIST this policy's Snapshots BEFORE the repository-readiness gate below:
-    // retention (further down) needs the population even while the repository is
-    // not Ready. The `kopiur_snapshot_consecutive_failures` / `kopiur_snapshots_live`
+    // Enumerate this policy's Snapshots BEFORE the repository-readiness gate
+    // below: retention (further down) needs the population even while the
+    // repository is not Ready. Served from the Snapshot reflector store when
+    // synced, live CONFIG_LABEL LIST otherwise (#382 M3 — `io::snapshot_children`
+    // filters namespace AND label, C4). The slice is INCLUSIVE of terminating
+    // rows (C1 scoping — `own_snapshot_ids_and_history` needs them); the
+    // kept-set computation inside `backups_to_delete` applies the exclusion.
+    // The `kopiur_snapshot_consecutive_failures` / `kopiur_snapshots_live`
     // gauges are no longer written here — they are store-backed observables derived
     // from the Snapshot reflector store at collection time (M6, #345), which is
     // what freeze-proofs them: they keep updating even when this reconcile stops
     // running (e.g. the repository left `Ready`, exactly when the streak matters
     // most), and a deleted policy's series vanish instead of lingering (#172/#175).
     let backup_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
-    let lp = ListParams::default().labels(&format!("{CONFIG_LABEL}={name}"));
-    let backups = backup_api.list(&lp).await?.items;
+    let backups = io::snapshot_children(ctx, &namespace, CONFIG_LABEL, &name).await?;
 
     // §2 dependent gating, refined to the READY SUBSET (#368 M10): partition
     // the targets by repository readiness. The ready subset keeps processing
@@ -1028,6 +1045,11 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         all_ready,
     );
     for cr_name in unchanged_prunes {
+        // #382 C2: the selection may be store-derived — trust the cache to
+        // SELECT, verify live before DESTROYING. Gone/terminating rows skip.
+        if !io::confirm_row_live(&backup_api, &cr_name).await? {
+            continue;
+        }
         // Stamp `pruned-by` THEN delete, exactly like every other operator
         // prune, so the finalizer classifies it as ours and the mass-deletion
         // breaker stays out of the way.
@@ -1052,6 +1074,12 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         // reclassification that keeps breaker-held drains moving.
         let to_delete = executable_prunes(to_delete, &backups, &ready_keys, all_ready);
         for cr_name in &to_delete {
+            // #382 C2: live-verify each store-selected row before destruction —
+            // a row that vanished (or started terminating) since the reflector
+            // snapshot must not be re-deleted.
+            if !io::confirm_row_live(&backup_api, cr_name).await? {
+                continue;
+            }
             // Stamp `pruned-by: retention` THEN delete, so the finalizer bypasses
             // the mass-deletion breaker + cascade guard (this is an operator prune,
             // never an external deletion). 404-tolerant + idempotent internally.
@@ -1674,10 +1702,12 @@ async fn adoption_pass_for_target(
 /// catalog-scan request (a belt requeue so the wave settles promptly); `None`
 /// means nothing happened — fall through to the normal steady-state return.
 ///
-/// `backups` is the retention pass's `CONFIG_LABEL` child LIST, reused here to
-/// derive this policy's own kopia ids + whether it has any history (never
-/// re-LISTed). The discovered candidates come from a SEPARATE cluster-wide
-/// LIST per repository.
+/// `backups` is the retention pass's `CONFIG_LABEL` child population, reused
+/// here to derive this policy's own kopia ids + whether it has any history
+/// (never re-enumerated). The discovered candidates come from a SEPARATE
+/// install-scope-wide enumeration per repository
+/// ([`list_adoption_candidates`] — reflector store when synced, live LIST
+/// otherwise, #382 M3).
 #[allow(clippy::too_many_arguments)]
 async fn run_adoption(
     ctx: &Context,
@@ -1812,13 +1842,36 @@ async fn run_adoption(
     Ok(None)
 }
 
-/// LIST this repository's discovered rows cluster-wide (inv. 1) via the install
-/// scope, selected by `origin: discovered` + the repository UID, and distill
-/// them into [`crate::adoption::AdoptionCandidate`]s.
+/// This repository's discovered rows, install-scope-wide (inv. 1), selected by
+/// `origin: discovered` + the repository UID, distilled into
+/// [`crate::adoption::AdoptionCandidate`]s.
+///
+/// Served from the Snapshot reflector store when it is published AND synced
+/// (#382 M3 — this was the 7.7MB full-object LIST per repo target per
+/// reconcile), else via today's live label-selector LIST (R2: a cold store is
+/// never read as "no candidates"). The store covers the same install watch
+/// scope as `scoped_api`, and — unlike the namespaced populations — this
+/// filter is deliberately NOT namespace-scoped: discovered rows are matched
+/// across every namespace the operator watches, exactly like the live LIST.
+/// Both label checks (and the terminating/status gates) live in the pure
+/// [`crate::adoption::adoption_candidates`], which BORROWS the store rows so
+/// full objects are never wholesale-cloned (C8). Every adopt-create is
+/// live-verified afterwards ([`execute_adoptions`], C6).
 async fn list_adoption_candidates(
     ctx: &Context,
     repo_uid: &str,
 ) -> Result<Vec<crate::adoption::AdoptionCandidate>> {
+    use std::sync::atomic::Ordering;
+    let store = ctx.snapshot_store.get();
+    if io::read_from_store(store.is_some(), ctx.snapshot_synced.load(Ordering::Acquire))
+        && let Some(store) = store
+    {
+        let rows = store.state();
+        return Ok(crate::adoption::adoption_candidates(
+            repo_uid,
+            rows.iter().map(std::sync::Arc::as_ref),
+        ));
+    }
     let api: Api<Snapshot> = crate::controllers::scoped_api(&ctx.client, &ctx.watch_scope);
     let lp = ListParams::default().labels(&format!(
         "{}={},{}={repo_uid}",
@@ -1881,6 +1934,17 @@ async fn execute_adoptions(
 ) -> Result<u64> {
     let mut count = 0u64;
     for candidate in adopt {
+        // #382 C6: the candidate may come from the reflector store — live-verify
+        // the discovered row still exists (and is not mid-finalizer) in ITS OWN
+        // namespace before creating the adopted row. A vanished candidate must
+        // not become a phantom restore point that later displaces a real one in
+        // GFS math; a terminating one is already being expired and must not be
+        // re-created under a new identity.
+        let discovered_api: Api<Snapshot> =
+            Api::namespaced(ctx.client.clone(), &candidate.namespace);
+        if !io::confirm_row_live(&discovered_api, &candidate.name).await? {
+            continue;
+        }
         adopt_one(ctx, config, namespace, repo_uid, repo_ref, candidate).await?;
         count += 1;
     }
@@ -3141,5 +3205,229 @@ mod tests {
         // Unpinned successes count for NO repo (their repository is not
         // knowable from the spec; the backfill pass pins them promptly).
         assert!(!multi_repo_has_success(&rows, "Repository/apps/repo-c"));
+    }
+
+    // --- #382 M3: store-served enumeration data-safety boundaries -----------
+
+    /// C1: with a store-served population, an externally-deleted-but-still-
+    /// cached NEWER snapshot must not claim a keep slot and push a LIVE row
+    /// into the delete set — but the SAME slice must keep feeding the
+    /// terminating row's kopia id into `own_snapshot_ids_and_history`, or
+    /// `plan_adoption` could re-adopt an id whose CR is mid-finalizer.
+    #[test]
+    fn terminating_row_neither_claims_a_keep_slot_nor_leaves_own_ids() {
+        let ghost = terminating(succeeded_backup("ghost", at(2026, 5, 25)), false);
+        let backups = vec![ghost, succeeded_backup("live", at(2026, 5, 24))];
+
+        // keepLatest: 1 — without the C1 exclusion the terminating "ghost"
+        // (newer) would win the one slot and select "live" for deletion.
+        let del = backups_to_delete(&backups, &policy(Some(1), None), false);
+        assert!(
+            del.is_empty(),
+            "a terminating cached row must not displace a live row out of the kept set, got {del:?}"
+        );
+
+        // C1 scoping: the shared slice stays INCLUSIVE — the terminating row's
+        // kopia id must still be visible to the re-adoption guard.
+        let (ids, _) = own_snapshot_ids_and_history(&backups);
+        assert!(
+            ids.contains("snap-ghost"),
+            "own_ids must keep seeing a terminating row's kopia id"
+        );
+    }
+
+    // -- mock-client harness (tower::service_fn, as in io/cached.rs tests) ---
+
+    use http::{Request, Response, StatusCode};
+    use kube::client::Body;
+
+    /// Logs `"<METHOD> <path>"` per request and answers every one with
+    /// `status` + `body`.
+    fn logging_client(
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> kube::Client {
+        let body = std::sync::Arc::new(body);
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            let body = body.clone();
+            async move {
+                log.lock()
+                    .unwrap()
+                    .push(format!("{} {}", req.method(), req.uri().path()));
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&*body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        });
+        kube::Client::new(svc, "default")
+    }
+
+    fn not_found_body() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "reason": "NotFound", "code": 404,
+        })
+    }
+
+    fn prime_snapshot_store(ctx: &Context, objs: Vec<Snapshot>, synced: bool) {
+        use std::sync::atomic::Ordering;
+        let (store, mut writer) = kube::runtime::reflector::store::<Snapshot>();
+        for o in objs {
+            writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(o));
+        }
+        std::mem::forget(writer);
+        ctx.snapshot_store.set(store).ok();
+        ctx.snapshot_synced.store(synced, Ordering::Release);
+    }
+
+    /// A discovered-origin store row for `repo_uid` living in `ns`.
+    fn discovered_row(ns: &str, name: &str, repo_uid: &str, id: &str) -> Snapshot {
+        let mut b = succeeded_backup(name, at(2026, 5, 20));
+        b.metadata.namespace = Some(ns.into());
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            crate::consts::ORIGIN_LABEL.to_string(),
+            Origin::Discovered.label_value().to_string(),
+        );
+        labels.insert(
+            crate::consts::REPOSITORY_UID_LABEL.to_string(),
+            repo_uid.to_string(),
+        );
+        b.metadata.labels = Some(labels);
+        if let Some(s) = b.status.as_mut() {
+            s.phase = Some(SnapshotPhase::Discovered);
+            s.origin = Some(Origin::Discovered);
+            if let Some(i) = s.snapshot.as_mut() {
+                i.kopia_snapshot_id = id.into();
+            }
+        }
+        b
+    }
+
+    /// The adoption enumeration is INSTALL-SCOPE-WIDE by design: candidates in
+    /// every namespace the store covers count (no namespace filter — matching
+    /// the live `origin=discovered,repository-uid=<uid>` LIST), while another
+    /// repository's rows never leak in. Served with zero HTTP when synced.
+    #[tokio::test]
+    async fn adoption_candidates_served_scope_wide_from_the_store_without_http() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(
+            &ctx,
+            vec![
+                discovered_row("ns-a", "disc-a", "repo-1", "id-a"),
+                discovered_row("ns-b", "disc-b", "repo-1", "id-b"),
+                // Another repository's discovered row: filtered by the uid label.
+                discovered_row("ns-a", "disc-other", "repo-2", "id-c"),
+                // This policy's own child (no discovered labels): never a candidate.
+                succeeded_backup("own-child", at(2026, 5, 21)),
+            ],
+            true,
+        );
+
+        let mut got: Vec<String> = list_adoption_candidates(&ctx, "repo-1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| format!("{}/{}", c.namespace, c.name))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["ns-a/disc-a", "ns-b/disc-b"]);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a synced store must serve adoption candidates with zero HTTP, got {:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    /// R2: an unset (or unsynced) store falls back to the live LIST — never
+    /// "no candidates".
+    #[tokio::test]
+    async fn adoption_candidates_fall_back_to_live_list_when_store_cold() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let row =
+            serde_json::to_value(discovered_row("ns-a", "disc-live", "repo-1", "id-live")).unwrap();
+        let list = serde_json::json!({
+            "apiVersion": crate::consts::API_VERSION,
+            "kind": "SnapshotList",
+            "metadata": {},
+            "items": [row],
+        });
+        let client = logging_client(log.clone(), StatusCode::OK, list);
+        let ctx = Context::test_context(client);
+        // Store present but NOT synced: must go live, same as unset.
+        prime_snapshot_store(
+            &ctx,
+            vec![discovered_row("ns-a", "disc-cached", "repo-1", "id-cached")],
+            false,
+        );
+
+        let got = list_adoption_candidates(&ctx, "repo-1").await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "disc-live", "served live, not cached");
+        assert_eq!(log.lock().unwrap().len(), 1, "exactly one live LIST");
+    }
+
+    /// C6: a store-derived candidate whose discovered row vanished must be
+    /// live-verified and SKIPPED — never created as a phantom restore point.
+    /// The guard is one GET in the candidate's own namespace; no create fires.
+    #[tokio::test]
+    async fn execute_adoptions_skips_a_vanished_candidate_without_creating() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
+        let ctx = Context::test_context(client);
+        let config: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": crate::consts::API_VERSION,
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pol", "namespace": "team-a", "uid": "uid-pol" },
+            "spec": { "repository": { "name": "repo" } },
+        }))
+        .unwrap();
+        let rref = kopiur_api::common::RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::Repository,
+            name: "repo".into(),
+            namespace: None,
+        };
+        let candidate = crate::adoption::AdoptionCandidate {
+            namespace: "disc-ns".into(),
+            name: "vanished".into(),
+            snapshot_id: "id-x".into(),
+            identity: ResolvedIdentity {
+                username: "u".into(),
+                hostname: "h".into(),
+                source_path: Some("/d".into()),
+            },
+            timing: None,
+            stats: None,
+            pinned: false,
+            recorded: None,
+            description: None,
+        };
+
+        let adopted = execute_adoptions(&ctx, &config, "team-a", "uid-repo", &rref, &[candidate])
+            .await
+            .unwrap();
+        assert_eq!(adopted, 0, "a vanished candidate must not count as adopted");
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly the one live verify GET, got {requests:?}"
+        );
+        assert!(
+            requests[0].starts_with("GET ") && requests[0].contains("/namespaces/disc-ns/"),
+            "the verify GET happens in the candidate's own namespace: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.starts_with("POST ")),
+            "no adopted-row create may fire for a vanished candidate: {requests:?}"
+        );
     }
 }

@@ -24,11 +24,12 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use kube::Api;
+use kube::api::ListParams;
 use kube::runtime::reflector::ObjectRef;
+use kube::{Api, ResourceExt};
 
 use kopiur_api::common::RepositoryRef;
-use kopiur_api::{ClusterRepository, Repository, SnapshotPolicy};
+use kopiur_api::{ClusterRepository, Repository, Snapshot, SnapshotPolicy};
 
 use crate::context::Context;
 use crate::error::{Error, Result};
@@ -180,6 +181,91 @@ pub async fn repository_ready_cached(
             Ok(repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&ready))
         }
     }
+}
+
+/// **Pure** (#382 M3, audit C4). Whether a cached `Snapshot` row belongs to
+/// the namespaced label population `namespace` + `label_key=label_value`.
+///
+/// The namespace check is NOT optional: the Snapshot reflector store is
+/// install-scope-wide, so a label-only filter would merge another namespace's
+/// same-named policy/schedule children into this owner's population — for the
+/// retention path that means cross-namespace GFS math and cross-namespace
+/// deletion. Every in-process filter that replaces a namespaced label-selector
+/// LIST must go through this predicate (or reproduce both checks).
+pub fn snapshot_matches(s: &Snapshot, namespace: &str, label_key: &str, label_value: &str) -> bool {
+    s.namespace().as_deref() == Some(namespace)
+        && s.labels().get(label_key).map(String::as_str) == Some(label_value)
+}
+
+/// Enumerate the `Snapshot` children in `namespace` carrying
+/// `label_key=label_value`, served from the Snapshot reflector store when it
+/// is published AND synced, else via today's live label-selector LIST (#382
+/// M3 — this replaces the per-reconcile full-collection LISTs that were the
+/// headline apiserver load).
+///
+/// - **R2**: an unset or not-yet-synced store is NEVER read as "no children"
+///   — that would erase a policy's whole population from retention math (and
+///   let a schedule's Forbid gate see "no active runs") on a cold cache. The
+///   fallback is a live LIST, never a deferral.
+/// - **C4**: the store path filters namespace AND label ([`snapshot_matches`]).
+/// - **C8**: the store's `Arc` rows are filtered first; only matches are
+///   deep-cloned.
+///
+/// Consumers that select rows for DESTRUCTION from this population must
+/// live-verify each selected row first ([`confirm_row_live`], audit C2).
+pub(crate) async fn snapshot_children(
+    ctx: &Context,
+    namespace: &str,
+    label_key: &str,
+    label_value: &str,
+) -> Result<Vec<Snapshot>> {
+    let store = ctx.snapshot_store.get();
+    if read_from_store(store.is_some(), ctx.snapshot_synced.load(Ordering::Acquire))
+        && let Some(store) = store
+    {
+        return Ok(store
+            .state()
+            .iter()
+            .filter(|row| snapshot_matches(row.as_ref(), namespace, label_key, label_value))
+            .map(|row| (**row).clone())
+            .collect());
+    }
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    let lp = ListParams::default().labels(&format!("{label_key}={label_value}"));
+    Ok(api.list(&lp).await?.items)
+}
+
+/// **Pure** (#382 M3, audits C2/C6): the trust-cache-for-selection /
+/// verify-live-before-acting skip decision. A row selected from the reflector
+/// store is actionable only if the LIVE read still finds it and it is not
+/// already terminating:
+///
+/// - gone (`None`): a prune would 404-race a finished drain, and an adoption
+///   CREATE would mint a phantom restore point for a snapshot whose CR
+///   vanished (C6);
+/// - terminating: its finalizer is already draining — re-deleting is noise,
+///   and re-creating (adoption) would resurrect an id that is mid-expiry.
+pub fn live_row_actionable(live: Option<&Snapshot>) -> bool {
+    match live {
+        Some(row) => row.metadata.deletion_timestamp.is_none(),
+        None => false,
+    }
+}
+
+/// Live-verify a store-derived selection before destruction or creation (#382
+/// M3, audits C2/C6): one `get_opt` per SELECTED row (never per population
+/// row), then the pure [`live_row_actionable`] decision. `Ok(false)` means
+/// "skip this row" and has already been debug-logged.
+pub(crate) async fn confirm_row_live(api: &Api<Snapshot>, name: &str) -> Result<bool> {
+    let live = api.get_opt(name).await?;
+    let actionable = live_row_actionable(live.as_ref());
+    if !actionable {
+        tracing::debug!(
+            snapshot = %name,
+            "skipping cache-selected row: gone or terminating on live verify (#382 C2/C6)"
+        );
+    }
+    Ok(actionable)
 }
 
 #[cfg(test)]
@@ -453,5 +539,246 @@ mod tests {
             matches!(err, Error::MissingDependency(ref m) if m.contains("Repository team-a/gone")),
             "got {err:?}"
         );
+    }
+
+    // --- M3: store-served Snapshot enumeration ------------------------------
+
+    fn snapshot_row(ns: &str, name: &str, labels: &[(&str, &str)]) -> Snapshot {
+        let mut s: Snapshot = serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "Snapshot",
+            "metadata": { "name": name, "namespace": ns, "uid": format!("uid-{ns}-{name}") },
+            "spec": {},
+        }))
+        .expect("valid Snapshot fixture");
+        s.metadata.labels = Some(
+            labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        s
+    }
+
+    fn prime_snapshot_store(ctx: &Context, objs: Vec<Snapshot>, synced: bool) {
+        let (store, mut writer) = kube::runtime::reflector::store::<Snapshot>();
+        for o in objs {
+            writer.apply_watcher_event(&watcher::Event::Apply(o));
+        }
+        std::mem::forget(writer);
+        ctx.snapshot_store.set(store).ok();
+        ctx.snapshot_synced.store(synced, Ordering::Release);
+    }
+
+    const CONFIG_LABEL: &str = kopiur_api::consts::CONFIG_LABEL;
+    const SCHEDULE_LABEL: &str = kopiur_api::consts::SCHEDULE_LABEL;
+
+    #[test]
+    fn snapshot_matches_requires_namespace_and_label() {
+        // C4 matrix: the store is install-scope-wide, so BOTH checks are
+        // load-bearing — a label-only filter would merge another namespace's
+        // same-named policy children into this policy's GFS math.
+        let row = snapshot_row("team-a", "child", &[(CONFIG_LABEL, "pg")]);
+        assert!(snapshot_matches(&row, "team-a", CONFIG_LABEL, "pg"));
+        assert!(
+            !snapshot_matches(&row, "team-b", CONFIG_LABEL, "pg"),
+            "cross-namespace intruder with the matching label must not match"
+        );
+        assert!(
+            !snapshot_matches(&row, "team-a", CONFIG_LABEL, "other"),
+            "label value mismatch"
+        );
+        assert!(
+            !snapshot_matches(&row, "team-a", SCHEDULE_LABEL, "pg"),
+            "missing label key"
+        );
+        let unlabeled = snapshot_row("team-a", "bare", &[]);
+        assert!(!snapshot_matches(&unlabeled, "team-a", CONFIG_LABEL, "pg"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_children_store_hit_filters_ns_and_label_without_http() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(
+            &ctx,
+            vec![
+                snapshot_row("team-a", "mine-1", &[(CONFIG_LABEL, "pg")]),
+                snapshot_row("team-a", "mine-2", &[(CONFIG_LABEL, "pg")]),
+                // C4 intruder: same label, ANOTHER namespace — must not leak in.
+                snapshot_row("team-b", "intruder", &[(CONFIG_LABEL, "pg")]),
+                snapshot_row("team-a", "other-policy", &[(CONFIG_LABEL, "redis")]),
+                snapshot_row("team-a", "sched-child", &[(SCHEDULE_LABEL, "pg")]),
+            ],
+            true,
+        );
+
+        let mut got: Vec<String> = snapshot_children(&ctx, "team-a", CONFIG_LABEL, "pg")
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.name_any())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["mine-1", "mine-2"]);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a synced-store enumeration must not touch the API server"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_children_store_hit_schedule_label_excludes_intruders() {
+        // The same C4 guarantee for the SCHEDULE_LABEL call site (the Forbid
+        // concurrency gate's population).
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(
+            &ctx,
+            vec![
+                snapshot_row("team-a", "run-1", &[(SCHEDULE_LABEL, "nightly")]),
+                snapshot_row("team-b", "intruder", &[(SCHEDULE_LABEL, "nightly")]),
+            ],
+            true,
+        );
+        let got = snapshot_children(&ctx, "team-a", SCHEDULE_LABEL, "nightly")
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name_any(), "run-1");
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    fn snapshot_list_body(items: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "SnapshotList",
+            "metadata": {},
+            "items": items,
+        })
+    }
+
+    #[tokio::test]
+    async fn snapshot_children_cold_store_falls_back_to_live_list() {
+        // R2: an unsynced store must NEVER be read as "no children" (a cold
+        // cache would erase the whole population from retention math). The
+        // fallback is a live LIST — never a deferral.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let live_row = serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "Snapshot",
+            "metadata": {
+                "name": "live-child", "namespace": "team-a",
+                "labels": { (CONFIG_LABEL): "pg" },
+            },
+            "spec": {},
+        });
+        let client = logging_client(
+            log.clone(),
+            StatusCode::OK,
+            snapshot_list_body(vec![live_row]),
+        );
+        let ctx = Context::test_context(client);
+        // Rows ARE in the store, but the synced flag never flipped.
+        prime_snapshot_store(
+            &ctx,
+            vec![snapshot_row(
+                "team-a",
+                "cached-child",
+                &[(CONFIG_LABEL, "pg")],
+            )],
+            false,
+        );
+
+        let got = snapshot_children(&ctx, "team-a", CONFIG_LABEL, "pg")
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name_any(), "live-child", "served live, not cached");
+        assert_eq!(log.lock().unwrap().len(), 1, "exactly one live LIST");
+    }
+
+    #[tokio::test]
+    async fn snapshot_children_unset_store_falls_back_to_live_list() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = logging_client(log.clone(), StatusCode::OK, snapshot_list_body(vec![]));
+        let ctx = Context::test_context(client);
+
+        let got = snapshot_children(&ctx, "team-a", CONFIG_LABEL, "pg")
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+        assert_eq!(log.lock().unwrap().len(), 1, "unset store must LIST live");
+    }
+
+    // --- C2/C6: verify live before destruction/creation ---------------------
+
+    #[test]
+    fn live_row_actionable_truth_table() {
+        assert!(!live_row_actionable(None), "gone: skip");
+        let live = snapshot_row("team-a", "row", &[]);
+        assert!(live_row_actionable(Some(&live)));
+        let mut terminating = snapshot_row("team-a", "row", &[]);
+        terminating.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+            ));
+        assert!(
+            !live_row_actionable(Some(&terminating)),
+            "terminating: skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_row_live_verifies_with_one_get_and_skips_absent() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
+        let ctx = Context::test_context(client);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "team-a");
+
+        assert!(!confirm_row_live(&api, "gone").await.unwrap());
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "the C2/C6 guard is exactly one live GET"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_row_live_skips_a_terminating_row() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let body = serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "Snapshot",
+            "metadata": {
+                "name": "draining", "namespace": "team-a",
+                "deletionTimestamp": "2026-01-01T00:00:00Z",
+                "finalizers": ["kopiur.home-operations.com/snapshot"],
+            },
+            "spec": {},
+        });
+        let client = logging_client(log.clone(), StatusCode::OK, body);
+        let ctx = Context::test_context(client);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "team-a");
+
+        assert!(!confirm_row_live(&api, "draining").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn confirm_row_live_passes_a_live_row() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let body = serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "Snapshot",
+            "metadata": { "name": "alive", "namespace": "team-a" },
+            "spec": {},
+        });
+        let client = logging_client(log.clone(), StatusCode::OK, body);
+        let ctx = Context::test_context(client);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "team-a");
+
+        assert!(confirm_row_live(&api, "alive").await.unwrap());
     }
 }

@@ -921,18 +921,23 @@ pub fn classify_active_runs(items: &[Snapshot]) -> ActiveRuns {
     out
 }
 
-/// This schedule's produced `Snapshot` children (the `SCHEDULE_LABEL` list),
-/// fetched ONCE per reconcile and shared by the failed-history prune, the
-/// `onScheduleDelete` propagation, and the concurrency gate (#382 M1 — these
-/// were previously three byte-identical LISTs per reconcile).
+/// This schedule's produced `Snapshot` children (the `SCHEDULE_LABEL`
+/// population), fetched ONCE per reconcile and shared by the failed-history
+/// prune, the `onScheduleDelete` propagation, and the concurrency gate (#382
+/// M1 — these were previously three byte-identical LISTs per reconcile).
+///
+/// Served from the Snapshot reflector store when synced, live LIST otherwise
+/// (#382 M3 via [`io::snapshot_children`] — namespace AND label filtered, C4).
+/// The Forbid concurrency gate keeps failing CLOSED: a cold store falls
+/// through to the live LIST, and a live-LIST error propagates to the gate
+/// exactly as its own LIST error did before — an unavailable population is
+/// never read as "no active runs".
 async fn schedule_children(
     ctx: &Context,
     namespace: &str,
     schedule: &str,
 ) -> Result<Vec<Snapshot>> {
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
-    Ok(api.list(&lp).await?.items)
+    io::snapshot_children(ctx, namespace, crate::consts::SCHEDULE_LABEL, schedule).await
 }
 
 /// The terminal time used to order Failed snapshots for pruning: `status.timing.endTime`
@@ -1030,6 +1035,12 @@ async fn prune_failed_history(
 ) -> Result<()> {
     let limit = kopiur_api::consts::effective_failed_jobs_history_limit(limit);
     for name in failed_snapshots_to_prune(children, limit) {
+        // #382 C2: `children` may be store-derived — trust the cache to SELECT,
+        // verify live before DESTROYING. A row that vanished or started
+        // terminating since the reflector snapshot is skipped.
+        if !io::confirm_row_live(api, &name).await? {
+            continue;
+        }
         // Stamp `pruned-by: failed-history` THEN delete, so the finalizer treats
         // this as an operator prune (bypassing the mass-deletion breaker), never
         // an external deletion. `failed_snapshots_to_prune` already excludes
@@ -2919,5 +2930,141 @@ mod tests {
             ..Default::default()
         });
         assert!(!recorded_blocked_on_unreadable(&sched));
+    }
+
+    // --- #382 M3: store-served schedule children ----------------------------
+
+    use http::{Request, Response, StatusCode};
+    use kube::client::Body;
+
+    /// Logs `"<METHOD> <path>"` per request; answers with `status` + `body`.
+    fn logging_client(
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> kube::Client {
+        let body = Arc::new(body);
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            let body = body.clone();
+            async move {
+                log.lock()
+                    .unwrap()
+                    .push(format!("{} {}", req.method(), req.uri().path()));
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&*body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        });
+        kube::Client::new(svc, "default")
+    }
+
+    fn labeled_child(ns: &str, name: &str, schedule: &str) -> Snapshot {
+        let mut s: Snapshot = serde_json::from_value(serde_json::json!({
+            "apiVersion": crate::consts::API_VERSION,
+            "kind": "Snapshot",
+            "metadata": {
+                "name": name, "namespace": ns, "uid": format!("uid-{ns}-{name}"),
+                "labels": { (crate::consts::SCHEDULE_LABEL): schedule },
+            },
+            "spec": {},
+        }))
+        .expect("valid Snapshot fixture");
+        s.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            phase: Some(SnapshotPhase::Failed),
+            ..Default::default()
+        });
+        s
+    }
+
+    fn prime_snapshot_store(ctx: &Context, objs: Vec<Snapshot>, synced: bool) {
+        use std::sync::atomic::Ordering;
+        let (store, mut writer) = kube::runtime::reflector::store::<Snapshot>();
+        for o in objs {
+            writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(o));
+        }
+        std::mem::forget(writer);
+        ctx.snapshot_store.set(store).ok();
+        ctx.snapshot_synced.store(synced, Ordering::Release);
+    }
+
+    /// C4: the schedule-children population served from the install-scope-wide
+    /// store must filter namespace AND label — another namespace's same-named
+    /// schedule must not feed this schedule's Forbid gate, prune set, or
+    /// cascade propagation.
+    #[tokio::test]
+    async fn schedule_children_from_store_exclude_cross_namespace_intruders() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = logging_client(
+            log.clone(),
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "kind": "Status", "code": 404 }),
+        );
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(
+            &ctx,
+            vec![
+                labeled_child("team-a", "run-1", "nightly"),
+                labeled_child("team-a", "run-2", "nightly"),
+                // Same schedule NAME, another namespace: must not leak in.
+                labeled_child("team-b", "intruder", "nightly"),
+                labeled_child("team-a", "other-sched", "weekly"),
+            ],
+            true,
+        );
+
+        let mut got: Vec<String> = schedule_children(&ctx, "team-a", "nightly")
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.name_any())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["run-1", "run-2"]);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a synced store serves the children with zero HTTP"
+        );
+    }
+
+    /// C2: the failed-history prune executor live-verifies each store-selected
+    /// row before destruction — a vanished row is skipped: one GET, no
+    /// stamp-PATCH, no DELETE.
+    #[tokio::test]
+    async fn prune_failed_history_live_verifies_before_deleting() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = logging_client(
+            log.clone(),
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404,
+            }),
+        );
+        let ctx = Context::test_context(client);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "team-a");
+        // Two artifact-less Failed rows over limit 0 → both selected.
+        let children = vec![
+            labeled_child("team-a", "fail-1", "nightly"),
+            labeled_child("team-a", "fail-2", "nightly"),
+        ];
+
+        prune_failed_history(&api, "nightly", &children, Some(0))
+            .await
+            .unwrap();
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly one verify GET per selected row, got {requests:?}"
+        );
+        assert!(
+            requests.iter().all(|r| r.starts_with("GET ")),
+            "vanished rows must produce NO stamp/delete traffic: {requests:?}"
+        );
     }
 }
