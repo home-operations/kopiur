@@ -400,6 +400,19 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
                  mover.securityContext explicitly or drop inheritSecurityContextFrom.snapshot."
             ),
         ),
+        // The DIRECT source PVC is gone. Same reason as the structural gate
+        // (`SOURCE_PVC_MISSING_GATE`) the snapshot reconciler writes for it, so
+        // the Event and the condition read as one signal; the note names the
+        // two levers that clear it.
+        Error::MissingSourcePvc(_) => (
+            crate::consts::SOURCE_PVC_MISSING_REASON,
+            crate::consts::RECREATE_SOURCE_PVC_ACTION,
+            format!(
+                "{err}. The backup is parked (re-checked every few minutes) and will fail \
+                 terminally once the missing-source deadline passes — recreate the PVC, or \
+                 update the SnapshotPolicy's spec.sources to name an existing PVC."
+            ),
+        ),
         Error::Serialization(_) => (
             SERIALIZATION_FAILED_REASON,
             REPORT_ISSUE_ACTION,

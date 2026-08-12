@@ -346,6 +346,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         config.operator_namespace.clone(),
         config.watch_scope.clone(),
         config.max_concurrent_delete_jobs,
+        config.source_pvc_deadline,
     ));
 
     // Self-managed webhook TLS (`webhook.tls.mode: self`): mint the serving cert

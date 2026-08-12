@@ -20,10 +20,11 @@ mod common;
 use common::*;
 
 use kube::Api;
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::events::v1::Event;
 use kopiur_api::{Repository, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 
@@ -181,6 +182,200 @@ async fn auto_pins_rwo_source_mover_to_the_consumer_node() {
     let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let _ = pods.delete(consumer, &DeleteParams::default()).await;
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = pvcs.delete(pvc, &DeleteParams::default()).await;
+}
+
+/// Read the `SourcePvcAvailable` condition off a Snapshot's status, as
+/// `(status, reason, lastTransitionTime)`.
+fn source_pvc_condition(status: &serde_json::Value) -> Option<(String, String, String)> {
+    status
+        .get("conditions")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("SourcePvcAvailable"))
+        .map(|c| {
+            (
+                c["status"].as_str().unwrap_or_default().to_string(),
+                c["reason"].as_str().unwrap_or_default().to_string(),
+                c["lastTransitionTime"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+}
+
+/// Missing-source-PVC bounded outcome (#382 M5). A Snapshot whose DIRECT source
+/// PVC does not exist must NOT retry-hot-loop forever: it parks at
+/// `phase: Pending` behind the registered `SourcePvcAvailable=False` /
+/// `SourcePvcMissing` structural gate with byte-stable status (no churn — the
+/// object's resourceVersion and the gate's lastTransitionTime hold still), a
+/// Warning Event fires once on the False transition, and recreating the PVC
+/// BEFORE the deadline recovers the backup to `Succeeded` with the gate flipped
+/// `True`. (The deadline→Failed leg is pinned by hermetic pure-fn unit tests —
+/// shortening the suite-wide deadline via Helm would destabilize the other
+/// colocation/retention scenarios.)
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn missing_source_pvc_parks_with_a_gate_and_recovers_on_recreate() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    ensure_repo(&client, "colocation-missing").await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let events: Api<Event> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    let repo = "e2e-colo-miss-repo";
+    let pvc = "e2e-colo-miss-src";
+    let policy = "e2e-colo-miss-policy";
+    let backup = "e2e-colo-miss-backup";
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                repo,
+                "colocation-missing",
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    // The recipe names a PVC that does NOT exist (the "deleted source" shape).
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                policy,
+                "Repository",
+                repo,
+                serde_json::json!({ "sources": [ { "pvc": { "name": pvc } } ] }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy over the missing source PVC");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                backup,
+                policy,
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create Snapshot");
+
+    // 1) The park: SourcePvcAvailable=False / SourcePvcMissing, phase Pending.
+    let (_, _, first_transition) = wait_until(
+        "SourcePvcAvailable=False (SourcePvcMissing) on the Snapshot",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let status = status_json(&backups, backup).await;
+            let parked = source_pvc_condition(&status)
+                .filter(|(s, r, _)| s == "False" && r == "SourcePvcMissing");
+            let pending = status.get("phase").and_then(|p| p.as_str()) == Some("Pending");
+            Ok(parked.filter(|_| pending))
+        },
+    )
+    .await
+    .expect("the Snapshot must park behind the SourcePvcAvailable gate at phase Pending");
+
+    // 2) The Warning Event fired (transition-gated) and names the PVC.
+    let ev = wait_until(
+        "a SourcePvcMissing Warning Event regarding the Snapshot",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let list = events.list(&ListParams::default()).await?;
+            Ok(list.items.into_iter().find(|e| {
+                e.type_.as_deref() == Some("Warning")
+                    && e.reason.as_deref() == Some("SourcePvcMissing")
+                    && e.regarding.as_ref().is_some_and(|r| {
+                        r.kind.as_deref() == Some("Snapshot") && r.name.as_deref() == Some(backup)
+                    })
+            }))
+        },
+    )
+    .await
+    .expect("the False transition must publish a Warning Event");
+    let note = ev.note.unwrap_or_default();
+    assert!(
+        note.contains(&format!("{E2E_NAMESPACE}/{pvc}")),
+        "the Event note must name the missing PVC, got: {note}"
+    );
+
+    // 3) No hot loop: the parked status is byte-stable — over an observation
+    //    window longer than the old 30s retry cadence, neither the object's
+    //    resourceVersion nor the gate's lastTransitionTime may move, and the
+    //    phase stays Pending (not Failed: the default deadline is 30 min).
+    let before = backups.get(backup).await.expect("read parked Snapshot");
+    let rv_before = before.metadata.resource_version.clone().expect("rv");
+    tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+    let after = backups.get(backup).await.expect("re-read parked Snapshot");
+    assert_eq!(
+        after.metadata.resource_version.as_deref(),
+        Some(rv_before.as_str()),
+        "a parked Snapshot must not churn its own status (the hot-loop regression)"
+    );
+    let status = status_json(&backups, backup).await;
+    let (s, _, transition) = source_pvc_condition(&status).expect("the gate condition persists");
+    assert_eq!(s, "False");
+    assert_eq!(
+        transition, first_transition,
+        "the deadline anchor (lastTransitionTime) must be stamped once, never re-stamped"
+    );
+    assert_eq!(
+        status.get("phase").and_then(|p| p.as_str()),
+        Some("Pending")
+    );
+
+    // 4) Recovery: recreate the PVC pre-deadline; the next reconcile launches
+    //    the mover (the WaitForFirstConsumer claim binds to it) and the gate
+    //    flips True. Nudge an immediate reconcile via a metadata touch — no PVC
+    //    watch exists by design, so recovery is otherwise slot/requeue-cadenced.
+    pvcs.create(
+        &PostParams::default(),
+        &kopiur_e2e::builders::dynamic_pvc(E2E_NAMESPACE, pvc, "100Mi"),
+    )
+    .await
+    .expect("recreate the source PVC");
+    backups
+        .patch_metadata(
+            backup,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": { "kopiur.home-operations.com/e2e-nudge": "pvc-recreated" } }
+            })),
+        )
+        .await
+        .expect("nudge the Snapshot reconcile");
+
+    wait_phase(&backups, backup, "Succeeded")
+        .await
+        .expect("the backup must recover once the source PVC exists again");
+    let status = status_json(&backups, backup).await;
+    let (s, r, _) = source_pvc_condition(&status)
+        .expect("the gate condition is cleared in place, never dropped");
+    assert_eq!(
+        (s.as_str(), r.as_str()),
+        ("True", "SourcePvcFound"),
+        "recovery must flip the existing gate condition True"
+    );
+
+    // Cleanup.
+    let _ = backups.delete(backup, &DeleteParams::default()).await;
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = repos.delete(repo, &DeleteParams::default()).await;
     let _ = pvcs.delete(pvc, &DeleteParams::default()).await;
 }
 

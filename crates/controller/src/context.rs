@@ -233,6 +233,12 @@ pub struct Context {
     /// `true` once [`schedule_store`](Self::schedule_store) has completed its
     /// initial list. Same fail-safe contract as [`snapshot_synced`](Self::snapshot_synced).
     pub schedule_synced: Arc<AtomicBool>,
+    /// How long a `Snapshot` parked on a missing DIRECT source PVC
+    /// (`SourcePvcAvailable=False`, issue #382) waits before flipping to
+    /// terminal `Failed` (`KOPIUR_SOURCE_PVC_DEADLINE_SECONDS`). `None` = park
+    /// indefinitely (the explicit `0` escape hatch). See
+    /// [`crate::config::SOURCE_PVC_DEADLINE_ENV`].
+    pub source_pvc_deadline: Option<std::time::Duration>,
 }
 
 impl Context {
@@ -257,6 +263,7 @@ impl Context {
         operator_namespace: Option<String>,
         watch_scope: crate::config::WatchScope,
         max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
+        source_pvc_deadline: Option<std::time::Duration>,
     ) -> Self {
         Context {
             client,
@@ -280,6 +287,7 @@ impl Context {
             snapshot_synced: Arc::new(AtomicBool::new(false)),
             schedule_store: Arc::new(OnceLock::new()),
             schedule_synced: Arc::new(AtomicBool::new(false)),
+            source_pvc_deadline,
         }
     }
 
@@ -338,6 +346,7 @@ impl Context {
             None,
             crate::config::WatchScope::Cluster,
             None,
+            Some(crate::consts::DEFAULT_SOURCE_PVC_DEADLINE),
         )
     }
 }
