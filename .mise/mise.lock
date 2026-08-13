@@ -292,7 +292,7 @@ checksum = "sha256:8294b7aa9b03997481c06babf1e8b270c859358f27da57a11509afe537ac3
 url = "https://nodejs.org/dist/v24.19.0/node-v24.19.0-darwin-arm64.tar.gz"
 
 [[tools.oxfmt]]
-version = "0.62.0"
+version = "0.63.0"
 backend = "npm:oxfmt"
 
 [[tools.promtool]]
