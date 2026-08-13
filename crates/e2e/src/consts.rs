@@ -84,6 +84,7 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "errh",
     "colocation",
     "colocation-off",
+    "colocation-missing",
     "copymethod",
     "copymethod-csi",
     "copymethod-explicit",
