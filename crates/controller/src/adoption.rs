@@ -96,17 +96,27 @@ pub struct AdoptionCandidate {
     pub description: Option<String>,
 }
 
-/// Extract adoption candidates from a `Snapshot` LIST: `discovered`-origin rows
-/// of THIS repository (`repo_uid`) that are not terminating and carry a
+/// Extract adoption candidates from a `Snapshot` population: `discovered`-origin
+/// rows of THIS repository (`repo_uid`) that are not terminating and carry a
 /// resolvable kopia id + identity in status. Pure.
+///
+/// Takes borrows (`impl IntoIterator<Item = &Snapshot>`) so the reflector-store
+/// path can feed it `Arc`-held rows without wholesale-cloning full objects
+/// (#382 M3, C8) — only the candidate's distilled fields are cloned. The scope
+/// is deliberately NOT namespace-filtered: discovered rows are matched across
+/// every namespace the caller's population covers (install scope), matching
+/// the live `origin=discovered,repository-uid=<uid>` LIST semantics.
 ///
 /// SKIPs (returns nothing for):
 /// - rows not labeled `origin: discovered` or not for `repo_uid`;
 /// - **terminating** rows (`metadata.deletionTimestamp` set) — a row already
 ///   being expired must not be re-created under a new identity;
 /// - rows missing `status.snapshot` (no id/identity to match on).
-pub fn adoption_candidates(repo_uid: &str, rows: &[Snapshot]) -> Vec<AdoptionCandidate> {
-    rows.iter()
+pub fn adoption_candidates<'a>(
+    repo_uid: &str,
+    rows: impl IntoIterator<Item = &'a Snapshot>,
+) -> Vec<AdoptionCandidate> {
+    rows.into_iter()
         .filter_map(|s| {
             let labels = s.labels();
             if labels.get(ORIGIN_LABEL).map(String::as_str)
@@ -624,6 +634,38 @@ mod tests {
         assert_eq!(got[0].snapshot_id, "aaa");
         assert_eq!(got[0].namespace, "disc-ns");
         assert_eq!(got[0].identity, ident);
+    }
+
+    #[test]
+    fn candidates_are_install_scope_wide_and_borrow_store_rows() {
+        // #382 M3: the reflector-store path replaces an INSTALL-SCOPE-WIDE
+        // live LIST, so — unlike the namespaced child populations (C4) — a
+        // discovered row in ANY namespace is a candidate; only the two label
+        // gates scope the set. The extractor takes borrowed rows (here: refs
+        // into Arc-held storage) so full objects are never wholesale-cloned.
+        let ident = identity("app", "billing", Some("/data"));
+        let mut other_ns = discovered_row("repo-1", "elsewhere", "bbb", ident.clone());
+        other_ns.metadata.namespace = Some("another-ns".to_string());
+        let arcs: Vec<std::sync::Arc<Snapshot>> = vec![
+            std::sync::Arc::new(discovered_row("repo-1", "here", "aaa", ident.clone())),
+            std::sync::Arc::new(other_ns),
+            std::sync::Arc::new(discovered_row("repo-2", "wrong-repo", "ccc", ident)),
+        ];
+
+        let mut got: Vec<(String, String)> =
+            adoption_candidates("repo-1", arcs.iter().map(std::sync::Arc::as_ref))
+                .into_iter()
+                .map(|c| (c.namespace, c.name))
+                .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("another-ns".to_string(), "elsewhere".to_string()),
+                ("disc-ns".to_string(), "here".to_string()),
+            ],
+            "both namespaces' discovered rows count; the other repo's never does"
+        );
     }
 
     #[test]

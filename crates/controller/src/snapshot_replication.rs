@@ -145,25 +145,15 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
 
     // Both endpoints are real repository CRs — resolve them (backend, encryption,
     // moverDefaults, CA bundles), source first for message determinism.
-    let source = io::resolve_repository_ref(
-        &ctx.client,
-        &repl.spec.source_ref,
-        &namespace,
-        ctx.operator_namespace.as_deref(),
-    )
-    .await?;
-    let dest = io::resolve_repository_ref(
-        &ctx.client,
-        &repl.spec.destination_ref,
-        &namespace,
-        ctx.operator_namespace.as_deref(),
-    )
-    .await?;
+    // Launch-side (migrate Job inputs) — store-backed point reads (#382 M2).
+    let source = io::resolve_repository_ref_cached(ctx, &repl.spec.source_ref, &namespace).await?;
+    let dest =
+        io::resolve_repository_ref_cached(ctx, &repl.spec.destination_ref, &namespace).await?;
 
     // Gate on BOTH repositories being Ready — an object-store repo must be
     // bootstrapped before `kopia snapshot migrate` can reach it. DISTINCT
     // reasons so `kubectl describe` names which end is holding the run.
-    if !io::repository_ready(&ctx.client, &repl.spec.source_ref, &namespace).await? {
+    if !io::repository_ready_cached(ctx, &repl.spec.source_ref, &namespace).await? {
         patch_ready_if_changed(
             &api,
             &name,
@@ -177,7 +167,7 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
         .await?;
         return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
-    if !io::repository_ready(&ctx.client, &repl.spec.destination_ref, &namespace).await? {
+    if !io::repository_ready_cached(ctx, &repl.spec.destination_ref, &namespace).await? {
         patch_ready_if_changed(
             &api,
             &name,

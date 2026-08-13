@@ -19,7 +19,9 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use kube::api::{ListParams, LogParams};
 
-use kopiur_e2e::{E2E_NAMESPACE, World, default_timeout, poll_interval, wait_until};
+use kopiur_e2e::{
+    E2E_NAMESPACE, World, default_timeout, poll_interval, scrape_controller_metrics, wait_until,
+};
 
 /// Read the logs of the first non-terminating pod matching a label `selector`.
 /// Returns `Ok(None)` when no such pod exists yet (so callers can poll). The
@@ -92,4 +94,95 @@ async fn operator_binaries_emit_logs() {
             "a mover Job pod produced ZERO stdout — the mover tracing subscriber is silent"
         );
     }
+}
+
+/// Sum every series of the client-side kube request counter, optionally
+/// filtered to samples whose label set contains all of `labels`. Test-local
+/// Prometheus-text parsing, same pattern as
+/// `steady_state.rs::reconciliations_by_kind` / `repo_breaker.rs::metric_sum`.
+fn kube_client_requests_sum(text: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    let mut sum = None;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("kopiur_kube_client_requests_total{") else {
+            continue;
+        };
+        let Some((label_str, value)) = rest.rsplit_once("} ") else {
+            continue;
+        };
+        if !labels
+            .iter()
+            .all(|(k, v)| label_str.contains(&format!("{k}=\"{v}\"")))
+        {
+            continue;
+        }
+        if let Ok(v) = value.trim().parse::<f64>() {
+            *sum.get_or_insert(0.0) += v;
+        }
+    }
+    sum
+}
+
+/// The client-side kube request counter (`kopiur_kube_client_requests_total`,
+/// issue #382) must exist on the deployed operator's `/metrics` with the
+/// expected attribution labels, and must keep rising across ordinary operator
+/// activity — the controllers' watches recycle and requeue, and the leader
+/// election renews its Lease every few seconds, so a live operator can never
+/// hold the counter flat for long.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn kube_client_request_counter_exists_and_rises() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    let client = world.client().clone();
+
+    // 1. The counter exists, and the `main` client has already issued watches
+    //    against kopiur's own API group (the controller fan-out registers them
+    //    at startup, so this is unconditional on any scenario CR).
+    let baseline = wait_until(
+        "kopiur_kube_client_requests_total present with main-client kopiur watches",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let text = scrape_controller_metrics(&client)
+                .await
+                .map_err(|e| kube::Error::Service(e.into()))?;
+            let total = kube_client_requests_sum(&text, &[]);
+            let kopiur_watches = kube_client_requests_sum(
+                &text,
+                &[
+                    ("client", "main"),
+                    ("verb", "watch"),
+                    ("group", "kopiur.home-operations.com"),
+                ],
+            );
+            Ok(match (total, kopiur_watches) {
+                (Some(total), Some(w)) if w >= 1.0 => Some(total),
+                _ => None,
+            })
+        },
+    )
+    .await
+    .expect(
+        "the deployed controller must expose kopiur_kube_client_requests_total with \
+         watch-verb series for the kopiur API group on the main client",
+    );
+
+    // 2. It rises across operator activity: leader-election Lease renewals
+    //    alone (election client, every few seconds) guarantee movement well
+    //    inside the poll budget.
+    wait_until(
+        "kopiur_kube_client_requests_total rises across operator activity",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let text = scrape_controller_metrics(&client)
+                .await
+                .map_err(|e| kube::Error::Service(e.into()))?;
+            let now = kube_client_requests_sum(&text, &[]).unwrap_or(0.0);
+            Ok((now > baseline).then_some(()))
+        },
+    )
+    .await
+    .expect("the client request counter must increase while the operator is running");
 }

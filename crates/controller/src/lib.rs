@@ -16,6 +16,7 @@ pub mod hooks;
 mod http;
 pub mod io;
 pub mod jobs;
+pub mod kube_metrics;
 pub mod leader;
 pub mod maintenance;
 pub mod metrics;

@@ -2032,6 +2032,20 @@ async fn observe_restore_mover(
     })
 }
 
+/// Map an absent restore TARGET PVC (seen while resolving mover co-location)
+/// to its per-caller error (#382 M5 mapping table): the claim was ensured
+/// moments earlier by this very reconcile — or is a user `pvcRef` that may
+/// still be provisioning — so a 404 is a race and stays a transient
+/// [`Error::MissingDependency`] retry. The Restore deliberately gets NO
+/// gate/deadline machinery here.
+pub(super) fn restore_target_pvc_race_error(pvc_ns: &str, pvc_name: &str) -> Error {
+    Error::MissingDependency(format!(
+        "restore target PVC `{pvc_ns}/{pvc_name}` was not found while resolving mover \
+         co-location; it was just ensured (or may still be provisioning), so this is treated \
+         as a race and retried automatically"
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_restore_mover(
     ctx: &Context,
@@ -2491,13 +2505,26 @@ async fn run_restore_mover(
     // has no holder → no pin). The resolved `sourceColocation` mode (default `Auto`)
     // decides. RWO multi-attach fix.
     let (mover_affinity, mover_tolerations) = {
-        let decision = io::resolve_source_colocation(
+        // Exhaustive over the outcome (no `_ =>`, #382 M5): the target PVC was
+        // just ensured above (or is the user's own `pvcRef`, which may still be
+        // provisioning), so a 404 here is a race — keep the transient
+        // MissingDependency retry, never the Snapshot-side terminal machinery
+        // (Restore's parking precedent, `waitTimeout`/`onMissing`, is about
+        // snapshots, not PVCs).
+        let decision = match io::resolve_source_colocation(
             &ctx.client,
             namespace,
             target_pvc,
             resolved_mover.source_colocation,
         )
-        .await?;
+        .await?
+        {
+            io::ColocationOutcome::Resolved(decision) => decision,
+            io::ColocationOutcome::SourcePvcAbsent {
+                namespace: pvc_ns,
+                name: pvc_name,
+            } => return Err(restore_target_pvc_race_error(&pvc_ns, &pvc_name)),
+        };
         io::apply_colocation(
             decision,
             resolved_mover.affinity.clone(),
@@ -3307,24 +3334,13 @@ async fn resolve_restore_repository(
         } else {
             cfg_ns
         };
-        return io::resolve_repository_ref(
-            &ctx.client,
-            &selected,
-            base_ns,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await;
+        // Launch-side (restore mover inputs) — store-backed point read (#382 M2).
+        return io::resolve_repository_ref_cached(ctx, &selected, base_ns).await;
     }
     // Explicit `spec.repository` wins for the other sources. Honors `kind`
     // (namespaced vs. ClusterRepository) via the shared resolver (ADR §5.5).
     if let Some(rref) = &restore.spec.repository {
-        return io::resolve_repository_ref(
-            &ctx.client,
-            rref,
-            namespace,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await;
+        return io::resolve_repository_ref_cached(ctx, rref, namespace).await;
     }
     // SnapshotRef: derive from the referenced Snapshot (pinned resolved
     // repository for produced, owning repository for discovered).
@@ -3345,13 +3361,7 @@ async fn resolve_restore_repository(
         })?;
         // Resolved relative to the SNAPSHOT's namespace (an absent ref
         // namespace means "same as the snapshot", not "same as the restore").
-        return io::resolve_repository_ref(
-            &ctx.client,
-            &rref,
-            snap_ns,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await;
+        return io::resolve_repository_ref_cached(ctx, &rref, snap_ns).await;
     }
     Err(Error::Validation(
         "restore with source.identity requires spec.repository (snapshotRef and fromPolicy \
@@ -3455,7 +3465,7 @@ async fn gate_on_repository_readiness(
     let Some((rref, base_ns)) = restore_repository_ref(ctx, restore, namespace).await? else {
         return Ok(None);
     };
-    match io::repository_ready(&ctx.client, &rref, &base_ns).await {
+    match io::repository_ready_cached(ctx, &rref, &base_ns).await {
         Ok(true) => Ok(None),
         Ok(false) => {
             // patch-if-changed for byte-stability: the parked status is identical

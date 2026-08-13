@@ -365,6 +365,19 @@ pub const SCHEDULE_FANOUT_CAPPED_CONDITION: &str = "FanoutCapped";
 /// `reason` for [`SCHEDULE_FANOUT_CAPPED_CONDITION`] = `True`.
 pub const FANOUT_TOO_LARGE_REASON: &str = "FanoutTooLarge";
 
+/// `Snapshot` condition recording whether the backup's DIRECT source PVC
+/// (`spec.sources[].pvc`) exists. Set `False` (with
+/// [`SOURCE_PVC_MISSING_REASON`]) when the PVC named by the recipe is absent
+/// at launch time: the backup parks (`phase: Pending`) and, after the
+/// controller's deadline, fails terminally — a PVC that never reappears never
+/// self-heals, the silent-wedge shape of #359. Structural
+/// ([`crate::gates::SOURCE_PVC_MISSING_GATE`]); only the direct source PVC
+/// earns this gate — a vanished operator-staged claim is a restage race and
+/// stays a transient retry.
+pub const SOURCE_PVC_AVAILABLE_CONDITION: &str = "SourcePvcAvailable";
+/// `reason`/Event reason for [`SOURCE_PVC_AVAILABLE_CONDITION`] = `False`.
+pub const SOURCE_PVC_MISSING_REASON: &str = "SourcePvcMissing";
+
 /// `Snapshot` condition: this deletion is HELD by the mass-deletion breaker
 /// (`Repository`/`ClusterRepository` `spec.deletionProtection.threshold`)
 /// until acknowledged via [`ALLOW_MASS_DELETION_ANNOTATION`] on the

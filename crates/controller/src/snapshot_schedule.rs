@@ -496,32 +496,47 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     let sched_name = schedule.name_any();
     let api: Api<SnapshotSchedule> = Api::namespaced(ctx.client.clone(), &namespace);
 
-    // Bound failure history: prune this schedule's oldest `Failed` Snapshots beyond
-    // `failedJobsHistoryLimit` (GFS retention only prunes successes). Runs every
-    // reconcile — a cheap labeled list — so a persistently-failing precondition or
-    // backend can't accumulate `Failed` CRs without limit. Best-effort: a transient
-    // list/delete error here must NOT block firing the due backup, so log and proceed
-    // (the next reconcile retries the prune) rather than short-circuiting the slot.
-    if let Err(e) = prune_failed_history(
-        ctx,
-        &namespace,
-        &sched_name,
-        schedule.spec.failed_jobs_history_limit,
-    )
-    .await
-    {
-        tracing::warn!(schedule = %sched_name, error = %e, "failed-history prune errored; continuing to schedule");
-    }
-
-    // Propagate a `spec.deletion.onScheduleDelete` edit to existing produced
-    // children whose stamped cascade value has drifted (so an edit to Delete
-    // actually cascades already-created Snapshots, not just future ones).
-    // Best-effort — must not block firing the due backup.
-    let desired_cascade = kopiur_api::snapshot_schedule::effective_on_schedule_delete(
-        schedule.spec.deletion.as_ref(),
-    );
-    if let Err(e) = propagate_cascade_stamp(ctx, &namespace, &sched_name, desired_cascade).await {
-        tracing::warn!(schedule = %sched_name, error = %e, "onScheduleDelete propagation errored; continuing to schedule");
+    // ONE `SCHEDULE_LABEL` population per reconcile (#382 M1): the same slice
+    // serves the failed-history prune, the `onScheduleDelete` propagation, and
+    // the concurrency gate further down — these were three byte-identical LISTs.
+    // Prune and propagation stay best-effort (a transient list/delete error must
+    // NOT block firing the due backup; the next reconcile retries), but the
+    // concurrency gate below keeps failing CLOSED: when this list errored, the
+    // gate read propagates that error exactly as its own list did before.
+    let snap_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
+    let children = schedule_children(ctx, &namespace, &sched_name).await;
+    match &children {
+        Ok(items) => {
+            // Bound failure history: prune this schedule's oldest `Failed`
+            // Snapshots beyond `failedJobsHistoryLimit` (GFS retention only
+            // prunes successes), so a persistently-failing precondition or
+            // backend can't accumulate `Failed` CRs without limit.
+            if let Err(e) = prune_failed_history(
+                &snap_api,
+                &sched_name,
+                items,
+                schedule.spec.failed_jobs_history_limit,
+            )
+            .await
+            {
+                tracing::warn!(schedule = %sched_name, error = %e, "failed-history prune errored; continuing to schedule");
+            }
+            // Propagate a `spec.deletion.onScheduleDelete` edit to existing
+            // produced children whose stamped cascade value has drifted (so an
+            // edit to Delete actually cascades already-created Snapshots, not
+            // just future ones).
+            let desired_cascade = kopiur_api::snapshot_schedule::effective_on_schedule_delete(
+                schedule.spec.deletion.as_ref(),
+            );
+            if let Err(e) =
+                propagate_cascade_stamp(&snap_api, &sched_name, items, desired_cascade).await
+            {
+                tracing::warn!(schedule = %sched_name, error = %e, "onScheduleDelete propagation errored; continuing to schedule");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(schedule = %sched_name, error = %e, "listing Snapshot children failed; failed-history prune and onScheduleDelete propagation skipped this pass");
+        }
     }
 
     let seed = schedule.uid().unwrap_or_else(|| schedule.name_any());
@@ -596,8 +611,13 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
             return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
         }
-        // Is a run currently active (an unfinished Snapshot owned by this schedule)?
-        let runs = active_runs(ctx, &namespace, &sched_name).await?;
+        // Is a run currently active (an unfinished Snapshot owned by this
+        // schedule)? Classified from the children slice fetched once above; a
+        // list failure fails CLOSED here (propagates), never "no active runs".
+        let runs = match children {
+            Ok(ref items) => classify_active_runs(items),
+            Err(e) => return Err(e),
+        };
         let disposition = slot_disposition(&schedule.spec.schedule, slot, now, runs.active);
         // The blocker only MATTERS when it is actually holding a due slot shut:
         // under `concurrencyPolicy: Allow` an unreadable run does not block, and
@@ -901,12 +921,23 @@ pub fn classify_active_runs(items: &[Snapshot]) -> ActiveRuns {
     out
 }
 
-/// Whether an unfinished Snapshot created by this schedule still exists, and
-/// whether the blocker is one this build cannot interpret.
-async fn active_runs(ctx: &Context, namespace: &str, schedule: &str) -> Result<ActiveRuns> {
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
-    Ok(classify_active_runs(&api.list(&lp).await?.items))
+/// This schedule's produced `Snapshot` children (the `SCHEDULE_LABEL`
+/// population), fetched ONCE per reconcile and shared by the failed-history
+/// prune, the `onScheduleDelete` propagation, and the concurrency gate (#382
+/// M1 — these were previously three byte-identical LISTs per reconcile).
+///
+/// Served from the Snapshot reflector store when synced, live LIST otherwise
+/// (#382 M3 via [`io::snapshot_children`] — namespace AND label filtered, C4).
+/// The Forbid concurrency gate keeps failing CLOSED: a cold store falls
+/// through to the live LIST, and a live-LIST error propagates to the gate
+/// exactly as its own LIST error did before — an unavailable population is
+/// never read as "no active runs".
+async fn schedule_children(
+    ctx: &Context,
+    namespace: &str,
+    schedule: &str,
+) -> Result<Vec<Snapshot>> {
+    io::snapshot_children(ctx, namespace, crate::consts::SCHEDULE_LABEL, schedule).await
 }
 
 /// The terminal time used to order Failed snapshots for pruning: `status.timing.endTime`
@@ -993,24 +1024,28 @@ pub(crate) fn failed_snapshots_to_prune(snapshots: &[Snapshot], limit: u32) -> V
 }
 
 /// Enforce `failedJobsHistoryLimit`: prune the schedule's oldest `Failed` Snapshots
-/// beyond the limit. Reuses the `SCHEDULE_LABEL` list and the GFS-prune delete idiom
-/// (delete the CR → its finalizer + `deletionPolicy` handle any kopia cleanup).
+/// beyond the limit. Consumes the shared per-reconcile children slice (#382 M1)
+/// and the GFS-prune delete idiom (delete the CR → its finalizer +
+/// `deletionPolicy` handle any kopia cleanup).
 async fn prune_failed_history(
-    ctx: &Context,
-    namespace: &str,
+    api: &Api<Snapshot>,
     schedule: &str,
+    children: &[Snapshot],
     limit: Option<u32>,
 ) -> Result<()> {
     let limit = kopiur_api::consts::effective_failed_jobs_history_limit(limit);
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
-    let items = api.list(&lp).await?.items;
-    for name in failed_snapshots_to_prune(&items, limit) {
+    for name in failed_snapshots_to_prune(children, limit) {
+        // #382 C2: `children` may be store-derived — trust the cache to SELECT,
+        // verify live before DESTROYING. A row that vanished or started
+        // terminating since the reflector snapshot is skipped.
+        if !io::confirm_row_live(api, &name).await? {
+            continue;
+        }
         // Stamp `pruned-by: failed-history` THEN delete, so the finalizer treats
         // this as an operator prune (bypassing the mass-deletion breaker), never
         // an external deletion. `failed_snapshots_to_prune` already excludes
         // terminating CRs, so there is no stamp-only partition here.
-        io::annotate_then_delete_snapshot(&api, &name, PrunedBy::FailedHistory).await?;
+        io::annotate_then_delete_snapshot(api, &name, PrunedBy::FailedHistory).await?;
         tracing::info!(schedule = %schedule, snapshot = %name, "pruned Failed Snapshot (failedJobsHistoryLimit)");
     }
     Ok(())
@@ -1019,20 +1054,18 @@ async fn prune_failed_history(
 /// Propagate a `spec.deletion.onScheduleDelete` edit to this schedule's existing
 /// produced `Snapshot` children (labelled `SCHEDULE_LABEL`) whose stamped value
 /// has drifted from `desired` ([`children_needing_cascade_stamp`]). One targeted
-/// merge-patch per child under the controller field manager. Best-effort exactly
-/// like [`prune_failed_history`]: a per-child (or list) error is logged and the
-/// reconcile continues — propagation must never block firing the due backup.
+/// merge-patch per child under the controller field manager. Consumes the shared
+/// per-reconcile children slice (#382 M1). Best-effort exactly like
+/// [`prune_failed_history`]: a per-child error is logged and the reconcile
+/// continues — propagation must never block firing the due backup.
 async fn propagate_cascade_stamp(
-    ctx: &Context,
-    namespace: &str,
+    api: &Api<Snapshot>,
     schedule: &str,
+    children: &[Snapshot],
     desired: ScheduleDeletePolicy,
 ) -> Result<()> {
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    let lp = ListParams::default().labels(&format!("{}={schedule}", crate::consts::SCHEDULE_LABEL));
-    let items = api.list(&lp).await?.items;
     let value = serde_json::to_value(desired).unwrap_or(serde_json::Value::Null);
-    for name in children_needing_cascade_stamp(&items, desired) {
+    for name in children_needing_cascade_stamp(children, desired) {
         let patch = serde_json::json!({ "spec": { "onScheduleDelete": value } });
         match api
             .patch(
@@ -1090,13 +1123,49 @@ async fn target_policy_refs(
     // Fan-out: read SnapshotPolicies in the schedule's namespace and filter by the
     // selector. (The schedule fires policies in its own namespace; a policyRef may
     // still cross namespaces, but the selector form is namespace-local by design.)
+    // Prefer the shared SnapshotPolicy reflector store when published AND synced
+    // (#382 M2) — this runs twice per reconcile (timezone default + fire loop),
+    // so serving it in-process removes two LISTs. A cold store falls back to the
+    // live LIST: an unset/unsynced store read as "no targets" would silently
+    // skip firing (design rule R2 — live fallback, never deferral-as-empty).
+    if let Some(store) = ctx.config_store.get()
+        && io::read_from_store(
+            true,
+            ctx.config_synced.load(std::sync::atomic::Ordering::Acquire),
+        )
+    {
+        let state = store.state();
+        return Ok(select_policy_targets(
+            state.iter().map(Arc::as_ref),
+            namespace,
+            selector,
+        ));
+    }
     let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), namespace);
     let policies = api.list(&ListParams::default()).await?.items;
-    let refs = policies
+    Ok(select_policy_targets(policies.iter(), namespace, selector))
+}
+
+/// **Pure.** The `policySelector` fan-out target set: every policy **in
+/// `namespace`** matching `selector`, skipping suspended policies (§14(e)),
+/// sorted by name (parity with the apiserver's name-ordered LIST, so the fire
+/// loop's per-policy child naming is order-stable however the set was read).
+///
+/// The namespace filter is INSIDE this kernel deliberately (audit C4): the
+/// reflector store is install-scope-wide, so an in-process replacement for a
+/// namespaced label-selector LIST must filter namespace AND label — a
+/// label-only filter would merge a matching policy from ANOTHER namespace into
+/// this schedule's fan-out.
+fn select_policy_targets<'a>(
+    policies: impl IntoIterator<Item = &'a SnapshotPolicy>,
+    namespace: &str,
+    selector: &k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector,
+) -> Vec<PolicyRef> {
+    let mut refs: Vec<PolicyRef> = policies
         .into_iter()
         .filter(|p| {
-            // Skip suspended policies (§14(e)) and apply the selector match.
-            !p.spec.suspend
+            p.metadata.namespace.as_deref() == Some(namespace)
+                && !p.spec.suspend
                 && policy_matches_selector(
                     p.metadata.labels.as_ref().unwrap_or(&BTreeMap::new()),
                     selector,
@@ -1107,7 +1176,8 @@ async fn target_policy_refs(
             namespace: None,
         })
         .collect();
-    Ok(refs)
+    refs.sort_by(|a, b| a.name.cmp(&b.name));
+    refs
 }
 
 /// Resolve the effective cron timezone for this reconcile (see
@@ -1181,19 +1251,17 @@ async fn policy_repo_timezone_default(
     schedule_ns: &str,
 ) -> Result<Vec<Option<String>>> {
     let policy_ns = policy_ref.namespace.as_deref().unwrap_or(schedule_ns);
-    let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), policy_ns);
-    let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
-        Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
-    })?;
+    // Store-backed point reads (#382 M2): policy + repository both come from
+    // the fetch kernel — a miss/cold store is live-confirmed, so the error
+    // shapes (and the caller's Degraded handling) are unchanged.
+    let policy = io::fetch_policy(ctx, policy_ns, &policy_ref.name)
+        .await?
+        .ok_or_else(|| {
+            Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
+        })?;
     let mut defaults = Vec::new();
     for rref in kopiur_api::repository_refs(&policy.spec) {
-        let repo = io::resolve_repository_ref(
-            &ctx.client,
-            rref,
-            policy_ns,
-            ctx.operator_namespace.as_deref(),
-        )
-        .await?;
+        let repo = io::resolve_repository_ref_cached(ctx, rref, policy_ns).await?;
         defaults.push(repo.schedule_defaults.and_then(|d| d.timezone));
     }
     Ok(defaults)
@@ -1316,15 +1384,18 @@ fn policy_usable(policy: &SnapshotPolicy) -> bool {
 /// the apply in [`create_scheduled_backup`] — the policy could start terminating
 /// in between, and a late-fired child dangles, bounded by `failedJobsHistoryLimit`.
 async fn policy_default_deletion_policy(
-    client: &kube::Client,
+    ctx: &Context,
     policy_ref: &PolicyRef,
     schedule_ns: &str,
 ) -> Result<Option<DeletionPolicy>> {
     let policy_ns = policy_ref.namespace.as_deref().unwrap_or(schedule_ns);
-    let api: Api<SnapshotPolicy> = Api::namespaced(client.clone(), policy_ns);
-    let policy = api.get_opt(&policy_ref.name).await?.ok_or_else(|| {
-        Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
-    })?;
+    // Store-backed point read (#382 M2): a miss/cold store is live-confirmed
+    // (`fetch_policy`), so the fail-the-fire error contract above is unchanged.
+    let policy = io::fetch_policy(ctx, policy_ns, &policy_ref.name)
+        .await?
+        .ok_or_else(|| {
+            Error::MissingDependency(format!("SnapshotPolicy {policy_ns}/{}", policy_ref.name))
+        })?;
     if !policy_usable(&policy) {
         return Err(Error::MissingDependency(format!(
             "SnapshotPolicy {policy_ns}/{} is being deleted",
@@ -1491,7 +1562,6 @@ async fn fire_for_targets(
     let targets = target_policy_refs(ctx, schedule, namespace).await?;
     let single = schedule.spec.policy_ref.is_some();
     let sched_name = schedule.name_any();
-    let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(ctx.client.clone(), namespace);
     for pref in &targets {
         let base_name = if single {
             scheduled_backup_name(&sched_name, slot)
@@ -1501,7 +1571,12 @@ async fn fire_for_targets(
         // Expand `pvcSelector` sources into one child per matched PVC. A policy
         // with no selector yields `None` — mint exactly one unpinned child,
         // byte-for-byte the pre-#346 behavior.
-        let policy = policies.get(&pref.name).await?;
+        // Store-backed point read (#382 M2); a vanished policy maps to the
+        // EXACT 404 error a bare `Api::get` used to raise here, so error
+        // classification and the fire's skip/retry cadence are unchanged.
+        let policy = io::fetch_policy(ctx, namespace, &pref.name)
+            .await?
+            .ok_or_else(|| fire_policy_not_found(&pref.name))?;
         let matched = crate::expand::match_pvcs(&ctx.client, &policy).await?;
         let members = crate::expand::expand_sources(&policy, &base_name, &matched)
             .map_err(|e| Error::Validation(e.to_string()))?;
@@ -1539,7 +1614,7 @@ async fn fire_for_targets(
                 // skipped and retried, never firing with a wrong (destructive)
                 // default.
                 let default_deletion_policy =
-                    policy_default_deletion_policy(&ctx.client, pref, namespace).await?;
+                    policy_default_deletion_policy(ctx, pref, namespace).await?;
                 if cells.len() != 1 || cells[0].name != base_name {
                     outcome.fanned_out = true;
                 }
@@ -1558,6 +1633,34 @@ async fn fire_for_targets(
         }
     }
     Ok(outcome)
+}
+
+/// **Pure.** The error the fire loop raises when a targeted policy vanished
+/// between `target_policy_refs` and the fire — byte-identical to the 404 a
+/// bare `Api::<SnapshotPolicy>::get` used to raise there (#382 M2), so the
+/// [`Error::Kube`] classification, requeue cadence, and event text are
+/// preserved now that the read goes through the miss-is-live-confirmed
+/// [`io::fetch_policy`] kernel (whose `None` IS a confirmed 404).
+fn fire_policy_not_found(name: &str) -> Error {
+    use kube::Resource;
+    use kube::core::response::{StatusDetails, StatusSummary};
+    let plural = SnapshotPolicy::plural(&());
+    let group = SnapshotPolicy::group(&());
+    Error::Kube(kube::Error::Api(Box::new(kube::core::Status {
+        status: Some(StatusSummary::Failure),
+        code: 404,
+        message: format!("{plural}.{group} \"{name}\" not found"),
+        reason: "NotFound".to_string(),
+        details: Some(StatusDetails {
+            name: name.to_string(),
+            group: group.into_owned(),
+            kind: plural.into_owned(),
+            uid: String::new(),
+            causes: Vec::new(),
+            retry_after_seconds: 0,
+        }),
+        metadata: None,
+    })))
 }
 
 /// `error_policy` for the `SnapshotSchedule` controller.
@@ -1838,7 +1941,8 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 status_body(500, "InternalError"),
             );
-            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            let ctx = Context::test_context(client);
+            let r = policy_default_deletion_policy(&ctx, &pref(), "default").await;
             assert!(
                 r.is_err(),
                 "a failing policy read must propagate, got {r:?}"
@@ -1850,7 +1954,8 @@ mod tests {
             // A genuinely-absent policy is an error too (mirrors the timezone
             // resolver) — the fire has nothing to inherit from, so skip/retry.
             let client = mock_client(StatusCode::NOT_FOUND, status_body(404, "NotFound"));
-            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            let ctx = Context::test_context(client);
+            let r = policy_default_deletion_policy(&ctx, &pref(), "default").await;
             assert!(
                 matches!(r, Err(Error::MissingDependency(_))),
                 "a missing policy must be MissingDependency, got {r:?}"
@@ -1873,7 +1978,8 @@ mod tests {
                 "spec": { "repository": { "name": "repo" } },
             });
             let client = mock_client(StatusCode::OK, body);
-            let r = policy_default_deletion_policy(&client, &pref(), "default").await;
+            let ctx = Context::test_context(client);
+            let r = policy_default_deletion_policy(&ctx, &pref(), "default").await;
             assert!(
                 matches!(r, Err(Error::MissingDependency(_))),
                 "a terminating policy must be MissingDependency, got {r:?}"
@@ -2251,6 +2357,89 @@ mod tests {
         assert!(!policy_matches_selector(&labels, &not_in));
     }
 
+    /// A minimal labeled policy in a namespace, for [`select_policy_targets`]
+    /// (parsed the cluster's way: JSON value → typed).
+    fn selectable_policy(
+        ns: &str,
+        name: &str,
+        tier: Option<&str>,
+        suspend: bool,
+    ) -> SnapshotPolicy {
+        let mut labels = serde_json::Map::new();
+        if let Some(t) = tier {
+            labels.insert("tier".to_string(), serde_json::Value::String(t.into()));
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": name, "namespace": ns, "labels": labels },
+            "spec": { "repository": { "name": "repo" }, "suspend": suspend },
+        }))
+        .expect("valid SnapshotPolicy fixture")
+    }
+
+    // --- select_policy_targets: the in-process replacement for the namespaced
+    // selector LIST (#382 M2). The namespace filter INSIDE the kernel is the
+    // audit-C4 guard: the reflector store is install-scope-wide, so a
+    // label-only filter would merge another namespace's same-labeled policy
+    // into this schedule's fan-out. ---
+    #[test]
+    fn select_policy_targets_filters_namespace_label_and_suspend() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+        let selector = LabelSelector {
+            match_labels: Some(BTreeMap::from([(
+                "tier".to_string(),
+                "critical".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let policies = [
+            selectable_policy("team-a", "zz-match", Some("critical"), false),
+            selectable_policy("team-a", "aa-match", Some("critical"), false),
+            // C4: same labels, OTHER namespace — must be excluded.
+            selectable_policy("team-b", "intruder", Some("critical"), false),
+            // §14(e): suspended — must be excluded even when matching.
+            selectable_policy("team-a", "paused", Some("critical"), true),
+            // Label mismatch / unlabeled — excluded by the selector.
+            selectable_policy("team-a", "wrong-tier", Some("low"), false),
+            selectable_policy("team-a", "unlabeled", None, false),
+        ];
+        let refs = select_policy_targets(policies.iter(), "team-a", &selector);
+        let names: Vec<_> = refs.iter().map(|r| r.name.as_str()).collect();
+        // Sorted by name (parity with the apiserver's name-ordered LIST).
+        assert_eq!(names, vec!["aa-match", "zz-match"]);
+        assert!(
+            refs.iter().all(|r| r.namespace.is_none()),
+            "selector targets are namespace-local by design"
+        );
+        // An empty selector still honors namespace + suspend.
+        let all = select_policy_targets(policies.iter(), "team-a", &LabelSelector::default());
+        let all_names: Vec<_> = all.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            all_names,
+            vec!["aa-match", "unlabeled", "wrong-tier", "zz-match"]
+        );
+    }
+
+    // --- fire_policy_not_found: the store-miss → live-confirmed-404 mapping
+    // must keep the EXACT error shape a bare `Api::get` raised (#382 M2), so
+    // classification (Transient via Error::Kube) and messages are unchanged. ---
+    #[test]
+    fn fire_policy_not_found_matches_bare_get_404_shape() {
+        let err = fire_policy_not_found("pg");
+        match err {
+            Error::Kube(kube::Error::Api(status)) => {
+                assert_eq!(status.code, 404);
+                assert_eq!(status.reason, "NotFound");
+                assert_eq!(
+                    status.message,
+                    "snapshotpolicies.kopiur.home-operations.com \"pg\" not found"
+                );
+            }
+            other => panic!("must be the kube Api 404 shape, got {other:?}"),
+        }
+    }
+
     #[test]
     fn missed_starting_deadline_skips() {
         let spec = schedule_spec("0 2 * * *", false, ConcurrencyPolicy::Allow, Some(600));
@@ -2337,6 +2526,62 @@ mod tests {
         );
         // Limit ≥ count → no-op.
         assert!(failed_snapshots_to_prune(&all, 10).is_empty());
+    }
+
+    /// One SCHEDULE_LABEL population per reconcile (#382 M1): the same slice
+    /// must coherently serve BOTH the concurrency gate and the failed-history
+    /// prune — an unfinished run keeps `active=true` while the prune set from
+    /// the very same slice still selects the artifact-less older failures.
+    /// (Previously each consumer issued its own byte-identical LIST.)
+    #[test]
+    fn one_children_slice_serves_gate_and_prune_coherently() {
+        use kopiur_api::snapshot::{SnapshotPhase, SnapshotStatus, SnapshotTiming};
+
+        fn snap(name: &str, phase: SnapshotPhase, end: &str) -> Snapshot {
+            let mut s = Snapshot::new(
+                name,
+                SnapshotSpec {
+                    repository: None,
+                    source: None,
+                    policy_ref: None,
+                    tags: None,
+                    failure_policy: None,
+                    deletion_policy: None,
+                    on_schedule_delete: None,
+                    pin: false,
+                    description: None,
+                },
+            );
+            s.status = Some(SnapshotStatus {
+                phase: Some(phase),
+                timing: Some(SnapshotTiming {
+                    end_time: Some(end.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            s
+        }
+
+        let slice = vec![
+            snap("running", SnapshotPhase::Running, "2026-01-01T04:00:00Z"),
+            snap("fail-old", SnapshotPhase::Failed, "2026-01-01T01:00:00Z"),
+            snap("fail-new", SnapshotPhase::Failed, "2026-01-01T02:00:00Z"),
+        ];
+
+        let runs = classify_active_runs(&slice);
+        assert!(
+            runs.active,
+            "the Running row must hold the Forbid gate shut"
+        );
+        assert!(runs.unreadable.is_none());
+
+        let prune = failed_snapshots_to_prune(&slice, 1);
+        assert_eq!(
+            prune,
+            vec!["fail-old".to_string()],
+            "the same slice must still bound failure history (keep the newest Failed)"
+        );
     }
 
     /// Multi-repo fan-out (#368): the failure-history bound is PER REPOSITORY
@@ -2685,5 +2930,141 @@ mod tests {
             ..Default::default()
         });
         assert!(!recorded_blocked_on_unreadable(&sched));
+    }
+
+    // --- #382 M3: store-served schedule children ----------------------------
+
+    use http::{Request, Response, StatusCode};
+    use kube::client::Body;
+
+    /// Logs `"<METHOD> <path>"` per request; answers with `status` + `body`.
+    fn logging_client(
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        status: StatusCode,
+        body: serde_json::Value,
+    ) -> kube::Client {
+        let body = Arc::new(body);
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            let body = body.clone();
+            async move {
+                log.lock()
+                    .unwrap()
+                    .push(format!("{} {}", req.method(), req.uri().path()));
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&*body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        });
+        kube::Client::new(svc, "default")
+    }
+
+    fn labeled_child(ns: &str, name: &str, schedule: &str) -> Snapshot {
+        let mut s: Snapshot = serde_json::from_value(serde_json::json!({
+            "apiVersion": crate::consts::API_VERSION,
+            "kind": "Snapshot",
+            "metadata": {
+                "name": name, "namespace": ns, "uid": format!("uid-{ns}-{name}"),
+                "labels": { (crate::consts::SCHEDULE_LABEL): schedule },
+            },
+            "spec": {},
+        }))
+        .expect("valid Snapshot fixture");
+        s.status = Some(kopiur_api::snapshot::SnapshotStatus {
+            phase: Some(SnapshotPhase::Failed),
+            ..Default::default()
+        });
+        s
+    }
+
+    fn prime_snapshot_store(ctx: &Context, objs: Vec<Snapshot>, synced: bool) {
+        use std::sync::atomic::Ordering;
+        let (store, mut writer) = kube::runtime::reflector::store::<Snapshot>();
+        for o in objs {
+            writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(o));
+        }
+        std::mem::forget(writer);
+        ctx.snapshot_store.set(store).ok();
+        ctx.snapshot_synced.store(synced, Ordering::Release);
+    }
+
+    /// C4: the schedule-children population served from the install-scope-wide
+    /// store must filter namespace AND label — another namespace's same-named
+    /// schedule must not feed this schedule's Forbid gate, prune set, or
+    /// cascade propagation.
+    #[tokio::test]
+    async fn schedule_children_from_store_exclude_cross_namespace_intruders() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = logging_client(
+            log.clone(),
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "kind": "Status", "code": 404 }),
+        );
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(
+            &ctx,
+            vec![
+                labeled_child("team-a", "run-1", "nightly"),
+                labeled_child("team-a", "run-2", "nightly"),
+                // Same schedule NAME, another namespace: must not leak in.
+                labeled_child("team-b", "intruder", "nightly"),
+                labeled_child("team-a", "other-sched", "weekly"),
+            ],
+            true,
+        );
+
+        let mut got: Vec<String> = schedule_children(&ctx, "team-a", "nightly")
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.name_any())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["run-1", "run-2"]);
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a synced store serves the children with zero HTTP"
+        );
+    }
+
+    /// C2: the failed-history prune executor live-verifies each store-selected
+    /// row before destruction — a vanished row is skipped: one GET, no
+    /// stamp-PATCH, no DELETE.
+    #[tokio::test]
+    async fn prune_failed_history_live_verifies_before_deleting() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = logging_client(
+            log.clone(),
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404,
+            }),
+        );
+        let ctx = Context::test_context(client);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "team-a");
+        // Two artifact-less Failed rows over limit 0 → both selected.
+        let children = vec![
+            labeled_child("team-a", "fail-1", "nightly"),
+            labeled_child("team-a", "fail-2", "nightly"),
+        ];
+
+        prune_failed_history(&api, "nightly", &children, Some(0))
+            .await
+            .unwrap();
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly one verify GET per selected row, got {requests:?}"
+        );
+        assert!(
+            requests.iter().all(|r| r.starts_with("GET ")),
+            "vanished rows must produce NO stamp/delete traffic: {requests:?}"
+        );
     }
 }

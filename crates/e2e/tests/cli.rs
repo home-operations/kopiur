@@ -1227,13 +1227,19 @@ async fn cli_doctor_fails_on_blocked_on_grant() {
         .await
         .expect("the namespace opt-in must un-stick the Snapshot (Namespace watch)");
 
+    // The freed Snapshot cannot be left in place for the green assertion: this
+    // namespace deliberately has no source PVC, and since #382 a missing DIRECT
+    // source PVC is itself a structural gate (`SourcePvcAvailable=False` /
+    // `SourcePvcMissing`) — the un-stuck backup would immediately park on THAT
+    // gate and doctor would (correctly!) keep failing. The grant arc this test
+    // pins is already proven: doctor failed while blocked, and the opt-in
+    // flipped `MoverPermitted=True` above. Remove the intentionally-unbackable
+    // Snapshot so the check can go green over the remaining, unblocked state.
+    delete_and_wait_gone(&snapshots, SNAP).await;
+
     // Only the per-check line is asserted, NOT the overall exit code: in a
     // full-suite run other binaries deliberately leave Failed repositories and
-    // Failed Snapshots behind (see `cli_doctor_and_status`), and the freed
-    // Snapshot itself may fail here — the workload namespace has no source PVC
-    // and no repo PVC, which is deliberate: this scenario proves the GATE, not a
-    // backup. A failed backup is terminal, not blocked, so it cannot flip this
-    // check.
+    // Failed Snapshots behind (see `cli_doctor_and_status`).
     let out = run_cli(&["-n", APP_NS, "doctor", "--stuck-threshold", "24h"]);
     eprintln!(
         "[#359] doctor after the opt-in (exit {:?}):\n{}",

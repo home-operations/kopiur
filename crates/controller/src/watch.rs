@@ -100,6 +100,26 @@ where
         .collect()
 }
 
+// --- #382 M4: Snapshot (metadata) -> owning SnapshotPolicy -------------------
+
+/// The `SnapshotPolicy` a changed `Snapshot` belongs to, via the config label —
+/// the GFS-retention prompt-retrigger mapping. Takes the METADATA-ONLY watch
+/// event (#382 M4): the mapper reads nothing but the label and the namespace,
+/// so decoding full `Snapshot` objects on this trigger stream was pure
+/// apiserver/CPU waste. Rows without the label (discovered, raw-applied) map to
+/// nothing by design — see the CONFIG_LABEL data-safety contract in `consts`.
+pub fn snapshot_meta_to_policy(
+    snapshot: &PartialObjectMeta<Snapshot>,
+) -> Option<ObjectRef<SnapshotPolicy>> {
+    match (
+        snapshot.labels().get(crate::consts::CONFIG_LABEL),
+        snapshot.namespace(),
+    ) {
+        (Some(policy), Some(ns)) => Some(ObjectRef::<SnapshotPolicy>::new(policy).within(&ns)),
+        (None, _) | (_, None) => None,
+    }
+}
+
 // --- M2: Secret / ConfigMap -> repository -----------------------------------
 
 /// Repositories that reference the changed `secret` (password or backend auth).
@@ -837,6 +857,40 @@ mod tests {
     use super::*;
     use kopiur_api::backend::{BackendAuth, FilesystemBackend, S3Backend};
     use kopiur_api::common::{SecretKeyRef, SecretRef};
+
+    /// #382 M4: the Snapshot→policy trigger mapper runs over a METADATA-ONLY
+    /// watch event (the full-object decode was pure waste — only the config
+    /// label and namespace feed the mapping). Pin the mapping matrix.
+    #[test]
+    fn snapshot_meta_maps_to_owning_policy_via_config_label() {
+        use kopiur_api::Snapshot;
+
+        fn meta(name: &str, ns: Option<&str>, label: Option<&str>) -> PartialObjectMeta<Snapshot> {
+            let mut metadata = serde_json::json!({ "name": name });
+            if let Some(ns) = ns {
+                metadata["namespace"] = ns.into();
+            }
+            if let Some(v) = label {
+                metadata["labels"] = serde_json::json!({ crate::consts::CONFIG_LABEL: v });
+            }
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Snapshot",
+                "metadata": metadata,
+            }))
+            .expect("snapshot meta fixture")
+        }
+
+        // Labeled + namespaced → the owning policy in the Snapshot's namespace.
+        let mapped = snapshot_meta_to_policy(&meta("s1", Some("apps"), Some("daily")))
+            .expect("labeled snapshot maps");
+        assert_eq!(mapped.name, "daily");
+        assert_eq!(mapped.namespace.as_deref(), Some("apps"));
+        // No config label (discovered / raw-applied rows) → no trigger.
+        assert!(snapshot_meta_to_policy(&meta("s2", Some("apps"), None)).is_none());
+        // No namespace (defensive; Snapshots are namespaced) → no trigger.
+        assert!(snapshot_meta_to_policy(&meta("s3", None, Some("daily"))).is_none());
+    }
 
     fn rref(kind: RepositoryKind, name: &str, ns: Option<&str>) -> RepositoryRef {
         RepositoryRef {

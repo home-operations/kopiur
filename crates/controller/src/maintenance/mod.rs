@@ -110,13 +110,8 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let api: Api<Maintenance> = Api::namespaced(ctx.client.clone(), &namespace);
 
     let repo_ref = &maint.spec.repository;
-    let repo = io::resolve_repository_ref(
-        &ctx.client,
-        repo_ref,
-        &namespace,
-        ctx.operator_namespace.as_deref(),
-    )
-    .await?;
+    // Launch-side (Job spawn inputs) — store-backed point read (#382 M2).
+    let repo = io::resolve_repository_ref_cached(ctx, repo_ref, &namespace).await?;
     // GitHub #174 item 3: the last of the three cascade levels (per-cron →
     // schedule-level → repo scheduleDefaults.timezone → UTC), resolved in
     // `slot_for`.
@@ -128,7 +123,7 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     // G7: an object-store repository must be bootstrapped (connected/created)
     // before `kopia maintenance` can reach it. Spawning earlier just produces a
     // doomed pod, so wait for the repository to report `Ready`.
-    if !io::repository_ready(&ctx.client, repo_ref, &namespace).await? {
+    if !io::repository_ready_cached(ctx, repo_ref, &namespace).await? {
         patch_condition_if_changed(
             &api,
             &name,

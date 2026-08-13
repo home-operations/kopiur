@@ -76,6 +76,21 @@ pub enum Error {
     #[error("missing recorded identity: {0}")]
     MissingRecordedIdentity(String),
 
+    /// A `Snapshot`'s DIRECT source PVC (`spec.sources[].pvc`) does not exist
+    /// at launch time. Permanent-*shaped* — no PVC watch exists on the Snapshot
+    /// controller, and only a human recreating the PVC (or repointing the
+    /// policy's `spec.sources`) clears it — so it holds on the slow structural
+    /// cadence (300s) instead of hot-looping every 30-60s forever (issue #382;
+    /// precedent: [`Error::MissingRecordedIdentity`]). The snapshot reconciler
+    /// writes the `SourcePvcAvailable=False` gate condition + a transition-gated
+    /// Warning Event before returning this, so the hold is never silent; after
+    /// the missing-source deadline it flips the Snapshot terminally `Failed`
+    /// instead of returning this at all. A vanished operator-staged claim
+    /// (copyMethod Snapshot/Clone) is a restage race, NOT this error — it stays
+    /// [`Error::MissingDependency`] (transient).
+    #[error("missing source PVC: {0}")]
+    MissingSourcePvc(String),
+
     /// JSON (de)serialization of a spec/status/work-spec failed. Structural.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -182,6 +197,7 @@ impl Error {
             Error::Validation(_)
             | Error::BlockedOnGrant(_)
             | Error::MissingRecordedIdentity(_)
+            | Error::MissingSourcePvc(_)
             | Error::Serialization(_)
             | Error::BuildJob(_)
             | Error::InvalidSchedule(_)
@@ -208,6 +224,7 @@ impl Error {
             | Error::MissingCaBundle(_)
             | Error::BlockedOnGrant(_)
             | Error::MissingRecordedIdentity(_)
+            | Error::MissingSourcePvc(_)
             | Error::Serialization(_)
             | Error::BuildJob(_)
             | Error::InvalidSchedule(_)
@@ -400,6 +417,33 @@ mod tests {
         assert!(err.to_string().contains("missing recorded identity"));
         assert!(err.to_string().contains("app/pg-b1"));
         assert!(!err.event_publish_futile());
+    }
+
+    #[test]
+    fn missing_source_pvc_is_structural_not_a_hot_loop() {
+        // Issue #382: a Snapshot whose DIRECT source PVC was deleted used to
+        // surface as MissingDependency (Transient) and retry every 30-60s
+        // forever. The absence is permanent-shaped — no PVC watch exists on the
+        // Snapshot controller, and only a human recreating the PVC (or
+        // repointing the policy's sources) clears it — so it holds on the slow
+        // structural cadence (300s), precedent `MissingRecordedIdentity`. The
+        // reconciler writes the `SourcePvcAvailable=False` gate + Warning Event
+        // before returning this, so the hold is never silent.
+        let err = Error::MissingSourcePvc("source PVC `app/data` does not exist".into());
+        assert_eq!(err.class(), ErrorClass::Structural);
+        assert!(!err.event_publish_futile());
+        assert!(err.to_string().contains("missing source PVC"));
+        assert!(err.to_string().contains("app/data"));
+    }
+
+    #[test]
+    fn missing_source_pvc_message_is_byte_stable() {
+        // The condition/Event message must not carry timestamps or attempt
+        // counters: volatile status bytes self-trigger the primary watch and
+        // hot-loop the reconciler. Two renders of the same error must be
+        // byte-identical.
+        let make = || Error::MissingSourcePvc("source PVC `app/data` does not exist".into());
+        assert_eq!(make().to_string(), make().to_string());
     }
 
     #[test]

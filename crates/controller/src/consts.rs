@@ -28,7 +28,8 @@ pub use kopiur_api::consts::{
     REPOSITORY_UID_LABEL, REPOSITORY_WRITABLE_CONDITION, RUN_MODE_ANNOTATION,
     RUN_REQUESTED_ANNOTATION, SCHEDULE_FANOUT_CAPPED_CONDITION, SCHEDULE_LABEL,
     SCHEDULE_RUNNABLE_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER,
-    SNAPSHOT_ID_LABEL, STALLED_CONDITION,
+    SNAPSHOT_ID_LABEL, SOURCE_PVC_AVAILABLE_CONDITION, SOURCE_PVC_MISSING_REASON,
+    STALLED_CONDITION,
 };
 
 /// `reason` when a backup is held in `Pending` (then `Failed` after the timeout)
@@ -50,6 +51,26 @@ pub const DEFAULT_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::
 /// forever and silently starve a `concurrencyPolicy: Forbid` schedule; a
 /// transient `status.error` during the wait never fails staging on its own.
 pub const DEFAULT_STAGING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Default deadline for a backup parked on a missing DIRECT source PVC
+/// ([`SOURCE_PVC_AVAILABLE_CONDITION`] = `False`): how long a `Snapshot` is
+/// held `Pending` (re-probed on the structural 300s cadence) from the gate
+/// condition's `lastTransitionTime` before it transitions to terminal
+/// `Failed`. Bounded so a `concurrencyPolicy: Forbid` schedule is released and
+/// `failedJobsHistoryLimit` can prune the row — each new schedule slot then
+/// re-probes the PVC live (CronJob semantics). Overridable via
+/// [`crate::config::SOURCE_PVC_DEADLINE_ENV`] (`0` = park indefinitely).
+pub const DEFAULT_SOURCE_PVC_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+/// `reason` for [`SOURCE_PVC_AVAILABLE_CONDITION`] = `True`: the source PVC
+/// resolved on a later launch attempt (the clear-side counterpart of
+/// [`SOURCE_PVC_MISSING_REASON`]; controller-internal remediation copy, like
+/// [`FANOUT_WITHIN_CAP_REASON`]). Written ONLY when the condition already
+/// exists — the healthy wire never grows the condition.
+pub const SOURCE_PVC_FOUND_REASON: &str = "SourcePvcFound";
+/// Event `action` (remediation hint) for [`SOURCE_PVC_MISSING_REASON`]:
+/// recreate the named PVC, or update the policy's `spec.sources`.
+pub const RECREATE_SOURCE_PVC_ACTION: &str = "RecreateSourcePvcOrUpdateSources";
 
 /// In-container mount path for an inline-NFS backup *source* whose server-side
 /// export is the NFSv4 pseudo-root (`/`). The export's server path and the

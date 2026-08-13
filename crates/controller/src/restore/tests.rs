@@ -1303,3 +1303,16 @@ fn recorded_verdict_root_uid_makes_the_elevation_visible() {
     assert!(v.message.contains("forge"), "{}", v.message);
     assert!(v.message.contains("privileged-movers"), "{}", v.message);
 }
+
+#[test]
+fn absent_restore_target_pvc_stays_a_transient_race() {
+    // #382 M5 per-caller mapping: the restore TARGET PVC was ensured moments
+    // before the co-location read, so a 404 is a race — a transient
+    // MissingDependency retry, never the Snapshot-side MissingSourcePvc
+    // gate/deadline machinery.
+    let err = restore_target_pvc_race_error("app", "restored-data");
+    assert!(matches!(&err, Error::MissingDependency(_)), "{err:?}");
+    assert_eq!(err.class(), crate::error::ErrorClass::Transient);
+    assert!(err.to_string().contains("app/restored-data"));
+    assert!(err.to_string().contains("race"));
+}

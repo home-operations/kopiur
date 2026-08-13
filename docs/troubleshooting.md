@@ -92,6 +92,40 @@ $ kubectl get snapshots <name> -n <ns> \
 - For a namespaced `Repository`, the repo and Secret are already together — nothing extra.
 - For a `ClusterRepository`, the credential Secret must reach each workload namespace. The easy fix: set [`credentialProjection.enabled: true`](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) on the `SnapshotPolicy`/`Restore`/`Maintenance` that uses it, so Kopiur copies it for you (off by default). Otherwise replicate it yourself. See [Movers → the credentials Secret](movers.md#the-credentials-secret).
 
+### `SourcePvcAvailable=False` — the source PVC is gone
+
+The backup's **direct source PVC** doesn't exist (deleted, or never created).
+Instead of retrying forever, the `Snapshot` parks in `Pending` with the
+`SourcePvcAvailable=False` condition (reason `SourcePvcMissing`), one `Warning`
+Event naming the PVC, and a slow re-check (~5 minutes). `kubectl kopiur doctor`
+reports it as a structural gate.
+
+```console
+$ kubectl get snapshots <name> -n <ns> \
+    -o jsonpath='{.status.conditions[?(@.type=="SourcePvcAvailable")].message}'
+# → names the exact PVC namespace/name the backup is waiting for
+```
+
+- **The PVC is coming back** (reprovisioning, GitOps ordering): recreate it —
+  the next re-check resumes the backup automatically.
+- **The PVC is gone for good**: update the `SnapshotPolicy`'s `sources` (or
+  delete the orphaned `Snapshot`).
+
+After a deadline (default **30 minutes**; operators can tune it with the
+controller env var `KOPIUR_SOURCE_PVC_DEADLINE_SECONDS`, `0` = park
+indefinitely) the parked `Snapshot` flips to terminal `Failed` so a
+`concurrencyPolicy: Forbid` schedule is released and `failedJobsHistoryLimit`
+bounds the leftovers. Each new scheduled slot re-probes the PVC fresh — exactly
+the CronJob model.
+
+/// note | Staged clones are not affected
+
+This gate fires only for the PVC you named in the policy. A staging PVC that
+vanishes mid-run (`copyMethod: Snapshot`/`Clone`) is an internal race and is
+retried as a transient error instead.
+
+///
+
 ### A feature works in the CR but status shows `HTTP 403` (missing RBAC)
 
 Two features need the operator to **write Secrets**, and that RBAC is **off by default**. If you enable the feature in a CR but not the matching Helm flag, the resource's `.status` shows an actionable `403` naming the exact flag — the operator degrades cleanly and heals as soon as you grant it.

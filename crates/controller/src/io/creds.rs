@@ -294,15 +294,18 @@ pub enum ProjectedOwnership<'a> {
 /// Classify an existing Secret at a projection target name against the
 /// consuming CR's uid. `None` (not found) is `Free` — a recreated same-name CR
 /// (new uid) must pass once GC reaped the old copy.
+///
+/// Takes the Secret's **metadata** only (#382 M2b): every input this decision
+/// needs (the controller ownerRef) lives there, so callers holding either a
+/// full `Secret` or a metadata-only `PartialObjectMeta<Secret>` read share it.
 pub fn projected_ownership<'a>(
-    existing: Option<&'a Secret>,
+    existing: Option<&'a ObjectMeta>,
     owner_uid: &str,
 ) -> ProjectedOwnership<'a> {
-    let Some(secret) = existing else {
+    let Some(meta) = existing else {
         return ProjectedOwnership::Free;
     };
-    let controller = secret
-        .metadata
+    let controller = meta
         .owner_references
         .as_deref()
         .unwrap_or_default()
@@ -344,15 +347,18 @@ fn projection_name_conflict_message(
 /// the fail-closed gate for every resolve-path delete (index shrink, disabled
 /// projection). Requires BOTH the [`crate::consts::CREDS_SCOPE_LABEL`] marker
 /// (legacy per-run copies belong to the sweep, user Secrets to the user) AND a
-/// matching controller ownerRef. Pure so it is unit-tested.
-pub fn is_reapable_projected_copy(secret: &Secret, owner_uid: &str) -> bool {
-    let marked = secret.metadata.labels.as_ref().is_some_and(|l| {
+/// matching controller ownerRef. Pure so it is unit-tested. Metadata-typed
+/// (#382 M2b): labels + ownerRefs are all it reads, so the reap pre-check can
+/// feed it from a metadata-only GET and the Secret payload never crosses the
+/// wire.
+pub fn is_reapable_projected_copy(meta: &ObjectMeta, owner_uid: &str) -> bool {
+    let marked = meta.labels.as_ref().is_some_and(|l| {
         l.get(crate::consts::CREDS_SCOPE_LABEL).map(String::as_str)
             == Some(crate::consts::CREDS_SCOPE_CR)
     });
     marked
         && matches!(
-            projected_ownership(Some(secret), owner_uid),
+            projected_ownership(Some(meta), owner_uid),
             ProjectedOwnership::OwnedBySelf
         )
 }
@@ -380,11 +386,16 @@ enum ReapSignal {
 /// precondition-pinned delete kernel (a concurrent re-apply bumps the RV and
 /// the delete 409s — the copy is spared and re-evaluated next run).
 /// 404/409/403 never propagate as errors.
+///
+/// The pre-check is a METADATA-ONLY GET (#382 M2b): the reapability decision
+/// reads labels + ownerRefs, and the precondition pin reads uid +
+/// resourceVersion — all metadata — so the Secret payload never crosses the
+/// wire on this (per-run, often multi-index) path.
 async fn reap_projected_copy(dst: &Api<Secret>, name: &str, owner_uid: &str) -> Result<ReapSignal> {
-    let Some(existing) = dst.get_opt(name).await? else {
+    let Some(existing) = dst.get_metadata_opt(name).await? else {
         return Ok(ReapSignal::Absent);
     };
-    if !is_reapable_projected_copy(&existing, owner_uid) {
+    if !is_reapable_projected_copy(&existing.metadata, owner_uid) {
         return Ok(ReapSignal::Kept);
     }
     use crate::sweep::DeleteOutcome;
@@ -452,6 +463,12 @@ async fn shrink_trailing_copies(
     owner_uid: &str,
     job_ns: &str,
 ) {
+    // When the live source set already covers every index the projector can
+    // ever write, no trailing copy can exist — skip the walk entirely instead
+    // of paying a guaranteed-Absent probe GET per run (#382 M2b).
+    if shrink_walk_is_vacuous(start_idx) {
+        return;
+    }
     for idx in start_idx.. {
         let name = prefix.secret_name(idx);
         match reap_quietly(dst, &name, owner_uid, job_ns, "stale (source set shrank)").await {
@@ -467,6 +484,14 @@ async fn shrink_trailing_copies(
 /// yields the encryption-password Secret plus, only when it is differently named, the
 /// backend's auth Secret.
 const MAX_CREDS_IDX: usize = 1;
+
+/// **Pure.** Whether the trailing-copy shrink walk starting at `start_idx`
+/// (= the live source-ref count) cannot possibly find anything: the projector
+/// never writes an index above [`MAX_CREDS_IDX`], so a walk starting past it
+/// would only ever probe names that cannot exist ([`shrink_trailing_copies`]).
+fn shrink_walk_is_vacuous(start_idx: usize) -> bool {
+    start_idx > MAX_CREDS_IDX
+}
 
 /// Reap EVERY projected copy of `prefix` — the whole-projection reap a consumer runs
 /// once its mover Job can no longer read them.
@@ -651,7 +676,9 @@ pub async fn resolve_mover_creds(
                     "leftover (projection not in use)",
                 )
                 .await;
-                if dst.get_opt(&r.name).await?.is_none() {
+                // Presence-only verify: a metadata GET keeps the Secret
+                // payload off the wire (#382 M2b).
+                if dst.get_metadata_opt(&r.name).await?.is_none() {
                     return Err(Error::MissingDependency(missing_creds_message(
                         &r.name, job_ns, ctx,
                     )));
@@ -675,7 +702,8 @@ pub async fn resolve_mover_creds(
                 "leftover (source is now same-namespace)",
             )
             .await;
-            if dst.get_opt(&r.name).await?.is_none() {
+            // Presence-only verify — metadata GET (#382 M2b).
+            if dst.get_metadata_opt(&r.name).await?.is_none() {
                 return Err(Error::MissingDependency(missing_creds_message(
                     &r.name, job_ns, ctx,
                 )));
@@ -699,7 +727,8 @@ pub async fn resolve_mover_creds(
                 "leftover (projection disabled)",
             )
             .await;
-            if dst.get_opt(&r.name).await?.is_none() {
+            // Presence-only verify — metadata GET (#382 M2b).
+            if dst.get_metadata_opt(&r.name).await?.is_none() {
                 return Err(Error::MissingDependency(missing_creds_message(
                     &r.name, job_ns, ctx,
                 )));
@@ -750,8 +779,9 @@ async fn project_one_ref(
     ctx: &CredsContext<'_>,
 ) -> Result<String> {
     let proj_name = prefix.secret_name(idx);
-    let existing = dst.get_opt(&proj_name).await?;
-    match projected_ownership(existing.as_ref(), &owner.uid) {
+    // Ownership pre-check needs metadata only (#382 M2b).
+    let existing = dst.get_metadata_opt(&proj_name).await?;
+    match projected_ownership(existing.as_ref().map(|s| &s.metadata), &owner.uid) {
         // Absent, or already ours: safe to (re-)apply.
         ProjectedOwnership::Free | ProjectedOwnership::OwnedBySelf => {}
         ProjectedOwnership::OwnedByOther(holder) => {
@@ -771,7 +801,7 @@ async fn project_one_ref(
     let applied = apply(dst, &proj_name, &secret)
         .await
         .map_err(|e| map_projection_apply_error(e, &proj_name, job_ns))?;
-    match projected_ownership(Some(&applied), &owner.uid) {
+    match projected_ownership(Some(&applied.metadata), &owner.uid) {
         ProjectedOwnership::OwnedBySelf => Ok(proj_name),
         // Unreachable for `Some(&applied)`, but the holder-`None` message
         // ("not managed by kopiur") is exactly right if it ever fires.
@@ -1093,7 +1123,7 @@ mod tests {
     fn ownership_self_when_controller_uid_matches() {
         let s = secret_owned_by("uid-123");
         assert!(matches!(
-            projected_ownership(Some(&s), "uid-123"),
+            projected_ownership(Some(&s.metadata), "uid-123"),
             ProjectedOwnership::OwnedBySelf
         ));
     }
@@ -1102,7 +1132,7 @@ mod tests {
     fn ownership_other_when_uid_differs_or_controller_ref_missing() {
         let s = secret_owned_by("uid-999");
         assert!(matches!(
-            projected_ownership(Some(&s), "uid-123"),
+            projected_ownership(Some(&s.metadata), "uid-123"),
             ProjectedOwnership::OwnedByOther(Some(_))
         ));
         // A same-named Secret with NO controller ownerRef (e.g. a user-created
@@ -1115,7 +1145,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            projected_ownership(Some(&bare), "uid-123"),
+            projected_ownership(Some(&bare.metadata), "uid-123"),
             ProjectedOwnership::OwnedByOther(None)
         ));
     }
@@ -1167,9 +1197,9 @@ mod tests {
             &src,
             chrono::Utc::now(),
         );
-        assert!(is_reapable_projected_copy(&ours, "uid-123"));
+        assert!(is_reapable_projected_copy(&ours.metadata, "uid-123"));
         // Different owner uid: not ours to delete.
-        assert!(!is_reapable_projected_copy(&ours, "uid-999"));
+        assert!(!is_reapable_projected_copy(&ours.metadata, "uid-999"));
         // No marker label (a legacy per-run copy, or a user Secret): never
         // reaped by the resolve path — the sweep owns the legacy case.
         let mut legacy = ours.clone();
@@ -1179,7 +1209,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .remove(crate::consts::CREDS_SCOPE_LABEL);
-        assert!(!is_reapable_projected_copy(&legacy, "uid-123"));
+        assert!(!is_reapable_projected_copy(&legacy.metadata, "uid-123"));
     }
 
     #[test]
@@ -1317,5 +1347,80 @@ mod tests {
             map_projection_apply_error(api_error(500), "job-creds-0", "team-a"),
             Error::Kube(_)
         ));
+    }
+
+    // --- shrink_walk_is_vacuous: skip the trailing-copy probe when no
+    // trailing index can exist (#382 M2b) ------------------------------------
+    #[test]
+    fn shrink_walk_vacuous_only_past_the_max_index() {
+        // 0 or 1 live refs: index 1 (or 0) may hold a stale trailing copy —
+        // the walk must run.
+        assert!(!shrink_walk_is_vacuous(0));
+        assert!(!shrink_walk_is_vacuous(1));
+        // The full set (password + backend auth) covers every index the
+        // projector ever writes — nothing past it can exist, skip the probe.
+        assert!(shrink_walk_is_vacuous(MAX_CREDS_IDX + 1));
+        assert!(shrink_walk_is_vacuous(MAX_CREDS_IDX + 2));
+    }
+
+    // --- reap pre-check is a METADATA read (#382 M2b): the reapability
+    // decision + precondition pin need only metadata, so the request must
+    // carry the PartialObjectMetadata Accept header (the Secret payload stays
+    // off the wire). -----------------------------------------------------------
+    mod reap_metadata_wire {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        use http::{Request, Response, StatusCode};
+        use kube::Client;
+        use kube::client::Body;
+
+        /// Records each request's `Accept` header; answers everything 404.
+        fn accept_logging_client(log: Arc<Mutex<Vec<String>>>) -> Client {
+            let svc = tower::service_fn(move |req: Request<Body>| {
+                let log = log.clone();
+                async move {
+                    let accept = req
+                        .headers()
+                        .get(http::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    log.lock().unwrap().push(accept);
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(&serde_json::json!({
+                                    "kind": "Status", "apiVersion": "v1",
+                                    "status": "Failure", "reason": "NotFound",
+                                    "code": 404,
+                                }))
+                                .unwrap(),
+                            ))
+                            .unwrap(),
+                    )
+                }
+            });
+            Client::new(svc, "team-a")
+        }
+
+        #[tokio::test]
+        async fn reap_precheck_requests_partial_object_metadata() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let api: Api<Secret> = Api::namespaced(accept_logging_client(log.clone()), "team-a");
+            let signal = reap_projected_copy(&api, "app-creds-0", "uid-123")
+                .await
+                .expect("404 pre-check is the benign Absent outcome");
+            assert!(matches!(signal, ReapSignal::Absent));
+            let accepts = log.lock().unwrap();
+            assert_eq!(accepts.len(), 1);
+            assert!(
+                accepts[0].contains("as=PartialObjectMetadata"),
+                "the pre-check must be a metadata-only GET, sent Accept: {}",
+                accepts[0]
+            );
+        }
     }
 }
