@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/home-operations/kopiur/compare/0.10.1...0.10.2) (2026-08-13)
+
+
+### Performance Improvements
+
+* **controller:** store-backed reads, LIST dedup, bounded PVC retries, client-side request metrics ([#382](https://github.com/home-operations/kopiur/issues/382)) ([#383](https://github.com/home-operations/kopiur/issues/383)) ([2b07022](https://github.com/home-operations/kopiur/commit/2b07022b0d8bd531634371dc949611e01c8cb049))
+
 ## [0.10.1](https://github.com/home-operations/kopiur/compare/0.10.0...0.10.1) (2026-08-11)
 
 
