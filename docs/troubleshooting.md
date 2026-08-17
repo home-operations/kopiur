@@ -45,6 +45,7 @@ primary   Failed    S3        2m
 | `Failed`, TLS error (`x509: certificate signed by unknown authority`) | Private-CA / self-signed HTTPS endpoint, or an HTTP-only endpoint spoken to as HTTPS. | Point `tls.caBundleRef` at a ConfigMap holding the CA PEM (`key` defaults to `ca.crt`; resolved in the `Repository`'s namespace — operator's namespace for a `ClusterRepository`), or set `tls.disableTls: true` for a genuinely HTTP-only store. See [Private-CA HTTPS](backends/s3.md#private-ca-https-trusting-your-own-ca). |
 | `MissingCaBundle` condition    | The `tls.caBundleRef` ConfigMap (or its key, default `ca.crt`) doesn't exist where it's resolved. | Create the ConfigMap in the `Repository`'s namespace (operator's namespace for a `ClusterRepository`) — it is **not** read from workload namespaces. `kubectl kopiur doctor` reports this as a structural gate; the ConfigMap appearing re-triggers the reconcile. |
 | Stuck `Pending`                | Operator not running, or not watching this scope.                                          | Check the controller is up; for `ClusterRepository`, confirm `installScope=cluster`.                           |
+| Stuck `Pending`/`Initializing` for a long time, `Seeded=False` | The repository has [`spec.seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica) and is copying a replica in — it deliberately does not go `Ready` until the copy lands. | Read the `Seeded` reason: see [a seeding repository never reaches `Ready`](#a-seeding-repository-never-reaches-ready). |
 
 ```console
 $ kubectl describe repository primary -n <ns>   # the condition message names the exact cause
@@ -62,6 +63,41 @@ The apply is deliberately best-effort: a bad parameter must not take an otherwis
 | `storage is read-only` | The repository is connected `mode: ReadOnly`. | Declare `spec.parameters` on the cluster that owns the repository. Admission normally rejects this pairing, so seeing it means the mode changed after the fact. |
 
 A backend that has no object lock at all (filesystem, sftp, webdav, rclone, b2, gdrive) is rejected at admission instead, so it never reaches this state.
+
+## A seeding repository never reaches `Ready`
+
+A `Repository`/`ClusterRepository` with [`spec.seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica)
+deliberately stays out of `Ready` until the copy lands, so "stuck `Pending` for a
+long time" is often just a large seed in progress. The `Seeded` condition says
+which:
+
+```console
+$ kubectl describe repository nas-primary -n billing | grep -A4 'Type: *Seeded'
+$ kubectl kopiur doctor -n billing        # explains any Seeded=False reason
+```
+
+| `Seeded` reason | Cause | Fix |
+| --- | --- | --- |
+| `Seeding` | The copy is running. A first seed transfers the whole repository, so hours is normal — the Job's deadline is 24 h by default. | Nothing. Watch `kubectl logs -n <ns> job/<repository>-discovery -f`. Raise `seed.failurePolicy.activeDeadlineSeconds` if attempts are being cut short. |
+| `WaitingForSeedSource` | Migrate mode: the source `Repository`/`ClusterRepository` is missing, not `Ready`, or is a bare-path `filesystem` repository the mover cannot mount. | Bring the source up (check its own conditions), fix the reference, or give a filesystem source a `backend.filesystem.volume`. Re-checked every 15 s — no action needed once it is usable. |
+| `SeedSourceNotFound` | The seed source answered but holds no kopia repository. Almost always a wrong bucket **or prefix**: a mirror is rooted at the replication destination's own prefix, not its parent. | Point `seed.from` at the exact bucket+prefix the repository lives under. Retried automatically every ~2 min. |
+| `SeedSourceEmpty` | The source *is* a kopia repository but holds zero snapshots, and `allowEmptySource` is `false`. | Usually a mis-pointed source or a replication that never ran. If the source really is meant to be empty, set `seed.allowEmptySource: true`. Retried automatically. |
+| `SeedIncomplete` | Migrate mode: `kopia snapshot migrate` exited 0 but the post-verify found snapshots missing (kopia only *logs* per-source failures). | Read the seeding Job's pod logs for kopia's per-source errors. The retry resumes and copies only what is still missing. |
+| `SeedLeftEmpty` | A seed was armed and the repository ended up holding zero snapshots — an earlier attempt initialized the backend and then died (deadline, OOM, a copy that errored after `repository create`). | **Do not delete anything at the backend** — kopiur records that an attempt started and resumes the copy itself. If it recurs, the deadline is usually too short: raise `seed.failurePolicy.activeDeadlineSeconds`. |
+| `MoverImageTooOldForSeed` | The running mover image predates `spec.seed` and silently dropped it. **Terminal.** | Upgrade the mover image, **and** delete the finished bootstrap Job (`kubectl -n <ns> delete job <repository>-discovery`) — nothing recycles a terminal Job before its TTL, so an upgrade alone looks like it changed nothing for up to an hour. |
+| `Bootstrapped=False`, class `BootstrapInternalInconsistency` | A kopiur defect, not a repository problem. **Terminal.** | Please file it with the message and the mover Job's logs. |
+
+Two more that look like seed failures but are not:
+
+- **`Failed` with an auth error against the seed source** — kopiur never seeds (or
+  creates) over a backend it could not authenticate to. Fix the source's
+  credentials.
+- **The seeding Job never starts, or dies on `CreateContainerConfigError`** — the
+  seed source's credential Secret is not in the namespace the bootstrap Job runs
+  in, or (migrate mode, cross-namespace) `seed.credentialProjection.enabled` is
+  set without the operator's `features.credentialProjection.enabled` Helm flag.
+  See [Feature permissions](feature-permissions.md) and
+  [where the Secret must live](repositories.md#seed--initialize-a-new-repository-from-a-replica).
 
 ## Backup (or Restore) stuck in `Pending` with no Job
 

@@ -39,6 +39,7 @@ snapshot means matching that identity. See [How Kopia works](../concepts/how-kop
 | 07  | [Point-in-time rollback](point-in-time-rollback.md)                | Roll a volume back to a specific known-good moment (`asOf`/`offset`).  | Simple     |
 | 08  | [Clone an app into another namespace](clone-app-to-namespace.md)   | Copy prod data into staging/preview to reproduce a bug or seed an env.| Advanced   |
 | 09  | [Share one repository across clusters](shared-repository-multi-cluster.md) | Several clusters back up to (or restore from) the SAME repository at once, safely. | Advanced   |
+| 10  | [DR from a replicated repository](dr-with-replicated-repository.md) | The primary repository is gone; seed a NEW one from the surviving off-site mirror (`spec.seed`). | Advanced   |
 
 /// warning | Alpha
 

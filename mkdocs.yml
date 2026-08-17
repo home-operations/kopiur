@@ -215,6 +215,7 @@ nav:
       - Point-in-time rollback: scenarios/point-in-time-rollback.md
       - Clone an app into another namespace: scenarios/clone-app-to-namespace.md
       - Share one repository across clusters: scenarios/shared-repository-multi-cluster.md
+      - DR from a replicated repository: scenarios/dr-with-replicated-repository.md
   - Reference:
       - Field reference (all CRDs): field-reference.md
       # navigation.indexes: reference/crds/index.md is the section landing (first child).

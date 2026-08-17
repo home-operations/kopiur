@@ -145,3 +145,4 @@ Matching zero identities is a **successful no-op** (`NoIdentitiesMatched`), not 
 - [Multi-repository fan-out](backups.md#repositories--one-recipe-several-repositories-fan-out) — backing up into N repositories *directly* from one `SnapshotPolicy` (and why hooks + fan-out points you back here).
 - [Repositories & backends](repositories.md) — the catalog, `deletionProtection`, `identityDefaults`.
 - [Disaster recovery scenario](scenarios/disaster-recovery.md)
+- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md) — the one-shot counterpart: `Repository.spec.seed` copies a whole repository in at first bootstrap (`seed.from.repository` is the same `kopia snapshot migrate`), instead of copying selected snapshots on a schedule.

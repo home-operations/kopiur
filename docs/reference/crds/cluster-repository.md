@@ -70,6 +70,25 @@ Default-managed like the namespaced kind, but since `Maintenance` is itself
 namespaced, `maintenance.namespace` selects where the owned `Maintenance` CR lands
 (defaulting to the operator's namespace). See [Maintenance](../../maintenance.md).
 
+### `seed`
+
+Same block as on the [Repository](repository.md#seed), with the cluster-scoped
+resolution rules:
+
+- The seeding bootstrap Job runs in **the namespace the repository's own
+  credentials resolve in** — the operator's namespace, unless
+  `encryption.passwordSecretRef.namespace` pins another. A blob seed's
+  `from.backend` credential Secret is loaded with `envFrom` (namespace-local), so
+  it must live in **that** namespace; a seed `secretRef` that pins a namespace is
+  rejected at admission, because a cluster-scoped spec cannot name the right one.
+- A migrate seed's `from.repository` with no `namespace` resolves in the
+  operator's namespace — the same rule every other cluster-scoped reference
+  follows. Set it explicitly whenever the source lives anywhere else.
+- A `ClusterRepository` with an armed seed holds its cleanup finalizer until the
+  bootstrap completes, so that deleting the CR mid-seed can stop the in-flight
+  seeding Job (a namespaced Job cannot carry a cluster-scoped ownerReference, so
+  nothing else would).
+
 ### `credentialProjection`
 
 The repository-owner gate for projecting this repository's credential Secret(s) into
@@ -83,7 +102,7 @@ projection there is a same-namespace no-op.
 
 Mirrors [Repository](repository.md) status (`phase`, `observedGeneration`,
 `resolvedCredentialVersion`, `uniqueId`, `backend`, `storageStats`, `catalog`,
-`server`, `conditions`) with one addition:
+`seed`, `server`, `conditions`) with one addition:
 
 - `allowedNamespaceCount` — number of namespaces currently resolved by
   `spec.allowedNamespaces`; also the `Namespaces` print column.

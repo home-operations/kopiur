@@ -927,14 +927,17 @@ pub enum ValidationError {
 
     /// A `ClusterRepository`'s `spec.seed.from.backend` credential Secret pins a
     /// namespace. A cluster-scoped repository's movers resolve their Secrets in
-    /// the operator's own namespace, which the spec cannot name, so a pinned
-    /// namespace is a dead reference.
+    /// the namespace the bootstrap Job runs in — the operator's own namespace
+    /// unless `encryption.passwordSecretRef.namespace` pins another — which the
+    /// spec cannot name here, so a pinned namespace is a dead reference.
     #[error(
         "spec.seed.from.backend auth.secretRef {secret:?} pins namespace {namespace:?}, but a \
-         ClusterRepository's seeding mover resolves credentials in the operator's own namespace — \
-         a pinned namespace would be a dead reference the Job hangs on \
-         (CreateContainerConfigError). Fix: omit `namespace` and put the Secret in the operator \
-         namespace alongside this repository's other credentials"
+         ClusterRepository's seeding mover resolves credentials in the namespace its bootstrap \
+         Job runs in — the operator's own namespace, unless \
+         encryption.passwordSecretRef.namespace pins another — so a namespace pinned here would \
+         be a dead reference the Job hangs on (CreateContainerConfigError). Fix: omit \
+         `namespace` and put the Secret alongside this repository's other credentials, in the \
+         same namespace as encryption.passwordSecretRef"
     )]
     SeedSourceSecretNamespaceForbidden {
         /// The referenced Secret name.

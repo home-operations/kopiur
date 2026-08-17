@@ -209,6 +209,12 @@ Where the waiting happens depends on the source. A `snapshotRef` (waiting for th
 
 A populator whose claiming PVC is deleted and re-created re-opens its resolution — and that clears `status.waitStartedAt`, so the re-created claim gets the full window again rather than inheriting the previous claim's spent one.
 
+/// tip | Restoring on a freshly-seeded repository
+
+A repository being initialized from a replica ([`spec.seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica)) does not reach `Ready` until the copy lands — which can legitimately take hours. A populator `Restore` waits for it and its `waitTimeout` window opens only at that moment, so a long seed does not spend it. Before re-applying policies over the recovered history, read the identity and retention hazards in [Scenario 10](scenarios/dr-with-replicated-repository.md#hazards-to-review-before-you-apply) — adoption under the default `deletionPolicy: Delete` prunes everything outside `spec.retention`.
+
+///
+
 ## Mover, cache & failure policy
 
 A restore writes data **into** a PVC, so the mover that does the writing has the same concerns a backup's does. `Restore.spec.mover` is the same `MoverSpec` a `SnapshotPolicy` exposes, and `Restore.spec.failurePolicy` mirrors `Snapshot.spec.failurePolicy`. See the full manifest in [example 12](examples.md#example-12--restore-mover-cache--failure-policy).
@@ -368,5 +374,5 @@ The full `Restore` surface, with the examples that exercise each. `source` is th
 - [Backups & schedules](backups.md) — producing the snapshots you restore.
 - [Repositories & backends](repositories.md) — where the snapshots live.
 - [Permissions](permissions.md) — choosing the mover's UID/GID and the privileged-movers opt-in (applies to restores too).
-- [Scenarios](scenarios/index.md) — [02 recover lost data](scenarios/recover-lost-data.md), [07 point-in-time rollback](scenarios/point-in-time-rollback.md), [08 clone to another namespace](scenarios/clone-app-to-namespace.md).
+- [Scenarios](scenarios/index.md) — [02 recover lost data](scenarios/recover-lost-data.md), [07 point-in-time rollback](scenarios/point-in-time-rollback.md), [08 clone to another namespace](scenarios/clone-app-to-namespace.md), [10 DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
 - [Examples](examples.md) — [03 by Snapshot](examples.md#example-03--restore-by-picking-a-snapshot), [05 deploy-or-restore](examples.md#example-05--deploy-or-restore-gitops), [07 discovered](examples.md#example-07--restore-a-discovered-backup), [12 mover/cache/failure policy](examples.md#example-12--restore-mover-cache--failure-policy), [13 by identity](examples.md#example-13--restore-by-raw-kopia-identity), [14 point-in-time](examples.md#example-14--point-in-time--offset-restore), [15 in-place mirror](examples.md#example-15--in-place-mirror-restore), [16 cross-namespace](examples.md#example-16--cross-namespace-clone-restore), [17 shared-repo projection](examples.md#example-17--restore-from-a-shared-repo-projection).

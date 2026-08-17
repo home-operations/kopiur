@@ -92,8 +92,12 @@ pub struct SeedSpec {
     pub failure_policy: Option<FailurePolicy>,
     /// Opt-in projection of the SOURCE repository's credential Secrets into the
     /// seeding mover Job's namespace. **Migrate mode only in practice** — a
-    /// blob-mode source carries its credentials in this CR's own namespace.
-    /// Requires the operator's `features.credentialProjection` install flag.
+    /// blob-mode source's credentials must already be in the namespace the
+    /// bootstrap Job runs in (this CR's own namespace for a `Repository`; for a
+    /// `ClusterRepository` the operator's namespace, unless
+    /// `encryption.passwordSecretRef.namespace` pins another, in which case the
+    /// Job runs there). Requires the operator's `features.credentialProjection`
+    /// install flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_projection: Option<CredentialProjection>,
 }

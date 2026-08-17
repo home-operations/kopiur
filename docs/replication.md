@@ -8,6 +8,12 @@ You already have a primary `Repository` and you want a durable copy elsewhere �
 
 ///
 
+/// info | The mirror is also a seed
+
+When the primary is gone for good, you do not have to promote the mirror to production. [`Repository.spec.seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica) copies it into a **new** repository during that repository's first bootstrap, so the rebuilt cluster gets its own store pre-loaded with the history and the mirror stays a pristine, read-only replica. Kick a final [on-demand run](#run-it-now) first so the mirror is current, then see [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
+
+///
+
 ## How it works
 
 - **Namespaced**, living alongside its source repository (like `Maintenance`). It references a `Repository` or `ClusterRepository` via `sourceRef`.
@@ -228,3 +234,4 @@ Every finished run is also counted in `kopiur_replication_runs_total{kind,trigge
 - [`deploy/examples/19-repository-replication.yaml`](examples.md#example-19--repository-replication)
 - [Repositories & backends](repositories.md)
 - [Disaster recovery scenario](scenarios/disaster-recovery.md)
+- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md) — turning this mirror back into a live repository with `spec.seed`.

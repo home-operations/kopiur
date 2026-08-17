@@ -30,6 +30,26 @@ existing repository, because kopia fixes them into the repository format. (The
 `encryption` password Secret reference itself is *not* locked: renaming the Secret
 with identical content is allowed.)
 
+### `seed`
+
+Initialize this repository from an existing replica on its **first** bootstrap —
+the disaster-recovery counterpart of `RepositoryReplication`. `seed.from` is a
+single-key one-of: `backend` (blob mode, `kopia repository sync-to` from a bare
+mirror backend, inheriting the mirror's format and password) or `repository`
+(migrate mode, `kopia snapshot migrate` from another `Repository`/`ClusterRepository`,
+which creates a local repository with its own format and password). Both preserve
+snapshot identities and times.
+
+Armed only while `status.uniqueId` is unset **and** the mover's first connect finds
+the backend uninitialized; on an already-initialized repository it is a no-op
+(`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave standing in a
+GitOps manifest. Mode-specific tuning (`sync` for blob, `migrate` and
+`credentialProjection` for migrate) is rejected when paired with the other mode's
+source. `allowEmptySource` (default `false`) is the only way to accept a source
+holding zero snapshots. `failurePolicy.activeDeadlineSeconds` defaults to **86400**
+(24 h) while seeding, versus the 120 s a routine connect gets. See
+[Repositories → `seed`](../../repositories.md#seed--initialize-a-new-repository-from-a-replica).
+
 ### `moverDefaults`
 
 Base mover configuration — security context, pod security context, resources,
@@ -162,6 +182,18 @@ catalog refresh).
 
 Resolved kopia server endpoint/auth, pinned by the reconciler. See
 [Server](../../server.md).
+
+### `seed`
+
+What the last seed attempt did. `startedAt` is the durable seed-attempt marker
+(stamped before the seeding Job is created, never cleared — it is what lets an
+interrupted seed resume instead of being mistaken for an ordinary adoption);
+`seededAt` is set once, when the seed completes. `mode` is `blob`/`migrate`,
+`source` is the rendered source (a backend discriminant, or `Kind/name`) and never
+a credential or a bucket path. `snapshotCount` is what the seed observed at the
+source; `snapshotsCopied` is migrate-only and **cumulative** — what is present
+after the run, including anything an interrupted earlier attempt had already
+moved. The matching condition is `Seeded`.
 
 ### Other status fields
 
