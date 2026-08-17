@@ -78,6 +78,12 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "repl-src",
     "repl-dst",
     "repl-s3-src",
+    // #380 on-demand run-requested run (replication.rs): its own source AND
+    // destination repo, because the scenario asserts that a SECOND run happened
+    // — sharing either end with the every-minute scenarios above would let their
+    // traffic move `lastReplicated` and make the proof meaningless.
+    "repl-run-src",
+    "repl-run-dst",
     "projgate",
     "hooks",
     "gfs",
@@ -148,6 +154,11 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "srepl-sel-dst",
     "srepl-susp-src",
     "srepl-susp-dst",
+    // #380 on-demand run-requested run (snapshot_replication.rs), isolated for
+    // the same reason as `repl-run-*`: the assertion is that `lastReplicated`
+    // MOVED, so no other scenario may write into either end.
+    "srepl-run-src",
+    "srepl-run-dst",
     // SnapshotPolicy multi-repository fan-out (issue #368 Feature B,
     // crates/e2e/tests/multi_repository.rs): every scenario needs TWO isolated
     // repositories (the whole point is per-repo children/manifests), and the
