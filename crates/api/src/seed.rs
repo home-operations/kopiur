@@ -190,7 +190,7 @@ impl SeedSource {
     }
 }
 
-/// Which copy mechanism a seed ran. Mirrors the [`SeedSource`] variant, named
+/// Which copy mechanism a seed ran. Mirrors the `SeedSource` variant, named
 /// after the operation rather than the input so status, metrics
 /// (`kopiur_repository_seed_total{mode}`) and docs share one vocabulary.
 // The wire strings are pinned by `tests::seed_mode_labels_are_stable` rather
@@ -256,7 +256,7 @@ pub struct SeedMigrateOptions {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub latest_only: bool,
     /// Whether the source's kopia **policies** are copied along with the
-    /// snapshots. Defaults to [`PolicyCopyMode::None`] (an explicit
+    /// snapshots. Defaults to `PolicyCopyMode::None` (an explicit
     /// `--no-policies`), not kopia's own copy-by-default: retention in a
     /// kopiur-managed repository is driven by `Snapshot` CRs, and importing the
     /// source's kopia-side policies could delete manifests behind the
@@ -279,7 +279,7 @@ pub struct SeedStatus {
     /// repository CR).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SeedMode>,
-    /// The source the data came from, rendered by [`SeedSource::describe`] —
+    /// The source the data came from, rendered by `SeedSource::describe` —
     /// the backend discriminant (`S3`, `Filesystem`, …) for blob mode,
     /// `Kind/name` for migrate mode. Never a credential or a bucket path.
     #[serde(default, skip_serializing_if = "Option::is_none")]

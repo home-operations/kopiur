@@ -812,7 +812,11 @@ pub enum ValidationError {
     /// a bare path is the one backend the CONTROLLER connects to in-process,
     /// and the Job would have nothing mounted at it (issue #380).
     #[error(
-        "spec.seed needs a repository the seeding mover Job can reach, but backend.filesystem          has no `volume` — a bare path {path:?} is connected in-process by the controller and          nothing would be mounted at it inside the Job, so the seed would fail as a confusing          \"repository not found\". Fix: back the filesystem repository with          backend.filesystem.volume (a PVC or an NFS export), or use an object-store backend"
+        "spec.seed needs a repository the seeding mover Job can reach, but backend.filesystem has \
+         no `volume` — a bare path {path:?} is connected in-process by the controller and nothing \
+         would be mounted at it inside the Job, so the seed would fail as a confusing \
+         \"repository not found\". Fix: back the filesystem repository with \
+         backend.filesystem.volume (a PVC or an NFS export), or use an object-store backend"
     )]
     SeedRequiresMountableRepository {
         /// The bare in-pod path the repository declares.
@@ -823,7 +827,10 @@ pub enum ValidationError {
     /// Same mover-topology problem as [`Self::SeedRequiresMountableRepository`],
     /// one field over: nothing would be mounted at the source path either.
     #[error(
-        "spec.seed.from.backend is a filesystem backend with no `volume` ({path:?}) — the          seeding mover Job mounts a volume per backend, so nothing would exist at that path          and the seed would fail as a confusing \"repository not found\". Fix: give the seed          source a `volume` (the PVC or NFS export holding the mirror), or point it at an          object-store backend"
+        "spec.seed.from.backend is a filesystem backend with no `volume` ({path:?}) — the seeding \
+         mover Job mounts a volume per backend, so nothing would exist at that path and the seed \
+         would fail as a confusing \"repository not found\". Fix: give the seed source a `volume` \
+         (the PVC or NFS export holding the mirror), or point it at an object-store backend"
     )]
     SeedSourceRequiresMountableBackend {
         /// The bare in-pod path the seed source declares.
@@ -833,7 +840,10 @@ pub enum ValidationError {
     /// `spec.seed` on a `mode: ReadOnly` repository. Seeding is the largest
     /// write a repository ever takes, so the two are contradictory.
     #[error(
-        "spec.seed writes this repository's initial contents, but spec.mode is ReadOnly — a          read-only repository refuses every write, so the seed could never complete and the          repository would never become Ready. Fix: seed with mode: ReadWrite and switch to          ReadOnly once status.seed is stamped, or remove spec.seed"
+        "spec.seed writes this repository's initial contents, but spec.mode is ReadOnly — a \
+         read-only repository refuses every write, so the seed could never complete and the \
+         repository would never become Ready. Fix: seed with mode: ReadWrite and switch to \
+         ReadOnly once status.seed is stamped, or remove spec.seed"
     )]
     SeedOnReadOnlyRepository,
 
@@ -842,7 +852,11 @@ pub enum ValidationError {
     /// copies the mirror's repository-format blob verbatim, so the declared
     /// algorithms are never applied — kopiur does not accept inert fields.
     #[error(
-        "spec.create sets {} alongside a blob-mode spec.seed (from.backend): the seed copies          the mirror's repository format verbatim, so these create-time algorithms are never          applied and the seeded repository keeps the SOURCE's format. Fix: remove them (they          are inert here), or seed in migrate mode (spec.seed.from.repository), which creates a          local repository with the format you declare",
+        "spec.create sets {} alongside a blob-mode spec.seed (from.backend): the seed copies the \
+         mirror's repository format verbatim, so these create-time algorithms are never applied \
+         and the seeded repository keeps the SOURCE's format. Fix: remove them (they are inert \
+         here), or seed in migrate mode (spec.seed.from.repository), which creates a local \
+         repository with the format you declare",
         fields.join(", ")
     )]
     SeedCreateOptionsInert {
@@ -856,7 +870,10 @@ pub enum ValidationError {
     /// `seed.credentialProjection.enabled` with `from.backend`). Honoring it
     /// silently would make it an inert field.
     #[error(
-        "spec.seed.{field} is only honored when spec.seed.from sets `{expected_source}`, but          this seed reads from `{actual_source}` — the block would be silently ignored, and          kopiur does not accept inert fields. Fix: remove spec.seed.{field}, or point          spec.seed.from at a `{expected_source}` source"
+        "spec.seed.{field} is only honored when spec.seed.from sets `{expected_source}`, but this \
+         seed reads from `{actual_source}` — the block would be silently ignored, and kopiur does \
+         not accept inert fields. Fix: remove spec.seed.{field}, or point spec.seed.from at a \
+         `{expected_source}` source"
     )]
     SeedTuningNotApplicable {
         /// The offending `spec.seed` sub-field (e.g. `sync`, `migrate`).
@@ -871,7 +888,10 @@ pub enum ValidationError {
     /// repository's own `spec.backend` (same `backend_target_key`) — the seed
     /// would read and write one location.
     #[error(
-        "spec.seed.from.backend resolves to the same {backend} storage target as this          repository's own spec.backend — a repository cannot be seeded from itself (the seed          would read and write one location). Fix: point spec.seed.from.backend at the          surviving off-site mirror's storage"
+        "spec.seed.from.backend resolves to the same {backend} storage target as this \
+         repository's own spec.backend — a repository cannot be seeded from itself (the seed \
+         would read and write one location). Fix: point spec.seed.from.backend at the surviving \
+         off-site mirror's storage"
     )]
     SeedSourceSameAsRepository {
         /// The backend kind both sides resolved to.
@@ -882,7 +902,10 @@ pub enum ValidationError {
     /// one in-pod `path`, so the seeding mover Job would carry two volumeMounts
     /// at a single `mountPath` — an invalid pod spec.
     #[error(
-        "this repository's filesystem backend and spec.seed.from.backend both mount at          {path:?} inside the seeding mover pod; two volumes cannot share one mountPath. Fix:          give the seed source a distinct backend.path (e.g. /seed-source) — the path is where          the volume mounts inside kopiur's pods, so changing it does not move any data"
+        "this repository's filesystem backend and spec.seed.from.backend both mount at {path:?} \
+         inside the seeding mover pod; two volumes cannot share one mountPath. Fix: give the seed \
+         source a distinct backend.path (e.g. /seed-source) — the path is where the volume mounts \
+         inside kopiur's pods, so changing it does not move any data"
     )]
     SeedMountPathCollision {
         /// The shared in-pod mount path.
@@ -891,7 +914,9 @@ pub enum ValidationError {
 
     /// `spec.seed.from.repository` points at the repository being defined.
     #[error(
-        "spec.seed.from.repository points at this same {kind} {name:?} — a repository cannot          be seeded from itself. Fix: point it at the surviving replica (typically the          off-site ClusterRepository or a Repository in another namespace)"
+        "spec.seed.from.repository points at this same {kind} {name:?} — a repository cannot be \
+         seeded from itself. Fix: point it at the surviving replica (typically the off-site \
+         ClusterRepository or a Repository in another namespace)"
     )]
     SeedSourceSelfReference {
         /// The repository kind both sides name.
@@ -905,7 +930,11 @@ pub enum ValidationError {
     /// the operator's own namespace, which the spec cannot name, so a pinned
     /// namespace is a dead reference.
     #[error(
-        "spec.seed.from.backend auth.secretRef {secret:?} pins namespace {namespace:?}, but a          ClusterRepository's seeding mover resolves credentials in the operator's own          namespace — a pinned namespace would be a dead reference the Job hangs on          (CreateContainerConfigError). Fix: omit `namespace` and put the Secret in the          operator namespace alongside this repository's other credentials"
+        "spec.seed.from.backend auth.secretRef {secret:?} pins namespace {namespace:?}, but a \
+         ClusterRepository's seeding mover resolves credentials in the operator's own namespace — \
+         a pinned namespace would be a dead reference the Job hangs on \
+         (CreateContainerConfigError). Fix: omit `namespace` and put the Secret in the operator \
+         namespace alongside this repository's other credentials"
     )]
     SeedSourceSecretNamespaceForbidden {
         /// The referenced Secret name.
@@ -918,7 +947,10 @@ pub enum ValidationError {
     /// pinned to some OTHER namespace. The seeding Job runs in the repository's
     /// namespace and loads the Secret via `envFrom`, which is namespace-local.
     #[error(
-        "spec.seed.from.backend auth.secretRef {secret:?} is pinned to namespace          {namespace:?}, but the seeding mover Job runs in {repository_namespace:?} and loads          it via envFrom, which is namespace-local — the Job could never read it. Fix: put the          Secret in {repository_namespace:?} (omit `namespace`, or set it to          {repository_namespace:?})"
+        "spec.seed.from.backend auth.secretRef {secret:?} is pinned to namespace {namespace:?}, \
+         but the seeding mover Job runs in {repository_namespace:?} and loads it via envFrom, \
+         which is namespace-local — the Job could never read it. Fix: put the Secret in \
+         {repository_namespace:?} (omit `namespace`, or set it to {repository_namespace:?})"
     )]
     SeedSourceSecretNamespaceMismatch {
         /// The referenced Secret name.

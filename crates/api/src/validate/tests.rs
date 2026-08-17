@@ -6647,11 +6647,113 @@ fn a_blob_seed_mixing_workload_identity_with_static_keys_is_rejected() {
         auth: { workloadIdentity: { serviceAccountName: seeder } }
 "#,
     ));
+    let e = errs
+        .iter()
+        .find(|e| matches!(e, ValidationError::InvalidFieldValue { .. }))
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    // `validate_replication_auth` is reused verbatim (it is the same one-pod
+    // constraint), so its field path and wording come through unchanged. Pinned
+    // so a later edit to that shared validator cannot silently stop covering
+    // seeding.
+    let ValidationError::InvalidFieldValue { field, reason } = e else {
+        unreachable!()
+    };
+    assert_eq!(field, "destination backend auth");
     assert!(
-        errs.iter()
-            .any(|e| matches!(e, ValidationError::InvalidFieldValue { .. })),
-        "{errs:?}"
+        reason.contains("cannot mix workloadIdentity with a static credential Secret"),
+        "{reason}"
     );
+    assert!(
+        reason.contains("use workloadIdentity on both sides"),
+        "{reason}"
+    );
+    let msg = e.to_string();
+    // TODO(#380 C4): message reads "replication" — wording generalization
+    // tracked for the docs stage. Pinned here so the current text is recorded
+    // and the generalization is a deliberate, visible edit.
+    assert!(msg.contains("replication mover"), "{msg}");
+}
+
+#[test]
+fn every_seed_rejection_message_is_free_of_wrapped_whitespace() {
+    // A `#[error]` literal split across source lines WITHOUT a trailing `\`
+    // keeps the newline and the source indentation, so the rendered admission
+    // message arrives with a run of ~10 spaces in the middle of a sentence.
+    // That shipped once; this pins every seed message against it.
+    let bad_repo = crate::testutil::from_yaml::<RepositorySpec>(
+        r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s } }
+mode: ReadOnly
+seed:
+  from:
+    backend: { filesystem: { path: /repo } }
+  migrate: { parallel: 1 }
+create: { enabled: true, splitter: FIXED-4M, hash: BLAKE2B-256, encryption: AES256-GCM-HMAC-SHA256 }
+"#,
+    );
+    let mut msgs: Vec<String> = validate_repository(&bad_repo)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    msgs.push(
+        validate_seed_secret_namespace(
+            repo_with_seed(
+                r#"  from:
+    backend:
+      s3:
+        bucket: mirror
+        endpoint: offsite.example
+        auth: { secretRef: { name: mirror-creds, namespace: elsewhere } }
+"#,
+            )
+            .seed
+            .as_ref(),
+            "backups",
+        )
+        .expect_err("cross-namespace seed Secret")
+        .to_string(),
+    );
+    msgs.push(
+        validate_seed_not_self(
+            repo_with_seed("  from:\n    repository: { name: nas }\n")
+                .seed
+                .as_ref(),
+            RepositoryKind::Repository,
+            "nas",
+            "backups",
+        )
+        .expect_err("self-reference")
+        .to_string(),
+    );
+    msgs.push(
+        validate_cluster_repository(&cluster_repo_with_seed(
+            r#"  from:
+    backend:
+      s3:
+        bucket: mirror
+        endpoint: offsite.example
+        auth: { secretRef: { name: mirror-creds, namespace: elsewhere } }
+"#,
+        ))
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" | "),
+    );
+
+    let seen: Vec<&String> = msgs.iter().filter(|m| m.contains("seed")).collect();
+    assert!(
+        seen.len() >= 8,
+        "expected the fixture to trip most seed rules, got {}: {seen:#?}",
+        seen.len()
+    );
+    for msg in &seen {
+        assert!(
+            !msg.contains("   "),
+            "rendered message carries wrapped source whitespace: {msg}"
+        );
+    }
 }
 
 #[test]

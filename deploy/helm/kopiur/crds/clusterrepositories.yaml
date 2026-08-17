@@ -2985,7 +2985,7 @@ spec:
                         default: none
                         description: |-
                           Whether the source's kopia **policies** are copied along with the
-                          snapshots. Defaults to [`PolicyCopyMode::None`] (an explicit
+                          snapshots. Defaults to `PolicyCopyMode::None` (an explicit
                           `--no-policies`), not kopia's own copy-by-default: retention in a
                           kopiur-managed repository is driven by `Snapshot` CRs, and importing the
                           source's kopia-side policies could delete manifests behind the
@@ -3640,7 +3640,7 @@ spec:
                 properties:
                   mode:
                     description: |-
-                      Which copy mechanism a seed ran. Mirrors the [`SeedSource`] variant, named
+                      Which copy mechanism a seed ran. Mirrors the `SeedSource` variant, named
                       after the operation rather than the input so status, metrics
                       (`kopiur_repository_seed_total{mode}`) and docs share one vocabulary.
                     enum:
@@ -3671,7 +3671,7 @@ spec:
                     type: integer
                   source:
                     description: |-
-                      The source the data came from, rendered by [`SeedSource::describe`] —
+                      The source the data came from, rendered by `SeedSource::describe` —
                       the backend discriminant (`S3`, `Filesystem`, …) for blob mode,
                       `Kind/name` for migrate mode. Never a credential or a bucket path.
                     nullable: true

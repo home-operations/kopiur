@@ -1444,37 +1444,42 @@ pub fn validate_repository_seed(
 /// enabled: an explicit `enabled: false` requests nothing and stays legal so a
 /// GitOps template can emit the block unconditionally.
 fn seed_tuning_pairing(seed: &SeedSpec) -> Vec<ValidationError> {
-    // The `from` key actually set, and the one each tuning block belongs to.
-    let (actual, blob) = match &seed.from {
-        SeedSource::Backend(_) => ("backend", true),
-        SeedSource::Repository(_) => ("repository", false),
+    // The `from` key this seed actually sets.
+    let actual = match &seed.from {
+        SeedSource::Backend(_) => SEED_FROM_BACKEND,
+        SeedSource::Repository(_) => SEED_FROM_REPOSITORY,
     };
-    let mismatched: [(&str, bool); 3] = [
-        ("sync", seed.sync.is_some() && !blob),
-        ("migrate", seed.migrate.is_some() && blob),
+    // (tuning field, the `from` key it belongs to, whether it is present).
+    // `expected` is carried in the row rather than re-derived from `field`, so a
+    // fourth tuning block cannot silently inherit the wrong expectation.
+    let rows: [(&str, &str, bool); 3] = [
+        ("sync", SEED_FROM_BACKEND, seed.sync.is_some()),
+        ("migrate", SEED_FROM_REPOSITORY, seed.migrate.is_some()),
         (
             "credentialProjection",
+            SEED_FROM_REPOSITORY,
             seed.credential_projection
                 .as_ref()
-                .is_some_and(|p| p.enabled)
-                && blob,
+                .is_some_and(|p| p.enabled),
         ),
     ];
-    mismatched
-        .into_iter()
-        .filter(|(_, tripped)| *tripped)
-        .map(|(field, _)| ValidationError::SeedTuningNotApplicable {
-            field: field.to_string(),
-            expected_source: if field == "sync" {
-                "backend"
-            } else {
-                "repository"
-            }
-            .to_string(),
-            actual_source: actual.to_string(),
-        })
+    rows.into_iter()
+        .filter(|(_, expected, present)| *present && *expected != actual)
+        .map(
+            |(field, expected, _)| ValidationError::SeedTuningNotApplicable {
+                field: field.to_string(),
+                expected_source: expected.to_string(),
+                actual_source: actual.to_string(),
+            },
+        )
         .collect()
 }
+
+/// The two `spec.seed.from` wire keys, named once so the pairing table and its
+/// messages cannot drift from the externally-tagged [`SeedSource`] variants.
+const SEED_FROM_BACKEND: &str = "backend";
+/// See [`SEED_FROM_BACKEND`].
+const SEED_FROM_REPOSITORY: &str = "repository";
 
 /// Blob-mode (`seed.from.backend`) rules: the source backend is well-formed and
 /// mountable, its credential Secret is reachable for a cluster-scoped
