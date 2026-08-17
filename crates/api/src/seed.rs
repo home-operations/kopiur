@@ -141,6 +141,12 @@ pub enum SeedSource {
     /// Another `Repository`/`ClusterRepository`, opened read-only (migrate mode,
     /// `kopia snapshot migrate`). Snapshot identities and times are preserved,
     /// so seeded history is restorable by `identity`/`fromPolicy`.
+    ///
+    /// A `kind: Repository` reference with no `namespace` resolves in the
+    /// referrer's own namespace — and, on a cluster-scoped `ClusterRepository`
+    /// (which has none), in the operator's namespace, the same rule its
+    /// credential `secretRef`s follow. Set `namespace` explicitly whenever the
+    /// source lives anywhere else.
     Repository(RepositoryRef),
 }
 

@@ -586,7 +586,7 @@ Externally tagged — set **exactly one** of: `backend` · `repository`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `backend` | [union](#repository-spec-seed-from-backend) | — | A bare storage backend holding a byte-for-byte mirror of a kopia repository (blob mode, `kopia repository sync-to`). The mirror's format and encryption password are inherited verbatim, so this repository's `encryption.passwordSecretRef` must already hold the MIRROR's password and `spec.create`'s format knobs are refused as inert. |
-| `repository` | [object](#repository-spec-seed-from-repository) | — | Another `Repository`/`ClusterRepository`, opened read-only (migrate mode, `kopia snapshot migrate`). Snapshot identities and times are preserved, so seeded history is restorable by `identity`/`fromPolicy`. |
+| `repository` | [object](#repository-spec-seed-from-repository) | — | Another `Repository`/`ClusterRepository`, opened read-only (migrate mode, `kopia snapshot migrate`). Snapshot identities and times are preserved, so seeded history is restorable by `identity`/`fromPolicy`.<br>A `kind: Repository` reference with no `namespace` resolves in the referrer's own namespace — and, on a cluster-scoped `ClusterRepository` (which has none), in the operator's namespace, the same rule its credential `secretRef`s follow. Set `namespace` explicitly whenever the source lives anywhere else. |
 
 ###### `spec.seed.from.backend` { #repository-spec-seed-from-backend }
 
@@ -1617,7 +1617,7 @@ Externally tagged — set **exactly one** of: `backend` · `repository`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `backend` | [union](#clusterrepository-spec-seed-from-backend) | — | A bare storage backend holding a byte-for-byte mirror of a kopia repository (blob mode, `kopia repository sync-to`). The mirror's format and encryption password are inherited verbatim, so this repository's `encryption.passwordSecretRef` must already hold the MIRROR's password and `spec.create`'s format knobs are refused as inert. |
-| `repository` | [object](#clusterrepository-spec-seed-from-repository) | — | Another `Repository`/`ClusterRepository`, opened read-only (migrate mode, `kopia snapshot migrate`). Snapshot identities and times are preserved, so seeded history is restorable by `identity`/`fromPolicy`. |
+| `repository` | [object](#clusterrepository-spec-seed-from-repository) | — | Another `Repository`/`ClusterRepository`, opened read-only (migrate mode, `kopia snapshot migrate`). Snapshot identities and times are preserved, so seeded history is restorable by `identity`/`fromPolicy`.<br>A `kind: Repository` reference with no `namespace` resolves in the referrer's own namespace — and, on a cluster-scoped `ClusterRepository` (which has none), in the operator's namespace, the same rule its credential `secretRef`s follow. Set `namespace` explicitly whenever the source lives anywhere else. |
 
 ###### `spec.seed.from.backend` { #clusterrepository-spec-seed-from-backend }
 
