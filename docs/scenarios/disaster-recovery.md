@@ -42,6 +42,19 @@ rebuild into a differently-named namespace. The `KOPIA_PASSWORD` must also be th
 
 ///
 
+/// danger | Check retention before re-applying policies over surviving history
+
+The `SnapshotPolicy` below adopts the repository's surviving snapshots, and an
+adopted snapshot is then GFS-governed like any produced backup: under the default
+`deletionPolicy: Delete`, everything **outside** `spec.retention` is pruned from
+the repository immediately, and retention prunes deliberately bypass the
+[mass-deletion breaker](../repositories.md#deletionprotection--the-mass-deletion-circuit-breaker).
+A five-year history re-adopted under `keepDaily: 14` loses the rest. Widen
+`retention` to what you actually intend to keep, or set the policy's
+`defaultDeletionPolicy: Retain` so pruning a row deletes only the `Snapshot` CR.
+
+///
+
 ## The values you must get right
 
 | Field | Must equal | Why |

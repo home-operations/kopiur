@@ -186,9 +186,9 @@ On an already-initialized repository the block is a documented **no-op**:
 `Seeded=True`, reason `AlreadyInitialized`, nothing copied, nothing touched. So
 `spec.seed` is a standing GitOps-safe field — leave it in the manifest forever and
 it does something exactly once, on the day you rebuild. An `AuthFailure`,
-`Locked` or `AccessDenied` connect never seeds and never creates, for the same
-reason it never creates today: kopiur does not write over a backend it could not
-open.
+`Locked`, `AccessDenied` or `PermissionDenied` connect never seeds and never
+creates, for the same reason it never creates today: kopiur does not write over a
+backend it could not open.
 
 While the seed is armed the bootstrap Job's deadline comes from
 `spec.seed.failurePolicy` and defaults to **86400 s (24 h)** instead of the usual
