@@ -411,40 +411,87 @@ pub(super) fn existing_conditions(restore: &Restore) -> Vec<Condition> {
         .map(|s| s.conditions.clone())
         .unwrap_or_default()
 }
-/// Where the `waitTimeout` window is anchored: the Restore's creation, or — when a
-/// populator RE-OPENED resolution because its claiming PVC was re-created — that moment
-/// instead (the `Ready` condition's transition into
-/// [`crate::consts::RESTORE_CLAIM_RECREATED_REASON`]).
+/// Where the `waitTimeout` window is anchored: `status.waitStartedAt` once
+/// [`super::ensure_wait_anchor`] has stamped it, else `created_epoch`.
 ///
-/// Without the re-anchor, a populator that no-op'd months ago and is now asked to populate a
-/// freshly re-created claim would measure its wait window from a creation timestamp long
-/// past: `wait_remaining_secs` returns `None` on the very first pass, and a `fromPolicy`
-/// source (which defaults to `onMissingSnapshot: Continue`) would skip the wait entirely and
-/// provision an EMPTY volume the instant the snapshot happens not to be there yet — exactly
-/// what the user configured `waitTimeout` to prevent. Pure.
-pub(super) fn wait_window_anchor(restore: &Restore, created_epoch: i64) -> i64 {
-    use crate::consts::{READY_CONDITION, RESTORE_CLAIM_RECREATED_REASON};
+/// The window opens when the restore can first actually PROCEED — its repository is
+/// `Ready` and, for a `target.populator`, a PVC already claims it — not when the
+/// Restore object happened to be created (#380). A standing GitOps `Restore` applied
+/// long before its repository comes up (or long before anything claims it) would
+/// otherwise spend the whole window parked on the readiness gate, and a `fromPolicy`
+/// source — which defaults to `onMissingSnapshot: Continue` — would provision an EMPTY
+/// volume on the very first pass that reaches resolution, exactly what `waitTimeout`
+/// was configured to prevent.
+///
+/// The stamp can never SHORTEN the window below the creation-anchored one
+/// (`created_epoch.max(..)`), so an anchor edited backwards by hand is inert: this
+/// change is one-directional, windows only ever extend. Pure — the stamping (and the
+/// "not open yet" case, which anchors at `now` rather than at creation) lives in
+/// [`super::ensure_wait_anchor`].
+pub(super) fn effective_wait_anchor(restore: &Restore, created_epoch: i64) -> i64 {
     restore
         .status
         .as_ref()
-        .and_then(|s| {
-            s.conditions
-                .iter()
-                .find(|c| c.type_ == READY_CONDITION && c.reason == RESTORE_CLAIM_RECREATED_REASON)
-                .map(|c| c.last_transition_time.0.as_second())
-        })
-        .map_or(created_epoch, |reopened| created_epoch.max(reopened))
+        .and_then(|s| s.wait_started_at.as_deref())
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map_or(created_epoch, |at| created_epoch.max(at.timestamp()))
 }
 
-/// Seconds left in the `waitTimeout` window that started at the Restore's
-/// creation, or `None` when no (parseable) window is configured or it has
-/// elapsed. Pure, clock-free — unit-tested without a cluster.
+/// Whether the `waitTimeout` window may OPEN on this pass — i.e. whether the restore can
+/// actually proceed now that its repository is `Ready`. A direct target always can; a
+/// `target.populator` only once a PVC claims it, because resolution runs while the
+/// populator is `AwaitingClaim` and a standing GitOps populator would otherwise burn its
+/// whole window sitting idle (#380). Exhaustive over [`PopulatorState`], so a new target
+/// mode must decide this before it compiles. Pure.
+pub(super) fn wait_window_opens(state: PopulatorState, has_claiming_pvc: bool) -> bool {
+    match state {
+        PopulatorState::DirectTarget => true,
+        PopulatorState::AwaitingClaim => has_claiming_pvc,
+    }
+}
+
+/// The status patch that re-opens a populator's source resolution for a re-created claim:
+/// `Resolving` + `Ready`/[`crate::consts::RESTORE_CLAIM_RECREATED_REASON`], **plus an
+/// explicit JSON `null` on `waitStartedAt`**.
+///
+/// The null is the whole point and cannot be expressed by the typed status: a merge patch
+/// deletes only the keys it names, and `wait_started_at` is `skip_serializing_if =
+/// "Option::is_none"`, so a `None` would serialize to nothing and silently leave the
+/// original claim's long-spent anchor in place — the re-created claim would then find a
+/// window that closed months ago. Pure, so the null is asserted without a cluster.
+pub(super) fn reopen_resolution_status(restore: &Restore, message: &str) -> serde_json::Value {
+    let mut status = restore_ready_status(
+        restore,
+        RestorePhase::Resolving,
+        crate::consts::RESTORE_CLAIM_RECREATED_REASON,
+        message,
+    );
+    status["waitStartedAt"] = serde_json::Value::Null;
+    status
+}
+
+/// The absolute instant (RFC3339) the `waitTimeout` window closes, given the anchor
+/// [`effective_wait_anchor`] resolved — `None` when no (parseable) window is
+/// configured. This is what the mover polls against, so an in-Job wait is stable
+/// across pod retries and matches the controller-side wait exactly. Pure.
+pub(super) fn wait_deadline_rfc3339(
+    anchor_epoch: i64,
+    wait_timeout: Option<&str>,
+) -> Option<String> {
+    let timeout = crate::snapshot_schedule::parse_go_duration(wait_timeout?)?;
+    let secs = i64::try_from(timeout.as_secs()).ok()?;
+    chrono::DateTime::from_timestamp(anchor_epoch.checked_add(secs)?, 0).map(|t| t.to_rfc3339())
+}
+
+/// Seconds left in the `waitTimeout` window that opened at `anchor_epoch` (see
+/// [`effective_wait_anchor`]), or `None` when no (parseable) window is configured or it
+/// has elapsed. Pure, clock-free — unit-tested without a cluster.
 pub fn wait_remaining_secs(
-    created_epoch: i64,
+    anchor_epoch: i64,
     wait_timeout: Option<&str>,
     now_epoch: i64,
 ) -> Option<u64> {
     let timeout = crate::snapshot_schedule::parse_go_duration(wait_timeout?)?;
-    let deadline = created_epoch.saturating_add(timeout.as_secs().try_into().ok()?);
+    let deadline = anchor_epoch.saturating_add(timeout.as_secs().try_into().ok()?);
     (now_epoch < deadline).then(|| (deadline - now_epoch) as u64)
 }

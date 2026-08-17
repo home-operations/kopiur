@@ -93,7 +93,7 @@ fn source_mode_strings_match_each_variant() {
 // only the mover resolves by-identity now.
 
 #[test]
-fn wait_remaining_counts_down_from_creation_and_closes() {
+fn wait_remaining_counts_down_from_the_anchor_and_closes() {
     // 5m window, 60s elapsed → 240s left.
     assert_eq!(wait_remaining_secs(1000, Some("5m"), 1060), Some(240));
     // Window exactly elapsed → closed (None), onMissingSnapshot applies.
@@ -700,53 +700,166 @@ fn populate_hijacked_message_points_at_the_provisioner() {
     );
 }
 
-/// A populator that no-op'd long ago and is then asked to populate a FRESHLY re-created
-/// claim must measure its `waitTimeout` from the re-open, not from its own creation —
-/// otherwise the window is already spent, and a `fromPolicy` source (which defaults to
-/// `Continue`) skips the wait and provisions an EMPTY volume the instant the snapshot
-/// happens not to be there yet.
+/// The `waitTimeout` window is anchored at `status.waitStartedAt` — the instant the
+/// restore could first PROCEED — and falls back to the Restore's creation only while no
+/// anchor has been stamped (#380). Precedence matrix: unset, set, stamped-before-creation.
 #[test]
-fn wait_window_re_anchors_when_a_recreated_claim_reopens_resolution() {
-    let with_ready = |reason: &str, at: &str| -> Restore {
-        serde_json::from_value(serde_json::json!({
-            "apiVersion": "kopiur.home-operations.com/v1alpha1",
-            "kind": "Restore",
-            "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
-            "spec": {
-                "source": { "fromPolicy": { "name": "cfg" } },
-                "target": { "populator": {} }
-            },
-            "status": { "conditions": [{
-                "type": "Ready", "status": "False", "reason": reason, "message": "m",
-                "lastTransitionTime": at
-            }] }
-        }))
-        .expect("valid Restore")
-    };
-
+fn effective_wait_anchor_prefers_the_stamped_window_start() {
     // 2026-01-01T00:00:00Z == 1767225600. The Restore itself was created long before.
     let created = 1_000_000_000;
-    let reopened = with_ready("ClaimRecreated", "2026-01-01T00:00:00Z");
-    assert_eq!(wait_window_anchor(&reopened, created), 1_767_225_600);
 
-    // Any other Ready reason leaves the window anchored at creation.
-    let normal = with_ready("PopulatingPrimePvc", "2026-01-01T00:00:00Z");
-    assert_eq!(wait_window_anchor(&normal, created), created);
-
-    // A re-open that somehow predates creation never SHORTENS the window.
-    let stale = with_ready("ClaimRecreated", "2001-09-09T01:46:40Z");
-    assert_eq!(wait_window_anchor(&stale, created), created);
-
-    // Net effect: the user's 5m window is fully available again from the re-open.
+    // Unset → the creation timestamp (the pre-#380 behavior, and what a Restore that has
+    // not yet cleared the readiness gate still reads).
     assert_eq!(
-        wait_remaining_secs(
-            wait_window_anchor(&reopened, created),
-            Some("5m"),
-            1_767_225_660,
-        ),
-        Some(240),
-        "the configured waitTimeout must actually apply to the re-created claim"
+        effective_wait_anchor(&restore_with_anchor(None), created),
+        created
     );
+
+    // Stamped → the stamp wins, so the window measures from when it OPENED.
+    assert_eq!(
+        effective_wait_anchor(&restore_with_anchor(Some("2026-01-01T00:00:00Z")), created),
+        1_767_225_600
+    );
+    // Non-UTC offsets are honored (RFC3339, not a fixed `Z` shape).
+    assert_eq!(
+        effective_wait_anchor(
+            &restore_with_anchor(Some("2026-01-01T01:00:00+01:00")),
+            created
+        ),
+        1_767_225_600
+    );
+
+    // An anchor that predates creation never SHORTENS the window (hand-edited status,
+    // clock skew): the change is one-directional — windows only ever extend.
+    assert_eq!(
+        effective_wait_anchor(&restore_with_anchor(Some("2001-09-09T01:46:40Z")), created),
+        created
+    );
+    // Garbage is inert rather than fatal.
+    assert_eq!(
+        effective_wait_anchor(&restore_with_anchor(Some("not-a-timestamp")), created),
+        created
+    );
+}
+
+/// The regression this whole change exists for: the mover's absolute wait deadline is
+/// `anchor + waitTimeout`, NOT `creation + waitTimeout`. A Restore parked for a week on a
+/// not-Ready repository (or a populator with no claim) must still get its full window on
+/// the pass that finally opens it — otherwise a `fromPolicy` source, defaulting to
+/// `onMissingSnapshot: Continue`, provisions an EMPTY volume instantly.
+#[test]
+fn wait_deadline_runs_from_the_anchor_not_from_creation() {
+    let created = 1_000_000_000; // long ago
+    let opened = 1_767_225_600; // 2026-01-01T00:00:00Z — the gate finally cleared
+    let restore = restore_with_anchor(Some("2026-01-01T00:00:00Z"));
+    let anchor = effective_wait_anchor(&restore, created);
+
+    // The deadline the mover polls against: anchor + 5m.
+    assert_eq!(
+        wait_deadline_rfc3339(anchor, Some("5m")).as_deref(),
+        Some("2026-01-01T00:05:00+00:00")
+    );
+    // Anchored at creation it would have closed in 2001 — the pre-fix bug.
+    assert!(
+        wait_deadline_rfc3339(created, Some("5m")).unwrap()
+            < wait_deadline_rfc3339(anchor, Some("5m")).unwrap()
+    );
+
+    // ...and the controller-side wait agrees: the full 5m remains one second after the
+    // window opened, where the creation-anchored window had long since elapsed.
+    assert_eq!(
+        wait_remaining_secs(anchor, Some("5m"), opened + 60),
+        Some(240)
+    );
+    assert_eq!(wait_remaining_secs(created, Some("5m"), opened + 60), None);
+
+    // No window configured / unparseable ⇒ no deadline at all (unchanged).
+    assert_eq!(wait_deadline_rfc3339(anchor, None), None);
+    assert_eq!(wait_deadline_rfc3339(anchor, Some("later")), None);
+}
+
+/// Which target modes may OPEN the window: a direct target the moment the repository is
+/// Ready, a populator only once a PVC claims it. Resolution runs while a populator is
+/// `AwaitingClaim`, so a standing GitOps populator created long before its claim would
+/// otherwise spend the whole window idle and pin `Empty` the instant a claim appeared.
+#[test]
+fn wait_window_opens_for_a_populator_only_once_a_claim_exists() {
+    use PopulatorState::{AwaitingClaim, DirectTarget};
+    assert!(wait_window_opens(DirectTarget, false));
+    assert!(wait_window_opens(DirectTarget, true));
+    assert!(!wait_window_opens(AwaitingClaim, false));
+    assert!(wait_window_opens(AwaitingClaim, true));
+}
+
+/// A populator that no-op'd long ago and is then asked to populate a FRESHLY re-created
+/// claim must measure its `waitTimeout` from the re-open, not from an anchor spent on the
+/// previous claim — otherwise the window is already gone, and a `fromPolicy` source (which
+/// defaults to `Continue`) skips the wait and provisions an EMPTY volume the instant the
+/// snapshot happens not to be there yet.
+///
+/// The re-open therefore CLEARS the anchor, and it must do so with an explicit JSON
+/// `null`: a merge patch deletes only the keys it names, so an elided `None` would leave
+/// the stale anchor in place. Re-anchoring then happens on the next pass, which is also
+/// the pass that finds the re-created claim.
+#[test]
+fn reopening_a_recreated_claim_clears_the_wait_anchor_with_an_explicit_null() {
+    let restore = restore_with_anchor(Some("2026-01-01T00:00:00Z"));
+    let status = reopen_resolution_status(&restore, "claim re-created");
+
+    assert_eq!(
+        status.get("waitStartedAt"),
+        Some(&serde_json::Value::Null),
+        "the clear must be an EXPLICIT null, not an omitted key: {status}"
+    );
+    assert_eq!(
+        status.get("phase").and_then(|p| p.as_str()),
+        Some("Resolving")
+    );
+    assert!(
+        status["conditions"]
+            .as_array()
+            .expect("conditions array")
+            .iter()
+            .any(|c| c["type"] == "Ready" && c["reason"] == "ClaimRecreated"),
+        "{status}"
+    );
+
+    // Serializing the typed status can NEVER produce that null (the field is
+    // skip_serializing_if = "Option::is_none") — which is exactly why the writer builds
+    // the key by hand.
+    let cleared = restore_with_anchor(None);
+    let typed = serde_json::to_value(cleared.status.as_ref().expect("status")).unwrap();
+    assert!(
+        typed.get("waitStartedAt").is_none(),
+        "an unset anchor elides the key entirely: {typed}"
+    );
+
+    // Once cleared, the anchor falls back and the next pass re-stamps it (`now`), so the
+    // re-created claim gets the user's window back in full.
+    let created = 1_000_000_000;
+    assert_eq!(
+        effective_wait_anchor(&restore_with_anchor(None), created),
+        created
+    );
+}
+
+/// A `Restore` carrying `status.waitStartedAt` (or not).
+fn restore_with_anchor(wait_started_at: Option<&str>) -> Restore {
+    let mut status = serde_json::json!({ "phase": "Pending" });
+    if let Some(at) = wait_started_at {
+        status["waitStartedAt"] = serde_json::Value::String(at.to_string());
+    }
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+        "spec": {
+            "source": { "fromPolicy": { "name": "cfg" } },
+            "target": { "populator": {} }
+        },
+        "status": status
+    }))
+    .expect("valid Restore")
 }
 
 // --- restore_flags (M2 flag sweep controller-glue guard) ---
