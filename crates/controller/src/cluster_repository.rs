@@ -901,7 +901,12 @@ async fn park_cluster_on_seed_source(
         api,
         name,
         current.as_ref(),
-        serde_json::json!({ "conditions": conditions }),
+        // `Pending`, deliberately: the repository has been accepted and is
+        // waiting on something outside itself. Not `Initializing` (nothing is
+        // connecting), not `Degraded`/`Failed` (nothing has failed) — and the
+        // phase must say SOMETHING, because the launch patch that would
+        // otherwise set it is exactly what this park skips.
+        serde_json::json!({ "phase": "Pending", "conditions": conditions }),
     )
     .await?;
     if wrote {
@@ -1324,6 +1329,10 @@ async fn bootstrap_cluster_via_mover(
         ca_referrer_ns: None,
         name,
         owner: owner.clone(),
+        kind: RepositoryKind::ClusterRepository,
+        repo_backend: backend,
+        repo_mode: repo.spec.mode,
+        repo_create: repo.spec.create.as_ref(),
     };
     let armed = crate::repo_seed::arm_seed(
         ctx,
@@ -1909,13 +1918,8 @@ async fn finalize_cluster_bootstrap(
         crate::repo_seed::reap_seed_projection(
             ctx,
             job_ns,
-            &crate::repo_seed::SeedContext {
-                job_ns,
-                source_default_ns: job_ns,
-                ca_referrer_ns: None,
-                name,
-                owner: io::owner_ref_for(repo, "ClusterRepository")?,
-            },
+            name,
+            &io::owner_ref_for(repo, "ClusterRepository")?.uid,
         )
         .await;
     }

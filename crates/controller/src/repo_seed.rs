@@ -62,6 +62,18 @@ pub(crate) struct SeedContext<'a> {
     /// The repository CR's owner reference — carried by any projected copy, so
     /// GC reaps it with the repository.
     pub owner: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    /// Which repository kind is being seeded — the co-resident-Secret rule
+    /// differs (a `ClusterRepository`'s seed Secret must pin NO namespace),
+    /// and it labels the defensive re-validation's messages.
+    pub kind: RepositoryKind,
+    /// This repository's own backend, for the defensive re-validation (the
+    /// bare-path and mount-collision rules compare the two sides).
+    pub repo_backend: &'a Backend,
+    /// This repository's access mode — `spec.seed` on a `ReadOnly` repository
+    /// is refused (the seed could never complete).
+    pub repo_mode: kopiur_api::common::RepositoryMode,
+    /// This repository's `spec.create`, for the inert-format-knob rule.
+    pub repo_create: Option<&'a kopiur_api::common::CreateBehavior>,
 }
 
 /// What the seed-arming pass decided.
@@ -412,6 +424,23 @@ pub(crate) async fn arm_seed(
     let Some(seed) = seed.filter(|_| armed) else {
         return Ok(SeedArming::NotArmed);
     };
+    // Defensive re-validation — one validator, two callers (the admission
+    // webhook and here). A seeding bootstrap is the one bootstrap that WRITES
+    // to a second repository, so a CR that reached etcd with the webhook
+    // disabled (or downgraded, or bypassed) must not get there on the strength
+    // of a rule nobody re-checked. Scoped to the seed rules and gated on
+    // `spec.seed` being present, so it is a no-op for every repository that
+    // predates #380.
+    let errs = kopiur_api::validate::validate_repository_seed(
+        Some(seed),
+        sctx.repo_backend,
+        sctx.repo_mode,
+        sctx.repo_create,
+        sctx.kind,
+    );
+    if let Some(first) = errs.into_iter().next() {
+        return Err(Error::Validation(first.to_string()));
+    }
     let source_description = seed.from.describe();
     match &seed.from {
         SeedSource::Backend(backend) => {
@@ -641,21 +670,24 @@ fn seed_password_env(resolved_names: &[String], source: &ResolvedRepository) -> 
 /// unconditionally on a finalized seed rather than only when projection was
 /// opted in, so a copy left behind by a since-disabled opt-in is still cleaned
 /// up. Never fails the reconcile.
-pub(crate) async fn reap_seed_projection(ctx: &Context, job_ns: &str, sctx: &SeedContext<'_>) {
+pub(crate) async fn reap_seed_projection(
+    ctx: &Context,
+    job_ns: &str,
+    repo_name: &str,
+    owner_uid: &str,
+) {
     let secrets: Api<k8s_openapi::api::core::v1::Secret> =
         Api::namespaced(ctx.client.clone(), job_ns);
-    let prefix = io::CredsPrefix::seed(sctx.name);
-    let outcome =
-        io::reap_projection(&secrets, &prefix, &sctx.owner.uid, job_ns, "seed finished").await;
+    let prefix = io::CredsPrefix::seed(repo_name);
+    let outcome = io::reap_projection(&secrets, &prefix, owner_uid, job_ns, "seed finished").await;
     if outcome.deleted > 0 {
         tracing::info!(
-            repo = %sctx.name,
+            repo = %repo_name,
             deleted = outcome.deleted,
             "reaped projected seed-source credential copies"
         );
     }
 }
-
 /// **Pure.** Merge a `{"seed": {…}}` fold into an assembled status patch.
 ///
 /// `status_patch` is built key-by-key before ONE `patch_status_if_changed`, so

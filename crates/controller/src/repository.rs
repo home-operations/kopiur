@@ -709,7 +709,12 @@ async fn park_on_seed_source(
         api,
         name,
         current.as_ref(),
-        serde_json::json!({ "conditions": conditions }),
+        // `Pending`, deliberately: the repository has been accepted and is
+        // waiting on something outside itself. Not `Initializing` (nothing is
+        // connecting), not `Degraded`/`Failed` (nothing has failed) — and the
+        // phase must say SOMETHING, because the launch patch that would
+        // otherwise set it is exactly what this park skips.
+        serde_json::json!({ "phase": "Pending", "conditions": conditions }),
     )
     .await?;
     if wrote {
@@ -1235,6 +1240,10 @@ async fn bootstrap_via_mover(
         ca_referrer_ns: Some(namespace),
         name,
         owner: owner.clone(),
+        kind: RepositoryKind::Repository,
+        repo_backend: backend,
+        repo_mode: repo.spec.mode,
+        repo_create: repo.spec.create.as_ref(),
     };
     let armed = repo_seed::arm_seed(
         ctx,
@@ -1955,13 +1964,8 @@ async fn finalize_bootstrap(
         repo_seed::reap_seed_projection(
             ctx,
             namespace,
-            &repo_seed::SeedContext {
-                job_ns: namespace,
-                source_default_ns: namespace,
-                ca_referrer_ns: Some(namespace),
-                name,
-                owner: io::owner_ref_for(repo, "Repository")?,
-            },
+            name,
+            &io::owner_ref_for(repo, "Repository")?.uid,
         )
         .await;
     }
