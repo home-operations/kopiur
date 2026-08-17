@@ -415,26 +415,25 @@ pub fn lease_held_by_other(current: &str, lease: &str, aliases: &[String]) -> bo
         .any(|alias| current == kopia_owner_for_lease(alias))
 }
 
+/// The `kubectl kopiur` invocation that stamps a `Maintenance` run request,
+/// quoted in the fix hint when the annotation does not parse.
+const MAINTENANCE_RUN_COMMAND: &str = "kubectl kopiur maintenance run";
+
 /// Parse the `run-requested`/`run-mode` annotations into a manual-run request.
 /// `Ok(None)` = no request; `Err` = the annotations are present but malformed
 /// (the messages say how to fix). Shared by the admission webhook and the
 /// controller so validation cannot fork (SKILL "one validator, two callers").
+///
+/// The timestamp half is [`crate::common::parse_run_requested_at`] — the one
+/// parser every "run it now" surface shares (both replication kinds call it
+/// directly); only the `run-mode` companion is maintenance-specific.
 pub fn parse_run_annotations(
     annotations: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<Option<(chrono::DateTime<chrono::Utc>, ManualRunMode)>, String> {
-    let Some(raw) = annotations.and_then(|a| a.get(crate::consts::RUN_REQUESTED_ANNOTATION)) else {
+    let Some(at) = crate::common::parse_run_requested_at(annotations, MAINTENANCE_RUN_COMMAND)?
+    else {
         return Ok(None);
     };
-    let at = chrono::DateTime::parse_from_rfc3339(raw)
-        .map_err(|e| {
-            format!(
-                "annotation {} must be an RFC3339 timestamp (got {raw:?}): {e}. \
-                 Fix: re-annotate with e.g. $(date -u +%Y-%m-%dT%H:%M:%SZ), or use \
-                 `kubectl kopiur maintenance run`",
-                crate::consts::RUN_REQUESTED_ANNOTATION
-            )
-        })?
-        .with_timezone(&chrono::Utc);
     let mode = match annotations.and_then(|a| a.get(crate::consts::RUN_MODE_ANNOTATION)) {
         None => ManualRunMode::Quick,
         Some(raw_mode) => ManualRunMode::parse(raw_mode).ok_or_else(|| {

@@ -9,7 +9,7 @@
 //! transition-guarded status) exactly like `Maintenance`.
 
 use crate::backend::Backend;
-use crate::common::{CronSpec, MoverSpec, RepositoryRef};
+use crate::common::{CronSpec, MoverSpec, ReplicationManualRunStatus, RepositoryRef};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -232,6 +232,11 @@ pub struct RepositoryReplicationStatus {
     /// Standard Kubernetes conditions (`Ready`, `Reconciling`, `Stalled`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+    /// State of the most recent annotation-requested out-of-band run
+    /// (`kopiur.home-operations.com/run-requested`); absent until one is
+    /// requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_run: Option<ReplicationManualRunStatus>,
 }
 
 #[cfg(test)]
@@ -407,5 +412,41 @@ schedule: { cron: "0 6 * * 0" }
         let json = serde_json::to_value(&status).unwrap();
         let reparsed: RepositoryReplicationStatus = serde_json::from_value(json).unwrap();
         assert_eq!(status, reparsed);
+    }
+
+    #[test]
+    fn manual_run_status_roundtrips_the_apiserver_way() {
+        use crate::common::ReplicationManualRunPhase;
+        // Parsed the cluster's way (YAML -> serde_json::Value -> typed), which
+        // is the only path that proves the camelCase wire names land.
+        let status: RepositoryReplicationStatus = from_yaml(
+            "phase: Succeeded\nmanualRun:\n  requestedAt: 2026-06-11T12:00:00Z\n  phase: Succeeded\n  completedAt: 2026-06-11T12:01:42Z\n",
+        );
+        let manual = status.manual_run.as_ref().expect("manualRun decodes");
+        assert_eq!(manual.requested_at.as_deref(), Some("2026-06-11T12:00:00Z"));
+        assert_eq!(manual.phase, Some(ReplicationManualRunPhase::Succeeded));
+        assert_eq!(manual.completed_at.as_deref(), Some("2026-06-11T12:01:42Z"));
+        assert!(manual.answers("2026-06-11T12:00:00Z"));
+        let reparsed: RepositoryReplicationStatus =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(status, reparsed);
+
+        // A manualRun phase written by a NEWER operator decodes instead of
+        // poisoning the typed watch for every RepositoryReplication.
+        let skewed: RepositoryReplicationStatus =
+            from_yaml("manualRun:\n  requestedAt: 2026-06-11T12:00:00Z\n  phase: Queued\n");
+        assert_eq!(
+            skewed.manual_run.and_then(|m| m.phase),
+            Some(ReplicationManualRunPhase::Unknown("Queued".into()))
+        );
+    }
+
+    #[test]
+    fn manual_run_is_absent_from_a_status_that_never_requested_one() {
+        let status: RepositoryReplicationStatus = from_yaml("phase: Succeeded\n");
+        assert!(status.manual_run.is_none());
+        // …and never serializes as an explicit null.
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json.get("manualRun").is_none(), "{json}");
     }
 }

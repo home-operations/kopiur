@@ -42,9 +42,10 @@ pub use cluster_repository::{
 pub use common::{
     CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, IdentityDefaults,
     InheritSecurityContextFrom, MoverDefaults, NamespaceDeletePolicy, ObjectRef, PhaseLabel,
-    PodSelector, PolicyRef, PvcConsumerInherit, ResolvedMover, SourceColocation,
-    SourceColocationMode, effective_run_as_group, effective_run_as_user, hardened_security_context,
-    merge_context_pair, merge_pod_security_context, merge_resources, merge_security_context,
+    PodSelector, PolicyRef, PvcConsumerInherit, ReplicationManualRunPhase,
+    ReplicationManualRunStatus, ResolvedMover, SourceColocation, SourceColocationMode,
+    effective_run_as_group, effective_run_as_user, hardened_security_context, merge_context_pair,
+    merge_pod_security_context, merge_resources, merge_security_context, parse_run_requested_at,
     resolve_mover,
 };
 pub use maintenance::{
