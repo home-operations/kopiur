@@ -2523,6 +2523,74 @@ mod tests {
         assert!(msg.contains("catalog.foreignSnapshots: Ignore"), "{msg}");
     }
 
+    /// #380: the cluster twin of the namespaced seed work-spec test — the seed
+    /// payload rides the op, and only when armed.
+    #[test]
+    fn the_cluster_bootstrap_work_spec_carries_the_seed_payload_only_when_armed() {
+        use kopiur_api::backend::FilesystemBackend;
+        use kopiur_mover::workspec::{RepositoryConnect, SeedConnectSource, SeedOpSpec};
+        let backend = Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        });
+        let build = |read_only: bool, seed: Option<SeedOpSpec>| {
+            let spec = cluster_bootstrap_work_spec(
+                &backend,
+                "shared",
+                "kopia-system",
+                true,
+                None,
+                None,
+                None,
+                ForeignSnapshots::Fallback,
+                read_only,
+                true,
+                false,
+                None,
+                None,
+                seed,
+            );
+            match spec.operation {
+                Operation::BootstrapRepository(op) => op,
+                other => panic!("expected BootstrapRepository, got {other:?}"),
+            }
+        };
+        let plain = build(false, None);
+        assert!(plain.seed.is_none());
+        assert!(
+            serde_json::to_value(&plain)
+                .expect("serialize")
+                .as_object()
+                .expect("object")
+                .get("seed")
+                .is_none(),
+            "an unarmed bootstrap must not put `seed` on the wire at all"
+        );
+
+        let armed = build(
+            false,
+            Some(SeedOpSpec {
+                from: SeedConnectSource::Backend(Box::new(RepositoryConnect::Filesystem {
+                    path: "/mirror".into(),
+                })),
+                source_description: "Filesystem".into(),
+                sync: None,
+                migrate: None,
+                allow_empty_source: true,
+                resume: false,
+            }),
+        );
+        let carried = armed.seed.expect("the seed rides the op");
+        assert!(carried.allow_empty_source);
+        assert!(!carried.resume);
+
+        // Admission refuses `spec.seed` with `mode: ReadOnly`, so the two are
+        // never both set — pinned here as the belt to that brace.
+        let read_only = build(true, None);
+        assert!(read_only.read_only);
+        assert!(read_only.seed.is_none());
+    }
+
     /// M6: the ClusterRepository bootstrap work spec's maintenance-owner gating,
     /// mirroring the namespaced Repository's matrix (whose test carries the full
     /// combinations) — here the kind-specific lease formats are the point.

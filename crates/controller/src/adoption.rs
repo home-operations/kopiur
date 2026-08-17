@@ -1016,6 +1016,88 @@ mod tests {
         )
     }
 
+    /// #380: the fork guards are Update-gated and cannot fire on a
+    /// fresh-cluster CREATE, so a recovered policy whose identity does not
+    /// match the seeded history adopts nothing while looking healthy. This is
+    /// the only signal that says so.
+    #[test]
+    fn a_non_empty_catalog_with_no_identity_match_is_flagged_once() {
+        let own = BTreeSet::new();
+        let gate = delete_gate();
+        let mine = identity("app", "billing", Some("/data"));
+        let theirs = identity("app", "OLD-CLUSTER", Some("/data"));
+
+        // Catalog HOLDS history, none of it matches ⇒ flagged.
+        let plan = gated_plan(
+            &mine,
+            vec![candidate("s1", theirs.clone(), false)],
+            &own,
+            false,
+            &gate,
+        );
+        assert!(plan.adopt.is_empty());
+        assert!(plan.no_adoptable_history);
+
+        // An EMPTY catalog says nothing — the scan may simply not have run yet,
+        // which is the ordinary state of a repository being bootstrapped. It
+        // still requests a scan; it must not warn about identity.
+        let plan = gated_plan(&mine, vec![], &own, false, &gate);
+        assert!(!plan.no_adoptable_history);
+        assert!(plan.request_scan);
+
+        // A catalog that DOES match is obviously not flagged.
+        let plan = gated_plan(
+            &mine,
+            vec![candidate("s1", mine.clone(), false)],
+            &own,
+            false,
+            &gate,
+        );
+        assert_eq!(adopt_ids(&plan), vec!["s1"]);
+        assert!(!plan.no_adoptable_history);
+
+        // A policy that already HAS history is not a fresh recovery — it is a
+        // live policy on a shared repository, where other identities are
+        // expected and warning every pass would be noise.
+        let plan = gated_plan(
+            &mine,
+            vec![candidate("s1", theirs.clone(), false)],
+            &own,
+            true,
+            &gate,
+        );
+        assert!(!plan.no_adoptable_history);
+
+        // ...and it fires ONCE per (policy, identity): the same latch the
+        // no-match scan request uses. A second pass, with the identity already
+        // stamped, stays silent.
+        let plan = plan_adoption(
+            SnapshotAdoption::Adopt,
+            &mine,
+            None,
+            vec![candidate("s1", theirs, false)],
+            &AdoptionHistory {
+                own_snapshot_ids: &own,
+                has_history: false,
+                scan_requested_identity: Some(&identity_string(&mine)),
+            },
+            &gate,
+        );
+        assert!(!plan.no_adoptable_history);
+        assert!(!plan.request_scan);
+    }
+
+    #[test]
+    fn the_no_adoptable_history_message_names_the_identity_and_the_fix() {
+        let m = no_adoptable_history_message("app@billing:/data", "nas");
+        assert!(!m.contains("   "), "wrapped source whitespace: {m}");
+        assert!(m.contains("app@billing:/data"), "{m}");
+        assert!(m.contains("nas"), "{m}");
+        assert!(m.contains("spec.seed"), "{m}");
+        assert!(m.contains("Fix:"), "{m}");
+        assert!(m.contains("spec.adoption: Ignore"), "{m}");
+    }
+
     fn adopt_ids(plan: &AdoptionPlan) -> Vec<&str> {
         plan.adopt.iter().map(|c| c.snapshot_id.as_str()).collect()
     }

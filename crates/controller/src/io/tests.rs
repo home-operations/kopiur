@@ -2366,6 +2366,138 @@ mod bootstrap_outcomes {
     }
 
     #[test]
+    fn every_seed_class_maps_to_a_typed_failure_and_routes_by_retryability() {
+        use super::super::events::SeedFailure;
+        use kopiur_mover::bootstrap as mb;
+
+        // Every sentinel the mover can write is recognised, and the label round
+        // trips — a class the controller cannot read would collapse to
+        // `Unknown` and lose both its reason and its retry routing.
+        for class in [
+            mb::SEED_SOURCE_NOT_FOUND_CLASS,
+            mb::SEED_SOURCE_EMPTY_CLASS,
+            mb::SEED_INCOMPLETE_CLASS,
+            mb::SEED_LEFT_EMPTY_CLASS,
+        ] {
+            let f = SeedFailure::from_class(class).unwrap_or_else(|| panic!("{class} unmapped"));
+            assert_eq!(f.reason(), class, "reason must BE the mover's class label");
+            assert!(!f.action().is_empty());
+        }
+        // Nothing else is a seed failure — not the sibling create sentinel, not
+        // a kopia class, not the mover's internal-inconsistency class.
+        assert!(SeedFailure::from_class(mb::REPOSITORY_NOT_INITIALIZED_CLASS).is_none());
+        assert!(SeedFailure::from_class(mb::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS).is_none());
+        assert!(SeedFailure::from_class("AuthFailure").is_none());
+
+        // The two SOURCE-side failures point at spec.seed.from; the two
+        // INTERRUPTED-copy ones say kopiur resumes it itself.
+        assert_eq!(
+            SeedFailure::SourceNotFound.action(),
+            crate::consts::CHECK_SEED_SOURCE_ACTION
+        );
+        assert_eq!(
+            SeedFailure::LeftEmpty.action(),
+            crate::consts::AWAIT_SEED_RESUME_ACTION
+        );
+
+        // Routing: ALL FOUR recycle-and-retry, because the relaunch RESUMES the
+        // copy (the seed-attempt marker is what makes that legitimate). If the
+        // marker or the resume plumbing is ever removed, the last two must go
+        // terminal with it — see `BootstrapFailure::recycles_for_retry`.
+        for f in [
+            SeedFailure::SourceNotFound,
+            SeedFailure::SourceEmpty,
+            SeedFailure::Incomplete,
+            SeedFailure::LeftEmpty,
+        ] {
+            let bf = BootstrapFailure::Seed {
+                failure: f,
+                message: "m".into(),
+            };
+            assert!(bf.recycles_for_retry(), "{f:?} must retry");
+            assert_eq!(bf.reason(), f.reason());
+            assert_eq!(bf.seed_reason(), Some(f.reason()));
+            // Never routed as "the repository is absent" (that path's
+            // remediation copy is about a WIPE) and never through the breaker's
+            // outage sensor (a seed only fires on a never-bootstrapped repo).
+            assert!(!bf.is_repository_absent());
+            assert!(!bf.retryable_outage_for_bootstrapped(true));
+        }
+
+        // The two TERMINAL ones: an old mover image and a broken mover
+        // invariant both reproduce identically on every attempt.
+        let skew = BootstrapFailure::SeedMoverTooOld;
+        assert!(!skew.recycles_for_retry());
+        assert_eq!(skew.reason(), crate::consts::SEED_MOVER_TOO_OLD_REASON);
+        assert_eq!(
+            skew.seed_reason(),
+            Some(crate::consts::SEED_MOVER_TOO_OLD_REASON)
+        );
+        let inconsistent = BootstrapFailure::InternalInconsistency {
+            message: "contradiction".into(),
+        };
+        assert!(!inconsistent.recycles_for_retry());
+        assert_eq!(
+            inconsistent.reason(),
+            mb::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS
+        );
+        // ...and it is NOT a seed statement, so it writes no `Seeded` condition.
+        assert_eq!(inconsistent.seed_reason(), None);
+        // Neither is an ordinary backend failure.
+        assert_eq!(
+            BootstrapFailure::JobFailedWithoutResult {
+                job_name: "j".into()
+            }
+            .seed_reason(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_seed_armed_success_without_a_seed_outcome_is_refused_as_mover_skew() {
+        use kopiur_mover::bootstrap::SeedOutcome;
+        use kopiur_mover::workspec::SeedModeSpec;
+
+        // THE GUARD (#380 D4). `BootstrapResult.seed` is mover-authored and
+        // every seed-armed success path emits one — the AlreadyInitialized
+        // no-op included — so its absence proves the running image dropped the
+        // unknown `seed` field, fell into the create fallback, and initialized
+        // an EMPTY repository. Accepting it would report Ready over a
+        // repository with no history.
+        match bootstrap_outcome(Some(ok_result()), true, "boot-x", true) {
+            BootstrapOutcome::Failed(BootstrapFailure::SeedMoverTooOld) => {}
+            _ => panic!("a seed-armed success with no seed outcome must be refused"),
+        }
+
+        // The SAME result with no seed armed is an ordinary success — the guard
+        // must not fire on every bootstrap in the fleet.
+        match bootstrap_outcome(Some(ok_result()), true, "boot-x", false) {
+            BootstrapOutcome::Succeeded(_) => {}
+            _ => panic!("an unarmed bootstrap is unaffected"),
+        }
+
+        // A seed-armed success that DOES acknowledge the seed passes through,
+        // for both the real copy and the documented no-op.
+        for outcome in [
+            SeedOutcome::performed(SeedModeSpec::Blob, "S3".into(), 4, None),
+            SeedOutcome::already_initialized(SeedModeSpec::Blob, "S3".into()),
+        ] {
+            let r = ok_result().with_seed(Some(outcome));
+            match bootstrap_outcome(Some(r), true, "boot-x", true) {
+                BootstrapOutcome::Succeeded(r) => assert!(r.seed.is_some()),
+                _ => panic!("an acknowledged seed must succeed"),
+            }
+        }
+
+        // The skew message is actionable and volatile-free (so the guarded
+        // status write stays a no-op across repeats).
+        let msg = BootstrapFailure::SeedMoverTooOld.condition_message();
+        assert!(!msg.contains("   "), "wrapped source whitespace: {msg}");
+        assert!(msg.contains("upgrade the mover image"), "{msg}");
+        assert!(msg.contains("empty"), "{msg}");
+    }
+
+    #[test]
     fn a_genuine_kopia_notfound_stays_a_backend_failure() {
         // A real kopia `NotFound` (not the sentinel) must still map to Backend —
         // the sentinel check keys on the exact label, not the NotFound class.

@@ -710,3 +710,427 @@ pub(crate) fn record_seed_failure(
         crate::metrics::SeedOutcomeLabel::Failed,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kopiur_api::common::Encryption;
+    use kopiur_mover::workspec::{PolicyCopyModeSpec, RepositoryConnect, SeedModeSpec};
+
+    /// Build a `SeedSpec` the way the apiserver hands one over: a JSON value
+    /// (what a decoded CR body is) into the typed struct. Never `serde_yaml`
+    /// straight into a typed value — 0.9 mis-encodes externally-tagged enums,
+    /// and `from.backend` is one.
+    fn seed_spec(v: serde_json::Value) -> SeedSpec {
+        serde_json::from_value(v).expect("typed")
+    }
+
+    fn resolved_source(backend: Backend, namespace: Option<&str>) -> ResolvedRepository {
+        ResolvedRepository {
+            backend,
+            encryption: Encryption {
+                password_secret_ref: kopiur_api::common::SecretKeyRef {
+                    name: "src-pw".into(),
+                    namespace: namespace.map(str::to_string),
+                    key: None,
+                },
+            },
+            repo_namespace: namespace.map(str::to_string),
+            mover_defaults: None,
+            identity_defaults: None,
+            schedule_defaults: None,
+            on_namespace_delete: Default::default(),
+            credential_projection_allowed: false,
+            mode: Default::default(),
+            owner_ref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "kopiur.home-operations.com/v1alpha1".into(),
+                kind: "Repository".into(),
+                name: "nas".into(),
+                uid: "uid-src".into(),
+                ..Default::default()
+            },
+            deletion_protection: None,
+            mass_deletion_ack: None,
+            catalog: None,
+            ca_bundle_pem: Some("SOURCE-CA".into()),
+        }
+    }
+
+    fn s3(bucket: &str) -> Backend {
+        serde_json::from_value(serde_json::json!({ "s3": { "bucket": bucket } })).expect("backend")
+    }
+
+    #[test]
+    fn seed_op_for_covers_both_source_shapes_and_carries_one_source_rendering() {
+        // BLOB: the inline backend + the CA bundle the async caller resolved.
+        // Every kopia invocation carries its CA inline, so a seed backend whose
+        // bundle was dropped would fail TLS against a private-CA endpoint.
+        let blob = seed_spec(serde_json::json!({
+            "from": { "backend": { "s3": { "bucket": "offsite" } } },
+            "sync": { "parallel": 8 },
+        }));
+        let op = seed_op_for(&blob, Some("SEED-CA".into()), None, false).expect("blob op");
+        assert_eq!(op.mode(), SeedModeSpec::Blob);
+        assert_eq!(op.source_description, "S3");
+        assert_eq!(op.sync.and_then(|s| s.parallel), Some(8));
+        assert!(op.migrate.is_none());
+        assert!(!op.resume);
+        match op.from {
+            SeedConnectSource::Backend(b) => match *b {
+                RepositoryConnect::S3 {
+                    bucket,
+                    ca_bundle_pem,
+                    ..
+                } => {
+                    assert_eq!(bucket, "offsite");
+                    assert_eq!(ca_bundle_pem.as_deref(), Some("SEED-CA"));
+                }
+                other => panic!("expected an S3 connect, got {other:?}"),
+            },
+            other => panic!("expected a backend source, got {other:?}"),
+        }
+
+        // MIGRATE: the resolved source repository, and its OWN CA bundle (which
+        // rides `ResolvedRepository`, not the blob parameter).
+        let migrate = seed_spec(serde_json::json!({
+            "from": { "repository": { "name": "offsite" } },
+            "migrate": { "latestOnly": true },
+        }));
+        let src = resolved_source(s3("source-bucket"), Some("backups"));
+        let source = SeedSourceRepository {
+            kind: RepositoryKind::Repository,
+            name: "offsite",
+            repo: &src,
+        };
+        let op = seed_op_for(&migrate, None, Some(&source), true).expect("migrate op");
+        assert_eq!(op.mode(), SeedModeSpec::Migrate);
+        assert!(op.resume, "resume must ride the op verbatim");
+        // The ONE rendering: `describe()` on the CR's own spec, NOT the
+        // resolved namespace. Re-deriving it mover-side would print
+        // `Repository/backups/offsite` here and `Repository/offsite` in the
+        // CRD-side status — two spellings of one repository.
+        assert_eq!(op.source_description, "Repository/offsite");
+        assert!(op.sync.is_none());
+        let m = op.migrate.expect("migrate tuning");
+        assert!(m.latest_only);
+        // kopia's own default COPIES policies; an imported retention policy
+        // would delete manifests behind the operator's back.
+        assert_eq!(m.policies, PolicyCopyModeSpec::None);
+        match op.from {
+            SeedConnectSource::Repository(r) => {
+                assert_eq!(r.kind, "Repository");
+                assert_eq!(r.name, "offsite");
+                // The RESOLVED namespace, so logs/messages name the real object.
+                assert_eq!(r.namespace.as_deref(), Some("backups"));
+                match r.connect {
+                    RepositoryConnect::S3 { ca_bundle_pem, .. } => {
+                        assert_eq!(ca_bundle_pem.as_deref(), Some("SOURCE-CA"));
+                    }
+                    other => panic!("expected an S3 connect, got {other:?}"),
+                }
+            }
+            other => panic!("expected a repository source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_migrate_seed_without_a_resolved_source_yields_no_payload() {
+        // Unreachable from the caller (it resolves or parks first) and
+        // deliberately NOT a silent fallback: launching a seed against a
+        // half-resolved source is the one mistake this feature exists to avoid.
+        let migrate =
+            seed_spec(serde_json::json!({ "from": { "repository": { "name": "offsite" } } }));
+        assert!(seed_op_for(&migrate, None, None, false).is_none());
+    }
+
+    #[test]
+    fn only_an_armed_seed_changes_the_bootstrap_job_limits() {
+        let base = JobLimits {
+            active_deadline_seconds: Some(120),
+            backoff_limit: 2,
+            ttl_seconds_after_finished: Some(3600),
+        };
+        let seed =
+            seed_spec(serde_json::json!({ "from": { "repository": { "name": "offsite" } } }));
+
+        // Not armed: byte-for-byte the pre-#380 limits, even with a seed in
+        // spec — that is every connect to an already-initialized repository.
+        let unarmed = seed_job_limits(false, Some(&seed), base);
+        assert_eq!(unarmed.active_deadline_seconds, Some(120));
+        assert_eq!(unarmed.backoff_limit, 2);
+
+        // Armed, no failurePolicy: the 24h seed default, base backoff + TTL.
+        let armed = seed_job_limits(true, Some(&seed), base);
+        assert_eq!(
+            armed.active_deadline_seconds,
+            Some(kopiur_api::seed::DEFAULT_SEED_BOOTSTRAP_DEADLINE_SECS)
+        );
+        assert_eq!(armed.backoff_limit, 2);
+        assert_eq!(armed.ttl_seconds_after_finished, Some(3600));
+
+        // Armed with an explicit policy: it wins on both knobs.
+        let tuned = seed_spec(serde_json::json!({
+            "from": { "repository": { "name": "offsite" } },
+            "failurePolicy": { "activeDeadlineSeconds": 43200, "backoffLimit": 5 },
+        }));
+        let armed = seed_job_limits(true, Some(&tuned), base);
+        assert_eq!(armed.active_deadline_seconds, Some(43_200));
+        assert_eq!(armed.backoff_limit, 5);
+
+        // No seed at all: untouched (JobLimits is not PartialEq, so compare
+        // the three fields the helper can touch).
+        let untouched = seed_job_limits(true, None, base);
+        assert_eq!(
+            untouched.active_deadline_seconds,
+            base.active_deadline_seconds
+        );
+        assert_eq!(untouched.backoff_limit, base.backoff_limit);
+        assert_eq!(
+            untouched.ttl_seconds_after_finished,
+            base.ttl_seconds_after_finished
+        );
+    }
+
+    #[test]
+    fn the_attempt_marker_is_stamped_once_and_never_over_a_finished_seed() {
+        let now = "2026-08-17T00:00:00+00:00";
+        // First attempt: stamped with `now` plus what is being attempted.
+        let patch = seed_marker_patch(None, SeedMode::Migrate, "Repository/offsite", now)
+            .expect("first attempt stamps a marker");
+        assert_eq!(patch["seed"]["startedAt"], serde_json::json!(now));
+        assert_eq!(patch["seed"]["mode"], serde_json::json!("migrate"));
+        assert_eq!(
+            patch["seed"]["source"],
+            serde_json::json!("Repository/offsite")
+        );
+
+        // A RELAUNCH preserves the original timestamp — the marker is a fact
+        // about the first attempt, and rewriting it every retry would churn
+        // resourceVersion and re-trigger the reconciler through its own watch.
+        let existing = SeedStatus {
+            started_at: Some("2026-08-16T00:00:00+00:00".into()),
+            mode: Some(SeedMode::Migrate),
+            source: Some("Repository/offsite".into()),
+            ..SeedStatus::default()
+        };
+        assert!(
+            seed_marker_patch(
+                Some(&existing),
+                SeedMode::Migrate,
+                "Repository/offsite",
+                now
+            )
+            .is_none(),
+            "an unchanged marker must be a no-op, not a rewrite"
+        );
+
+        // A REPOINTED seed says what it is now attempting, keeping the original
+        // attempt time (the backend may still hold the first attempt's leavings).
+        let repointed = seed_marker_patch(Some(&existing), SeedMode::Blob, "S3", now)
+            .expect("a repointed seed updates mode/source");
+        assert_eq!(
+            repointed["seed"]["startedAt"],
+            serde_json::json!("2026-08-16T00:00:00+00:00")
+        );
+        assert_eq!(repointed["seed"]["mode"], serde_json::json!("blob"));
+
+        // A COMPLETED seed never gets a new marker: `startedAt` and `seededAt`
+        // must always describe the same attempt, or the resume decision has to
+        // guess which.
+        let done = SeedStatus {
+            seeded_at: Some("2026-08-16T02:00:00+00:00".into()),
+            ..existing.clone()
+        };
+        assert!(seed_marker_patch(Some(&done), SeedMode::Blob, "S3", now).is_none());
+    }
+
+    #[test]
+    fn the_resume_matrix_the_controller_relies_on() {
+        // The four states the reconciler distinguishes, spelled out against the
+        // SAME two fields the marker patch writes — this is the guard that
+        // stops a migrate-resume writing into a repository kopiur never began
+        // seeding.
+        use kopiur_api::seed::{seed_armed, seed_resume};
+        let armed = |uid: Option<&str>| {
+            seed_armed(
+                Some(&seed_spec(
+                    serde_json::json!({ "from": { "repository": { "name": "offsite" } } }),
+                )),
+                uid,
+            )
+        };
+        let marker = |started: Option<&str>, seeded: Option<&str>| SeedStatus {
+            started_at: started.map(str::to_string),
+            seeded_at: seeded.map(str::to_string),
+            ..SeedStatus::default()
+        };
+
+        // (1) FRESH seed: armed, no marker ⇒ no resume.
+        assert!(armed(None));
+        assert!(!seed_resume(armed(None), None));
+
+        // (2) RETRY after a recorded attempt ⇒ resume.
+        let attempted = marker(Some("2026-08-17T00:00:00Z"), None);
+        assert!(seed_resume(armed(None), Some(&attempted)));
+
+        // (3) ALREADY SEEDED: not armed at all (uniqueId pinned), and not a
+        //     resume even if something asked.
+        assert!(!armed(Some("uid-1")));
+        assert!(!seed_resume(armed(Some("uid-1")), Some(&attempted)));
+
+        // (4) ADOPTED repository — `spec.seed` standing in a GitOps manifest
+        //     over a backend somebody else initialized. Armed (no uniqueId
+        //     yet), but NO marker, so no resume: the mover reports the
+        //     documented AlreadyInitialized no-op instead of copying over it.
+        let adopted = marker(None, None);
+        assert!(armed(None));
+        assert!(!seed_resume(armed(None), Some(&adopted)));
+    }
+
+    #[test]
+    fn a_seed_interrupted_by_suspend_still_resumes_when_the_repository_wakes() {
+        // `spec.suspend` returns before the bootstrap path entirely, so nothing
+        // clears the marker: the Job keeps running, its result is consumed on
+        // resume, and a relaunch after an interrupted attempt still resumes.
+        use kopiur_api::seed::seed_resume;
+        let mid_seed = SeedStatus {
+            started_at: Some("2026-08-17T00:00:00Z".into()),
+            mode: Some(SeedMode::Blob),
+            source: Some("S3".into()),
+            ..SeedStatus::default()
+        };
+        assert!(seed_resume(true, Some(&mid_seed)));
+        // ...and the marker patch stays a no-op across the suspend/resume, so
+        // waking the repository does not churn its status.
+        assert!(
+            seed_marker_patch(
+                Some(&mid_seed),
+                SeedMode::Blob,
+                "S3",
+                "2026-08-18T00:00:00Z"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_success_fold_distinguishes_a_real_seed_from_the_standing_no_op() {
+        let now = "2026-08-17T03:00:00+00:00";
+        // A real MIGRATE copy: seededAt + both counts + the Seeded reason, and
+        // an Event that warns about adoption-time pruning.
+        let performed = SeedOutcome::performed(
+            SeedModeSpec::Migrate,
+            "Repository/offsite".into(),
+            412,
+            Some(412),
+        );
+        let fold = seed_success_fold(&performed, now);
+        assert_eq!(fold.reason, kopiur_api::consts::SEEDED_REASON);
+        assert_eq!(fold.outcome, crate::metrics::SeedOutcomeLabel::Seeded);
+        assert_eq!(fold.status["seed"]["seededAt"], serde_json::json!(now));
+        assert_eq!(fold.status["seed"]["mode"], serde_json::json!("migrate"));
+        assert_eq!(fold.status["seed"]["snapshotCount"], serde_json::json!(412));
+        assert_eq!(
+            fold.status["seed"]["snapshotsCopied"],
+            serde_json::json!(412)
+        );
+        let event = fold.event.expect("a real seed announces itself");
+        assert!(event.contains("retention"), "{event}");
+        assert!(event.contains("SnapshotPolic"), "{event}");
+
+        // A BLOB copy leaves `snapshotsCopied` unset — it moves storage, not
+        // manifests — and the post-seed catalog listing reports the count on
+        // storageStats instead.
+        let blob = SeedOutcome::performed(SeedModeSpec::Blob, "S3".into(), 7, None);
+        let fold = seed_success_fold(&blob, now);
+        assert_eq!(fold.status["seed"]["snapshotCount"], serde_json::json!(7));
+        assert!(fold.status["seed"].get("snapshotsCopied").is_none());
+
+        // The STANDING NO-OP: no seededAt, no counts (nothing was opened, so
+        // reporting 0 would be a lie), its own reason and metric label, and NO
+        // Event — nothing happened.
+        let noop = SeedOutcome::already_initialized(SeedModeSpec::Blob, "S3".into());
+        let fold = seed_success_fold(&noop, now);
+        assert_eq!(fold.reason, kopiur_api::consts::ALREADY_INITIALIZED_REASON);
+        assert_eq!(
+            fold.outcome,
+            crate::metrics::SeedOutcomeLabel::AlreadyInitialized
+        );
+        assert!(fold.status["seed"].get("seededAt").is_none());
+        assert!(fold.status["seed"].get("snapshotCount").is_none());
+        assert!(fold.event.is_none());
+    }
+
+    #[test]
+    fn merging_the_seed_fold_never_drops_a_key_already_in_the_patch() {
+        // `status_patch` is assembled key-by-key before ONE patch, so a plain
+        // assignment would drop whatever `seed` already held.
+        let mut patch = serde_json::json!({
+            "phase": "Ready",
+            "seed": { "startedAt": "2026-08-17T00:00:00Z" },
+        });
+        let fold = seed_success_fold(
+            &SeedOutcome::performed(SeedModeSpec::Blob, "S3".into(), 3, None),
+            "2026-08-17T03:00:00Z",
+        );
+        merge_seed_status(&mut patch, &fold.status);
+        assert_eq!(
+            patch["seed"]["startedAt"],
+            serde_json::json!("2026-08-17T00:00:00Z"),
+            "the marker survives the success fold"
+        );
+        assert_eq!(
+            patch["seed"]["seededAt"],
+            serde_json::json!("2026-08-17T03:00:00Z")
+        );
+        assert_eq!(patch["phase"], serde_json::json!("Ready"));
+
+        // No prior `seed` key: the fold lands whole.
+        let mut patch = serde_json::json!({ "phase": "Ready" });
+        merge_seed_status(&mut patch, &fold.status);
+        assert_eq!(patch["seed"]["mode"], serde_json::json!("blob"));
+
+        // A fold with no `seed` key is inert (defensive: the helper is the only
+        // writer of this sub-object).
+        let mut patch = serde_json::json!({ "phase": "Ready" });
+        merge_seed_status(&mut patch, &serde_json::json!({}));
+        assert!(patch.get("seed").is_none());
+    }
+
+    #[test]
+    fn every_seed_park_and_progress_message_says_what_why_and_how_to_fix_it() {
+        let messages = [
+            seeding_message("S3", 86_400),
+            waiting_for_seed_source_message("Repository/offsite", "it is not Ready"),
+            bare_path_seed_source_message("Repository/offsite", "/srv/kopia"),
+        ];
+        for m in &messages {
+            // The what/why/fix rule, plus the C1 wrapped-whitespace regression:
+            // a Rust line continuation authored badly leaves a run of spaces in
+            // the rendered string, which users see verbatim in a condition.
+            assert!(!m.contains("   "), "wrapped source whitespace in: {m}");
+            assert!(m.len() > 80, "too terse to be actionable: {m}");
+        }
+        assert!(messages[0].contains("86400"), "{}", messages[0]);
+        assert!(
+            messages[0].contains("spec.seed.failurePolicy"),
+            "{}",
+            messages[0]
+        );
+        assert!(messages[1].contains("not Ready"), "{}", messages[1]);
+        assert!(messages[1].contains("Fix:"), "{}", messages[1]);
+        assert!(messages[2].contains("volume"), "{}", messages[2]);
+        assert!(messages[2].contains("Fix:"), "{}", messages[2]);
+    }
+
+    #[test]
+    fn the_seed_creds_prefix_is_distinct_from_the_repositorys_own() {
+        // One bootstrap pod touches TWO repositories in migrate mode. A shared
+        // prefix would make the source projection clobber this repository's own
+        // `-creds-0` copy.
+        let own = io::CredsPrefix::bootstrap("nas");
+        let seed = io::CredsPrefix::seed("nas");
+        assert_ne!(own.secret_name(0), seed.secret_name(0));
+        assert_ne!(own.secret_name(1), seed.secret_name(1));
+    }
+}

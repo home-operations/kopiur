@@ -2637,6 +2637,99 @@ mod tests {
         assert!(stale_bootstrap_job(Some("not-a-number"), Some(3)));
     }
 
+    /// #380: the seed payload rides the bootstrap op, and only when armed.
+    #[test]
+    fn the_bootstrap_work_spec_carries_the_seed_payload_only_when_one_is_armed() {
+        use kopiur_api::backend::FilesystemBackend;
+        use kopiur_mover::workspec::{SeedConnectSource, SeedModeSpec, SeedOpSpec};
+        let backend = Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        });
+        let build = |read_only: bool, seed: Option<SeedOpSpec>| {
+            let spec = bootstrap_work_spec(
+                &backend,
+                "nas",
+                "billing",
+                true,
+                true,
+                None,
+                None,
+                None,
+                ForeignSnapshots::Fallback,
+                read_only,
+                true,
+                false,
+                None,
+                None,
+                seed,
+            );
+            match spec.operation {
+                Operation::BootstrapRepository(op) => op,
+                other => panic!("expected BootstrapRepository, got {other:?}"),
+            }
+        };
+        // No seed armed: the wire shape is byte-identical to pre-#380 — the key
+        // is absent entirely, so an older mover parses what we write.
+        let plain = build(false, None);
+        assert!(plain.seed.is_none());
+        let json = serde_json::to_value(&plain).expect("serialize");
+        assert!(
+            json.as_object().expect("object").get("seed").is_none(),
+            "an unarmed bootstrap must not put `seed` on the wire at all"
+        );
+
+        // Armed: the payload rides verbatim, resume included.
+        let op = SeedOpSpec {
+            from: SeedConnectSource::Backend(Box::new(
+                kopiur_mover::workspec::RepositoryConnect::Filesystem {
+                    path: "/mirror".into(),
+                },
+            )),
+            source_description: "Filesystem".into(),
+            sync: None,
+            migrate: None,
+            allow_empty_source: false,
+            resume: true,
+        };
+        let armed = build(false, Some(op.clone()));
+        let carried = armed.seed.expect("the seed rides the op");
+        assert_eq!(carried.mode(), SeedModeSpec::Blob);
+        assert!(carried.resume);
+        assert_eq!(carried.source_description, "Filesystem");
+
+        // A ReadOnly repository never carries one. Admission refuses
+        // `spec.seed` with `mode: ReadOnly` outright (a read-only repository
+        // refuses every write, so the seed could never complete), and the
+        // caller's `seed_armed` is the only source of this value — so the two
+        // are never both set. Pinned here as the belt to that brace.
+        let read_only = build(true, None);
+        assert!(read_only.read_only);
+        assert!(read_only.seed.is_none());
+    }
+
+    /// #380: a `spec.seed` edit while a seeding Job is in flight. The running
+    /// Job is NOT killed — it finishes, and its result is discarded as stale by
+    /// the existing generation machinery, so the next pass launches a fresh
+    /// seed for the live spec. The seed-attempt marker survives, so that fresh
+    /// launch RESUMES rather than reporting the AlreadyInitialized no-op over
+    /// whatever the interrupted attempt left at the backend.
+    #[test]
+    fn editing_spec_seed_mid_flight_discards_the_in_flight_result_as_stale() {
+        // The Job was stamped with the pre-edit generation; the edit bumped it.
+        assert!(stale_bootstrap_job(Some("4"), Some(5)));
+        // Its replacement (stamped with the live generation) is consumed
+        // normally — success or failure — so a persistently-broken seed spec
+        // still surfaces instead of livelocking.
+        assert!(!stale_bootstrap_job(Some("5"), Some(5)));
+        // And the marker is what makes the relaunch a RESUME.
+        let marker = kopiur_api::seed::SeedStatus {
+            started_at: Some("2026-08-17T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(kopiur_api::seed::seed_resume(true, Some(&marker)));
+    }
+
     #[test]
     fn bootstrap_generation_annotation_stamps_the_launch_generation() {
         let a = bootstrap_generation_annotation(Some(7));
