@@ -146,6 +146,21 @@ pub const SNAPSHOT_REPLICATION_INSTANCE_LABEL: &str =
 pub const SNAPSHOT_REPLICATION_SLOT_ANNOTATION: &str =
     "kopiur.home-operations.com/snapshot-replication-slot";
 
+/// Annotation on a replication mover Job recording WHAT asked for the run —
+/// `cron` (a scheduled slot) or `manual` (a `run-requested` annotation). It is
+/// the only place the run's trigger survives once the Job is the sole record
+/// of it, and it is what lets `kopiur_replication_runs_total` attribute an
+/// outcome without re-reading the CR. A Job written by an older kopiur carries
+/// none and is attributed to `cron` — that build had no manual path.
+pub const RUN_TRIGGER_ANNOTATION: &str = "kopiur.home-operations.com/run-trigger";
+/// Annotation stamped on a TERMINAL replication mover Job once its outcome has
+/// been counted into `kopiur_replication_runs_total` (value: the outcome).
+/// The durable "already counted" marker: the reconcile's Job-outcome arms are
+/// reached zero-to-many times per run, so exactly-once counting needs a marker
+/// on the run itself. It rides the Job, so it self-cleans with the Job's TTL
+/// and survives an operator restart.
+pub const RUN_COUNTED_ANNOTATION: &str = "kopiur.home-operations.com/run-counted";
+
 /// Annotation on the kopia-server Deployment's POD TEMPLATE carrying a short
 /// hash of the serialized `ServerWorkSpec`. The server reads its spec from a
 /// mounted ConfigMap, and a ConfigMap content change alone never restarts a

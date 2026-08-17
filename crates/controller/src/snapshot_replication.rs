@@ -48,7 +48,12 @@ use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
 use crate::io::{self, ResolvedRepository};
 use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
+use crate::metrics::{ReplicationKind, ReplicationRunTrigger};
 use crate::naming::short_hash;
+use crate::replication_run::{
+    RunObservation, RunRequest, manual_replication_job_name, manual_run_request, manual_run_status,
+    observe_and_count_runs, recorded_running, run_job_annotations, suspended_report,
+};
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
 
@@ -62,6 +67,9 @@ const REQUEUE_NOT_READY: Duration = Duration::from_secs(60);
 const REQUEUE_FAILED: Duration = Duration::from_secs(300);
 /// Upper bound on any requeue so the schedule/readiness is re-evaluated.
 const REQUEUE_CAP: Duration = Duration::from_secs(1800);
+/// This reconciler's discriminant for the plumbing shared with
+/// `RepositoryReplication` (Job labels, manual Job names, metric labels).
+const KIND: ReplicationKind = ReplicationKind::Snapshot;
 
 /// Condition reporting the runtime identity-overlap check: `True` when a
 /// destination-side `SnapshotPolicy` writes directly under an identity this
@@ -103,6 +111,7 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
         .ok_or_else(|| Error::Invariant("SnapshotReplication has no namespace".into()))?;
     let name = repl.name_any();
     let api: Api<SnapshotReplication> = Api::namespaced(ctx.client.clone(), &namespace);
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
 
     // Version skew: a phase written by a NEWER kopiur. Two facts shape what this
     // warning is for, and neither is the prompt-overwrite story the other
@@ -127,20 +136,16 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
         io::warn_unreadable_phase("SnapshotReplication", &namespace, &name, label);
     }
 
+    // Count any terminal run this reconciler has not counted yet, and learn the
+    // single-flight answer from the same LIST. FIRST, before every gate: a run
+    // that finished just before the CR was suspended (or before an endpoint
+    // went un-Ready) must still be counted, and the early returns below would
+    // otherwise skip it until its Job TTL-reaped uncounted.
+    let observed = observe_and_count_runs(ctx, &job_api, KIND, &name).await?;
+
     // A suspended replication is skipped (surface phase + Ready=Reconciling).
     if repl.spec.suspend {
-        patch_ready_if_changed(
-            &api,
-            &name,
-            repl,
-            io::ReadyOutcome::Reconciling,
-            "Suspended",
-            "replication is suspended (spec.suspend)",
-            Some(SnapshotReplicationPhase::Suspended),
-            None,
-        )
-        .await?;
-        return Ok(Action::requeue(REQUEUE_CAP));
+        return suspended(&api, repl, &namespace, &name).await;
     }
 
     // Both endpoints are real repository CRs — resolve them (backend, encryption,
@@ -225,7 +230,63 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
         return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
 
-    drive_schedule(ctx, repl, &api, &namespace, &name, &source, &dest, &overlap).await
+    drive_schedule(
+        ctx, repl, &api, &job_api, &namespace, &name, &source, &dest, &overlap, observed,
+    )
+    .await
+}
+
+/// The `spec.suspend` arm: record any pending run request (so it is VISIBLE
+/// rather than silently queued) and surface the suspension.
+///
+/// A request that lands while suspended is NOT dropped — `Pending` does not
+/// answer it, so the run fires on the first reconcile after the unsuspend. The
+/// `Ready` reason differs from the plain suspended one precisely so the
+/// transition guard fires and the message reaches `kubectl describe`.
+async fn suspended(
+    api: &Api<SnapshotReplication>,
+    repl: &SnapshotReplication,
+    namespace: &str,
+    name: &str,
+) -> Result<Action> {
+    let manual = repl.status.as_ref().and_then(|s| s.manual_run.as_ref());
+    // A malformed annotation must not change the suspended report: it is
+    // surfaced by the reconcile path that can act on it, once unsuspended.
+    let pending = manual_run_request(
+        KIND,
+        repl.metadata.annotations.as_ref(),
+        manual,
+        namespace,
+        name,
+    )
+    .ok()
+    .flatten();
+    let (reason, message) = suspended_report(pending.is_some());
+    if let Some(request) = &pending {
+        patch_manual_run(
+            api,
+            repl,
+            name,
+            manual_run_status(
+                request,
+                kopiur_api::common::ReplicationManualRunPhase::Pending,
+                Utc::now(),
+            ),
+        )
+        .await?;
+    }
+    patch_ready_if_changed(
+        api,
+        name,
+        repl,
+        io::ReadyOutcome::Reconciling,
+        reason,
+        message,
+        Some(SnapshotReplicationPhase::Suspended),
+        None,
+    )
+    .await?;
+    Ok(Action::requeue(REQUEUE_CAP))
 }
 
 /// The scheduling half of the reconcile: decide the due slot, drive the
@@ -236,14 +297,15 @@ async fn drive_schedule(
     ctx: &Context,
     repl: &SnapshotReplication,
     api: &Api<SnapshotReplication>,
+    job_api: &Api<Job>,
     namespace: &str,
     name: &str,
     source: &ResolvedRepository,
     dest: &ResolvedRepository,
     overlap: &OverlapVerdict,
+    observed: RunObservation,
 ) -> Result<Action> {
     let now = Utc::now();
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     // Timezone precedence: `spec.schedule.timezone` wins; else the SOURCE
     // repository's `scheduleDefaults.timezone`; else UTC (GitHub #174 item 3 —
     // the source is where the data lives, so its operational zone anchors the
@@ -253,13 +315,51 @@ async fn drive_schedule(
         .as_ref()
         .and_then(|d| d.timezone.as_deref());
 
+    // An annotation-requested run takes precedence over waiting for the next
+    // cron slot — but flows through the SAME spawn path (mover, gates,
+    // single-flight), so it cannot bypass any guarantee the cron path has.
+    // A MALFORMED annotation must not suspend the schedule: surface it as a
+    // condition and fall through to the cron flow (degrade-not-crash).
+    match manual_run_request(
+        KIND,
+        repl.metadata.annotations.as_ref(),
+        repl.status.as_ref().and_then(|s| s.manual_run.as_ref()),
+        namespace,
+        name,
+    ) {
+        Ok(Some(request)) => {
+            if let Some(action) = handle_manual_run(
+                ctx, repl, api, job_api, namespace, name, source, dest, &request, observed, overlap,
+            )
+            .await?
+            {
+                return Ok(action);
+            }
+        }
+        Ok(None) => {}
+        Err(Error::Validation(msg)) => {
+            patch_ready_if_changed(
+                api,
+                name,
+                repl,
+                io::ReadyOutcome::Stalled,
+                "InvalidRunRequest",
+                &msg,
+                None,
+                Some(overlap),
+            )
+            .await?;
+        }
+        Err(e) => return Err(e),
+    }
+
     let Some(slot) = due_slot(repl, now, repo_tz) else {
         // The idle heal pass: reap cross-namespace discovered duplicates
         // (ClusterRepository destinations, A6) and any lingering projected
         // credential copies, then mark Ready (this is also where the two-pass
         // terminal heal lands: the mover stamped phase/lastReplicated, and this
         // arm heals Ready + observedGeneration + the overlap condition).
-        idle_heal(ctx, repl, &job_api, namespace, name, dest).await?;
+        idle_heal(ctx, repl, observed, namespace, name, dest).await?;
         patch_ready_if_changed(
             api,
             name,
@@ -316,17 +416,174 @@ async fn drive_schedule(
             None => Ok(Action::requeue(REQUEUE_RUNNING)),
         },
         None => {
-            if has_active_snapshot_replication_job(&job_api, name).await? {
+            if observed.has_active {
                 return Ok(Action::requeue(REQUEUE_RUNNING));
             }
             spawn_snapshot_replication_job(
-                ctx, namespace, name, &job_name, repl, source, dest, slot,
+                ctx,
+                namespace,
+                name,
+                &job_name,
+                repl,
+                source,
+                dest,
+                slot,
+                ReplicationRunTrigger::Cron,
             )
             .await?;
             tracing::info!(replication = %name, slot = %slot.to_rfc3339(), "spawned snapshot-replication Job");
             Ok(Action::requeue(REQUEUE_RUNNING))
         }
     }
+}
+
+/// Drive an unhandled run request: observe or spawn its Job and book-keep
+/// `status.manualRun`. `Some(action)` stops the reconcile here (a requested Job
+/// is in flight); `None` continues with the cron flow.
+///
+/// The run rides the ORDINARY per-slot spawn path with the request instant as
+/// its slot, so the mover is untouched — which also means a successful manual
+/// run stamps `status.lastReplicated` and therefore RE-ANCHORS the next cron
+/// slot, exactly as a scheduled run would. That is intended: the schedule means
+/// "this often", not "at these wall-clock instants".
+#[allow(clippy::too_many_arguments)]
+async fn handle_manual_run(
+    ctx: &Context,
+    repl: &SnapshotReplication,
+    api: &Api<SnapshotReplication>,
+    job_api: &Api<Job>,
+    namespace: &str,
+    name: &str,
+    source: &ResolvedRepository,
+    dest: &ResolvedRepository,
+    request: &RunRequest,
+    observed: RunObservation,
+    overlap: &OverlapVerdict,
+) -> Result<Option<Action>> {
+    use kopiur_api::common::ReplicationManualRunPhase as P;
+    let job_name = manual_replication_job_name(KIND, name, request.at);
+    let manual = repl.status.as_ref().and_then(|s| s.manual_run.as_ref());
+    match job_api.get_opt(&job_name).await? {
+        Some(job) => match job_terminal_state(&job) {
+            Some(true) => {
+                patch_manual_run(
+                    api,
+                    repl,
+                    name,
+                    manual_run_status(request, P::Succeeded, Utc::now()),
+                )
+                .await?;
+                Ok(None)
+            }
+            Some(false) => {
+                patch_manual_run(
+                    api,
+                    repl,
+                    name,
+                    manual_run_status(request, P::Failed, Utc::now()),
+                )
+                .await?;
+                patch_ready_if_changed(
+                    api,
+                    name,
+                    repl,
+                    io::ReadyOutcome::Stalled,
+                    "ReplicationFailed",
+                    "requested snapshot-replication Job failed; see the Job/pod logs",
+                    Some(SnapshotReplicationPhase::Failed),
+                    Some(overlap),
+                )
+                .await?;
+                // The Job is terminal, so no pod can still read the projected
+                // copies — reclaim them now rather than only at the next idle.
+                if projection_enabled(repl) {
+                    reap_srepl_projections(ctx, repl, namespace, name).await;
+                }
+                nudge_repositories_reverify(ctx, repl, name, namespace).await;
+                Ok(None)
+            }
+            None => Ok(Some(Action::requeue(REQUEUE_RUNNING))),
+        },
+        None if recorded_running(manual, request) => {
+            // The Job was TTL-reaped before its terminal state was observed:
+            // be honest rather than silently re-running side-effectful work.
+            patch_manual_run(
+                api,
+                repl,
+                name,
+                manual_run_status(request, P::Failed, Utc::now()),
+            )
+            .await?;
+            patch_ready_if_changed(
+                api,
+                name,
+                repl,
+                io::ReadyOutcome::Stalled,
+                "ManualRunOutcomeLost",
+                "the requested snapshot-replication Job disappeared before its outcome was \
+                 observed (TTL-reaped?); re-annotate to run again",
+                None,
+                Some(overlap),
+            )
+            .await?;
+            Ok(None)
+        }
+        None => {
+            // Single-flight: never two snapshot-replication Jobs for one CR.
+            if observed.has_active {
+                return Ok(Some(Action::requeue(REQUEUE_RUNNING)));
+            }
+            spawn_snapshot_replication_job(
+                ctx,
+                namespace,
+                name,
+                &job_name,
+                repl,
+                source,
+                dest,
+                request.at,
+                ReplicationRunTrigger::Manual,
+            )
+            .await?;
+            patch_manual_run(
+                api,
+                repl,
+                name,
+                manual_run_status(request, P::Running, Utc::now()),
+            )
+            .await?;
+            tracing::info!(
+                replication = %name,
+                requested = %request.raw,
+                "spawned REQUESTED snapshot-replication Job"
+            );
+            Ok(Some(Action::requeue(REQUEUE_RUNNING)))
+        }
+    }
+}
+
+/// Patch `status.manualRun` from the TYPED struct (never hand-written field
+/// names — the structural schema silently prunes typos), and only when it
+/// actually changes, so a terminal requested run does not hot-loop on its own
+/// status write.
+async fn patch_manual_run(
+    api: &Api<SnapshotReplication>,
+    repl: &SnapshotReplication,
+    name: &str,
+    manual: kopiur_api::common::ReplicationManualRunStatus,
+) -> Result<()> {
+    let current = repl
+        .status
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok());
+    io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "manualRun": manual }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// The stored `status.phase` label when it is one this build cannot read.
@@ -550,7 +807,7 @@ fn identity_sample(identities: &[String]) -> String {
 async fn idle_heal(
     ctx: &Context,
     repl: &SnapshotReplication,
-    job_api: &Api<Job>,
+    observed: RunObservation,
     namespace: &str,
     name: &str,
     dest: &ResolvedRepository,
@@ -568,8 +825,10 @@ async fn idle_heal(
     // them via `envFrom`; reap them between runs so no live copy of either
     // repository's Secrets lingers (they are re-projected at the next spawn).
     // Gated on no active Job — reaping under an Active Job would strand a
-    // retry pod in `CreateContainerConfigError` (the #103-class hazard).
-    if projection_enabled(repl) && !has_active_snapshot_replication_job(job_api, name).await? {
+    // retry pod in `CreateContainerConfigError` (the #103-class hazard). The
+    // answer comes from this reconcile's single Job LIST: this is the idle arm,
+    // so nothing has been spawned since it was taken.
+    if projection_enabled(repl) && !observed.has_active {
         reap_srepl_projections(ctx, repl, namespace, name).await;
     }
     Ok(())
@@ -733,6 +992,7 @@ async fn spawn_snapshot_replication_job(
     source: &ResolvedRepository,
     dest: &ResolvedRepository,
     slot: DateTime<Utc>,
+    trigger: ReplicationRunTrigger,
 ) -> Result<()> {
     // Defensive re-check of the admission rule (one validator, two callers): a
     // same-kind static/workload-identity auth mix would leak the static side's
@@ -762,11 +1022,10 @@ async fn spawn_snapshot_replication_job(
         SNAPSHOT_REPLICATION_INSTANCE_LABEL.to_string(),
         cr_name.to_string(),
     );
-    let mut annotations = BTreeMap::new();
-    annotations.insert(
-        SNAPSHOT_REPLICATION_SLOT_ANNOTATION.to_string(),
-        slot.to_rfc3339(),
-    );
+    // The slot the run covers, plus WHAT asked for it — the Job outlives the
+    // reconcile that made it, and the trigger has to survive with it for the
+    // outcome metric to attribute cron vs manual.
+    let annotations = run_job_annotations(SNAPSHOT_REPLICATION_SLOT_ANNOTATION, slot, trigger);
 
     // One migrate pod touches BOTH backends. It runs under the DEDICATED
     // snapshot-replication mover SA/role: this mover creates and deletes
@@ -1179,18 +1438,6 @@ fn snapshot_replication_job_name(cr: &str, slot: DateTime<Utc>) -> String {
         let trunc: String = cr.chars().take(keep).collect();
         format!("{trunc}-{hash}{suffix}")
     }
-}
-
-/// Whether any non-terminal snapshot-replication Job is owned by this CR
-/// (single-flight gate).
-async fn has_active_snapshot_replication_job(job_api: &Api<Job>, cr_name: &str) -> Result<bool> {
-    let selector = format!(
-        "{COMPONENT_LABEL}={SNAPSHOT_REPLICATION_COMPONENT},{SNAPSHOT_REPLICATION_INSTANCE_LABEL}={cr_name}"
-    );
-    let jobs = job_api
-        .list(&ListParams::default().labels(&selector))
-        .await?;
-    Ok(jobs.items.iter().any(|j| job_terminal_state(j).is_none()))
 }
 
 // --- status writer ------------------------------------------------------------
