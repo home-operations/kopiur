@@ -1578,17 +1578,28 @@ const WA_REPO: &str = "e2e-wa-repo";
 const WA_CFG: &str = "e2e-wa-cfg";
 const WA_BACKUP: &str = "e2e-wa-seed";
 const WA_RESTORE: &str = "e2e-r-waitanchor";
-/// The window under test. Deliberately SHORT so the "elapsed since creation" sleep below
-/// stays cheap — and long enough that, once the repository is released, the seed Snapshot
-/// (gated on the same repository, so its Job starts at the same moment) finishes inside it.
-const WA_WAIT_TIMEOUT: &str = "45s";
+/// The `waitTimeout` window under test, in seconds — the ONE literal this scenario's three
+/// time values derive from (`spec.policy.waitTimeout`, the parked sleep, and the
+/// "opened well after creation" bound), so they cannot drift apart.
+///
+/// Sized for the slow half of the scenario, not the fast half: once the repository is
+/// released, the seed Snapshot is gated on that SAME repository, so its mover Job only
+/// starts once the repo is Ready — the same instant the restore's window opens. The window
+/// must comfortably cover a cold kind Job (schedule + kopia snapshot + status write) so a
+/// slow node cannot turn the assertion into a false negative. The scenario itself only
+/// needs `window < park`, which [`WA_PARK_SECS`] guarantees.
+const WA_WINDOW_SECS: u64 = 180;
+/// How long the restore stays parked on the readiness gate. Strictly greater than
+/// [`WA_WINDOW_SECS`], so a creation-anchored window (the bug) is definitively spent by the
+/// time the repository is released.
+const WA_PARK_SECS: u64 = WA_WINDOW_SECS + 15;
 
 /// #380 — a `waitTimeout` window must not be spent while the restore CANNOT ACT.
 ///
 /// Shape: a `Repository` created `suspend: true` never connects, so it never reaches
 /// `Ready` and the Restore's repository-readiness gate holds the restore in `Pending`. The
-/// scenario parks there for longer than `waitTimeout`, then releases the repository and
-/// creates the source Snapshot.
+/// scenario parks there for longer than `waitTimeout` ([`WA_PARK_SECS`] > [`WA_WINDOW_SECS`]),
+/// then releases the repository and creates the source Snapshot.
 ///
 /// Pre-fix the window was anchored at `metadata.creationTimestamp`: by the time the gate
 /// opened it had already elapsed, so the `fromPolicy` source — whose `onMissingSnapshot`
@@ -1671,7 +1682,7 @@ async fn restore_wait_window_opens_when_the_repository_becomes_ready() {
         "spec": {
             "repository": { "kind": "Repository", "name": WA_REPO },
             "source": { "fromPolicy": { "name": WA_CFG } },
-            "policy": { "waitTimeout": WA_WAIT_TIMEOUT },
+            "policy": { "waitTimeout": format!("{WA_WINDOW_SECS}s") },
             "target": { "pvc": { "name": format!("{WA_RESTORE}-dst"), "capacity": "1Gi", "accessModes": ["ReadWriteOnce"] } }
         }
     });
@@ -1713,8 +1724,7 @@ async fn restore_wait_window_opens_when_the_repository_becomes_ready() {
     }
 
     // Park past the window. Anchored at creation (the bug), it is now spent.
-    let window = std::time::Duration::from_secs(45);
-    tokio::time::sleep(window + std::time::Duration::from_secs(15)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(WA_PARK_SECS)).await;
     let still_parked = status_json(&restores, WA_RESTORE).await;
     assert_eq!(
         still_parked.get("phase").and_then(|v| v.as_str()),
@@ -1765,10 +1775,12 @@ async fn restore_wait_window_opens_when_the_repository_becomes_ready() {
     let opened_at = chrono::DateTime::parse_from_rfc3339(&opened)
         .unwrap_or_else(|e| panic!("waitStartedAt {opened} must be RFC3339: {e}"))
         .timestamp();
+    let bound = i64::try_from(WA_WINDOW_SECS).expect("the window fits an i64");
     assert!(
-        opened_at - created_at > 45,
-        "the window must open when the restore could first PROCEED, well after creation \
-         (created at epoch {created_at}, opened at {opened})"
+        opened_at - created_at > bound,
+        "the window must open when the restore could first PROCEED, more than \
+         {WA_WINDOW_SECS}s after creation — a creation-anchored window would already have \
+         closed (created at epoch {created_at}, opened at {opened})"
     );
 
     // (2) ...so the restore actually waits for the snapshot instead of coming up empty.
