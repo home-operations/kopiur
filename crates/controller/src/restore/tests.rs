@@ -791,6 +791,47 @@ fn wait_window_opens_for_a_populator_only_once_a_claim_exists() {
     assert!(wait_window_opens(AwaitingClaim, true));
 }
 
+/// Parking inside the wait window reports the REAL blocker. An unclaimed populator reaches
+/// the wait branch (resolution runs while `AwaitingClaim`), and telling that user to read
+/// `status.waitStartedAt` — deliberately absent until a claim appears — points them at the
+/// wrong thing. It also never resolves on its own, so it takes the 30s awaiting-claim
+/// cadence rather than a permanent 15s poll.
+#[test]
+fn wait_park_report_names_the_blocker_and_picks_the_cadence() {
+    let (reason, msg, requeue) = wait_park_report(WaitWindow::Open(1000), Some("5m"), 240);
+    assert_eq!(reason, "WaitingForSnapshot");
+    assert!(msg.contains("no snapshot matched"), "{msg}");
+    assert!(msg.contains("waitTimeout (5m)"), "{msg}");
+    assert!(msg.contains("status.waitStartedAt"), "{msg}");
+    assert_eq!(requeue, 15, "the wait cadence is capped at 15s");
+    // ...but never past the deadline.
+    assert_eq!(wait_park_report(WaitWindow::Open(1000), Some("5m"), 3).2, 3);
+    assert_eq!(wait_park_report(WaitWindow::Open(1000), Some("5m"), 0).2, 1);
+
+    let (reason, msg, requeue) = wait_park_report(WaitWindow::AwaitingClaim(1000), Some("5m"), 240);
+    assert_eq!(reason, "AwaitingPvcDataSourceRef");
+    assert!(
+        msg.contains("dataSourceRef") && msg.contains("Create the claiming PVC"),
+        "the message must name the real blocker and the fix: {msg}"
+    );
+    assert!(
+        msg.contains("has NOT started"),
+        "it must say the window has not started, not imply a snapshot wait: {msg}"
+    );
+    assert!(
+        !msg.contains("no snapshot matched"),
+        "an unclaimed populator is not waiting on a snapshot: {msg}"
+    );
+    assert_eq!(
+        requeue, 30,
+        "the awaiting-claim cadence, not the wait cadence"
+    );
+
+    // Whichever state, the anchor the caller measures with is the one it carries.
+    assert_eq!(WaitWindow::Open(1000).anchor(), 1000);
+    assert_eq!(WaitWindow::AwaitingClaim(7).anchor(), 7);
+}
+
 /// A populator that no-op'd long ago and is then asked to populate a FRESHLY re-created
 /// claim must measure its `waitTimeout` from the re-open, not from an anchor spent on the
 /// previous claim — otherwise the window is already gone, and a `fromPolicy` source (which

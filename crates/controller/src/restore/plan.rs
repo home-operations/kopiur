@@ -437,6 +437,67 @@ pub(super) fn effective_wait_anchor(restore: &Restore, created_epoch: i64) -> i6
         .map_or(created_epoch, |at| created_epoch.max(at.timestamp()))
 }
 
+/// Where a Restore's `waitTimeout` window stands on this pass — the return of
+/// [`super::ensure_wait_anchor`], carried to the one place that parks on it. Closed so the
+/// "not open yet" state can never be silently reported as an ordinary snapshot wait: the
+/// two park with different messages AND different cadences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaitWindow {
+    /// Open, anchored at this epoch — `status.waitStartedAt` once stamped, else the
+    /// Restore's creation (which is also what an unconfigured window reads, where nothing
+    /// measures the anchor at all).
+    Open(i64),
+    /// Not opened: a `target.populator` with no PVC claiming it cannot proceed, so its
+    /// window has not started. Anchored at `now`, so the full window always remains.
+    AwaitingClaim(i64),
+}
+
+impl WaitWindow {
+    /// The epoch this pass measures `waitTimeout` from.
+    pub(super) fn anchor(self) -> i64 {
+        match self {
+            Self::Open(at) | Self::AwaitingClaim(at) => at,
+        }
+    }
+}
+
+/// How to park a restore that is still inside (or has not yet started) its wait: the
+/// condition `reason`, the actionable message, and the requeue cadence in seconds.
+///
+/// Exhaustive over [`WaitWindow`] because the two states are NOT interchangeable. An
+/// unclaimed populator is the state that most often reaches here — resolution runs while a
+/// populator is `AwaitingClaim` — and reporting it as an ordinary snapshot wait would point
+/// the user at `status.waitStartedAt`, which is deliberately absent until a claim appears.
+/// It also never resolves on its own, so it takes the awaiting-claim cadence (30s) rather
+/// than the wait cadence (≤15s, and never past the deadline). Pure.
+pub(super) fn wait_park_report(
+    window: WaitWindow,
+    wait_timeout: Option<&str>,
+    remaining: u64,
+) -> (&'static str, String, u64) {
+    match window {
+        WaitWindow::Open(_) => (
+            "WaitingForSnapshot",
+            format!(
+                "no snapshot matched the restore source yet; waiting up to waitTimeout \
+                 ({}) from when the wait window opened (status.waitStartedAt) for it to \
+                 appear before applying onMissingSnapshot",
+                wait_timeout.unwrap_or_default()
+            ),
+            remaining.clamp(1, 15),
+        ),
+        WaitWindow::AwaitingClaim(_) => (
+            "AwaitingPvcDataSourceRef",
+            "passive populator: no PersistentVolumeClaim claims this Restore yet \
+             (spec.dataSourceRef), so there is nothing to populate and the waitTimeout \
+             window has NOT started — it opens when a claim appears, and \
+             status.waitStartedAt records that instant. Create the claiming PVC to proceed."
+                .to_string(),
+            30,
+        ),
+    }
+}
+
 /// Whether the `waitTimeout` window may OPEN on this pass — i.e. whether the restore can
 /// actually proceed now that its repository is `Ready`. A direct target always can; a
 /// `target.populator` only once a PVC claims it, because resolution runs while the

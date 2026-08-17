@@ -268,13 +268,23 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         return Ok(action);
     }
 
-    // #380: the `waitTimeout` window opens HERE — on the first pass that clears the
+    // The claiming PVC, looked up ONCE per pass and shared by everything below that needs
+    // it: the wait-window anchor (a populator with no claim cannot proceed, so its window
+    // must not open) and `drive_populator_restore`'s handshake. A direct target never has
+    // one, and never pays for the LIST.
+    let consumer = match state {
+        PopulatorState::AwaitingClaim => claiming_pvc(ctx, &namespace, &name).await?,
+        PopulatorState::DirectTarget => None,
+    };
+
+    // #380: the `waitTimeout` window opens HERE — on the first pass that gets past the
     // readiness gate (and, for a populator, finds a claiming PVC) — not at the Restore's
-    // creation. The returned epoch is the anchor in effect for THIS pass and is what both
-    // waits below are measured from: the freshly stamped value rather than a re-read of
-    // `restore`, because the pass that OPENS the window is exactly the pass that must not
-    // measure it from creation.
-    let wait_anchor = ensure_wait_anchor(ctx, restore, &api, &namespace, &name, state).await?;
+    // creation. The returned window carries the anchor in effect for THIS pass, and is what
+    // both waits below are measured from: the freshly stamped value rather than a re-read
+    // of `restore`, because the pass that OPENS the window is exactly the pass that must
+    // not measure it from creation.
+    let wait_window =
+        ensure_wait_anchor(restore, &api, &namespace, &name, state, consumer.as_ref()).await?;
 
     let on_missing = effective_on_missing(
         restore
@@ -310,7 +320,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         // Deliberately unresolved this pass (see above).
         None if noop_already_bound => None,
         None => Some(
-            match resolve_snapshot(ctx, restore, &namespace, wait_anchor).await? {
+            match resolve_snapshot(ctx, restore, &namespace, wait_window.anchor()).await? {
                 Some(ResolveOutcome::Pinned(res)) => {
                     // Pin the FULL resolution (outcome + id + provenance + timestamp) exactly
                     // once; the no-pin check above makes this a single write, so it cannot
@@ -356,21 +366,20 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                         .policy
                         .as_ref()
                         .and_then(|p| p.wait_timeout.as_deref());
-                    if let Some(remaining) = wait_remaining_secs(wait_anchor, wait_timeout, now) {
-                        // Static message (no countdown): an identical re-patch is a
-                        // server-side no-op, so polling here cannot churn status.
-                        let msg = format!(
-                            "no snapshot matched the restore source yet; waiting up to \
-                             waitTimeout ({}) from when the wait window opened \
-                             (status.waitStartedAt) for it to appear before applying \
-                             onMissingSnapshot",
-                            wait_timeout.unwrap_or_default()
-                        );
+                    if let Some(remaining) =
+                        wait_remaining_secs(wait_window.anchor(), wait_timeout, now)
+                    {
+                        // Report the REAL blocker, at the cadence that state deserves
+                        // (`wait_park_report`, pure + exhaustive). Static messages (no
+                        // countdown): an identical re-patch is a server-side no-op, so
+                        // polling here cannot churn status.
+                        let (reason, msg, requeue) =
+                            wait_park_report(wait_window, wait_timeout, remaining);
                         let conditions = io::upsert_condition(
                             &existing_conditions(restore),
                             "Resolved",
                             false,
-                            "WaitingForSnapshot",
+                            reason,
                             &msg,
                             restore.metadata.generation,
                         );
@@ -381,14 +390,12 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                                 restore,
                                 &conditions,
                                 RestorePhase::Pending,
-                                "WaitingForSnapshot",
+                                reason,
                                 &msg,
                             ),
                         )
                         .await?;
-                        return Ok(Action::requeue(std::time::Duration::from_secs(
-                            remaining.clamp(1, 15),
-                        )));
+                        return Ok(Action::requeue(std::time::Duration::from_secs(requeue)));
                     }
                     // Window closed (or none configured): honor the closed enum exhaustively.
                     match on_missing {
@@ -467,7 +474,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                 Some(Resolution::Empty) => PopulatorWork::EmptyVolume,
                 None => PopulatorWork::Unresolved,
             };
-            drive_populator_restore(ctx, restore, &api, &namespace, &name, &work).await
+            drive_populator_restore(ctx, restore, &api, &namespace, &name, &work, consumer).await
         }
     }
 }
@@ -816,6 +823,12 @@ async fn park_awaiting_claim(
 /// PVC. [`PopulatorWork::Restore`] runs the mover into the prime (a deferred selector
 /// resolves in-Job, and may itself find no snapshot under `Continue` — then the prime stays
 /// empty).
+///
+/// `consumer` is the claiming PVC ([`claiming_pvc`]), resolved ONCE per reconcile by the
+/// caller and shared with [`ensure_wait_anchor`]: both need the same answer, and an
+/// unfiltered namespaced LIST per consumer is exactly the read amplification a fleet of
+/// standing populator `Restore`s cannot afford.
+#[allow(clippy::too_many_arguments)]
 async fn drive_populator_restore(
     ctx: &Context,
     restore: &Restore,
@@ -823,20 +836,11 @@ async fn drive_populator_restore(
     namespace: &str,
     name: &str,
     work: &PopulatorWork,
+    consumer: Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>,
 ) -> Result<Action> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
-
-    // The claiming PVC: one in this namespace whose dataSourceRef targets this
-    // Restore. (dataSourceRef is namespace-local; a cross-namespace claim would need
-    // a ReferenceGrant, out of scope here.)
-    let consumer = pvc_api
-        .list(&kube::api::ListParams::default())
-        .await?
-        .items
-        .into_iter()
-        .find(|pvc| pvc_claims_restore(pvc, name));
 
     let Some(consumer) = consumer else {
         park_awaiting_claim(
@@ -3488,13 +3492,20 @@ async fn gate_on_repository_readiness(
     }
 }
 
-/// Open the `waitTimeout` window if it is not open yet, and return the anchor epoch in
-/// effect for THIS pass (#380).
+/// Open the `waitTimeout` window if it is not open yet, and return where it stands for
+/// THIS pass (#380).
 ///
-/// The window is stamped ONCE, into `status.waitStartedAt`, on the first pass that has
-/// cleared [`gate_on_repository_readiness`] **and** — for a `target.populator` — found a
-/// PVC that actually claims this Restore. Both halves matter, and both are about a
-/// restore that cannot yet do anything measuring a window it will need later:
+/// The window is stamped ONCE, into `status.waitStartedAt`, on the first pass that gets
+/// PAST [`gate_on_repository_readiness`] **and** — for a `target.populator` — has a PVC
+/// claiming this Restore (`consumer`). "Past the gate" is what the code enforces, and it is
+/// weaker than "the repository is Ready": the gate also declines to hold a restore whose
+/// mover Job is already live or settled ([`restore_awaiting_launch`]), and one whose
+/// `Repository` OBJECT is missing outright. Stamping in those cases is harmless — a live
+/// Job keeps the deadline it was dispatched with — and the ordering still guarantees the
+/// thing that matters: a restore parked waiting for its backend never opens a window.
+///
+/// Both halves of the condition are about a restore that cannot yet do anything measuring
+/// a window it will need later:
 /// - **Repository readiness.** A `Restore` applied by GitOps alongside its `Repository`
 ///   sits on the gate until the backend comes up. Anchored at creation, an outage longer
 ///   than `waitTimeout` means the first pass that reaches resolution already finds the
@@ -3504,26 +3515,25 @@ async fn gate_on_repository_readiness(
 ///   standing populator `Restore` created months before anything claims it would burn its
 ///   whole window sitting idle and pin `Empty` the moment a claim finally appears.
 ///
-/// Returns the *effective* anchor rather than relying on the caller re-reading the CR: on
-/// the pass that opens the window the stamp is not on the `restore` we were handed, and
-/// that is precisely the pass that must not fall back to the creation timestamp. While
-/// the window is not open yet (populator with no claim) the anchor is `now`, so the full
-/// window always remains — never the creation timestamp, which is the bug itself.
+/// Returns the *effective* window rather than relying on the caller re-reading the CR: on
+/// the pass that opens it the stamp is not on the `restore` we were handed, and that is
+/// precisely the pass that must not fall back to the creation timestamp.
+/// [`WaitWindow::AwaitingClaim`] anchors at `now`, so the full window always remains — and
+/// tells the parking caller to report the claim, not a phantom snapshot wait.
 ///
 /// Writes NOTHING but `waitStartedAt`: the conditions array is replaced wholesale by a
 /// merge patch, so a second conditions writer in one reconcile would erase the first.
 ///
-/// No window configured ⇒ no anchor and no claim probe: the value is only ever read
-/// through `waitTimeout`, and skipping it keeps a parked populator's per-pass cost
-/// unchanged.
+/// No window configured ⇒ no anchor stamped: the value is only ever read through
+/// `waitTimeout`, so a `Restore` without one carries no `status.waitStartedAt` at all.
 async fn ensure_wait_anchor(
-    ctx: &Context,
     restore: &Restore,
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
     state: PopulatorState,
-) -> Result<i64> {
+    consumer: Option<&k8s_openapi::api::core::v1::PersistentVolumeClaim>,
+) -> Result<WaitWindow> {
     let now = chrono::Utc::now();
     let created = restore
         .metadata
@@ -3538,10 +3548,14 @@ async fn ensure_wait_anchor(
         .as_ref()
         .is_some_and(|s| s.wait_started_at.is_some())
     {
-        return Ok(effective_wait_anchor(restore, created));
+        return Ok(WaitWindow::Open(effective_wait_anchor(restore, created)));
     }
-    // No `waitTimeout` ⇒ nothing measures a window; don't stamp one (or probe for a
-    // claim). `wait_remaining_secs`/`wait_deadline_rfc3339` both return `None` here.
+    // A populator with nothing claiming it cannot proceed, so its window has not opened.
+    if !wait_window_opens(state, consumer.is_some()) {
+        return Ok(WaitWindow::AwaitingClaim(now.timestamp()));
+    }
+    // No `waitTimeout` ⇒ nothing measures a window; don't stamp one.
+    // `wait_remaining_secs`/`wait_deadline_rfc3339` both return `None` here.
     if restore
         .spec
         .policy
@@ -3549,38 +3563,35 @@ async fn ensure_wait_anchor(
         .and_then(|p| p.wait_timeout.as_deref())
         .is_none()
     {
-        return Ok(created);
-    }
-    // A populator with nothing claiming it cannot proceed, so its window has not opened:
-    // anchor at `now` (full window remains) and re-check next pass. The LIST is lazy —
-    // only a populator's answer is ever consulted.
-    let has_claiming_pvc = match state {
-        PopulatorState::AwaitingClaim => claiming_pvc_exists(ctx, namespace, name).await?,
-        PopulatorState::DirectTarget => false,
-    };
-    if !wait_window_opens(state, has_claiming_pvc) {
-        return Ok(now.timestamp());
+        return Ok(WaitWindow::Open(created));
     }
     let at = now.to_rfc3339();
     tracing::debug!(%namespace, restore = %name, wait_started_at = %at, "waitTimeout window opened");
     io::patch_status(api, name, serde_json::json!({ "waitStartedAt": at })).await?;
-    Ok(now.timestamp())
+    Ok(WaitWindow::Open(now.timestamp()))
 }
 
-/// Whether any PVC in `namespace` claims this Restore via `spec.dataSourceRef`
-/// ([`pvc_claims_restore`]) — the populator half of [`ensure_wait_anchor`]'s
-/// "can this restore actually proceed?" question. Same LIST
-/// [`drive_populator_restore`] does, and only ever reached while the window is
-/// unopened AND a `waitTimeout` is configured.
-async fn claiming_pvc_exists(ctx: &Context, namespace: &str, name: &str) -> Result<bool> {
+/// The PVC in `namespace` that claims this Restore via `spec.dataSourceRef`
+/// ([`pvc_claims_restore`]), if any. (`dataSourceRef` is namespace-local; a cross-namespace
+/// claim would need a ReferenceGrant, out of scope here.)
+///
+/// Resolved ONCE per reconcile by `reconcile_inner` and shared by [`ensure_wait_anchor`]
+/// and [`drive_populator_restore`] — this unfiltered namespaced LIST is the populator
+/// path's per-pass cost, and a fleet of standing populator `Restore`s must not pay it
+/// twice.
+async fn claiming_pvc(
+    ctx: &Context,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
     Ok(pvc_api
         .list(&kube::api::ListParams::default())
         .await?
         .items
-        .iter()
-        .any(|pvc| pvc_claims_restore(pvc, name)))
+        .into_iter()
+        .find(|pvc| pvc_claims_restore(pvc, name)))
 }
 
 /// Map a resolved repository backend to the mover connect spec for a restore.
