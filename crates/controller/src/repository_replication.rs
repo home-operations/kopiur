@@ -89,11 +89,12 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     // - Nothing below READS `status.phase` — no branch, no gate, no dedupe — so
     //   an unreadable value changes no behavior: the replication keeps running
     //   its schedule normally.
-    // - Nothing below promptly rewrites it either. Only the suspended and
-    //   Job-failed paths pass a phase at all (and both go through
+    // - Nothing below promptly rewrites it either. Only the suspended path and
+    //   the failure paths (a failed Job, or an idle pass carrying a stall from
+    //   a requested run) pass a phase at all (and both go through
     //   `patch_ready_if_changed`, which short-circuits when the `Ready`
-    //   condition is unchanged); the waiting/idle/in-flight paths pass
-    //   `phase: None` or do not patch, and the terminal `Succeeded`/`Failed`
+    //   condition is unchanged); the waiting, healthy-idle and in-flight paths
+    //   pass `phase: None` or do not patch, and the terminal `Succeeded`/`Failed`
     //   stamp comes from the mover at the END of a run. So the value PERSISTS —
     //   potentially a whole schedule interval, until the next run stamps over it.
     //
