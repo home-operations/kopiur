@@ -62,6 +62,11 @@ fn srepl_job_selector(name: &str) -> String {
     format!("app.kubernetes.io/component=snapshot-replication,{SNAPSHOT_REPLICATION_LABEL}={name}")
 }
 
+/// The `Repository` API in the e2e namespace.
+fn repos_api(client: &Client) -> Api<Repository> {
+    Api::namespaced(client.clone(), E2E_NAMESPACE)
+}
+
 /// This replication's copy `Snapshot` CRs at the destination — the exact
 /// three-label conjunction the mover stamps at birth AND uses as its pruning
 /// candidate set (labels-at-birth contract).
@@ -1163,6 +1168,152 @@ async fn snapshot_replication_suspend_holds_slots() {
         }
         tokio::time::sleep(poll_interval()).await;
     }
+
+    let _ = repls.delete(REPL, &DeleteParams::default()).await;
+}
+
+/// Issue #380: an ON-DEMAND copy pass, requested with the `run-requested`
+/// annotation, on a replication whose cron will not fire for months.
+///
+/// The far-future schedule (`0 5 1 1 *` — 05:00 on 1 January) is what makes
+/// this a proof rather than a coincidence: no slot can come due, so a stamped
+/// `lastReplicated` can only have come from the annotation. It pins the halves
+/// a unit test cannot reach — the requested run rides the ordinary two-password
+/// `kopia snapshot migrate` path (copies really land at the destination), and
+/// `status.manualRun` answers the exact timestamp requested.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn snapshot_replication_runs_on_demand_from_the_run_requested_annotation() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    const REPO_SRC: &str = "e2e-srepl-run-src";
+    const REPO_DST: &str = "e2e-srepl-run-dst";
+    const REPL: &str = "e2e-srepl-run";
+
+    // A source with real snapshot history to copy.
+    ensure_seed(
+        &client,
+        REPO_SRC,
+        "e2e-srepl-run-policy",
+        "e2e-srepl-run-seed",
+        "srepl-run-src",
+    )
+    .await;
+    ensure_dest_repo(
+        &client,
+        REPO_DST,
+        "srepl-run-dst",
+        CREDS_SECRET,
+        serde_json::json!({}),
+    )
+    .await;
+
+    let repls: Api<SnapshotReplication> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    create_idempotent(
+        &repls,
+        &cr(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotReplication",
+            "metadata": { "name": REPL, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "sourceRef": { "kind": "Repository", "name": REPO_SRC },
+                "destinationRef": { "kind": "Repository", "name": REPO_DST },
+                // Months away: no cron slot can fire during this test.
+                "schedule": { "cron": "0 5 1 1 *" }
+            }
+        })),
+        "create SnapshotReplication with a far-future schedule",
+    )
+    .await;
+
+    // Nothing should have run yet — otherwise the assertion below would pass on
+    // a cron slot and prove nothing about the annotation.
+    let before = status_json(&repls, REPL).await;
+    assert!(
+        before.get("lastReplicated").is_none(),
+        "a far-future schedule must not have replicated yet; status: {before}"
+    );
+
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    repls
+        .patch(
+            REPL,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": {
+                    kopiur_api::consts::RUN_REQUESTED_ANNOTATION: requested_at
+                } }
+            })),
+        )
+        .await
+        .expect("annotate the replication with a run request");
+
+    wait_until(
+        "an annotation-requested snapshot-replication run stamps status.lastReplicated",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, REPL).await;
+            Ok(s.get("lastReplicated")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|_| ()))
+        },
+    )
+    .await
+    .expect("the requested run should execute and stamp status.lastReplicated");
+
+    let manual = wait_until(
+        "status.manualRun reaches a terminal phase",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, REPL).await;
+            Ok(s.get("manualRun")
+                .and_then(|m| m.get("phase").and_then(|p| p.as_str()).map(|_| m.clone())))
+        },
+    )
+    .await
+    .expect("the controller should record status.manualRun");
+    assert_eq!(
+        manual.get("phase").and_then(|v| v.as_str()),
+        Some("Succeeded"),
+        "manualRun: {manual}"
+    );
+    assert_eq!(
+        manual.get("requestedAt").and_then(|v| v.as_str()),
+        Some(requested_at.as_str()),
+        "manualRun must pin the timestamp that was requested; got {manual}"
+    );
+
+    // The copies really landed: the requested run did exactly the work a
+    // scheduled one would, through the same mover.
+    let dest_uid = repos_api(&client)
+        .get(REPO_DST)
+        .await
+        .expect("get destination Repository")
+        .uid()
+        .expect("destination Repository has a uid");
+    let copies = wait_until(
+        "the requested run's copies materialize as replicated Snapshot CRs",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let client = client.clone();
+            let dest_uid = dest_uid.clone();
+            async move {
+                let rows = copy_rows(&client, REPL, &dest_uid).await;
+                Ok((!rows.is_empty()).then_some(rows))
+            }
+        },
+    )
+    .await
+    .expect("a successful requested run must materialize copy Snapshot CRs at the destination");
+    assert!(!copies.is_empty());
 
     let _ = repls.delete(REPL, &DeleteParams::default()).await;
 }

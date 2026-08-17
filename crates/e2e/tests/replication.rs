@@ -10,7 +10,7 @@ mod common;
 use common::*;
 
 use kube::Api;
-use kube::api::{DeleteParams, ListParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -366,4 +366,133 @@ async fn repository_replication_s3_to_s3_uses_destination_scoped_credentials() {
 
     let _ = repls.delete(name, &DeleteParams::default()).await;
     let _ = repos.delete(src, &DeleteParams::default()).await;
+}
+
+/// Issue #380: an ON-DEMAND run, requested with the `run-requested`
+/// annotation, on a replication whose cron will not fire for months.
+///
+/// The far-future schedule (`0 5 1 1 *` — 05:00 on 1 January) is the whole
+/// point: nothing but the annotation can produce a run, so `lastReplicated`
+/// stamping proves the REQUEST drove it rather than a slot that happened to
+/// come due. It also pins the two halves of the contract that a unit test
+/// cannot reach — that the requested run rides the ordinary mover path (a real
+/// `sync-to` into a real destination), and that `status.manualRun` answers the
+/// exact timestamp that was asked for.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn repository_replication_runs_on_demand_from_the_run_requested_annotation() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    ensure_seed(
+        &client,
+        "e2e-repl-run-src",
+        "e2e-repl-run-policy",
+        "e2e-repl-run-seed",
+        "repl-run-src",
+    )
+    .await;
+    ensure_repo(&client, "repl-run-dst").await;
+
+    let repls: Api<RepositoryReplication> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let name = "e2e-repl-run";
+    repls
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "RepositoryReplication",
+                "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "sourceRef": { "kind": "Repository", "name": "e2e-repl-run-src" },
+                    "destination": { "filesystem": { "path": "/repo-dst", "volume": { "pvc": { "name": consts::isolated_repo_pvc("repl-run-dst") } } } },
+                    // Months away: no cron slot can fire during this test.
+                    "schedule": { "cron": "0 5 1 1 *" }
+                }
+            })),
+        )
+        .await
+        .expect("create RepositoryReplication with a far-future schedule");
+
+    // Nothing should have run yet — otherwise the assertion below would pass
+    // on a cron slot and prove nothing about the annotation.
+    let before = status_json(&repls, name).await;
+    assert!(
+        before.get("lastReplicated").is_none(),
+        "a far-future schedule must not have replicated yet; status: {before}"
+    );
+
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    repls
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": {
+                    kopiur_api::consts::RUN_REQUESTED_ANNOTATION: requested_at
+                } }
+            })),
+        )
+        .await
+        .expect("annotate the replication with a run request");
+
+    // The requested run goes through the ordinary mover path, so success means
+    // a real `sync-to` completed: the mover stamps `lastReplicated`…
+    wait_until(
+        "an annotation-requested replication run stamps status.lastReplicated",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, name).await;
+            Ok(s.get("lastReplicated")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|_| ()))
+        },
+    )
+    .await
+    .expect("the requested run should execute and stamp status.lastReplicated");
+
+    // …and the controller answers the EXACT request in status.manualRun.
+    let manual = wait_until(
+        "status.manualRun reaches a terminal phase",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, name).await;
+            Ok(s.get("manualRun")
+                .and_then(|m| m.get("phase").and_then(|p| p.as_str()).map(|_| m.clone())))
+        },
+    )
+    .await
+    .expect("the controller should record status.manualRun");
+    assert_eq!(
+        manual.get("phase").and_then(|v| v.as_str()),
+        Some("Succeeded"),
+        "manualRun: {manual}"
+    );
+    assert_eq!(
+        manual.get("requestedAt").and_then(|v| v.as_str()),
+        Some(requested_at.as_str()),
+        "manualRun must pin the timestamp that was requested; got {manual}"
+    );
+    assert!(
+        manual
+            .get("completedAt")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "a terminal manual run must record completedAt; got {manual}"
+    );
+
+    // The destination really received the snapshot — the requested run did the
+    // same work a scheduled one would.
+    let count = observed_snapshot_count(&client, "e2e-repl-run-verify", "repl-run-dst").await;
+    assert!(
+        count >= 1,
+        "the destination repository must hold the mirrored snapshot, got {count}"
+    );
+
+    let _ = repls.delete(name, &DeleteParams::default()).await;
 }
