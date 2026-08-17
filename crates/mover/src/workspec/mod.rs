@@ -755,6 +755,30 @@ pub struct SeedOpSpec {
     /// seeding nothing and reporting `Ready` — the failure mode #380 is about.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_empty_source: bool,
+    /// RESUME a seed a previous attempt started but did not finish: re-run the
+    /// copy even though this repository's backend is already initialized.
+    ///
+    /// Without this, an interrupted seed is unrecoverable-by-retry and silently
+    /// wrong. A seed that dies after initializing the backend — a `sync-to`
+    /// killed by the Job deadline, an OOM, a migrate whose `repository create`
+    /// landed before the copy failed — leaves a repository that the NEXT
+    /// bootstrap connects to successfully. The seed then reports itself the
+    /// documented `AlreadyInitialized` no-op and the repository goes `Ready`
+    /// with partial history (or none). Resuming is what makes the retry
+    /// actually retry.
+    ///
+    /// The controller sets it (issue #380 stage C3) from a durable
+    /// seed-attempt marker it stamps BEFORE creating a seeding bootstrap Job:
+    /// marker present and `status.seed.seededAt` absent ⇒ a previous attempt
+    /// started and never finished ⇒ `resume: true`. A repository with NO marker
+    /// is an ordinary adoption — its backend was initialized by someone else —
+    /// and keeps the no-clobber `AlreadyInitialized` path.
+    ///
+    /// Both copies are safe to re-run: `sync-to` is incremental (it copies only
+    /// blobs the destination lacks) and `snapshot migrate` is idempotent by
+    /// `(SourceInfo, StartTime)`. Absent on old work specs (serde default).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume: bool,
 }
 
 impl SeedOpSpec {
@@ -766,24 +790,33 @@ impl SeedOpSpec {
     /// The [`SyncToOptions`](kopiur_kopia::SyncToOptions) for the blob-mode
     /// `sync-to`, from the carried tuning (absent ⇒ kopia's own defaults).
     ///
-    /// Two options are FIXED rather than exposed, because a seed writes into a
-    /// repository that does not exist yet:
-    /// * `must_exist: Some(false)` — initializing the destination's format blob
-    ///   IS the operation. Rendered explicitly (`--no-must-exist`) rather than
-    ///   relying on kopia's default, so a future default flip cannot turn every
-    ///   seed into a failure.
-    /// * `delete_extra: false` — there is nothing at the destination to prune,
-    ///   and `--delete` against a mis-pointed destination is the one flag that
-    ///   could destroy data.
+    /// `local_initialized` says whether THIS repository's backend already holds
+    /// a kopia format blob — false on a first seed into an empty backend, true
+    /// when resuming into one a previous attempt started.
     ///
-    /// `times`/`update` stay `None` (kopia's defaults): with no prior copy at
-    /// the destination there is nothing to compare against.
-    pub fn sync_options(&self) -> kopiur_kopia::SyncToOptions {
+    /// Two options are FIXED rather than exposed:
+    /// * `must_exist: Some(local_initialized)` — a FIRST seed must be allowed to
+    ///   initialize the destination (that IS the operation), while a RESUME must
+    ///   NOT: the format blob is there, and if it has vanished between the
+    ///   connect and the copy something is wrong enough that quietly
+    ///   re-initializing would be the wrong answer. Rendered explicitly either
+    ///   way (`--no-must-exist` / `--must-exist`) rather than relying on kopia's
+    ///   default, so a future default flip cannot turn every seed into a
+    ///   failure — pinned against the real binary by the `sync_to_seeds_*`
+    ///   integration test.
+    /// * `delete_extra: false` — a seed never prunes. On a first seed there is
+    ///   nothing at the destination to prune; on a resume the destination holds
+    ///   the previous attempt's partial copy, and `--delete` is the one flag that
+    ///   could destroy it.
+    ///
+    /// `times`/`update` stay `None` (kopia's defaults): kopia already skips blobs
+    /// the destination has, which is exactly what makes a resume incremental.
+    pub fn sync_options(&self, local_initialized: bool) -> kopiur_kopia::SyncToOptions {
         let sync = self.sync.unwrap_or_default();
         kopiur_kopia::SyncToOptions {
             parallel: sync.parallel,
             delete_extra: false,
-            must_exist: Some(false),
+            must_exist: Some(local_initialized),
             times: None,
             update: None,
             max_download_speed_bytes_per_second: sync.max_download_speed_bytes_per_second,

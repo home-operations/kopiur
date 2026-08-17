@@ -1582,12 +1582,24 @@ impl KopiaClient {
     }
 
     /// List EVERY snapshot in the repository regardless of owning identity
-    /// (`kopia snapshot list --json --all`). The unfiltered
-    /// [`Self::snapshot_list`] never passes `--all`, so kopia scopes it to the
-    /// CONNECTED identity's snapshots and foreign identities (e.g. rows
-    /// migrated from another repository under their original `user@host`) can
-    /// be missed entirely. Replication enumeration and post-migrate
-    /// verification must use this.
+    /// (`kopia snapshot list --json --all`).
+    ///
+    /// **What `--all` actually does** (verified against kopia 0.23.1, whose help
+    /// text — "Show all snapshots (not just current username/host)" — reads more
+    /// broadly than the behavior): the flag only takes effect when a `<source>`
+    /// positional is supplied. A *source-less* `snapshot list --json` already
+    /// returns every identity in the repository, foreign ones included; it is
+    /// NOT scoped to the connected `user@host`. So [`Self::snapshot_list`] with
+    /// `filter: None` is not, today, the identity-scoped call the flag name
+    /// suggests.
+    ///
+    /// Use this one anyway wherever the count or the set is load-bearing —
+    /// replication enumeration, post-migrate verification, the `spec.seed`
+    /// empty-repository backstop. Those are decisions that strand or accept a
+    /// repository, and none of them should rest on a kopia default that could
+    /// change without the flag name changing with it. The behavior above is
+    /// pinned by the `sync_to_seeds_*` integration test, which asserts a
+    /// foreign-identity-only repository lists its snapshots BOTH ways.
     pub async fn snapshot_list_all(&self) -> Result<Vec<SnapshotListEntry>, KopiaError> {
         self.run_json(&snapshot_list_all_args(), "snapshot list --all")
             .await

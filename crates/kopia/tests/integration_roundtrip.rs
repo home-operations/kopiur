@@ -839,6 +839,34 @@ async fn sync_to_seeds_an_empty_backend_from_a_readonly_source_connect() {
          restores is unreachable by identity/fromPolicy"
     );
 
+    // (d2) …and the UNFILTERED listing sees it too, from a client connected as
+    // some entirely different `user@host`. Two things rest on this and would
+    // fail silently if a kopia release ever scoped a source-less
+    // `snapshot list` to the connected identity the way its `--all` help text
+    // suggests:
+    //
+    //   * the bootstrap catalog scan (`snapshot_list(None)`) would report ZERO
+    //     for every seeded repository and materialize no discovered Snapshot
+    //     CRs — the seeded history would be invisible to kopiur;
+    //   * the `spec.seed` empty-repository backstop would have to be the only
+    //     thing standing between that and a `Ready` empty repository.
+    //
+    // The backstop deliberately calls `snapshot_list_all` so it survives such a
+    // change; this assertion is what would tell us the change happened.
+    let unfiltered = seeded
+        .snapshot_list(None)
+        .await
+        .expect("list the seeded repository without --all");
+    assert_eq!(
+        unfiltered.len(),
+        1,
+        "a source-less `snapshot list` must still return FOREIGN identities \
+         (kopia 0.23.1: `--all` only narrows when a <source> positional is \
+         given). If this fails, kopia changed: the bootstrap catalog scan now \
+         misses every seeded snapshot and must move to snapshot_list_all"
+    );
+    assert_eq!(unfiltered[0].source.identity(), "seeduser@seedhost:/data");
+
     // (e) ...and it arrived owned by the DEAD cluster's operator, which is why
     // the mover restamps a just-seeded repository unconditionally.
     let info = seeded

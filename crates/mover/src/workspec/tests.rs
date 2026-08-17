@@ -2369,6 +2369,7 @@ fn blob_seed() -> SeedOpSpec {
         }),
         migrate: None,
         allow_empty_source: false,
+        resume: false,
     }
 }
 
@@ -2390,6 +2391,7 @@ fn migrate_seed() -> SeedOpSpec {
             policies: PolicyCopyModeSpec::Copy,
         }),
         allow_empty_source: true,
+        resume: false,
     }
 }
 
@@ -2455,31 +2457,63 @@ fn seed_connect_returns_the_backend_for_either_mode() {
 }
 
 #[test]
-fn seed_sync_options_fix_must_exist_off_and_never_delete() {
-    // `must_exist: Some(false)` is rendered EXPLICITLY (`--no-must-exist`)
-    // rather than left to kopia's default: initializing the destination is the
-    // whole operation, and a future default flip must not turn every seed into
-    // a failure. `delete_extra` is hard `false` — there is nothing at an
-    // uninitialized destination to prune, and `--delete` at a mis-pointed one
-    // is the single flag that could destroy data.
-    let opts = blob_seed().sync_options();
-    assert_eq!(opts.must_exist, Some(false));
-    assert!(!opts.delete_extra);
-    assert_eq!(opts.parallel, Some(8));
-    assert_eq!(opts.max_download_speed_bytes_per_second, Some(20_000_000));
-    // No prior copy at the destination ⇒ nothing to compare against.
-    assert_eq!(opts.times, None);
-    assert_eq!(opts.update, None);
+fn seed_sync_options_track_whether_the_destination_already_exists() {
+    // `must_exist` is rendered EXPLICITLY either way rather than left to
+    // kopia's default, and it follows the DESTINATION's state, not the resume
+    // flag: a first seed must be allowed to initialize the backend (that IS the
+    // operation), a resume into an existing one must not.
+    let first = blob_seed().sync_options(false);
+    assert_eq!(first.must_exist, Some(false));
+    let resumed = blob_seed().sync_options(true);
+    assert_eq!(resumed.must_exist, Some(true));
+
+    // `delete_extra` is hard `false` in BOTH: on a first seed there is nothing
+    // to prune, and on a resume the destination holds the previous attempt's
+    // partial copy, which `--delete` is the one flag that could destroy.
+    assert!(!first.delete_extra);
+    assert!(!resumed.delete_extra);
+
+    // Tuning still flows through, and `times`/`update` stay at kopia's defaults
+    // — kopia already skips blobs the destination has, which is exactly what
+    // makes a resume incremental.
+    assert_eq!(first.parallel, Some(8));
+    assert_eq!(first.max_download_speed_bytes_per_second, Some(20_000_000));
+    assert_eq!(first.times, None);
+    assert_eq!(first.update, None);
 
     // The same two invariants hold with NO tuning block at all.
     let bare = SeedOpSpec {
         sync: None,
         ..blob_seed()
     };
-    let opts = bare.sync_options();
-    assert_eq!(opts.must_exist, Some(false));
-    assert!(!opts.delete_extra);
-    assert_eq!(opts.parallel, None);
+    assert_eq!(bare.sync_options(false).must_exist, Some(false));
+    assert_eq!(bare.sync_options(true).must_exist, Some(true));
+    assert!(!bare.sync_options(false).delete_extra);
+    assert_eq!(bare.sync_options(false).parallel, None);
+}
+
+#[test]
+fn resume_rides_the_wire_and_defaults_off_on_old_specs() {
+    // A work spec stamped before the resume edge existed carries no key and
+    // must decode to "do not re-run over an existing repository" — the
+    // conservative half. The controller opts in per attempt (issue #380 C3).
+    let op: SeedOpSpec = serde_json::from_value(serde_json::json!({
+        "from": { "backend": { "filesystem": { "path": "/mnt/mirror" } } },
+        "sourceDescription": "Filesystem"
+    }))
+    .unwrap();
+    assert!(!op.resume);
+    // …and stays absent from the wire at its default, so an older mover parses
+    // what a newer controller writes.
+    assert!(serde_json::to_value(&op).unwrap().get("resume").is_none());
+
+    let resuming = SeedOpSpec {
+        resume: true,
+        ..blob_seed()
+    };
+    let v = serde_json::to_value(&resuming).unwrap();
+    assert_eq!(v["resume"], true);
+    assert_eq!(serde_json::from_value::<SeedOpSpec>(v).unwrap(), resuming);
 }
 
 #[test]

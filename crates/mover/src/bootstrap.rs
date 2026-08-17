@@ -262,21 +262,31 @@ pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source is a kopia repos
 /// repository would go `Ready` with no history: exactly the failure #380
 /// exists to prevent, re-entered through the back door.
 ///
-/// Deliberately NOT retryable — unlike its source-side siblings, retrying finds
-/// the same initialized-and-empty repository forever. It needs a human: delete
-/// the half-initialized repository at the backend and let the seed re-run, or
-/// (if the repository really is meant to start empty) set `allowEmptySource`.
+/// **Retryable under the same resume contract as [`SEED_INCOMPLETE_CLASS`]**,
+/// and for the same reason: with `resume` the next bootstrap re-runs the copy
+/// against the already-initialized backend instead of reporting the
+/// `AlreadyInitialized` no-op, so an interrupted seed converges. Without
+/// `resume` a retry would find the same initialized-and-empty repository
+/// forever — so a controller that never sets it must treat this as terminal
+/// rather than spin on it.
+///
+/// The class is kept even though `resume` makes the underlying state
+/// recoverable: it is the assertion that stops a seed-armed bootstrap from
+/// reporting SUCCESS over an empty repository. Refusing is what turns a silent
+/// wrong answer into a visible, converging one.
 pub const SEED_LEFT_EMPTY_CLASS: &str = "SeedLeftEmpty";
 
 /// Stable, volatile-free actionable message for [`SEED_LEFT_EMPTY_CLASS`].
 pub const SEED_LEFT_EMPTY_MESSAGE: &str = "spec.seed is set and this repository is initialized but holds ZERO snapshots, so reporting \
      it Ready would hand you a repository with no history. This normally means an earlier seed \
      attempt initialized the backend and then failed (a mover killed by the Job deadline, an \
-     OOM, or a copy that errored after `repository create`) — the retry then finds a repository \
-     that already exists and has nothing to seed into. Check the bootstrap Job's earlier pod \
-     logs for the failed attempt, delete the half-initialized repository at the backend so the \
-     seed can run again, or — if this repository really is meant to start empty — set \
-     spec.seed.allowEmptySource: true";
+     OOM, or a copy that errored after `repository create`). Kopiur retries the seed itself — it \
+     records that an attempt started and resumes the copy on the next bootstrap, so no manual \
+     cleanup is needed and nothing at the backend should be deleted. If it keeps recurring, read \
+     the bootstrap Job's pod logs for why each attempt stops (a deadline too short for the \
+     repository's size is the usual cause — raise \
+     spec.seed.failurePolicy.activeDeadlineSeconds). If this repository really is meant to start \
+     out empty, set spec.seed.allowEmptySource: true";
 
 /// Whether a bootstrap must refuse to report success because a seed was armed
 /// yet the repository ends up empty. See [`SEED_LEFT_EMPTY_CLASS`] for the
@@ -302,9 +312,22 @@ pub fn seed_left_repository_empty(
 ///
 /// Mandatory because kopia's per-source migration goroutines only LOG their
 /// errors — a zero exit does NOT mean every snapshot arrived, so the
-/// destination listing is the only honest success signal. Retryable: migrate is
-/// idempotent by `(identity, startTime)`, so a retry copies only what is still
-/// missing.
+/// destination listing is the only honest success signal.
+///
+/// **Retryable, but ONLY under the resume contract.** `snapshot migrate` is
+/// idempotent by `(identity, startTime)`, so a retry copies just what is still
+/// missing — but a retry only *reaches* the copy if the next bootstrap runs the
+/// seed again. By the time this fires the local repository EXISTS, so the next
+/// connect succeeds and, without [`crate::workspec::SeedOpSpec::resume`], the
+/// seed would report the `AlreadyInitialized` no-op and the repository would go
+/// `Ready` carrying exactly the incomplete history this failure just refused.
+///
+/// The contract, therefore: **a controller that never sets `resume` must not
+/// treat this class as retryable.** The controller stamps a durable
+/// seed-attempt marker before creating a seeding Job and passes `resume: true`
+/// while that marker exists and `status.seed.seededAt` does not (issue #380
+/// stage C3). The marker is also the second lock — it is what keeps an
+/// interrupted seed from being mistaken for an ordinary adoption.
 pub const SEED_INCOMPLETE_CLASS: &str = "SeedIncomplete";
 
 /// The outcome of a seed that ran (or was skipped as already-initialized),
@@ -377,12 +400,17 @@ impl SeedOutcome {
     }
 }
 
-/// What the mover should do after its first bootstrap connect FAILED. Closed
-/// enum + exhaustive `match`: a new outcome cannot compile until every caller
-/// accounts for it, which for backup software is the difference between a
-/// declined create and a silently emptied repository.
+/// What the mover should do about initializing the repository, after its first
+/// bootstrap connect. Closed enum + exhaustive `match`: a new outcome cannot
+/// compile until every caller accounts for it, which for backup software is the
+/// difference between a declined create and a silently emptied repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapInitAction {
+    /// The repository is connected and usable as-is — initialize nothing and
+    /// carry on with the rest of the bootstrap. The ordinary connect-to-existing
+    /// outcome, and the one a standing (non-resuming) `spec.seed` gets on an
+    /// already-initialized repository.
+    Proceed,
     /// Do not initialize anything — report the failure. Covers a repository
     /// that exists but cannot be opened, a backend that denied or could not be
     /// reached, and the create/seed opt-outs.
@@ -390,34 +418,47 @@ pub enum BootstrapInitAction {
     /// Initialize an EMPTY repository here (`kopia repository create`), the
     /// pre-#380 `spec.create.enabled` fallback.
     Create,
-    /// Initialize this repository from `spec.seed`'s source.
+    /// Run `spec.seed`: either initializing this repository from its source, or
+    /// — when `resume` is set and the backend is already initialized —
+    /// finishing a copy a previous attempt started.
     Seed,
 }
 
-/// Decide how a failed first bootstrap connect is answered (issue #380). Pure,
-/// so the whole matrix is unit-tested without kopia.
+/// Decide how the first bootstrap connect is answered (issue #380). Pure, so
+/// the whole matrix is unit-tested without kopia.
 ///
-/// `uninitialized` is the caller's `notfound_is_uninitialized(stderr)` verdict:
-/// a `NotFound` is only "there is no repository here" when the backend ANSWERED
-/// and the format blob is absent. A missing path or unbound mount also
-/// classifies `NotFound` (`no such file or directory`), and treating that as an
-/// empty backend is how a mis-mounted volume would get seeded — or created —
-/// over.
+/// `connect_class` is `None` when the connect SUCCEEDED and `Some(class)` when
+/// it failed. `uninitialized` is the caller's
+/// `notfound_is_uninitialized(stderr)` verdict: a `NotFound` is only "there is
+/// no repository here" when the backend ANSWERED and the format blob is absent.
+/// A missing path or unbound mount also classifies `NotFound` (`no such file or
+/// directory`), and treating that as an empty backend is how a mis-mounted
+/// volume would get seeded — or created — over.
 ///
 /// The rules, in order:
 ///
-/// 1. `AuthFailure` / `Locked` / `AccessDenied` / `PermissionDenied` ⇒ [`Fail`](BootstrapInitAction::Fail).
-///    A repository exists here that we cannot open, another writer holds it, or
-///    the backend refused us. Creating would risk a second repository and
-///    seeding would write another cluster's data on top; both mask the real,
-///    fixable error.
-/// 2. Seed armed ⇒ [`Seed`](BootstrapInitAction::Seed), but ONLY on a genuinely
+/// 1. **The connect succeeded.** The repository exists and opens.
+///    * `resume` (with a seed armed) ⇒ [`Seed`](BootstrapInitAction::Seed): a
+///      previous attempt started a copy and did not finish it, so re-run it
+///      against the existing backend. Without this edge an interrupted seed is
+///      unrecoverable by retry — the retry connects fine, reports the
+///      `AlreadyInitialized` no-op, and the repository goes `Ready` with
+///      partial history.
+///    * otherwise ⇒ [`Proceed`](BootstrapInitAction::Proceed). A standing
+///      `spec.seed` over a repository someone else initialized is the
+///      documented no-op; clobbering it would be the opposite of safe.
+/// 2. `AuthFailure` / `Locked` / `AccessDenied` / `PermissionDenied` ⇒
+///    [`Fail`](BootstrapInitAction::Fail), whatever else is set. A repository
+///    exists here that we cannot open, another writer holds it, or the backend
+///    refused us. Creating would risk a second repository and seeding would
+///    write another cluster's data over a state we could not even read; both
+///    mask the real, fixable error.
+/// 3. Seed armed ⇒ [`Seed`](BootstrapInitAction::Seed), but ONLY on a genuinely
 ///    uninitialized `NotFound`. Anything else — an unreachable backend, an
 ///    unclassified error — is [`Fail`](BootstrapInitAction::Fail): a seed is a
-///    one-shot whole-repository copy, and the create fallback is deliberately
-///    NOT taken behind it (falling back would produce the empty repository
-///    #380 is about).
-/// 3. Otherwise the pre-#380 create gate: `auto_create` ⇒
+///    whole-repository copy, and the create fallback is deliberately NOT taken
+///    behind it (falling back would produce the empty repository #380 is about).
+/// 4. Otherwise the pre-#380 create gate: `auto_create` ⇒
 ///    [`Create`](BootstrapInitAction::Create), else
 ///    [`Fail`](BootstrapInitAction::Fail). kopia's own `create` refuses to
 ///    overwrite an existing repository, so this can never smash data.
@@ -429,33 +470,58 @@ pub enum BootstrapInitAction {
 /// use kopiur_kopia::KopiaErrorClass;
 /// use kopiur_mover::bootstrap::{BootstrapInitAction, bootstrap_init_action};
 ///
+/// // Connect succeeded, nothing to do.
+/// assert_eq!(
+///     bootstrap_init_action(false, false, true, None, false),
+///     BootstrapInitAction::Proceed
+/// );
+/// // Connect succeeded, a seed is armed but not resuming: the documented no-op.
+/// assert_eq!(
+///     bootstrap_init_action(true, false, false, None, false),
+///     BootstrapInitAction::Proceed
+/// );
+/// // Connect succeeded and we are RESUMING an interrupted seed: run it anyway.
+/// assert_eq!(
+///     bootstrap_init_action(true, true, false, None, false),
+///     BootstrapInitAction::Seed
+/// );
 /// // No seed, create enabled, repo genuinely absent ⇒ create an empty one.
 /// assert_eq!(
-///     bootstrap_init_action(false, true, KopiaErrorClass::NotFound, true),
+///     bootstrap_init_action(false, false, true, Some(KopiaErrorClass::NotFound), true),
 ///     BootstrapInitAction::Create
 /// );
 /// // Seed armed on the same miss ⇒ seed instead; create is never the fallback.
 /// assert_eq!(
-///     bootstrap_init_action(true, true, KopiaErrorClass::NotFound, true),
+///     bootstrap_init_action(true, false, true, Some(KopiaErrorClass::NotFound), true),
 ///     BootstrapInitAction::Seed
 /// );
 /// // A NotFound that is a missing mount, not an empty backend ⇒ never touch it.
 /// assert_eq!(
-///     bootstrap_init_action(true, true, KopiaErrorClass::NotFound, false),
+///     bootstrap_init_action(true, false, true, Some(KopiaErrorClass::NotFound), false),
 ///     BootstrapInitAction::Fail
 /// );
 /// // A repository we cannot open is never recreated and never seeded over.
 /// assert_eq!(
-///     bootstrap_init_action(true, true, KopiaErrorClass::AuthFailure, true),
+///     bootstrap_init_action(true, true, true, Some(KopiaErrorClass::AuthFailure), true),
 ///     BootstrapInitAction::Fail
 /// );
 /// ```
 pub fn bootstrap_init_action(
     seed_armed: bool,
+    resume: bool,
     auto_create: bool,
-    class: KopiaErrorClass,
+    connect_class: Option<KopiaErrorClass>,
     uninitialized: bool,
 ) -> BootstrapInitAction {
+    let Some(class) = connect_class else {
+        // The connect succeeded: the repository exists and opens. Only a
+        // RESUMING seed has work to do against it.
+        return if seed_armed && resume {
+            BootstrapInitAction::Seed
+        } else {
+            BootstrapInitAction::Proceed
+        };
+    };
     // Exhaustive, no `_ =>`: a new kopia error class must be classified here
     // before it can reach a repository-initializing decision.
     match class {
@@ -465,6 +531,10 @@ pub fn bootstrap_init_action(
         | KopiaErrorClass::PermissionDenied => BootstrapInitAction::Fail,
         KopiaErrorClass::NotFound => {
             if seed_armed {
+                // `resume` does not gate this arm: a marker-bearing repository
+                // whose backend turns out to be genuinely empty (the copy died
+                // before writing the format blob, or someone cleared it) still
+                // needs the seed run from the start.
                 if uninitialized {
                     BootstrapInitAction::Seed
                 } else {
@@ -480,8 +550,9 @@ pub fn bootstrap_init_action(
         | KopiaErrorClass::SourceError
         | KopiaErrorClass::Unknown => {
             // A seed never runs on an unclassified miss: the connect never got
-            // far enough to prove the backend is empty, and a whole-repository
-            // copy onto an unknown state is not a recoverable mistake.
+            // far enough to prove anything about the backend, and a
+            // whole-repository copy onto an unknown state is not a recoverable
+            // mistake.
             if seed_armed {
                 BootstrapInitAction::Fail
             } else if auto_create {
@@ -491,6 +562,34 @@ pub fn bootstrap_init_action(
             }
         }
     }
+}
+
+/// The [`SeedOutcome`] a bootstrap whose connect SUCCEEDED must report, or
+/// `None` when there is none to report.
+///
+/// Pure, and the testable core of the mover-skew invariant: **every seed-armed
+/// SUCCESS carries a `seed` block**, the standing no-op included, because its
+/// presence is what proves to the controller that this mover image understood
+/// `spec.seed` at all.
+///
+/// * no seed armed ⇒ `None` (nothing to acknowledge).
+/// * seed armed, NOT resuming ⇒ the `AlreadyInitialized` no-op: the repository
+///   was initialized by someone else and must not be clobbered.
+/// * seed armed and RESUMING ⇒ `None` **here**, because the seed is about to
+///   actually run ([`BootstrapInitAction::Seed`]) and will report what it did.
+///   Emitting the no-op alongside a real run is the one way this could report a
+///   seed that never happened.
+pub fn already_initialized_outcome(
+    seed: Option<&crate::workspec::SeedOpSpec>,
+) -> Option<SeedOutcome> {
+    let seed = seed?;
+    if seed.resume {
+        return None;
+    }
+    Some(SeedOutcome::already_initialized(
+        seed.mode(),
+        seed.source_description.clone(),
+    ))
 }
 
 /// The outcome of a bootstrap run, serialized into the work-spec `ConfigMap`.
@@ -747,13 +846,13 @@ impl BootstrapResult {
     }
 
     /// A terminal-failure outcome for "a seed was armed but this repository is
-    /// initialized and empty" ([`SEED_LEFT_EMPTY_CLASS`]). NOT retryable: unlike
-    /// its source-side siblings, a retry finds the same state forever.
+    /// initialized and empty" ([`SEED_LEFT_EMPTY_CLASS`]). Retryable **under the
+    /// resume contract** — see that constant.
     pub fn seed_left_empty() -> Self {
         BootstrapResult::sentinel(
             SEED_LEFT_EMPTY_CLASS,
             SEED_LEFT_EMPTY_MESSAGE.to_string(),
-            false,
+            true,
         )
     }
 
@@ -772,9 +871,10 @@ impl BootstrapResult {
                  arrive after `kopia snapshot migrate` (which exits 0 even when a per-source \
                  migration fails — see the bootstrap Job's pod logs for kopia's per-source \
                  errors). Missing (up to {cap} shown): {sample}. The bootstrap retries \
-                 automatically and migrate is idempotent by (identity, startTime), so a retry \
-                 copies only what is still missing; if it never converges, check the source \
-                 repository's health with `kopia snapshot verify`",
+                 automatically and migrate is idempotent by (identity, startTime), so it \
+                 resumes the copy and moves only what is still missing; if it never converges, \
+                 check the source repository's health with `kopia snapshot verify` and the \
+                 bootstrap Job's pod logs for kopia's per-source errors",
                 cap = crate::error::MISSING_SAMPLE_CAP
             ),
             true,
@@ -827,10 +927,12 @@ impl BootstrapResult {
 pub fn should_attempt_create(auto_create: bool, class: KopiaErrorClass) -> bool {
     // Delegates rather than restating the gate: [`bootstrap_init_action`] is the
     // single decision, and this is its `Create` arm. `seed_armed: false` (no
-    // seed is in play on this call), and `uninitialized` is then unread — it
-    // only ever selects between Seed and Fail.
+    // seed is in play on this call, so `resume` is moot too), and
+    // `uninitialized` is then unread — it only ever selects between Seed and
+    // Fail. `Some(class)` because a create decision only arises from a FAILED
+    // connect.
     matches!(
-        bootstrap_init_action(false, auto_create, class, false),
+        bootstrap_init_action(false, false, auto_create, Some(class), false),
         BootstrapInitAction::Create
     )
 }
@@ -854,6 +956,22 @@ mod tests {
         KopiaErrorClass::Unknown,
     ];
 
+    /// A blob seed fixture whose `resume` flag the caller chooses.
+    fn sample_seed(resume: bool) -> crate::workspec::SeedOpSpec {
+        crate::workspec::SeedOpSpec {
+            from: crate::workspec::SeedConnectSource::Backend(Box::new(
+                crate::workspec::RepositoryConnect::Filesystem {
+                    path: "/mnt/mirror".into(),
+                },
+            )),
+            source_description: "S3".into(),
+            sync: None,
+            migrate: None,
+            allow_empty_source: false,
+            resume,
+        }
+    }
+
     #[test]
     fn an_unopenable_repository_is_never_created_and_never_seeded_over() {
         // A repo exists here we can't open (wrong password), another writer
@@ -870,11 +988,13 @@ mod tests {
             for seed in [false, true] {
                 for create in [false, true] {
                     for uninit in [false, true] {
-                        assert_eq!(
-                            bootstrap_init_action(seed, create, class, uninit),
-                            BootstrapInitAction::Fail,
-                            "{class:?} seed={seed} create={create} uninit={uninit}"
-                        );
+                        for resume in [false, true] {
+                            assert_eq!(
+                                bootstrap_init_action(seed, resume, create, Some(class), uninit),
+                                BootstrapInitAction::Fail,
+                                "{class:?} seed={seed} resume={resume} create={create} uninit={uninit}"
+                            );
+                        }
                     }
                 }
             }
@@ -888,17 +1008,24 @@ mod tests {
         // file or directory"), and only kopia's "repository not initialized"
         // proves the backend answered and is simply empty.
         assert_eq!(
-            bootstrap_init_action(true, false, KopiaErrorClass::NotFound, true),
+            bootstrap_init_action(true, false, false, Some(KopiaErrorClass::NotFound), true),
             BootstrapInitAction::Seed
         );
         assert_eq!(
-            bootstrap_init_action(true, false, KopiaErrorClass::NotFound, false),
+            bootstrap_init_action(true, false, false, Some(KopiaErrorClass::NotFound), false),
             BootstrapInitAction::Fail
         );
         // `auto_create` does not gate a seed either way — a seed is the
         // initialization the user explicitly asked for, not the create fallback.
         assert_eq!(
-            bootstrap_init_action(true, true, KopiaErrorClass::NotFound, true),
+            bootstrap_init_action(true, false, true, Some(KopiaErrorClass::NotFound), true),
+            BootstrapInitAction::Seed
+        );
+        // A marker-bearing (resuming) seed over a backend that turns out to be
+        // genuinely EMPTY still seeds from the start — the previous attempt died
+        // before writing a format blob, or someone cleared it.
+        assert_eq!(
+            bootstrap_init_action(true, true, false, Some(KopiaErrorClass::NotFound), true),
             BootstrapInitAction::Seed
         );
     }
@@ -909,23 +1036,109 @@ mod tests {
         // Fail rather than Create: falling back would report a `Ready` but
         // EMPTY repository, which is the data-loss shape the feature exists to
         // prevent. Note `auto_create: true` throughout — the fallback is armed
-        // and still must not fire.
+        // and still must not fire — and both `resume` states, since neither may
+        // reopen the create path.
         for class in ALL_CLASSES {
-            let action = bootstrap_init_action(true, true, class, false);
-            assert_ne!(
-                action,
-                BootstrapInitAction::Create,
-                "a seed-armed bootstrap must never create ({class:?})"
+            for resume in [false, true] {
+                assert_eq!(
+                    bootstrap_init_action(true, resume, true, Some(class), false),
+                    BootstrapInitAction::Fail,
+                    "no proof the backend is empty ⇒ neither create nor seed ({class:?}, resume={resume})"
+                );
+            }
+        }
+        // WITH the "backend is empty" proof, the outcome is exactly Seed for a
+        // genuine NotFound and Fail for everything else — never Create.
+        for class in ALL_CLASSES {
+            for resume in [false, true] {
+                let expected = if class == KopiaErrorClass::NotFound {
+                    BootstrapInitAction::Seed
+                } else {
+                    BootstrapInitAction::Fail
+                };
+                assert_eq!(
+                    bootstrap_init_action(true, resume, true, Some(class), true),
+                    expected,
+                    "{class:?} resume={resume}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_resuming_seed_re_runs_over_an_already_initialized_repository() {
+        // The connect SUCCEEDED — the repository exists and opens. Without
+        // `resume` that is the documented standing no-op; WITH it, a previous
+        // attempt left a copy unfinished and the seed must actually run, or the
+        // retry Readies partial history (issue #380).
+        assert_eq!(
+            bootstrap_init_action(true, true, false, None, false),
+            BootstrapInitAction::Seed
+        );
+        assert_eq!(
+            bootstrap_init_action(true, false, false, None, false),
+            BootstrapInitAction::Proceed
+        );
+        // `resume` is meaningless without a seed armed, and must never invent
+        // work on a repository that simply connected.
+        for resume in [false, true] {
+            for auto_create in [false, true] {
+                assert_eq!(
+                    bootstrap_init_action(false, resume, auto_create, None, false),
+                    BootstrapInitAction::Proceed,
+                    "resume={resume} auto_create={auto_create}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resume_never_reaches_create_and_never_survives_the_denylist() {
+        // Two invariants the resume edge must not weaken:
+        //  * it is a SEED lever, never a create one;
+        //  * a repository we cannot open is still never touched, marker or not.
+        for class in ALL_CLASSES {
+            for uninit in [false, true] {
+                assert_ne!(
+                    bootstrap_init_action(true, true, true, Some(class), uninit),
+                    BootstrapInitAction::Create,
+                    "{class:?} uninit={uninit}"
+                );
+            }
+        }
+        for class in [
+            KopiaErrorClass::AuthFailure,
+            KopiaErrorClass::Locked,
+            KopiaErrorClass::AccessDenied,
+            KopiaErrorClass::PermissionDenied,
+        ] {
+            assert_eq!(
+                bootstrap_init_action(true, true, true, Some(class), true),
+                BootstrapInitAction::Fail,
+                "{class:?}"
             );
         }
-        // With the "backend is empty" proof, the only non-Fail outcome is Seed.
-        for class in ALL_CLASSES {
-            assert_ne!(
-                bootstrap_init_action(true, true, class, true),
-                BootstrapInitAction::Create,
-                "a seed-armed bootstrap must never create ({class:?})"
-            );
-        }
+    }
+
+    #[test]
+    fn the_already_initialized_outcome_is_emitted_only_when_not_resuming() {
+        // The testable core of the mover-skew invariant: every seed-armed
+        // SUCCESS carries a `seed` block, so its presence proves this mover
+        // image understood `spec.seed`.
+        let seed = sample_seed(false);
+        let outcome = already_initialized_outcome(Some(&seed)).expect("a no-op outcome");
+        assert!(!outcome.performed);
+        assert_eq!(outcome.mode, crate::workspec::SeedModeSpec::Blob);
+        assert_eq!(outcome.source, "S3");
+        assert!(outcome.snapshot_count.is_none());
+
+        // RESUMING: none here, because the seed is about to actually run and
+        // will report what it did. Emitting the no-op alongside a real run is
+        // the one way this could report a seed that never happened.
+        assert!(already_initialized_outcome(Some(&sample_seed(true))).is_none());
+
+        // No seed armed ⇒ nothing to acknowledge.
+        assert!(already_initialized_outcome(None).is_none());
     }
 
     #[test]
@@ -936,7 +1149,7 @@ mod tests {
         for class in ALL_CLASSES {
             for create in [false, true] {
                 for uninit in [false, true] {
-                    let creates = bootstrap_init_action(false, create, class, uninit)
+                    let creates = bootstrap_init_action(false, false, create, Some(class), uninit)
                         == BootstrapInitAction::Create;
                     assert_eq!(
                         creates,
@@ -1012,9 +1225,13 @@ mod tests {
 
     #[test]
     fn seed_failures_are_retryable_and_carry_no_partial_outcome() {
-        // D9: a dead or empty mirror routes to the controller's recycle arm and
-        // is retried every couple of minutes — the promptness disaster recovery
-        // wants — rather than needing a spec edit like `not_initialized` does.
+        // D9 plus the two the resume contract added: a dead or empty mirror, an
+        // incomplete migrate, and a repository an interrupted seed left empty
+        // all route to the controller's recycle arm and retry every couple of
+        // minutes — the promptness disaster recovery wants — rather than needing
+        // a spec edit like `not_initialized` does. The last two are retryable
+        // ONLY because the controller's marker + `resume` make the retry
+        // actually re-run the copy; see their class docs.
         for (result, class) in [
             (
                 BootstrapResult::seed_source_not_found(),
@@ -1028,6 +1245,7 @@ mod tests {
                 BootstrapResult::seed_incomplete(2, 5, "a@b:/c@2026-01-01T00:00:00Z"),
                 SEED_INCOMPLETE_CLASS,
             ),
+            (BootstrapResult::seed_left_empty(), SEED_LEFT_EMPTY_CLASS),
         ] {
             assert!(!result.success, "{class}");
             // A failure never reports a seed outcome: a half-populated one would
@@ -1065,28 +1283,42 @@ mod tests {
     }
 
     #[test]
-    fn the_left_empty_failure_is_terminal_not_retryable() {
-        // Unlike its source-side siblings, retrying finds the same
-        // initialized-and-empty repository forever, so spinning every two
-        // minutes would hide the problem rather than fix it. It needs a human.
+    fn the_left_empty_failure_is_retryable_under_the_resume_contract() {
+        // Reclassified once `resume` existed: with it, the next bootstrap
+        // re-runs the copy against the already-initialized backend instead of
+        // reporting the no-op, so an interrupted seed CONVERGES. The remedy
+        // changed with the classification — it must no longer tell anyone to
+        // delete a repository kopiur is about to finish filling.
         let r = BootstrapResult::seed_left_empty();
         assert!(!r.success);
         assert!(r.seed.is_none());
         let f = r.failure.expect("failure block");
         assert_eq!(f.kopia_error_class, SEED_LEFT_EMPTY_CLASS);
-        assert!(!f.retry_recommended);
+        assert!(f.retry_recommended);
         // what
         assert!(f.message.contains("ZERO snapshots"), "{}", f.message);
         // why it happened
         assert!(f.message.contains("earlier seed attempt"), "{}", f.message);
-        // fix, both branches
+        // fix: kopiur retries itself; the operator tunes the deadline
+        assert!(f.message.contains("resumes the copy"), "{}", f.message);
+        assert!(f.message.contains("activeDeadlineSeconds"), "{}", f.message);
         assert!(
-            f.message.contains("delete the half-initialized repository"),
+            f.message.contains("spec.seed.allowEmptySource: true"),
             "{}",
             f.message
         );
+        // The OLD remedy must be gone: with resume, deleting the backend
+        // repository destroys the partial copy the next attempt would finish.
+        // Matched on the imperative, since the new text mentions deletion only
+        // to forbid it ("nothing at the backend should be deleted").
         assert!(
-            f.message.contains("spec.seed.allowEmptySource: true"),
+            !f.message.contains("delete the half-initialized repository"),
+            "the pre-resume remedy is still in the message: {}",
+            f.message
+        );
+        assert!(
+            f.message
+                .contains("nothing at the backend should be deleted"),
             "{}",
             f.message
         );
