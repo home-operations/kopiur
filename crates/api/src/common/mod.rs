@@ -275,6 +275,24 @@ pub enum RepositoryKind {
     ClusterRepository,
 }
 
+impl RepositoryKind {
+    /// The CRD kind name, for messages and status rendering. Exhaustive, so a
+    /// new repository kind cannot compile until its label is decided.
+    ///
+    /// ```
+    /// use kopiur_api::common::RepositoryKind;
+    ///
+    /// assert_eq!(RepositoryKind::Repository.kind_str(), "Repository");
+    /// assert_eq!(RepositoryKind::ClusterRepository.kind_str(), "ClusterRepository");
+    /// ```
+    pub fn kind_str(self) -> &'static str {
+        match self {
+            RepositoryKind::Repository => "Repository",
+            RepositoryKind::ClusterRepository => "ClusterRepository",
+        }
+    }
+}
+
 /// Reference from a consumer CR to a `Repository` or `ClusterRepository`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]

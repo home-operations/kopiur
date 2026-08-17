@@ -9,6 +9,7 @@ pub mod maintenance;
 pub mod repository;
 pub mod repository_replication;
 pub mod restore;
+pub mod seed;
 pub mod server;
 pub mod snapshot;
 pub mod snapshot_policy;
@@ -63,6 +64,10 @@ pub use repository_replication::{
 pub use restore::{
     OnMissingSnapshot, PopulatorTarget, ResolutionOutcome, Restore, RestorePhase, RestoreSource,
     RestoreSpec, RestoreStatus, RestoreTarget,
+};
+pub use seed::{
+    SeedMigrateOptions, SeedMode, SeedSource, SeedSpec, SeedStatus, SeedSyncOptions,
+    seed_active_deadline_seconds, seed_armed, seed_backend, seed_repository_ref,
 };
 pub use server::{
     ClusterServerSpec, ServerAuth, ServerService, ServerSpec, ServerStatus, ServiceType,
