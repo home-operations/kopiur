@@ -249,6 +249,53 @@ pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source is a kopia repos
      true. The bootstrap retries automatically, so a mirror that fills up later seeds without \
      further action";
 
+/// Sentinel [`FailureBlock::kopia_error_class`] for the case a `spec.seed` was
+/// armed but the repository ends the bootstrap holding ZERO snapshots, with
+/// `allowEmptySource` at its `false` default (issue #380).
+///
+/// This is the backstop for the one path the source-side gates cannot see. A
+/// seed that dies AFTER initializing the backend — a migrate whose
+/// `repository create` succeeded before the copy failed, a `sync-to` killed by
+/// the Job deadline mid-copy, an OOM — leaves an initialized but empty
+/// repository behind. The NEXT bootstrap's connect then SUCCEEDS, the seed
+/// reports itself a documented no-op ("already initialized"), and the
+/// repository would go `Ready` with no history: exactly the failure #380
+/// exists to prevent, re-entered through the back door.
+///
+/// Deliberately NOT retryable — unlike its source-side siblings, retrying finds
+/// the same initialized-and-empty repository forever. It needs a human: delete
+/// the half-initialized repository at the backend and let the seed re-run, or
+/// (if the repository really is meant to start empty) set `allowEmptySource`.
+pub const SEED_LEFT_EMPTY_CLASS: &str = "SeedLeftEmpty";
+
+/// Stable, volatile-free actionable message for [`SEED_LEFT_EMPTY_CLASS`].
+pub const SEED_LEFT_EMPTY_MESSAGE: &str = "spec.seed is set and this repository is initialized but holds ZERO snapshots, so reporting \
+     it Ready would hand you a repository with no history. This normally means an earlier seed \
+     attempt initialized the backend and then failed (a mover killed by the Job deadline, an \
+     OOM, or a copy that errored after `repository create`) — the retry then finds a repository \
+     that already exists and has nothing to seed into. Check the bootstrap Job's earlier pod \
+     logs for the failed attempt, delete the half-initialized repository at the backend so the \
+     seed can run again, or — if this repository really is meant to start empty — set \
+     spec.seed.allowEmptySource: true";
+
+/// Whether a bootstrap must refuse to report success because a seed was armed
+/// yet the repository ends up empty. See [`SEED_LEFT_EMPTY_CLASS`] for the
+/// failure this catches. Pure.
+///
+/// Deliberately keyed on the OUTCOME (the repository holds nothing) rather than
+/// on which seed path ran: the same refusal is correct whether the seed copied
+/// nothing, was a no-op over a repository a previous attempt left behind, or
+/// something else emptied it. A seed that legitimately copied an empty source
+/// can only have got here with `allow_empty_source` set, which switches the
+/// guard off.
+pub fn seed_left_repository_empty(
+    seed_armed: bool,
+    allow_empty_source: bool,
+    snapshot_count: i64,
+) -> bool {
+    seed_armed && !allow_empty_source && snapshot_count == 0
+}
+
 /// Sentinel [`FailureBlock::kopia_error_class`] for a migrate-mode seed where
 /// `kopia snapshot migrate` exited 0 but the post-verify found snapshots
 /// missing at the destination (issue #380).
@@ -699,6 +746,17 @@ impl BootstrapResult {
         )
     }
 
+    /// A terminal-failure outcome for "a seed was armed but this repository is
+    /// initialized and empty" ([`SEED_LEFT_EMPTY_CLASS`]). NOT retryable: unlike
+    /// its source-side siblings, a retry finds the same state forever.
+    pub fn seed_left_empty() -> Self {
+        BootstrapResult::sentinel(
+            SEED_LEFT_EMPTY_CLASS,
+            SEED_LEFT_EMPTY_MESSAGE.to_string(),
+            false,
+        )
+    }
+
     /// A terminal-failure outcome for a migrate-mode seed whose post-verify
     /// found snapshots missing at the destination ([`SEED_INCOMPLETE_CLASS`]).
     ///
@@ -987,6 +1045,52 @@ mod tests {
         assert_eq!(f.kopia_error_class, REPOSITORY_NOT_INITIALIZED_CLASS);
         assert!(!f.retry_recommended);
         assert_eq!(f.message, REPOSITORY_NOT_INITIALIZED_MESSAGE);
+    }
+
+    #[test]
+    fn a_seed_that_left_the_repository_empty_is_refused() {
+        // The backstop for the one path the source-side gates cannot see: an
+        // earlier seed initialized the backend and then died, so the retry's
+        // connect SUCCEEDS, the seed reports a no-op, and the repository would
+        // go Ready with no history — #380 re-entered through the back door.
+        assert!(seed_left_repository_empty(true, false, 0));
+        // A repository that actually holds history is fine.
+        assert!(!seed_left_repository_empty(true, false, 1));
+        // The explicit opt-out switches the guard off, exactly as it does for
+        // the source-side empty gate.
+        assert!(!seed_left_repository_empty(true, true, 0));
+        // And a bootstrap with no seed armed is untouched: an empty repository
+        // is the ordinary outcome of `spec.create.enabled` on a fresh backend.
+        assert!(!seed_left_repository_empty(false, false, 0));
+    }
+
+    #[test]
+    fn the_left_empty_failure_is_terminal_not_retryable() {
+        // Unlike its source-side siblings, retrying finds the same
+        // initialized-and-empty repository forever, so spinning every two
+        // minutes would hide the problem rather than fix it. It needs a human.
+        let r = BootstrapResult::seed_left_empty();
+        assert!(!r.success);
+        assert!(r.seed.is_none());
+        let f = r.failure.expect("failure block");
+        assert_eq!(f.kopia_error_class, SEED_LEFT_EMPTY_CLASS);
+        assert!(!f.retry_recommended);
+        // what
+        assert!(f.message.contains("ZERO snapshots"), "{}", f.message);
+        // why it happened
+        assert!(f.message.contains("earlier seed attempt"), "{}", f.message);
+        // fix, both branches
+        assert!(
+            f.message.contains("delete the half-initialized repository"),
+            "{}",
+            f.message
+        );
+        assert!(
+            f.message.contains("spec.seed.allowEmptySource: true"),
+            "{}",
+            f.message
+        );
+        assert!(!f.message.contains("   "), "{}", f.message);
     }
 
     #[test]

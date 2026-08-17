@@ -1519,13 +1519,22 @@ async fn run_seed_migrate(
         source = %seed.source_description,
         "seeding this repository from another repository (kopia snapshot migrate)"
     );
+    // ORDER MATTERS: every source-side check runs BEFORE the local
+    // `repository create`. A migrate that creates first and then fails on a
+    // dead, mis-credentialed or empty source leaves an initialized-but-empty
+    // repository behind — and the next bootstrap's connect would SUCCEED,
+    // making the seed a no-op over the leftovers. Those are precisely the
+    // retryable failures expected to recur, so they must not be able to
+    // initialize anything. (`seed_left_repository_empty` in `run_bootstrap` is
+    // the backstop for the windows this ordering cannot close — a copy killed
+    // mid-flight after the create.)
     let source_password = seed_source_password()?;
-    let local_client =
-        seed_create_and_connect_local(client, spec, op, local_connect, kopia_binary, paths).await?;
     let source_client =
         seed_connect_source(spec, seed, kopia_binary, paths, Some(source_password)).await?;
     seed_probe_source_password(spec, kopia_binary, paths).await?;
     let source_list = seed_source_snapshots(seed, &source_client).await?;
+    let local_client =
+        seed_create_and_connect_local(client, spec, op, local_connect, kopia_binary, paths).await?;
 
     let migrate = seed.migrate.unwrap_or_default();
     let snapshots_copied =
@@ -1900,6 +1909,20 @@ async fn run_bootstrap(
         Err(e) => return BootstrapResult::failed(&e),
     };
     let snapshot_count = listing.len() as i64;
+    // The seeding backstop (issue #380): refuse to report success on an EMPTY
+    // repository when a seed was armed. Catches the one path the source-side
+    // gates cannot see — an earlier seed that initialized the backend and then
+    // died, whose retry connects successfully and reports a no-op over the
+    // half-initialized leftovers. Placed here, after the authoritative listing,
+    // so it covers every route to "seed armed, nothing in the repository".
+    if kopiur_mover::bootstrap::seed_left_repository_empty(
+        op.seed.is_some(),
+        op.seed.as_ref().is_some_and(|s| s.allow_empty_source),
+        snapshot_count,
+    ) {
+        error!("spec.seed is set but this repository is initialized and holds zero snapshots");
+        return BootstrapResult::seed_left_empty();
+    }
     let (snapshots, truncated, foreign_suffix_dropped) = if op.scan_catalog {
         kopiur_mover::bootstrap::prepare_catalog_entries(
             listing,
