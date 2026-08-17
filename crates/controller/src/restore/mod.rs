@@ -272,10 +272,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // it: the wait-window anchor (a populator with no claim cannot proceed, so its window
     // must not open) and `drive_populator_restore`'s handshake. A direct target never has
     // one, and never pays for the LIST.
-    let consumer = match state {
-        PopulatorState::AwaitingClaim => claiming_pvc(ctx, &namespace, &name).await?,
-        PopulatorState::DirectTarget => None,
-    };
+    let consumer = populator_consumer(ctx, &namespace, &name, state).await?;
 
     // #380: the `waitTimeout` window opens HERE — on the first pass that gets past the
     // readiness gate (and, for a populator, finds a claiming PVC) — not at the Restore's
@@ -3569,6 +3566,22 @@ async fn ensure_wait_anchor(
     tracing::debug!(%namespace, restore = %name, wait_started_at = %at, "waitTimeout window opened");
     io::patch_status(api, name, serde_json::json!({ "waitStartedAt": at })).await?;
     Ok(WaitWindow::Open(now.timestamp()))
+}
+
+/// The claiming PVC for this pass, or `None` for a direct target (which never has one and
+/// never pays for the LIST). Hoisted out of `reconcile_inner` so the populator-vs-direct
+/// dispatch reads as one line there; behavior is unchanged — `AwaitingClaim` still resolves
+/// via [`claiming_pvc`], `DirectTarget` still short-circuits to `None`.
+async fn populator_consumer(
+    ctx: &Context,
+    namespace: &str,
+    name: &str,
+    state: PopulatorState,
+) -> Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>> {
+    match state {
+        PopulatorState::AwaitingClaim => claiming_pvc(ctx, namespace, name).await,
+        PopulatorState::DirectTarget => Ok(None),
+    }
 }
 
 /// The PVC in `namespace` that claims this Restore via `spec.dataSourceRef`
