@@ -2453,7 +2453,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `sourceKind` | string | — | The pinned source kind (`SnapshotRef`/`FromPolicy`/`Identity`); backs the `SOURCE` printer column. |
 | `target` | [object](#restore-status-target) | — | Resolved target details (the PVC written to / populator handshake). |
 | `timing` | [object](#restore-status-timing) | — | Start/end timestamps for the restore run. |
-| `waitStartedAt` | string | — | When the `policy.waitTimeout` window OPENED (RFC3339) — the first reconcile on which the restore could actually proceed (its repository reached `Ready`, and for a `target.populator` a PVC already claims it), NOT when the Restore was created. Stamped once and then honored verbatim, so the window survives controller restarts and Job pod retries; cleared when a populator re-opens resolution for a re-created claim, so that claim gets the full window again. Absent means the window has not opened yet. |
+| `waitStartedAt` | string | — | When the `policy.waitTimeout` window OPENED (RFC3339) — the first reconcile on which the restore could actually proceed (its repository reached `Ready`, and for a `target.populator` a PVC already claims it), NOT when the Restore was created. Stamped once and then honored verbatim, so the window survives controller restarts and Job pod retries; cleared when a populator re-opens resolution for a re-created claim, so that claim gets the full window again. Absent means the window has not opened yet (or no `policy.waitTimeout` is configured, in which case there is no window to anchor). |
 
 #### `status.conditions[]` { #restore-status-conditions }
 
