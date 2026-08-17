@@ -243,6 +243,50 @@ pub fn run_job_annotations(
     annotations
 }
 
+/// A stall a replication must report on THIS reconcile's SINGLE `Ready` write.
+///
+/// Two writers of the `Ready` condition in one reconcile do not merge — the
+/// second rebuilds the condition array from the object it was handed, which
+/// still predates the first, so it silently erases it. Worse, each write wakes
+/// the watch, so a pair that disagrees (a stall, then "Idle") flaps forever
+/// instead of settling. So the requested-run paths do not write `Ready`
+/// themselves: they hand back what to say, and the scheduling flow folds it
+/// into the one write it was going to make anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunStall {
+    /// The `Ready` condition `reason`.
+    pub reason: &'static str,
+    /// The `Ready` condition `message`.
+    pub message: String,
+}
+
+impl RunStall {
+    /// A stall with a fixed message.
+    pub fn new(reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
+}
+
+/// What the idle (nothing-due) arm should report: the stall a requested run
+/// left behind, or the ordinary "reconciled, waiting for the next slot".
+///
+/// The stall wins because it is the actionable half — an idle replication is
+/// the *normal* state and says nothing a user needs, whereas a failed requested
+/// run or a typo'd annotation is precisely what they are looking for.
+pub fn idle_report(stall: Option<&RunStall>) -> (bool, &'static str, &str) {
+    match stall {
+        Some(s) => (false, s.reason, s.message.as_str()),
+        None => (
+            true,
+            "Idle",
+            "replication is reconciled; waiting for the next scheduled slot",
+        ),
+    }
+}
+
 /// The `Ready` condition `(reason, message)` a SUSPENDED replication reports,
 /// given whether an unanswered run request is waiting. Shared so both kinds say
 /// the same thing, and pure so what a suspended CR tells the operator is
@@ -628,6 +672,23 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn the_idle_arm_reports_a_stall_over_the_ordinary_idle_line() {
+        // No stall: the ordinary Ready/Idle report.
+        let (ready, reason, message) = idle_report(None);
+        assert!(ready);
+        assert_eq!(reason, "Idle");
+        assert!(message.contains("waiting for the next scheduled slot"));
+
+        // A stall from a requested run REPLACES it — one Ready writer per
+        // reconcile, so the actionable half must be the one that lands.
+        let stall = RunStall::new("InvalidRunRequest", "annotation ... is not RFC3339");
+        let (ready, reason, message) = idle_report(Some(&stall));
+        assert!(!ready);
+        assert_eq!(reason, "InvalidRunRequest");
+        assert_eq!(message, "annotation ... is not RFC3339");
     }
 
     #[test]

@@ -369,15 +369,18 @@ async fn repository_replication_s3_to_s3_uses_destination_scoped_credentials() {
 }
 
 /// Issue #380: an ON-DEMAND run, requested with the `run-requested`
-/// annotation, on a replication whose cron will not fire for months.
+/// annotation, on a replication whose cron cannot fire again for months.
 ///
-/// The far-future schedule (`0 5 1 1 *` — 05:00 on 1 January) is the whole
-/// point: nothing but the annotation can produce a run, so `lastReplicated`
-/// stamping proves the REQUEST drove it rather than a slot that happened to
-/// come due. It also pins the two halves of the contract that a unit test
-/// cannot reach — that the requested run rides the ordinary mover path (a real
-/// `sync-to` into a real destination), and that `status.manualRun` answers the
-/// exact timestamp that was asked for.
+/// The schedule is `0 5 1 1 *` (05:00 on 1 January). A brand-new replication is
+/// always immediately due — the scheduler anchors an unrun CR a year back — so
+/// the CR takes exactly ONE catch-up run, which stamps `status.lastReplicated`
+/// and re-anchors the next slot to next January. From that point the annotation
+/// is the only thing in the cluster that can produce another run, which is what
+/// makes the second `lastReplicated` a proof rather than a coincidence.
+///
+/// It pins the halves a unit test cannot reach: the requested run rides the
+/// ordinary mover path (a real `sync-to`, tagged `run-trigger: manual` on its
+/// Job), and `status.manualRun` answers the exact timestamp requested.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn repository_replication_runs_on_demand_from_the_run_requested_annotation() {
@@ -408,21 +411,30 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
                 "spec": {
                     "sourceRef": { "kind": "Repository", "name": "e2e-repl-run-src" },
                     "destination": { "filesystem": { "path": "/repo-dst", "volume": { "pvc": { "name": consts::isolated_repo_pvc("repl-run-dst") } } } },
-                    // Months away: no cron slot can fire during this test.
+                    // Yearly: one catch-up run now, then nothing until January.
                     "schedule": { "cron": "0 5 1 1 *" }
                 }
             })),
         )
         .await
-        .expect("create RepositoryReplication with a far-future schedule");
+        .expect("create RepositoryReplication with a yearly schedule");
 
-    // Nothing should have run yet — otherwise the assertion below would pass
-    // on a cron slot and prove nothing about the annotation.
-    let before = status_json(&repls, name).await;
-    assert!(
-        before.get("lastReplicated").is_none(),
-        "a far-future schedule must not have replicated yet; status: {before}"
-    );
+    // The one catch-up run, whose timestamp becomes the baseline the requested
+    // run must move.
+    let first = wait_until(
+        "the initial catch-up run stamps status.lastReplicated",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, name).await;
+            Ok(s.get("lastReplicated")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string))
+        },
+    )
+    .await
+    .expect("the catch-up run should stamp status.lastReplicated");
 
     let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     repls
@@ -438,22 +450,26 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
         .await
         .expect("annotate the replication with a run request");
 
-    // The requested run goes through the ordinary mover path, so success means
-    // a real `sync-to` completed: the mover stamps `lastReplicated`…
+    // A SECOND run happens even though no cron slot is due — only the
+    // annotation can have caused it.
     wait_until(
-        "an annotation-requested replication run stamps status.lastReplicated",
+        "the requested run stamps a NEW status.lastReplicated",
         default_timeout(),
         poll_interval(),
-        || async {
-            let s = status_json(&repls, name).await;
-            Ok(s.get("lastReplicated")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|_| ()))
+        || {
+            let first = first.clone();
+            let repls = repls.clone();
+            async move {
+                let s = status_json(&repls, name).await;
+                Ok(s.get("lastReplicated")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty() && *v != first)
+                    .map(str::to_string))
+            }
         },
     )
     .await
-    .expect("the requested run should execute and stamp status.lastReplicated");
+    .expect("the requested run should execute and re-stamp status.lastReplicated");
 
     // …and the controller answers the EXACT request in status.manualRun.
     let manual = wait_until(
@@ -463,11 +479,17 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
         || async {
             let s = status_json(&repls, name).await;
             Ok(s.get("manualRun")
-                .and_then(|m| m.get("phase").and_then(|p| p.as_str()).map(|_| m.clone())))
+                .filter(|m| {
+                    matches!(
+                        m.get("phase").and_then(|p| p.as_str()),
+                        Some("Succeeded" | "Failed")
+                    )
+                })
+                .cloned())
         },
     )
     .await
-    .expect("the controller should record status.manualRun");
+    .expect("the controller should record a terminal status.manualRun");
     assert_eq!(
         manual.get("phase").and_then(|v| v.as_str()),
         Some("Succeeded"),
@@ -486,12 +508,29 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
         "a terminal manual run must record completedAt; got {manual}"
     );
 
-    // The destination really received the snapshot — the requested run did the
-    // same work a scheduled one would.
-    let count = observed_snapshot_count(&client, "e2e-repl-run-verify", "repl-run-dst").await;
+    // The controller→metrics contract: the requested run's Job is tagged as
+    // manual, which is what `kopiur_replication_runs_total{trigger}` reads.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let selector = format!(
+        "app.kubernetes.io/component=replication,kopiur.home-operations.com/replication={name}"
+    );
+    let triggers: Vec<String> = jobs
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .expect("list replication Jobs")
+        .items
+        .iter()
+        .filter_map(|j| {
+            j.metadata
+                .annotations
+                .as_ref()?
+                .get("kopiur.home-operations.com/run-trigger")
+                .cloned()
+        })
+        .collect();
     assert!(
-        count >= 1,
-        "the destination repository must hold the mirrored snapshot, got {count}"
+        triggers.iter().any(|t| t == "manual"),
+        "the requested run's Job must be tagged run-trigger: manual; got {triggers:?}"
     );
 
     let _ = repls.delete(name, &DeleteParams::default()).await;

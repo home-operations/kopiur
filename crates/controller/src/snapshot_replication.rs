@@ -51,8 +51,9 @@ use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
 use crate::metrics::{ReplicationKind, ReplicationRunTrigger};
 use crate::naming::short_hash;
 use crate::replication_run::{
-    RunObservation, RunRequest, manual_replication_job_name, manual_run_request, manual_run_status,
-    observe_and_count_runs, recorded_running, run_job_annotations, suspended_report,
+    RunObservation, RunRequest, RunStall, idle_report, manual_replication_job_name,
+    manual_run_request, manual_run_status, observe_and_count_runs, recorded_running,
+    run_job_annotations, suspended_report,
 };
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
@@ -320,7 +321,7 @@ async fn drive_schedule(
     // single-flight), so it cannot bypass any guarantee the cron path has.
     // A MALFORMED annotation must not suspend the schedule: surface it as a
     // condition and fall through to the cron flow (degrade-not-crash).
-    match manual_run_request(
+    let stall = match manual_run_request(
         KIND,
         repl.metadata.annotations.as_ref(),
         repl.status.as_ref().and_then(|s| s.manual_run.as_ref()),
@@ -328,30 +329,22 @@ async fn drive_schedule(
         name,
     ) {
         Ok(Some(request)) => {
-            if let Some(action) = handle_manual_run(
-                ctx, repl, api, job_api, namespace, name, source, dest, &request, observed, overlap,
+            match handle_manual_run(
+                ctx, repl, api, job_api, namespace, name, source, dest, &request, observed,
             )
             .await?
             {
-                return Ok(action);
+                ManualRunVerdict::InFlight(action) => return Ok(action),
+                ManualRunVerdict::Continue(stall) => stall,
             }
         }
-        Ok(None) => {}
-        Err(Error::Validation(msg)) => {
-            patch_ready_if_changed(
-                api,
-                name,
-                repl,
-                io::ReadyOutcome::Stalled,
-                "InvalidRunRequest",
-                &msg,
-                None,
-                Some(overlap),
-            )
-            .await?;
-        }
+        Ok(None) => None,
+        // Degrade, don't crash: a typo'd annotation must not stop the
+        // schedule. It rides out on the idle arm's single `Ready` write below
+        // rather than a second one that would flap against it.
+        Err(Error::Validation(msg)) => Some(RunStall::new("InvalidRunRequest", msg)),
         Err(e) => return Err(e),
-    }
+    };
 
     let Some(slot) = due_slot(repl, now, repo_tz) else {
         // The idle heal pass: reap cross-namespace discovered duplicates
@@ -360,14 +353,21 @@ async fn drive_schedule(
         // terminal heal lands: the mover stamped phase/lastReplicated, and this
         // arm heals Ready + observedGeneration + the overlap condition).
         idle_heal(ctx, repl, observed, namespace, name, dest).await?;
+        // Nothing due: report Ready/Idle — or, if a requested run left a stall,
+        // report THAT instead. One `Ready` writer per reconcile.
+        let (ready, reason, message) = idle_report(stall.as_ref());
         patch_ready_if_changed(
             api,
             name,
             repl,
-            io::ReadyOutcome::Ready,
-            "Idle",
-            "replication is reconciled; waiting for the next scheduled slot",
-            None,
+            if ready {
+                io::ReadyOutcome::Ready
+            } else {
+                io::ReadyOutcome::Stalled
+            },
+            reason,
+            message,
+            (!ready).then_some(SnapshotReplicationPhase::Failed),
             Some(overlap),
         )
         .await?;
@@ -437,9 +437,20 @@ async fn drive_schedule(
     }
 }
 
+/// What the requested-run pass decided for the rest of this reconcile.
+enum ManualRunVerdict {
+    /// A requested Job is in flight — stop here with this action.
+    InFlight(Action),
+    /// Nothing further to drive for the request; continue with the cron flow,
+    /// carrying any stall into its single `Ready` write.
+    Continue(Option<RunStall>),
+}
+
 /// Drive an unhandled run request: observe or spawn its Job and book-keep
-/// `status.manualRun`. `Some(action)` stops the reconcile here (a requested Job
-/// is in flight); `None` continues with the cron flow.
+/// `status.manualRun`.
+///
+/// Deliberately writes only `status.manualRun`, never the `Ready` condition:
+/// the caller owns the one `Ready` write per reconcile (see [`RunStall`]).
 ///
 /// The run rides the ORDINARY per-slot spawn path with the request instant as
 /// its slot, so the mover is untouched — which also means a successful manual
@@ -458,8 +469,7 @@ async fn handle_manual_run(
     dest: &ResolvedRepository,
     request: &RunRequest,
     observed: RunObservation,
-    overlap: &OverlapVerdict,
-) -> Result<Option<Action>> {
+) -> Result<ManualRunVerdict> {
     use kopiur_api::common::ReplicationManualRunPhase as P;
     let job_name = manual_replication_job_name(KIND, name, request.at);
     let manual = repl.status.as_ref().and_then(|s| s.manual_run.as_ref());
@@ -473,7 +483,7 @@ async fn handle_manual_run(
                     manual_run_status(request, P::Succeeded, Utc::now()),
                 )
                 .await?;
-                Ok(None)
+                Ok(ManualRunVerdict::Continue(None))
             }
             Some(false) => {
                 patch_manual_run(
@@ -483,26 +493,18 @@ async fn handle_manual_run(
                     manual_run_status(request, P::Failed, Utc::now()),
                 )
                 .await?;
-                patch_ready_if_changed(
-                    api,
-                    name,
-                    repl,
-                    io::ReadyOutcome::Stalled,
-                    "ReplicationFailed",
-                    "requested snapshot-replication Job failed; see the Job/pod logs",
-                    Some(SnapshotReplicationPhase::Failed),
-                    Some(overlap),
-                )
-                .await?;
                 // The Job is terminal, so no pod can still read the projected
                 // copies — reclaim them now rather than only at the next idle.
                 if projection_enabled(repl) {
                     reap_srepl_projections(ctx, repl, namespace, name).await;
                 }
                 nudge_repositories_reverify(ctx, repl, name, namespace).await;
-                Ok(None)
+                Ok(ManualRunVerdict::Continue(Some(RunStall::new(
+                    "ReplicationFailed",
+                    "requested snapshot-replication Job failed; see the Job/pod logs",
+                ))))
             }
-            None => Ok(Some(Action::requeue(REQUEUE_RUNNING))),
+            None => Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING))),
         },
         None if recorded_running(manual, request) => {
             // The Job was TTL-reaped before its terminal state was observed:
@@ -514,24 +516,16 @@ async fn handle_manual_run(
                 manual_run_status(request, P::Failed, Utc::now()),
             )
             .await?;
-            patch_ready_if_changed(
-                api,
-                name,
-                repl,
-                io::ReadyOutcome::Stalled,
+            Ok(ManualRunVerdict::Continue(Some(RunStall::new(
                 "ManualRunOutcomeLost",
                 "the requested snapshot-replication Job disappeared before its outcome was \
                  observed (TTL-reaped?); re-annotate to run again",
-                None,
-                Some(overlap),
-            )
-            .await?;
-            Ok(None)
+            ))))
         }
         None => {
             // Single-flight: never two snapshot-replication Jobs for one CR.
             if observed.has_active {
-                return Ok(Some(Action::requeue(REQUEUE_RUNNING)));
+                return Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)));
             }
             spawn_snapshot_replication_job(
                 ctx,
@@ -557,7 +551,7 @@ async fn handle_manual_run(
                 requested = %request.raw,
                 "spawned REQUESTED snapshot-replication Job"
             );
-            Ok(Some(Action::requeue(REQUEUE_RUNNING)))
+            Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)))
         }
     }
 }

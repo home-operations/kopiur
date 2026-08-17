@@ -1173,14 +1173,14 @@ async fn snapshot_replication_suspend_holds_slots() {
 }
 
 /// Issue #380: an ON-DEMAND copy pass, requested with the `run-requested`
-/// annotation, on a replication whose cron will not fire for months.
+/// annotation, on a replication whose cron cannot fire again for months.
 ///
-/// The far-future schedule (`0 5 1 1 *` — 05:00 on 1 January) is what makes
-/// this a proof rather than a coincidence: no slot can come due, so a stamped
-/// `lastReplicated` can only have come from the annotation. It pins the halves
-/// a unit test cannot reach — the requested run rides the ordinary two-password
-/// `kopia snapshot migrate` path (copies really land at the destination), and
-/// `status.manualRun` answers the exact timestamp requested.
+/// The schedule is `0 5 1 1 *` (05:00 on 1 January). A brand-new replication is
+/// always immediately due — the scheduler anchors an unrun CR a year back — so
+/// the CR takes exactly ONE catch-up run, which stamps `status.lastReplicated`
+/// and re-anchors the next slot to next January. From that point the annotation
+/// is the only thing in the cluster that can produce another run, which is what
+/// makes the second `lastReplicated` a proof rather than a coincidence.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn snapshot_replication_runs_on_demand_from_the_run_requested_annotation() {
@@ -1222,21 +1222,30 @@ async fn snapshot_replication_runs_on_demand_from_the_run_requested_annotation()
             "spec": {
                 "sourceRef": { "kind": "Repository", "name": REPO_SRC },
                 "destinationRef": { "kind": "Repository", "name": REPO_DST },
-                // Months away: no cron slot can fire during this test.
+                // Yearly: one catch-up run now, then nothing until January.
                 "schedule": { "cron": "0 5 1 1 *" }
             }
         })),
-        "create SnapshotReplication with a far-future schedule",
+        "create SnapshotReplication with a yearly schedule",
     )
     .await;
 
-    // Nothing should have run yet — otherwise the assertion below would pass on
-    // a cron slot and prove nothing about the annotation.
-    let before = status_json(&repls, REPL).await;
-    assert!(
-        before.get("lastReplicated").is_none(),
-        "a far-future schedule must not have replicated yet; status: {before}"
-    );
+    // The one catch-up run, whose timestamp becomes the baseline the requested
+    // run must move.
+    let first = wait_until(
+        "the initial catch-up run stamps status.lastReplicated",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, REPL).await;
+            Ok(s.get("lastReplicated")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string))
+        },
+    )
+    .await
+    .expect("the catch-up run should stamp status.lastReplicated");
 
     let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     repls
@@ -1252,20 +1261,26 @@ async fn snapshot_replication_runs_on_demand_from_the_run_requested_annotation()
         .await
         .expect("annotate the replication with a run request");
 
+    // A SECOND run happens even though no cron slot is due — only the
+    // annotation can have caused it.
     wait_until(
-        "an annotation-requested snapshot-replication run stamps status.lastReplicated",
+        "the requested run stamps a NEW status.lastReplicated",
         default_timeout(),
         poll_interval(),
-        || async {
-            let s = status_json(&repls, REPL).await;
-            Ok(s.get("lastReplicated")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|_| ()))
+        || {
+            let first = first.clone();
+            let repls = repls.clone();
+            async move {
+                let s = status_json(&repls, REPL).await;
+                Ok(s.get("lastReplicated")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty() && *v != first)
+                    .map(str::to_string))
+            }
         },
     )
     .await
-    .expect("the requested run should execute and stamp status.lastReplicated");
+    .expect("the requested run should execute and re-stamp status.lastReplicated");
 
     let manual = wait_until(
         "status.manualRun reaches a terminal phase",
@@ -1274,11 +1289,17 @@ async fn snapshot_replication_runs_on_demand_from_the_run_requested_annotation()
         || async {
             let s = status_json(&repls, REPL).await;
             Ok(s.get("manualRun")
-                .and_then(|m| m.get("phase").and_then(|p| p.as_str()).map(|_| m.clone())))
+                .filter(|m| {
+                    matches!(
+                        m.get("phase").and_then(|p| p.as_str()),
+                        Some("Succeeded" | "Failed")
+                    )
+                })
+                .cloned())
         },
     )
     .await
-    .expect("the controller should record status.manualRun");
+    .expect("the controller should record a terminal status.manualRun");
     assert_eq!(
         manual.get("phase").and_then(|v| v.as_str()),
         Some("Succeeded"),
@@ -1298,22 +1319,11 @@ async fn snapshot_replication_runs_on_demand_from_the_run_requested_annotation()
         .expect("get destination Repository")
         .uid()
         .expect("destination Repository has a uid");
-    let copies = wait_until(
-        "the requested run's copies materialize as replicated Snapshot CRs",
-        default_timeout(),
-        poll_interval(),
-        || {
-            let client = client.clone();
-            let dest_uid = dest_uid.clone();
-            async move {
-                let rows = copy_rows(&client, REPL, &dest_uid).await;
-                Ok((!rows.is_empty()).then_some(rows))
-            }
-        },
-    )
-    .await
-    .expect("a successful requested run must materialize copy Snapshot CRs at the destination");
-    assert!(!copies.is_empty());
+    let copies = copy_rows(&client, REPL, &dest_uid).await;
+    assert!(
+        !copies.is_empty(),
+        "the destination must hold copy Snapshot CRs after a successful requested run"
+    );
 
     let _ = repls.delete(REPL, &DeleteParams::default()).await;
 }
