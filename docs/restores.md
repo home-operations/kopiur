@@ -201,7 +201,7 @@ The window opens when the restore can first actually **proceed**, not when you a
 
 /// warning | The window is not measured from `metadata.creationTimestamp`
 
-A `Restore` is very often applied long before it can do anything: GitOps applies it in the same commit as the `Repository` it reads from, or a `target.populator` sits in the repo for months waiting for an app to claim it. Anchoring the window at creation would mean that by the time the restore could finally act, the window had already expired — and for a `fromPolicy` source, whose `onMissingSnapshot` defaults to `Continue`, "expired" means **provision an empty volume immediately**, precisely the outcome `waitTimeout` exists to prevent. Read `status.waitStartedAt` to see when the clock actually started; an absent value means it has not started yet.
+A `Restore` is very often applied long before it can do anything: GitOps applies it in the same commit as the `Repository` it reads from, or a `target.populator` sits in the repo for months waiting for an app to claim it. Anchoring the window at creation would mean that by the time the restore could finally act, the window had already expired — and for a `fromPolicy` source, whose `onMissingSnapshot` defaults to `Continue`, "expired" means **provision an empty volume immediately**, precisely the outcome `waitTimeout` exists to prevent. Read `status.waitStartedAt` to see when the clock actually started; an absent value means it has not started yet — or that no `waitTimeout` is set, in which case there is no window to anchor.
 
 ///
 
