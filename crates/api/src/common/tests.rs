@@ -1470,6 +1470,21 @@ fn replication_manual_run_phase_answers_only_terminal_outcomes() {
     // Every canonical variant is covered above; `ALL` pins that count so a new
     // variant forces this test to state its dedupe rule.
     assert_eq!(P::ALL.len(), 4);
+    // The "a Job was launched for this request" classification, exhaustive for
+    // the same reason: it decides whether the controller reports a LOST outcome
+    // or silently re-runs side-effectful work.
+    assert!(P::Running.implies_job_launched());
+    for not_launched in [
+        P::Pending,
+        P::Succeeded,
+        P::Failed,
+        P::Unknown("Queued".into()),
+    ] {
+        assert!(
+            !not_launched.implies_job_launched(),
+            "{not_launched:?} does not imply a Job ran"
+        );
+    }
     assert!(P::Unknown("Queued".into()).is_unknown());
     for p in P::ALL {
         assert!(!p.is_unknown(), "{p:?} is a canonical phase");

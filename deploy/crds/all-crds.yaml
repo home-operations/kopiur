@@ -11464,6 +11464,33 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              manualRun:
+                description: |-
+                  State of the most recent annotation-requested out-of-band run
+                  (`kopiur.home-operations.com/run-requested`); absent until one is
+                  requested.
+                nullable: true
+                properties:
+                  completedAt:
+                    description: RFC3339 instant the run reached a terminal phase.
+                    nullable: true
+                    type: string
+                  phase:
+                    description: Lifecycle of a manual replication run. Closed enum.
+                    enum:
+                    - Pending
+                    - Running
+                    - Succeeded
+                    - Failed
+                    nullable: true
+                    type: string
+                  requestedAt:
+                    description: |-
+                      The `run-requested` annotation value this status reflects (RFC3339),
+                      verbatim as the user wrote it — it pins WHICH request is answered.
+                    nullable: true
+                    type: string
+                type: object
               nextScheduledAt:
                 description: RFC3339 timestamp of the next scheduled replication run (cron + jitter, pinned).
                 nullable: true
@@ -12287,6 +12314,33 @@ spec:
                     minimum: 0.0
                     nullable: true
                     type: integer
+                type: object
+              manualRun:
+                description: |-
+                  State of the most recent annotation-requested out-of-band run
+                  (`kopiur.home-operations.com/run-requested`); absent until one is
+                  requested.
+                nullable: true
+                properties:
+                  completedAt:
+                    description: RFC3339 instant the run reached a terminal phase.
+                    nullable: true
+                    type: string
+                  phase:
+                    description: Lifecycle of a manual replication run. Closed enum.
+                    enum:
+                    - Pending
+                    - Running
+                    - Succeeded
+                    - Failed
+                    nullable: true
+                    type: string
+                  requestedAt:
+                    description: |-
+                      The `run-requested` annotation value this status reflects (RFC3339),
+                      verbatim as the user wrote it — it pins WHICH request is answered.
+                    nullable: true
+                    type: string
                 type: object
               observedGeneration:
                 description: '`metadata.generation` last reconciled, for staleness detection / kstatus.'

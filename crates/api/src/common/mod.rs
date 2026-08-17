@@ -1205,6 +1205,22 @@ impl ReplicationManualRunPhase {
         }
     }
 
+    /// Whether this phase says a mover Job for the request EXISTS OR EXISTED.
+    ///
+    /// The controller's "the Job vanished before its outcome was observed"
+    /// check: `Running` with no Job present means a TTL reap beat the
+    /// reconcile, and re-running side-effectful work silently would be worse
+    /// than reporting the lost outcome. Exhaustive rather than an equality so a
+    /// phase added later must state whether it implies a Job was launched —
+    /// under `==` the new variant would silently take the "no Job ever ran"
+    /// branch.
+    pub fn implies_job_launched(&self) -> bool {
+        match self {
+            Self::Running => true,
+            Self::Pending | Self::Succeeded | Self::Failed | Self::Unknown(_) => false,
+        }
+    }
+
     /// Whether this phase ANSWERS the request it is recorded against — i.e. the
     /// run reached a terminal outcome, so re-applying the same `run-requested`
     /// value is a no-op.

@@ -220,7 +220,9 @@ pub fn manual_run_status(
 pub fn recorded_running(manual: Option<&ReplicationManualRunStatus>, request: &RunRequest) -> bool {
     manual.is_some_and(|m| {
         m.requested_at.as_deref() == Some(request.raw.as_str())
-            && m.phase.as_ref() == Some(&ReplicationManualRunPhase::Running)
+            && m.phase
+                .as_ref()
+                .is_some_and(ReplicationManualRunPhase::implies_job_launched)
     })
 }
 
