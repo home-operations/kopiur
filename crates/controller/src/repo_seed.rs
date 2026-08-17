@@ -1156,6 +1156,52 @@ mod tests {
     }
 
     #[test]
+    fn the_defensive_validator_refuses_the_seeds_admission_would_have() {
+        // One validator, two callers. The reconcile-side call is what stands
+        // between a CR that reached etcd with the webhook disabled and a
+        // seeding mover pointed somewhere it must never go — so pin that the
+        // shared validator actually bites on the reconcile-side inputs.
+        use kopiur_api::backend::FilesystemBackend;
+        let bare = Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        });
+        let seed = seed_spec(serde_json::json!({
+            "from": { "repository": { "name": "offsite" } }
+        }));
+
+        // A bare-path repository can never be seeded: the mover mounts nothing.
+        let errs = kopiur_api::validate::validate_repository_seed(
+            Some(&seed),
+            &bare,
+            Default::default(),
+            None,
+            RepositoryKind::Repository,
+        );
+        assert!(!errs.is_empty(), "a bare-path repository must be refused");
+
+        // A ReadOnly repository can never complete a seed.
+        let errs = kopiur_api::validate::validate_repository_seed(
+            Some(&seed),
+            &s3("target"),
+            kopiur_api::common::RepositoryMode::ReadOnly,
+            None,
+            RepositoryKind::Repository,
+        );
+        assert!(!errs.is_empty(), "a ReadOnly repository must be refused");
+
+        // ...and the ordinary shape is accepted, so the gate is not vacuous.
+        let errs = kopiur_api::validate::validate_repository_seed(
+            Some(&seed),
+            &s3("target"),
+            Default::default(),
+            None,
+            RepositoryKind::Repository,
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
     fn the_seed_creds_prefix_is_distinct_from_the_repositorys_own() {
         // One bootstrap pod touches TWO repositories in migrate mode. A shared
         // prefix would make the source projection clobber this repository's own

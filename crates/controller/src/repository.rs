@@ -115,6 +115,28 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
     if let Err(e) = validate::validate_repository_no_inline_retention(&repo.spec) {
         return Err(Error::Validation(e.to_string()));
     }
+    // #380: defensive re-validation of `spec.seed`, at the TOP so it also
+    // covers the in-process bare-path filesystem arm below — which never
+    // reaches the seed-arming pass and would otherwise create an EMPTY
+    // repository while silently ignoring the seed, the exact failure #380
+    // exists to prevent. (Admission refuses `spec.seed` on a bare path for
+    // precisely that reason; this is the belt to that brace, for a CR that
+    // reached etcd with the webhook disabled or bypassed.) Gated on
+    // `spec.seed` being present, so it is a no-op for every repository that
+    // predates #380. The ClusterRepository reconciler gets this for free — it
+    // already runs the whole `validate_cluster_repository` aggregate.
+    if repo.spec.seed.is_some() {
+        let errs = validate::validate_repository_seed(
+            repo.spec.seed.as_ref(),
+            &repo.spec.backend,
+            repo.spec.mode,
+            repo.spec.create.as_ref(),
+            RepositoryKind::Repository,
+        );
+        if let Some(first) = errs.into_iter().next() {
+            return Err(Error::Validation(first.to_string()));
+        }
+    }
 
     let namespace = repo
         .namespace()
