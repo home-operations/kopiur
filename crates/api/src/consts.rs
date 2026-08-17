@@ -386,6 +386,38 @@ pub const DELETION_HELD_CONDITION: &str = "DeletionHeld";
 /// `reason` for [`DELETION_HELD_CONDITION`] = `True`.
 pub const MASS_DELETION_BREAKER_REASON: &str = "MassDeletionBreaker";
 
+/// `Repository`/`ClusterRepository` condition reporting the state of
+/// `spec.seed` — initializing a brand-new repository from an existing replica
+/// (issue #380).
+///
+/// `True` means the repository holds its seeded content (reason
+/// [`SEEDED_REASON`]) or never needed seeding because it was already
+/// initialized (reason [`ALREADY_INITIALIZED_REASON`]). `False` means the seed
+/// is in flight ([`SEEDING_REASON`]), parked on a source that is not usable yet
+/// ([`WAITING_FOR_SEED_SOURCE_REASON`]), or failed (the mover's failure class).
+///
+/// Wire-visible: GitOps health checks, `kubectl kopiur status`/`doctor` and
+/// user automation read it, so it lives in `kopiur-api` beside the other
+/// contract strings rather than controller-side.
+pub const SEEDED_CONDITION: &str = "Seeded";
+/// `reason` for [`SEEDED_CONDITION`] = `True` when this repository's content
+/// was actually copied in from `spec.seed.from`.
+pub const SEEDED_REASON: &str = "Seeded";
+/// `reason` for [`SEEDED_CONDITION`] = `True` when `spec.seed` was a standing
+/// no-op: the repository was already initialized, so nothing was copied. This
+/// is the steady state of a seed block left in a GitOps manifest forever.
+pub const ALREADY_INITIALIZED_REASON: &str = "AlreadyInitialized";
+/// `reason` for [`SEEDED_CONDITION`] = `False` while the seeding bootstrap Job
+/// is in flight. Bounded by `spec.seed.failurePolicy` (default 24h), but a seed
+/// legitimately runs for hours, so anything reporting on a repository must be
+/// able to say "seeding" rather than "stuck".
+pub const SEEDING_REASON: &str = "Seeding";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when a migrate-mode seed is
+/// parked because its source `Repository`/`ClusterRepository` is not `Ready`
+/// (or does not exist). The repository stays `Pending` and re-checks until the
+/// source comes up — an out-of-band change nothing in kopiur can make.
+pub const WAITING_FOR_SEED_SOURCE_REASON: &str = "WaitingForSeedSource";
+
 #[cfg(test)]
 mod tests {
     use super::*;
