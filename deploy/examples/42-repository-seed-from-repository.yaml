@@ -1,0 +1,114 @@
+# Example 42 — Seed a new repository from another repository (migrate mode)
+#
+# The second shape of `spec.seed` (see example 41 for blob mode). MIGRATE MODE
+# (`seed.from.repository`) points at another `Repository`/`ClusterRepository` CR
+# and runs `kopia snapshot migrate`: source and destination are two INDEPENDENT
+# repositories with their own formats and their own passwords. Kopiur creates the
+# local repository itself (honoring `create.{splitter,hash,encryption,ecc}`) and
+# then copies the source's snapshot manifests into it.
+#
+# Reach for migrate mode when:
+#
+#   * the surviving replica is a real repository CR you can still reach (a
+#     ClusterRepository the platform team keeps, a peer cluster's repository),
+#     not a bare blob mirror;
+#   * you want the new repository to have its OWN password and format rather than
+#     inheriting the source's.
+#
+# `kopia snapshot migrate` PRESERVES each snapshot's `username@hostname:path`
+# identity and its times, so seeded history stays restorable by
+# `Restore.source.identity` / `fromPolicy` — which is what makes a rebuilt
+# cluster's policies find their own old snapshots.
+#
+# CROSS-NAMESPACE CREDENTIALS: the seeding Job runs in this Repository's
+# namespace, and the SOURCE repository's Secrets usually live somewhere else.
+# `seed.credentialProjection.enabled: true` lets the operator copy them in for
+# the duration of the run — which needs the operator's
+# `features.credentialProjection.enabled` Helm flag (see
+# docs/feature-permissions.md). Without the flag the bootstrap fails closed with
+# an actionable message rather than launching a Job that cannot authenticate.
+#
+# Field shapes verified against crates/api (crates/api/src/seed.rs):
+# `seed.from.repository` is a RepositoryRef (kind defaults to Repository; an
+# absent namespace resolves in this CR's own namespace); `seed.migrate` is
+# migrate-mode-only tuning and is rejected alongside a `backend:` source;
+# `policies` is the same enum SnapshotReplication uses and defaults to `none`
+# (an explicit `--no-policies`).
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# (docs/repositories.md pulls the Repository on its own). Plain YAML comments —
+# the file stays `kubectl apply -f`-able as-is.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: billing
+type: Opaque
+stringData:
+  # Credentials for THIS repository's own backend.
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # THIS repository's own password — in migrate mode it is a brand-new
+  # repository, so this is independent of the source's password.
+  KOPIA_PASSWORD: "REPLACE_ME"
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: rebuilt-primary
+      prefix: prod/
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    # Migrate mode creates the local repository itself, so these format knobs ARE
+    # honored here (unlike blob mode, which inherits the mirror's format and
+    # rejects them as inert).
+    enabled: true
+    splitter: DYNAMIC-4M-BUZHASH
+  seed:
+    from:
+      # The surviving replica, as a repository CR. `kind` defaults to
+      # `Repository`; a ClusterRepository is the usual DR source. A namespaced
+      # `kind: Repository` with no `namespace` resolves in THIS CR's namespace.
+      repository:
+        kind: ClusterRepository
+        name: offsite-archive
+    # Migrate-mode tuning. Rejected at admission alongside a `backend:` source.
+    migrate:
+      parallel: 4 # snapshots migrated concurrently (kopia default 1)
+      latestOnly: false # copy the FULL history, not just each identity's newest
+      # Do NOT import the source's kopia-side policies (the default). Retention in
+      # a kopiur-managed repository is driven by Snapshot CRs and their GFS
+      # window; imported kopia policies could delete manifests behind the
+      # operator's back.
+      policies: none
+    allowEmptySource: false
+    # Copy the SOURCE repository's credential Secrets into the seeding Job's
+    # namespace for the duration of the run. Needed whenever the source's Secrets
+    # live somewhere this namespace cannot read (the usual cross-namespace or
+    # ClusterRepository case). Requires the operator's
+    # `features.credentialProjection.enabled` Helm flag.
+    credentialProjection:
+      enabled: true
+    failurePolicy:
+      # Wall-clock cap for the SEEDING bootstrap Job (default 86400 = 24h).
+      activeDeadlineSeconds: 43200
+  catalog:
+    # Bound the `discovered` Snapshot CRs a large seeded history materializes.
+    retain:
+      perIdentity: 100
+      maxAgeDays: 365
+# --8<-- [end:repository]

@@ -1,0 +1,132 @@
+# Example 41 — Seed a new repository from a mirror backend (blob mode)
+#
+# `spec.seed` fills a BRAND-NEW repository with an existing replica's contents on
+# its very first bootstrap, BEFORE the repository is ever reported Ready. This is
+# the disaster-recovery half of `RepositoryReplication` (example 19): the mirror
+# you have been writing off-site becomes the starting point of the rebuilt
+# cluster's own repository, instead of something you point a Repository directly
+# at (which would make the mirror the live repository) or copy by hand.
+#
+# BLOB MODE (`seed.from.backend`) runs `kopia repository sync-to` from a bare
+# storage backend holding a byte-for-byte mirror of a kopia repository — exactly
+# what a RepositoryReplication writes. The copy is at the storage layer, so:
+#
+#   * the seeded repository inherits the MIRROR's format AND password verbatim.
+#     `encryption.passwordSecretRef` below must therefore already hold the
+#     mirror's password;
+#   * `create.{splitter,hash,encryption,ecc}` are REJECTED at admission next to a
+#     blob seed — the format comes from the mirror, so declaring one would be an
+#     inert field. (`create.enabled` keeps its ordinary meaning for every later
+#     connect and is not refused.)
+#
+# Seeding is armed only while the repository has never been initialized
+# (`status.uniqueId` unset) and the mover's first connect finds the backend
+# uninitialized. On an already-initialized repository the block is a documented
+# no-op (`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave
+# standing in a GitOps manifest forever.
+#
+# Not to be confused with the "seed job" fixtures elsewhere in deploy/examples —
+# those are one-shot Jobs that write test data into a volume. This seeds a
+# REPOSITORY, from another repository.
+#
+# Field shapes verified against crates/api (crates/api/src/seed.rs): `seed.from`
+# is an externally-tagged one-of (`backend:` or `repository:`); `seed.sync` is
+# blob-mode-only tuning; `allowEmptySource` defaults to false; `failurePolicy`
+# is the shared FailurePolicy shape (24h activeDeadlineSeconds by default while
+# seeding, versus the 120s a routine connect gets).
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# (docs/repositories.md pulls the Repository on its own). Plain YAML comments —
+# the file stays `kubectl apply -f`-able as-is.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: billing
+type: Opaque
+stringData:
+  # Credentials for THIS repository's own backend (the new cluster's bucket).
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # The repository password. In blob mode this MUST be the password the MIRROR
+  # was written with — `sync-to` copies the format blob verbatim, so the seeded
+  # repository is openable with the mirror's password and no other.
+  KOPIA_PASSWORD: "REPLACE_ME"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: offsite-mirror-creds
+  # Must live in THIS Repository's namespace: the seeding mover Job runs here and
+  # loads the seed source's keys with envFrom, which is namespace-local.
+  namespace: billing
+type: Opaque
+stringData:
+  # Credentials for the MIRROR's storage (read-only access is enough — seeding
+  # never writes to its source).
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+---
+# --8<-- [start:repository]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  # The NEW repository this cluster will write into from now on. It does not
+  # exist yet — that is what arms the seed.
+  backend:
+    s3:
+      bucket: rebuilt-primary
+      prefix: prod/
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+  seed:
+    # Exactly one of `backend:` (blob mode) or `repository:` (migrate mode).
+    from:
+      backend:
+        s3:
+          # The surviving off-site mirror — the destination a
+          # RepositoryReplication has been syncing to (example 19). Point this at
+          # the bucket AND prefix the kopia repository actually lives under: a
+          # mirror is rooted at the replication destination's own prefix, not its
+          # parent.
+          bucket: offsite-mirror
+          prefix: prod/
+          region: us-west-2
+          auth:
+            secretRef:
+              name: offsite-mirror-creds
+    # Blob-mode tuning for `kopia repository sync-to`. Optional; `sync` is
+    # rejected at admission alongside a `repository:` source, so no field is ever
+    # inert.
+    sync:
+      parallel: 8 # concurrent blob-copy workers (kopia default 1 = sequential)
+      # maxDownloadSpeedBytesPerSecond: 104857600  # cap the read from the mirror
+      # maxUploadSpeedBytesPerSecond: 104857600    # cap the write into this repo
+    # Refuse to seed from a source that holds zero snapshots (the default). An
+    # empty mirror is nearly always a mis-pointed bucket/prefix, and seeding
+    # nothing would hand you a Ready repository with no history.
+    allowEmptySource: false
+    failurePolicy:
+      # Wall-clock cap for the SEEDING bootstrap Job. Defaults to 86400 (24h)
+      # while a seed is armed; raise it for a very large repository over a slow
+      # link, lower it to fail a hopeless copy sooner.
+      activeDeadlineSeconds: 86400
+  catalog:
+    # A seeded repository's whole history is materialized as `discovered`
+    # Snapshot CRs when it goes Ready. Bound the rows on a multi-year mirror so
+    # the recovery does not create thousands of CRs — this bounds the CRs only,
+    # never the data (every snapshot stays restorable by identity).
+    retain:
+      perIdentity: 100
+      maxAgeDays: 365
+# --8<-- [end:repository]

@@ -1,0 +1,300 @@
+# Scenario 10 — Disaster recovery from a replicated repository (spec.seed)
+#
+# Scenario 03 rebuilds a cluster by CONNECTING to the surviving repository, so
+# the recovered cluster keeps writing into the same bucket forever. This scenario
+# is the other half of a 3-2-1 strategy: you have been mirroring the primary
+# repository off-site (RepositoryReplication, example 19), the primary is gone,
+# and you want the rebuilt cluster to get its OWN repository back — pre-loaded
+# with the mirror's history — instead of adopting the mirror as its live store.
+#
+# `spec.seed` does that in the repository's very first bootstrap: the seeding
+# mover copies the replica in BEFORE the Repository is ever reported Ready, so
+# nothing downstream (a populator Restore, a policy's adoption pass) can ever
+# observe a Ready-but-empty repository. That failure — a blank PVC populated from
+# an empty repository, silently, on the day you needed the backups — is issue
+# #380 and the reason this block exists.
+#
+# IMPORTANT — this file shows BOTH clusters' manifests together, and they are
+# NEVER applied to the same cluster:
+#
+#   * `primary` + `mirror`  → the ORIGINAL cluster, before the disaster. This is
+#     the prerequisite: without a replica there is nothing to seed from.
+#   * `seed-blob` OR `seed-migrate` (pick ONE) + `populator-restore`
+#     → the REBUILT cluster. The rebuilt Repository deliberately reuses the same
+#     name and namespace as the original — that is what a real recovery looks
+#     like, and it is what lets `fromPolicy` resolve the old snapshots.
+#
+# BLOB vs MIGRATE, in one line each:
+#   * blob    (`seed.from.backend`)    — `kopia repository sync-to` from a bare
+#     mirror backend. Inherits the mirror's format AND password verbatim.
+#   * migrate (`seed.from.repository`) — `kopia snapshot migrate` from another
+#     repository CR. A brand-new local repository with its OWN password/format;
+#     snapshot identities and times are preserved either way.
+#
+# Not to be confused with the "seed job" fixtures elsewhere in deploy/examples —
+# those are one-shot Jobs that write test data into a volume. This seeds a
+# REPOSITORY, from another repository.
+#
+# Field shapes verified against crates/api (crates/api/src/seed.rs). See
+# docs/scenarios/dr-with-replicated-repository.md for the full walkthrough,
+# including the identity-must-match and adoption/retention hazards.
+
+# ============================================================================
+# ORIGINAL CLUSTER — the repository that is about to be lost, and its mirror
+# ============================================================================
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: repo-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  # Keep this password OUTSIDE the cluster too (password manager / external
+  # secret store). Blob-mode seeding needs the ORIGINAL password: `sync-to`
+  # copies the format blob verbatim, and kopia cannot decrypt without it.
+  KOPIA_PASSWORD: "REPLACE_ME"
+---
+# --8<-- [start:primary]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: primary-backups
+      prefix: prod/
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD
+# --8<-- [end:primary]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: offsite-mirror-creds
+  namespace: billing
+type: Opaque
+stringData:
+  # The MIRROR's own storage credentials (a different account/region is the
+  # point of an off-site copy).
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+---
+# --8<-- [start:mirror]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: RepositoryReplication
+metadata:
+  name: nas-primary-offsite
+  namespace: billing
+spec:
+  sourceRef:
+    kind: Repository
+    name: nas-primary
+  # The off-site mirror. Note the prefix: a mirror is rooted HERE, so this is the
+  # exact bucket+prefix the seed below must point at.
+  destination:
+    s3:
+      bucket: offsite-mirror
+      prefix: prod/
+      region: us-west-2
+      auth:
+        secretRef:
+          name: offsite-mirror-creds
+  schedule:
+    cron: "H 5 * * *" # nightly, after the backup window
+    jitter: 30m
+# --8<-- [end:mirror]
+
+# ============================================================================
+# REBUILT CLUSTER — variant A: seed from the mirror BACKEND (blob mode)
+# ============================================================================
+# Apply the Secrets above (same names, same namespace) on the rebuilt cluster
+# too — `repo-creds` must carry the ORIGINAL KOPIA_PASSWORD, because a blob seed
+# inherits the mirror's format and password.
+---
+# --8<-- [start:seed-blob]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  # The NEW primary this cluster writes into. It does not exist yet — that is
+  # what arms the seed. (`spec.seed` is armed only while status.uniqueId is
+  # unset; once the repository is initialized the block is a documented no-op,
+  # `Seeded=True reason=AlreadyInitialized`, so it is safe to leave in Git.)
+  backend:
+    s3:
+      bucket: rebuilt-primary
+      prefix: prod/
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD # the ORIGINAL password — the mirror's format demands it
+  seed:
+    from:
+      backend:
+        s3:
+          # Byte-identical to the RepositoryReplication destination above.
+          bucket: offsite-mirror
+          prefix: prod/
+          region: us-west-2
+          auth:
+            # Must be a Secret in THIS Repository's namespace — the seeding Job
+            # loads it with envFrom, which is namespace-local.
+            secretRef:
+              name: offsite-mirror-creds
+    sync:
+      parallel: 8 # a first seed over a WAN is what sequential copying is worst at
+    # An empty mirror is nearly always a mis-pointed bucket/prefix; refuse it
+    # rather than reporting a Ready repository with no history (the default).
+    allowEmptySource: false
+    failurePolicy:
+      activeDeadlineSeconds: 86400 # 24h — the default while a seed is armed
+  catalog:
+    # A years-deep mirror would otherwise materialize thousands of `discovered`
+    # Snapshot CRs the moment the repository goes Ready. This bounds the CRs
+    # only — every snapshot stays restorable by identity.
+    retain:
+      perIdentity: 100
+      maxAgeDays: 365
+# --8<-- [end:seed-blob]
+
+# ============================================================================
+# REBUILT CLUSTER — variant B: seed from another REPOSITORY CR (migrate mode)
+# ============================================================================
+# Use this instead of variant A when the surviving replica is a real repository
+# you can still reach (a ClusterRepository the platform team keeps, a peer
+# cluster's repository) rather than a bare blob mirror — or when you want the
+# rebuilt repository to have its OWN password and format.
+#
+# Requires the operator's `features.credentialProjection.enabled` Helm flag when
+# the source repository's Secrets are not readable from this namespace.
+---
+# --8<-- [start:seed-migrate]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: rebuilt-primary
+      prefix: prod/
+      region: us-east-1
+      auth:
+        secretRef:
+          name: repo-creds
+  encryption:
+    passwordSecretRef:
+      name: repo-creds
+      key: KOPIA_PASSWORD # this repository's OWN password (migrate mode)
+  create:
+    # Migrate mode creates the local repository itself, so format knobs ARE
+    # honored here (blob mode rejects them as inert).
+    enabled: true
+  seed:
+    from:
+      repository:
+        kind: ClusterRepository
+        name: offsite-archive
+    migrate:
+      parallel: 4
+      latestOnly: false # copy the FULL history, not just each identity's newest
+      policies: none # do NOT import the source's kopia-side policies (default)
+    allowEmptySource: false
+    credentialProjection:
+      enabled: true # copy the SOURCE repository's Secrets in for this run
+    failurePolicy:
+      activeDeadlineSeconds: 86400
+  catalog:
+    retain:
+      perIdentity: 100
+      maxAgeDays: 365
+# --8<-- [end:seed-migrate]
+
+# ============================================================================
+# REBUILT CLUSTER — the app comes back on top of the seeded repository
+# ============================================================================
+---
+# --8<-- [start:populator-restore]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    name: nas-primary
+  sources:
+    - pvc:
+        name: postgres-data
+  # Pin the identity to EXACTLY what the old cluster recorded. Seeding preserves
+  # each snapshot's username@hostname:path, so this is what makes the recovered
+  # history resolvable — a mismatch silently finds nothing (kopiur raises a
+  # NoAdoptableHistory Warning event when a policy matches none of a non-empty
+  # catalog).
+  identity:
+    username: postgres-data
+    hostname: billing
+  # Review this BEFORE re-applying policies over seeded history: adoption pulls
+  # matching discovered snapshots under GFS retention, and under the default
+  # `deletionPolicy: Delete` anything outside this window is pruned from the
+  # repository immediately. Widen it, or set defaultDeletionPolicy: Retain.
+  retention:
+    keepDaily: 14
+    keepWeekly: 6
+    keepMonthly: 12
+---
+# PASSIVE populator Restore. It does nothing on its own; the PVC below consumes
+# it via spec.dataSourceRef. Because the Repository is not Ready until the seed
+# finishes, this restore parks — and its waitTimeout window only OPENS at that
+# point (status.waitStartedAt), so a 24h seed does not burn it.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: postgres-data-restore
+  namespace: billing
+spec:
+  source:
+    fromPolicy:
+      name: postgres-data
+      offset: 0 # 0 = latest seeded snapshot
+  target:
+    populator: {}
+  policy:
+    onMissingSnapshot: Continue
+    waitTimeout: 30m
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  storageClassName: fast-ssd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  dataSourceRef:
+    apiGroup: kopiur.home-operations.com
+    kind: Restore
+    name: postgres-data-restore
+# --8<-- [end:populator-restore]
