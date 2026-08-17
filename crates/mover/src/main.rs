@@ -1261,10 +1261,13 @@ fn seed_source_connect_failure(seed: &workspec::SeedOpSpec, err: &KopiaError) ->
 
 /// List the seed source and apply the empty-source gate (`allowEmptySource`).
 ///
-/// `snapshot list --all` deliberately: a mirror's snapshots belong to the
-/// identities of the cluster that WROTE them, while the unfiltered
-/// `snapshot list` is scoped to the connected identity — it would report zero
-/// on a perfectly good mirror and trip the empty gate on every seed.
+/// `snapshot list --all` deliberately. A mirror's snapshots belong to the
+/// identities of the cluster that WROTE them, and this listing decides whether
+/// the bootstrap fails — so it must not depend on kopia's source-less default.
+/// On 0.23.1 a source-less `snapshot list` does return foreign identities
+/// (verified; `--all` only narrows when a `<source>` positional is given), but
+/// the flag name says otherwise and the gate would silently report every good
+/// mirror as empty if that ever became true.
 async fn seed_source_snapshots(
     seed: &workspec::SeedOpSpec,
     source_client: &KopiaClient,
@@ -1511,8 +1514,16 @@ fn seed_migrate_verify(
             &srepl::missing_sample(&missing, kopiur_mover::error::MISSING_SAMPLE_CAP),
         )));
     }
-    // The repository was empty before the migrate (this arm created it), so
-    // everything present now arrived from the source.
+    // CUMULATIVE, not copied-by-this-run: this counts what is PRESENT after the
+    // migrate. On a first seed the repository was empty beforehand, so the two
+    // readings coincide. On a RESUME the destination already held the previous
+    // attempt's partial copy, and this number includes it.
+    //
+    // Chosen deliberately over a before/after delta. `status.seed.snapshotsCopied`
+    // answers "how much of the source is here now", which is what someone
+    // watching a recovery wants and what stays meaningful across however many
+    // attempts it took; a per-run delta would report a small number on the run
+    // that finally completed the copy. It also costs no extra listing.
     Ok(srepl::dest_keys(local_after, &selected).len() as i64)
 }
 
@@ -1641,6 +1652,23 @@ async fn run_seed(
 ) -> SeedStep<SeedOutcome> {
     let paths = SeedPaths::new();
     if seed.resume {
+        // TRUST CONTRACT. `resume: true` is an ASSERTION by the controller that
+        // it previously started a seed of THIS repository and that seed did not
+        // finish. The mover does not — cannot — independently verify it: from
+        // here an interrupted seed's leftovers and a stranger's repository look
+        // identical, and the only thing that distinguishes them is the durable
+        // seed-attempt marker the controller stamps in status before creating a
+        // seeding Job (issue #380 stage C3).
+        //
+        // What rides on that marker: a resuming MIGRATE writes into whatever
+        // repository is at this backend, and a successful seed then re-stamps
+        // its maintenance owner. If the flag were ever set for a repository this
+        // operator never began seeding, the migrate would pour snapshots into a
+        // stranger's repository and claim its maintenance. Blob mode is
+        // structurally safer — kopia's own `sync-to` refuses a destination whose
+        // format blob differs from the source's — but migrate has no such
+        // backstop, so the marker is the ONLY guard. Never set `resume` from
+        // anything weaker than that marker.
         info!(
             source = %seed.source_description,
             local_initialized,
@@ -1752,12 +1780,24 @@ async fn bootstrap_create_arm(
 /// The [`BootstrapInitAction::Seed`] arm (issue #380): initialize this
 /// repository from `spec.seed`'s source, then reconnect to it.
 ///
-/// Returns `(created, outcome)`. `created` is TRUE only for migrate mode, which
-/// creates the local repository itself and therefore takes the ordinary
-/// create path — including the create-time owner stamp. Blob mode copied a
-/// whole repository in, so it leaves `created` false and is reported as
-/// `seeded` instead, which is what drives the unconditional owner RESTAMP (the
-/// copied `kopia.maintenance` blob names the source cluster's operator).
+/// Returns `(created, outcome)`. `created` is TRUE only for a migrate that
+/// actually created the local repository this run — migrate mode into a backend
+/// that was NOT already initialized. It then takes the ordinary create path,
+/// including the create-time owner stamp.
+///
+/// The other two shapes report `seeded` instead, and both need the
+/// unconditional owner RESTAMP that flag drives:
+/// * **blob** (first seed or resume) — the copy carries the SOURCE cluster's
+///   `kopia.maintenance` blob, so the repository arrives owned by an operator
+///   that no longer exists;
+/// * **a RESUMING migrate** — the repository was created by an earlier attempt
+///   whose own stamp may never have run (that attempt died), leaving kopia's
+///   ephemeral pod identity as owner. Nothing else would ever fix it, since
+///   `created` is false on this pass.
+///
+/// So `seeded == !created` here by construction, and that is the honest
+/// reading: "this run initialized or finished the repository, but not by
+/// `repository create`".
 #[allow(clippy::too_many_arguments)]
 async fn bootstrap_seed_arm(
     client: &KopiaClient,
@@ -1926,14 +1966,19 @@ async fn run_bootstrap(
             created = true;
         }
         BootstrapInitAction::Seed => {
-            // Unreachable without a seed (the action is only returned when one
+            // Unreachable without a seed (`Seed` is only ever returned when one
             // is armed), but expressed as a `let else` rather than an `unwrap`
             // so a future rearrangement degrades to a real failure instead of a
             // panic in the middle of a disaster recovery.
+            //
+            // TERMINAL, and deliberately not one of the seed classes: this would
+            // be the mover disagreeing with itself, which no retry can resolve.
+            // Classifying it retryable would spin a Job every two minutes
+            // forever while hiding the defect behind it.
             let Some(seed) = op.seed.as_ref() else {
-                return connect_err
-                    .as_ref()
-                    .map_or_else(BootstrapResult::seed_left_empty, BootstrapResult::failed);
+                return BootstrapResult::internal_inconsistency(
+                    "bootstrap_init_action selected Seed for a work spec that carries no                      spec.seed payload",
+                );
             };
             match bootstrap_seed_arm(
                 client,

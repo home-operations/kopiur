@@ -802,8 +802,11 @@ impl SeedOpSpec {
     ///   re-initializing would be the wrong answer. Rendered explicitly either
     ///   way (`--no-must-exist` / `--must-exist`) rather than relying on kopia's
     ///   default, so a future default flip cannot turn every seed into a
-    ///   failure — pinned against the real binary by the `sync_to_seeds_*`
-    ///   integration test.
+    ///   failure. BOTH renderings are pinned against the real binary by the
+    ///   `sync_to_seeds_*` integration test: its first `sync-to` initializes an
+    ///   empty directory with `--no-must-exist`, and its resume leg runs
+    ///   `--must-exist` into the destination that produced, then asserts the
+    ///   copy converged.
     /// * `delete_extra: false` — a seed never prunes. On a first seed there is
     ///   nothing at the destination to prune; on a resume the destination holds
     ///   the previous attempt's partial copy, and `--delete` is the one flag that
@@ -982,18 +985,27 @@ pub enum RestampPolicy {
 /// its owner was already stamped unconditionally at create time, so this
 /// self-heal never fires there (see the mover's create-path stamp).
 ///
-/// `seeded` is `true` only for a repository a **blob-mode seed** (`spec.seed`
-/// with a mirror backend, issue #380) just initialized by copying another
-/// cluster's storage. That copy carries the SOURCE cluster's
-/// `kopia.maintenance` blob, so the repository arrives owned by an operator
-/// that — this being disaster recovery — no longer exists. Under
-/// [`RestampPolicy::OwnFormatsOnly`] (forced whenever `identityDefaults.cluster`
-/// is set) that owner is unrecognized, the self-heal would decline to touch it,
-/// and maintenance would yield indefinitely on a repository nobody else can
-/// claim. So a just-seeded repository restamps unconditionally: it is
-/// semantically as fresh as a created one, even though `created` stays `false`
-/// (only the create fallback creates). Migrate-mode seeds create the local
-/// repository normally and take the `created` path instead.
+/// `seeded` is `true` for a repository a `spec.seed` (issue #380) initialized or
+/// FINISHED on this run without a `repository create` of its own — which is two
+/// shapes, both needing the unconditional restamp for the same underlying
+/// reason (the recorded owner is one no later pass would ever fix):
+///
+/// * **any blob-mode seed.** The `sync-to` copy carries the SOURCE cluster's
+///   `kopia.maintenance` blob, so the repository arrives owned by an operator
+///   that — this being disaster recovery — no longer exists.
+/// * **a RESUMING migrate.** The repository was created by an EARLIER attempt,
+///   so `created` is false on this pass; and that attempt died, quite possibly
+///   before its own create-time stamp ran, leaving kopia's ephemeral pod
+///   identity as owner.
+///
+/// Under [`RestampPolicy::OwnFormatsOnly`] (forced whenever
+/// `identityDefaults.cluster` is set) such an owner is unrecognized, the
+/// self-heal would decline to touch it, and maintenance would yield
+/// indefinitely on a repository nobody else can claim. So a seeded repository
+/// restamps unconditionally: it is semantically as fresh as a created one, even
+/// though `created` stays `false` (only a `repository create` this run sets
+/// that). A FIRST migrate does create the repository and takes the `created`
+/// path instead.
 ///
 /// Exhaustive over [`RestampPolicy`]:
 /// * [`RestampPolicy::AnyStale`] — restamp whenever `current != desired`

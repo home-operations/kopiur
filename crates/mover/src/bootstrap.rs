@@ -330,6 +330,19 @@ pub fn seed_left_repository_empty(
 /// interrupted seed from being mistaken for an ordinary adoption.
 pub const SEED_INCOMPLETE_CLASS: &str = "SeedIncomplete";
 
+/// Sentinel [`FailureBlock::kopia_error_class`] for a state the mover believes
+/// is unreachable having reached it anyway — a broken internal invariant, not
+/// anything about the repository or its backend.
+///
+/// Deliberately **terminal**. Every other bootstrap failure class describes a
+/// world that can change (a source that will exist later, a copy that will
+/// finish), so retrying them is progress. This one describes the mover
+/// disagreeing with itself: the same inputs produce the same contradiction on
+/// every attempt, so a retryable classification would spin a Job every two
+/// minutes forever while hiding the bug behind it. Failing terminally puts the
+/// message somewhere a human reads.
+pub const BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS: &str = "BootstrapInternalInconsistency";
+
 /// The outcome of a seed that ran (or was skipped as already-initialized),
 /// carried on [`BootstrapResult::seed`].
 ///
@@ -361,9 +374,19 @@ pub struct SeedOutcome {
     /// recorded when `allowEmptySource` permitted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_count: Option<i64>,
-    /// Snapshots that arrived at this repository — migrate mode only. A blob
-    /// copy moves storage, not manifests, so it leaves this unset and the
+    /// Snapshots PRESENT at this repository after the copy — migrate mode only.
+    /// A blob copy moves storage, not manifests, so it leaves this unset and the
     /// controller reports the post-seed catalog listing instead.
+    ///
+    /// **Cumulative, not per-run.** On a first seed the repository was empty
+    /// beforehand, so "present now" and "copied by this run" are the same
+    /// number. On a RESUME
+    /// ([`crate::workspec::SeedOpSpec::resume`]) it includes what the
+    /// interrupted attempt had already moved. Chosen deliberately: the question
+    /// `status.seed.snapshotsCopied` should answer is "how much of the source is
+    /// here now", which stays meaningful across however many attempts a recovery
+    /// took — a per-run delta would report a small number on the very run that
+    /// finished the job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots_copied: Option<i64>,
 }
@@ -818,6 +841,24 @@ impl BootstrapResult {
             // itself succeeded in reporting the state we refuse.
             op: None,
         })
+    }
+
+    /// A terminal-failure outcome for a broken internal invariant
+    /// ([`BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS`]). `detail` names the
+    /// contradiction; it is a fixed, per-call-site string, never a per-attempt
+    /// value, because the controller renders the message verbatim as a
+    /// condition.
+    pub fn internal_inconsistency(detail: &str) -> Self {
+        BootstrapResult::sentinel(
+            BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS,
+            format!(
+                "the bootstrap mover reached a state it believes is impossible: {detail}. This \
+                 is a defect in kopiur, not a problem with this repository or its backend, so \
+                 retrying will reproduce it — the failure is terminal on purpose. Please report \
+                 it with the bootstrap Job's pod logs and the repository's spec"
+            ),
+            false,
+        )
     }
 
     /// A terminal-failure outcome for "`spec.seed`'s source backend answered but
