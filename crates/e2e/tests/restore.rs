@@ -1566,3 +1566,233 @@ async fn restore_inherits_recorded_identity_and_holds_without_it() {
     );
     cleanup_restore(&restores, hold).await;
 }
+
+// --- #380: the `waitTimeout` window opens when the restore can first PROCEED ---
+
+/// Isolated repo for the wait-anchor scenario: it is created **suspended** (cold — never
+/// connected, so `status.phase` never reaches `Ready`) and released mid-test, which no
+/// other scenario can tolerate on a shared repository. Subpath in `consts::REPO_SUBPATHS`
+/// + the mise node-seed list (LOCKSTEP).
+const WA_SUBPATH: &str = "waitanchor";
+const WA_REPO: &str = "e2e-wa-repo";
+const WA_CFG: &str = "e2e-wa-cfg";
+const WA_BACKUP: &str = "e2e-wa-seed";
+const WA_RESTORE: &str = "e2e-r-waitanchor";
+/// The window under test. Deliberately SHORT so the "elapsed since creation" sleep below
+/// stays cheap — and long enough that, once the repository is released, the seed Snapshot
+/// (gated on the same repository, so its Job starts at the same moment) finishes inside it.
+const WA_WAIT_TIMEOUT: &str = "45s";
+
+/// #380 — a `waitTimeout` window must not be spent while the restore CANNOT ACT.
+///
+/// Shape: a `Repository` created `suspend: true` never connects, so it never reaches
+/// `Ready` and the Restore's repository-readiness gate holds the restore in `Pending`. The
+/// scenario parks there for longer than `waitTimeout`, then releases the repository and
+/// creates the source Snapshot.
+///
+/// Pre-fix the window was anchored at `metadata.creationTimestamp`: by the time the gate
+/// opened it had already elapsed, so the `fromPolicy` source — whose `onMissingSnapshot`
+/// defaults to `Continue` — resolved to `NoSnapshot` and provisioned an EMPTY volume on its
+/// very first real pass. Post-fix the window opens at gate release (`status.waitStartedAt`),
+/// the mover waits, and the restore resolves to the real snapshot.
+///
+/// Two assertions, in order of robustness: (1) `status.waitStartedAt` is stamped and lands
+/// AFTER the parked stretch (race-free — it is the anchor semantics themselves), and (2) the
+/// pinned resolution is `Snapshot`, not `NoSnapshot`.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn restore_wait_window_opens_when_the_repository_becomes_ready() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    common::ensure_repo(&client, WA_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Clean slate: this scenario is only meaningful against a repository that has NEVER
+    // connected and a Restore whose window has not opened.
+    cleanup_restore(&restores, WA_RESTORE).await;
+    let _ = backups.delete(WA_BACKUP, &DeleteParams::default()).await;
+    let _ = repos.delete(WA_REPO, &DeleteParams::default()).await;
+    wait_until(
+        "the suspended wait-anchor Repository is gone",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let repos = repos.clone();
+            async move { Ok(repos.get_opt(WA_REPO).await?.is_none().then_some(())) }
+        },
+    )
+    .await
+    .expect("the previous run's wait-anchor Repository should be deleted");
+
+    // A COLD, suspended repository: `spec.suspend` skips connect/bootstrap entirely, so
+    // the phase never becomes Ready and the Restore's readiness gate holds.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(common::repository_json(
+                WA_REPO,
+                WA_SUBPATH,
+                serde_json::json!({ "suspend": true, "maintenance": { "enabled": false } }),
+            )),
+        )
+        .await
+        .expect("create the suspended wait-anchor Repository");
+    if configs.get_opt(WA_CFG).await.ok().flatten().is_none() {
+        let _ = configs
+            .create(
+                &PostParams::default(),
+                &cr(common::snapshot_policy_json(
+                    E2E_NAMESPACE,
+                    WA_CFG,
+                    "Repository",
+                    WA_REPO,
+                    serde_json::json!({}),
+                )),
+            )
+            .await;
+    }
+
+    // The Restore under test: `fromPolicy` (so `onMissingSnapshot` defaults to `Continue`
+    // — the empty-volume outcome the window exists to prevent) with a short window.
+    let restore = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": WA_RESTORE, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": WA_REPO },
+            "source": { "fromPolicy": { "name": WA_CFG } },
+            "policy": { "waitTimeout": WA_WAIT_TIMEOUT },
+            "target": { "pvc": { "name": format!("{WA_RESTORE}-dst"), "capacity": "1Gi", "accessModes": ["ReadWriteOnce"] } }
+        }
+    });
+    restores
+        .create(&PostParams::default(), &cr(restore))
+        .await
+        .expect("create the gated Restore");
+
+    // It parks on the readiness gate — non-terminal, and NOT resolving.
+    wait_condition(&restores, WA_RESTORE, "Ready", "False")
+        .await
+        .expect("the Restore must park Ready=False behind a not-Ready repository");
+    let parked = status_json(&restores, WA_RESTORE).await;
+    assert_eq!(
+        condition_reason(&parked, "Ready"),
+        "RepositoryNotReady",
+        "the parked Restore's Ready reason must be RepositoryNotReady: {parked}"
+    );
+    assert!(
+        parked.get("waitStartedAt").is_none(),
+        "the wait window must NOT open while the repository is not Ready: {parked}"
+    );
+
+    // Create the source Snapshot NOW so its own repository gate releases in the same pass
+    // the Restore's does (it cannot run while the repository is suspended either) — that
+    // keeps it inside the restore's window once the window finally opens.
+    if backups.get_opt(WA_BACKUP).await.ok().flatten().is_none() {
+        let _ = backups
+            .create(
+                &PostParams::default(),
+                &cr(common::snapshot_json(
+                    E2E_NAMESPACE,
+                    WA_BACKUP,
+                    WA_CFG,
+                    serde_json::json!({}),
+                )),
+            )
+            .await;
+    }
+
+    // Park past the window. Anchored at creation (the bug), it is now spent.
+    let window = std::time::Duration::from_secs(45);
+    tokio::time::sleep(window + std::time::Duration::from_secs(15)).await;
+    let still_parked = status_json(&restores, WA_RESTORE).await;
+    assert_eq!(
+        still_parked.get("phase").and_then(|v| v.as_str()),
+        Some("Pending"),
+        "a gated Restore stays Pending while its repository is down: {still_parked}"
+    );
+
+    // Release the repository: connect + bootstrap run, the phase reaches Ready, and BOTH
+    // the Snapshot and the Restore leave their gates.
+    repos
+        .patch(
+            WA_REPO,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "suspend": false } })),
+        )
+        .await
+        .expect("un-suspend the wait-anchor Repository");
+    wait_phase(&repos, WA_REPO, "Ready")
+        .await
+        .expect("the released Repository should reach Ready");
+
+    // (1) The window opens HERE, not at creation — the core of #380.
+    let opened = wait_until(
+        &format!("{WA_RESTORE} stamps status.waitStartedAt"),
+        default_timeout(),
+        poll_interval(),
+        || {
+            let restores = restores.clone();
+            async move {
+                let s = status_json(&restores, WA_RESTORE).await;
+                Ok(s.get("waitStartedAt")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string))
+            }
+        },
+    )
+    .await
+    .expect("the released Restore must stamp status.waitStartedAt");
+    let created_at = restores
+        .get(WA_RESTORE)
+        .await
+        .expect("get the Restore")
+        .metadata
+        .creation_timestamp
+        .expect("creationTimestamp")
+        .0
+        .as_second();
+    let opened_at = chrono::DateTime::parse_from_rfc3339(&opened)
+        .unwrap_or_else(|e| panic!("waitStartedAt {opened} must be RFC3339: {e}"))
+        .timestamp();
+    assert!(
+        opened_at - created_at > 45,
+        "the window must open when the restore could first PROCEED, well after creation \
+         (created at epoch {created_at}, opened at {opened})"
+    );
+
+    // (2) ...so the restore actually waits for the snapshot instead of coming up empty.
+    wait_phase(&backups, WA_BACKUP, "Succeeded")
+        .await
+        .expect("the released seed Snapshot should Succeed");
+    wait_phase(&restores, WA_RESTORE, "Completed")
+        .await
+        .expect("the released Restore should complete");
+    let done = status_json(&restores, WA_RESTORE).await;
+    let resolved = done.get("resolved").cloned().unwrap_or_default();
+    assert_eq!(
+        resolved.get("resolution").and_then(|v| v.as_str()),
+        Some("Snapshot"),
+        "pre-fix the spent window made `Continue` provision an EMPTY volume \
+         (resolution: NoSnapshot); status: {done}"
+    );
+    assert!(
+        resolved
+            .get("kopiaSnapshotID")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| !id.is_empty()),
+        "a real restore pins the kopia snapshot id it read: {done}"
+    );
+
+    cleanup_restore(&restores, WA_RESTORE).await;
+}
