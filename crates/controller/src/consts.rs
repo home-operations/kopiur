@@ -115,8 +115,11 @@ pub const VERIFY_REPO_LABEL: &str = "kopiur.home-operations.com/verify-repo";
 
 /// `COMPONENT_LABEL` value for replication mover Jobs (ADR-0005 §13(d)).
 pub const REPLICATION_COMPONENT: &str = "replication";
-/// Label tying a replication Job back to its owning `RepositoryReplication`.
-pub const REPLICATION_INSTANCE_LABEL: &str = "kopiur.home-operations.com/replication";
+/// Label tying a replication Job back to its owning `RepositoryReplication`
+/// (single-flight selector: [`COMPONENT_LABEL`] + this = CR name). Defined in
+/// `kopiur-api` because `kubectl kopiur replication run` prints the same
+/// selector when a requested run fails — one label, one definition.
+pub const REPLICATION_INSTANCE_LABEL: &str = kopiur_api::consts::REPLICATION_LABEL;
 /// Annotation on a replication Job recording the scheduled slot it runs (RFC3339).
 pub const REPLICATION_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/replication-slot";
 

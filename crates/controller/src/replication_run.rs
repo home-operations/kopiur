@@ -226,6 +226,40 @@ pub fn recorded_running(manual: Option<&ReplicationManualRunStatus>, request: &R
     })
 }
 
+/// What `status.manualRun` a SUSPENDED replication should write for an
+/// unanswered request — `None` meaning "write nothing, leave what is recorded
+/// standing".
+///
+/// `Pending` is only correct for a request whose Job has NOT been launched.
+/// When `suspend` is flipped while the requested Job is already in flight the
+/// recorded phase is `Running`, and overwriting it with `Pending` would be
+/// wrong twice over:
+///
+/// * it LIES — `Pending` is documented (and reported by `kubectl kopiur
+///   replication run --wait`) as "recorded but not started"; and
+/// * it defeats the lost-outcome guard. [`recorded_running`] is the only
+///   evidence that a Job ever existed, so once it is overwritten a Job that
+///   TTL-reaps during the suspension (1h) leaves no trace, and the first
+///   reconcile after the resume silently RE-RUNS side-effectful work instead of
+///   reporting `ManualRunOutcomeLost`.
+///
+/// The suspension is still surfaced either way — [`suspended_report`] fires its
+/// distinct `Ready` reason on the presence of the request, not on this write.
+pub fn suspended_manual_run(
+    request: &RunRequest,
+    manual: Option<&ReplicationManualRunStatus>,
+    now: DateTime<Utc>,
+) -> Option<ReplicationManualRunStatus> {
+    if recorded_running(manual, request) {
+        return None;
+    }
+    Some(manual_run_status(
+        request,
+        ReplicationManualRunPhase::Pending,
+        now,
+    ))
+}
+
 /// The Job annotations a replication mover Job carries for one run: the slot it
 /// runs (RFC3339, the caller's own annotation key) and the trigger that asked
 /// for it (so the outcome metric can attribute cron vs manual without the CR).
@@ -369,8 +403,15 @@ pub async fn observe_and_count_runs(
         let Some(job_name) = job.metadata.name.as_deref() else {
             continue;
         };
-        // Stamp first, count second: a double-count is a worse lie than a
-        // one-reconcile-late count, and the stamp is what makes it once.
+        // Stamp first, count second. The ordering is a deliberate bias, not a
+        // guarantee: a crash in the window between the two LOSES that run's
+        // increment forever (the Job is now marked counted and no later
+        // reconcile will revisit it). Counting first and stamping second would
+        // trade that for a DOUBLE count on the same crash. Undercount wins —
+        // this is an in-process counter that resets on every operator restart
+        // anyway, so a rate/alert built on it already tolerates a missing
+        // increment around a restart, whereas a phantom `outcome="failed"`
+        // would page someone for a run that never failed.
         let body = Patch::Merge(serde_json::json!({
             "metadata": { "annotations": { RUN_COUNTED_ANNOTATION: outcome.as_str() } }
         }));
@@ -672,6 +713,83 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn suspending_mid_run_leaves_the_running_phase_standing() {
+        let req = RunRequest {
+            raw: RAW.into(),
+            at: Utc::now(),
+        };
+        let now = Utc::now();
+
+        // The Job is in flight: write NOTHING. Overwriting `Running` with
+        // `Pending` would both lie and erase the only evidence a Job exists,
+        // which is what `recorded_running` reads to report a lost outcome.
+        assert_eq!(
+            suspended_manual_run(
+                &req,
+                Some(&status(RAW, ReplicationManualRunPhase::Running)),
+                now
+            ),
+            None
+        );
+
+        // Nothing launched yet — the ordinary case — records Pending.
+        for before in [
+            None,
+            Some(status(RAW, ReplicationManualRunPhase::Pending)),
+            // A terminal answer to a DIFFERENT request is not this request's
+            // Job, so this request is still un-launched.
+            Some(status(
+                "2026-06-11T13:00:00Z",
+                ReplicationManualRunPhase::Succeeded,
+            )),
+        ] {
+            let written = suspended_manual_run(&req, before.as_ref(), now)
+                .expect("an un-launched request records Pending");
+            assert_eq!(written.phase, Some(ReplicationManualRunPhase::Pending));
+            assert_eq!(written.requested_at.as_deref(), Some(RAW));
+            assert!(
+                written.completed_at.is_none(),
+                "Pending has not completed: {written:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_ttl_reaped_during_a_suspension_is_still_reported_lost() {
+        // The whole point of the rule above, as a sequence:
+        //   Running -> suspend (no write) -> Job TTL-reaps -> resume.
+        let req = RunRequest {
+            raw: RAW.into(),
+            at: Utc::now(),
+        };
+        let running = status(RAW, ReplicationManualRunPhase::Running);
+
+        // Suspend leaves it alone…
+        assert_eq!(suspended_manual_run(&req, Some(&running), Utc::now()), None);
+        // …so the request is STILL owed after the resume…
+        let a = requested(RAW);
+        assert!(
+            manual_run_request(
+                ReplicationKind::Repository,
+                Some(&a),
+                Some(&running),
+                "ns",
+                "r"
+            )
+            .expect("ok")
+            .is_some()
+        );
+        // …and the reaped-Job branch still fires, so the post-resume reconcile
+        // reports the lost outcome instead of silently re-running.
+        assert!(recorded_running(Some(&running), &req));
+
+        // Contrast: had the suspend written Pending, the guard would be blind
+        // and the resume would spawn a SECOND run for the same request.
+        let clobbered = status(RAW, ReplicationManualRunPhase::Pending);
+        assert!(!recorded_running(Some(&clobbered), &req));
     }
 
     #[test]

@@ -36,7 +36,7 @@ use crate::naming::short_hash;
 use crate::replication_run::{
     RunObservation, RunRequest, RunStall, idle_report, manual_replication_job_name,
     manual_run_request, manual_run_status, observe_and_count_runs, recorded_running,
-    run_job_annotations, suspended_report,
+    run_job_annotations, suspended_manual_run, suspended_report,
 };
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
@@ -170,18 +170,14 @@ async fn suspended(
     .ok()
     .flatten();
     let (reason, message) = suspended_report(pending.is_some());
-    if let Some(request) = &pending {
-        patch_manual_run(
-            api,
-            repl,
-            name,
-            manual_run_status(
-                request,
-                kopiur_api::common::ReplicationManualRunPhase::Pending,
-                Utc::now(),
-            ),
-        )
-        .await?;
+    // Record the waiting request — but NEVER over an in-flight one. A suspend
+    // that lands mid-run must leave `Running` standing, or the lost-outcome
+    // guard goes blind and a TTL-reaped Job silently re-runs after the resume.
+    if let Some(status) = pending
+        .as_ref()
+        .and_then(|request| suspended_manual_run(request, manual, Utc::now()))
+    {
+        patch_manual_run(api, repl, name, status).await?;
     }
     patch_ready_if_changed(
         api,
@@ -400,8 +396,18 @@ async fn handle_manual_run(
             ))))
         }
         None => {
-            // Single-flight: never two replication Jobs for one CR.
+            // Single-flight: never two replication Jobs for one CR. The request is
+            // not dropped — it is RECORDED as `Pending` so it is visible while
+            // it waits behind the in-flight run, instead of looking like
+            // nothing happened until that run finishes.
             if observed.has_active {
+                patch_manual_run(
+                    api,
+                    repl,
+                    name,
+                    manual_run_status(request, P::Pending, Utc::now()),
+                )
+                .await?;
                 return Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)));
             }
             spawn_replication_job(
@@ -1184,5 +1190,127 @@ mod tests {
         // the source entries, none prefixed.
         let out = replication_creds_env_from(vec!["src-pw".into()], None);
         assert_eq!(out, vec![jobs::CredsEnvFrom::plain("src-pw")]);
+    }
+
+    // --- #380: suspend landing mid-requested-run --------------------------------
+
+    /// A `RUN_REQUESTED_ANNOTATION` + a `status.manualRun` in one phase — the
+    /// exact CR shape the suspend arm reads.
+    fn repl_requested(
+        phase: kopiur_api::common::ReplicationManualRunPhase,
+    ) -> RepositoryReplication {
+        let mut r = repl_with(
+            "0 5 * * *",
+            Some(RepositoryReplicationStatus {
+                manual_run: Some(kopiur_api::common::ReplicationManualRunStatus {
+                    requested_at: Some(REQ_RAW.into()),
+                    phase: Some(phase),
+                    completed_at: None,
+                }),
+                ..Default::default()
+            }),
+        );
+        r.spec.suspend = true;
+        r.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            crate::consts::RUN_REQUESTED_ANNOTATION.to_string(),
+            REQ_RAW.to_string(),
+        )]));
+        r
+    }
+
+    const REQ_RAW: &str = "2026-06-11T12:00:00Z";
+
+    /// Suspending a replication whose requested Job is ALREADY RUNNING must not
+    /// rewrite `manualRun` — the sequence the suspend arm walks, end to end.
+    ///
+    /// Overwriting `Running` with `Pending` would lie (`Pending` is documented,
+    /// and reported by `kubectl kopiur replication run --wait`, as "recorded but
+    /// not started") AND blind the lost-outcome guard, so a Job that TTL-reaps
+    /// during the suspension would silently RE-RUN after the resume.
+    #[test]
+    fn suspending_mid_requested_run_keeps_the_running_phase() {
+        use kopiur_api::common::ReplicationManualRunPhase as P;
+        let r = repl_requested(P::Running);
+        let manual = r.status.as_ref().and_then(|s| s.manual_run.as_ref());
+
+        // What the suspend arm resolves…
+        let request = manual_run_request(
+            KIND,
+            r.metadata.annotations.as_ref(),
+            manual,
+            "ns",
+            &r.name_any(),
+        )
+        .expect("a well-formed request")
+        .expect("Running does not answer the request, so it is still owed");
+
+        // …and what it decides to write: nothing.
+        assert_eq!(
+            suspended_manual_run(&request, manual, Utc::now()),
+            None,
+            "an in-flight requested run must survive the suspend untouched"
+        );
+        // The suspension is still SURFACED — via the Ready reason, which keys
+        // on the presence of the request, not on the manualRun write.
+        assert_eq!(suspended_report(true).0, "SuspendedWithPendingRun");
+    }
+
+    /// The consequence, as a sequence: Running -> suspend (no write) -> the Job
+    /// TTL-reaps -> resume. The post-resume reconcile must take the
+    /// lost-outcome branch, never spawn a second run.
+    #[test]
+    fn a_requested_job_reaped_during_a_suspension_is_reported_not_rerun() {
+        use kopiur_api::common::ReplicationManualRunPhase as P;
+        let r = repl_requested(P::Running);
+        let manual = r.status.as_ref().and_then(|s| s.manual_run.as_ref());
+        let request = manual_run_request(
+            KIND,
+            r.metadata.annotations.as_ref(),
+            manual,
+            "ns",
+            &r.name_any(),
+        )
+        .expect("ok")
+        .expect("still owed");
+        assert_eq!(suspended_manual_run(&request, manual, Utc::now()), None);
+
+        // Post-resume, with the Job gone: `handle_manual_run` reaches its
+        // `None if recorded_running` arm — report lost, do not re-spawn.
+        assert!(
+            recorded_running(manual, &request),
+            "the Running phase is the only evidence a Job ever existed"
+        );
+
+        // Had the suspend clobbered it with Pending, that evidence would be
+        // gone and the same reconcile would spawn a SECOND run.
+        let clobbered = repl_requested(P::Pending);
+        assert!(!recorded_running(
+            clobbered
+                .status
+                .as_ref()
+                .and_then(|s| s.manual_run.as_ref()),
+            &request
+        ));
+    }
+
+    /// The ordinary suspend case is unchanged: a request that never launched a
+    /// Job is recorded `Pending` so it is visible while it waits.
+    #[test]
+    fn suspending_before_the_requested_run_starts_records_pending() {
+        use kopiur_api::common::ReplicationManualRunPhase as P;
+        let mut r = repl_requested(P::Pending);
+        r.status = None; // never answered at all
+        let request = manual_run_request(
+            KIND,
+            r.metadata.annotations.as_ref(),
+            None,
+            "ns",
+            &r.name_any(),
+        )
+        .expect("ok")
+        .expect("owed");
+        let written = suspended_manual_run(&request, None, Utc::now()).expect("records Pending");
+        assert_eq!(written.phase, Some(P::Pending));
+        assert_eq!(written.requested_at.as_deref(), Some(REQ_RAW));
     }
 }

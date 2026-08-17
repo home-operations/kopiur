@@ -41,6 +41,11 @@ pub trait ReplicationTarget:
     const SINGULAR: &'static str;
     /// Lowercase plural, for RBAC hints and `kubectl get` remediation.
     const PLURAL: &'static str;
+    /// The label tying THIS kind's mover Jobs to their owning CR, for the
+    /// "where are the logs" hint. An associated const rather than a lookup:
+    /// a third replication kind cannot compile until it names its own label,
+    /// where a string dispatch would have silently handed it another kind's.
+    const INSTANCE_LABEL: &'static str;
 
     /// `status.manualRun`, absent until a run has ever been requested.
     fn manual_run(&self) -> Option<&ReplicationManualRunStatus>;
@@ -52,6 +57,7 @@ impl ReplicationTarget for RepositoryReplication {
     const KIND: &'static str = "RepositoryReplication";
     const SINGULAR: &'static str = "repositoryreplication";
     const PLURAL: &'static str = "repositoryreplications";
+    const INSTANCE_LABEL: &'static str = kopiur_api::consts::REPLICATION_LABEL;
 
     fn manual_run(&self) -> Option<&ReplicationManualRunStatus> {
         self.status.as_ref()?.manual_run.as_ref()
@@ -68,6 +74,7 @@ impl ReplicationTarget for SnapshotReplication {
     const KIND: &'static str = "SnapshotReplication";
     const SINGULAR: &'static str = "snapshotreplication";
     const PLURAL: &'static str = "snapshotreplications";
+    const INSTANCE_LABEL: &'static str = kopiur_api::consts::SNAPSHOT_REPLICATION_LABEL;
 
     fn manual_run(&self) -> Option<&ReplicationManualRunStatus> {
         self.status.as_ref()?.manual_run.as_ref()
@@ -129,19 +136,8 @@ pub fn failure_detail<K: ReplicationTarget>(obj: &K, name: &str, requested_at: &
         "{} {name} requested run ({requested_at}) failed{condition_msg}\n\
          the mover Job's logs are at `kubectl get jobs -l {}={name}`\n",
         K::KIND,
-        instance_label::<K>(),
+        K::INSTANCE_LABEL,
     )
-}
-
-/// The Job label selecting this kind's mover Jobs, for the logs hint.
-fn instance_label<K: ReplicationTarget>() -> &'static str {
-    // Not a `match` on a value — the two kinds are distinguished by their
-    // associated const, which is already exhaustive by construction.
-    if K::KIND == RepositoryReplication::KIND {
-        "kopiur.home-operations.com/replication"
-    } else {
-        kopiur_api::consts::SNAPSHOT_REPLICATION_LABEL
-    }
 }
 
 /// Run `replication run`: resolve the target kind, stamp the annotation, and
@@ -413,17 +409,20 @@ mod tests {
 
     #[test]
     fn each_kind_points_at_its_own_job_label() {
+        // The labels are the API's, not a copy — a controller-side rename must
+        // move this hint with it, which is the whole reason they live there.
         assert_eq!(
-            instance_label::<RepositoryReplication>(),
-            "kopiur.home-operations.com/replication"
+            RepositoryReplication::INSTANCE_LABEL,
+            kopiur_api::consts::REPLICATION_LABEL
         );
         assert_eq!(
-            instance_label::<SnapshotReplication>(),
+            SnapshotReplication::INSTANCE_LABEL,
             kopiur_api::consts::SNAPSHOT_REPLICATION_LABEL
         );
         assert_ne!(
-            instance_label::<RepositoryReplication>(),
-            instance_label::<SnapshotReplication>()
+            RepositoryReplication::INSTANCE_LABEL,
+            SnapshotReplication::INSTANCE_LABEL,
+            "the two kinds must never point at one label"
         );
     }
 }

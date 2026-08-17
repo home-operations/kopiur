@@ -62,7 +62,7 @@ Annotating a `SnapshotReplication` with `kopiur.home-operations.com/run-requeste
 
 /// warning | A malformed timestamp is refused at admission
 
-The admission webhook rejects a `run-requested` value that is not RFC3339, naming the offending value and the fix. An object annotated while the webhook was down degrades gracefully instead: the controller surfaces `Ready=False` with reason `InvalidRunRequest` and keeps running the schedule.
+The admission webhook rejects a `run-requested` value that is not RFC3339, naming the offending value and the fix — so in practice a malformed annotation never reaches the controller. An object annotated while the webhook was down degrades gracefully instead of stalling: the schedule keeps running, and the controller reports `Ready=False` with reason `InvalidRunRequest` on the next pass where **no cron slot is due** (a due slot's own report takes that one `Ready` write, so on a very frequent schedule the message appears once the replication next goes idle).
 
 ///
 

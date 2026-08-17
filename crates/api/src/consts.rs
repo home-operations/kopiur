@@ -42,6 +42,14 @@ pub const SCHEDULE_LABEL: &str = "kopiur.home-operations.com/schedule";
 /// milestone of #368.)
 pub const SNAPSHOT_REPLICATION_LABEL: &str = "kopiur.home-operations.com/snapshot-replication";
 
+/// Label tying a blob-replication mover Job back to its owning
+/// `RepositoryReplication` — the single-flight selector the controller uses,
+/// and the selector `kubectl kopiur replication run` prints when a requested
+/// run fails and the user needs the Job's logs. Lives here, next to
+/// [`SNAPSHOT_REPLICATION_LABEL`], because the controller and the CLI must
+/// agree on it byte-for-byte; a copy in either would drift silently.
+pub const REPLICATION_LABEL: &str = "kopiur.home-operations.com/replication";
+
 /// Label naming the shared CSI `VolumeGroupSnapshot` a fanned-out `Snapshot`
 /// stages from — carried by BOTH the member `Snapshot` CRs and the
 /// `VolumeGroupSnapshot` object itself.
@@ -407,6 +415,7 @@ mod tests {
             SNAPSHOT_ID_LABEL,
             REPOSITORY_UID_LABEL,
             CONFIG_LABEL,
+            REPLICATION_LABEL,
             SCHEDULE_LABEL,
             SNAPSHOT_REPLICATION_LABEL,
             GROUP_LABEL,
