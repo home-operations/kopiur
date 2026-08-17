@@ -23,8 +23,8 @@ pub use error::CliError;
 use std::process::ExitCode;
 
 use cli::{
-    Command, LogsCommand, MaintenanceCommand, MigrateCommand, SessionCommand, SnapshotCommand,
-    SnapshotsCommand,
+    Command, LogsCommand, MaintenanceCommand, MigrateCommand, ReplicationCommand, SessionCommand,
+    SnapshotCommand, SnapshotsCommand,
 };
 
 /// What a command hands back to the dispatcher: text for stdout (streaming
@@ -91,6 +91,9 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         }
         Command::Maintenance(MaintenanceCommand::Run(args)) => {
             cmd::maintenance::run(&ctx, args, chrono::Utc::now()).await?
+        }
+        Command::Replication(ReplicationCommand::Run(args)) => {
+            cmd::replication::run(&ctx, args, chrono::Utc::now()).await?
         }
         Command::Migrate(MigrateCommand::Volsync(_)) => {
             unreachable!("migrate volsync is dispatched before connecting")
