@@ -44,11 +44,32 @@ Tuning knobs for the underlying `kopia repository sync-to` invocation (issue #21
 
 `parallel` and the two speed caps must be `>= 1` when set (admission-webhook enforced).
 
+## Out-of-band runs
+
+Annotating a `RepositoryReplication` with `kopiur.home-operations.com/run-requested` (an RFC3339 timestamp) triggers a one-off mirror. There is no `run-mode` companion — a replication has exactly one kind of run. The timestamp pins *which* request the status answers, so re-applying the same value is a no-op and a new timestamp starts a new run. The requested run flows through the same mover, gates and single-flight rule as a cron slot, and — because it stamps `status.lastReplicated` on success — re-anchors the next scheduled slot. See [Run it now](../../replication.md#run-it-now); `kubectl kopiur replication run` stamps the annotation for you.
+
+/// warning | A malformed timestamp is refused at admission
+
+The admission webhook rejects a `run-requested` value that is not RFC3339, naming the offending value and the fix. An object annotated while the webhook was down degrades gracefully instead: the controller surfaces `Ready=False` with reason `InvalidRunRequest` and keeps running the schedule.
+
+///
+
 ## `status`
 
 ### `phase`
 
 Lifecycle phase: `Pending` (admitted, not yet run — the default), `Replicating` (a mover Job is in flight), `Succeeded` (last run completed, idle until the next slot), `Failed` (last run failed; see conditions), or `Suspended` (paused via `spec.suspend`).
+
+### `manualRun`
+
+State of the most recent [annotation-requested run](#out-of-band-runs): the `requestedAt` value it answers, its `phase`, and the `completedAt` instant it reached a terminal one. Absent until a run is requested.
+
+| `phase` | Meaning |
+| --- | --- |
+| `Pending` | Recorded but not started — the replication is `suspend: true`. It runs on resume. |
+| `Running` | The requested mover Job is in flight. |
+| `Succeeded` | The requested run completed. |
+| `Failed` | The requested run's Job failed; conditions carry the detail. |
 
 ### others
 
