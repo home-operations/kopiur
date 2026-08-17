@@ -1069,7 +1069,7 @@ fn matcher_spec(m: &IdentityMatcher) -> IdentityMatcherSpec {
 
 /// CRD [`PolicyCopyMode`] → wire [`PolicyCopyModeSpec`]. Exhaustive — a new
 /// mode cannot compile until mapped.
-fn policy_copy_mode_spec(mode: PolicyCopyMode) -> PolicyCopyModeSpec {
+pub(crate) fn policy_copy_mode_spec(mode: PolicyCopyMode) -> PolicyCopyModeSpec {
     match mode {
         PolicyCopyMode::None => PolicyCopyModeSpec::None,
         PolicyCopyMode::Copy => PolicyCopyModeSpec::Copy,

@@ -2298,12 +2298,12 @@ mod bootstrap_outcomes {
     fn four_way_mapping() {
         // (None, job succeeded): the result ConfigMap hasn't propagated yet.
         assert!(matches!(
-            bootstrap_outcome(None, true, "boot-x"),
+            bootstrap_outcome(None, true, "boot-x", false),
             BootstrapOutcome::ResultPending
         ));
 
         // (None, job failed): result-less terminal failure, names the Job.
-        match bootstrap_outcome(None, false, "boot-x") {
+        match bootstrap_outcome(None, false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::JobFailedWithoutResult { job_name }) => {
                 assert_eq!(job_name, "boot-x");
             }
@@ -2321,7 +2321,7 @@ mod bootstrap_outcomes {
             retry_recommended: false,
             op: None,
         });
-        match bootstrap_outcome(Some(bad), false, "boot-x") {
+        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, message }) => {
                 assert_eq!(class, KopiaErrorClass::AuthFailure);
                 assert_eq!(message, "invalid repository password");
@@ -2330,7 +2330,7 @@ mod bootstrap_outcomes {
         }
 
         // (Some successful, _): the success arm owns the result.
-        match bootstrap_outcome(Some(ok_result()), true, "boot-x") {
+        match bootstrap_outcome(Some(ok_result()), true, "boot-x", false) {
             BootstrapOutcome::Succeeded(r) => assert_eq!(r.unique_id.as_deref(), Some("uid-1")),
             _ => panic!("expected Succeeded"),
         }
@@ -2343,7 +2343,7 @@ mod bootstrap_outcomes {
         // never panic or silently succeed.
         let mut bad = ok_result();
         bad.success = false;
-        match bootstrap_outcome(Some(bad), false, "boot-x") {
+        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, message }) => {
                 assert_eq!(class, KopiaErrorClass::Unknown);
                 assert!(message.contains("bootstrap failed"));
@@ -2359,7 +2359,7 @@ mod bootstrap_outcomes {
         // BEFORE the generic Backend mapping) so the operator sees an actionable
         // "enable create" reason, not a bare kopia NotFound.
         let r = BootstrapResult::not_initialized();
-        match bootstrap_outcome(Some(r), false, "boot-x") {
+        match bootstrap_outcome(Some(r), false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::RepositoryNotInitialized) => {}
             _ => panic!("expected RepositoryNotInitialized"),
         }
@@ -2379,7 +2379,7 @@ mod bootstrap_outcomes {
             retry_recommended: false,
             op: None,
         });
-        match bootstrap_outcome(Some(bad), false, "boot-x") {
+        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, .. }) => {
                 assert_eq!(class, KopiaErrorClass::NotFound);
             }
@@ -3303,6 +3303,28 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         false,
         crate::consts::SOURCE_PVC_MISSING_REASON,
         "snapshot::handle_missing_source_pvc (computed polarity)",
+    ),
+    // `repository::park_on_seed_source` +
+    // `cluster_repository::park_cluster_on_seed_source`, both via
+    // io::upsert_gate(&SEED_SOURCE_NOT_READY_GATE, ...); cleared by
+    // finalize_bootstrap's `Seeded=True` fold once the seed runs.
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::WAITING_FOR_SEED_SOURCE_REASON,
+        "repository::park_on_seed_source + cluster_repository::park_cluster_on_seed_source \
+         (upsert_gate)",
+    ),
+    // `repository::write_seeding_condition` +
+    // `cluster_repository::write_cluster_seeding_condition`, both via
+    // io::upsert_gate(&SEEDING_GATE, ...) while the seeding Job is in flight;
+    // cleared by the same `Seeded=True` fold.
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEEDING_REASON,
+        "repository::write_seeding_condition + \
+         cluster_repository::write_cluster_seeding_condition (upsert_gate)",
     ),
 ];
 

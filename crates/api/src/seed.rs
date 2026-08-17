@@ -277,8 +277,8 @@ pub struct SeedStatus {
     /// to distinguish "a seed this operator started did not finish" from "this
     /// backend was initialized by somebody else": the first must resume the
     /// copy, the second must keep the no-clobber `AlreadyInitialized` path.
-    /// See [`seed_resume`] — the marker is the ONLY input the resume decision
-    /// is allowed to take, because a resuming migrate writes into whatever
+    /// See `seed_resume` — the marker is the ONLY input the resume decision is
+    /// allowed to take, because a resuming migrate writes into whatever
     /// repository is at the backend and then re-stamps its maintenance owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,

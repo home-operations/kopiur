@@ -21,6 +21,7 @@ pub mod leader;
 pub mod maintenance;
 pub mod metrics;
 pub mod naming;
+pub mod repo_seed;
 pub mod repository;
 pub mod repository_replication;
 pub mod restore;

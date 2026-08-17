@@ -187,6 +187,14 @@ impl CredsPrefix {
     pub fn bootstrap(repo: &str) -> Self {
         Self(format!("{repo}-bootstrap"))
     }
+    /// SEED-SOURCE credentials of a seeding bootstrap mover (issue #380). One
+    /// bootstrap pod touches TWO repositories in migrate mode — this one and
+    /// the source it copies from — so the source side gets its own stable
+    /// prefix, DISTINCT from [`Self::bootstrap`]: a shared prefix would make
+    /// the source projection clobber this repository's own `-creds-0` copy.
+    pub fn seed(repo: &str) -> Self {
+        Self(format!("{repo}-seed"))
+    }
     /// SOURCE-side credentials of a `SnapshotReplication`'s mover (issue #368).
     /// One mover pod touches TWO repository CRs, each with its own credential
     /// Secrets, so the two sides get DISTINCT stable prefixes — a shared prefix

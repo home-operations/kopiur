@@ -267,10 +267,26 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
         return handle_cluster_deletion(ctx, repo, &name, &api).await;
     }
 
-    // Ensure the server-cleanup finalizer while a server is configured, so the
-    // deletion path above can run before the CR is removed.
+    // Ensure the cleanup finalizer while a server is configured, so the deletion
+    // path above can run before the CR is removed.
+    //
+    // #380 widened it to also hold while a `spec.seed` is ARMED — i.e. while a
+    // bootstrap Job that can legitimately run for 24h may be in flight. That
+    // Job is namespaced and its owner is cluster-scoped, so Kubernetes forbids
+    // the ownerReference and nothing GCs it; without the finalizer the CR
+    // vanishes instantly and the seeding pod keeps copying a whole repository
+    // into a backend nobody manages any more. Released the moment the seed is
+    // no longer armed (`status.uniqueId` pinned), by the symmetric removal
+    // below. The CONSTANT keeps its `server-cleanup` name deliberately:
+    // renaming a finalizer strands the old string on every existing object,
+    // where nothing would ever remove it.
     let server_enabled = repo.spec.server.is_some();
-    if server_enabled && io::ensure_finalizer(&api, repo, SERVER_CLEANUP_FINALIZER).await? {
+    let seed_job_may_be_in_flight = kopiur_api::seed::seed_armed(
+        repo.spec.seed.as_ref(),
+        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
+    );
+    let hold_cleanup_finalizer = server_enabled || seed_job_may_be_in_flight;
+    if hold_cleanup_finalizer && io::ensure_finalizer(&api, repo, SERVER_CLEANUP_FINALIZER).await? {
         return Ok(Action::requeue(Duration::from_secs(2)));
     }
 
@@ -329,9 +345,11 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
         )
         .await;
     }
-    // Once a server is no longer configured (and any teardown above has run), the
-    // cleanup finalizer is no longer needed.
-    if !server_enabled {
+    // Once neither a server nor an armed seed needs it (and any teardown above
+    // has run), the cleanup finalizer is no longer needed. Symmetric with the
+    // ensure above — an asymmetry here would either wedge deletion forever or
+    // drop the hold mid-seed.
+    if !hold_cleanup_finalizer {
         io::remove_finalizer(&api, repo, SERVER_CLEANUP_FINALIZER).await?;
     }
 
@@ -820,8 +838,111 @@ async fn handle_cluster_deletion(
         io::delete_secret_if_present(&ctx.client, &ns, &mirrored_creds_secret_name(name)).await?;
     }
 
+    // An in-flight bootstrap Job outlives its `ClusterRepository` (#380). A
+    // cluster-scoped owner cannot own a namespaced Job — Kubernetes forbids the
+    // cross-scope ownerReference — so nothing GCs it, and a SEEDING bootstrap is
+    // the case where that stops being cosmetic: it can run for 24h, holding a
+    // pod and copying a whole repository into a backend nobody is managing any
+    // more, long after the CR that asked for it is gone. Delete it here.
+    //
+    // Best-effort and separate from the Secret cleanup above: a Job that has
+    // already finished (or was never created) is an ordinary miss, and cleanup
+    // must not wedge a deletion.
+    let job_ns = cluster_secret_namespace(
+        io::repo_credentials(&repo.spec.encryption)
+            .namespace
+            .as_deref(),
+        ctx.operator_namespace.as_deref(),
+    )
+    .ok();
+    if let Some(job_ns) = job_ns {
+        let job_name = format!("{name}-discovery");
+        if let Err(e) = io::delete_mover_run(&ctx.client, &job_ns, &job_name).await {
+            tracing::warn!(
+                repo = %name, namespace = %job_ns, job = %job_name, error = %e,
+                "could not delete the bootstrap Job while finalizing the ClusterRepository; \
+                 it may keep running until its own deadline"
+            );
+        }
+    }
+
     io::remove_finalizer(api, repo, SERVER_CLEANUP_FINALIZER).await?;
     Ok(Action::await_change())
+}
+
+/// Park this `ClusterRepository` on a `spec.seed` source that is not usable yet
+/// (#380) — the namespaced twin of `repository::park_on_seed_source`; see it
+/// for why the conditions are re-read fresh and the write is guarded.
+async fn park_cluster_on_seed_source(
+    repo: &ClusterRepository,
+    api: &Api<ClusterRepository>,
+    name: &str,
+    message: &str,
+) -> Result<Action> {
+    let fresh = api.get_opt(name).await?;
+    let conditions = fresh.as_ref().map(cluster_conditions).unwrap_or_default();
+    let conditions = io::upsert_gate(
+        &conditions,
+        &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
+        message,
+        repo.metadata.generation,
+    );
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ReadyOutcome::Reconciling,
+        kopiur_api::consts::WAITING_FOR_SEED_SOURCE_REASON,
+        message,
+    );
+    let current = fresh
+        .as_ref()
+        .and_then(|f| serde_json::to_value(&f.status).ok());
+    let wrote = io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await?;
+    if wrote {
+        tracing::info!(repo = %name, "spec.seed source is not usable yet; deferring the bootstrap");
+    }
+    Ok(Action::requeue(Duration::from_secs(15)))
+}
+
+/// The `Seeded=False`/`Seeding` progress condition while a seeding Job is in
+/// flight (#380) — the namespaced twin of `repository::write_seeding_condition`.
+async fn write_cluster_seeding_condition(
+    repo: &ClusterRepository,
+    api: &Api<ClusterRepository>,
+    name: &str,
+) -> Result<()> {
+    let Some(seed) = repo.spec.seed.as_ref() else {
+        return Ok(());
+    };
+    let message = crate::repo_seed::seeding_message(
+        &seed.from.describe(),
+        kopiur_api::seed::seed_active_deadline_seconds(seed),
+    );
+    let fresh = api.get_opt(name).await?;
+    let conditions = fresh.as_ref().map(cluster_conditions).unwrap_or_default();
+    let conditions = io::upsert_gate(
+        &conditions,
+        &kopiur_api::gates::SEEDING_GATE,
+        &message,
+        repo.metadata.generation,
+    );
+    let current = fresh
+        .as_ref()
+        .and_then(|f| serde_json::to_value(&f.status).ok());
+    io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({ "conditions": conditions }),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Drive the mover-Job bootstrap for a `ClusterRepository` whose backend the
@@ -880,6 +1001,19 @@ async fn bootstrap_cluster_via_mover(
         .as_ref()
         .and_then(|s| s.unique_id.as_deref())
         .is_some();
+    // #380: armed ONLY while this repository has never been initialized, so
+    // every routine connect / probe / catalog re-scan of a live repository
+    // carries no seed and keeps its short deadline. `resume` comes from the
+    // durable seed-attempt marker and nothing else — see
+    // `kopiur_api::seed::seed_resume`.
+    let seed_armed = kopiur_api::seed::seed_armed(
+        repo.spec.seed.as_ref(),
+        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
+    );
+    let seed_resume = kopiur_api::seed::seed_resume(
+        seed_armed,
+        repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+    );
     let probe_enabled =
         kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
     let prior_phase = repo.status.as_ref().and_then(|s| s.phase.as_ref());
@@ -964,6 +1098,11 @@ async fn bootstrap_cluster_via_mover(
                     )
                     .await?;
                 }
+                // #380: the `Seeded=False`/`Seeding` progress condition while a
+                // seeding Job is in flight — see the namespaced twin.
+                if seed_armed {
+                    write_cluster_seeding_condition(repo, api, name).await?;
+                }
                 Ok(Action::requeue(Duration::from_secs(15)))
             }
             // Finished — unless the result is stale (catalog refresh due, the spec
@@ -1007,6 +1146,7 @@ async fn bootstrap_cluster_via_mover(
                 }
                 finalize_cluster_bootstrap(
                     ctx, repo, name, &job_ns, &job_name, api, backend, success, probe_run,
+                    seed_armed,
                 )
                 .await
             }
@@ -1168,6 +1308,38 @@ async fn bootstrap_cluster_via_mover(
         ctx.operator_namespace.as_deref(),
     )
     .await?;
+    // #380: the seed-arming pass — the namespaced twin, with the two namespaces
+    // that differ. A cluster-scoped repository has no namespace of its own, so
+    // a namespace-less `kind: Repository` seed reference resolves in the
+    // OPERATOR's namespace (`job_ns`, which IS that namespace unless the
+    // credential Secret pinned another) — the same rule its credential
+    // `secretRef`s follow — and the CA bundle of an inline seed backend is read
+    // there too (`ca_referrer_ns: None` selects that arm of
+    // `io::resolve_backend_ca`).
+    let owner = io::owner_ref_for(repo, "ClusterRepository")?;
+    let source_default_ns = ctx.operator_namespace.clone().unwrap_or(job_ns.clone());
+    let seed_ctx = crate::repo_seed::SeedContext {
+        job_ns: &job_ns,
+        source_default_ns: &source_default_ns,
+        ca_referrer_ns: None,
+        name,
+        owner: owner.clone(),
+    };
+    let armed = crate::repo_seed::arm_seed(
+        ctx,
+        repo.spec.seed.as_ref(),
+        seed_armed,
+        seed_resume,
+        &seed_ctx,
+    )
+    .await?;
+    let seed = match armed {
+        crate::repo_seed::SeedArming::NotArmed => None,
+        crate::repo_seed::SeedArming::Park { message } => {
+            return park_cluster_on_seed_source(repo, api, name, &message).await;
+        }
+        crate::repo_seed::SeedArming::Armed(armed) => Some(armed),
+    };
     let work_spec = cluster_bootstrap_work_spec(
         backend,
         name,
@@ -1182,6 +1354,7 @@ async fn bootstrap_cluster_via_mover(
         foreign_maintenance,
         repo.spec.parameters.as_ref(),
         ca_bundle_pem,
+        seed.as_ref().map(|s| s.op.clone()),
     );
     // Preflight the credential Secret(s) the bootstrap mover loads via `envFrom`, in the
     // namespace it will actually run in. Without this the Job launches against a Secret
@@ -1210,16 +1383,29 @@ async fn bootstrap_cluster_via_mover(
         },
     )
     .await?;
-    let creds_secrets = io::plain_creds(creds_names);
-    let owner = io::owner_ref_for(repo, "ClusterRepository")?;
+    // This repository's own Secrets load VERBATIM; a seed source's ride under
+    // `KOPIUR_SEED_` so its keys cannot collide with the identically-named
+    // ambient ones (the namespaced twin explains why they are not deduped).
+    let mut creds_secrets = io::plain_creds(creds_names);
+    if let Some(s) = seed.as_ref() {
+        creds_secrets.extend(s.creds.iter().cloned());
+        if s.projected > 0 {
+            ctx.metrics.inc_secrets_projected(&job_ns, s.projected);
+        }
+    }
     // The bootstrap Job runs in the credentials Secret's namespace (`job_ns`).
     // Resolve its run identity there: the user's workload-identity SA
     // (preflighted + bound to the mover role), or the minted mover SA +
-    // RoleBinding — it is NOT the operator SA either way (ADR §4.12).
+    // RoleBinding — it is NOT the operator SA either way (ADR §4.12). A SEEDING
+    // bootstrap touches TWO backends in one pod, so both are offered.
+    let identity_backends: Vec<&Backend> = match seed.as_ref() {
+        Some(s) => vec![backend, &s.source_backend],
+        None => vec![backend],
+    };
     let mover_identity = io::ensure_mover_identity(
         &ctx.client,
         &job_ns,
-        &[backend],
+        &identity_backends,
         ctx.mover_service_account.as_deref(),
         ctx.mover_role_kind.as_str(),
         &ctx.mover_clusterrole,
@@ -1271,15 +1457,22 @@ async fn bootstrap_cluster_via_mover(
         // `finalize_cluster_bootstrap` runs and surfaces a Warning Event. Shared with
         // `health::probe_attempt_timeout`, so the bound on a probe Job's life and the
         // gate that waits for its result can never disagree.
-        limits: JobLimits {
-            active_deadline_seconds: Some(health::bootstrap_deadline_seconds(
-                bootstrap_fp.and_then(|fp| fp.active_deadline_seconds),
-            )),
-            backoff_limit: bootstrap_fp
-                .and_then(|fp| fp.backoff_limit)
-                .unwrap_or(JobLimits::default().backoff_limit),
-            ttl_seconds_after_finished: resolved_mover.ttl_seconds_after_finished,
-        },
+        // A SEEDING bootstrap replaces those limits wholesale (#380): 24h by
+        // default, from `spec.seed.failurePolicy`. Every non-seeding bootstrap
+        // keeps the values above byte-for-byte.
+        limits: crate::repo_seed::seed_job_limits(
+            seed_armed,
+            repo.spec.seed.as_ref(),
+            JobLimits {
+                active_deadline_seconds: Some(health::bootstrap_deadline_seconds(
+                    bootstrap_fp.and_then(|fp| fp.active_deadline_seconds),
+                )),
+                backoff_limit: bootstrap_fp
+                    .and_then(|fp| fp.backoff_limit)
+                    .unwrap_or(JobLimits::default().backoff_limit),
+                ttl_seconds_after_finished: resolved_mover.ttl_seconds_after_finished,
+            },
+        ),
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),
         pod_security_context: resolved_mover.pod_security_context.clone(),
@@ -1287,13 +1480,18 @@ async fn bootstrap_cluster_via_mover(
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
         labels,
-        source_volume: None,
+        // A filesystem seed SOURCE rides the spare volume slot — the
+        // bootstrap's own `repo_volume` is taken.
+        source_volume: seed.as_ref().and_then(|s| s.source_volume.clone()),
         repo_volume,
         creds_secrets,
         result_configmap: Some(&job_name),
         service_account: mover_identity.service_account.as_deref(),
         passthrough_env: ctx.mover_env_passthrough.clone(),
-        extra_env: Vec::new(),
+        extra_env: seed
+            .as_ref()
+            .map(|s| s.extra_env.clone())
+            .unwrap_or_default(),
         annotations: crate::repository::bootstrap_generation_annotation(repo.metadata.generation),
         // Bootstrap is a short connect/create probe: an emptyDir cache suffices.
         cache_volume: Default::default(),
@@ -1302,7 +1500,28 @@ async fn bootstrap_cluster_via_mover(
     };
     let cm = jobs::build_result_config_map(&inputs);
     let job = jobs::build_job(&inputs)?;
+    // #380: stamp the durable seed-attempt marker BEFORE the Job exists — the
+    // ORDER is the whole point; see the namespaced twin.
+    if let Some(s) = seed.as_ref()
+        && let Some(patch) = crate::repo_seed::seed_marker_patch(
+            repo.status.as_ref().and_then(|st| st.seed.as_ref()),
+            s.mode,
+            &s.source_description,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+    {
+        io::patch_status(api, name, patch).await?;
+    }
     io::apply_mover_objects(&ctx.client, &job_ns, &job_name, Some(&cm), &job).await?;
+    if let Some(s) = seed.as_ref() {
+        tracing::info!(
+            repo = %name,
+            mode = s.mode.as_str(),
+            source = %s.source_description,
+            resume = seed_resume,
+            "launching a SEEDING ClusterRepository bootstrap Job"
+        );
+    }
     // Stamp the reverify token (loop guard): this request is now honored. A
     // health-probe re-run keeps the phase `Ready` so backups/replication aren't
     // paused; a `Degraded` repo's strict retry keeps `Degraded`
@@ -1378,6 +1597,10 @@ fn cluster_bootstrap_work_spec(
     // Resolved by the async caller (`io::resolve_backend_ca`, operator-namespace
     // arm) so this builder stays pure; the backend's `tls.caBundleRef` PEM.
     ca_bundle_pem: Option<String>,
+    // #380: the seed payload the arming pass resolved, or `None` for every
+    // ordinary bootstrap — resolved by the async caller for the same reason as
+    // the CA bundle above.
+    seed: Option<kopiur_mover::workspec::SeedOpSpec>,
 ) -> MoverWorkSpec {
     let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
     let prefilter_cluster = (cluster_mode && matches!(foreign, ForeignSnapshots::Ignore))
@@ -1415,10 +1638,11 @@ fn cluster_bootstrap_work_spec(
             restamp_policy,
             maintenance_owner_aliases,
             read_only,
-            // #380: the seed payload is built by the repository reconciler's
-            // arming pass (stage C3). `None` here keeps today's behavior — a
-            // bootstrap that connects, or falls back to create when enabled.
-            seed: None,
+            // #380: armed ONLY on a repository that has never been
+            // initialized; `None` is every other bootstrap, byte-identical to
+            // pre-#380. Admission refuses `spec.seed` on a ReadOnly repository,
+            // so this and `read_only` are never both set.
+            seed,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
@@ -1457,6 +1681,10 @@ async fn finalize_cluster_bootstrap(
     // once the breaker opens) and consume the Job exactly once (deleted after
     // processing).
     probe_run: bool,
+    // #380: whether the launch that produced this result armed a `spec.seed` —
+    // drives the mover-skew guard and the `Seeded` condition fold. See the
+    // namespaced twin for why a pre-seed Job can never reach here mis-labelled.
+    seed_armed: bool,
 ) -> Result<Action> {
     let result = read_cluster_bootstrap_result(ctx, job_ns, job_name).await?;
 
@@ -1465,14 +1693,14 @@ async fn finalize_cluster_bootstrap(
     // exhaustively-handled modes — never a silent `Failed/Unknown` with no
     // Event — and the success arm *owns* the result, so there is no
     // `.expect()` invariant to get wrong.
-    let result = match io::bootstrap_outcome(result, job_succeeded, job_name) {
+    let result = match io::bootstrap_outcome(result, job_succeeded, job_name, seed_armed) {
         io::BootstrapOutcome::ResultPending => {
             tracing::warn!(repo = %name, "bootstrap Job complete but result not readable yet; requeueing");
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
         io::BootstrapOutcome::Failed(failure) => {
             return finalize_cluster_bootstrap_failure(
-                ctx, repo, name, job_ns, job_name, api, backend, failure, probe_run,
+                ctx, repo, name, job_ns, job_name, api, backend, failure, probe_run, seed_armed,
             )
             .await;
         }
@@ -1554,6 +1782,24 @@ async fn finalize_cluster_bootstrap(
     // Non-blocking MassDeletionHeld condition from the live Snapshot store,
     // folded into the conditions array before the kstatus set_ready.
     let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
+    // #380: fold the seed outcome into the SAME conditions array — the
+    // mover-skew guard has already refused a seed-armed success carrying no
+    // outcome, so a present `result.seed` is proof the image understood it.
+    let seed_fold = result
+        .seed
+        .as_ref()
+        .map(|outcome| crate::repo_seed::seed_success_fold(outcome, &now));
+    let conditions = match seed_fold.as_ref() {
+        Some(fold) => io::upsert_condition(
+            &conditions,
+            kopiur_api::consts::SEEDED_CONDITION,
+            true,
+            fold.reason,
+            &fold.message,
+            repo.metadata.generation,
+        ),
+        None => conditions,
+    };
     // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
     // healthy repository (issue #245), layered onto the conditions built above so
     // the merge-patch replace of `conditions` still carries Bootstrapped and
@@ -1628,8 +1874,51 @@ async fn finalize_cluster_bootstrap(
     if let Some(pinned) = pinned_unique_id {
         status_patch["uniqueId"] = serde_json::Value::String(pinned);
     }
+    if let Some(fold) = seed_fold.as_ref() {
+        crate::repo_seed::merge_seed_status(&mut status_patch, &fold.status);
+    }
     let current = serde_json::to_value(&repo.status).ok();
-    io::patch_status_if_changed(api, name, current.as_ref(), status_patch).await?;
+    let wrote = io::patch_status_if_changed(api, name, current.as_ref(), status_patch).await?;
+    // #380: metric + Event on the TRANSITION only — this arm re-runs on every
+    // reconcile while the finished Job lingers (~1h TTL).
+    if let Some(fold) = seed_fold.as_ref()
+        && wrote
+    {
+        ctx.metrics.inc_repository_seed(
+            "ClusterRepository",
+            "",
+            name,
+            crate::repo_seed::seed_mode_of(
+                result.seed.as_ref().expect("seed_fold implies result.seed"),
+            ),
+            fold.outcome,
+        );
+        if let Some(note) = fold.event.as_deref() {
+            io::publish_normal_event(
+                ctx,
+                repo,
+                crate::consts::REPOSITORY_SEEDED_REASON,
+                crate::consts::REVIEW_SEEDED_HISTORY_ACTION,
+                note,
+            )
+            .await;
+        }
+        // Nothing can read the projected source credentials any more: the
+        // seeding Job is finished and no later bootstrap arms a seed
+        // (`status.uniqueId` is pinned by this very patch).
+        crate::repo_seed::reap_seed_projection(
+            ctx,
+            job_ns,
+            &crate::repo_seed::SeedContext {
+                job_ns,
+                source_default_ns: job_ns,
+                ca_referrer_ns: None,
+                name,
+                owner: io::owner_ref_for(repo, "ClusterRepository")?,
+            },
+        )
+        .await;
+    }
     // Fire the Warning Event only on the transition into unhealthy. Non-blocking:
     // the cluster repository stays Ready.
     if let Some(w) = index_blob_event {
@@ -1705,6 +1994,9 @@ async fn finalize_cluster_bootstrap_failure(
     backend: &Backend,
     failure: io::BootstrapFailure,
     probe_run: bool,
+    // #380: whether the launch armed a seed — gates the
+    // `kopiur_repository_seed_total` `failed` increment.
+    seed_armed: bool,
 ) -> Result<Action> {
     // Health-probe failure on an already-`Ready` ClusterRepository: the probe
     // path folds the unified sensor itself (and applies the breaker verdict),
@@ -1714,6 +2006,23 @@ async fn finalize_cluster_bootstrap_failure(
             .await;
     }
     let reason = failure.reason();
+    // #380: a seed failure ALSO says something about the seed, so it gets a
+    // `Seeded=False` condition beside `Bootstrapped=False`, folded into the
+    // same array both arms build (a conditions patch replaces the whole thing).
+    let seed_fold =
+        |conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]| match failure
+            .seed_reason()
+        {
+            Some(seed_reason) => io::upsert_condition(
+                conditions,
+                kopiur_api::consts::SEEDED_CONDITION,
+                false,
+                seed_reason,
+                &failure.condition_message(),
+                repo.metadata.generation,
+            ),
+            None => conditions.to_vec(),
+        };
     // A result-less Job failure carries no backend verdict (mover
     // crashed / evicted / deadline / result write hit a down apiserver
     // — the outage incident): recycle the dead Job and retry as
@@ -1723,6 +2032,7 @@ async fn finalize_cluster_bootstrap_failure(
         io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
         let conditions =
             cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
+        let conditions = seed_fold(&conditions);
         let conditions = io::set_ready(
             &conditions,
             repo.metadata.generation,
@@ -1745,11 +2055,18 @@ async fn finalize_cluster_bootstrap_failure(
         .await?;
         if wrote {
             failure.publish(ctx, &io::event_ref(repo), name).await;
+            crate::repo_seed::record_seed_failure(
+                &ctx.metrics,
+                repo.spec.seed.as_ref(),
+                "ClusterRepository",
+                "",
+                name,
+                seed_armed,
+            );
             tracing::warn!(
                 repo = %name,
                 reason,
-                "ClusterRepository bootstrap Job failed without a result; recycled it \
-                 for retry"
+                "ClusterRepository bootstrap Job failed; recycled it for retry"
             );
         }
         return Ok(Action::requeue(Duration::from_secs(120)));
@@ -1768,6 +2085,7 @@ async fn finalize_cluster_bootstrap_failure(
         .await;
     }
     let conditions = cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
+    let conditions = seed_fold(&conditions);
     // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
     // should fail its health check fast, not hang until timeout.
     let conditions = io::set_ready(
@@ -1795,6 +2113,14 @@ async fn finalize_cluster_bootstrap_failure(
     .await?;
     if wrote {
         failure.publish(ctx, &io::event_ref(repo), name).await;
+        crate::repo_seed::record_seed_failure(
+            &ctx.metrics,
+            repo.spec.seed.as_ref(),
+            "ClusterRepository",
+            "",
+            name,
+            seed_armed,
+        );
         tracing::warn!(repo = %name, reason, "ClusterRepository bootstrap failed");
     }
     Ok(Action::requeue(Duration::from_secs(120)))
@@ -2221,6 +2547,7 @@ mod tests {
                 read_only,
                 enabled,
                 foreign_m,
+                None,
                 None,
                 None,
             );

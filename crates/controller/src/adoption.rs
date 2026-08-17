@@ -163,6 +163,21 @@ pub struct AdoptionPlan {
     /// because [`AdoptionRetentionGate`] proved GFS would immediately prune
     /// them (inv. 8). Surfaced via `status.adoption.skippedByRetention`.
     pub skipped_by_retention: u64,
+    /// The repository's catalog holds discovered snapshots, and NONE of them
+    /// match this policy's identity (issue #380).
+    ///
+    /// Silent by construction otherwise, and dangerous after a disaster
+    /// recovery: `spec.seed` brings a whole repository's history back, but the
+    /// identity fork guards are Update-gated and cannot fire on a fresh-cluster
+    /// CREATE — so a recovered `SnapshotPolicy` whose identity differs even
+    /// slightly from the pre-disaster one adopts NOTHING while looking
+    /// perfectly healthy, and starts a brand-new chain beside the history it
+    /// was supposed to reclaim.
+    ///
+    /// Gated by the SAME once-per-(policy, identity) latch as the no-match scan
+    /// request, so a policy that legitimately has no history to adopt warns
+    /// once rather than on every reconcile.
+    pub no_adoptable_history: bool,
 }
 
 /// What this policy already carries and has already asked for — the inputs to
@@ -230,6 +245,7 @@ pub fn plan_adoption(
             adopt: Vec::new(),
             request_scan: false,
             skipped_by_retention: 0,
+            no_adoptable_history: false,
         },
         SnapshotAdoption::Adopt => {
             // Identity-matching, non-foreign candidates (inv. 2 + 3). `matched_any`
@@ -237,6 +253,11 @@ pub fn plan_adoption(
             // already ours means there IS relevant history, so it must not trigger a
             // "nothing matched" scan request. The retention gate (inv. 8) runs after
             // BOTH — a retention-withheld candidate is still "history exists".
+            // Whether the repository's catalog held ANY discovered candidate at
+            // all, captured before the filters consume it — the difference
+            // between "nothing to adopt" and "history exists but none of it is
+            // yours", which is the whole point of the #380 warning below.
+            let catalog_non_empty = !candidates.is_empty();
             let mut matched: Vec<AdoptionCandidate> = candidates
                 .into_iter()
                 .filter(|c| {
@@ -255,12 +276,16 @@ pub fn plan_adoption(
 
             let already_requested =
                 history.scan_requested_identity == Some(identity_string(policy_identity).as_str());
-            let request_scan =
-                !adopt.is_empty() || (!matched_any && !history.has_history && !already_requested);
+            let no_match_first_time = !matched_any && !history.has_history && !already_requested;
+            let request_scan = !adopt.is_empty() || no_match_first_time;
             AdoptionPlan {
                 adopt,
                 request_scan,
                 skipped_by_retention,
+                // A catalog that is EMPTY says nothing (the scan may not have
+                // run yet) — only a populated one none of whose entries match
+                // is evidence of an identity mismatch.
+                no_adoptable_history: no_match_first_time && catalog_non_empty,
             }
         }
     }
@@ -494,6 +519,27 @@ pub fn adoption_event_message(count: u64, identity: &str) -> String {
          pruned like any snapshot this policy produces. To opt out of automatic adoption, set \
          spec.adoption: Ignore on this SnapshotPolicy, or spec.catalog.adoption: Ignore on the \
          referenced repository."
+    )
+}
+
+/// The `NoAdoptableHistory` Warning Event message (#380): the repository holds
+/// discovered snapshots, and none of them belong to this policy's identity.
+///
+/// Pure so the exact text is asserted, and volatile-free so a repeat is
+/// byte-identical. Names what was found, why it matters, and the two things
+/// that actually fix it.
+pub fn no_adoptable_history_message(identity: &str, repository: &str) -> String {
+    format!(
+        "Repository {repository} holds discovered snapshots, but NONE of them match this \
+         SnapshotPolicy's identity {identity}, so there is nothing for it to adopt. After a \
+         disaster recovery (spec.seed) this almost always means the recovered identity does not \
+         match the one that wrote the history — kopiur's identity-fork guards are update-gated \
+         and cannot fire on a freshly-created SnapshotPolicy, so the mismatch is otherwise \
+         silent, and this policy will start a NEW backup chain beside history you could have \
+         reclaimed. Fix: compare this policy's identity (spec.identity and the repository's \
+         identityDefaults) with the pre-disaster configuration byte for byte, and re-apply it \
+         once they match. If the mismatch is intentional, set spec.adoption: Ignore to silence \
+         this."
     )
 }
 

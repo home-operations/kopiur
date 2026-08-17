@@ -1002,6 +1002,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `snapshotCount` | integer | — | Snapshots observed at the SOURCE when the seed ran. Zero is only ever recorded when `allowEmptySource` permitted it. |
 | `snapshotsCopied` | integer | — | Snapshots actually copied into this repository. Migrate mode only — a blob copy moves storage, not manifests, so it leaves this unset and reports `snapshotCount` from the post-seed catalog listing instead. |
 | `source` | string | — | The source the data came from, rendered by `SeedSource::describe` — the backend discriminant (`S3`, `Filesystem`, …) for blob mode, `Kind/name` for migrate mode. Never a credential or a bucket path. |
+| `startedAt` | string | — | RFC 3339 timestamp the operator LAUNCHED a seeding bootstrap Job for this repository — the durable **seed-attempt marker**.<br>Stamped before the Job is created, and never cleared. Its whole job is to distinguish "a seed this operator started did not finish" from "this backend was initialized by somebody else": the first must resume the copy, the second must keep the no-clobber `AlreadyInitialized` path. See `seed_resume` — the marker is the ONLY input the resume decision is allowed to take, because a resuming migrate writes into whatever repository is at the backend and then re-stamps its maintenance owner. |
 
 #### `status.server` { #repository-status-server }
 
@@ -2035,6 +2036,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `snapshotCount` | integer | — | Snapshots observed at the SOURCE when the seed ran. Zero is only ever recorded when `allowEmptySource` permitted it. |
 | `snapshotsCopied` | integer | — | Snapshots actually copied into this repository. Migrate mode only — a blob copy moves storage, not manifests, so it leaves this unset and reports `snapshotCount` from the post-seed catalog listing instead. |
 | `source` | string | — | The source the data came from, rendered by `SeedSource::describe` — the backend discriminant (`S3`, `Filesystem`, …) for blob mode, `Kind/name` for migrate mode. Never a credential or a bucket path. |
+| `startedAt` | string | — | RFC 3339 timestamp the operator LAUNCHED a seeding bootstrap Job for this repository — the durable **seed-attempt marker**.<br>Stamped before the Job is created, and never cleared. Its whole job is to distinguish "a seed this operator started did not finish" from "this backend was initialized by somebody else": the first must resume the copy, the second must keep the no-clobber `AlreadyInitialized` path. See `seed_resume` — the marker is the ONLY input the resume decision is allowed to take, because a resuming migrate writes into whatever repository is at the backend and then re-stamps its maintenance owner. |
 
 #### `status.server` { #clusterrepository-status-server }
 

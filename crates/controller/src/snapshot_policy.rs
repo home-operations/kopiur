@@ -1660,6 +1660,30 @@ async fn adoption_pass_for_target(
         .await;
     }
 
+    // 7a. #380: a NON-EMPTY catalog with ZERO identity matches. The fork guards
+    //     are Update-gated and cannot fire on a fresh-cluster CREATE, so after a
+    //     disaster recovery this is the only signal that the recovered identity
+    //     does not match the one that wrote the history. Warning, because
+    //     silently starting a new chain beside recoverable history is a data
+    //     outcome, not a style issue. Once per (policy, identity) — it rides
+    //     the same latch as the no-match scan request.
+    if plan.no_adoptable_history {
+        io::publish_warning_event(
+            ctx,
+            config,
+            crate::consts::NO_ADOPTABLE_HISTORY_REASON,
+            crate::consts::CHECK_IDENTITY_ACTION,
+            &crate::adoption::no_adoptable_history_message(&identity_str, &t.rref.name),
+        )
+        .await;
+        tracing::warn!(
+            policy = %name,
+            identity = %identity_str,
+            repository = %t.rref.name,
+            "repository holds discovered snapshots but none match this policy's identity"
+        );
+    }
+
     // 7. Adoption-wave observability (metric + Normal event).
     if adopted > 0 {
         ctx.metrics.inc_snapshots_adopted(namespace, name, adopted);

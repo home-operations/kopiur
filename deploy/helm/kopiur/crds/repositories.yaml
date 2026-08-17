@@ -3612,6 +3612,20 @@ spec:
                       `Kind/name` for migrate mode. Never a credential or a bucket path.
                     nullable: true
                     type: string
+                  startedAt:
+                    description: |-
+                      RFC 3339 timestamp the operator LAUNCHED a seeding bootstrap Job for
+                      this repository — the durable **seed-attempt marker**.
+
+                      Stamped before the Job is created, and never cleared. Its whole job is
+                      to distinguish "a seed this operator started did not finish" from "this
+                      backend was initialized by somebody else": the first must resume the
+                      copy, the second must keep the no-clobber `AlreadyInitialized` path.
+                      See `seed_resume` — the marker is the ONLY input the resume decision is
+                      allowed to take, because a resuming migrate writes into whatever
+                      repository is at the backend and then re-stamps its maintenance owner.
+                    nullable: true
+                    type: string
                 type: object
               server:
                 description: Resolved kopia server endpoint/auth, pinned by the reconciler.

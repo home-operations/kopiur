@@ -518,6 +518,54 @@ pub const REPOSITORY_NOT_INITIALIZED_REASON: &str = "RepositoryNotInitialized";
 /// repository creation (or point at an existing repository).
 pub const ENABLE_CREATE_ACTION: &str = "EnableRepositoryCreate";
 
+/// `action` for the source-side `spec.seed` failures (issue #380): the seed
+/// source is not usable — a mis-pointed bucket/prefix, or a mirror that was
+/// never written. The seeding bootstrap keeps retrying, so the fix is to point
+/// `spec.seed.from` somewhere real (or set `allowEmptySource`).
+pub const CHECK_SEED_SOURCE_ACTION: &str = "CheckSeedSource";
+/// `action` for the seed failures kopiur RESUMES by itself (an interrupted copy:
+/// `SeedIncomplete`/`SeedLeftEmpty`, issue #380). Nothing at the backend should
+/// be deleted — the next bootstrap continues the copy — so the only human action
+/// is to give the copy room to finish (raise
+/// `spec.seed.failurePolicy.activeDeadlineSeconds`) if it keeps being cut short.
+pub const AWAIT_SEED_RESUME_ACTION: &str = "AwaitSeedResume";
+
+/// Machine-readable `reason` (condition + Warning Event) for the **mover-skew
+/// guard** (issue #380): the work spec armed a `spec.seed`, but the mover
+/// reported SUCCESS without a seed outcome — proof the running mover image
+/// predates `spec.seed`, silently dropped the field, and initialized an EMPTY
+/// repository via the create fallback. Terminal: only an image upgrade changes
+/// it, and Ready-ing the repository would hand back exactly the empty
+/// repository #380 exists to prevent.
+pub const SEED_MOVER_TOO_OLD_REASON: &str = "MoverImageTooOldForSeed";
+/// `action` for [`SEED_MOVER_TOO_OLD_REASON`]: upgrade the mover image.
+pub const UPGRADE_MOVER_IMAGE_ACTION: &str = "UpgradeMoverImage";
+
+/// `action` for [`kopiur_mover::bootstrap::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS`]:
+/// the mover disagreed with itself. Not a repository problem and not retryable —
+/// the same inputs reproduce the same contradiction — so the remediation is to
+/// report it.
+pub const REPORT_KOPIUR_BUG_ACTION: &str = "ReportKopiurBug";
+
+/// `reason` for the `RepositorySeeded` Normal Event published when a
+/// `spec.seed` actually copied this repository's initial contents in (#380).
+pub const REPOSITORY_SEEDED_REASON: &str = "RepositorySeeded";
+/// `action` for [`REPOSITORY_SEEDED_REASON`]: seeded history is adopted by
+/// re-applying `SnapshotPolicy`s, and GFS retention prunes beyond-budget points
+/// immediately — so review retention/`defaultDeletionPolicy` before doing that.
+pub const REVIEW_SEEDED_HISTORY_ACTION: &str = "ReviewSeededHistory";
+
+/// `reason` for the Warning Event published when a `SnapshotPolicy`'s adoption
+/// pass finds a NON-EMPTY repository catalog but ZERO snapshots matching its
+/// identity (#380). The identity fork guards are Update-gated and cannot fire on
+/// a fresh-cluster CREATE, so after a disaster recovery a policy whose identity
+/// config differs even slightly from the pre-disaster one adopts nothing while
+/// looking perfectly healthy.
+pub const NO_ADOPTABLE_HISTORY_REASON: &str = "NoAdoptableHistory";
+/// `action` for [`NO_ADOPTABLE_HISTORY_REASON`]: the recovered identity must
+/// match the pre-disaster one byte for byte.
+pub const CHECK_IDENTITY_ACTION: &str = "CheckIdentityConfiguration";
+
 /// Condition type for the opt-in backend health probe (`spec.health.probe`).
 /// `True` = the last probe reached the backend and the kopia repository is
 /// present; `False` with reason [`REPOSITORY_VANISHED_REASON`] or

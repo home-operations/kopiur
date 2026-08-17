@@ -631,6 +631,118 @@ pub enum BootstrapFailure {
     /// confusing `NotFound`. Signalled by the mover via
     /// [`kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_CLASS`].
     RepositoryNotInitialized,
+    /// A `spec.seed` failed (issue #380). Its own variant rather than a
+    /// [`Backend`](Self::Backend) one because the seed sentinels are kopiur
+    /// seeding-policy outcomes, not kopia stderr classes — routed through
+    /// [`KopiaErrorClass::from_label`] they would all collapse to `Unknown`,
+    /// losing both the reason a user sees and the retry routing.
+    Seed {
+        /// Which seeding failure the mover reported.
+        failure: SeedFailure,
+        /// The mover's persisted, volatile-free message (a constant for three
+        /// of the four; `SeedIncomplete` carries counts and a bounded sample,
+        /// so it cannot be one).
+        message: String,
+    },
+    /// **The mover-skew guard** (issue #380): the work spec armed a
+    /// `spec.seed`, and the mover reported SUCCESS carrying no seed outcome.
+    ///
+    /// `BootstrapResult.seed` is mover-authored and every seed-armed success
+    /// path emits one — the `AlreadyInitialized` no-op included — so its
+    /// absence is proof the running image predates `spec.seed`: it dropped the
+    /// unknown field, fell into the create fallback, and initialized an EMPTY
+    /// repository. Accepting that success would report `Ready` over a
+    /// repository with no history, which is the failure #380 exists to
+    /// prevent. Terminal: only an image upgrade changes it.
+    SeedMoverTooOld,
+    /// The mover reported a broken internal invariant
+    /// ([`kopiur_mover::bootstrap::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS`]).
+    /// Terminal by construction: the same inputs reproduce the same
+    /// contradiction, so retrying would spin a Job forever while hiding the
+    /// defect behind it.
+    InternalInconsistency {
+        /// The mover's message, naming the contradiction.
+        message: String,
+    },
+}
+
+/// Which `spec.seed` failure the mover reported (issue #380).
+///
+/// A closed enum over the mover's seed sentinel classes rather than the raw
+/// string, so the reason, the remediation action and — critically — the retry
+/// routing are decided by exhaustive `match`es a new class cannot compile past.
+/// [`from_class`](Self::from_class) is the single place the wire label is
+/// interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedFailure {
+    /// [`kopiur_mover::bootstrap::SEED_SOURCE_NOT_FOUND_CLASS`] — the seed
+    /// source answered but holds no kopia repository.
+    SourceNotFound,
+    /// [`kopiur_mover::bootstrap::SEED_SOURCE_EMPTY_CLASS`] — the source is a
+    /// repository but holds zero snapshots and `allowEmptySource` is `false`.
+    SourceEmpty,
+    /// [`kopiur_mover::bootstrap::SEED_INCOMPLETE_CLASS`] — a migrate-mode
+    /// post-verify found snapshots missing at the destination.
+    Incomplete,
+    /// [`kopiur_mover::bootstrap::SEED_LEFT_EMPTY_CLASS`] — a seed was armed
+    /// and the repository ended the run holding zero snapshots.
+    LeftEmpty,
+}
+
+impl SeedFailure {
+    /// Interpret a mover `FailureBlock::kopia_error_class` label, or `None`
+    /// when it is not a seed sentinel. The round trip against
+    /// [`Self::reason`] is pinned by
+    /// `io::tests::every_seed_class_maps_to_a_typed_failure`.
+    pub fn from_class(class: &str) -> Option<Self> {
+        use kopiur_mover::bootstrap as mb;
+        match class {
+            c if c == mb::SEED_SOURCE_NOT_FOUND_CLASS => Some(Self::SourceNotFound),
+            c if c == mb::SEED_SOURCE_EMPTY_CLASS => Some(Self::SourceEmpty),
+            c if c == mb::SEED_INCOMPLETE_CLASS => Some(Self::Incomplete),
+            c if c == mb::SEED_LEFT_EMPTY_CLASS => Some(Self::LeftEmpty),
+            _ => None,
+        }
+    }
+
+    /// The machine-readable `reason` shared by the `Bootstrapped=False` and
+    /// `Seeded=False` conditions and the Warning Event — the mover's own class
+    /// label, so the three can never drift. Exhaustive.
+    pub fn reason(self) -> &'static str {
+        use kopiur_mover::bootstrap as mb;
+        match self {
+            Self::SourceNotFound => mb::SEED_SOURCE_NOT_FOUND_CLASS,
+            Self::SourceEmpty => mb::SEED_SOURCE_EMPTY_CLASS,
+            Self::Incomplete => mb::SEED_INCOMPLETE_CLASS,
+            Self::LeftEmpty => mb::SEED_LEFT_EMPTY_CLASS,
+        }
+    }
+
+    /// The remediation hint. The two SOURCE-side failures ask the user to look
+    /// at `spec.seed.from`; the two INTERRUPTED-copy failures are ones kopiur
+    /// resumes by itself, so their action says to let it (and to give it room).
+    /// Exhaustive.
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::SourceNotFound | Self::SourceEmpty => crate::consts::CHECK_SEED_SOURCE_ACTION,
+            Self::Incomplete | Self::LeftEmpty => crate::consts::AWAIT_SEED_RESUME_ACTION,
+        }
+    }
+}
+
+/// The stable, actionable condition/Event message for the mover-skew guard
+/// ([`BootstrapFailure::SeedMoverTooOld`]). Pure so its exact text is asserted;
+/// volatile-free so the guarded status write stays a no-op across repeats.
+pub fn seed_mover_too_old_message() -> String {
+    "spec.seed is set and this repository has never been initialized, but the bootstrap mover \
+     reported success without saying what it did about the seed — which means the running mover \
+     image predates spec.seed, silently ignored it, and initialized an EMPTY repository instead \
+     of copying your data in. kopiur refuses to report Ready over that, because an empty \
+     repository that looks healthy is exactly the failure spec.seed exists to prevent. Fix: \
+     upgrade the mover image (Helm `mover.image.tag`, or `KOPIUR_MOVER_IMAGE`) to the same \
+     version as the controller, then delete the empty repository at the backend so the seed can \
+     run from scratch."
+        .to_string()
 }
 
 impl BootstrapFailure {
@@ -643,6 +755,26 @@ impl BootstrapFailure {
             BootstrapFailure::Backend { class, .. } => class.as_str(),
             BootstrapFailure::JobFailedWithoutResult { .. } => BOOTSTRAP_JOB_FAILED_REASON,
             BootstrapFailure::RepositoryNotInitialized => REPOSITORY_NOT_INITIALIZED_REASON,
+            BootstrapFailure::Seed { failure, .. } => failure.reason(),
+            BootstrapFailure::SeedMoverTooOld => crate::consts::SEED_MOVER_TOO_OLD_REASON,
+            BootstrapFailure::InternalInconsistency { .. } => {
+                kopiur_mover::bootstrap::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS
+            }
+        }
+    }
+
+    /// Which seeding failure this is, or `None` when it is not one. Drives the
+    /// `Seeded=False` condition the seed finalizers fold in beside
+    /// `Bootstrapped=False` (issue #380) — the skew guard counts, because it
+    /// too is a statement about the seed.
+    pub fn seed_reason(&self) -> Option<&'static str> {
+        match self {
+            BootstrapFailure::Seed { failure, .. } => Some(failure.reason()),
+            BootstrapFailure::SeedMoverTooOld => Some(crate::consts::SEED_MOVER_TOO_OLD_REASON),
+            BootstrapFailure::Backend { .. }
+            | BootstrapFailure::JobFailedWithoutResult { .. }
+            | BootstrapFailure::RepositoryNotInitialized
+            | BootstrapFailure::InternalInconsistency { .. } => None,
         }
     }
 
@@ -658,9 +790,16 @@ impl BootstrapFailure {
     pub fn is_repository_absent(&self) -> bool {
         match self {
             BootstrapFailure::RepositoryNotInitialized => true,
-            BootstrapFailure::Backend { .. } | BootstrapFailure::JobFailedWithoutResult { .. } => {
-                false
-            }
+            // A seed failure says something about the SOURCE or the copy, never
+            // "this repository's backend is empty" — and the skew guard says the
+            // opposite (an empty repository was just created here). Routing any
+            // of them as "absent" would feed the probe's `RepositoryVanished`
+            // path, whose remediation copy is about a WIPE.
+            BootstrapFailure::Backend { .. }
+            | BootstrapFailure::JobFailedWithoutResult { .. }
+            | BootstrapFailure::Seed { .. }
+            | BootstrapFailure::SeedMoverTooOld
+            | BootstrapFailure::InternalInconsistency { .. } => false,
         }
     }
 
@@ -677,10 +816,28 @@ impl BootstrapFailure {
     /// Typed backend rejections and the create-disabled sentinel keep the
     /// terminal park: retrying them cannot succeed without a spec change.
     /// Exhaustive so a new variant must choose.
+    /// A seed failure recycles too, and the reason is worth stating: all four
+    /// seed sentinels describe a world that can change — a source that will
+    /// exist or fill up later, a copy the next attempt finishes — and the
+    /// bootstrap is the only thing that can act on the change. The last two
+    /// (`SeedIncomplete`, `SeedLeftEmpty`) are retryable **only because the
+    /// relaunch resumes** (`SeedOpSpec::resume`, driven by the durable
+    /// seed-attempt marker `status.seed.startedAt`): without that the relaunch
+    /// would connect to the half-seeded repository, report the
+    /// `AlreadyInitialized` no-op, and go `Ready` carrying exactly the history
+    /// the failure just refused. The two are joined at the hip — if the marker
+    /// or the resume plumbing is ever removed, these must go terminal with it.
+    ///
+    /// The skew guard and the internal-inconsistency class stay terminal: an
+    /// old mover image and a broken mover invariant both reproduce identically
+    /// on every attempt, so retrying hides them behind a two-minute loop.
     pub fn recycles_for_retry(&self) -> bool {
         match self {
-            BootstrapFailure::JobFailedWithoutResult { .. } => true,
-            BootstrapFailure::Backend { .. } | BootstrapFailure::RepositoryNotInitialized => false,
+            BootstrapFailure::JobFailedWithoutResult { .. } | BootstrapFailure::Seed { .. } => true,
+            BootstrapFailure::Backend { .. }
+            | BootstrapFailure::RepositoryNotInitialized
+            | BootstrapFailure::SeedMoverTooOld
+            | BootstrapFailure::InternalInconsistency { .. } => false,
         }
     }
 
@@ -720,7 +877,15 @@ impl BootstrapFailure {
                     }
             }
             BootstrapFailure::JobFailedWithoutResult { .. }
-            | BootstrapFailure::RepositoryNotInitialized => false,
+            | BootstrapFailure::RepositoryNotInitialized
+            // A seed failure only ever fires on a repository that has NEVER
+            // bootstrapped (the seed is armed only while `status.uniqueId` is
+            // unset), so this arm is unreachable for it — and it already has
+            // its own recycle route, which must not be shadowed by the outage
+            // sensor's streak/breaker bookkeeping.
+            | BootstrapFailure::Seed { .. }
+            | BootstrapFailure::SeedMoverTooOld
+            | BootstrapFailure::InternalInconsistency { .. } => false,
         }
     }
 
@@ -736,6 +901,9 @@ impl BootstrapFailure {
             BootstrapFailure::RepositoryNotInitialized => {
                 kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string()
             }
+            BootstrapFailure::Seed { message, .. }
+            | BootstrapFailure::InternalInconsistency { message } => message.clone(),
+            BootstrapFailure::SeedMoverTooOld => seed_mover_too_old_message(),
         }
     }
 
@@ -778,6 +946,42 @@ impl BootstrapFailure {
                 )
                 .await;
             }
+            BootstrapFailure::Seed { failure, message } => {
+                let note = truncate_for_note(message, EVENT_NOTE_MAX_BYTES);
+                publish_warning(
+                    ctx,
+                    regarding,
+                    name,
+                    failure.reason(),
+                    failure.action(),
+                    note,
+                )
+                .await;
+            }
+            BootstrapFailure::SeedMoverTooOld => {
+                let note = truncate_for_note(&seed_mover_too_old_message(), EVENT_NOTE_MAX_BYTES);
+                publish_warning(
+                    ctx,
+                    regarding,
+                    name,
+                    crate::consts::SEED_MOVER_TOO_OLD_REASON,
+                    crate::consts::UPGRADE_MOVER_IMAGE_ACTION,
+                    note,
+                )
+                .await;
+            }
+            BootstrapFailure::InternalInconsistency { message } => {
+                let note = truncate_for_note(message, EVENT_NOTE_MAX_BYTES);
+                publish_warning(
+                    ctx,
+                    regarding,
+                    name,
+                    kopiur_mover::bootstrap::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS,
+                    crate::consts::REPORT_KOPIUR_BUG_ACTION,
+                    note,
+                )
+                .await;
+            }
         }
     }
 }
@@ -800,11 +1004,20 @@ pub enum BootstrapOutcome {
 }
 
 /// Classify a bootstrap Job's `(result, job_succeeded)` into a
-/// [`BootstrapOutcome`]. Pure, so the four-way mapping is unit-tested.
+/// [`BootstrapOutcome`]. Pure, so the mapping is unit-tested.
+///
+/// `seed_armed` is whether THIS launch carried a `spec.seed` payload (issue
+/// #380). It is what makes the mover-skew guard possible: `BootstrapResult.seed`
+/// is mover-authored and every seed-armed success emits one, so a seed-armed
+/// success WITHOUT one is proof the running image is too old to have understood
+/// the request — and it is refused here, before any caller can read `Ready` out
+/// of it. Passing `false` (a bootstrap that armed nothing) keeps the pre-#380
+/// mapping byte-for-byte.
 pub fn bootstrap_outcome(
     result: Option<kopiur_mover::bootstrap::BootstrapResult>,
     job_succeeded: bool,
     job_name: &str,
+    seed_armed: bool,
 ) -> BootstrapOutcome {
     match result {
         None if job_succeeded => BootstrapOutcome::ResultPending,
@@ -822,6 +1035,44 @@ pub fn bootstrap_outcome(
         {
             BootstrapOutcome::Failed(BootstrapFailure::RepositoryNotInitialized)
         }
+        // The seed sentinels + the mover's internal-inconsistency class (#380),
+        // checked before the generic Backend mapping for the same reason: they
+        // are kopiur outcomes, not kopia stderr, and `from_label` would flatten
+        // every one of them to `Unknown`.
+        Some(r)
+            if !r.success
+                && r.failure
+                    .as_ref()
+                    .and_then(|f| SeedFailure::from_class(&f.kopia_error_class))
+                    .is_some() =>
+        {
+            let failure = r
+                .failure
+                .as_ref()
+                .and_then(|f| SeedFailure::from_class(&f.kopia_error_class))
+                .unwrap_or(SeedFailure::SourceNotFound);
+            BootstrapOutcome::Failed(BootstrapFailure::Seed {
+                failure,
+                message: r
+                    .failure
+                    .as_ref()
+                    .map(|f| f.message.clone())
+                    .unwrap_or_else(|| failure.reason().to_string()),
+            })
+        }
+        Some(r)
+            if !r.success
+                && r.failure.as_ref().map(|f| f.kopia_error_class.as_str())
+                    == Some(kopiur_mover::bootstrap::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS) =>
+        {
+            BootstrapOutcome::Failed(BootstrapFailure::InternalInconsistency {
+                message: r
+                    .failure
+                    .as_ref()
+                    .map(|f| f.message.clone())
+                    .unwrap_or_else(|| "the bootstrap mover reported a broken invariant".into()),
+            })
+        }
         Some(r) if !r.success => BootstrapOutcome::Failed(BootstrapFailure::Backend {
             class: r
                 .failure
@@ -834,6 +1085,12 @@ pub fn bootstrap_outcome(
                 .map(|f| f.message.clone())
                 .unwrap_or_else(|| "repository bootstrap failed".to_string()),
         }),
+        // The mover-skew guard (#380). A seed-armed SUCCESS must acknowledge the
+        // seed; one that does not was produced by an image that never saw the
+        // field, so it Ready-ed an empty repository.
+        Some(r) if seed_armed && r.seed.is_none() => {
+            BootstrapOutcome::Failed(BootstrapFailure::SeedMoverTooOld)
+        }
         Some(r) => BootstrapOutcome::Succeeded(Box::new(r)),
     }
 }
