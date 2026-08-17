@@ -134,6 +134,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // the whole repo runs at uid/gid 3001 (bootstrap AND backup — kopia's 0600 control
     // files must share one owner), so it cannot share the restore shard's 65532 seed repo.
     "recrestore",
+    // #380: the waitTimeout window must open when the restore can first PROCEED
+    // (repository Ready), not at the Restore's creation — needs its own repo, created
+    // SUSPENDED so it is cold until the scenario releases it.
+    "waitanchor",
     // SnapshotReplication (issue #368, crates/e2e/tests/snapshot_replication.rs):
     // logical fs→fs replication. Each scenario needs its OWN source AND destination
     // kopia repository so copy/prune/idempotency counts never leak between scenarios:
