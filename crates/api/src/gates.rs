@@ -401,6 +401,49 @@ pub const SOURCE_PVC_MISSING_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Fail,
 };
 
+/// A `spec.seed` in migrate mode whose SOURCE repository is missing or not
+/// `Ready` (issue #380). The repository parks `Pending` with `Seeded=False`
+/// and re-checks; nothing in kopiur can bring the source up, so it is squarely
+/// "needs a human" — and the park is phase-INVISIBLE in the worst way: a
+/// brand-new repository sitting at `Pending` looks identical to one that is
+/// simply still bootstrapping, and it will sit there for as long as the source
+/// is down.
+///
+/// WARN rather than Fail, for two reasons that point the same way. The
+/// registry pins one severity per condition+scope
+/// (`gate_rows_are_unique_and_internally_consistent`), and the sibling
+/// [`SEEDING_GATE`] on this same condition *must* be Warn — a seed legitimately
+/// runs for hours, and a healthy copy must not turn a diagnostic red. And on
+/// its own merits this park is the same shape as
+/// [`POLICY_REPOSITORY_NOT_READY_GATE`]: a source repository that is still
+/// bootstrapping alongside this one (the ordinary DR bring-up) comes up by
+/// itself, and one deliberately taken down is a plausible operator choice. The
+/// block is reported either way, with the writer's message — which is what
+/// makes it worth registering.
+pub const SEED_SOURCE_NOT_READY_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::SEEDED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::WAITING_FOR_SEED_SOURCE_REASON,
+    severity: GateSeverity::Warn,
+};
+
+/// A seeding bootstrap Job is in flight (issue #380): the repository is
+/// copying a whole repository across and is legitimately not `Ready` yet.
+///
+/// Registered for EXPLANATORY value, like [`REPOSITORY_READ_ONLY_GATE`]: a seed
+/// runs for hours by design (its Job deadline defaults to 24h), so a
+/// diagnostic must be able to say "seeding" rather than "stuck at Pending".
+/// Hence WARN — progress is not a fault, and this row must never on its own
+/// turn a diagnostic red.
+pub const SEEDING_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::SEEDED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::SEEDING_REASON,
+    severity: GateSeverity::Warn,
+};
+
 /// Every human-actionable structural gate kopiur's reconcilers can park an
 /// object on.
 ///
@@ -432,6 +475,8 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     SCHEDULE_FANOUT_CAPPED_GATE,
     POLICY_REPOSITORY_NOT_READY_GATE,
     SOURCE_PVC_MISSING_GATE,
+    SEED_SOURCE_NOT_READY_GATE,
+    SEEDING_GATE,
 ];
 
 #[cfg(test)]
@@ -658,6 +703,20 @@ mod tests {
                 consts::SOURCE_PVC_MISSING_REASON,
                 GateScope::Snapshot,
                 GateSeverity::Fail,
+            ),
+            (
+                consts::SEEDED_CONDITION,
+                CONDITION_FALSE,
+                consts::WAITING_FOR_SEED_SOURCE_REASON,
+                GateScope::Repository,
+                GateSeverity::Warn,
+            ),
+            (
+                consts::SEEDED_CONDITION,
+                CONDITION_FALSE,
+                consts::SEEDING_REASON,
+                GateScope::Repository,
+                GateSeverity::Warn,
             ),
         ];
         assert_eq!(

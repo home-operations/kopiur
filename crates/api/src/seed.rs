@@ -270,6 +270,18 @@ pub struct SeedMigrateOptions {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SeedStatus {
+    /// RFC 3339 timestamp the operator LAUNCHED a seeding bootstrap Job for
+    /// this repository — the durable **seed-attempt marker**.
+    ///
+    /// Stamped before the Job is created, and never cleared. Its whole job is
+    /// to distinguish "a seed this operator started did not finish" from "this
+    /// backend was initialized by somebody else": the first must resume the
+    /// copy, the second must keep the no-clobber `AlreadyInitialized` path.
+    /// See [`seed_resume`] — the marker is the ONLY input the resume decision
+    /// is allowed to take, because a resuming migrate writes into whatever
+    /// repository is at the backend and then re-stamps its maintenance owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
     /// RFC 3339 timestamp the seed completed. Set once: a repository is seeded
     /// exactly once, at its first bootstrap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,6 +370,52 @@ pub fn seed_backend(seed: &SeedSpec) -> Option<&Backend> {
 /// Once the bootstrap pins a unique ID the block is a standing no-op.
 pub fn seed_armed(seed: Option<&SeedSpec>, unique_id: Option<&str>) -> bool {
     seed.is_some() && unique_id.is_none_or(str::is_empty)
+}
+
+/// Whether an armed seed must **RESUME** an attempt a previous bootstrap
+/// started but did not finish, rather than run as a first seed.
+///
+/// `armed` is [`seed_armed`]; `status` is the repository's `status.seed`. The
+/// answer is `true` exactly when the seed is armed, the durable seed-attempt
+/// marker ([`SeedStatus::started_at`]) is present, and
+/// [`SeedStatus::seeded_at`] is not — i.e. this operator recorded that it began
+/// seeding THIS repository and never recorded finishing.
+///
+/// **The marker is the sole guard**, deliberately. A resuming migrate re-runs
+/// `kopia snapshot migrate` into whatever repository is at the backend and then
+/// re-stamps its maintenance owner, with no kopia-side backstop (blob mode gets
+/// one for free — `sync-to` refuses a destination whose format blob differs
+/// from the source's). So a repository this operator never began seeding — an
+/// ordinary ADOPTION of a backend somebody else initialized, `spec.seed` left
+/// standing in a GitOps manifest — must never resume: it has no marker, and it
+/// keeps the no-clobber `AlreadyInitialized` no-op. Never derive `resume` from
+/// anything weaker (a Job's existence, an unset `status.uniqueId`, a
+/// condition).
+///
+/// ```
+/// use kopiur_api::seed::{SeedStatus, seed_resume};
+///
+/// let none = SeedStatus::default();
+/// // Fresh seed: armed, but no attempt was ever recorded.
+/// assert!(!seed_resume(true, Some(&none)));
+/// assert!(!seed_resume(true, None));
+///
+/// // A previous attempt started and never finished ⇒ resume.
+/// let attempted = SeedStatus { started_at: Some("2026-01-01T00:00:00Z".into()), ..none.clone() };
+/// assert!(seed_resume(true, Some(&attempted)));
+///
+/// // Finished ⇒ nothing to resume (and the seed is no longer armed anyway).
+/// let done = SeedStatus { seeded_at: Some("2026-01-01T01:00:00Z".into()), ..attempted.clone() };
+/// assert!(!seed_resume(true, Some(&done)));
+/// assert!(!seed_resume(false, Some(&attempted)));
+/// ```
+pub fn seed_resume(armed: bool, status: Option<&SeedStatus>) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    armed
+        && status.started_at.as_deref().is_some_and(|s| !s.is_empty())
+        && !status.seeded_at.as_deref().is_some_and(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -518,6 +576,79 @@ snapshotsCopied: 412
         let reparsed: SeedStatus =
             serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
         assert_eq!(status, reparsed);
+        // The marker is optional on the wire and elided when unset, so an
+        // upgrade over a status written before #380 decodes cleanly.
+        assert_eq!(status.started_at, None);
+        assert!(
+            !serde_json::to_value(&status)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("startedAt")
+        );
+    }
+
+    #[test]
+    fn resume_is_decided_by_the_attempt_marker_and_nothing_else() {
+        // The full matrix the controller depends on. `armed` alone never
+        // resumes — that is the ADOPTION case (a backend somebody else
+        // initialized, with `spec.seed` standing in the manifest), and it must
+        // keep the no-clobber AlreadyInitialized path.
+        let marker = |started: Option<&str>, seeded: Option<&str>| SeedStatus {
+            started_at: started.map(str::to_string),
+            seeded_at: seeded.map(str::to_string),
+            ..SeedStatus::default()
+        };
+        // (armed, status) -> resume
+        let cases: &[(bool, Option<SeedStatus>, bool, &str)] = &[
+            (true, None, false, "fresh seed: no status at all"),
+            (
+                true,
+                Some(marker(None, None)),
+                false,
+                "fresh seed: status exists but no attempt was recorded",
+            ),
+            (
+                true,
+                Some(marker(Some(""), None)),
+                false,
+                "an empty marker is not a marker",
+            ),
+            (
+                true,
+                Some(marker(Some("2026-01-01T00:00:00Z"), None)),
+                true,
+                "retry after a recorded attempt: RESUME",
+            ),
+            (
+                true,
+                Some(marker(
+                    Some("2026-01-01T00:00:00Z"),
+                    Some("2026-01-01T01:00:00Z"),
+                )),
+                false,
+                "already seeded: nothing to resume",
+            ),
+            (
+                false,
+                Some(marker(Some("2026-01-01T00:00:00Z"), None)),
+                false,
+                "not armed (uniqueId pinned): never resume",
+            ),
+            (
+                true,
+                Some(marker(None, Some("2026-01-01T01:00:00Z"))),
+                false,
+                "seeded without a marker (impossible, but must not resume)",
+            ),
+        ];
+        for (armed, status, expected, why) in cases {
+            assert_eq!(
+                seed_resume(*armed, status.as_ref()),
+                *expected,
+                "seed_resume({armed}, {status:?}): {why}"
+            );
+        }
     }
 
     fn seed_of(from: SeedSource) -> SeedSpec {

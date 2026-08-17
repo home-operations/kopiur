@@ -1977,7 +1977,7 @@ async fn run_bootstrap(
             // forever while hiding the defect behind it.
             let Some(seed) = op.seed.as_ref() else {
                 return BootstrapResult::internal_inconsistency(
-                    "bootstrap_init_action selected Seed for a work spec that carries no                      spec.seed payload",
+                    "bootstrap_init_action selected Seed for a work spec that carries no spec.seed payload",
                 );
             };
             match bootstrap_seed_arm(
