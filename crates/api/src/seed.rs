@@ -83,12 +83,11 @@ pub struct SeedSpec {
     /// deliberately pruned to nothing).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_empty_source: bool,
-    /// Deadline/backoff for the **seeding** bootstrap Job. Absent
-    /// `activeDeadlineSeconds` means [`DEFAULT_SEED_BOOTSTRAP_DEADLINE_SECS`]
-    /// (24h) rather than the 120s a routine connect gets — a seed copies a whole
-    /// repository once. Only applied while the seed is armed; later connects to
-    /// the now-initialized repository use `spec.bootstrap.failurePolicy` as
-    /// before.
+    /// Deadline/backoff for the **seeding** bootstrap Job. An absent
+    /// `activeDeadlineSeconds` means **24h** here, rather than the 120s a
+    /// routine connect gets — a seed copies a whole repository, once. Only
+    /// applied while the seed is armed; later connects to the now-initialized
+    /// repository use `spec.bootstrap.failurePolicy` as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<FailurePolicy>,
     /// Opt-in projection of the SOURCE repository's credential Secrets into the
@@ -135,10 +134,9 @@ pub enum SeedSource {
     /// and encryption password are inherited verbatim, so this repository's
     /// `encryption.passwordSecretRef` must already hold the MIRROR's password
     /// and `spec.create`'s format knobs are refused as inert.
-    ///
-    /// Boxed because a `Backend` is much larger than a `RepositoryRef` and an
-    /// unboxed variant would inflate every `SeedSource` (and every `SeedSpec`
-    /// embedding one) to the larger size.
+    // Boxed because a `Backend` is far larger than a `RepositoryRef`; an
+    // unboxed variant would inflate every `SeedSource` — and every `SeedSpec`
+    // and repository spec embedding one — to the larger size.
     Backend(Box<Backend>),
     /// Another `Repository`/`ClusterRepository`, opened read-only (migrate mode,
     /// `kopia snapshot migrate`). Snapshot identities and times are preserved,
@@ -186,17 +184,12 @@ impl SeedSource {
     }
 }
 
-/// Which copy mechanism a seed ran (or would run). Mirrors the
-/// [`SeedSource`] variant, named after the operation rather than the input so
-/// status, metrics (`kopiur_repository_seed_total{mode}`) and docs share one
-/// vocabulary.
-///
-/// ```
-/// use kopiur_api::seed::SeedMode;
-///
-/// assert_eq!(serde_json::to_value(SeedMode::Blob).unwrap(), "blob");
-/// assert_eq!(SeedMode::Migrate.as_str(), "migrate");
-/// ```
+/// Which copy mechanism a seed ran. Mirrors the [`SeedSource`] variant, named
+/// after the operation rather than the input so status, metrics
+/// (`kopiur_repository_seed_total{mode}`) and docs share one vocabulary.
+// The wire strings are pinned by `tests::seed_mode_labels_are_stable` rather
+// than a doctest: schemars lifts a referenced enum's doc comment into the field
+// description, so a code block here would land in `docs/field-reference.md`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SeedMode {
@@ -275,7 +268,9 @@ pub struct SeedStatus {
     /// exactly once, at its first bootstrap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seeded_at: Option<String>,
-    /// Which copy mechanism ran.
+    /// Which copy mechanism ran: `blob` (a `kopia repository sync-to` from a
+    /// mirror backend) or `migrate` (a `kopia snapshot migrate` from another
+    /// repository CR).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<SeedMode>,
     /// The source the data came from, rendered by [`SeedSource::describe`] —

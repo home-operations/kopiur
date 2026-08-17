@@ -203,3 +203,19 @@ allow:
     reason: >-
       #346 — only meaningful for pvcSelector expansion, so it is inert for the
       same reason. Wired in M4.
+
+  # ==========================================================================
+  # (e) #380 `spec.seed` — the API surface landed ahead of the mover/controller
+  #     that reads it. Both entries fail the check the moment their consumer
+  #     lands, so they cannot outlive the feature work.
+  # ==========================================================================
+  - path: "*.seed.allowEmptySource"
+    reason: >-
+      #380 — read by the seeding mover, which fails the bootstrap with
+      SEED_SOURCE_EMPTY_CLASS when the source holds zero snapshots and this is
+      false. Inert until that mover arm lands (feat/380 stage C2).
+  - path: "*.seed.seededAt"
+    reason: >-
+      #380 — status OUTPUT stamped by the repository reconciler's
+      finalize_bootstrap alongside the Seeded condition. Inert until that
+      writer lands (feat/380 stage C3).
