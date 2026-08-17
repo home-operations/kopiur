@@ -110,9 +110,9 @@ pub fn answered<K: ReplicationTarget>(
         return None;
     }
     match manual.phase.as_ref()? {
-        // Recorded but blocked (the replication is suspended) — the run is
-        // still owed, so keep waiting; the caller's timeout bounds it and its
-        // hint names the suspension.
+        // Recorded but blocked (suspended, or queued behind an in-flight run)
+        // — the run is still owed, so keep waiting; the caller's timeout
+        // bounds it and its hint names both causes.
         ReplicationManualRunPhase::Pending => None,
         ReplicationManualRunPhase::Running => None,
         ReplicationManualRunPhase::Succeeded => Some(Ok(Box::new(obj.clone()))),
@@ -256,8 +256,9 @@ async fn run_kind<K: ReplicationTarget>(
         format!("{} {name} requested run", K::KIND),
         format!(
             "watch it with `kubectl get {} {name} -n {ns} -o jsonpath='{{.status.manualRun}}'`, \
-             or raise --timeout. A phase of Pending means the replication is suspended — \
-             `kubectl kopiur resume` it and the run starts",
+             or raise --timeout. A phase of Pending means the replication is suspended, or \
+             the request is waiting behind an in-flight run — `kubectl kopiur resume` it if \
+             suspended, or wait for the in-flight run to finish",
             K::PLURAL
         ),
         timeout,

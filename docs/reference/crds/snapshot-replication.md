@@ -74,7 +74,7 @@ Lifecycle phase: `Pending` (admitted, not yet run), `Replicating` (a mover Job i
 
 ### `manualRun`
 
-State of the most recent [annotation-requested run](#out-of-band-runs): the `requestedAt` value it answers, its `phase` (`Pending` while the replication is suspended, then `Running` → `Succeeded`/`Failed`), and the `completedAt` instant it reached a terminal phase. Absent until a run is requested.
+State of the most recent [annotation-requested run](#out-of-band-runs): the `requestedAt` value it answers, its `phase` (`Pending` while the replication is suspended, or while the request is waiting behind an in-flight run; then `Running` → `Succeeded`/`Failed`), and the `completedAt` instant it reached a terminal phase. Absent until a run is requested.
 
 ### others
 

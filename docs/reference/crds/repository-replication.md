@@ -66,7 +66,7 @@ State of the most recent [annotation-requested run](#out-of-band-runs): the `req
 
 | `phase` | Meaning |
 | --- | --- |
-| `Pending` | Recorded but not started — the replication is `suspend: true`. It runs on resume. |
+| `Pending` | Recorded but not started — either the replication is suspended, or the request is waiting behind an in-flight run. It runs once unsuspended, or once that run finishes. |
 | `Running` | The requested mover Job is in flight. |
 | `Succeeded` | The requested run completed. |
 | `Failed` | The requested run's Job failed; conditions carry the detail. |
