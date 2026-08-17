@@ -56,11 +56,25 @@ Opt in to [credential projection](../../movers.md#let-kopiur-project-the-credent
 
 Pause replication declaratively (default `false`) without deleting the CR.
 
+## Out-of-band runs
+
+Annotating a `SnapshotReplication` with `kopiur.home-operations.com/run-requested` (an RFC3339 timestamp) triggers a one-off copy pass. There is no `run-mode` companion — a replication has exactly one kind of run. The timestamp pins *which* request the status answers, so re-applying the same value is a no-op and a new timestamp starts a new run. The requested run flows through the same mover, gates (both repositories `Ready`, destination writable, `IdentityOverlap`) and single-flight rule as a cron slot, and — because it stamps `status.lastReplicated` on success — re-anchors the next scheduled slot. See [Run it now](../../snapshot-replication.md#run-it-now); `kubectl kopiur replication run` stamps the annotation for you.
+
+/// warning | A malformed timestamp is refused at admission
+
+The admission webhook rejects a `run-requested` value that is not RFC3339, naming the offending value and the fix — so in practice a malformed annotation never reaches the controller. An object annotated while the webhook was down degrades gracefully instead of stalling: the schedule keeps running, and the controller reports `Ready=False` with reason `InvalidRunRequest` on the next pass where **no cron slot is due** (a due slot's own report takes that one `Ready` write, so on a very frequent schedule the message appears once the replication next goes idle).
+
+///
+
 ## `status`
 
 ### `phase`
 
 Lifecycle phase: `Pending` (admitted, not yet run), `Replicating` (a mover Job is in flight), `Succeeded` (last run completed), `Failed` (last run failed; see conditions), or `Suspended`.
+
+### `manualRun`
+
+State of the most recent [annotation-requested run](#out-of-band-runs): the `requestedAt` value it answers, its `phase` (`Pending` while the replication is suspended, or while the request is waiting behind an in-flight run; then `Running` → `Succeeded`/`Failed`), and the `completedAt` instant it reached a terminal phase. Absent until a run is requested.
 
 ### others
 

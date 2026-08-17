@@ -10,7 +10,7 @@ mod common;
 use common::*;
 
 use kube::Api;
-use kube::api::{DeleteParams, ListParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -366,4 +366,172 @@ async fn repository_replication_s3_to_s3_uses_destination_scoped_credentials() {
 
     let _ = repls.delete(name, &DeleteParams::default()).await;
     let _ = repos.delete(src, &DeleteParams::default()).await;
+}
+
+/// Issue #380: an ON-DEMAND run, requested with the `run-requested`
+/// annotation, on a replication whose cron cannot fire again for months.
+///
+/// The schedule is `0 5 1 1 *` (05:00 on 1 January). A brand-new replication is
+/// always immediately due — the scheduler anchors an unrun CR a year back — so
+/// the CR takes exactly ONE catch-up run, which stamps `status.lastReplicated`
+/// and re-anchors the next slot to next January. From that point the annotation
+/// is the only thing in the cluster that can produce another run, which is what
+/// makes the second `lastReplicated` a proof rather than a coincidence.
+///
+/// It pins the halves a unit test cannot reach: the requested run rides the
+/// ordinary mover path (a real `sync-to`, tagged `run-trigger: manual` on its
+/// Job), and `status.manualRun` answers the exact timestamp requested.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn repository_replication_runs_on_demand_from_the_run_requested_annotation() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    ensure_seed(
+        &client,
+        "e2e-repl-run-src",
+        "e2e-repl-run-policy",
+        "e2e-repl-run-seed",
+        "repl-run-src",
+    )
+    .await;
+    ensure_repo(&client, "repl-run-dst").await;
+
+    let repls: Api<RepositoryReplication> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let name = "e2e-repl-run";
+    repls
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "RepositoryReplication",
+                "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "sourceRef": { "kind": "Repository", "name": "e2e-repl-run-src" },
+                    "destination": { "filesystem": { "path": "/repo-dst", "volume": { "pvc": { "name": consts::isolated_repo_pvc("repl-run-dst") } } } },
+                    // Yearly: one catch-up run now, then nothing until January.
+                    "schedule": { "cron": "0 5 1 1 *" }
+                }
+            })),
+        )
+        .await
+        .expect("create RepositoryReplication with a yearly schedule");
+
+    // The one catch-up run, whose timestamp becomes the baseline the requested
+    // run must move.
+    let first = wait_until(
+        "the initial catch-up run stamps status.lastReplicated",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, name).await;
+            Ok(s.get("lastReplicated")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string))
+        },
+    )
+    .await
+    .expect("the catch-up run should stamp status.lastReplicated");
+
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    repls
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": {
+                    kopiur_api::consts::RUN_REQUESTED_ANNOTATION: requested_at
+                } }
+            })),
+        )
+        .await
+        .expect("annotate the replication with a run request");
+
+    // A SECOND run happens even though no cron slot is due — only the
+    // annotation can have caused it.
+    wait_until(
+        "the requested run stamps a NEW status.lastReplicated",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let first = first.clone();
+            let repls = repls.clone();
+            async move {
+                let s = status_json(&repls, name).await;
+                Ok(s.get("lastReplicated")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty() && *v != first)
+                    .map(str::to_string))
+            }
+        },
+    )
+    .await
+    .expect("the requested run should execute and re-stamp status.lastReplicated");
+
+    // …and the controller answers the EXACT request in status.manualRun.
+    let manual = wait_until(
+        "status.manualRun reaches a terminal phase",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, name).await;
+            Ok(s.get("manualRun")
+                .filter(|m| {
+                    matches!(
+                        m.get("phase").and_then(|p| p.as_str()),
+                        Some("Succeeded" | "Failed")
+                    )
+                })
+                .cloned())
+        },
+    )
+    .await
+    .expect("the controller should record a terminal status.manualRun");
+    assert_eq!(
+        manual.get("phase").and_then(|v| v.as_str()),
+        Some("Succeeded"),
+        "manualRun: {manual}"
+    );
+    assert_eq!(
+        manual.get("requestedAt").and_then(|v| v.as_str()),
+        Some(requested_at.as_str()),
+        "manualRun must pin the timestamp that was requested; got {manual}"
+    );
+    assert!(
+        manual
+            .get("completedAt")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "a terminal manual run must record completedAt; got {manual}"
+    );
+
+    // The controller→metrics contract: the requested run's Job is tagged as
+    // manual, which is what `kopiur_replication_runs_total{trigger}` reads.
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let selector = format!(
+        "app.kubernetes.io/component=replication,kopiur.home-operations.com/replication={name}"
+    );
+    let triggers: Vec<String> = jobs
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .expect("list replication Jobs")
+        .items
+        .iter()
+        .filter_map(|j| {
+            j.metadata
+                .annotations
+                .as_ref()?
+                .get("kopiur.home-operations.com/run-trigger")
+                .cloned()
+        })
+        .collect();
+    assert!(
+        triggers.iter().any(|t| t == "manual"),
+        "the requested run's Job must be tagged run-trigger: manual; got {triggers:?}"
+    );
+
+    let _ = repls.delete(name, &DeleteParams::default()).await;
 }

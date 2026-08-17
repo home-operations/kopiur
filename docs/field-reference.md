@@ -3677,6 +3677,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `lastReplicated` | string | — | RFC3339 timestamp of the most recent successful replication run. |
 | `lastReplicatedBlobs` | integer | — | Blobs replicated by the last successful run (best-effort). |
 | `lastReplicatedBytes` | integer | — | Bytes replicated by the last successful run (best-effort from kopia output). |
+| `manualRun` | [object](#repositoryreplication-status-manualrun) | — | State of the most recent annotation-requested out-of-band run (`kopiur.home-operations.com/run-requested`); absent until one is requested. |
 | `nextScheduledAt` | string | — | RFC3339 timestamp of the next scheduled replication run (cron + jitter, pinned). |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection / kstatus. |
 | `phase` | enum: Pending \| Replicating \| Succeeded \| Failed \| Suspended | — | Lifecycle phase of a replication. |
@@ -3691,6 +3692,14 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `status` | string | **required** | status of the condition, one of True, False, Unknown. |
 | `type` | string | **required** | type of condition in CamelCase or in foo.example.com/CamelCase. |
 | `observedGeneration` | integer | — | observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditionsx.observedGeneration is 9, the condition is out of date with respect to the current state of the instance. |
+
+#### `status.manualRun` { #repositoryreplication-status-manualrun }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `completedAt` | string | — | RFC3339 instant the run reached a terminal phase. |
+| `phase` | enum: Pending \| Running \| Succeeded \| Failed | — | Lifecycle of a manual replication run. Closed enum. |
+| `requestedAt` | string | — | The `run-requested` annotation value this status reflects (RFC3339), verbatim as the user wrote it — it pins WHICH request is answered. |
 
 ---
 
@@ -3852,6 +3861,7 @@ Externally tagged — set **exactly one** of: `mirrorSource` · `none` · `reten
 | `conditions` | [][object](#snapshotreplication-status-conditions) | — | Standard Kubernetes conditions (`Ready`, `Reconciling`, `Stalled`). |
 | `lastReplicated` | string | — | RFC3339 timestamp of the most recent successful replication run (also the scheduling anchor for the next slot). |
 | `lastRun` | [object](#snapshotreplication-status-lastrun) | — | Counters from the most recent run. |
+| `manualRun` | [object](#snapshotreplication-status-manualrun) | — | State of the most recent annotation-requested out-of-band run (`kopiur.home-operations.com/run-requested`); absent until one is requested. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection / kstatus. |
 | `phase` | enum: Pending \| Replicating \| Succeeded \| Failed \| Suspended | — | Lifecycle phase of a snapshot replication. |
 
@@ -3875,3 +3885,11 @@ Externally tagged — set **exactly one** of: `mirrorSource` · `none` · `reten
 | `identitiesSelected` | integer | —<br><sub>min 0</sub> | Source identities the selector matched this run. |
 | `pruned` | integer | —<br><sub>min 0</sub> | Copies pruned this run per `spec.pruning`. |
 | `snapshotsCopied` | integer | —<br><sub>min 0</sub> | Snapshots newly copied to the destination this run. |
+
+#### `status.manualRun` { #snapshotreplication-status-manualrun }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `completedAt` | string | — | RFC3339 instant the run reached a terminal phase. |
+| `phase` | enum: Pending \| Running \| Succeeded \| Failed | — | Lifecycle of a manual replication run. Closed enum. |
+| `requestedAt` | string | — | The `run-requested` annotation value this status reflects (RFC3339), verbatim as the user wrote it — it pins WHICH request is answered. |

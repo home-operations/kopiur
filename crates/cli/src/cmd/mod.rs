@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod logs;
 pub mod maintenance;
 pub mod migrate;
+pub mod replication;
 pub mod restore;
 pub mod snapshot;
 pub mod snapshots;

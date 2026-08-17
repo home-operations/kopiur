@@ -81,6 +81,7 @@ pub struct Metrics {
     snapshots_policy_cascade_retained: Counter<u64>,
     policy_cascade_children_deleted: Counter<u64>,
     snapshot_delete_batch_jobs: Counter<u64>,
+    replication_runs: Counter<u64>,
     snapshot_delete_batch_members: Counter<u64>,
     work_spec_cms_swept: Counter<u64>,
     projected_secrets_swept: Counter<u64>,
@@ -112,6 +113,85 @@ pub struct Metrics {
     leader_transitions: Counter<u64>,
     leader_renew_failures: Counter<u64>,
     leader_renew_duration: Histogram<f64>,
+}
+
+/// Which replication kind a run outcome belongs to, as the `kind` label of
+/// `kopiur_replication_runs_total`. An exhaustive, closed set (the type-safety
+/// thesis): [`Metrics::inc_replication_run`] takes this enum, never a free
+/// string, so a third replication kind cannot mint an unbounded label value —
+/// and it doubles as the discriminant the shared
+/// [`crate::replication_run`] plumbing matches on for Job labels and names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationKind {
+    /// `RepositoryReplication` — blob-level `kopia repository sync-to`.
+    Repository,
+    /// `SnapshotReplication` — logical `kopia snapshot migrate`.
+    Snapshot,
+}
+
+impl ReplicationKind {
+    /// The `kind` label value (the CR kind verbatim, so a PromQL selector reads
+    /// the same as `kubectl get`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplicationKind::Repository => "RepositoryReplication",
+            ReplicationKind::Snapshot => "SnapshotReplication",
+        }
+    }
+}
+
+/// What asked for a replication run, as the `trigger` label of
+/// `kopiur_replication_runs_total`. Closed set, like every other label type
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationRunTrigger {
+    /// A scheduled slot (cron + jitter).
+    Cron,
+    /// An out-of-band `run-requested` annotation.
+    Manual,
+}
+
+impl ReplicationRunTrigger {
+    /// The `trigger` label value; also the value stamped on the mover Job's
+    /// `run-trigger` annotation, so the two can never drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplicationRunTrigger::Cron => "cron",
+            ReplicationRunTrigger::Manual => "manual",
+        }
+    }
+
+    /// Parse a stamped `run-trigger` annotation value; `None` for anything this
+    /// build does not recognize (the caller decides how to degrade).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cron" => Some(ReplicationRunTrigger::Cron),
+            "manual" => Some(ReplicationRunTrigger::Manual),
+            _ => None,
+        }
+    }
+}
+
+/// How a replication run ended, as the `outcome` label of
+/// `kopiur_replication_runs_total`. Only TERMINAL outcomes exist here: a run
+/// still in flight is not counted at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationRunOutcome {
+    /// The mover Job completed.
+    Succeeded,
+    /// The mover Job failed.
+    Failed,
+}
+
+impl ReplicationRunOutcome {
+    /// The `outcome` label value; also the value stamped on the counted Job's
+    /// `run-counted` annotation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplicationRunOutcome::Succeeded => "succeeded",
+            ReplicationRunOutcome::Failed => "failed",
+        }
+    }
 }
 
 /// Outcome of a `Snapshot`'s finalizer resolving its kopia snapshot lifecycle,
@@ -446,6 +526,17 @@ impl Metrics {
                  resolution is already covered by kopiur_snapshots_policy_cascade_retained.",
             )
             .build();
+        let replication_runs = m
+            .u64_counter("kopiur_replication_runs")
+            .with_description(
+                "Total replication runs that reached a terminal mover-Job outcome, by kind \
+                 (RepositoryReplication|SnapshotReplication), trigger (cron|manual) and \
+                 outcome (succeeded|failed). Counted ONCE per run: the reconcile's \
+                 Job-outcome arms are reached zero-to-many times for one run, so the \
+                 increment is keyed on a durable run-counted marker stamped on the Job \
+                 itself. A run still in flight is not counted at all.",
+            )
+            .build();
         let snapshot_delete_batch_jobs = m
             .u64_counter("kopiur_snapshot_delete_batch_jobs")
             .with_description(
@@ -620,6 +711,7 @@ impl Metrics {
             snapshots_policy_cascade_retained,
             policy_cascade_children_deleted,
             snapshot_delete_batch_jobs,
+            replication_runs,
             snapshot_delete_batch_members,
             work_spec_cms_swept,
             projected_secrets_swept,
@@ -1323,6 +1415,28 @@ impl Metrics {
             &[
                 KeyValue::new("namespace", ns.to_string()),
                 KeyValue::new("mode", mode.as_str()),
+            ],
+        );
+    }
+
+    /// Count one replication run reaching a terminal mover-Job outcome.
+    ///
+    /// Called from exactly one place —
+    /// [`crate::replication_run::observe_and_count_runs`], immediately after
+    /// the durable `run-counted` marker lands on the Job — so cron and manual
+    /// runs of both kinds are attributed by one rule and cannot double-count.
+    pub fn inc_replication_run(
+        &self,
+        kind: ReplicationKind,
+        trigger: ReplicationRunTrigger,
+        outcome: ReplicationRunOutcome,
+    ) {
+        self.replication_runs.add(
+            1,
+            &[
+                KeyValue::new("kind", kind.as_str()),
+                KeyValue::new("trigger", trigger.as_str()),
+                KeyValue::new("outcome", outcome.as_str()),
             ],
         );
     }

@@ -741,6 +741,32 @@ async fn handle_maintenance(
     Ok(resp)
 }
 
+// --- replication run-now annotation -----------------------------------------
+
+/// The `kubectl kopiur` invocation that stamps a `RepositoryReplication` run
+/// request, quoted verbatim in the fix hint.
+const REPOSITORY_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run --kind repository";
+/// The `SnapshotReplication` counterpart.
+const SNAPSHOT_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run --kind snapshot";
+
+/// Refuse a malformed `run-requested` annotation at admission (issue #380).
+///
+/// The annotation is user input on both replication kinds exactly as it is on
+/// `Maintenance`, and it flows into a scheduling decision — so a typo'd
+/// timestamp is refused here rather than reaching a reconciler that can only
+/// surface it as a condition. Same shared parser the controller uses (one
+/// validator, two callers); objects annotated while the webhook was down are
+/// still degraded gracefully controller-side.
+fn refuse_malformed_run_annotation(
+    obj: &DynamicObject,
+    run_command: &str,
+) -> Result<(), AdmissionError> {
+    api::common::parse_run_requested_at(obj.metadata.annotations.as_ref(), run_command).map_err(
+        |message| AdmissionError::Invalid(vec![ValidationError::InvalidRunAnnotation { message }]),
+    )?;
+    Ok(())
+}
+
 // --- RepositoryReplication --------------------------------------------------
 
 async fn handle_repository_replication(
@@ -759,6 +785,8 @@ async fn handle_repository_replication(
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
+
+    refuse_malformed_run_annotation(obj, REPOSITORY_REPLICATION_RUN_COMMAND)?;
 
     // Tenancy: a ClusterRepository sourceRef is gated against allowedNamespaces.
     if let TenancyDecision::Deny(denial) =
@@ -819,6 +847,8 @@ async fn handle_snapshot_replication(
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
+
+    refuse_malformed_run_annotation(obj, SNAPSHOT_REPLICATION_RUN_COMMAND)?;
 
     // Tenancy on BOTH refs (fail closed, per the shared `tenancy_for` semantics):
     // the mover opens the source read-only AND writes the destination, so a
@@ -1244,6 +1274,76 @@ fn set_spec_field(data: &Value, field: &str, value: Value) -> PatchOperation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // --- replication run-now annotation ------------------------------------------
+
+    /// A bare object carrying only the annotations under test — the exact
+    /// surface `refuse_malformed_run_annotation` reads.
+    fn annotated_object(annotations: Value) -> DynamicObject {
+        serde_json::from_value(json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "RepositoryReplication",
+            "metadata": { "name": "offsite", "namespace": "media", "annotations": annotations },
+        }))
+        .expect("a DynamicObject with annotations")
+    }
+
+    #[test]
+    fn a_replication_without_a_run_annotation_is_admitted() {
+        for annotations in [json!({}), json!({ "other": "value" })] {
+            assert!(
+                refuse_malformed_run_annotation(
+                    &annotated_object(annotations),
+                    REPOSITORY_REPLICATION_RUN_COMMAND
+                )
+                .is_ok()
+            );
+        }
+        // No annotations map at all.
+        let bare: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotReplication",
+            "metadata": { "name": "offsite", "namespace": "media" },
+        }))
+        .expect("a DynamicObject without annotations");
+        assert!(refuse_malformed_run_annotation(&bare, SNAPSHOT_REPLICATION_RUN_COMMAND).is_ok());
+    }
+
+    #[test]
+    fn a_well_formed_run_request_is_admitted() {
+        let obj = annotated_object(json!({
+            api::consts::RUN_REQUESTED_ANNOTATION: "2026-06-11T12:00:00Z"
+        }));
+        assert!(refuse_malformed_run_annotation(&obj, REPOSITORY_REPLICATION_RUN_COMMAND).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_run_request_is_refused_with_this_kinds_fix_hint() {
+        let obj = annotated_object(json!({
+            api::consts::RUN_REQUESTED_ANNOTATION: "yesterday"
+        }));
+        for (command, want) in [
+            (REPOSITORY_REPLICATION_RUN_COMMAND, "--kind repository"),
+            (SNAPSHOT_REPLICATION_RUN_COMMAND, "--kind snapshot"),
+        ] {
+            let err = refuse_malformed_run_annotation(&obj, command)
+                .expect_err("a typo'd timestamp must be refused at admission");
+            // The shared error type, so the denial reads like every other one.
+            let AdmissionError::Invalid(errs) = &err else {
+                panic!("expected Invalid, got {err:?}");
+            };
+            assert!(
+                matches!(
+                    errs.as_slice(),
+                    [ValidationError::InvalidRunAnnotation { .. }]
+                ),
+                "{errs:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("must be an RFC3339 timestamp"), "{msg}");
+            assert!(msg.contains(want), "{msg}");
+        }
+    }
 
     // --- config_label_stamp (pure) ---------------------------------------------
 
