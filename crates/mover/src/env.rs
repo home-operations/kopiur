@@ -59,6 +59,20 @@ pub const RESULT_CONFIGMAP: &str = "KOPIUR_RESULT_CONFIGMAP";
 /// value pinned by `dest_kopia_password_env_is_stable`.
 pub const DEST_KOPIA_PASSWORD: &str = kopiur_api::creds::DEST_KOPIA_PASSWORD_ENV;
 
+/// The `spec.seed` SOURCE repository's kopia password, for a **migrate-mode**
+/// seed (issue #380). Injected by the controller via a `secretKeyRef` under this
+/// dedicated name so it can never collide with THIS repository's own
+/// `KOPIA_PASSWORD` (the source's other creds ride `KOPIUR_SEED_`-prefixed env,
+/// the same rule issue #200 set for replication destinations). The seeding mover
+/// sets it as `KOPIA_PASSWORD` on the seed-source client only.
+///
+/// Not read in **blob** mode: a `sync-to` copy inherits the mirror's format and
+/// password verbatim, so both sides use this repository's own `KOPIA_PASSWORD`.
+/// Re-exported from the api crate so the controller (which stamps it onto the
+/// Job) and the mover (which reads it back) share one definition; value pinned
+/// by `seed_kopia_password_env_is_stable`.
+pub const SEED_KOPIA_PASSWORD: &str = kopiur_api::creds::SEED_KOPIA_PASSWORD_ENV;
+
 /// Marker file a `BrowseSession` mover writes once its read-only repository
 /// connect succeeded. The session pod's readinessProbe execs `kopiur-mover
 /// ready`, which exits 0 iff this file exists — the distroless image has no
@@ -82,5 +96,22 @@ mod tests {
             super::DEST_KOPIA_PASSWORD.starts_with(kopiur_api::creds::DEST_ENV_PREFIX),
             "the destination password must ride the KOPIUR_DEST_ prefix"
         );
+    }
+
+    #[test]
+    fn seed_kopia_password_env_is_stable() {
+        // Same contract as the destination password above (issue #380): the
+        // controller stamps this exact name onto the seeding bootstrap Job and
+        // the mover reads it back, so a silent rename would strand the seed
+        // source's password. Riding the KOPIUR_SEED_ prefix is what keeps the
+        // projected-Secret reap and the env-collision rule covering it.
+        assert_eq!(super::SEED_KOPIA_PASSWORD, "KOPIUR_SEED_KOPIA_PASSWORD");
+        assert!(
+            super::SEED_KOPIA_PASSWORD.starts_with(kopiur_api::creds::SEED_ENV_PREFIX),
+            "the seed source password must ride the KOPIUR_SEED_ prefix"
+        );
+        // A repository can be both a seed target and a replication source, so
+        // the two password envs must not alias.
+        assert_ne!(super::SEED_KOPIA_PASSWORD, super::DEST_KOPIA_PASSWORD);
     }
 }

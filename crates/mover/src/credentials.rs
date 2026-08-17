@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use kopiur_api::creds::DEST_ENV_PREFIX;
+use kopiur_api::creds::{DEST_ENV_PREFIX, SEED_ENV_PREFIX};
 use kopiur_kopia::ConnectSpec;
 use tracing::info;
 
@@ -176,43 +176,107 @@ pub fn ambient_aws_hints_present(lookup: &dyn Fn(&str) -> Option<String>) -> boo
         .any(|k| lookup(k).is_some_and(|v| !v.is_empty()))
 }
 
-/// The credential lookup a replication **destination** uses with [`materialize_with`]:
-/// file-based creds and static keys come from the [`DEST_ENV_PREFIX`]-prefixed env
-/// (so they never collide with the source's identically named ones, issue #200), but
-/// the ambient AWS chain *hints* stay UNPREFIXED — they belong to the pod's
-/// ServiceAccount (a workload-identity destination), not to a credential Secret, so a
-/// prefixed lookup would spuriously report them missing. `raw` reads the underlying
-/// environment (`|k| std::env::var(k).ok()` in the mover; a map in tests).
-pub fn dest_materialize_lookup(key: &str, raw: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+/// The credential lookup for a SECOND backend in a two-repository mover flow,
+/// whose credentials ride `prefix`-prefixed env vars so they cannot collide with
+/// the ambient repository's identically-named ones (issue #200): file-based
+/// creds and static keys come from the prefixed env, but the ambient AWS chain
+/// *hints* stay UNPREFIXED — they belong to the pod's ServiceAccount (a
+/// workload-identity backend), not to a credential Secret, so a prefixed lookup
+/// would spuriously report them missing.
+///
+/// `raw` reads the underlying environment (`|k| std::env::var(k).ok()` in the
+/// mover; a map in tests). The two prefixes in use are
+/// `kopiur_api::creds::DEST_ENV_PREFIX` (a replication destination) and
+/// `kopiur_api::creds::SEED_ENV_PREFIX` (a `spec.seed` source); see
+/// [`dest_materialize_lookup`] / [`seed_materialize_lookup`].
+pub fn prefixed_materialize_lookup(
+    prefix: &str,
+    key: &str,
+    raw: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
     if AMBIENT_AWS_HINT_ENVS.contains(&key) {
         raw(key)
     } else {
-        raw(&format!("{DEST_ENV_PREFIX}{key}"))
+        raw(&format!("{prefix}{key}"))
     }
 }
 
-/// Build the `sync-to` environment overlay for a replication **destination**: for
-/// each credential env var the destination backend reads directly
-/// ([`ConnectSpec::direct_credential_env_names`]), take its [`DEST_ENV_PREFIX`]-prefixed
-/// value (`Some` → set the plain name) or `None` (→ unset it, so a source credential
-/// the destination does not provide — e.g. a stale `AWS_SESSION_TOKEN` — cannot leak
-/// into the destination auth). `raw` reads the underlying environment. The source
-/// repository's storage credentials are persisted in the kopia config at connect
-/// time, so overriding the plain names for the sync-to subprocess cannot disturb the
-/// source read.
+/// Build a subprocess environment overlay that gives `spec`'s backend its own
+/// credentials: for each credential env var the backend reads directly
+/// ([`ConnectSpec::direct_credential_env_names`]), take its `prefix`-prefixed
+/// value (`Some` → set the plain name) or `None` (→ unset it, so a credential
+/// the backend does not provide — e.g. a stale `AWS_SESSION_TOKEN` belonging to
+/// the OTHER repository — cannot leak into its auth).
+///
+/// The already-connected repository's storage credentials are persisted in the
+/// kopia config at connect time, so overriding the plain names for a subprocess
+/// cannot disturb reads of it. That property is what makes the overlay
+/// **invertible**: replication overlays the DESTINATION onto a source connect
+/// (`prefix = KOPIUR_DEST_`), while a blob seed connects the SOURCE with
+/// `KOPIUR_SEED_` creds and overlays THIS repository's plain ones back on for
+/// the `sync-to` — see [`plain_env_overlay`].
+pub fn prefixed_env_overlay(
+    prefix: &str,
+    spec: &ConnectSpec,
+    raw: &dyn Fn(&str) -> Option<String>,
+) -> BTreeMap<String, Option<String>> {
+    spec.direct_credential_env_names()
+        .iter()
+        .map(|name| ((*name).to_string(), raw(&format!("{prefix}{name}"))))
+        .collect()
+}
+
+/// [`prefixed_materialize_lookup`] for a replication **destination**
+/// ([`DEST_ENV_PREFIX`]). Byte-compatible with the pre-generalization function.
+pub fn dest_materialize_lookup(key: &str, raw: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    prefixed_materialize_lookup(DEST_ENV_PREFIX, key, raw)
+}
+
+/// [`prefixed_env_overlay`] for a replication **destination**
+/// ([`DEST_ENV_PREFIX`]). Byte-compatible with the pre-generalization function.
 pub fn dest_env_overlay(
     dest: &ConnectSpec,
     raw: &dyn Fn(&str) -> Option<String>,
 ) -> BTreeMap<String, Option<String>> {
-    dest.direct_credential_env_names()
-        .iter()
-        .map(|name| {
-            (
-                (*name).to_string(),
-                raw(&format!("{DEST_ENV_PREFIX}{name}")),
-            )
-        })
-        .collect()
+    prefixed_env_overlay(DEST_ENV_PREFIX, dest, raw)
+}
+
+/// [`prefixed_materialize_lookup`] for a `spec.seed` **source**
+/// ([`SEED_ENV_PREFIX`], issue #380). A repository can be both a seed target and
+/// a replication source, so the two prefixes are deliberately disjoint (pinned
+/// by `kopiur_api::creds`'s `seed_and_dest_prefixes_are_disjoint`).
+pub fn seed_materialize_lookup(key: &str, raw: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    prefixed_materialize_lookup(SEED_ENV_PREFIX, key, raw)
+}
+
+/// [`prefixed_env_overlay`] for a `spec.seed` **source** ([`SEED_ENV_PREFIX`]).
+/// Applied to the seed client's whole environment (not one subprocess), because
+/// that client's every invocation talks to the seed source.
+pub fn seed_env_overlay(
+    source: &ConnectSpec,
+    raw: &dyn Fn(&str) -> Option<String>,
+) -> BTreeMap<String, Option<String>> {
+    prefixed_env_overlay(SEED_ENV_PREFIX, source, raw)
+}
+
+/// The INVERSE overlay: restore the ambient (unprefixed) credentials of `spec`'s
+/// backend for one subprocess, undoing a client-level prefixed overlay.
+///
+/// A blob-mode seed is the mirror image of replication: the connected side is
+/// the seed SOURCE (opened with `KOPIUR_SEED_`-prefixed creds), and the
+/// `sync-to` destination is THIS repository, whose credentials arrive plain. So
+/// the sync-to subprocess needs each of this repository's direct credential
+/// vars set back to its ambient value — `None` for one the repository does not
+/// provide, which unsets the seed source's copy rather than letting it leak
+/// into the write side.
+///
+/// Implemented as [`prefixed_env_overlay`] with an EMPTY prefix, so the "read
+/// the value, or unset the name" rule has exactly one implementation.
+pub fn plain_env_overlay(
+    spec: &ConnectSpec,
+    raw: &dyn Fn(&str) -> Option<String>,
+) -> BTreeMap<String, Option<String>> {
+    prefixed_env_overlay("", spec, raw)
 }
 
 /// If `lookup(env_key)` yields a non-empty value, write it to

@@ -412,8 +412,12 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                         Ok(info) => {
                             // `created` is `false` here (the `if` above already
                             // handled the create case) — a genuine connect-to-existing
-                            // self-heal pass.
+                            // self-heal pass. `seeded` is `false` too: a bare-path
+                            // filesystem repository can never be seeded (admission
+                            // refuses `spec.seed` on one — seeding runs in the mover,
+                            // and a bare path is controller-only).
                             if let Some(owner) = kopiur_mover::workspec::maintenance_restamp_target(
+                                false,
                                 false,
                                 Some(desired),
                                 policy,
@@ -1414,6 +1418,10 @@ fn bootstrap_work_spec(
             restamp_policy,
             maintenance_owner_aliases,
             read_only,
+            // #380: the seed payload is built by the repository reconciler's
+            // arming pass (stage C3). `None` here keeps today's behavior — a
+            // bootstrap that connects, or falls back to create when enabled.
+            seed: None,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),

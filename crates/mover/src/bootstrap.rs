@@ -209,6 +209,243 @@ pub const REPOSITORY_NOT_INITIALIZED_MESSAGE: &str = "no kopia repository exists
      spec.create.enabled: true to create a new repository here, or point the backend \
      at an existing repository";
 
+/// Sentinel [`FailureBlock::kopia_error_class`] the mover writes when a seed's
+/// SOURCE backend answered but holds no kopia repository at all (issue #380) —
+/// a connect that classified `NotFound` with kopia's "not initialized" on
+/// stderr. Almost always a mis-pointed bucket/prefix or a mirror that was never
+/// written.
+///
+/// A sibling of [`REPOSITORY_NOT_INITIALIZED_CLASS`], and deliberately NOT a
+/// [`kopiur_kopia::KopiaErrorClass`], for the same reason: the class enum
+/// describes kopia's stderr, while "the seed source is not a repository" is a
+/// kopiur seeding-policy outcome the controller renders as its own condition
+/// reason.
+pub const SEED_SOURCE_NOT_FOUND_CLASS: &str = "SeedSourceNotFound";
+
+/// Stable, volatile-free actionable message for [`SEED_SOURCE_NOT_FOUND_CLASS`].
+/// Used verbatim as a condition message, so it carries no per-attempt detail.
+pub const SEED_SOURCE_NOT_FOUND_MESSAGE: &str = "spec.seed's source answered but holds no kopia repository (connect returned NotFound with \
+     kopia's `repository not initialized`), so there is nothing to seed this repository from. \
+     Check that spec.seed.from points at the bucket AND prefix a kopia repository actually \
+     lives under — a mirror written by a RepositoryReplication is rooted at the destination's \
+     own prefix, not its parent. The bootstrap retries automatically once the source is \
+     reachable";
+
+/// Sentinel [`FailureBlock::kopia_error_class`] for a seed source that IS a
+/// kopia repository but holds zero snapshots, with `spec.seed.allowEmptySource`
+/// left at its `false` default (issue #380).
+///
+/// Blocking `Ready` here is the point: a valid-but-empty mirror is nearly always
+/// a mis-pointed source, and seeding nothing would hand back a `Ready`
+/// repository with no history — the exact failure #380 exists to prevent.
+pub const SEED_SOURCE_EMPTY_CLASS: &str = "SeedSourceEmpty";
+
+/// Stable, volatile-free actionable message for [`SEED_SOURCE_EMPTY_CLASS`],
+/// naming the explicit override.
+pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source is a kopia repository but holds zero snapshots, so seeding it would \
+     leave this repository empty while reporting it Ready. Check that spec.seed.from points at \
+     the intended mirror (an empty one is usually a wrong bucket/prefix or a replication that \
+     never ran); if the source really is meant to be empty, set spec.seed.allowEmptySource: \
+     true. The bootstrap retries automatically, so a mirror that fills up later seeds without \
+     further action";
+
+/// Sentinel [`FailureBlock::kopia_error_class`] for a migrate-mode seed where
+/// `kopia snapshot migrate` exited 0 but the post-verify found snapshots
+/// missing at the destination (issue #380).
+///
+/// Mandatory because kopia's per-source migration goroutines only LOG their
+/// errors — a zero exit does NOT mean every snapshot arrived, so the
+/// destination listing is the only honest success signal. Retryable: migrate is
+/// idempotent by `(identity, startTime)`, so a retry copies only what is still
+/// missing.
+pub const SEED_INCOMPLETE_CLASS: &str = "SeedIncomplete";
+
+/// The outcome of a seed that ran (or was skipped as already-initialized),
+/// carried on [`BootstrapResult::seed`].
+///
+/// **Presence is the controller's mover-skew guard** (issue #380): when the work
+/// spec armed a seed, a successful result WITHOUT this block means the mover
+/// image is old enough to have silently dropped the unknown `seed` field, fallen
+/// into the create fallback, and initialized an EMPTY repository. Because this
+/// block is mover-authored, its presence is proof the running image understood
+/// the request — so every seed-armed success path must emit one, including the
+/// no-op [`SeedOutcome::already_initialized`] case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedOutcome {
+    /// Which copy mechanism the work spec selected. Set even when no copy ran.
+    pub mode: crate::workspec::SeedModeSpec,
+    /// The source rendering the controller pinned on the work spec, echoed back
+    /// verbatim for `status.seed.source` (see
+    /// [`crate::workspec::SeedOpSpec::source_description`] for why the mover
+    /// does not re-derive it).
+    pub source: String,
+    /// `false` when the repository was ALREADY initialized and the seed was a
+    /// documented no-op — the controller then reports `Seeded=True` with reason
+    /// `AlreadyInitialized` rather than `Seeded`, and leaves `status.seed`
+    /// counts unset.
+    #[serde(default)]
+    pub performed: bool,
+    /// Snapshots observed at the SOURCE when the seed ran. `None` on the
+    /// already-initialized no-op (nothing was opened). Zero is only ever
+    /// recorded when `allowEmptySource` permitted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_count: Option<i64>,
+    /// Snapshots that arrived at this repository — migrate mode only. A blob
+    /// copy moves storage, not manifests, so it leaves this unset and the
+    /// controller reports the post-seed catalog listing instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots_copied: Option<i64>,
+}
+
+impl SeedOutcome {
+    /// The no-op outcome: a seed was armed, but the initial connect SUCCEEDED,
+    /// so the repository was already initialized and nothing was copied.
+    /// Emitted rather than omitted so the controller's mover-skew guard sees an
+    /// acknowledgment — see the type docs.
+    pub fn already_initialized(mode: crate::workspec::SeedModeSpec, source: String) -> Self {
+        SeedOutcome {
+            mode,
+            source,
+            performed: false,
+            snapshot_count: None,
+            snapshots_copied: None,
+        }
+    }
+
+    /// The outcome of a seed that actually copied data.
+    pub fn performed(
+        mode: crate::workspec::SeedModeSpec,
+        source: String,
+        snapshot_count: i64,
+        snapshots_copied: Option<i64>,
+    ) -> Self {
+        SeedOutcome {
+            mode,
+            source,
+            performed: true,
+            snapshot_count: Some(snapshot_count),
+            snapshots_copied,
+        }
+    }
+}
+
+/// What the mover should do after its first bootstrap connect FAILED. Closed
+/// enum + exhaustive `match`: a new outcome cannot compile until every caller
+/// accounts for it, which for backup software is the difference between a
+/// declined create and a silently emptied repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapInitAction {
+    /// Do not initialize anything — report the failure. Covers a repository
+    /// that exists but cannot be opened, a backend that denied or could not be
+    /// reached, and the create/seed opt-outs.
+    Fail,
+    /// Initialize an EMPTY repository here (`kopia repository create`), the
+    /// pre-#380 `spec.create.enabled` fallback.
+    Create,
+    /// Initialize this repository from `spec.seed`'s source.
+    Seed,
+}
+
+/// Decide how a failed first bootstrap connect is answered (issue #380). Pure,
+/// so the whole matrix is unit-tested without kopia.
+///
+/// `uninitialized` is the caller's `notfound_is_uninitialized(stderr)` verdict:
+/// a `NotFound` is only "there is no repository here" when the backend ANSWERED
+/// and the format blob is absent. A missing path or unbound mount also
+/// classifies `NotFound` (`no such file or directory`), and treating that as an
+/// empty backend is how a mis-mounted volume would get seeded — or created —
+/// over.
+///
+/// The rules, in order:
+///
+/// 1. `AuthFailure` / `Locked` / `AccessDenied` / `PermissionDenied` ⇒ [`Fail`](BootstrapInitAction::Fail).
+///    A repository exists here that we cannot open, another writer holds it, or
+///    the backend refused us. Creating would risk a second repository and
+///    seeding would write another cluster's data on top; both mask the real,
+///    fixable error.
+/// 2. Seed armed ⇒ [`Seed`](BootstrapInitAction::Seed), but ONLY on a genuinely
+///    uninitialized `NotFound`. Anything else — an unreachable backend, an
+///    unclassified error — is [`Fail`](BootstrapInitAction::Fail): a seed is a
+///    one-shot whole-repository copy, and the create fallback is deliberately
+///    NOT taken behind it (falling back would produce the empty repository
+///    #380 is about).
+/// 3. Otherwise the pre-#380 create gate: `auto_create` ⇒
+///    [`Create`](BootstrapInitAction::Create), else
+///    [`Fail`](BootstrapInitAction::Fail). kopia's own `create` refuses to
+///    overwrite an existing repository, so this can never smash data.
+///
+/// [`should_attempt_create`] is exactly this function's `Create` arm, kept as
+/// the narrow published predicate.
+///
+/// ```
+/// use kopiur_kopia::KopiaErrorClass;
+/// use kopiur_mover::bootstrap::{BootstrapInitAction, bootstrap_init_action};
+///
+/// // No seed, create enabled, repo genuinely absent ⇒ create an empty one.
+/// assert_eq!(
+///     bootstrap_init_action(false, true, KopiaErrorClass::NotFound, true),
+///     BootstrapInitAction::Create
+/// );
+/// // Seed armed on the same miss ⇒ seed instead; create is never the fallback.
+/// assert_eq!(
+///     bootstrap_init_action(true, true, KopiaErrorClass::NotFound, true),
+///     BootstrapInitAction::Seed
+/// );
+/// // A NotFound that is a missing mount, not an empty backend ⇒ never touch it.
+/// assert_eq!(
+///     bootstrap_init_action(true, true, KopiaErrorClass::NotFound, false),
+///     BootstrapInitAction::Fail
+/// );
+/// // A repository we cannot open is never recreated and never seeded over.
+/// assert_eq!(
+///     bootstrap_init_action(true, true, KopiaErrorClass::AuthFailure, true),
+///     BootstrapInitAction::Fail
+/// );
+/// ```
+pub fn bootstrap_init_action(
+    seed_armed: bool,
+    auto_create: bool,
+    class: KopiaErrorClass,
+    uninitialized: bool,
+) -> BootstrapInitAction {
+    // Exhaustive, no `_ =>`: a new kopia error class must be classified here
+    // before it can reach a repository-initializing decision.
+    match class {
+        KopiaErrorClass::AuthFailure
+        | KopiaErrorClass::Locked
+        | KopiaErrorClass::AccessDenied
+        | KopiaErrorClass::PermissionDenied => BootstrapInitAction::Fail,
+        KopiaErrorClass::NotFound => {
+            if seed_armed {
+                if uninitialized {
+                    BootstrapInitAction::Seed
+                } else {
+                    BootstrapInitAction::Fail
+                }
+            } else if auto_create {
+                BootstrapInitAction::Create
+            } else {
+                BootstrapInitAction::Fail
+            }
+        }
+        KopiaErrorClass::RepositoryUnavailable
+        | KopiaErrorClass::SourceError
+        | KopiaErrorClass::Unknown => {
+            // A seed never runs on an unclassified miss: the connect never got
+            // far enough to prove the backend is empty, and a whole-repository
+            // copy onto an unknown state is not a recoverable mistake.
+            if seed_armed {
+                BootstrapInitAction::Fail
+            } else if auto_create {
+                BootstrapInitAction::Create
+            } else {
+                BootstrapInitAction::Fail
+            }
+        }
+    }
+}
+
 /// The outcome of a bootstrap run, serialized into the work-spec `ConfigMap`.
 ///
 /// Constructed via [`BootstrapResult::ready`] (success) or
@@ -296,6 +533,13 @@ pub struct BootstrapResult {
     /// `epoch_error` carries the single reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_retention: Option<kopiur_api::repository::ObservedBlobRetention>,
+    /// What `spec.seed` did on this run (issue #380), or `None` when the work
+    /// spec armed no seed. On a seed-armed run this doubles as the controller's
+    /// **mover-skew acknowledgment**: a success WITHOUT it means an older mover
+    /// image dropped the unknown `seed` field and initialized an empty
+    /// repository instead — see [`SeedOutcome`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<SeedOutcome>,
     /// Structured failure block on `success == false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureBlock>,
@@ -324,6 +568,7 @@ impl BootstrapResult {
             epoch: None,
             epoch_error: None,
             blob_retention: None,
+            seed: None,
             failure: None,
         }
     }
@@ -354,6 +599,25 @@ impl BootstrapResult {
 
     /// A terminal-failure outcome carrying the kopia error class + stderr tail.
     pub fn failed(err: &KopiaError) -> Self {
+        BootstrapResult::with_failure(failure_block_from_kopia(err))
+    }
+
+    /// A terminal-failure outcome carrying a typed [`crate::error::MoverError`].
+    ///
+    /// The sibling of [`Self::failed`] for the bootstrap failures that are NOT
+    /// kopia invocations — a seed whose source credentials could not be staged,
+    /// or whose source password env is unset. Class, retry hint and message all
+    /// come from the error itself (`From<&MoverError> for FailureBlock`), so
+    /// they cannot drift from each other.
+    pub fn from_mover_error(err: &crate::error::MoverError) -> Self {
+        BootstrapResult::with_failure(FailureBlock::from(err))
+    }
+
+    /// The one place a FAILED [`BootstrapResult`] is built. Every failure
+    /// constructor funnels through it so a new one cannot forget a field — and
+    /// so the "a failed run reports no seed outcome" rule below has a single
+    /// site rather than one copy per class.
+    fn with_failure(failure: FailureBlock) -> Self {
         BootstrapResult {
             success: false,
             created: false,
@@ -366,7 +630,12 @@ impl BootstrapResult {
             epoch: None,
             epoch_error: None,
             blob_retention: None,
-            failure: Some(failure_block_from_kopia(err)),
+            // A FAILED seed carries no outcome: the mover-skew guard only needs
+            // an acknowledgment on the SUCCESS path (a failure already stops the
+            // controller from reporting a Ready — and empty — repository), and a
+            // half-populated outcome would read as a seed that partly worked.
+            seed: None,
+            failure: Some(failure),
         }
     }
 
@@ -378,29 +647,93 @@ impl BootstrapResult {
     /// the operator to enable create — not a bare, confusing `NotFound`. Never
     /// retryable: it needs a spec change.
     pub fn not_initialized() -> Self {
-        BootstrapResult {
-            success: false,
-            created: false,
-            unique_id: None,
-            snapshot_count: 0,
-            snapshots: Vec::new(),
-            snapshots_truncated: false,
-            foreign_suffix_dropped: 0,
-            index_blob_count: None,
-            epoch: None,
-            epoch_error: None,
-            blob_retention: None,
-            failure: Some(FailureBlock {
-                kopia_error_class: REPOSITORY_NOT_INITIALIZED_CLASS.to_string(),
-                message: REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string(),
-                stderr_tail: None,
-                exit_code: None,
-                retry_recommended: false,
-                // A synthesized outcome, not a kopia invocation failure — the
-                // connect itself succeeded in reporting "no repository here".
-                op: None,
-            }),
-        }
+        BootstrapResult::sentinel(
+            REPOSITORY_NOT_INITIALIZED_CLASS,
+            REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string(),
+            false,
+        )
+    }
+
+    /// A terminal-failure outcome for a KOPIUR-decided (non-kopia) bootstrap
+    /// verdict: a fixed sentinel `class` plus an actionable `message` the
+    /// controller renders verbatim as a condition. `retry_recommended` says
+    /// whether re-running the same pod could succeed without a spec change.
+    ///
+    /// One constructor for all of them so a new sentinel cannot forget a field
+    /// (every seed failure class and [`Self::not_initialized`] go through it).
+    fn sentinel(class: &str, message: String, retry_recommended: bool) -> Self {
+        BootstrapResult::with_failure(FailureBlock {
+            kopia_error_class: class.to_string(),
+            message,
+            stderr_tail: None,
+            exit_code: None,
+            retry_recommended,
+            // A synthesized outcome, not a kopia invocation failure — the call
+            // itself succeeded in reporting the state we refuse.
+            op: None,
+        })
+    }
+
+    /// A terminal-failure outcome for "`spec.seed`'s source backend answered but
+    /// holds no kopia repository" ([`SEED_SOURCE_NOT_FOUND_CLASS`]). Retryable:
+    /// the source may simply not exist YET (a replication that has not run), and
+    /// the controller's recycle arm relaunches the bootstrap every ~2 minutes —
+    /// which is the promptness disaster recovery wants.
+    pub fn seed_source_not_found() -> Self {
+        BootstrapResult::sentinel(
+            SEED_SOURCE_NOT_FOUND_CLASS,
+            SEED_SOURCE_NOT_FOUND_MESSAGE.to_string(),
+            true,
+        )
+    }
+
+    /// A terminal-failure outcome for "`spec.seed`'s source holds zero snapshots
+    /// and `allowEmptySource` is false" ([`SEED_SOURCE_EMPTY_CLASS`]). Retryable
+    /// for the same reason as [`Self::seed_source_not_found`]: a mirror that
+    /// fills up later seeds on the next pass with no further action.
+    pub fn seed_source_empty() -> Self {
+        BootstrapResult::sentinel(
+            SEED_SOURCE_EMPTY_CLASS,
+            SEED_SOURCE_EMPTY_MESSAGE.to_string(),
+            true,
+        )
+    }
+
+    /// A terminal-failure outcome for a migrate-mode seed whose post-verify
+    /// found snapshots missing at the destination ([`SEED_INCOMPLETE_CLASS`]).
+    ///
+    /// Unlike its two siblings the message interpolates counts and a bounded
+    /// sample, because *which* snapshots did not arrive is the whole diagnostic
+    /// — and unlike a per-attempt temp filename, those values are stable
+    /// properties of the copy rather than of the pod.
+    pub fn seed_incomplete(missing: usize, expected: usize, sample: &str) -> Self {
+        BootstrapResult::sentinel(
+            SEED_INCOMPLETE_CLASS,
+            format!(
+                "seeding is incomplete: {missing} of {expected} expected snapshot(s) did not \
+                 arrive after `kopia snapshot migrate` (which exits 0 even when a per-source \
+                 migration fails — see the bootstrap Job's pod logs for kopia's per-source \
+                 errors). Missing (up to {cap} shown): {sample}. The bootstrap retries \
+                 automatically and migrate is idempotent by (identity, startTime), so a retry \
+                 copies only what is still missing; if it never converges, check the source \
+                 repository's health with `kopia snapshot verify`",
+                cap = crate::error::MISSING_SAMPLE_CAP
+            ),
+            true,
+        )
+    }
+
+    /// Attach the [`SeedOutcome`] for a seed-armed run. Separate from
+    /// [`BootstrapResult::ready`] for the same reason
+    /// [`BootstrapResult::with_epoch`] is: the positional list is already at the
+    /// limit of what stays legible.
+    ///
+    /// MUST be called on every seed-armed success — including the
+    /// already-initialized no-op — or the controller treats the result as
+    /// written by a mover too old to understand `spec.seed` (see [`SeedOutcome`]).
+    pub fn with_seed(mut self, seed: Option<SeedOutcome>) -> Self {
+        self.seed = seed;
+        self
     }
 }
 
@@ -434,14 +767,14 @@ impl BootstrapResult {
 /// assert!(!should_attempt_create(false, KopiaErrorClass::NotFound));
 /// ```
 pub fn should_attempt_create(auto_create: bool, class: KopiaErrorClass) -> bool {
-    auto_create
-        && !matches!(
-            class,
-            KopiaErrorClass::AuthFailure
-                | KopiaErrorClass::Locked
-                | KopiaErrorClass::AccessDenied
-                | KopiaErrorClass::PermissionDenied
-        )
+    // Delegates rather than restating the gate: [`bootstrap_init_action`] is the
+    // single decision, and this is its `Create` arm. `seed_armed: false` (no
+    // seed is in play on this call), and `uninitialized` is then unread — it
+    // only ever selects between Seed and Fail.
+    matches!(
+        bootstrap_init_action(false, auto_create, class, false),
+        BootstrapInitAction::Create
+    )
 }
 
 #[cfg(test)]

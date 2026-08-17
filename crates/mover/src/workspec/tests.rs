@@ -423,6 +423,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             restamp_policy: RestampPolicy::OwnFormatsOnly,
             maintenance_owner_aliases: vec!["kopiur@kopiur-ns-repo-legacy".into()],
             read_only: true,
+            seed: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -509,6 +510,7 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
         restamp_policy: RestampPolicy::AnyStale,
         maintenance_owner_aliases: Vec::new(),
         read_only: false,
+        seed: None,
     };
     let v = serde_json::to_value(&op).unwrap();
     assert!(v.get("maintenanceOwnerAliases").is_none());
@@ -1820,7 +1822,14 @@ fn restamp_target_skips_the_create_path_regardless_of_policy() {
     // self-heal must never also fire, under either policy.
     for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
         assert_eq!(
-            maintenance_restamp_target(true, Some("kopiur@kopiur-prod"), policy, &[], "anything"),
+            maintenance_restamp_target(
+                true,
+                false,
+                Some("kopiur@kopiur-prod"),
+                policy,
+                &[],
+                "anything"
+            ),
             None,
             "{policy:?}"
         );
@@ -1833,7 +1842,7 @@ fn restamp_target_skips_without_a_configured_owner() {
     // under either policy.
     for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
         assert_eq!(
-            maintenance_restamp_target(false, None, policy, &[], "ephemeral@pod-xyz"),
+            maintenance_restamp_target(false, false, None, policy, &[], "ephemeral@pod-xyz"),
             None,
             "{policy:?}"
         );
@@ -1856,7 +1865,7 @@ fn restamp_target_decision_table() {
     // current == desired: never restamp, either policy (nothing to heal).
     for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
         assert_eq!(
-            maintenance_restamp_target(false, Some(desired), policy, &aliases, desired),
+            maintenance_restamp_target(false, false, Some(desired), policy, &aliases, desired),
             None,
             "==desired x {policy:?}"
         );
@@ -1864,12 +1873,20 @@ fn restamp_target_decision_table() {
 
     // current empty (never-run repo): both policies heal it.
     assert_eq!(
-        maintenance_restamp_target(false, Some(desired), RestampPolicy::AnyStale, &aliases, ""),
+        maintenance_restamp_target(
+            false,
+            false,
+            Some(desired),
+            RestampPolicy::AnyStale,
+            &aliases,
+            ""
+        ),
         Some(desired),
         "empty x AnyStale"
     );
     assert_eq!(
         maintenance_restamp_target(
+            false,
             false,
             Some(desired),
             RestampPolicy::OwnFormatsOnly,
@@ -1884,6 +1901,7 @@ fn restamp_target_decision_table() {
     assert_eq!(
         maintenance_restamp_target(
             false,
+            false,
             Some(desired),
             RestampPolicy::AnyStale,
             &aliases,
@@ -1894,6 +1912,7 @@ fn restamp_target_decision_table() {
     );
     assert_eq!(
         maintenance_restamp_target(
+            false,
             false,
             Some(desired),
             RestampPolicy::OwnFormatsOnly,
@@ -1910,6 +1929,7 @@ fn restamp_target_decision_table() {
     assert_eq!(
         maintenance_restamp_target(
             false,
+            false,
             Some(desired),
             RestampPolicy::AnyStale,
             &aliases,
@@ -1920,6 +1940,7 @@ fn restamp_target_decision_table() {
     );
     assert_eq!(
         maintenance_restamp_target(
+            false,
             false,
             Some(desired),
             RestampPolicy::OwnFormatsOnly,
@@ -1936,6 +1957,7 @@ fn restamp_target_decision_table() {
     assert_eq!(
         maintenance_restamp_target(
             false,
+            false,
             Some(desired),
             RestampPolicy::AnyStale,
             &aliases,
@@ -1946,6 +1968,7 @@ fn restamp_target_decision_table() {
     );
     assert_eq!(
         maintenance_restamp_target(
+            false,
             false,
             Some(desired),
             RestampPolicy::OwnFormatsOnly,

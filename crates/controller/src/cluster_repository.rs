@@ -1415,6 +1415,10 @@ fn cluster_bootstrap_work_spec(
             restamp_policy,
             maintenance_owner_aliases,
             read_only,
+            // #380: the seed payload is built by the repository reconciler's
+            // arming pass (stage C3). `None` here keeps today's behavior — a
+            // bootstrap that connects, or falls back to create when enabled.
+            seed: None,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),

@@ -2289,6 +2289,7 @@ mod bootstrap_outcomes {
             epoch: None,
             epoch_error: None,
             blob_retention: None,
+            seed: None,
             failure: None,
         }
     }
