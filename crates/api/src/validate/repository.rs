@@ -1,11 +1,14 @@
 use super::*;
 use crate::backend::{Backend, RepoVolume};
 use crate::cluster_repository::{AllowedNamespaces, ClusterRepositorySpec};
-use crate::common::{MoverDefaults, RepositoryKind, RepositoryRef, Retention};
+use crate::common::{
+    CreateBehavior, MoverDefaults, RepositoryKind, RepositoryMode, RepositoryRef, Retention,
+};
 use crate::error::{ValidationError, ValidationResult};
 use crate::maintenance::{MaintenanceSpec, RepositoryMaintenanceSpec};
 use crate::repository::{RepositoryHealthSpec, RepositorySpec};
 use crate::repository_replication::RepositoryReplicationSpec;
+use crate::seed::{SeedSource, SeedSpec, SeedSyncOptions};
 use crate::snapshot_replication::{Pruning, SnapshotReplicationSpec, validate_component_glob};
 use std::collections::BTreeMap;
 
@@ -653,6 +656,17 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     ) {
         errs.push(e);
     }
+    // #380: `spec.seed` rules derivable from the spec alone. The namespaced arm
+    // of the co-resident seed-Secret rule and the migrate-mode self-reference
+    // check need the CR's own namespace/name, so the webhook calls
+    // `validate_seed_secret_namespace` / `validate_seed_not_self` separately.
+    errs.extend(validate_repository_seed(
+        spec.seed.as_ref(),
+        &spec.backend,
+        spec.mode,
+        spec.create.as_ref(),
+        RepositoryKind::Repository,
+    ));
     errs
 }
 
@@ -1334,5 +1348,330 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
     ) {
         errs.push(e);
     }
+    // #380: same seed rules, cluster arm — a ClusterRepository's seed-source
+    // Secret must not pin a namespace (its movers resolve credentials in the
+    // operator's own namespace, which a cluster-scoped spec cannot name).
+    errs.extend(validate_repository_seed(
+        spec.seed.as_ref(),
+        &spec.backend,
+        spec.mode,
+        spec.create.as_ref(),
+        RepositoryKind::ClusterRepository,
+    ));
     errs
+}
+
+// --- spec.seed (#380) -------------------------------------------------------
+
+/// Validate `spec.seed` on a `Repository`/`ClusterRepository`, accumulating
+/// every independent problem.
+///
+/// Everything here is derivable from the spec alone, so both aggregate
+/// validators call it and the controller gets it for free on its defensive
+/// re-validation. Two seed rules are NOT derivable and live beside it as
+/// separately-callable helpers the webhook invokes with the request's context:
+/// [`validate_seed_secret_namespace`] (the namespaced arm of the co-resident
+/// Secret rule) and [`validate_seed_not_self`] (migrate-mode self-reference).
+///
+/// The rules, and why each exists:
+///
+/// * A seed runs in a mover Job, so neither the repository nor a filesystem
+///   seed source may be a **bare path** — nothing would be mounted at it.
+/// * `mode: ReadOnly` and seeding are contradictory.
+/// * A mode-specific tuning block (`sync`/`migrate`/`credentialProjection`)
+///   paired with the other mode's source would be inert.
+/// * Blob mode inherits the mirror's repository format, so explicit
+///   `create.{splitter,hash,encryption,ecc}` would be inert too.
+/// * Blob mode must not read its own storage, must not collide on an in-pod
+///   mount path, and must not mix workload identity with static keys in the one
+///   seeding pod (the same three rules a `RepositoryReplication` gets, for the
+///   same reason: one pod, two backends).
+/// * A `ClusterRepository`'s seed-source Secret must not pin a namespace — a
+///   cluster-scoped repository resolves credentials in the operator namespace,
+///   which the spec cannot name.
+pub fn validate_repository_seed(
+    seed: Option<&SeedSpec>,
+    repo_backend: &Backend,
+    mode: RepositoryMode,
+    create: Option<&CreateBehavior>,
+    kind: RepositoryKind,
+) -> Vec<ValidationError> {
+    let Some(seed) = seed else {
+        return Vec::new();
+    };
+    let mut errs = Vec::new();
+    if let Backend::Filesystem(fs) = repo_backend
+        && fs.volume.is_none()
+    {
+        errs.push(ValidationError::SeedRequiresMountableRepository {
+            path: fs.path.clone(),
+        });
+    }
+    if !mode.allows_writes() {
+        errs.push(ValidationError::SeedOnReadOnlyRepository);
+    }
+    errs.extend(seed_tuning_pairing(seed));
+    if let Some(fp) = &seed.failure_policy
+        && let Err(e) = validate_failure_policy(fp, &format!("{} spec.seed", kind.kind_str()))
+    {
+        errs.push(e);
+    }
+    // Exhaustive over `SeedSource`: a new seed source cannot compile until its
+    // per-mode rules are decided here.
+    match &seed.from {
+        SeedSource::Backend(b) => {
+            errs.extend(validate_seed_blob_source(b, repo_backend, create, kind));
+            if let Some(sync) = &seed.sync {
+                errs.extend(validate_seed_sync_options(sync));
+            }
+        }
+        SeedSource::Repository(r) => {
+            if let Err(e) = validate_repository_ref(r) {
+                errs.push(e);
+            }
+            if let Some(p) = seed.migrate.as_ref().and_then(|m| m.parallel)
+                && let Some(e) = require_min("spec.seed.migrate.parallel", p.into(), 1)
+            {
+                errs.push(e);
+            }
+        }
+    }
+    errs
+}
+
+/// A mode-specific `spec.seed` block must match the `from` variant it tunes, or
+/// it is an inert field. `credentialProjection` is refused only when actually
+/// enabled: an explicit `enabled: false` requests nothing and stays legal so a
+/// GitOps template can emit the block unconditionally.
+fn seed_tuning_pairing(seed: &SeedSpec) -> Vec<ValidationError> {
+    // The `from` key actually set, and the one each tuning block belongs to.
+    let (actual, blob) = match &seed.from {
+        SeedSource::Backend(_) => ("backend", true),
+        SeedSource::Repository(_) => ("repository", false),
+    };
+    let mismatched: [(&str, bool); 3] = [
+        ("sync", seed.sync.is_some() && !blob),
+        ("migrate", seed.migrate.is_some() && blob),
+        (
+            "credentialProjection",
+            seed.credential_projection
+                .as_ref()
+                .is_some_and(|p| p.enabled)
+                && blob,
+        ),
+    ];
+    mismatched
+        .into_iter()
+        .filter(|(_, tripped)| *tripped)
+        .map(|(field, _)| ValidationError::SeedTuningNotApplicable {
+            field: field.to_string(),
+            expected_source: if field == "sync" {
+                "backend"
+            } else {
+                "repository"
+            }
+            .to_string(),
+            actual_source: actual.to_string(),
+        })
+        .collect()
+}
+
+/// Blob-mode (`seed.from.backend`) rules: the source backend is well-formed and
+/// mountable, its credential Secret is reachable for a cluster-scoped
+/// repository, it is not this repository's own storage, it does not collide on
+/// an in-pod mount path, its auth pairs safely with the local backend in one
+/// pod, its `sync` knobs are positive, and `spec.create`'s format algorithms are
+/// not silently discarded.
+fn validate_seed_blob_source(
+    source: &Backend,
+    repo_backend: &Backend,
+    create: Option<&CreateBehavior>,
+    kind: RepositoryKind,
+) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    if let Err(e) = validate_backend(source) {
+        errs.push(e);
+    }
+    if let Backend::Filesystem(fs) = source
+        && fs.volume.is_none()
+    {
+        errs.push(ValidationError::SeedSourceRequiresMountableBackend {
+            path: fs.path.clone(),
+        });
+    }
+    // A ClusterRepository's movers resolve credentials in the operator's own
+    // namespace, which a cluster-scoped spec cannot name — so the seed Secret
+    // must not pin one. The namespaced arm needs the CR's namespace and lives in
+    // `validate_seed_secret_namespace`.
+    if kind == RepositoryKind::ClusterRepository
+        && let Some(secret) = crate::creds::backend_auth_secret_ref(source)
+        && let Some(ns) = secret.namespace.as_deref()
+    {
+        errs.push(ValidationError::SeedSourceSecretNamespaceForbidden {
+            secret: secret.name.clone(),
+            namespace: ns.to_string(),
+        });
+    }
+    if !replication_destination_differs(repo_backend, source) {
+        errs.push(ValidationError::SeedSourceSameAsRepository {
+            backend: source.kind_str().to_string(),
+        });
+    }
+    if let Some(path) = replication_filesystem_mount_collision(repo_backend, source) {
+        errs.push(ValidationError::SeedMountPathCollision { path });
+    }
+    // One pod carries both credential sets, so the replication rule applies
+    // verbatim: a same-kind static/workloadIdentity mix would let the ambient
+    // credential chain pick up the other side's keys.
+    if let Err(e) = validate_replication_auth(repo_backend, source) {
+        errs.push(e);
+    }
+    let inert = inert_create_fields(create);
+    if !inert.is_empty() {
+        errs.push(ValidationError::SeedCreateOptionsInert { fields: inert });
+    }
+    errs
+}
+
+/// The `spec.create.*` format algorithms a blob-mode seed would discard (the
+/// copy inherits the mirror's repository-format blob). `create.enabled` is NOT
+/// in the set: a seed-armed bootstrap never falls back to `create`, so the flag
+/// keeps its ordinary meaning for every later connect.
+fn inert_create_fields(create: Option<&CreateBehavior>) -> Vec<String> {
+    let Some(c) = create else {
+        return Vec::new();
+    };
+    [
+        ("create.splitter", c.splitter.is_some()),
+        ("create.hash", c.hash.is_some()),
+        ("create.encryption", c.encryption.is_some()),
+        ("create.ecc", c.ecc.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, set)| *set)
+    .map(|(field, _)| field.to_string())
+    .collect()
+}
+
+/// Blob-mode `sync` knobs are positive counts/rates. Split out of
+/// [`validate_repository_seed`] because it is called for the blob arm only.
+fn validate_seed_sync_options(sync: &SeedSyncOptions) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    if let Some(p) = sync.parallel
+        && let Some(e) = require_min("spec.seed.sync.parallel", p.into(), 1)
+    {
+        errs.push(e);
+    }
+    if let Some(s) = sync.max_download_speed_bytes_per_second
+        && let Some(e) = require_min("spec.seed.sync.maxDownloadSpeedBytesPerSecond", s, 1)
+    {
+        errs.push(e);
+    }
+    if let Some(s) = sync.max_upload_speed_bytes_per_second
+        && let Some(e) = require_min("spec.seed.sync.maxUploadSpeedBytesPerSecond", s, 1)
+    {
+        errs.push(e);
+    }
+    errs
+}
+
+/// The namespaced arm of the co-resident seed-Secret rule: a `Repository`'s
+/// blob-mode seed source Secret must be unset or name the repository's OWN
+/// namespace, because the seeding Job runs there and `envFrom` is
+/// namespace-local. Needs the CR's namespace, which the spec does not carry, so
+/// the webhook calls it with `req.namespace` (the cluster-scoped arm — "must be
+/// unset" — is fully spec-derivable and lives in
+/// [`validate_repository_seed`]).
+///
+/// ```
+/// use kopiur_api::seed::{SeedSpec, SeedSource};
+/// use kopiur_api::validate::validate_seed_secret_namespace;
+///
+/// let seed_with = |ns: serde_json::Value| -> SeedSpec {
+///     let from: SeedSource = serde_json::from_value(serde_json::json!({
+///         "backend": { "s3": { "bucket": "mirror", "auth": { "secretRef": ns } } }
+///     }))
+///     .unwrap();
+///     SeedSpec { from, sync: None, migrate: None, allow_empty_source: false,
+///                failure_policy: None, credential_projection: None }
+/// };
+/// // Unset namespace = "the repository's own" → fine.
+/// let ok = seed_with(serde_json::json!({ "name": "mirror-creds" }));
+/// assert!(validate_seed_secret_namespace(Some(&ok), "backups").is_ok());
+/// // Same namespace spelled out → also fine.
+/// let same = seed_with(serde_json::json!({ "name": "mirror-creds", "namespace": "backups" }));
+/// assert!(validate_seed_secret_namespace(Some(&same), "backups").is_ok());
+/// // Another namespace → the Job could never read it.
+/// let other = seed_with(serde_json::json!({ "name": "mirror-creds", "namespace": "elsewhere" }));
+/// assert!(validate_seed_secret_namespace(Some(&other), "backups").is_err());
+/// ```
+pub fn validate_seed_secret_namespace(
+    seed: Option<&SeedSpec>,
+    repository_namespace: &str,
+) -> ValidationResult {
+    let Some(source) = seed.and_then(crate::seed::seed_backend) else {
+        return Ok(());
+    };
+    let Some(secret) = crate::creds::backend_auth_secret_ref(source) else {
+        return Ok(());
+    };
+    match secret.namespace.as_deref() {
+        Some(ns) if ns != repository_namespace => {
+            Err(ValidationError::SeedSourceSecretNamespaceMismatch {
+                secret: secret.name.clone(),
+                namespace: ns.to_string(),
+                repository_namespace: repository_namespace.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A migrate-mode seed must not point at the repository being defined. Uses the
+/// shared [`crate::common::repo_key`] normalization, so a `Repository` naming
+/// its own namespace explicitly and one omitting it are both caught. Needs the
+/// CR's own identity, which the spec does not carry.
+///
+/// ```
+/// use kopiur_api::common::RepositoryKind;
+/// use kopiur_api::seed::{SeedSpec, SeedSource};
+/// use kopiur_api::validate::validate_seed_not_self;
+///
+/// let seed = |from: serde_json::Value| -> SeedSpec {
+///     SeedSpec { from: serde_json::from_value(from).unwrap(), sync: None, migrate: None,
+///                allow_empty_source: false, failure_policy: None, credential_projection: None }
+/// };
+/// let itself = seed(serde_json::json!({ "repository": { "name": "nas" } }));
+/// assert!(
+///     validate_seed_not_self(Some(&itself), RepositoryKind::Repository, "nas", "backups")
+///         .is_err()
+/// );
+/// let other = seed(serde_json::json!({ "repository": { "name": "offsite" } }));
+/// assert!(
+///     validate_seed_not_self(Some(&other), RepositoryKind::Repository, "nas", "backups").is_ok()
+/// );
+/// ```
+pub fn validate_seed_not_self(
+    seed: Option<&SeedSpec>,
+    self_kind: RepositoryKind,
+    self_name: &str,
+    self_namespace: &str,
+) -> ValidationResult {
+    let Some(source) = seed.and_then(crate::seed::seed_repository_ref) else {
+        return Ok(());
+    };
+    let own = RepositoryRef {
+        kind: self_kind,
+        name: self_name.to_string(),
+        namespace: None,
+    };
+    if crate::common::repo_key(source, self_namespace)
+        == crate::common::repo_key(&own, self_namespace)
+    {
+        return Err(ValidationError::SeedSourceSelfReference {
+            kind: source.kind.kind_str().to_string(),
+            name: source.name.clone(),
+        });
+    }
+    Ok(())
 }

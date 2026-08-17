@@ -6208,3 +6208,471 @@ pruning: { mirrorSource: {} }
     );
     assert!(validate_snapshot_replication(&ok).is_empty());
 }
+
+// --- spec.seed (#380) -------------------------------------------------------
+
+/// A namespaced `Repository` on an object-store backend, with `spec.seed`
+/// spliced in from the YAML fragment. Built through the cluster's own path
+/// (YAML → JSON value → typed) so the externally-tagged `seed.from` union is
+/// exercised exactly as admission sees it.
+fn repo_with_seed(seed_yaml: &str) -> RepositorySpec {
+    crate::testutil::from_yaml(&format!(
+        r#"
+backend:
+  s3:
+    bucket: live
+    endpoint: s3.local
+    auth: {{ secretRef: {{ name: live-creds }} }}
+encryption:
+  passwordSecretRef: {{ name: live-creds }}
+seed:
+{seed_yaml}
+"#
+    ))
+}
+
+/// The `ClusterRepository` counterpart of [`repo_with_seed`].
+fn cluster_repo_with_seed(seed_yaml: &str) -> ClusterRepositorySpec {
+    crate::testutil::from_yaml(&format!(
+        r#"
+backend:
+  s3:
+    bucket: live
+    endpoint: s3.local
+    auth: {{ secretRef: {{ name: live-creds, namespace: kopiur-system }} }}
+encryption:
+  passwordSecretRef: {{ name: live-creds, namespace: kopiur-system }}
+allowedNamespaces: {{ all: true }}
+seed:
+{seed_yaml}
+"#
+    ))
+}
+
+const BLOB_SEED: &str = r#"  from:
+    backend:
+      s3:
+        bucket: mirror
+        endpoint: offsite.example
+        auth: { secretRef: { name: mirror-creds } }
+"#;
+
+const MIGRATE_SEED: &str = r#"  from:
+    repository: { kind: ClusterRepository, name: offsite }
+"#;
+
+#[test]
+fn a_plain_blob_and_migrate_seed_are_accepted() {
+    // The two shapes the docs teach must pass unchanged; every rule below is a
+    // deviation from one of these.
+    assert!(validate_repository(&repo_with_seed(BLOB_SEED)).is_empty());
+    assert!(validate_repository(&repo_with_seed(MIGRATE_SEED)).is_empty());
+    // Same two shapes on the cluster-scoped kind. The blob source's Secret
+    // carries NO namespace — a ClusterRepository resolves it in the operator
+    // namespace, and pinning one is the cluster arm's rejection.
+    assert!(validate_cluster_repository(&cluster_repo_with_seed(BLOB_SEED)).is_empty());
+    assert!(validate_cluster_repository(&cluster_repo_with_seed(MIGRATE_SEED)).is_empty());
+}
+
+#[test]
+fn seed_on_a_bare_path_filesystem_repository_is_rejected() {
+    // Seeding runs in a mover Job; a bare path is the one backend the
+    // CONTROLLER connects to in-process, so nothing would be mounted at it.
+    let spec: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend: { filesystem: { path: /repo } }
+encryption: { passwordSecretRef: { name: s } }
+seed:
+  from:
+    repository: { kind: ClusterRepository, name: offsite }
+"#,
+    );
+    let errs = validate_repository(&spec);
+    let e = errs
+        .iter()
+        .find(|e| matches!(e, ValidationError::SeedRequiresMountableRepository { .. }))
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    let msg = e.to_string();
+    assert!(msg.contains("\"/repo\""), "{msg}");
+    assert!(msg.contains("backend.filesystem.volume"), "{msg}");
+}
+
+#[test]
+fn a_bare_path_filesystem_seed_source_is_rejected() {
+    let errs = validate_repository(&repo_with_seed(
+        "  from:\n    backend: { filesystem: { path: /mirror } }\n",
+    ));
+    let e = errs
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                ValidationError::SeedSourceRequiresMountableBackend { .. }
+            )
+        })
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    let msg = e.to_string();
+    assert!(msg.contains("\"/mirror\""), "{msg}");
+    assert!(msg.contains("`volume`"), "{msg}");
+}
+
+#[test]
+fn seed_on_a_read_only_repository_is_rejected() {
+    let mut spec = repo_with_seed(MIGRATE_SEED);
+    spec.mode = RepositoryMode::ReadOnly;
+    let errs = validate_repository(&spec);
+    let e = errs
+        .iter()
+        .find(|e| matches!(e, ValidationError::SeedOnReadOnlyRepository))
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    let msg = e.to_string();
+    assert!(msg.contains("ReadOnly"), "{msg}");
+    assert!(msg.contains("mode: ReadWrite"), "{msg}");
+}
+
+#[test]
+fn blob_seed_with_explicit_create_format_knobs_is_rejected() {
+    // `sync-to` copies the mirror's repository-format blob verbatim, so these
+    // would be inert — and kopiur does not ship inert fields.
+    let mut spec = repo_with_seed(BLOB_SEED);
+    spec.create = Some(crate::common::CreateBehavior {
+        enabled: true,
+        encryption: Some("AES256-GCM-HMAC-SHA256".into()),
+        splitter: Some("DYNAMIC-4M-BUZHASH".into()),
+        hash: None,
+        ecc: None,
+    });
+    let errs = validate_repository(&spec);
+    let e = errs
+        .iter()
+        .find(|e| matches!(e, ValidationError::SeedCreateOptionsInert { .. }))
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    let msg = e.to_string();
+    assert!(msg.contains("create.splitter"), "{msg}");
+    assert!(msg.contains("create.encryption"), "{msg}");
+    assert!(
+        !msg.contains("create.hash"),
+        "unset knobs must not be named: {msg}"
+    );
+    assert!(msg.contains("migrate mode"), "{msg}");
+
+    // `create.enabled` alone stays legal: a seed-armed bootstrap never falls
+    // back to `create`, so the flag keeps its ordinary meaning afterwards.
+    spec.create = Some(crate::common::CreateBehavior {
+        enabled: true,
+        encryption: None,
+        splitter: None,
+        hash: None,
+        ecc: None,
+    });
+    assert!(validate_repository(&spec).is_empty());
+    // ...and migrate mode declares the local format itself, so the knobs apply.
+    let mut migrate = repo_with_seed(MIGRATE_SEED);
+    migrate.create = Some(crate::common::CreateBehavior {
+        enabled: true,
+        encryption: None,
+        splitter: Some("DYNAMIC-4M-BUZHASH".into()),
+        hash: None,
+        ecc: None,
+    });
+    assert!(validate_repository(&migrate).is_empty());
+}
+
+#[test]
+fn mode_specific_seed_tuning_must_match_its_source() {
+    // `sync` tunes the blob copy; pairing it with a repository source would
+    // silently ignore it.
+    let errs = validate_repository(&repo_with_seed(&format!(
+        "{MIGRATE_SEED}  sync: {{ parallel: 8 }}\n"
+    )));
+    let e = errs
+        .iter()
+        .find(|e| {
+            matches!(e, ValidationError::SeedTuningNotApplicable { field, .. } if field == "sync")
+        })
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    let msg = e.to_string();
+    assert!(msg.contains("`backend`"), "{msg}");
+    assert!(msg.contains("`repository`"), "{msg}");
+
+    // ...and the mirror image: `migrate` + `credentialProjection` on a blob seed.
+    let errs = validate_repository(&repo_with_seed(&format!(
+        "{BLOB_SEED}  migrate: {{ parallel: 2 }}\n  credentialProjection: {{ enabled: true }}\n"
+    )));
+    for field in ["migrate", "credentialProjection"] {
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::SeedTuningNotApplicable { field: f, .. } if f == field
+            )),
+            "expected {field} to be refused: {errs:?}"
+        );
+    }
+
+    // An explicitly-disabled projection requests nothing and stays legal, so a
+    // GitOps template may emit the block unconditionally.
+    assert!(
+        validate_repository(&repo_with_seed(&format!(
+            "{BLOB_SEED}  credentialProjection: {{ enabled: false }}\n"
+        )))
+        .is_empty()
+    );
+}
+
+#[test]
+fn a_blob_seed_from_this_repositorys_own_storage_is_rejected() {
+    let errs = validate_repository(&repo_with_seed(
+        r#"  from:
+    backend:
+      s3:
+        bucket: live
+        endpoint: s3.local
+        auth: { secretRef: { name: live-creds } }
+"#,
+    ));
+    let e = errs
+        .iter()
+        .find(|e| matches!(e, ValidationError::SeedSourceSameAsRepository { .. }))
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    assert!(e.to_string().contains("seeded from itself"), "{e}");
+}
+
+#[test]
+fn two_filesystem_seed_sides_sharing_one_in_pod_path_are_rejected() {
+    // Two volumeMounts at one mountPath is an invalid pod spec — catch it at
+    // admission instead of at Job-create time.
+    let spec: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend: { filesystem: { path: /repo, volume: { pvc: { name: live } } } }
+encryption: { passwordSecretRef: { name: s } }
+seed:
+  from:
+    backend: { filesystem: { path: /repo, volume: { pvc: { name: mirror } } } }
+"#,
+    );
+    let errs = validate_repository(&spec);
+    let e = errs
+        .iter()
+        .find(|e| matches!(e, ValidationError::SeedMountPathCollision { .. }))
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    let msg = e.to_string();
+    assert!(msg.contains("\"/repo\""), "{msg}");
+    assert!(msg.contains("does not move any data"), "{msg}");
+}
+
+#[test]
+fn a_cluster_repository_seed_secret_must_not_pin_a_namespace() {
+    // A ClusterRepository's movers resolve credentials in the operator's own
+    // namespace, which a cluster-scoped spec cannot name.
+    let errs = validate_cluster_repository(&cluster_repo_with_seed(
+        r#"  from:
+    backend:
+      s3:
+        bucket: mirror
+        endpoint: offsite.example
+        auth: { secretRef: { name: mirror-creds, namespace: elsewhere } }
+"#,
+    ));
+    let e = errs
+        .iter()
+        .find(|e| {
+            matches!(
+                e,
+                ValidationError::SeedSourceSecretNamespaceForbidden { .. }
+            )
+        })
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    let msg = e.to_string();
+    assert!(msg.contains("\"elsewhere\""), "{msg}");
+    assert!(msg.contains("operator's own"), "{msg}");
+
+    // The namespaced arm is the OPPOSITE rule and must not fire here.
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::SeedSourceSecretNamespaceMismatch { .. })),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_namespaced_seed_secret_must_be_co_resident() {
+    // Spec-only validation cannot know the CR's namespace, so the rule lives in
+    // its own helper the webhook calls with `req.namespace`.
+    let same = repo_with_seed(BLOB_SEED);
+    assert!(validate_seed_secret_namespace(same.seed.as_ref(), "backups").is_ok());
+
+    let elsewhere = repo_with_seed(
+        r#"  from:
+    backend:
+      s3:
+        bucket: mirror
+        endpoint: offsite.example
+        auth: { secretRef: { name: mirror-creds, namespace: elsewhere } }
+"#,
+    );
+    let err = validate_seed_secret_namespace(elsewhere.seed.as_ref(), "backups")
+        .expect_err("a cross-namespace seed Secret is unreadable from the Job");
+    assert_eq!(
+        err,
+        ValidationError::SeedSourceSecretNamespaceMismatch {
+            secret: "mirror-creds".to_string(),
+            namespace: "elsewhere".to_string(),
+            repository_namespace: "backups".to_string(),
+        }
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("envFrom"), "{msg}");
+    assert!(msg.contains("\"backups\""), "{msg}");
+
+    // Migrate mode carries no backend Secret, so the rule is a no-op there.
+    let migrate = repo_with_seed(MIGRATE_SEED);
+    assert!(validate_seed_secret_namespace(migrate.seed.as_ref(), "backups").is_ok());
+    assert!(validate_seed_secret_namespace(None, "backups").is_ok());
+}
+
+#[test]
+fn a_migrate_seed_pointing_at_itself_is_rejected() {
+    let itself = repo_with_seed("  from:\n    repository: { name: nas }\n");
+    let err = validate_seed_not_self(
+        itself.seed.as_ref(),
+        RepositoryKind::Repository,
+        "nas",
+        "backups",
+    )
+    .expect_err("a repository cannot seed from itself");
+    assert!(err.to_string().contains("seeded from itself"), "{err}");
+
+    // The same reference spelled with an explicit namespace is still itself.
+    let spelled = repo_with_seed("  from:\n    repository: { name: nas, namespace: backups }\n");
+    assert!(
+        validate_seed_not_self(
+            spelled.seed.as_ref(),
+            RepositoryKind::Repository,
+            "nas",
+            "backups"
+        )
+        .is_err()
+    );
+    // A same-named repository in ANOTHER namespace is a legitimate source.
+    let other_ns = repo_with_seed("  from:\n    repository: { name: nas, namespace: dr }\n");
+    assert!(
+        validate_seed_not_self(
+            other_ns.seed.as_ref(),
+            RepositoryKind::Repository,
+            "nas",
+            "backups"
+        )
+        .is_ok()
+    );
+    // A same-named ClusterRepository is a DIFFERENT object, not itself.
+    let cluster =
+        repo_with_seed("  from:\n    repository: { kind: ClusterRepository, name: nas }\n");
+    assert!(
+        validate_seed_not_self(
+            cluster.seed.as_ref(),
+            RepositoryKind::Repository,
+            "nas",
+            "backups"
+        )
+        .is_ok()
+    );
+    // Blob mode has no reference to compare.
+    assert!(
+        validate_seed_not_self(
+            repo_with_seed(BLOB_SEED).seed.as_ref(),
+            RepositoryKind::Repository,
+            "nas",
+            "backups"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn seed_numeric_knobs_and_failure_policy_must_be_positive() {
+    let errs = validate_repository(&repo_with_seed(&format!(
+        "{BLOB_SEED}  sync: {{ parallel: 0, maxDownloadSpeedBytesPerSecond: 0 }}\n  failurePolicy: {{ activeDeadlineSeconds: 0 }}\n"
+    )));
+    for field in [
+        "spec.seed.sync.parallel",
+        "spec.seed.sync.maxDownloadSpeedBytesPerSecond",
+        "Repository spec.seed failurePolicy.activeDeadlineSeconds",
+    ] {
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field: f, .. } if f == field
+            )),
+            "expected {field} to be refused: {errs:?}"
+        );
+    }
+    let errs = validate_repository(&repo_with_seed(&format!(
+        "{MIGRATE_SEED}  migrate: {{ parallel: 0 }}\n"
+    )));
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. }
+                if field == "spec.seed.migrate.parallel"
+        )),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_cluster_repository_seed_ref_must_not_carry_a_namespace() {
+    // `validate_repository_ref`'s existing rule reaches the seed source too.
+    let errs = validate_repository(&repo_with_seed(
+        "  from:\n    repository: { kind: ClusterRepository, name: offsite, namespace: oops }\n",
+    ));
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::ClusterRepoNamespaceForbidden { .. })),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_blob_seed_mixing_workload_identity_with_static_keys_is_rejected() {
+    // One seeding pod carries both credential sets, so the replication rule
+    // applies verbatim: the ambient AWS chain would pick up the static side's
+    // env and authenticate as the wrong identity.
+    let errs = validate_repository(&repo_with_seed(
+        r#"  from:
+    backend:
+      s3:
+        bucket: mirror
+        endpoint: offsite.example
+        auth: { workloadIdentity: { serviceAccountName: seeder } }
+"#,
+    ));
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidFieldValue { .. })),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn absent_seed_adds_no_errors_on_either_kind() {
+    // The block is entirely opt-in: every existing repository must keep
+    // validating exactly as before.
+    let spec: RepositorySpec = crate::testutil::from_yaml(
+        r#"
+backend: { s3: { bucket: live } }
+encryption: { passwordSecretRef: { name: s } }
+"#,
+    );
+    assert!(validate_repository(&spec).is_empty());
+    assert!(
+        validate_repository_seed(
+            None,
+            &spec.backend,
+            RepositoryMode::ReadOnly,
+            None,
+            RepositoryKind::Repository,
+        )
+        .is_empty()
+    );
+}
