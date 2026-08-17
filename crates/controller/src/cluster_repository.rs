@@ -848,22 +848,34 @@ async fn handle_cluster_deletion(
     // Best-effort and separate from the Secret cleanup above: a Job that has
     // already finished (or was never created) is an ordinary miss, and cleanup
     // must not wedge a deletion.
-    let job_ns = cluster_secret_namespace(
+    match cluster_secret_namespace(
         io::repo_credentials(&repo.spec.encryption)
             .namespace
             .as_deref(),
         ctx.operator_namespace.as_deref(),
-    )
-    .ok();
-    if let Some(job_ns) = job_ns {
-        let job_name = format!("{name}-discovery");
-        if let Err(e) = io::delete_mover_run(&ctx.client, &job_ns, &job_name).await {
-            tracing::warn!(
-                repo = %name, namespace = %job_ns, job = %job_name, error = %e,
-                "could not delete the bootstrap Job while finalizing the ClusterRepository; \
-                 it may keep running until its own deadline"
-            );
+    ) {
+        Ok(job_ns) => {
+            let job_name = crate::naming::discovery_job_name(name);
+            if let Err(e) = io::delete_mover_run(&ctx.client, &job_ns, &job_name).await {
+                tracing::warn!(
+                    repo = %name, namespace = %job_ns, job = %job_name, error = %e,
+                    "could not delete the bootstrap Job while finalizing the ClusterRepository; \
+                     it may keep running until its own deadline"
+                );
+            }
         }
+        // Not silently swallowed: if we cannot work out which namespace the Job
+        // runs in, we cannot reap it, and a seeding Job can legitimately keep
+        // running for 24h after its CR is gone. Never fatal — a deletion must
+        // not wedge on cleanup — but it must be visible, because the leftover
+        // pod is otherwise invisible from the (now-deleted) CR.
+        Err(e) => tracing::warn!(
+            repo = %name, error = %e,
+            "cannot resolve the bootstrap Job's namespace while finalizing the \
+             ClusterRepository; an in-flight bootstrap/seeding Job may keep running until its \
+             own deadline. Set encryption.passwordSecretRef.namespace or KOPIUR_NAMESPACE, then \
+             delete the `<name>-discovery` Job by hand."
+        ),
     }
 
     io::remove_finalizer(api, repo, SERVER_CLEANUP_FINALIZER).await?;
@@ -931,6 +943,17 @@ async fn write_cluster_seeding_condition(
     );
     let fresh = api.get_opt(name).await?;
     let conditions = fresh.as_ref().map(cluster_conditions).unwrap_or_default();
+    // Leave a RECORDED FAILURE standing rather than overwriting it with
+    // `Seeding` on every relaunch. Each retry cycle would otherwise rewrite the
+    // condition twice (`<class>` -> `Seeding` -> `<class>`), turning every
+    // ~2-minute cycle into a fresh status transition — and the failure Event and
+    // the `failed` metric are both gated on exactly that, so a dead seed source
+    // would mint ~30 of each an hour instead of one per real change. It also
+    // reports better: "the last attempt failed with X, and kopiur is retrying"
+    // beats a bare "seeding".
+    if crate::repo_seed::seed_failure_recorded(&conditions) {
+        return Ok(());
+    }
     let conditions = io::upsert_gate(
         &conditions,
         &kopiur_api::gates::SEEDING_GATE,
@@ -975,7 +998,7 @@ async fn bootstrap_cluster_via_mover(
     // "discovery" (not "bootstrap"): the FIRST run does bootstrap the
     // repository, but every later run of this Job is a catalog re-scan — the
     // name follows the recurring purpose users actually see.
-    let job_name = format!("{name}-discovery");
+    let job_name = crate::naming::discovery_job_name(name);
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &job_ns);
 
     // Honor a `Snapshot`'s reverify nudge: force a re-probe (ORs into the
@@ -1807,7 +1830,13 @@ async fn finalize_cluster_bootstrap(
             &fold.message,
             repo.metadata.generation,
         ),
-        None => conditions,
+        // No seed outcome on a SUCCESSFUL bootstrap means this repository has
+        // no `spec.seed` any more (a standing one always produces an outcome,
+        // and the skew guard already refused a seed-armed success without one).
+        // Any `Seeded=False` left over from a park, or from an in-flight seed
+        // the user has since removed, is now a claim about nothing — drop it,
+        // or the repository goes Ready carrying a permanent phantom block.
+        None => crate::repo_seed::drop_seed_condition(&conditions),
     };
     // Publish the standard kstatus Ready/Reconciling/Stalled conditions for the
     // healthy repository (issue #245), layered onto the conditions built above so
@@ -2025,7 +2054,13 @@ async fn finalize_cluster_bootstrap_failure(
                 &failure.condition_message(),
                 repo.metadata.generation,
             ),
-            None => conditions.to_vec(),
+            // A bootstrap that failed for a reason having NOTHING to do with
+            // the seed (an AuthFailure against this repository's own backend, a
+            // result-less Job) says nothing about the seed's state — so a
+            // `Seeded=False/Seeding` left standing from the in-flight pass would
+            // claim a copy is running beside a terminal `Failed`. Drop it; the
+            // real story is on `Bootstrapped` and `Ready`.
+            None => crate::repo_seed::drop_seed_condition(conditions),
         };
     // A result-less Job failure carries no backend verdict (mover
     // crashed / evicted / deadline / result write hit a down apiserver

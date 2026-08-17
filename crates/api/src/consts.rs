@@ -418,6 +418,61 @@ pub const SEEDING_REASON: &str = "Seeding";
 /// source comes up — an out-of-band change nothing in kopiur can make.
 pub const WAITING_FOR_SEED_SOURCE_REASON: &str = "WaitingForSeedSource";
 
+// The FAILURE reasons for [`SEEDED_CONDITION`] = `False`. Each is byte-identical
+// to the sentinel `kopia_error_class` the seeding mover writes
+// (`kopiur_mover::bootstrap::SEED_*_CLASS`) — one vocabulary across the mover's
+// result, the condition, the Warning Event and the CLI. They live HERE, not in
+// the mover, because `gates.rs` registers them and `kopiur-api` cannot depend on
+// `kopiur-mover`; the equality is pinned by the controller's
+// `io::tests::every_seed_class_maps_to_a_typed_failure_and_routes_by_retryability`,
+// which is the one crate that sees both sides.
+//
+// Registering ALL of them matters: a `Seeded=False` reason with no registry row
+// trips `StructuralGate::trips` but matches no row, and `kubectl kopiur doctor`
+// then reports it as "the operator is newer than the plugin" — a false diagnosis
+// in exactly the disaster-recovery flow these reasons exist for.
+
+/// `reason` for [`SEEDED_CONDITION`] = `False` when the seed SOURCE answered but
+/// holds no kopia repository (a mis-pointed bucket/prefix, or a mirror that was
+/// never written). Retried automatically.
+pub const SEED_SOURCE_NOT_FOUND_REASON: &str = "SeedSourceNotFound";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when the seed source IS a kopia
+/// repository but holds zero snapshots and `spec.seed.allowEmptySource` is
+/// `false`. Retried automatically, so a mirror that fills up later seeds itself.
+pub const SEED_SOURCE_EMPTY_REASON: &str = "SeedSourceEmpty";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when a migrate-mode seed's
+/// post-verify found snapshots missing at the destination (`kopia snapshot
+/// migrate` exits 0 on a per-source failure, so the destination listing is the
+/// only honest success signal). The next attempt resumes the copy.
+pub const SEED_INCOMPLETE_REASON: &str = "SeedIncomplete";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when a seed was armed and the
+/// repository ended the bootstrap holding ZERO snapshots — an attempt that
+/// initialized the backend and then died. The next attempt resumes the copy;
+/// nothing at the backend should be deleted.
+pub const SEED_LEFT_EMPTY_REASON: &str = "SeedLeftEmpty";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when the running mover image
+/// predates `spec.seed`: it dropped the unknown field, fell into the create
+/// fallback, and initialized an EMPTY repository. Terminal — only an image
+/// upgrade changes it.
+pub const SEED_MOVER_TOO_OLD_REASON: &str = "MoverImageTooOldForSeed";
+
+/// Every `Seeded=False` reason that means "the last seed attempt FAILED", as
+/// opposed to the park/progress reasons ([`WAITING_FOR_SEED_SOURCE_REASON`],
+/// [`SEEDING_REASON`]).
+///
+/// Exists so a writer can ask "has a previous attempt already recorded a
+/// failure here?" without restating the list — the seeding-progress writer uses
+/// it to leave a recorded failure standing rather than overwriting it with
+/// `Seeding` on every ~2-minute retry, which would make every retry cycle a
+/// fresh status transition (and so a fresh Event and metric increment).
+pub const SEED_FAILURE_REASONS: &[&str] = &[
+    SEED_SOURCE_NOT_FOUND_REASON,
+    SEED_SOURCE_EMPTY_REASON,
+    SEED_INCOMPLETE_REASON,
+    SEED_LEFT_EMPTY_REASON,
+    SEED_MOVER_TOO_OLD_REASON,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

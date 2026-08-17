@@ -530,15 +530,11 @@ pub const CHECK_SEED_SOURCE_ACTION: &str = "CheckSeedSource";
 /// `spec.seed.failurePolicy.activeDeadlineSeconds`) if it keeps being cut short.
 pub const AWAIT_SEED_RESUME_ACTION: &str = "AwaitSeedResume";
 
-/// Machine-readable `reason` (condition + Warning Event) for the **mover-skew
-/// guard** (issue #380): the work spec armed a `spec.seed`, but the mover
-/// reported SUCCESS without a seed outcome — proof the running mover image
-/// predates `spec.seed`, silently dropped the field, and initialized an EMPTY
-/// repository via the create fallback. Terminal: only an image upgrade changes
-/// it, and Ready-ing the repository would hand back exactly the empty
-/// repository #380 exists to prevent.
-pub const SEED_MOVER_TOO_OLD_REASON: &str = "MoverImageTooOldForSeed";
-/// `action` for [`SEED_MOVER_TOO_OLD_REASON`]: upgrade the mover image.
+// The mover-skew guard's `reason` lives in `kopiur_api::consts` beside the other
+// `Seeded` reasons, not here: `kopiur_api::gates` registers it, and the
+// phase-ratchet rule keeps a gating condition's strings in the api crate.
+/// `action` for [`kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON`]: upgrade the
+/// mover image.
 pub const UPGRADE_MOVER_IMAGE_ACTION: &str = "UpgradeMoverImage";
 
 /// `action` for [`kopiur_mover::bootstrap::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS`]:

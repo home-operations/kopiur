@@ -762,6 +762,17 @@ async fn write_seeding_condition(
     );
     let fresh = api.get_opt(name).await?;
     let conditions = fresh.as_ref().map(repo_conditions).unwrap_or_default();
+    // Leave a RECORDED FAILURE standing rather than overwriting it with
+    // `Seeding` on every relaunch. Each retry cycle would otherwise rewrite the
+    // condition twice (`<class>` -> `Seeding` -> `<class>`), turning every
+    // ~2-minute cycle into a fresh status transition — and the failure Event and
+    // the `failed` metric are both gated on exactly that, so a dead seed source
+    // would mint ~30 of each an hour instead of one per real change. It also
+    // reports better: "the last attempt failed with X, and kopiur is retrying"
+    // beats a bare "seeding".
+    if repo_seed::seed_failure_recorded(&conditions) {
+        return Ok(());
+    }
     let conditions = io::upsert_gate(
         &conditions,
         &kopiur_api::gates::SEEDING_GATE,
@@ -886,7 +897,7 @@ async fn bootstrap_via_mover(
     // "discovery" (not "bootstrap"): the FIRST run does bootstrap the
     // repository, but every later run of this Job is a catalog re-scan — the
     // name follows the recurring purpose users actually see.
-    let job_name = format!("{name}-discovery");
+    let job_name = crate::naming::discovery_job_name(name);
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
 
     // Honor a `Snapshot`'s reverify nudge: force a re-probe (ORs into the
@@ -1926,7 +1937,13 @@ async fn finalize_bootstrap(
             &fold.message,
             repo.metadata.generation,
         ),
-        None => conditions,
+        // No seed outcome on a SUCCESSFUL bootstrap means this repository has
+        // no `spec.seed` any more (a standing one always produces an outcome,
+        // and the skew guard already refused a seed-armed success without one).
+        // Any `Seeded=False` left over from a park, or from an in-flight seed
+        // the user has since removed, is now a claim about nothing — drop it,
+        // or the repository goes Ready carrying a permanent phantom block.
+        None => repo_seed::drop_seed_condition(&conditions),
     };
     if let Some(fold) = seed_fold.as_ref() {
         repo_seed::merge_seed_status(&mut status_patch, &fold.status);
@@ -2112,7 +2129,13 @@ async fn finalize_bootstrap_failure(
                 &failure.condition_message(),
                 repo.metadata.generation,
             ),
-            None => conditions.to_vec(),
+            // A bootstrap that failed for a reason having NOTHING to do with
+            // the seed (an AuthFailure against this repository's own backend, a
+            // result-less Job) says nothing about the seed's state — so a
+            // `Seeded=False/Seeding` left standing from the in-flight pass would
+            // claim a copy is running beside a terminal `Failed`. Drop it; the
+            // real story is on `Bootstrapped` and `Ready`.
+            None => repo_seed::drop_seed_condition(conditions),
         };
     // A result-less Job failure carries no backend verdict (mover
     // crashed / evicted / deadline / result write hit a down apiserver

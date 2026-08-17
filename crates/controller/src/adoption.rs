@@ -285,7 +285,20 @@ pub fn plan_adoption(
                 // A catalog that is EMPTY says nothing (the scan may not have
                 // run yet) — only a populated one none of whose entries match
                 // is evidence of an identity mismatch.
-                no_adoptable_history: no_match_first_time && catalog_non_empty,
+                //
+                // Deliberately NOT latched behind `already_requested`, unlike
+                // `request_scan`. That latch is stamped by the FIRST no-match
+                // pass, and in the apply-everything disaster-recovery flow the
+                // first pass very plausibly races the discovered-Snapshot
+                // reflector: it sees an empty catalog, requests a scan, stamps
+                // the identity — and every later pass, now seeing the real
+                // non-empty catalog, would find the latch already set and stay
+                // silent forever. Losing the ONE signal that a recovered
+                // identity does not match the history it was meant to reclaim
+                // is a far worse outcome than repeating a Warning that the
+                // apiserver aggregates by (reason, object) into a single
+                // counted Event.
+                no_adoptable_history: !matched_any && !history.has_history && catalog_non_empty,
             }
         }
     }
@@ -1068,9 +1081,10 @@ mod tests {
         );
         assert!(!plan.no_adoptable_history);
 
-        // ...and it fires ONCE per (policy, identity): the same latch the
-        // no-match scan request uses. A second pass, with the identity already
-        // stamped, stays silent.
+        // ...and it is deliberately NOT latched behind the scan-request stamp:
+        // a first pass racing the reflector store (empty catalog -> scan
+        // requested -> identity stamped) would otherwise suppress the warning
+        // forever, in exactly the apply-everything DR flow it exists for.
         let plan = plan_adoption(
             SnapshotAdoption::Adopt,
             &mine,
@@ -1083,8 +1097,11 @@ mod tests {
             },
             &gate,
         );
-        assert!(!plan.no_adoptable_history);
-        assert!(!plan.request_scan);
+        assert!(
+            plan.no_adoptable_history,
+            "the warning must survive an already-stamped scan-request latch"
+        );
+        assert!(!plan.request_scan, "the scan request itself stays latched");
     }
 
     #[test]

@@ -105,3 +105,34 @@ mod tests {
         );
     }
 }
+
+/// The bootstrap/catalog-scan ("discovery") Job name for a repository of either
+/// kind.
+///
+/// "discovery", not "bootstrap": the FIRST run does bootstrap the repository,
+/// but every later run of this Job is a catalog re-scan — the name follows the
+/// recurring purpose users actually see. (`{repo}-bootstrap` is the pre-rename
+/// name, still reaped by `io::legacy_bootstrap_cleared` during an upgrade.)
+///
+/// Shared because the name is a LOOKUP KEY in four places across the two
+/// repository reconcilers — the launch, the finished-Job read, the recycle, and
+/// the `ClusterRepository` deletion path that reaps an in-flight seeding Job
+/// (#380). A typo in any one of them silently means "no Job here": the
+/// reconciler would launch a second mover against the same repository, or leave
+/// a 24h seeding Job running after its CR is gone.
+///
+/// ```
+/// assert_eq!(kopiur_controller::naming::discovery_job_name("nas"), "nas-discovery");
+/// ```
+pub fn discovery_job_name(repo: &str) -> String {
+    format!("{repo}-discovery")
+}
+
+#[cfg(test)]
+mod discovery_job_name_tests {
+    #[test]
+    fn the_suffix_is_the_one_every_lookup_site_uses() {
+        assert_eq!(super::discovery_job_name("nas"), "nas-discovery");
+        assert_eq!(super::discovery_job_name("shared"), "shared-discovery");
+    }
+}

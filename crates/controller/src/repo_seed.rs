@@ -342,6 +342,62 @@ pub(crate) fn seed_success_fold(outcome: &SeedOutcome, now: &str) -> SeedSuccess
     }
 }
 
+/// **Pure.** Drop any `Seeded` condition from `conditions`.
+///
+/// Conditions are upsert-only everywhere else in this codebase, which is right
+/// for a condition that always has a current answer — but `Seeded` does not:
+/// once `spec.seed` is gone (or the bootstrap failed for a reason that says
+/// nothing about the seed), there IS no true `Seeded` value, and leaving the
+/// last one standing states something false. Three ways that bites, all of them
+/// user-visible and none self-healing:
+///
+/// * a repository parked on `WaitingForSeedSource`, whose owner gives up,
+///   removes `spec.seed` and enables `create` — it goes `Ready` carrying a
+///   permanent phantom "blocked on Seeded=False";
+/// * `spec.seed` removed while a seeding Job is in flight — the repository goes
+///   `Ready` still claiming a copy is in progress;
+/// * a seed-armed bootstrap that dies on a NON-seed failure (an `AuthFailure`
+///   against this repository's own backend, say) — `Seeded=False/Seeding`
+///   stands beside terminal `Failed`, telling the operator a copy is running
+///   when nothing is.
+///
+/// A dropped condition is the honest answer in all three: `Bootstrapped` and
+/// `Ready` already carry the real story.
+pub(crate) fn drop_seed_condition(
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    conditions
+        .iter()
+        .filter(|c| c.type_ != kopiur_api::consts::SEEDED_CONDITION)
+        .cloned()
+        .collect()
+}
+
+/// **Pure.** Whether a previously-recorded `Seeded=False` reason is one of the
+/// FAILURE reasons, as opposed to the park/progress ones.
+///
+/// The seeding-progress writer consults this so it leaves a recorded failure
+/// standing instead of overwriting it with `Seeding` on every relaunch. Without
+/// that, each ~2-minute retry cycle would rewrite the condition twice
+/// (`<class>` → `Seeding` → `<class>`), making every cycle a fresh status
+/// TRANSITION — and the failure Event and the
+/// `kopiur_repository_seed_total{outcome="failed"}` increment are both gated on
+/// exactly that, so a dead seed source would mint ~30 Events and ~30 counter
+/// increments an hour instead of one per real change.
+///
+/// Keeping the failure reason visible is also the better report: "the last
+/// attempt failed with X, and kopiur is retrying" beats "seeding", which is
+/// what a bare relaunch would say.
+pub(crate) fn seed_failure_recorded(
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> bool {
+    conditions.iter().any(|c| {
+        c.type_ == kopiur_api::consts::SEEDED_CONDITION
+            && c.status == kopiur_api::gates::CONDITION_FALSE
+            && kopiur_api::consts::SEED_FAILURE_REASONS.contains(&c.reason.as_str())
+    })
+}
+
 /// The API-side [`SeedMode`] of a mover outcome. Exhaustive over the wire enum,
 /// which is what keeps `status.seed.mode` and the metric label speaking the
 /// same vocabulary as the CRD.
@@ -1199,6 +1255,137 @@ mod tests {
             RepositoryKind::Repository,
         );
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    fn cond(
+        type_: &str,
+        status: &str,
+        reason: &str,
+    ) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+            type_: type_.into(),
+            status: status.into(),
+            reason: reason.into(),
+            message: "m".into(),
+            observed_generation: None,
+            last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ),
+        }
+    }
+
+    /// The three ways a stale `Seeded=False` used to survive onto a repository
+    /// it no longer describes. Conditions are upsert-only everywhere else, so
+    /// each of these left a permanent, self-contradicting block that no later
+    /// reconcile could clear.
+    #[test]
+    fn a_seeded_condition_that_no_longer_describes_anything_is_dropped() {
+        use kopiur_api::consts as c;
+        let keep = cond("Bootstrapped", "True", "Bootstrapped");
+        let ready = cond("Ready", "True", "Bootstrapped");
+
+        // (a) parked on WaitingForSeedSource, then the owner removes spec.seed
+        //     and enables create — the repository goes Ready, and without the
+        //     drop it carries a permanent phantom "blocked on Seeded=False".
+        let parked = vec![
+            keep.clone(),
+            cond(
+                c::SEEDED_CONDITION,
+                "False",
+                c::WAITING_FOR_SEED_SOURCE_REASON,
+            ),
+            ready.clone(),
+        ];
+        let out = drop_seed_condition(&parked);
+        assert!(!out.iter().any(|x| x.type_ == c::SEEDED_CONDITION));
+        assert_eq!(out.len(), 2, "only the Seeded condition is removed");
+        assert_eq!(out[0].type_, "Bootstrapped");
+        assert_eq!(out[1].type_, "Ready");
+
+        // (b) spec.seed removed MID-FLIGHT: the running Job finishes, its
+        //     result carries no seed outcome, and the repository would go Ready
+        //     still claiming a copy is in progress.
+        let seeding = vec![
+            keep.clone(),
+            cond(c::SEEDED_CONDITION, "False", c::SEEDING_REASON),
+        ];
+        assert!(
+            !drop_seed_condition(&seeding)
+                .iter()
+                .any(|x| x.type_ == c::SEEDED_CONDITION)
+        );
+
+        // (c) a seed-armed bootstrap dying on a NON-seed failure: an
+        //     `AuthFailure` against this repository's own backend says nothing
+        //     about the seed, so `Seeded=False/Seeding` beside terminal
+        //     `Failed` claims a copy is running when nothing is.
+        let mid_seed_auth_failure = vec![
+            cond("Bootstrapped", "False", "AuthFailure"),
+            cond(c::SEEDED_CONDITION, "False", c::SEEDING_REASON),
+        ];
+        let out = drop_seed_condition(&mid_seed_auth_failure);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reason, "AuthFailure", "the real story survives");
+
+        // Idempotent, and a no-op when there is nothing to drop.
+        assert_eq!(drop_seed_condition(&out).len(), 1);
+        assert!(drop_seed_condition(&[]).is_empty());
+    }
+
+    /// MINOR-3: the relaunch must NOT overwrite a recorded failure with
+    /// `Seeding`, or every ~2-minute retry cycle becomes a fresh status
+    /// transition — and the failure Event and the `failed` metric are gated on
+    /// exactly that.
+    #[test]
+    fn a_recorded_seed_failure_suppresses_the_seeding_rewrite() {
+        use kopiur_api::consts as c;
+        // Every failure reason this build can write suppresses it...
+        for reason in c::SEED_FAILURE_REASONS {
+            assert!(
+                seed_failure_recorded(&[cond(c::SEEDED_CONDITION, "False", reason)]),
+                "{reason} must suppress the Seeding rewrite"
+            );
+        }
+        // ...and the park/progress reasons do NOT (a park must be allowed to
+        // advance to Seeding when the Job finally launches, and a re-poll of an
+        // in-flight seed must be free to refresh its own message).
+        assert!(!seed_failure_recorded(&[cond(
+            c::SEEDED_CONDITION,
+            "False",
+            c::WAITING_FOR_SEED_SOURCE_REASON
+        )]));
+        assert!(!seed_failure_recorded(&[cond(
+            c::SEEDED_CONDITION,
+            "False",
+            c::SEEDING_REASON
+        )]));
+        // A SUCCEEDED seed does not suppress anything either (polarity matters:
+        // the reason set is only meaningful at `False`).
+        assert!(!seed_failure_recorded(&[cond(
+            c::SEEDED_CONDITION,
+            "True",
+            c::SEEDED_REASON
+        )]));
+        // Nor does a same-named reason on a DIFFERENT condition.
+        assert!(!seed_failure_recorded(&[cond(
+            "Bootstrapped",
+            "False",
+            c::SEED_SOURCE_EMPTY_REASON
+        )]));
+        assert!(!seed_failure_recorded(&[]));
+    }
+
+    #[test]
+    fn the_skew_message_names_every_step_including_the_stranded_job() {
+        // The guard is terminal and nothing recycles the finished Job before
+        // its ~1h TTL, so an operator who upgrades the image and stops there
+        // sees no change for up to an hour and concludes the fix did not work.
+        let m = crate::io::seed_mover_too_old_message();
+        assert!(!m.contains("   "), "wrapped source whitespace: {m}");
+        assert!(m.contains("upgrade the mover image"), "{m}");
+        assert!(m.contains("delete the empty repository"), "{m}");
+        assert!(m.contains("delete job"), "{m}");
+        assert!(m.contains("discovery"), "{m}");
     }
 
     #[test]

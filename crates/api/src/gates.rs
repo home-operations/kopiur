@@ -444,6 +444,66 @@ pub const SEEDING_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Warn,
 };
 
+/// A `spec.seed` whose SOURCE answered but holds no kopia repository. Retried
+/// automatically every ~2 minutes, so it clears itself the moment the source
+/// exists — but until then the repository never becomes `Ready`, and the fix
+/// (repoint `spec.seed.from`) is squarely out-of-band.
+pub const SEED_SOURCE_NOT_FOUND_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::SEEDED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::SEED_SOURCE_NOT_FOUND_REASON,
+    severity: GateSeverity::Warn,
+};
+
+/// A `spec.seed` whose source is a real repository holding zero snapshots, with
+/// `allowEmptySource` at its `false` default. Blocking `Ready` is the point: a
+/// valid-but-empty mirror is nearly always mis-pointed.
+pub const SEED_SOURCE_EMPTY_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::SEEDED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::SEED_SOURCE_EMPTY_REASON,
+    severity: GateSeverity::Warn,
+};
+
+/// A migrate-mode seed whose post-verify found snapshots missing. The next
+/// attempt resumes the copy, so this converges on its own — but a seed that
+/// keeps being cut short needs a human to raise its deadline.
+pub const SEED_INCOMPLETE_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::SEEDED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::SEED_INCOMPLETE_REASON,
+    severity: GateSeverity::Warn,
+};
+
+/// A seed that was armed and left the repository holding ZERO snapshots. Like
+/// [`SEED_INCOMPLETE_GATE`], the next attempt resumes the copy.
+pub const SEED_LEFT_EMPTY_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::SEEDED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::SEED_LEFT_EMPTY_REASON,
+    severity: GateSeverity::Warn,
+};
+
+/// The mover-skew guard: the running mover image predates `spec.seed`, ignored
+/// it, and initialized an EMPTY repository. Genuinely terminal and genuinely
+/// human-actionable (upgrade the image, delete the empty repository and the
+/// terminal bootstrap Job) — the ONE row here that would earn `Fail` on its own
+/// merits. It is `Warn` because the registry pins one severity per
+/// condition+scope and its siblings must not turn a healthy in-progress seed
+/// red; nothing is lost, because a repository in this state is also not `Ready`,
+/// which `doctor`'s repository check fails on independently.
+pub const SEED_MOVER_TOO_OLD_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::SEEDED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::SEED_MOVER_TOO_OLD_REASON,
+    severity: GateSeverity::Warn,
+};
+
 /// Every human-actionable structural gate kopiur's reconcilers can park an
 /// object on.
 ///
@@ -477,6 +537,11 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     SOURCE_PVC_MISSING_GATE,
     SEED_SOURCE_NOT_READY_GATE,
     SEEDING_GATE,
+    SEED_SOURCE_NOT_FOUND_GATE,
+    SEED_SOURCE_EMPTY_GATE,
+    SEED_INCOMPLETE_GATE,
+    SEED_LEFT_EMPTY_GATE,
+    SEED_MOVER_TOO_OLD_GATE,
 ];
 
 #[cfg(test)]
@@ -622,6 +687,54 @@ mod tests {
     }
 
     #[test]
+    fn every_seeded_false_reason_this_build_writes_has_a_row() {
+        // The `Seeded` condition is the one gated condition with a WIDE reason
+        // set, and a partial registration is worse than none: a reason with no
+        // row still trips `StructuralGate::trips`, so `kubectl kopiur doctor`
+        // classifies it as UNREGISTERED and tells the operator "the operator is
+        // newer than the plugin — upgrade the plugin". That would be a false
+        // diagnosis handed to someone mid-disaster-recovery, whose actual
+        // problem is a mis-pointed seed source.
+        //
+        // So: every reason this build can stamp on `Seeded=False` must select
+        // exactly one row. The list is assembled from the two park/progress
+        // reasons plus the shared failure set, so a new reason added to
+        // `consts::SEED_FAILURE_REASONS` fails here until it is registered.
+        let mut reasons: Vec<&str> = vec![
+            consts::WAITING_FOR_SEED_SOURCE_REASON,
+            consts::SEEDING_REASON,
+        ];
+        reasons.extend_from_slice(consts::SEED_FAILURE_REASONS);
+        for reason in reasons {
+            let hits: Vec<_> = STRUCTURAL_GATES
+                .iter()
+                .filter(|g| g.matches(consts::SEEDED_CONDITION, CONDITION_FALSE, reason))
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "Seeded=False reason `{reason}` selects {} rows, not 1 — doctor would report it \
+                 as an unknown reason from a newer operator",
+                hits.len()
+            );
+            assert!(hits[0].applies_to.covers_repository());
+        }
+        // Guard against the reverse rot: every registered `Seeded` row must be
+        // one of those reasons, so a row nobody can write cannot linger.
+        for g in STRUCTURAL_GATES
+            .iter()
+            .filter(|g| g.condition == consts::SEEDED_CONDITION)
+        {
+            assert!(
+                g.reason == consts::WAITING_FOR_SEED_SOURCE_REASON
+                    || g.reason == consts::SEEDING_REASON
+                    || consts::SEED_FAILURE_REASONS.contains(&g.reason),
+                "{g:?}: registered but not a reason this build writes"
+            );
+        }
+    }
+
+    #[test]
     fn expected_gates_are_registered_with_expected_scope_and_severity() {
         // Pins the exact contract M3's doctor consumes. A row removed, or its
         // severity/scope quietly changed, fails here rather than silently
@@ -715,6 +828,41 @@ mod tests {
                 consts::SEEDED_CONDITION,
                 CONDITION_FALSE,
                 consts::SEEDING_REASON,
+                GateScope::Repository,
+                GateSeverity::Warn,
+            ),
+            (
+                consts::SEEDED_CONDITION,
+                CONDITION_FALSE,
+                consts::SEED_SOURCE_NOT_FOUND_REASON,
+                GateScope::Repository,
+                GateSeverity::Warn,
+            ),
+            (
+                consts::SEEDED_CONDITION,
+                CONDITION_FALSE,
+                consts::SEED_SOURCE_EMPTY_REASON,
+                GateScope::Repository,
+                GateSeverity::Warn,
+            ),
+            (
+                consts::SEEDED_CONDITION,
+                CONDITION_FALSE,
+                consts::SEED_INCOMPLETE_REASON,
+                GateScope::Repository,
+                GateSeverity::Warn,
+            ),
+            (
+                consts::SEEDED_CONDITION,
+                CONDITION_FALSE,
+                consts::SEED_LEFT_EMPTY_REASON,
+                GateScope::Repository,
+                GateSeverity::Warn,
+            ),
+            (
+                consts::SEEDED_CONDITION,
+                CONDITION_FALSE,
+                consts::SEED_MOVER_TOO_OLD_REASON,
                 GateScope::Repository,
                 GateSeverity::Warn,
             ),

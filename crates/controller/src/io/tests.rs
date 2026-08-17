@@ -2380,8 +2380,32 @@ mod bootstrap_outcomes {
             mb::SEED_LEFT_EMPTY_CLASS,
         ] {
             let f = SeedFailure::from_class(class).unwrap_or_else(|| panic!("{class} unmapped"));
-            assert_eq!(f.reason(), class, "reason must BE the mover's class label");
+            // THE cross-crate pin. `reason()` reads `kopiur_api::consts` (so
+            // `kopiur_api::gates` can register the same strings without
+            // depending on the mover) while `from_class` reads the mover's
+            // sentinels. This is the only crate that sees both, so if the two
+            // ever drift, a real failure would stop selecting its gate row and
+            // doctor would report it as an unknown reason from a newer
+            // operator.
+            assert_eq!(
+                f.reason(),
+                class,
+                "the api reason must BE the mover's class label"
+            );
             assert!(!f.action().is_empty());
+            // ...and it must actually select a registry row.
+            assert_eq!(
+                kopiur_api::gates::STRUCTURAL_GATES
+                    .iter()
+                    .filter(|g| g.matches(
+                        kopiur_api::consts::SEEDED_CONDITION,
+                        kopiur_api::gates::CONDITION_FALSE,
+                        f.reason()
+                    ))
+                    .count(),
+                1,
+                "{class} must select exactly one structural-gate row"
+            );
         }
         // Nothing else is a seed failure — not the sibling create sentinel, not
         // a kopia class, not the mover's internal-inconsistency class.
@@ -2428,10 +2452,10 @@ mod bootstrap_outcomes {
         // invariant both reproduce identically on every attempt.
         let skew = BootstrapFailure::SeedMoverTooOld;
         assert!(!skew.recycles_for_retry());
-        assert_eq!(skew.reason(), crate::consts::SEED_MOVER_TOO_OLD_REASON);
+        assert_eq!(skew.reason(), kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON);
         assert_eq!(
             skew.seed_reason(),
-            Some(crate::consts::SEED_MOVER_TOO_OLD_REASON)
+            Some(kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON)
         );
         let inconsistent = BootstrapFailure::InternalInconsistency {
             message: "contradiction".into(),
@@ -3457,6 +3481,43 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         kopiur_api::consts::SEEDING_REASON,
         "repository::write_seeding_condition + \
          cluster_repository::write_cluster_seeding_condition (upsert_gate)",
+    ),
+    // The five `Seeded=False` FAILURE reasons, all folded by
+    // `repository::finalize_bootstrap_failure` +
+    // `cluster_repository::finalize_cluster_bootstrap_failure` from
+    // `BootstrapFailure::seed_reason()`. One writer, five rows: the reason is
+    // computed from the typed failure, so the fold keeps its own
+    // `upsert_condition` rather than naming a row.
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_SOURCE_NOT_FOUND_REASON,
+        "repository::finalize_bootstrap_failure seed fold (computed reason)",
+    ),
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_SOURCE_EMPTY_REASON,
+        "repository::finalize_bootstrap_failure seed fold (computed reason)",
+    ),
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_INCOMPLETE_REASON,
+        "repository::finalize_bootstrap_failure seed fold (computed reason)",
+    ),
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_LEFT_EMPTY_REASON,
+        "repository::finalize_bootstrap_failure seed fold (computed reason)",
+    ),
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON,
+        "repository::finalize_bootstrap_failure seed fold, mover-skew guard \
+         (computed reason)",
     ),
 ];
 

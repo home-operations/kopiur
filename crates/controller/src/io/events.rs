@@ -706,15 +706,19 @@ impl SeedFailure {
     }
 
     /// The machine-readable `reason` shared by the `Bootstrapped=False` and
-    /// `Seeded=False` conditions and the Warning Event — the mover's own class
-    /// label, so the three can never drift. Exhaustive.
+    /// `Seeded=False` conditions, the Warning Event and the structural-gate
+    /// registry. Byte-identical to the mover's own class label — pinned by
+    /// `io::tests::every_seed_class_maps_to_a_typed_failure_and_routes_by_retryability`,
+    /// which is the only crate that sees both sides. Sourced from
+    /// `kopiur_api::consts` rather than the mover so `kopiur_api::gates` can
+    /// register the same strings. Exhaustive.
     pub fn reason(self) -> &'static str {
-        use kopiur_mover::bootstrap as mb;
+        use kopiur_api::consts as c;
         match self {
-            Self::SourceNotFound => mb::SEED_SOURCE_NOT_FOUND_CLASS,
-            Self::SourceEmpty => mb::SEED_SOURCE_EMPTY_CLASS,
-            Self::Incomplete => mb::SEED_INCOMPLETE_CLASS,
-            Self::LeftEmpty => mb::SEED_LEFT_EMPTY_CLASS,
+            Self::SourceNotFound => c::SEED_SOURCE_NOT_FOUND_REASON,
+            Self::SourceEmpty => c::SEED_SOURCE_EMPTY_REASON,
+            Self::Incomplete => c::SEED_INCOMPLETE_REASON,
+            Self::LeftEmpty => c::SEED_LEFT_EMPTY_REASON,
         }
     }
 
@@ -740,8 +744,11 @@ pub fn seed_mover_too_old_message() -> String {
      of copying your data in. kopiur refuses to report Ready over that, because an empty \
      repository that looks healthy is exactly the failure spec.seed exists to prevent. Fix: \
      upgrade the mover image (Helm `mover.image.tag`, or `KOPIUR_MOVER_IMAGE`) to the same \
-     version as the controller, then delete the empty repository at the backend so the seed can \
-     run from scratch."
+     version as the controller, delete the empty repository at the backend so the seed can run \
+     from scratch, then delete this repository\'s finished bootstrap Job \
+     (`kubectl -n <namespace> delete job <repository>-discovery`) — nothing recycles a terminal \
+     Job before its ~1h TTL, so without that last step the upgraded mover will not be given a \
+     chance to run for up to an hour."
         .to_string()
 }
 
@@ -756,7 +763,7 @@ impl BootstrapFailure {
             BootstrapFailure::JobFailedWithoutResult { .. } => BOOTSTRAP_JOB_FAILED_REASON,
             BootstrapFailure::RepositoryNotInitialized => REPOSITORY_NOT_INITIALIZED_REASON,
             BootstrapFailure::Seed { failure, .. } => failure.reason(),
-            BootstrapFailure::SeedMoverTooOld => crate::consts::SEED_MOVER_TOO_OLD_REASON,
+            BootstrapFailure::SeedMoverTooOld => kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON,
             BootstrapFailure::InternalInconsistency { .. } => {
                 kopiur_mover::bootstrap::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS
             }
@@ -770,7 +777,9 @@ impl BootstrapFailure {
     pub fn seed_reason(&self) -> Option<&'static str> {
         match self {
             BootstrapFailure::Seed { failure, .. } => Some(failure.reason()),
-            BootstrapFailure::SeedMoverTooOld => Some(crate::consts::SEED_MOVER_TOO_OLD_REASON),
+            BootstrapFailure::SeedMoverTooOld => {
+                Some(kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON)
+            }
             BootstrapFailure::Backend { .. }
             | BootstrapFailure::JobFailedWithoutResult { .. }
             | BootstrapFailure::RepositoryNotInitialized
@@ -964,7 +973,7 @@ impl BootstrapFailure {
                     ctx,
                     regarding,
                     name,
-                    crate::consts::SEED_MOVER_TOO_OLD_REASON,
+                    kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON,
                     crate::consts::UPGRADE_MOVER_IMAGE_ACTION,
                     note,
                 )
