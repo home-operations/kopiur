@@ -781,6 +781,279 @@ pub fn should_attempt_create(auto_create: bool, class: KopiaErrorClass) -> bool 
 mod tests {
     use super::*;
 
+    // --- #380: the seed init decision + seed outcomes ----------------------
+
+    /// Every `KopiaErrorClass`, so the matrices below cannot silently skip one
+    /// a future variant adds.
+    const ALL_CLASSES: [KopiaErrorClass; 8] = [
+        KopiaErrorClass::RepositoryUnavailable,
+        KopiaErrorClass::AuthFailure,
+        KopiaErrorClass::AccessDenied,
+        KopiaErrorClass::PermissionDenied,
+        KopiaErrorClass::NotFound,
+        KopiaErrorClass::Locked,
+        KopiaErrorClass::SourceError,
+        KopiaErrorClass::Unknown,
+    ];
+
+    #[test]
+    fn an_unopenable_repository_is_never_created_and_never_seeded_over() {
+        // A repo exists here we can't open (wrong password), another writer
+        // holds it, or the backend refused us. Creating risks a second
+        // repository; seeding would write another cluster's data over a state
+        // we could not even read. Both are unrecoverable mistakes, so neither
+        // is ever attempted — for ANY combination of the two opt-ins.
+        for class in [
+            KopiaErrorClass::AuthFailure,
+            KopiaErrorClass::Locked,
+            KopiaErrorClass::AccessDenied,
+            KopiaErrorClass::PermissionDenied,
+        ] {
+            for seed in [false, true] {
+                for create in [false, true] {
+                    for uninit in [false, true] {
+                        assert_eq!(
+                            bootstrap_init_action(seed, create, class, uninit),
+                            BootstrapInitAction::Fail,
+                            "{class:?} seed={seed} create={create} uninit={uninit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_armed_seed_runs_only_on_a_genuinely_uninitialized_backend() {
+        // The `uninitialized` half is what keeps a mis-mounted volume from
+        // being seeded over: a missing path classifies `NotFound` too ("no such
+        // file or directory"), and only kopia's "repository not initialized"
+        // proves the backend answered and is simply empty.
+        assert_eq!(
+            bootstrap_init_action(true, false, KopiaErrorClass::NotFound, true),
+            BootstrapInitAction::Seed
+        );
+        assert_eq!(
+            bootstrap_init_action(true, false, KopiaErrorClass::NotFound, false),
+            BootstrapInitAction::Fail
+        );
+        // `auto_create` does not gate a seed either way — a seed is the
+        // initialization the user explicitly asked for, not the create fallback.
+        assert_eq!(
+            bootstrap_init_action(true, true, KopiaErrorClass::NotFound, true),
+            BootstrapInitAction::Seed
+        );
+    }
+
+    #[test]
+    fn an_armed_seed_never_falls_back_to_creating_an_empty_repository() {
+        // THE #380 invariant. Any class that is not a proven-empty backend must
+        // Fail rather than Create: falling back would report a `Ready` but
+        // EMPTY repository, which is the data-loss shape the feature exists to
+        // prevent. Note `auto_create: true` throughout — the fallback is armed
+        // and still must not fire.
+        for class in ALL_CLASSES {
+            let action = bootstrap_init_action(true, true, class, false);
+            assert_ne!(
+                action,
+                BootstrapInitAction::Create,
+                "a seed-armed bootstrap must never create ({class:?})"
+            );
+        }
+        // With the "backend is empty" proof, the only non-Fail outcome is Seed.
+        for class in ALL_CLASSES {
+            assert_ne!(
+                bootstrap_init_action(true, true, class, true),
+                BootstrapInitAction::Create,
+                "a seed-armed bootstrap must never create ({class:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_seed_the_decision_is_exactly_the_old_create_gate() {
+        // `should_attempt_create` is now this function's Create arm; the two
+        // must agree for every class and both opt-in states, so the #380
+        // refactor cannot have changed a single pre-existing decision.
+        for class in ALL_CLASSES {
+            for create in [false, true] {
+                for uninit in [false, true] {
+                    let creates = bootstrap_init_action(false, create, class, uninit)
+                        == BootstrapInitAction::Create;
+                    assert_eq!(
+                        creates,
+                        should_attempt_create(create, class),
+                        "{class:?} create={create} uninit={uninit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_seed_outcome_round_trips_and_distinguishes_the_no_op() {
+        let performed = SeedOutcome::performed(
+            crate::workspec::SeedModeSpec::Migrate,
+            "ClusterRepository/offsite".into(),
+            42,
+            Some(42),
+        );
+        assert!(performed.performed);
+        let v = serde_json::to_value(&performed).unwrap();
+        assert_eq!(v["mode"], "migrate");
+        assert_eq!(v["source"], "ClusterRepository/offsite");
+        assert_eq!(v["snapshotCount"], 42);
+        assert_eq!(v["snapshotsCopied"], 42);
+        let back: SeedOutcome = serde_json::from_value(v).unwrap();
+        assert_eq!(back, performed);
+
+        // The already-initialized no-op still names mode + source (the
+        // controller renders `status.seed` from them), but carries no counts:
+        // nothing was opened, so reporting zero would be a lie.
+        let noop =
+            SeedOutcome::already_initialized(crate::workspec::SeedModeSpec::Blob, "S3".into());
+        assert!(!noop.performed);
+        assert!(noop.snapshot_count.is_none());
+        assert!(noop.snapshots_copied.is_none());
+        let v = serde_json::to_value(&noop).unwrap();
+        assert!(v.get("snapshotCount").is_none());
+        assert!(v.get("snapshotsCopied").is_none());
+        assert_eq!(serde_json::from_value::<SeedOutcome>(v).unwrap(), noop);
+
+        // A blob copy moves storage, not manifests — no per-snapshot count.
+        let blob =
+            SeedOutcome::performed(crate::workspec::SeedModeSpec::Blob, "S3".into(), 7, None);
+        assert_eq!(blob.snapshot_count, Some(7));
+        assert!(blob.snapshots_copied.is_none());
+    }
+
+    #[test]
+    fn a_bootstrap_result_carries_its_seed_outcome_and_still_decodes_old_wire() {
+        let r = BootstrapResult::ready(false, Some("abc".into()), 3, vec![], false, 0, None)
+            .with_seed(Some(SeedOutcome::performed(
+                crate::workspec::SeedModeSpec::Blob,
+                "S3".into(),
+                3,
+                None,
+            )));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["seed"]["mode"], "blob");
+        assert_eq!(v["seed"]["performed"], true);
+        // A blob seed leaves `created` false — only the create fallback creates.
+        assert_eq!(v["created"], false);
+        assert_eq!(serde_json::from_value::<BootstrapResult>(v).unwrap(), r);
+
+        // Old wire (and every unseeded bootstrap): no `seed` key at all, which
+        // must decode to `None` and re-serialize without one.
+        let old = r#"{"success":true,"created":true,"uniqueId":"abc","snapshotCount":0,
+                       "snapshots":[],"snapshotsTruncated":false}"#;
+        let parsed: BootstrapResult = serde_json::from_str(old).unwrap();
+        assert!(parsed.seed.is_none());
+        assert!(serde_json::to_value(&parsed).unwrap().get("seed").is_none());
+    }
+
+    #[test]
+    fn seed_failures_are_retryable_and_carry_no_partial_outcome() {
+        // D9: a dead or empty mirror routes to the controller's recycle arm and
+        // is retried every couple of minutes — the promptness disaster recovery
+        // wants — rather than needing a spec edit like `not_initialized` does.
+        for (result, class) in [
+            (
+                BootstrapResult::seed_source_not_found(),
+                SEED_SOURCE_NOT_FOUND_CLASS,
+            ),
+            (
+                BootstrapResult::seed_source_empty(),
+                SEED_SOURCE_EMPTY_CLASS,
+            ),
+            (
+                BootstrapResult::seed_incomplete(2, 5, "a@b:/c@2026-01-01T00:00:00Z"),
+                SEED_INCOMPLETE_CLASS,
+            ),
+        ] {
+            assert!(!result.success, "{class}");
+            // A failure never reports a seed outcome: a half-populated one would
+            // read as a seed that partly worked.
+            assert!(result.seed.is_none(), "{class}");
+            let failure = result.failure.expect("failure block");
+            assert_eq!(failure.kopia_error_class, class);
+            assert!(failure.retry_recommended, "{class} must be retryable");
+            assert!(!failure.message.is_empty(), "{class}");
+        }
+        // The pre-existing sentinel is unchanged: it needs a spec change, so it
+        // is deliberately NOT retryable.
+        let r = BootstrapResult::not_initialized();
+        let f = r.failure.expect("failure block");
+        assert_eq!(f.kopia_error_class, REPOSITORY_NOT_INITIALIZED_CLASS);
+        assert!(!f.retry_recommended);
+        assert_eq!(f.message, REPOSITORY_NOT_INITIALIZED_MESSAGE);
+    }
+
+    #[test]
+    fn every_seed_failure_message_says_what_why_and_how_to_fix_it() {
+        let not_found = BootstrapResult::seed_source_not_found()
+            .failure
+            .unwrap()
+            .message;
+        // what
+        assert!(
+            not_found.contains("holds no kopia repository"),
+            "{not_found}"
+        );
+        // fix: the overwhelmingly common cause is a wrong prefix
+        assert!(not_found.contains("spec.seed.from"), "{not_found}");
+        assert!(not_found.contains("prefix"), "{not_found}");
+
+        let empty = BootstrapResult::seed_source_empty()
+            .failure
+            .unwrap()
+            .message;
+        // what + why it is refused rather than silently accepted
+        assert!(empty.contains("zero snapshots"), "{empty}");
+        assert!(empty.contains("Ready"), "{empty}");
+        // fix: name the exact override field
+        assert!(
+            empty.contains("spec.seed.allowEmptySource: true"),
+            "{empty}"
+        );
+
+        let incomplete = BootstrapResult::seed_incomplete(2, 5, "mydb@prod:/pvc@t")
+            .failure
+            .unwrap()
+            .message;
+        // what: the counts and a sample of what did not arrive
+        assert!(incomplete.contains("2 of 5"), "{incomplete}");
+        assert!(incomplete.contains("mydb@prod:/pvc@t"), "{incomplete}");
+        // why exit 0 was not the success signal
+        assert!(incomplete.contains("exits 0"), "{incomplete}");
+        // fix: retrying is safe and copies only the remainder
+        assert!(incomplete.contains("idempotent"), "{incomplete}");
+
+        // Authored through a bash heredoc, not a Python one — the wrapped-
+        // whitespace defect that hit the C1 error literals would show up here.
+        for msg in [not_found, empty, incomplete] {
+            assert!(!msg.contains("   "), "wrapped source whitespace: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_mover_error_becomes_a_bootstrap_failure_without_inventing_a_class() {
+        // The seed paths can fail outside a kopia invocation (credential
+        // staging, a missing source password). Class, retry hint and message
+        // must all come from the typed error rather than a hand-written trio
+        // that could drift.
+        let err = crate::error::MoverError::SeedPasswordMissing {
+            env_key: crate::env::SEED_KOPIA_PASSWORD,
+        };
+        let r = BootstrapResult::from_mover_error(&err);
+        assert!(!r.success);
+        assert!(r.seed.is_none());
+        let f = r.failure.unwrap();
+        assert_eq!(f.kopia_error_class, err.kopia_class().as_str());
+        assert_eq!(f.retry_recommended, err.retry_recommended());
+        assert_eq!(f.message, err.to_string());
+    }
+
     #[test]
     fn create_blocked_on_auth_and_lock() {
         // An existing repo we can't open / is locked must never be recreated.

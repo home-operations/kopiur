@@ -843,6 +843,30 @@ mod tests {
     }
 
     #[test]
+    fn seed_password_missing_names_the_env_var_and_the_projection_prerequisite() {
+        let err = MoverError::SeedPasswordMissing {
+            env_key: crate::env::SEED_KOPIA_PASSWORD,
+        };
+        let msg = err.to_string();
+        // what: the exact env var, so it is greppable in the Job spec
+        assert!(msg.contains("$KOPIUR_SEED_KOPIA_PASSWORD"), "{msg}");
+        // why: it belongs to the SOURCE repository, not this one
+        assert!(
+            msg.contains("SOURCE repository's encryption Secret"),
+            "{msg}"
+        );
+        // fix: the cross-namespace case needs projection AND the install flag
+        assert!(msg.contains("spec.seed.credentialProjection"), "{msg}");
+        assert!(msg.contains("features.credentialProjection"), "{msg}");
+        // Environmental/config: re-running the same pod will not help.
+        assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+        assert!(!err.retry_recommended());
+        // Authored through a bash heredoc, not a Python one (the wrapped-
+        // whitespace defect that hit the C1 literals).
+        assert!(!msg.contains("   "), "wrapped source whitespace: {msg}");
+    }
+
+    #[test]
     fn dest_password_missing_names_the_env_var_and_the_fix() {
         let err = MoverError::DestPasswordMissing {
             env_key: crate::env::DEST_KOPIA_PASSWORD,

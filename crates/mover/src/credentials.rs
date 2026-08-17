@@ -640,6 +640,145 @@ mod tests {
     }
 
     #[test]
+    fn the_dest_wrappers_are_byte_compatible_with_the_prefixed_cores() {
+        // #380 generalized `dest_materialize_lookup`/`dest_env_overlay` into
+        // prefix-parameterized cores. The replication path must be unchanged by
+        // that refactor, so pin the wrappers against the cores directly rather
+        // than trusting the one-line bodies.
+        let env = BTreeMap::from([
+            (
+                format!("{DEST_ENV_PREFIX}AWS_ACCESS_KEY_ID"),
+                "dest-id".to_string(),
+            ),
+            (
+                format!("{DEST_ENV_PREFIX}{SFTP_KEY_DATA_ENV}"),
+                "DEST-KEY".to_string(),
+            ),
+            (
+                "AWS_WEB_IDENTITY_TOKEN_FILE".to_string(),
+                "/var/run/token".to_string(),
+            ),
+        ]);
+        let raw = |k: &str| env.get(k).cloned();
+        for key in [
+            SFTP_KEY_DATA_ENV,
+            "AWS_ACCESS_KEY_ID",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        ] {
+            assert_eq!(
+                dest_materialize_lookup(key, &raw),
+                prefixed_materialize_lookup(DEST_ENV_PREFIX, key, &raw),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            dest_env_overlay(&s3(), &raw),
+            prefixed_env_overlay(DEST_ENV_PREFIX, &s3(), &raw)
+        );
+    }
+
+    #[test]
+    fn seed_lookups_read_the_seed_prefix_and_never_this_repositorys_creds() {
+        // A repository can be both a seed target and a replication source, so
+        // the three credential sets in one seeding pod — this repository's
+        // (plain), the seed source's (KOPIUR_SEED_) and any replication
+        // destination's (KOPIUR_DEST_) — must not alias.
+        let env = BTreeMap::from([
+            (
+                format!("{SEED_ENV_PREFIX}{SFTP_KEY_DATA_ENV}"),
+                "SEED-KEY".to_string(),
+            ),
+            (
+                format!("{DEST_ENV_PREFIX}{SFTP_KEY_DATA_ENV}"),
+                "DEST-KEY".to_string(),
+            ),
+            (SFTP_KEY_DATA_ENV.to_string(), "LOCAL-KEY".to_string()),
+            (
+                "AWS_WEB_IDENTITY_TOKEN_FILE".to_string(),
+                "/var/run/token".to_string(),
+            ),
+        ]);
+        let raw = |k: &str| env.get(k).cloned();
+        assert_eq!(
+            seed_materialize_lookup(SFTP_KEY_DATA_ENV, &raw).as_deref(),
+            Some("SEED-KEY")
+        );
+        // Ambient hints stay unprefixed here too: they belong to the pod's
+        // ServiceAccount, not to any credential Secret.
+        assert_eq!(
+            seed_materialize_lookup("AWS_WEB_IDENTITY_TOKEN_FILE", &raw).as_deref(),
+            Some("/var/run/token")
+        );
+    }
+
+    #[test]
+    fn the_seed_overlay_and_its_plain_inverse_swap_the_two_credential_sets() {
+        // A blob seed is the mirror image of replication: the CONNECTED side is
+        // the seed source (dressed at the client level with KOPIUR_SEED_), and
+        // the sync-to writes into THIS repository, whose plain credentials the
+        // per-invocation overlay restores. Both overlays must also UNSET what
+        // their side does not provide, or the other side's key silently
+        // authenticates the wrong repository.
+        let env = BTreeMap::from([
+            (
+                format!("{SEED_ENV_PREFIX}AWS_ACCESS_KEY_ID"),
+                "seed-id".to_string(),
+            ),
+            (
+                format!("{SEED_ENV_PREFIX}AWS_SECRET_ACCESS_KEY"),
+                "seed-secret".to_string(),
+            ),
+            ("AWS_ACCESS_KEY_ID".to_string(), "local-id".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "local-secret".to_string(),
+            ),
+            // Only THIS repository carries a session token.
+            ("AWS_SESSION_TOKEN".to_string(), "local-token".to_string()),
+        ]);
+        let raw = |k: &str| env.get(k).cloned();
+
+        let seed = seed_env_overlay(&s3(), &raw);
+        assert_eq!(
+            seed.get("AWS_ACCESS_KEY_ID"),
+            Some(&Some("seed-id".to_string()))
+        );
+        // The seed source provides no session token, so this repository's is
+        // UNSET for the source connect rather than leaking into it.
+        assert_eq!(seed.get("AWS_SESSION_TOKEN"), Some(&None));
+
+        let plain = plain_env_overlay(&s3(), &raw);
+        assert_eq!(
+            plain.get("AWS_ACCESS_KEY_ID"),
+            Some(&Some("local-id".to_string()))
+        );
+        assert_eq!(
+            plain.get("AWS_SESSION_TOKEN"),
+            Some(&Some("local-token".to_string()))
+        );
+        // The two overlays cover exactly the same env names — that is what makes
+        // the inversion total: every name the seed connect overrode is restored
+        // (or explicitly unset) for the sync-to.
+        assert_eq!(
+            seed.keys().collect::<Vec<_>>(),
+            plain.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_prefixed_overlay_is_empty_for_a_file_based_backend() {
+        // SFTP/GCS/rclone credentials become FILES on argv, not env vars, so
+        // there is nothing for any overlay to set — the staging dir separation
+        // is what keeps those apart instead.
+        for overlay in [
+            seed_env_overlay(&sftp(None, None), &|_| None),
+            plain_env_overlay(&sftp(None, None), &|_| None),
+        ] {
+            assert!(overlay.is_empty());
+        }
+    }
+
+    #[test]
     fn dest_env_overlay_is_empty_for_file_based_backends() {
         // GCS/SFTP deliver via a materialized file, not a direct env var.
         let overlay = dest_env_overlay(&sftp(None, None), &|_| None);

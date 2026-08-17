@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 
 use kopiur_kopia::{
-    ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions, SyncToOptions,
-    VerifyOptions,
+    ConnectOptions, ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions,
+    SyncToOptions, VerifyOptions,
 };
 
 /// Build a client whose env isolates kopia state inside `config_dir` so the
@@ -714,5 +714,140 @@ async fn identity_scope_keep_max_pin_survives_twelve_creates() {
         12,
         "all 12 manifests must survive with the identity-scope keep-* pin applied; \
          without it kopia's own default keep-latest=10 would have pruned 2, got {list:?}"
+    );
+}
+
+/// Real-kopia guard for the blob-mode `spec.seed` mechanic (issue #380): the
+/// two behaviors the seeding mover rests on, neither of which the pure unit
+/// tests can prove.
+///
+/// 1. **`repository sync-to` works from a `--readonly` connect.** The seed
+///    opens its source read-only on purpose — the mirror may still be another
+///    cluster's live off-site copy — and kopia persists that read-only bit into
+///    the client config, so every later invocation on the connection is
+///    structurally unable to write. If a kopia release ever refused `sync-to`
+///    on such a connection, blob seeding would break with a confusing
+///    "storage is read-only", and the fallback (a normal connect; sync-to never
+///    writes the source either way) would have to be adopted deliberately.
+///    Verified by hand against kopia 0.23.1 during the C2 spike; pinned here so
+///    it stays verified.
+///
+/// 2. **The copy carries the SOURCE's `kopia.maintenance` owner.** This is the
+///    entire justification for the seeded-restamp rule
+///    (`maintenance_restamp_target`'s `seeded` arm): a blob-seeded repository
+///    arrives owned by the operator of the cluster the mirror came from, which
+///    — under `RestampPolicy::OwnFormatsOnly`, forced whenever
+///    `identityDefaults.cluster` is set — the ordinary self-heal would refuse to
+///    touch as "foreign", leaving maintenance yielding forever on a repository
+///    nobody else can claim. If a future kopia stopped copying that blob, the
+///    unconditional restamp would become dead code rather than a live fix, and
+///    this assertion is what would say so.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn sync_to_seeds_an_empty_backend_from_a_readonly_source_connect() {
+    let source_repo_dir = tempfile::tempdir().unwrap();
+    let seeded_repo_dir = tempfile::tempdir().unwrap();
+    let admin_config_dir = tempfile::tempdir().unwrap();
+    let ro_config_dir = tempfile::tempdir().unwrap();
+    let seeded_config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("a.txt"), b"seed me\n").unwrap();
+    let source_spec = ConnectSpec::Filesystem {
+        path: source_repo_dir.path().to_path_buf(),
+    };
+
+    // (a) The "mirror": a repository with one snapshot, plus a maintenance
+    // owner standing in for the now-dead source cluster's operator.
+    let admin = isolated_client(admin_config_dir.path());
+    admin
+        .repository_create(&source_spec, Default::default(), &Default::default())
+        .await
+        .expect("mirror repository create");
+    admin
+        .snapshot_create(
+            source_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("seeduser@seedhost:/data"),
+        )
+        .await
+        .expect("mirror snapshot create");
+    admin
+        .maintenance_set_owner("kopiur@kopiur-dead-cluster-repo")
+        .await
+        .expect("stamp the source cluster's maintenance owner");
+
+    // (b) Re-open the mirror READ-ONLY under its own config, with credentials
+    // persisted — the exact connect `seed_connect_source` performs.
+    let source_ro = isolated_client(ro_config_dir.path());
+    source_ro
+        .repository_connect_with(
+            &source_spec,
+            Default::default(),
+            ConnectOptions {
+                readonly: true,
+                persist_credentials: true,
+            },
+        )
+        .await
+        .expect("read-only connect to the seed source");
+
+    // (c) THE MECHANIC: sync-to an EMPTY destination directory from that
+    // read-only connection, with the two options `SeedOpSpec::sync_options`
+    // fixes — `--no-must-exist` (initializing the destination IS the point) and
+    // no `--delete`.
+    source_ro
+        .repository_sync_to(
+            &ConnectSpec::Filesystem {
+                path: seeded_repo_dir.path().to_path_buf(),
+            },
+            &SyncToOptions {
+                must_exist: Some(false),
+                delete_extra: false,
+                parallel: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("sync-to from a READ-ONLY source connect must succeed (issue #380)");
+
+    // (d) The seeded backend is a working repository holding the mirror's
+    // history — proving the copy happened, not merely that kopia exited 0.
+    let seeded = isolated_client(seeded_config_dir.path());
+    seeded
+        .repository_connect(
+            &ConnectSpec::Filesystem {
+                path: seeded_repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+        )
+        .await
+        .expect("connect to the seeded repository");
+    let list = seeded
+        .snapshot_list_all()
+        .await
+        .expect("list the seeded repository");
+    assert_eq!(
+        list.len(),
+        1,
+        "the seeded repository must hold the mirror's snapshot"
+    );
+    assert_eq!(
+        list[0].source.identity(),
+        "seeduser@seedhost:/data",
+        "seeding must preserve the snapshot's identity, or the history it \
+         restores is unreachable by identity/fromPolicy"
+    );
+
+    // (e) ...and it arrived owned by the DEAD cluster's operator, which is why
+    // the mover restamps a just-seeded repository unconditionally.
+    let info = seeded
+        .maintenance_info()
+        .await
+        .expect("read the seeded repository's maintenance owner");
+    assert_eq!(
+        info.owner, "kopiur@kopiur-dead-cluster-repo",
+        "a blob seed carries the SOURCE's maintenance owner; the mover's \
+         seeded-restamp rule exists to replace it"
     );
 }
