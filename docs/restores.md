@@ -197,7 +197,7 @@ The empty-volume path applies to `fromPolicy`/`identity` sources on **every** ba
 
 `waitTimeout` (a Go-style duration, e.g. `5m`) opens a grace window during which "no matching snapshot yet" means *wait and re-check* instead of giving up. `onMissingSnapshot` applies only once the window closes. Use it when the Restore may be applied before the thing that produces its snapshot — a schedule about to fire, a GitOps apply ordering, a populator claim racing the first backup.
 
-The window opens when the restore can first actually **proceed**, not when you applied it: Kopiur stamps that instant into `status.waitStartedAt` and measures `waitTimeout` from there. Two things have to be true — the restore's repository has reached `Ready`, and (for `target.populator`) a PVC already claims the Restore via `dataSourceRef`. Until then the clock has not started.
+The window opens when the restore can first actually **proceed**, not when you applied it: Kopiur stamps that instant into `status.waitStartedAt` and measures `waitTimeout` from there. Two things have to be true — the restore's repository has reached `Ready`, once the controller can see it (the gate falls through unverified if the referenced `Repository`/`SnapshotPolicy` object doesn't exist yet), and (for `target.populator`) a PVC already claims the Restore via `dataSourceRef`. Until then the clock has not started.
 
 /// warning | The window is not measured from `metadata.creationTimestamp`
 
