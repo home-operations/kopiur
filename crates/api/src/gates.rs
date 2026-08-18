@@ -772,8 +772,9 @@ mod tests {
     /// someone actually looks: the troubleshooting table (symptom → fix) and the
     /// DR scenario (the reason table plus the retry/terminal contract).
     ///
-    /// A reason added to `consts::SEED_FAILURE_REASONS` fails here until both
-    /// pages mention it by name.
+    /// A reason added to `consts::SEED_FAILURE_REASONS` — or to the
+    /// terminal-until-edited park set the body extends it with — fails here
+    /// until both pages mention it by name.
     #[test]
     fn every_seed_failure_reason_is_documented_on_both_user_facing_pages() {
         // CARGO_MANIFEST_DIR = crates/api; the docs tree is at the repo root.
