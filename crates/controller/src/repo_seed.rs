@@ -505,7 +505,7 @@ pub(crate) fn migrate_source_backend_park(
     source: &Backend,
 ) -> Option<SeedPark> {
     use kopiur_api::validate::{
-        replication_destination_differs, replication_filesystem_mount_collision,
+        AuthPairKind, replication_destination_differs, replication_filesystem_mount_collision,
         validate_replication_auth,
     };
     // 1. The source resolves to THIS repository's own storage. `repo_key`
@@ -529,7 +529,7 @@ pub(crate) fn migrate_source_backend_park(
     }
     // 3. The credentials cannot share one pod. Same argument order
     //    `validate_seed_blob_source` uses, which matters for the one-sided arms.
-    if validate_replication_auth(local, source).is_err() {
+    if validate_replication_auth(local, source, AuthPairKind::Seed).is_err() {
         return Some(SeedPark {
             gate: &kopiur_api::gates::SEED_SOURCE_AUTH_CONFLICT_GATE,
             message: seed_source_auth_conflict_message(source_description, local, source),
@@ -571,10 +571,11 @@ fn seed_mount_path_collision_message(source_description: &str, path: &str) -> St
 ///
 /// The VERDICT is `kopiur_api::validate::validate_replication_auth` — the same
 /// function admission runs on a blob seed, so the two arms of the rule cannot
-/// mean different things. Only the WORDING is rebuilt here: that validator
-/// speaks about "the replication mover", which is right for its own kind and
-/// confusing when a repository bootstrap prints it, and it never names the
-/// second ServiceAccount.
+/// mean different things. Only the WORDING is rebuilt here, because this arm
+/// has something admission cannot see: the seed source is a REFERENCE, so the
+/// park has to name the `Repository`/`ClusterRepository` it resolved to before
+/// any of this is actionable. It also names the federating ServiceAccount on
+/// the one-sided arm, where the validator names neither.
 fn seed_source_auth_conflict_message(
     source_description: &str,
     local_backend: &Backend,
@@ -1552,8 +1553,9 @@ mod tests {
     #[test]
     fn every_migrate_backend_park_message_says_what_why_and_how_to_fix_it() {
         // The MESSAGE half. The auth wording is rebuilt rather than borrowed
-        // from the validator (which speaks about "the replication mover" and
-        // never names the second ServiceAccount), so it needs its own pin.
+        // from the validator (which cannot name the resolved source CR, and
+        // names no ServiceAccount on the one-sided arm), so it needs its own
+        // pin.
         let both = seed_source_auth_conflict_message(
             "Repository/offsite",
             &s3_wi("local", "kopiur-new"),

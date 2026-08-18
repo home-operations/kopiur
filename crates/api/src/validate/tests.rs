@@ -610,12 +610,14 @@ fn replication_auth_same_kind_static_wi_mix_is_rejected() {
     // Both directions of the same-kind mix leak the static env into the
     // ambient chain and are rejected with the why in the message.
     for (src, dst) in [(&static_side, &wi_side), (&wi_side, &static_side)] {
-        let err = validate_replication_auth(src, dst).unwrap_err();
+        let err = validate_replication_auth(src, dst, AuthPairKind::Replication).unwrap_err();
         assert!(err.to_string().contains("ambient"), "{err}");
     }
     // Same-kind, same auth style on both sides is fine.
-    assert!(validate_replication_auth(&static_side, &static_side).is_ok());
-    assert!(validate_replication_auth(&wi_side, &wi_side).is_ok());
+    assert!(
+        validate_replication_auth(&static_side, &static_side, AuthPairKind::Replication).is_ok()
+    );
+    assert!(validate_replication_auth(&wi_side, &wi_side, AuthPairKind::Replication).is_ok());
 }
 
 #[test]
@@ -642,11 +644,11 @@ fn replication_auth_cross_kind_and_gcs_mixes_are_allowed() {
         }),
     });
     // Cross-kind: the static side's env keys mean nothing to the other cloud.
-    assert!(validate_replication_auth(&s3_wi, &gcs_static).is_ok());
+    assert!(validate_replication_auth(&s3_wi, &gcs_static, AuthPairKind::Replication).is_ok());
     // GCS static creds travel as a --credentials-file path, never ambient env,
     // so even a same-kind GCS mix is safe.
-    assert!(validate_replication_auth(&gcs_wi, &gcs_static).is_ok());
-    assert!(validate_replication_auth(&gcs_static, &gcs_wi).is_ok());
+    assert!(validate_replication_auth(&gcs_wi, &gcs_static, AuthPairKind::Replication).is_ok());
+    assert!(validate_replication_auth(&gcs_static, &gcs_wi, AuthPairKind::Replication).is_ok());
 }
 
 #[test]
@@ -660,7 +662,7 @@ fn replication_auth_both_wi_must_share_the_service_account() {
         secret_ref: None,
         workload_identity: Some(wi("sa-b")),
     }));
-    let err = validate_replication_auth(&wi_a, &wi_b).unwrap_err();
+    let err = validate_replication_auth(&wi_a, &wi_b, AuthPairKind::Replication).unwrap_err();
     let msg = err.to_string();
     // The message names both SAs and says the fix (one SA, both stores).
     assert!(msg.contains("sa-a") && msg.contains("sa-b"), "{msg}");
@@ -6657,14 +6659,15 @@ fn a_blob_seed_mixing_workload_identity_with_static_keys_is_rejected() {
         .iter()
         .find(|e| matches!(e, ValidationError::InvalidFieldValue { .. }))
         .unwrap_or_else(|| panic!("{errs:?}"));
-    // `validate_replication_auth` is reused verbatim (it is the same one-pod
-    // constraint), so its field path and wording come through unchanged. Pinned
-    // so a later edit to that shared validator cannot silently stop covering
-    // seeding.
+    // `validate_replication_auth` decides this verbatim (it is the same one-pod
+    // constraint), but the seed call site passes `AuthPairKind::Seed`, so the
+    // rejection names a field the author actually wrote and the Job that
+    // actually runs. Pinned so a later edit to that shared validator cannot
+    // silently stop covering seeding, and cannot regress to replication wording.
     let ValidationError::InvalidFieldValue { field, reason } = e else {
         unreachable!()
     };
-    assert_eq!(field, "destination backend auth");
+    assert_eq!(field, "seed.from.backend auth");
     assert!(
         reason.contains("cannot mix workloadIdentity with a static credential Secret"),
         "{reason}"
@@ -6674,10 +6677,55 @@ fn a_blob_seed_mixing_workload_identity_with_static_keys_is_rejected() {
         "{reason}"
     );
     let msg = e.to_string();
-    // TODO(#380 C4): message reads "replication" — wording generalization
-    // tracked for the docs stage. Pinned here so the current text is recorded
-    // and the generalization is a deliberate, visible edit.
-    assert!(msg.contains("replication mover"), "{msg}");
+    assert!(msg.contains("the seeding mover's environment"), "{msg}");
+    assert!(
+        !msg.contains("replication") && !msg.contains("destination"),
+        "a repository bootstrap must not blame a replication mover or a \
+         `destination` field the author never wrote: {msg}"
+    );
+}
+
+#[test]
+fn a_blob_seed_whose_two_sides_federate_as_different_service_accounts_is_rejected() {
+    // The other `AuthPairKind::Seed` arm. The repository's own backend and the
+    // seed source both federate, but as different ServiceAccounts — one pod
+    // runs as exactly one. Argument order matters here: the seed call site
+    // passes (repository, seed source), so the message must name them in that
+    // order rather than "source"/"destination".
+    let errs = validate_repository(&crate::testutil::from_yaml::<RepositorySpec>(
+        r#"
+backend:
+  s3:
+    bucket: primary
+    endpoint: s3.example
+    auth: { workloadIdentity: { serviceAccountName: repo-sa } }
+encryption: { passwordSecretRef: { name: s } }
+seed:
+  from:
+    backend:
+      s3:
+        bucket: mirror
+        endpoint: offsite.example
+        auth: { workloadIdentity: { serviceAccountName: seed-sa } }
+"#,
+    ));
+    let e = errs
+        .iter()
+        .find(|e| matches!(e, ValidationError::InvalidFieldValue { .. }))
+        .unwrap_or_else(|| panic!("{errs:?}"));
+    let ValidationError::InvalidFieldValue { field, reason } = e else {
+        unreachable!()
+    };
+    assert_eq!(
+        field,
+        "seed.from.backend auth.workloadIdentity.serviceAccountName"
+    );
+    assert!(
+        reason.contains("this repository federates as \"repo-sa\"")
+            && reason.contains("the seed source as \"seed-sa\""),
+        "{reason}"
+    );
+    assert!(reason.contains("the seeding mover is one pod"), "{reason}");
 }
 
 #[test]

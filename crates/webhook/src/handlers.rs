@@ -820,8 +820,11 @@ async fn handle_repository_replication(
                 ValidationError::ReplicationMountPathCollision { path },
             ]));
         }
-        if let Err(e) = api::validate::validate_replication_auth(&source_backend, &spec.destination)
-        {
+        if let Err(e) = api::validate::validate_replication_auth(
+            &source_backend,
+            &spec.destination,
+            api::validate::AuthPairKind::Replication,
+        ) {
             return Err(AdmissionError::Invalid(vec![e]));
         }
     }
@@ -904,7 +907,11 @@ async fn handle_snapshot_replication(
         }
         // One mover pod carries both credential sets, so the same
         // static/workload-identity mixing rules apply verbatim.
-        if let Err(e) = api::validate::validate_replication_auth(src, dst) {
+        if let Err(e) = api::validate::validate_replication_auth(
+            src,
+            dst,
+            api::validate::AuthPairKind::Replication,
+        ) {
             return Err(AdmissionError::Invalid(vec![e]));
         }
     }

@@ -569,9 +569,11 @@ async fn spawn_replication_job(
     // env into the workload-identity side's ambient credential chain; (b) the
     // destination's static credential Secret must co-reside with the Job (envFrom is
     // namespace-local and replication does not project credentials).
-    if let Err(e) =
-        kopiur_api::validate::validate_replication_auth(&repo.backend, &repl.spec.destination)
-    {
+    if let Err(e) = kopiur_api::validate::validate_replication_auth(
+        &repo.backend,
+        &repl.spec.destination,
+        kopiur_api::validate::AuthPairKind::Replication,
+    ) {
         return Err(Error::Validation(e.to_string()));
     }
     if let Some(path) = kopiur_api::validate::replication_filesystem_mount_collision(

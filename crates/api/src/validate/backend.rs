@@ -194,6 +194,78 @@ pub fn validate_backend(backend: &crate::backend::Backend) -> ValidationResult {
     }
 }
 
+/// WHICH one-pod credential pairing [`validate_replication_auth`] is judging.
+///
+/// The rule itself is identical everywhere a single mover pod carries two
+/// backends' credentials, so exactly one implementation decides it. Only the
+/// FIELD PATHS and the prose differ, and they differ enough to matter: a
+/// repository bootstrap rejection that says "destination backend auth" and
+/// blames "the replication mover" names a field the author never wrote and a
+/// mover that never ran. An enum rather than free-form strings so a new pairing
+/// cannot be added without deciding what its rejection says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthPairKind {
+    /// A `RepositoryReplication` / `SnapshotReplication` source→destination
+    /// pair, carried by one replication mover Job.
+    Replication,
+    /// A repository's own `spec.backend` paired with its `spec.seed` source,
+    /// carried by one seeding Job at bootstrap. Note the argument order this
+    /// implies: the `source` argument is the repository being created and the
+    /// `destination` argument is the seed it reads FROM.
+    Seed,
+}
+
+impl AuthPairKind {
+    /// Field path for the both-federated, disagreeing-ServiceAccount rejection.
+    fn service_account_field(self) -> &'static str {
+        match self {
+            Self::Replication => "destination auth.workloadIdentity.serviceAccountName",
+            Self::Seed => "seed.from.backend auth.workloadIdentity.serviceAccountName",
+        }
+    }
+
+    /// Field path for the static/workload-identity mix rejection.
+    fn auth_field(self) -> &'static str {
+        match self {
+            Self::Replication => "destination backend auth",
+            Self::Seed => "seed.from.backend auth",
+        }
+    }
+
+    /// The single pod that carries both credential sets, as a noun phrase (also
+    /// used possessively, so it must read correctly with a trailing `'s`).
+    fn mover(self) -> &'static str {
+        match self {
+            Self::Replication => "the replication mover",
+            Self::Seed => "the seeding mover",
+        }
+    }
+
+    /// How to name the `source` argument's side in prose.
+    fn source_label(self) -> &'static str {
+        match self {
+            Self::Replication => "the source repository",
+            Self::Seed => "this repository",
+        }
+    }
+
+    /// How to name the `destination` argument's side in prose.
+    fn destination_label(self) -> &'static str {
+        match self {
+            Self::Replication => "the destination",
+            Self::Seed => "the seed source",
+        }
+    }
+
+    /// The pairing itself, for "a same-kind {} pair cannot mix ...".
+    fn pair_label(self) -> &'static str {
+        match self {
+            Self::Replication => "source/destination",
+            Self::Seed => "repository/seed-source",
+        }
+    }
+}
+
 /// A `RepositoryReplication`'s source/destination auth pair is safe to run in
 /// **one** mover pod. The replicate pod's environment carries the static side's
 /// credential Secret (`envFrom`); for a same-kind S3 or Azure pair where exactly
@@ -204,9 +276,15 @@ pub fn validate_backend(backend: &crate::backend::Backend) -> ValidationResult {
 /// mixed pairs are safe (the static side's key travels as a `--credentials-file`
 /// path, not ambient env). Both-workload-identity pairs must name the same
 /// ServiceAccount — a pod runs as exactly one.
+///
+/// A repository `spec.seed` reuses this VERDICT unchanged — one seeding pod
+/// carries both credential sets for exactly the same reason — and passes
+/// [`AuthPairKind::Seed`] so the rejection points at `spec.seed.from.backend`
+/// and speaks about the seeding Job (issue #380).
 pub fn validate_replication_auth(
     source: &crate::backend::Backend,
     destination: &crate::backend::Backend,
+    kind: AuthPairKind,
 ) -> ValidationResult {
     use crate::creds::{WorkloadIdentityCloud, backend_workload_identity};
     let src_wi = backend_workload_identity(source);
@@ -218,13 +296,17 @@ pub fn validate_replication_auth(
                 Ok(())
             } else {
                 Err(ValidationError::InvalidFieldValue {
-                    field: "destination auth.workloadIdentity.serviceAccountName".to_string(),
+                    field: kind.service_account_field().to_string(),
                     reason: format!(
-                        "the replication mover is one pod and runs as exactly one \
-                         ServiceAccount, but the source repository federates as \
-                         {:?} and the destination as {:?} — point both at the same \
-                         ServiceAccount (with IAM access to both stores)",
-                        a.service_account_name, b.service_account_name
+                        "{mover} is one pod and runs as exactly one ServiceAccount, \
+                         but {src} federates as {a:?} and {dst} as {b:?} — point \
+                         both at the same ServiceAccount (with IAM access to both \
+                         stores)",
+                        mover = kind.mover(),
+                        src = kind.source_label(),
+                        dst = kind.destination_label(),
+                        a = a.service_account_name,
+                        b = b.service_account_name,
                     ),
                 })
             }
@@ -248,17 +330,18 @@ pub fn validate_replication_auth(
             };
             if conflicts {
                 Err(ValidationError::InvalidFieldValue {
-                    field: "destination backend auth".to_string(),
-                    reason: "a same-kind source/destination pair cannot mix \
-                             workloadIdentity with a static credential Secret: the \
-                             replication mover's environment carries the static \
-                             side's keys, and the workload-identity side's ambient \
-                             credential chain would silently pick them up and \
-                             authenticate as the wrong identity — use \
-                             workloadIdentity on both sides (one ServiceAccount \
-                             with IAM access to both stores) or static Secrets on \
-                             both"
-                        .to_string(),
+                    field: kind.auth_field().to_string(),
+                    reason: format!(
+                        "a same-kind {pair} pair cannot mix workloadIdentity with a \
+                         static credential Secret: {mover}'s environment carries \
+                         the static side's keys, and the workload-identity side's \
+                         ambient credential chain would silently pick them up and \
+                         authenticate as the wrong identity — use workloadIdentity \
+                         on both sides (one ServiceAccount with IAM access to both \
+                         stores) or static Secrets on both",
+                        pair = kind.pair_label(),
+                        mover = kind.mover(),
+                    ),
                 })
             } else {
                 Ok(())

@@ -1525,10 +1525,12 @@ fn validate_seed_blob_source(
     if let Some(path) = replication_filesystem_mount_collision(repo_backend, source) {
         errs.push(ValidationError::SeedMountPathCollision { path });
     }
-    // One pod carries both credential sets, so the replication rule applies
+    // One pod carries both credential sets, so the replication VERDICT applies
     // verbatim: a same-kind static/workloadIdentity mix would let the ambient
-    // credential chain pick up the other side's keys.
-    if let Err(e) = validate_replication_auth(repo_backend, source) {
+    // credential chain pick up the other side's keys. `AuthPairKind::Seed` only
+    // changes what the rejection says — `spec.seed.from.backend` and the seeding
+    // Job, not "destination" and a replication mover that never runs (#380).
+    if let Err(e) = validate_replication_auth(repo_backend, source, AuthPairKind::Seed) {
         errs.push(e);
     }
     let inert = inert_create_fields(create);

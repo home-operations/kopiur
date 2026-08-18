@@ -998,8 +998,11 @@ async fn spawn_snapshot_replication_job(
     // Defensive re-check of the admission rule (one validator, two callers): a
     // same-kind static/workload-identity auth mix would leak the static side's
     // env into the workload-identity side's ambient credential chain.
-    if let Err(e) = kopiur_api::validate::validate_replication_auth(&source.backend, &dest.backend)
-    {
+    if let Err(e) = kopiur_api::validate::validate_replication_auth(
+        &source.backend,
+        &dest.backend,
+        kopiur_api::validate::AuthPairKind::Replication,
+    ) {
         return Err(Error::Validation(e.to_string()));
     }
     // Two distinct fs repos sharing one in-pod path would render an invalid
