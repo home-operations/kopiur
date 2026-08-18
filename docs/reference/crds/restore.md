@@ -36,7 +36,7 @@ The rest mirror `kopia snapshot restore`'s own flags one-to-one and are all tri-
 
 ### `policy`
 
-How the restore reacts to a missing snapshot. `onMissingSnapshot` is `Fail` (fail-closed; the default for explicit `snapshotRef`/`identity` sources, so an explicit restore can never silently no-op) or `Continue` (proceed with an empty, deploy-or-restore volume; the default for `fromPolicy`). `waitTimeout` (e.g. `5m`) bounds how long the restore waits for the source snapshot to appear before giving up.
+How the restore reacts to a missing snapshot. `onMissingSnapshot` is `Fail` (fail-closed; the default for explicit `snapshotRef`/`identity` sources, so an explicit restore can never silently no-op) or `Continue` (proceed with an empty, deploy-or-restore volume; the default for `fromPolicy`). `waitTimeout` (e.g. `5m`) bounds how long the restore waits for the source snapshot to appear before giving up. The window opens when the restore can first proceed — its repository is `Ready`, and for `target.populator` a PVC claims it — and that instant is recorded in `status.waitStartedAt`; it is **not** measured from `metadata.creationTimestamp`. See [Restores → `waitTimeout`](../../restores.md#waittimeout--wait-before-giving-up).
 
 ### `mover`
 

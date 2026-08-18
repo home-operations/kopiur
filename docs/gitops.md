@@ -85,6 +85,34 @@ don't report an `OutOfSync` diff against a controller-set value. *Conditional*
 defaults (identity, `policy.onMissingSnapshot`) stay controller/webhook-resolved and
 pinned to **status**, never written into `spec`.
 
+## Standing fields that act exactly once
+
+Some fields are written for a situation that has not happened yet, and stay in
+Git forever without doing anything until it does. They are safe to commit
+unconditionally — the "fresh install or recovery?" branch that GitOps hates is
+exactly what they remove.
+
+- **`Repository.spec.seed` / `ClusterRepository.spec.seed`** — initializes the
+  repository from a surviving replica, but is armed **only** while the repository
+  has never been initialized (`status.uniqueId` unset) *and* the backend really is
+  uninitialized. On every subsequent reconcile it is a documented no-op
+  (`Seeded=True`, reason `AlreadyInitialized`) that copies nothing and touches
+  nothing. Commit it once and the same manifest set rebuilds the cluster on the
+  day you need it — see
+  [Scenario 10](scenarios/dr-with-replicated-repository.md). It writes only to
+  `status.seed`, never back into your `spec`.
+- **`Restore` with `target.populator: {}`** — passive until a PVC claims it via
+  `dataSourceRef` (see [deploy-or-restore](restores.md#deploy-or-restore-gitops)).
+  Its `waitTimeout` window opens when the restore can first proceed, not when you
+  applied it, so a populator that sits in Git for months does not arrive with its
+  window already spent.
+
+`spec.seed` is also **mutable**: editing it mid-seed lets the running Job finish,
+discards its result as stale, and relaunches for the live spec — so a GitOps
+change to the seed source is applied, not ignored. Read
+[Repositories → editing `spec.seed` mid-flight](repositories.md#editing-specseed-mid-flight-and-suspend)
+before repointing a migrate seed that has already started.
+
 ## Status-only writes
 
 The controller writes only `.status`, **never** your `spec`. The pinned identity
@@ -156,7 +184,11 @@ let `kubeconform` validate kopiur CRs without a cluster, and make
 The admission webhook is scoped to kopiur kinds only, so a `failurePolicy: Fail`
 outage never wedges unrelated GitOps applies. **CRD applies bypass the webhook**, so
 a CRD-only sync-wave/`dependsOn` still bootstraps even during operator downtime —
-apply CRDs in an early wave so a CR never races ahead of its CRD.
+apply CRDs in an early wave so a CR never races ahead of its CRD. Two of the CRDs
+(`Repository`, `ClusterRepository`) now exceed the 256 KB `kubectl.kubernetes.io/last-applied-configuration`
+annotation cap for client-side apply, so Argo CD applications managing the CRDs
+need `syncOptions: [ServerSideApply=true]` (Flux's `kustomize-controller` already
+applies server-side by default).
 
 ## The populator cutover caveat
 
@@ -179,5 +211,6 @@ The full pre-upgrade step and the Flux/Argo recovery sequence live on the
 
 - [Upgrading](upgrade.md) — the one-time 0.5.x → 0.6.0 CRD migration and recovery.
 - [Restores → deploy-or-restore](restores.md#deploy-or-restore-gitops) — the one-bundle GitOps pattern.
+- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md) — `spec.seed`, the standing field that rebuilds a repository from its mirror.
 - [Field reference](field-reference.md) — the conditions and status fields per kind.
 - [Observability](dev/observability.md) — metrics + the `resource_phase` gauge.

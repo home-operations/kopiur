@@ -127,6 +127,42 @@ maintenance nas full run completed at 2026-06-11T12:01:42Z
 `--full` selects the full (compaction + reclamation) pass; the default is
 quick. `--wait` exits 0 on `Succeeded` and 1 on `Failed`.
 
+## `replication run`
+
+Trigger an out-of-band replication run — either kind. The plugin stamps the
+`run-requested` annotation (also usable from bare `kubectl annotate` — see
+[Repository replication](../replication.md#run-it-now) and
+[Snapshot replication](../snapshot-replication.md#run-it-now)); the operator
+runs it through the same gates and single-flight path as the cron slots and
+answers in `status.manualRun`.
+
+```console
+$ kubectl kopiur replication run nas-primary-offsite -n billing --wait
+repositoryreplication.kopiur.home-operations.com/nas-primary-offsite run requested (2026-06-11T12:00:00Z)
+RepositoryReplication nas-primary-offsite run completed at 2026-06-11T12:04:18Z
+```
+
+The kind is detected from the name. Pass `--kind repository` or `--kind
+snapshot` when a namespace holds a `RepositoryReplication` **and** a
+`SnapshotReplication` under the same name — the plugin refuses to guess.
+`--wait` exits 0 on `Succeeded` and 1 on `Failed`.
+
+/// note | A successful run re-anchors the schedule
+
+The next cron slot is computed from `status.lastReplicated`, which a successful
+requested run stamps just like a scheduled one. Running at 14:00 on an
+`0 5 * * *` mirror therefore moves the next automatic run to 05:00 tomorrow.
+
+///
+
+/// warning | A suspended replication holds the request
+
+The run is recorded as `status.manualRun.phase: Pending` and starts on
+`kubectl kopiur resume` — so `--wait` on a suspended object waits out its
+timeout rather than failing fast. Resume it first.
+
+///
+
 ## `suspend` / `resume`
 
 Pause and unpause reconciliation declaratively. Suspending a

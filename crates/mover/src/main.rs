@@ -29,7 +29,8 @@ use kopiur_kopia::{
 use tracing::{error, info, warn};
 
 use kopiur_mover::bootstrap::{
-    BootstrapResult, MAX_RETURNED_SNAPSHOTS, RESULT_CONFIGMAP_KEY, should_attempt_create,
+    BootstrapInitAction, BootstrapResult, MAX_RETURNED_SNAPSHOTS, RESULT_CONFIGMAP_KEY,
+    SeedOutcome, bootstrap_init_action,
 };
 use kopiur_mover::cli::{MoverCli, MoverCommand};
 use kopiur_mover::credentials;
@@ -230,7 +231,15 @@ async fn run(cli: &MoverCli) -> Result<()> {
         // first, then runs with periodic progress PATCHes.
         Ok(connect) => match &spec.operation {
             Operation::BootstrapRepository(op) => {
-                run_bootstrap_flow(&client, &spec, op, &connect, cli.result_configmap()).await
+                run_bootstrap_flow(
+                    &client,
+                    &spec,
+                    op,
+                    &connect,
+                    cli.result_configmap(),
+                    cli.kopia_binary(),
+                )
+                .await
             }
             // Maintenance, like bootstrap, owns its own connect lifecycle: the
             // lease decision needs `kopia maintenance info`, which requires repo
@@ -984,6 +993,7 @@ async fn run_bootstrap_flow(
     op: &BootstrapRepositoryOp,
     connect: &ConnectSpec,
     result_configmap: Option<&str>,
+    kopia_binary: Option<&str>,
 ) -> Result<()> {
     info!(
         backend = spec.repository.kind_str(),
@@ -991,7 +1001,7 @@ async fn run_bootstrap_flow(
         repository = %spec.target_ref.name,
         "bootstrapping repository"
     );
-    let result = run_bootstrap(client, op, connect).await;
+    let result = run_bootstrap(client, spec, op, connect, kopia_binary).await;
     // Persist BEFORE returning: a failed bootstrap still exits non-zero (so the
     // Job is marked Failed and backoff is bounded), but the controller must be
     // able to read the structured failure to set an actionable Repository status.
@@ -1087,12 +1097,821 @@ async fn bootstrap_connect(
     }
 }
 
+/// How a seed step reports failure: `Ok` on success, or the terminal
+/// [`BootstrapResult`] the whole bootstrap reports.
+///
+/// BOXED because a `BootstrapResult` carries a whole catalog listing (~456
+/// bytes even empty), and every seed step would otherwise pay that in its
+/// `Result` on the success path too — `clippy::result_large_err`. One alias for
+/// the entire seed layer so `?` composes across its steps without a per-call
+/// conversion.
+type SeedStep<T> = std::result::Result<T, Box<BootstrapResult>>;
+
+/// Per-run file locations for a seeding bootstrap (issue #380). Everything
+/// lives under the writable cache emptyDir; the separate config paths are what
+/// keep the seed source's connection from clobbering this repository's.
+///
+/// Mirrors [`SreplPaths`] and for the same reasons, with one difference: a
+/// blob-mode seed uses only the two `source_*` paths (its `sync-to` destination
+/// is written to, never *connected*), while migrate mode needs all four —
+/// it holds both repositories open at once.
+struct SeedPaths {
+    source_config: String,
+    source_cache: String,
+    local_config: String,
+    local_xdg: String,
+}
+
+impl SeedPaths {
+    fn new() -> Self {
+        let base = kopiur_kopia::env::DEFAULT_CACHE_DIR;
+        Self {
+            source_config: format!("{base}/seed-source.config"),
+            source_cache: format!("{base}/seed-source-cache"),
+            local_config: format!("{base}/seed-local.config"),
+            local_xdg: format!("{base}/seed-local-xdg"),
+        }
+    }
+}
+
+/// An opened seed SOURCE: the client plus the connect spec it was opened with.
+///
+/// The spec travels with the client because the persisted-password probe has to
+/// rebuild a SECOND client against the same source, and it needs the same
+/// `KOPIUR_SEED_` credential overlay to do it — which is derived from the
+/// backend, and only from the MATERIALIZED spec (file-based credentials were
+/// staged into paths that the original wire spec does not carry).
+struct SeedSource {
+    client: KopiaClient,
+    connect: ConnectSpec,
+}
+
+/// Builder for a client that talks to the seed SOURCE: its own config + cache,
+/// plus the `KOPIUR_SEED_` credential overlay.
+///
+/// A builder rather than a finished client because two callers need the same
+/// environment with a different password disposition — the connect SETS the
+/// source's password, the persisted-password probe REMOVES it (see
+/// [`seed_probe_source_password`]). Sharing the builder is what keeps the probe
+/// from silently running with a different credential set than the connect, which
+/// on a static-key backend would make it probe the wrong storage.
+///
+/// The overlay sets what the seed source provides and UNSETS what it does not,
+/// so one of THIS repository's credentials (a stale `AWS_SESSION_TOKEN`, say)
+/// can never silently authenticate the source read.
+fn seed_source_builder(
+    spec: &MoverWorkSpec,
+    source: &ConnectSpec,
+    kopia_binary: Option<&str>,
+    paths: &SeedPaths,
+) -> kopiur_kopia::KopiaClientBuilder {
+    let raw_env = |key: &str| std::env::var(key).ok();
+    let mut builder = srepl_client_builder(spec, kopia_binary)
+        .env(kopiur_kopia::env::CONFIG_PATH_ENV, &paths.source_config)
+        .env(kopiur_kopia::env::CACHE_DIRECTORY_ENV, &paths.source_cache);
+    for (key, value) in credentials::seed_env_overlay(source, &raw_env) {
+        builder = match value {
+            Some(v) => builder.env(key, v),
+            None => builder.env_remove(key),
+        };
+    }
+    builder
+}
+
+/// Build + connect the seed SOURCE client, read-only.
+///
+/// `password` is `None` in blob mode (the mirror shares THIS repository's
+/// password, which is already ambient) and `Some(..)` in migrate mode (the
+/// source is an independent repository with its own).
+///
+/// Read-only is not merely defensive: kopia persists the read-only bit into the
+/// client config, so every later invocation on this connection is structurally
+/// unable to mutate the source — which may well still be another cluster's live
+/// off-site copy. Verified against kopia 0.23.1 that `repository sync-to` works
+/// from a `--readonly` connect (sync-to only ever reads the connected side).
+///
+/// `--persist-credentials` writes the password beside the config, which is what
+/// `snapshot migrate --source-config` reads in migrate mode; it is harmless in
+/// blob mode and kept symmetrical so both arms share this function.
+async fn seed_connect_source(
+    spec: &MoverWorkSpec,
+    seed: &workspec::SeedOpSpec,
+    kopia_binary: Option<&str>,
+    paths: &SeedPaths,
+    password: Option<String>,
+) -> SeedStep<SeedSource> {
+    let raw_env = |key: &str| std::env::var(key).ok();
+    // The seed source's file-based credentials (SFTP key, GCS/Gdrive JSON,
+    // rclone.conf) arrive KOPIUR_SEED_-prefixed and stage into their own dir, so
+    // they cannot overwrite this repository's already-materialized copies.
+    let mut source = seed.from.connect().to_connect_spec();
+    if let Err(e) = credentials::materialize_with(
+        &mut source,
+        &credential_staging_dir().join("seed"),
+        &|key| credentials::seed_materialize_lookup(key, &raw_env),
+    ) {
+        error!(error = %e, "could not materialize the seed source's credentials");
+        return Err(Box::new(BootstrapResult::from_mover_error(&e)));
+    }
+
+    let mut builder = seed_source_builder(spec, &source, kopia_binary, paths);
+    if let Some(p) = password {
+        builder = builder.env("KOPIA_PASSWORD", p);
+    }
+    let client = builder.build();
+    match client
+        .repository_connect_with(
+            &source,
+            spec.cache,
+            ConnectOptions {
+                readonly: true,
+                persist_credentials: true,
+            },
+        )
+        .await
+    {
+        Ok(()) => Ok(SeedSource {
+            client,
+            connect: source,
+        }),
+        Err(e) => Err(Box::new(seed_source_connect_failure(seed, &e))),
+    }
+}
+
+/// Classify a failed seed-source connect. Split out so the "the backend
+/// answered and there is no repository here" verdict is one small, readable
+/// decision rather than a branch inside the connect.
+///
+/// That distinction is the same one `run_bootstrap` draws for THIS repository's
+/// backend, and for the same reason: a missing path / unbound mount also
+/// classifies `NotFound` ("no such file or directory") and must surface as the
+/// mount fault it is, not as a mirror that needs writing.
+fn seed_source_connect_failure(seed: &workspec::SeedOpSpec, err: &KopiaError) -> BootstrapResult {
+    if err.class() == KopiaErrorClass::NotFound
+        && err
+            .stderr_tail()
+            .is_some_and(kopiur_kopia::notfound_is_uninitialized)
+    {
+        error!(source = %seed.source_description, "seed source holds no kopia repository");
+        return BootstrapResult::seed_source_not_found();
+    }
+    error!(class = %err.class(), "seed source connect failed");
+    BootstrapResult::failed(err)
+}
+
+/// List the seed source and apply the empty-source gate (`allowEmptySource`).
+///
+/// `snapshot list --all` deliberately. A mirror's snapshots belong to the
+/// identities of the cluster that WROTE them, and this listing decides whether
+/// the bootstrap fails — so it must not depend on kopia's source-less default.
+/// On 0.23.1 a source-less `snapshot list` does return foreign identities
+/// (verified; `--all` only narrows when a `<source>` positional is given), but
+/// the flag name says otherwise and the gate would silently report every good
+/// mirror as empty if that ever became true.
+async fn seed_source_snapshots(
+    seed: &workspec::SeedOpSpec,
+    source_client: &KopiaClient,
+) -> SeedStep<Vec<kopiur_kopia::SnapshotListEntry>> {
+    let listing = match source_client.snapshot_list_all().await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(class = %e.class(), "could not list the seed source's snapshots");
+            return Err(Box::new(BootstrapResult::failed(&e)));
+        }
+    };
+    if listing.is_empty() {
+        if !seed.allow_empty_source {
+            error!(
+                source = %seed.source_description,
+                "seed source holds zero snapshots and spec.seed.allowEmptySource is false"
+            );
+            return Err(Box::new(BootstrapResult::seed_source_empty()));
+        }
+        warn!(
+            source = %seed.source_description,
+            "seed source holds zero snapshots; continuing because \
+             spec.seed.allowEmptySource is true"
+        );
+    }
+    Ok(listing)
+}
+
+/// Blob-mode seed: `kopia repository sync-to` from the mirror backend into THIS
+/// repository's (uninitialized) backend.
+///
+/// The credential flow is the INVERSE of replication's. There, the connected
+/// side is the source and a `KOPIUR_DEST_`-prefixed overlay dresses the sync-to
+/// destination. Here the connected side is the seed SOURCE (dressed with
+/// `KOPIUR_SEED_` at the client level) and the sync-to writes into THIS
+/// repository, so the per-invocation overlay restores this repository's own
+/// plain credentials. Both directions rest on the same property: kopia persists
+/// the connected repository's storage credentials into its config at connect, so
+/// overlaying the plain names for a subprocess cannot disturb the read side.
+///
+/// The kopia PASSWORD is deliberately not overlaid: a `sync-to` copy is
+/// byte-for-byte, so the seeded repository inherits the mirror's format and
+/// password — which is why admission requires this repository's
+/// `encryption.passwordSecretRef` to already carry the mirror's.
+async fn run_seed_blob(
+    spec: &MoverWorkSpec,
+    seed: &workspec::SeedOpSpec,
+    local_connect: &ConnectSpec,
+    kopia_binary: Option<&str>,
+    paths: &SeedPaths,
+    local_initialized: bool,
+) -> SeedStep<SeedOutcome> {
+    info!(
+        source = %seed.source_description,
+        local_initialized,
+        "seeding this repository from a mirror backend (kopia repository sync-to)"
+    );
+    let source = seed_connect_source(spec, seed, kopia_binary, paths, None).await?;
+    let snapshot_count = seed_source_snapshots(seed, &source.client).await?.len() as i64;
+
+    let raw_env = |key: &str| std::env::var(key).ok();
+    let local_env = credentials::plain_env_overlay(local_connect, &raw_env);
+    // `sync-to` is INCREMENTAL: kopia copies only the blobs the destination
+    // lacks, so a resume picks up where the interrupted attempt stopped rather
+    // than re-transferring the whole repository.
+    if let Err(e) = source
+        .client
+        .repository_sync_to_with_env(
+            local_connect,
+            &seed.sync_options(local_initialized),
+            &local_env,
+        )
+        .await
+    {
+        error!(class = %e.class(), "seed repository sync-to failed");
+        return Err(Box::new(BootstrapResult::failed(&e)));
+    }
+    info!(
+        snapshot_count,
+        "seeded this repository's backend from the mirror"
+    );
+    Ok(SeedOutcome::performed(
+        workspec::SeedModeSpec::Blob,
+        seed.source_description.clone(),
+        snapshot_count,
+        // A blob copy moves storage, not manifests: there is no per-snapshot
+        // copy count to report, and the controller reports the post-seed catalog
+        // listing instead.
+        None,
+    ))
+}
+
+/// The migrate-mode seed source's own kopia password, from its dedicated env
+/// var. Without it the migrate would open the source with THIS repository's
+/// password and fail as a confusing `AuthFailure` against a repository the
+/// operator never touched.
+fn seed_source_password() -> SeedStep<String> {
+    match std::env::var(kopiur_mover::env::SEED_KOPIA_PASSWORD) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => {
+            let err = MoverError::SeedPasswordMissing {
+                env_key: kopiur_mover::env::SEED_KOPIA_PASSWORD,
+            };
+            error!("{err}");
+            Err(Box::new(BootstrapResult::from_mover_error(&err)))
+        }
+    }
+}
+
+/// Prove the seed source's password was PERSISTED beside its config, which is
+/// what `snapshot migrate --source-config` reads.
+///
+/// Probe polarity (pinned by the replication integration test): env
+/// `KOPIA_PASSWORD` WINS over the persisted password on a normal open, while
+/// migrate's source open reads the PERSISTED password FIRST — so the only probe
+/// that proves the migrate will authenticate is `repository status` with
+/// `KOPIA_PASSWORD` removed. Failing here rather than at the migrate turns a
+/// mid-copy auth error into an up-front, explicable one.
+async fn seed_probe_source_password(
+    spec: &MoverWorkSpec,
+    source_connect: &ConnectSpec,
+    kopia_binary: Option<&str>,
+    paths: &SeedPaths,
+) -> SeedStep<()> {
+    // Built from the SAME builder the connect used, so the probe carries the
+    // seed source's `KOPIUR_SEED_` storage credentials too. It happens to work
+    // without them today — kopia persists storage credentials into the config at
+    // connect, so the probe's open reads them from there — but relying on that
+    // would make the probe a different operation than the one it is standing in
+    // for, and a backend whose credentials kopia does NOT persist would probe
+    // this repository's storage instead of the source's. Only the PASSWORD
+    // differs, and deliberately: see the polarity note above.
+    let probe_client = seed_source_builder(spec, source_connect, kopia_binary, paths)
+        .env_remove("KOPIA_PASSWORD")
+        .build();
+    match probe_client.repository_status().await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let err = MoverError::Kopia {
+                op: KopiaOp::SeedSourcePasswordProbe,
+                source: e,
+            };
+            error!("{err}");
+            Err(Box::new(BootstrapResult::from_mover_error(&err)))
+        }
+    }
+}
+
+/// `kopia repository create` for the repository a migrate seed writes into,
+/// unless it is already there.
+///
+/// A RESUMING migrate writes into the repository a previous attempt created, so
+/// there is nothing to create — and `repository create` against an existing
+/// repository FAILS rather than adopting it, which would turn every resume into
+/// a hard error. `snapshot migrate` is idempotent by `(identity, startTime)`, so
+/// the copy that follows simply moves what is still missing.
+async fn seed_create_local_if_absent(
+    client: &KopiaClient,
+    op: &BootstrapRepositoryOp,
+    local_connect: &ConnectSpec,
+    local_initialized: bool,
+) -> SeedStep<()> {
+    if local_initialized {
+        info!("the repository a migrate seed writes into already exists; skipping create");
+        return Ok(());
+    }
+    match client
+        .repository_create(
+            local_connect,
+            kopiur_kopia::CacheTuning::default(),
+            &op.create_options(),
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            error!(class = %e.class(), "could not create the repository a migrate seed writes into");
+            Err(Box::new(BootstrapResult::failed(&e)))
+        }
+    }
+}
+
+/// Create + connect THIS repository as the migrate destination.
+///
+/// The migrating client must NOT carry a process-wide `KOPIA_CACHE_DIRECTORY`:
+/// that override applies to every repository the process opens, so migrate's
+/// source open would read the LOCAL repository's cached format blob and fail
+/// with "invalid repository password" (pinned by the replication integration
+/// test). Cache isolation comes from `XDG_CACHE_HOME` instead.
+#[allow(clippy::too_many_arguments)]
+async fn seed_create_and_connect_local(
+    client: &KopiaClient,
+    spec: &MoverWorkSpec,
+    op: &BootstrapRepositoryOp,
+    local_connect: &ConnectSpec,
+    kopia_binary: Option<&str>,
+    paths: &SeedPaths,
+    local_initialized: bool,
+) -> SeedStep<KopiaClient> {
+    seed_create_local_if_absent(client, op, local_connect, local_initialized).await?;
+    let local_client = srepl_client_builder(spec, kopia_binary)
+        .env(kopiur_kopia::env::CONFIG_PATH_ENV, &paths.local_config)
+        .env_remove(kopiur_kopia::env::CACHE_DIRECTORY_ENV)
+        .env("XDG_CACHE_HOME", &paths.local_xdg)
+        .build();
+    match local_client
+        .repository_connect(local_connect, spec.cache)
+        .await
+    {
+        Ok(()) => Ok(local_client),
+        Err(e) => {
+            error!(class = %e.class(), "could not connect the repository a migrate seed writes into");
+            Err(Box::new(BootstrapResult::failed(&e)))
+        }
+    }
+}
+
+/// The MANDATORY post-verify for a migrate-mode seed: how many snapshots
+/// arrived, or the incomplete-seed failure.
+///
+/// Mandatory because kopia's per-source migration goroutines only LOG their
+/// errors — exit 0 does not mean every snapshot arrived, so the destination
+/// listing is the only honest success signal. Pure over the two listings, so
+/// the correspondence is unit-testable without kopia; everything in the source
+/// is selected (a seed has no identity selection), which is what lets the
+/// replication helpers verify the full copy.
+fn seed_migrate_verify(
+    source_list: &[kopiur_kopia::SnapshotListEntry],
+    local_after: &[kopiur_kopia::SnapshotListEntry],
+    latest_only: bool,
+) -> SeedStep<i64> {
+    let selected = srepl::select_identities(&[], &[], source_list);
+    let missing = srepl::missing_after_migrate(source_list, &selected, local_after, latest_only);
+    if !missing.is_empty() {
+        let expected = srepl::expected_keys(source_list, &selected, latest_only);
+        error!(
+            missing = missing.len(),
+            expected = expected.len(),
+            "seed migrate is incomplete"
+        );
+        return Err(Box::new(BootstrapResult::seed_incomplete(
+            missing.len(),
+            expected.len(),
+            &srepl::missing_sample(&missing, kopiur_mover::error::MISSING_SAMPLE_CAP),
+        )));
+    }
+    // CUMULATIVE, not copied-by-this-run: this counts what is PRESENT after the
+    // migrate. On a first seed the repository was empty beforehand, so the two
+    // readings coincide. On a RESUME the destination already held the previous
+    // attempt's partial copy, and this number includes it.
+    //
+    // Chosen deliberately over a before/after delta. `status.seed.snapshotsCopied`
+    // answers "how much of the source is here now", which is what someone
+    // watching a recovery wants and what stays meaningful across however many
+    // attempts it took; a per-run delta would report a small number on the run
+    // that finally completed the copy. It also costs no extra listing.
+    Ok(srepl::dest_keys(local_after, &selected).len() as i64)
+}
+
+/// Run the migrate itself, then the mandatory post-verify. Returns how many
+/// snapshots arrived.
+///
+/// Kept together because they are one indivisible step: `kopia snapshot
+/// migrate` exits 0 even when a per-source migration failed (its goroutines
+/// only LOG their errors), so a migrate whose result was not verified against
+/// the destination listing has told you nothing.
+async fn seed_migrate_and_verify(
+    local_client: &KopiaClient,
+    paths: &SeedPaths,
+    migrate: workspec::SeedMigrateSpec,
+    source_list: &[kopiur_kopia::SnapshotListEntry],
+) -> SeedStep<i64> {
+    if let Err(e) = local_client
+        .snapshot_migrate(&SnapshotMigrateOptions {
+            source_config_path: paths.source_config.clone(),
+            // A seed copies the WHOLE source: unlike a SnapshotReplication it
+            // has no identity selection, because recovering a subset of a
+            // disaster-recovery mirror is not a thing anyone asks for.
+            sources: MigrateSources::All,
+            latest_only: migrate.latest_only,
+            parallel: migrate.parallel,
+            // Rendered explicitly by `PolicyCopyModeSpec::to_kopia`; the default
+            // is `--no-policies`, because kopia's own default IMPORTS the
+            // source's policies — retention among them, which would delete
+            // manifests behind the operator's back.
+            policies: migrate.policies.to_kopia(),
+        })
+        .await
+    {
+        error!(class = %e.class(), "seed snapshot migrate failed");
+        return Err(Box::new(BootstrapResult::failed(&e)));
+    }
+    let local_after = match local_client.snapshot_list_all().await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(class = %e.class(), "could not list this repository after the seed migrate");
+            return Err(Box::new(BootstrapResult::failed(&e)));
+        }
+    };
+    seed_migrate_verify(source_list, &local_after, migrate.latest_only)
+}
+
+/// Migrate-mode seed: create THIS repository, then `kopia snapshot migrate`
+/// every snapshot from the source repository CR into it.
+///
+/// Unlike blob mode this copies between two independently encrypted
+/// repositories, so it creates the local repository first — honoring
+/// `spec.create.{splitter,hash,encryption,ecc}` even though `create.enabled`
+/// does not gate it (a seed is not the create fallback; it is the
+/// initialization the user explicitly asked for).
+///
+/// Two kopia clients under DISTINCT config files, exactly like the snapshot
+/// replication flow — see [`seed_create_and_connect_local`] for the cache
+/// isolation rule that makes that work.
+#[allow(clippy::too_many_arguments)]
+async fn run_seed_migrate(
+    client: &KopiaClient,
+    spec: &MoverWorkSpec,
+    op: &BootstrapRepositoryOp,
+    seed: &workspec::SeedOpSpec,
+    local_connect: &ConnectSpec,
+    kopia_binary: Option<&str>,
+    paths: &SeedPaths,
+    local_initialized: bool,
+) -> SeedStep<SeedOutcome> {
+    info!(
+        source = %seed.source_description,
+        "seeding this repository from another repository (kopia snapshot migrate)"
+    );
+    // ORDER MATTERS: every source-side check runs BEFORE the local
+    // `repository create`. A migrate that creates first and then fails on a
+    // dead, mis-credentialed or empty source leaves an initialized-but-empty
+    // repository behind — and the next bootstrap's connect would SUCCEED,
+    // making the seed a no-op over the leftovers. Those are precisely the
+    // retryable failures expected to recur, so they must not be able to
+    // initialize anything. (`seed_left_repository_empty` in `run_bootstrap` is
+    // the backstop for the windows this ordering cannot close — a copy killed
+    // mid-flight after the create.)
+    let source_password = seed_source_password()?;
+    let source =
+        seed_connect_source(spec, seed, kopia_binary, paths, Some(source_password)).await?;
+    seed_probe_source_password(spec, &source.connect, kopia_binary, paths).await?;
+    let source_list = seed_source_snapshots(seed, &source.client).await?;
+    let local_client = seed_create_and_connect_local(
+        client,
+        spec,
+        op,
+        local_connect,
+        kopia_binary,
+        paths,
+        local_initialized,
+    )
+    .await?;
+
+    let migrate = seed.migrate.unwrap_or_default();
+    let snapshots_copied =
+        seed_migrate_and_verify(&local_client, paths, migrate, &source_list).await?;
+    info!(
+        snapshot_count = source_list.len(),
+        snapshots_copied, "seeded this repository from the source repository"
+    );
+    Ok(SeedOutcome::performed(
+        workspec::SeedModeSpec::Migrate,
+        seed.source_description.clone(),
+        source_list.len() as i64,
+        Some(snapshots_copied),
+    ))
+}
+
+/// Run the seed the work spec armed, dispatching on its source. Exhaustive over
+/// [`workspec::SeedConnectSource`] — a new seed source cannot compile until its
+/// execution is written.
+#[allow(clippy::too_many_arguments)]
+async fn run_seed(
+    client: &KopiaClient,
+    spec: &MoverWorkSpec,
+    op: &BootstrapRepositoryOp,
+    seed: &workspec::SeedOpSpec,
+    local_connect: &ConnectSpec,
+    kopia_binary: Option<&str>,
+    local_initialized: bool,
+) -> SeedStep<SeedOutcome> {
+    let paths = SeedPaths::new();
+    if seed.resume {
+        // TRUST CONTRACT. `resume: true` is an ASSERTION by the controller that
+        // it previously started a seed of THIS repository and that seed did not
+        // finish. The mover does not — cannot — independently verify it: from
+        // here an interrupted seed's leftovers and a stranger's repository look
+        // identical, and the only thing that distinguishes them is the durable
+        // seed-attempt marker the controller stamps in status before creating a
+        // seeding Job (issue #380 stage C3).
+        //
+        // What rides on that marker: a resuming MIGRATE writes into whatever
+        // repository is at this backend, and a successful seed then re-stamps
+        // its maintenance owner. If the flag were ever set for a repository this
+        // operator never began seeding, the migrate would pour snapshots into a
+        // stranger's repository and claim its maintenance. Blob mode is
+        // structurally safer — kopia's own `sync-to` refuses a destination whose
+        // format blob differs from the source's — but migrate has no such
+        // backstop, so the marker is the ONLY guard. Never set `resume` from
+        // anything weaker than that marker.
+        info!(
+            source = %seed.source_description,
+            local_initialized,
+            "resuming a seed a previous attempt did not finish"
+        );
+    }
+    match &seed.from {
+        workspec::SeedConnectSource::Backend(_) => {
+            run_seed_blob(
+                spec,
+                seed,
+                local_connect,
+                kopia_binary,
+                &paths,
+                local_initialized,
+            )
+            .await
+        }
+        workspec::SeedConnectSource::Repository(_) => {
+            run_seed_migrate(
+                client,
+                spec,
+                op,
+                seed,
+                local_connect,
+                kopia_binary,
+                &paths,
+                local_initialized,
+            )
+            .await
+        }
+    }
+}
+
+/// Stamp the stable, lease-derived maintenance owner on a repository this run
+/// just INITIALIZED (created, or migrate-seeded into a fresh create).
+///
+/// kopia auto-assigns the creating pod's EPHEMERAL identity as owner. Left
+/// alone, every later maintenance mover sees a foreign owner and — with the
+/// default `takeoverPolicy: Never` — yields forever: full maintenance never
+/// runs and index blobs accumulate. Best-effort: a failed stamp degrades to the
+/// pre-existing `takeoverPolicy: Force` recovery rather than failing the
+/// bootstrap (degrade-not-crash).
+async fn stamp_owner_on_new_repository(client: &KopiaClient, owner: Option<&String>) {
+    let Some(owner) = owner else { return };
+    match client.maintenance_set_owner(owner).await {
+        Ok(()) => info!(%owner, "stamped maintenance owner on newly initialized repository"),
+        Err(e) => warn!(
+            %owner,
+            class = %e.class(),
+            "could not stamp maintenance owner on newly initialized repository; \
+             maintenance will need takeoverPolicy=Force once"
+        ),
+    }
+}
+
+/// The [`BootstrapInitAction::Fail`] arm: turn a failed first connect into the
+/// most accurate message available.
+///
+/// Two distinct decline reasons → two distinct messages:
+/// * create opt-out (`auto_create` off, no seed) + a genuinely-absent
+///   repository ⇒ the actionable "set `spec.create.enabled: true`": the
+///   repository just needs initializing. Scoped to exactly that case — an
+///   unreachable backend (`RepositoryUnavailable`) or a denied bucket
+///   (`AccessDenied`) is NOT "uninitialized", and telling the user to enable
+///   create there would be wrong advice.
+/// * everything else (a repository exists that we cannot open — auth/locked; an
+///   access or permission problem; or create/seed blocked by the class) ⇒
+///   surface the real kopia class. Recreating would mask it or risk a second
+///   repository, and seeding would write another cluster's data over a state we
+///   could not even read.
+fn bootstrap_declined(
+    op: &BootstrapRepositoryOp,
+    err: &KopiaError,
+    uninitialized: bool,
+) -> BootstrapResult {
+    if !op.auto_create
+        && op.seed.is_none()
+        && err.class() == KopiaErrorClass::NotFound
+        && uninitialized
+    {
+        return BootstrapResult::not_initialized();
+    }
+    BootstrapResult::failed(err)
+}
+
+/// The [`BootstrapInitAction::Create`] arm: initialize an EMPTY repository here
+/// (the pre-#380 `spec.create.enabled` fallback), reconnect, and stamp the
+/// maintenance owner.
+async fn bootstrap_create_arm(
+    client: &KopiaClient,
+    op: &BootstrapRepositoryOp,
+    connect_spec: &ConnectSpec,
+    cache: kopiur_kopia::CacheTuning,
+) -> SeedStep<()> {
+    if let Err(ce) = client
+        .repository_create(connect_spec, cache, &op.create_options())
+        .await
+    {
+        return Err(Box::new(BootstrapResult::failed(&ce)));
+    }
+    if let Err(ce) = bootstrap_connect(client, connect_spec, cache, op.read_only).await {
+        return Err(Box::new(BootstrapResult::failed(&ce)));
+    }
+    stamp_owner_on_new_repository(client, op.maintenance_owner.as_ref()).await;
+    Ok(())
+}
+
+/// The [`BootstrapInitAction::Seed`] arm (issue #380): initialize this
+/// repository from `spec.seed`'s source, then reconnect to it.
+///
+/// Returns `(created, outcome)`. `created` is TRUE only for a migrate that
+/// actually created the local repository this run — migrate mode into a backend
+/// that was NOT already initialized. It then takes the ordinary create path,
+/// including the create-time owner stamp.
+///
+/// The other two shapes report `seeded` instead, and both need the
+/// unconditional owner RESTAMP that flag drives:
+/// * **blob** (first seed or resume) — the copy carries the SOURCE cluster's
+///   `kopia.maintenance` blob, so the repository arrives owned by an operator
+///   that no longer exists;
+/// * **a RESUMING migrate** — the repository was created by an earlier attempt
+///   whose own stamp may never have run (that attempt died), leaving kopia's
+///   ephemeral pod identity as owner. Nothing else would ever fix it, since
+///   `created` is false on this pass.
+///
+/// So `seeded == !created` here by construction, and that is the honest
+/// reading: "this run initialized or finished the repository, but not by
+/// `repository create`".
+#[allow(clippy::too_many_arguments)]
+async fn bootstrap_seed_arm(
+    client: &KopiaClient,
+    spec: &MoverWorkSpec,
+    op: &BootstrapRepositoryOp,
+    seed: &workspec::SeedOpSpec,
+    connect_spec: &ConnectSpec,
+    cache: kopiur_kopia::CacheTuning,
+    kopia_binary: Option<&str>,
+    local_initialized: bool,
+) -> SeedStep<(bool, SeedOutcome)> {
+    let outcome = run_seed(
+        client,
+        spec,
+        op,
+        seed,
+        connect_spec,
+        kopia_binary,
+        local_initialized,
+    )
+    .await?;
+    // Exhaustive: a new seed mode cannot compile until its create-vs-seed
+    // classification — which decides how the maintenance owner is fixed up — is
+    // decided here. A RESUMING migrate did not create anything this run (the
+    // repository was already there), so it takes the connect-to-existing
+    // restamp path like blob mode does.
+    let created = match outcome.mode {
+        workspec::SeedModeSpec::Blob => false,
+        workspec::SeedModeSpec::Migrate => !local_initialized,
+    };
+    if let Err(ce) = bootstrap_connect(client, connect_spec, cache, op.read_only).await {
+        return Err(Box::new(BootstrapResult::failed(&ce)));
+    }
+    if created {
+        stamp_owner_on_new_repository(client, op.maintenance_owner.as_ref()).await;
+    }
+    Ok((created, outcome))
+}
+
+/// Everything the first bootstrap connect decided, gathered in one place.
+struct BootstrapProbe {
+    /// The connect failure, when it failed.
+    err: Option<KopiaError>,
+    /// Whether this repository's backend already holds a kopia format blob —
+    /// true iff the connect opened it. This, NOT
+    /// [`crate::workspec::SeedOpSpec::resume`], is what decides whether a seed
+    /// initializes the backend or copies into an existing one: a marker-bearing
+    /// repository whose backend turns out to be genuinely empty still needs the
+    /// first-seed treatment.
+    local_initialized: bool,
+    /// Whether the failure was kopia's "repository not initialized", i.e. the
+    /// backend ANSWERED and the format blob is absent. A missing path or unbound
+    /// mount also classifies `NotFound` ("no such file or directory") but is a
+    /// backend/mount fault — never an empty backend to create or seed over.
+    uninitialized: bool,
+    /// The standing-no-op seed outcome this connect owes the controller, if any.
+    already_initialized: Option<SeedOutcome>,
+    /// What to do about initializing the repository.
+    action: BootstrapInitAction,
+}
+
+/// Perform the first bootstrap connect and classify it. The IO is the connect
+/// itself; every judgement it feeds is the pure [`bootstrap_init_action`].
+async fn bootstrap_connect_probe(
+    client: &KopiaClient,
+    connect_spec: &ConnectSpec,
+    cache: kopiur_kopia::CacheTuning,
+    op: &BootstrapRepositoryOp,
+) -> BootstrapProbe {
+    let err = bootstrap_connect(client, connect_spec, cache, op.read_only)
+        .await
+        .err();
+    let local_initialized = err.is_none();
+    let uninitialized = err
+        .as_ref()
+        .and_then(KopiaError::stderr_tail)
+        .is_some_and(kopiur_kopia::notfound_is_uninitialized);
+    let already_initialized = if local_initialized {
+        let outcome = kopiur_mover::bootstrap::already_initialized_outcome(op.seed.as_ref());
+        if let Some(o) = &outcome {
+            info!(
+                source = %o.source,
+                "spec.seed is set but this repository is already initialized and no resume \
+                 was requested; nothing to seed"
+            );
+        }
+        outcome
+    } else {
+        None
+    };
+    let action = bootstrap_init_action(
+        op.seed.is_some(),
+        op.seed.as_ref().is_some_and(|s| s.resume),
+        op.auto_create,
+        err.as_ref().map(KopiaError::class),
+        uninitialized,
+    );
+    BootstrapProbe {
+        err,
+        local_initialized,
+        uninitialized,
+        already_initialized,
+        action,
+    }
+}
+
 /// The bootstrap routine: connect-first (adopt an existing repo), create only
 /// when gated by [`should_attempt_create`], then read identity + catalog.
 async fn run_bootstrap(
     client: &KopiaClient,
+    spec: &MoverWorkSpec,
     op: &BootstrapRepositoryOp,
     connect: &ConnectSpec,
+    kopia_binary: Option<&str>,
 ) -> BootstrapResult {
     let connect_spec = connect.clone();
 
@@ -1100,60 +1919,85 @@ async fn run_bootstrap(
     // it connects with kopia's default cache budgets.
     let cache = kopiur_kopia::CacheTuning::default();
     let mut created = false;
-    if let Err(e) = bootstrap_connect(client, &connect_spec, cache, op.read_only).await {
-        if !should_attempt_create(op.auto_create, e.class()) {
-            // We will NOT create. Two distinct decline reasons → two distinct,
-            // accurate messages:
-            //  - create opt-out (`auto_create` off) + a genuinely-absent repo
-            //    (`NotFound`) ⇒ actionable "set spec.create.enabled: true": the repo
-            //    just needs initializing. Scoped to `NotFound` only — an unreachable
-            //    backend (`RepositoryUnavailable`) or a denied bucket (`AccessDenied`)
-            //    is NOT "uninitialized", and telling the user to enable create there
-            //    would be wrong advice.
-            //  - everything else (a repo exists we can't open — auth/locked; an
-            //    access/permission problem; or auto_create on but blocked) ⇒ surface
-            //    the real kopia class; recreating would mask it or risk a 2nd repo.
-            //
-            // A `NotFound` is only "uninitialized" when the backend answered and the
-            // format blob is absent (`repository not initialized`). A missing path /
-            // unbound mount also classifies `NotFound` ("no such file or directory")
-            // but is a backend/mount fault, NOT an empty repository — surface it as a
-            // real failure so the controller's health probe never misreads a
-            // mis-mounted volume as a vanished repository (and never nudges a recreate).
-            if !op.auto_create
-                && e.class() == KopiaErrorClass::NotFound
-                && e.stderr_tail()
-                    .is_some_and(kopiur_kopia::notfound_is_uninitialized)
-            {
-                return BootstrapResult::not_initialized();
+    // `seeded` is blob-mode seeding's counterpart to `created`: the repository
+    // was initialized (or finished) by this run, but by COPYING another
+    // cluster's storage rather than by `repository create`. It stays out of
+    // `created` on purpose (the controller's created-vs-connected event, and the
+    // create-time-only maintenance stamp, both key on a genuine create) and
+    // instead drives the unconditional owner restamp below — the copied
+    // `kopia.maintenance` blob names the source cluster's operator, which under
+    // `OwnFormatsOnly` the normal self-heal would refuse to touch, yielding
+    // maintenance forever.
+    let mut seeded = false;
+
+    let probe = bootstrap_connect_probe(client, &connect_spec, cache, op).await;
+    let (connect_err, local_initialized, uninitialized) =
+        (probe.err, probe.local_initialized, probe.uninitialized);
+    // A successful connect over a NON-resuming armed seed is the documented
+    // standing no-op, and its outcome must be emitted even though nothing ran:
+    // the controller reads its presence as proof this mover image understood
+    // `spec.seed` at all. Computed up front so the invariant holds on every
+    // route out of the match below; the Seed arm overwrites it with what the
+    // seed actually did.
+    let mut seed_outcome: Option<SeedOutcome> = probe.already_initialized;
+
+    // ONE decision, exhaustive over its outcomes (issue #380): what this connect
+    // is answered with. Proceed / Fail / Create / Seed.
+    match probe.action {
+        // Connected and usable — the ordinary connect-to-existing path.
+        BootstrapInitAction::Proceed => {}
+        BootstrapInitAction::Fail => {
+            // `Fail` is only ever returned for a FAILED connect, so the error is
+            // present. Expressed as a match rather than an unwrap so a future
+            // rearrangement degrades to carrying on with a repository that IS
+            // connected, instead of panicking mid-disaster-recovery.
+            if let Some(e) = connect_err.as_ref() {
+                return bootstrap_declined(op, e, uninitialized);
             }
-            return BootstrapResult::failed(&e);
         }
-        info!(class = %e.class(), "connect failed; attempting repository create");
-        if let Err(ce) = client
-            .repository_create(&connect_spec, cache, &op.create_options())
+        BootstrapInitAction::Create => {
+            info!(
+                class = ?connect_err.as_ref().map(KopiaError::class),
+                "connect failed; attempting repository create"
+            );
+            if let Err(result) = bootstrap_create_arm(client, op, &connect_spec, cache).await {
+                return *result;
+            }
+            created = true;
+        }
+        BootstrapInitAction::Seed => {
+            // Unreachable without a seed (`Seed` is only ever returned when one
+            // is armed), but expressed as a `let else` rather than an `unwrap`
+            // so a future rearrangement degrades to a real failure instead of a
+            // panic in the middle of a disaster recovery.
+            //
+            // TERMINAL, and deliberately not one of the seed classes: this would
+            // be the mover disagreeing with itself, which no retry can resolve.
+            // Classifying it retryable would spin a Job every two minutes
+            // forever while hiding the defect behind it.
+            let Some(seed) = op.seed.as_ref() else {
+                return BootstrapResult::internal_inconsistency(
+                    "bootstrap_init_action selected Seed for a work spec that carries no spec.seed payload",
+                );
+            };
+            match bootstrap_seed_arm(
+                client,
+                spec,
+                op,
+                seed,
+                &connect_spec,
+                cache,
+                kopia_binary,
+                local_initialized,
+            )
             .await
-        {
-            return BootstrapResult::failed(&ce);
-        }
-        if let Err(ce) = bootstrap_connect(client, &connect_spec, cache, op.read_only).await {
-            return BootstrapResult::failed(&ce);
-        }
-        created = true;
-        // Stamp the stable, lease-derived maintenance owner on a repo we just
-        // CREATED (kopia auto-assigned this pod's ephemeral identity). Without
-        // this, every maintenance mover sees a foreign owner and a
-        // `takeoverPolicy: Never` yields forever. Best-effort: a failed stamp
-        // is recoverable later via takeoverPolicy=Force (degrade-not-crash).
-        if let Some(owner) = &op.maintenance_owner {
-            match client.maintenance_set_owner(owner).await {
-                Ok(()) => info!(%owner, "stamped maintenance owner on created repository"),
-                Err(e) => warn!(
-                    %owner,
-                    class = %e.class(),
-                    "could not stamp maintenance owner on created repository; \
-                     maintenance will need takeoverPolicy=Force once"
-                ),
+            {
+                Ok((was_created, outcome)) => {
+                    created = was_created;
+                    seeded = !was_created;
+                    seed_outcome = Some(outcome);
+                }
+                Err(result) => return *result,
             }
         }
     }
@@ -1173,6 +2017,7 @@ async fn run_bootstrap(
             Ok(info) => {
                 if let Some(owner) = maintenance_restamp_target(
                     created,
+                    seeded,
                     Some(desired),
                     op.restamp_policy,
                     &op.maintenance_owner_aliases,
@@ -1302,6 +2147,35 @@ async fn run_bootstrap(
         Err(e) => return BootstrapResult::failed(&e),
     };
     let snapshot_count = listing.len() as i64;
+    // The seeding backstop (issue #380): refuse to report success on an EMPTY
+    // repository when a seed was armed. Catches the one path the source-side
+    // gates cannot see — an earlier seed that initialized the backend and then
+    // died, whose retry connects successfully and would otherwise report a no-op
+    // over the half-initialized leftovers. Placed here so it covers every route
+    // to "seed armed, nothing in the repository".
+    //
+    // It counts with `snapshot list --all` rather than reusing the catalog
+    // listing above, and pays a second kopia call to do it. Every SEEDED
+    // snapshot belongs to the identity of the cluster that WROTE it, and this is
+    // a TERMINAL decision about whether a repository holds history. Plain
+    // `snapshot list` is not identity-scoped on kopia 0.23.1 (verified; pinned
+    // against the real binary by the `sync_to_seeds_*` integration test), but
+    // kopia's own `--all` help reads as though it were — betting a
+    // repository-stranding decision on that staying true is not a bet worth
+    // taking. `--all` is unconditional. Only paid on a seed-armed run.
+    if let Some(seed) = op.seed.as_ref() {
+        let all = match client.snapshot_list_all().await {
+            Ok(l) => l.len() as i64,
+            Err(e) => {
+                error!(class = %e.class(), "could not list this repository to check the seed result");
+                return BootstrapResult::failed(&e);
+            }
+        };
+        if kopiur_mover::bootstrap::seed_left_repository_empty(true, seed.allow_empty_source, all) {
+            error!("spec.seed is set but this repository is initialized and holds zero snapshots");
+            return BootstrapResult::seed_left_empty();
+        }
+    }
     let (snapshots, truncated, foreign_suffix_dropped) = if op.scan_catalog {
         kopiur_mover::bootstrap::prepare_catalog_entries(
             listing,
@@ -1350,6 +2224,10 @@ async fn run_bootstrap(
     )
     .with_epoch(observed_epoch, epoch_error)
     .with_blob_retention(observed_blob_retention)
+    // MUST be present on every seed-armed success — including the
+    // already-initialized no-op — or the controller reads the result as written
+    // by a mover too old to understand `spec.seed` (issue #380).
+    .with_seed(seed_outcome)
 }
 
 /// Apply the ConfigMap size backstop (issue #237) to a bootstrap result, warning

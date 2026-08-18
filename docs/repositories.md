@@ -157,6 +157,193 @@ Set **`create.enabled: false`** for a strictly read-only or externally-managed r
 
 So enabling `create.enabled` for a repository that turns out to already exist is safe: kopiur will adopt it, not re-initialize it.
 
+## `seed` — initialize a new repository from a replica
+
+`spec.seed` fills a **brand-new** repository with an existing replica's contents
+during its very first bootstrap, before the repository is ever reported `Ready`.
+It is the disaster-recovery counterpart of
+[repository replication](replication.md): the mirror you have been writing
+off-site becomes the *starting point* of the rebuilt cluster's own repository,
+instead of something you promote to production or copy by hand.
+
+/// info | `spec.seed` seeds a repository, not a volume
+
+Some example bundles contain a one-shot `Job` named `seed-…` that writes test
+data into a volume. Unrelated. **`spec.seed` seeds a _repository_, from another
+repository.**
+
+///
+
+### When it is armed (and why it is safe to leave in Git)
+
+A seed is armed only when **both** are true:
+
+1. the repository has never been initialized (`status.uniqueId` is unset), and
+2. the mover's first connect reports the backend **uninitialized** — kopia's own
+   "repository not initialized", never a missing path or an unbound mount.
+
+On an already-initialized repository the block is a documented **no-op**:
+`Seeded=True`, reason `AlreadyInitialized`, nothing copied, nothing touched. So
+`spec.seed` is a standing GitOps-safe field — leave it in the manifest forever and
+it does something exactly once, on the day you rebuild. An `AuthFailure`,
+`Locked`, `AccessDenied` or `PermissionDenied` connect never seeds and never
+creates, for the same reason it never creates today: kopiur does not write over a
+backend it could not open.
+
+While the seed is armed the bootstrap Job's deadline comes from
+`spec.seed.failurePolicy` and defaults to **86400 s (24 h)** instead of the usual
+120 s — a seed copies a whole repository, once. Every later connect uses
+`spec.bootstrap.failurePolicy` as before.
+
+### Blob mode — from a mirror backend
+
+```yaml
+--8<-- "deploy/examples/41-repository-seed-from-backend.yaml:repository"
+```
+
+`kopia repository sync-to` from a bare storage backend holding a byte-for-byte
+mirror — what a [`RepositoryReplication`](replication.md) writes. The copy is at
+the storage layer, so the seeded repository **inherits the mirror's format and
+password verbatim**: `encryption.passwordSecretRef` must already hold the
+mirror's password.
+
+### Migrate mode — from another repository CR
+
+```yaml
+--8<-- "deploy/examples/42-repository-seed-from-repository.yaml:repository"
+```
+
+`kopia snapshot migrate` from another `Repository`/`ClusterRepository`. Source and
+destination are two independent repositories with their own formats and passwords;
+kopiur creates the local one itself. The source is opened read-only and gated on
+being `Ready` — until then the repository parks visibly (`Seeded=False`, reason
+`WaitingForSeedSource`) and re-checks every 15 s.
+
+Seeding from a **`ClusterRepository`** makes this repository a *consumer* of it,
+so the source's [`allowedNamespaces`](#allowednamespaces--who-may-use-it-clusterrepository-only)
+must admit this `Repository`'s namespace — the same fail-closed tenancy gate every
+other consumer reference goes through. The webhook rejects the apply naming
+`spec.seed.from.repository` if it does not. (A `ClusterRepository` seeding from
+another `ClusterRepository` is not gated: a cluster-scoped author has no consumer
+namespace to check.)
+
+Both modes preserve each snapshot's `username@hostname:path` identity and its
+times, so seeded history stays restorable by `Restore.source.identity` and by
+`fromPolicy`.
+
+### `create` and `seed` together
+
+| You set | What happens |
+| --- | --- |
+| `seed` only | The seed initializes the repository. `create.enabled` keeps its ordinary meaning for later connects, but the **create fallback is never taken** while a seed is armed — a failed seed fails the bootstrap instead of quietly creating an empty repository. |
+| `seed.from.backend` + `create.{splitter,hash,encryption,ecc}` | **Rejected at admission.** A blob copy takes the mirror's repository format verbatim, so those algorithms would never be applied. Remove them, or use migrate mode. |
+| `seed.from.repository` + `create.{…}` | Honored — migrate mode really does create a local repository with the format you declare. |
+| `seed` + `mode: ReadOnly` | **Rejected at admission.** Seeding is the largest write a repository ever takes. |
+| `seed` on a bare-path `filesystem` backend (no `volume`) | **Rejected at admission** — for the repository *and* for a filesystem seed source. Seeding runs in a mover Job; a bare path exists only on the controller's own filesystem, so the Job would mount nothing. |
+
+### The fields
+
+| Field | Default | What it does |
+| --- | --- | --- |
+| `seed.from.backend` | — | Blob mode: a mirror's storage backend (the same externally-tagged `Backend` shape `spec.backend` uses). |
+| `seed.from.repository` | — | Migrate mode: a `RepositoryRef` (`kind` defaults to `Repository`; an absent `namespace` resolves in this CR's namespace, and for a `ClusterRepository` in the operator's namespace). |
+| `seed.sync.parallel` | kopia's `1` | Blob mode only: concurrent blob-copy workers. Raise it — a first seed over a WAN is what sequential copying is worst at. |
+| `seed.sync.maxDownloadSpeedBytesPerSecond` / `maxUploadSpeedBytesPerSecond` | unlimited | Blob mode only: throttle the copy. |
+| `seed.migrate.parallel` | kopia's `1` | Migrate mode only: snapshots migrated concurrently. |
+| `seed.migrate.latestOnly` | `false` | Copy only each identity's newest snapshot instead of its full history. |
+| `seed.migrate.policies` | `none` | Whether the source's **kopia-side** policies come along. Default is an explicit `--no-policies`, unlike kopia's own copy-by-default: retention here is driven by `Snapshot` CRs, and imported kopia policies could delete manifests behind the operator's back. |
+| `seed.allowEmptySource` | `false` | Accept a source holding zero snapshots. Left at `false`, an empty source **fails the bootstrap** and retries. |
+| `seed.failurePolicy.activeDeadlineSeconds` | `86400` (24 h) | Wall-clock cap for the seeding Job. |
+| `seed.failurePolicy.backoffLimit` | as `bootstrap` | Pod retries within one seeding Job. |
+| `seed.credentialProjection.enabled` | `false` | Migrate mode: copy the **source** repository's credential Secrets into the seeding Job's namespace for the run. Requires the operator's `features.credentialProjection.enabled` flag — see [Feature permissions](feature-permissions.md). |
+
+The mode-specific blocks are **not** silently ignored when paired with the other
+mode's source: `sync` with a repository source, and `migrate` (or an enabled
+`credentialProjection`) with a backend source, are rejected at admission. Kopiur
+does not accept inert fields.
+
+/// warning | Where the seed source's credential Secret must live
+
+It is loaded with `envFrom`, which is namespace-local, so it must be in **the
+namespace the bootstrap Job runs in**. For a namespaced `Repository` that is its
+own namespace. For a `ClusterRepository` it is the operator's namespace — unless
+`encryption.passwordSecretRef.namespace` pins one, in which case the Job runs
+there and the seed Secret must be there too. A seed `secretRef` on a
+`ClusterRepository` may not pin a namespace at all (a cluster-scoped spec cannot
+name the right one).
+
+///
+
+### Never clobbering anything
+
+- Seeding **never writes to its source**. Both modes connect it read-only.
+- A seed that ends with the repository holding **zero** snapshots is refused
+  (`Seeded=False`, reason `SeedLeftEmpty`) rather than reported `Ready` — the
+  `allowEmptySource` opt-in is the only way to accept that.
+- A migrate seed only ever *resumes* into an existing repository when kopiur
+  itself recorded starting that seed (`status.seed.startedAt`). A repository
+  somebody else initialized — an ordinary adoption with `spec.seed` standing in
+  the manifest — takes the `AlreadyInitialized` no-op instead.
+- Blob mode gets a kopia-side backstop for free: `sync-to` refuses a destination
+  whose format blob differs from the source's.
+
+### Failures retry; an interrupted seed resumes
+
+Source-side and copy-side failures (`SeedSourceNotFound`, `SeedSourceEmpty`,
+`SeedIncomplete`, `SeedLeftEmpty`) are **retryable**: the failed Job is recycled
+and a fresh one — with a fresh 24 h deadline — is launched roughly every **two
+minutes**, so a mirror that is briefly unreachable or a replication that has not
+run yet heals with no operator action.
+
+Kopiur stamps `status.seed.startedAt` *before* creating the seeding Job, so a copy
+killed mid-flight is recognizable as its own on the next pass and the relaunch
+**resumes**: `sync-to` copies only the blobs the destination lacks, and
+`snapshot migrate` is idempotent by `(identity, startTime)`. Nothing at the
+backend should be deleted to "clean up" after an interrupted seed —
+`status.seed.snapshotsCopied` is therefore *cumulative*, reporting what is present
+after the run rather than a per-attempt delta.
+
+`MoverImageTooOldForSeed` (the running mover image predates `spec.seed` and
+dropped it) and `BootstrapInternalInconsistency` are **terminal** — the same
+inputs reproduce them forever.
+
+### Editing `spec.seed` mid-flight, and `suspend`
+
+`spec.seed` is mutable. An in-flight seeding Job is **not** killed: it runs to
+completion, its result is discarded as stale, and the next pass launches a fresh
+seed for the live spec. The attempt marker survives, so that relaunch resumes —
+**against the new source**. Blob mode fails safe there (`sync-to` refuses a
+mismatched format blob); migrate mode does not, and will merge the new source's
+history into what the first attempt left behind. To deliberately repoint a
+migrate seed before it finishes, delete the half-seeded repository at the backend
+first, or let it finish and move the extra history with a
+[`SnapshotReplication`](snapshot-replication.md).
+
+`spec.suspend` mid-seed leaves the Job running; its result is consumed when you
+resume.
+
+### Status and conditions
+
+`status.seed` carries `startedAt`, `seededAt`, `mode`, `source`, `snapshotCount`
+and (migrate only) `snapshotsCopied`. The `Seeded` condition carries the state,
+`kopiur_repository_seed_total{mode,outcome}` counts the outcomes, and
+`kubectl kopiur doctor` explains every `Seeded=False` reason. The full reason
+table, the DR walkthrough, and the identity/retention hazards to review **before**
+re-applying policies over seeded history are in
+[Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
+
+/// danger | Review retention before re-applying policies over seeded history
+
+Adoption re-attaches matching `discovered` snapshots to a live `SnapshotPolicy`,
+and under the default `deletionPolicy: Delete` everything outside
+`spec.retention` is then pruned from the repository immediately (retention prunes
+bypass `deletionProtection` by design). Widen the window, set
+`defaultDeletionPolicy: Retain`, `spec.pin` what must survive, or use
+`adoption: Ignore` — and bound `catalog.retain` so a multi-year mirror does not
+materialize thousands of `Snapshot` CRs at once.
+
+///
+
 ## `bootstrap` — tuning the connect/create Job
 
 Object-store and volume-backed repositories connect (and, with `create`, create) in a short-lived **bootstrap Job** the operator cannot run in-process. By default that Job is bounded to **120s** so a pod that never schedules (missing mover ServiceAccount, image-pull failure) becomes terminal-`Failed` and surfaces an actionable Event instead of hanging. A valid-but-slow backend can need longer — most commonly an [rclone](backends/rclone.md) remote whose metadata/indexes load through kopia's embedded `rclone serve` bridge.
@@ -611,6 +798,7 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `backend.<kind>.auth.secretRef.name`                   | The Secret holding the backend keys.              |
 | `encryption.passwordSecretRef.{name,key}`              | Where the kopia password lives.                   |
 | `create.enabled`                                       | Whether to initialize a new repository.           |
+| `seed.from.{backend,repository}`                        | Initialize a brand-new repository from a surviving replica on its first bootstrap (disaster recovery). |
 | `backend.s3.tls.disableTls`                            | Plain-HTTP endpoints (in-cluster MinIO/RustFS).   |
 | `backend.s3.tls.caBundleRef`                           | Trust a private-CA HTTPS endpoint: a ConfigMap key with the CA PEM (`key` defaults to `ca.crt`), resolved in the `Repository`'s namespace — operator's namespace for a `ClusterRepository` — and inlined into every mover. See [Private-CA HTTPS](backends/s3.md#private-ca-https-trusting-your-own-ca). |
 | `allowedNamespaces` _(ClusterRepository)_              | Which namespaces may use the repo.                |
@@ -631,3 +819,4 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 - [Maintenance](maintenance.md) — the default-managed space reclamation per repo.
 - [`deploy/examples/01-single-pvc-scheduled.yaml`](examples.md#example-01--single-pvc-scheduled) — S3 `Repository`, end to end.
 - [`deploy/examples/02-cluster-repository.yaml`](examples.md#example-02--shared-platform-repository) — `ClusterRepository`.
+- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md) — `spec.seed` end to end.

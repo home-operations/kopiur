@@ -7,6 +7,7 @@ use crate::common::{
     default_namespace_delete_policy, default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
+use crate::seed::{SeedSpec, SeedStatus};
 use crate::server::{ServerSpec, ServerStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
@@ -56,6 +57,18 @@ pub struct RepositorySpec {
     /// What to do when the repository does not yet exist (absent means it must already exist).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create: Option<CreateBehavior>,
+    /// Initialize this repository from an existing replica on its FIRST
+    /// bootstrap (issue #380) — a disaster-recovery entry point.
+    ///
+    /// Armed only while the repository has never been initialized
+    /// (`status.uniqueId` unset) **and** the mover's connect reports the backend
+    /// uninitialized; on an already-initialized repository it is a documented
+    /// no-op (`Seeded=True`, reason `AlreadyInitialized`), so it is safe to
+    /// leave standing in a GitOps manifest. When armed it also replaces
+    /// `spec.create`'s fallback: the repository is seeded or the bootstrap
+    /// fails, never silently created empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<SeedSpec>,
     /// Tuning for the bootstrap/discovery mover Job (`<name>-discovery`) that
     /// connects/creates an object-store repository the operator cannot reach
     /// in-process (and re-runs for catalog re-scans).
@@ -662,6 +675,10 @@ pub struct RepositoryStatus {
     /// Kopia repository unique ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_id: Option<String>,
+    /// What the last seed attempt did (`spec.seed`); absent on a repository that
+    /// was never seeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<SeedStatus>,
     /// Mirror of `spec.backend` discriminant for the print column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,

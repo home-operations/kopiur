@@ -22,6 +22,15 @@ pattern, hardened for DR with two changes from a normal install.
 
 ///
 
+/// tip | If you were mirroring the repository off-site
+
+This scenario **connects** to the surviving repository, so the rebuilt cluster
+keeps writing into it. If what survived is an off-site *mirror* and you want the
+new cluster to have its own repository back — mirror intact — seed a new one
+instead: [Scenario 10 — DR from a replicated repository](dr-with-replicated-repository.md).
+
+///
+
 /// warning | Identity must match the old cluster
 
 kopia finds the surviving snapshots by `username@hostname:path`. The defaults are
@@ -30,6 +39,19 @@ kopia finds the surviving snapshots by `username@hostname:path`. The defaults ar
 This bundle pins `identity` explicitly anyway, so recovery still works even if you
 rebuild into a differently-named namespace. The `KOPIA_PASSWORD` must also be the
 **original** one — kopia cannot decrypt the repo with a new password.
+
+///
+
+/// danger | Check retention before re-applying policies over surviving history
+
+The `SnapshotPolicy` below adopts the repository's surviving snapshots, and an
+adopted snapshot is then GFS-governed like any produced backup: under the default
+`deletionPolicy: Delete`, everything **outside** `spec.retention` is pruned from
+the repository immediately, and retention prunes deliberately bypass the
+[mass-deletion breaker](../repositories.md#deletionprotection--the-mass-deletion-circuit-breaker).
+A five-year history re-adopted under `keepDaily: 14` loses the rest. Widen
+`retention` to what you actually intend to keep, or set the policy's
+`defaultDeletionPolicy: Retain` so pruning a row deletes only the `Snapshot` CR.
 
 ///
 
@@ -93,3 +115,4 @@ The volume-populator handshake needs the `AnyVolumeDataSource` feature (GA from
 - [Restores → deploy-or-restore](../restores.md#deploy-or-restore-gitops) and [example 05](../examples.md#example-05--deploy-or-restore-gitops) — the populator mechanism in detail.
 - [Scenario 04 — migrate across clusters](migrate-across-clusters.md) — when the destination's name/namespace is _different_ (and `fromPolicy` won't resolve the old snapshots).
 - [Repositories & backends](../repositories.md) — `create.enabled` and connection details.
+- [Scenario 10 — DR from a replicated repository](dr-with-replicated-repository.md) — when the survivor is a mirror and you seed a *new* repository from it (`spec.seed`).

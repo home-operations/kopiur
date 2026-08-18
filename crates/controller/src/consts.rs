@@ -115,8 +115,11 @@ pub const VERIFY_REPO_LABEL: &str = "kopiur.home-operations.com/verify-repo";
 
 /// `COMPONENT_LABEL` value for replication mover Jobs (ADR-0005 §13(d)).
 pub const REPLICATION_COMPONENT: &str = "replication";
-/// Label tying a replication Job back to its owning `RepositoryReplication`.
-pub const REPLICATION_INSTANCE_LABEL: &str = "kopiur.home-operations.com/replication";
+/// Label tying a replication Job back to its owning `RepositoryReplication`
+/// (single-flight selector: [`COMPONENT_LABEL`] + this = CR name). Defined in
+/// `kopiur-api` because `kubectl kopiur replication run` prints the same
+/// selector when a requested run fails — one label, one definition.
+pub const REPLICATION_INSTANCE_LABEL: &str = kopiur_api::consts::REPLICATION_LABEL;
 /// Annotation on a replication Job recording the scheduled slot it runs (RFC3339).
 pub const REPLICATION_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/replication-slot";
 
@@ -145,6 +148,21 @@ pub const SNAPSHOT_REPLICATION_INSTANCE_LABEL: &str =
 /// runs (RFC3339; not a valid *label* value because of the colons).
 pub const SNAPSHOT_REPLICATION_SLOT_ANNOTATION: &str =
     "kopiur.home-operations.com/snapshot-replication-slot";
+
+/// Annotation on a replication mover Job recording WHAT asked for the run —
+/// `cron` (a scheduled slot) or `manual` (a `run-requested` annotation). It is
+/// the only place the run's trigger survives once the Job is the sole record
+/// of it, and it is what lets `kopiur_replication_runs_total` attribute an
+/// outcome without re-reading the CR. A Job written by an older kopiur carries
+/// none and is attributed to `cron` — that build had no manual path.
+pub const RUN_TRIGGER_ANNOTATION: &str = "kopiur.home-operations.com/run-trigger";
+/// Annotation stamped on a TERMINAL replication mover Job once its outcome has
+/// been counted into `kopiur_replication_runs_total` (value: the outcome).
+/// The durable "already counted" marker: the reconcile's Job-outcome arms are
+/// reached zero-to-many times per run, so exactly-once counting needs a marker
+/// on the run itself. It rides the Job, so it self-cleans with the Job's TTL
+/// and survives an operator restart.
+pub const RUN_COUNTED_ANNOTATION: &str = "kopiur.home-operations.com/run-counted";
 
 /// Annotation on the kopia-server Deployment's POD TEMPLATE carrying a short
 /// hash of the serialized `ServerWorkSpec`. The server reads its spec from a
@@ -517,6 +535,50 @@ pub const REPOSITORY_NOT_INITIALIZED_REASON: &str = "RepositoryNotInitialized";
 /// `action` (remediation hint) for [`REPOSITORY_NOT_INITIALIZED_REASON`]: enable
 /// repository creation (or point at an existing repository).
 pub const ENABLE_CREATE_ACTION: &str = "EnableRepositoryCreate";
+
+/// `action` for the source-side `spec.seed` failures (issue #380): the seed
+/// source is not usable — a mis-pointed bucket/prefix, or a mirror that was
+/// never written. The seeding bootstrap keeps retrying, so the fix is to point
+/// `spec.seed.from` somewhere real (or set `allowEmptySource`).
+pub const CHECK_SEED_SOURCE_ACTION: &str = "CheckSeedSource";
+/// `action` for the seed failures kopiur RESUMES by itself (an interrupted copy:
+/// `SeedIncomplete`/`SeedLeftEmpty`, issue #380). Nothing at the backend should
+/// be deleted — the next bootstrap continues the copy — so the only human action
+/// is to give the copy room to finish (raise
+/// `spec.seed.failurePolicy.activeDeadlineSeconds`) if it keeps being cut short.
+pub const AWAIT_SEED_RESUME_ACTION: &str = "AwaitSeedResume";
+
+// The mover-skew guard's `reason` lives in `kopiur_api::consts` beside the other
+// `Seeded` reasons, not here: `kopiur_api::gates` registers it, and the
+// phase-ratchet rule keeps a gating condition's strings in the api crate.
+/// `action` for [`kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON`]: upgrade the
+/// mover image.
+pub const UPGRADE_MOVER_IMAGE_ACTION: &str = "UpgradeMoverImage";
+
+/// `action` for [`kopiur_mover::bootstrap::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS`]:
+/// the mover disagreed with itself. Not a repository problem and not retryable —
+/// the same inputs reproduce the same contradiction — so the remediation is to
+/// report it.
+pub const REPORT_KOPIUR_BUG_ACTION: &str = "ReportKopiurBug";
+
+/// `reason` for the `RepositorySeeded` Normal Event published when a
+/// `spec.seed` actually copied this repository's initial contents in (#380).
+pub const REPOSITORY_SEEDED_REASON: &str = "RepositorySeeded";
+/// `action` for [`REPOSITORY_SEEDED_REASON`]: seeded history is adopted by
+/// re-applying `SnapshotPolicy`s, and GFS retention prunes beyond-budget points
+/// immediately — so review retention/`defaultDeletionPolicy` before doing that.
+pub const REVIEW_SEEDED_HISTORY_ACTION: &str = "ReviewSeededHistory";
+
+/// `reason` for the Warning Event published when a `SnapshotPolicy`'s adoption
+/// pass finds a NON-EMPTY repository catalog but ZERO snapshots matching its
+/// identity (#380). The identity fork guards are Update-gated and cannot fire on
+/// a fresh-cluster CREATE, so after a disaster recovery a policy whose identity
+/// config differs even slightly from the pre-disaster one adopts nothing while
+/// looking perfectly healthy.
+pub const NO_ADOPTABLE_HISTORY_REASON: &str = "NoAdoptableHistory";
+/// `action` for [`NO_ADOPTABLE_HISTORY_REASON`]: the recovered identity must
+/// match the pre-disaster one byte for byte.
+pub const CHECK_IDENTITY_ACTION: &str = "CheckIdentityConfiguration";
 
 /// Condition type for the opt-in backend health probe (`spec.health.probe`).
 /// `True` = the last probe reached the backend and the kopia repository is

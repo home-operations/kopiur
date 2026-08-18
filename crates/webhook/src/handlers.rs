@@ -741,6 +741,32 @@ async fn handle_maintenance(
     Ok(resp)
 }
 
+// --- replication run-now annotation -----------------------------------------
+
+/// The `kubectl kopiur` invocation that stamps a `RepositoryReplication` run
+/// request, quoted verbatim in the fix hint.
+const REPOSITORY_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run --kind repository";
+/// The `SnapshotReplication` counterpart.
+const SNAPSHOT_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run --kind snapshot";
+
+/// Refuse a malformed `run-requested` annotation at admission (issue #380).
+///
+/// The annotation is user input on both replication kinds exactly as it is on
+/// `Maintenance`, and it flows into a scheduling decision — so a typo'd
+/// timestamp is refused here rather than reaching a reconciler that can only
+/// surface it as a condition. Same shared parser the controller uses (one
+/// validator, two callers); objects annotated while the webhook was down are
+/// still degraded gracefully controller-side.
+fn refuse_malformed_run_annotation(
+    obj: &DynamicObject,
+    run_command: &str,
+) -> Result<(), AdmissionError> {
+    api::common::parse_run_requested_at(obj.metadata.annotations.as_ref(), run_command).map_err(
+        |message| AdmissionError::Invalid(vec![ValidationError::InvalidRunAnnotation { message }]),
+    )?;
+    Ok(())
+}
+
 // --- RepositoryReplication --------------------------------------------------
 
 async fn handle_repository_replication(
@@ -759,6 +785,8 @@ async fn handle_repository_replication(
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
+
+    refuse_malformed_run_annotation(obj, REPOSITORY_REPLICATION_RUN_COMMAND)?;
 
     // Tenancy: a ClusterRepository sourceRef is gated against allowedNamespaces.
     if let TenancyDecision::Deny(denial) =
@@ -792,8 +820,11 @@ async fn handle_repository_replication(
                 ValidationError::ReplicationMountPathCollision { path },
             ]));
         }
-        if let Err(e) = api::validate::validate_replication_auth(&source_backend, &spec.destination)
-        {
+        if let Err(e) = api::validate::validate_replication_auth(
+            &source_backend,
+            &spec.destination,
+            api::validate::AuthPairKind::Replication,
+        ) {
             return Err(AdmissionError::Invalid(vec![e]));
         }
     }
@@ -819,6 +850,8 @@ async fn handle_snapshot_replication(
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
+
+    refuse_malformed_run_annotation(obj, SNAPSHOT_REPLICATION_RUN_COMMAND)?;
 
     // Tenancy on BOTH refs (fail closed, per the shared `tenancy_for` semantics):
     // the mover opens the source read-only AND writes the destination, so a
@@ -874,7 +907,11 @@ async fn handle_snapshot_replication(
         }
         // One mover pod carries both credential sets, so the same
         // static/workload-identity mixing rules apply verbatim.
-        if let Err(e) = api::validate::validate_replication_auth(src, dst) {
+        if let Err(e) = api::validate::validate_replication_auth(
+            src,
+            dst,
+            api::validate::AuthPairKind::Replication,
+        ) {
             return Err(AdmissionError::Invalid(vec![e]));
         }
     }
@@ -1002,6 +1039,23 @@ async fn handle_cluster_repository(
             old, &spec,
         ));
     }
+    // #380: a migrate-mode seed must not name the ClusterRepository being
+    // defined. Needs the object's own name, which the spec does not carry.
+    //
+    // Deliberately NO `tenancy_for` here, unlike `handle_repository` below: the
+    // gate answers "may THIS namespace use that ClusterRepository", and a
+    // cluster-scoped author has no consumer namespace — `tenancy_for` would
+    // return `NoConsumerNamespace` and deny every cluster-to-cluster seed. The
+    // author of a `ClusterRepository` is already the privileged party the gate
+    // exists to protect namespaces FROM.
+    if let Err(e) = api::validate::validate_seed_not_self(
+        spec.seed.as_ref(),
+        RepositoryKind::ClusterRepository,
+        obj.metadata.name.as_deref().unwrap_or(req.name.as_str()),
+        "",
+    ) {
+        errs.push(e);
+    }
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -1079,8 +1133,49 @@ async fn handle_repository(
     if let Some(old) = &old_spec {
         errs.extend(api::validate::validate_repository_immutability(old, &spec));
     }
+    // #380: the two `spec.seed` rules that need this request's own identity —
+    // the seeding Job runs in this namespace and reads its blob-source Secret
+    // via namespace-local `envFrom`, and a migrate seed must not name this very
+    // Repository. Everything else about `spec.seed` is already covered by
+    // `validate_repository` above.
+    let repo_namespace = obj
+        .metadata
+        .namespace
+        .as_deref()
+        .or(req.namespace.as_deref())
+        .unwrap_or_default();
+    if let Err(e) =
+        api::validate::validate_seed_secret_namespace(spec.seed.as_ref(), repo_namespace)
+    {
+        errs.push(e);
+    }
+    if let Err(e) = api::validate::validate_seed_not_self(
+        spec.seed.as_ref(),
+        RepositoryKind::Repository,
+        obj.metadata.name.as_deref().unwrap_or(req.name.as_str()),
+        repo_namespace,
+    ) {
+        errs.push(e);
+    }
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
+    }
+
+    // Tenancy: a namespaced Repository seeding from a cluster-scoped
+    // `ClusterRepository` is a CONSUMER of it — the seed mover reads that
+    // repository's snapshots into this namespace — so it goes through the same
+    // fail-closed `allowedNamespaces` gate as any other consumer ref (mirroring
+    // the `SnapshotReplication` gates above). A `Repository` seed source is not
+    // gated here, exactly as elsewhere.
+    if let Some(seed) = &spec.seed
+        && let Some(source) = api::seed::seed_repository_ref(seed)
+        && let TenancyDecision::Deny(denial) =
+            tenancy_for(source, req.namespace.as_deref(), client).await
+    {
+        return Err(AdmissionError::RefTenancy {
+            field: "spec.seed.from.repository",
+            source: denial,
+        });
     }
 
     let mut warnings =
@@ -1186,6 +1281,76 @@ fn set_spec_field(data: &Value, field: &str, value: Value) -> PatchOperation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // --- replication run-now annotation ------------------------------------------
+
+    /// A bare object carrying only the annotations under test — the exact
+    /// surface `refuse_malformed_run_annotation` reads.
+    fn annotated_object(annotations: Value) -> DynamicObject {
+        serde_json::from_value(json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "RepositoryReplication",
+            "metadata": { "name": "offsite", "namespace": "media", "annotations": annotations },
+        }))
+        .expect("a DynamicObject with annotations")
+    }
+
+    #[test]
+    fn a_replication_without_a_run_annotation_is_admitted() {
+        for annotations in [json!({}), json!({ "other": "value" })] {
+            assert!(
+                refuse_malformed_run_annotation(
+                    &annotated_object(annotations),
+                    REPOSITORY_REPLICATION_RUN_COMMAND
+                )
+                .is_ok()
+            );
+        }
+        // No annotations map at all.
+        let bare: DynamicObject = serde_json::from_value(json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotReplication",
+            "metadata": { "name": "offsite", "namespace": "media" },
+        }))
+        .expect("a DynamicObject without annotations");
+        assert!(refuse_malformed_run_annotation(&bare, SNAPSHOT_REPLICATION_RUN_COMMAND).is_ok());
+    }
+
+    #[test]
+    fn a_well_formed_run_request_is_admitted() {
+        let obj = annotated_object(json!({
+            api::consts::RUN_REQUESTED_ANNOTATION: "2026-06-11T12:00:00Z"
+        }));
+        assert!(refuse_malformed_run_annotation(&obj, REPOSITORY_REPLICATION_RUN_COMMAND).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_run_request_is_refused_with_this_kinds_fix_hint() {
+        let obj = annotated_object(json!({
+            api::consts::RUN_REQUESTED_ANNOTATION: "yesterday"
+        }));
+        for (command, want) in [
+            (REPOSITORY_REPLICATION_RUN_COMMAND, "--kind repository"),
+            (SNAPSHOT_REPLICATION_RUN_COMMAND, "--kind snapshot"),
+        ] {
+            let err = refuse_malformed_run_annotation(&obj, command)
+                .expect_err("a typo'd timestamp must be refused at admission");
+            // The shared error type, so the denial reads like every other one.
+            let AdmissionError::Invalid(errs) = &err else {
+                panic!("expected Invalid, got {err:?}");
+            };
+            assert!(
+                matches!(
+                    errs.as_slice(),
+                    [ValidationError::InvalidRunAnnotation { .. }]
+                ),
+                "{errs:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("must be an RFC3339 timestamp"), "{msg}");
+            assert!(msg.contains(want), "{msg}");
+        }
+    }
 
     // --- config_label_stamp (pure) ---------------------------------------------
 
@@ -2699,6 +2864,138 @@ mod tests {
     #[tokio::test]
     async fn from_policy_restore_degrades_to_admit_without_a_client() {
         let resp = dispatch(&restore_create_request(from_policy_restore(None)), None).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    // --- spec.seed (#380) ---------------------------------------------------
+
+    /// A `Repository`/`ClusterRepository` spec carrying `spec.seed`.
+    fn repo_spec_with_seed(seed: Value) -> Value {
+        json!({
+            "backend": { "s3": { "bucket": "live", "endpoint": "s3.local" } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+            "seed": seed,
+        })
+    }
+
+    #[tokio::test]
+    async fn repository_seeding_from_a_cluster_repository_is_tenancy_gated() {
+        // A namespaced Repository seeding from a cluster-scoped repository is a
+        // CONSUMER of it, so it goes through the same fail-closed
+        // allowedNamespaces gate as any other consumer ref. No client to
+        // resolve the gate => deny, naming the field.
+        let spec = repo_spec_with_seed(json!({
+            "from": { "repository": { "kind": "ClusterRepository", "name": "offsite" } }
+        }));
+        let resp = dispatch(&admission_request("Repository", spec), None).await;
+        assert!(!resp.allowed, "{:?}", resp.result.message);
+        assert!(
+            resp.result
+                .message
+                .starts_with("spec.seed.from.repository: "),
+            "{:?}",
+            resp.result.message
+        );
+        assert!(resp.result.message.contains("fail-closed"));
+    }
+
+    #[tokio::test]
+    async fn repository_seeding_from_a_namespaced_repository_is_not_tenancy_gated() {
+        // Cross-namespace `Repository` references are a supported, RBAC-gated
+        // shape — the tenancy gate only covers ClusterRepository.
+        let spec = repo_spec_with_seed(json!({
+            "from": { "repository": { "name": "offsite", "namespace": "dr" } }
+        }));
+        let resp = dispatch(&admission_request("Repository", spec), None).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    #[tokio::test]
+    async fn cluster_repository_seed_ref_skips_the_tenancy_gate() {
+        // The gate answers "may THIS namespace use that ClusterRepository", and
+        // a cluster-scoped author has no consumer namespace — running it here
+        // would deny every cluster-to-cluster seed with NoConsumerNamespace.
+        // Same seed source that the Repository handler denies above.
+        let spec = json!({
+            "backend": { "s3": { "bucket": "live", "endpoint": "s3.local" } },
+            "encryption": { "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" } },
+            "allowedNamespaces": { "all": true },
+            "seed": { "from": { "repository": { "kind": "ClusterRepository", "name": "offsite" } } },
+        });
+        let resp = dispatch(&admission_request("ClusterRepository", spec), None).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    #[tokio::test]
+    async fn cluster_repository_cannot_seed_from_itself() {
+        // `admission_request` names the object `repo`; a seed ref to `repo` is
+        // this very object.
+        let spec = json!({
+            "backend": { "s3": { "bucket": "live", "endpoint": "s3.local" } },
+            "encryption": { "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" } },
+            "allowedNamespaces": { "all": true },
+            "seed": { "from": { "repository": { "kind": "ClusterRepository", "name": "repo" } } },
+        });
+        let resp = dispatch(&admission_request("ClusterRepository", spec), None).await;
+        assert!(!resp.allowed, "{:?}", resp.result.message);
+        assert!(
+            resp.result.message.contains("seeded from itself"),
+            "{:?}",
+            resp.result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_cannot_seed_from_itself() {
+        let spec = repo_spec_with_seed(json!({ "from": { "repository": { "name": "repo" } } }));
+        let resp = dispatch(&admission_request("Repository", spec), None).await;
+        assert!(!resp.allowed, "{:?}", resp.result.message);
+        assert!(
+            resp.result.message.contains("seeded from itself"),
+            "{:?}",
+            resp.result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_seed_secret_must_be_co_resident_with_the_repository() {
+        // The seeding Job runs in the Repository's namespace and loads the seed
+        // backend's Secret via namespace-local `envFrom`.
+        let spec = repo_spec_with_seed(json!({
+            "from": { "backend": { "s3": {
+                "bucket": "mirror",
+                "endpoint": "offsite.example",
+                "auth": { "secretRef": { "name": "mirror-creds", "namespace": "elsewhere" } },
+            } } }
+        }));
+        let resp = dispatch(&admission_request("Repository", spec), None).await;
+        assert!(!resp.allowed, "{:?}", resp.result.message);
+        assert!(
+            resp.result.message.contains("kopiur-system"),
+            "{:?}",
+            resp.result.message
+        );
+
+        // Omitted namespace = "this Repository's own" and is always legal.
+        let ok = repo_spec_with_seed(json!({
+            "from": { "backend": { "s3": {
+                "bucket": "mirror",
+                "endpoint": "offsite.example",
+                "auth": { "secretRef": { "name": "mirror-creds" } },
+            } } }
+        }));
+        let resp = dispatch(&admission_request("Repository", ok), None).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    #[tokio::test]
+    async fn a_repository_without_seed_is_unaffected() {
+        // The whole block is opt-in: no seed, no new gate, no new denial.
+        let spec = json!({
+            "backend": { "s3": { "bucket": "live", "endpoint": "s3.local" } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+        });
+        let resp = dispatch(&admission_request("Repository", spec), None).await;
         assert!(resp.allowed, "{:?}", resp.result.message);
     }
 }

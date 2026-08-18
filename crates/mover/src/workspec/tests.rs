@@ -423,6 +423,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             restamp_policy: RestampPolicy::OwnFormatsOnly,
             maintenance_owner_aliases: vec!["kopiur@kopiur-ns-repo-legacy".into()],
             read_only: true,
+            seed: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -509,6 +510,7 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
         restamp_policy: RestampPolicy::AnyStale,
         maintenance_owner_aliases: Vec::new(),
         read_only: false,
+        seed: None,
     };
     let v = serde_json::to_value(&op).unwrap();
     assert!(v.get("maintenanceOwnerAliases").is_none());
@@ -1820,7 +1822,14 @@ fn restamp_target_skips_the_create_path_regardless_of_policy() {
     // self-heal must never also fire, under either policy.
     for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
         assert_eq!(
-            maintenance_restamp_target(true, Some("kopiur@kopiur-prod"), policy, &[], "anything"),
+            maintenance_restamp_target(
+                true,
+                false,
+                Some("kopiur@kopiur-prod"),
+                policy,
+                &[],
+                "anything"
+            ),
             None,
             "{policy:?}"
         );
@@ -1833,7 +1842,7 @@ fn restamp_target_skips_without_a_configured_owner() {
     // under either policy.
     for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
         assert_eq!(
-            maintenance_restamp_target(false, None, policy, &[], "ephemeral@pod-xyz"),
+            maintenance_restamp_target(false, false, None, policy, &[], "ephemeral@pod-xyz"),
             None,
             "{policy:?}"
         );
@@ -1856,7 +1865,7 @@ fn restamp_target_decision_table() {
     // current == desired: never restamp, either policy (nothing to heal).
     for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
         assert_eq!(
-            maintenance_restamp_target(false, Some(desired), policy, &aliases, desired),
+            maintenance_restamp_target(false, false, Some(desired), policy, &aliases, desired),
             None,
             "==desired x {policy:?}"
         );
@@ -1864,12 +1873,20 @@ fn restamp_target_decision_table() {
 
     // current empty (never-run repo): both policies heal it.
     assert_eq!(
-        maintenance_restamp_target(false, Some(desired), RestampPolicy::AnyStale, &aliases, ""),
+        maintenance_restamp_target(
+            false,
+            false,
+            Some(desired),
+            RestampPolicy::AnyStale,
+            &aliases,
+            ""
+        ),
         Some(desired),
         "empty x AnyStale"
     );
     assert_eq!(
         maintenance_restamp_target(
+            false,
             false,
             Some(desired),
             RestampPolicy::OwnFormatsOnly,
@@ -1884,6 +1901,7 @@ fn restamp_target_decision_table() {
     assert_eq!(
         maintenance_restamp_target(
             false,
+            false,
             Some(desired),
             RestampPolicy::AnyStale,
             &aliases,
@@ -1894,6 +1912,7 @@ fn restamp_target_decision_table() {
     );
     assert_eq!(
         maintenance_restamp_target(
+            false,
             false,
             Some(desired),
             RestampPolicy::OwnFormatsOnly,
@@ -1910,6 +1929,7 @@ fn restamp_target_decision_table() {
     assert_eq!(
         maintenance_restamp_target(
             false,
+            false,
             Some(desired),
             RestampPolicy::AnyStale,
             &aliases,
@@ -1920,6 +1940,7 @@ fn restamp_target_decision_table() {
     );
     assert_eq!(
         maintenance_restamp_target(
+            false,
             false,
             Some(desired),
             RestampPolicy::OwnFormatsOnly,
@@ -1936,6 +1957,7 @@ fn restamp_target_decision_table() {
     assert_eq!(
         maintenance_restamp_target(
             false,
+            false,
             Some(desired),
             RestampPolicy::AnyStale,
             &aliases,
@@ -1946,6 +1968,7 @@ fn restamp_target_decision_table() {
     );
     assert_eq!(
         maintenance_restamp_target(
+            false,
             false,
             Some(desired),
             RestampPolicy::OwnFormatsOnly,
@@ -2321,5 +2344,306 @@ fn a_work_spec_without_blob_retention_decodes_as_unmanaged() {
             Some(&retention_on("GOVERNANCE", NS_720H))
         )
         .is_none()
+    );
+}
+
+// --- #380: spec.seed wire mirror ------------------------------------------
+
+fn blob_seed() -> SeedOpSpec {
+    SeedOpSpec {
+        from: SeedConnectSource::Backend(Box::new(RepositoryConnect::S3 {
+            bucket: "offsite-mirror".into(),
+            endpoint: None,
+            prefix: Some("kopiur/".into()),
+            region: None,
+            disable_tls: false,
+            disable_tls_verification: false,
+            ambient_credentials: false,
+            ca_bundle_pem: None,
+        })),
+        source_description: "S3".into(),
+        sync: Some(SeedSyncSpec {
+            parallel: Some(8),
+            max_download_speed_bytes_per_second: Some(20_000_000),
+            max_upload_speed_bytes_per_second: None,
+        }),
+        migrate: None,
+        allow_empty_source: false,
+        resume: false,
+    }
+}
+
+fn migrate_seed() -> SeedOpSpec {
+    SeedOpSpec {
+        from: SeedConnectSource::Repository(Box::new(SeedRepositoryConnect {
+            kind: "ClusterRepository".into(),
+            name: "offsite".into(),
+            namespace: None,
+            connect: RepositoryConnect::Filesystem {
+                path: "/mnt/offsite".into(),
+            },
+        })),
+        source_description: "ClusterRepository/offsite".into(),
+        sync: None,
+        migrate: Some(SeedMigrateSpec {
+            parallel: Some(4),
+            latest_only: true,
+            policies: PolicyCopyModeSpec::Copy,
+        }),
+        allow_empty_source: true,
+        resume: false,
+    }
+}
+
+#[test]
+fn seed_sources_ride_their_own_externally_tagged_wire_keys() {
+    // Externally tagged, mirroring the CRD's `from` one-of. An internally
+    // tagged enum here would fork from the API surface it mirrors.
+    let blob = serde_json::to_value(&blob_seed().from).unwrap();
+    assert_eq!(blob["backend"]["s3"]["bucket"], "offsite-mirror");
+    assert!(blob.get("repository").is_none());
+
+    let migrate = serde_json::to_value(&migrate_seed().from).unwrap();
+    assert_eq!(migrate["repository"]["kind"], "ClusterRepository");
+    assert_eq!(
+        migrate["repository"]["connect"]["filesystem"]["path"],
+        "/mnt/offsite"
+    );
+    assert!(migrate.get("backend").is_none());
+}
+
+#[test]
+fn seed_mode_follows_the_source_variant() {
+    assert_eq!(blob_seed().mode(), SeedModeSpec::Blob);
+    assert_eq!(migrate_seed().mode(), SeedModeSpec::Migrate);
+}
+
+#[test]
+fn seed_mode_wire_labels_match_the_api_crate() {
+    // `status.seed.mode` is written by the controller from the mover's outcome,
+    // so the wire mirror's labels and the CRD enum's must be the same two
+    // strings — otherwise a seeded repository would report a mode its own CRD
+    // schema rejects.
+    assert_eq!(
+        SeedModeSpec::Blob.as_str(),
+        kopiur_api::seed::SeedMode::Blob.as_str()
+    );
+    assert_eq!(
+        SeedModeSpec::Migrate.as_str(),
+        kopiur_api::seed::SeedMode::Migrate.as_str()
+    );
+    // And the serde renderings agree with both.
+    assert_eq!(
+        serde_json::to_value(SeedModeSpec::Blob).unwrap(),
+        serde_json::json!("blob")
+    );
+    assert_eq!(
+        serde_json::to_value(SeedModeSpec::Migrate).unwrap(),
+        serde_json::json!("migrate")
+    );
+}
+
+#[test]
+fn seed_connect_returns_the_backend_for_either_mode() {
+    // Both arms open a backend; only the way the data is copied differs.
+    assert!(matches!(
+        blob_seed().from.connect(),
+        RepositoryConnect::S3 { .. }
+    ));
+    assert!(matches!(
+        migrate_seed().from.connect(),
+        RepositoryConnect::Filesystem { .. }
+    ));
+}
+
+#[test]
+fn seed_sync_options_track_whether_the_destination_already_exists() {
+    // `must_exist` is rendered EXPLICITLY either way rather than left to
+    // kopia's default, and it follows the DESTINATION's state, not the resume
+    // flag: a first seed must be allowed to initialize the backend (that IS the
+    // operation), a resume into an existing one must not.
+    let first = blob_seed().sync_options(false);
+    assert_eq!(first.must_exist, Some(false));
+    let resumed = blob_seed().sync_options(true);
+    assert_eq!(resumed.must_exist, Some(true));
+
+    // `delete_extra` is hard `false` in BOTH: on a first seed there is nothing
+    // to prune, and on a resume the destination holds the previous attempt's
+    // partial copy, which `--delete` is the one flag that could destroy.
+    assert!(!first.delete_extra);
+    assert!(!resumed.delete_extra);
+
+    // Tuning still flows through, and `times`/`update` stay at kopia's defaults
+    // — kopia already skips blobs the destination has, which is exactly what
+    // makes a resume incremental.
+    assert_eq!(first.parallel, Some(8));
+    assert_eq!(first.max_download_speed_bytes_per_second, Some(20_000_000));
+    assert_eq!(first.times, None);
+    assert_eq!(first.update, None);
+
+    // The same two invariants hold with NO tuning block at all.
+    let bare = SeedOpSpec {
+        sync: None,
+        ..blob_seed()
+    };
+    assert_eq!(bare.sync_options(false).must_exist, Some(false));
+    assert_eq!(bare.sync_options(true).must_exist, Some(true));
+    assert!(!bare.sync_options(false).delete_extra);
+    assert_eq!(bare.sync_options(false).parallel, None);
+}
+
+#[test]
+fn resume_rides_the_wire_and_defaults_off_on_old_specs() {
+    // A work spec stamped before the resume edge existed carries no key and
+    // must decode to "do not re-run over an existing repository" — the
+    // conservative half. The controller opts in per attempt (issue #380 C3).
+    let op: SeedOpSpec = serde_json::from_value(serde_json::json!({
+        "from": { "backend": { "filesystem": { "path": "/mnt/mirror" } } },
+        "sourceDescription": "Filesystem"
+    }))
+    .unwrap();
+    assert!(!op.resume);
+    // …and stays absent from the wire at its default, so an older mover parses
+    // what a newer controller writes.
+    assert!(serde_json::to_value(&op).unwrap().get("resume").is_none());
+
+    let resuming = SeedOpSpec {
+        resume: true,
+        ..blob_seed()
+    };
+    let v = serde_json::to_value(&resuming).unwrap();
+    assert_eq!(v["resume"], true);
+    assert_eq!(serde_json::from_value::<SeedOpSpec>(v).unwrap(), resuming);
+}
+
+#[test]
+fn seed_migrate_policies_default_to_an_explicit_no_policies() {
+    // kopia's OWN default copies the source's policies, retention included,
+    // which would delete manifests behind the operator's back. The wire default
+    // must therefore be `None` AND render as an explicit `--no-policies`.
+    let default = SeedMigrateSpec::default();
+    assert_eq!(default.policies, PolicyCopyModeSpec::None);
+    assert_eq!(
+        default.policies.to_kopia(),
+        kopiur_kopia::MigratePolicies::None
+    );
+    assert!(!default.latest_only);
+    // ...and a seed that carries no `migrate` block at all lands on the same
+    // default, since the mover reads it through `unwrap_or_default`.
+    assert_eq!(
+        SeedMigrateSpec::default().policies,
+        SeedOpSpec {
+            migrate: None,
+            ..migrate_seed()
+        }
+        .migrate
+        .unwrap_or_default()
+        .policies
+    );
+}
+
+#[test]
+fn a_seeding_bootstrap_op_round_trips_and_elides_its_defaults() {
+    let op = BootstrapRepositoryOp {
+        auto_create: false,
+        scan_catalog: true,
+        create_options: Default::default(),
+        epoch_parameters: Default::default(),
+        blob_retention: None,
+        maintenance_owner: None,
+        catalog_foreign_prefilter_cluster: None,
+        restamp_policy: RestampPolicy::AnyStale,
+        maintenance_owner_aliases: Vec::new(),
+        read_only: false,
+        seed: Some(blob_seed()),
+    };
+    let v = serde_json::to_value(&op).unwrap();
+    assert_eq!(
+        v["seed"]["from"]["backend"]["s3"]["bucket"],
+        "offsite-mirror"
+    );
+    assert_eq!(v["seed"]["sourceDescription"], "S3");
+    assert_eq!(v["seed"]["sync"]["parallel"], 8);
+    // `allowEmptySource: false` and the unused `migrate` block are elided.
+    assert!(v["seed"].get("allowEmptySource").is_none());
+    assert!(v["seed"].get("migrate").is_none());
+    let back: BootstrapRepositoryOp = serde_json::from_value(v).unwrap();
+    assert_eq!(back, op);
+
+    // The migrate arm round-trips too, with `allowEmptySource: true` present.
+    let op = BootstrapRepositoryOp {
+        seed: Some(migrate_seed()),
+        ..op
+    };
+    let v = serde_json::to_value(&op).unwrap();
+    assert_eq!(v["seed"]["allowEmptySource"], true);
+    assert_eq!(v["seed"]["migrate"]["policies"], "copy");
+    let back: BootstrapRepositoryOp = serde_json::from_value(v).unwrap();
+    assert_eq!(back, op);
+}
+
+#[test]
+fn a_bootstrap_op_without_a_seed_keeps_the_old_wire_shape_in_both_directions() {
+    // Old→new: a work spec stamped before #380 carries no `seed` key and must
+    // decode to "no seed armed" — NOT to some default that would seed.
+    let old = r#"{"autoCreate":true,"scanCatalog":true}"#;
+    let parsed: BootstrapRepositoryOp = serde_json::from_str(old).unwrap();
+    assert!(parsed.seed.is_none());
+
+    // New→old: a controller that arms no seed must put no `seed` key on the
+    // wire at all, so a mover that has never heard of the field still parses it.
+    let v = serde_json::to_value(&parsed).unwrap();
+    assert!(v.get("seed").is_none());
+}
+
+#[test]
+fn a_just_seeded_repository_restamps_its_maintenance_owner_unconditionally() {
+    // The whole point of the `seeded` arm (D7): a blob copy carries the SOURCE
+    // cluster's `kopia.maintenance` blob, so the repository arrives owned by an
+    // operator that — this being disaster recovery — no longer exists. Under
+    // `OwnFormatsOnly` (forced once `identityDefaults.cluster` is set) that
+    // owner is neither empty nor a recognized alias, so the ordinary self-heal
+    // would decline it and maintenance would yield forever.
+    let desired = "kopiur@kopiur-prod-repo";
+    let foreign = "kopiur@kopiur-DEAD-CLUSTER-repo";
+    for policy in [RestampPolicy::AnyStale, RestampPolicy::OwnFormatsOnly] {
+        assert_eq!(
+            maintenance_restamp_target(false, true, Some(desired), policy, &[], foreign),
+            Some(desired),
+            "a seeded repository must restamp under {policy:?}"
+        );
+        // Control: WITHOUT the seeded flag, OwnFormatsOnly still refuses — the
+        // pre-#380 behavior for a foreign owner is unchanged.
+        let unseeded =
+            maintenance_restamp_target(false, false, Some(desired), policy, &[], foreign);
+        match policy {
+            RestampPolicy::AnyStale => assert_eq!(unseeded, Some(desired)),
+            RestampPolicy::OwnFormatsOnly => assert_eq!(unseeded, None),
+        }
+    }
+    // `seeded` never overrides the two universal early-outs: an owner that is
+    // already ours needs no write, and a CREATED repository was stamped at
+    // create time.
+    assert_eq!(
+        maintenance_restamp_target(
+            false,
+            true,
+            Some(desired),
+            RestampPolicy::OwnFormatsOnly,
+            &[],
+            desired
+        ),
+        None
+    );
+    assert_eq!(
+        maintenance_restamp_target(
+            true,
+            true,
+            Some(desired),
+            RestampPolicy::OwnFormatsOnly,
+            &[],
+            foreign
+        ),
+        None
     );
 }

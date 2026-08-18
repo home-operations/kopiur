@@ -268,6 +268,21 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         return Ok(action);
     }
 
+    // The claiming PVC, looked up ONCE per pass and shared by everything below that needs
+    // it: the wait-window anchor (a populator with no claim cannot proceed, so its window
+    // must not open) and `drive_populator_restore`'s handshake. A direct target never has
+    // one, and never pays for the LIST.
+    let consumer = populator_consumer(ctx, &namespace, &name, state).await?;
+
+    // #380: the `waitTimeout` window opens HERE — on the first pass that gets past the
+    // readiness gate (and, for a populator, finds a claiming PVC) — not at the Restore's
+    // creation. The returned window carries the anchor in effect for THIS pass, and is what
+    // both waits below are measured from: the freshly stamped value rather than a re-read
+    // of `restore`, because the pass that OPENS the window is exactly the pass that must
+    // not measure it from creation.
+    let wait_window =
+        ensure_wait_anchor(restore, &api, &namespace, &name, state, consumer.as_ref()).await?;
+
     let on_missing = effective_on_missing(
         restore
             .spec
@@ -301,109 +316,68 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         Some(d) => Some(d),
         // Deliberately unresolved this pass (see above).
         None if noop_already_bound => None,
-        None => Some(match resolve_snapshot(ctx, restore, &namespace).await? {
-            Some(ResolveOutcome::Pinned(res)) => {
-                // Pin the FULL resolution (outcome + id + provenance + timestamp) exactly
-                // once; the no-pin check above makes this a single write, so it cannot
-                // churn status.
-                let mut resolved = serde_json::json!({
-                    "kopiaSnapshotID": res.kopia_snapshot_id,
-                    "pinnedAt": chrono::Utc::now().to_rfc3339(),
-                });
-                resolved["resolution"] = serde_json::to_value(ResolutionOutcome::Snapshot)?;
-                if let Some(r) = &res.snapshot_ref {
-                    resolved["snapshotRef"] = serde_json::to_value(r)?;
+        None => Some(
+            match resolve_snapshot(ctx, restore, &namespace, wait_window.anchor()).await? {
+                Some(ResolveOutcome::Pinned(res)) => {
+                    // Pin the FULL resolution (outcome + id + provenance + timestamp) exactly
+                    // once; the no-pin check above makes this a single write, so it cannot
+                    // churn status.
+                    let mut resolved = serde_json::json!({
+                        "kopiaSnapshotID": res.kopia_snapshot_id,
+                        "pinnedAt": chrono::Utc::now().to_rfc3339(),
+                    });
+                    resolved["resolution"] = serde_json::to_value(ResolutionOutcome::Snapshot)?;
+                    if let Some(r) = &res.snapshot_ref {
+                        resolved["snapshotRef"] = serde_json::to_value(r)?;
+                    }
+                    if let Some(i) = &res.identity {
+                        resolved["identity"] = serde_json::to_value(i)?;
+                    }
+                    let mut status = restore_ready_status(
+                        restore,
+                        RestorePhase::Resolving,
+                        "SourceResolved",
+                        "the restore source resolved to a concrete kopia snapshot \
+                         (pinned to status.resolved)",
+                    );
+                    status["resolved"] = resolved;
+                    io::patch_status(&api, &name, status).await?;
+                    Resolution::Snapshot(res.kopia_snapshot_id)
                 }
-                if let Some(i) = &res.identity {
-                    resolved["identity"] = serde_json::to_value(i)?;
-                }
-                let mut status = restore_ready_status(
-                    restore,
-                    RestorePhase::Resolving,
-                    "SourceResolved",
-                    "the restore source resolved to a concrete kopia snapshot \
-                     (pinned to status.resolved)",
-                );
-                status["resolved"] = resolved;
-                io::patch_status(&api, &name, status).await?;
-                Resolution::Snapshot(res.kopia_snapshot_id)
-            }
-            // Object stores can't be listed in-process, so the controller resolves
-            // only the identity and defers snapshot selection to the mover Job. Do
-            // NOT pin here — the mover pins `status.resolved` once it resolves
-            // "latest"/offset/asOf (or NoSnapshot under Continue). The driver's
-            // job-exists guard makes re-dispatch across requeues idempotent while
-            // unpinned, so the pin-once invariant holds (a one-shot Restore is
-            // terminal after the Job, and never re-resolves).
-            Some(ResolveOutcome::Deferred(sel)) => Resolution::Deferred(sel),
-            None => {
-                // No snapshot matched. While the `waitTimeout` window (anchored at
-                // the Restore's creation) is open, keep waiting instead of giving
-                // up — `onMissingSnapshot` applies only once the window closes
-                // (ADR §4.6 G7).
-                let now = chrono::Utc::now().timestamp();
-                // Anchored at creation — or, for a populator whose claim was re-created
-                // after an already-bound no-op, at that re-open (`wait_window_anchor`).
-                let created = wait_window_anchor(
-                    restore,
-                    restore
-                        .metadata
-                        .creation_timestamp
+                // Object stores can't be listed in-process, so the controller resolves
+                // only the identity and defers snapshot selection to the mover Job. Do
+                // NOT pin here — the mover pins `status.resolved` once it resolves
+                // "latest"/offset/asOf (or NoSnapshot under Continue). The driver's
+                // job-exists guard makes re-dispatch across requeues idempotent while
+                // unpinned, so the pin-once invariant holds (a one-shot Restore is
+                // terminal after the Job, and never re-resolves).
+                Some(ResolveOutcome::Deferred(sel)) => Resolution::Deferred(sel),
+                None => {
+                    // No snapshot matched. While the `waitTimeout` window (opened when this
+                    // restore could first proceed — `ensure_wait_anchor`) is open, keep
+                    // waiting instead of giving up — `onMissingSnapshot` applies only once
+                    // the window closes (ADR §4.6 G7).
+                    let now = chrono::Utc::now().timestamp();
+                    let wait_timeout = restore
+                        .spec
+                        .policy
                         .as_ref()
-                        .map(|t| t.0.as_second())
-                        .unwrap_or(now),
-                );
-                let wait_timeout = restore
-                    .spec
-                    .policy
-                    .as_ref()
-                    .and_then(|p| p.wait_timeout.as_deref());
-                if let Some(remaining) = wait_remaining_secs(created, wait_timeout, now) {
-                    // Static message (no countdown): an identical re-patch is a
-                    // server-side no-op, so polling here cannot churn status.
-                    let msg = format!(
-                        "no snapshot matched the restore source yet; waiting up to \
-                         waitTimeout ({}) from creation for it to appear before \
-                         applying onMissingSnapshot",
-                        wait_timeout.unwrap_or_default()
-                    );
-                    let conditions = io::upsert_condition(
-                        &existing_conditions(restore),
-                        "Resolved",
-                        false,
-                        "WaitingForSnapshot",
-                        &msg,
-                        restore.metadata.generation,
-                    );
-                    io::patch_status(
-                        &api,
-                        &name,
-                        restore_ready_status_on(
-                            restore,
-                            &conditions,
-                            RestorePhase::Pending,
-                            "WaitingForSnapshot",
-                            &msg,
-                        ),
-                    )
-                    .await?;
-                    return Ok(Action::requeue(std::time::Duration::from_secs(
-                        remaining.clamp(1, 15),
-                    )));
-                }
-                // Window closed (or none configured): honor the closed enum exhaustively.
-                match on_missing {
-                    OnMissingSnapshot::Fail => {
-                        let msg = "no snapshot matched the restore source within the \
-                                   waitTimeout window; fix spec.source (or create the missing \
-                                   snapshot) and create a NEW Restore — a Failed Restore is \
-                                   terminal and never retries";
+                        .and_then(|p| p.wait_timeout.as_deref());
+                    if let Some(remaining) =
+                        wait_remaining_secs(wait_window.anchor(), wait_timeout, now)
+                    {
+                        // Report the REAL blocker, at the cadence that state deserves
+                        // (`wait_park_report`, pure + exhaustive). Static messages (no
+                        // countdown): an identical re-patch is a server-side no-op, so
+                        // polling here cannot churn status.
+                        let (reason, msg, requeue) =
+                            wait_park_report(wait_window, wait_timeout, remaining);
                         let conditions = io::upsert_condition(
                             &existing_conditions(restore),
                             "Resolved",
                             false,
-                            "SnapshotNotFound",
-                            msg,
+                            reason,
+                            &msg,
                             restore.metadata.generation,
                         );
                         io::patch_status(
@@ -412,25 +386,55 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                             restore_ready_status_on(
                                 restore,
                                 &conditions,
-                                RestorePhase::Failed,
-                                "SnapshotNotFound",
-                                msg,
+                                RestorePhase::Pending,
+                                reason,
+                                &msg,
                             ),
                         )
                         .await?;
-                        return Err(Error::MissingDependency(
-                            "no snapshot matched restore source".into(),
-                        ));
+                        return Ok(Action::requeue(std::time::Duration::from_secs(requeue)));
                     }
-                    // Deploy-or-restore: no snapshot, so the volume comes up empty. Do NOT
-                    // complete-and-return here — fall through to the target driver, which
-                    // provisions the empty volume (an empty prime PVC for a populator; an
-                    // empty `target.pvc` for a direct restore). The decision is pinned
-                    // below so a later-appearing snapshot never retargets it (ADR §4.6).
-                    OnMissingSnapshot::Continue => Resolution::Empty,
+                    // Window closed (or none configured): honor the closed enum exhaustively.
+                    match on_missing {
+                        OnMissingSnapshot::Fail => {
+                            let msg = "no snapshot matched the restore source within the \
+                                       waitTimeout window; fix spec.source (or create the \
+                                       missing snapshot) and create a NEW Restore — a Failed \
+                                       Restore is terminal and never retries";
+                            let conditions = io::upsert_condition(
+                                &existing_conditions(restore),
+                                "Resolved",
+                                false,
+                                "SnapshotNotFound",
+                                msg,
+                                restore.metadata.generation,
+                            );
+                            io::patch_status(
+                                &api,
+                                &name,
+                                restore_ready_status_on(
+                                    restore,
+                                    &conditions,
+                                    RestorePhase::Failed,
+                                    "SnapshotNotFound",
+                                    msg,
+                                ),
+                            )
+                            .await?;
+                            return Err(Error::MissingDependency(
+                                "no snapshot matched restore source".into(),
+                            ));
+                        }
+                        // Deploy-or-restore: no snapshot, so the volume comes up empty. Do NOT
+                        // complete-and-return here — fall through to the target driver, which
+                        // provisions the empty volume (an empty prime PVC for a populator; an
+                        // empty `target.pvc` for a direct restore). The decision is pinned
+                        // below so a later-appearing snapshot never retargets it (ADR §4.6).
+                        OnMissingSnapshot::Continue => Resolution::Empty,
+                    }
                 }
-            }
-        }),
+            },
+        ),
     };
 
     // Dispatch the decision to the target driver. Exhaustive over `Resolution` so a new
@@ -467,7 +471,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                 Some(Resolution::Empty) => PopulatorWork::EmptyVolume,
                 None => PopulatorWork::Unresolved,
             };
-            drive_populator_restore(ctx, restore, &api, &namespace, &name, &work).await
+            drive_populator_restore(ctx, restore, &api, &namespace, &name, &work, consumer).await
         }
     }
 }
@@ -816,6 +820,12 @@ async fn park_awaiting_claim(
 /// PVC. [`PopulatorWork::Restore`] runs the mover into the prime (a deferred selector
 /// resolves in-Job, and may itself find no snapshot under `Continue` — then the prime stays
 /// empty).
+///
+/// `consumer` is the claiming PVC ([`claiming_pvc`]), resolved ONCE per reconcile by the
+/// caller and shared with [`ensure_wait_anchor`]: both need the same answer, and an
+/// unfiltered namespaced LIST per consumer is exactly the read amplification a fleet of
+/// standing populator `Restore`s cannot afford.
+#[allow(clippy::too_many_arguments)]
 async fn drive_populator_restore(
     ctx: &Context,
     restore: &Restore,
@@ -823,20 +833,11 @@ async fn drive_populator_restore(
     namespace: &str,
     name: &str,
     work: &PopulatorWork,
+    consumer: Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>,
 ) -> Result<Action> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
-
-    // The claiming PVC: one in this namespace whose dataSourceRef targets this
-    // Restore. (dataSourceRef is namespace-local; a cross-namespace claim would need
-    // a ReferenceGrant, out of scope here.)
-    let consumer = pvc_api
-        .list(&kube::api::ListParams::default())
-        .await?
-        .items
-        .into_iter()
-        .find(|pvc| pvc_claims_restore(pvc, name));
 
     let Some(consumer) = consumer else {
         park_awaiting_claim(
@@ -1349,6 +1350,13 @@ async fn fail_populate_hijacked(
 /// the phase off `Completed` (and the `Ready` reason off `TargetAlreadyBound`) makes the
 /// next pass resolve normally; an already-pinned snapshot id is honored unchanged, so the
 /// re-created claim gets the SAME snapshot (ADR §4.6: pinned once, never re-resolved).
+///
+/// Re-opening also RE-OPENS the `waitTimeout` window, by clearing `status.waitStartedAt`:
+/// the anchor stamped for the original claim is long spent, and the re-created claim is
+/// owed the window the user configured (#380). The clear must be an EXPLICIT JSON `null` —
+/// a merge patch only deletes the keys it names, so an omitted (`None`, serde-elided) field
+/// would leave the stale anchor in place and the next pass would find a window that closed
+/// months ago.
 async fn reopen_populator_resolution(
     api: &Api<Restore>,
     restore: &Restore,
@@ -1359,17 +1367,7 @@ async fn reopen_populator_resolution(
         "populator: the claiming PVC `{consumer_name}` is unbound again (re-created), so this \
          Restore has work to do after all — re-resolving the restore source"
     );
-    io::patch_status(
-        api,
-        name,
-        restore_ready_status(
-            restore,
-            RestorePhase::Resolving,
-            crate::consts::RESTORE_CLAIM_RECREATED_REASON,
-            &msg,
-        ),
-    )
-    .await?;
+    io::patch_status(api, name, reopen_resolution_status(restore, &msg)).await?;
     Ok(Action::requeue(std::time::Duration::from_secs(5)))
 }
 
@@ -3116,13 +3114,14 @@ async fn resolve_snapshot(
     ctx: &Context,
     restore: &Restore,
     namespace: &str,
+    wait_anchor: i64,
 ) -> Result<Option<ResolveOutcome>> {
     use kopiur_api::common::{ObjectRef, ResolvedIdentity};
     // Selector policy is the same for both deferred arms: the per-mode default
     // onMissing unless the spec overrides it, and the waitTimeout window as an
-    // ABSOLUTE deadline anchored at the Restore's creation (so the in-Job wait
-    // matches the snapshotRef path and is stable across pod retries), polled by
-    // the mover until that wall-clock instant.
+    // ABSOLUTE deadline anchored at `wait_anchor` — the instant the window OPENED
+    // (`ensure_wait_anchor`), so the in-Job wait matches the snapshotRef path and is
+    // stable across pod retries — polled by the mover until that wall-clock instant.
     let on_missing = effective_on_missing(
         restore
             .spec
@@ -3131,17 +3130,14 @@ async fn resolve_snapshot(
             .and_then(|p| p.on_missing_snapshot),
         &restore.spec.source,
     );
-    let wait_deadline = restore
-        .spec
-        .policy
-        .as_ref()
-        .and_then(|p| p.wait_timeout.as_deref())
-        .and_then(crate::snapshot_schedule::parse_go_duration)
-        .and_then(|d| {
-            let created = restore.metadata.creation_timestamp.as_ref()?.0.as_second();
-            let secs = i64::try_from(d.as_secs()).ok()?;
-            chrono::DateTime::from_timestamp(created.checked_add(secs)?, 0).map(|t| t.to_rfc3339())
-        });
+    let wait_deadline = wait_deadline_rfc3339(
+        wait_anchor,
+        restore
+            .spec
+            .policy
+            .as_ref()
+            .and_then(|p| p.wait_timeout.as_deref()),
+    );
     match &restore.spec.source {
         RestoreSource::SnapshotRef(r) => {
             let ns = r.namespace.as_deref().unwrap_or(namespace);
@@ -3437,14 +3433,13 @@ async fn restore_repository_ref(
 ///   true; a read-only repo serves restores. Readiness (`status.phase == Ready`)
 ///   is REACHABILITY: an unreachable backend fails restores exactly like backups,
 ///   hence this gate.
-/// - **`waitTimeout` interaction.** The wait window is anchored at the Restore's
-///   creation as an ABSOLUTE deadline (see `resolve_snapshot` — spec'd so the
-///   in-Job wait is stable across pod retries), so wall-clock time parked on this
-///   gate DOES consume it. What running BEFORE the resolution machinery guarantees
-///   is that the window is only ever EVALUATED against a Ready repository: an
-///   outage can at worst make the post-recovery pass apply `onMissingSnapshot`
-///   immediately (window already elapsed); it can never fail the restore — or fake
-///   a `Continue` empty-volume outcome — while the repository is down.
+/// - **`waitTimeout` interaction.** Clearing this gate is what OPENS the wait window
+///   ([`ensure_wait_anchor`], #380): time parked here does NOT consume it, and the
+///   window is both opened and evaluated only against a Ready repository. Once open
+///   it is an ABSOLUTE deadline anchored at `status.waitStartedAt` (see
+///   `resolve_snapshot` — spec'd so the in-Job wait is stable across pod retries), so
+///   a repository outage can never fail a restore — or fake a `Continue` empty-volume
+///   outcome — by silently burning the window while the backend is down.
 ///
 /// Only a restore that has NOT launched its mover Job is gated
 /// ([`restore_awaiting_launch`]); a `Restoring` restore's live Job is tracked to
@@ -3492,6 +3487,124 @@ async fn gate_on_repository_readiness(
         Err(Error::MissingDependency(_)) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Open the `waitTimeout` window if it is not open yet, and return where it stands for
+/// THIS pass (#380).
+///
+/// The window is stamped ONCE, into `status.waitStartedAt`, on the first pass that gets
+/// PAST [`gate_on_repository_readiness`] **and** — for a `target.populator` — has a PVC
+/// claiming this Restore (`consumer`). "Past the gate" is what the code enforces, and it is
+/// weaker than "the repository is Ready": the gate also declines to hold a restore whose
+/// mover Job is already live or settled ([`restore_awaiting_launch`]), and one whose
+/// `Repository` OBJECT is missing outright. Stamping in those cases is harmless — a live
+/// Job keeps the deadline it was dispatched with — and the ordering still guarantees the
+/// thing that matters: a restore parked waiting for its backend never opens a window.
+///
+/// Both halves of the condition are about a restore that cannot yet do anything measuring
+/// a window it will need later:
+/// - **Repository readiness.** A `Restore` applied by GitOps alongside its `Repository`
+///   sits on the gate until the backend comes up. Anchored at creation, an outage longer
+///   than `waitTimeout` means the first pass that reaches resolution already finds the
+///   window closed and applies `onMissingSnapshot` — for `fromPolicy` that defaults to
+///   `Continue`, i.e. an EMPTY volume.
+/// - **A claiming PVC.** Resolution runs while a populator is `AwaitingClaim`, so a
+///   standing populator `Restore` created months before anything claims it would burn its
+///   whole window sitting idle and pin `Empty` the moment a claim finally appears.
+///
+/// Returns the *effective* window rather than relying on the caller re-reading the CR: on
+/// the pass that opens it the stamp is not on the `restore` we were handed, and that is
+/// precisely the pass that must not fall back to the creation timestamp.
+/// [`WaitWindow::AwaitingClaim`] anchors at `now`, so the full window always remains — and
+/// tells the parking caller to report the claim, not a phantom snapshot wait.
+///
+/// Writes NOTHING but `waitStartedAt`: the conditions array is replaced wholesale by a
+/// merge patch, so a second conditions writer in one reconcile would erase the first.
+///
+/// No window configured ⇒ no anchor stamped: the value is only ever read through
+/// `waitTimeout`, so a `Restore` without one carries no `status.waitStartedAt` at all.
+async fn ensure_wait_anchor(
+    restore: &Restore,
+    api: &Api<Restore>,
+    namespace: &str,
+    name: &str,
+    state: PopulatorState,
+    consumer: Option<&k8s_openapi::api::core::v1::PersistentVolumeClaim>,
+) -> Result<WaitWindow> {
+    let now = chrono::Utc::now();
+    let created = restore
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| t.0.as_second())
+        .unwrap_or_else(|| now.timestamp());
+
+    // Already open: honor the stamp verbatim (the window survives restarts).
+    if restore
+        .status
+        .as_ref()
+        .is_some_and(|s| s.wait_started_at.is_some())
+    {
+        return Ok(WaitWindow::Open(effective_wait_anchor(restore, created)));
+    }
+    // A populator with nothing claiming it cannot proceed, so its window has not opened.
+    if !wait_window_opens(state, consumer.is_some()) {
+        return Ok(WaitWindow::AwaitingClaim(now.timestamp()));
+    }
+    // No `waitTimeout` ⇒ nothing measures a window; don't stamp one.
+    // `wait_remaining_secs`/`wait_deadline_rfc3339` both return `None` here.
+    if restore
+        .spec
+        .policy
+        .as_ref()
+        .and_then(|p| p.wait_timeout.as_deref())
+        .is_none()
+    {
+        return Ok(WaitWindow::Open(created));
+    }
+    let at = now.to_rfc3339();
+    tracing::debug!(%namespace, restore = %name, wait_started_at = %at, "waitTimeout window opened");
+    io::patch_status(api, name, serde_json::json!({ "waitStartedAt": at })).await?;
+    Ok(WaitWindow::Open(now.timestamp()))
+}
+
+/// The claiming PVC for this pass, or `None` for a direct target (which never has one and
+/// never pays for the LIST). Hoisted out of `reconcile_inner` so the populator-vs-direct
+/// dispatch reads as one line there; behavior is unchanged — `AwaitingClaim` still resolves
+/// via [`claiming_pvc`], `DirectTarget` still short-circuits to `None`.
+async fn populator_consumer(
+    ctx: &Context,
+    namespace: &str,
+    name: &str,
+    state: PopulatorState,
+) -> Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>> {
+    match state {
+        PopulatorState::AwaitingClaim => claiming_pvc(ctx, namespace, name).await,
+        PopulatorState::DirectTarget => Ok(None),
+    }
+}
+
+/// The PVC in `namespace` that claims this Restore via `spec.dataSourceRef`
+/// ([`pvc_claims_restore`]), if any. (`dataSourceRef` is namespace-local; a cross-namespace
+/// claim would need a ReferenceGrant, out of scope here.)
+///
+/// Resolved ONCE per reconcile by `reconcile_inner` and shared by [`ensure_wait_anchor`]
+/// and [`drive_populator_restore`] — this unfiltered namespaced LIST is the populator
+/// path's per-pass cost, and a fleet of standing populator `Restore`s must not pay it
+/// twice.
+async fn claiming_pvc(
+    ctx: &Context,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<k8s_openapi::api::core::v1::PersistentVolumeClaim>> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    Ok(pvc_api
+        .list(&kube::api::ListParams::default())
+        .await?
+        .items
+        .into_iter()
+        .find(|pvc| pvc_claims_restore(pvc, name)))
 }
 
 /// Map a resolved repository backend to the mover connect spec for a restore.

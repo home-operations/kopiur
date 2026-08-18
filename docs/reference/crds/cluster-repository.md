@@ -70,6 +70,30 @@ Default-managed like the namespaced kind, but since `Maintenance` is itself
 namespaced, `maintenance.namespace` selects where the owned `Maintenance` CR lands
 (defaulting to the operator's namespace). See [Maintenance](../../maintenance.md).
 
+### `seed`
+
+Same block as on the [Repository](repository.md#seed), with the cluster-scoped
+resolution rules:
+
+- The seeding bootstrap Job runs in **the namespace the repository's own
+  credentials resolve in** — the operator's namespace, unless
+  `encryption.passwordSecretRef.namespace` pins another. A blob seed's
+  `from.backend` credential Secret is loaded with `envFrom` (namespace-local), so
+  it must live in **that** namespace; a seed `secretRef` that pins a namespace is
+  rejected at admission, because a cluster-scoped spec cannot name the right one.
+- A migrate seed's `from.repository` with no `namespace` resolves in the
+  operator's namespace — the same rule every other cluster-scoped reference
+  follows. Set it explicitly whenever the source lives anywhere else.
+- An armed seed makes the CR hold its cleanup finalizer, so that a deletion
+  reconcile runs at all. That reconcile then deletes the in-flight
+  `<name>-discovery` Job **best-effort** — it does not block or retry, and a
+  deletion is never wedged on the cleanup: a Job that already finished is an
+  ordinary miss, a failed delete is logged as a warning, and if the Job's
+  namespace cannot be resolved at all the operator warns and tells you to delete
+  the Job by hand. This exists because a namespaced Job cannot carry a
+  cluster-scoped ownerReference, so nothing else would ever reap a 24 h seeding
+  Job whose CR is gone.
+
 ### `credentialProjection`
 
 The repository-owner gate for projecting this repository's credential Secret(s) into
@@ -83,7 +107,7 @@ projection there is a same-namespace no-op.
 
 Mirrors [Repository](repository.md) status (`phase`, `observedGeneration`,
 `resolvedCredentialVersion`, `uniqueId`, `backend`, `storageStats`, `catalog`,
-`server`, `conditions`) with one addition:
+`seed`, `server`, `conditions`) with one addition:
 
 - `allowedNamespaceCount` — number of namespaces currently resolved by
   `spec.allowedNamespaces`; also the `Namespaces` print column.

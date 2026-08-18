@@ -28,6 +28,7 @@ will eventually use.
 | CRD field you set… | …needs this Helm flag | Grants the operator `secrets` |
 | --- | --- | --- |
 | `spec.credentialProjection` on a `SnapshotPolicy` / `Restore` / `Maintenance` | `features.credentialProjection.enabled` | `create`, `patch`, `delete` |
+| `spec.seed.credentialProjection` on a `Repository` / `ClusterRepository` (migrate-mode seeding) | `features.credentialProjection.enabled` | `create`, `patch`, `delete` |
 | `spec.server` on a `Repository` / `ClusterRepository` (the kopia web-UI) | `features.kopiaUi.enabled` | `create`, `patch`, `delete` |
 
 Both default to `false`. With both off, the operator's `secrets` access is
@@ -46,6 +47,14 @@ read-only — exactly what a vanilla backup deployment needs.
   is a backstop for the case where the whole CR is removed; it is not the cleanup
   mechanism (a `Snapshot` is retained for your entire retention window, so waiting
   for GC would mean waiting months).
+- **Seeding from another repository** ([Repositories → `seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica))
+  is the same mechanism aimed at a different Secret: a migrate-mode seed opens
+  **two** repositories from one bootstrap pod, and the SOURCE repository's
+  credentials usually live in another namespace. `seed.credentialProjection.enabled`
+  copies them into the seeding Job's namespace for the run, and the copies are
+  reclaimed when the seed finishes. Without the flag the bootstrap fails closed
+  with a message naming both the CR field and the install flag, rather than
+  launching a Job that cannot authenticate.
 - **kopia web-UI server** ([Web UI](server.md)) creates a generated-auth `Secret`
   for the UI login (`auth: generate`), and for a `ClusterRepository` also mirrors
   the repository's credentials into the server's namespace (because the
@@ -124,6 +133,7 @@ $ kubectl describe repository nas-primary -n apps
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `SnapshotPolicy`/`Restore`/`Maintenance` status shows a `403` about a *projected credentials Secret* | `spec.credentialProjection` is on but `features.credentialProjection.enabled` is `false` | Set `features.credentialProjection.enabled: true` (or manage the `Secret` yourself and drop `spec.credentialProjection`) |
+| `Repository`/`ClusterRepository` bootstrap fails naming `spec.seed.credentialProjection` and the install flag | `spec.seed.credentialProjection.enabled` is on but `features.credentialProjection.enabled` is `false` | Set `features.credentialProjection.enabled: true` (or put the source repository's Secrets in the seeding Job's namespace yourself and drop the block) |
 | `Repository`/`ClusterRepository` status shows a `403` about a *kopia web-UI Secret* | `spec.server` is set but `features.kopiaUi.enabled` is `false` | Set `features.kopiaUi.enabled: true` (or remove `spec.server`) |
 
 After you grant the flag, the operator re-reconciles and the condition clears on

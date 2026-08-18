@@ -1048,8 +1048,16 @@ fn connect_args_matrix_readonly_by_persist_credentials() {
 
 #[test]
 fn snapshot_list_all_args_passes_all() {
-    // `--all` is the whole point: without it kopia scopes the list to the
-    // connected identity and misses foreign (e.g. migrated) identities.
+    // `--all` with NO `<source>` positional. On kopia 0.23.1 a source-less
+    // `snapshot list` already returns every identity, so the flag is redundant
+    // there in practice — but its help text ("not just current username/host")
+    // reads as though it were load-bearing, and the callers that use this
+    // (replication enumeration, post-migrate verification, the `spec.seed`
+    // empty-repository backstop) all make decisions that strand or accept a
+    // repository. Passing it unconditionally is what keeps those decisions off
+    // a kopia default that could change without the flag name changing with it.
+    // Both halves of that behavior are pinned against the real binary by the
+    // `sync_to_seeds_*` integration test.
     assert_eq!(
         snapshot_list_all_args(),
         vec!["snapshot", "list", "--json", "--all"]

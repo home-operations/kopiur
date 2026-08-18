@@ -195,9 +195,25 @@ The empty-volume path applies to `fromPolicy`/`identity` sources on **every** ba
 
 ### `waitTimeout` — wait before giving up
 
-`waitTimeout` (a Go-style duration, e.g. `5m`) opens a grace window, anchored at the Restore's **creation**, during which "no matching snapshot yet" means *wait and re-check* instead of giving up. `onMissingSnapshot` applies only once the window closes. Use it when the Restore may be applied before the thing that produces its snapshot — a schedule about to fire, a GitOps apply ordering, a populator claim racing the first backup.
+`waitTimeout` (a Go-style duration, e.g. `5m`) opens a grace window during which "no matching snapshot yet" means *wait and re-check* instead of giving up. `onMissingSnapshot` applies only once the window closes. Use it when the Restore may be applied before the thing that produces its snapshot — a schedule about to fire, a GitOps apply ordering, a populator claim racing the first backup.
 
-Where the waiting happens depends on the source. A `snapshotRef` (waiting for the referenced `Snapshot` CR to gain an id) re-checks **in the controller** (~15 s, surfacing `Resolved=False reason=WaitingForSnapshot` on the conditions). A `fromPolicy`/`identity` source re-lists the repository **inside the restore Job** (the same mover run that does the restore, so it works on every backend) — the `Restore` shows `Restoring` for that window rather than a per-poll condition. Either way the window is measured from creation, so it's bounded even across controller restarts or Job pod retries. Because the wait runs inside the Job for the latter, `waitTimeout` must be shorter than the Job's `failurePolicy.activeDeadlineSeconds` — the admission webhook rejects a Restore that sets both with `waitTimeout` ≥ the deadline.
+The window opens when the restore can first actually **proceed**, not when you applied it: Kopiur stamps that instant into `status.waitStartedAt` and measures `waitTimeout` from there. Two things have to be true — the restore's repository has reached `Ready`, once the controller can see it (the gate falls through unverified if the referenced `Repository`/`SnapshotPolicy` object doesn't exist yet), and (for `target.populator`) a PVC already claims the Restore via `dataSourceRef`. Until then the clock has not started.
+
+/// warning | The window is not measured from `metadata.creationTimestamp`
+
+A `Restore` is very often applied long before it can do anything: GitOps applies it in the same commit as the `Repository` it reads from, or a `target.populator` sits in the repo for months waiting for an app to claim it. Anchoring the window at creation would mean that by the time the restore could finally act, the window had already expired — and for a `fromPolicy` source, whose `onMissingSnapshot` defaults to `Continue`, "expired" means **provision an empty volume immediately**, precisely the outcome `waitTimeout` exists to prevent. Read `status.waitStartedAt` to see when the clock actually started; an absent value means it has not started yet — or that no `waitTimeout` is set, in which case there is no window to anchor.
+
+///
+
+Where the waiting happens depends on the source. A `snapshotRef` (waiting for the referenced `Snapshot` CR to gain an id) re-checks **in the controller** (~15 s, surfacing `Resolved=False reason=WaitingForSnapshot` on the conditions). A `fromPolicy`/`identity` source re-lists the repository **inside the restore Job** (the same mover run that does the restore, so it works on every backend) — the `Restore` shows `Restoring` for that window rather than a per-poll condition. Either way the window is an absolute deadline computed from `status.waitStartedAt`, so it's bounded even across controller restarts or Job pod retries. Because the wait runs inside the Job for the latter, `waitTimeout` must be shorter than the Job's `failurePolicy.activeDeadlineSeconds` — the admission webhook rejects a Restore that sets both with `waitTimeout` ≥ the deadline.
+
+A populator whose claiming PVC is deleted and re-created re-opens its resolution — and that clears `status.waitStartedAt`, so the re-created claim gets the full window again rather than inheriting the previous claim's spent one.
+
+/// tip | Restoring on a freshly-seeded repository
+
+A repository being initialized from a replica ([`spec.seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica)) does not reach `Ready` until the copy lands — which can legitimately take hours. A populator `Restore` waits for it and its `waitTimeout` window opens only at that moment, so a long seed does not spend it. Before re-applying policies over the recovered history, read the identity and retention hazards in [Scenario 10](scenarios/dr-with-replicated-repository.md#hazards-to-review-before-you-apply) — adoption under the default `deletionPolicy: Delete` prunes everything outside `spec.retention`.
+
+///
 
 ## Mover, cache & failure policy
 
@@ -358,5 +374,5 @@ The full `Restore` surface, with the examples that exercise each. `source` is th
 - [Backups & schedules](backups.md) — producing the snapshots you restore.
 - [Repositories & backends](repositories.md) — where the snapshots live.
 - [Permissions](permissions.md) — choosing the mover's UID/GID and the privileged-movers opt-in (applies to restores too).
-- [Scenarios](scenarios/index.md) — [02 recover lost data](scenarios/recover-lost-data.md), [07 point-in-time rollback](scenarios/point-in-time-rollback.md), [08 clone to another namespace](scenarios/clone-app-to-namespace.md).
+- [Scenarios](scenarios/index.md) — [02 recover lost data](scenarios/recover-lost-data.md), [07 point-in-time rollback](scenarios/point-in-time-rollback.md), [08 clone to another namespace](scenarios/clone-app-to-namespace.md), [10 DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
 - [Examples](examples.md) — [03 by Snapshot](examples.md#example-03--restore-by-picking-a-snapshot), [05 deploy-or-restore](examples.md#example-05--deploy-or-restore-gitops), [07 discovered](examples.md#example-07--restore-a-discovered-backup), [12 mover/cache/failure policy](examples.md#example-12--restore-mover-cache--failure-policy), [13 by identity](examples.md#example-13--restore-by-raw-kopia-identity), [14 point-in-time](examples.md#example-14--point-in-time--offset-restore), [15 in-place mirror](examples.md#example-15--in-place-mirror-restore), [16 cross-namespace](examples.md#example-16--cross-namespace-clone-restore), [17 shared-repo projection](examples.md#example-17--restore-from-a-shared-repo-projection).

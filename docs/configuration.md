@@ -118,7 +118,7 @@ installs them, but `helm upgrade` **never** touches them (a Helm rule for the
 must apply the new CRDs yourself:
 
 ```console
-$ kubectl apply -f deploy/crds/
+$ kubectl apply --server-side -f deploy/crds/
 ```
 
 A GitOps flow (`CreateReplace` sync) applies them automatically. There is no

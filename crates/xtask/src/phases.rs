@@ -133,6 +133,7 @@ use crate::scan;
 /// source by [`discover_api_phase_enums`].
 pub const API_PHASE_ENUMS: &[&str] = &[
     "ManualRunPhase",
+    "ReplicationManualRunPhase",
     "RepositoryPhase",
     "RepositoryReplicationPhase",
     "RestorePhase",

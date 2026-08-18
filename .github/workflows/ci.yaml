@@ -206,6 +206,22 @@ jobs:
           - shard: snapshot-replication
             bins: "snapshot_replication"
             backends: false
+          # Repository `spec.seed` DR drill (issue #380): rebuild a repository
+          # from a surviving replica, in both modes, and restore its recovered
+          # history. Its own shard for two reasons. It is long — each scenario
+          # chains a real backup, a cron-driven mirror or a full
+          # `snapshot migrate`, a seeding bootstrap and a restore — and the
+          # empty-source scenario deliberately leaves a repository RETRYING its
+          # seed every ~2 minutes, which is exactly the background churn the
+          # quiescence and mass-deletion shards measure against. Filesystem
+          # only: both seed modes are exercised over isolated repo subpaths, so
+          # no object store is needed. The migrate mode's cross-namespace
+          # credential projection needs `features.credentialProjection.enabled`,
+          # which deploy/e2e/values.yaml already sets for EVERY shard — hence no
+          # helm_set here.
+          - shard: repository-seed
+            bins: "seed"
+            backends: false
           # SnapshotPolicy multi-repository fan-out (issue #368 Feature B): one
           # policy fanning every slot into TWO repositories — per-repo children
           # + spec pins, keepLatest-per-repo retention, the one-repo-down

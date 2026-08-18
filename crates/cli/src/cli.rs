@@ -82,6 +82,9 @@ pub enum Command {
     /// Run repository maintenance now.
     #[command(subcommand)]
     Maintenance(MaintenanceCommand),
+    /// Run a replication now.
+    #[command(subcommand)]
+    Replication(ReplicationCommand),
     /// Translate other tools' backup configs into kopiur objects.
     #[command(subcommand)]
     Migrate(MigrateCommand),
@@ -252,6 +255,48 @@ pub struct MaintenanceRunArgs {
     /// Run a FULL maintenance (compaction + reclamation) instead of quick.
     #[arg(long)]
     pub full: bool,
+
+    /// Wait for the run to finish: exit 0 on success, 1 on failure.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Give up waiting after this long (e.g. 90s, 30m, 1h; default 30m).
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub timeout: Option<std::time::Duration>,
+}
+
+/// `kubectl kopiur replication …`
+#[derive(clap::Subcommand, Debug)]
+pub enum ReplicationCommand {
+    /// Trigger an out-of-band replication run (annotation-based; the operator
+    /// runs it through the same gates and single-flight path as the cron slots).
+    Run(ReplicationRunArgs),
+}
+
+/// Which replication kind a name refers to. Closed enum: the dispatch `match`es
+/// it exhaustively, so a future replication kind cannot compile until the CLI
+/// is extended too.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicationKindArg {
+    /// RepositoryReplication — blob mirror (`kopia repository sync-to`).
+    #[value(alias = "repo", alias = "repositoryreplication")]
+    Repository,
+    /// SnapshotReplication — logical copy (`kopia snapshot migrate`).
+    #[value(alias = "snap", alias = "snapshotreplication")]
+    Snapshot,
+}
+
+/// Flags for `replication run`.
+#[derive(clap::Args, Debug)]
+pub struct ReplicationRunArgs {
+    /// The replication object to run.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// Which replication kind NAME is. Omit to detect it: exactly one of the
+    /// two must exist under that name in the namespace.
+    #[arg(long, value_enum, value_name = "KIND")]
+    pub kind: Option<ReplicationKindArg>,
 
     /// Wait for the run to finish: exit 0 on success, 1 on failure.
     #[arg(long)]

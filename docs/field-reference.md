@@ -41,6 +41,7 @@ This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen
 | `onNamespaceDelete` | enum: Orphan \| Delete | `Orphan` | What happens to this repository's snapshots when a consuming namespace is deleted. |
 | `parameters` | [object](#repository-spec-parameters) | — | Mutable kopia repository parameters, re-applied on bootstrap whenever they drift. |
 | `scheduleDefaults` | [object](#repository-spec-scheduledefaults) | — | Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set their own equivalent field — verification, replication, and maintenance schedules today; set once here instead of repeating it on every cron. |
+| `seed` | [object](#repository-spec-seed) | — | Initialize this repository from an existing replica on its FIRST bootstrap (issue #380) — a disaster-recovery entry point.<br>Armed only while the repository has never been initialized (`status.uniqueId` unset) **and** the mover's connect reports the backend uninitialized; on an already-initialized repository it is a documented no-op (`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave standing in a GitOps manifest. When armed it also replaces `spec.create`'s fallback: the repository is seeded or the bootstrap fails, never silently created empty. |
 | `server` | [object](#repository-spec-server) | — | Optional kopia web-UI server, exposed via a `Service` in this namespace. |
 | `suspend` | boolean | — | Pause this repository: skip connect/bootstrap and maintenance projection. |
 
@@ -567,6 +568,305 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 | --- | --- | --- | --- |
 | `timezone` | string | — | IANA timezone name applied to every consuming cron that doesn't set its own `timezone` (e.g. `America/New_York`). Set once here instead of repeating it on every `SnapshotPolicy.verification`, `RepositoryReplication.schedule`, and `Maintenance.schedule` cron. |
 
+#### `spec.seed` { #repository-spec-seed }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `from` | [union](#repository-spec-seed-from) | **required** | Where the seed data comes from: exactly one of a bare storage backend (blob mode) or another repository CR (migrate mode). |
+| `allowEmptySource` | boolean | — | Accept a source that holds zero snapshots (default `false`).<br>A mirror that answers but is empty is almost always a mis-pointed bucket/prefix, and silently seeding nothing would hand you a `Ready` repository with no history — the failure mode #380 is about. By default the bootstrap fails loudly and retries; set this when an empty source is genuinely expected (e.g. re-homing a repository whose history was deliberately pruned to nothing). |
+| `credentialProjection` | [object](#repository-spec-seed-credentialprojection) | — | Opt-in projection of the SOURCE repository's credential Secrets into the seeding mover Job's namespace. **Migrate mode only in practice** — a blob-mode source's credentials must already be in the namespace the bootstrap Job runs in (this CR's own namespace for a `Repository`; for a `ClusterRepository` the operator's namespace, unless `encryption.passwordSecretRef.namespace` pins another, in which case the Job runs there). Requires the operator's `features.credentialProjection` install flag. |
+| `failurePolicy` | [object](#repository-spec-seed-failurepolicy) | — | Deadline/backoff for the **seeding** bootstrap Job. An absent `activeDeadlineSeconds` means **24h** here, rather than the 120s a routine connect gets — a seed copies a whole repository, once. Only applied while the seed is armed; later connects to the now-initialized repository use `spec.bootstrap.failurePolicy` as before. |
+| `migrate` | [object](#repository-spec-seed-migrate) | — | Tuning for the `kopia snapshot migrate` copy. **Migrate mode only** (`from.repository`); rejected at admission alongside `from.backend`. |
+| `sync` | [object](#repository-spec-seed-sync) | — | Tuning for the `kopia repository sync-to` blob copy. **Blob mode only** (`from.backend`); rejected at admission alongside `from.repository`. |
+
+##### `spec.seed.from` { #repository-spec-seed-from }
+
+Externally tagged — set **exactly one** of: `backend` · `repository`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `backend` | [union](#repository-spec-seed-from-backend) | — | A bare storage backend holding a byte-for-byte mirror of a kopia repository (blob mode, `kopia repository sync-to`). The mirror's format and encryption password are inherited verbatim, so this repository's `encryption.passwordSecretRef` must already hold the MIRROR's password and `spec.create`'s format knobs are refused as inert. |
+| `repository` | [object](#repository-spec-seed-from-repository) | — | Another `Repository`/`ClusterRepository`, opened read-only (migrate mode, `kopia snapshot migrate`). Snapshot identities and times are preserved, so seeded history is restorable by `identity`/`fromPolicy`.<br>A `kind: Repository` reference with no `namespace` resolves in the referrer's own namespace — and, on a cluster-scoped `ClusterRepository` (which has none), in the operator's namespace, the same rule its credential `secretRef`s follow. Set `namespace` explicitly whenever the source lives anywhere else. |
+
+###### `spec.seed.from.backend` { #repository-spec-seed-from-backend }
+
+Externally tagged — set **exactly one** of: `azure` · `b2` · `filesystem` · `gcs` · `gdrive` · `rclone` · `s3` · `sftp` · `webDav`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `azure` | [object](#repository-spec-seed-from-backend-azure) | — | Azure Blob Storage. |
+| `b2` | [object](#repository-spec-seed-from-backend-b2) | — | Backblaze B2. |
+| `filesystem` | [object](#repository-spec-seed-from-backend-filesystem) | — | A local filesystem path, backed by a PVC the operator mounts into the mover. |
+| `gcs` | [object](#repository-spec-seed-from-backend-gcs) | — | Google Cloud Storage. |
+| `gdrive` | [object](#repository-spec-seed-from-backend-gdrive) | — | Google Drive via kopia's native `gdrive` provider (service-account JSON). kopia marks this provider experimental / not maintained, and a native gdrive repository is not interchangeable with an rclone-backed Drive remote. |
+| `rclone` | [object](#repository-spec-seed-from-backend-rclone) | — | Any rclone remote (kopia shells out to `rclone`), broadening reach to providers without a native kopia backend. |
+| `s3` | [object](#repository-spec-seed-from-backend-s3) | — | Amazon S3 or any S3-compatible object store (MinIO, RustFS, Ceph RGW, …). |
+| `sftp` | [object](#repository-spec-seed-from-backend-sftp) | — | SFTP server. |
+| `webDav` | [object](#repository-spec-seed-from-backend-webdav) | — | WebDAV endpoint. |
+
+###### `spec.seed.from.backend.azure` { #repository-spec-seed-from-backend-azure }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `container` | string | **required** | Blob container holding the kopia repository. |
+| `auth` | [object](#repository-spec-seed-from-backend-azure-auth) | — | Access credentials (Secret ref / workload identity). |
+| `prefix` | string | — | Blob-name prefix within the container; empty/absent means the container root. |
+| `storageAccount` | string | — | Storage-account name (when not inferred from credentials). |
+
+###### `spec.seed.from.backend.azure.auth` { #repository-spec-seed-from-backend-azure-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#repository-spec-seed-from-backend-azure-auth-secretref) | — | Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`). |
+| `workloadIdentity` | [object](#repository-spec-seed-from-backend-azure-auth-workloadidentity) | — | Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`). |
+
+###### `spec.seed.from.backend.azure.auth.secretRef` { #repository-spec-seed-from-backend-azure-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.azure.auth.workloadIdentity` { #repository-spec-seed-from-backend-azure-auth-workloadidentity }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `serviceAccountName` | string | **required** | Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace. |
+
+###### `spec.seed.from.backend.b2` { #repository-spec-seed-from-backend-b2 }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bucket` | string | **required** | B2 bucket holding the kopia repository. |
+| `auth` | [object](#repository-spec-seed-from-backend-b2-auth) | — | Access credentials (application key ID/key Secret); Secret-only. |
+| `prefix` | string | — | Object-name prefix within the bucket; empty/absent means the bucket root. |
+
+###### `spec.seed.from.backend.b2.auth` { #repository-spec-seed-from-backend-b2-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#repository-spec-seed-from-backend-b2-auth-secretref) | — | Secret holding the backend's access credentials, read by well-known keys. |
+
+###### `spec.seed.from.backend.b2.auth.secretRef` { #repository-spec-seed-from-backend-b2-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.filesystem` { #repository-spec-seed-from-backend-filesystem }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | string | **required** | Mount path inside the mover pod where kopia writes the repository (e.g. `/repo`). |
+| `volume` | [union](#repository-spec-seed-from-backend-filesystem-volume) | — | What backs `path`: a PVC or an inline NFS export; absent for a path already on the node/image. |
+
+###### `spec.seed.from.backend.filesystem.volume` { #repository-spec-seed-from-backend-filesystem-volume }
+
+Externally tagged — set **exactly one** of: `nfs` · `pvc`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `nfs` | [object](#repository-spec-seed-from-backend-filesystem-volume-nfs) | — | An inline NFS export mounted directly (no PVC). |
+| `pvc` | [object](#repository-spec-seed-from-backend-filesystem-volume-pvc) | — | A `PersistentVolumeClaim` mounted read-write at the repo path. |
+
+###### `spec.seed.from.backend.filesystem.volume.nfs` { #repository-spec-seed-from-backend-filesystem-volume-nfs }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | string | **required** | Exported path on the NFS server (e.g. `/export/kopia` or `/mnt/eros/Media`). |
+| `server` | string | **required** | NFS server hostname or IP (e.g. `nas.lan` or `expanse.internal`). |
+
+###### `spec.seed.from.backend.filesystem.volume.pvc` { #repository-spec-seed-from-backend-filesystem-volume-pvc }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `PersistentVolumeClaim` to mount (in the mover's namespace). |
+
+###### `spec.seed.from.backend.gcs` { #repository-spec-seed-from-backend-gcs }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bucket` | string | **required** | GCS bucket holding the kopia repository. |
+| `auth` | [object](#repository-spec-seed-from-backend-gcs-auth) | — | Access credentials (service-account key Secret / workload identity). |
+| `prefix` | string | — | Object-name prefix within the bucket; empty/absent means the bucket root. |
+
+###### `spec.seed.from.backend.gcs.auth` { #repository-spec-seed-from-backend-gcs-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#repository-spec-seed-from-backend-gcs-auth-secretref) | — | Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`). |
+| `workloadIdentity` | [object](#repository-spec-seed-from-backend-gcs-auth-workloadidentity) | — | Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`). |
+
+###### `spec.seed.from.backend.gcs.auth.secretRef` { #repository-spec-seed-from-backend-gcs-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.gcs.auth.workloadIdentity` { #repository-spec-seed-from-backend-gcs-auth-workloadidentity }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `serviceAccountName` | string | **required** | Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace. |
+
+###### `spec.seed.from.backend.gdrive` { #repository-spec-seed-from-backend-gdrive }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `folderId` | string | **required** | Google Drive folder ID that holds the kopia repository. |
+| `credentialsSecretRef` | [object](#repository-spec-seed-from-backend-gdrive-credentialssecretref) | — | Secret holding the Google service-account JSON used to reach the folder, read by the well-known key `KOPIA_GDRIVE_CREDENTIALS`. Absent means kopia falls back to ambient credentials (`GOOGLE_APPLICATION_CREDENTIALS` or instance metadata). |
+
+###### `spec.seed.from.backend.gdrive.credentialsSecretRef` { #repository-spec-seed-from-backend-gdrive-credentialssecretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.rclone` { #repository-spec-seed-from-backend-rclone }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `remotePath` | string | **required** | rclone path in `remote:path` form (the remote name must exist in the supplied rclone config). |
+| `configSecretRef` | [object](#repository-spec-seed-from-backend-rclone-configsecretref) | — | Secret holding the `rclone.conf` that defines the remote referenced by `remote_path`. |
+| `startupTimeout` | string | — | How long kopia waits for its embedded `rclone serve` to come up before failing the connect, as a Go duration (e.g. `2m`). kopia's default is `15s`; raise it for slow remotes whose repository metadata/indexes load through the rclone/WebDAV bridge and take longer than the default budget. |
+
+###### `spec.seed.from.backend.rclone.configSecretRef` { #repository-spec-seed-from-backend-rclone-configsecretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.s3` { #repository-spec-seed-from-backend-s3 }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bucket` | string | **required** | Bucket holding the kopia repository. |
+| `auth` | [object](#repository-spec-seed-from-backend-s3-auth) | — | Access credentials (Secret ref / workload identity). |
+| `endpoint` | string | — | S3 endpoint host. Omit for AWS; set it for MinIO/RustFS/other S3-compatible stores. |
+| `prefix` | string | — | Key prefix under the bucket, letting several repositories share one bucket (e.g. `clusters/prod/`). Empty/absent means the bucket root. |
+| `region` | string | — | S3 region. Required by AWS and some compatible providers. |
+| `tls` | [object](#repository-spec-seed-from-backend-s3-tls) | — | TLS overrides for self-signed CAs or HTTP-only endpoints. |
+
+###### `spec.seed.from.backend.s3.auth` { #repository-spec-seed-from-backend-s3-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#repository-spec-seed-from-backend-s3-auth-secretref) | — | Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`). |
+| `workloadIdentity` | [object](#repository-spec-seed-from-backend-s3-auth-workloadidentity) | — | Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`). |
+
+###### `spec.seed.from.backend.s3.auth.secretRef` { #repository-spec-seed-from-backend-s3-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.s3.auth.workloadIdentity` { #repository-spec-seed-from-backend-s3-auth-workloadidentity }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `serviceAccountName` | string | **required** | Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace. |
+
+###### `spec.seed.from.backend.s3.tls` { #repository-spec-seed-from-backend-s3-tls }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `caBundleRef` | [object](#repository-spec-seed-from-backend-s3-tls-cabundleref) | — | CA bundle (PEM) used to verify the endpoint's certificate, sourced from a `ConfigMap`. |
+| `disableTls` | boolean | — | Disable TLS entirely and talk plain HTTP; maps to kopia's `--disable-tls`. |
+| `insecureSkipVerify` | boolean | — | Skip TLS certificate verification (still uses TLS); maps to kopia's `--disable-tls-verification`. |
+
+###### `spec.seed.from.backend.s3.tls.caBundleRef` { #repository-spec-seed-from-backend-s3-tls-cabundleref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `configMapName` | string | — | Name of the `ConfigMap` holding the value (e.g. a CA bundle). Resolved in the referrer's namespace for a namespaced `Repository`, and in the operator's namespace (`KOPIUR_NAMESPACE`) for a `ClusterRepository` (cluster-scoped, no namespace of its own). |
+| `key` | string | — | Which key inside the `ConfigMap` to read; defaults to `ca.crt` when unset. |
+
+###### `spec.seed.from.backend.sftp` { #repository-spec-seed-from-backend-sftp }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `host` | string | **required** | SFTP server hostname or IP. |
+| `path` | string | **required** | Remote path on the server that holds the kopia repository. |
+| `auth` | [object](#repository-spec-seed-from-backend-sftp-auth) | — | Credentials (SSH private key / known-hosts) sourced from a Secret; Secret-only. |
+| `port` | integer | —<br><sub>min 0; max 65535</sub> | TCP port; defaults to 22 when absent. |
+| `username` | string | — | SSH username to connect as. |
+
+###### `spec.seed.from.backend.sftp.auth` { #repository-spec-seed-from-backend-sftp-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#repository-spec-seed-from-backend-sftp-auth-secretref) | — | Secret holding the backend's access credentials, read by well-known keys. |
+
+###### `spec.seed.from.backend.sftp.auth.secretRef` { #repository-spec-seed-from-backend-sftp-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.webDav` { #repository-spec-seed-from-backend-webdav }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `url` | string | **required** | WebDAV collection URL holding the kopia repository. |
+| `auth` | [object](#repository-spec-seed-from-backend-webdav-auth) | — | HTTP basic-auth credentials sourced from a Secret; Secret-only. |
+
+###### `spec.seed.from.backend.webDav.auth` { #repository-spec-seed-from-backend-webdav-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#repository-spec-seed-from-backend-webdav-auth-secretref) | — | Secret holding the backend's access credentials, read by well-known keys. |
+
+###### `spec.seed.from.backend.webDav.auth.secretRef` { #repository-spec-seed-from-backend-webdav-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.repository` { #repository-spec-seed-from-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+##### `spec.seed.credentialProjection` { #repository-spec-seed-credentialprojection }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default. |
+
+##### `spec.seed.failurePolicy` { #repository-spec-seed-failurepolicy }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `activeDeadlineSeconds` | integer | — | Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed. |
+| `backoffLimit` | integer | — | Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed. |
+| `podStartupDeadlineSeconds` | integer | — | Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s. |
+
+##### `spec.seed.migrate` { #repository-spec-seed-migrate }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `latestOnly` | boolean | — | Copy only each source identity's most recent snapshot instead of its full history (`kopia snapshot migrate --latest`). Default `false` — a seed exists to recover history, so the full copy is the sane default; set this when you only need the latest restore point back quickly. |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
+| `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether the source's kopia **policies** are copied along with the snapshots. Defaults to `PolicyCopyMode::None` (an explicit `--no-policies`), not kopia's own copy-by-default: retention in a kopiur-managed repository is driven by `Snapshot` CRs, and importing the source's kopia-side policies could delete manifests behind the operator's back. |
+
+##### `spec.seed.sync` { #repository-spec-seed-sync }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `maxDownloadSpeedBytesPerSecond` | integer | — | `--max-download-speed`: cap read throughput from the seed source, in bytes/sec (kopia default: unlimited). |
+| `maxUploadSpeedBytesPerSecond` | integer | — | `--max-upload-speed`: cap write throughput into this repository, in bytes/sec (kopia default: unlimited). |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: concurrent blob-copy workers (kopia default `1` — sequential). Raise it: a first-time seed of a large repository over a WAN is exactly the workload sequential copying is worst at. |
+
 #### `spec.server` { #repository-spec-server }
 
 | Field | Type | Default | Description |
@@ -629,6 +929,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `parameters` | [object](#repository-status-parameters) | — | The kopia repository parameters actually observed at the last bootstrap. Compare against `spec.parameters` to see whether a declared value landed. |
 | `phase` | enum: Pending \| Initializing \| Ready \| Degraded \| Failed | — | Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`. |
 | `resolvedCredentialVersion` | string | — | `resourceVersion` of the password Secret observed at the last connect attempt. |
+| `seed` | [object](#repository-status-seed) | — | What the last seed attempt did (`spec.seed`); absent on a repository that was never seeded. |
 | `server` | [object](#repository-status-server) | — | Resolved kopia server endpoint/auth, pinned by the reconciler. |
 | `storageStats` | [object](#repository-status-storagestats) | — | Repository size and snapshot counts from the last catalog scan. |
 | `uniqueId` | string | — | Kopia repository unique ID. |
@@ -692,6 +993,17 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `minDuration` | string | **required** | Observed minimum epoch age, as a Go-style duration. |
 | `refreshFrequency` | string | **required** | Observed epoch-state refresh frequency, as a Go-style duration. |
 
+#### `status.seed` { #repository-status-seed }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | enum: blob \| migrate | — | Which copy mechanism a seed ran. Mirrors the `SeedSource` variant, named after the operation rather than the input so status, metrics (`kopiur_repository_seed_total{mode}`) and docs share one vocabulary. |
+| `seededAt` | string | — | RFC 3339 timestamp the seed completed. Set once: a repository is seeded exactly once, at its first bootstrap. |
+| `snapshotCount` | integer | — | Snapshots observed at the SOURCE when the seed ran. Zero is only ever recorded when `allowEmptySource` permitted it. |
+| `snapshotsCopied` | integer | — | Snapshots actually copied into this repository. Migrate mode only — a blob copy moves storage, not manifests, so there is no per-snapshot copy count to report and it leaves this unset; its `snapshotCount` is the listing taken at the SOURCE before the copy, which for a byte-for-byte mirror is also what this repository ends up holding. |
+| `source` | string | — | The source the data came from, rendered by `SeedSource::describe` — the backend discriminant (`S3`, `Filesystem`, …) for blob mode, `Kind/name` for migrate mode. Never a credential or a bucket path. |
+| `startedAt` | string | — | RFC 3339 timestamp the operator LAUNCHED a seeding bootstrap Job for this repository — the durable **seed-attempt marker**.<br>Stamped before the Job is created, and never cleared. Its whole job is to distinguish "a seed this operator started did not finish" from "this backend was initialized by somebody else": the first must resume the copy, the second must keep the no-clobber `AlreadyInitialized` path. See `seed_resume` — the marker is the ONLY input the resume decision is allowed to take, because a resuming migrate writes into whatever repository is at the backend and then re-stamps its maintenance owner. |
+
 #### `status.server` { #repository-status-server }
 
 | Field | Type | Default | Description |
@@ -745,6 +1057,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `onNamespaceDelete` | enum: Orphan \| Delete | `Orphan` | What happens to this repository's snapshots when a consuming namespace is deleted. |
 | `parameters` | [object](#clusterrepository-spec-parameters) | — | Mutable kopia repository parameters, re-applied on bootstrap whenever they drift. |
 | `scheduleDefaults` | [object](#clusterrepository-spec-scheduledefaults) | — | Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set their own equivalent field — verification, replication, and maintenance schedules today; set once here instead of repeating it on every cron. |
+| `seed` | [object](#clusterrepository-spec-seed) | — | Initialize this repository from an existing replica on its FIRST bootstrap (issue #380) — a disaster-recovery entry point.<br>Armed only while the repository has never been initialized (`status.uniqueId` unset) **and** the mover's connect reports the backend uninitialized; on an already-initialized repository it is a documented no-op (`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave standing in a GitOps manifest. When armed it also replaces `spec.create`'s fallback: the repository is seeded or the bootstrap fails, never silently created empty. |
 | `server` | [object](#clusterrepository-spec-server) | — | Optional kopia web-UI server (the target `namespace` is required). |
 | `suspend` | boolean | — | Pause this cluster repository: skip connect/bootstrap and maintenance projection. |
 
@@ -1287,6 +1600,305 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 | --- | --- | --- | --- |
 | `timezone` | string | — | IANA timezone name applied to every consuming cron that doesn't set its own `timezone` (e.g. `America/New_York`). Set once here instead of repeating it on every `SnapshotPolicy.verification`, `RepositoryReplication.schedule`, and `Maintenance.schedule` cron. |
 
+#### `spec.seed` { #clusterrepository-spec-seed }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `from` | [union](#clusterrepository-spec-seed-from) | **required** | Where the seed data comes from: exactly one of a bare storage backend (blob mode) or another repository CR (migrate mode). |
+| `allowEmptySource` | boolean | — | Accept a source that holds zero snapshots (default `false`).<br>A mirror that answers but is empty is almost always a mis-pointed bucket/prefix, and silently seeding nothing would hand you a `Ready` repository with no history — the failure mode #380 is about. By default the bootstrap fails loudly and retries; set this when an empty source is genuinely expected (e.g. re-homing a repository whose history was deliberately pruned to nothing). |
+| `credentialProjection` | [object](#clusterrepository-spec-seed-credentialprojection) | — | Opt-in projection of the SOURCE repository's credential Secrets into the seeding mover Job's namespace. **Migrate mode only in practice** — a blob-mode source's credentials must already be in the namespace the bootstrap Job runs in (this CR's own namespace for a `Repository`; for a `ClusterRepository` the operator's namespace, unless `encryption.passwordSecretRef.namespace` pins another, in which case the Job runs there). Requires the operator's `features.credentialProjection` install flag. |
+| `failurePolicy` | [object](#clusterrepository-spec-seed-failurepolicy) | — | Deadline/backoff for the **seeding** bootstrap Job. An absent `activeDeadlineSeconds` means **24h** here, rather than the 120s a routine connect gets — a seed copies a whole repository, once. Only applied while the seed is armed; later connects to the now-initialized repository use `spec.bootstrap.failurePolicy` as before. |
+| `migrate` | [object](#clusterrepository-spec-seed-migrate) | — | Tuning for the `kopia snapshot migrate` copy. **Migrate mode only** (`from.repository`); rejected at admission alongside `from.backend`. |
+| `sync` | [object](#clusterrepository-spec-seed-sync) | — | Tuning for the `kopia repository sync-to` blob copy. **Blob mode only** (`from.backend`); rejected at admission alongside `from.repository`. |
+
+##### `spec.seed.from` { #clusterrepository-spec-seed-from }
+
+Externally tagged — set **exactly one** of: `backend` · `repository`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `backend` | [union](#clusterrepository-spec-seed-from-backend) | — | A bare storage backend holding a byte-for-byte mirror of a kopia repository (blob mode, `kopia repository sync-to`). The mirror's format and encryption password are inherited verbatim, so this repository's `encryption.passwordSecretRef` must already hold the MIRROR's password and `spec.create`'s format knobs are refused as inert. |
+| `repository` | [object](#clusterrepository-spec-seed-from-repository) | — | Another `Repository`/`ClusterRepository`, opened read-only (migrate mode, `kopia snapshot migrate`). Snapshot identities and times are preserved, so seeded history is restorable by `identity`/`fromPolicy`.<br>A `kind: Repository` reference with no `namespace` resolves in the referrer's own namespace — and, on a cluster-scoped `ClusterRepository` (which has none), in the operator's namespace, the same rule its credential `secretRef`s follow. Set `namespace` explicitly whenever the source lives anywhere else. |
+
+###### `spec.seed.from.backend` { #clusterrepository-spec-seed-from-backend }
+
+Externally tagged — set **exactly one** of: `azure` · `b2` · `filesystem` · `gcs` · `gdrive` · `rclone` · `s3` · `sftp` · `webDav`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `azure` | [object](#clusterrepository-spec-seed-from-backend-azure) | — | Azure Blob Storage. |
+| `b2` | [object](#clusterrepository-spec-seed-from-backend-b2) | — | Backblaze B2. |
+| `filesystem` | [object](#clusterrepository-spec-seed-from-backend-filesystem) | — | A local filesystem path, backed by a PVC the operator mounts into the mover. |
+| `gcs` | [object](#clusterrepository-spec-seed-from-backend-gcs) | — | Google Cloud Storage. |
+| `gdrive` | [object](#clusterrepository-spec-seed-from-backend-gdrive) | — | Google Drive via kopia's native `gdrive` provider (service-account JSON). kopia marks this provider experimental / not maintained, and a native gdrive repository is not interchangeable with an rclone-backed Drive remote. |
+| `rclone` | [object](#clusterrepository-spec-seed-from-backend-rclone) | — | Any rclone remote (kopia shells out to `rclone`), broadening reach to providers without a native kopia backend. |
+| `s3` | [object](#clusterrepository-spec-seed-from-backend-s3) | — | Amazon S3 or any S3-compatible object store (MinIO, RustFS, Ceph RGW, …). |
+| `sftp` | [object](#clusterrepository-spec-seed-from-backend-sftp) | — | SFTP server. |
+| `webDav` | [object](#clusterrepository-spec-seed-from-backend-webdav) | — | WebDAV endpoint. |
+
+###### `spec.seed.from.backend.azure` { #clusterrepository-spec-seed-from-backend-azure }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `container` | string | **required** | Blob container holding the kopia repository. |
+| `auth` | [object](#clusterrepository-spec-seed-from-backend-azure-auth) | — | Access credentials (Secret ref / workload identity). |
+| `prefix` | string | — | Blob-name prefix within the container; empty/absent means the container root. |
+| `storageAccount` | string | — | Storage-account name (when not inferred from credentials). |
+
+###### `spec.seed.from.backend.azure.auth` { #clusterrepository-spec-seed-from-backend-azure-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#clusterrepository-spec-seed-from-backend-azure-auth-secretref) | — | Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`). |
+| `workloadIdentity` | [object](#clusterrepository-spec-seed-from-backend-azure-auth-workloadidentity) | — | Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`). |
+
+###### `spec.seed.from.backend.azure.auth.secretRef` { #clusterrepository-spec-seed-from-backend-azure-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.azure.auth.workloadIdentity` { #clusterrepository-spec-seed-from-backend-azure-auth-workloadidentity }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `serviceAccountName` | string | **required** | Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace. |
+
+###### `spec.seed.from.backend.b2` { #clusterrepository-spec-seed-from-backend-b2 }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bucket` | string | **required** | B2 bucket holding the kopia repository. |
+| `auth` | [object](#clusterrepository-spec-seed-from-backend-b2-auth) | — | Access credentials (application key ID/key Secret); Secret-only. |
+| `prefix` | string | — | Object-name prefix within the bucket; empty/absent means the bucket root. |
+
+###### `spec.seed.from.backend.b2.auth` { #clusterrepository-spec-seed-from-backend-b2-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#clusterrepository-spec-seed-from-backend-b2-auth-secretref) | — | Secret holding the backend's access credentials, read by well-known keys. |
+
+###### `spec.seed.from.backend.b2.auth.secretRef` { #clusterrepository-spec-seed-from-backend-b2-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.filesystem` { #clusterrepository-spec-seed-from-backend-filesystem }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | string | **required** | Mount path inside the mover pod where kopia writes the repository (e.g. `/repo`). |
+| `volume` | [union](#clusterrepository-spec-seed-from-backend-filesystem-volume) | — | What backs `path`: a PVC or an inline NFS export; absent for a path already on the node/image. |
+
+###### `spec.seed.from.backend.filesystem.volume` { #clusterrepository-spec-seed-from-backend-filesystem-volume }
+
+Externally tagged — set **exactly one** of: `nfs` · `pvc`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `nfs` | [object](#clusterrepository-spec-seed-from-backend-filesystem-volume-nfs) | — | An inline NFS export mounted directly (no PVC). |
+| `pvc` | [object](#clusterrepository-spec-seed-from-backend-filesystem-volume-pvc) | — | A `PersistentVolumeClaim` mounted read-write at the repo path. |
+
+###### `spec.seed.from.backend.filesystem.volume.nfs` { #clusterrepository-spec-seed-from-backend-filesystem-volume-nfs }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | string | **required** | Exported path on the NFS server (e.g. `/export/kopia` or `/mnt/eros/Media`). |
+| `server` | string | **required** | NFS server hostname or IP (e.g. `nas.lan` or `expanse.internal`). |
+
+###### `spec.seed.from.backend.filesystem.volume.pvc` { #clusterrepository-spec-seed-from-backend-filesystem-volume-pvc }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `PersistentVolumeClaim` to mount (in the mover's namespace). |
+
+###### `spec.seed.from.backend.gcs` { #clusterrepository-spec-seed-from-backend-gcs }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bucket` | string | **required** | GCS bucket holding the kopia repository. |
+| `auth` | [object](#clusterrepository-spec-seed-from-backend-gcs-auth) | — | Access credentials (service-account key Secret / workload identity). |
+| `prefix` | string | — | Object-name prefix within the bucket; empty/absent means the bucket root. |
+
+###### `spec.seed.from.backend.gcs.auth` { #clusterrepository-spec-seed-from-backend-gcs-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#clusterrepository-spec-seed-from-backend-gcs-auth-secretref) | — | Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`). |
+| `workloadIdentity` | [object](#clusterrepository-spec-seed-from-backend-gcs-auth-workloadidentity) | — | Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`). |
+
+###### `spec.seed.from.backend.gcs.auth.secretRef` { #clusterrepository-spec-seed-from-backend-gcs-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.gcs.auth.workloadIdentity` { #clusterrepository-spec-seed-from-backend-gcs-auth-workloadidentity }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `serviceAccountName` | string | **required** | Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace. |
+
+###### `spec.seed.from.backend.gdrive` { #clusterrepository-spec-seed-from-backend-gdrive }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `folderId` | string | **required** | Google Drive folder ID that holds the kopia repository. |
+| `credentialsSecretRef` | [object](#clusterrepository-spec-seed-from-backend-gdrive-credentialssecretref) | — | Secret holding the Google service-account JSON used to reach the folder, read by the well-known key `KOPIA_GDRIVE_CREDENTIALS`. Absent means kopia falls back to ambient credentials (`GOOGLE_APPLICATION_CREDENTIALS` or instance metadata). |
+
+###### `spec.seed.from.backend.gdrive.credentialsSecretRef` { #clusterrepository-spec-seed-from-backend-gdrive-credentialssecretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.rclone` { #clusterrepository-spec-seed-from-backend-rclone }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `remotePath` | string | **required** | rclone path in `remote:path` form (the remote name must exist in the supplied rclone config). |
+| `configSecretRef` | [object](#clusterrepository-spec-seed-from-backend-rclone-configsecretref) | — | Secret holding the `rclone.conf` that defines the remote referenced by `remote_path`. |
+| `startupTimeout` | string | — | How long kopia waits for its embedded `rclone serve` to come up before failing the connect, as a Go duration (e.g. `2m`). kopia's default is `15s`; raise it for slow remotes whose repository metadata/indexes load through the rclone/WebDAV bridge and take longer than the default budget. |
+
+###### `spec.seed.from.backend.rclone.configSecretRef` { #clusterrepository-spec-seed-from-backend-rclone-configsecretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.s3` { #clusterrepository-spec-seed-from-backend-s3 }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `bucket` | string | **required** | Bucket holding the kopia repository. |
+| `auth` | [object](#clusterrepository-spec-seed-from-backend-s3-auth) | — | Access credentials (Secret ref / workload identity). |
+| `endpoint` | string | — | S3 endpoint host. Omit for AWS; set it for MinIO/RustFS/other S3-compatible stores. |
+| `prefix` | string | — | Key prefix under the bucket, letting several repositories share one bucket (e.g. `clusters/prod/`). Empty/absent means the bucket root. |
+| `region` | string | — | S3 region. Required by AWS and some compatible providers. |
+| `tls` | [object](#clusterrepository-spec-seed-from-backend-s3-tls) | — | TLS overrides for self-signed CAs or HTTP-only endpoints. |
+
+###### `spec.seed.from.backend.s3.auth` { #clusterrepository-spec-seed-from-backend-s3-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#clusterrepository-spec-seed-from-backend-s3-auth-secretref) | — | Secret holding the backend's static access credentials (mutually exclusive with `workloadIdentity`). |
+| `workloadIdentity` | [object](#clusterrepository-spec-seed-from-backend-s3-auth-workloadidentity) | — | Use a cloud-federated ServiceAccount instead of static keys (mutually exclusive with `secretRef`). |
+
+###### `spec.seed.from.backend.s3.auth.secretRef` { #clusterrepository-spec-seed-from-backend-s3-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.s3.auth.workloadIdentity` { #clusterrepository-spec-seed-from-backend-s3-auth-workloadidentity }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `serviceAccountName` | string | **required** | Name of the `ServiceAccount` the mover pod runs as, resolved in the Job's own namespace. |
+
+###### `spec.seed.from.backend.s3.tls` { #clusterrepository-spec-seed-from-backend-s3-tls }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `caBundleRef` | [object](#clusterrepository-spec-seed-from-backend-s3-tls-cabundleref) | — | CA bundle (PEM) used to verify the endpoint's certificate, sourced from a `ConfigMap`. |
+| `disableTls` | boolean | — | Disable TLS entirely and talk plain HTTP; maps to kopia's `--disable-tls`. |
+| `insecureSkipVerify` | boolean | — | Skip TLS certificate verification (still uses TLS); maps to kopia's `--disable-tls-verification`. |
+
+###### `spec.seed.from.backend.s3.tls.caBundleRef` { #clusterrepository-spec-seed-from-backend-s3-tls-cabundleref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `configMapName` | string | — | Name of the `ConfigMap` holding the value (e.g. a CA bundle). Resolved in the referrer's namespace for a namespaced `Repository`, and in the operator's namespace (`KOPIUR_NAMESPACE`) for a `ClusterRepository` (cluster-scoped, no namespace of its own). |
+| `key` | string | — | Which key inside the `ConfigMap` to read; defaults to `ca.crt` when unset. |
+
+###### `spec.seed.from.backend.sftp` { #clusterrepository-spec-seed-from-backend-sftp }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `host` | string | **required** | SFTP server hostname or IP. |
+| `path` | string | **required** | Remote path on the server that holds the kopia repository. |
+| `auth` | [object](#clusterrepository-spec-seed-from-backend-sftp-auth) | — | Credentials (SSH private key / known-hosts) sourced from a Secret; Secret-only. |
+| `port` | integer | —<br><sub>min 0; max 65535</sub> | TCP port; defaults to 22 when absent. |
+| `username` | string | — | SSH username to connect as. |
+
+###### `spec.seed.from.backend.sftp.auth` { #clusterrepository-spec-seed-from-backend-sftp-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#clusterrepository-spec-seed-from-backend-sftp-auth-secretref) | — | Secret holding the backend's access credentials, read by well-known keys. |
+
+###### `spec.seed.from.backend.sftp.auth.secretRef` { #clusterrepository-spec-seed-from-backend-sftp-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.backend.webDav` { #clusterrepository-spec-seed-from-backend-webdav }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `url` | string | **required** | WebDAV collection URL holding the kopia repository. |
+| `auth` | [object](#clusterrepository-spec-seed-from-backend-webdav-auth) | — | HTTP basic-auth credentials sourced from a Secret; Secret-only. |
+
+###### `spec.seed.from.backend.webDav.auth` { #clusterrepository-spec-seed-from-backend-webdav-auth }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `secretRef` | [object](#clusterrepository-spec-seed-from-backend-webdav-auth-secretref) | — | Secret holding the backend's access credentials, read by well-known keys. |
+
+###### `spec.seed.from.backend.webDav.auth.secretRef` { #clusterrepository-spec-seed-from-backend-webdav-auth-secretref }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `Secret`. |
+| `namespace` | string | — | Namespace of the `Secret`; absent = same namespace as the referrer. A `ClusterRepository` is cluster-scoped and has no namespace of its own, so when IT reads the `Secret` (to connect, to bootstrap, or to run its repository server) an absent namespace means the operator's namespace (`KOPIUR_NAMESPACE`). A workload mover (Snapshot/Restore/Maintenance) still needs the `Secret` in its OWN namespace — `envFrom` is namespace-local — so put it there, or use `credentialProjection`, which needs this namespace set EXPLICITLY to know what to copy. Set it whenever anything other than the operator itself reads the `Secret`. |
+
+###### `spec.seed.from.repository` { #clusterrepository-spec-seed-from-repository }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
+| `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
+| `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+##### `spec.seed.credentialProjection` { #clusterrepository-spec-seed-credentialprojection }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Copy the repository's credential Secret(s) into the namespace of each mover Job; off by default. |
+
+##### `spec.seed.failurePolicy` { #clusterrepository-spec-seed-failurepolicy }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `activeDeadlineSeconds` | integer | — | Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed. |
+| `backoffLimit` | integer | — | Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed. |
+| `podStartupDeadlineSeconds` | integer | — | Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s. |
+
+##### `spec.seed.migrate` { #clusterrepository-spec-seed-migrate }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `latestOnly` | boolean | — | Copy only each source identity's most recent snapshot instead of its full history (`kopia snapshot migrate --latest`). Default `false` — a seed exists to recover history, so the full copy is the sane default; set this when you only need the latest restore point back quickly. |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
+| `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether the source's kopia **policies** are copied along with the snapshots. Defaults to `PolicyCopyMode::None` (an explicit `--no-policies`), not kopia's own copy-by-default: retention in a kopiur-managed repository is driven by `Snapshot` CRs, and importing the source's kopia-side policies could delete manifests behind the operator's back. |
+
+##### `spec.seed.sync` { #clusterrepository-spec-seed-sync }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `maxDownloadSpeedBytesPerSecond` | integer | — | `--max-download-speed`: cap read throughput from the seed source, in bytes/sec (kopia default: unlimited). |
+| `maxUploadSpeedBytesPerSecond` | integer | — | `--max-upload-speed`: cap write throughput into this repository, in bytes/sec (kopia default: unlimited). |
+| `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: concurrent blob-copy workers (kopia default `1` — sequential). Raise it: a first-time seed of a large repository over a WAN is exactly the workload sequential copying is worst at. |
+
 #### `spec.server` { #clusterrepository-spec-server }
 
 | Field | Type | Default | Description |
@@ -1351,6 +1963,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `parameters` | [object](#clusterrepository-status-parameters) | — | The kopia repository parameters actually observed at the last bootstrap. Compare against `spec.parameters` to see whether a declared value landed. |
 | `phase` | enum: Pending \| Initializing \| Ready \| Degraded \| Failed | — | Lifecycle phase of a repository. A freshly admitted CR starts in `Pending`. |
 | `resolvedCredentialVersion` | string | — | `resourceVersion` of the password Secret observed at the last connect attempt. |
+| `seed` | [object](#clusterrepository-status-seed) | — | What the last seed attempt did (`spec.seed`); absent on a repository that was never seeded. |
 | `server` | [object](#clusterrepository-status-server) | — | Resolved kopia server endpoint/auth, pinned by the reconciler. |
 | `storageStats` | [object](#clusterrepository-status-storagestats) | — | Repository size and snapshot counts from the last catalog scan. |
 | `uniqueId` | string | — | Kopia repository unique ID. |
@@ -1413,6 +2026,17 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `enabled` | boolean | **required** | Whether kopia's epoch manager is enabled on this repository at all. |
 | `minDuration` | string | **required** | Observed minimum epoch age, as a Go-style duration. |
 | `refreshFrequency` | string | **required** | Observed epoch-state refresh frequency, as a Go-style duration. |
+
+#### `status.seed` { #clusterrepository-status-seed }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | enum: blob \| migrate | — | Which copy mechanism a seed ran. Mirrors the `SeedSource` variant, named after the operation rather than the input so status, metrics (`kopiur_repository_seed_total{mode}`) and docs share one vocabulary. |
+| `seededAt` | string | — | RFC 3339 timestamp the seed completed. Set once: a repository is seeded exactly once, at its first bootstrap. |
+| `snapshotCount` | integer | — | Snapshots observed at the SOURCE when the seed ran. Zero is only ever recorded when `allowEmptySource` permitted it. |
+| `snapshotsCopied` | integer | — | Snapshots actually copied into this repository. Migrate mode only — a blob copy moves storage, not manifests, so there is no per-snapshot copy count to report and it leaves this unset; its `snapshotCount` is the listing taken at the SOURCE before the copy, which for a byte-for-byte mirror is also what this repository ends up holding. |
+| `source` | string | — | The source the data came from, rendered by `SeedSource::describe` — the backend discriminant (`S3`, `Filesystem`, …) for blob mode, `Kind/name` for migrate mode. Never a credential or a bucket path. |
+| `startedAt` | string | — | RFC 3339 timestamp the operator LAUNCHED a seeding bootstrap Job for this repository — the durable **seed-attempt marker**.<br>Stamped before the Job is created, and never cleared. Its whole job is to distinguish "a seed this operator started did not finish" from "this backend was initialized by somebody else": the first must resume the copy, the second must keep the no-clobber `AlreadyInitialized` path. See `seed_resume` — the marker is the ONLY input the resume decision is allowed to take, because a resuming migrate writes into whatever repository is at the backend and then re-stamps its maintenance owner. |
 
 #### `status.server` { #clusterrepository-status-server }
 
@@ -2453,6 +3077,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `sourceKind` | string | — | The pinned source kind (`SnapshotRef`/`FromPolicy`/`Identity`); backs the `SOURCE` printer column. |
 | `target` | [object](#restore-status-target) | — | Resolved target details (the PVC written to / populator handshake). |
 | `timing` | [object](#restore-status-timing) | — | Start/end timestamps for the restore run. |
+| `waitStartedAt` | string | — | When the `policy.waitTimeout` window OPENED (RFC3339) — the first reconcile on which the restore could actually proceed (its repository reached `Ready`, and for a `target.populator` a PVC already claims it), NOT when the Restore was created. If the referenced `Repository`/`SnapshotPolicy` object doesn't exist yet, the readiness gate falls through unverified and the anchor can be stamped as early as creation. Stamped once and then honored verbatim, so the window survives controller restarts and Job pod retries; cleared when a populator re-opens resolution for a re-created claim, so that claim gets the full window again. Absent means the window has not opened yet (or no `policy.waitTimeout` is configured, in which case there is no window to anchor). |
 
 #### `status.conditions[]` { #restore-status-conditions }
 
@@ -3052,6 +3677,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `lastReplicated` | string | — | RFC3339 timestamp of the most recent successful replication run. |
 | `lastReplicatedBlobs` | integer | — | Blobs replicated by the last successful run (best-effort). |
 | `lastReplicatedBytes` | integer | — | Bytes replicated by the last successful run (best-effort from kopia output). |
+| `manualRun` | [object](#repositoryreplication-status-manualrun) | — | State of the most recent annotation-requested out-of-band run (`kopiur.home-operations.com/run-requested`); absent until one is requested. |
 | `nextScheduledAt` | string | — | RFC3339 timestamp of the next scheduled replication run (cron + jitter, pinned). |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection / kstatus. |
 | `phase` | enum: Pending \| Replicating \| Succeeded \| Failed \| Suspended | — | Lifecycle phase of a replication. |
@@ -3066,6 +3692,14 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `status` | string | **required** | status of the condition, one of True, False, Unknown. |
 | `type` | string | **required** | type of condition in CamelCase or in foo.example.com/CamelCase. |
 | `observedGeneration` | integer | — | observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditionsx.observedGeneration is 9, the condition is out of date with respect to the current state of the instance. |
+
+#### `status.manualRun` { #repositoryreplication-status-manualrun }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `completedAt` | string | — | RFC3339 instant the run reached a terminal phase. |
+| `phase` | enum: Pending \| Running \| Succeeded \| Failed | — | Lifecycle of a manual replication run. Closed enum. |
+| `requestedAt` | string | — | The `run-requested` annotation value this status reflects (RFC3339), verbatim as the user wrote it — it pins WHICH request is answered. |
 
 ---
 
@@ -3227,6 +3861,7 @@ Externally tagged — set **exactly one** of: `mirrorSource` · `none` · `reten
 | `conditions` | [][object](#snapshotreplication-status-conditions) | — | Standard Kubernetes conditions (`Ready`, `Reconciling`, `Stalled`). |
 | `lastReplicated` | string | — | RFC3339 timestamp of the most recent successful replication run (also the scheduling anchor for the next slot). |
 | `lastRun` | [object](#snapshotreplication-status-lastrun) | — | Counters from the most recent run. |
+| `manualRun` | [object](#snapshotreplication-status-manualrun) | — | State of the most recent annotation-requested out-of-band run (`kopiur.home-operations.com/run-requested`); absent until one is requested. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection / kstatus. |
 | `phase` | enum: Pending \| Replicating \| Succeeded \| Failed \| Suspended | — | Lifecycle phase of a snapshot replication. |
 
@@ -3250,3 +3885,11 @@ Externally tagged — set **exactly one** of: `mirrorSource` · `none` · `reten
 | `identitiesSelected` | integer | —<br><sub>min 0</sub> | Source identities the selector matched this run. |
 | `pruned` | integer | —<br><sub>min 0</sub> | Copies pruned this run per `spec.pruning`. |
 | `snapshotsCopied` | integer | —<br><sub>min 0</sub> | Snapshots newly copied to the destination this run. |
+
+#### `status.manualRun` { #snapshotreplication-status-manualrun }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `completedAt` | string | — | RFC3339 instant the run reached a terminal phase. |
+| `phase` | enum: Pending \| Running \| Succeeded \| Failed | — | Lifecycle of a manual replication run. Closed enum. |
+| `requestedAt` | string | — | The `run-requested` annotation value this status reflects (RFC3339), verbatim as the user wrote it — it pins WHICH request is answered. |

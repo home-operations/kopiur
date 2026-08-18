@@ -54,9 +54,13 @@ fn all_examples_match_crd_field_shapes() {
     // under `backends/` — both must deserialize into the real CRD types.
     let ladder = yaml_files(&dir);
     let backends = yaml_files(&dir.join("backends"));
-    // Floors, not exact counts — both sets grow as examples/variants are added,
-    // and every file found below is validated regardless. The point is to catch
-    // an empty/missing dir, not to pin a number.
+    // The problem-driven scenario bundles. They are apply-ready manifests users
+    // copy verbatim in a recovery, so a wrong field shape here is worse than in
+    // the ladder, not better.
+    let scenarios = yaml_files(&dir.join("scenarios"));
+    // Floors, not exact counts — all three sets grow as examples/variants are
+    // added, and every file found below is validated regardless. The point is to
+    // catch an empty/missing dir, not to pin a number.
     assert!(
         ladder.len() >= 9,
         "expected >=9 numbered example files, found {ladder:?}"
@@ -65,7 +69,15 @@ fn all_examples_match_crd_field_shapes() {
         backends.len() >= 8,
         "expected >=8 per-backend example files (one per backend kind), found {backends:?}"
     );
-    let files: Vec<PathBuf> = ladder.into_iter().chain(backends).collect();
+    assert!(
+        scenarios.len() >= 10,
+        "expected >=10 scenario bundles (one per docs/scenarios page), found {scenarios:?}"
+    );
+    let files: Vec<PathBuf> = ladder
+        .into_iter()
+        .chain(backends)
+        .chain(scenarios)
+        .collect();
 
     let mut kopia_docs = 0usize;
     for path in &files {
@@ -171,5 +183,123 @@ fn new_optional_example_keys_survive_the_round_trip() {
         r["parameters"]["epoch"]["minDuration"],
         serde_json::json!("6h"),
         "spec.parameters.epoch.minDuration must survive: {r}"
+    );
+}
+
+/// Every `Repository` document in `file`, round-tripped through `RepositorySpec`.
+///
+/// The scenario bundles deliberately carry several same-named `Repository`
+/// documents (one per cluster / per variant), so a "first document of this kind"
+/// lookup cannot reach them all.
+fn round_tripped_repositories(file: &str) -> Vec<serde_json::Value> {
+    use serde::Deserialize;
+    let text = std::fs::read_to_string(examples_dir().join(file)).expect("read example");
+    let mut out = Vec::new();
+    for de in serde_yaml::Deserializer::from_str(&text) {
+        let value = serde_yaml::Value::deserialize(de).expect("yaml doc");
+        let v: serde_json::Value = serde_json::to_value(&value).expect("yaml -> json");
+        if v.get("kind").and_then(|k| k.as_str()) != Some("Repository") {
+            continue;
+        }
+        let spec = v.get("spec").expect("Repository has a spec").clone();
+        let typed: RepositorySpec = serde_json::from_value(spec)
+            .unwrap_or_else(|e| panic!("{file}: Repository.spec does not match CRD type: {e}"));
+        out.push(serde_json::to_value(typed).expect("spec -> json"));
+    }
+    assert!(!out.is_empty(), "{file}: no Repository document");
+    out
+}
+
+/// #380: the `spec.seed` examples must document fields that actually EXIST.
+///
+/// `spec.seed` is the one block whose misspelling is invisible until a disaster:
+/// kopiur's API types do not set `deny_unknown_fields`, so `seed: {frm: ...}`
+/// parses fine and is silently dropped — the repository then bootstraps EMPTY
+/// and reports itself `Ready`, which is the exact failure #380 exists to
+/// prevent. Re-serializing and looking for each documented key is the only check
+/// that catches that.
+#[test]
+fn the_seed_examples_document_keys_that_survive_the_round_trip() {
+    // 41 — blob mode: a bare mirror backend plus its blob-only tuning.
+    let blob = round_tripped_repositories("41-repository-seed-from-backend.yaml");
+    assert_eq!(blob.len(), 1, "example 41 should hold one Repository");
+    let seed = &blob[0]["seed"];
+    assert_eq!(
+        seed["from"]["backend"]["s3"]["bucket"],
+        serde_json::json!("offsite-mirror"),
+        "seed.from.backend must survive under its externally-tagged wire key: {seed}"
+    );
+    assert_eq!(
+        seed["sync"]["parallel"],
+        serde_json::json!(8),
+        "seed.sync.parallel must survive (blob-mode tuning): {seed}"
+    );
+    assert_eq!(
+        seed["failurePolicy"]["activeDeadlineSeconds"],
+        serde_json::json!(86_400),
+        "seed.failurePolicy must survive: {seed}"
+    );
+    assert!(
+        seed["migrate"].is_null(),
+        "a blob seed must not carry migrate tuning (admission refuses it): {seed}"
+    );
+
+    // 42 — migrate mode: a repository reference plus its migrate-only tuning.
+    let migrate = round_tripped_repositories("42-repository-seed-from-repository.yaml");
+    assert_eq!(migrate.len(), 1, "example 42 should hold one Repository");
+    let seed = &migrate[0]["seed"];
+    assert_eq!(
+        seed["from"]["repository"]["kind"],
+        serde_json::json!("ClusterRepository"),
+        "seed.from.repository must survive under its externally-tagged wire key: {seed}"
+    );
+    assert_eq!(
+        seed["migrate"]["parallel"],
+        serde_json::json!(4),
+        "seed.migrate.parallel must survive: {seed}"
+    );
+    assert_eq!(
+        seed["migrate"]["policies"],
+        serde_json::json!("none"),
+        "seed.migrate.policies must survive as the documented `none` default: {seed}"
+    );
+    assert_eq!(
+        seed["credentialProjection"]["enabled"],
+        serde_json::json!(true),
+        "seed.credentialProjection must survive, or the example documents a no-op: {seed}"
+    );
+    assert!(
+        seed["sync"].is_null(),
+        "a migrate seed must not carry blob tuning (admission refuses it): {seed}"
+    );
+
+    // The DR scenario bundle carries BOTH variants, same name, one per cluster
+    // shape — plus the pre-disaster primary, which must carry no seed at all.
+    let dr = round_tripped_repositories("scenarios/10-dr-seed-from-replica.yaml");
+    let seeds: Vec<&serde_json::Value> = dr
+        .iter()
+        .map(|r| &r["seed"])
+        .filter(|s| !s.is_null())
+        .collect();
+    assert_eq!(
+        seeds.len(),
+        2,
+        "the DR bundle documents exactly two seed variants (blob + migrate): {dr:?}"
+    );
+    assert_eq!(
+        seeds
+            .iter()
+            .filter(|s| !s["from"]["backend"].is_null())
+            .count(),
+        1,
+        "exactly one variant seeds from a mirror BACKEND: {seeds:?}"
+    );
+    assert_eq!(
+        seeds
+            .iter()
+            .filter(|s| !s["from"]["repository"].is_null())
+            .count(),
+        1,
+        "exactly one variant seeds from a repository CR: {seeds:?}"
     );
 }

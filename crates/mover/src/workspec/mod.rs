@@ -628,9 +628,10 @@ pub struct BootstrapRepositoryOp {
     pub maintenance_owner: Option<String>,
     /// Run `snapshot list` and return the entries so the controller can
     /// materialize `origin: discovered` Snapshot CRs. The snapshot *count* is
-    /// always reported; the entries are only returned when this is set (the
-    /// controller sets it for namespaced `Repository`, not `ClusterRepository`,
-    /// whose cross-namespace placement is a separate concern).
+    /// always reported; the entries are only returned when this is set. BOTH
+    /// repository kinds set it — a `ClusterRepository`'s discovered snapshots
+    /// are placed per identity hostname by the controller's catalog pass, which
+    /// needs the same entries a namespaced `Repository` does.
     #[serde(default)]
     pub scan_catalog: bool,
     /// Create-time-fixed repository format knobs honored only when this bootstrap
@@ -692,6 +693,19 @@ pub struct BootstrapRepositoryOp {
     /// work specs (serde default ⇒ `false`, the pre-M6 behavior).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
+    /// Initialize this repository from an existing replica when — and only when —
+    /// the first connect reports the backend UNINITIALIZED (`Repository.spec.seed`,
+    /// issue #380). The controller arms this only while `status.uniqueId` is unset,
+    /// so a standing `spec.seed` on an already-bootstrapped repository is a no-op.
+    ///
+    /// Presence is also the **mover-skew acknowledgment token**: when this is set,
+    /// the controller accepts a successful [`crate::bootstrap::BootstrapResult`]
+    /// only if it carries a [`crate::bootstrap::SeedOutcome`]. An older mover image
+    /// would silently drop this unknown field, fall into the create fallback and
+    /// report a `Ready` but EMPTY repository — reintroducing the data-loss shape
+    /// #380 exists to prevent. Absent on old work specs (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<SeedOpSpec>,
 }
 
 impl BootstrapRepositoryOp {
@@ -700,6 +714,240 @@ impl BootstrapRepositoryOp {
     pub fn create_options(&self) -> kopiur_kopia::CreateOptions {
         self.create_options.to_kopia()
     }
+}
+
+/// The seeding payload carried on [`BootstrapRepositoryOp::seed`] — a **wire
+/// mirror** of `kopiur_api::seed::SeedSpec` (the [`ReplicateOp`] rule: plain
+/// serde structs, never the CRD types, so the controller↔mover JSON contract
+/// cannot drift with a CRD refactor).
+///
+/// Everything past `from` and `source_description` is serde-defaulted so a spec
+/// stamped by a controller that omits the tuning blocks still decodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedOpSpec {
+    /// Where the seed reads from: a bare mirror backend (blob mode,
+    /// `kopia repository sync-to`) or another repository CR (migrate mode,
+    /// `kopia snapshot migrate`).
+    pub from: SeedConnectSource,
+    /// The source rendering the controller pinned for `status.seed.source`
+    /// (`kopiur_api::seed::SeedSource::describe`), echoed back verbatim on
+    /// [`crate::bootstrap::SeedOutcome::source`].
+    ///
+    /// Carried rather than re-derived in the mover on purpose: the controller
+    /// RESOLVES a migrate reference's namespace before building this op, so a
+    /// mover-side rendering would print a namespace the CRD-side rendering
+    /// does not — two spellings of one repository in status and logs. One
+    /// renderer, one string. (Same shape as [`ReplicationSourceRef`], carried
+    /// so the mover can stamp lineage it did not itself resolve.)
+    pub source_description: String,
+    /// Blob-mode tuning for `kopia repository sync-to`. Ignored in migrate mode
+    /// — admission refuses the mismatched pairing, so it is never both present
+    /// and inert on a live CR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SeedSyncSpec>,
+    /// Migrate-mode tuning for `kopia snapshot migrate`. Ignored in blob mode,
+    /// for the same reason `sync` is ignored in migrate mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrate: Option<SeedMigrateSpec>,
+    /// Accept a source holding zero snapshots. `false` (the default) fails the
+    /// bootstrap with [`crate::bootstrap::SEED_SOURCE_EMPTY_CLASS`] instead of
+    /// seeding nothing and reporting `Ready` — the failure mode #380 is about.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_empty_source: bool,
+    /// RESUME a seed a previous attempt started but did not finish: re-run the
+    /// copy even though this repository's backend is already initialized.
+    ///
+    /// Without this, an interrupted seed is unrecoverable-by-retry and silently
+    /// wrong. A seed that dies after initializing the backend — a `sync-to`
+    /// killed by the Job deadline, an OOM, a migrate whose `repository create`
+    /// landed before the copy failed — leaves a repository that the NEXT
+    /// bootstrap connects to successfully. The seed then reports itself the
+    /// documented `AlreadyInitialized` no-op and the repository goes `Ready`
+    /// with partial history (or none). Resuming is what makes the retry
+    /// actually retry.
+    ///
+    /// The controller sets it (issue #380 stage C3) from a durable
+    /// seed-attempt marker it stamps BEFORE creating a seeding bootstrap Job:
+    /// marker present and `status.seed.seededAt` absent ⇒ a previous attempt
+    /// started and never finished ⇒ `resume: true`. A repository with NO marker
+    /// is an ordinary adoption — its backend was initialized by someone else —
+    /// and keeps the no-clobber `AlreadyInitialized` path.
+    ///
+    /// Both copies are safe to re-run: `sync-to` is incremental (it copies only
+    /// blobs the destination lacks) and `snapshot migrate` is idempotent by
+    /// `(SourceInfo, StartTime)`. Absent on old work specs (serde default).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume: bool,
+}
+
+impl SeedOpSpec {
+    /// Which copy mechanism this op selects. Exhaustive.
+    pub fn mode(&self) -> SeedModeSpec {
+        self.from.mode()
+    }
+
+    /// The [`SyncToOptions`](kopiur_kopia::SyncToOptions) for the blob-mode
+    /// `sync-to`, from the carried tuning (absent ⇒ kopia's own defaults).
+    ///
+    /// `local_initialized` says whether THIS repository's backend already holds
+    /// a kopia format blob — false on a first seed into an empty backend, true
+    /// when resuming into one a previous attempt started.
+    ///
+    /// Two options are FIXED rather than exposed:
+    /// * `must_exist: Some(local_initialized)` — a FIRST seed must be allowed to
+    ///   initialize the destination (that IS the operation), while a RESUME must
+    ///   NOT: the format blob is there, and if it has vanished between the
+    ///   connect and the copy something is wrong enough that quietly
+    ///   re-initializing would be the wrong answer. Rendered explicitly either
+    ///   way (`--no-must-exist` / `--must-exist`) rather than relying on kopia's
+    ///   default, so a future default flip cannot turn every seed into a
+    ///   failure. BOTH renderings are pinned against the real binary by the
+    ///   `sync_to_seeds_*` integration test: its first `sync-to` initializes an
+    ///   empty directory with `--no-must-exist`, and its resume leg runs
+    ///   `--must-exist` into the destination that produced, then asserts the
+    ///   copy converged.
+    /// * `delete_extra: false` — a seed never prunes. On a first seed there is
+    ///   nothing at the destination to prune; on a resume the destination holds
+    ///   the previous attempt's partial copy, and `--delete` is the one flag that
+    ///   could destroy it.
+    ///
+    /// `times`/`update` stay `None` (kopia's defaults): kopia already skips blobs
+    /// the destination has, which is exactly what makes a resume incremental.
+    pub fn sync_options(&self, local_initialized: bool) -> kopiur_kopia::SyncToOptions {
+        let sync = self.sync.unwrap_or_default();
+        kopiur_kopia::SyncToOptions {
+            parallel: sync.parallel,
+            delete_extra: false,
+            must_exist: Some(local_initialized),
+            times: None,
+            update: None,
+            max_download_speed_bytes_per_second: sync.max_download_speed_bytes_per_second,
+            max_upload_speed_bytes_per_second: sync.max_upload_speed_bytes_per_second,
+        }
+    }
+}
+
+/// Where a seed reads from — externally tagged
+/// (`{ "backend": { "s3": {...} } }` / `{ "repository": {...} }`), mirroring
+/// the CRD's `SeedSource` one-of. Never `#[serde(tag)]`.
+///
+/// Boxed variants: a [`RepositoryConnect`] is far larger than the reference
+/// beside it, and an unboxed variant would inflate every
+/// [`BootstrapRepositoryOp`] — including the overwhelming majority that carry
+/// no seed at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SeedConnectSource {
+    /// Blob mode: a bare storage backend holding a byte-for-byte mirror of a
+    /// kopia repository. Copied with `kopia repository sync-to`, so the seeded
+    /// repository inherits the mirror's format and password — the mover uses
+    /// THIS repository's own `KOPIA_PASSWORD` for both sides.
+    Backend(Box<RepositoryConnect>),
+    /// Migrate mode: another repository CR, opened read-only. Copied with
+    /// `kopia snapshot migrate`, which preserves each snapshot's
+    /// `username@hostname:path` identity and times.
+    Repository(Box<SeedRepositoryConnect>),
+}
+
+impl SeedConnectSource {
+    /// Which copy mechanism this source selects. Exhaustive — a new variant
+    /// cannot compile until its mode is decided.
+    pub fn mode(&self) -> SeedModeSpec {
+        match self {
+            SeedConnectSource::Backend(_) => SeedModeSpec::Blob,
+            SeedConnectSource::Repository(_) => SeedModeSpec::Migrate,
+        }
+    }
+
+    /// The backend to open as the seed source, for either mode. Exhaustive.
+    pub fn connect(&self) -> &RepositoryConnect {
+        match self {
+            SeedConnectSource::Backend(b) => b,
+            SeedConnectSource::Repository(r) => &r.connect,
+        }
+    }
+}
+
+/// The migrate-mode seed source: the resolved source repository CR plus the
+/// backend to open it with. Mirrors [`ReplicationSourceRef`]'s kind/name/
+/// namespace triple (carried for logs and error messages) and adds the connect
+/// spec, since — unlike a replication source — the mover has never connected to
+/// this repository before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedRepositoryConnect {
+    /// `"Repository"` or `"ClusterRepository"` (the CRD kind's serde value).
+    pub kind: String,
+    /// Name of the source repository CR.
+    pub name: String,
+    /// Namespace of a namespaced source `Repository`; `None` for a
+    /// `ClusterRepository`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// The source repository's backend. Its storage credentials arrive
+    /// `KOPIUR_SEED_`-prefixed and its kopia password on
+    /// `KOPIUR_SEED_KOPIA_PASSWORD`, so neither can collide with THIS
+    /// repository's identically-named ambient ones.
+    pub connect: RepositoryConnect,
+}
+
+/// Which copy mechanism a seed ran. The wire strings are the same two
+/// `kopiur_api::seed::SeedMode` uses (`blob`/`migrate`) so status, metrics and
+/// logs share one vocabulary — pinned by
+/// `tests::seed_mode_wire_labels_match_the_api_crate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SeedModeSpec {
+    /// `kopia repository sync-to` from a bare mirror backend.
+    Blob,
+    /// `kopia snapshot migrate` from another repository CR.
+    Migrate,
+}
+
+impl SeedModeSpec {
+    /// Stable lowercase label for logs and metrics. Exhaustive.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeedModeSpec::Blob => "blob",
+            SeedModeSpec::Migrate => "migrate",
+        }
+    }
+}
+
+/// Blob-mode tuning, a wire mirror of `kopiur_api::seed::SeedSyncOptions`.
+/// Deliberately a strict subset of [`ReplicateOp`]'s knobs — see
+/// [`SeedOpSpec::sync_options`] for the two that are fixed and why.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedSyncSpec {
+    /// `--parallel`: concurrent blob-copy workers (kopia default `1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--max-download-speed`, bytes/sec (kopia default: unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_download_speed_bytes_per_second: Option<i64>,
+    /// `--max-upload-speed`, bytes/sec (kopia default: unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_upload_speed_bytes_per_second: Option<i64>,
+}
+
+/// Migrate-mode tuning, a wire mirror of `kopiur_api::seed::SeedMigrateOptions`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedMigrateSpec {
+    /// `--parallel <n>`: sources migrated concurrently (kopia default `1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<u32>,
+    /// `--latest-only`: copy only the newest snapshot per source identity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub latest_only: bool,
+    /// How kopia-side policies are treated. Defaults to
+    /// [`PolicyCopyModeSpec::None`] — an EXPLICIT `--no-policies`, because
+    /// kopia's own default copies them and an imported retention policy would
+    /// delete manifests behind the operator's back.
+    #[serde(default, skip_serializing_if = "PolicyCopyModeSpec::is_default")]
+    pub policies: PolicyCopyModeSpec,
 }
 
 /// How aggressively the bootstrap mover's connect-to-existing self-heal (see
@@ -737,6 +985,28 @@ pub enum RestampPolicy {
 /// its owner was already stamped unconditionally at create time, so this
 /// self-heal never fires there (see the mover's create-path stamp).
 ///
+/// `seeded` is `true` for a repository a `spec.seed` (issue #380) initialized or
+/// FINISHED on this run without a `repository create` of its own — which is two
+/// shapes, both needing the unconditional restamp for the same underlying
+/// reason (the recorded owner is one no later pass would ever fix):
+///
+/// * **any blob-mode seed.** The `sync-to` copy carries the SOURCE cluster's
+///   `kopia.maintenance` blob, so the repository arrives owned by an operator
+///   that — this being disaster recovery — no longer exists.
+/// * **a RESUMING migrate.** The repository was created by an EARLIER attempt,
+///   so `created` is false on this pass; and that attempt died, quite possibly
+///   before its own create-time stamp ran, leaving kopia's ephemeral pod
+///   identity as owner.
+///
+/// Under [`RestampPolicy::OwnFormatsOnly`] (forced whenever
+/// `identityDefaults.cluster` is set) such an owner is unrecognized, the
+/// self-heal would decline to touch it, and maintenance would yield
+/// indefinitely on a repository nobody else can claim. So a seeded repository
+/// restamps unconditionally: it is semantically as fresh as a created one, even
+/// though `created` stays `false` (only a `repository create` this run sets
+/// that). A FIRST migrate does create the repository and takes the `created`
+/// path instead.
+///
 /// Exhaustive over [`RestampPolicy`]:
 /// * [`RestampPolicy::AnyStale`] — restamp whenever `current != desired`
 ///   (unconditional on a connect-to-existing; the pre-M6 rule).
@@ -751,6 +1021,7 @@ pub enum RestampPolicy {
 /// (bare-path filesystem) restamp, which needs the identical decision.
 pub fn maintenance_restamp_target<'a>(
     created: bool,
+    seeded: bool,
     desired: Option<&'a str>,
     policy: RestampPolicy,
     aliases: &[String],
@@ -759,6 +1030,9 @@ pub fn maintenance_restamp_target<'a>(
     let owner = desired?;
     if created || current == owner {
         return None;
+    }
+    if seeded {
+        return Some(owner);
     }
     match policy {
         RestampPolicy::AnyStale => Some(owner),

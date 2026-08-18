@@ -163,6 +163,37 @@ pub struct AdoptionPlan {
     /// because [`AdoptionRetentionGate`] proved GFS would immediately prune
     /// them (inv. 8). Surfaced via `status.adoption.skippedByRetention`.
     pub skipped_by_retention: u64,
+    /// The repository's catalog holds discovered snapshots, and NONE of them
+    /// match this policy's identity (issue #380).
+    ///
+    /// Silent by construction otherwise, and dangerous after a disaster
+    /// recovery: `spec.seed` brings a whole repository's history back, but the
+    /// identity fork guards are Update-gated and cannot fire on a fresh-cluster
+    /// CREATE — so a recovered `SnapshotPolicy` whose identity differs even
+    /// slightly from the pre-disaster one adopts NOTHING while looking
+    /// perfectly healthy, and starts a brand-new chain beside the history it
+    /// was supposed to reclaim.
+    ///
+    /// Deliberately NOT latched: it stays true on every pass for as long as the
+    /// mismatch does, and goes quiet only when the mismatch is resolved — the
+    /// policy adopts or takes a matching backup (`has_history`), a scan finds
+    /// an identity-matching entry (`matched_any`), or the operator sets
+    /// `adoption: Ignore` and opts out of adoption altogether.
+    ///
+    /// It cannot ride the once-per-(policy, identity) latch the no-match scan
+    /// request uses, because that latch is stamped by the FIRST no-match pass —
+    /// which, in the apply-everything disaster-recovery flow, very plausibly
+    /// races the discovered-`Snapshot` reflector and sees an EMPTY catalog. An
+    /// empty catalog is not evidence of anything, so that pass must not warn;
+    /// but it stamps the latch anyway, and every later pass — now seeing the
+    /// real, non-empty catalog — would find the latch set and stay silent
+    /// forever. Repeating the Warning is the cheaper failure: the apiserver
+    /// aggregates by (reason, object) into one counted Event, whereas losing
+    /// the signal loses the only warning that a recovered identity does not
+    /// match the history it was meant to reclaim. Pinned by
+    /// `a_non_empty_catalog_with_no_identity_match_is_flagged_once`, whose last
+    /// arm asserts the flag survives an already-stamped latch.
+    pub no_adoptable_history: bool,
 }
 
 /// What this policy already carries and has already asked for — the inputs to
@@ -230,6 +261,7 @@ pub fn plan_adoption(
             adopt: Vec::new(),
             request_scan: false,
             skipped_by_retention: 0,
+            no_adoptable_history: false,
         },
         SnapshotAdoption::Adopt => {
             // Identity-matching, non-foreign candidates (inv. 2 + 3). `matched_any`
@@ -237,6 +269,11 @@ pub fn plan_adoption(
             // already ours means there IS relevant history, so it must not trigger a
             // "nothing matched" scan request. The retention gate (inv. 8) runs after
             // BOTH — a retention-withheld candidate is still "history exists".
+            // Whether the repository's catalog held ANY discovered candidate at
+            // all, captured before the filters consume it — the difference
+            // between "nothing to adopt" and "history exists but none of it is
+            // yours", which is the whole point of the #380 warning below.
+            let catalog_non_empty = !candidates.is_empty();
             let mut matched: Vec<AdoptionCandidate> = candidates
                 .into_iter()
                 .filter(|c| {
@@ -255,12 +292,29 @@ pub fn plan_adoption(
 
             let already_requested =
                 history.scan_requested_identity == Some(identity_string(policy_identity).as_str());
-            let request_scan =
-                !adopt.is_empty() || (!matched_any && !history.has_history && !already_requested);
+            let no_match_first_time = !matched_any && !history.has_history && !already_requested;
+            let request_scan = !adopt.is_empty() || no_match_first_time;
             AdoptionPlan {
                 adopt,
                 request_scan,
                 skipped_by_retention,
+                // A catalog that is EMPTY says nothing (the scan may not have
+                // run yet) — only a populated one none of whose entries match
+                // is evidence of an identity mismatch.
+                //
+                // Deliberately NOT latched behind `already_requested`, unlike
+                // `request_scan`. That latch is stamped by the FIRST no-match
+                // pass, and in the apply-everything disaster-recovery flow the
+                // first pass very plausibly races the discovered-Snapshot
+                // reflector: it sees an empty catalog, requests a scan, stamps
+                // the identity — and every later pass, now seeing the real
+                // non-empty catalog, would find the latch already set and stay
+                // silent forever. Losing the ONE signal that a recovered
+                // identity does not match the history it was meant to reclaim
+                // is a far worse outcome than repeating a Warning that the
+                // apiserver aggregates by (reason, object) into a single
+                // counted Event.
+                no_adoptable_history: !matched_any && !history.has_history && catalog_non_empty,
             }
         }
     }
@@ -494,6 +548,27 @@ pub fn adoption_event_message(count: u64, identity: &str) -> String {
          pruned like any snapshot this policy produces. To opt out of automatic adoption, set \
          spec.adoption: Ignore on this SnapshotPolicy, or spec.catalog.adoption: Ignore on the \
          referenced repository."
+    )
+}
+
+/// The `NoAdoptableHistory` Warning Event message (#380): the repository holds
+/// discovered snapshots, and none of them belong to this policy's identity.
+///
+/// Pure so the exact text is asserted, and volatile-free so a repeat is
+/// byte-identical. Names what was found, why it matters, and the two things
+/// that actually fix it.
+pub fn no_adoptable_history_message(identity: &str, repository: &str) -> String {
+    format!(
+        "Repository {repository} holds discovered snapshots, but NONE of them match this \
+         SnapshotPolicy's identity {identity}, so there is nothing for it to adopt. After a \
+         disaster recovery (spec.seed) this almost always means the recovered identity does not \
+         match the one that wrote the history — kopiur's identity-fork guards are update-gated \
+         and cannot fire on a freshly-created SnapshotPolicy, so the mismatch is otherwise \
+         silent, and this policy will start a NEW backup chain beside history you could have \
+         reclaimed. Fix: compare this policy's identity (spec.identity and the repository's \
+         identityDefaults) with the pre-disaster configuration byte for byte, and re-apply it \
+         once they match. If the mismatch is intentional, set spec.adoption: Ignore to silence \
+         this."
     )
 }
 
@@ -968,6 +1043,92 @@ mod tests {
             },
             gate,
         )
+    }
+
+    /// #380: the fork guards are Update-gated and cannot fire on a
+    /// fresh-cluster CREATE, so a recovered policy whose identity does not
+    /// match the seeded history adopts nothing while looking healthy. This is
+    /// the only signal that says so.
+    #[test]
+    fn a_non_empty_catalog_with_no_identity_match_is_flagged_once() {
+        let own = BTreeSet::new();
+        let gate = delete_gate();
+        let mine = identity("app", "billing", Some("/data"));
+        let theirs = identity("app", "OLD-CLUSTER", Some("/data"));
+
+        // Catalog HOLDS history, none of it matches ⇒ flagged.
+        let plan = gated_plan(
+            &mine,
+            vec![candidate("s1", theirs.clone(), false)],
+            &own,
+            false,
+            &gate,
+        );
+        assert!(plan.adopt.is_empty());
+        assert!(plan.no_adoptable_history);
+
+        // An EMPTY catalog says nothing — the scan may simply not have run yet,
+        // which is the ordinary state of a repository being bootstrapped. It
+        // still requests a scan; it must not warn about identity.
+        let plan = gated_plan(&mine, vec![], &own, false, &gate);
+        assert!(!plan.no_adoptable_history);
+        assert!(plan.request_scan);
+
+        // A catalog that DOES match is obviously not flagged.
+        let plan = gated_plan(
+            &mine,
+            vec![candidate("s1", mine.clone(), false)],
+            &own,
+            false,
+            &gate,
+        );
+        assert_eq!(adopt_ids(&plan), vec!["s1"]);
+        assert!(!plan.no_adoptable_history);
+
+        // A policy that already HAS history is not a fresh recovery — it is a
+        // live policy on a shared repository, where other identities are
+        // expected and warning every pass would be noise.
+        let plan = gated_plan(
+            &mine,
+            vec![candidate("s1", theirs.clone(), false)],
+            &own,
+            true,
+            &gate,
+        );
+        assert!(!plan.no_adoptable_history);
+
+        // ...and it is deliberately NOT latched behind the scan-request stamp:
+        // a first pass racing the reflector store (empty catalog -> scan
+        // requested -> identity stamped) would otherwise suppress the warning
+        // forever, in exactly the apply-everything DR flow it exists for.
+        let plan = plan_adoption(
+            SnapshotAdoption::Adopt,
+            &mine,
+            None,
+            vec![candidate("s1", theirs, false)],
+            &AdoptionHistory {
+                own_snapshot_ids: &own,
+                has_history: false,
+                scan_requested_identity: Some(&identity_string(&mine)),
+            },
+            &gate,
+        );
+        assert!(
+            plan.no_adoptable_history,
+            "the warning must survive an already-stamped scan-request latch"
+        );
+        assert!(!plan.request_scan, "the scan request itself stays latched");
+    }
+
+    #[test]
+    fn the_no_adoptable_history_message_names_the_identity_and_the_fix() {
+        let m = no_adoptable_history_message("app@billing:/data", "nas");
+        assert!(!m.contains("   "), "wrapped source whitespace: {m}");
+        assert!(m.contains("app@billing:/data"), "{m}");
+        assert!(m.contains("nas"), "{m}");
+        assert!(m.contains("spec.seed"), "{m}");
+        assert!(m.contains("Fix:"), "{m}");
+        assert!(m.contains("spec.adoption: Ignore"), "{m}");
     }
 
     fn adopt_ids(plan: &AdoptionPlan) -> Vec<&str> {

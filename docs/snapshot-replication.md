@@ -58,6 +58,39 @@ $ kubectl -n billing get snapshots -l kopiur.home-operations.com/origin=replicat
 | `credentialProjection` | Opt in to [credential projection](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) for a `ClusterRepository` source/destination whose Secret lives elsewhere. |
 | `suspend` | Pause replication without deleting the CR. |
 
+## Run it now
+
+A `SnapshotReplication` normally fires on its cron, but you can ask for a copy pass **right now** — after seeding a new destination, after fixing a failed run, or just to watch the first migrate work:
+
+```console
+$ kubectl kopiur replication run nas-primary-to-offsite -n billing --wait
+snapshotreplication.kopiur.home-operations.com/nas-primary-to-offsite run requested (2026-06-11T12:00:00Z)
+SnapshotReplication nas-primary-to-offsite run completed at 2026-06-11T12:09:51Z
+```
+
+If a `RepositoryReplication` and a `SnapshotReplication` share a name in one namespace, add `--kind snapshot` (otherwise the kind is detected for you). The plugin just stamps the `kopiur.home-operations.com/run-requested` annotation with an RFC3339 timestamp, so plain `kubectl` works too:
+
+```console
+$ kubectl annotate snapshotreplication nas-primary-to-offsite -n billing \
+    kopiur.home-operations.com/run-requested="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+```
+
+The timestamp pins *which* request the status answers: re-applying the same value is a no-op (safe in GitOps), a **new** timestamp starts a new run, and progress lands in `status.manualRun` (`requestedAt` / `phase` / `completedAt`).
+
+The requested run takes the **same** path as a scheduled one — the same mover, the same both-repositories-`Ready` and destination-writable gates, the same `IdentityOverlap` guard, and the same single-flight rule.
+
+/// note | A requested run re-anchors the schedule
+
+The next cron slot is computed from `status.lastReplicated`, and a successful requested run stamps it exactly as a scheduled run does. So running at 14:00 on an `0 6 * * *` replication means the next automatic run is 06:00 **tomorrow**. That is intended: the cron means "at least this often", and the snapshots just copied would only be re-scanned by a redundant run.
+
+///
+
+/// warning | Suspended? The request waits, it does not vanish
+
+Requesting a run on a `suspend: true` replication records it as `status.manualRun.phase: Pending` and surfaces `Ready=False` with reason `SuspendedWithPendingRun`. Nothing starts until you [resume](cli/operations.md#suspend--resume) it — at which point the still-unanswered request fires immediately.
+
+///
+
 ## Selecting what to copy
 
 `selection.identities` takes `include` and `exclude` lists of **matchers**. Each matcher sets any of the three identity components — `username`, `hostname`, `sourcePath` — and every **set** component must match for the matcher to match (an unset component matches anything). At least one component must be set per matcher (webhook-enforced).
@@ -103,6 +136,7 @@ Matching zero identities is a **successful no-op** (`NoIdentitiesMatched`), not 
 - **Identity overlap with destination-side policies is guarded.** If a `SnapshotPolicy` writing *directly* into the destination produces the **same kopia identity** as a copied snapshot, the two histories would interleave. The webhook denies that combination outright when `pruning: mirrorSource` is set (the prune would eat the policy's own snapshots) and warns otherwise; at runtime the controller re-checks each pass and surfaces an `IdentityOverlap` condition (skipping the run under `mirrorSource`).
 - **A dedicated mover ServiceAccount.** Replication movers create/patch/delete `Snapshot` CRs (the copies), which the ordinary backup mover must never be able to do — so they run as the dedicated `kopiur-snapshot-replication-mover` ServiceAccount with its own narrowly-scoped Role, generated alongside the rest of the [RBAC](rbac.md).
 - **No destination maintenance behind your back.** The mover always disables kopia's auto-maintenance; the destination's own [`Maintenance`](maintenance.md) remains the only compaction that runs there.
+- **Every run is counted.** `kopiur_replication_runs_total{kind,trigger,outcome}` records each finished run, so "the nightly copy has been failing" is alertable without watching conditions. `trigger` separates `cron` from the [requested](#run-it-now) runs.
 - **Size the first run.** A full-history first replication of a large repository moves everything once (idempotent thereafter). Raise `migrate.parallel`, consider `latestOnly: true` for seeding, and note the mover Job's deadline can be tuned via `mover`/`failurePolicy` knobs on big estates.
 
 ## See also
@@ -111,3 +145,4 @@ Matching zero identities is a **successful no-op** (`NoIdentitiesMatched`), not 
 - [Multi-repository fan-out](backups.md#repositories--one-recipe-several-repositories-fan-out) — backing up into N repositories *directly* from one `SnapshotPolicy` (and why hooks + fan-out points you back here).
 - [Repositories & backends](repositories.md) — the catalog, `deletionProtection`, `identityDefaults`.
 - [Disaster recovery scenario](scenarios/disaster-recovery.md)
+- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md) — the one-shot counterpart: `Repository.spec.seed` copies a whole repository in at first bootstrap (`seed.from.repository` is the same `kopia snapshot migrate`), instead of copying selected snapshots on a schedule.

@@ -78,6 +78,12 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "repl-src",
     "repl-dst",
     "repl-s3-src",
+    // #380 on-demand run-requested run (replication.rs): its own source AND
+    // destination repo, because the scenario asserts that a SECOND run happened
+    // — sharing either end with the every-minute scenarios above would let their
+    // traffic move `lastReplicated` and make the proof meaningless.
+    "repl-run-src",
+    "repl-run-dst",
     "projgate",
     "hooks",
     "gfs",
@@ -134,6 +140,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // the whole repo runs at uid/gid 3001 (bootstrap AND backup — kopia's 0600 control
     // files must share one owner), so it cannot share the restore shard's 65532 seed repo.
     "recrestore",
+    // #380: the waitTimeout window must open when the restore can first PROCEED
+    // (repository Ready), not at the Restore's creation — needs its own repo, created
+    // SUSPENDED so it is cold until the scenario releases it.
+    "waitanchor",
     // SnapshotReplication (issue #368, crates/e2e/tests/snapshot_replication.rs):
     // logical fs→fs replication. Each scenario needs its OWN source AND destination
     // kopia repository so copy/prune/idempotency counts never leak between scenarios:
@@ -148,6 +158,11 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "srepl-sel-dst",
     "srepl-susp-src",
     "srepl-susp-dst",
+    // #380 on-demand run-requested run (snapshot_replication.rs), isolated for
+    // the same reason as `repl-run-*`: the assertion is that `lastReplicated`
+    // MOVED, so no other scenario may write into either end.
+    "srepl-run-src",
+    "srepl-run-dst",
     // SnapshotPolicy multi-repository fan-out (issue #368 Feature B,
     // crates/e2e/tests/multi_repository.rs): every scenario needs TWO isolated
     // repositories (the whole point is per-repo children/manifests), and the
@@ -162,6 +177,25 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "mrepo-down-b",
     "mrepo-rest-a",
     "mrepo-rest-b",
+    // #380 `spec.seed` DR drill (crates/e2e/tests/seed.rs). Every one of these
+    // is a repository the scenarios read snapshot COUNTS out of, or write into
+    // for the first time, so none may be shared with another scenario:
+    //   seed-primary   the pre-disaster primary (policy + a real snapshot)
+    //   seed-mirror    the RepositoryReplication mirror — the DR survivor, and
+    //                  the blob seed's source
+    //   seed-blob      the rebuilt repository, blob-seeded from the mirror
+    //   seed-mig-src   the migrate-mode source repository (its own history)
+    //   seed-mig-dst   the migrate-seeded repository (its own password, and
+    //                  `create.enabled: false` — migrate creates it itself)
+    //   seed-empty-src an initialized kopia repository holding ZERO snapshots
+    //   seed-empty-dst the repository that must never reach Ready behind it
+    "seed-primary",
+    "seed-mirror",
+    "seed-blob",
+    "seed-mig-src",
+    "seed-mig-dst",
+    "seed-empty-src",
+    "seed-empty-dst",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per
@@ -611,3 +645,68 @@ pub const KOPIA_BIN: &str = "/usr/local/bin/kopia";
 pub const MOVER_UID: i64 = 65532;
 /// Server-side-apply field manager for objects the e2e harness owns.
 pub const FIELD_MANAGER: &str = "kopiur-e2e";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`REPO_SUBPATHS`] and the `node-seed` mise task must list exactly the
+    /// same directories.
+    ///
+    /// This pairing has bitten this repo repeatedly, and it fails in the worst
+    /// possible way: a scenario adds a subpath to the Rust list only, the PVC
+    /// binds to a hostPath directory that was never created, and the mover's
+    /// failure looks like a kopia/permissions problem several minutes into a
+    /// CI-only run. The reverse (a stale entry in the shell loop) is harmless
+    /// but rots. Neither is caught by anything else, so it is caught here — in
+    /// the hermetic suite, seconds after the edit.
+    #[test]
+    fn every_repo_subpath_is_seeded_by_the_node_seed_task() {
+        // CARGO_MANIFEST_DIR = crates/e2e; mise.toml is the crate's own.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("mise.toml");
+        let toml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("crates/e2e/mise.toml must be readable: {e}"));
+        // The one `for s in <subpaths>; do` loop in the node-seed task. Matched
+        // on the loop variable rather than the task name so a reformat of the
+        // surrounding script cannot make this test silently vacuous.
+        let seeded: Vec<&str> = toml
+            .lines()
+            .find_map(|l| {
+                let rest = l.trim().strip_prefix("for s in ")?;
+                rest.split_once("; do").map(|(list, _)| list)
+            })
+            .unwrap_or_else(|| {
+                panic!("crates/e2e/mise.toml no longer has a `for s in ...; do` node-seed loop")
+            })
+            .split_whitespace()
+            .collect();
+
+        let in_rust: std::collections::BTreeSet<&str> = REPO_SUBPATHS.iter().copied().collect();
+        let in_mise: std::collections::BTreeSet<&str> = seeded.iter().copied().collect();
+        let missing: Vec<&&str> = in_rust.difference(&in_mise).collect();
+        let extra: Vec<&&str> = in_mise.difference(&in_rust).collect();
+        assert!(
+            missing.is_empty(),
+            "REPO_SUBPATHS lists {missing:?}, which the node-seed task never creates — the PVC \
+             would bind to a hostPath directory that does not exist. Add them to the `for s in \
+             ...` loop in crates/e2e/mise.toml"
+        );
+        assert!(
+            extra.is_empty(),
+            "the node-seed task creates {extra:?}, which no scenario claims — drop them from \
+             crates/e2e/mise.toml or add them to REPO_SUBPATHS"
+        );
+        // Duplicates in either list are a copy/paste slip, not a lockstep
+        // failure, and would make the set comparison above pass regardless.
+        assert_eq!(
+            in_rust.len(),
+            REPO_SUBPATHS.len(),
+            "duplicate in REPO_SUBPATHS"
+        );
+        assert_eq!(
+            in_mise.len(),
+            seeded.len(),
+            "duplicate in the node-seed loop"
+        );
+    }
+}

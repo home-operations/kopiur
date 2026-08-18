@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 
 use kopiur_kopia::{
-    ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions, SyncToOptions,
-    VerifyOptions,
+    ConnectOptions, ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions,
+    SnapshotSource, SyncToOptions, VerifyOptions,
 };
 
 /// Build a client whose env isolates kopia state inside `config_dir` so the
@@ -714,5 +714,281 @@ async fn identity_scope_keep_max_pin_survives_twelve_creates() {
         12,
         "all 12 manifests must survive with the identity-scope keep-* pin applied; \
          without it kopia's own default keep-latest=10 would have pruned 2, got {list:?}"
+    );
+}
+
+/// Real-kopia guard for the blob-mode `spec.seed` mechanic (issue #380): the
+/// behaviors the seeding mover rests on, none of which the pure unit
+/// tests can prove.
+///
+/// 1. **`repository sync-to` works from a `--readonly` connect.** The seed
+///    opens its source read-only on purpose — the mirror may still be another
+///    cluster's live off-site copy — and kopia persists that read-only bit into
+///    the client config, so every later invocation on the connection is
+///    structurally unable to write. If a kopia release ever refused `sync-to`
+///    on such a connection, blob seeding would break with a confusing
+///    "storage is read-only", and the fallback (a normal connect; sync-to never
+///    writes the source either way) would have to be adopted deliberately.
+///    Verified by hand against kopia 0.23.1 during the C2 spike; pinned here so
+///    it stays verified.
+///
+/// 2. **`sync-to --must-exist` resumes into an already-seeded destination, and
+///    the copy converges.** The resume rendering of
+///    `SeedOpSpec::sync_options` — `must_exist: Some(true)` once the
+///    destination has a format blob. Leg (f) below proves kopia accepts the
+///    flag against an initialized destination AND that a second pass moves only
+///    what is missing, which is the whole reason an interrupted seed is
+///    recoverable rather than terminal.
+///
+/// 3. **The copy carries the SOURCE's `kopia.maintenance` owner.** This is the
+///    entire justification for the seeded-restamp rule
+///    (`maintenance_restamp_target`'s `seeded` arm): a blob-seeded repository
+///    arrives owned by the operator of the cluster the mirror came from, which
+///    — under `RestampPolicy::OwnFormatsOnly`, forced whenever
+///    `identityDefaults.cluster` is set — the ordinary self-heal would refuse to
+///    touch as "foreign", leaving maintenance yielding forever on a repository
+///    nobody else can claim. If a future kopia stopped copying that blob, the
+///    unconditional restamp would become dead code rather than a live fix, and
+///    this assertion is what would say so.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn sync_to_seeds_an_empty_backend_from_a_readonly_source_connect() {
+    let source_repo_dir = tempfile::tempdir().unwrap();
+    let seeded_repo_dir = tempfile::tempdir().unwrap();
+    let admin_config_dir = tempfile::tempdir().unwrap();
+    let ro_config_dir = tempfile::tempdir().unwrap();
+    let seeded_config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(source_dir.path().join("a.txt"), b"seed me\n").unwrap();
+    let source_spec = ConnectSpec::Filesystem {
+        path: source_repo_dir.path().to_path_buf(),
+    };
+
+    // (a) The "mirror": a repository with one snapshot, plus a maintenance
+    // owner standing in for the now-dead source cluster's operator.
+    let admin = isolated_client(admin_config_dir.path());
+    admin
+        .repository_create(&source_spec, Default::default(), &Default::default())
+        .await
+        .expect("mirror repository create");
+    admin
+        .snapshot_create(
+            source_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("seeduser@seedhost:/data"),
+        )
+        .await
+        .expect("mirror snapshot create");
+    admin
+        .maintenance_set_owner("kopiur@kopiur-dead-cluster-repo")
+        .await
+        .expect("stamp the source cluster's maintenance owner");
+
+    // (b) Re-open the mirror READ-ONLY under its own config, with credentials
+    // persisted — the exact connect `seed_connect_source` performs.
+    let source_ro = isolated_client(ro_config_dir.path());
+    source_ro
+        .repository_connect_with(
+            &source_spec,
+            Default::default(),
+            ConnectOptions {
+                readonly: true,
+                persist_credentials: true,
+            },
+        )
+        .await
+        .expect("read-only connect to the seed source");
+
+    // (c) THE MECHANIC: sync-to an EMPTY destination directory from that
+    // read-only connection, with the two options `SeedOpSpec::sync_options`
+    // fixes — `--no-must-exist` (initializing the destination IS the point) and
+    // no `--delete`.
+    source_ro
+        .repository_sync_to(
+            &ConnectSpec::Filesystem {
+                path: seeded_repo_dir.path().to_path_buf(),
+            },
+            &SyncToOptions {
+                must_exist: Some(false),
+                delete_extra: false,
+                parallel: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("sync-to from a READ-ONLY source connect must succeed (issue #380)");
+
+    // (d) The seeded backend is a working repository holding the mirror's
+    // history — proving the copy happened, not merely that kopia exited 0.
+    let seeded = isolated_client(seeded_config_dir.path());
+    seeded
+        .repository_connect(
+            &ConnectSpec::Filesystem {
+                path: seeded_repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+        )
+        .await
+        .expect("connect to the seeded repository");
+    let list = seeded
+        .snapshot_list_all()
+        .await
+        .expect("list the seeded repository");
+    assert_eq!(
+        list.len(),
+        1,
+        "the seeded repository must hold the mirror's snapshot"
+    );
+    assert_eq!(
+        list[0].source.identity(),
+        "seeduser@seedhost:/data",
+        "seeding must preserve the snapshot's identity, or the history it \
+         restores is unreachable by identity/fromPolicy"
+    );
+
+    // (d2) …and the UNFILTERED listing sees it too, from a client connected as
+    // some entirely different `user@host`. Two things rest on this and would
+    // fail silently if a kopia release ever scoped a source-less
+    // `snapshot list` to the connected identity the way its `--all` help text
+    // suggests:
+    //
+    //   * the bootstrap catalog scan (`snapshot_list(None)`) would report ZERO
+    //     for every seeded repository and materialize no discovered Snapshot
+    //     CRs — the seeded history would be invisible to kopiur;
+    //   * the `spec.seed` empty-repository backstop would have to be the only
+    //     thing standing between that and a `Ready` empty repository.
+    //
+    // The backstop deliberately calls `snapshot_list_all` so it survives such a
+    // change; this assertion is what would tell us the change happened.
+    let unfiltered = seeded
+        .snapshot_list(None)
+        .await
+        .expect("list the seeded repository without --all");
+    assert_eq!(
+        unfiltered.len(),
+        1,
+        "a source-less `snapshot list` must still return FOREIGN identities \
+         (kopia 0.23.1: `--all` only narrows when a <source> positional is \
+         given). If this fails, kopia changed: the bootstrap catalog scan now \
+         misses every seeded snapshot and must move to snapshot_list_all"
+    );
+    assert_eq!(unfiltered[0].source.identity(), "seeduser@seedhost:/data");
+
+    // (d3) The OTHER half of that doc claim: a `<source>` positional DOES
+    // scope. Both halves are asserted so the corrected comment on
+    // `snapshot_list_all` is test-backed in both directions rather than half
+    // observed and half assumed.
+    let scoped_miss = seeded
+        .snapshot_list(Some(&SnapshotSource {
+            user_name: "nobody".into(),
+            host: "nowhere".into(),
+            path: "/none".into(),
+        }))
+        .await
+        .expect("list the seeded repository scoped to a non-existent source");
+    assert!(
+        scoped_miss.is_empty(),
+        "a <source> positional must scope the listing — that is the ONLY place \
+         kopia's identity filtering applies"
+    );
+    let scoped_hit = seeded
+        .snapshot_list(Some(&SnapshotSource {
+            user_name: "seeduser".into(),
+            host: "seedhost".into(),
+            path: "/data".into(),
+        }))
+        .await
+        .expect("list the seeded repository scoped to the seeded source");
+    assert_eq!(scoped_hit.len(), 1);
+
+    // (e) ...and it arrived owned by the DEAD cluster's operator, which is why
+    // the mover restamps a just-seeded repository unconditionally.
+    let info = seeded
+        .maintenance_info()
+        .await
+        .expect("read the seeded repository's maintenance owner");
+    assert_eq!(
+        info.owner, "kopiur@kopiur-dead-cluster-repo",
+        "a blob seed carries the SOURCE's maintenance owner; the mover's \
+         seeded-restamp rule exists to replace it"
+    );
+
+    // ---- (f) THE RESUME LEG ------------------------------------------------
+    //
+    // What a seed killed mid-copy leaves behind, and how the retry finishes it.
+    // `SeedOpSpec::sync_options(local_initialized)` renders `must_exist` from
+    // whether the destination already has a format blob, so a resume runs
+    // `sync-to --must-exist` into a destination that a previous attempt already
+    // initialized. Two things have to hold for that to be a recovery rather
+    // than a wedge, and only the real binary can say so:
+    //
+    //   1. `--must-exist` is ACCEPTED against an initialized destination (the
+    //      `--no-must-exist` half is covered by the first sync-to above, which
+    //      created this destination from an empty directory);
+    //   2. the copy is INCREMENTAL and CONVERGES — the second run moves only
+    //      what is missing and the destination ends up holding everything.
+    //
+    // Without this leg the `must_exist` doc's "pinned against the real binary"
+    // claim would be false for the resume half.
+    std::fs::write(source_dir.path().join("b.txt"), b"seeded later\n").unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    std::fs::write(second_dir.path().join("c.txt"), b"a second identity\n").unwrap();
+    admin
+        .snapshot_create(
+            second_dir.path().to_str().unwrap(),
+            &BTreeMap::new(),
+            Some("lateuser@seedhost:/late"),
+        )
+        .await
+        .expect("a snapshot the first seed never saw");
+
+    source_ro
+        .repository_sync_to(
+            &ConnectSpec::Filesystem {
+                path: seeded_repo_dir.path().to_path_buf(),
+            },
+            &SyncToOptions {
+                // The resume rendering: the destination exists, so re-initializing
+                // it is NOT the operation and kopia must be told so explicitly.
+                must_exist: Some(true),
+                delete_extra: false,
+                parallel: Some(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("sync-to --must-exist into an already-seeded destination must succeed (#380)");
+
+    // Converged: a fresh client (no cached index from the pre-resume listing)
+    // sees BOTH the snapshot the first pass copied and the one only the resume
+    // could have brought.
+    let resumed_config_dir = tempfile::tempdir().unwrap();
+    let resumed = isolated_client(resumed_config_dir.path());
+    resumed
+        .repository_connect(
+            &ConnectSpec::Filesystem {
+                path: seeded_repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+        )
+        .await
+        .expect("connect to the resumed repository");
+    let mut identities: Vec<String> = resumed
+        .snapshot_list_all()
+        .await
+        .expect("list the resumed repository")
+        .iter()
+        .map(|e| e.source.identity())
+        .collect();
+    identities.sort();
+    assert_eq!(
+        identities,
+        vec![
+            "lateuser@seedhost:/late".to_string(),
+            "seeduser@seedhost:/data".to_string(),
+        ],
+        "a resumed seed must converge: the destination holds what the first \
+         pass copied AND what only the second pass could have brought"
     );
 }

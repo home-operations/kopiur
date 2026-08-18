@@ -45,6 +45,7 @@ primary   Failed    S3        2m
 | `Failed`, TLS error (`x509: certificate signed by unknown authority`) | Private-CA / self-signed HTTPS endpoint, or an HTTP-only endpoint spoken to as HTTPS. | Point `tls.caBundleRef` at a ConfigMap holding the CA PEM (`key` defaults to `ca.crt`; resolved in the `Repository`'s namespace — operator's namespace for a `ClusterRepository`), or set `tls.disableTls: true` for a genuinely HTTP-only store. See [Private-CA HTTPS](backends/s3.md#private-ca-https-trusting-your-own-ca). |
 | `MissingCaBundle` condition    | The `tls.caBundleRef` ConfigMap (or its key, default `ca.crt`) doesn't exist where it's resolved. | Create the ConfigMap in the `Repository`'s namespace (operator's namespace for a `ClusterRepository`) — it is **not** read from workload namespaces. `kubectl kopiur doctor` reports this as a structural gate; the ConfigMap appearing re-triggers the reconcile. |
 | Stuck `Pending`                | Operator not running, or not watching this scope.                                          | Check the controller is up; for `ClusterRepository`, confirm `installScope=cluster`.                           |
+| Stuck `Pending`/`Initializing` for a long time, `Seeded=False` | The repository has [`spec.seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica) and is copying a replica in — it deliberately does not go `Ready` until the copy lands. | Read the `Seeded` reason: see [a seeding repository never reaches `Ready`](#a-seeding-repository-never-reaches-ready). |
 
 ```console
 $ kubectl describe repository primary -n <ns>   # the condition message names the exact cause
@@ -62,6 +63,48 @@ The apply is deliberately best-effort: a bad parameter must not take an otherwis
 | `storage is read-only` | The repository is connected `mode: ReadOnly`. | Declare `spec.parameters` on the cluster that owns the repository. Admission normally rejects this pairing, so seeing it means the mode changed after the fact. |
 
 A backend that has no object lock at all (filesystem, sftp, webdav, rclone, b2, gdrive) is rejected at admission instead, so it never reaches this state.
+
+## A seeding repository never reaches `Ready`
+
+A `Repository`/`ClusterRepository` with [`spec.seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica)
+deliberately stays out of `Ready` until the copy lands, so "stuck `Pending` for a
+long time" is often just a large seed in progress. The `Seeded` condition says
+which:
+
+```console
+$ kubectl describe repository nas-primary -n billing | grep -A4 'Type: *Seeded'
+$ kubectl kopiur doctor -n billing        # explains any Seeded=False reason
+```
+
+| `Seeded` reason | Cause | Fix |
+| --- | --- | --- |
+| `Seeding` | The copy is running. A first seed transfers the whole repository, so hours is normal — the Job's deadline is 24 h by default. | Nothing. Watch `kubectl logs -n <ns> job/<repository>-discovery -f`. Raise `seed.failurePolicy.activeDeadlineSeconds` if attempts are being cut short. |
+| `WaitingForSeedSource` | Migrate mode: the source `Repository`/`ClusterRepository` is missing, not `Ready`, or is a bare-path `filesystem` repository the mover cannot mount. | Bring the source up (check its own conditions), fix the reference, or give a filesystem source a `backend.filesystem.volume`. Re-checked every 15 s — no action needed once it is usable. |
+| `SeedSourceAuthConflict` | Migrate mode: this repository's backend and the resolved source repository's backend disagree on workload identity, and a bootstrap pod runs as exactly one ServiceAccount. Admission cannot see through a `seed.from.repository` reference, so the operator refuses the seed here instead. | Point both backends' `auth.workloadIdentity` at the **same** ServiceAccount (granted access to both stores), or give both sides static credential Secrets in the namespace the bootstrap Job runs in (this `Repository`'s own namespace; for a `ClusterRepository`, the operator's namespace unless `encryption.passwordSecretRef.namespace` pins another). The message names both ServiceAccounts; re-checked every 15 s, so either edit clears it. |
+| `SeedSourceNotFound` | The seed source answered but holds no kopia repository. Almost always a wrong bucket **or prefix**: a mirror is rooted at the replication destination's own prefix, not its parent. | Point `seed.from` at the exact bucket+prefix the repository lives under. Retried automatically every ~2 min. |
+| `SeedSourceEmpty` | The source *is* a kopia repository but holds zero snapshots, and `allowEmptySource` is `false`. | Usually a mis-pointed source or a replication that never ran. If the source really is meant to be empty, set `seed.allowEmptySource: true`. Retried automatically. |
+| `SeedIncomplete` | Migrate mode: `kopia snapshot migrate` exited 0 but the post-verify found snapshots missing (kopia only *logs* per-source failures). | Read the seeding Job's pod logs for kopia's per-source errors. The retry resumes and copies only what is still missing. |
+| `SeedLeftEmpty` | A seed was armed and the repository ended up holding zero snapshots — an earlier attempt initialized the backend and then died (deadline, OOM, a copy that errored after `repository create`). | **Do not delete anything at the backend** — kopiur records that an attempt started and resumes the copy itself. If it recurs, the deadline is usually too short: raise `seed.failurePolicy.activeDeadlineSeconds`. |
+| `MoverImageTooOldForSeed` | The running mover image predates `spec.seed` and silently dropped it. **Terminal.** | Upgrade the mover image, **and** delete the finished bootstrap Job (`kubectl -n <ns> delete job <repository>-discovery`) — nothing recycles a terminal Job before its TTL, so an upgrade alone looks like it changed nothing for up to an hour. |
+| `Bootstrapped=False`, class `BootstrapInternalInconsistency` | A kopiur defect, not a repository problem. **Terminal.** | Please file it with the message and the mover Job's logs. |
+
+Two more that look like seed failures but are not:
+
+- **`Failed` with an auth error against the seed source** — kopiur never seeds (or
+  creates) over a backend it could not authenticate to. Fix the source's
+  credentials.
+- **The apply is rejected naming `spec.seed.from.repository`** — a namespaced
+  `Repository` seeding from a `ClusterRepository` is a consumer of it, so the
+  source's `allowedNamespaces` must admit this namespace (fail-closed: the
+  operator denies rather than guesses if it cannot resolve the gate). Add the
+  namespace to the source `ClusterRepository`'s
+  [`allowedNamespaces`](repositories.md#allowednamespaces--who-may-use-it-clusterrepository-only).
+- **The seeding Job never starts, or dies on `CreateContainerConfigError`** — the
+  seed source's credential Secret is not in the namespace the bootstrap Job runs
+  in, or (migrate mode, cross-namespace) `seed.credentialProjection.enabled` is
+  set without the operator's `features.credentialProjection.enabled` Helm flag.
+  See [Feature permissions](feature-permissions.md) and
+  [where the Secret must live](repositories.md#seed--initialize-a-new-repository-from-a-replica).
 
 ## Backup (or Restore) stuck in `Pending` with no Job
 
@@ -386,7 +429,8 @@ $ kubectl describe restore <name> -n <ns>
 | Symptom                                 | Cause                                                         | Fix                                                                                                                                                             |
 | --------------------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Failed`, "no matching snapshot"        | The source resolved to nothing and `onMissingSnapshot: Fail`. | Verify the `snapshotRef`/identity; for deploy-or-restore use `fromPolicy` (which defaults to `Continue`).                                                         |
-| Stuck `Resolving`                       | Waiting for the source snapshot to appear (`waitTimeout`).    | Confirm the snapshot exists; raise `policy.waitTimeout` if a schedule is about to produce it.                                                                   |
+| Stuck `Pending`, `Resolved=False reason=WaitingForSnapshot` | Waiting for the source snapshot to appear (`waitTimeout`); the controller-side wait for a `snapshotRef`. A `fromPolicy`/`identity` source waits **inside the Job** instead and shows `Restoring`. | Confirm the snapshot exists; raise `policy.waitTimeout` if a schedule is about to produce it. The window runs from `status.waitStartedAt` (when the restore could first proceed), not from creation. |
+| `Continue` came up **empty** although `waitTimeout` was set | 0.10.2 and earlier anchored the window at `metadata.creationTimestamp`, so a Restore applied before its repository was `Ready` (or a populator applied before anything claimed it) reached resolution with the window already spent. | Upgrade: the window now opens when the restore can first proceed, stamped into `status.waitStartedAt`. The empty decision is *pinned*, so re-create the `Restore` to pick up the snapshot. |
 | PVC stuck `Pending` (populator)         | Volume-populator handshake not completing.                    | Need Kubernetes ≥ 1.24; install `volume-data-source-validator` to see the real event. See [Restores → deploy-or-restore](restores.md#deploy-or-restore-gitops). |
 | `prime-*` PVCs piling up, `Bound`, mounted by nothing | ≤ 0.7.x: a populator `Restore` re-created over an **already-bound** claim restored into a prime PVC that could never be adopted, and leaked it — one full copy of the data per re-created `Restore`. | Upgrade: Kopiur now completes that case as a no-op (`Ready=True reason=TargetAlreadyBound`) and reaps the orphans (`OrphanedPrimePvcReaped` event). List them with `kubectl get pvc -A -l kopiur.home-operations.com/op=restore-populate`; any whose claiming PVC is gone are collected with their `Restore`. |
 | Populator `Restore` says `TargetAlreadyBound` and restores nothing | Working as intended: its claiming PVC is already **Bound**, and a volume populator can only fill an **unbound** claim. | To really restore into it, delete the **PVC** (keep its `dataSourceRef`) and let it be re-created. Deleting the `Restore` just re-triggers the no-op. |

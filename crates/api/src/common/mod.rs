@@ -275,6 +275,24 @@ pub enum RepositoryKind {
     ClusterRepository,
 }
 
+impl RepositoryKind {
+    /// The CRD kind name, for messages and status rendering. Exhaustive, so a
+    /// new repository kind cannot compile until its label is decided.
+    ///
+    /// ```
+    /// use kopiur_api::common::RepositoryKind;
+    ///
+    /// assert_eq!(RepositoryKind::Repository.kind_str(), "Repository");
+    /// assert_eq!(RepositoryKind::ClusterRepository.kind_str(), "ClusterRepository");
+    /// ```
+    pub fn kind_str(self) -> &'static str {
+        match self {
+            RepositoryKind::Repository => "Repository",
+            RepositoryKind::ClusterRepository => "ClusterRepository",
+        }
+    }
+}
+
 /// Reference from a consumer CR to a `Repository` or `ClusterRepository`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1071,6 +1089,204 @@ impl RepositoryRef {
             }
             RepositoryKind::ClusterRepository => true,
         }
+    }
+}
+
+/// Parse the `run-requested` annotation into the pinned request instant.
+///
+/// `Ok(None)` = no request; `Err` = the annotation is present but not an
+/// RFC3339 timestamp (the message says how to fix it). The one timestamp
+/// parser behind every "run it now" surface — `Maintenance`'s
+/// [`crate::maintenance::parse_run_annotations`] delegates here, and both
+/// replication kinds call it directly — so admission and the reconcilers can
+/// never disagree about what a request *is* (SKILL "one validator, two
+/// callers").
+///
+/// `run_command` is the kind's own `kubectl kopiur … run` invocation, quoted
+/// verbatim in the fix hint: the annotation is identical across kinds but the
+/// command that stamps it is not, and a fix hint naming the wrong command is
+/// worse than none.
+///
+/// ```
+/// use kopiur_api::common::parse_run_requested_at;
+/// use std::collections::BTreeMap;
+///
+/// assert_eq!(parse_run_requested_at(None, "kubectl kopiur replication run"), Ok(None));
+///
+/// let mut a = BTreeMap::new();
+/// a.insert(
+///     kopiur_api::consts::RUN_REQUESTED_ANNOTATION.to_string(),
+///     "2026-06-11T12:00:00Z".to_string(),
+/// );
+/// let at = parse_run_requested_at(Some(&a), "kubectl kopiur replication run")
+///     .unwrap()
+///     .unwrap();
+/// assert_eq!(at.to_rfc3339(), "2026-06-11T12:00:00+00:00");
+///
+/// a.insert(
+///     kopiur_api::consts::RUN_REQUESTED_ANNOTATION.to_string(),
+///     "yesterday".to_string(),
+/// );
+/// let err = parse_run_requested_at(Some(&a), "kubectl kopiur replication run").unwrap_err();
+/// assert!(err.contains("must be an RFC3339 timestamp"));
+/// assert!(err.contains("kubectl kopiur replication run"));
+/// ```
+pub fn parse_run_requested_at(
+    annotations: Option<&std::collections::BTreeMap<String, String>>,
+    run_command: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let Some(raw) = annotations.and_then(|a| a.get(crate::consts::RUN_REQUESTED_ANNOTATION)) else {
+        return Ok(None);
+    };
+    let at = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|e| {
+            format!(
+                "annotation {} must be an RFC3339 timestamp (got {raw:?}): {e}. \
+                 Fix: re-annotate with e.g. $(date -u +%Y-%m-%dT%H:%M:%SZ), or use \
+                 `{run_command}`",
+                crate::consts::RUN_REQUESTED_ANNOTATION
+            )
+        })?
+        .with_timezone(&chrono::Utc);
+    Ok(Some(at))
+}
+
+/// Lifecycle of an annotation-requested (on-demand) replication run, shared by
+/// `RepositoryReplication` and `SnapshotReplication`.
+///
+/// **Closed on the wire, open on decode** — the same contract every kopiur
+/// phase carries (see the `phase_serde!` macro): the CRD schema admits exactly
+/// `Pending`/`Running`/`Succeeded`/`Failed`, and [`Self::Unknown`] exists only
+/// so a value written by a NEWER kopiur decodes instead of failing the typed
+/// watch for the whole Kind.
+///
+/// It has a `Pending` variant that [`crate::ManualRunPhase`] does not: a
+/// replication can be `suspend: true` when the request lands, and a request
+/// that cannot start yet must be VISIBLE rather than silently queued.
+///
+/// ```
+/// use kopiur_api::common::ReplicationManualRunPhase;
+///
+/// assert_eq!(serde_json::to_value(ReplicationManualRunPhase::Pending).unwrap(), "Pending");
+/// // An unrecognized phase from a newer operator decodes instead of erroring.
+/// let p: ReplicationManualRunPhase = serde_json::from_value(serde_json::json!("Queued")).unwrap();
+/// assert_eq!(p, ReplicationManualRunPhase::Unknown("Queued".into()));
+/// assert_eq!(serde_json::to_value(&p).unwrap(), "Queued");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicationManualRunPhase {
+    /// The request is recorded but no Job can start yet (the replication is
+    /// `suspend: true`); it runs when the block clears.
+    Pending,
+    /// The mover Job for this request is in flight.
+    Running,
+    /// The requested run completed successfully.
+    Succeeded,
+    /// The requested run's Job failed; conditions carry the detail.
+    Failed,
+    /// A phase string this build does not recognize (newer operator, or legacy
+    /// stored data). Decode-compat only — hidden from the CRD schema, never
+    /// produced by this build. Never counted as a finished run, so a re-run
+    /// request is never deduped against it.
+    Unknown(String),
+}
+
+crate::common::phase_serde!(
+    ReplicationManualRunPhase,
+    "Lifecycle of a manual replication run. Closed enum."
+);
+
+impl PhaseLabel for ReplicationManualRunPhase {
+    const ALL: &'static [Self] = &[Self::Pending, Self::Running, Self::Succeeded, Self::Failed];
+    fn label(&self) -> &str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Running => "Running",
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Unknown(s) => s,
+        }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
+    }
+}
+
+impl ReplicationManualRunPhase {
+    /// Whether this is the decode-compat [`Self::Unknown`] sentinel. The
+    /// exhaustive `match` lives here so a variant added later cannot be
+    /// silently classified by an `if let … Unknown(_)` probe elsewhere.
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::Unknown(_) => true,
+            Self::Pending | Self::Running | Self::Succeeded | Self::Failed => false,
+        }
+    }
+
+    /// Whether this phase says a mover Job for the request EXISTS OR EXISTED.
+    ///
+    /// The controller's "the Job vanished before its outcome was observed"
+    /// check: `Running` with no Job present means a TTL reap beat the
+    /// reconcile, and re-running side-effectful work silently would be worse
+    /// than reporting the lost outcome. Exhaustive rather than an equality so a
+    /// phase added later must state whether it implies a Job was launched —
+    /// under `==` the new variant would silently take the "no Job ever ran"
+    /// branch.
+    pub fn implies_job_launched(&self) -> bool {
+        match self {
+            Self::Running => true,
+            Self::Pending | Self::Succeeded | Self::Failed | Self::Unknown(_) => false,
+        }
+    }
+
+    /// Whether this phase ANSWERS the request it is recorded against — i.e. the
+    /// run reached a terminal outcome, so re-applying the same `run-requested`
+    /// value is a no-op.
+    ///
+    /// Exhaustive on purpose: this predicate decides whether a user's run
+    /// request is DROPPED, so a new phase must state whether it counts as an
+    /// answer. `Unknown` is deliberately NOT an answer — re-driving is
+    /// idempotent (the Job name is keyed on the request timestamp), whereas
+    /// dropping the request loses the run.
+    pub fn answers_request(&self) -> bool {
+        match self {
+            Self::Succeeded | Self::Failed => true,
+            Self::Pending | Self::Running | Self::Unknown(_) => false,
+        }
+    }
+}
+
+/// Bookkeeping for the most recent annotation-requested replication run, shared
+/// by `RepositoryReplication` and `SnapshotReplication` (`status.manualRun`).
+///
+/// Deliberately narrower than `Maintenance`'s [`crate::ManualRunStatus`]: a
+/// replication has no `run-mode` (there is exactly one kind of run), so there
+/// is no `mode` field to record.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationManualRunStatus {
+    /// The `run-requested` annotation value this status reflects (RFC3339),
+    /// verbatim as the user wrote it — it pins WHICH request is answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
+    /// Where the requested run is in its lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ReplicationManualRunPhase>,
+    /// RFC3339 instant the run reached a terminal phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+impl ReplicationManualRunStatus {
+    /// Does this status terminally answer the request annotated as `raw`?
+    /// Both halves matter: the pinned `requestedAt` must be exactly this
+    /// request, AND its phase must answer it.
+    pub fn answers(&self, raw: &str) -> bool {
+        self.requested_at.as_deref() == Some(raw)
+            && self
+                .phase
+                .as_ref()
+                .is_some_and(ReplicationManualRunPhase::answers_request)
     }
 }
 

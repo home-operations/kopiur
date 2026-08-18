@@ -1293,6 +1293,7 @@ fn every_phase_enum_decodes_an_unknown_string_instead_of_erroring() {
     assert_phase_contract::<RepositoryPhase>("Upgrading");
     assert_phase_contract::<RepositoryReplicationPhase>("Verifying");
     assert_phase_contract::<ManualRunPhase>("Queued");
+    assert_phase_contract::<ReplicationManualRunPhase>("Queued");
 }
 
 #[test]
@@ -1370,4 +1371,159 @@ status:
         r.status.as_ref().unwrap().phase,
         Some(RestorePhase::Unknown("Staging".into()))
     );
+}
+
+#[test]
+fn parse_run_requested_at_is_the_one_timestamp_parser() {
+    use std::collections::BTreeMap;
+    // No annotation at all, and an annotation map without the key: both "no
+    // request", never an error.
+    assert_eq!(
+        parse_run_requested_at(None, "kubectl kopiur replication run"),
+        Ok(None)
+    );
+    let empty = BTreeMap::new();
+    assert_eq!(
+        parse_run_requested_at(Some(&empty), "kubectl kopiur replication run"),
+        Ok(None)
+    );
+
+    // A well-formed request parses to the pinned instant, normalized to UTC —
+    // an offset timestamp and its UTC equivalent are the SAME request.
+    let at = |raw: &str| {
+        let mut a = BTreeMap::new();
+        a.insert(
+            crate::consts::RUN_REQUESTED_ANNOTATION.to_string(),
+            raw.to_string(),
+        );
+        parse_run_requested_at(Some(&a), "kubectl kopiur replication run")
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(at("2026-06-11T12:00:00Z"), at("2026-06-11T14:00:00+02:00"));
+
+    // Garbage names the annotation, the offending value, the shape, AND the
+    // caller's own run command (the fix hint is per-kind for a reason).
+    let mut bad = BTreeMap::new();
+    bad.insert(
+        crate::consts::RUN_REQUESTED_ANNOTATION.to_string(),
+        "yesterday".to_string(),
+    );
+    let err = parse_run_requested_at(Some(&bad), "kubectl kopiur replication run").unwrap_err();
+    assert!(
+        err.contains(crate::consts::RUN_REQUESTED_ANNOTATION),
+        "{err}"
+    );
+    assert!(err.contains("must be an RFC3339 timestamp"), "{err}");
+    assert!(err.contains("yesterday"), "{err}");
+    assert!(err.contains("kubectl kopiur replication run"), "{err}");
+    // The hint is the CALLER's command, not a hardcoded maintenance one — the
+    // whole reason the parameter exists.
+    assert!(!err.contains("maintenance"), "{err}");
+}
+
+#[test]
+fn maintenance_run_annotations_delegate_to_the_shared_parser() {
+    use std::collections::BTreeMap;
+    // The hoist must be behavior-preserving: `Maintenance`'s parser and the
+    // shared one agree on the instant, and maintenance keeps its OWN fix hint.
+    let mut a = BTreeMap::new();
+    a.insert(
+        crate::consts::RUN_REQUESTED_ANNOTATION.to_string(),
+        "2026-06-11T12:00:00Z".to_string(),
+    );
+    let (via_maintenance, _) = crate::maintenance::parse_run_annotations(Some(&a))
+        .unwrap()
+        .unwrap();
+    let shared = parse_run_requested_at(Some(&a), "kubectl kopiur maintenance run")
+        .unwrap()
+        .unwrap();
+    assert_eq!(via_maintenance, shared);
+
+    a.insert(
+        crate::consts::RUN_REQUESTED_ANNOTATION.to_string(),
+        "not-a-time".to_string(),
+    );
+    let err = crate::maintenance::parse_run_annotations(Some(&a)).unwrap_err();
+    assert!(err.contains("kubectl kopiur maintenance run"), "{err}");
+}
+
+#[test]
+fn replication_manual_run_phase_answers_only_terminal_outcomes() {
+    use ReplicationManualRunPhase as P;
+    // The dedupe predicate decides whether a user's run request is DROPPED.
+    // Only a terminal outcome answers it.
+    assert!(P::Succeeded.answers_request());
+    assert!(P::Failed.answers_request());
+    assert!(
+        !P::Pending.answers_request(),
+        "a queued request still owes a run"
+    );
+    assert!(
+        !P::Running.answers_request(),
+        "an in-flight run is not an answer"
+    );
+    assert!(
+        !P::Unknown("Queued".into()).answers_request(),
+        "a phase this build cannot read is not an answer we can vouch for"
+    );
+    // Every canonical variant is covered above; `ALL` pins that count so a new
+    // variant forces this test to state its dedupe rule.
+    assert_eq!(P::ALL.len(), 4);
+    // The "a Job was launched for this request" classification, exhaustive for
+    // the same reason: it decides whether the controller reports a LOST outcome
+    // or silently re-runs side-effectful work.
+    assert!(P::Running.implies_job_launched());
+    for not_launched in [
+        P::Pending,
+        P::Succeeded,
+        P::Failed,
+        P::Unknown("Queued".into()),
+    ] {
+        assert!(
+            !not_launched.implies_job_launched(),
+            "{not_launched:?} does not imply a Job ran"
+        );
+    }
+    assert!(P::Unknown("Queued".into()).is_unknown());
+    for p in P::ALL {
+        assert!(!p.is_unknown(), "{p:?} is a canonical phase");
+    }
+}
+
+#[test]
+fn replication_manual_run_status_answers_pins_the_exact_request() {
+    let status = |requested: &str, phase: ReplicationManualRunPhase| ReplicationManualRunStatus {
+        requested_at: Some(requested.to_string()),
+        phase: Some(phase),
+        completed_at: None,
+    };
+    let raw = "2026-06-11T12:00:00Z";
+    assert!(status(raw, ReplicationManualRunPhase::Succeeded).answers(raw));
+    assert!(status(raw, ReplicationManualRunPhase::Failed).answers(raw));
+    // A NEW timestamp is a NEW request, even though the old one finished.
+    assert!(!status(raw, ReplicationManualRunPhase::Succeeded).answers("2026-06-11T13:00:00Z"));
+    // Same request, not yet terminal.
+    assert!(!status(raw, ReplicationManualRunPhase::Running).answers(raw));
+    assert!(!status(raw, ReplicationManualRunPhase::Pending).answers(raw));
+    // Nothing recorded at all.
+    assert!(!ReplicationManualRunStatus::default().answers(raw));
+}
+
+#[test]
+fn replication_manual_run_status_roundtrips_camel_case() {
+    let st = ReplicationManualRunStatus {
+        requested_at: Some("2026-06-11T12:00:00Z".into()),
+        phase: Some(ReplicationManualRunPhase::Succeeded),
+        completed_at: Some("2026-06-11T12:01:42Z".into()),
+    };
+    let json = serde_json::to_value(&st).unwrap();
+    assert_eq!(json["requestedAt"], "2026-06-11T12:00:00Z");
+    assert_eq!(json["phase"], "Succeeded");
+    assert_eq!(json["completedAt"], "2026-06-11T12:01:42Z");
+    let back: ReplicationManualRunStatus = serde_json::from_value(json).unwrap();
+    assert_eq!(back, st);
+    // Absent fields serialize away entirely (no explicit nulls in status).
+    let empty = serde_json::to_value(ReplicationManualRunStatus::default()).unwrap();
+    assert_eq!(empty, serde_json::json!({}));
 }

@@ -157,6 +157,35 @@ pub const DEST_ENV_PREFIX: &str = "KOPIUR_DEST_";
 /// a different Secret name), not via an `envFrom` prefix remap.
 pub const DEST_KOPIA_PASSWORD_ENV: &str = "KOPIUR_DEST_KOPIA_PASSWORD";
 
+/// Env-var prefix under which a **seeding** bootstrap mover receives the seed
+/// SOURCE's credential Secret (`envFrom.prefix`), the mirror image of
+/// [`DEST_ENV_PREFIX`].
+///
+/// The local repository's own credentials arrive unprefixed (kopia reads the
+/// plain names at `repository connect` and persists them into its config), so
+/// the two sides never collide even when both are the same backend family with
+/// different keys. A distinct prefix from `KOPIUR_DEST_` matters because a
+/// single repository can carry BOTH a `spec.seed` and be a replication source:
+/// reusing one prefix would make the two overlays ambiguous.
+pub const SEED_ENV_PREFIX: &str = "KOPIUR_SEED_";
+
+/// Env var carrying the seed SOURCE repository's encryption password into a
+/// seeding bootstrap mover, the mirror image of [`DEST_KOPIA_PASSWORD_ENV`].
+///
+/// **Migrate mode only.** A blob-mode seed (`kopia repository sync-to`) copies
+/// storage verbatim and the copy therefore keeps the mirror's format and
+/// password — there is exactly one password in play, the local repository's own
+/// `KOPIA_PASSWORD`, and this var is unset. Migrate mode reads two genuinely
+/// different repositories, so the source's password must arrive under a name
+/// that cannot be mistaken for the destination's.
+///
+/// Deliberately NOT `{SEED_ENV_PREFIX}KOPIA_PASSWORD` by mechanical prefixing:
+/// like `KOPIUR_DEST_KOPIA_PASSWORD`, the controller delivers it as a single
+/// `valueFrom.secretKeyRef` built from the RESOLVED source credentials (which
+/// may be a projected copy under a different Secret name), not via an `envFrom`
+/// prefix remap.
+pub const SEED_KOPIA_PASSWORD_ENV: &str = "KOPIUR_SEED_KOPIA_PASSWORD";
+
 #[cfg(test)]
 mod dest_env_tests {
     use super::*;
@@ -173,5 +202,25 @@ mod dest_env_tests {
     #[test]
     fn dest_kopia_password_env_is_stable() {
         assert_eq!(DEST_KOPIA_PASSWORD_ENV, "KOPIUR_DEST_KOPIA_PASSWORD");
+    }
+
+    /// Same wire-contract pin as the destination pair: the controller writes
+    /// these into seeding bootstrap Jobs and the mover reads them back by name,
+    /// so a rename would silently break every in-flight Job across a skewed
+    /// upgrade.
+    #[test]
+    fn seed_env_names_are_stable() {
+        assert_eq!(SEED_ENV_PREFIX, "KOPIUR_SEED_");
+        assert_eq!(SEED_KOPIA_PASSWORD_ENV, "KOPIUR_SEED_KOPIA_PASSWORD");
+    }
+
+    /// The seed and destination overlays must never collide: one repository can
+    /// be both a seed target and a replication source, and a shared prefix
+    /// would make the two `envFrom` remaps ambiguous.
+    #[test]
+    fn seed_and_dest_prefixes_are_disjoint() {
+        assert_ne!(SEED_ENV_PREFIX, DEST_ENV_PREFIX);
+        assert!(!SEED_ENV_PREFIX.starts_with(DEST_ENV_PREFIX));
+        assert!(!DEST_ENV_PREFIX.starts_with(SEED_ENV_PREFIX));
     }
 }

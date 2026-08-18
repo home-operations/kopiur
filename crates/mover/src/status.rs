@@ -173,6 +173,7 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::Telemetry(_)
             | MoverError::BatchDeleteIncomplete { .. }
             | MoverError::DestPasswordMissing { .. }
+            | MoverError::SeedPasswordMissing { .. }
             | MoverError::MigrateIncomplete { .. }
             | MoverError::CopyCrSyncIncomplete { .. }
             | MoverError::ReplicationCrList { .. }

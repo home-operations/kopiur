@@ -8,6 +8,12 @@ You already have a primary `Repository` and you want a durable copy elsewhere �
 
 ///
 
+/// info | The mirror is also a seed
+
+When the primary is gone for good, you do not have to promote the mirror to production. [`Repository.spec.seed`](repositories.md#seed--initialize-a-new-repository-from-a-replica) copies it into a **new** repository during that repository's first bootstrap, so the rebuilt cluster gets its own store pre-loaded with the history and the mirror stays a pristine, read-only replica. Kick a final [on-demand run](#run-it-now) first so the mirror is current, then see [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
+
+///
+
 ## How it works
 
 - **Namespaced**, living alongside its source repository (like `Maintenance`). It references a `Repository` or `ClusterRepository` via `sourceRef`.
@@ -24,9 +30,9 @@ The `RepositoryReplication` is the new piece: it mirrors `sourceRef` to a second
 --8<-- "deploy/examples/tryit/replication.yaml:replication"
 ```
 
-/// note | Replication runs on a schedule — there is no on-demand trigger
+/// tip | Don't want to wait for the cron?
 
-Unlike `Maintenance`, a `RepositoryReplication` has **no** `run-requested` annotation. To make the demo fire promptly, the bundle uses `schedule.cron: "* * * * *"` (every minute). A production mirror would run nightly (e.g. `0 5 * * *`, after the backups land). Fill in the single `REPLACE_ME` (`KOPIA_PASSWORD`) and apply once.
+The bundle uses `schedule.cron: "* * * * *"` (every minute) so the demo fires promptly; a production mirror would run nightly (e.g. `0 5 * * *`, after the backups land) and you would trigger the first run yourself with [`kubectl kopiur replication run`](#run-it-now). Fill in the single `REPLACE_ME` (`KOPIA_PASSWORD`) and apply once.
 
 ///
 
@@ -173,6 +179,44 @@ S3 account to another). Kopiur delivers the destination Secret to the pod under 
 `KOPIUR_DEST_` env prefix and remaps it for the `sync-to` step only, so the two
 sides' identically named keys never collide.
 
+## Run it now
+
+A `RepositoryReplication` normally fires on its cron, but you can ask for a mirror **right now** — after a big restore, before decommissioning the source, or just to see the pipe work the first time:
+
+```console
+$ kubectl kopiur replication run nas-primary-offsite -n billing --wait
+repositoryreplication.kopiur.home-operations.com/nas-primary-offsite run requested (2026-06-11T12:00:00Z)
+RepositoryReplication nas-primary-offsite run completed at 2026-06-11T12:04:18Z
+```
+
+The plugin stamps the `kopiur.home-operations.com/run-requested` annotation with an RFC3339 timestamp; `kubectl annotate` does exactly the same thing if you'd rather not install the plugin:
+
+```console
+$ kubectl annotate repositoryreplication nas-primary-offsite -n billing \
+    kopiur.home-operations.com/run-requested="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite
+```
+
+The timestamp pins *which* request the status answers, so re-applying the same value is a no-op (safe in GitOps) and a **new** timestamp starts a new run. Progress lands in `status.manualRun`:
+
+```console
+$ kubectl get repositoryreplication nas-primary-offsite -n billing -o jsonpath='{.status.manualRun}'
+{"completedAt":"2026-06-11T12:04:18Z","phase":"Succeeded","requestedAt":"2026-06-11T12:00:00Z"}
+```
+
+The run goes through the **same** path as a scheduled one — the same mover, the same source-repository-`Ready` gate, the same single-flight rule that never runs two mirrors of one CR at once. `--wait` exits 0 on `Succeeded` and 1 on `Failed`.
+
+/// note | A requested run re-anchors the schedule
+
+The next cron slot is computed from `status.lastReplicated`, and a successful requested run stamps it just like a scheduled run does. So running at 14:00 on an `0 5 * * *` mirror means the next automatic run is 05:00 **tomorrow**, not tonight. That is intended: a cron here means "at least this often", and having just mirrored, another run hours later would be redundant.
+
+///
+
+/// warning | Suspended? The request waits, it does not vanish
+
+Requesting a run on a `suspend: true` replication records it as `status.manualRun.phase: Pending` and surfaces `Ready=False` with reason `SuspendedWithPendingRun`. Nothing starts until you [resume](cli/operations.md#suspend--resume) it — at which point the still-unanswered request fires immediately.
+
+///
+
 ## Watching it
 
 ```console
@@ -181,10 +225,13 @@ NAME                  SOURCE        DESTINATION   SCHEDULE    LAST   AGE
 nas-primary-offsite   nas-primary   s3            0 5 * * *   8h     6d
 ```
 
-`status` surfaces `lastReplicated`, `nextScheduledAt`, and best-effort `lastReplicatedBytes`/`lastReplicatedBlobs`, plus standard `Ready`/`Reconciling`/`Stalled` conditions for `kubectl wait`.
+`status` surfaces `lastReplicated`, `nextScheduledAt`, and best-effort `lastReplicatedBytes`/`lastReplicatedBlobs`, plus standard `Ready`/`Reconciling`/`Stalled` conditions for `kubectl wait` — and `manualRun` once you have [requested a run](#run-it-now).
+
+Every finished run is also counted in `kopiur_replication_runs_total{kind,trigger,outcome}`, so a Prometheus alert can catch "the nightly mirror has been failing for three days" without watching conditions.
 
 ## See also
 
 - [`deploy/examples/19-repository-replication.yaml`](examples.md#example-19--repository-replication)
 - [Repositories & backends](repositories.md)
 - [Disaster recovery scenario](scenarios/disaster-recovery.md)
+- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md) — turning this mirror back into a live repository with `spec.seed`.

@@ -2289,6 +2289,7 @@ mod bootstrap_outcomes {
             epoch: None,
             epoch_error: None,
             blob_retention: None,
+            seed: None,
             failure: None,
         }
     }
@@ -2297,12 +2298,12 @@ mod bootstrap_outcomes {
     fn four_way_mapping() {
         // (None, job succeeded): the result ConfigMap hasn't propagated yet.
         assert!(matches!(
-            bootstrap_outcome(None, true, "boot-x"),
+            bootstrap_outcome(None, true, "boot-x", false),
             BootstrapOutcome::ResultPending
         ));
 
         // (None, job failed): result-less terminal failure, names the Job.
-        match bootstrap_outcome(None, false, "boot-x") {
+        match bootstrap_outcome(None, false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::JobFailedWithoutResult { job_name }) => {
                 assert_eq!(job_name, "boot-x");
             }
@@ -2320,7 +2321,7 @@ mod bootstrap_outcomes {
             retry_recommended: false,
             op: None,
         });
-        match bootstrap_outcome(Some(bad), false, "boot-x") {
+        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, message }) => {
                 assert_eq!(class, KopiaErrorClass::AuthFailure);
                 assert_eq!(message, "invalid repository password");
@@ -2329,7 +2330,7 @@ mod bootstrap_outcomes {
         }
 
         // (Some successful, _): the success arm owns the result.
-        match bootstrap_outcome(Some(ok_result()), true, "boot-x") {
+        match bootstrap_outcome(Some(ok_result()), true, "boot-x", false) {
             BootstrapOutcome::Succeeded(r) => assert_eq!(r.unique_id.as_deref(), Some("uid-1")),
             _ => panic!("expected Succeeded"),
         }
@@ -2342,7 +2343,7 @@ mod bootstrap_outcomes {
         // never panic or silently succeed.
         let mut bad = ok_result();
         bad.success = false;
-        match bootstrap_outcome(Some(bad), false, "boot-x") {
+        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, message }) => {
                 assert_eq!(class, KopiaErrorClass::Unknown);
                 assert!(message.contains("bootstrap failed"));
@@ -2358,10 +2359,166 @@ mod bootstrap_outcomes {
         // BEFORE the generic Backend mapping) so the operator sees an actionable
         // "enable create" reason, not a bare kopia NotFound.
         let r = BootstrapResult::not_initialized();
-        match bootstrap_outcome(Some(r), false, "boot-x") {
+        match bootstrap_outcome(Some(r), false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::RepositoryNotInitialized) => {}
             _ => panic!("expected RepositoryNotInitialized"),
         }
+    }
+
+    #[test]
+    fn every_seed_class_maps_to_a_typed_failure_and_routes_by_retryability() {
+        use super::super::events::SeedFailure;
+        use kopiur_mover::bootstrap as mb;
+
+        // Every sentinel the mover can write is recognised, and the label round
+        // trips — a class the controller cannot read would collapse to
+        // `Unknown` and lose both its reason and its retry routing.
+        for class in [
+            mb::SEED_SOURCE_NOT_FOUND_CLASS,
+            mb::SEED_SOURCE_EMPTY_CLASS,
+            mb::SEED_INCOMPLETE_CLASS,
+            mb::SEED_LEFT_EMPTY_CLASS,
+        ] {
+            let f = SeedFailure::from_class(class).unwrap_or_else(|| panic!("{class} unmapped"));
+            // THE cross-crate pin. `reason()` reads `kopiur_api::consts` (so
+            // `kopiur_api::gates` can register the same strings without
+            // depending on the mover) while `from_class` reads the mover's
+            // sentinels. This is the only crate that sees both, so if the two
+            // ever drift, a real failure would stop selecting its gate row and
+            // doctor would report it as an unknown reason from a newer
+            // operator.
+            assert_eq!(
+                f.reason(),
+                class,
+                "the api reason must BE the mover's class label"
+            );
+            assert!(!f.action().is_empty());
+            // ...and it must actually select a registry row.
+            assert_eq!(
+                kopiur_api::gates::STRUCTURAL_GATES
+                    .iter()
+                    .filter(|g| g.matches(
+                        kopiur_api::consts::SEEDED_CONDITION,
+                        kopiur_api::gates::CONDITION_FALSE,
+                        f.reason()
+                    ))
+                    .count(),
+                1,
+                "{class} must select exactly one structural-gate row"
+            );
+        }
+        // Nothing else is a seed failure — not the sibling create sentinel, not
+        // a kopia class, not the mover's internal-inconsistency class.
+        assert!(SeedFailure::from_class(mb::REPOSITORY_NOT_INITIALIZED_CLASS).is_none());
+        assert!(SeedFailure::from_class(mb::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS).is_none());
+        assert!(SeedFailure::from_class("AuthFailure").is_none());
+
+        // The two SOURCE-side failures point at spec.seed.from; the two
+        // INTERRUPTED-copy ones say kopiur resumes it itself.
+        assert_eq!(
+            SeedFailure::SourceNotFound.action(),
+            crate::consts::CHECK_SEED_SOURCE_ACTION
+        );
+        assert_eq!(
+            SeedFailure::LeftEmpty.action(),
+            crate::consts::AWAIT_SEED_RESUME_ACTION
+        );
+
+        // Routing: ALL FOUR recycle-and-retry, because the relaunch RESUMES the
+        // copy (the seed-attempt marker is what makes that legitimate). If the
+        // marker or the resume plumbing is ever removed, the last two must go
+        // terminal with it — see `BootstrapFailure::recycles_for_retry`.
+        for f in [
+            SeedFailure::SourceNotFound,
+            SeedFailure::SourceEmpty,
+            SeedFailure::Incomplete,
+            SeedFailure::LeftEmpty,
+        ] {
+            let bf = BootstrapFailure::Seed {
+                failure: f,
+                message: "m".into(),
+            };
+            assert!(bf.recycles_for_retry(), "{f:?} must retry");
+            assert_eq!(bf.reason(), f.reason());
+            assert_eq!(bf.seed_reason(), Some(f.reason()));
+            // Never routed as "the repository is absent" (that path's
+            // remediation copy is about a WIPE) and never through the breaker's
+            // outage sensor (a seed only fires on a never-bootstrapped repo).
+            assert!(!bf.is_repository_absent());
+            assert!(!bf.retryable_outage_for_bootstrapped(true));
+        }
+
+        // The two TERMINAL ones: an old mover image and a broken mover
+        // invariant both reproduce identically on every attempt.
+        let skew = BootstrapFailure::SeedMoverTooOld;
+        assert!(!skew.recycles_for_retry());
+        assert_eq!(skew.reason(), kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON);
+        assert_eq!(
+            skew.seed_reason(),
+            Some(kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON)
+        );
+        let inconsistent = BootstrapFailure::InternalInconsistency {
+            message: "contradiction".into(),
+        };
+        assert!(!inconsistent.recycles_for_retry());
+        assert_eq!(
+            inconsistent.reason(),
+            mb::BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS
+        );
+        // ...and it is NOT a seed statement, so it writes no `Seeded` condition.
+        assert_eq!(inconsistent.seed_reason(), None);
+        // Neither is an ordinary backend failure.
+        assert_eq!(
+            BootstrapFailure::JobFailedWithoutResult {
+                job_name: "j".into()
+            }
+            .seed_reason(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_seed_armed_success_without_a_seed_outcome_is_refused_as_mover_skew() {
+        use kopiur_mover::bootstrap::SeedOutcome;
+        use kopiur_mover::workspec::SeedModeSpec;
+
+        // THE GUARD (#380 D4). `BootstrapResult.seed` is mover-authored and
+        // every seed-armed success path emits one — the AlreadyInitialized
+        // no-op included — so its absence proves the running image dropped the
+        // unknown `seed` field, fell into the create fallback, and initialized
+        // an EMPTY repository. Accepting it would report Ready over a
+        // repository with no history.
+        match bootstrap_outcome(Some(ok_result()), true, "boot-x", true) {
+            BootstrapOutcome::Failed(BootstrapFailure::SeedMoverTooOld) => {}
+            _ => panic!("a seed-armed success with no seed outcome must be refused"),
+        }
+
+        // The SAME result with no seed armed is an ordinary success — the guard
+        // must not fire on every bootstrap in the fleet.
+        match bootstrap_outcome(Some(ok_result()), true, "boot-x", false) {
+            BootstrapOutcome::Succeeded(_) => {}
+            _ => panic!("an unarmed bootstrap is unaffected"),
+        }
+
+        // A seed-armed success that DOES acknowledge the seed passes through,
+        // for both the real copy and the documented no-op.
+        for outcome in [
+            SeedOutcome::performed(SeedModeSpec::Blob, "S3".into(), 4, None),
+            SeedOutcome::already_initialized(SeedModeSpec::Blob, "S3".into()),
+        ] {
+            let r = ok_result().with_seed(Some(outcome));
+            match bootstrap_outcome(Some(r), true, "boot-x", true) {
+                BootstrapOutcome::Succeeded(r) => assert!(r.seed.is_some()),
+                _ => panic!("an acknowledged seed must succeed"),
+            }
+        }
+
+        // The skew message is actionable and volatile-free (so the guarded
+        // status write stays a no-op across repeats).
+        let msg = BootstrapFailure::SeedMoverTooOld.condition_message();
+        assert!(!msg.contains("   "), "wrapped source whitespace: {msg}");
+        assert!(msg.contains("upgrade the mover image"), "{msg}");
+        assert!(msg.contains("empty"), "{msg}");
     }
 
     #[test]
@@ -2378,7 +2535,7 @@ mod bootstrap_outcomes {
             retry_recommended: false,
             op: None,
         });
-        match bootstrap_outcome(Some(bad), false, "boot-x") {
+        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, .. }) => {
                 assert_eq!(class, KopiaErrorClass::NotFound);
             }
@@ -3302,6 +3459,77 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         false,
         crate::consts::SOURCE_PVC_MISSING_REASON,
         "snapshot::handle_missing_source_pvc (computed polarity)",
+    ),
+    // `repository::park_on_seed_source` +
+    // `cluster_repository::park_cluster_on_seed_source`, both via
+    // io::upsert_gate(&SEED_SOURCE_NOT_READY_GATE, ...); cleared by
+    // finalize_bootstrap's `Seeded=True` fold once the seed runs.
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::WAITING_FOR_SEED_SOURCE_REASON,
+        "repository::park_on_seed_source + cluster_repository::park_cluster_on_seed_source \
+         (upsert_gate)",
+    ),
+    // The SAME two park writers, reached with the OTHER park gate: a
+    // migrate-mode seed whose local and source backends disagree on workload
+    // identity (`repo_seed::arm_migrate_seed`'s `validate_replication_auth`
+    // arm). The gate row rides `SeedArming::Park`, so the reason is chosen
+    // where the problem is diagnosed, not at the writer.
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_SOURCE_AUTH_CONFLICT_REASON,
+        "repository::park_on_seed_source + cluster_repository::park_cluster_on_seed_source, \
+         armed by repo_seed::arm_migrate_seed (upsert_gate)",
+    ),
+    // `repository::write_seeding_condition` +
+    // `cluster_repository::write_cluster_seeding_condition`, both via
+    // io::upsert_gate(&SEEDING_GATE, ...) while the seeding Job is in flight;
+    // cleared by the same `Seeded=True` fold.
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEEDING_REASON,
+        "repository::write_seeding_condition + \
+         cluster_repository::write_cluster_seeding_condition (upsert_gate)",
+    ),
+    // The five `Seeded=False` FAILURE reasons, all folded by
+    // `repository::finalize_bootstrap_failure` +
+    // `cluster_repository::finalize_cluster_bootstrap_failure` from
+    // `BootstrapFailure::seed_reason()`. One writer, five rows: the reason is
+    // computed from the typed failure, so the fold keeps its own
+    // `upsert_condition` rather than naming a row.
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_SOURCE_NOT_FOUND_REASON,
+        "repository::finalize_bootstrap_failure seed fold (computed reason)",
+    ),
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_SOURCE_EMPTY_REASON,
+        "repository::finalize_bootstrap_failure seed fold (computed reason)",
+    ),
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_INCOMPLETE_REASON,
+        "repository::finalize_bootstrap_failure seed fold (computed reason)",
+    ),
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_LEFT_EMPTY_REASON,
+        "repository::finalize_bootstrap_failure seed fold (computed reason)",
+    ),
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON,
+        "repository::finalize_bootstrap_failure seed fold, mover-skew guard \
+         (computed reason)",
     ),
 ];
 

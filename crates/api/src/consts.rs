@@ -42,6 +42,14 @@ pub const SCHEDULE_LABEL: &str = "kopiur.home-operations.com/schedule";
 /// milestone of #368.)
 pub const SNAPSHOT_REPLICATION_LABEL: &str = "kopiur.home-operations.com/snapshot-replication";
 
+/// Label tying a blob-replication mover Job back to its owning
+/// `RepositoryReplication` — the single-flight selector the controller uses,
+/// and the selector `kubectl kopiur replication run` prints when a requested
+/// run fails and the user needs the Job's logs. Lives here, next to
+/// [`SNAPSHOT_REPLICATION_LABEL`], because the controller and the CLI must
+/// agree on it byte-for-byte; a copy in either would drift silently.
+pub const REPLICATION_LABEL: &str = "kopiur.home-operations.com/replication";
+
 /// Label naming the shared CSI `VolumeGroupSnapshot` a fanned-out `Snapshot`
 /// stages from — carried by BOTH the member `Snapshot` CRs and the
 /// `VolumeGroupSnapshot` object itself.
@@ -386,6 +394,107 @@ pub const DELETION_HELD_CONDITION: &str = "DeletionHeld";
 /// `reason` for [`DELETION_HELD_CONDITION`] = `True`.
 pub const MASS_DELETION_BREAKER_REASON: &str = "MassDeletionBreaker";
 
+/// `Repository`/`ClusterRepository` condition reporting the state of
+/// `spec.seed` — initializing a brand-new repository from an existing replica
+/// (issue #380).
+///
+/// `True` means the repository holds its seeded content (reason
+/// [`SEEDED_REASON`]) or never needed seeding because it was already
+/// initialized (reason [`ALREADY_INITIALIZED_REASON`]). `False` means the seed
+/// is in flight ([`SEEDING_REASON`]), parked on a source that is not usable yet
+/// ([`WAITING_FOR_SEED_SOURCE_REASON`]) or on a workload-identity conflict
+/// between the two backends ([`SEED_SOURCE_AUTH_CONFLICT_REASON`]), or failed
+/// (the mover's failure class).
+///
+/// Wire-visible: GitOps health checks, `kubectl kopiur status`/`doctor` and
+/// user automation read it, so it lives in `kopiur-api` beside the other
+/// contract strings rather than controller-side.
+pub const SEEDED_CONDITION: &str = "Seeded";
+/// `reason` for [`SEEDED_CONDITION`] = `True` when this repository's content
+/// was actually copied in from `spec.seed.from`.
+pub const SEEDED_REASON: &str = "Seeded";
+/// `reason` for [`SEEDED_CONDITION`] = `True` when `spec.seed` was a standing
+/// no-op: the repository was already initialized, so nothing was copied. This
+/// is the steady state of a seed block left in a GitOps manifest forever.
+pub const ALREADY_INITIALIZED_REASON: &str = "AlreadyInitialized";
+/// `reason` for [`SEEDED_CONDITION`] = `False` while the seeding bootstrap Job
+/// is in flight. Bounded by `spec.seed.failurePolicy` (default 24h), but a seed
+/// legitimately runs for hours, so anything reporting on a repository must be
+/// able to say "seeding" rather than "stuck".
+pub const SEEDING_REASON: &str = "Seeding";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when a migrate-mode seed is
+/// parked because its source `Repository`/`ClusterRepository` is not `Ready`
+/// (or does not exist). The repository stays `Pending` and re-checks until the
+/// source comes up — an out-of-band change nothing in kopiur can make.
+pub const WAITING_FOR_SEED_SOURCE_REASON: &str = "WaitingForSeedSource";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when a migrate-mode seed's
+/// LOCAL backend and its resolved SOURCE repository disagree on workload
+/// identity: one seeding pod runs as exactly one ServiceAccount, so one of the
+/// two backends would authenticate as the wrong identity (or not at all).
+///
+/// The blob arm of this rule is an admission rejection
+/// (`validate_replication_auth`, reached through `validate_seed_blob_source`),
+/// but admission cannot follow a `seed.from.repository` reference to the source
+/// CR's backend — so the migrate arm is a controller-side park instead, and it
+/// needs its own reason for `kubectl kopiur doctor` to explain rather than
+/// misreport it.
+pub const SEED_SOURCE_AUTH_CONFLICT_REASON: &str = "SeedSourceAuthConflict";
+
+// The FAILURE reasons for [`SEEDED_CONDITION`] = `False`. Each is byte-identical
+// to the sentinel `kopia_error_class` the seeding mover writes
+// (`kopiur_mover::bootstrap::SEED_*_CLASS`) — one vocabulary across the mover's
+// result, the condition, the Warning Event and the CLI. They live HERE, not in
+// the mover, because `gates.rs` registers them and `kopiur-api` cannot depend on
+// `kopiur-mover`; the equality is pinned by the controller's
+// `io::tests::every_seed_class_maps_to_a_typed_failure_and_routes_by_retryability`,
+// which is the one crate that sees both sides.
+//
+// Registering ALL of them matters: a `Seeded=False` reason with no registry row
+// trips `StructuralGate::trips` but matches no row, and `kubectl kopiur doctor`
+// then reports it as "the operator is newer than the plugin" — a false diagnosis
+// in exactly the disaster-recovery flow these reasons exist for.
+
+/// `reason` for [`SEEDED_CONDITION`] = `False` when the seed SOURCE answered but
+/// holds no kopia repository (a mis-pointed bucket/prefix, or a mirror that was
+/// never written). Retried automatically.
+pub const SEED_SOURCE_NOT_FOUND_REASON: &str = "SeedSourceNotFound";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when the seed source IS a kopia
+/// repository but holds zero snapshots and `spec.seed.allowEmptySource` is
+/// `false`. Retried automatically, so a mirror that fills up later seeds itself.
+pub const SEED_SOURCE_EMPTY_REASON: &str = "SeedSourceEmpty";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when a migrate-mode seed's
+/// post-verify found snapshots missing at the destination (`kopia snapshot
+/// migrate` exits 0 on a per-source failure, so the destination listing is the
+/// only honest success signal). The next attempt resumes the copy.
+pub const SEED_INCOMPLETE_REASON: &str = "SeedIncomplete";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when a seed was armed and the
+/// repository ended the bootstrap holding ZERO snapshots — an attempt that
+/// initialized the backend and then died. The next attempt resumes the copy;
+/// nothing at the backend should be deleted.
+pub const SEED_LEFT_EMPTY_REASON: &str = "SeedLeftEmpty";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when the running mover image
+/// predates `spec.seed`: it dropped the unknown field, fell into the create
+/// fallback, and initialized an EMPTY repository. Terminal — only an image
+/// upgrade changes it.
+pub const SEED_MOVER_TOO_OLD_REASON: &str = "MoverImageTooOldForSeed";
+
+/// Every `Seeded=False` reason that means "the last seed attempt FAILED", as
+/// opposed to the park/progress reasons ([`WAITING_FOR_SEED_SOURCE_REASON`],
+/// [`SEEDING_REASON`]).
+///
+/// Exists so a writer can ask "has a previous attempt already recorded a
+/// failure here?" without restating the list — the seeding-progress writer uses
+/// it to leave a recorded failure standing rather than overwriting it with
+/// `Seeding` on every ~2-minute retry, which would make every retry cycle a
+/// fresh status transition (and so a fresh Event and metric increment).
+pub const SEED_FAILURE_REASONS: &[&str] = &[
+    SEED_SOURCE_NOT_FOUND_REASON,
+    SEED_SOURCE_EMPTY_REASON,
+    SEED_INCOMPLETE_REASON,
+    SEED_LEFT_EMPTY_REASON,
+    SEED_MOVER_TOO_OLD_REASON,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +516,7 @@ mod tests {
             SNAPSHOT_ID_LABEL,
             REPOSITORY_UID_LABEL,
             CONFIG_LABEL,
+            REPLICATION_LABEL,
             SCHEDULE_LABEL,
             SNAPSHOT_REPLICATION_LABEL,
             GROUP_LABEL,

@@ -74,6 +74,31 @@ pub enum KopiaOp {
     SourceSnapshotList,
     /// `snapshot list --all` on the replication DESTINATION.
     DestSnapshotList,
+    /// `repository connect --readonly --persist-credentials` to a `spec.seed`
+    /// SOURCE (under the dedicated `seed-source` config), issue #380.
+    SeedSourceConnect,
+    /// `repository connect` to the repository a migrate-mode seed writes into
+    /// (under the dedicated `seed-local` config, read-write).
+    SeedLocalConnect,
+    /// The persisted-password probe on a migrate-mode seed SOURCE: `repository
+    /// status` with `KOPIA_PASSWORD` REMOVED. Must succeed — it proves the
+    /// persisted password alone opens the source, which is what `snapshot
+    /// migrate`'s source open reads FIRST.
+    SeedSourcePasswordProbe,
+    /// `snapshot list --all` on a `spec.seed` source (the empty-source gate and
+    /// the migrate post-verify baseline).
+    SeedSourceSnapshotList,
+    /// `snapshot list --all` on this repository after a migrate-mode seed (the
+    /// mandatory post-verify — migrate exits 0 on a per-source failure).
+    SeedLocalSnapshotList,
+    /// `repository sync-to` copying a blob-mode seed source into this
+    /// repository's backend.
+    SeedSyncTo,
+    /// `snapshot migrate --source-config` from a migrate-mode seed source.
+    SeedMigrate,
+    /// `repository create` initializing the local repository a migrate-mode
+    /// seed migrates into.
+    SeedLocalCreate,
 }
 
 impl KopiaOp {
@@ -106,6 +131,14 @@ impl KopiaOp {
             KopiaOp::SnapshotMigrate => "snapshot migrate",
             KopiaOp::SourceSnapshotList => "source snapshot list",
             KopiaOp::DestSnapshotList => "destination snapshot list",
+            KopiaOp::SeedSourceConnect => "seed source connect",
+            KopiaOp::SeedLocalConnect => "seed local repository connect",
+            KopiaOp::SeedSourcePasswordProbe => "seed source password probe",
+            KopiaOp::SeedSourceSnapshotList => "seed source snapshot list",
+            KopiaOp::SeedLocalSnapshotList => "seed local repository snapshot list",
+            KopiaOp::SeedSyncTo => "seed repository sync-to",
+            KopiaOp::SeedMigrate => "seed snapshot migrate",
+            KopiaOp::SeedLocalCreate => "seed local repository create",
         }
     }
 }
@@ -398,6 +431,26 @@ pub enum MoverError {
         env_key: &'static str,
     },
 
+    /// A migrate-mode `spec.seed`'s SOURCE kopia password env var is unset
+    /// (issue #380). The controller injects it via a `secretKeyRef` under a
+    /// dedicated name so it can never collide with THIS repository's own
+    /// `KOPIA_PASSWORD` — the two repositories have different passwords, and
+    /// silently reusing this one would surface as a confusing `AuthFailure`
+    /// against the source.
+    #[error(
+        "the seed source repository's kopia password is missing: ${env_key} is unset, so \
+         `spec.seed`'s source repository cannot be opened. The controller injects it from the \
+         SOURCE repository's encryption Secret — check that the source repository CR still \
+         exists and is readable, that its encryption Secret (or its projected copy) is present, \
+         and — for a cross-namespace source — that spec.seed.credentialProjection is enabled \
+         along with the operator's features.credentialProjection install flag"
+    )]
+    SeedPasswordMissing {
+        /// The env var that should carry the seed source's password
+        /// ([`crate::env::SEED_KOPIA_PASSWORD`]).
+        env_key: &'static str,
+    },
+
     /// `kopia snapshot migrate` exited 0 but the post-verify listing found
     /// expected `(identity, startTime)` pairs missing on the destination.
     /// kopia's per-source migration goroutines only LOG their errors, so exit
@@ -528,6 +581,7 @@ impl MoverError {
             | MoverError::Telemetry(_)
             | MoverError::BatchDeleteIncomplete { .. }
             | MoverError::DestPasswordMissing { .. }
+            | MoverError::SeedPasswordMissing { .. }
             | MoverError::MigrateIncomplete { .. }
             | MoverError::CopyCrSyncIncomplete { .. }
             | MoverError::ReplicationCrList { .. }
@@ -579,6 +633,14 @@ mod tests {
             KopiaOp::SnapshotMigrate,
             KopiaOp::SourceSnapshotList,
             KopiaOp::DestSnapshotList,
+            KopiaOp::SeedSourceConnect,
+            KopiaOp::SeedLocalConnect,
+            KopiaOp::SeedSourcePasswordProbe,
+            KopiaOp::SeedSourceSnapshotList,
+            KopiaOp::SeedLocalSnapshotList,
+            KopiaOp::SeedSyncTo,
+            KopiaOp::SeedMigrate,
+            KopiaOp::SeedLocalCreate,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for op in all {
@@ -778,6 +840,30 @@ mod tests {
         // fix: retrying only re-attempts what's outstanding (idempotent deletes)
         assert!(msg.contains("idempotent"), "{msg}");
         assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+    }
+
+    #[test]
+    fn seed_password_missing_names_the_env_var_and_the_projection_prerequisite() {
+        let err = MoverError::SeedPasswordMissing {
+            env_key: crate::env::SEED_KOPIA_PASSWORD,
+        };
+        let msg = err.to_string();
+        // what: the exact env var, so it is greppable in the Job spec
+        assert!(msg.contains("$KOPIUR_SEED_KOPIA_PASSWORD"), "{msg}");
+        // why: it belongs to the SOURCE repository, not this one
+        assert!(
+            msg.contains("SOURCE repository's encryption Secret"),
+            "{msg}"
+        );
+        // fix: the cross-namespace case needs projection AND the install flag
+        assert!(msg.contains("spec.seed.credentialProjection"), "{msg}");
+        assert!(msg.contains("features.credentialProjection"), "{msg}");
+        // Environmental/config: re-running the same pod will not help.
+        assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+        assert!(!err.retry_recommended());
+        // Authored through a bash heredoc, not a Python one (the wrapped-
+        // whitespace defect that hit the C1 literals).
+        assert!(!msg.contains("   "), "wrapped source whitespace: {msg}");
     }
 
     #[test]

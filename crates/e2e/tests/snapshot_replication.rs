@@ -62,6 +62,11 @@ fn srepl_job_selector(name: &str) -> String {
     format!("app.kubernetes.io/component=snapshot-replication,{SNAPSHOT_REPLICATION_LABEL}={name}")
 }
 
+/// The `Repository` API in the e2e namespace.
+fn repos_api(client: &Client) -> Api<Repository> {
+    Api::namespaced(client.clone(), E2E_NAMESPACE)
+}
+
 /// This replication's copy `Snapshot` CRs at the destination — the exact
 /// three-label conjunction the mover stamps at birth AND uses as its pruning
 /// candidate set (labels-at-birth contract).
@@ -1163,6 +1168,162 @@ async fn snapshot_replication_suspend_holds_slots() {
         }
         tokio::time::sleep(poll_interval()).await;
     }
+
+    let _ = repls.delete(REPL, &DeleteParams::default()).await;
+}
+
+/// Issue #380: an ON-DEMAND copy pass, requested with the `run-requested`
+/// annotation, on a replication whose cron cannot fire again for months.
+///
+/// The schedule is `0 5 1 1 *` (05:00 on 1 January). A brand-new replication is
+/// always immediately due — the scheduler anchors an unrun CR a year back — so
+/// the CR takes exactly ONE catch-up run, which stamps `status.lastReplicated`
+/// and re-anchors the next slot to next January. From that point the annotation
+/// is the only thing in the cluster that can produce another run, which is what
+/// makes the second `lastReplicated` a proof rather than a coincidence.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn snapshot_replication_runs_on_demand_from_the_run_requested_annotation() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    const REPO_SRC: &str = "e2e-srepl-run-src";
+    const REPO_DST: &str = "e2e-srepl-run-dst";
+    const REPL: &str = "e2e-srepl-run";
+
+    // A source with real snapshot history to copy.
+    ensure_seed(
+        &client,
+        REPO_SRC,
+        "e2e-srepl-run-policy",
+        "e2e-srepl-run-seed",
+        "srepl-run-src",
+    )
+    .await;
+    ensure_dest_repo(
+        &client,
+        REPO_DST,
+        "srepl-run-dst",
+        CREDS_SECRET,
+        serde_json::json!({}),
+    )
+    .await;
+
+    let repls: Api<SnapshotReplication> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    create_idempotent(
+        &repls,
+        &cr(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotReplication",
+            "metadata": { "name": REPL, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "sourceRef": { "kind": "Repository", "name": REPO_SRC },
+                "destinationRef": { "kind": "Repository", "name": REPO_DST },
+                // Yearly: one catch-up run now, then nothing until January.
+                "schedule": { "cron": "0 5 1 1 *" }
+            }
+        })),
+        "create SnapshotReplication with a yearly schedule",
+    )
+    .await;
+
+    // The one catch-up run, whose timestamp becomes the baseline the requested
+    // run must move.
+    let first = wait_until(
+        "the initial catch-up run stamps status.lastReplicated",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, REPL).await;
+            Ok(s.get("lastReplicated")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string))
+        },
+    )
+    .await
+    .expect("the catch-up run should stamp status.lastReplicated");
+
+    let requested_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    repls
+        .patch(
+            REPL,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": {
+                    kopiur_api::consts::RUN_REQUESTED_ANNOTATION: requested_at
+                } }
+            })),
+        )
+        .await
+        .expect("annotate the replication with a run request");
+
+    // A SECOND run happens even though no cron slot is due — only the
+    // annotation can have caused it.
+    wait_until(
+        "the requested run stamps a NEW status.lastReplicated",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let first = first.clone();
+            let repls = repls.clone();
+            async move {
+                let s = status_json(&repls, REPL).await;
+                Ok(s.get("lastReplicated")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty() && *v != first)
+                    .map(str::to_string))
+            }
+        },
+    )
+    .await
+    .expect("the requested run should execute and re-stamp status.lastReplicated");
+
+    let manual = wait_until(
+        "status.manualRun reaches a terminal phase",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, REPL).await;
+            Ok(s.get("manualRun")
+                .filter(|m| {
+                    matches!(
+                        m.get("phase").and_then(|p| p.as_str()),
+                        Some("Succeeded" | "Failed")
+                    )
+                })
+                .cloned())
+        },
+    )
+    .await
+    .expect("the controller should record a terminal status.manualRun");
+    assert_eq!(
+        manual.get("phase").and_then(|v| v.as_str()),
+        Some("Succeeded"),
+        "manualRun: {manual}"
+    );
+    assert_eq!(
+        manual.get("requestedAt").and_then(|v| v.as_str()),
+        Some(requested_at.as_str()),
+        "manualRun must pin the timestamp that was requested; got {manual}"
+    );
+
+    // The copies really landed: the requested run did exactly the work a
+    // scheduled one would, through the same mover.
+    let dest_uid = repos_api(&client)
+        .get(REPO_DST)
+        .await
+        .expect("get destination Repository")
+        .uid()
+        .expect("destination Repository has a uid");
+    let copies = copy_rows(&client, REPL, &dest_uid).await;
+    assert!(
+        !copies.is_empty(),
+        "the destination must hold copy Snapshot CRs after a successful requested run"
+    );
 
     let _ = repls.delete(REPL, &DeleteParams::default()).await;
 }
