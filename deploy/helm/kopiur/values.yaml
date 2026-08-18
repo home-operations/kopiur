@@ -97,14 +97,6 @@ replicaCount: 1
 # -- Enable leader election. Required when replicaCount > 1; harmless at 1.
 leaderElection:
   enabled: true
-  # -- API Priority and Fairness lane for the election Lease. Kubernetes' own
-  # `system-leader-election` FlowSchema covers only kube-system ServiceAccounts,
-  # so an operator in its own namespace has its lease renewals queued behind all
-  # other ServiceAccount traffic in `workload-low` — the congestion behind the
-  # controller restart storms in #319. This puts Kopiur's `leases` calls (and
-  # only those) into the built-in guaranteed `leader-election` priority level.
-  # Turn off if APF is disabled on the cluster or you cannot create
-  # cluster-scoped flowcontrol.apiserver.k8s.io objects.
   # -- Leader-election protocol timings, in seconds. Leave unset to use the
   # client-go defaults (lease 15 / renewDeadline 10 / renewPeriod 2 / retry 2).
   # `renewDeadline` is a budget for a whole ROUND of renew attempts, not one
@@ -118,6 +110,15 @@ leaderElection:
   #  renewDeadlineSeconds: 10
   #  renewPeriodSeconds: 2
   #  retryPeriodSeconds: 2
+
+  # -- API Priority and Fairness lane for the election Lease. Kubernetes' own
+  # `system-leader-election` FlowSchema covers only kube-system ServiceAccounts,
+  # so an operator in its own namespace has its lease renewals queued behind all
+  # other ServiceAccount traffic in `workload-low` — the congestion behind the
+  # controller restart storms in #319. This puts Kopiur's `leases` calls (and
+  # only those) into the built-in guaranteed `leader-election` priority level.
+  # Turn off if APF is disabled on the cluster or you cannot create
+  # cluster-scoped flowcontrol.apiserver.k8s.io objects.
   flowSchema:
     enabled: true
     # -- Ordering against other FlowSchemas; lower wins. Must stay above the
