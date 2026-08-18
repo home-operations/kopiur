@@ -645,7 +645,7 @@ impl Metrics {
             )
             .build();
         let repository_seeds = m
-            .u64_counter("kopiur_repository_seed_total")
+            .u64_counter("kopiur_repository_seed")
             .with_description(
                 "Total spec.seed outcomes on a repository bootstrap (issue #380), labeled by mode \
                  (blob = kopia repository sync-to from a mirror backend; migrate = kopia snapshot \
