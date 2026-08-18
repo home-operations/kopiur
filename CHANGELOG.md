@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.10.3](https://github.com/home-operations/kopiur/compare/0.10.2...0.10.3) (2026-08-18)
+
+
+### Features
+
+* **repository:** seed a fresh repository from its replica — DR for replicated repositories ([#380](https://github.com/home-operations/kopiur/issues/380)) ([#396](https://github.com/home-operations/kopiur/issues/396)) ([74665dc](https://github.com/home-operations/kopiur/commit/74665dc7ae245523b3b21e907ca6663e4d172e47))
+
+
+### Bug Fixes
+
+* **rust:** update crate cel (0.14.2 → 0.14.3) ([#387](https://github.com/home-operations/kopiur/issues/387)) ([bf9aa0c](https://github.com/home-operations/kopiur/commit/bf9aa0c90544e2acea7bed056d0e49f2635b5a6c))
+* **rust:** update crate http-body-util (0.1.4 → 0.1.5) ([#381](https://github.com/home-operations/kopiur/issues/381)) ([6354e17](https://github.com/home-operations/kopiur/commit/6354e177736bbbe1b8b482828ce5c95cb0040b3a))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action jdx/mise-action (v4.2.4 → v4.2.5) ([#388](https://github.com/home-operations/kopiur/issues/388)) ([1040c9e](https://github.com/home-operations/kopiur/commit/1040c9ea0918a86107ce764fbfbc3b742d8a8b15))
+* **mise:** update tool aqua:astral-sh/uv (0.12.3 → 0.12.4) ([#390](https://github.com/home-operations/kopiur/issues/390)) ([bf3916c](https://github.com/home-operations/kopiur/commit/bf3916cfdef9e7555c8cad063820b42818549d53))
+* **mise:** update tool aqua:astral-sh/uv (0.12.4 → 0.12.5) ([#395](https://github.com/home-operations/kopiur/issues/395)) ([b919878](https://github.com/home-operations/kopiur/commit/b9198789ede21d5f7a2b0566ac3ee9eef54cb66f))
+* **mise:** update tool helm (4.2.3 → 4.2.4) ([#389](https://github.com/home-operations/kopiur/issues/389)) ([5b134fa](https://github.com/home-operations/kopiur/commit/5b134faaeff2ebefd0b98513344daebd960dcf5a))
+* **mise:** Update tool oxfmt (0.62.0 → 0.63.0) ([#386](https://github.com/home-operations/kopiur/issues/386)) ([65db237](https://github.com/home-operations/kopiur/commit/65db2378b4c23de220a407673f71504b3a6d87a0))
+
 ## [0.10.2](https://github.com/home-operations/kopiur/compare/0.10.1...0.10.2) (2026-08-13)
 
 
