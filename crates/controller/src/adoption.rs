@@ -174,9 +174,25 @@ pub struct AdoptionPlan {
     /// perfectly healthy, and starts a brand-new chain beside the history it
     /// was supposed to reclaim.
     ///
-    /// Gated by the SAME once-per-(policy, identity) latch as the no-match scan
-    /// request, so a policy that legitimately has no history to adopt warns
-    /// once rather than on every reconcile.
+    /// Deliberately NOT latched: it stays true on every pass for as long as the
+    /// mismatch does, and goes quiet only when the mismatch is resolved — the
+    /// policy adopts or takes a matching backup (`has_history`), a scan finds
+    /// an identity-matching entry (`matched_any`), or the operator sets
+    /// `adoption: Ignore` and opts out of adoption altogether.
+    ///
+    /// It cannot ride the once-per-(policy, identity) latch the no-match scan
+    /// request uses, because that latch is stamped by the FIRST no-match pass —
+    /// which, in the apply-everything disaster-recovery flow, very plausibly
+    /// races the discovered-`Snapshot` reflector and sees an EMPTY catalog. An
+    /// empty catalog is not evidence of anything, so that pass must not warn;
+    /// but it stamps the latch anyway, and every later pass — now seeing the
+    /// real, non-empty catalog — would find the latch set and stay silent
+    /// forever. Repeating the Warning is the cheaper failure: the apiserver
+    /// aggregates by (reason, object) into one counted Event, whereas losing
+    /// the signal loses the only warning that a recovered identity does not
+    /// match the history it was meant to reclaim. Pinned by
+    /// `a_non_empty_catalog_with_no_identity_match_is_flagged_once`, whose last
+    /// arm asserts the flag survives an already-stamped latch.
     pub no_adoptable_history: bool,
 }
 

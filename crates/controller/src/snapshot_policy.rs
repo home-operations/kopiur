@@ -1665,8 +1665,10 @@ async fn adoption_pass_for_target(
     //     disaster recovery this is the only signal that the recovered identity
     //     does not match the one that wrote the history. Warning, because
     //     silently starting a new chain beside recoverable history is a data
-    //     outcome, not a style issue. Once per (policy, identity) — it rides
-    //     the same latch as the no-match scan request.
+    //     outcome, not a style issue. Deliberately NOT latched (see
+    //     `AdoptionPlan::no_adoptable_history`): it repeats while the mismatch
+    //     persists, and the apiserver aggregates the repeats into one counted
+    //     Event.
     if plan.no_adoptable_history {
         io::publish_warning_event(
             ctx,
