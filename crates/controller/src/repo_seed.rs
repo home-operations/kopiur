@@ -85,22 +85,38 @@ pub(crate) struct SeedContext<'a> {
 pub(crate) enum SeedArming {
     /// No seed is armed — build the bootstrap exactly as before #380.
     NotArmed,
-    /// The seed cannot run: write `Seeded=False` with `gate`'s reason and this
-    /// message, then re-check. Nothing is launched.
-    Park {
-        /// The registry row the condition is written FROM, so the triple the
-        /// CLI's doctor matches and the one stamped here cannot drift. Carried
-        /// on the variant rather than fixed at the writer, because the park
-        /// arms do NOT share a reason: three of them mean "the source is not
-        /// usable yet" (`WaitingForSeedSource`), while a workload-identity
-        /// conflict between the two backends is a different problem with a
-        /// different fix.
-        gate: &'static kopiur_api::gates::StructuralGate,
-        /// The actionable park message (what is missing / why / how to fix).
-        message: String,
-    },
+    /// The seed cannot run: write `Seeded=False` from this park's gate row with
+    /// its message, then re-check. Nothing is launched.
+    Park(SeedPark),
     /// Everything resolved: launch a seeding bootstrap Job with this payload.
     Armed(Box<ArmedSeed>),
+}
+
+/// A refusal to launch a seed, as a condition to write.
+///
+/// The gate row rides the decision rather than being fixed at the writer,
+/// because the park arms do NOT share a reason: most of them mean "the source
+/// is not usable yet" (`WaitingForSeedSource`), while a workload-identity
+/// conflict between the two backends is a different problem with a different
+/// fix. Carrying the row keeps the condition written FROM the registry
+/// (`io::upsert_gate`), so the triple the CLI's doctor matches and the one
+/// stamped here cannot drift.
+pub(crate) struct SeedPark {
+    /// The registry row this park's condition is written from.
+    pub gate: &'static kopiur_api::gates::StructuralGate,
+    /// The actionable park message (what is blocked / why / how to fix).
+    pub message: String,
+}
+
+impl SeedPark {
+    /// A park on the "the seed source is not usable (yet)" gate — the arms an
+    /// operator fixes by changing the SOURCE side or the reference to it.
+    fn source_not_usable(message: String) -> Self {
+        Self {
+            gate: &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
+            message,
+        }
+    }
 }
 
 /// A fully-resolved seed, ready to ride a bootstrap Job.
@@ -463,6 +479,93 @@ pub(crate) fn bare_path_seed_source_message(source_description: &str, path: &str
     )
 }
 
+/// **Pure.** Every refusal that can only be decided once a migrate seed's
+/// SOURCE backend has been resolved from its `Repository`/`ClusterRepository`
+/// reference.
+///
+/// All three of these rules ARE enforced at admission for a BLOB seed, where
+/// the source backend is written inline and a spec-only validator can see it
+/// (`validate_seed_blob_source` -> `SeedSourceSameAsRepository`,
+/// `SeedMountPathCollision`, `validate_replication_auth`). A migrate seed hides
+/// its source behind a reference admission cannot follow, so the same three
+/// rules are re-applied here, against the resolved backend, using the SAME
+/// shared helpers — the two arms of each rule cannot mean different things.
+///
+/// Extracted as a pure function so the decision (including WHICH gate row each
+/// refusal parks on) is testable without a cluster; `arm_migrate_seed`
+/// delegates and does nothing but turn `Some` into a park.
+///
+/// Order is deliberate, most-fundamental first: two backends that resolve to
+/// the same storage are the same repository (so a shared filesystem path is a
+/// consequence, not the problem), and only genuinely distinct repositories can
+/// have a meaningful credential pairing.
+pub(crate) fn migrate_source_backend_park(
+    source_description: &str,
+    local: &Backend,
+    source: &Backend,
+) -> Option<SeedPark> {
+    use kopiur_api::validate::{
+        replication_destination_differs, replication_filesystem_mount_collision,
+        validate_replication_auth,
+    };
+    // 1. The source resolves to THIS repository's own storage. `repo_key`
+    //    self-reference detection at admission is by CR NAME, so a second
+    //    `Repository` CR over the same bucket/PVC sails through it — and a seed
+    //    from it would read and write one location.
+    if !replication_destination_differs(local, source) {
+        return Some(SeedPark::source_not_usable(
+            seed_source_same_storage_message(source_description, local),
+        ));
+    }
+    // 2. Two DISTINCT filesystem repositories sharing one in-pod path. Both
+    //    defaulting to `/repo` is the most probable authoring of a migrate
+    //    seed, and the seeding Job mounts both — so without this the failure is
+    //    a raw apiserver rejection of duplicate volumeMounts at Job-create
+    //    time, with nothing on the CR to explain it.
+    if let Some(path) = replication_filesystem_mount_collision(local, source) {
+        return Some(SeedPark::source_not_usable(
+            seed_mount_path_collision_message(source_description, &path),
+        ));
+    }
+    // 3. The credentials cannot share one pod. Same argument order
+    //    `validate_seed_blob_source` uses, which matters for the one-sided arms.
+    if validate_replication_auth(local, source).is_err() {
+        return Some(SeedPark {
+            gate: &kopiur_api::gates::SEED_SOURCE_AUTH_CONFLICT_GATE,
+            message: seed_source_auth_conflict_message(source_description, local, source),
+        });
+    }
+    None
+}
+
+/// **Pure.** The park message for a migrate seed whose source repository
+/// resolves to the SAME storage this repository is being created on.
+fn seed_source_same_storage_message(source_description: &str, local: &Backend) -> String {
+    format!(
+        "spec.seed reads from {source_description}, which resolves to the same {kind} storage \
+         target as this repository's own spec.backend — the seed would read and write one \
+         location, so there is nothing to copy in. Admission only catches a seed reference that \
+         names this repository BY NAME; two different repository CRs over one bucket or PVC are \
+         a different object with the same storage. Fix: point spec.seed.from.repository at the \
+         repository that actually holds the surviving history, or drop spec.seed if this \
+         repository already has it.",
+        kind = local.kind_str()
+    )
+}
+
+/// **Pure.** The park message for a migrate seed whose source repository shares
+/// this repository's in-pod filesystem `path`.
+fn seed_mount_path_collision_message(source_description: &str, path: &str) -> String {
+    format!(
+        "spec.seed reads from {source_description}, whose filesystem backend mounts at {path:?} \
+         — the same in-pod path as this repository's own backend. One seeding pod mounts BOTH, \
+         and two volumes cannot share one mountPath, so the Job would be rejected outright. Fix: \
+         give one of the two repositories a distinct backend.filesystem.path (e.g. /seed-source). \
+         The path is only where the volume mounts inside kopiur's pods, so changing it moves no \
+         data."
+    )
+}
+
 /// **Pure.** The park message for a migrate seed whose LOCAL backend and
 /// resolved SOURCE backend disagree on workload identity.
 ///
@@ -515,8 +618,10 @@ fn seed_source_auth_conflict_message(
          as exactly ONE ServiceAccount, so kopiur refuses to launch a seed that would fail \
          part-way with a bare cloud authentication error. This repository stays Pending and \
          re-checks. Fix: point both backends' auth.workloadIdentity at the SAME ServiceAccount \
-         (granted access to both stores), or give both sides static credential Secrets this \
-         namespace can read."
+         (granted access to both stores), or give both sides static credential Secrets in the \
+         namespace the bootstrap Job runs in (this repository's namespace for a Repository; the \
+         operator's namespace for a ClusterRepository, unless \
+         encryption.passwordSecretRef.namespace pins another)."
     )
 }
 
@@ -652,48 +757,34 @@ async fn arm_migrate_seed(
     let source = match io::resolve_repository_ref_cached(ctx, rref, sctx.source_default_ns).await {
         Ok(s) => s,
         Err(Error::MissingDependency(_)) => {
-            return Ok(SeedArming::Park {
-                gate: &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
-                message: waiting_for_seed_source_message(
-                    source_description,
-                    "it does not exist (yet)",
-                ),
-            });
+            return Ok(SeedArming::Park(SeedPark::source_not_usable(
+                waiting_for_seed_source_message(source_description, "it does not exist (yet)"),
+            )));
         }
         Err(e) => return Err(e),
     };
     if !io::repository_ready_cached(ctx, rref, sctx.source_default_ns).await? {
-        return Ok(SeedArming::Park {
-            gate: &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
-            message: waiting_for_seed_source_message(source_description, "it is not Ready"),
-        });
+        return Ok(SeedArming::Park(SeedPark::source_not_usable(
+            waiting_for_seed_source_message(source_description, "it is not Ready"),
+        )));
     }
     // The one bare-path arm admission cannot see: it would have to read the
     // SOURCE CR to know its backend shape.
     if let Some(path) = filesystem_repo_path(&source.backend)
         && filesystem_repo_mount_source(&source.backend).is_none()
     {
-        return Ok(SeedArming::Park {
-            gate: &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
-            message: bare_path_seed_source_message(source_description, &path),
-        });
+        return Ok(SeedArming::Park(SeedPark::source_not_usable(
+            bare_path_seed_source_message(source_description, &path),
+        )));
     }
-    // The workload-identity arm admission cannot reach either, for the same
-    // reason: `validate_replication_auth` needs BOTH backends inline, and a
-    // `seed.from.repository` reference hides the source's. One bootstrap pod
-    // runs as exactly one ServiceAccount and now touches two repositories, so
-    // re-apply the blob arm's rule here, against the resolved source, in the
-    // same argument order `validate_seed_blob_source` uses.
-    if kopiur_api::validate::validate_replication_auth(sctx.repo_backend, &source.backend).is_err()
+    // The three rules admission enforces on a BLOB seed but cannot reach
+    // through a repository REFERENCE: same storage, a shared in-pod filesystem
+    // path, and a credential pairing that cannot share one pod. Decided by one
+    // pure function so the gate row each refusal parks on is testable.
+    if let Some(park) =
+        migrate_source_backend_park(source_description, sctx.repo_backend, &source.backend)
     {
-        return Ok(SeedArming::Park {
-            gate: &kopiur_api::gates::SEED_SOURCE_AUTH_CONFLICT_GATE,
-            message: seed_source_auth_conflict_message(
-                source_description,
-                sctx.repo_backend,
-                &source.backend,
-            ),
-        });
+        return Ok(SeedArming::Park(park));
     }
     let consumer_enabled = seed
         .credential_projection
@@ -1333,67 +1424,136 @@ mod tests {
     }
 
     #[test]
-    fn the_migrate_auth_gate_is_exactly_the_rule_admission_applies_to_a_blob_seed() {
-        // The VERDICT half. `arm_migrate_seed` refuses on
-        // `validate_replication_auth(local, source).is_err()` and nothing else,
-        // so this matrix IS the gate's behaviour — the async arm only wraps it.
-        // Same argument order `validate_seed_blob_source` uses (local repo
-        // backend first), which matters for the one-sided arms.
-        use kopiur_api::validate::validate_replication_auth;
-        let cases: &[(&str, Backend, Backend, bool)] = &[
+    fn the_migrate_backend_parks_pick_the_right_gate_row_for_the_right_problem() {
+        // The DECISION half, including gate SELECTION — which is the part a
+        // reason-equality assertion cannot reach (a row's `reason` equals its
+        // own const by construction). Every case pins the gate row the park
+        // carries, so re-pointing an arm at the wrong row fails here.
+        use kopiur_api::gates::{SEED_SOURCE_AUTH_CONFLICT_GATE, SEED_SOURCE_NOT_READY_GATE};
+
+        let fs = |path: &str, pvc: &str| -> Backend {
+            serde_json::from_value(serde_json::json!({
+                "filesystem": { "path": path, "volume": { "pvc": { "name": pvc } } }
+            }))
+            .expect("backend")
+        };
+        // gate == None means "no park at all".
+        let cases: &[(&str, Backend, Backend, Option<&'static str>)] = &[
+            // Distinct storage, distinct in-pod paths, no federation: allowed.
             (
-                "no workload identity on either side",
+                "two ordinary filesystem repositories",
+                fs("/repo", "local"),
+                fs("/seed-src", "source"),
+                None,
+            ),
+            (
+                "no workload identity on either object store",
                 s3_static("local"),
                 s3_static("source"),
-                true,
+                None,
             ),
             (
                 "both federate as the SAME ServiceAccount",
                 s3_wi("local", "kopiur-dr"),
                 s3_wi("source", "kopiur-dr"),
-                true,
+                None,
+            ),
+            // A GCS static key travels as a --credentials-file path, never
+            // ambient env, so it cannot be picked up by the federated side.
+            (
+                "GCS federation beside a static S3 side is safe",
+                gcs_wi("local", "kopiur-dr"),
+                s3_static("source"),
+                None,
+            ),
+            // A SECOND repository CR over the same storage: admission's
+            // self-reference check is by NAME, so only this catches it.
+            (
+                "the source resolves to this repository's own storage",
+                fs("/repo", "shared"),
+                fs("/repo", "shared"),
+                Some(SEED_SOURCE_NOT_READY_GATE.reason),
+            ),
+            (
+                "the same bucket under a different CR",
+                s3_static("shared"),
+                s3_static("shared"),
+                Some(SEED_SOURCE_NOT_READY_GATE.reason),
+            ),
+            // The most probable authoring of a migrate seed: both left at the
+            // default `/repo`, over genuinely different volumes.
+            (
+                "two distinct filesystem repositories at one in-pod path",
+                fs("/repo", "local"),
+                fs("/repo", "source"),
+                Some(SEED_SOURCE_NOT_READY_GATE.reason),
             ),
             (
                 "both federate as DIFFERENT ServiceAccounts",
                 s3_wi("local", "kopiur-new"),
                 s3_wi("source", "kopiur-old"),
-                false,
+                Some(SEED_SOURCE_AUTH_CONFLICT_GATE.reason),
             ),
             (
                 "local federates, same-kind source is static",
                 s3_wi("local", "kopiur-dr"),
                 s3_static("source"),
-                false,
+                Some(SEED_SOURCE_AUTH_CONFLICT_GATE.reason),
             ),
             (
                 "source federates, same-kind local is static",
                 s3_static("local"),
                 s3_wi("source", "kopiur-dr"),
-                false,
-            ),
-            (
-                // A GCS static key travels as a --credentials-file path, never
-                // ambient env, so it cannot be picked up by the federated side.
-                "GCS federation beside a static S3 side is safe",
-                gcs_wi("local", "kopiur-dr"),
-                s3_static("source"),
-                true,
+                Some(SEED_SOURCE_AUTH_CONFLICT_GATE.reason),
             ),
         ];
-        for (what, local, source, allowed) in cases {
-            assert_eq!(
-                validate_replication_auth(local, source).is_ok(),
-                *allowed,
-                "{what}"
-            );
+        for (what, local, source, want) in cases {
+            let park = migrate_source_backend_park("Repository/offsite", local, source);
+            match (park, want) {
+                (None, None) => {}
+                (Some(p), Some(reason)) => {
+                    assert_eq!(
+                        p.gate.reason, *reason,
+                        "{what}: parked on the wrong gate row"
+                    );
+                    // A park that doctor cannot explain is worse than none.
+                    assert_eq!(
+                        kopiur_api::gates::STRUCTURAL_GATES
+                            .iter()
+                            .filter(|g| g.matches(
+                                kopiur_api::consts::SEEDED_CONDITION,
+                                kopiur_api::gates::CONDITION_FALSE,
+                                p.gate.reason
+                            ))
+                            .count(),
+                        1,
+                        "{what}: the park's row must be registered exactly once"
+                    );
+                }
+                (got, _) => panic!(
+                    "{what}: expected {want:?}, got {:?}",
+                    got.map(|p| p.gate.reason)
+                ),
+            }
         }
+        // The auth arm must be reached only AFTER the two storage arms: two
+        // sides on one bucket with mismatched federation is a same-storage
+        // problem, and telling the operator to align ServiceAccounts would send
+        // them somewhere that cannot help.
+        let overlapping = migrate_source_backend_park(
+            "Repository/offsite",
+            &s3_wi("shared", "kopiur-new"),
+            &s3_wi("shared", "kopiur-old"),
+        )
+        .expect("an overlapping pair must park");
+        assert_eq!(overlapping.gate.reason, SEED_SOURCE_NOT_READY_GATE.reason);
     }
 
     #[test]
-    fn the_migrate_auth_conflict_message_names_both_identities_and_the_two_fixes() {
-        // The MESSAGE half. The wording is rebuilt rather than borrowed from
-        // the validator (which speaks about "the replication mover" and never
-        // names the second ServiceAccount), so it needs its own pin.
+    fn every_migrate_backend_park_message_says_what_why_and_how_to_fix_it() {
+        // The MESSAGE half. The auth wording is rebuilt rather than borrowed
+        // from the validator (which speaks about "the replication mover" and
+        // never names the second ServiceAccount), so it needs its own pin.
         let both = seed_source_auth_conflict_message(
             "Repository/offsite",
             &s3_wi("local", "kopiur-new"),
@@ -1409,18 +1569,38 @@ mod tests {
             &s3_static("local"),
             &s3_wi("source", "kopiur-old"),
         );
-        for m in [&both, &one_sided, &other_side] {
+        let same_storage =
+            seed_source_same_storage_message("Repository/offsite", &s3_static("shared"));
+        let collision = seed_mount_path_collision_message("Repository/offsite", "/repo");
+
+        for m in [&both, &one_sided, &other_side, &same_storage, &collision] {
             // WHAT is blocked, and the source it names.
             assert!(m.contains("spec.seed"), "{m}");
-            // WHY — the one-pod/one-SA fact the whole gate rests on.
-            assert!(m.contains("ONE ServiceAccount"), "{m}");
-            // ...and BOTH ways out, so neither is a dead end.
-            assert!(m.contains("auth.workloadIdentity"), "{m}");
-            assert!(m.contains("static credential Secret"), "{m}");
+            assert!(
+                m.contains("Repository/offsite") || m.contains("ClusterRepository/"),
+                "{m}"
+            );
+            // ...and HOW to fix it, concretely.
             assert!(m.contains("Fix:"), "{m}");
+            assert!(m.len() > 80, "too terse to be actionable: {m}");
             // The C1 wrapped-whitespace regression: a badly-authored Rust line
             // continuation leaves a run of spaces users read verbatim.
             assert!(!m.contains("   "), "wrapped source whitespace in: {m}");
+        }
+
+        // Auth: WHY (one pod, one SA) plus BOTH ways out, so neither is a dead
+        // end — and a namespace instruction that is true for BOTH kinds (a
+        // ClusterRepository's seeding Job does not run in "this namespace").
+        for m in [&both, &one_sided, &other_side] {
+            assert!(m.contains("ONE ServiceAccount"), "{m}");
+            assert!(m.contains("auth.workloadIdentity"), "{m}");
+            assert!(m.contains("static credential Secret"), "{m}");
+            assert!(m.contains("ClusterRepository"), "{m}");
+            assert!(
+                !m.contains("this namespace can read"),
+                "the remediation must not assume the CR's own namespace — a ClusterRepository's \
+                 bootstrap Job runs in the operator's (or its passwordSecretRef's): {m}"
+            );
         }
         // The both-federated arm must name BOTH ServiceAccounts — naming only
         // one leaves the reader guessing which side to change.
@@ -1430,12 +1610,15 @@ mod tests {
         // static partner is the problem.
         assert!(one_sided.contains("kopiur-new"), "{one_sided}");
         assert!(other_side.contains("kopiur-old"), "{other_side}");
-        // And the message is written FROM the gate row's reason at the writer,
-        // so the two cannot drift: pin the row this arm parks on.
-        assert_eq!(
-            kopiur_api::gates::SEED_SOURCE_AUTH_CONFLICT_GATE.reason,
-            kopiur_api::consts::SEED_SOURCE_AUTH_CONFLICT_REASON
-        );
+
+        // Same storage: says WHY admission let it through, so the operator does
+        // not go looking for a webhook bug.
+        assert!(same_storage.contains("BY NAME"), "{same_storage}");
+        assert!(same_storage.contains("S3"), "{same_storage}");
+        // Collision: names the path AND that changing it moves no data.
+        assert!(collision.contains("/repo"), "{collision}");
+        assert!(collision.contains("mountPath"), "{collision}");
+        assert!(collision.contains("moves no data"), "{collision}");
     }
 
     #[test]

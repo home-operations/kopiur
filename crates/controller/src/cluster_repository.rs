@@ -918,7 +918,13 @@ async fn park_cluster_on_seed_source(
     )
     .await?;
     if wrote {
-        tracing::info!(repo = %name, "spec.seed source is not usable yet; deferring the bootstrap");
+        // The reason, not a fixed sentence: this writer serves every park arm,
+        // and only some of them are about the source being unusable.
+        tracing::info!(
+            repo = %name,
+            reason = gate.reason,
+            "spec.seed cannot run yet; deferring the bootstrap"
+        );
     }
     Ok(Action::requeue(Duration::from_secs(15)))
 }
@@ -1363,8 +1369,8 @@ async fn bootstrap_cluster_via_mover(
     .await?;
     let seed = match armed {
         crate::repo_seed::SeedArming::NotArmed => None,
-        crate::repo_seed::SeedArming::Park { gate, message } => {
-            return park_cluster_on_seed_source(repo, api, name, gate, &message).await;
+        crate::repo_seed::SeedArming::Park(park) => {
+            return park_cluster_on_seed_source(repo, api, name, park.gate, &park.message).await;
         }
         crate::repo_seed::SeedArming::Armed(armed) => Some(armed),
     };

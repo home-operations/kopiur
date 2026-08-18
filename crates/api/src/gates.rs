@@ -722,7 +722,7 @@ mod tests {
         // problem is a mis-pointed seed source.
         //
         // So: every reason this build can stamp on `Seeded=False` must select
-        // exactly one row. The list is assembled from the two park/progress
+        // exactly one row. The list is assembled from the three park/progress
         // reasons plus the shared failure set, so a new reason added to
         // `consts::SEED_FAILURE_REASONS` fails here until it is registered.
         let mut reasons: Vec<&str> = vec![

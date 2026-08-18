@@ -428,7 +428,16 @@ disagree on workload identity, it **refuses to launch the seed** and parks the
 repository on `Seeded=False` with reason `SeedSourceAuthConflict`, naming both
 ServiceAccounts. It re-checks, so correcting either side clears it with no other
 action. Give both repositories the same workload-identity ServiceAccount, or give
-both sides static credentials this namespace can read.
+both sides static credentials in the namespace the bootstrap Job runs in — see
+[Where the seed source's Secret must live](#where-the-seed-sources-secret-must-live).
+
+The operator applies two more rules it cannot see at admission either: it refuses
+a `seed.from.repository` that resolves to **this repository's own storage**
+(admission's self-reference check is by CR *name*, so a second CR over one bucket
+or PVC passes it), and one whose filesystem backend shares this repository's
+in-pod `backend.filesystem.path` (one seeding pod mounts both, and two volumes
+cannot share a `mountPath`). Both park on `Seeded=False`/`WaitingForSeedSource`
+with a message naming the storage or the path.
 
 ///
 
