@@ -704,16 +704,12 @@ async fn park_on_seed_source(
     repo: &Repository,
     api: &Api<Repository>,
     name: &str,
+    gate: &kopiur_api::gates::StructuralGate,
     message: &str,
 ) -> Result<Action> {
     let fresh = api.get_opt(name).await?;
     let conditions = fresh.as_ref().map(repo_conditions).unwrap_or_default();
-    let conditions = io::upsert_gate(
-        &conditions,
-        &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
-        message,
-        repo.metadata.generation,
-    );
+    let conditions = io::upsert_gate(&conditions, gate, message, repo.metadata.generation);
     // kstatus: Reconciling, not Stalled — kopiur keeps re-checking and will seed
     // by itself the moment the source is usable, so a GitOps `wait` should hold
     // rather than fail.
@@ -721,7 +717,7 @@ async fn park_on_seed_source(
         &conditions,
         repo.metadata.generation,
         io::ReadyOutcome::Reconciling,
-        kopiur_api::consts::WAITING_FOR_SEED_SOURCE_REASON,
+        gate.reason,
         message,
     );
     let current = fresh
@@ -1288,8 +1284,8 @@ async fn bootstrap_via_mover(
     .await?;
     let seed = match armed {
         repo_seed::SeedArming::NotArmed => None,
-        repo_seed::SeedArming::Park { message } => {
-            return park_on_seed_source(repo, api, name, &message).await;
+        repo_seed::SeedArming::Park { gate, message } => {
+            return park_on_seed_source(repo, api, name, gate, &message).await;
         }
         repo_seed::SeedArming::Armed(armed) => Some(armed),
     };
@@ -1317,12 +1313,15 @@ async fn bootstrap_via_mover(
     // on either names the ServiceAccount the pod runs as, and the FIRST backend
     // that names one wins.
     //
-    // Admission's `validate_replication_auth` reuse guarantees the pair agrees
-    // for a BLOB seed only — it is called from `validate_seed_blob_source`,
-    // which sees the seed backend inline. A MIGRATE seed's source backend
-    // arrives via a repository REFERENCE that admission cannot follow, so an
-    // unagreeing pair is not rejected there and is not gated here either: the
-    // pod simply runs as this repository's identity (#380).
+    // The pair is guaranteed to AGREE by the time we get here, by two different
+    // enforcers. A BLOB seed is rejected at admission
+    // (`validate_seed_blob_source` -> `validate_replication_auth`, which sees
+    // the seed backend inline). A MIGRATE seed's source backend arrives via a
+    // repository REFERENCE that admission cannot follow, so
+    // `repo_seed::arm_migrate_seed` re-applies the same validator against the
+    // RESOLVED source and parks on `Seeded=False`/`SeedSourceAuthConflict`
+    // instead of launching — a disagreeing pair therefore never reaches this
+    // line, rather than silently running as this repository's identity (#380).
     let identity_backends: Vec<&Backend> = match seed.as_ref() {
         Some(s) => vec![backend, &s.source_backend],
         None => vec![backend],

@@ -428,6 +428,30 @@ pub const SEED_SOURCE_NOT_READY_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Warn,
 };
 
+/// A migrate-mode `spec.seed` whose LOCAL backend and resolved SOURCE
+/// repository disagree on workload identity (issue #380).
+///
+/// The blob arm of this rule is refused at admission
+/// (`validate_replication_auth`), but a `seed.from.repository` reference hides
+/// the source's backend from a spec-only validator, so the controller
+/// re-applies the same rule once it has resolved the source and parks here
+/// instead. Without the park the CR is admitted, a Job is launched, and the
+/// failure surfaces as a bare cloud auth error from whichever side the pod's
+/// single ServiceAccount is not.
+///
+/// WARN for the same reason every other `Seeded` row is: the registry pins one
+/// severity per condition+scope, and the in-flight [`SEEDING_GATE`] must not
+/// turn a diagnostic red. Nothing is lost — the message names both
+/// ServiceAccounts and the two ways out, and the repository is not `Ready`,
+/// which a diagnostic fails on independently.
+pub const SEED_SOURCE_AUTH_CONFLICT_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::Repository,
+    condition: consts::SEEDED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::SEED_SOURCE_AUTH_CONFLICT_REASON,
+    severity: GateSeverity::Warn,
+};
+
 /// A seeding bootstrap Job is in flight (issue #380): the repository is
 /// copying a whole repository across and is legitimately not `Ready` yet.
 ///
@@ -536,6 +560,7 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     POLICY_REPOSITORY_NOT_READY_GATE,
     SOURCE_PVC_MISSING_GATE,
     SEED_SOURCE_NOT_READY_GATE,
+    SEED_SOURCE_AUTH_CONFLICT_GATE,
     SEEDING_GATE,
     SEED_SOURCE_NOT_FOUND_GATE,
     SEED_SOURCE_EMPTY_GATE,
@@ -702,6 +727,7 @@ mod tests {
         // `consts::SEED_FAILURE_REASONS` fails here until it is registered.
         let mut reasons: Vec<&str> = vec![
             consts::WAITING_FOR_SEED_SOURCE_REASON,
+            consts::SEED_SOURCE_AUTH_CONFLICT_REASON,
             consts::SEEDING_REASON,
         ];
         reasons.extend_from_slice(consts::SEED_FAILURE_REASONS);
@@ -727,6 +753,7 @@ mod tests {
         {
             assert!(
                 g.reason == consts::WAITING_FOR_SEED_SOURCE_REASON
+                    || g.reason == consts::SEED_SOURCE_AUTH_CONFLICT_REASON
                     || g.reason == consts::SEEDING_REASON
                     || consts::SEED_FAILURE_REASONS.contains(&g.reason),
                 "{g:?}: registered but not a reason this build writes"
@@ -760,7 +787,19 @@ mod tests {
             let path = root.join(page);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{page} must exist and be readable: {e}"));
-            for reason in consts::SEED_FAILURE_REASONS {
+            // The mover's failure classes, PLUS the one park reason that is
+            // equally terminal-until-edited: a migrate-mode workload-identity
+            // conflict is re-checked forever and never clears by itself, so
+            // doctor prints it at someone who needs the same lookup. The two
+            // progress/park reasons that DO clear on their own
+            // (`Seeding`, `WaitingForSeedSource`) are deliberately not required
+            // here — they describe motion, not a thing to look up.
+            let documented: Vec<&str> = consts::SEED_FAILURE_REASONS
+                .iter()
+                .copied()
+                .chain(std::iter::once(consts::SEED_SOURCE_AUTH_CONFLICT_REASON))
+                .collect();
+            for reason in documented {
                 assert!(
                     text.contains(reason),
                     "{page} never mentions the `Seeded=False` reason `{reason}` — doctor will \
@@ -857,6 +896,13 @@ mod tests {
                 consts::SEEDED_CONDITION,
                 CONDITION_FALSE,
                 consts::WAITING_FOR_SEED_SOURCE_REASON,
+                GateScope::Repository,
+                GateSeverity::Warn,
+            ),
+            (
+                consts::SEEDED_CONDITION,
+                CONDITION_FALSE,
+                consts::SEED_SOURCE_AUTH_CONFLICT_REASON,
                 GateScope::Repository,
                 GateSeverity::Warn,
             ),

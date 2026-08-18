@@ -402,7 +402,9 @@ pub const MASS_DELETION_BREAKER_REASON: &str = "MassDeletionBreaker";
 /// [`SEEDED_REASON`]) or never needed seeding because it was already
 /// initialized (reason [`ALREADY_INITIALIZED_REASON`]). `False` means the seed
 /// is in flight ([`SEEDING_REASON`]), parked on a source that is not usable yet
-/// ([`WAITING_FOR_SEED_SOURCE_REASON`]), or failed (the mover's failure class).
+/// ([`WAITING_FOR_SEED_SOURCE_REASON`]) or on a workload-identity conflict
+/// between the two backends ([`SEED_SOURCE_AUTH_CONFLICT_REASON`]), or failed
+/// (the mover's failure class).
 ///
 /// Wire-visible: GitOps health checks, `kubectl kopiur status`/`doctor` and
 /// user automation read it, so it lives in `kopiur-api` beside the other
@@ -425,6 +427,18 @@ pub const SEEDING_REASON: &str = "Seeding";
 /// (or does not exist). The repository stays `Pending` and re-checks until the
 /// source comes up — an out-of-band change nothing in kopiur can make.
 pub const WAITING_FOR_SEED_SOURCE_REASON: &str = "WaitingForSeedSource";
+/// `reason` for [`SEEDED_CONDITION`] = `False` when a migrate-mode seed's
+/// LOCAL backend and its resolved SOURCE repository disagree on workload
+/// identity: one seeding pod runs as exactly one ServiceAccount, so one of the
+/// two backends would authenticate as the wrong identity (or not at all).
+///
+/// The blob arm of this rule is an admission rejection
+/// (`validate_replication_auth`, reached through `validate_seed_blob_source`),
+/// but admission cannot follow a `seed.from.repository` reference to the source
+/// CR's backend — so the migrate arm is a controller-side park instead, and it
+/// needs its own reason for `kubectl kopiur doctor` to explain rather than
+/// misreport it.
+pub const SEED_SOURCE_AUTH_CONFLICT_REASON: &str = "SeedSourceAuthConflict";
 
 // The FAILURE reasons for [`SEEDED_CONDITION`] = `False`. Each is byte-identical
 // to the sentinel `kopia_error_class` the seeding mover writes

@@ -258,6 +258,7 @@ and re-anchors the next cron slot, which is what you want mid-incident.
 | `True` / `AlreadyInitialized` | the standing no-op — the repository was already initialized, so nothing was copied |
 | `False` / `Seeding` | the copy is running |
 | `False` / `WaitingForSeedSource` | migrate mode: the source repository is missing, not `Ready`, or is a bare-path filesystem repository the mover cannot mount |
+| `False` / `SeedSourceAuthConflict` | migrate mode: this repository's backend and the resolved source's disagree on workload identity, and one pod runs as one ServiceAccount — see [One pod, one ServiceAccount](#one-pod-one-serviceaccount) |
 | `False` / `SeedSourceNotFound` | the source answered but holds no kopia repository (usually a wrong bucket **or prefix**) |
 | `False` / `SeedSourceEmpty` | the source is a kopia repository with zero snapshots and `allowEmptySource` is `false` |
 | `False` / `SeedIncomplete` | migrate post-verify found snapshots missing (kopia exits 0 even when a per-source migration fails, so the destination listing is the real success gate) |
@@ -418,15 +419,16 @@ pod's environment and the workload-identity side would silently pick them up.
 environment, so that mixed pair is safe.) This is the same rule, and the same
 validator, [`SnapshotReplication`](../snapshot-replication.md) uses.
 
-/// warning | Migrate mode is not checked
+/// note | Migrate mode is checked at reconcile, not at apply
 
 A migrate seed's source backend arrives through a **repository reference**, which
-admission cannot follow, so none of those pairings are validated — and there is no
-runtime gate either. If the source repository federates with a workload identity
-and this repository does not, the seeding pod still runs as **this** repository's
-identity and the source connect will fail with an authentication error rather than
-a rejected apply. Give both repositories the same workload-identity
-ServiceAccount, or give the source static credentials this namespace can read.
+admission cannot follow — so the *apply* is accepted. The operator applies the
+same rule itself once it has resolved the source repository: if the two backends
+disagree on workload identity, it **refuses to launch the seed** and parks the
+repository on `Seeded=False` with reason `SeedSourceAuthConflict`, naming both
+ServiceAccounts. It re-checks, so correcting either side clears it with no other
+action. Give both repositories the same workload-identity ServiceAccount, or give
+both sides static credentials this namespace can read.
 
 ///
 

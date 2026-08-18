@@ -889,21 +889,17 @@ async fn park_cluster_on_seed_source(
     repo: &ClusterRepository,
     api: &Api<ClusterRepository>,
     name: &str,
+    gate: &kopiur_api::gates::StructuralGate,
     message: &str,
 ) -> Result<Action> {
     let fresh = api.get_opt(name).await?;
     let conditions = fresh.as_ref().map(cluster_conditions).unwrap_or_default();
-    let conditions = io::upsert_gate(
-        &conditions,
-        &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
-        message,
-        repo.metadata.generation,
-    );
+    let conditions = io::upsert_gate(&conditions, gate, message, repo.metadata.generation);
     let conditions = io::set_ready(
         &conditions,
         repo.metadata.generation,
         io::ReadyOutcome::Reconciling,
-        kopiur_api::consts::WAITING_FOR_SEED_SOURCE_REASON,
+        gate.reason,
         message,
     );
     let current = fresh
@@ -1367,8 +1363,8 @@ async fn bootstrap_cluster_via_mover(
     .await?;
     let seed = match armed {
         crate::repo_seed::SeedArming::NotArmed => None,
-        crate::repo_seed::SeedArming::Park { message } => {
-            return park_cluster_on_seed_source(repo, api, name, &message).await;
+        crate::repo_seed::SeedArming::Park { gate, message } => {
+            return park_cluster_on_seed_source(repo, api, name, gate, &message).await;
         }
         crate::repo_seed::SeedArming::Armed(armed) => Some(armed),
     };

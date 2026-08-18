@@ -85,9 +85,17 @@ pub(crate) struct SeedContext<'a> {
 pub(crate) enum SeedArming {
     /// No seed is armed — build the bootstrap exactly as before #380.
     NotArmed,
-    /// The seed cannot run yet: write `Seeded=False`/`WaitingForSeedSource`
-    /// with this message and re-check. Nothing is launched.
+    /// The seed cannot run: write `Seeded=False` with `gate`'s reason and this
+    /// message, then re-check. Nothing is launched.
     Park {
+        /// The registry row the condition is written FROM, so the triple the
+        /// CLI's doctor matches and the one stamped here cannot drift. Carried
+        /// on the variant rather than fixed at the writer, because the park
+        /// arms do NOT share a reason: three of them mean "the source is not
+        /// usable yet" (`WaitingForSeedSource`), while a workload-identity
+        /// conflict between the two backends is a different problem with a
+        /// different fix.
+        gate: &'static kopiur_api::gates::StructuralGate,
         /// The actionable park message (what is missing / why / how to fix).
         message: String,
     },
@@ -455,6 +463,63 @@ pub(crate) fn bare_path_seed_source_message(source_description: &str, path: &str
     )
 }
 
+/// **Pure.** The park message for a migrate seed whose LOCAL backend and
+/// resolved SOURCE backend disagree on workload identity.
+///
+/// The VERDICT is `kopiur_api::validate::validate_replication_auth` — the same
+/// function admission runs on a blob seed, so the two arms of the rule cannot
+/// mean different things. Only the WORDING is rebuilt here: that validator
+/// speaks about "the replication mover", which is right for its own kind and
+/// confusing when a repository bootstrap prints it, and it never names the
+/// second ServiceAccount.
+fn seed_source_auth_conflict_message(
+    source_description: &str,
+    local_backend: &Backend,
+    source_backend: &Backend,
+) -> String {
+    use kopiur_api::creds::backend_workload_identity;
+    // Exhaustive over the four pairings. Only the middle three can reach here
+    // (the validator accepts a no-identity pair outright, and a both-federated
+    // pair only when the two ServiceAccounts already agree), but the fourth
+    // arm still has to say something true rather than be an `unreachable!` in
+    // a reconcile path.
+    let detail = match (
+        backend_workload_identity(local_backend),
+        backend_workload_identity(source_backend),
+    ) {
+        (Some((a, _)), Some((b, _))) => format!(
+            "this repository federates as ServiceAccount {:?} and the seed source as {:?}",
+            a.service_account_name, b.service_account_name
+        ),
+        (Some((a, _)), None) => format!(
+            "this repository federates as ServiceAccount {:?} while the seed source authenticates \
+             with a static credential Secret of the same backend kind, whose keys the pod's \
+             environment carries — the federated side's ambient credential chain would pick them \
+             up and authenticate as the wrong identity",
+            a.service_account_name
+        ),
+        (None, Some((b, _))) => format!(
+            "the seed source federates as ServiceAccount {:?} while this repository authenticates \
+             with a static credential Secret of the same backend kind, whose keys the pod's \
+             environment carries — the federated side's ambient credential chain would pick them \
+             up and authenticate as the wrong identity",
+            b.service_account_name
+        ),
+        (None, None) => {
+            "the two backends' credentials cannot both be used from one pod".to_string()
+        }
+    };
+    format!(
+        "spec.seed copies this repository's initial contents from {source_description}, but the \
+         two backends' credentials cannot share one seeding pod: {detail}. A bootstrap Job runs \
+         as exactly ONE ServiceAccount, so kopiur refuses to launch a seed that would fail \
+         part-way with a bare cloud authentication error. This repository stays Pending and \
+         re-checks. Fix: point both backends' auth.workloadIdentity at the SAME ServiceAccount \
+         (granted access to both stores), or give both sides static credential Secrets this \
+         namespace can read."
+    )
+}
+
 /// Resolve everything a seeding bootstrap Job needs, or decide to park.
 ///
 /// The IO half of the arming pass, shared by both repository kinds:
@@ -588,6 +653,7 @@ async fn arm_migrate_seed(
         Ok(s) => s,
         Err(Error::MissingDependency(_)) => {
             return Ok(SeedArming::Park {
+                gate: &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
                 message: waiting_for_seed_source_message(
                     source_description,
                     "it does not exist (yet)",
@@ -598,6 +664,7 @@ async fn arm_migrate_seed(
     };
     if !io::repository_ready_cached(ctx, rref, sctx.source_default_ns).await? {
         return Ok(SeedArming::Park {
+            gate: &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
             message: waiting_for_seed_source_message(source_description, "it is not Ready"),
         });
     }
@@ -607,7 +674,25 @@ async fn arm_migrate_seed(
         && filesystem_repo_mount_source(&source.backend).is_none()
     {
         return Ok(SeedArming::Park {
+            gate: &kopiur_api::gates::SEED_SOURCE_NOT_READY_GATE,
             message: bare_path_seed_source_message(source_description, &path),
+        });
+    }
+    // The workload-identity arm admission cannot reach either, for the same
+    // reason: `validate_replication_auth` needs BOTH backends inline, and a
+    // `seed.from.repository` reference hides the source's. One bootstrap pod
+    // runs as exactly one ServiceAccount and now touches two repositories, so
+    // re-apply the blob arm's rule here, against the resolved source, in the
+    // same argument order `validate_seed_blob_source` uses.
+    if kopiur_api::validate::validate_replication_auth(sctx.repo_backend, &source.backend).is_err()
+    {
+        return Ok(SeedArming::Park {
+            gate: &kopiur_api::gates::SEED_SOURCE_AUTH_CONFLICT_GATE,
+            message: seed_source_auth_conflict_message(
+                source_description,
+                sctx.repo_backend,
+                &source.backend,
+            ),
         });
     }
     let consumer_enabled = seed
@@ -1224,6 +1309,133 @@ mod tests {
         assert!(messages[1].contains("Fix:"), "{}", messages[1]);
         assert!(messages[2].contains("volume"), "{}", messages[2]);
         assert!(messages[2].contains("Fix:"), "{}", messages[2]);
+    }
+
+    /// An S3 backend federating as `sa`, and one with static keys, for the
+    /// migrate-mode workload-identity matrix below.
+    fn s3_wi(bucket: &str, sa: &str) -> Backend {
+        serde_json::from_value(serde_json::json!({
+            "s3": { "bucket": bucket, "auth": { "workloadIdentity": { "serviceAccountName": sa } } }
+        }))
+        .expect("backend")
+    }
+    fn s3_static(bucket: &str) -> Backend {
+        serde_json::from_value(serde_json::json!({
+            "s3": { "bucket": bucket, "auth": { "secretRef": { "name": "keys" } } }
+        }))
+        .expect("backend")
+    }
+    fn gcs_wi(bucket: &str, sa: &str) -> Backend {
+        serde_json::from_value(serde_json::json!({
+            "gcs": { "bucket": bucket, "auth": { "workloadIdentity": { "serviceAccountName": sa } } }
+        }))
+        .expect("backend")
+    }
+
+    #[test]
+    fn the_migrate_auth_gate_is_exactly_the_rule_admission_applies_to_a_blob_seed() {
+        // The VERDICT half. `arm_migrate_seed` refuses on
+        // `validate_replication_auth(local, source).is_err()` and nothing else,
+        // so this matrix IS the gate's behaviour — the async arm only wraps it.
+        // Same argument order `validate_seed_blob_source` uses (local repo
+        // backend first), which matters for the one-sided arms.
+        use kopiur_api::validate::validate_replication_auth;
+        let cases: &[(&str, Backend, Backend, bool)] = &[
+            (
+                "no workload identity on either side",
+                s3_static("local"),
+                s3_static("source"),
+                true,
+            ),
+            (
+                "both federate as the SAME ServiceAccount",
+                s3_wi("local", "kopiur-dr"),
+                s3_wi("source", "kopiur-dr"),
+                true,
+            ),
+            (
+                "both federate as DIFFERENT ServiceAccounts",
+                s3_wi("local", "kopiur-new"),
+                s3_wi("source", "kopiur-old"),
+                false,
+            ),
+            (
+                "local federates, same-kind source is static",
+                s3_wi("local", "kopiur-dr"),
+                s3_static("source"),
+                false,
+            ),
+            (
+                "source federates, same-kind local is static",
+                s3_static("local"),
+                s3_wi("source", "kopiur-dr"),
+                false,
+            ),
+            (
+                // A GCS static key travels as a --credentials-file path, never
+                // ambient env, so it cannot be picked up by the federated side.
+                "GCS federation beside a static S3 side is safe",
+                gcs_wi("local", "kopiur-dr"),
+                s3_static("source"),
+                true,
+            ),
+        ];
+        for (what, local, source, allowed) in cases {
+            assert_eq!(
+                validate_replication_auth(local, source).is_ok(),
+                *allowed,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_migrate_auth_conflict_message_names_both_identities_and_the_two_fixes() {
+        // The MESSAGE half. The wording is rebuilt rather than borrowed from
+        // the validator (which speaks about "the replication mover" and never
+        // names the second ServiceAccount), so it needs its own pin.
+        let both = seed_source_auth_conflict_message(
+            "Repository/offsite",
+            &s3_wi("local", "kopiur-new"),
+            &s3_wi("source", "kopiur-old"),
+        );
+        let one_sided = seed_source_auth_conflict_message(
+            "ClusterRepository/archive",
+            &s3_wi("local", "kopiur-new"),
+            &s3_static("source"),
+        );
+        let other_side = seed_source_auth_conflict_message(
+            "Repository/offsite",
+            &s3_static("local"),
+            &s3_wi("source", "kopiur-old"),
+        );
+        for m in [&both, &one_sided, &other_side] {
+            // WHAT is blocked, and the source it names.
+            assert!(m.contains("spec.seed"), "{m}");
+            // WHY — the one-pod/one-SA fact the whole gate rests on.
+            assert!(m.contains("ONE ServiceAccount"), "{m}");
+            // ...and BOTH ways out, so neither is a dead end.
+            assert!(m.contains("auth.workloadIdentity"), "{m}");
+            assert!(m.contains("static credential Secret"), "{m}");
+            assert!(m.contains("Fix:"), "{m}");
+            // The C1 wrapped-whitespace regression: a badly-authored Rust line
+            // continuation leaves a run of spaces users read verbatim.
+            assert!(!m.contains("   "), "wrapped source whitespace in: {m}");
+        }
+        // The both-federated arm must name BOTH ServiceAccounts — naming only
+        // one leaves the reader guessing which side to change.
+        assert!(both.contains("kopiur-new"), "{both}");
+        assert!(both.contains("kopiur-old"), "{both}");
+        // The one-sided arms name the federated side and say why a same-kind
+        // static partner is the problem.
+        assert!(one_sided.contains("kopiur-new"), "{one_sided}");
+        assert!(other_side.contains("kopiur-old"), "{other_side}");
+        // And the message is written FROM the gate row's reason at the writer,
+        // so the two cannot drift: pin the row this arm parks on.
+        assert_eq!(
+            kopiur_api::gates::SEED_SOURCE_AUTH_CONFLICT_GATE.reason,
+            kopiur_api::consts::SEED_SOURCE_AUTH_CONFLICT_REASON
+        );
     }
 
     #[test]

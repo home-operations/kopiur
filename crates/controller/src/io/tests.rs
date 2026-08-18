@@ -3471,6 +3471,18 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         "repository::park_on_seed_source + cluster_repository::park_cluster_on_seed_source \
          (upsert_gate)",
     ),
+    // The SAME two park writers, reached with the OTHER park gate: a
+    // migrate-mode seed whose local and source backends disagree on workload
+    // identity (`repo_seed::arm_migrate_seed`'s `validate_replication_auth`
+    // arm). The gate row rides `SeedArming::Park`, so the reason is chosen
+    // where the problem is diagnosed, not at the writer.
+    (
+        kopiur_api::consts::SEEDED_CONDITION,
+        false,
+        kopiur_api::consts::SEED_SOURCE_AUTH_CONFLICT_REASON,
+        "repository::park_on_seed_source + cluster_repository::park_cluster_on_seed_source, \
+         armed by repo_seed::arm_migrate_seed (upsert_gate)",
+    ),
     // `repository::write_seeding_condition` +
     // `cluster_repository::write_cluster_seeding_condition`, both via
     // io::upsert_gate(&SEEDING_GATE, ...) while the seeding Job is in flight;
