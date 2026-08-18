@@ -305,8 +305,10 @@ pub struct SeedStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_count: Option<i64>,
     /// Snapshots actually copied into this repository. Migrate mode only — a
-    /// blob copy moves storage, not manifests, so it leaves this unset and
-    /// reports `snapshotCount` from the post-seed catalog listing instead.
+    /// blob copy moves storage, not manifests, so there is no per-snapshot copy
+    /// count to report and it leaves this unset; its `snapshotCount` is the
+    /// listing taken at the SOURCE before the copy, which for a byte-for-byte
+    /// mirror is also what this repository ends up holding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots_copied: Option<i64>,
 }

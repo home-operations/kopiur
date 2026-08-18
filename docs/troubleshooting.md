@@ -92,6 +92,12 @@ Two more that look like seed failures but are not:
 - **`Failed` with an auth error against the seed source** — kopiur never seeds (or
   creates) over a backend it could not authenticate to. Fix the source's
   credentials.
+- **The apply is rejected naming `spec.seed.from.repository`** — a namespaced
+  `Repository` seeding from a `ClusterRepository` is a consumer of it, so the
+  source's `allowedNamespaces` must admit this namespace (fail-closed: the
+  operator denies rather than guesses if it cannot resolve the gate). Add the
+  namespace to the source `ClusterRepository`'s
+  [`allowedNamespaces`](repositories.md#allowednamespaces--who-may-use-it-clusterrepository-only).
 - **The seeding Job never starts, or dies on `CreateContainerConfigError`** — the
   seed source's credential Secret is not in the namespace the bootstrap Job runs
   in, or (migrate mode, cross-namespace) `seed.credentialProjection.enabled` is

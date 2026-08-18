@@ -219,6 +219,14 @@ kopiur creates the local one itself. The source is opened read-only and gated on
 being `Ready` — until then the repository parks visibly (`Seeded=False`, reason
 `WaitingForSeedSource`) and re-checks every 15 s.
 
+Seeding from a **`ClusterRepository`** makes this repository a *consumer* of it,
+so the source's [`allowedNamespaces`](#allowednamespaces--who-may-use-it-clusterrepository-only)
+must admit this `Repository`'s namespace — the same fail-closed tenancy gate every
+other consumer reference goes through. The webhook rejects the apply naming
+`spec.seed.from.repository` if it does not. (A `ClusterRepository` seeding from
+another `ClusterRepository` is not gated: a cluster-scoped author has no consumer
+namespace to check.)
+
 Both modes preserve each snapshot's `username@hostname:path` identity and its
 times, so seeded history stays restorable by `Restore.source.identity` and by
 `fromPolicy`.

@@ -45,7 +45,7 @@ newest snapshot. The recovery looks green the whole way through.
 
 Seeding inside the first bootstrap removes the window: the repository does not
 go `Ready` until the copy has landed, and if the copy cannot complete the
-repository stays `Pending`/`Degraded` with an actionable reason instead. A seed
+repository stays `Initializing`/`Degraded` with an actionable reason instead. A seed
 that copies **nothing** is refused outright (`allowEmptySource` is the one
 explicit override).
 
@@ -69,22 +69,29 @@ flowchart LR
   M -.->|seed: kopia repository sync-to| S
 ```
 
-The full bundle — the original cluster's primary and mirror, then **both** seed
-variants and the app's recovery on the rebuilt cluster:
-
-```yaml
---8<-- "deploy/examples/scenarios/10-dr-seed-from-replica.yaml"
-```
+Every manifest below is pulled from one apply-ready bundle,
+[`deploy/examples/scenarios/10-dr-seed-from-replica.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/scenarios/10-dr-seed-from-replica.yaml)
+— copy it whole, fill in the `REPLACE_ME` values, and apply the half that belongs
+on the cluster you are standing in front of.
 
 /// warning | Two clusters, one file
 
 The `primary` + `mirror` documents belong on the **original** cluster; the seed
-variants and the populator restore belong on the **rebuilt** one. Pick exactly
+variants and the app's recovery belong on the **rebuilt** one. Pick exactly
 **one** seed variant — they are two spellings of the same recovery. The rebuilt
 `Repository` deliberately reuses the original's name and namespace; that is what
 lets the recovered policies resolve their own old snapshots.
 
 ///
+
+### What the original cluster had
+
+The prerequisite, and the whole reason this scenario is possible — an ordinary
+`Repository` with nothing special about it:
+
+```yaml
+--8<-- "deploy/examples/scenarios/10-dr-seed-from-replica.yaml:primary"
+```
 
 ## The two modes
 
@@ -124,8 +131,14 @@ formats and passwords.
   `create.{splitter,hash,encryption,ecc}` — you get a genuinely new repository
   with a password of your choosing.
 - The source is resolved as a CR and gated on it being `Ready`; until then the
-  repository parks visibly (`Seeded=False`, reason `WaitingForSeedSource`) and
-  re-checks every 15 s.
+  repository parks visibly (`Seeded=False`, reason `WaitingForSeedSource`, phase
+  `Pending`) and re-checks every 15 s.
+- Seeding from a **`ClusterRepository`** makes this repository a *consumer* of
+  it, so the source's `allowedNamespaces` must admit this namespace — the same
+  fail-closed gate every other consumer reference goes through, and the webhook
+  rejects the apply naming `spec.seed.from.repository` if it does not. The
+  bundle's `ClusterRepository/offsite-archive` is assumed to exist already: it is
+  the surviving replica.
 - **Needs `features.credentialProjection.enabled`** whenever the source
   repository's Secrets are not readable from the seeding Job's namespace — see
   [the prerequisite below](#prerequisite-credential-projection-for-migrate-mode).
@@ -135,10 +148,26 @@ Either way, `kopia snapshot migrate` **preserves each snapshot's
 restorable by `Restore.source.identity` and by `fromPolicy`. That is what lets a
 rebuilt cluster's policies find their own old snapshots.
 
+## The rest of the recovery bundle
+
+The seeded repository is only half of it. The other half is what the rebuilt
+cluster runs on top: the policy that reclaims the recovered history, the passive
+populator `Restore`, and the PVC that consumes it.
+
+```yaml
+--8<-- "deploy/examples/scenarios/10-dr-seed-from-replica.yaml:app-recovery"
+```
+
 ## Before you start: kick a final mirror sync
 
-The mirror is only as current as its last replication run. If the primary is
-still reachable at all, force one more sync before you seed:
+The mirror is only as current as its last replication run — this is the
+`RepositoryReplication` that has been writing it:
+
+```yaml
+--8<-- "deploy/examples/scenarios/10-dr-seed-from-replica.yaml:mirror"
+```
+
+If the primary is still reachable at all, force one more sync before you seed:
 
 ```console
 $ kubectl kopiur replication run nas-primary-offsite -n billing --wait
@@ -164,19 +193,23 @@ and re-anchors the next cron slot, which is what you want mid-incident.
 
     ```console
     $ kubectl get repository nas-primary -n billing
-    NAME          PHASE     BACKEND   AGE
-    nas-primary   Pending   S3        4m
+    NAME          PHASE          BACKEND   AGE
+    nas-primary   Initializing   S3        4m
 
     $ kubectl describe repository nas-primary -n billing | grep -A3 Seeded
       Type:     Seeded
       Status:   False
       Reason:   Seeding
-      Message:  copying this repository's initial contents from S3; the repository stays
-                Pending until the copy finishes...
+      Message:  copying this repository's initial contents from S3; it does not become
+                Ready until the copy finishes (phase Initializing, or Degraded while
+                an earlier attempt is being retried)...
     ```
 
-    A first seed transfers the whole repository, so hours is normal. The seeding
-    Job's own logs are the progress view:
+    A first seed transfers the whole repository, so hours is normal. The phase is
+    `Initializing` while the copy runs — it flips to `Degraded` if an attempt
+    fails and is being retried, and `Pending` is the *park*, meaning a migrate
+    seed's source is not usable yet. The seeding Job's own logs are the progress
+    view:
 
     ```console
     $ kubectl logs -n billing job/nas-primary-discovery -f
@@ -371,15 +404,31 @@ in**:
 ### One pod, one ServiceAccount
 
 A seeding bootstrap resolves its run identity against **both** backends, but a pod
-runs as exactly one ServiceAccount: the first backend that names a workload
-identity wins. A both-workload-identity pair must therefore name the **same**
-ServiceAccount, and a *same-kind* pair (S3+S3, Azure+Azure) may not mix
-`workloadIdentity` on one side with a static credential Secret on the other —
-the static side's keys are on the pod's environment and the workload-identity
-side would silently pick them up. Both are rejected at admission. (A GCS static
-key travels as a `--credentials-file` path rather than ambient environment, so
-that mixed pair is safe.) This is the same limitation
-[`SnapshotReplication`](../snapshot-replication.md) has, for the same reason.
+runs as exactly one ServiceAccount: **the first backend that names a workload
+identity wins** — and here that is this repository's own backend, not the seed
+source's.
+
+In **blob mode** admission catches the pairings that would misauthenticate,
+because the seed backend is written inline where the validator can see it: a
+both-workload-identity pair must name the **same** ServiceAccount, and a
+*same-kind* pair (S3+S3, Azure+Azure) may not mix `workloadIdentity` on one side
+with a static credential Secret on the other — the static side's keys sit on the
+pod's environment and the workload-identity side would silently pick them up.
+(A GCS static key travels as a `--credentials-file` path rather than ambient
+environment, so that mixed pair is safe.) This is the same rule, and the same
+validator, [`SnapshotReplication`](../snapshot-replication.md) uses.
+
+/// warning | Migrate mode is not checked
+
+A migrate seed's source backend arrives through a **repository reference**, which
+admission cannot follow, so none of those pairings are validated — and there is no
+runtime gate either. If the source repository federates with a workload identity
+and this repository does not, the seeding pod still runs as **this** repository's
+identity and the source connect will fail with an authentication error rather than
+a rejected apply. Give both repositories the same workload-identity
+ServiceAccount, or give the source static credentials this namespace can read.
+
+///
 
 The rejection message is the shared replication one, so it says *"the replication
 mover's environment carries the static side's keys"* — it means the seeding mover;

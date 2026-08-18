@@ -1314,8 +1314,15 @@ async fn bootstrap_via_mover(
     // the user's workload-identity SA (preflighted + bound to the mover role),
     // or the minted mover SA + RoleBinding (ADR §4.12). A SEEDING bootstrap
     // touches TWO backends in one pod, so both are offered: a workload identity
-    // on either names the ServiceAccount the pod runs as (admission's
-    // `validate_replication_auth` reuse guarantees the pair agrees).
+    // on either names the ServiceAccount the pod runs as, and the FIRST backend
+    // that names one wins.
+    //
+    // Admission's `validate_replication_auth` reuse guarantees the pair agrees
+    // for a BLOB seed only — it is called from `validate_seed_blob_source`,
+    // which sees the seed backend inline. A MIGRATE seed's source backend
+    // arrives via a repository REFERENCE that admission cannot follow, so an
+    // unagreeing pair is not rejected there and is not gated here either: the
+    // pod simply runs as this repository's identity (#380).
     let identity_backends: Vec<&Backend> = match seed.as_ref() {
         Some(s) => vec![backend, &s.source_backend],
         None => vec![backend],

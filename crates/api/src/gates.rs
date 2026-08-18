@@ -734,6 +734,42 @@ mod tests {
         }
     }
 
+    /// Every `Seeded=False` failure reason must be EXPLAINED in the docs, not
+    /// just registered (#380).
+    ///
+    /// The registry above guarantees `kubectl kopiur doctor` recognizes a
+    /// reason; it says nothing about whether a human who reads it can find out
+    /// what to do. These reasons surface in exactly one situation — a disaster
+    /// recovery that is not going well — so an unexplained one is worse here
+    /// than almost anywhere else in kopiur. The two pages are the two places
+    /// someone actually looks: the troubleshooting table (symptom → fix) and the
+    /// DR scenario (the reason table plus the retry/terminal contract).
+    ///
+    /// A reason added to `consts::SEED_FAILURE_REASONS` fails here until both
+    /// pages mention it by name.
+    #[test]
+    fn every_seed_failure_reason_is_documented_on_both_user_facing_pages() {
+        // CARGO_MANIFEST_DIR = crates/api; the docs tree is at the repo root.
+        // Same relative-path approach `crates/api/tests/examples_match_crd_shapes.rs`
+        // uses to reach `deploy/examples`.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for page in [
+            "docs/troubleshooting.md",
+            "docs/scenarios/dr-with-replicated-repository.md",
+        ] {
+            let path = root.join(page);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{page} must exist and be readable: {e}"));
+            for reason in consts::SEED_FAILURE_REASONS {
+                assert!(
+                    text.contains(reason),
+                    "{page} never mentions the `Seeded=False` reason `{reason}` — doctor will \
+                     print it at a user who then has nowhere to look it up"
+                );
+            }
+        }
+    }
+
     #[test]
     fn expected_gates_are_registered_with_expected_scope_and_severity() {
         // Pins the exact contract M3's doctor consumes. A row removed, or its

@@ -83,6 +83,12 @@ spec:
       # The surviving replica, as a repository CR. `kind` defaults to
       # `Repository`; a ClusterRepository is the usual DR source. A namespaced
       # `kind: Repository` with no `namespace` resolves in THIS CR's namespace.
+      #
+      # `ClusterRepository/offsite-archive` is ASSUMED PRE-EXISTING — it is the
+      # surviving replica, not something this bundle creates. Seeding from it
+      # makes this Repository a CONSUMER of it, so its `allowedNamespaces` must
+      # admit THIS namespace (`billing`); the webhook otherwise rejects the apply
+      # naming spec.seed.from.repository.
       repository:
         kind: ClusterRepository
         name: offsite-archive

@@ -19,7 +19,8 @@
 #
 #   * `primary` + `mirror`  → the ORIGINAL cluster, before the disaster. This is
 #     the prerequisite: without a replica there is nothing to seed from.
-#   * `seed-blob` OR `seed-migrate` (pick ONE) + `populator-restore`
+#   * `seed-blob` OR `seed-migrate` (pick ONE) + `app-recovery` (the policy,
+#     the populator Restore and its PVC)
 #     → the REBUILT cluster. The rebuilt Repository deliberately reuses the same
 #     name and namespace as the original — that is what a real recovery looks
 #     like, and it is what lets `fromPolicy` resolve the old snapshots.
@@ -210,6 +211,10 @@ spec:
     enabled: true
   seed:
     from:
+      # ASSUMED PRE-EXISTING: the surviving replica, not something this bundle
+      # creates. Seeding from a ClusterRepository makes this Repository a
+      # CONSUMER of it, so its `allowedNamespaces` must admit `billing` — the
+      # webhook otherwise rejects the apply naming spec.seed.from.repository.
       repository:
         kind: ClusterRepository
         name: offsite-archive
@@ -232,7 +237,7 @@ spec:
 # REBUILT CLUSTER — the app comes back on top of the seeded repository
 # ============================================================================
 ---
-# --8<-- [start:populator-restore]
+# --8<-- [start:app-recovery]
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -297,4 +302,4 @@ spec:
     apiGroup: kopiur.home-operations.com
     kind: Restore
     name: postgres-data-restore
-# --8<-- [end:populator-restore]
+# --8<-- [end:app-recovery]

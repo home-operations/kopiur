@@ -100,15 +100,43 @@ to, stop and make it a file under `deploy/examples/` instead. (Short inline
   — see [[kopiur-design]]. Apply-ready and self-contained (Secret + CRs in one
   file) so `kubectl apply -f` just works after filling in `REPLACE_ME`.
 
-### Adding an example is a three-touch change
+### Adding an example: which of the two homes it belongs to
+
+There are **two** conventions, and the number tells you which:
+
+**01–20 — the `docs/examples.md` ladder.** A three-touch change:
 
 1. Create `deploy/examples/NN-name.yaml`.
 2. Add a `## Example NN — …` section in `docs/examples.md` with the
    `--8<-- "deploy/examples/NN-name.yaml"` snippet inside a `yaml` fence.
 3. Add a row to the table at the top of `docs/examples.md`.
 
+**21+ — capability-page inclusion.** The ladder is a *tutorial* sequence and
+stops at 20 deliberately; everything after it is a per-capability example that
+belongs beside the prose explaining that capability, not at the end of a
+tutorial. So a two-touch change:
+
+1. Create `deploy/examples/NN-name.yaml`, usually with
+   `# --8<-- [start:…]` / `[end:…]` section markers so the page can pull just
+   the CR that teaches the point.
+2. Snippet-include it from the capability page that documents the field
+   (`docs/replication.md` for 19's replication CR, `docs/repositories.md` for
+   the `spec.seed` examples, `docs/backends/s3.md` for 38, …).
+
+   **Do not** add a `docs/examples.md` row/section for a 21+ example — that is
+   how the same manifest ends up documented twice and the two copies drift.
+
+Either way the file must be reachable from *some* page: an example nothing
+includes is an orphan, and nothing in the build catches it.
+
+**Scenario bundles** are a third home: `deploy/examples/scenarios/NN-name.yaml`,
+one per `docs/scenarios/*.md` page, pulled by that page (whole-file or by
+section) and listed in the scenarios index table. They are typed-checked by
+`crates/api/tests/examples_match_crd_shapes.rs` like everything else.
+
 A new top-level **page** (not an example) also needs an entry in the `nav:` of
-`mkdocs.yml`, or it builds unlinked (and `--strict` warns).
+`mkdocs.yml`, or it builds unlinked (and `--strict` warns). A new **scenario**
+page additionally needs its row in `docs/scenarios/index.md`.
 
 ## Docs change in the same PR as the behavior
 
@@ -147,8 +175,10 @@ manifest that wouldn't survive admission is wrong even if the site builds.
 ## Common mistakes
 
 - Pasting YAML inline in a `.md` instead of snippet-including a file → drift.
-- Adding `deploy/examples/NN.yaml` but forgetting the table row or the section
-  (or vice-versa) → orphaned file or dead reference.
+- Adding a **01–20** ladder example but forgetting the `docs/examples.md` table
+  row or the section (or vice-versa) → orphaned file or dead reference.
+- Adding a **21+** example to the `docs/examples.md` ladder as well as its
+  capability page → the same manifest documented twice, and the copies drift.
 - New page not added to the `nav:` in `mkdocs.yml` → builds unlinked.
 - Writing an admonition in the classic `!!! note` form (4-space-indented body)
   instead of the `/// note | Title` … `///` blocks form → the title renders as

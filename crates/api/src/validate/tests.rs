@@ -6485,6 +6485,12 @@ fn a_cluster_repository_seed_secret_must_not_pin_a_namespace() {
     let msg = e.to_string();
     assert!(msg.contains("\"elsewhere\""), "{msg}");
     assert!(msg.contains("operator's own"), "{msg}");
+    // The fix text must name the field that actually decides the namespace: the
+    // bootstrap Job runs where `encryption.passwordSecretRef` resolves, which is
+    // the operator's namespace ONLY when that ref pins none. Telling the user
+    // "put it in the operator namespace" is the wrong instruction for a
+    // ClusterRepository that pins one (#380).
+    assert!(msg.contains("encryption.passwordSecretRef"), "{msg}");
 
     // The namespaced arm is the OPPOSITE rule and must not fire here.
     assert!(

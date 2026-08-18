@@ -291,8 +291,9 @@ pub(crate) struct SeedSuccess {
 /// `snapshotCount`/`snapshotsCopied` are mirrored verbatim rather than
 /// recomputed: the outcome's counts are what the seed actually observed, and
 /// `snapshotsCopied` is migrate-only by construction (a blob copy moves
-/// storage, not manifests, so the post-seed catalog listing reports its
-/// snapshot count on `status.storageStats` instead).
+/// storage, not manifests, so there is no per-snapshot copy count; its
+/// `snapshotCount` is the SOURCE listing the mover took before the copy, which
+/// for a byte-for-byte mirror is also what this repository ends up holding).
 pub(crate) fn seed_success_fold(outcome: &SeedOutcome, now: &str) -> SeedSuccess {
     let mode = seed_mode_of(outcome);
     let mut status = serde_json::json!({
@@ -412,9 +413,10 @@ pub(crate) fn seed_mode_of(outcome: &SeedOutcome) -> SeedMode {
 /// written while a seeding bootstrap Job is in flight.
 pub(crate) fn seeding_message(source_description: &str, deadline_secs: i64) -> String {
     format!(
-        "copying this repository's initial contents from {source_description}; the repository \
-         stays Pending until the copy finishes. A first seed transfers the whole repository, so \
-         this legitimately runs for a long time — the seeding Job's deadline is {deadline_secs}s \
+        "copying this repository's initial contents from {source_description}; it does not \
+         become Ready until the copy finishes (phase Initializing, or Degraded while an earlier \
+         attempt is being retried). A first seed transfers the whole repository, so this \
+         legitimately runs for a long time — the seeding Job's deadline is {deadline_secs}s \
          (spec.seed.failurePolicy.activeDeadlineSeconds). Watch the bootstrap Job's pod logs for \
          progress."
     )
@@ -1205,7 +1207,20 @@ mod tests {
             "{}",
             messages[0]
         );
+        // The PROGRESS message must name the phase the launch patch actually
+        // writes — `health::launch_phase` yields `Initializing` (or keeps
+        // `Degraded` while an earlier attempt is retried), never `Pending`.
+        // `Pending` belongs to the PARK, which is the one arm that returns
+        // before the launch patch, and its own message says so.
+        assert!(messages[0].contains("Initializing"), "{}", messages[0]);
+        assert!(
+            !messages[0].contains("Pending"),
+            "the seeding progress message must not claim a phase the launch \
+             patch never writes: {}",
+            messages[0]
+        );
         assert!(messages[1].contains("not Ready"), "{}", messages[1]);
+        assert!(messages[1].contains("Pending"), "{}", messages[1]);
         assert!(messages[1].contains("Fix:"), "{}", messages[1]);
         assert!(messages[2].contains("volume"), "{}", messages[2]);
         assert!(messages[2].contains("Fix:"), "{}", messages[2]);

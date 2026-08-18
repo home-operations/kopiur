@@ -84,10 +84,15 @@ resolution rules:
 - A migrate seed's `from.repository` with no `namespace` resolves in the
   operator's namespace — the same rule every other cluster-scoped reference
   follows. Set it explicitly whenever the source lives anywhere else.
-- A `ClusterRepository` with an armed seed holds its cleanup finalizer until the
-  bootstrap completes, so that deleting the CR mid-seed can stop the in-flight
-  seeding Job (a namespaced Job cannot carry a cluster-scoped ownerReference, so
-  nothing else would).
+- An armed seed makes the CR hold its cleanup finalizer, so that a deletion
+  reconcile runs at all. That reconcile then deletes the in-flight
+  `<name>-discovery` Job **best-effort** — it does not block or retry, and a
+  deletion is never wedged on the cleanup: a Job that already finished is an
+  ordinary miss, a failed delete is logged as a warning, and if the Job's
+  namespace cannot be resolved at all the operator warns and tells you to delete
+  the Job by hand. This exists because a namespaced Job cannot carry a
+  cluster-scoped ownerReference, so nothing else would ever reap a 24 h seeding
+  Job whose CR is gone.
 
 ### `credentialProjection`
 
