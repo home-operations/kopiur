@@ -184,7 +184,11 @@ let `kubeconform` validate kopiur CRs without a cluster, and make
 The admission webhook is scoped to kopiur kinds only, so a `failurePolicy: Fail`
 outage never wedges unrelated GitOps applies. **CRD applies bypass the webhook**, so
 a CRD-only sync-wave/`dependsOn` still bootstraps even during operator downtime —
-apply CRDs in an early wave so a CR never races ahead of its CRD.
+apply CRDs in an early wave so a CR never races ahead of its CRD. Two of the CRDs
+(`Repository`, `ClusterRepository`) now exceed the 256 KB `kubectl.kubernetes.io/last-applied-configuration`
+annotation cap for client-side apply, so Argo CD applications managing the CRDs
+need `syncOptions: [ServerSideApply=true]` (Flux's `kustomize-controller` already
+applies server-side by default).
 
 ## The populator cutover caveat
 
