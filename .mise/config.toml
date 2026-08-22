@@ -48,14 +48,14 @@ kopia = "v0.23.1"
 "aqua:astral-sh/uv" = "0.12.5"
 helm-docs = "1.14.2"
 "aqua:dadav/helm-schema" = "0.23.4"
-yq = "4.53.3"
+yq = "4.53.4"
 # `promtool` (the Prometheus rule/query test runner) ships inside the
 # `prometheus/prometheus` aqua package; mise's `promtool` short-name maps to it
 # (`mise registry promtool` → aqua:prometheus/prometheus) and exposes the
 # promtool binary. Used by `scripts/test-alert-rules.sh` (wired into helm-test)
 # to drive the bundled PrometheusRule through `promtool test rules` — the only
 # tier that pins alert BEHAVIOR (issue #280), not just the rendered text.
-promtool = "3.13.2"
+promtool = "3.14.0"
 
 [env]
 CARGO_TERM_COLOR = "always"
