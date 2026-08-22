@@ -55,7 +55,7 @@ yq = "4.53.3"
 # promtool binary. Used by `scripts/test-alert-rules.sh` (wired into helm-test)
 # to drive the bundled PrometheusRule through `promtool test rules` — the only
 # tier that pins alert BEHAVIOR (issue #280), not just the rendered text.
-promtool = "3.13.2"
+promtool = "3.14.0"
 
 [env]
 CARGO_TERM_COLOR = "always"
