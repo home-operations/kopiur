@@ -219,20 +219,20 @@ url = "https://github.com/kopia/kopia/releases/download/v0.23.1/kopia-0.23.1-mac
 url_api = "https://api.github.com/repos/kopia/kopia/releases/assets/448730947"
 
 [[tools.kubectl]]
-version = "1.36.3"
+version = "1.36.4"
 backend = "aqua:kubernetes/kubernetes/kubectl"
 
 [tools.kubectl."platforms.linux-arm64"]
-checksum = "sha256:3d86f24401c41ae5a46ac50eef8865fe891d3647d324a0836f6c63757a126e62"
-url = "https://dl.k8s.io/v1.36.3/bin/linux/arm64/kubectl"
+checksum = "sha256:0ecf44450ee6063bf19dd166a103ee6df4a9034455c2abce626e6eea657d73fb"
+url = "https://dl.k8s.io/v1.36.4/bin/linux/arm64/kubectl"
 
 [tools.kubectl."platforms.linux-x64"]
-checksum = "sha256:ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336"
-url = "https://dl.k8s.io/v1.36.3/bin/linux/amd64/kubectl"
+checksum = "sha256:8b8f088da2dab964f853b38464033b1be15ede2839eca751482357c45abdd05a"
+url = "https://dl.k8s.io/v1.36.4/bin/linux/amd64/kubectl"
 
 [tools.kubectl."platforms.macos-arm64"]
-checksum = "sha256:fc8582acde13869a606730a79379d6515f30c68afcced0b5ac8789d5d002b7d6"
-url = "https://dl.k8s.io/v1.36.3/bin/darwin/arm64/kubectl"
+checksum = "sha256:c9e4f713d6fee0043a3d835cca13077cda2bc0973840eb9779360df0b5bdfc69"
+url = "https://dl.k8s.io/v1.36.4/bin/darwin/arm64/kubectl"
 
 [[tools.lefthook]]
 version = "2.1.10"
