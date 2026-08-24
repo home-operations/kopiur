@@ -27,6 +27,13 @@ clap = { workspace = true }
 [dev-dependencies]
 serial_test = { workspace = true }
 tempfile = "3"
+# Mock kube client for the KubeStatusReporter tests (`tower::service_fn` needs
+# the `util` feature — the workspace `tower` is default-features, and relying on
+# feature unification with kube-client would make `cargo test -p kopiur-mover`
+# fragile on its own).
+tower = { workspace = true, features = ["util"] }
+http = "1"
+http-body-util = "0.1"
 
 [features]
 integration = []

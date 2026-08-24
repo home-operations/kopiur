@@ -168,6 +168,7 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }
             | MoverError::StatusPatch { .. }
+            | MoverError::StatusRead { .. }
             | MoverError::ResultSerialize { .. }
             | MoverError::ResultConfigMapPatch { .. }
             | MoverError::Telemetry(_)
@@ -867,7 +868,10 @@ impl StatusReporter {
     /// Read the target's currently-pinned `status.resolved`, if any. Used by the
     /// in-Job restore resolver to reuse a snapshot a PRIOR pod attempt already
     /// pinned (deterministic across Job retries) instead of re-resolving "latest".
-    /// Best-effort: returns `None` when there's no client or the read fails.
+    /// The read goes through the `/status` subresource, the one resource the
+    /// least-privilege mover role grants `get` on (#401 — a base-object GET is
+    /// Forbidden under that role). Best-effort: returns `None` when there's no
+    /// client or the read fails.
     pub async fn resolved(&self) -> Option<ResolvedRestore> {
         let r = self.inner.as_ref()?;
         let guard = r.lock().await;
@@ -915,25 +919,42 @@ impl KubeStatusReporter {
     /// Build the dynamic-API reporter for `target`, erroring when no kube
     /// client can be constructed.
     pub async fn try_new(target: &workspec::TargetRef) -> Result<Self> {
-        use kube::core::{ApiResource, GroupVersionKind};
-
         let client =
             kube::Client::try_default()
                 .await
                 .map_err(|source| MoverError::KubeClient {
                     source: Box::new(source),
                 })?;
+        Ok(Self::from_client(client, target))
+    }
+
+    /// Build the reporter around an existing client. The seam the unit tests
+    /// inject a mock service through ([`kube::Client::new`]); production goes
+    /// via [`Self::try_new`].
+    fn from_client(client: kube::Client, target: &workspec::TargetRef) -> Self {
+        use kube::core::{ApiResource, GroupVersionKind};
+
         let (group, version) = split_api_version(&target.api_version);
         let gvk = GroupVersionKind::gvk(&group, &version, &target.kind);
         let ar = ApiResource::from_gvk(&gvk);
-        let api =
-            kube::Api::<kube::api::DynamicObject>::namespaced_with(client, &target.namespace, &ar);
-        Ok(KubeStatusReporter {
+        // ClusterRepository is the one cluster-scoped mover target kind: a
+        // namespaced API would build `/namespaces/<ns>/clusterrepositories/...`,
+        // a path that does not exist, so every status call would 404 into the
+        // best-effort warn. No operation reaches this today (the only
+        // ClusterRepository targetRef is the bootstrap work-spec, and the
+        // bootstrap flow reports via its result ConfigMap, never a
+        // StatusReporter) — this keeps the trap from going live with a future op.
+        let api = if target.kind == "ClusterRepository" {
+            kube::Api::<kube::api::DynamicObject>::all_with(client, &ar)
+        } else {
+            kube::Api::<kube::api::DynamicObject>::namespaced_with(client, &target.namespace, &ar)
+        };
+        KubeStatusReporter {
             api,
             kind: target.kind.clone(),
             namespace: target.namespace.clone(),
             name: target.name.clone(),
-        })
+        }
     }
 
     /// PATCH the update's `.status` merge body onto the target object.
@@ -952,18 +973,32 @@ impl KubeStatusReporter {
         Ok(())
     }
 
-    /// GET the target and deserialize its `status.resolved`, if present.
+    /// GET the target THROUGH THE `/status` SUBRESOURCE (which returns the full
+    /// object) and deserialize its `status.resolved`, if present.
+    ///
+    /// The subresource route is load-bearing, not a style choice (#401): the
+    /// least-privilege mover role grants `get` only on `{crd}/status`, never on
+    /// the base resource, so a base-object GET is Forbidden in every real
+    /// install and the retry-determinism this read exists for silently never
+    /// works. A NotFound (CR deleted mid-run) is "no pin", matching the old
+    /// `get_opt` semantics; any other failure is a [`MoverError::StatusRead`]
+    /// so the log names the rejected GET rather than a PATCH.
     async fn read_resolved(&self) -> Result<Option<ResolvedRestore>> {
-        let obj = self
-            .api
-            .get_opt(&self.name)
-            .await
-            .map_err(|source| MoverError::StatusPatch {
-                kind: self.kind.clone(),
-                namespace: self.namespace.clone(),
-                name: self.name.clone(),
-                source: Box::new(source),
-            })?;
+        let obj = match self.api.get_status(&self.name).await {
+            Ok(obj) => Some(obj),
+            // `is_not_found()` (reason == "NotFound"), not a bare 404 check:
+            // a non-NotFound 404 (e.g. the CRD or API path absent) is a real
+            // misconfiguration and must surface, not read as "no pin yet".
+            Err(kube::Error::Api(status)) if status.is_not_found() => None,
+            Err(source) => {
+                return Err(MoverError::StatusRead {
+                    kind: self.kind.clone(),
+                    namespace: self.namespace.clone(),
+                    name: self.name.clone(),
+                    source: Box::new(source),
+                });
+            }
+        };
         Ok(obj
             .and_then(|o| {
                 o.data
@@ -1706,6 +1741,164 @@ mod tests {
                 stamps["Repository/backups/nas"].is_string()
                     && stamps["ClusterRepository/offsite"].is_string(),
                 "both concurrent stamps must survive in either order: {status}"
+            );
+        }
+    }
+
+    /// Wire-level `KubeStatusReporter` tests through a mock client
+    /// (`tower::service_fn`, no cluster): the request PATH is the contract the
+    /// mover RBAC authorizes, so it is asserted literally.
+    mod reporter {
+        use std::sync::{Arc, Mutex};
+
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+
+        use super::super::KubeStatusReporter;
+        use crate::workspec::TargetRef;
+
+        fn target(kind: &str) -> TargetRef {
+            TargetRef {
+                api_version: kopiur_api::consts::API_VERSION.to_string(),
+                kind: kind.to_string(),
+                name: "plex".to_string(),
+                namespace: "test-ns".to_string(),
+            }
+        }
+
+        /// A mock client that logs every request path and answers with
+        /// `status` + `body` (mirrors `controller::io::cached`'s harness).
+        fn logging_client(
+            log: Arc<Mutex<Vec<String>>>,
+            status: StatusCode,
+            body: serde_json::Value,
+        ) -> kube::Client {
+            let body = Arc::new(body);
+            let svc = tower::service_fn(move |req: Request<Body>| {
+                let log = log.clone();
+                let body = body.clone();
+                async move {
+                    log.lock().unwrap().push(req.uri().path().to_string());
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&*body).unwrap()))
+                            .unwrap(),
+                    )
+                }
+            });
+            kube::Client::new(svc, "test-ns")
+        }
+
+        fn not_found_body() -> serde_json::Value {
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404,
+            })
+        }
+
+        fn restore_with_resolved() -> serde_json::Value {
+            serde_json::json!({
+                "apiVersion": kopiur_api::consts::API_VERSION,
+                "kind": "Restore",
+                "metadata": { "name": "plex", "namespace": "test-ns", "uid": "uid-r" },
+                "spec": {},
+                "status": { "resolved": {
+                    "resolution": "Snapshot",
+                    "kopiaSnapshotID": "abc123",
+                } },
+            })
+        }
+
+        /// #401 regression guard: the read MUST go through the `/status`
+        /// subresource — that is the resource the least-privilege mover role
+        /// grants `get` on. The buggy code GETted the BASE resource
+        /// (`.../restores/plex`), which the role does not grant, and 403'd on
+        /// every in-Job restore resolution.
+        #[tokio::test]
+        async fn read_resolved_gets_the_status_subresource() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let client = logging_client(log.clone(), StatusCode::OK, restore_with_resolved());
+            let reporter = KubeStatusReporter::from_client(client, &target("Restore"));
+            let resolved = reporter
+                .read_resolved()
+                .await
+                .expect("read succeeds against the mock");
+            assert_eq!(
+                log.lock().unwrap().as_slice(),
+                [
+                    "/apis/kopiur.home-operations.com/v1alpha1/namespaces/test-ns/restores/plex/status"
+                ],
+                "the read must target the status subresource, not the base resource (#401)"
+            );
+            assert_eq!(
+                resolved
+                    .expect("status.resolved present")
+                    .kopia_snapshot_id
+                    .as_deref(),
+                Some("abc123"),
+                "the pinned snapshot id round-trips"
+            );
+        }
+
+        /// A deleted CR (404 NotFound) is "no pin", not an error — the same
+        /// semantics `get_opt` gave the base-resource read.
+        #[tokio::test]
+        async fn read_resolved_maps_not_found_to_none() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let client = logging_client(log, StatusCode::NOT_FOUND, not_found_body());
+            let reporter = KubeStatusReporter::from_client(client, &target("Restore"));
+            let resolved = reporter
+                .read_resolved()
+                .await
+                .expect("NotFound is not an error");
+            assert!(resolved.is_none(), "a deleted CR has no pinned resolution");
+        }
+
+        /// A non-NotFound failure surfaces as `StatusRead` — naming the GET,
+        /// not a PATCH (#401's log line said "failed to PATCH" for a rejected
+        /// GET, which sent the reporter debugging the wrong call).
+        #[tokio::test]
+        async fn read_resolved_failure_names_the_read_not_a_patch() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let forbidden = serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "Forbidden", "code": 403,
+            });
+            let client = logging_client(log, StatusCode::FORBIDDEN, forbidden);
+            let reporter = KubeStatusReporter::from_client(client, &target("Restore"));
+            let err = reporter
+                .read_resolved()
+                .await
+                .expect_err("403 is a real error");
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("failed to read the status of Restore test-ns/plex"),
+                "the message must name the read: {msg}"
+            );
+            assert!(
+                !msg.contains("PATCH"),
+                "a rejected GET must not be reported as a PATCH: {msg}"
+            );
+            // Environmental, not a kopia failure: Unknown and not retryable.
+            assert_eq!(err.kopia_class(), kopiur_kopia::KopiaErrorClass::Unknown);
+            assert!(!err.retry_recommended());
+        }
+
+        /// ClusterRepository is cluster-scoped: its status path must not carry
+        /// a `/namespaces/` segment (a namespaced path 404s — the latent trap
+        /// found while fixing #401; dead code today, guarded anyway).
+        #[tokio::test]
+        async fn cluster_scoped_target_builds_a_cluster_path() {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
+            let reporter = KubeStatusReporter::from_client(client, &target("ClusterRepository"));
+            let _ = reporter.read_resolved().await;
+            assert_eq!(
+                log.lock().unwrap().as_slice(),
+                ["/apis/kopiur.home-operations.com/v1alpha1/clusterrepositories/plex/status"],
+                "cluster-scoped kinds must not use a namespaced path"
             );
         }
     }
