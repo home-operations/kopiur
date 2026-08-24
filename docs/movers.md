@@ -23,7 +23,7 @@ The mover patches its owning `Snapshot`/`Restore` `.status`, so it needs a Servi
 
 /// info | Least privilege
 
-The `kopiur-mover` role grants only what a mover actually uses: `patch` on the owning CRDs' `/status` subresource and on the bootstrap-result ConfigMap. It does **not** grant Secrets, Jobs, Pods, or PVCs — a far smaller surface than the operator's own role. A namespace tenant who can read that SA's token can do almost nothing with it (see [Privileged movers](#privileged-movers) for the one exception that needs your sign-off).
+The `kopiur-mover` role grants only what a mover actually uses: `get` + `patch` on the owning CRDs' `/status` subresource (`patch` to report progress and the terminal result; `get` so a retried restore Job can re-read the snapshot a prior attempt pinned in `status.resolved` instead of re-resolving "latest"), and `get` + `patch` on the bootstrap-result ConfigMap. It does **not** grant the base CRD resources, Secrets, Jobs, Pods, or PVCs — a far smaller surface than the operator's own role. A namespace tenant who can read that SA's token can do almost nothing with it (see [Privileged movers](#privileged-movers) for the one exception that needs your sign-off).
 
 ///
 

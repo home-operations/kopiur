@@ -47,11 +47,12 @@ confined to admin-chosen namespaces.
 
 ## The mover (`kopiur-mover`)
 
-The mover is deliberately tiny — it can **only** report its result:
+The mover is deliberately tiny — it can only report its result and read back
+what a prior attempt reported:
 
 | API group → resources | Verbs | Why |
 | --- | --- | --- |
-| `kopiur.home-operations.com` → every CRD's `/status` | get, patch | Patch progress and the terminal result (snapshot id, stats, timing, `logTail`, `failure`) onto the CR that owns the Job. |
+| `kopiur.home-operations.com` → every CRD's `/status` | get, patch | `patch`: progress and the terminal result (snapshot id, stats, timing, `logTail`, `failure`) onto the CR that owns the Job. `get`: a restore mover re-reads the CR's pinned `status.resolved` through the status subresource, so a retried Job pod restores the same snapshot a prior attempt chose instead of re-resolving "latest". |
 | core → `configmaps` | get, patch | Write bootstrap results back to the result ConfigMap (the work spec itself rides the Job env). |
 
 It cannot read Secrets (credentials arrive via `envFrom` on the Job), cannot

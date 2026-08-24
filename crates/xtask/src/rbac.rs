@@ -341,6 +341,13 @@ fn webhook_cert_secret_rules() -> Vec<PolicyRule> {
 /// spec rides the Job's own pod env (no `configmaps` get for it). This is deliberately a
 /// tiny subset of [`workload_rules`]; the mover runs as its own least-privilege SA.
 ///
+/// The `get` verb on `{crd}/status` is LOAD-BEARING (#401): the restore mover
+/// reads the CR's pinned `status.resolved` (retry determinism) via a GET on the
+/// status subresource — the one route this role authorizes. The mover must
+/// never GET/LIST the base resources, and this role must never grant them; the
+/// mover-side counterpart is `KubeStatusReporter::read_resolved` using
+/// `get_status`, guarded by tests on both sides.
+///
 /// `cluster` decides whether `clusterrepositories/status` is included. The
 /// namespaced mover Role must EXCLUDE it: RBAC escalation prevention rejects a
 /// RoleBinding whose referenced role grants permissions the binder does not

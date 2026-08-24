@@ -1827,6 +1827,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "http",
+ "http-body-util",
  "k8s-openapi",
  "kopiur-api",
  "kopiur-kopia",
@@ -1840,6 +1842,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tower",
  "tracing",
 ]
 

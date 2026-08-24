@@ -892,6 +892,35 @@ async fn cli_restore_from_policy_into_created_pvc() {
         .await
         .expect("S3 fromPolicy-restored PVC must contain the seeded bytes");
 
+    // #401 regression guard: the in-Job resolver's `status.resolved` read must
+    // be authorized under the chart's REAL mover RBAC. Before the fix the mover
+    // GETted the base `restores` resource (granted nowhere), so every in-Job
+    // resolution warned `status.resolved read failed ... Forbidden` and a Job
+    // retry could never reuse the pinned snapshot. The mover pods persist —
+    // restore Jobs set no TTL and are owner-GC'd only with the Restore CR,
+    // which this test leaves in place — so their logs are the observable
+    // contract. `backoffLimit` is 2, so assert across EVERY pod of the Job, and
+    // require at least one so the check can never pass vacuously.
+    let mover_pods = pods
+        .list(&ListParams::default().labels("batch.kubernetes.io/job-name=e2e-cli-restore-s3pol"))
+        .await
+        .expect("list S3 fromPolicy mover pods");
+    assert!(
+        !mover_pods.items.is_empty(),
+        "no mover pod found for Job e2e-cli-restore-s3pol; the #401 log guard would be vacuous"
+    );
+    for pod in &mover_pods.items {
+        let pod_name = pod.metadata.name.as_deref().expect("pod has a name");
+        let logs = kopiur_e2e::wait::pod_logs(&client, E2E_NAMESPACE, pod_name)
+            .await
+            .unwrap_or_else(|e| panic!("fetch mover pod {pod_name} logs: {e}"));
+        assert!(
+            !logs.contains("status.resolved read failed"),
+            "#401 regression: mover pod {pod_name} could not read status.resolved under the \
+             chart's mover RBAC; logs:\n{logs}"
+        );
+    }
+
     // Restore error path: a snapshotRef that doesn't exist fails closed
     // (onMissingSnapshot defaults to Fail for explicit sources) → exit 1.
     let out = run_cli(&[
