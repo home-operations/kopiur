@@ -21,9 +21,13 @@
 //!   directly on a `--readonly` connection — contradicting the design premise
 //!   this milestone was written to confirm (kopia registers it as a write action,
 //!   but it never puts a blob, so read-only storage never rejects it). The
-//!   sequence M3c/M3d will actually ship is therefore `connect --readonly` →
-//!   `throttle set` → migrate, with no flip; that is what steps (1b)→(6) assert,
-//!   end to end, and it is the sequence the timing probe measures.
+//!   sequence that shipped is therefore `connect --readonly` → `throttle set` →
+//!   migrate, with **no flip** — that is what steps (1b)→(6) assert, end to end,
+//!   and it is the sequence the timing probe measures. `repository set-client
+//!   --read-only/--read-write` consequently stays UNWIRED in the mover flows;
+//!   the flip coverage below is a contingency guard, kept so that a future kopia
+//!   turning `throttle set` into a real write action finds the alternative
+//!   already proven rather than having to discover it under an outage.
 //! * **…and that sequence leaves the source READ-ONLY.** `throttle set` rewrites
 //!   the config file, so "the bit survives the rewrite" is a data-safety
 //!   invariant for a replication source, not a formality. Step (1c) asserts it
@@ -351,9 +355,9 @@ async fn set_client_flip_brackets_throttle_and_migrate_honors_persisted_limits()
     // (1b) THE PRODUCTION SEQUENCE, and the premise this milestone was written to
     // check — which does NOT hold as the plan stated it. `repository throttle set`
     // SUCCEEDS on the read-only connection: it only rewrites the local config's
-    // `throttlingLimits`, it never puts a blob. So what M3c/M3d will actually ship
-    // is `connect --readonly` → `throttle set` → migrate, with NO flip, and that
-    // is the sequence measured in step (6).
+    // `throttlingLimits`, it never puts a blob. So what shipped is `connect
+    // --readonly` → `throttle set` → migrate, with NO flip, and that is the
+    // sequence measured in step (6).
     //
     // If a future kopia turns this into a real write action, this fails loudly and
     // the flip below stops being defensive and becomes mandatory.

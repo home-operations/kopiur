@@ -3045,6 +3045,12 @@ async fn srepl_terminal_kopia(
 
 /// PATCH a terminal failure body for a typed mover error in the snapshot
 /// replication flow (with whatever run counters exist) and return it.
+///
+/// A [`MoverError::Kopia`] arriving here (a throttle application, say) carries a
+/// `class` exactly like one going through [`srepl_terminal_kopia`], so it is
+/// logged with the same structured field — otherwise whether the operator can
+/// filter on `class` would depend on which helper the call site happened to
+/// pick. Non-kopia errors have no class to report and log plainly.
 async fn srepl_terminal(
     target: &workspec::TargetRef,
     err: MoverError,
@@ -3055,7 +3061,10 @@ async fn srepl_terminal(
         &snapshot_replicate_failed_body(&err.to_string(), stats),
     )
     .await;
-    error!("{err}");
+    match &err {
+        MoverError::Kopia { .. } => error!(class = %err.kopia_class(), "{err}"),
+        _ => error!("{err}"),
+    }
     Err(err)
 }
 

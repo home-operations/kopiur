@@ -103,19 +103,24 @@ cache. See [movers](../../movers.md).
   applied by every mover after it connects to this repository, so a run doesn't
   saturate the link or hammer the object store: `uploadBytesPerSecond`,
   `downloadBytesPerSecond`, `readOpsPerSecond`, `writeOpsPerSecond` (each unset
-  leaves kopia's current limit). Every batch mover honors it — bootstrap, backup,
-  restore, maintenance, verification, deletion, repository replication and
-  snapshot replication. kopia's limits are **per connection**, so a run that
-  opens two repositories caps each from *that* repository's own `moverDefaults`:
-  a [`SnapshotReplication`](snapshot-replication.md) caps its source connection
+  leaves kopia's current limit). Honored by the transfer movers — bootstrap,
+  backup, restore, maintenance, verification, repository replication and snapshot
+  replication. kopia's limits are **per connection**, so a run that opens two
+  repositories caps each from *that* repository's own `moverDefaults`: a
+  [`SnapshotReplication`](snapshot-replication.md) caps its source connection
   from the source repo's defaults and its destination connection from the
   destination repo's, each overridable per CR via
-  [`spec.migrate.throttle`](snapshot-replication.md#migrate). The exceptions:
-  the interactive [`serve`/browse](../../server.md) session (a read-only UI
-  session, not a batch transfer), and a `RepositoryReplication`'s **destination**
-  side — `kopia repository sync-to` copies blobs without opening the destination
-  as a repository, so its caps live on
-  [`spec.sync`](repository-replication.md) instead.
+  [`spec.migrate.throttle`](snapshot-replication.md#migrate).
+
+  Three things it does **not** cap today: the interactive
+  [`serve`/browse](../../server.md) session (a read-only UI session, not a batch
+  transfer); a `RepositoryReplication`'s **destination** side, because `kopia
+  repository sync-to` copies blobs without opening the destination as a
+  repository — its caps live on [`spec.sync`](repository-replication.md) instead;
+  and **batched snapshot deletions and pins**, whose work specs leave the throttle
+  block empty, so a repository-wide cap does not currently reach them (deletion
+  load is instead bounded by per-repository batching and the cluster-wide
+  `maxConcurrentDeleteJobs` backstop).
 
 /// warning | A byte cap bites much harder than its number suggests
 
