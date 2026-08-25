@@ -71,6 +71,68 @@ pub async fn pod_succeeded(client: &Client, ns: &str, name: &str) -> Result<()> 
     Err(anyhow!("pod {ns}/{name} ended {phase}; logs:\n{logs}"))
 }
 
+/// Concatenated stdout of every non-terminating Pod matching `selector` in `ns`.
+///
+/// Mover Jobs carry their component/instance labels on the POD template as well
+/// as the Job, so the same selector a scenario uses to find a mover Job finds
+/// the pod that ran it. Pods that have not produced logs yet (still `Pending`,
+/// or already reaped) are skipped rather than failing the call, so this composes
+/// with [`crate::wait_until`]: poll until the line you are looking for shows up.
+///
+/// Every matching pod is concatenated on purpose — a retried Job has several,
+/// and the assertion is about what the mover DID, not about which attempt did it.
+pub async fn pod_logs_for_selector(
+    client: &Client,
+    ns: &str,
+    selector: &str,
+) -> std::result::Result<String, kube::Error> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let list = api
+        .list(&kube::api::ListParams::default().labels(selector))
+        .await?;
+    let mut out = String::new();
+    for pod in list
+        .items
+        .into_iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_none())
+    {
+        let Some(name) = pod.metadata.name else {
+            continue;
+        };
+        if let Ok(logs) = api.logs(&name, &LogParams::default()).await {
+            out.push_str(&logs);
+        }
+    }
+    Ok(out)
+}
+
+/// Poll until some pod matching `selector` has logged `needle`.
+///
+/// The assertion form for "the mover actually did X" when X leaves no trace in
+/// any CR status — e.g. the repository throttle (#374), whose only observable is
+/// [`crate::consts::THROTTLE_APPLIED_LOG`]. Polls rather than reading once,
+/// because the pod may not exist (or may still be starting) when the caller
+/// first looks.
+pub async fn wait_for_pod_log(
+    client: &Client,
+    ns: &str,
+    selector: &str,
+    needle: &str,
+) -> Result<()> {
+    crate::wait_until(
+        &format!("a pod matching `{selector}` logs `{needle}`"),
+        default_timeout(),
+        crate::poll_interval(),
+        || async {
+            Ok(pod_logs_for_selector(client, ns, selector)
+                .await?
+                .contains(needle)
+                .then_some(()))
+        },
+    )
+    .await
+}
+
 /// Fetch a Pod's logs (best-effort context for failure messages).
 pub async fn pod_logs(client: &Client, ns: &str, name: &str) -> Result<String> {
     let api: Api<Pod> = Api::namespaced(client.clone(), ns);

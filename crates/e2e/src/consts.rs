@@ -246,6 +246,20 @@ pub const PV_SRC_EH: &str = "kopiur-e2e-src-eh";
 /// PVC (operator namespace) binding [`PV_SRC_EH`].
 pub const PVC_SRC_EH: &str = "e2e-src-eh";
 
+// --- Repository throttle (#374) ------------------------------------------------
+/// The mover's log line proving `moverDefaults.throttle` reached kopia on a
+/// connection (`crates/mover/src/main.rs::apply_repository_throttle`). Scenarios
+/// assert on THIS, not on timing: kopia's limits only bite cold-cache backend
+/// traffic, so a generous cap changes no runtime and a timing-based assertion
+/// would be a silent green. Keep in lockstep with the mover's `info!` message.
+pub const THROTTLE_APPLIED_LOG: &str = "applied repository throttle";
+
+/// A deliberately NON-BINDING throttle (100 MiB/s) for the scenarios that assert
+/// the throttle is applied at all. Generous on purpose: it must not move any
+/// scenario's runtime, and a low byte cap is punishing out of all proportion on
+/// the small-object workloads these fixtures produce.
+pub const THROTTLE_BYTES_PER_SECOND: i64 = 104_857_600;
+
 // --- Secrets -------------------------------------------------------------------
 /// Filesystem-backend credentials (just `KOPIA_PASSWORD`).
 pub const SECRET_FS_CREDS: &str = "kopia-creds";

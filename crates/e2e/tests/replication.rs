@@ -31,6 +31,49 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
     };
     world.ensure(&[Need::Filesystem]).await.expect("fixtures");
     let client = world.client().clone();
+
+    // #374: the SOURCE repository carries a repository-wide throttle, so the
+    // replication mover — which opens its own connect to the source and reads the
+    // whole repository through it — must apply it. Created HERE rather than
+    // through `ensure_seed` (which hardcodes an empty overlay and is
+    // create-if-absent); no other scenario uses this repo, so pre-creating it is
+    // race-free. Non-binding at 100 MiB/s over a local hostPath.
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    ensure_repo(&client, "repl-src").await;
+    create_idempotent(
+        &repos,
+        &cr(repository_json(
+            "e2e-repl-src",
+            "repl-src",
+            serde_json::json!({
+                "moverDefaults": {
+                    "throttle": {
+                        "uploadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND,
+                        "downloadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND
+                    }
+                }
+            }),
+        )),
+        "create the throttled replication source Repository",
+    )
+    .await;
+    // Bare spec fields, not a `{"spec": ...}` wrapper — the wrapper is dropped
+    // silently and would leave the throttle assertion below vacuous.
+    let landed = repos
+        .get("e2e-repl-src")
+        .await
+        .expect("read back the throttled replication source Repository");
+    assert_eq!(
+        landed
+            .spec
+            .mover_defaults
+            .as_ref()
+            .and_then(|m| m.throttle.as_ref())
+            .and_then(|t| t.upload_bytes_per_second),
+        Some(consts::THROTTLE_BYTES_PER_SECOND),
+        "moverDefaults.throttle must survive onto the source Repository"
+    );
+
     // A source repo with a real snapshot to mirror.
     ensure_seed(
         &client,
@@ -138,6 +181,18 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
     )
     .await
     .expect("the replication should run and stamp status.lastReplicated");
+
+    // #374 regression guard: the replication mover applied the SOURCE
+    // repository's throttle on its own connect. `sync-to` succeeds either way,
+    // so the mover's log line is the only proof the cap was in force.
+    kopiur_e2e::wait::wait_for_pod_log(
+        &client,
+        E2E_NAMESPACE,
+        &selector,
+        consts::THROTTLE_APPLIED_LOG,
+    )
+    .await
+    .expect("the replication mover must apply moverDefaults.throttle on its own connect (#374)");
 
     // kstatus consistency guard (regression: the same two-pass heal bug as
     // restore/snapshot). The mover stamps `phase: Succeeded` + `lastReplicated`;
