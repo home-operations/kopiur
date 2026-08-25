@@ -234,7 +234,10 @@ and re-anchors the next cron slot, which is what you want mid-incident.
    whole time waiting for the repository — and its `waitTimeout` window opens at
    that moment, not at creation, so a long seed does not spend it (see
    [Restores → `waitTimeout`](../restores.md#waittimeout--wait-before-giving-up)
-   and `status.waitStartedAt`).
+   and `status.waitStartedAt`). That holds from the very first second of the
+   bring-up: while the `Repository` (or the `SnapshotPolicy` a `fromPolicy`
+   restore names) has not been applied yet, the `Restore` parks with
+   `RestoreReferentMissing` and the window is not open either.
 
 ## Observability
 

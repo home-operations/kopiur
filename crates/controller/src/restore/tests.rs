@@ -142,6 +142,157 @@ fn repository_not_ready_restore_message_says_what_why_how() {
     );
 }
 
+// --- #393: the readiness gate's tri-state repository lookup ---------------
+
+/// A `Snapshot` fixture, parsed the cluster's way. `pin` is the
+/// `spec.repository` mint-time pin (`None` ⇒ nothing derivable at all).
+fn snapshot_fixture(pin: Option<&str>) -> kopiur_api::Snapshot {
+    let mut spec = serde_json::json!({ "sources": [ { "pvc": { "name": "data" } } ] });
+    if let Some(name) = pin {
+        spec["repository"] = serde_json::json!({ "kind": "Repository", "name": name });
+    }
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Snapshot",
+        "metadata": { "name": "b", "namespace": "apps" },
+        "spec": spec,
+    }))
+    .expect("Snapshot fixture")
+}
+
+/// A `SnapshotPolicy` fixture: one repository (`repository`) or a
+/// multi-repository fan-out (`repositories`), which has no single ref.
+fn policy_fixture(repositories: &[&str]) -> kopiur_api::SnapshotPolicy {
+    let mut spec = serde_json::json!({ "sources": [ { "pvc": { "name": "data" } } ] });
+    match repositories {
+        [one] => spec["repository"] = serde_json::json!({ "kind": "Repository", "name": one }),
+        many => {
+            spec["repositories"] = serde_json::json!(
+                many.iter()
+                    .map(|n| serde_json::json!({ "kind": "Repository", "name": n }))
+                    .collect::<Vec<_>>()
+            )
+        }
+    }
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "cfg", "namespace": "apps" },
+        "spec": spec,
+    }))
+    .expect("SnapshotPolicy fixture")
+}
+
+/// The distinction the pre-#393 chained `get_opt(..).and_then(..)` erased: a
+/// `Snapshot` ROW that does not exist is a supported, waited-for shape; a row
+/// that exists but names no repository is a spec problem.
+#[test]
+fn snapshot_lookup_separates_a_missing_row_from_an_underivable_one() {
+    // Missing row: the shape the `waitTimeout` window is FOR. The gate must not
+    // engage, or `onMissingSnapshot: Fail` could never fire for a typo'd ref.
+    assert_eq!(
+        classify_snapshot_lookup(None, "apps"),
+        RepoRefLookup::SnapshotRowMissing
+    );
+    // Row present WITH a pin: derived, relative to the snapshot's namespace.
+    let pinned = snapshot_fixture(Some("nas"));
+    match classify_snapshot_lookup(Some(&pinned), "apps") {
+        RepoRefLookup::Derived(rref, ns) => {
+            assert_eq!(rref.name, "nas");
+            assert_eq!(ns, "apps");
+        }
+        other => panic!("a pinned Snapshot must derive its repository: {other:?}"),
+    }
+    // Row present WITHOUT a pin (no status, no spec.repository, no repository
+    // owner): the object is there, so nothing will appear later to fix it —
+    // falls through to downstream validation rather than parking forever.
+    assert_eq!(
+        classify_snapshot_lookup(Some(&snapshot_fixture(None)), "apps"),
+        RepoRefLookup::NotDerivable
+    );
+}
+
+/// The other half: a `SnapshotPolicy` that does not exist parks the gate; one
+/// that exists but fans out over several repositories does not (the gate must
+/// never guess repository #1).
+#[test]
+fn policy_lookup_separates_a_missing_policy_from_a_multi_repo_one() {
+    assert_eq!(
+        classify_policy_lookup(None, "apps", "cfg"),
+        RepoRefLookup::ReferentMissing {
+            kind: "SnapshotPolicy",
+            namespace: Some("apps".into()),
+            name: "cfg".into(),
+        }
+    );
+    let single = policy_fixture(&["nas"]);
+    match classify_policy_lookup(Some(&single), "apps", "cfg") {
+        RepoRefLookup::Derived(rref, ns) => {
+            assert_eq!(rref.name, "nas");
+            assert_eq!(ns, "apps");
+        }
+        other => panic!("a single-repository policy must derive its repository: {other:?}"),
+    }
+    // Multi-repo with no explicit selection: `resolve_restore_repository` fails
+    // closed downstream listing the valid choices — parking would hide that.
+    assert_eq!(
+        classify_policy_lookup(Some(&policy_fixture(&["a", "b"])), "apps", "cfg"),
+        RepoRefLookup::NotDerivable
+    );
+}
+
+#[test]
+fn referent_missing_message_says_what_why_and_how() {
+    let msg = referent_missing_restore_message("SnapshotPolicy", Some("apps"), "cfg");
+    // WHAT is missing, namespaced.
+    assert!(msg.contains("SnapshotPolicy `apps/cfg`"), "{msg}");
+    // WHY it blocks: the repository is derived from it and cannot be verified.
+    assert!(msg.contains("derived from it"), "{msg}");
+    // The #393 promise itself: the window is NOT running meanwhile.
+    assert!(msg.contains("waitTimeout"), "{msg}");
+    assert!(msg.contains("status.waitStartedAt"), "{msg}");
+    // HOW to clear it.
+    assert!(msg.contains("Create the SnapshotPolicy"), "{msg}");
+    // A cluster-scoped referent must not be given an invented namespace.
+    let cluster = referent_missing_restore_message("ClusterRepository", None, "offsite");
+    assert!(cluster.contains("ClusterRepository `offsite`"), "{cluster}");
+    assert!(!cluster.contains('/'), "{cluster}");
+    // The reason is distinct from the not-Ready one: a SnapshotPolicy that was
+    // never applied is not an unreachable backend.
+    assert_ne!(
+        crate::consts::RESTORE_REFERENT_MISSING_REASON,
+        crate::consts::REPOSITORY_NOT_READY_REASON
+    );
+    assert_eq!(
+        crate::consts::RESTORE_REFERENT_MISSING_REASON,
+        "RestoreReferentMissing"
+    );
+}
+
+/// The park's gate condition must not outlive the park: the registry row is
+/// age-independent, so a stale `ReferentAvailable=False` would keep `kubectl
+/// kopiur doctor` reporting a restore that proceeded hours ago as blocked.
+#[test]
+fn the_referent_gate_condition_clears_only_when_it_is_stale() {
+    use crate::consts::RESTORE_REFERENT_AVAILABLE_CONDITION;
+    // Never parked: nothing to clear, and the healthy wire must not GROW the
+    // condition (a write per pass would be pure churn).
+    assert!(cleared_referent_conditions(&restore_with_condition("Resolved", "True")).is_none());
+    // Parked: flipped back to True in place, keeping the array a single row.
+    let parked = restore_with_condition(RESTORE_REFERENT_AVAILABLE_CONDITION, "False");
+    let cleared = cleared_referent_conditions(&parked).expect("a stale park must clear");
+    let row = cleared
+        .iter()
+        .find(|c| c.type_ == RESTORE_REFERENT_AVAILABLE_CONDITION)
+        .expect("the condition survives, flipped");
+    assert_eq!(row.status, "True");
+    assert_eq!(row.reason, crate::consts::RESTORE_REFERENT_FOUND_REASON);
+    // Already cleared: idempotent, so the clear cannot flip-flop with the
+    // condition writers that rebuild from the reconcile-start copy.
+    let healthy = restore_with_condition(RESTORE_REFERENT_AVAILABLE_CONDITION, "True");
+    assert!(cleared_referent_conditions(&healthy).is_none());
+}
+
 #[test]
 fn populator_state_depends_on_target_variant() {
     use kopiur_api::PopulatorTarget;

@@ -3534,6 +3534,17 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         crate::consts::SOURCE_PVC_MISSING_REASON,
         "snapshot::handle_missing_source_pvc (computed polarity)",
     ),
+    // `restore::park_on_missing_referent` via
+    // io::upsert_gate(&RESTORE_REFERENT_MISSING_GATE, ...) — the tri-state
+    // readiness gate's `Undetermined` arm (#393); cleared (True, reason
+    // `RestoreReferentFound`) by `restore::proceed_past_gate` /
+    // `plan::cleared_referent_conditions` once the referent exists.
+    (
+        crate::consts::RESTORE_REFERENT_AVAILABLE_CONDITION,
+        false,
+        crate::consts::RESTORE_REFERENT_MISSING_REASON,
+        "restore::park_on_missing_referent",
+    ),
     // `repository::park_on_seed_source` +
     // `cluster_repository::park_cluster_on_seed_source`, both via
     // io::upsert_gate(&SEED_SOURCE_NOT_READY_GATE, ...); cleared by

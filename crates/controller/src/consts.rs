@@ -25,7 +25,8 @@ pub use kopiur_api::consts::{
     OP_RESTORE_TARGET, ORIGIN_LABEL, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
     PRIVILEGED_MOVERS_ANNOTATION, READY_CONDITION, RECONCILING_CONDITION,
     REPOSITORIES_READY_CONDITION, REPOSITORY_NOT_READY_REASON, REPOSITORY_READ_ONLY_REASON,
-    REPOSITORY_UID_LABEL, REPOSITORY_WRITABLE_CONDITION, RUN_MODE_ANNOTATION,
+    REPOSITORY_UID_LABEL, REPOSITORY_WRITABLE_CONDITION, RESTORE_REFERENT_AVAILABLE_CONDITION,
+    RESTORE_REFERENT_FOUND_REASON, RESTORE_REFERENT_MISSING_REASON, RUN_MODE_ANNOTATION,
     RUN_REQUESTED_ANNOTATION, SCHEDULE_FANOUT_CAPPED_CONDITION, SCHEDULE_LABEL,
     SCHEDULE_RUNNABLE_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER,
     SNAPSHOT_ID_LABEL, SOURCE_PVC_AVAILABLE_CONDITION, SOURCE_PVC_MISSING_REASON,
@@ -287,6 +288,13 @@ pub const ORPHANED_PRIME_REAPED_REASON: &str = "OrphanedPrimePvcReaped";
 /// `action` for the already-bound no-op / orphan-reap Events: to actually restore into the
 /// claim, delete it and let it be recreated (keeping its `dataSourceRef`).
 pub const RECREATE_CLAIM_TO_RESTORE_ACTION: &str = "RecreateClaimToRestore";
+/// Event `action` (remediation hint) for
+/// [`RESTORE_REFERENT_MISSING_REASON`]: create the referenced object, or repoint
+/// the `Restore` at one that exists. Published on the park TRANSITION only (the
+/// park itself re-patches an identical status every 15s, which is a server-side
+/// no-op) — it is what replaces the error metric + Warning Event the pre-#393
+/// unverified fall-through produced downstream.
+pub const CREATE_RESTORE_REFERENT_ACTION: &str = "CreateRestoreReferentOrFixTheReference";
 
 /// `Snapshot` condition tracking kopia-side pin reconciliation (ADR-0005 §13(c)).
 /// `True`/`False` mirrors `status.pinned` once a SnapshotPin mover Job ran;

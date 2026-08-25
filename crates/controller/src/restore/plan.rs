@@ -411,6 +411,157 @@ pub(super) fn existing_conditions(restore: &Restore) -> Vec<Condition> {
         .map(|s| s.conditions.clone())
         .unwrap_or_default()
 }
+
+/// What the repository-readiness gate could learn about the repository a restore
+/// will connect to (issue #393) — the return of `super::restore_repository_ref`.
+///
+/// The point of the enum is that "no repository ref" is THREE different
+/// situations that the pre-#393 `Option<(RepositoryRef, String)>` collapsed into
+/// one `None`, and only some of them may fall through the gate unverified:
+///
+/// - [`Self::Derived`] — the ref is known; the gate goes on to check readiness.
+/// - [`Self::SnapshotRowMissing`] — a `snapshotRef` whose `Snapshot` CR does not
+///   exist (yet). Deliberately falls through: the `waitTimeout` window exists
+///   precisely to wait for that row, and `onMissingSnapshot: Fail` must be able
+///   to fire for a typo'd ref. Parking here would break both.
+/// - [`Self::ReferentMissing`] — a `fromPolicy` whose `SnapshotPolicy` does not
+///   exist. Nothing downstream can wait for it usefully, and letting the gate
+///   fall through stamps `status.waitStartedAt` against a repository nobody
+///   verified — the #393 bug.
+/// - [`Self::NotDerivable`] — the referent EXISTS but names no single repository
+///   (a `Snapshot` with neither pin nor repository owner, a multi-repository
+///   `fromPolicy` with no explicit selection, a raw `identity` source). That is a
+///   spec problem, not a missing object: it falls through to the downstream
+///   validation that fails closed and lists the valid choices. Parking would
+///   hide a permanent misconfiguration behind a "waiting…" message.
+///
+/// **Match this enum EXHAUSTIVELY.** Never `matches!(…)` it and never add a
+/// `_ =>` arm: the compiler's exhaustiveness check is the only thing that makes
+/// a fifth shape decide, at compile time, whether it may spend a restore's wait
+/// window. This is a COMPILER-ONLY guard: `cargo xtask check-phases` scans only
+/// the `*Phase` enums in `kopiur-api`, so nothing but exhaustiveness protects it
+/// — which is exactly why the rule is written down here (same convention as the
+/// `unreadable_phase` named predicate in `repository_replication`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RepoRefLookup {
+    /// The repository ref, plus the namespace it resolves relative to.
+    Derived(kopiur_api::common::RepositoryRef, String),
+    /// `snapshotRef` naming a `Snapshot` CR that does not exist — the shape the
+    /// `waitTimeout` window is FOR. The gate must not engage.
+    SnapshotRowMissing,
+    /// A referent object the repository ref is derived FROM does not exist.
+    /// `namespace` is `None` for a cluster-scoped referent.
+    ReferentMissing {
+        /// The referent's kind, for the message (`SnapshotPolicy`, …).
+        kind: &'static str,
+        /// The namespace it was looked up in; `None` when cluster-scoped.
+        namespace: Option<String>,
+        /// The referent's name.
+        name: String,
+    },
+    /// The referent exists but yields no single repository ref (or there is
+    /// nothing to derive from at all): a spec problem for downstream validation.
+    NotDerivable,
+}
+
+/// Classify a `snapshotRef` lookup: the fetched `Snapshot` (`None` ⇒ the row
+/// does not exist) into a [`RepoRefLookup`]. Pure.
+///
+/// A missing ROW is [`RepoRefLookup::SnapshotRowMissing`] — a supported,
+/// waited-for shape. A row that exists but carries no derivable repository
+/// (neither `status.resolved.repository`, nor `spec.repository`, nor a
+/// repository `ownerReference`) is [`RepoRefLookup::NotDerivable`]: the object
+/// is there, so nothing will appear later to fix it.
+pub(super) fn classify_snapshot_lookup(
+    snapshot: Option<&kopiur_api::Snapshot>,
+    snapshot_namespace: &str,
+) -> RepoRefLookup {
+    match snapshot {
+        None => RepoRefLookup::SnapshotRowMissing,
+        Some(snap) => match kopiur_api::snapshot::repository_ref_for(snap) {
+            Some(rref) => RepoRefLookup::Derived(rref, snapshot_namespace.to_string()),
+            None => RepoRefLookup::NotDerivable,
+        },
+    }
+}
+
+/// Classify a `fromPolicy` lookup: the fetched `SnapshotPolicy` (`None` ⇒ the
+/// object does not exist) into a [`RepoRefLookup`]. Pure.
+///
+/// A missing POLICY is [`RepoRefLookup::ReferentMissing`] — the gate parks. A
+/// policy that exists but fans out over several repositories with no explicit
+/// selection is [`RepoRefLookup::NotDerivable`]: the gate cannot know which
+/// repository to wait on and must never guess repository #1, so it falls through
+/// to `resolve_restore_repository`, which fails closed listing the valid choices.
+pub(super) fn classify_policy_lookup(
+    policy: Option<&kopiur_api::SnapshotPolicy>,
+    policy_namespace: &str,
+    policy_name: &str,
+) -> RepoRefLookup {
+    match policy {
+        None => RepoRefLookup::ReferentMissing {
+            kind: "SnapshotPolicy",
+            namespace: Some(policy_namespace.to_string()),
+            name: policy_name.to_string(),
+        },
+        Some(cfg) => match kopiur_api::single_repository_ref(&cfg.spec) {
+            Ok(rref) => RepoRefLookup::Derived(rref.clone(), policy_namespace.to_string()),
+            Err(_) => RepoRefLookup::NotDerivable,
+        },
+    }
+}
+
+/// Message for a restore parked because a referent it derives its repository
+/// from does not exist (issue #393). Pure so the text is unit-asserted.
+///
+/// Says what is missing (kind + namespaced name), why that blocks the restore,
+/// that the `waitTimeout` window is deliberately NOT running meanwhile, and how
+/// to clear it.
+pub(super) fn referent_missing_restore_message(
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> String {
+    let target = match namespace {
+        Some(ns) => format!("{ns}/{name}"),
+        None => name.to_string(),
+    };
+    format!(
+        "waiting for {kind} `{target}` to exist: the repository this restore connects to is \
+         derived from it, so kopiur cannot verify the backend is reachable and will not launch \
+         the restore. The `policy.waitTimeout` window is NOT running while this is missing \
+         (status.waitStartedAt stays unstamped) — it opens once the {kind} exists and its \
+         repository becomes `Ready`. Create the {kind} (or repoint the Restore at one that \
+         exists) to proceed."
+    )
+}
+
+/// A stale [`crate::consts::RESTORE_REFERENT_AVAILABLE_CONDITION`] = `False`
+/// left by an earlier park, flipped back to `True` — or `None` when there is
+/// nothing to clear (the healthy wire never grows the condition). Pure.
+///
+/// Without this the park's gate condition outlives the park: the registry row is
+/// age-independent, so `kubectl kopiur doctor` would keep reporting a restore
+/// that has long since proceeded as blocked on a referent that has existed for
+/// hours. Mirrors how the `MoverPermitted`/`CredentialsAvailable` gates clear.
+pub(super) fn cleared_referent_conditions(restore: &Restore) -> Option<Vec<Condition>> {
+    use crate::consts::{RESTORE_REFERENT_AVAILABLE_CONDITION, RESTORE_REFERENT_FOUND_REASON};
+    let existing = existing_conditions(restore);
+    if !existing
+        .iter()
+        .any(|c| c.type_ == RESTORE_REFERENT_AVAILABLE_CONDITION && c.status != "True")
+    {
+        return None;
+    }
+    Some(io::upsert_condition(
+        &existing,
+        RESTORE_REFERENT_AVAILABLE_CONDITION,
+        true,
+        RESTORE_REFERENT_FOUND_REASON,
+        "the referent the restore derives its repository from now exists",
+        restore.metadata.generation,
+    ))
+}
 /// Where the `waitTimeout` window is anchored: `status.waitStartedAt` once
 /// [`super::ensure_wait_anchor`] has stamped it, else `created_epoch`.
 ///

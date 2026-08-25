@@ -144,6 +144,11 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // (repository Ready), not at the Restore's creation — needs its own repo, created
     // SUSPENDED so it is cold until the scenario releases it.
     "waitanchor",
+    // #393: the readiness gate must PARK (no `waitStartedAt`) while the repository
+    // referent does not exist. Distinct from `waitanchor`, whose repository
+    // pre-exists (suspended): here the `Repository` and the `SnapshotPolicy` are
+    // created MID-TEST, so the shard must start with no repository at all.
+    "waitref",
     // SnapshotReplication (issue #368, crates/e2e/tests/snapshot_replication.rs):
     // logical fs→fs replication. Each scenario needs its OWN source AND destination
     // kopia repository so copy/prune/idempotency counts never leak between scenarios:
