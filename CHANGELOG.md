@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.10.4](https://github.com/home-operations/kopiur/compare/0.10.3...0.10.4) (2026-08-24)
+
+
+### Bug Fixes
+
+* **chart:** give flowSchema its doc comment and timings a clean schema entry ([#397](https://github.com/home-operations/kopiur/issues/397)) ([7c8dd3f](https://github.com/home-operations/kopiur/commit/7c8dd3ffb68f7373a7e72bbbe3ea36bfb6b5f939))
+* **mover:** read status.resolved via the /status subresource ([#408](https://github.com/home-operations/kopiur/issues/408)) ([06fc2f9](https://github.com/home-operations/kopiur/commit/06fc2f93a3133b891fefb729b65304b323646613))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action docker/github-builder (v1.16.0 → v1.17.0) ([#407](https://github.com/home-operations/kopiur/issues/407)) ([b6d7d04](https://github.com/home-operations/kopiur/commit/b6d7d04ed37b58f8c91354dc1537c3943cc85330))
+* **mise:** update mise tools ([#400](https://github.com/home-operations/kopiur/issues/400)) ([b1a83f8](https://github.com/home-operations/kopiur/commit/b1a83f8f8b381b815a70fe419acdfeaa5df96a90))
+* **mise:** update tool kubectl (1.36.3 → 1.36.4) ([#405](https://github.com/home-operations/kopiur/issues/405)) ([274e3d6](https://github.com/home-operations/kopiur/commit/274e3d67cb62bcb467452592bfb9ce02033bad14))
+* **mise:** update tool lefthook (2.1.10 → 2.1.11) ([#406](https://github.com/home-operations/kopiur/issues/406)) ([2ba700d](https://github.com/home-operations/kopiur/commit/2ba700dfa96abfb3b9e613bb126e83819208c0a6))
+* **mise:** update tool rust (1.97.1 → 1.98.0) ([#403](https://github.com/home-operations/kopiur/issues/403)) ([c655005](https://github.com/home-operations/kopiur/commit/c6550054916a6818b506026ec2a4165ba63a0e33))
+* **mise:** update tool yq (4.53.3 → 4.53.4) ([#402](https://github.com/home-operations/kopiur/issues/402)) ([d1ed8a7](https://github.com/home-operations/kopiur/commit/d1ed8a7ded8b432793f81b94b740cb4ff94eb094))
+* **mise:** update tool yq (4.53.4 → 4.53.6) ([#404](https://github.com/home-operations/kopiur/issues/404)) ([dd5878c](https://github.com/home-operations/kopiur/commit/dd5878cfb1f324635ec97ecec3fbb8f2e9f360b6))
+
 ## [0.10.3](https://github.com/home-operations/kopiur/compare/0.10.2...0.10.3) (2026-08-18)
 
 
