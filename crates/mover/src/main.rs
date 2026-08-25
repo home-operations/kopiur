@@ -436,9 +436,13 @@ async fn connect_and_throttle(
 /// scenarios assert on it, and its ABSENCE is the version-skew signal for a new
 /// controller driving an old mover image. Emitted only after kopia accepted
 /// them, so it can never claim a throttle that is not in force. One line per
-/// APPLICATION, not per run: a flow that opens two connections (a seed: the
-/// bootstrap's and the local repository's) logs it once per connection, which is
-/// what lets an e2e assert that both were capped.
+/// APPLICATION, not per run: a flow that opens several connections logs it once
+/// per connection, which is what lets an e2e assert that every one of them was
+/// capped. A first migrate seed opens three (the replica, the seed's local
+/// client, the post-seed reconnect — its probe connect FAILS on the
+/// uninitialized backend, which is what arms the seed, so it never reaches its
+/// own application); a resuming one opens four, since that probe connect
+/// succeeds.
 ///
 /// Applied on read-only connections too. `repository throttle set` registers a
 /// kopia *write* action, but is empirically accepted on a `--readonly` connect
@@ -1679,7 +1683,8 @@ async fn seed_create_and_connect_local(
     // capped, and kopia's limits are per-config. `snapshot migrate` has no speed
     // flags of its own, so the limits persisted into this config are the ONLY cap
     // on the heaviest transfer kopiur performs. (The seed SOURCE's own cap is a
-    // separate knob, wired in a later change.)
+    // separate knob on a separate connection — `replicaThrottle`, applied in
+    // `seed_connect_source`; kopia's limits never cross between the two.)
     if let Err(e) =
         connect_and_throttle(&local_client, local_connect, spec.cache, &spec.throttle).await
     {

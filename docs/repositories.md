@@ -286,8 +286,10 @@ number chosen for a one-time copy does not go on constraining routine work.
 If any of the applications fails, the bootstrap **fails** rather than proceeding
 uncapped: saturating exactly the link you asked to protect is worse than not
 running. The mover logs `applied repository throttle` once per capped connection
-— three times for a healthy migrate seed (the replica, this repository's
-seed-local connect, and the post-seed reconnect):
+— three times for a healthy first migrate seed (the replica, this repository's
+seed-local connect, and the post-seed reconnect), and four when it is *resuming*
+an interrupted attempt, whose opening probe connect finds the repository already
+there and so gets capped too:
 
 ```console
 $ kubectl -n billing logs job/rebuilt-nas-bootstrap | grep 'applied repository throttle'
