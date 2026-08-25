@@ -100,10 +100,35 @@ cache. See [movers](../../movers.md).
   mover Job so finished Jobs self-GC. Defaults to 1h when neither the repo nor
   the recipe sets one.
 - **`throttle`** — repository throttle limits (`kopia repository throttle set`)
-  applied by every mover after it connects, so a run doesn't saturate the link or
-  hammer the object store: `uploadBytesPerSecond`, `downloadBytesPerSecond`,
-  `readOpsPerSecond`, `writeOpsPerSecond` (each unset leaves kopia's current
-  limit).
+  applied by every mover after it connects to this repository, so a run doesn't
+  saturate the link or hammer the object store: `uploadBytesPerSecond`,
+  `downloadBytesPerSecond`, `readOpsPerSecond`, `writeOpsPerSecond` (each unset
+  leaves kopia's current limit). Every batch mover honors it — bootstrap, backup,
+  restore, maintenance, verification, deletion, repository replication and
+  snapshot replication. kopia's limits are **per connection**, so a run that
+  opens two repositories caps each from *that* repository's own `moverDefaults`:
+  a [`SnapshotReplication`](snapshot-replication.md) caps its source connection
+  from the source repo's defaults and its destination connection from the
+  destination repo's, each overridable per CR via
+  [`spec.migrate.throttle`](snapshot-replication.md#migrate). The exceptions:
+  the interactive [`serve`/browse](../../server.md) session (a read-only UI
+  session, not a batch transfer), and a `RepositoryReplication`'s **destination**
+  side — `kopia repository sync-to` copies blobs without opening the destination
+  as a repository, so its caps live on
+  [`spec.sync`](repository-replication.md) instead.
+
+/// warning | A byte cap bites much harder than its number suggests
+
+A `*BytesPerSecond` cap is enforced against **cold** backend traffic only —
+content already in the mover's kopia cache is read without touching the limiter,
+so a warm re-run can look completely unthrottled. And on small-object workloads
+the effective throughput lands far below the nominal rate: a measured 2 MB/s cap
+took ~14 s to move a 28 KiB cold repository, while caps of 10 MB/s and up often
+did not bind at all at that size. Treat these as a **ceiling for large transfers**
+— set them generously and verify against your own data, rather than tuning them
+down to a number that looks safe.
+
+///
 
 The `securityContext`/`podSecurityContext`/`resources`/`cache` fields resolve by
 field-wise merge: a repo-wide default composes with a partial per-recipe

@@ -5832,6 +5832,7 @@ fn srepl_spec(source: RepositoryRef, dest: RepositoryRef, cron: &str) -> Snapsho
 
 #[test]
 fn srepl_valid_full_spec_has_no_errors() {
+    use crate::common::{MigrateThrottle, Throttle};
     use crate::snapshot_replication::{
         IdentityMatcher, IdentitySelection, MigrateOptions, PolicyCopyMode, Pruning, SelectionSpec,
     };
@@ -5860,6 +5861,17 @@ fn srepl_valid_full_spec_has_no_errors() {
     spec.migrate = Some(MigrateOptions {
         parallel: Some(4),
         policies: PolicyCopyMode::Copy,
+        throttle: Some(MigrateThrottle {
+            source: Some(Throttle {
+                download_bytes_per_second: Some(20 * 1024 * 1024),
+                ..Default::default()
+            }),
+            destination: Some(Throttle {
+                upload_bytes_per_second: Some(5 * 1024 * 1024),
+                write_ops_per_second: Some(50),
+                ..Default::default()
+            }),
+        }),
     });
     spec.pruning = Some(Pruning::Retention(Retention {
         keep_daily: Some(7),
@@ -6137,6 +6149,127 @@ fn srepl_migrate_parallel_zero_is_rejected() {
         ..Default::default()
     });
     assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_migrate_throttle_rejects_non_positive_rates_per_side() {
+    use crate::common::{MigrateThrottle, Throttle};
+    use crate::snapshot_replication::MigrateOptions;
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    // A zero on one side and a negative on the other: BOTH must be reported, and
+    // each message must name the side + the knob (a per-side cap is useless
+    // guidance if the operator can't tell which connection is wrong).
+    spec.migrate = Some(MigrateOptions {
+        throttle: Some(MigrateThrottle {
+            source: Some(Throttle {
+                download_bytes_per_second: Some(0),
+                ..Default::default()
+            }),
+            destination: Some(Throttle {
+                upload_bytes_per_second: Some(-1),
+                write_ops_per_second: Some(0),
+                ..Default::default()
+            }),
+        }),
+        ..Default::default()
+    });
+    let fields: Vec<String> = validate_snapshot_replication(&spec)
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, .. } => Some(field.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            "SnapshotReplication spec.migrate.throttle.source.downloadBytesPerSecond",
+            "SnapshotReplication spec.migrate.throttle.destination.uploadBytesPerSecond",
+            "SnapshotReplication spec.migrate.throttle.destination.writeOpsPerSecond",
+        ],
+        "every offending knob is named, source side first"
+    );
+
+    // 1 is the smallest accepted rate; unset knobs are always fine.
+    spec.migrate = Some(MigrateOptions {
+        throttle: Some(MigrateThrottle {
+            source: Some(Throttle {
+                download_bytes_per_second: Some(1),
+                ..Default::default()
+            }),
+            destination: Some(Throttle {
+                upload_bytes_per_second: Some(1),
+                read_ops_per_second: Some(1),
+                write_ops_per_second: Some(1),
+                ..Default::default()
+            }),
+        }),
+        ..Default::default()
+    });
+    assert!(validate_snapshot_replication(&spec).is_empty());
+
+    // An empty MigrateThrottle constrains nothing and is accepted (both sides
+    // simply inherit their repository's moverDefaults).
+    spec.migrate = Some(MigrateOptions {
+        throttle: Some(MigrateThrottle::default()),
+        ..Default::default()
+    });
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_migrate_throttle_roundtrips_camel_case_through_the_apiserver_path() {
+    // YAML → JSON → typed, the way the cluster parses it (serde_yaml 0.9 would
+    // mis-encode the nested sub-objects).
+    use crate::snapshot_replication::SnapshotReplicationSpec;
+    use crate::testutil::from_yaml;
+    let spec: SnapshotReplicationSpec = from_yaml(
+        r#"
+sourceRef: { name: nas-primary }
+destinationRef: { name: offsite }
+schedule: { cron: "0 6 * * *" }
+migrate:
+  parallel: 2
+  throttle:
+    source:
+      downloadBytesPerSecond: 20971520
+      readOpsPerSecond: 200
+    destination:
+      uploadBytesPerSecond: 5242880
+      writeOpsPerSecond: 50
+"#,
+    );
+    let t = spec
+        .migrate
+        .as_ref()
+        .and_then(|m| m.throttle.as_ref())
+        .expect("migrate.throttle set");
+    let src = t.source.as_ref().expect("source side set");
+    assert_eq!(src.download_bytes_per_second, Some(20 * 1024 * 1024));
+    assert_eq!(src.read_ops_per_second, Some(200));
+    assert_eq!(src.upload_bytes_per_second, None);
+    let dst = t.destination.as_ref().expect("destination side set");
+    assert_eq!(dst.upload_bytes_per_second, Some(5 * 1024 * 1024));
+    assert_eq!(dst.write_ops_per_second, Some(50));
+
+    // Re-serializing keeps the camelCase wire shape and elides unset knobs.
+    let json = serde_json::to_value(&spec).expect("serialize");
+    assert_eq!(
+        json["migrate"]["throttle"]["source"]["readOpsPerSecond"],
+        200
+    );
+    assert!(
+        json["migrate"]["throttle"]["source"]
+            .get("uploadBytesPerSecond")
+            .is_none(),
+        "unset knobs are elided: {json}"
+    );
+    let reparsed: SnapshotReplicationSpec = serde_json::from_value(json).expect("reparse");
+    assert_eq!(spec, reparsed);
 }
 
 #[test]

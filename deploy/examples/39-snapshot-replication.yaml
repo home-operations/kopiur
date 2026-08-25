@@ -105,6 +105,27 @@ spec:
     # Whether kopia POLICIES ride along: none (default — a Kopiur-managed
     # destination keeps retention CR-driven), copy, or copyOverwrite.
     policies: none
+    # Bandwidth/ops caps for THIS replication's runs, one block per side.
+    # `kopia snapshot migrate` has no speed flags, so each side is applied as
+    # `kopia repository throttle set` on that side's connection before the
+    # migrate runs. Each side overrides THAT side's repository's
+    # `moverDefaults.throttle` field by field: a knob set here wins, a knob left
+    # unset keeps the repository's value. Every set knob must be >= 1.
+    #
+    # Caveat worth knowing before you tune these down: byte caps only bite on
+    # COLD backend traffic (cached content bypasses the limiter), and on
+    # small-object workloads the real throughput lands far below the nominal
+    # rate. Treat them as a ceiling for large transfers and measure.
+    throttle:
+      # Reading out of nas-primary — on the LAN, so leave it roomy.
+      source:
+        downloadBytesPerSecond: 209715200 # 200 MiB/s
+      # Writing to the off-site bucket — the scarce link, and the one worth
+      # capping. Unset knobs (downloadBytesPerSecond, readOpsPerSecond) fall
+      # back to the destination Repository's own moverDefaults.throttle.
+      destination:
+        uploadBytesPerSecond: 10485760 # 10 MiB/s
+        writeOpsPerSecond: 100
   # What happens to already-replicated copies on later runs. Exactly one of:
   #   none:         never prune (the default when `pruning` is omitted)
   #   mirrorSource: delete a copy when its snapshot vanished from the source

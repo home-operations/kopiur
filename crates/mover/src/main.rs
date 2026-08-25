@@ -413,8 +413,10 @@ async fn connect_and_throttle(
 ///   `throttle: Default::default()`, so `spec.throttle` is structurally always
 ///   empty; capping it means teaching the CLI to resolve `moverDefaults` first.
 /// * **snapshot-replication source and destination** — a dual connect under two
-///   kopia configs, with per-CR per-side overrides; wired by the next milestone
-///   (M3c), which adds the destination's own `destinationThrottle`.
+///   kopia configs, so ONE funnel call cannot serve both: each side is connected
+///   directly and then throttled in place from its own resolved block (the work
+///   spec's `throttle` for the source, the op's `destinationThrottle` for the
+///   destination). Both applications are terminal, via the flow's `srepl_terminal`.
 /// * **a seed's SOURCE (replica) connect** — same shape, wired by M3d together
 ///   with its `replica_throttle`.
 ///
@@ -3133,6 +3135,22 @@ async fn srepl_connect_source(
         unreachable!("srepl_terminal_kopia always errors");
     }
 
+    // Cap the SOURCE read side on this connection. `snapshot migrate` reopens
+    // this very config, and kopia persists the limits into it — that is the only
+    // lever migrate has, since it carries no speed flags of its own. Applied
+    // straight onto the read-only connect: `repository throttle set` is accepted
+    // there (pinned by the kopia crate's integration test), so no read-write
+    // flip is involved.
+    //
+    // Deliberately BEFORE the no-env-password probe below, not after: the probe's
+    // whole job is to prove the config migrate will reopen is usable, so it
+    // should see that config in its FINAL state — throttle limits written and
+    // all — rather than a state no later step ever runs against.
+    if let Err(e) = apply_repository_throttle(&source_client, &spec.throttle).await {
+        srepl_terminal(&spec.target_ref, e, None).await?;
+        unreachable!("srepl_terminal always errors");
+    }
+
     let probe_client = srepl_client_builder(spec, kopia_binary)
         .env(kopiur_kopia::env::CONFIG_PATH_ENV, &paths.source_config)
         .env(kopiur_kopia::env::CACHE_DIRECTORY_ENV, &paths.source_cache)
@@ -3214,6 +3232,15 @@ async fn srepl_connect_dest(
     if let Err(e) = dest_client.repository_connect(&dest, spec.cache).await {
         srepl_terminal_kopia(&spec.target_ref, Op::SnapshotReplicateDestConnect, e).await?;
         unreachable!("srepl_terminal_kopia always errors");
+    }
+    // Cap the DESTINATION write side on ITS connection, from the op's own
+    // `destinationThrottle` (the destination repository's `moverDefaults`
+    // overlaid by `spec.migrate.throttle.destination`). kopia's limits are
+    // per-connection, so the source's cap above says nothing here — this is the
+    // block that keeps a migrate from saturating the off-site link it writes to.
+    if let Err(e) = apply_repository_throttle(&dest_client, &op.destination_throttle).await {
+        srepl_terminal(&spec.target_ref, e, None).await?;
+        unreachable!("srepl_terminal always errors");
     }
     Ok(dest_client)
 }
@@ -3982,11 +4009,13 @@ mod tests {
             ),
             (
                 "srepl_connect_source",
-                "snapshot-replication source; M3c (1 call)",
+                "snapshot-replication source; dual-config connect, throttled in place \
+                 from spec.throttle immediately after (1 call)",
             ),
             (
                 "srepl_connect_dest",
-                "snapshot-replication destination; M3c (1 call)",
+                "snapshot-replication destination; dual-config connect, throttled in \
+                 place from op.destinationThrottle immediately after (1 call)",
             ),
             (
                 "run_browse_session_flow",

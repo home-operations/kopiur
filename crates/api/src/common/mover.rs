@@ -134,6 +134,36 @@ pub struct MoverDefaults {
 /// their pods self-GC instead of lingering (ADR-0005 §12).
 pub const DEFAULT_JOB_TTL_SECONDS: i64 = 3600;
 
+/// Per-side throttle overrides for a `kopia snapshot migrate` run, which reads
+/// from a SOURCE repository and writes into a DESTINATION repository under two
+/// separate kopia connections.
+///
+/// `snapshot migrate` has **no speed flags of its own** — the only lever is
+/// `kopia repository throttle set` on each side's connection (kopia persists the
+/// limits in that connection's client config, and the migrate honors them when it
+/// reopens it). So a cap here is expressed per side, and each side overrides
+/// **that side's repository's** `moverDefaults.throttle` field by field: a field
+/// set here wins, a field left unset falls back to the repository default, and
+/// all four [`Throttle`] knobs are available on each side independently.
+///
+/// Not `Copy` (neither is [`Throttle`]).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateThrottle {
+    /// Caps for the SOURCE (read) side, overriding the source repository's
+    /// `moverDefaults.throttle` field by field. Applied with `repository
+    /// throttle set` on the migrate's read-only source connection — accepted
+    /// there, so a read-only source is throttled like any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Throttle>,
+    /// Caps for the DESTINATION (write) side, overriding the destination
+    /// repository's `moverDefaults.throttle` field by field. Applied with
+    /// `repository throttle set` on the destination connection the migrate
+    /// writes through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Throttle>,
+}
+
 /// Repository-wide throttling for a mover's kopia connection; each `None` leaves kopia's current limit.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]

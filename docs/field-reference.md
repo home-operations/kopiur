@@ -3757,6 +3757,32 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | --- | --- | --- | --- |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: number of snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
 | `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether kopia **policies** attached to the copied sources are also copied to the destination. Defaults to `PolicyCopyMode::None`. |
+| `throttle` | [object](#snapshotreplication-spec-migrate-throttle) | — | Bandwidth/ops caps for THIS replication's runs, per side. `snapshot migrate` has no speed flags, so each side is applied as `kopia repository throttle set` on that side's connection; `source` overrides the source repository's `moverDefaults.throttle` and `destination` the destination repository's, field by field (a field left unset keeps that repository's default). Absent: both sides use their repository's defaults. |
+
+##### `spec.migrate.throttle` { #snapshotreplication-spec-migrate-throttle }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `destination` | [object](#snapshotreplication-spec-migrate-throttle-destination) | — | Caps for the DESTINATION (write) side, overriding the destination repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the destination connection the migrate writes through. |
+| `source` | [object](#snapshotreplication-spec-migrate-throttle-source) | — | Caps for the SOURCE (read) side, overriding the source repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the migrate's read-only source connection — accepted there, so a read-only source is throttled like any other. |
+
+###### `spec.migrate.throttle.destination` { #snapshotreplication-spec-migrate-throttle-destination }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
+
+###### `spec.migrate.throttle.source` { #snapshotreplication-spec-migrate-throttle-source }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
 #### `spec.mover` { #snapshotreplication-spec-mover }
 

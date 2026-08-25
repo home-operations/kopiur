@@ -1677,6 +1677,16 @@ pub struct SnapshotReplicateOp {
     /// [`PruningSpec::None`] (never prune) — absent on the wire means none.
     #[serde(default, skip_serializing_if = "PruningSpec::is_none")]
     pub pruning: PruningSpec,
+    /// Throttle limits for the DESTINATION connection (`kopia repository
+    /// throttle set` after the dest connect). The SOURCE side rides the work
+    /// spec's own [`MoverWorkSpec::throttle`] — a snapshot replication opens two
+    /// repositories under two kopia configs, and kopia's limits are per
+    /// connection, so each side needs its own resolved block. The controller
+    /// merges the destination repository's `moverDefaults.throttle` with
+    /// `spec.migrate.throttle.destination` field by field. All-`None` ⇒ the
+    /// mover skips the dest throttle call.
+    #[serde(default, skip_serializing_if = "ThrottleSpec::is_empty")]
+    pub destination_throttle: ThrottleSpec,
 }
 
 /// A fully-resolved repository CR reference on the wire (kind + name +
