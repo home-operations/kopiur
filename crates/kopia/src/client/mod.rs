@@ -1427,13 +1427,15 @@ impl KopiaClient {
     ///   blob write and hard-errors there.
     /// - **The bit lives in the local config, not the repository.** `read_only: true`
     ///   writes `"readonly": true` into the `KOPIA_CONFIG_PATH` JSON; `false` removes the
-    ///   key. Nothing is written to the backend, so this never mutates shared state and
-    ///   needs no maintenance ownership/lease.
+    ///   key. The test fingerprints every blob in the backend across the flip and requires
+    ///   it unchanged, so this never mutates shared state and needs no maintenance
+    ///   ownership/lease.
     /// - **It is the "flip window" primitive** for a read-only-connected config that must
     ///   run a write-requiring verb: flip read-write, run the verb, flip back. Note that
     ///   [`Self::repository_throttle_set`] does *not* need this window — M3a measured it
-    ///   succeeding directly on a `--readonly` connection (it only rewrites the local
-    ///   config's `throttlingLimits`), so the flip is defensive there, not required.
+    ///   succeeding directly on a `--readonly` connection, and leaving the read-only bit
+    ///   intact, because it only rewrites the local config's `throttlingLimits`. The flip
+    ///   is defensive there, not required.
     pub async fn repository_set_client_read_only(&self, read_only: bool) -> Result<(), KopiaError> {
         let mode = if read_only {
             "--read-only"

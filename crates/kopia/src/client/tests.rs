@@ -1486,6 +1486,9 @@ async fn set_client_read_only_emits_the_matching_polarity_flag() {
     // assertion has to be on what the process is actually SPAWNED with. A shim
     // standing in for `kopia` appends its argv to a file (issue #374).
     let dir = std::env::temp_dir().join(format!("kopiur-setclient-{}", std::process::id()));
+    // The shim APPENDS, so a leftover argv.out from an earlier run in the same
+    // process-id directory would prepend phantom lines. Start from nothing.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let shim = dir.join("kopia");
     let out = dir.join("argv.out");
