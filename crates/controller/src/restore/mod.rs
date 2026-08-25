@@ -280,7 +280,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     let restore = match gate_on_repository_readiness(ctx, restore, &api, &namespace, &name).await? {
         RepositoryGate::Proceed(carried) => {
             gated = carried;
-            gated.as_ref()
+            gated.get()
         }
         RepositoryGate::Held(action) | RepositoryGate::Undetermined(action) => {
             return Ok(action);
@@ -3466,7 +3466,14 @@ enum RepositoryGate<'a> {
     /// one, so the clear cannot be silently dropped by a later edit. Dropping it
     /// would let the unconditional downstream gate parks re-write the stale
     /// `False` and alternate two writes forever — see [`restore_with_conditions`].
-    Proceed(std::borrow::Cow<'a, Restore>),
+    ///
+    /// [`CarriedRestore`], not `Cow<Restore>`: a `Cow`'s owned variant is stored
+    /// inline, and `Restore` is large enough that it would bloat every value of
+    /// this enum past `clippy::large_enum_variant` (denied workspace-wide) while
+    /// the sibling variants are one `Action` each. `CarriedRestore` boxes only
+    /// its owned arm, so this stays pointer-sized AND the borrowed path keeps
+    /// costing nothing.
+    Proceed(CarriedRestore<'a>),
     /// VERIFIED not ready: the repository object exists and its phase is not
     /// `Ready` (the backend is unreachable). Park + requeue.
     Held(Action),

@@ -588,7 +588,43 @@ pub(super) fn restore_with_conditions(restore: &Restore, conditions: Vec<Conditi
     carried
 }
 
-/// The `Restore` the rest of the pass must build on, given what
+/// The `Restore` the rest of a reconcile pass must build on: the one the
+/// reconcile was handed, or — when the readiness gate cleared a stale
+/// `ReferentAvailable=False` — an owned copy carrying the cleared conditions.
+///
+/// A hand-written two-variant carrier rather than `Cow<'a, Restore>`, for one
+/// concrete reason: `Restore` is a large struct, so a `Cow` stores the owned
+/// variant INLINE and every value of the enum carrying it (here
+/// [`super::RepositoryGate`], whose other variants are one `Action` each) grows
+/// to that size — `clippy::large_enum_variant`, denied workspace-wide. Boxing
+/// the whole `Cow` (clippy's suggestion) would allocate on the borrowed path
+/// too, which is the overwhelmingly common one and must stay free. Boxing only
+/// [`Self::Cleared`] keeps the carrier pointer-sized in both arms: the unchanged
+/// path is still a bare borrow with no clone and no allocation, and the cleared
+/// path pays one `Box` on top of a `Restore` clone it was already making.
+///
+/// [`Self::get`] is an exhaustive `match`, so a third carrier shape would have
+/// to say which object the pass continues with.
+#[derive(Debug)]
+pub(super) enum CarriedRestore<'a> {
+    /// Nothing was cleared: the reconcile's own `Restore`, borrowed.
+    Unchanged(&'a Restore),
+    /// The gate cleared a stale gate condition: this copy mirrors the status
+    /// patch it just made, and is what every later writer must rebuild from.
+    Cleared(Box<Restore>),
+}
+
+impl CarriedRestore<'_> {
+    /// The `Restore` to continue the pass with. Exhaustive.
+    pub(super) fn get(&self) -> &Restore {
+        match self {
+            Self::Unchanged(restore) => restore,
+            Self::Cleared(restore) => restore,
+        }
+    }
+}
+
+/// The [`CarriedRestore`] for this pass, given what
 /// [`cleared_referent_conditions`] produced: the original borrowed when nothing
 /// was cleared (the overwhelmingly common path — no clone), an owned copy
 /// carrying the cleared conditions when something was. Pure and TOTAL.
@@ -600,14 +636,16 @@ pub(super) fn restore_with_conditions(restore: &Restore, conditions: Vec<Conditi
 pub(super) fn carried_after_clear<'a>(
     restore: &'a Restore,
     cleared: Option<&[Condition]>,
-) -> std::borrow::Cow<'a, Restore> {
+) -> CarriedRestore<'a> {
     match cleared {
-        None => std::borrow::Cow::Borrowed(restore),
-        Some(conditions) => {
-            std::borrow::Cow::Owned(restore_with_conditions(restore, conditions.to_vec()))
-        }
+        None => CarriedRestore::Unchanged(restore),
+        Some(conditions) => CarriedRestore::Cleared(Box::new(restore_with_conditions(
+            restore,
+            conditions.to_vec(),
+        ))),
     }
 }
+
 /// Where the `waitTimeout` window is anchored: `status.waitStartedAt` once
 /// [`super::ensure_wait_anchor`] has stamped it, else `created_epoch`.
 ///

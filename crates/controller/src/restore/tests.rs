@@ -325,7 +325,12 @@ fn a_cleared_referent_condition_survives_a_downstream_gate_park() {
     let cleared = cleared_referent_conditions(&parked).expect("a stale park clears");
     // Built through the one construction site the gate uses, so this exercises
     // the real seam rather than a re-implementation of it.
-    let carried = carried_after_clear(&parked, Some(&cleared)).into_owned();
+    let carrier = carried_after_clear(&parked, Some(&cleared));
+    assert!(
+        matches!(carrier, CarriedRestore::Cleared(_)),
+        "a cleared pass must carry an OWNED copy, never the stale borrow"
+    );
+    let carried = carrier.get().clone();
 
     // What a downstream gate park computes from the CARRIED copy: the clear holds.
     let after_park = io::upsert_gate(
@@ -370,8 +375,11 @@ fn a_cleared_referent_condition_survives_a_downstream_gate_park() {
         &untouched,
         cleared_referent_conditions(&untouched).as_deref(),
     );
-    assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
-    assert_eq!(same.as_ref().status, untouched.status);
+    assert!(
+        matches!(same, CarriedRestore::Unchanged(_)),
+        "the common path must borrow: no clone, no allocation, nothing changed"
+    );
+    assert_eq!(same.get().status, untouched.status);
 }
 
 #[test]
