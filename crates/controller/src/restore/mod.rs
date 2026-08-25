@@ -267,12 +267,25 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // `ensure_wait_anchor` below — which is the whole of #393: a restore whose
     // repository could not even be looked up must not open (and start spending)
     // its `waitTimeout` window.
-    match gate_on_repository_readiness(ctx, restore, &api, &namespace, &name).await? {
-        RepositoryGate::Proceed => {}
+    //
+    // The gate hands back THE `Restore` the rest of this pass must use, and
+    // `restore` is rebound to it: unchanged in the ordinary case, and a carried
+    // copy holding the cleared conditions when the gate cleared a stale
+    // `ReferentAvailable=False`. Every condition writer below rebuilds the array
+    // from this `restore`, and four of them (the gate parks in
+    // `run_restore_mover`) patch UNCONDITIONALLY — continuing from the
+    // reconcile-start copy would re-write the `False` just cleared and alternate
+    // the two writes on every requeue, forever. See `restore_with_conditions`.
+    let gated;
+    let restore = match gate_on_repository_readiness(ctx, restore, &api, &namespace, &name).await? {
+        RepositoryGate::Proceed(carried) => {
+            gated = carried;
+            gated.as_ref()
+        }
         RepositoryGate::Held(action) | RepositoryGate::Undetermined(action) => {
             return Ok(action);
         }
-    }
+    };
 
     // The claiming PVC, looked up ONCE per pass and shared by everything below that needs
     // it: the wait-window anchor (a populator with no claim cannot proceed, so its window
@@ -3440,10 +3453,20 @@ async fn restore_repository_ref(
 /// `_ =>` arm — a fourth outcome must force its caller to decide, at compile
 /// time, whether it proceeds or parks. COMPILER-ONLY guard: `cargo xtask
 /// check-phases` scans only the `*Phase` enums in `kopiur-api`.
-enum RepositoryGate {
+enum RepositoryGate<'a> {
     /// The gate does not hold this restore: reconcile continues (and the
     /// `waitTimeout` window may open).
-    Proceed,
+    ///
+    /// It carries **the `Restore` the rest of the pass must use** — borrowed
+    /// unchanged in the ordinary case, and an owned copy holding the cleared
+    /// conditions when this pass cleared a stale `ReferentAvailable=False`
+    /// ([`restore_with_conditions`]). Returning the object rather than a
+    /// "…and also remember to apply this" side value is deliberate: the caller
+    /// cannot obtain a `&Restore` to continue with WITHOUT taking the carried
+    /// one, so the clear cannot be silently dropped by a later edit. Dropping it
+    /// would let the unconditional downstream gate parks re-write the stale
+    /// `False` and alternate two writes forever — see [`restore_with_conditions`].
+    Proceed(std::borrow::Cow<'a, Restore>),
     /// VERIFIED not ready: the repository object exists and its phase is not
     /// `Ready` (the backend is unreachable). Park + requeue.
     Held(Action),
@@ -3499,13 +3522,13 @@ enum RepositoryGate {
 /// crash window: a Job created moments before the controller died — before the
 /// `Restoring` patch landed — is re-gated as `Pending`/`Resolving`; harmless, the
 /// Job runs to terminal on its own and is observed once the gate opens.)
-async fn gate_on_repository_readiness(
+async fn gate_on_repository_readiness<'a>(
     ctx: &Context,
-    restore: &Restore,
+    restore: &'a Restore,
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-) -> Result<RepositoryGate> {
+) -> Result<RepositoryGate<'a>> {
     if !restore_awaiting_launch(restore.status.as_ref().and_then(|s| s.phase.as_ref())) {
         return proceed_past_gate(restore, api, name).await;
     }
@@ -3602,15 +3625,29 @@ fn repository_referent_namespace<'a>(rref: &'a RepositoryRef, base_ns: &'a str) 
 /// nothing and the healthy wire never grows the condition. Without it the
 /// registry row — which is deliberately age-independent — would keep reporting a
 /// restore that proceeded hours ago as blocked.
-async fn proceed_past_gate(
-    restore: &Restore,
+///
+/// The cleared array is not just written to the server: the returned
+/// [`RepositoryGate::Proceed`] carries a `Restore` holding it, which is the
+/// object the rest of the pass must build on. The downstream gate parks rebuild
+/// `conditions` from the `Restore` they are handed and patch it
+/// UNCONDITIONALLY, so continuing from the reconcile-start copy would re-write
+/// the `False` this just cleared — see [`restore_with_conditions`] for the write
+/// loop that prevents. Nothing was cleared ⇒ the original is borrowed, no clone.
+async fn proceed_past_gate<'a>(
+    restore: &'a Restore,
     api: &Api<Restore>,
     name: &str,
-) -> Result<RepositoryGate> {
-    if let Some(conditions) = cleared_referent_conditions(restore) {
+) -> Result<RepositoryGate<'a>> {
+    let cleared = cleared_referent_conditions(restore);
+    if let Some(conditions) = &cleared {
         io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
     }
-    Ok(RepositoryGate::Proceed)
+    // One construction site, pure and total: a cleared pass CANNOT continue from
+    // the stale object, because that combination is unwritable here.
+    Ok(RepositoryGate::Proceed(carried_after_clear(
+        restore,
+        cleared.as_deref(),
+    )))
 }
 
 /// Park a restore whose repository referent does not exist (issue #393):
@@ -3632,7 +3669,7 @@ async fn park_on_missing_referent(
     kind: &str,
     referent_namespace: Option<&str>,
     referent: &str,
-) -> Result<RepositoryGate> {
+) -> Result<RepositoryGate<'static>> {
     let msg = referent_missing_restore_message(kind, referent_namespace, referent);
     let conditions = io::upsert_gate(
         &existing_conditions(restore),

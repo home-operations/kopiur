@@ -562,6 +562,52 @@ pub(super) fn cleared_referent_conditions(restore: &Restore) -> Option<Vec<Condi
         restore.metadata.generation,
     ))
 }
+
+/// `restore` with `conditions` substituted — the in-memory mirror of a status
+/// patch this pass has ALREADY made, so the rest of the pass builds on what the
+/// server now holds instead of the reconcile-start copy. Pure.
+///
+/// This is what keeps [`cleared_referent_conditions`] from starting a write
+/// loop. Nearly every condition writer downstream of the readiness gate rebuilds
+/// the array from the `restore` it was handed (a merge patch replaces the array
+/// wholesale, so it has to), and four of them — the `MissingCaBundle`,
+/// `MissingServiceAccount`, `PrivilegedMover` and `MissingCredentials` gate parks
+/// in `run_restore_mover` — patch UNCONDITIONALLY. Against a reconcile-start copy
+/// that still carries `ReferentAvailable=False`, a clear written earlier in the
+/// same pass would be re-written back to `False` by that park, then cleared again
+/// next pass: two resourceVersion-bumping writes per iteration, each waking the
+/// watch, forever — for exactly the GitOps bring-up (repository up, credentials
+/// Secret not yet) this feature exists to serve. Those parks are byte-identical
+/// no-ops today ONLY because nothing writes conditions before them; carrying the
+/// cleared copy forward preserves that.
+pub(super) fn restore_with_conditions(restore: &Restore, conditions: Vec<Condition>) -> Restore {
+    let mut carried = restore.clone();
+    let mut status = carried.status.take().unwrap_or_default();
+    status.conditions = conditions;
+    carried.status = Some(status);
+    carried
+}
+
+/// The `Restore` the rest of the pass must build on, given what
+/// [`cleared_referent_conditions`] produced: the original borrowed when nothing
+/// was cleared (the overwhelmingly common path — no clone), an owned copy
+/// carrying the cleared conditions when something was. Pure and TOTAL.
+///
+/// The single construction site for the readiness gate's proceed payload, so the
+/// "cleared but continued from the stale copy" combination — the one that starts
+/// the alternating-write loop described on [`restore_with_conditions`] — has no
+/// place to be written. Both arms are unit-asserted.
+pub(super) fn carried_after_clear<'a>(
+    restore: &'a Restore,
+    cleared: Option<&[Condition]>,
+) -> std::borrow::Cow<'a, Restore> {
+    match cleared {
+        None => std::borrow::Cow::Borrowed(restore),
+        Some(conditions) => {
+            std::borrow::Cow::Owned(restore_with_conditions(restore, conditions.to_vec()))
+        }
+    }
+}
 /// Where the `waitTimeout` window is anchored: `status.waitStartedAt` once
 /// [`super::ensure_wait_anchor`] has stamped it, else `created_epoch`.
 ///

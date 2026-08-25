@@ -293,6 +293,87 @@ fn the_referent_gate_condition_clears_only_when_it_is_stale() {
     assert!(cleared_referent_conditions(&healthy).is_none());
 }
 
+/// The write-loop guard: a pass that clears the referent gate must carry the
+/// cleared conditions forward, or the UNCONDITIONAL gate parks downstream
+/// (`run_restore_mover`'s `MissingCaBundle`/`MissingServiceAccount`/
+/// `PrivilegedMover`/`MissingCredentials` writes) rebuild the array from the
+/// reconcile-start copy and put `ReferentAvailable=False` straight back.
+///
+/// That alternation is not cosmetic: both writes bump `resourceVersion`, each
+/// wakes the watch and re-enqueues immediately, so the pair repeats forever (two
+/// writes + an Event per iteration) for as long as the Secret/SA/ConfigMap is
+/// missing — precisely the GitOps bring-up this feature serves. Those parks are
+/// byte-identical no-ops today only because nothing writes conditions ahead of
+/// them; this test pins the property that keeps that true.
+///
+/// The CALLER half of the contract is enforced by the compiler rather than here:
+/// `RepositoryGate::Proceed` carries the `Cow<Restore>` to continue with, so
+/// `reconcile_inner` cannot get a `&Restore` for the rest of the pass without
+/// taking the carried one. This test pins the mechanism that carrying provides.
+#[test]
+fn a_cleared_referent_condition_survives_a_downstream_gate_park() {
+    use crate::consts::RESTORE_REFERENT_AVAILABLE_CONDITION;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+    let status_of = |conds: &[Condition]| {
+        conds
+            .iter()
+            .find(|c| c.type_ == RESTORE_REFERENT_AVAILABLE_CONDITION)
+            .map(|c| c.status.clone())
+    };
+
+    let parked = restore_with_condition(RESTORE_REFERENT_AVAILABLE_CONDITION, "False");
+    let cleared = cleared_referent_conditions(&parked).expect("a stale park clears");
+    // Built through the one construction site the gate uses, so this exercises
+    // the real seam rather than a re-implementation of it.
+    let carried = carried_after_clear(&parked, Some(&cleared)).into_owned();
+
+    // What a downstream gate park computes from the CARRIED copy: the clear holds.
+    let after_park = io::upsert_gate(
+        &existing_conditions(&carried),
+        &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
+        "the credentials Secret is not in the mover namespace",
+        carried.metadata.generation,
+    );
+    assert_eq!(
+        status_of(&after_park).as_deref(),
+        Some("True"),
+        "carrying the cleared conditions forward must survive an unconditional \
+         downstream gate park: {after_park:?}"
+    );
+    // ...and the same park computed from the reconcile-start copy is the write
+    // that used to alternate with the clear. Asserted so this test fails loudly
+    // if the clobber ever stops being reproducible (i.e. the guard goes vacuous).
+    let clobbered = io::upsert_gate(
+        &existing_conditions(&parked),
+        &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
+        "the credentials Secret is not in the mover namespace",
+        parked.metadata.generation,
+    );
+    assert_eq!(
+        status_of(&clobbered).as_deref(),
+        Some("False"),
+        "the reconcile-start copy still carries the stale park — that is the write \
+         the carried copy exists to prevent"
+    );
+
+    // The carried copy is also a fixed point: a second pass over it clears
+    // nothing, so the loop cannot restart from the other side.
+    assert!(cleared_referent_conditions(&carried).is_none());
+    // Carrying preserves everything else about the object (only conditions move).
+    assert_eq!(carried.metadata.generation, parked.metadata.generation);
+    assert_eq!(carried.spec, parked.spec);
+
+    // Both arms of the construction site: nothing cleared ⇒ the original is
+    // BORROWED (the common path pays no clone and changes nothing).
+    let untouched = restore_with_condition("Resolved", "True");
+    let same = carried_after_clear(
+        &untouched,
+        cleared_referent_conditions(&untouched).as_deref(),
+    );
+    assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(same.as_ref().status, untouched.status);
+}
+
 #[test]
 fn populator_state_depends_on_target_variant() {
     use kopiur_api::PopulatorTarget;
