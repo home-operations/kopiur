@@ -104,8 +104,8 @@ cache. See [movers](../../movers.md).
   saturate the link or hammer the object store: `uploadBytesPerSecond`,
   `downloadBytesPerSecond`, `readOpsPerSecond`, `writeOpsPerSecond` (each unset
   leaves kopia's current limit). Honored by the transfer movers — bootstrap,
-  backup, restore, maintenance, verification, repository replication and snapshot
-  replication. kopia's limits are **per connection**, so a run that opens two
+  backup, restore, maintenance, verification, repository replication, snapshot
+  replication and seed. kopia's limits are **per connection**, so a run that opens two
   repositories caps each from *that* repository's own `moverDefaults`: a
   [`SnapshotReplication`](snapshot-replication.md) caps its source connection
   from the source repo's defaults and its destination connection from the

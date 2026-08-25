@@ -307,7 +307,7 @@ fn the_referent_gate_condition_clears_only_when_it_is_stale() {
 /// them; this test pins the property that keeps that true.
 ///
 /// The CALLER half of the contract is enforced by the compiler rather than here:
-/// `RepositoryGate::Proceed` carries the `Cow<Restore>` to continue with, so
+/// `RepositoryGate::Proceed` carries the `CarriedRestore` to continue with, so
 /// `reconcile_inner` cannot get a `&Restore` for the rest of the pass without
 /// taking the carried one. This test pins the mechanism that carrying provides.
 #[test]

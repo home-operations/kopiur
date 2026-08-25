@@ -427,11 +427,6 @@ async fn connect_and_throttle(
 /// A failure is TERMINAL for the run, never best-effort: continuing would
 /// saturate exactly the link the user capped, which is worse than not running.
 ///
-/// No limits set → no kopia process is spawned (the common case stays free).
-///
-/// A failure is TERMINAL for the run, never best-effort: continuing would
-/// saturate exactly the link the user capped, which is worse than not running.
-///
 /// The `info!` line is the observable proof the limits reached kopia — the e2e
 /// scenarios assert on it, and its ABSENCE is the version-skew signal for a new
 /// controller driving an old mover image. Emitted only after kopia accepted
@@ -2578,7 +2573,7 @@ async fn run_maintenance_flow(
     if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
         let e = e.into_mover_error(KopiaOp::MaintenanceConnect);
         patch_maintenance_status(&spec.target_ref, &maintenance_failed_body_from_mover(&e)).await;
-        error!(class = %e.kopia_class(), "maintenance connect failed");
+        error!(class = %e.kopia_class(), "could not open a capped connection to the repository undergoing maintenance");
         return Err(e);
     }
 
@@ -2734,7 +2729,7 @@ async fn run_verify_flow(
     if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
         let e = e.into_mover_error(KopiaOp::VerifyConnect);
         patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
-        error!(class = %e.kopia_class(), "verify connect failed");
+        error!(class = %e.kopia_class(), "could not open a capped connection to the repository being verified");
         return Err(e);
     }
 
@@ -2980,7 +2975,7 @@ async fn run_replicate_flow(
     if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
         let e = e.into_mover_error(KopiaOp::ReplicateConnect);
         patch_replicate_status(&spec.target_ref, &replicate_failed_body(&e.to_string())).await;
-        error!(class = %e.kopia_class(), "replication source connect failed");
+        error!(class = %e.kopia_class(), "could not open a capped connection to the source repository a replication reads from");
         return Err(e);
     }
 
