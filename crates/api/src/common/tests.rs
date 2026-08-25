@@ -1523,7 +1523,31 @@ fn replication_manual_run_status_roundtrips_camel_case() {
     assert_eq!(json["completedAt"], "2026-06-11T12:01:42Z");
     let back: ReplicationManualRunStatus = serde_json::from_value(json).unwrap();
     assert_eq!(back, st);
-    // Absent fields serialize away entirely (no explicit nulls in status).
+    // The contract (#394): `requestedAt`/`phase` serialize away when absent, but
+    // `completedAt` ALWAYS emits — as an explicit null when there is no
+    // completion instant — so the merge-patch DELETES a previous run's stamp
+    // instead of leaving it standing over a fresh non-terminal phase.
     let empty = serde_json::to_value(ReplicationManualRunStatus::default()).unwrap();
-    assert_eq!(empty, serde_json::json!({}));
+    assert_eq!(empty, serde_json::json!({ "completedAt": null }));
+    // …and that explicit null reads back as "no completion instant", not as a
+    // decode error (the round trip both directions).
+    let back: ReplicationManualRunStatus = serde_json::from_value(empty).unwrap();
+    assert_eq!(back, ReplicationManualRunStatus::default());
+    assert!(back.completed_at.is_none());
+
+    // A non-terminal run keeps its other fields AND clears the stamp.
+    let running = serde_json::to_value(ReplicationManualRunStatus {
+        requested_at: Some("2026-06-11T13:00:00Z".into()),
+        phase: Some(ReplicationManualRunPhase::Running),
+        completed_at: None,
+    })
+    .unwrap();
+    assert_eq!(
+        running,
+        serde_json::json!({
+            "requestedAt": "2026-06-11T13:00:00Z",
+            "phase": "Running",
+            "completedAt": null,
+        })
+    );
 }

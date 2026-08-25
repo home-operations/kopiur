@@ -381,6 +381,10 @@ async fn repository_replication_s3_to_s3_uses_destination_scoped_credentials() {
 /// It pins the halves a unit test cannot reach: the requested run rides the
 /// ordinary mover path (a real `sync-to`, tagged `run-trigger: manual` on its
 /// Job), and `status.manualRun` answers the exact timestamp requested.
+///
+/// It then pins issue #394 against a REAL apiserver: a follow-up request parked
+/// as `Pending` must have the finished run's `completedAt` merge-patched away,
+/// which only the explicit-null serialization achieves.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn repository_replication_runs_on_demand_from_the_run_requested_annotation() {
@@ -531,6 +535,57 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
     assert!(
         triggers.iter().any(|t| t == "manual"),
         "the requested run's Job must be tagged run-trigger: manual; got {triggers:?}"
+    );
+
+    // Issue #394: a FOLLOW-UP request must not inherit the finished run's
+    // `completedAt`. The non-terminal patch now serializes an explicit null, and
+    // an RFC-7386 merge-patch DELETES the key it is nulling — so the stale stamp
+    // disappears from the stored object rather than sitting under a `Pending`.
+    //
+    // Suspending is what makes the park deterministic (#380 records an
+    // unanswered request as `Pending` and stops). Ordering hazard: the
+    // reconciler checks `spec.suspend` BEFORE the run request, but annotating an
+    // un-suspended CR can spawn the Job and record `Running` before the suspend
+    // lands — so both fields ride ONE patch.
+    let second_request = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    repls
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": {
+                    kopiur_api::consts::RUN_REQUESTED_ANNOTATION: second_request
+                } },
+                "spec": { "suspend": true }
+            })),
+        )
+        .await
+        .expect("suspend and re-request in one patch");
+
+    let parked = wait_until(
+        "the follow-up request parks as Pending on the suspended replication",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let repls = repls.clone();
+            let want = second_request.clone();
+            async move {
+                let s = status_json(&repls, name).await;
+                Ok(s.get("manualRun")
+                    .filter(|m| {
+                        m.get("phase").and_then(|p| p.as_str()) == Some("Pending")
+                            && m.get("requestedAt").and_then(|r| r.as_str()) == Some(want.as_str())
+                    })
+                    .cloned())
+            }
+        },
+    )
+    .await
+    .expect("the suspended replication should record the new request as Pending");
+    assert!(
+        parked.get("completedAt").is_none(),
+        "a non-terminal manualRun must carry NO completedAt — the previous run's \
+         stamp must have been merge-patched away, not left standing; got {parked}"
     );
 
     let _ = repls.delete(name, &DeleteParams::default()).await;
