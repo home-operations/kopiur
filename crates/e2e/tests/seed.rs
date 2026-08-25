@@ -553,6 +553,20 @@ async fn migrate_seed_copies_history_from_another_repository_and_keeps_its_ident
                 // itself, and a seed-armed bootstrap never takes the create
                 // fallback — so reaching Ready here proves both at once.
                 "create": { "enabled": false },
+                // #374: a migrate seed opens TWO connections to this repository
+                // under two kopia configs — the seed's own local client (which
+                // `snapshot migrate` reopens, and which has no speed flags of its
+                // own, making this the ONLY cap on the heaviest transfer kopiur
+                // performs) and the post-seed bootstrap reconnect. Both must be
+                // capped; the assertion below counts the mover's log line per pod
+                // to prove the seed-local one specifically fired. Non-binding at
+                // 100 MiB/s over a local hostPath.
+                "moverDefaults": {
+                    "throttle": {
+                        "uploadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND,
+                        "downloadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND
+                    }
+                },
                 "seed": {
                     "from": { "repository": { "kind": "Repository", "name": SOURCE } },
                     "migrate": { "parallel": 2 }
@@ -570,6 +584,18 @@ async fn migrate_seed_copies_history_from_another_repository_and_keeps_its_ident
             .and_then(|v| v.as_str()),
         Some(SOURCE),
         "spec.seed.from.repository must have survived admission"
+    );
+    // Bare spec fields, not a `{"spec": ...}` wrapper — read the throttle back
+    // too, or the log-count assertion below would pass vacuously against a repo
+    // that never carried a cap.
+    assert_eq!(
+        live.spec
+            .mover_defaults
+            .as_ref()
+            .and_then(|m| m.throttle.as_ref())
+            .and_then(|t| t.upload_bytes_per_second),
+        Some(consts::THROTTLE_BYTES_PER_SECOND),
+        "moverDefaults.throttle must survive onto the seeded Repository"
     );
 
     wait_seeded(&repos, SEEDED, "True", "Seeded").await;
@@ -591,6 +617,27 @@ async fn migrate_seed_copies_history_from_another_repository_and_keeps_its_ident
             .and_then(|v| v.as_i64())
             .is_some_and(|n| n >= 1),
         "a migrate seed must report the manifests it copied; status.seed: {seed_status}"
+    );
+
+    // #374 regression guard for the highest-value call site of the fix: the
+    // seed's LOCAL repository connect. This one bootstrap pod opens two capped
+    // connections — the seed's local client (under its own kopia config, the
+    // only cap `snapshot migrate` can honor) and the post-seed reconnect — so it
+    // must log the line TWICE. Counting per pod is load-bearing: the same
+    // selector also matches later catalog-rescan/probe pods that log it once
+    // each, and a bare `contains` (or a count across pods) would stay green with
+    // the seed-local call deleted.
+    kopiur_e2e::wait::wait_for_pod_log_times(
+        &client,
+        E2E_NAMESPACE,
+        &format!("kopiur.home-operations.com/repository={SEEDED}"),
+        consts::THROTTLE_APPLIED_LOG,
+        2,
+    )
+    .await
+    .expect(
+        "the seeding mover must cap BOTH the seed's local connect and the post-seed \
+         reconnect (#374); one occurrence means the seed-local throttle is gone",
     );
 
     // Identity survives the migrate, so a restore keyed on the SOURCE's
