@@ -2404,6 +2404,9 @@ fn blob_seed() -> SeedOpSpec {
         migrate: None,
         allow_empty_source: false,
         resume: false,
+        // Blob mode caps its copy through `sync-to`'s own speed flags above;
+        // there is no source repository CR to carry `moverDefaults`.
+        replica_throttle: ThrottleSpec::default(),
     }
 }
 
@@ -2426,6 +2429,11 @@ fn migrate_seed() -> SeedOpSpec {
         }),
         allow_empty_source: true,
         resume: false,
+        replica_throttle: ThrottleSpec {
+            download_bytes_per_second: Some(20 * 1024 * 1024),
+            read_ops_per_second: Some(200),
+            ..Default::default()
+        },
     }
 }
 
@@ -2548,6 +2556,55 @@ fn resume_rides_the_wire_and_defaults_off_on_old_specs() {
     let v = serde_json::to_value(&resuming).unwrap();
     assert_eq!(v["resume"], true);
     assert_eq!(serde_json::from_value::<SeedOpSpec>(v).unwrap(), resuming);
+}
+
+#[test]
+fn the_replica_throttle_rides_the_seed_op_and_defaults_empty_on_old_specs() {
+    // The SOURCE (replica) side's cap rides the op; THIS repository's side rides
+    // the work spec's own `throttle`. Two repositories, two kopia connections,
+    // two independent blocks — a migrate seed is the only flow that opens both.
+    let v = serde_json::to_value(migrate_seed()).unwrap();
+    assert_eq!(
+        v["replicaThrottle"]["downloadBytesPerSecond"],
+        20 * 1024 * 1024
+    );
+    assert_eq!(v["replicaThrottle"]["readOpsPerSecond"], 200);
+    assert!(
+        v["replicaThrottle"].get("uploadBytesPerSecond").is_none(),
+        "unset replica knobs are elided: {v}"
+    );
+    assert_eq!(
+        serde_json::from_value::<SeedOpSpec>(v).unwrap(),
+        migrate_seed()
+    );
+
+    // The common case must not grow a key: an all-None block is the mover's
+    // "skip `throttle set`" signal, so it serializes to nothing at all.
+    let uncapped = SeedOpSpec {
+        replica_throttle: ThrottleSpec::default(),
+        ..migrate_seed()
+    };
+    assert!(
+        serde_json::to_value(&uncapped)
+            .unwrap()
+            .get("replicaThrottle")
+            .is_none(),
+        "an empty replica throttle is elided from the wire"
+    );
+
+    // Old→new: a spec stamped before `replicaThrottle` existed decodes to an
+    // empty block, i.e. an old controller driving a new mover leaves the replica
+    // read uncapped rather than failing to decode.
+    let old: SeedOpSpec = serde_json::from_value(serde_json::json!({
+        "from": { "repository": {
+            "kind": "Repository",
+            "name": "offsite",
+            "connect": { "filesystem": { "path": "/mnt/offsite" } }
+        } },
+        "sourceDescription": "Repository/offsite"
+    }))
+    .unwrap();
+    assert!(old.replica_throttle.is_empty());
 }
 
 #[test]

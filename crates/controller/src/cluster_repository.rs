@@ -1380,7 +1380,11 @@ async fn bootstrap_cluster_via_mover(
         &job_ns,
         create_enabled,
         repo.spec.create.as_ref(),
-        repo.spec.mover_defaults.as_ref(),
+        crate::repo_seed::seed_bootstrap_throttle(
+            seed_armed,
+            repo.spec.seed.as_ref(),
+            repo.spec.mover_defaults.as_ref(),
+        ),
         cluster,
         foreign,
         read_only,
@@ -1621,7 +1625,10 @@ fn cluster_bootstrap_work_spec(
     job_ns: &str,
     auto_create: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
-    mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
+    // The cap for every connection this bootstrap opens to THIS repository,
+    // resolved by the caller through `repo_seed::seed_bootstrap_throttle` —
+    // identical rule to the `Repository` twin, so the two kinds cannot drift.
+    throttle: kopiur_mover::workspec::ThrottleSpec,
     cluster: Option<&str>,
     foreign: ForeignSnapshots,
     read_only: bool,
@@ -1694,7 +1701,7 @@ fn cluster_bootstrap_work_spec(
         options: MoverOptions::default(),
         // Bootstrap is a connect/create probe, not a data run: kopia defaults.
         cache: Default::default(),
-        throttle: io::throttle_spec(mover_defaults),
+        throttle,
     }
 }
 
@@ -2581,7 +2588,7 @@ mod tests {
                 "kopia-system",
                 true,
                 None,
-                None,
+                Default::default(),
                 None,
                 ForeignSnapshots::Fallback,
                 read_only,
@@ -2619,6 +2626,7 @@ mod tests {
                 migrate: None,
                 allow_empty_source: true,
                 resume: false,
+                replica_throttle: Default::default(),
             }),
         );
         let carried = armed.seed.expect("the seed rides the op");
@@ -2650,7 +2658,7 @@ mod tests {
                 "kopia-system",
                 true,
                 None,
-                None,
+                Default::default(),
                 cluster,
                 ForeignSnapshots::Fallback,
                 read_only,

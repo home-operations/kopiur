@@ -1452,6 +1452,24 @@ pub fn validate_repository_seed(
             {
                 errs.push(e);
             }
+            // Per-side seed caps, the same "a rate is >= 1" rule the throttle
+            // knobs carry everywhere. Validated per side so the message names
+            // the side that is wrong: `source` is the REPLICA being read,
+            // `destination` this repository — and mixing them up is the likely
+            // authoring mistake.
+            if let Some(throttle) = seed.migrate.as_ref().and_then(|m| m.throttle.as_ref()) {
+                for (side, block) in [
+                    ("source", throttle.source.as_ref()),
+                    ("destination", throttle.destination.as_ref()),
+                ] {
+                    if let Some(block) = block {
+                        errs.extend(validate_throttle(
+                            &format!("spec.seed.migrate.throttle.{side}"),
+                            block,
+                        ));
+                    }
+                }
+            }
         }
     }
     errs

@@ -110,7 +110,11 @@ cache. See [movers](../../movers.md).
   [`SnapshotReplication`](snapshot-replication.md) caps its source connection
   from the source repo's defaults and its destination connection from the
   destination repo's, each overridable per CR via
-  [`spec.migrate.throttle`](snapshot-replication.md#migrate).
+  [`spec.migrate.throttle`](snapshot-replication.md#migrate). A migrate-mode
+  [`seed`](repository.md#seed) is the same shape: the replica's connection is
+  capped from the *replica's* defaults and this repository's from its own, each
+  overridable while the seed is armed via `spec.seed.migrate.throttle.source` /
+  `.destination`.
 
   Three things it does **not** cap today: the interactive
   [`serve`/browse](../../server.md) session (a read-only UI session, not a batch

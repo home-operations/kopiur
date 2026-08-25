@@ -516,7 +516,33 @@ async fn migrate_seed_copies_history_from_another_repository_and_keeps_its_ident
     // DIFFERENT from the shared `kopia-creds` password — the whole point.
     const SEEDED_PASSWORD: &str = "e2e-seed-migrate-password-789";
 
-    // The source repository, with real history under a real identity.
+    // The source repository, with real history under a real identity. Created
+    // HERE rather than by `ensure_seed` (which is idempotent and will find it
+    // present) so the REPLICA can carry its own `moverDefaults.throttle` — the
+    // base layer the per-CR `seed.migrate.throttle.source` override below has to
+    // merge over. Caps are deliberately GENEROUS: the point is to prove the
+    // limits reach kopia on the replica's connection, and a low byte cap is far
+    // more punitive than nominal on a small-object cold-cache migrate, which
+    // would only make this scenario slow and flaky.
+    ensure_repo(&client, "seed-mig-src").await;
+    {
+        let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        create_idempotent(
+            &repos,
+            &cr(repository_json(
+                SOURCE,
+                "seed-mig-src",
+                serde_json::json!({
+                    "moverDefaults": { "throttle": {
+                        "downloadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND,
+                        "readOpsPerSecond": 10000
+                    } }
+                }),
+            )),
+            "create the seed SOURCE Repository with moverDefaults.throttle",
+        )
+        .await;
+    }
     ensure_seed(&client, SOURCE, POLICY, BACKUP, "seed-mig-src").await;
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let source_identity = snapshot_identity(&backups, BACKUP).await;
@@ -553,23 +579,33 @@ async fn migrate_seed_copies_history_from_another_repository_and_keeps_its_ident
                 // itself, and a seed-armed bootstrap never takes the create
                 // fallback — so reaching Ready here proves both at once.
                 "create": { "enabled": false },
-                // #374: a migrate seed opens TWO connections to this repository
-                // under two kopia configs — the seed's own local client (which
-                // `snapshot migrate` reopens, and which has no speed flags of its
-                // own, making this the ONLY cap on the heaviest transfer kopiur
-                // performs) and the post-seed bootstrap reconnect. Both must be
-                // capped; the assertion below counts the mover's log line per pod
-                // to prove the seed-local one specifically fired. Non-binding at
-                // 100 MiB/s over a local hostPath.
+                // #374: a migrate seed opens THREE kopia connections in one pod
+                // — the replica (read-only), this repository's own seed-local
+                // client (which `snapshot migrate` reopens, and which has no
+                // speed flags of its own, making it the ONLY cap on the heaviest
+                // transfer kopiur performs) and the post-seed bootstrap
+                // reconnect. All must be capped; the assertion below counts the
+                // mover's log line per pod. Non-binding at 100 MiB/s over a
+                // local hostPath.
                 "moverDefaults": {
                     "throttle": {
                         "uploadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND,
-                        "downloadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND
+                        "writeOpsPerSecond": 10000
                     }
                 },
                 "seed": {
                     "from": { "repository": { "kind": "Repository", "name": SOURCE } },
-                    "migrate": { "parallel": 2 }
+                    // Per-CR, per-side overrides (#374). Each side sets ONE knob,
+                    // so the merged block must also carry the knob that side's
+                    // repository defaulted — the field-wise merge, end to end.
+                    // `source` is the REPLICA, `destination` this repository.
+                    "migrate": {
+                        "parallel": 2,
+                        "throttle": {
+                            "source": { "downloadBytesPerSecond": 209715200 },
+                            "destination": { "uploadBytesPerSecond": 209715200 }
+                        }
+                    }
                 }
             }),
         )),
@@ -597,6 +633,39 @@ async fn migrate_seed_copies_history_from_another_repository_and_keeps_its_ident
         Some(consts::THROTTLE_BYTES_PER_SECOND),
         "moverDefaults.throttle must survive onto the seeded Repository"
     );
+    // The per-side seed overrides too — an apiserver whose CRD schema predates
+    // them PRUNES them silently, which is the exact #374 symptom this change is
+    // about, and the log-count assertion below would then pass for the wrong
+    // reason (the repositories' own defaults alone).
+    {
+        let seed = live
+            .spec
+            .seed
+            .as_ref()
+            .and_then(|s| s.migrate.as_ref())
+            .and_then(|m| m.throttle.as_ref())
+            .unwrap_or_else(|| {
+                panic!(
+                    "spec.seed.migrate.throttle survived admission (a pruned field means a stale \
+                     CRD): {:?}",
+                    live.spec.seed
+                )
+            });
+        assert_eq!(
+            seed.source
+                .as_ref()
+                .and_then(|t| t.download_bytes_per_second),
+            Some(209_715_200),
+            "the REPLICA-side override must survive: {seed:?}"
+        );
+        assert_eq!(
+            seed.destination
+                .as_ref()
+                .and_then(|t| t.upload_bytes_per_second),
+            Some(209_715_200),
+            "the DESTINATION-side override must survive: {seed:?}"
+        );
+    }
 
     wait_seeded(&repos, SEEDED, "True", "Seeded").await;
     wait_phase(&repos, SEEDED, "Ready")
@@ -619,25 +688,35 @@ async fn migrate_seed_copies_history_from_another_repository_and_keeps_its_ident
         "a migrate seed must report the manifests it copied; status.seed: {seed_status}"
     );
 
-    // #374 regression guard for the highest-value call site of the fix: the
-    // seed's LOCAL repository connect. This one bootstrap pod opens two capped
-    // connections — the seed's local client (under its own kopia config, the
-    // only cap `snapshot migrate` can honor) and the post-seed reconnect — so it
-    // must log the line TWICE. Counting per pod is load-bearing: the same
-    // selector also matches later catalog-rescan/probe pods that log it once
-    // each, and a bare `contains` (or a count across pods) would stay green with
-    // the seed-local call deleted.
+    // #374 regression guard for the highest-value call sites of the fix: every
+    // connection a migrate seed opens. The arithmetic for THIS pod, which is why
+    // the number is 3:
+    //
+    //   probe connect     0 — the backend is uninitialized, so the connect FAILS
+    //                         (that failure is what arms the seed) and never
+    //                         reaches its throttle;
+    //   replica connect  +1 — the read-only source open, capped from
+    //                         `replicaThrottle` (source repo defaults ⊕
+    //                         seed.migrate.throttle.source);
+    //   seed-local       +1 — this repository under its own kopia config, the
+    //                         only cap `snapshot migrate` can honor;
+    //   post-seed        +1 — the bootstrap reconnect after the copy.
+    //
+    // Counting per pod is load-bearing: the same selector also matches later
+    // catalog-rescan/probe pods that log it once each, and a bare `contains` (or
+    // a count across pods) would stay green with any one application deleted.
     kopiur_e2e::wait::wait_for_pod_log_times(
         &client,
         E2E_NAMESPACE,
         &format!("kopiur.home-operations.com/repository={SEEDED}"),
         consts::THROTTLE_APPLIED_LOG,
-        2,
+        3,
     )
     .await
     .expect(
-        "the seeding mover must cap BOTH the seed's local connect and the post-seed \
-         reconnect (#374); one occurrence means the seed-local throttle is gone",
+        "the seeding mover must cap ALL THREE of its connections — the replica read, the \
+         seed's local connect and the post-seed reconnect (#374); two occurrences means one \
+         of them is uncapped",
     );
 
     // Identity survives the migrate, so a restore keyed on the SOURCE's

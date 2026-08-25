@@ -417,8 +417,10 @@ async fn connect_and_throttle(
 ///   directly and then throttled in place from its own resolved block (the work
 ///   spec's `throttle` for the source, the op's `destinationThrottle` for the
 ///   destination). Both applications are terminal, via the flow's `srepl_terminal`.
-/// * **a seed's SOURCE (replica) connect** — same shape, wired by M3d together
-///   with its `replica_throttle`.
+/// * **a seed's SOURCE (replica) connect** — same shape: the seed holds its own
+///   repository and the replica open at once under two kopia configs, so the
+///   replica is connected directly and then throttled in place from the op's
+///   `replicaThrottle`. Terminal, and reported as the bootstrap's failure.
 ///
 /// No limits set → no kopia process is spawned (the common case stays free).
 ///
@@ -1361,6 +1363,13 @@ fn seed_source_builder(
 /// `--persist-credentials` writes the password beside the config, which is what
 /// `snapshot migrate --source-config` reads in migrate mode; it is harmless in
 /// blob mode and kept symmetrical so both arms share this function.
+///
+/// The connection is capped in place from the op's `replicaThrottle` right after
+/// it opens — this is one of the connects that cannot go through
+/// [`connect_and_throttle`], because a seed holds two repositories open under two
+/// kopia configs and the work spec's own `throttle` belongs to the other one.
+/// Empty in blob mode (no source repository CR to take `moverDefaults` from; its
+/// caps ride `sync-to`'s own speed flags), so that arm spawns no kopia process.
 async fn seed_connect_source(
     spec: &MoverWorkSpec,
     seed: &workspec::SeedOpSpec,
@@ -1398,12 +1407,35 @@ async fn seed_connect_source(
         )
         .await
     {
-        Ok(()) => Ok(SeedSource {
-            client,
-            connect: source,
-        }),
-        Err(e) => Err(Box::new(seed_source_connect_failure(seed, &e))),
+        Ok(()) => {}
+        Err(e) => return Err(Box::new(seed_source_connect_failure(seed, &e))),
     }
+    // Cap the REPLICA read side on this connection, from the op's own
+    // `replicaThrottle` (the SOURCE repository's `moverDefaults.throttle`
+    // overlaid by `spec.seed.migrate.throttle.source`). kopia's limits are
+    // per-connection, so the cap the bootstrap put on THIS repository says
+    // nothing here — and in migrate mode `snapshot migrate` reopens this very
+    // config, which is the only lever it has (it carries no speed flags).
+    // Applied straight onto the read-only connect: `repository throttle set` is
+    // accepted there, so no read-write flip is involved.
+    //
+    // Deliberately BEFORE migrate mode's persisted-password probe: that probe's
+    // whole job is to prove the config `snapshot migrate` will reopen is usable,
+    // so it should see that config in its FINAL state — throttle limits written
+    // and all.
+    //
+    // Terminal, like every other throttle application: proceeding would pull a
+    // whole repository across exactly the link the user asked to protect, and a
+    // seed is the largest read kopiur ever makes of a replica that is usually
+    // still another cluster's live off-site copy.
+    if let Err(e) = apply_repository_throttle(&client, &seed.replica_throttle).await {
+        error!(class = %e.kopia_class(), "could not cap the seed source connection");
+        return Err(Box::new(BootstrapResult::from_mover_error(&e)));
+    }
+    Ok(SeedSource {
+        client,
+        connect: source,
+    })
 }
 
 /// Classify a failed seed-source connect. Split out so the "the backend
@@ -4014,7 +4046,8 @@ mod tests {
             ),
             (
                 "seed_connect_source",
-                "seed SOURCE/replica; its own cap lands with M3d (1 call)",
+                "seed SOURCE/replica; dual-config connect, throttled in place from \
+                 op.replicaThrottle immediately after (1 call)",
             ),
             (
                 "srepl_connect_source",

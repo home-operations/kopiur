@@ -1302,7 +1302,11 @@ async fn bootstrap_via_mover(
         create_enabled,
         true,
         repo.spec.create.as_ref(),
-        repo.spec.mover_defaults.as_ref(),
+        repo_seed::seed_bootstrap_throttle(
+            seed_armed,
+            repo.spec.seed.as_ref(),
+            repo.spec.mover_defaults.as_ref(),
+        ),
         cluster,
         foreign,
         read_only,
@@ -1632,7 +1636,11 @@ fn bootstrap_work_spec(
     auto_create: bool,
     scan_catalog: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
-    mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
+    // The cap for every connection this bootstrap opens to THIS repository,
+    // resolved by the caller through `repo_seed::seed_bootstrap_throttle`: the
+    // repository's own `moverDefaults.throttle`, plus — while a seed is armed —
+    // `spec.seed.migrate.throttle.destination` over it, field by field.
+    throttle: kopiur_mover::workspec::ThrottleSpec,
     cluster: Option<&str>,
     foreign: ForeignSnapshots,
     read_only: bool,
@@ -1709,8 +1717,10 @@ fn bootstrap_work_spec(
         options: MoverOptions::default(),
         // Bootstrap is a connect/create probe, not a data run: kopia defaults.
         cache: Default::default(),
-        // Apply the repo throttle on the bootstrap connection too (§13(e)).
-        throttle: io::throttle_spec(mover_defaults),
+        // Apply the repo throttle on the bootstrap connection too (§13(e)) —
+        // and, on a seeding bootstrap, on the seed's own local connect, which
+        // is the only cap `kopia snapshot migrate` can honor on the write side.
+        throttle,
     }
 }
 
@@ -2715,7 +2725,7 @@ mod tests {
                 true,
                 true,
                 None,
-                None,
+                Default::default(),
                 None,
                 ForeignSnapshots::Fallback,
                 read_only,
@@ -2752,6 +2762,7 @@ mod tests {
             migrate: None,
             allow_empty_source: false,
             resume: true,
+            replica_throttle: Default::default(),
         };
         let armed = build(false, Some(op.clone()));
         let carried = armed.seed.expect("the seed rides the op");
@@ -2861,8 +2872,21 @@ mod tests {
         });
         let prefilter = |cluster: Option<&str>, foreign: ForeignSnapshots| {
             let spec = bootstrap_work_spec(
-                &backend, "nas", "billing", true, true, None, None, cluster, foreign, false, true,
-                false, None, None, None,
+                &backend,
+                "nas",
+                "billing",
+                true,
+                true,
+                None,
+                Default::default(),
+                cluster,
+                foreign,
+                false,
+                true,
+                false,
+                None,
+                None,
+                None,
             );
             match spec.operation {
                 Operation::BootstrapRepository(op) => op.catalog_foreign_prefilter_cluster,
@@ -2902,7 +2926,7 @@ mod tests {
                 true,
                 true,
                 None,
-                None,
+                Default::default(),
                 cluster,
                 ForeignSnapshots::Fallback,
                 read_only,

@@ -6762,6 +6762,66 @@ fn seed_numeric_knobs_and_failure_policy_must_be_positive() {
 }
 
 #[test]
+fn a_seed_migrate_throttle_is_rejected_per_side_and_names_the_knob() {
+    // #374: a cap is a positive rate on either side. Both sides are checked
+    // independently and the message names the side, because "source" is the
+    // REPLICA and "destination" is this repository — mixing them up is the
+    // likely authoring mistake, and a message that only named the knob would
+    // not help at all.
+    let errs = validate_repository(&repo_with_seed(&format!(
+        "{MIGRATE_SEED}  migrate:\n    throttle:\n      source: {{ downloadBytesPerSecond: 0 }}\n      \
+         destination: {{ uploadBytesPerSecond: -1, writeOpsPerSecond: 0 }}\n"
+    )));
+    let fields: Vec<String> = errs
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, .. } => Some(field.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            "spec.seed.migrate.throttle.source.downloadBytesPerSecond",
+            "spec.seed.migrate.throttle.destination.uploadBytesPerSecond",
+            "spec.seed.migrate.throttle.destination.writeOpsPerSecond",
+        ],
+        "every offending knob is named, source side first: {errs:?}"
+    );
+
+    // 1 is the smallest accepted rate, unset knobs are always fine, and an
+    // empty block constrains nothing (both sides inherit their repository's
+    // moverDefaults).
+    assert!(
+        validate_repository(&repo_with_seed(&format!(
+            "{MIGRATE_SEED}  migrate:\n    throttle:\n      source: {{ downloadBytesPerSecond: 1 }}\n      \
+             destination: {{ uploadBytesPerSecond: 1, readOpsPerSecond: 1, writeOpsPerSecond: 1 }}\n"
+        )))
+        .is_empty()
+    );
+    assert!(
+        validate_repository(&repo_with_seed(&format!(
+            "{MIGRATE_SEED}  migrate: {{ throttle: {{}} }}\n"
+        )))
+        .is_empty()
+    );
+
+    // A throttle on a BLOB seed is refused as an inert field by the existing
+    // mode-pairing rule — `migrate` belongs to `from.repository`, throttle and
+    // all — rather than silently doing nothing.
+    let errs = validate_repository(&repo_with_seed(&format!(
+        "{BLOB_SEED}  migrate: {{ throttle: {{ source: {{ downloadBytesPerSecond: 1 }} }} }}\n"
+    )));
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::SeedTuningNotApplicable { field, .. } if field == "migrate"
+        )),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn a_cluster_repository_seed_ref_must_not_carry_a_namespace() {
     // `validate_repository_ref`'s existing rule reaches the seed source too.
     let errs = validate_repository(&repo_with_seed(

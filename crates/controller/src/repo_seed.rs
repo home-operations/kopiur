@@ -24,7 +24,7 @@ use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
 use kube::api::Api;
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{RepositoryKind, RepositoryRef};
+use kopiur_api::common::{MoverDefaults, RepositoryKind, RepositoryRef, Throttle};
 use kopiur_api::seed::{SeedMode, SeedSource, SeedSpec, SeedStatus};
 use kopiur_mover::bootstrap::SeedOutcome;
 use kopiur_mover::jobs::VolumeMountSpec;
@@ -155,8 +155,61 @@ pub(crate) struct SeedSourceRepository<'a> {
     pub kind: RepositoryKind,
     /// The source CR's name.
     pub name: &'a str,
-    /// The source's resolved backend/encryption/CA surface.
+    /// The source's resolved backend/encryption/CA surface — and its
+    /// `moverDefaults`, which is where the REPLICA side's throttle comes from
+    /// (kopia's limits are per connection, so the replica's cap can only be the
+    /// replica's own default, never the seeded repository's).
     pub repo: &'a ResolvedRepository,
+}
+
+/// **Pure.** The per-CR override for ONE side of a migrate seed's copy, or
+/// `None` when this seed caps nothing (blob mode included — `spec.seed.migrate`
+/// is refused alongside `from.backend`, so the block cannot exist there).
+///
+/// Two named accessors rather than one indexed helper because the two sides are
+/// two different repositories with two different failure modes, and a caller
+/// that picked the wrong one would produce a run that caps the link it meant to
+/// leave alone.
+fn seed_source_throttle(seed: &SeedSpec) -> Option<&Throttle> {
+    seed.migrate
+        .as_ref()
+        .and_then(|m| m.throttle.as_ref())
+        .and_then(|t| t.source.as_ref())
+}
+
+/// The DESTINATION-side counterpart of [`seed_source_throttle`]: the override
+/// for THIS repository, the one being seeded.
+fn seed_destination_throttle(seed: &SeedSpec) -> Option<&Throttle> {
+    seed.migrate
+        .as_ref()
+        .and_then(|m| m.throttle.as_ref())
+        .and_then(|t| t.destination.as_ref())
+}
+
+/// **Pure.** The throttle a bootstrap work spec carries — the cap that lands on
+/// every connection the bootstrap mover opens to THIS repository.
+///
+/// Ordinarily that is just this repository's own `moverDefaults.throttle`. While
+/// a seed is ARMED it also picks up `spec.seed.migrate.throttle.destination`,
+/// field by field: a seeding bootstrap's local connect is the write side of the
+/// heaviest transfer kopiur performs, and `kopia snapshot migrate` has no speed
+/// flags of its own, so the limits persisted into that connection's config are
+/// the only cap it can honor.
+///
+/// Gated on `armed` deliberately. The destination override describes the SEED
+/// RUN, not the repository; leaving it in force on every later connect to the
+/// now-initialized repository would cap routine work with a number chosen for a
+/// one-time copy. `armed == false` therefore reproduces the pre-#374 value byte
+/// for byte.
+pub(crate) fn seed_bootstrap_throttle(
+    armed: bool,
+    seed: Option<&SeedSpec>,
+    defaults: Option<&MoverDefaults>,
+) -> kopiur_mover::workspec::ThrottleSpec {
+    io::merged_throttle(
+        defaults,
+        seed.filter(|_| armed).and_then(seed_destination_throttle),
+    )
 }
 
 /// **Pure.** Build the mover's seed payload from `spec.seed`.
@@ -181,11 +234,21 @@ pub(crate) fn seed_op_for(
     source: Option<&SeedSourceRepository<'_>>,
     resume: bool,
 ) -> Option<SeedOpSpec> {
-    let from = match (&seed.from, source) {
-        (SeedSource::Backend(backend), _) => SeedConnectSource::Backend(Box::new(
-            backend_to_repository_connect(backend, blob_ca_bundle_pem),
-        )),
-        (SeedSource::Repository(_), Some(src)) => {
+    // Resolved together with the source it belongs to, so the two can never
+    // describe different repositories: kopia's limits are per CONNECTION, and
+    // the replica's cap comes from the REPLICA's own `moverDefaults.throttle`
+    // (overlaid field-wise by `spec.seed.migrate.throttle.source`) — never from
+    // the repository being seeded. Blob mode caps its copy through `sync-to`'s
+    // own speed flags instead, so it carries none.
+    let (from, replica_throttle) = match (&seed.from, source) {
+        (SeedSource::Backend(backend), _) => (
+            SeedConnectSource::Backend(Box::new(backend_to_repository_connect(
+                backend,
+                blob_ca_bundle_pem,
+            ))),
+            Default::default(),
+        ),
+        (SeedSource::Repository(_), Some(src)) => (
             SeedConnectSource::Repository(Box::new(SeedRepositoryConnect {
                 kind: io::repo_kind_str(src.kind).to_string(),
                 name: src.name.to_string(),
@@ -194,8 +257,9 @@ pub(crate) fn seed_op_for(
                     &src.repo.backend,
                     src.repo.ca_bundle_pem.clone(),
                 ),
-            }))
-        }
+            })),
+            io::merged_throttle(src.repo.mover_defaults.as_ref(), seed_source_throttle(seed)),
+        ),
         (SeedSource::Repository(_), None) => return None,
     };
     Some(SeedOpSpec {
@@ -211,13 +275,14 @@ pub(crate) fn seed_op_for(
             max_download_speed_bytes_per_second: s.max_download_speed_bytes_per_second,
             max_upload_speed_bytes_per_second: s.max_upload_speed_bytes_per_second,
         }),
-        migrate: seed.migrate.map(|m| SeedMigrateSpec {
+        migrate: seed.migrate.as_ref().map(|m| SeedMigrateSpec {
             parallel: m.parallel,
             latest_only: m.latest_only,
             policies: crate::snapshot_replication::policy_copy_mode_spec(m.policies),
         }),
         allow_empty_source: seed.allow_empty_source,
         resume,
+        replica_throttle,
     })
 }
 
@@ -1098,6 +1163,101 @@ mod tests {
             }
             other => panic!("expected a repository source, got {other:?}"),
         }
+    }
+
+    /// The #374 seed glue guard: two repositories, two kopia connections, two
+    /// independently resolved caps — and neither side's knobs may reach the
+    /// other. A crossed merge is invisible in production until the wrong link
+    /// gets saturated, which is exactly what this feature exists to prevent.
+    #[test]
+    fn seed_throttles_resolve_per_side_from_each_repositorys_own_defaults() {
+        use kopiur_api::common::{MoverDefaults, Throttle};
+        let throttle = |up, down, r, w| Throttle {
+            upload_bytes_per_second: up,
+            download_bytes_per_second: down,
+            read_ops_per_second: r,
+            write_ops_per_second: w,
+        };
+        // The REPLICA brings its own defaults; so does the repository being
+        // seeded. The CR overrides ONE knob per side, so a correct merge shows
+        // the override AND that side's surviving default — and nothing else.
+        let mut src = resolved_source(s3("source-bucket"), Some("backups"));
+        src.mover_defaults = Some(MoverDefaults {
+            throttle: Some(throttle(None, Some(1), Some(2), None)),
+            ..Default::default()
+        });
+        let local_defaults = MoverDefaults {
+            throttle: Some(throttle(Some(3), None, None, Some(4))),
+            ..Default::default()
+        };
+        let seed = seed_spec(serde_json::json!({
+            "from": { "repository": { "name": "offsite" } },
+            "migrate": { "throttle": {
+                "source": { "downloadBytesPerSecond": 11 },
+                "destination": { "uploadBytesPerSecond": 22 },
+            } },
+        }));
+        let source = SeedSourceRepository {
+            kind: RepositoryKind::Repository,
+            name: "offsite",
+            repo: &src,
+        };
+        let op = seed_op_for(&seed, None, Some(&source), false).expect("migrate op");
+        // REPLICA side: the CR's download override wins, the replica repo's
+        // readOps default survives, and NOTHING from the local repository's
+        // defaults leaks in.
+        assert_eq!(op.replica_throttle.download_bytes_per_second, Some(11));
+        assert_eq!(op.replica_throttle.read_ops_per_second, Some(2));
+        assert_eq!(
+            op.replica_throttle.upload_bytes_per_second, None,
+            "the SEEDED repository's upload default must not reach the replica"
+        );
+        assert_eq!(
+            op.replica_throttle.write_ops_per_second, None,
+            "the SEEDED repository's writeOps default must not reach the replica"
+        );
+
+        // LOCAL (destination) side rides the bootstrap work spec's own throttle:
+        // the CR's upload override wins, this repository's writeOps default
+        // survives, and the REPLICA's knobs stay out.
+        let armed = seed_bootstrap_throttle(true, Some(&seed), Some(&local_defaults));
+        assert_eq!(armed.upload_bytes_per_second, Some(22));
+        assert_eq!(armed.write_ops_per_second, Some(4));
+        assert_eq!(
+            armed.download_bytes_per_second, None,
+            "the REPLICA's download default must not reach the seeded repository"
+        );
+        assert_eq!(armed.read_ops_per_second, None);
+
+        // NOT armed — every ordinary bootstrap, including every later connect to
+        // the now-initialized repository: byte-for-byte this repository's own
+        // defaults, with the seed-run override nowhere in sight.
+        let unarmed = seed_bootstrap_throttle(false, Some(&seed), Some(&local_defaults));
+        assert_eq!(unarmed.upload_bytes_per_second, Some(3));
+        assert_eq!(unarmed.write_ops_per_second, Some(4));
+        assert!(unarmed.download_bytes_per_second.is_none());
+
+        // A migrate seed that caps nothing leaves both sides on their
+        // repositories' defaults (and an all-empty pair skips `throttle set`).
+        let plain = seed_spec(serde_json::json!({
+            "from": { "repository": { "name": "offsite" } },
+        }));
+        let op = seed_op_for(&plain, None, Some(&source), false).expect("migrate op");
+        assert_eq!(op.replica_throttle.download_bytes_per_second, Some(1));
+        assert!(seed_bootstrap_throttle(true, Some(&plain), None).is_empty());
+
+        // BLOB mode has no source repository CR at all — its copy is capped by
+        // `sync-to`'s own speed flags — so the replica block stays empty rather
+        // than inheriting this repository's defaults.
+        let blob = seed_spec(serde_json::json!({
+            "from": { "backend": { "s3": { "bucket": "offsite" } } },
+            "sync": { "maxDownloadSpeedBytesPerSecond": 20000000 },
+        }));
+        let op = seed_op_for(&blob, None, None, false).expect("blob op");
+        assert!(op.replica_throttle.is_empty());
+        // …and admission refuses `migrate` beside `from.backend`, so a blob seed
+        // can never carry a destination override either.
+        assert!(seed_bootstrap_throttle(true, Some(&blob), None).is_empty());
     }
 
     #[test]

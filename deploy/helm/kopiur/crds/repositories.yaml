@@ -2946,6 +2946,85 @@ spec:
                         - copy
                         - copyOverwrite
                         type: string
+                      throttle:
+                        description: |-
+                          Bandwidth/ops caps for THIS seed's copy, per side. A migrate seed opens
+                          two repositories under two kopia connections and `snapshot migrate` has
+                          no speed flags of its own, so each side is applied as `kopia repository
+                          throttle set` on that side's connection:
+
+                          * `source` caps the REPLICA — the repository named by
+                            `spec.seed.from.repository`, opened read-only — overriding **its**
+                            `moverDefaults.throttle`;
+                          * `destination` caps THIS repository, the one being seeded, overriding
+                            **its own** `moverDefaults.throttle`.
+
+                          Each side overrides field by field: a knob set here wins, a knob left
+                          unset keeps that repository's default. Absent: both sides use their
+                          repository's defaults. Applies only while the seed is armed — an
+                          ordinary connect to the now-initialized repository is capped by
+                          `moverDefaults.throttle` alone.
+                        nullable: true
+                        properties:
+                          destination:
+                            description: |-
+                              Caps for the DESTINATION (write) side, overriding the destination
+                              repository's `moverDefaults.throttle` field by field. Applied with
+                              `repository throttle set` on the destination connection the migrate
+                              writes through.
+                            nullable: true
+                            properties:
+                              downloadBytesPerSecond:
+                                description: Cap download throughput in bytes/sec (`--download-bytes-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              readOpsPerSecond:
+                                description: Cap read/list ops/sec (`--read-requests-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              uploadBytesPerSecond:
+                                description: Cap upload throughput in bytes/sec (`--upload-bytes-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              writeOpsPerSecond:
+                                description: Cap write ops/sec (`--write-requests-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                            type: object
+                          source:
+                            description: |-
+                              Caps for the SOURCE (read) side, overriding the source repository's
+                              `moverDefaults.throttle` field by field. Applied with `repository
+                              throttle set` on the migrate's read-only source connection — accepted
+                              there, so a read-only source is throttled like any other.
+                            nullable: true
+                            properties:
+                              downloadBytesPerSecond:
+                                description: Cap download throughput in bytes/sec (`--download-bytes-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              readOpsPerSecond:
+                                description: Cap read/list ops/sec (`--read-requests-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              uploadBytesPerSecond:
+                                description: Cap upload throughput in bytes/sec (`--upload-bytes-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              writeOpsPerSecond:
+                                description: Cap write ops/sec (`--write-requests-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                            type: object
+                        type: object
                     type: object
                   sync:
                     description: |-
