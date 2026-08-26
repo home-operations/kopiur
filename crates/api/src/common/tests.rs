@@ -1525,8 +1525,10 @@ fn replication_manual_run_status_roundtrips_camel_case() {
     assert_eq!(back, st);
     // The contract (#394): `requestedAt`/`phase` serialize away when absent, but
     // `completedAt` ALWAYS emits — as an explicit null when there is no
-    // completion instant — so the merge-patch DELETES a previous run's stamp
-    // instead of leaving it standing over a fresh non-terminal phase.
+    // completion instant — so the merge-patch CLEARS a previous run's stamp
+    // instead of leaving it standing over a fresh non-terminal phase. The
+    // apiserver either deletes the key or stores the null; both decode back to
+    // `None`, so neither leaves a stale timestamp.
     let empty = serde_json::to_value(ReplicationManualRunStatus::default()).unwrap();
     assert_eq!(empty, serde_json::json!({ "completedAt": null }));
     // …and that explicit null reads back as "no completion instant", not as a

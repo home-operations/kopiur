@@ -611,15 +611,18 @@ pub struct ManualRunStatus {
     /// RFC3339 instant the run reached a terminal phase.
     // Deliberately serialized EVEN WHEN `None` (no `skip_serializing_if`), for
     // the same reason as `common::ReplicationManualRunStatus::completed_at`: a
-    // non-terminal phase emits `"completedAt": null` so the RFC-7386 merge-patch
-    // DELETES the previous run's stamp instead of leaving it standing over a
-    // fresh `Running` (#394). Maintenance patches `manualRun` unconditionally
-    // (no noop guard), so here the stake is a truthful status rather than a
-    // non-converging write loop.
+    // non-terminal phase emits `"completedAt": null` so the merge-patch CLEARS
+    // the previous run's stamp instead of leaving it standing over a fresh
+    // `Running` (#394). The apiserver answers that null by deleting the key
+    // (plain RFC-7386) or by storing the null verbatim — a nullable CRD field on
+    // k8s 1.33 was observed doing the latter — and both decode back to `None`,
+    // so no stale timestamp survives either way. Maintenance patches `manualRun`
+    // unconditionally (no noop guard), so here the stake is a truthful status
+    // rather than a non-converging write loop.
     //
     // This depends on `patch_status` sending `kube::api::Patch::Merge`
     // (`crates/controller/src/io/apply.rs`). Under `Patch::Apply` an explicit
-    // null does NOT delete, and this contract silently breaks.
+    // null does NOT clear the field, and this contract silently breaks.
     //
     // Kept a plain comment rather than rustdoc on purpose: doc comments become
     // the CRD `description` (`kubectl explain`, docs/field-reference.md).
@@ -710,8 +713,9 @@ mod tests {
         assert_eq!(json["completedAt"], "2026-06-11T12:01:42Z");
 
         // #394: a non-terminal run emits an EXPLICIT null completedAt, so the
-        // RFC-7386 merge-patch deletes the previous run's stamp rather than
-        // leaving it standing over a fresh `Running`.
+        // merge-patch clears the previous run's stamp rather than leaving it
+        // standing over a fresh `Running`. Whether the apiserver deletes the key
+        // or stores the null, it decodes back to `None`.
         let running = serde_json::to_value(ManualRunStatus {
             requested_at: Some("2026-06-11T13:00:00Z".into()),
             mode: Some(ManualRunMode::Quick),

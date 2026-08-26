@@ -623,8 +623,9 @@ mod tests {
             let st = manual_run_status(&req, phase.clone(), now);
             assert!(st.completed_at.is_none(), "{phase:?} has not completed");
             // #394: and it must SERIALIZE as an explicit null, not vanish — the
-            // merge-patch only deletes a previous run's stamp when the key is
-            // present with a null value.
+            // merge-patch only clears a previous run's stamp when the key is
+            // present with a null value (the apiserver then deletes the key or
+            // stores the null; either way no stale timestamp survives).
             let json = serde_json::to_value(&st).unwrap();
             assert_eq!(
                 json.get("completedAt"),

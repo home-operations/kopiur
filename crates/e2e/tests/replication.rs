@@ -438,8 +438,9 @@ async fn repository_replication_s3_to_s3_uses_destination_scoped_credentials() {
 /// Job), and `status.manualRun` answers the exact timestamp requested.
 ///
 /// It then pins issue #394 against a REAL apiserver: a follow-up request parked
-/// as `Pending` must have the finished run's `completedAt` merge-patched away,
-/// which only the explicit-null serialization achieves.
+/// as `Pending` must carry no `completedAt` VALUE from the finished run, which
+/// only the explicit-null serialization achieves (the apiserver may delete the
+/// key or store the null; either way the stale stamp is gone).
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn repository_replication_runs_on_demand_from_the_run_requested_annotation() {
@@ -593,9 +594,11 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
     );
 
     // Issue #394: a FOLLOW-UP request must not inherit the finished run's
-    // `completedAt`. The non-terminal patch now serializes an explicit null, and
-    // an RFC-7386 merge-patch DELETES the key it is nulling — so the stale stamp
-    // disappears from the stored object rather than sitting under a `Pending`.
+    // `completedAt`. The non-terminal patch serializes an explicit null; the
+    // apiserver then either DELETES the key (plain RFC-7386) or stores the null
+    // verbatim — a nullable CRD field on k8s 1.33 was observed keeping it. Both
+    // converge on the property that matters and the assertion below tests
+    // exactly that: no stale timestamp survives under the fresh `Pending`.
     //
     // Suspending is what makes the park deterministic (#380 records an
     // unanswered request as `Pending` and stops). Ordering hazard: the
@@ -638,9 +641,12 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
     .await
     .expect("the suspended replication should record the new request as Pending");
     assert!(
-        parked.get("completedAt").is_none(),
-        "a non-terminal manualRun must carry NO completedAt — the previous run's \
-         stamp must have been merge-patched away, not left standing; got {parked}"
+        parked
+            .get("completedAt")
+            .is_none_or(serde_json::Value::is_null),
+        "a non-terminal manualRun must carry NO completedAt VALUE — absent or an \
+         explicit null are both fine (the apiserver picks), but the previous run's \
+         stamp must not still be standing; got {parked}"
     );
 
     let _ = repls.delete(name, &DeleteParams::default()).await;

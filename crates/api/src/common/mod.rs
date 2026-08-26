@@ -1275,17 +1275,23 @@ pub struct ReplicationManualRunStatus {
     /// RFC3339 instant the run reached a terminal phase.
     // Deliberately serialized EVEN WHEN `None` — no `skip_serializing_if`, unlike
     // every other optional in this struct. A non-terminal phase must emit
-    // `"completedAt": null` so the RFC-7386 merge-patch the controller sends
-    // DELETES the previous run's stamp. Omitting the key instead leaves the old
-    // instant standing, which is both a lie in `kubectl get -o yaml` and —
-    // because the replication controllers build the noop guard's `current` by
-    // re-serializing this very struct — a guard that never converges: `desired`
-    // would omit the key while `current` carries the stale value, so every
-    // queued pass re-fires a PATCH the apiserver no-ops (#394).
+    // `"completedAt": null` so the merge-patch the controller sends CLEARS the
+    // previous run's stamp. On receiving that null the apiserver either deletes
+    // the key (plain RFC-7386) or stores the null verbatim — a nullable CRD
+    // field on k8s 1.33 was observed doing the latter — and BOTH converge here:
+    // an absent key decodes to `None`, an explicit null decodes to `None`, and
+    // re-serializing either yields `null` again.
+    //
+    // Omitting the key instead leaves the old instant standing, which is both a
+    // lie in `kubectl get -o yaml` and — because the replication controllers
+    // build the noop guard's `current` by re-serializing this very struct — a
+    // guard that never converges: `desired` would omit the key while `current`
+    // carries the stale value, so every queued pass re-fires a PATCH the
+    // apiserver no-ops (#394).
     //
     // This depends on `patch_status` sending `kube::api::Patch::Merge`
     // (`crates/controller/src/io/apply.rs`). Under `Patch::Apply` an explicit
-    // null does NOT delete, and this contract silently breaks.
+    // null does NOT clear the field, and this contract silently breaks.
     //
     // Kept a plain comment rather than rustdoc on purpose: doc comments become
     // the CRD `description` (`kubectl explain`, docs/field-reference.md), and

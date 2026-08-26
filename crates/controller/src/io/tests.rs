@@ -853,7 +853,7 @@ fn non_terminal_manual_run_patch_carries_an_explicit_null_completed_at() {
         desired["manualRun"].get("completedAt"),
         Some(&serde_json::Value::Null),
         "a non-terminal manualRun must NAME completedAt so the merge-patch \
-         deletes the previous run's stamp; got {desired}"
+         clears the previous run's stamp; got {desired}"
     );
 }
 
@@ -875,23 +875,42 @@ fn manual_run_patch_converges_after_clearing_a_stale_completed_at() {
         "answering a NEW request must write"
     );
 
-    // The apiserver applies the merge patch (this is `Patch::Merge` — an
-    // explicit null DELETES the key).
+    // The apiserver applies the merge patch (this is `Patch::Merge`). Given the
+    // explicit null it either DELETES the key — plain RFC-7386, what
+    // `json_patch::merge` models — or STORES the null verbatim; a nullable CRD
+    // field on k8s 1.33 was observed doing the latter. Both outcomes are
+    // replayed below, because the guard has to converge under either.
     json_patch::merge(&mut stored, &desired);
     assert!(
         stored["manualRun"].get("completedAt").is_none(),
-        "the merge-patch must have deleted the stale stamp; got {stored}"
+        "the merge-patch must have cleared the stale stamp; got {stored}"
     );
 
     // Next reconcile: `current` is the typed status of the refreshed object,
     // re-serialized — the exact round trip `patch_manual_run` performs.
-    let typed: kopiur_api::common::ReplicationManualRunStatus =
-        serde_json::from_value(stored["manualRun"].clone()).expect("stored manualRun decodes");
-    let current = serde_json::json!({ "manualRun": typed });
-    assert!(
-        status_patch_is_noop(Some(&current), &desired),
-        "the guard must CONVERGE once the stamp is cleared; current {current}, desired {desired}"
-    );
+    let converges = |stored: &serde_json::Value| {
+        let typed: kopiur_api::common::ReplicationManualRunStatus =
+            serde_json::from_value(stored["manualRun"].clone()).expect("stored manualRun decodes");
+        let current = serde_json::json!({ "manualRun": typed });
+        assert!(
+            status_patch_is_noop(Some(&current), &desired),
+            "the guard must CONVERGE once the stamp is cleared; current {current}, \
+             desired {desired}"
+        );
+    };
+    converges(&stored);
+
+    // The other apiserver outcome: the null is STORED rather than deleted. It
+    // decodes to `None` just the same (`#[serde(default)]` on an `Option`), so
+    // the rebuilt `current` is identical and the guard converges here too.
+    let stored_null = serde_json::json!({
+        "manualRun": {
+            "requestedAt": "2026-06-11T13:00:00Z",
+            "phase": "Pending",
+            "completedAt": null,
+        },
+    });
+    converges(&stored_null);
 }
 
 #[test]
