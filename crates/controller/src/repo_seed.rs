@@ -383,14 +383,43 @@ pub(crate) struct SeedSuccess {
 /// storage, not manifests, so there is no per-snapshot copy count; its
 /// `snapshotCount` is the SOURCE listing the mover took before the copy, which
 /// for a byte-for-byte mirror is also what this repository ends up holding).
-pub(crate) fn seed_success_fold(outcome: &SeedOutcome, now: &str) -> SeedSuccess {
+///
+/// # Why `existing` — the fold must be BYTE-STABLE across re-folds
+///
+/// `finalize_bootstrap` re-enters on EVERY reconcile for as long as the
+/// finished bootstrap Job lingers (it is deleted only on the probe arm), and it
+/// re-reads the same result ConfigMap each time — so a seeding Job's outcome is
+/// re-folded, unchanged, hundreds of times. Two properties make that pass a
+/// no-op under [`crate::io::status_patch_is_noop`], and both need `existing`:
+///
+/// * `seededAt` is stamped ONCE, at the first fold, and reused verbatim
+///   afterwards. Re-stamping `now` made every pass a fresh status write, which
+///   bumped `resourceVersion`, re-triggered this reconciler through its own
+///   primary watch and spun the repository at ~4 reconciles/second until the
+///   Job's TTL. (A seed happens exactly once, so "when it completed" is a fact,
+///   not a heartbeat — the same rule `seed_marker_patch` already applies to
+///   `startedAt`.)
+/// * the seed-attempt marker (`startedAt`) is carried FORWARD into the patch.
+///   A merge patch would preserve it either way, but the no-op guard compares
+///   the whole `seed` value: a partial sub-object can never equal the stored
+///   one, so omitting the marker re-writes forever on its own.
+pub(crate) fn seed_success_fold(
+    outcome: &SeedOutcome,
+    existing: Option<&SeedStatus>,
+    now: &str,
+) -> SeedSuccess {
     let mode = seed_mode_of(outcome);
     let mut status = serde_json::json!({
         "mode": mode,
         "source": outcome.source,
     });
+    if let Some(started_at) = existing.and_then(|s| s.started_at.as_deref()) {
+        status["startedAt"] = serde_json::Value::String(started_at.to_string());
+    }
     if outcome.performed {
-        status["seededAt"] = serde_json::Value::String(now.to_string());
+        // Set once; every later re-fold of the same lingering result reuses it.
+        let seeded_at = existing.and_then(|s| s.seeded_at.as_deref()).unwrap_or(now);
+        status["seededAt"] = serde_json::Value::String(seeded_at.to_string());
         if let Some(n) = outcome.snapshot_count {
             status["snapshotCount"] = serde_json::json!(n);
         }
@@ -1451,7 +1480,7 @@ mod tests {
             412,
             Some(412),
         );
-        let fold = seed_success_fold(&performed, now);
+        let fold = seed_success_fold(&performed, None, now);
         assert_eq!(fold.reason, kopiur_api::consts::SEEDED_REASON);
         assert_eq!(fold.outcome, crate::metrics::SeedOutcomeLabel::Seeded);
         assert_eq!(fold.status["seed"]["seededAt"], serde_json::json!(now));
@@ -1469,7 +1498,7 @@ mod tests {
         // manifests — and the post-seed catalog listing reports the count on
         // storageStats instead.
         let blob = SeedOutcome::performed(SeedModeSpec::Blob, "S3".into(), 7, None);
-        let fold = seed_success_fold(&blob, now);
+        let fold = seed_success_fold(&blob, None, now);
         assert_eq!(fold.status["seed"]["snapshotCount"], serde_json::json!(7));
         assert!(fold.status["seed"].get("snapshotsCopied").is_none());
 
@@ -1477,7 +1506,7 @@ mod tests {
         // reporting 0 would be a lie), its own reason and metric label, and NO
         // Event — nothing happened.
         let noop = SeedOutcome::already_initialized(SeedModeSpec::Blob, "S3".into());
-        let fold = seed_success_fold(&noop, now);
+        let fold = seed_success_fold(&noop, None, now);
         assert_eq!(fold.reason, kopiur_api::consts::ALREADY_INITIALIZED_REASON);
         assert_eq!(
             fold.outcome,
@@ -1486,6 +1515,94 @@ mod tests {
         assert!(fold.status["seed"].get("seededAt").is_none());
         assert!(fold.status["seed"].get("snapshotCount").is_none());
         assert!(fold.event.is_none());
+    }
+
+    /// HOT-LOOP REGRESSION (#396 follow-up). `finalize_bootstrap` re-enters on
+    /// every reconcile while the finished bootstrap Job lingers and re-folds the
+    /// SAME `SeedOutcome` out of the same result ConfigMap. That steady-state
+    /// pass must be a no-op under `io::status_patch_is_noop`, or the write bumps
+    /// `resourceVersion`, the primary watch re-delivers the object and the
+    /// repository spins until the Job's TTL.
+    ///
+    /// Shaped like the e2e's `e2e-seed-mig-dst`: a completed MIGRATE seed on a
+    /// `Ready` repository. Both failure modes are covered — the wall clock
+    /// advancing between passes, and the marker (`startedAt`) the stored
+    /// sub-object carries but the fold used to omit.
+    #[test]
+    fn re_folding_a_finished_seed_is_a_byte_stable_no_op() {
+        use kopiur_api::repository::RepositoryStatus;
+
+        let outcome = SeedOutcome::performed(
+            SeedModeSpec::Migrate,
+            "Repository/e2e-seed-mig-src".into(),
+            1,
+            Some(1),
+        );
+        // The marker stamped by `seed_marker_patch` before the seeding Job ran.
+        let marker = SeedStatus {
+            started_at: Some("2026-08-26T03:33:20+00:00".into()),
+            ..Default::default()
+        };
+
+        // FIRST fold: nothing recorded yet, so `now` is what gets stamped.
+        let first = seed_success_fold(&outcome, Some(&marker), "2026-08-26T03:33:26+00:00");
+        assert_eq!(
+            first.status["seed"]["seededAt"],
+            serde_json::json!("2026-08-26T03:33:26+00:00"),
+            "the first fold stamps the completion time"
+        );
+        assert_eq!(
+            first.status["seed"]["startedAt"],
+            serde_json::json!("2026-08-26T03:33:20+00:00"),
+            "the seed-attempt marker rides the patch, or the no-op compare below \
+             can never hold"
+        );
+
+        // What that first pass persisted, read back the way the reconciler reads
+        // it (`serde_json::to_value(&repo.status)`).
+        let stored = RepositoryStatus {
+            phase: Some(kopiur_api::RepositoryPhase::Ready),
+            observed_generation: Some(1),
+            unique_id: Some("c36584a9".into()),
+            backend: Some("Filesystem".into()),
+            seed: Some(SeedStatus {
+                started_at: marker.started_at.clone(),
+                seeded_at: Some("2026-08-26T03:33:26+00:00".into()),
+                mode: Some(SeedMode::Migrate),
+                source: Some("Repository/e2e-seed-mig-src".into()),
+                snapshot_count: Some(1),
+                snapshots_copied: Some(1),
+            }),
+            ..Default::default()
+        };
+        let current = serde_json::to_value(Some(&stored)).expect("status serializes");
+        let existing = stored.seed.as_ref();
+
+        // EVERY later pass, minutes later on the wall clock, is a no-op.
+        let mut later = serde_json::json!({
+            "phase": "Ready",
+            "backend": "Filesystem",
+            "uniqueId": "c36584a9",
+            "observedGeneration": 1,
+        });
+        merge_seed_status(
+            &mut later,
+            &seed_success_fold(&outcome, existing, "2026-08-26T03:51:54+00:00").status,
+        );
+        assert!(
+            io::status_patch_is_noop(Some(&current), &later),
+            "the steady-state re-fold must not re-write status (hot loop): {later}"
+        );
+
+        // The standing no-op arm carries the marker forward too, so an
+        // `AlreadyInitialized` repository is equally quiet.
+        let adopted = SeedOutcome::already_initialized(SeedModeSpec::Blob, "S3".into());
+        let fold = seed_success_fold(&adopted, Some(&marker), "2026-08-26T03:51:54+00:00");
+        assert_eq!(
+            fold.status["seed"]["startedAt"],
+            serde_json::json!("2026-08-26T03:33:20+00:00")
+        );
+        assert!(fold.status["seed"].get("seededAt").is_none());
     }
 
     #[test]
@@ -1498,6 +1615,7 @@ mod tests {
         });
         let fold = seed_success_fold(
             &SeedOutcome::performed(SeedModeSpec::Blob, "S3".into(), 3, None),
+            None,
             "2026-08-17T03:00:00Z",
         );
         merge_seed_status(&mut patch, &fold.status);

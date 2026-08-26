@@ -1946,10 +1946,13 @@ async fn finalize_bootstrap(
     // patch. `bootstrap_outcome` has already refused a seed-armed success that
     // carries no outcome (the mover-skew guard), so `result.seed` being present
     // here is proof the running mover understood the request.
-    let seed_fold = result
-        .seed
-        .as_ref()
-        .map(|outcome| repo_seed::seed_success_fold(outcome, &now));
+    let seed_fold = result.seed.as_ref().map(|outcome| {
+        repo_seed::seed_success_fold(
+            outcome,
+            repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+            &now,
+        )
+    });
     let conditions = match seed_fold.as_ref() {
         Some(fold) => io::upsert_condition(
             &conditions,

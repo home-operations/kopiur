@@ -1826,10 +1826,13 @@ async fn finalize_cluster_bootstrap(
     // #380: fold the seed outcome into the SAME conditions array — the
     // mover-skew guard has already refused a seed-armed success carrying no
     // outcome, so a present `result.seed` is proof the image understood it.
-    let seed_fold = result
-        .seed
-        .as_ref()
-        .map(|outcome| crate::repo_seed::seed_success_fold(outcome, &now));
+    let seed_fold = result.seed.as_ref().map(|outcome| {
+        crate::repo_seed::seed_success_fold(
+            outcome,
+            repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+            &now,
+        )
+    });
     let conditions = match seed_fold.as_ref() {
         Some(fold) => io::upsert_condition(
             &conditions,
