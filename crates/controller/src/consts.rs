@@ -273,6 +273,13 @@ pub const BOOTSTRAP_JOB_FAILED_REASON: &str = "BootstrapJobFailed";
 /// longer deadline and index compaction, not a backend/credentials hunt.
 pub const BOOTSTRAP_DEADLINE_EXCEEDED_REASON: &str = "BootstrapDeadlineExceeded";
 
+/// `LeaseOwned=False` (Maintenance) / `Ready=False` (RepositoryReplication)
+/// reason while the gate on the target repository holds. For maintenance the
+/// gate is `health::maintenance_may_proceed` (bootstrapped-before + degradation
+/// cause, issue #413); for replication it is strictly `phase == Ready` (the
+/// #345 breaker pauses replication).
+pub const WAITING_FOR_REPOSITORY_REASON: &str = "WaitingForRepository";
+
 /// [`OP_LABEL`] value for a populator `Restore`'s prime PVC and populate mover Job
 /// (distinct from the direct-target `restore` Jobs). ADR-0005 §9.
 pub const OP_RESTORE_POPULATE: &str = "restore-populate";

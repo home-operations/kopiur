@@ -936,6 +936,67 @@ pub fn strict_retry_holdoff(
     }
 }
 
+/// Whether the repository's backend is CONFIRMED down or wiped: a
+/// `BackendReachable=False` condition whose reason is `BackendUnreachable`
+/// (the probe's connect verdict says the backend is not answering) or
+/// `RepositoryVanished` (the backend answers but the kopia repository is
+/// gone). A deny-list on purpose: a deadline-killed probe
+/// (`ProbeDeadlineExceeded`, #414) says "connect slower than the Job
+/// deadline", which is NOT confirmation of an outage — and any future reason
+/// passes through as not-confirmed by construction, so the maintenance gate
+/// can never silently widen its own deny-list.
+pub fn backend_confirmed_down(conditions: &[Condition]) -> bool {
+    conditions
+        .iter()
+        .find(|c| c.type_ == BACKEND_REACHABLE_CONDITION)
+        .is_some_and(|c| {
+            c.status == "False"
+                && (c.reason == BACKEND_UNREACHABLE_REASON
+                    || c.reason == REPOSITORY_VANISHED_REASON)
+        })
+}
+
+/// Whether a `Maintenance` may spawn its mover Job against this repository —
+/// the G7 gate's predicate (issue #413).
+///
+/// Keyed on **bootstrapped-before** (`status.uniqueId` set), NOT on
+/// `phase == Ready`: an already-bootstrapped repository that went `Degraded`
+/// *because* its index blobs need compacting (the probe deadline-kill spiral)
+/// must still receive maintenance — maintenance IS the cure, and the
+/// maintenance Job's own deadline is the 48h mover default, not the probe's
+/// 120s. Deferring is reserved for the states where a maintenance pod is
+/// doomed or dangerous:
+///
+/// - never bootstrapped (`Pending`/`Initializing`, or no `uniqueId`) — there
+///   is nothing to maintain yet, spawning just produces a doomed pod;
+/// - `Degraded` with the backend CONFIRMED unreachable or the repository
+///   vanished ([`backend_confirmed_down`]) — the #345 breaker semantics;
+/// - terminal `Failed` — the verdict (bad credentials, locked, …) dooms a
+///   maintenance connect identically;
+/// - `Unknown` — a newer controller's phase; consumers must hold, not proceed.
+///
+/// A `Degraded` repo whose mover merely crash-loops (`BootstrapJobFailed`,
+/// OOM, bad image — no `BackendReachable=False` written) still gets
+/// maintenance: the Jobs are bounded (deterministic per-slot names +
+/// single-flight) and may well succeed. Exhaustive over [`RepositoryPhase`].
+pub fn maintenance_may_proceed(
+    phase: Option<&RepositoryPhase>,
+    unique_id: Option<&str>,
+    conditions: &[Condition],
+) -> bool {
+    match phase {
+        Some(RepositoryPhase::Ready) => true,
+        Some(RepositoryPhase::Degraded) => {
+            unique_id.is_some() && !backend_confirmed_down(conditions)
+        }
+        Some(RepositoryPhase::Pending)
+        | Some(RepositoryPhase::Initializing)
+        | Some(RepositoryPhase::Failed)
+        | Some(RepositoryPhase::Unknown(_))
+        | None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2022,5 +2083,79 @@ mod tests {
                 "streak {streak} must stay Ready under Alert"
             );
         }
+    }
+
+    /// #413 maintenance deadlock: Degraded-because-slow must not withhold the
+    /// cure. The full gate truth table — phase × bootstrapped-before ×
+    /// `BackendReachable` shape. The deny-list is exactly
+    /// {BackendUnreachable, RepositoryVanished}: every other reason (a
+    /// deadline-killed probe, a future reason this build has never seen)
+    /// passes through as "maintenance may proceed" by construction.
+    #[test]
+    fn maintenance_gate_truth_table() {
+        let br_false = |reason: &str| vec![reachable_cond("False", reason)];
+        let br_true = || vec![reachable_cond("True", BACKEND_REACHABLE_REASON)];
+        let uid = Some("uid-1");
+
+        // Ready proceeds regardless of uniqueId or conditions.
+        assert!(maintenance_may_proceed(
+            Some(&RepositoryPhase::Ready),
+            None,
+            &[]
+        ));
+        assert!(maintenance_may_proceed(
+            Some(&RepositoryPhase::Ready),
+            uid,
+            &br_false(BACKEND_UNREACHABLE_REASON)
+        ));
+
+        // Degraded + bootstrapped: proceeds unless confirmed down.
+        let degraded = Some(&RepositoryPhase::Degraded);
+        assert!(maintenance_may_proceed(degraded, uid, &[]));
+        assert!(maintenance_may_proceed(degraded, uid, &br_true()));
+        // The deadline-kill degradation (#414's reason) is NOT confirmation of
+        // an outage — maintenance runs; so does any future unlisted reason.
+        assert!(maintenance_may_proceed(
+            degraded,
+            uid,
+            &br_false("ProbeDeadlineExceeded")
+        ));
+        assert!(maintenance_may_proceed(
+            degraded,
+            uid,
+            &br_false("SomeFutureReason")
+        ));
+        // Confirmed unreachable / vanished: deferred (#345 breaker semantics).
+        assert!(!maintenance_may_proceed(
+            degraded,
+            uid,
+            &br_false(BACKEND_UNREACHABLE_REASON)
+        ));
+        assert!(!maintenance_may_proceed(
+            degraded,
+            uid,
+            &br_false(REPOSITORY_VANISHED_REASON)
+        ));
+        // Degraded but never bootstrapped: nothing to maintain, deferred.
+        assert!(!maintenance_may_proceed(degraded, None, &[]));
+
+        // Every other phase defers, bootstrapped or not.
+        for phase in [
+            None,
+            Some(&RepositoryPhase::Pending),
+            Some(&RepositoryPhase::Initializing),
+            Some(&RepositoryPhase::Failed),
+        ] {
+            assert!(
+                !maintenance_may_proceed(phase, uid, &[]),
+                "phase {phase:?} must defer"
+            );
+            assert!(!maintenance_may_proceed(phase, None, &[]));
+        }
+        let upgrading = RepositoryPhase::Unknown("Upgrading".into());
+        assert!(
+            !maintenance_may_proceed(Some(&upgrading), uid, &[]),
+            "an unknown (newer-controller) phase must hold, not proceed"
+        );
     }
 }

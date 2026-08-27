@@ -122,15 +122,18 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     // Launch-side (mirror Job inputs) — store-backed point read (#382 M2).
     let repo = io::resolve_repository_ref_cached(ctx, source_ref, &namespace).await?;
 
-    // Gate on the source repository being Ready (an object-store repo must be
-    // bootstrapped before `sync-to` can reach it) — mirrors maintenance's G7.
+    // Gate on the source repository being strictly Ready. This DELIBERATELY
+    // diverges from maintenance's G7 since #413: the #345 circuit breaker
+    // pauses replication (fanning `sync-to` Jobs at a degraded backend is
+    // doomed work), whereas maintenance is exempt because it is the cure for
+    // a Degraded-because-slow repository.
     if !io::repository_ready_cached(ctx, source_ref, &namespace).await? {
         patch_ready_if_changed(
             &api,
             &name,
             repl,
             io::ReadyOutcome::Reconciling,
-            "WaitingForRepository",
+            crate::consts::WAITING_FOR_REPOSITORY_REASON,
             "source repository is not Ready; deferring replication",
             None,
         )

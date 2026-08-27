@@ -618,9 +618,12 @@ pub enum RepositoryPhase {
     Ready,
     /// Temporarily not fully operational, and self-healing: a retryable
     /// bootstrap/connect failure is being retried, or the backend health probe
-    /// exceeded its `failureThreshold` (the circuit breaker is open — backups,
-    /// maintenance, and replication are paused until a re-connect succeeds).
-    /// See the `BackendReachable` and `Ready` conditions for the cause.
+    /// exceeded its `failureThreshold` (the circuit breaker is open — backups
+    /// and replication are paused until a re-connect succeeds; maintenance
+    /// still runs for an already-bootstrapped repository unless the backend is
+    /// confirmed unreachable or the repository vanished, because index
+    /// compaction is often the cure). See the `BackendReachable` and `Ready`
+    /// conditions for the cause.
     Degraded,
     /// Connect/create failed; see conditions for the actionable reason.
     Failed,
