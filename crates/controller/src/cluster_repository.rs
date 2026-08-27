@@ -2120,10 +2120,84 @@ async fn finalize_cluster_bootstrap_failure(
         // A result-less Job failure carries no backend verdict (mover
         // crashed / evicted / result write hit a down apiserver — the outage
         // incident): recycle the dead Job and retry as `Degraded` instead of
-        // parking `Failed` until the Job's TTL finally reaps it. A seed failure
-        // retries the same way but PROMPTLY (flat cadence — the documented DR
-        // contract).
-        io::FailureRoute::Recycle | io::FailureRoute::SeedRetry => {
+        // parking `Failed` until the Job's TTL finally reaps it. #415: the
+        // retry ALSO stamps the failure streak + `lastProbeAt` anchor, so
+        // `strict_retry_holdoff` re-arms per failure and the relaunch cadence
+        // decays 120→240→480→960→1800s instead of the flat ~2.5-minute
+        // metronome. Mirrors `repository.rs::finalize_bootstrap_failure`.
+        io::FailureRoute::Recycle => {
+            io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
+            let conditions =
+                cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
+            let conditions = seed_fold(&conditions);
+            let conditions = io::set_ready(
+                &conditions,
+                repo.metadata.generation,
+                io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
+                reason,
+                &failure.condition_message(),
+            );
+            let now = chrono::Utc::now().to_rfc3339();
+            let health = health::failure_streak_health(
+                repo.status.as_ref().and_then(|s| s.health.as_ref()),
+                &now,
+            );
+            let streak = health.consecutive_probe_failures.unwrap_or(1);
+            let current = serde_json::to_value(&repo.status).ok();
+            let wrote = io::patch_status_if_changed(
+                api,
+                name,
+                current.as_ref(),
+                serde_json::json!({
+                    "phase": "Degraded",
+                    "backend": backend.kind_str(),
+                    "observedGeneration": repo.metadata.generation,
+                    "conditions": conditions,
+                    // Explicit-null builder, never a direct serialize (#273).
+                    "health": health::probe_failure_health_patch(&health),
+                }),
+            )
+            .await?;
+            // Gate the Event/metric/warn on the TRANSITION — the streak++
+            // makes every cycle a real status write, so `wrote` alone would
+            // publish a Warning per cycle for the life of a crash loop.
+            let prior_degraded = repo.status.as_ref().and_then(|s| s.phase.as_ref())
+                == Some(&RepositoryPhase::Degraded);
+            let prior_reason = repo
+                .status
+                .as_ref()
+                .map(|s| s.conditions.as_slice())
+                .unwrap_or(&[])
+                .iter()
+                .find(|c| {
+                    c.type_ == crate::consts::REPOSITORY_BOOTSTRAPPED_CONDITION
+                        && c.status == "False"
+                })
+                .map(|c| c.reason.as_str());
+            if wrote && (!prior_degraded || prior_reason != Some(reason)) {
+                failure.publish(ctx, &io::event_ref(repo), name).await;
+                crate::repo_seed::record_seed_failure(
+                    &ctx.metrics,
+                    repo.spec.seed.as_ref(),
+                    "ClusterRepository",
+                    "",
+                    name,
+                    seed_armed,
+                );
+                tracing::warn!(
+                    repo = %name,
+                    reason,
+                    "ClusterRepository bootstrap Job failed; recycled it for retry"
+                );
+            }
+            Ok(Action::requeue(health::strict_retry_backoff(
+                streak.saturating_sub(1),
+            )))
+        }
+        // A seed failure retries PROMPTLY — flat ~120s cadence, no failure
+        // streak, no backoff (the documented DR contract; see the namespaced
+        // twin's SeedRetry arm).
+        io::FailureRoute::SeedRetry => {
             io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
             let conditions =
                 cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());

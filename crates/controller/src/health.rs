@@ -632,21 +632,30 @@ pub fn success_fold(
 /// The event fires on a *transition*: the first reconcile that crosses the
 /// threshold, or one where the failure *reason* changes (e.g. `BackendUnreachable`
 /// → `RepositoryVanished`), so an escalation is never silently swallowed.
-pub fn reconcile_probe_failure(
-    existing: &[Condition],
+/// Fold ONE backend failure into the unified sensor's `status.health` state:
+/// streak = prior+1, `firstFailureAt` continues an active streak (fresh stamp
+/// on a new episode), `lastProbeAt` = now — the anchor
+/// [`strict_retry_holdoff`] measures the relaunch backoff from. Extracted from
+/// [`reconcile_probe_failure`] (which delegates) so the result-less recycle
+/// route can arm the SAME holdoff (#415: that route previously wrote no
+/// health at all, so the anchor went stale and the gate failed open into a
+/// flat ~2.5-minute relaunch metronome).
+///
+/// Widening note: this stamps `lastProbeAt` on repositories no probe ever ran
+/// against. That is safe for `health_probe_due`'s timer because `probe_action`
+/// requires `phase_is_ready` and every writer here also writes a non-Ready
+/// phase; and it is exactly what the holdoff needs (a per-failure anchor).
+/// `probe_attempt_at` is `None` here — callers MUST patch through
+/// [`probe_failure_health_patch`], which emits the explicit JSON null a typed
+/// `None` cannot express through a merge patch.
+pub fn failure_streak_health(
     prior: Option<&RepositoryHealthStatus>,
-    kind: ProbeFailureKind,
-    failure_threshold: i64,
     now: &str,
-    generation: Option<i64>,
-) -> ProbeUpdate {
+) -> RepositoryHealthStatus {
     let prior_failures = prior
         .and_then(|h| h.consecutive_probe_failures)
         .unwrap_or(0)
         .max(0);
-    let consecutive = prior_failures + 1;
-    // Continue the streak's first-failure stamp; start a fresh one if the prior
-    // count was zero (a new episode).
     let first_failure_at = prior
         .and_then(|h| {
             if prior_failures > 0 {
@@ -656,15 +665,25 @@ pub fn reconcile_probe_failure(
             }
         })
         .unwrap_or_else(|| now.to_string());
-    let health = RepositoryHealthStatus {
+    RepositoryHealthStatus {
         last_probe_at: Some(now.to_string()),
         last_healthy_at: prior.and_then(|h| h.last_healthy_at.clone()),
-        consecutive_probe_failures: Some(consecutive),
+        consecutive_probe_failures: Some(prior_failures + 1),
         first_failure_at: Some(first_failure_at),
-        // Retired by the caller through `probe_failure_health_patch`, which emits the
-        // explicit null this `None` cannot express through a merge patch.
         probe_attempt_at: None,
-    };
+    }
+}
+
+pub fn reconcile_probe_failure(
+    existing: &[Condition],
+    prior: Option<&RepositoryHealthStatus>,
+    kind: ProbeFailureKind,
+    failure_threshold: i64,
+    now: &str,
+    generation: Option<i64>,
+) -> ProbeUpdate {
+    let health = failure_streak_health(prior, now);
+    let consecutive = health.consecutive_probe_failures.unwrap_or(1);
 
     let threshold = failure_threshold.max(1);
     if consecutive < threshold {
@@ -932,21 +951,30 @@ pub fn launch_phase(prior: Option<&RepositoryPhase>) -> &'static str {
     }
 }
 
+/// The single cap on the strict-retry relaunch backoff (and, through
+/// [`strict_retry_holdoff`], the launch gate), shared so the finalize requeue
+/// and the gate can never disagree. 1800s (#415, matching the default probe
+/// interval): against a paid-per-request object store every relaunch is a
+/// cold-cache `kopia repository connect` billed per attempt, so a doomed loop
+/// must decay to ~2 attempts/hour — while a healed backend is still noticed
+/// within 30 minutes worst case.
+pub const STRICT_RETRY_BACKOFF_CAP_SECS: u64 = 1800;
+
 /// Requeue for the strict recycle-retry loop while the backend is unavailable:
-/// exponential from 120s, doubling per consecutive failure, capped at 600s —
-/// `(120, 240, 480, 600, 600, …)` for inputs `0, 1, 2, 3, …` (negative/zero
-/// input → 120s). Bounds multi-day-outage Job churn (~144 Jobs/day worst case
-/// instead of 720) while keeping worst-case recovery detection ≤ 10m. The
-/// caller passes the number of failures *before* the retry being scheduled
-/// (post-fold streak minus one), so the first retry after a fresh failure
-/// waits the base 120s — matching the result-less recycle's flat cadence.
+/// exponential from 120s, doubling per consecutive failure, capped at
+/// [`STRICT_RETRY_BACKOFF_CAP_SECS`] — `(120, 240, 480, 960, 1800, 1800, …)`
+/// for inputs `0, 1, 2, 3, 4, …` (negative/zero input → 120s). Bounds
+/// multi-day-outage Job churn (~48 Jobs/day worst case instead of 720) while
+/// keeping worst-case recovery detection ≤ 30m. The caller passes the number
+/// of failures *before* the retry being scheduled (post-fold streak minus
+/// one), so the first retry after a fresh failure waits the base 120s.
 pub fn strict_retry_backoff(consecutive_failures: i64) -> std::time::Duration {
     const BASE_SECS: u64 = 120;
-    const CAP_SECS: u64 = 600;
-    // 2^3 * 120 = 960 already exceeds the cap, so clamping the exponent at 3
-    // keeps the shift small and overflow-free for any i64 input.
-    let exponent = consecutive_failures.clamp(0, 3) as u32;
-    std::time::Duration::from_secs((BASE_SECS << exponent).min(CAP_SECS))
+    // 120 << 4 = 1920 already exceeds the cap, so clamping the exponent at 4
+    // keeps the shift small and overflow-free for any i64 input (and any
+    // future cap value only needs a clamp bump the test derives).
+    let exponent = consecutive_failures.clamp(0, 4) as u32;
+    std::time::Duration::from_secs((BASE_SECS << exponent).min(STRICT_RETRY_BACKOFF_CAP_SECS))
 }
 
 /// How long a `Degraded` repository must still WAIT before relaunching its
@@ -961,8 +989,8 @@ pub fn strict_retry_backoff(consecutive_failures: i64) -> std::time::Duration {
 /// retry cycle relaunches the Job the moment the previous one is finalized,
 /// regardless of the requeue. Same launch-stamp discipline as
 /// [`crate::catalog::scan_requested_due`], keyed on `status.health.lastProbeAt`
-/// (which [`reconcile_probe_failure`] stamps on every failure fold, probe or
-/// strict).
+/// (which [`failure_streak_health`] stamps on every failure fold — probe,
+/// strict, or the result-less recycle route since #415).
 ///
 /// **Fails OPEN** on every edge: not `Degraded`, no recorded failure streak, an
 /// absent or unparseable stamp, or an elapsed backoff all mean "launch now" —
@@ -2055,14 +2083,22 @@ mod tests {
     }
 
     #[test]
-    fn strict_retry_backoff_doubles_from_120s_and_caps_at_600s() {
+    fn strict_retry_backoff_doubles_from_120s_and_caps_at_the_shared_cap() {
         let secs = |n: i64| strict_retry_backoff(n).as_secs();
         assert_eq!(secs(0), 120);
         assert_eq!(secs(1), 240);
         assert_eq!(secs(2), 480);
-        assert_eq!(secs(3), 600, "960 saturates at the cap");
-        assert_eq!(secs(4), 600);
-        assert_eq!(secs(1_000_000), 600, "huge streaks must not overflow");
+        assert_eq!(secs(3), 960);
+        // #415: the cap is the shared const (1800s = ~2 attempts/hour against
+        // a paid-per-request store), so the curve and any consumer deriving
+        // budgets from it can never disagree.
+        assert_eq!(secs(4), STRICT_RETRY_BACKOFF_CAP_SECS);
+        assert_eq!(secs(5), STRICT_RETRY_BACKOFF_CAP_SECS);
+        assert_eq!(
+            secs(1_000_000),
+            STRICT_RETRY_BACKOFF_CAP_SECS,
+            "huge streaks must not overflow"
+        );
         assert_eq!(secs(-1), 120, "negative input is the base");
         assert_eq!(secs(i64::MIN), 120);
     }
@@ -2239,6 +2275,138 @@ mod tests {
                 "streak {streak} must stay Ready under Alert"
             );
         }
+    }
+
+    /// #415 relaunch metronome, encoded as an executable regression. The
+    /// result-less recycle route used to write NO `status.health`: the
+    /// holdoff's `lastProbeAt` anchor went stale, `elapsed` exceeded any
+    /// backoff window, and the gate failed open into a fresh cold-cache
+    /// connect every ~2.5 minutes, forever (24 billed attempts/hour against
+    /// B2). With the route folding `failure_streak_health` per failure, the
+    /// holdoff re-arms each cycle and the cadence decays
+    /// 120→240→480→960→1800s.
+    #[test]
+    fn recycled_bootstrap_failures_rearm_the_holdoff() {
+        // The BUG, as the contrast case: streak recorded once (by the original
+        // probe failures), never re-stamped by the recycle route. Once the
+        // stale anchor's backoff window has elapsed, every subsequent pass
+        // launches immediately — the metronome.
+        let stale_anchor = t(0).to_rfc3339();
+        for pass in 1..5 {
+            let now = t(600 + pass * 150); // any time past the stale window
+            assert!(
+                strict_retry_holdoff(true, 3, Some(&stale_anchor), now).is_none(),
+                "pass {pass}: a never-re-stamped anchor fails open — the pre-fix bug"
+            );
+        }
+
+        // The FIX: each failed relaunch folds the streak++ and a fresh anchor,
+        // so the gate holds for the full (growing) backoff after every failure.
+        let mut health: Option<RepositoryHealthStatus> = None;
+        let mut clock = 0i64;
+        for (failure_n, expected_hold) in [(1, 120u64), (2, 240), (3, 480), (4, 960), (5, 1800)] {
+            let now = t(clock).to_rfc3339();
+            let folded = failure_streak_health(health.as_ref(), &now);
+            assert_eq!(folded.consecutive_probe_failures, Some(failure_n));
+            // Immediately after the failure the relaunch is gated for the full
+            // backoff window…
+            let held = strict_retry_holdoff(
+                true,
+                folded.consecutive_probe_failures.unwrap(),
+                folded.last_probe_at.as_deref(),
+                t(clock),
+            )
+            .unwrap_or_else(|| panic!("failure {failure_n} must re-arm the holdoff"));
+            assert_eq!(
+                held.as_secs(),
+                expected_hold,
+                "failure {failure_n} holds for the {expected_hold}s rung"
+            );
+            // …and releases once the window elapses (no wedge), which is when
+            // the next attempt launches (and, here, fails again).
+            assert!(
+                strict_retry_holdoff(
+                    true,
+                    folded.consecutive_probe_failures.unwrap(),
+                    folded.last_probe_at.as_deref(),
+                    t(clock + expected_hold as i64),
+                )
+                .is_none(),
+                "failure {failure_n}: the gate must release after {expected_hold}s"
+            );
+            clock += expected_hold as i64;
+            health = Some(folded);
+        }
+    }
+
+    /// The recycle route's fold IS the probe fold: `failure_streak_health`
+    /// must stay byte-equal to what `reconcile_probe_failure` records, across
+    /// prior-streak shapes, or the two writers drift apart.
+    #[test]
+    fn failure_streak_health_matches_the_probe_fold() {
+        let now = t(500).to_rfc3339();
+        for prior in [
+            None,
+            Some(health_with_failures(0)),
+            Some(health_with_failures(3)),
+            // A continuing streak with a missing firstFailureAt heals it.
+            Some(RepositoryHealthStatus {
+                last_probe_at: Some(t(100).to_rfc3339()),
+                last_healthy_at: None,
+                consecutive_probe_failures: Some(2),
+                first_failure_at: None,
+                probe_attempt_at: Some(t(90).to_rfc3339()),
+            }),
+        ] {
+            let folded = failure_streak_health(prior.as_ref(), &now);
+            let probe = reconcile_probe_failure(
+                &[],
+                prior.as_ref(),
+                ProbeFailureKind::Unreachable,
+                3,
+                &now,
+                None,
+            );
+            assert_eq!(folded, probe.health, "prior {prior:?}");
+        }
+    }
+
+    /// The recycle route's health patch must clear `probeAttemptAt` with an
+    /// explicit JSON null — every field is skip_serializing_if, so a direct
+    /// serialize can never clear it through a merge patch (the #273 class).
+    #[test]
+    fn recycle_route_health_patch_emits_the_explicit_null() {
+        let folded = failure_streak_health(Some(&health_with_failures(1)), &t(100).to_rfc3339());
+        let patch = probe_failure_health_patch(&folded);
+        assert!(
+            patch["probeAttemptAt"].is_null(),
+            "must be an explicit null, got {patch:?}"
+        );
+        assert_eq!(patch["consecutiveProbeFailures"].as_i64(), Some(2));
+        assert!(
+            patch["lastProbeAt"].is_string(),
+            "the holdoff anchor is stamped"
+        );
+        assert!(patch["firstFailureAt"].is_string());
+    }
+
+    /// The reset half of #415: after recycle-route failures, one successful
+    /// bootstrap folds Heal and nulls the streak/anchor, so the next episode
+    /// starts back at the 120s rung.
+    #[test]
+    fn success_clears_a_recycle_streak() {
+        let now = t(1_000).to_rfc3339();
+        let after_failures = failure_streak_health(
+            Some(&failure_streak_health(None, &t(500).to_rfc3339())),
+            &t(700).to_rfc3339(),
+        );
+        assert_eq!(after_failures.consecutive_probe_failures, Some(2));
+        let fold = success_fold(false, Some(&after_failures), true, &now)
+            .expect("a recorded streak must fold a Heal");
+        let patch = fold.health_patch;
+        assert!(patch["consecutiveProbeFailures"].is_null(), "{patch:?}");
+        assert!(patch["firstFailureAt"].is_null(), "{patch:?}");
+        assert!(patch["probeAttemptAt"].is_null(), "{patch:?}");
     }
 
     /// The one `BootstrapFailure` → sensor-kind mapping (#414): only the
