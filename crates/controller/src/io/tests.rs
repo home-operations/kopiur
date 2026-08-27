@@ -2288,7 +2288,7 @@ mod bootstrap_outcomes {
             success: true,
             created: true,
             unique_id: Some("uid-1".into()),
-            snapshot_count: 0,
+            snapshot_count: Some(0),
             snapshots: vec![],
             snapshots_truncated: false,
             foreign_suffix_dropped: 0,

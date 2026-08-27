@@ -1212,23 +1212,23 @@ async fn bootstrap_cluster_via_mover(
     // one (`ttlSecondsAfterFinished`). An already-Ready repo only re-creates it
     // when a re-run is actually warranted (`bootstrap_create_due`: catalog refresh
     // due, or spec changed) — re-creating unconditionally would pin the refresh
-    // cadence to the Job TTL instead of `catalog.refreshInterval`.
-    if !(reverify
-        || probe.launches()
-        || catalog::bootstrap_create_due(
-            repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
-            repo.metadata.generation,
-            repo.status.as_ref().and_then(|s| s.observed_generation),
-            cluster_last_refresh_at(repo),
-            CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
-            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
-            cluster_scan_requested_token(repo),
-            cluster_scan_requested_honored(repo),
-            cluster_scan_requested_attempt_at(repo),
-            kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
-            chrono::Utc::now(),
-        ))
-    {
+    // cadence to the Job TTL instead of `catalog.refreshInterval`. Hoisted into a
+    // variable because it also decides `probe_only` below (#414): a launch driven
+    // by catalog work must run the full mover, never the cheap probe mode.
+    let catalog_create_due = catalog::bootstrap_create_due(
+        repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
+        repo.metadata.generation,
+        repo.status.as_ref().and_then(|s| s.observed_generation),
+        cluster_last_refresh_at(repo),
+        CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
+        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+        cluster_scan_requested_token(repo),
+        cluster_scan_requested_honored(repo),
+        cluster_scan_requested_attempt_at(repo),
+        kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
+        chrono::Utc::now(),
+    );
+    if !(reverify || probe.launches() || catalog_create_due) {
         // This is the STEADY STATE of a Ready object-store repo (`bootstrap_create_due` is
         // true for any non-Ready phase, so nothing that has yet to bootstrap gets here).
         // Re-evaluate maintenance coverage before parking: it is the only pass a repo whose
@@ -1404,6 +1404,8 @@ async fn bootstrap_cluster_via_mover(
         name,
         &job_ns,
         create_enabled,
+        // Probe-only (#414): see the namespaced twin.
+        probe_style_launch && !catalog_create_due,
         repo.spec.create.as_ref(),
         repo.spec.mover_defaults.as_ref(),
         cluster,
@@ -1645,6 +1647,8 @@ fn cluster_bootstrap_work_spec(
     name: &str,
     job_ns: &str,
     auto_create: bool,
+    // #414: this launch is a pure health probe — see the namespaced twin.
+    probe_only: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
     mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
     cluster: Option<&str>,
@@ -1681,6 +1685,7 @@ fn cluster_bootstrap_work_spec(
             // can materialize discovered Snapshots (placed per identity hostname —
             // see `crate::catalog`).
             scan_catalog: true,
+            probe_only,
             create_options: kopiur_mover::workspec::CreateOptionsSpec::from_create(create),
             // MUTABLE parameters (#258), re-applied on drift on every bootstrap — the
             // opposite of create_options. Empty for a ReadOnly repository: `set-parameters`
@@ -1792,9 +1797,15 @@ async fn finalize_cluster_bootstrap(
     // conditions array and stamp the count onto storageStats (merge-patch
     // preserves snapshotCount below). Best-effort in the mover — `None` leaves the
     // prior condition/count. The Warning event fires only on the transition.
+    // `snapshot_count` is stamped only when the listing RAN (#414): a
+    // probe-only result reports `None`, and writing it unconditionally would
+    // reset the count to 0 on every probe (and poison the catalog gauge).
     let threshold = resolve_index_blob_warn_threshold(repo.spec.health.as_ref());
     let mut index_blob_event = None;
-    let mut storage_stats = serde_json::json!({ "snapshotCount": result.snapshot_count });
+    let mut storage_stats = serde_json::json!({});
+    if let Some(count) = result.snapshot_count {
+        storage_stats["snapshotCount"] = serde_json::json!(count);
+    }
     if let Some(count) = result.index_blob_count {
         let upd = health::reconcile_index_blob_health(
             &conditions,
@@ -2010,22 +2021,26 @@ async fn finalize_cluster_bootstrap(
     // covers the spec-change recycle (see the Repository twin): the fresh
     // result must be scanned NOW, not at the next timed refresh.
     let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-    if catalog::scan_due(
-        repo.metadata.generation,
-        repo.status.as_ref().and_then(|s| s.observed_generation),
-        cluster_last_refresh_at(repo),
-        interval,
-        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
-        cluster_scan_requested_token(repo),
-        cluster_scan_requested_honored(repo),
-        chrono::Utc::now(),
-    ) {
+    // `snapshot_count: None` = the listing DID NOT RUN (a probe-only result,
+    // #414): never scan over it — see the Repository twin.
+    if let Some(snapshot_count) = result.snapshot_count
+        && catalog::scan_due(
+            repo.metadata.generation,
+            repo.status.as_ref().and_then(|s| s.observed_generation),
+            cluster_last_refresh_at(repo),
+            interval,
+            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+            cluster_scan_requested_token(repo),
+            cluster_scan_requested_honored(repo),
+            chrono::Utc::now(),
+        )
+    {
         run_cluster_catalog_scan(
             ctx,
             repo,
             name,
             &result.snapshots,
-            result.snapshot_count,
+            snapshot_count,
             result.snapshots_truncated,
             result.foreign_suffix_dropped,
         )
@@ -2049,11 +2064,13 @@ async fn finalize_cluster_bootstrap(
 
 /// Reflect a FAILED bootstrap Job into the `ClusterRepository` status — the
 /// failed arm of [`finalize_cluster_bootstrap`], mirroring the namespaced
-/// [`crate::repository`] twin's four exhaustive routes: probe-run →
-/// [`finalize_cluster_probe_failure`]; result-less → recycle as `Degraded`
-/// (flat 120s, untouched by M4); a `RepositoryUnavailable` verdict on a
-/// once-bootstrapped repo → [`recycle_cluster_bootstrap_outage`] (the #345
-/// strict-verdict reroute); everything else → terminal `Failed`.
+/// [`crate::repository`] twin's exhaustive routes: probe-run →
+/// [`finalize_cluster_probe_failure`]; a `RepositoryUnavailable` verdict or
+/// deadline kill on a once-bootstrapped repo →
+/// [`recycle_cluster_bootstrap_outage`] (the #345 strict-verdict reroute);
+/// result-less → recycle as `Degraded` with the failure streak stamped so the
+/// relaunch backs off exponentially (#415); a seed failure → recycle at the
+/// flat prompt DR cadence; everything else → terminal `Failed`.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_cluster_bootstrap_failure(
     ctx: &Context,
@@ -2691,6 +2708,7 @@ mod tests {
                 "shared",
                 "kopia-system",
                 true,
+                false,
                 None,
                 None,
                 None,
@@ -2760,6 +2778,7 @@ mod tests {
                 "shared",
                 "kopia-system",
                 true,
+                false,
                 None,
                 None,
                 cluster,

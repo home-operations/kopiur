@@ -1135,23 +1135,23 @@ async fn bootstrap_via_mover(
     // one (`ttlSecondsAfterFinished`). An already-Ready repo only re-creates it
     // when a re-run is actually warranted (`bootstrap_create_due`: catalog refresh
     // due, or spec changed) — re-creating unconditionally would pin the refresh
-    // cadence to the Job TTL instead of `catalog.refreshInterval`.
-    if !(reverify
-        || probe.launches()
-        || catalog::bootstrap_create_due(
-            repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
-            repo.metadata.generation,
-            repo.status.as_ref().and_then(|s| s.observed_generation),
-            last_refresh_at(repo),
-            CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
-            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
-            scan_requested_token(repo),
-            scan_requested_honored(repo),
-            scan_requested_attempt_at(repo),
-            kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
-            chrono::Utc::now(),
-        ))
-    {
+    // cadence to the Job TTL instead of `catalog.refreshInterval`. Hoisted into a
+    // variable because it also decides `probe_only` below (#414): a launch driven
+    // by catalog work must run the full mover, never the cheap probe mode.
+    let catalog_create_due = catalog::bootstrap_create_due(
+        repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
+        repo.metadata.generation,
+        repo.status.as_ref().and_then(|s| s.observed_generation),
+        last_refresh_at(repo),
+        CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
+        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+        scan_requested_token(repo),
+        scan_requested_honored(repo),
+        scan_requested_attempt_at(repo),
+        kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
+        chrono::Utc::now(),
+    );
+    if !(reverify || probe.launches() || catalog_create_due) {
         // The STEADY STATE of a Ready mover-bootstrapped repo (`bootstrap_create_due` is
         // true for any non-Ready phase, so nothing pre-bootstrap reaches here). Re-evaluate
         // maintenance coverage before parking — otherwise this repo's `MaintenanceConfigured`
@@ -1327,6 +1327,10 @@ async fn bootstrap_via_mover(
         namespace,
         create_enabled,
         true,
+        // Probe-only (#414): a probe-style launch with no catalog work due
+        // skips the O(snapshots) listing. A scan-token/refresh/spec-driven
+        // launch — even one that coincides with a due probe — runs in full.
+        probe_style_launch && !catalog_create_due,
         repo.spec.create.as_ref(),
         repo.spec.mover_defaults.as_ref(),
         cluster,
@@ -1657,6 +1661,10 @@ fn bootstrap_work_spec(
     namespace: &str,
     auto_create: bool,
     scan_catalog: bool,
+    // #414: this launch is a pure health probe (probe-style, no catalog work
+    // due) — the mover skips the `kopia snapshot list` catalog step and
+    // reports `snapshot_count: None`, decoupling probe cost from catalog size.
+    probe_only: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
     mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
     cluster: Option<&str>,
@@ -1690,6 +1698,7 @@ fn bootstrap_work_spec(
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
             auto_create,
             scan_catalog,
+            probe_only,
             // Create-time format knobs (encryption/splitter/hash/ECC) honored only
             // when the bootstrap creates the repo (ADR-0005 §13(a)).
             create_options: kopiur_mover::workspec::CreateOptionsSpec::from_create(create),
@@ -2065,7 +2074,7 @@ async fn finalize_bootstrap(
     if result.snapshots_truncated {
         tracing::warn!(
             repo = %name,
-            snapshot_count = result.snapshot_count,
+            snapshot_count = result.snapshot_count.unwrap_or(0),
             "catalog larger than the materialization cap; not all snapshots were materialized"
         );
     }
@@ -2079,16 +2088,24 @@ async fn finalize_bootstrap(
     // refresh — `repo` is the pre-reconcile cache, so its observedGeneration is
     // still the old one exactly once per spec change.
     let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-    if catalog::scan_due(
-        repo.metadata.generation,
-        repo.status.as_ref().and_then(|s| s.observed_generation),
-        last_refresh_at(repo),
-        interval,
-        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
-        scan_requested_token(repo),
-        scan_requested_honored(repo),
-        chrono::Utc::now(),
-    ) {
+    // `snapshot_count: None` = the listing DID NOT RUN (a probe-only result,
+    // #414) — running the scan over it would expire every discovered Snapshot
+    // and zero the stats against an empty list. Skipping leaves any pending
+    // scan-request token un-honored, so `bootstrap_recycle_due`'s token arm
+    // recycles the Job for a full run — the launch-side `probe_only` gating
+    // makes this arm unreachable in practice; this is its belt.
+    if let Some(snapshot_count) = result.snapshot_count
+        && catalog::scan_due(
+            repo.metadata.generation,
+            repo.status.as_ref().and_then(|s| s.observed_generation),
+            last_refresh_at(repo),
+            interval,
+            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+            scan_requested_token(repo),
+            scan_requested_honored(repo),
+            chrono::Utc::now(),
+        )
+    {
         run_catalog_scan(
             ctx,
             repo,
@@ -2096,7 +2113,7 @@ async fn finalize_bootstrap(
             name,
             repo_uid,
             &result.snapshots,
-            result.snapshot_count,
+            snapshot_count,
             result.snapshots_truncated,
             result.foreign_suffix_dropped,
         )
@@ -2811,6 +2828,44 @@ mod tests {
         assert!(stale_bootstrap_job(Some("not-a-number"), Some(3)));
     }
 
+    /// #414: `probe_only` rides the bootstrap op verbatim, so a probe-style
+    /// launch with no catalog work due skips the O(snapshots) listing in the
+    /// mover — and any other launch keeps the full run.
+    #[test]
+    fn the_bootstrap_work_spec_threads_probe_only() {
+        use kopiur_api::backend::FilesystemBackend;
+        let backend = Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        });
+        let build = |probe_only: bool| {
+            let spec = bootstrap_work_spec(
+                &backend,
+                "nas",
+                "billing",
+                true,
+                true,
+                probe_only,
+                None,
+                None,
+                None,
+                ForeignSnapshots::Fallback,
+                false,
+                true,
+                false,
+                None,
+                None,
+                None,
+            );
+            match spec.operation {
+                Operation::BootstrapRepository(op) => op,
+                other => panic!("expected BootstrapRepository, got {other:?}"),
+            }
+        };
+        assert!(build(true).probe_only);
+        assert!(!build(false).probe_only);
+    }
+
     /// #380: the seed payload rides the bootstrap op, and only when armed.
     #[test]
     fn the_bootstrap_work_spec_carries_the_seed_payload_only_when_one_is_armed() {
@@ -2827,6 +2882,7 @@ mod tests {
                 "billing",
                 true,
                 true,
+                false,
                 None,
                 None,
                 None,
@@ -2974,8 +3030,8 @@ mod tests {
         });
         let prefilter = |cluster: Option<&str>, foreign: ForeignSnapshots| {
             let spec = bootstrap_work_spec(
-                &backend, "nas", "billing", true, true, None, None, cluster, foreign, false, true,
-                false, None, None, None,
+                &backend, "nas", "billing", true, true, false, None, None, cluster, foreign, false,
+                true, false, None, None, None,
             );
             match spec.operation {
                 Operation::BootstrapRepository(op) => op.catalog_foreign_prefilter_cluster,
@@ -3014,6 +3070,7 @@ mod tests {
                 "billing",
                 true,
                 true,
+                false,
                 None,
                 None,
                 cluster,

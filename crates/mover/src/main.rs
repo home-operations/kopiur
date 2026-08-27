@@ -2139,14 +2139,23 @@ async fn run_bootstrap(
         .as_ref()
         .map(kopiur_mover::workspec::observed_blob_retention);
 
-    // Always list to report an authoritative snapshot count (unaffected by either
+    // List to report an authoritative snapshot count (unaffected by either
     // the foreign-suffix prefilter or the cap below); return the entries for
-    // materialization only when scanning is requested.
-    let listing = match client.snapshot_list(None).await {
-        Ok(l) => l,
-        Err(e) => return BootstrapResult::failed(&e),
+    // materialization only when scanning is requested. A `probe_only` run
+    // (#414) skips the listing entirely — it is the O(snapshots) step that
+    // makes probe cost scale with catalog size — and reports `None` so the
+    // controller leaves the prior catalog/stats untouched. A seed-armed run
+    // never skips (the seed verdict below needs repository contents, and a
+    // probe is only ever armed for an already-bootstrapped repository).
+    let (snapshot_count, listing) = if op.probe_only && op.seed.is_none() {
+        (None, Vec::new())
+    } else {
+        let l = match client.snapshot_list(None).await {
+            Ok(l) => l,
+            Err(e) => return BootstrapResult::failed(&e),
+        };
+        (Some(l.len() as i64), l)
     };
-    let snapshot_count = listing.len() as i64;
     // The seeding backstop (issue #380): refuse to report success on an EMPTY
     // repository when a seed was armed. Catches the one path the source-side
     // gates cannot see — an earlier seed that initialized the backend and then
