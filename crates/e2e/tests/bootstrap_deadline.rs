@@ -6,10 +6,19 @@
 //! the resulting `Degraded` repository (#413), and (c) relaunched the doomed
 //! discovery Job every ~2.5 minutes forever, billed per request (#415).
 //!
-//! The fixture is a deliberately impossible `activeDeadlineSeconds: 1` against
-//! a HEALTHY MinIO — the deterministic way to make every connect die by
-//! deadline while the backend answers instantly, i.e. exactly the
-//! "slow, not down" shape the fixes classify.
+//! The fixture pairs an impossible `activeDeadlineSeconds: 1` with a network
+//! BLACKHOLE of the MinIO port ([`kopiur_e2e::blackhole_tcp_port`]): the
+//! connect hangs (SYN retransmits, no RST) so the kill is DETERMINISTICALLY
+//! result-less. The blackhole is essential — against a healthy in-cluster
+//! MinIO the whole mover run frequently beats the Job controller's lazy
+//! deadline enforcement and persists a SUCCESS result, which rightly outranks
+//! the Job's late `DeadlineExceeded` verdict (observed live while building
+//! this test: the repo healed to Ready every probe cycle). Lifting the
+//! blackhole then lets the deadline-escalation self-heal story complete.
+//!
+//! One sequential test fn on purpose: the blackhole is node-global state, so
+//! two concurrently-running scenarios would fight over it — and this binary
+//! must own its CI shard (every MinIO consumer hangs while the rule stands).
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
 //! `mise run //crates/e2e:test`. Skips gracefully without a cluster.
@@ -24,14 +33,21 @@ use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use kube::{Api, ResourceExt};
 
 use kopiur_api::{Maintenance, Repository};
-use kopiur_e2e::{E2E_NAMESPACE, Need, World, consts, default_timeout, poll_interval, wait_until};
+use kopiur_e2e::{
+    E2E_NAMESPACE, Need, World, blackhole_tcp_port, consts, default_timeout, poll_interval,
+    wait_until,
+};
+
+/// The MinIO port the blackhole drops (`consts::MINIO_ENDPOINT`'s port).
+const MINIO_PORT: u16 = 9000;
 
 /// How long the #415 guard watches for a premature relaunch. The strict-retry
 /// holdoff gates the second attempt for ≥120s from the failure's `lastProbeAt`
 /// stamp; on the pre-fix code the relaunch landed within seconds of the
 /// finalize, so 90s of "no new Job UID" cleanly separates the two without
 /// waiting out a full backoff rung (the full 120→240→480→960→1800 ladder is
-/// pinned by the unit sequence test `recycled_bootstrap_failures_rearm_the_holdoff`).
+/// pinned by the unit sequence test
+/// `recycled_bootstrap_failures_rearm_the_holdoff`).
 const HOLDOFF_GUARD_WINDOW: Duration = Duration::from_secs(90);
 
 fn repository_json(name: &str, bucket: &str, deadline_secs: Option<i64>) -> serde_json::Value {
@@ -64,8 +80,8 @@ fn repository_json(name: &str, bucket: &str, deadline_secs: Option<i64>) -> serd
     })
 }
 
-fn status_value(repo: &Repository) -> serde_json::Value {
-    serde_json::to_value(repo)
+fn status_value<K: serde::Serialize>(obj: &K) -> serde_json::Value {
+    serde_json::to_value(obj)
         .ok()
         .and_then(|v| v.get("status").cloned())
         .unwrap_or_default()
@@ -121,86 +137,141 @@ async fn distinct_discovery_job_uids(
     seen
 }
 
-/// #414 + #413 on a BOOTSTRAPPED repository: a spec edit drops the bootstrap
-/// deadline to an impossible 1s, so the strict re-bootstrap is deadline-killed
-/// against a healthy backend. The kill must be classified as a deadline kill
-/// (`ProbeDeadlineExceeded` on `BackendReachable`/`Ready`,
-/// `BootstrapDeadlineExceeded` on `Bootstrapped` — NOT the old
-/// "unreachable/credentials" text), and the repository's managed `Maintenance`
-/// must keep working (#413: no `WaitingForRepository` deferral — a manual run
-/// SUCCEEDS against the degraded-but-reachable repository, because the
-/// maintenance mover's own deadline is the 48h default, not the probe's).
+/// The whole deadline-kill arc, sequentially (the blackhole is node-global):
+///
+/// 1. `repo-a` bootstraps normally to Ready (+ managed Maintenance).
+/// 2. Blackhole MinIO; drop `repo-a`'s deadline to 1s; birth `repo-b` under a
+///    1s deadline. Every connect now hangs → every kill is result-less.
+/// 3. #414: `repo-a` (strict relaunch of a bootstrapped repo) degrades with
+///    `ProbeDeadlineExceeded`/`BootstrapDeadlineExceeded` and the
+///    raise-the-deadline message — never the credentials-ghost text.
+/// 4. #413: while `repo-a` is Degraded-by-deadline, its managed Maintenance is
+///    NOT deferred `WaitingForRepository`; a manual run's Job spawns.
+/// 5. #415: `repo-b`'s first kill stamps `consecutiveProbeFailures: 1` and no
+///    new discovery Job appears inside the holdoff window.
+/// 6. Heal (lift the blackhole): the manual maintenance run completes,
+///    `repo-b`'s released second attempt carries the ESCALATED 2s deadline,
+///    and both repositories self-heal to Ready — the end-to-end #414 story.
+/// Restore the blackhole on ANY exit — a panicking assertion unwinds past the
+/// in-line `blackhole_tcp_port(.., false)` call, and a leaked rule wedges the
+/// retry (and every later scenario on a kept cluster) at MinIO provisioning.
+/// Sync `docker` in `Drop` because `Drop` cannot await.
+struct BlackholeGuard;
+impl Drop for BlackholeGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("docker")
+            .args([
+                "exec",
+                consts::KIND_CONTROL_PLANE_CONTAINER,
+                "iptables",
+                "-w",
+                "-D",
+                "FORWARD",
+                "-p",
+                "tcp",
+                "--dport",
+                "9000",
+                "-j",
+                "DROP",
+            ])
+            .output();
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn deadline_killed_relaunch_degrades_with_the_deadline_reason_and_maintenance_still_runs() {
+async fn deadline_kills_classify_exempt_maintenance_hold_off_and_self_heal() {
     let Some(world) = World::connect().await else {
         return;
     };
+    // BEFORE provisioning: a rule leaked by an interrupted earlier try would
+    // hang `ensure(Minio)`'s bucket pod. `-D` of an absent rule errors; ignore.
+    let _ = blackhole_tcp_port(MINIO_PORT, false).await;
+    let _guard = BlackholeGuard;
     world
         .ensure(&[Need::Minio])
         .await
         .expect("provision MinIO + buckets");
     let client = world.client().clone();
-    let bucket = "kopiur-bootstrap-deadline-a";
-    let repo = "e2e-deadline-a";
+    let repo_a = "e2e-deadline-a";
+    let repo_b = "e2e-deadline-b";
+    let job_b = format!("{repo_b}-discovery");
 
     let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let maints: Api<Maintenance> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    clear_leftover(&repos, repo).await;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    clear_leftover(&repos, repo_a).await;
+    clear_leftover(&repos, repo_b).await;
 
-    // 1. Bootstrap normally to Ready (default 120s deadline is plenty for
-    //    in-cluster MinIO) and pin the uniqueId + the managed Maintenance.
+    // 1. Bootstrap `repo-a` normally (default 120s deadline, healthy MinIO).
     repos
         .create(
             &PostParams::default(),
-            &serde_json::from_value(repository_json(repo, bucket, None))
+            &serde_json::from_value(repository_json(repo_a, "kopiur-bootstrap-deadline-a", None))
                 .expect("Repository JSON deserializes"),
         )
         .await
-        .expect("create Repository");
+        .expect("create repo-a");
     wait_until(
-        &format!("{repo} Ready with a uniqueId"),
+        &format!("{repo_a} Ready with a uniqueId"),
         default_timeout(),
         poll_interval(),
         || async {
-            let s = status_value(&repos.get(repo).await?);
+            let s = status_value(&repos.get(repo_a).await?);
             let ready = s.get("phase").and_then(|p| p.as_str()) == Some("Ready")
                 && s.get("uniqueId").and_then(|u| u.as_str()).is_some();
             Ok(ready.then_some(()))
         },
     )
     .await
-    .expect("repository bootstraps to Ready");
+    .expect("repo-a bootstraps to Ready");
     wait_until(
-        &format!("managed Maintenance {repo} exists"),
+        &format!("managed Maintenance {repo_a} exists"),
         default_timeout(),
         poll_interval(),
-        || async { Ok(maints.get_opt(repo).await?.map(|_| ())) },
+        || async { Ok(maints.get_opt(repo_a).await?.map(|_| ())) },
     )
     .await
     .expect("a Ready repository projects its managed Maintenance");
 
-    // 2. Drop the bootstrap deadline to an impossible 1s. The generation bump
-    //    forces a strict re-bootstrap, which the Job controller deadline-kills
-    //    while MinIO stays healthy — the exact "slow, not down" shape.
+    // 2. Blackhole MinIO, then make both repos' deadlines impossible. From here
+    //    to the heal, EVERY guard below must not leave this fn without lifting
+    //    the rule — panics unwind past it, so a failed run leaves the rule for
+    //    the next run's pre-clean above (and CI clusters are throwaway).
+    blackhole_tcp_port(MINIO_PORT, true)
+        .await
+        .expect("install the MinIO blackhole");
     repos
         .patch(
-            repo,
+            repo_a,
             &PatchParams::default(),
             &Patch::Merge(serde_json::json!({
                 "spec": { "bootstrap": { "failurePolicy": { "activeDeadlineSeconds": 1 } } }
             })),
         )
         .await
-        .expect("patch activeDeadlineSeconds");
+        .expect("patch repo-a activeDeadlineSeconds");
+    repos
+        .create(
+            &PostParams::default(),
+            &serde_json::from_value(repository_json(
+                repo_b,
+                "kopiur-bootstrap-deadline-b",
+                Some(1),
+            ))
+            .expect("Repository JSON deserializes"),
+        )
+        .await
+        .expect("create repo-b");
 
-    // 3. #414: the degradation names the DEADLINE, not a phantom outage.
+    // 3. #414 on the bootstrapped repo: the strict relaunch is deadline-killed
+    //    result-less and must degrade with the DEADLINE reasons.
     wait_until(
-        &format!("{repo} Degraded with the deadline reasons"),
+        &format!("{repo_a} Degraded with the deadline reasons"),
         default_timeout(),
         poll_interval(),
         || async {
-            let s = status_value(&repos.get(repo).await?);
+            let s = status_value(&repos.get(repo_a).await?);
             let classified = s.get("phase").and_then(|p| p.as_str()) == Some("Degraded")
                 && condition(&s, "BackendReachable", "reason").as_deref()
                     == Some("ProbeDeadlineExceeded")
@@ -213,7 +284,7 @@ async fn deadline_killed_relaunch_degrades_with_the_deadline_reason_and_maintena
     .expect(
         "#414: a deadline kill must degrade with ProbeDeadlineExceeded/BootstrapDeadlineExceeded",
     );
-    let s = status_value(&repos.get(repo).await.unwrap());
+    let s = status_value(&repos.get(repo_a).await.unwrap());
     let msg = condition(&s, "BackendReachable", "message").unwrap_or_default();
     assert!(
         msg.contains("activeDeadlineSeconds"),
@@ -224,14 +295,15 @@ async fn deadline_killed_relaunch_degrades_with_the_deadline_reason_and_maintena
         "#414: the alert must NOT send the operator chasing credential ghosts: {msg}"
     );
 
-    // 4. #413: maintenance is EXEMPT for a deadline-degraded repository — the
-    //    managed Maintenance must not defer WaitingForRepository, and a manual
-    //    quick run must actually SUCCEED (its mover connects fine: only the
-    //    1s bootstrap deadline is impossible, the backend is healthy).
+    // 4. #413, asserted while `repo-a` is Degraded and the backend is STILL
+    //    blackholed: the manual maintenance run must not defer
+    //    WaitingForRepository, and its mover Job must spawn (it hangs against
+    //    the blackhole for now — its own deadline is the 48h mover default —
+    //    and completes after the heal below).
     let requested = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     maints
         .patch(
-            repo,
+            repo_a,
             &PatchParams::default(),
             &Patch::Merge(serde_json::json!({ "metadata": { "annotations": {
                 kopiur_api::consts::RUN_REQUESTED_ANNOTATION: requested,
@@ -240,83 +312,42 @@ async fn deadline_killed_relaunch_degrades_with_the_deadline_reason_and_maintena
         )
         .await
         .expect("annotate Maintenance with a manual run request");
+    // The #413 deadlock, as a live assertion: the G7 gate runs BEFORE manual-run
+    // handling, so on the old Ready-only gate this wait can never complete — the
+    // Maintenance parks at LeaseOwned=False/WaitingForRepository and the
+    // annotation is never picked up. (Deliberately NOT asserted by sighting that
+    // condition: a stale WaitingForRepository from the bootstrap-race window can
+    // linger on status after the gate already passes, so only the manual run's
+    // acceptance proves the gate's LIVE verdict.)
     wait_until(
-        &format!("manual maintenance {requested} succeeds against the Degraded repository"),
+        &format!("manual maintenance {requested} spawns against the Degraded repo-a"),
         default_timeout(),
         poll_interval(),
         || async {
-            let m = maints.get(repo).await?;
-            let s = serde_json::to_value(&m)
-                .ok()
-                .and_then(|v| v.get("status").cloned())
-                .unwrap_or_default();
-            // The #413 deadlock, as a live assertion: the old gate wrote
-            // LeaseOwned=False/WaitingForRepository here and never spawned.
-            if let Some(reason) = condition(&s, "LeaseOwned", "reason")
-                && reason == "WaitingForRepository"
-            {
-                panic!(
-                    "#413 deadlock: maintenance deferred WaitingForRepository against a \
-                     Degraded-because-slow repository — maintenance is the cure and must run"
-                );
-            }
-            let done = s.pointer("/manualRun/requestedAt").and_then(|v| v.as_str())
-                == Some(requested.as_str())
-                && s.pointer("/manualRun/phase").and_then(|v| v.as_str()) == Some("Succeeded");
-            Ok(done.then_some(()))
+            let s = status_value(&maints.get(repo_a).await?);
+            Ok(
+                (s.pointer("/manualRun/requestedAt").and_then(|v| v.as_str())
+                    == Some(requested.as_str()))
+                .then_some(()),
+            )
         },
     )
     .await
-    .expect("#413: maintenance must run (and succeed) against a deadline-degraded repository");
-
-    // Cleanup (best-effort).
-    let _ = repos.delete(repo, &DeleteParams::default()).await;
-}
-
-/// #415 + deadline escalation on a NEVER-bootstrapped repository born with an
-/// impossible 1s deadline: the first kill must arm the strict-retry holdoff
-/// (no relaunch inside [`HOLDOFF_GUARD_WINDOW`] — pre-fix, a fresh cold-cache
-/// connect launched within seconds, ~24 billed attempts/hour), the gate must
-/// then RELEASE (no wedge), and the second attempt must run with the ESCALATED
-/// 2s deadline (the operator applies the "raise activeDeadlineSeconds"
-/// remediation itself).
-#[tokio::test]
-#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
-async fn first_deadline_kill_arms_the_relaunch_holdoff_and_escalates_the_deadline() {
-    let Some(world) = World::connect().await else {
-        return;
-    };
-    world
-        .ensure(&[Need::Minio])
-        .await
-        .expect("provision MinIO + buckets");
-    let client = world.client().clone();
-    let bucket = "kopiur-bootstrap-deadline-b";
-    let repo = "e2e-deadline-b";
-    let job_name = format!("{repo}-discovery");
-
-    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    clear_leftover(&repos, repo).await;
-
-    repos
-        .create(
-            &PostParams::default(),
-            &serde_json::from_value(repository_json(repo, bucket, Some(1)))
-                .expect("Repository JSON deserializes"),
+    .unwrap_or_else(|e| {
+        panic!(
+            "#413 deadlock: the manual maintenance run was never accepted against a \
+             Degraded-because-slow repository — the G7 gate is deferring the cure: {e}"
         )
-        .await
-        .expect("create Repository");
+    });
 
-    // 1. The first attempt dies by deadline: Degraded, streak 1 stamped (#415's
-    //    prerequisite — the old code never wrote status.health here), and the
-    //    Ready condition names the deadline (#414's first-bootstrap flavor).
+    // 5a. #415 prerequisite on the never-bootstrapped repo: the first
+    //     result-less kill stamps the failure streak and the deadline reason.
     wait_until(
-        &format!("{repo} Degraded with consecutiveProbeFailures=1"),
+        &format!("{repo_b} Degraded with consecutiveProbeFailures=1"),
         default_timeout(),
         poll_interval(),
         || async {
-            let s = status_value(&repos.get(repo).await?);
+            let s = status_value(&repos.get(repo_b).await?);
             let armed = s.get("phase").and_then(|p| p.as_str()) == Some("Degraded")
                 && s.pointer("/health/consecutiveProbeFailures")
                     .and_then(|v| v.as_i64())
@@ -326,7 +357,7 @@ async fn first_deadline_kill_arms_the_relaunch_holdoff_and_escalates_the_deadlin
     )
     .await
     .expect("#415: the first result-less failure must stamp the failure streak");
-    let s = status_value(&repos.get(repo).await.unwrap());
+    let s = status_value(&repos.get(repo_b).await.unwrap());
     assert_eq!(
         condition(&s, "Ready", "reason").as_deref(),
         Some("BootstrapDeadlineExceeded"),
@@ -337,14 +368,13 @@ async fn first_deadline_kill_arms_the_relaunch_holdoff_and_escalates_the_deadlin
         msg.contains("activeDeadlineSeconds"),
         "#414: the message must name the deadline and its fix: {msg}"
     );
-    let first_uids = distinct_discovery_job_uids(&jobs, &job_name, Duration::from_secs(5)).await;
+    let first_uids = distinct_discovery_job_uids(&jobs, &job_b, Duration::from_secs(5)).await;
 
-    // 2. THE #415 ASSERTION: for the guard window, NO new discovery Job may
-    //    appear — the holdoff gates the relaunch for ≥120s from the failure.
-    //    Pre-fix, the recycle route never stamped the holdoff's anchor, so a
-    //    fresh Job (and a fresh billed cold-cache connect) landed within
-    //    seconds of the finalize.
-    let during = distinct_discovery_job_uids(&jobs, &job_name, HOLDOFF_GUARD_WINDOW).await;
+    // 5b. THE #415 ASSERTION: for the guard window, NO new discovery Job may
+    //     appear — the holdoff gates the relaunch for ≥120s from the failure.
+    //     Pre-fix, the recycle route never stamped the holdoff's anchor, so a
+    //     fresh Job (a fresh billed cold-cache connect) landed within seconds.
+    let during = distinct_discovery_job_uids(&jobs, &job_b, HOLDOFF_GUARD_WINDOW).await;
     let new_during: BTreeSet<_> = during.difference(&first_uids).collect();
     assert!(
         new_during.is_empty(),
@@ -354,18 +384,23 @@ async fn first_deadline_kill_arms_the_relaunch_holdoff_and_escalates_the_deadlin
         new_during.len()
     );
 
-    // 3. The gate RELEASES (no wedge): the second attempt arrives once the
-    //    120s rung elapses, and it runs with the ESCALATED 2s deadline.
+    // 6. HEAL: lift the blackhole. From here everything self-resolves.
+    blackhole_tcp_port(MINIO_PORT, false)
+        .await
+        .expect("lift the MinIO blackhole");
+
+    // 6a. The gate releases (no wedge) and the second attempt runs with the
+    //     ESCALATED 2s deadline — the operator applied the raise-the-deadline
+    //     remediation itself.
     wait_until(
-        &format!("{job_name} second attempt with the escalated deadline"),
+        &format!("{job_b} second attempt with the escalated deadline"),
         default_timeout(),
         poll_interval(),
         || async {
-            let Some(job) = jobs.get_opt(&job_name).await? else {
+            let Some(job) = jobs.get_opt(&job_b).await? else {
                 return Ok(None);
             };
-            let is_new = job.uid().is_some_and(|u| !during.contains(&u));
-            if !is_new {
+            if job.uid().is_none_or(|u| during.contains(&u)) {
                 return Ok(None);
             }
             Ok(job.spec.as_ref().and_then(|s| s.active_deadline_seconds))
@@ -380,6 +415,47 @@ async fn first_deadline_kill_arms_the_relaunch_holdoff_and_escalates_the_deadlin
     })
     .expect("the holdoff must release and relaunch with an escalated deadline");
 
+    // 6b. The manual maintenance run completes against the healed backend —
+    //     proof the #413 exemption spawned REAL, working maintenance.
+    wait_until(
+        &format!("manual maintenance {requested} succeeds"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_value(&maints.get(repo_a).await?);
+            let done = s.pointer("/manualRun/requestedAt").and_then(|v| v.as_str())
+                == Some(requested.as_str())
+                && s.pointer("/manualRun/phase").and_then(|v| v.as_str()) == Some("Succeeded");
+            Ok(done.then_some(()))
+        },
+    )
+    .await
+    .expect("#413: the exempted maintenance run must succeed once the backend heals");
+
+    // 6c. Both repositories self-heal to Ready: an escalated-deadline connect
+    //     succeeds, the streak clears, and the deadline returns to base — the
+    //     end-to-end #414 story (no human ever edited the spec back).
+    for repo in [repo_a, repo_b] {
+        wait_until(
+            &format!("{repo} self-heals to Ready"),
+            // The retry that heals rides the holdoff ladder, and repo-a's 4s
+            // rung can race a slow pod start: a heal may need the NEXT rung,
+            // waiting out backoff(2) = 480s first — budget for one full extra
+            // rung beyond that.
+            Duration::from_secs(900),
+            poll_interval(),
+            || async {
+                let s = status_value(&repos.get(repo).await?);
+                Ok((s.get("phase").and_then(|p| p.as_str()) == Some("Ready")).then_some(()))
+            },
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("{repo} must self-heal to Ready after the blackhole lifts: {e}")
+        });
+    }
+
     // Cleanup (best-effort).
-    let _ = repos.delete(repo, &DeleteParams::default()).await;
+    let _ = repos.delete(repo_a, &DeleteParams::default()).await;
+    let _ = repos.delete(repo_b, &DeleteParams::default()).await;
 }
