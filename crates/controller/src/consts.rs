@@ -255,11 +255,23 @@ pub const CHECK_CREDENTIALS_ACTION: &str = "CheckCredentials";
 
 /// Machine-readable `reason` (condition + Warning Event) when a bootstrap Job
 /// reaches a terminal/failed state but wrote **no** structured result — the mover
-/// pod crashed, was evicted, hit its [`BOOTSTRAP_JOB_DEADLINE_SECS`] deadline, or
-/// never scheduled (e.g. a missing mover ServiceAccount). Distinct from a kopia
-/// error class so the failure mode is not silently conflated with a backend
-/// rejection ([`crate::io::BootstrapFailure`]).
+/// pod crashed, was OOM-killed/evicted, or never scheduled (e.g. a missing mover
+/// ServiceAccount). A deadline kill carries its own
+/// [`BOOTSTRAP_DEADLINE_EXCEEDED_REASON`] (read off the Job's `Failed`
+/// condition), so this reason falls back to covering a deadline kill only on a
+/// cluster whose Job conditions omit the `DeadlineExceeded` reason string.
+/// Distinct from a kopia error class so the failure mode is not silently
+/// conflated with a backend rejection ([`crate::io::BootstrapFailure`]).
 pub const BOOTSTRAP_JOB_FAILED_REASON: &str = "BootstrapJobFailed";
+
+/// Machine-readable `reason` (condition + Warning Event) when a bootstrap Job
+/// was killed by its `activeDeadlineSeconds` before the mover could write a
+/// result (issue #414). Its own reason — NOT folded into
+/// [`BOOTSTRAP_JOB_FAILED_REASON`] — because the remediation is entirely
+/// different: the backend may be healthy but slow (a cold-cache
+/// `kopia repository connect` scales with index-blob count), so the fix is a
+/// longer deadline and index compaction, not a backend/credentials hunt.
+pub const BOOTSTRAP_DEADLINE_EXCEEDED_REASON: &str = "BootstrapDeadlineExceeded";
 
 /// [`OP_LABEL`] value for a populator `Restore`'s prime PVC and populate mover Job
 /// (distinct from the direct-target `restore` Jobs). ADR-0005 §9.
@@ -505,6 +517,10 @@ pub const SET_SCRATCH_CAPACITY_ACTION: &str = "SetScratchCapacity";
 pub const CHECK_PERMISSIONS_ACTION: &str = "CheckPermissions";
 /// `action` for any other backend failure: check the backend configuration.
 pub const CHECK_BACKEND_ACTION: &str = "CheckBackend";
+/// `action` for a deadline-killed bootstrap/probe Job (issue #414): raise
+/// `spec.bootstrap.failurePolicy.activeDeadlineSeconds` (and let maintenance
+/// compact indexes so the connect gets faster).
+pub const RAISE_BOOTSTRAP_DEADLINE_ACTION: &str = "RaiseBootstrapDeadline";
 
 /// `SnapshotSchedule` warn-only condition: the schedule inherits its cron timezone
 /// from its target policies' repository `scheduleDefaults.timezone`, but the matched

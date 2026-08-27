@@ -1026,7 +1026,7 @@ async fn bootstrap_via_mover(
             io::delete_mover_run(&ctx.client, namespace, &job_name).await?;
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
-        return match crate::snapshot::job_terminal_state(&job) {
+        return match io::mover_job_terminal(&job) {
             // Still running: surface progress and poll. A catalog-refresh
             // re-run of an already-Ready repo keeps its phase — flapping
             // Ready→Initializing every refresh would be pure status churn —
@@ -1066,7 +1066,7 @@ async fn bootstrap_via_mover(
             // this arm stands down so `finalize_bootstrap` can consume it. Recycling
             // then too is the #273 livelock — it destroys the very result that would
             // have stamped `lastProbeAt` and cleared the gate.
-            Some(success) => {
+            Some(terminal) => {
                 let interval =
                     CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
                 if reverify
@@ -1096,9 +1096,35 @@ async fn bootstrap_via_mover(
                     io::delete_mover_run(&ctx.client, namespace, &job_name).await?;
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
+                // The deadline the Job actually ran with (exact even under
+                // deadline escalation), for the deadline-kill classification's
+                // condition message (#414).
+                let job_deadline_secs = job
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.active_deadline_seconds)
+                    .unwrap_or_else(|| {
+                        health::bootstrap_deadline_seconds(
+                            repo.spec
+                                .bootstrap
+                                .as_ref()
+                                .and_then(|b| b.failure_policy.as_ref())
+                                .and_then(|fp| fp.active_deadline_seconds),
+                        )
+                    });
                 finalize_bootstrap(
-                    ctx, repo, namespace, name, repo_uid, api, backend, &job_name, success,
-                    probe_run, seed_armed,
+                    ctx,
+                    repo,
+                    namespace,
+                    name,
+                    repo_uid,
+                    api,
+                    backend,
+                    &job_name,
+                    terminal,
+                    job_deadline_secs,
+                    probe_run,
+                    seed_armed,
                 )
                 .await
             }
@@ -1777,7 +1803,12 @@ async fn finalize_bootstrap(
     api: &Api<Repository>,
     backend: &Backend,
     job_name: &str,
-    job_succeeded: bool,
+    // The Job's terminal state, WHY included (issue #414): a deadline kill is
+    // classified apart from a crashed/never-scheduled mover.
+    job_terminal: io::MoverJobTerminal,
+    // The `activeDeadlineSeconds` the Job actually ran with, for the
+    // deadline-kill condition message.
+    job_deadline_secs: i64,
     // True when this is a health-probe re-run of an already-`Ready` repo (same
     // spec): the result is interpreted as a probe (the `BackendReachable`
     // condition carries the outcome; the phase follows `health::breaker_verdict`
@@ -1799,7 +1830,13 @@ async fn finalize_bootstrap(
     // exhaustively-handled modes — never a silent `Failed/Unknown` with no
     // Event — and the success arm *owns* the result, so there is no
     // `.expect()` invariant to get wrong.
-    let result = match io::bootstrap_outcome(result, job_succeeded, job_name, seed_armed) {
+    let result = match io::bootstrap_outcome(
+        result,
+        job_terminal,
+        job_name,
+        seed_armed,
+        job_deadline_secs,
+    ) {
         // Result not visible yet (write/propagation race): requeue briefly rather
         // than guessing. A truly result-less Job stays terminal for the next pass.
         io::BootstrapOutcome::ResultPending => {
@@ -2149,109 +2186,117 @@ async fn finalize_bootstrap_failure(
             // real story is on `Bootstrapped` and `Ready`.
             None => repo_seed::drop_seed_condition(conditions),
         };
-    // A result-less Job failure carries no backend verdict (mover
-    // crashed / evicted / deadline / result write hit a down apiserver
-    // — the outage incident): recycle the dead Job and retry as
-    // `Degraded` (the retryable-class semantics of the in-process
-    // path) instead of parking `Failed` and re-reading the same Job
-    // every pass until its TTL reaps it. Guarded write + stable
-    // message keep repeats a no-op (no hot-loop).
-    if failure.recycles_for_retry() {
-        io::delete_mover_run(&ctx.client, namespace, job_name).await?;
-        let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
-        let conditions = seed_fold(&conditions);
-        let conditions = io::set_ready(
-            &conditions,
-            repo.metadata.generation,
-            io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
-            reason,
-            &failure.condition_message(),
-        );
-        let current = serde_json::to_value(&repo.status).ok();
-        let wrote = io::patch_status_if_changed(
-            api,
-            name,
-            current.as_ref(),
-            serde_json::json!({
-                "phase": "Degraded",
-                "backend": backend.kind_str(),
-                "observedGeneration": repo.metadata.generation,
-                "conditions": conditions,
-            }),
-        )
-        .await?;
-        if wrote {
-            failure.publish(ctx, &io::event_ref(repo), name).await;
-            repo_seed::record_seed_failure(
-                &ctx.metrics,
-                repo.spec.seed.as_ref(),
-                "Repository",
-                namespace,
-                name,
-                seed_armed,
-            );
-            tracing::warn!(
-                repo = %name,
-                reason,
-                "bootstrap Job failed; recycled it for retry"
-            );
-        }
-        return Ok(Action::requeue(Duration::from_secs(120)));
-    }
-    // A backend-outage verdict on a once-bootstrapped repo (#345 M4): recycle
-    // and retry as `Degraded`, feeding the unified backend sensor so the
-    // failure streak keeps climbing while the breaker is open.
     let bootstrapped = repo
         .status
         .as_ref()
         .and_then(|s| s.unique_id.as_deref())
         .is_some();
-    if failure.retryable_outage_for_bootstrapped(bootstrapped) {
-        return recycle_bootstrap_outage(
-            ctx, repo, namespace, name, api, backend, job_name, &failure,
-        )
-        .await;
+    // Route precedence lives in ONE tested place (`BootstrapFailure::route`,
+    // outage sensor first) — not in the ordering of `if` arms two hand-copied
+    // reconcilers must keep in sync.
+    match failure.route(bootstrapped) {
+        // A backend-outage verdict (or deadline kill) on a once-bootstrapped
+        // repo (#345 M4): recycle and retry as `Degraded`, feeding the unified
+        // backend sensor so the failure streak keeps climbing while the
+        // breaker is open.
+        io::FailureRoute::OutageSensor => {
+            recycle_bootstrap_outage(ctx, repo, namespace, name, api, backend, job_name, &failure)
+                .await
+        }
+        // A result-less Job failure carries no backend verdict (mover
+        // crashed / evicted / result write hit a down apiserver — the outage
+        // incident): recycle the dead Job and retry as `Degraded` (the
+        // retryable-class semantics of the in-process path) instead of parking
+        // `Failed` and re-reading the same Job every pass until its TTL reaps
+        // it. A seed failure retries the same way but PROMPTLY (flat cadence —
+        // the documented DR contract). Guarded write + stable message keep
+        // repeats a no-op (no hot-loop).
+        io::FailureRoute::Recycle | io::FailureRoute::SeedRetry => {
+            io::delete_mover_run(&ctx.client, namespace, job_name).await?;
+            let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
+            let conditions = seed_fold(&conditions);
+            let conditions = io::set_ready(
+                &conditions,
+                repo.metadata.generation,
+                io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
+                reason,
+                &failure.condition_message(),
+            );
+            let current = serde_json::to_value(&repo.status).ok();
+            let wrote = io::patch_status_if_changed(
+                api,
+                name,
+                current.as_ref(),
+                serde_json::json!({
+                    "phase": "Degraded",
+                    "backend": backend.kind_str(),
+                    "observedGeneration": repo.metadata.generation,
+                    "conditions": conditions,
+                }),
+            )
+            .await?;
+            if wrote {
+                failure.publish(ctx, &io::event_ref(repo), name).await;
+                repo_seed::record_seed_failure(
+                    &ctx.metrics,
+                    repo.spec.seed.as_ref(),
+                    "Repository",
+                    namespace,
+                    name,
+                    seed_armed,
+                );
+                tracing::warn!(
+                    repo = %name,
+                    reason,
+                    "bootstrap Job failed; recycled it for retry"
+                );
+            }
+            Ok(Action::requeue(Duration::from_secs(120)))
+        }
+        io::FailureRoute::Terminal => {
+            let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
+            let conditions = seed_fold(&conditions);
+            // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
+            // should fail its health check fast, not hang until timeout.
+            let conditions = io::set_ready(
+                &conditions,
+                repo.metadata.generation,
+                io::ready_outcome_for_phase(&RepositoryPhase::Failed),
+                reason,
+                &failure.condition_message(),
+            );
+            // Guard the write so a re-confirmed failure fires the Event + warn log
+            // only on the real transition, not on every 120 s re-read (the message
+            // is stable, so this becomes a true no-op once written — no reconcile
+            // hot-loop).
+            let current = serde_json::to_value(&repo.status).ok();
+            let wrote = io::patch_status_if_changed(
+                api,
+                name,
+                current.as_ref(),
+                serde_json::json!({
+                    "phase": "Failed",
+                    "backend": backend.kind_str(),
+                    "observedGeneration": repo.metadata.generation,
+                    "conditions": conditions,
+                }),
+            )
+            .await?;
+            if wrote {
+                failure.publish(ctx, &io::event_ref(repo), name).await;
+                repo_seed::record_seed_failure(
+                    &ctx.metrics,
+                    repo.spec.seed.as_ref(),
+                    "Repository",
+                    namespace,
+                    name,
+                    seed_armed,
+                );
+                tracing::warn!(repo = %name, reason, "repository bootstrap failed");
+            }
+            Ok(Action::requeue(Duration::from_secs(120)))
+        }
     }
-    let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
-    let conditions = seed_fold(&conditions);
-    // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
-    // should fail its health check fast, not hang until timeout.
-    let conditions = io::set_ready(
-        &conditions,
-        repo.metadata.generation,
-        io::ready_outcome_for_phase(&RepositoryPhase::Failed),
-        reason,
-        &failure.condition_message(),
-    );
-    // Guard the write so a re-confirmed failure fires the Event + warn log only
-    // on the real transition, not on every 120 s re-read (the message is stable,
-    // so this becomes a true no-op once written — no reconcile hot-loop).
-    let current = serde_json::to_value(&repo.status).ok();
-    let wrote = io::patch_status_if_changed(
-        api,
-        name,
-        current.as_ref(),
-        serde_json::json!({
-            "phase": "Failed",
-            "backend": backend.kind_str(),
-            "observedGeneration": repo.metadata.generation,
-            "conditions": conditions,
-        }),
-    )
-    .await?;
-    if wrote {
-        failure.publish(ctx, &io::event_ref(repo), name).await;
-        repo_seed::record_seed_failure(
-            &ctx.metrics,
-            repo.spec.seed.as_ref(),
-            "Repository",
-            namespace,
-            name,
-            seed_armed,
-        );
-        tracing::warn!(repo = %name, reason, "repository bootstrap failed");
-    }
-    Ok(Action::requeue(Duration::from_secs(120)))
 }
 
 /// The strict-verdict reroute (#345 M4): a failed strict bootstrap whose verdict
