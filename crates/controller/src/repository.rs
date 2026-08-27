@@ -956,6 +956,33 @@ async fn bootstrap_via_mover(
         .as_ref()
         .and_then(|s| s.health.as_ref())
         .and_then(|h| h.probe_attempt_at.clone());
+    // The effective bootstrap-Job deadline under escalation (#414): the spec
+    // base, doubled per consecutive DEADLINE-killed attempt (status-derived).
+    // Computed once, before the Job fetch, and used for BOTH the Job's
+    // `activeDeadlineSeconds` and the probe-attempt window below — the streak
+    // only grows between a launch and its poll, so the attempt window only
+    // ever widens relative to the running Job's real deadline (never the
+    // #273-class undercut).
+    let bootstrap_deadline_secs = health::escalated_bootstrap_deadline(
+        health::bootstrap_deadline_seconds(
+            repo.spec
+                .bootstrap
+                .as_ref()
+                .and_then(|b| b.failure_policy.as_ref())
+                .and_then(|fp| fp.active_deadline_seconds),
+        ),
+        health::timeout_streak(
+            repo.status
+                .as_ref()
+                .map(|s| s.conditions.as_slice())
+                .unwrap_or(&[]),
+            repo.status
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .and_then(|h| h.consecutive_probe_failures)
+                .unwrap_or(0),
+        ),
+    );
     let probe = health::probe_action(
         already_ready,
         bootstrapped_before,
@@ -968,13 +995,7 @@ async fn bootstrap_via_mover(
         kopiur_api::repository::RepositoryHealthProbeSpec::effective_interval(
             repo.spec.health.as_ref(),
         ),
-        health::probe_attempt_timeout(health::bootstrap_deadline_seconds(
-            repo.spec
-                .bootstrap
-                .as_ref()
-                .and_then(|b| b.failure_policy.as_ref())
-                .and_then(|fp| fp.active_deadline_seconds),
-        )),
+        health::probe_attempt_timeout(bootstrap_deadline_secs),
         chrono::Utc::now(),
     );
     let spec_changed =
@@ -1475,9 +1496,10 @@ async fn bootstrap_via_mover(
             seed_armed,
             repo.spec.seed.as_ref(),
             JobLimits {
-                active_deadline_seconds: Some(health::bootstrap_deadline_seconds(
-                    bootstrap_fp.and_then(|fp| fp.active_deadline_seconds),
-                )),
+                // The spec base under deadline escalation (#414) — doubled per
+                // consecutive deadline-killed attempt, computed once above so
+                // the Job limit and the probe-attempt window cannot disagree.
+                active_deadline_seconds: Some(bootstrap_deadline_secs),
                 backoff_limit: bootstrap_fp
                     .and_then(|fp| fp.backoff_limit)
                     .unwrap_or(JobLimits::default().backoff_limit),

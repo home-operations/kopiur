@@ -311,7 +311,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `failurePolicy` | [object](#repository-spec-bootstrap-failurepolicy) | — | Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long a connect may run before the Job is marked failed (default 120s); raise it for a slow backend — e.g. an rclone remote whose repository metadata and indexes load through kopia's embedded `rclone serve`/WebDAV bridge. `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for shape parity but is not honored by the bootstrap Job. |
+| `failurePolicy` | [object](#repository-spec-bootstrap-failurepolicy) | — | Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long a connect may run before the Job is marked failed (default 120s); raise it for a slow backend — e.g. an rclone remote whose repository metadata and indexes load through kopia's embedded `rclone serve`/WebDAV bridge, or a large repository whose cold-cache connect outgrows the default. The value is a BASE, not a ceiling: after consecutive deadline-killed attempts the operator escalates the effective deadline itself (doubling per attempt, up to 30 minutes or the configured value, whichever is larger — never below it), so a slow-but-alive backend self-heals without a spec edit. `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for shape parity but is not honored by the bootstrap Job. |
 
 ##### `spec.bootstrap.failurePolicy` { #repository-spec-bootstrap-failurepolicy }
 
@@ -1337,7 +1337,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `failurePolicy` | [object](#clusterrepository-spec-bootstrap-failurepolicy) | — | Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long a connect may run before the Job is marked failed (default 120s); raise it for a slow backend — e.g. an rclone remote whose repository metadata and indexes load through kopia's embedded `rclone serve`/WebDAV bridge. `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for shape parity but is not honored by the bootstrap Job. |
+| `failurePolicy` | [object](#clusterrepository-spec-bootstrap-failurepolicy) | — | Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long a connect may run before the Job is marked failed (default 120s); raise it for a slow backend — e.g. an rclone remote whose repository metadata and indexes load through kopia's embedded `rclone serve`/WebDAV bridge, or a large repository whose cold-cache connect outgrows the default. The value is a BASE, not a ceiling: after consecutive deadline-killed attempts the operator escalates the effective deadline itself (doubling per attempt, up to 30 minutes or the configured value, whichever is larger — never below it), so a slow-but-alive backend self-heals without a spec edit. `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for shape parity but is not honored by the bootstrap Job. |
 
 ##### `spec.bootstrap.failurePolicy` { #clusterrepository-spec-bootstrap-failurepolicy }
 

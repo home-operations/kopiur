@@ -22,8 +22,9 @@ use kopiur_api::repository::{ProbeOnFailure, RepositoryHealthStatus};
 
 use crate::consts::{
     BACKEND_REACHABLE_CONDITION, BACKEND_REACHABLE_REASON, BACKEND_UNREACHABLE_REASON,
-    CHECK_BACKEND_ACTION, INDEX_BLOB_HEALTH_CONDITION, PROBE_DEADLINE_EXCEEDED_REASON,
-    RAISE_BOOTSTRAP_DEADLINE_ACTION, REPOSITORY_VANISHED_REASON, VERIFY_BACKEND_ACTION,
+    BOOTSTRAP_DEADLINE_EXCEEDED_REASON, CHECK_BACKEND_ACTION, INDEX_BLOB_HEALTH_CONDITION,
+    PROBE_DEADLINE_EXCEEDED_REASON, RAISE_BOOTSTRAP_DEADLINE_ACTION,
+    REPOSITORY_BOOTSTRAPPED_CONDITION, REPOSITORY_VANISHED_REASON, VERIFY_BACKEND_ACTION,
 };
 use crate::io;
 
@@ -1015,6 +1016,58 @@ pub fn strict_retry_holdoff(
     } else {
         Some((due - now).to_std().unwrap_or(backoff))
     }
+}
+
+/// The consecutive-failure streak attributable to Job-DEADLINE kills, derived
+/// from status alone: `consecutive_failures` iff the current `Bootstrapped` or
+/// `BackendReachable` `False` condition carries a deadline reason
+/// (`BootstrapDeadlineExceeded` / `ProbeDeadlineExceeded`), else `0` — a
+/// crash-loop or outage streak must never inflate the deadline.
+///
+/// Threshold nuance (documented, not a bug): on a bootstrapped repository with
+/// the default `failureThreshold: 3`, below-threshold probe failures leave
+/// conditions untouched (the debounce), so escalation only engages once the
+/// threshold crosses and the deadline reason lands on a condition. The
+/// never-bootstrapped recycle route writes its `Bootstrapped=False` reason on
+/// failure 1, so there escalation starts from attempt 2.
+pub fn timeout_streak(conditions: &[Condition], consecutive_failures: i64) -> i64 {
+    let deadline_reasoned = conditions.iter().any(|c| {
+        (c.type_ == REPOSITORY_BOOTSTRAPPED_CONDITION || c.type_ == BACKEND_REACHABLE_CONDITION)
+            && c.status == "False"
+            && (c.reason == BOOTSTRAP_DEADLINE_EXCEEDED_REASON
+                || c.reason == PROBE_DEADLINE_EXCEEDED_REASON)
+    });
+    if deadline_reasoned {
+        consecutive_failures.max(0)
+    } else {
+        0
+    }
+}
+
+/// The effective bootstrap-Job `activeDeadlineSeconds` under DEADLINE
+/// ESCALATION (#414): `base << min(timeout_streak, 4)`, capped at
+/// `max(base, STRICT_RETRY_BACKOFF_CAP_SECS)` — the operator applies the
+/// "raise activeDeadlineSeconds until one connect succeeds" remediation
+/// itself, in lockstep with the relaunch backoff (deadline ladder
+/// 120→240→480→960→1800 at the default base), so a slow-but-alive backend
+/// self-heals: one longer-deadline connect succeeds, maintenance (exempt from
+/// the breaker for deadline degradation) compacts the index, the streak
+/// resets, and the deadline returns to base. If even the 1800s rung fails, the
+/// backend is genuinely dark and the honest breaker state stands.
+///
+/// Never reduces: the cap includes `base`, so an explicit user override larger
+/// than the escalation cap is respected verbatim. `streak <= 0` → `base`.
+///
+/// Callers MUST feed the same status-derived value into
+/// [`probe_attempt_timeout`] as into the Job's limits — both are computed
+/// before the Job is fetched, and the streak only grows between a launch and
+/// its poll, so the computed attempt window only ever WIDENS relative to the
+/// running Job's real deadline. An attempt window narrower than the Job's
+/// deadline would recycle a live Job mid-connect (the #273 class).
+pub fn escalated_bootstrap_deadline(base_secs: i64, timeout_streak: i64) -> i64 {
+    let exponent = timeout_streak.clamp(0, 4) as u32;
+    let cap = (STRICT_RETRY_BACKOFF_CAP_SECS as i64).max(base_secs);
+    base_secs.saturating_mul(1_i64 << exponent).min(cap)
 }
 
 /// Whether the repository's backend is CONFIRMED down or wiped: a
@@ -2407,6 +2460,81 @@ mod tests {
         assert!(patch["consecutiveProbeFailures"].is_null(), "{patch:?}");
         assert!(patch["firstFailureAt"].is_null(), "{patch:?}");
         assert!(patch["probeAttemptAt"].is_null(), "{patch:?}");
+    }
+
+    /// #414 deadline escalation: base << min(streak, 4), capped at
+    /// max(base, the shared backoff cap), never reducing an explicit override.
+    #[test]
+    fn escalated_deadline_ladder() {
+        // Default base: the ladder runs in lockstep with the relaunch backoff.
+        for (streak, expected) in [(0, 120), (1, 240), (2, 480), (3, 960), (4, 1800), (5, 1800)] {
+            assert_eq!(
+                escalated_bootstrap_deadline(120, streak),
+                expected,
+                "streak {streak}"
+            );
+        }
+        // An explicit override below the cap escalates from ITS base…
+        assert_eq!(escalated_bootstrap_deadline(900, 1), 1800);
+        // …and one above the cap is respected verbatim, never reduced.
+        assert_eq!(escalated_bootstrap_deadline(7_200, 0), 7_200);
+        assert_eq!(escalated_bootstrap_deadline(7_200, 3), 7_200);
+        // Degenerate inputs stay safe.
+        assert_eq!(escalated_bootstrap_deadline(120, -1), 120);
+        assert_eq!(escalated_bootstrap_deadline(120, i64::MAX), 1800);
+        assert_eq!(escalated_bootstrap_deadline(i64::MAX, 4), i64::MAX);
+        // The attempt window derived from the escalated value only ever widens
+        // as the streak grows — the #273-class undercut is unrepresentable.
+        for streak in 0..6 {
+            assert!(
+                probe_attempt_timeout(escalated_bootstrap_deadline(120, streak + 1))
+                    >= probe_attempt_timeout(escalated_bootstrap_deadline(120, streak))
+            );
+        }
+    }
+
+    /// Escalation is keyed on DEADLINE-reasoned failures only: a crash-loop or
+    /// outage streak must never inflate the deadline.
+    #[test]
+    fn timeout_streak_only_counts_deadline_reasons() {
+        let boot_false = |reason: &str| Condition {
+            type_: REPOSITORY_BOOTSTRAPPED_CONDITION.to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message: "m".to_string(),
+            last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ),
+            observed_generation: None,
+        };
+        // Deadline reasons on either condition count the full streak.
+        assert_eq!(
+            timeout_streak(&[boot_false(BOOTSTRAP_DEADLINE_EXCEEDED_REASON)], 3),
+            3
+        );
+        assert_eq!(
+            timeout_streak(
+                &[reachable_cond("False", PROBE_DEADLINE_EXCEEDED_REASON)],
+                2
+            ),
+            2
+        );
+        // Non-deadline reasons — and True conditions — contribute nothing.
+        assert_eq!(timeout_streak(&[boot_false("BootstrapJobFailed")], 3), 0);
+        assert_eq!(
+            timeout_streak(&[reachable_cond("False", BACKEND_UNREACHABLE_REASON)], 5),
+            0
+        );
+        assert_eq!(
+            timeout_streak(&[reachable_cond("True", BACKEND_REACHABLE_REASON)], 5),
+            0
+        );
+        assert_eq!(timeout_streak(&[], 5), 0);
+        // A negative streak clamps to zero.
+        assert_eq!(
+            timeout_streak(&[boot_false(BOOTSTRAP_DEADLINE_EXCEEDED_REASON)], -2),
+            0
+        );
     }
 
     /// The one `BootstrapFailure` → sensor-kind mapping (#414): only the
