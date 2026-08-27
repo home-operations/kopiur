@@ -273,6 +273,14 @@ pub const BOOTSTRAP_JOB_FAILED_REASON: &str = "BootstrapJobFailed";
 /// longer deadline and index compaction, not a backend/credentials hunt.
 pub const BOOTSTRAP_DEADLINE_EXCEEDED_REASON: &str = "BootstrapDeadlineExceeded";
 
+/// `BackendReachable=False` (and breaker-open `Ready`) reason when the health
+/// probe / strict retry keeps being killed by the bootstrap Job deadline
+/// (issue #414): "connect slower than `activeDeadlineSeconds`" — NOT
+/// confirmation of an outage, so the maintenance gate
+/// (`health::maintenance_may_proceed`) deliberately lets maintenance keep
+/// running under this reason.
+pub const PROBE_DEADLINE_EXCEEDED_REASON: &str = "ProbeDeadlineExceeded";
+
 /// `LeaseOwned=False` (Maintenance) / `Ready=False` (RepositoryReplication)
 /// reason while the gate on the target repository holds. For maintenance the
 /// gate is `health::maintenance_may_proceed` (bootstrapped-before + degradation

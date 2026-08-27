@@ -931,8 +931,9 @@ impl BootstrapFailure {
     }
 
     /// Whether this failed strict-bootstrap verdict should recycle-and-retry as
-    /// `Degraded` instead of parking terminal `Failed` — ONLY a backend verdict
-    /// of class `RepositoryUnavailable` on a repository that has bootstrapped
+    /// `Degraded` feeding the unified backend sensor, instead of parking
+    /// terminal `Failed` — a backend verdict of class `RepositoryUnavailable`,
+    /// or a Job-deadline kill (#414), on a repository that has bootstrapped
     /// before (`status.uniqueId` pinned). This is the strict-verdict half of the
     /// #345 circuit breaker: without it, a breaker-opened `Degraded` repository
     /// is overwritten to terminal `Failed` one pass later by its own strict
@@ -965,12 +966,15 @@ impl BootstrapFailure {
                         | KopiaErrorClass::Unknown => false,
                     }
             }
+            // A deadline kill on a BOOTSTRAPPED repo joins the outage sensor
+            // (#414): `recycle_bootstrap_outage` folds it as
+            // `ProbeFailureKind::TimedOut`, so the streak/backoff/breaker
+            // machinery — and the deadline escalation keyed on the streak —
+            // see deadline kills. A never-bootstrapped repo keeps the plain
+            // recycle route (there is no sensor state to feed yet; the #415
+            // streak stamp there still arms the holdoff).
+            BootstrapFailure::JobDeadlineExceeded { .. } => bootstrapped,
             BootstrapFailure::JobFailedWithoutResult { .. }
-            // NOTE: `JobDeadlineExceeded` joins the outage sensor for
-            // bootstrapped repositories in the #414 sensor commit (so the
-            // streak/backoff/breaker machinery sees deadline kills); until then
-            // it recycles like the result-less bucket.
-            | BootstrapFailure::JobDeadlineExceeded { .. }
             | BootstrapFailure::RepositoryNotInitialized
             // A seed failure only ever fires on a repository that has NEVER
             // bootstrapped (the seed is armed only while `status.uniqueId` is

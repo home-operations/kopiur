@@ -2753,9 +2753,17 @@ mod job_terminal_and_routes {
             );
             // Result-less infrastructure failures recycle (with backoff, #415).
             assert_eq!(no_result.route(bootstrapped), FailureRoute::Recycle);
-            // A deadline kill recycles too (it joins the outage sensor for
-            // bootstrapped repositories in the #414 sensor commit).
-            assert_eq!(deadline.route(bootstrapped), FailureRoute::Recycle);
+            // A deadline kill feeds the outage sensor once bootstrapped
+            // (#414: streak/backoff/breaker + deadline escalation see it);
+            // a never-bootstrapped repo keeps the plain recycle route.
+            assert_eq!(
+                deadline.route(bootstrapped),
+                if bootstrapped {
+                    FailureRoute::OutageSensor
+                } else {
+                    FailureRoute::Recycle
+                }
+            );
             // Seed failures keep their own PROMPT retry route.
             assert_eq!(seed.route(bootstrapped), FailureRoute::SeedRetry);
             // The rest are terminal verdicts.

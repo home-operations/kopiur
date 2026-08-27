@@ -22,8 +22,8 @@ use kopiur_api::repository::{ProbeOnFailure, RepositoryHealthStatus};
 
 use crate::consts::{
     BACKEND_REACHABLE_CONDITION, BACKEND_REACHABLE_REASON, BACKEND_UNREACHABLE_REASON,
-    CHECK_BACKEND_ACTION, INDEX_BLOB_HEALTH_CONDITION, REPOSITORY_VANISHED_REASON,
-    VERIFY_BACKEND_ACTION,
+    CHECK_BACKEND_ACTION, INDEX_BLOB_HEALTH_CONDITION, PROBE_DEADLINE_EXCEEDED_REASON,
+    RAISE_BOOTSTRAP_DEADLINE_ACTION, REPOSITORY_VANISHED_REASON, VERIFY_BACKEND_ACTION,
 };
 use crate::io;
 
@@ -370,18 +370,47 @@ pub enum ProbeFailureKind {
     /// Backend unreachable, mount/path missing, or auth/lock failed — NOT a
     /// confirmed wipe. kopiur never treats it as one.
     Unreachable,
+    /// The probe/bootstrap Job was killed by its `activeDeadlineSeconds` before
+    /// kopia could report a verdict (issue #414): the backend may be reachable
+    /// but SLOW — a cold-cache `kopia repository connect` scales with
+    /// index-blob count. Counts toward the breaker threshold (a repository
+    /// that cannot be confirmed healthy pauses backups/replication), but
+    /// maintenance keeps running: index compaction is the cure
+    /// (`maintenance_may_proceed`), and the retry deadline escalates.
+    TimedOut,
 }
 
 impl ProbeFailureKind {
-    /// The stable metric-label value (`vanished` / `unreachable`), shared by the
-    /// `kopiur_repository_health_probe_failures` `outcome` label and the
-    /// `kopiur_repository_breaker_trips` `probe_kind` label so dashboards join
-    /// the two on identical values.
+    /// The stable metric-label value (`vanished` / `unreachable` /
+    /// `timed_out`), shared by the `kopiur_repository_health_probe_failures`
+    /// `outcome` label and the `kopiur_repository_breaker_trips` `probe_kind`
+    /// label so dashboards join the two on identical values.
     pub fn label(self) -> &'static str {
         match self {
             ProbeFailureKind::Vanished => "vanished",
             ProbeFailureKind::Unreachable => "unreachable",
+            ProbeFailureKind::TimedOut => "timed_out",
         }
+    }
+}
+
+/// Classify a [`crate::io::BootstrapFailure`] as the unified backend sensor's
+/// failure kind — the ONE place the mapping lives (it was four hand-copied
+/// two-way collapses across the twins before #414). Exhaustive: only the
+/// mover's genuine `RepositoryNotInitialized` sentinel may read as *vanished*
+/// (a wrong "absent" here could, in a future auto-recreate, be catastrophic),
+/// only a Job-deadline kill reads as *timed out*, and everything else is the
+/// conservative *unreachable*.
+pub fn probe_failure_kind(failure: &crate::io::BootstrapFailure) -> ProbeFailureKind {
+    use crate::io::BootstrapFailure;
+    match failure {
+        BootstrapFailure::RepositoryNotInitialized => ProbeFailureKind::Vanished,
+        BootstrapFailure::JobDeadlineExceeded { .. } => ProbeFailureKind::TimedOut,
+        BootstrapFailure::Backend { .. }
+        | BootstrapFailure::JobFailedWithoutResult { .. }
+        | BootstrapFailure::Seed { .. }
+        | BootstrapFailure::SeedMoverTooOld
+        | BootstrapFailure::InternalInconsistency { .. } => ProbeFailureKind::Unreachable,
     }
 }
 
@@ -672,6 +701,19 @@ pub fn reconcile_probe_failure(
                  Check the backend, credentials, and any mounted volume."
             ),
         ),
+        ProbeFailureKind::TimedOut => (
+            PROBE_DEADLINE_EXCEEDED_REASON,
+            RAISE_BOOTSTRAP_DEADLINE_ACTION,
+            format!(
+                "the backend health probe was killed by its activeDeadlineSeconds before kopia \
+                 finished connecting ({consecutive} consecutive deadline-killed probes). The \
+                 backend may be reachable but slow — a cold cache over a large index makes \
+                 `kopia repository connect` exceed the deadline. This is NOT evidence of an \
+                 outage or a wipe, and kopiur never auto-recreates. Raise \
+                 spec.bootstrap.failurePolicy.activeDeadlineSeconds; maintenance (index \
+                 compaction) shrinks connect time and keeps running."
+            ),
+        ),
     };
 
     // Fire on a transition: prior was not already `False` with this same reason.
@@ -704,9 +746,11 @@ pub fn reconcile_probe_failure(
 // The repository circuit breaker (#345 M4).
 //
 // The probe (and the strict retry loop) is the sensor; `breaker_verdict` is the
-// switch. Open = phase `Degraded`, which every consumer gate (backups,
-// maintenance, replication) already reads as "paused". Closed again by any
-// successful strict connect via `success_fold`'s Heal case.
+// switch. Open = phase `Degraded`, which the backup/replication consumer gates
+// read as "paused". Maintenance is deliberately EXEMPT since #413
+// (`maintenance_may_proceed`): it keeps running unless the backend is
+// confirmed unreachable/vanished, because index compaction is often the cure.
+// Closed again by any successful strict connect via `success_fold`'s Heal case.
 // ---------------------------------------------------------------------------
 
 /// What a threshold-crossing check decides for the repository phase. A closed
@@ -763,6 +807,7 @@ pub fn breaker_reason(kind: ProbeFailureKind) -> &'static str {
     match kind {
         ProbeFailureKind::Vanished => REPOSITORY_VANISHED_REASON,
         ProbeFailureKind::Unreachable => BACKEND_UNREACHABLE_REASON,
+        ProbeFailureKind::TimedOut => PROBE_DEADLINE_EXCEEDED_REASON,
     }
 }
 
@@ -772,6 +817,7 @@ pub fn breaker_action(kind: ProbeFailureKind) -> &'static str {
     match kind {
         ProbeFailureKind::Vanished => VERIFY_BACKEND_ACTION,
         ProbeFailureKind::Unreachable => CHECK_BACKEND_ACTION,
+        ProbeFailureKind::TimedOut => RAISE_BOOTSTRAP_DEADLINE_ACTION,
     }
 }
 
@@ -790,6 +836,13 @@ pub fn breaker_open_message(kind: ProbeFailureKind) -> &'static str {
             "the repository backend is unreachable — the circuit breaker is open: backups, \
              maintenance, and replication are paused until a connect succeeds; retrying with \
              backoff (recovery is automatic)"
+        }
+        ProbeFailureKind::TimedOut => {
+            "the repository connect keeps exceeding its bootstrap deadline — the circuit breaker \
+             is open: backups and replication are paused until a connect succeeds; maintenance \
+             still runs (index compaction shrinks connect time); retrying with backoff and a \
+             progressively longer deadline (recovery is automatic). Raise \
+             spec.bootstrap.failurePolicy.activeDeadlineSeconds if the backend is just slow"
         }
     }
 }
@@ -1608,6 +1661,62 @@ mod tests {
         let ev = unreachable.event.unwrap();
         assert!(!ev.message.contains("VANISHED"));
         assert!(ev.message.contains("NOT treated as a wipe"));
+        // #414: the third kind — a deadline-killed probe — carries its own
+        // reason; it must claim neither a vanish nor an outage.
+        let timed_out = reconcile_probe_failure(
+            &[],
+            Some(&health_with_failures(0)),
+            ProbeFailureKind::TimedOut,
+            1,
+            &now,
+            None,
+        );
+        let c = timed_out
+            .conditions
+            .iter()
+            .find(|c| c.type_ == BACKEND_REACHABLE_CONDITION)
+            .unwrap();
+        assert_eq!(c.reason, PROBE_DEADLINE_EXCEEDED_REASON);
+        assert_ne!(c.reason, BACKEND_UNREACHABLE_REASON);
+        let ev = timed_out.event.unwrap();
+        assert_eq!(ev.action, RAISE_BOOTSTRAP_DEADLINE_ACTION);
+        assert!(!ev.message.contains("VANISHED"), "{}", ev.message);
+        assert!(
+            !ev.message.contains("credentials/lock failed"),
+            "{}",
+            ev.message
+        );
+    }
+
+    /// #414 message obligations for the deadline-kill probe alert: the what
+    /// (deadline kill + streak), the why (cold-cache connect scales with the
+    /// index), the not-an-outage disclaimer, and the fix (raise the deadline;
+    /// maintenance keeps running and shrinks connect time).
+    #[test]
+    fn deadline_kill_message_obligations() {
+        let now = t(100).to_rfc3339();
+        let upd = reconcile_probe_failure(
+            &[],
+            Some(&health_with_failures(2)),
+            ProbeFailureKind::TimedOut,
+            3,
+            &now,
+            None,
+        );
+        let msg = &upd.event.expect("threshold crossed → event").message;
+        assert!(msg.contains("activeDeadlineSeconds"), "{msg}");
+        assert!(
+            msg.contains("3 consecutive deadline-killed probes"),
+            "{msg}"
+        );
+        assert!(msg.contains("may be reachable but slow"), "{msg}");
+        assert!(msg.contains("NOT evidence of an outage"), "{msg}");
+        assert!(
+            msg.contains("spec.bootstrap.failurePolicy.activeDeadlineSeconds"),
+            "{msg}"
+        );
+        assert!(msg.contains("maintenance"), "{msg}");
+        assert!(msg.contains("keeps running"), "{msg}");
     }
 
     #[test]
@@ -1814,9 +1923,11 @@ mod tests {
 
     #[test]
     fn both_probe_failure_kinds_open_the_breaker() {
-        // `breaker_verdict` takes no kind on purpose: a vanished backend dooms
-        // backups exactly like an unreachable one. The kind-mapped surfaces
-        // (reason/action/message) must still be distinct and stable.
+        // `breaker_verdict` takes no kind on purpose: a backend that cannot be
+        // confirmed healthy dooms backups whether it vanished, refuses
+        // connections, or is merely too slow for the probe deadline. The
+        // kind-mapped surfaces (reason/action/message) must still be distinct
+        // and stable.
         assert_eq!(
             breaker_reason(ProbeFailureKind::Vanished),
             REPOSITORY_VANISHED_REASON
@@ -1826,6 +1937,10 @@ mod tests {
             BACKEND_UNREACHABLE_REASON
         );
         assert_eq!(
+            breaker_reason(ProbeFailureKind::TimedOut),
+            PROBE_DEADLINE_EXCEEDED_REASON
+        );
+        assert_eq!(
             breaker_action(ProbeFailureKind::Vanished),
             VERIFY_BACKEND_ACTION
         );
@@ -1833,15 +1948,52 @@ mod tests {
             breaker_action(ProbeFailureKind::Unreachable),
             CHECK_BACKEND_ACTION
         );
-        for kind in [ProbeFailureKind::Vanished, ProbeFailureKind::Unreachable] {
+        assert_eq!(
+            breaker_action(ProbeFailureKind::TimedOut),
+            RAISE_BOOTSTRAP_DEADLINE_ACTION
+        );
+        for kind in [
+            ProbeFailureKind::Vanished,
+            ProbeFailureKind::Unreachable,
+            ProbeFailureKind::TimedOut,
+        ] {
             let msg = breaker_open_message(kind);
             assert!(msg.contains("paused until a connect succeeds"), "{msg}");
             assert!(msg.contains("retrying with backoff"), "{msg}");
         }
+        // The two pre-#414 messages are pinned BYTE-IDENTICALLY: guarded no-op
+        // status writes (and any operator tooling matching on them) depend on
+        // the exact bytes not drifting when a new kind is added.
+        assert_eq!(
+            breaker_open_message(ProbeFailureKind::Vanished),
+            "the backend is reachable but the kopia repository is absent — the circuit breaker \
+             is open: backups, maintenance, and replication are paused until a connect succeeds; \
+             retrying with backoff (recovery is automatic; kopiur never auto-recreates)"
+        );
+        assert_eq!(
+            breaker_open_message(ProbeFailureKind::Unreachable),
+            "the repository backend is unreachable — the circuit breaker is open: backups, \
+             maintenance, and replication are paused until a connect succeeds; retrying with \
+             backoff (recovery is automatic)"
+        );
         // The vanished message must still refuse the destructive nudge.
         assert!(breaker_open_message(ProbeFailureKind::Vanished).contains("never auto-recreates"));
+        // Only the TimedOut message says maintenance keeps running (#413): the
+        // confirmed-down kinds really do pause maintenance, so their text must
+        // NOT be softened.
+        let timed_out = breaker_open_message(ProbeFailureKind::TimedOut);
+        assert!(timed_out.contains("maintenance still runs"), "{timed_out}");
+        assert!(
+            !timed_out.contains("maintenance, and replication are paused"),
+            "{timed_out}"
+        );
+        assert!(
+            timed_out.contains("spec.bootstrap.failurePolicy.activeDeadlineSeconds"),
+            "{timed_out}"
+        );
         assert_eq!(ProbeFailureKind::Vanished.label(), "vanished");
         assert_eq!(ProbeFailureKind::Unreachable.label(), "unreachable");
+        assert_eq!(ProbeFailureKind::TimedOut.label(), "timed_out");
     }
 
     #[test]
@@ -1862,7 +2014,11 @@ mod tests {
         assert_eq!(p.requeue, steady);
         // Open: Degraded + the byte-stable breaker message + a short hop into
         // the strict retry loop (which strict_retry_holdoff then governs).
-        for kind in [ProbeFailureKind::Vanished, ProbeFailureKind::Unreachable] {
+        for kind in [
+            ProbeFailureKind::Vanished,
+            ProbeFailureKind::Unreachable,
+            ProbeFailureKind::TimedOut,
+        ] {
             let p = probe_failure_phase(BreakerVerdict::Open, kind, steady);
             assert!(p.opened);
             assert_eq!(p.phase, RepositoryPhase::Degraded);
@@ -2085,6 +2241,49 @@ mod tests {
         }
     }
 
+    /// The one `BootstrapFailure` → sensor-kind mapping (#414): only the
+    /// genuine not-initialized sentinel reads Vanished, only a deadline kill
+    /// reads TimedOut, everything else is the conservative Unreachable.
+    #[test]
+    fn probe_failure_kind_maps_each_failure_conservatively() {
+        use crate::io::{BootstrapFailure, SeedFailure};
+        use kopiur_kopia::KopiaErrorClass;
+        assert_eq!(
+            probe_failure_kind(&BootstrapFailure::RepositoryNotInitialized),
+            ProbeFailureKind::Vanished
+        );
+        assert_eq!(
+            probe_failure_kind(&BootstrapFailure::JobDeadlineExceeded {
+                job_name: "j".into(),
+                deadline_secs: 120,
+            }),
+            ProbeFailureKind::TimedOut
+        );
+        for failure in [
+            BootstrapFailure::Backend {
+                class: KopiaErrorClass::RepositoryUnavailable,
+                message: "m".into(),
+            },
+            BootstrapFailure::JobFailedWithoutResult {
+                job_name: "j".into(),
+            },
+            BootstrapFailure::Seed {
+                failure: SeedFailure::SourceNotFound,
+                message: "m".into(),
+            },
+            BootstrapFailure::SeedMoverTooOld,
+            BootstrapFailure::InternalInconsistency {
+                message: "m".into(),
+            },
+        ] {
+            assert_eq!(
+                probe_failure_kind(&failure),
+                ProbeFailureKind::Unreachable,
+                "{failure:?} must read as the conservative Unreachable"
+            );
+        }
+    }
+
     /// #413 maintenance deadlock: Degraded-because-slow must not withhold the
     /// cure. The full gate truth table — phase × bootstrapped-before ×
     /// `BackendReachable` shape. The deny-list is exactly
@@ -2118,7 +2317,7 @@ mod tests {
         assert!(maintenance_may_proceed(
             degraded,
             uid,
-            &br_false("ProbeDeadlineExceeded")
+            &br_false(PROBE_DEADLINE_EXCEEDED_REASON)
         ));
         assert!(maintenance_may_proceed(
             degraded,

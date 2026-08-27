@@ -2324,11 +2324,7 @@ async fn recycle_bootstrap_outage(
 ) -> Result<Action> {
     io::delete_mover_run(&ctx.client, namespace, job_name).await?;
     let reason = failure.reason();
-    let kind = if failure.is_repository_absent() {
-        health::ProbeFailureKind::Vanished
-    } else {
-        health::ProbeFailureKind::Unreachable
-    };
+    let kind = health::probe_failure_kind(failure);
     let now = chrono::Utc::now().to_rfc3339();
     let existing = repo
         .status
@@ -2482,11 +2478,7 @@ async fn finalize_probe_failure(
         .as_deref()
         .unwrap_or_default()
         .to_string();
-    let kind = if failure.is_repository_absent() {
-        health::ProbeFailureKind::Vanished
-    } else {
-        health::ProbeFailureKind::Unreachable
-    };
+    let kind = health::probe_failure_kind(failure);
     let existing = repo
         .status
         .as_ref()
