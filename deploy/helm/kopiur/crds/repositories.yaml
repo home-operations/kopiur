@@ -758,10 +758,13 @@ spec:
                         description: |-
                           What sustained backend-probe failure (past `failureThreshold`) does to the
                           repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing
-                          backups, maintenance, and replication until a re-connect succeeds —
-                          recovery is automatic. `Alert` keeps the repository `Ready` and only raises
-                          the `BackendReachable` condition + Warning event + metric; backups keep
-                          running against the failing backend. Neither ever auto-recreates.
+                          backups and replication until a re-connect succeeds — recovery is
+                          automatic (maintenance also pauses for a confirmed-unreachable/vanished
+                          backend, but keeps running for a probe deadline kill, where index
+                          compaction is often the cure). `Alert` keeps the repository `Ready` and
+                          only raises the `BackendReachable` condition + Warning event + metric;
+                          backups keep running against the failing backend. Neither ever
+                          auto-recreates.
                         enum:
                         - Degrade
                         - Alert
