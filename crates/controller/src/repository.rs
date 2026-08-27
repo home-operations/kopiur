@@ -2200,31 +2200,6 @@ async fn finalize_bootstrap_failure(
     if probe_run {
         return finalize_probe_failure(ctx, repo, api, name, job_name, &failure).await;
     }
-    let reason = failure.reason();
-    // #380: a seed failure ALSO says something about the seed, so it gets a
-    // `Seeded=False` condition beside `Bootstrapped=False`. Folded into the
-    // same array both arms below build, because a conditions patch replaces the
-    // whole thing.
-    let seed_fold =
-        |conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]| match failure
-            .seed_reason()
-        {
-            Some(seed_reason) => io::upsert_condition(
-                conditions,
-                kopiur_api::consts::SEEDED_CONDITION,
-                false,
-                seed_reason,
-                &failure.condition_message(),
-                repo.metadata.generation,
-            ),
-            // A bootstrap that failed for a reason having NOTHING to do with
-            // the seed (an AuthFailure against this repository's own backend, a
-            // result-less Job) says nothing about the seed's state — so a
-            // `Seeded=False/Seeding` left standing from the in-flight pass would
-            // claim a copy is running beside a terminal `Failed`. Drop it; the
-            // real story is on `Bootstrapped` and `Ready`.
-            None => repo_seed::drop_seed_condition(conditions),
-        };
     let bootstrapped = repo
         .status
         .as_ref()
@@ -2242,84 +2217,18 @@ async fn finalize_bootstrap_failure(
             recycle_bootstrap_outage(ctx, repo, namespace, name, api, backend, job_name, &failure)
                 .await
         }
-        // A result-less Job failure carries no backend verdict (mover
-        // crashed / evicted / result write hit a down apiserver — the outage
-        // incident): recycle the dead Job and retry as `Degraded` (the
-        // retryable-class semantics of the in-process path) instead of parking
-        // `Failed` and re-reading the same Job every pass until its TTL reaps
-        // it. #415: the retry ALSO stamps the failure streak + `lastProbeAt`
-        // anchor, so `strict_retry_holdoff` re-arms per failure and the
-        // relaunch cadence decays 120→240→480→960→1800s instead of the flat
-        // ~2.5-minute metronome (each attempt is a cold-cache connect billed
-        // per request on paid object stores).
+        // A result-less Job failure carries no backend verdict (mover crashed /
+        // evicted / result write hit a down apiserver — the outage incident):
+        // recycle the dead Job and retry as `Degraded` instead of parking
+        // `Failed` until the Job's TTL reaps it. #415: the retry stamps the
+        // failure streak + `lastProbeAt` anchor so `strict_retry_holdoff`
+        // re-arms per failure (cadence 120→240→480→960→1800s, not the flat
+        // ~2.5-minute metronome of billed cold-cache connects).
         io::FailureRoute::Recycle => {
-            io::delete_mover_run(&ctx.client, namespace, job_name).await?;
-            let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
-            let conditions = seed_fold(&conditions);
-            let conditions = io::set_ready(
-                &conditions,
-                repo.metadata.generation,
-                io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
-                reason,
-                &failure.condition_message(),
-            );
-            let now = chrono::Utc::now().to_rfc3339();
-            let health = health::failure_streak_health(
-                repo.status.as_ref().and_then(|s| s.health.as_ref()),
-                &now,
-            );
-            let streak = health.consecutive_probe_failures.unwrap_or(1);
-            let current = serde_json::to_value(&repo.status).ok();
-            let wrote = io::patch_status_if_changed(
-                api,
-                name,
-                current.as_ref(),
-                serde_json::json!({
-                    "phase": "Degraded",
-                    "backend": backend.kind_str(),
-                    "observedGeneration": repo.metadata.generation,
-                    "conditions": conditions,
-                    // Explicit-null builder, never a direct serialize: every
-                    // health field is skip_serializing_if, so only the builder
-                    // can clear `probeAttemptAt` through a merge patch (#273).
-                    "health": health::probe_failure_health_patch(&health),
-                }),
+            recycle_failed_bootstrap(
+                ctx, repo, namespace, name, api, backend, job_name, &failure, seed_armed, true,
             )
-            .await?;
-            // The streak++ makes every cycle a real status write, so `wrote`
-            // no longer identifies the episode's start. Gate the Event/metric/
-            // warn on the TRANSITION (into Degraded, or an escalation that
-            // changes the Bootstrapped=False reason) — without this, a
-            // multi-day crash loop publishes a Warning per cycle.
-            let prior_degraded = repo.status.as_ref().and_then(|s| s.phase.as_ref())
-                == Some(&RepositoryPhase::Degraded);
-            let prior_reason = repo
-                .status
-                .as_ref()
-                .map(|s| s.conditions.as_slice())
-                .unwrap_or(&[])
-                .iter()
-                .find(|c| c.type_ == REPOSITORY_BOOTSTRAPPED_CONDITION && c.status == "False")
-                .map(|c| c.reason.as_str());
-            if wrote && (!prior_degraded || prior_reason != Some(reason)) {
-                failure.publish(ctx, &io::event_ref(repo), name).await;
-                repo_seed::record_seed_failure(
-                    &ctx.metrics,
-                    repo.spec.seed.as_ref(),
-                    "Repository",
-                    namespace,
-                    name,
-                    seed_armed,
-                );
-                tracing::warn!(
-                    repo = %name,
-                    reason,
-                    "bootstrap Job failed; recycled it for retry"
-                );
-            }
-            Ok(Action::requeue(health::strict_retry_backoff(
-                streak.saturating_sub(1),
-            )))
+            .await
         }
         // A seed failure retries PROMPTLY — flat ~120s cadence, no failure
         // streak, no backoff: the documented DR contract
@@ -2327,91 +2236,166 @@ async fn finalize_bootstrap_failure(
         // fast because this is the flow you are in on the worst day of the
         // year, and a seeding repository has no probe-health state to pollute.
         io::FailureRoute::SeedRetry => {
-            io::delete_mover_run(&ctx.client, namespace, job_name).await?;
-            let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
-            let conditions = seed_fold(&conditions);
-            let conditions = io::set_ready(
-                &conditions,
-                repo.metadata.generation,
-                io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
-                reason,
-                &failure.condition_message(),
-            );
-            let current = serde_json::to_value(&repo.status).ok();
-            let wrote = io::patch_status_if_changed(
-                api,
-                name,
-                current.as_ref(),
-                serde_json::json!({
-                    "phase": "Degraded",
-                    "backend": backend.kind_str(),
-                    "observedGeneration": repo.metadata.generation,
-                    "conditions": conditions,
-                }),
+            recycle_failed_bootstrap(
+                ctx, repo, namespace, name, api, backend, job_name, &failure, seed_armed, false,
             )
-            .await?;
-            if wrote {
-                failure.publish(ctx, &io::event_ref(repo), name).await;
-                repo_seed::record_seed_failure(
-                    &ctx.metrics,
-                    repo.spec.seed.as_ref(),
-                    "Repository",
-                    namespace,
-                    name,
-                    seed_armed,
-                );
-                tracing::warn!(
-                    repo = %name,
-                    reason,
-                    "bootstrap Job failed; recycled it for retry"
-                );
-            }
-            Ok(Action::requeue(Duration::from_secs(120)))
+            .await
         }
         io::FailureRoute::Terminal => {
-            let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
-            let conditions = seed_fold(&conditions);
-            // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
-            // should fail its health check fast, not hang until timeout.
-            let conditions = io::set_ready(
-                &conditions,
-                repo.metadata.generation,
-                io::ready_outcome_for_phase(&RepositoryPhase::Failed),
-                reason,
-                &failure.condition_message(),
-            );
-            // Guard the write so a re-confirmed failure fires the Event + warn log
-            // only on the real transition, not on every 120 s re-read (the message
-            // is stable, so this becomes a true no-op once written — no reconcile
-            // hot-loop).
-            let current = serde_json::to_value(&repo.status).ok();
-            let wrote = io::patch_status_if_changed(
-                api,
-                name,
-                current.as_ref(),
-                serde_json::json!({
-                    "phase": "Failed",
-                    "backend": backend.kind_str(),
-                    "observedGeneration": repo.metadata.generation,
-                    "conditions": conditions,
-                }),
+            park_terminal_bootstrap(
+                ctx, repo, namespace, name, api, backend, &failure, seed_armed,
             )
-            .await?;
-            if wrote {
-                failure.publish(ctx, &io::event_ref(repo), name).await;
-                repo_seed::record_seed_failure(
-                    &ctx.metrics,
-                    repo.spec.seed.as_ref(),
-                    "Repository",
-                    namespace,
-                    name,
-                    seed_armed,
-                );
-                tracing::warn!(repo = %name, reason, "repository bootstrap failed");
-            }
-            Ok(Action::requeue(Duration::from_secs(120)))
+            .await
         }
     }
+}
+
+/// The shared recycle-and-retry-as-`Degraded` write for a failed bootstrap
+/// ([`io::FailureRoute::Recycle`] / [`io::FailureRoute::SeedRetry`]).
+///
+/// `stamp_streak` is the #415 lever: the result-less route folds
+/// [`health::failure_streak_health`] into the patch (via the explicit-null
+/// builder — every health field is `skip_serializing_if`, so only the builder
+/// can clear `probeAttemptAt` through a merge patch, #273) and requeues on the
+/// exponential [`health::strict_retry_backoff`]; the seed route keeps its flat
+/// prompt 120s with no health stamping. With the streak, every cycle is a real
+/// status write, so the Event/metric/warn re-gate on the TRANSITION (into
+/// `Degraded`, or an escalation changing the `Bootstrapped=False` reason) —
+/// without that, a multi-day crash loop publishes a Warning per cycle.
+#[allow(clippy::too_many_arguments)]
+async fn recycle_failed_bootstrap(
+    ctx: &Context,
+    repo: &Repository,
+    namespace: &str,
+    name: &str,
+    api: &Api<Repository>,
+    backend: &Backend,
+    job_name: &str,
+    failure: &io::BootstrapFailure,
+    seed_armed: bool,
+    stamp_streak: bool,
+) -> Result<Action> {
+    io::delete_mover_run(&ctx.client, namespace, job_name).await?;
+    let reason = failure.reason();
+    let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
+    let conditions = repo_seed::seed_condition_fold(repo.metadata.generation, failure, &conditions);
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
+        reason,
+        &failure.condition_message(),
+    );
+    let mut patch = serde_json::json!({
+        "phase": "Degraded",
+        "backend": backend.kind_str(),
+        "observedGeneration": repo.metadata.generation,
+        "conditions": conditions,
+    });
+    let mut requeue = Duration::from_secs(120);
+    if stamp_streak {
+        let now = chrono::Utc::now().to_rfc3339();
+        let health = health::failure_streak_health(
+            repo.status.as_ref().and_then(|s| s.health.as_ref()),
+            &now,
+        );
+        requeue = health::strict_retry_backoff(
+            health
+                .consecutive_probe_failures
+                .unwrap_or(1)
+                .saturating_sub(1),
+        );
+        patch["health"] = health::probe_failure_health_patch(&health);
+    }
+    let current = serde_json::to_value(&repo.status).ok();
+    let wrote = io::patch_status_if_changed(api, name, current.as_ref(), patch).await?;
+    let transition = if stamp_streak {
+        let prior_degraded =
+            repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Degraded);
+        let prior_reason = repo
+            .status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .find(|c| c.type_ == REPOSITORY_BOOTSTRAPPED_CONDITION && c.status == "False")
+            .map(|c| c.reason.as_str());
+        !prior_degraded || prior_reason != Some(reason)
+    } else {
+        // Without a streak the guarded write itself identifies the transition.
+        true
+    };
+    if wrote && transition {
+        failure.publish(ctx, &io::event_ref(repo), name).await;
+        repo_seed::record_seed_failure(
+            &ctx.metrics,
+            repo.spec.seed.as_ref(),
+            "Repository",
+            namespace,
+            name,
+            seed_armed,
+        );
+        tracing::warn!(
+            repo = %name,
+            reason,
+            "bootstrap Job failed; recycled it for retry"
+        );
+    }
+    Ok(Action::requeue(requeue))
+}
+
+/// Park a non-retryable bootstrap verdict at terminal `Failed`
+/// ([`io::FailureRoute::Terminal`]) — kstatus-Stalled (issue #245) so Flux
+/// fails its health check fast instead of hanging until timeout. The guarded
+/// write fires the Event + warn only on the real transition (the message is
+/// stable, so re-reads are byte-stable no-ops — no hot loop, no Event spam).
+#[allow(clippy::too_many_arguments)]
+async fn park_terminal_bootstrap(
+    ctx: &Context,
+    repo: &Repository,
+    namespace: &str,
+    name: &str,
+    api: &Api<Repository>,
+    backend: &Backend,
+    failure: &io::BootstrapFailure,
+    seed_armed: bool,
+) -> Result<Action> {
+    let reason = failure.reason();
+    let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
+    let conditions = repo_seed::seed_condition_fold(repo.metadata.generation, failure, &conditions);
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(&RepositoryPhase::Failed),
+        reason,
+        &failure.condition_message(),
+    );
+    let current = serde_json::to_value(&repo.status).ok();
+    let wrote = io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        serde_json::json!({
+            "phase": "Failed",
+            "backend": backend.kind_str(),
+            "observedGeneration": repo.metadata.generation,
+            "conditions": conditions,
+        }),
+    )
+    .await?;
+    if wrote {
+        failure.publish(ctx, &io::event_ref(repo), name).await;
+        repo_seed::record_seed_failure(
+            &ctx.metrics,
+            repo.spec.seed.as_ref(),
+            "Repository",
+            namespace,
+            name,
+            seed_armed,
+        );
+        tracing::warn!(repo = %name, reason, "repository bootstrap failed");
+    }
+    Ok(Action::requeue(Duration::from_secs(120)))
 }
 
 /// The strict-verdict reroute (#345 M4): a failed strict bootstrap whose verdict
