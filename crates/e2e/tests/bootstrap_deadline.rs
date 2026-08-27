@@ -137,21 +137,6 @@ async fn distinct_discovery_job_uids(
     seen
 }
 
-/// The whole deadline-kill arc, sequentially (the blackhole is node-global):
-///
-/// 1. `repo-a` bootstraps normally to Ready (+ managed Maintenance).
-/// 2. Blackhole MinIO; drop `repo-a`'s deadline to 1s; birth `repo-b` under a
-///    1s deadline. Every connect now hangs → every kill is result-less.
-/// 3. #414: `repo-a` (strict relaunch of a bootstrapped repo) degrades with
-///    `ProbeDeadlineExceeded`/`BootstrapDeadlineExceeded` and the
-///    raise-the-deadline message — never the credentials-ghost text.
-/// 4. #413: while `repo-a` is Degraded-by-deadline, its managed Maintenance is
-///    NOT deferred `WaitingForRepository`; a manual run's Job spawns.
-/// 5. #415: `repo-b`'s first kill stamps `consecutiveProbeFailures: 1` and no
-///    new discovery Job appears inside the holdoff window.
-/// 6. Heal (lift the blackhole): the manual maintenance run completes,
-///    `repo-b`'s released second attempt carries the ESCALATED 2s deadline,
-///    and both repositories self-heal to Ready — the end-to-end #414 story.
 /// Restore the blackhole on ANY exit — a panicking assertion unwinds past the
 /// in-line `blackhole_tcp_port(.., false)` call, and a leaked rule wedges the
 /// retry (and every later scenario on a kept cluster) at MinIO provisioning.
@@ -178,6 +163,21 @@ impl Drop for BlackholeGuard {
     }
 }
 
+/// The whole deadline-kill arc, sequentially (the blackhole is node-global):
+///
+/// 1. `repo-a` bootstraps normally to Ready (+ managed Maintenance).
+/// 2. Blackhole MinIO; drop `repo-a`'s deadline to 1s; birth `repo-b` under a
+///    1s deadline. Every connect now hangs → every kill is result-less.
+/// 3. #414: `repo-a` (strict relaunch of a bootstrapped repo) degrades with
+///    `ProbeDeadlineExceeded`/`BootstrapDeadlineExceeded` and the
+///    raise-the-deadline message — never the credentials-ghost text.
+/// 4. #413: while `repo-a` is Degraded-by-deadline, its managed Maintenance is
+///    NOT deferred `WaitingForRepository`; a manual run's Job spawns.
+/// 5. #415: `repo-b`'s first kill stamps `consecutiveProbeFailures: 1` and no
+///    new discovery Job appears inside the holdoff window.
+/// 6. Heal (lift the blackhole): the manual maintenance run completes,
+///    `repo-b`'s released second attempt carries the ESCALATED 2s deadline,
+///    and both repositories self-heal to Ready — the end-to-end #414 story.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn deadline_kills_classify_exempt_maintenance_hold_off_and_self_heal() {
