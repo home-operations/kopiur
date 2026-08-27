@@ -615,24 +615,6 @@ pub fn success_fold(
     })
 }
 
-/// Fold a **failing** probe into the health state, applying the consecutive-failure
-/// debounce: the loud `BackendReachable=False` condition (and its Warning event)
-/// is raised only once `failure_threshold` consecutive failures have accrued, so a
-/// single transient blip never alarms or nudges a destructive manual recreate.
-///
-/// **Phase is the caller's concern** and is mode-dependent since M4: the caller
-/// feeds the post-fold streak into [`breaker_verdict`] — under `onFailure:
-/// Alert` (or below the threshold) the phase stays `Ready` (alert-only, the
-/// pre-#345 contract); under the default `Degrade` a threshold-crossing streak
-/// opens the circuit breaker and the caller moves the phase to `Degraded`.
-/// This fn also feeds the STRICT retry loop while the breaker is open (the
-/// recycle-to-`Degraded` path in both `finalize_bootstrap` twins folds it), so
-/// `consecutiveProbeFailures` keeps climbing across probe *and* strict connect
-/// failures — one unified backend sensor.
-///
-/// The event fires on a *transition*: the first reconcile that crosses the
-/// threshold, or one where the failure *reason* changes (e.g. `BackendUnreachable`
-/// → `RepositoryVanished`), so an escalation is never silently swallowed.
 /// Fold ONE backend failure into the unified sensor's `status.health` state:
 /// streak = prior+1, `firstFailureAt` continues an active streak (fresh stamp
 /// on a new episode), `lastProbeAt` = now — the anchor
@@ -675,6 +657,25 @@ pub fn failure_streak_health(
     }
 }
 
+/// Fold a **failing** probe into the health state (via
+/// [`failure_streak_health`]), applying the consecutive-failure debounce: the
+/// loud `BackendReachable=False` condition (and its Warning event) is raised
+/// only once `failure_threshold` consecutive failures have accrued, so a
+/// single transient blip never alarms or nudges a destructive manual recreate.
+///
+/// **Phase is the caller's concern** and is mode-dependent since M4: the caller
+/// feeds the post-fold streak into [`breaker_verdict`] — under `onFailure:
+/// Alert` (or below the threshold) the phase stays `Ready` (alert-only, the
+/// pre-#345 contract); under the default `Degrade` a threshold-crossing streak
+/// opens the circuit breaker and the caller moves the phase to `Degraded`.
+/// This fn also feeds the STRICT retry loop while the breaker is open (the
+/// recycle-to-`Degraded` path in both `finalize_bootstrap` twins folds it), so
+/// `consecutiveProbeFailures` keeps climbing across probe *and* strict connect
+/// failures — one unified backend sensor.
+///
+/// The event fires on a *transition*: the first reconcile that crosses the
+/// threshold, or one where the failure *reason* changes (e.g. `BackendUnreachable`
+/// → `RepositoryVanished`), so an escalation is never silently swallowed.
 pub fn reconcile_probe_failure(
     existing: &[Condition],
     prior: Option<&RepositoryHealthStatus>,
