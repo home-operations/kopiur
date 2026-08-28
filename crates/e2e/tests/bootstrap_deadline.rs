@@ -66,7 +66,20 @@ fn repository_json(name: &str, bucket: &str, deadline_secs: Option<i64>) -> serd
         // failureThreshold 1: the FIRST deadline kill crosses the breaker
         // threshold, so the reason/condition assertions don't wait out a
         // 3-failure debounce.
-        "health": { "probe": { "enabled": true, "interval": "30s", "failureThreshold": 1 } }
+        "health": { "probe": { "enabled": true, "interval": "30s", "failureThreshold": 1 } },
+        // Yearly crons: a fresh Maintenance still fires ONE initial full run
+        // immediately (`mode_after` anchors a year back when there is no run
+        // history; full subsumes quick) — the test drains it before
+        // blackholing — but no scheduled slot can then RE-fire mid-test and
+        // grab the G3 single-flight slot the manual-run assertion depends on.
+        // With the default quick cron (`0 */6 * * *`) a run straddling a
+        // 6-hour boundary lost that race in CI: the scheduled Job hung
+        // against the blackhole (48h mover deadline) and the manual run
+        // starved behind it.
+        "maintenance": { "schedule": {
+            "quick": { "cron": "0 3 1 1 *" },
+            "full": { "cron": "0 3 1 1 *" }
+        } }
     });
     if let Some(secs) = deadline_secs {
         spec["bootstrap"] =
@@ -225,14 +238,37 @@ async fn deadline_kills_classify_exempt_maintenance_hold_off_and_self_heal() {
     )
     .await
     .expect("repo-a bootstraps to Ready");
+    // Drain the projected Maintenance's initial scheduled run BEFORE the
+    // blackhole: `mode_after` treats a history-less mode as due immediately,
+    // so a fresh Maintenance fires its first full run right away regardless
+    // of cron. That Job shares the G3 single-flight slot with the manual run
+    // asserted in step 4 — if it is still in flight when the blackhole goes
+    // up it hangs (its deadline is the 48h mover default) and the manual run
+    // can never be accepted (the deterministic CI failure this wait fixes;
+    // locally the initial run happened to finish before the blackhole). The
+    // drained-state marker mirrors `mode_after`'s own anchor per mode:
+    // `lastRunAt` (the mover's END-of-run stamp on success — a full run
+    // stamps quick's too, full subsumes quick, so no separate quick Job ever
+    // fires) or `lastHandledAt` (the controller's marker for a yielded run).
+    // With the yearly crons above, nothing re-fires after this drain.
     wait_until(
-        &format!("managed Maintenance {repo_a} exists"),
+        &format!("managed Maintenance {repo_a} drains its initial scheduled run"),
         default_timeout(),
         poll_interval(),
-        || async { Ok(maints.get_opt(repo_a).await?.map(|_| ())) },
+        || async {
+            let Some(m) = maints.get_opt(repo_a).await? else {
+                return Ok(None);
+            };
+            let s = status_value(&m);
+            let anchored = |mode: &str| {
+                s.pointer(&format!("/{mode}/lastRunAt")).is_some()
+                    || s.pointer(&format!("/{mode}/lastHandledAt")).is_some()
+            };
+            Ok((anchored("full") && anchored("quick")).then_some(()))
+        },
     )
     .await
-    .expect("a Ready repository projects its managed Maintenance");
+    .expect("the managed Maintenance must finish its initial scheduled run pre-blackhole");
 
     // 2. Blackhole MinIO, then make both repos' deadlines impossible. From here
     //    to the heal, EVERY guard below must not leave this fn without lifting
@@ -299,7 +335,10 @@ async fn deadline_kills_classify_exempt_maintenance_hold_off_and_self_heal() {
     //    blackholed: the manual maintenance run must not defer
     //    WaitingForRepository, and its mover Job must spawn (it hangs against
     //    the blackhole for now — its own deadline is the 48h mover default —
-    //    and completes after the heal below).
+    //    and completes after the heal below). The pre-blackhole drain above
+    //    guarantees the G3 single-flight slot is FREE here: acceptance is
+    //    gated on `has_active_maintenance_job`, so any lingering scheduled
+    //    Job would starve this wait without the gate being at fault.
     let requested = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     maints
         .patch(
