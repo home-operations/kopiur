@@ -49,7 +49,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -77,7 +77,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -308,7 +308,7 @@ jobs:
 
       # kind, kubectl, helm, and the Rust toolchain come from .mise/config.toml.
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -422,7 +422,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -471,7 +471,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -497,7 +497,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -522,7 +522,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -564,7 +564,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -598,7 +598,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
           install_args: --locked
@@ -648,7 +648,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           install: false
 
