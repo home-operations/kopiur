@@ -269,6 +269,16 @@ pub const SECRET_S3_CREDS: &str = "kopia-s3-creds";
 /// Valid S3 keys but a WRONG repo password — exercises the safe-create guard.
 pub const SECRET_S3_BADPW: &str = "kopia-s3-badpw";
 
+// --- Split-secret layout (#416) --------------------------------------------------
+// The password and the backend keys live in SEPARATE Secrets, so any pod that
+// env-injects only one of them fails to connect. The single-Secret fixture above
+// dedupes to one `envFrom` and therefore HID the class of bug where the second
+// Secret is dropped (the kopia UI server crashlooped exactly this way).
+/// AWS keys ONLY (no repo password) — pair with [`SECRET_KOPIA_PW_ONLY`].
+pub const SECRET_S3_KEYS_ONLY: &str = "kopia-s3-keys-only";
+/// Repo password ONLY (no backend keys) — pair with [`SECRET_S3_KEYS_ONLY`].
+pub const SECRET_KOPIA_PW_ONLY: &str = "kopia-password-only";
+
 // --- S3→S3 replication isolation (crates/e2e/tests/replication.rs, #200) ---------
 // Two DISJOINT, bucket-scoped MinIO users so a replication mover proves it uses the
 // DESTINATION's credentials (not the source's) for `sync-to`: the source user cannot
@@ -360,6 +370,11 @@ pub const BUCKETS: &[&str] = &[
     // `server_read_only_ui_connects_read_only`): a distinct bucket so the
     // read-only and read-write server fixtures don't collide.
     "kopiur-server-ui-ro",
+    // #416: ClusterRepository web-UI server with SPLIT password/backend Secrets
+    // and `spec.server.namespace` set to a fresh namespace — proves the operator
+    // mirrors EACH credential Secret next to the server and mints the mover SA
+    // there (crates/e2e/tests/lifecycle.rs).
+    "kopiur-crepo-server",
     // Foreign-repo import scenarios (crates/e2e/tests/import.rs): repositories +
     // snapshots created by RAW kopia (the seeder pod), then adopted by kopiur.
     "kopiur-import",
