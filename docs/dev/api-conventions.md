@@ -49,6 +49,8 @@ Use `k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, Condition}`
 
 Every credential/policy/identity/schedule surface is a **sub-object**, not a leaf field. Optionals: `#[serde(default, skip_serializing_if = "Option::is_none")] pub x: Option<T>`. Bools that default false: `#[serde(default, skip_serializing_if = "std::ops::Not::not")]`. Vecs: `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
 
+Exception: `manualRun.completedAt` (`ReplicationManualRunStatus` and `maintenance::ManualRunStatus`) deliberately omits `skip_serializing_if` — a non-terminal-phase status patch must emit an explicit JSON `null` so the RFC-7386 merge-patch clears a stale timestamp left standing from a prior run; see the field comments and #394.
+
 ## 4a. Schema defaults (`#[schemars(default = …)]`)
 
 A schemars `default` becomes a CRD `default:` that the **API server materializes

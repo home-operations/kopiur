@@ -1426,7 +1426,11 @@ async fn bootstrap_cluster_via_mover(
         // Probe-only (#414): see the namespaced twin.
         probe_style_launch && !catalog_create_due,
         repo.spec.create.as_ref(),
-        repo.spec.mover_defaults.as_ref(),
+        crate::repo_seed::seed_bootstrap_throttle(
+            seed_armed,
+            repo.spec.seed.as_ref(),
+            repo.spec.mover_defaults.as_ref(),
+        ),
         cluster,
         foreign,
         read_only,
@@ -1670,7 +1674,10 @@ fn cluster_bootstrap_work_spec(
     // #414: this launch is a pure health probe — see the namespaced twin.
     probe_only: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
-    mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
+    // The cap for every connection this bootstrap opens to THIS repository,
+    // resolved by the caller through `repo_seed::seed_bootstrap_throttle` —
+    // identical rule to the `Repository` twin, so the two kinds cannot drift.
+    throttle: kopiur_mover::workspec::ThrottleSpec,
     cluster: Option<&str>,
     foreign: ForeignSnapshots,
     read_only: bool,
@@ -1744,7 +1751,7 @@ fn cluster_bootstrap_work_spec(
         options: MoverOptions::default(),
         // Bootstrap is a connect/create probe, not a data run: kopia defaults.
         cache: Default::default(),
-        throttle: io::throttle_spec(mover_defaults),
+        throttle,
     }
 }
 
@@ -1886,10 +1893,13 @@ async fn finalize_cluster_bootstrap(
     // #380: fold the seed outcome into the SAME conditions array — the
     // mover-skew guard has already refused a seed-armed success carrying no
     // outcome, so a present `result.seed` is proof the image understood it.
-    let seed_fold = result
-        .seed
-        .as_ref()
-        .map(|outcome| crate::repo_seed::seed_success_fold(outcome, &now));
+    let seed_fold = result.seed.as_ref().map(|outcome| {
+        crate::repo_seed::seed_success_fold(
+            outcome,
+            repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+            &now,
+        )
+    });
     let conditions = match seed_fold.as_ref() {
         Some(fold) => io::upsert_condition(
             &conditions,
@@ -2699,7 +2709,7 @@ mod tests {
                 true,
                 false,
                 None,
-                None,
+                Default::default(),
                 None,
                 ForeignSnapshots::Fallback,
                 read_only,
@@ -2737,6 +2747,7 @@ mod tests {
                 migrate: None,
                 allow_empty_source: true,
                 resume: false,
+                replica_throttle: Default::default(),
             }),
         );
         let carried = armed.seed.expect("the seed rides the op");
@@ -2769,7 +2780,7 @@ mod tests {
                 true,
                 false,
                 None,
-                None,
+                Default::default(),
                 cluster,
                 ForeignSnapshots::Fallback,
                 read_only,

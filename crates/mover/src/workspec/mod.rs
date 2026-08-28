@@ -791,6 +791,21 @@ pub struct SeedOpSpec {
     /// `(SourceInfo, StartTime)`. Absent on old work specs (serde default).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resume: bool,
+    /// Throttle limits for the seed SOURCE (replica) connection — applied with
+    /// `kopia repository throttle set` right after that read-only connect.
+    ///
+    /// THIS repository's own side rides the work spec's
+    /// [`MoverWorkSpec::throttle`]: a migrate seed opens two repositories under
+    /// two kopia configs, and kopia's limits are per connection, so each side
+    /// needs its own resolved block. The controller merges the SOURCE
+    /// repository's `moverDefaults.throttle` with
+    /// `spec.seed.migrate.throttle.source` field by field; blob mode leaves it
+    /// empty (its source has no repository CR, and its caps ride
+    /// [`SeedSyncSpec`]'s `sync-to` speed flags). All-`None` ⇒ the mover skips
+    /// the call. Absent on old work specs (serde default ⇒ an uncapped replica
+    /// read, the pre-#374 behavior).
+    #[serde(default, skip_serializing_if = "ThrottleSpec::is_empty")]
+    pub replica_throttle: ThrottleSpec,
 }
 
 impl SeedOpSpec {
@@ -1689,6 +1704,16 @@ pub struct SnapshotReplicateOp {
     /// [`PruningSpec::None`] (never prune) — absent on the wire means none.
     #[serde(default, skip_serializing_if = "PruningSpec::is_none")]
     pub pruning: PruningSpec,
+    /// Throttle limits for the DESTINATION connection (`kopia repository
+    /// throttle set` after the dest connect). The SOURCE side rides the work
+    /// spec's own [`MoverWorkSpec::throttle`] — a snapshot replication opens two
+    /// repositories under two kopia configs, and kopia's limits are per
+    /// connection, so each side needs its own resolved block. The controller
+    /// merges the destination repository's `moverDefaults.throttle` with
+    /// `spec.migrate.throttle.destination` field by field. All-`None` ⇒ the
+    /// mover skips the dest throttle call.
+    #[serde(default, skip_serializing_if = "ThrottleSpec::is_empty")]
+    pub destination_throttle: ThrottleSpec,
 }
 
 /// A fully-resolved repository CR reference on the wire (kind + name +

@@ -767,12 +767,31 @@ pub fn lease_blocked_body(owner: &str, reason: &str, message: &str) -> serde_jso
 
 /// `{ "status": ... }` body for a failed kopia maintenance call.
 pub fn maintenance_failed_body(e: &KopiaError) -> serde_json::Value {
+    maintenance_failure_body(e.class(), &e.to_string())
+}
+
+/// [`maintenance_failed_body`] for a maintenance step whose typed cause is a
+/// [`MoverError`] rather than a bare [`KopiaError`] — the repository throttle
+/// applied right after the maintenance connect. Same condition shape; the class
+/// comes from the error's own classification
+/// ([`MoverError::kopia_class`](crate::error::MoverError::kopia_class)) so the
+/// controller's retry hint cannot drift from the message.
+pub fn maintenance_failed_body_from_mover(e: &MoverError) -> serde_json::Value {
+    maintenance_failure_body(e.kopia_class(), &e.to_string())
+}
+
+/// The one `MaintenanceFailed` condition body, so the two constructors above
+/// cannot drift in reason, wording or timestamp shape.
+fn maintenance_failure_body(
+    class: kopiur_kopia::KopiaErrorClass,
+    message: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "status": {
             "conditions": [lease_condition_body(
                 "False",
                 "MaintenanceFailed",
-                &format!("maintenance failed (class {}): {e}", e.class()),
+                &format!("maintenance failed (class {class}): {message}"),
                 &chrono::Utc::now(),
             )],
         }
@@ -1041,6 +1060,48 @@ mod tests {
 
     fn ts() -> DateTime<Utc> {
         "2026-06-01T12:00:00Z".parse().unwrap()
+    }
+
+    /// #374: a maintenance run can now fail on the repository THROTTLE, whose
+    /// typed cause is a `MoverError`. Both constructors must produce the same
+    /// `MaintenanceFailed` condition shape and carry the real class, so the
+    /// controller's retry hint is identical whichever step failed.
+    #[test]
+    fn both_maintenance_failure_bodies_share_one_condition_shape() {
+        let kopia = KopiaError::NonZeroExit {
+            args: "maintenance run".into(),
+            code: Some(1),
+            class: KopiaErrorClass::Locked,
+            stderr_tail: "repository is locked".into(),
+        };
+        let from_kopia = maintenance_failed_body(&kopia);
+        let from_mover = maintenance_failed_body_from_mover(&crate::error::MoverError::Kopia {
+            op: crate::error::KopiaOp::ThrottleSet,
+            source: KopiaError::NonZeroExit {
+                args: "repository throttle set".into(),
+                code: Some(1),
+                class: KopiaErrorClass::Locked,
+                stderr_tail: "repository is locked".into(),
+            },
+        });
+        for body in [&from_kopia, &from_mover] {
+            let cond = &body["status"]["conditions"][0];
+            assert_eq!(cond["type"], kopiur_api::maintenance::LEASE_OWNED_CONDITION);
+            assert_eq!(cond["status"], "False");
+            assert_eq!(cond["reason"], "MaintenanceFailed");
+            assert!(
+                cond["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("class Locked")),
+                "the condition message must carry the real kopia class: {cond}"
+            );
+        }
+        assert!(
+            from_mover["status"]["conditions"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("repository throttle set")),
+            "a throttle failure must name the invocation that failed"
+        );
     }
 
     #[test]

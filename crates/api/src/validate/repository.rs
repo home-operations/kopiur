@@ -1027,10 +1027,28 @@ pub fn validate_snapshot_replication(spec: &SnapshotReplicationSpec) -> Vec<Vali
             }
         }
     }
-    if let Some(p) = spec.migrate.as_ref().and_then(|m| m.parallel)
-        && let Some(e) = require_min("SnapshotReplication spec.migrate.parallel", p.into(), 1)
-    {
-        errs.push(e);
+    if let Some(migrate) = spec.migrate.as_ref() {
+        if let Some(p) = migrate.parallel
+            && let Some(e) = require_min("SnapshotReplication spec.migrate.parallel", p.into(), 1)
+        {
+            errs.push(e);
+        }
+        // Per-side migrate caps: the same "a rate is >= 1" rule the throttle
+        // knobs carry everywhere, applied to each side independently so a
+        // message names the side that is wrong.
+        if let Some(throttle) = migrate.throttle.as_ref() {
+            for (side, block) in [
+                ("source", throttle.source.as_ref()),
+                ("destination", throttle.destination.as_ref()),
+            ] {
+                if let Some(block) = block {
+                    errs.extend(validate_throttle(
+                        &format!("SnapshotReplication spec.migrate.throttle.{side}"),
+                        block,
+                    ));
+                }
+            }
+        }
     }
     if let Some(pruning) = &spec.pruning {
         // Exhaustive: a new pruning mode cannot compile without deciding its
@@ -1433,6 +1451,24 @@ pub fn validate_repository_seed(
                 && let Some(e) = require_min("spec.seed.migrate.parallel", p.into(), 1)
             {
                 errs.push(e);
+            }
+            // Per-side seed caps, the same "a rate is >= 1" rule the throttle
+            // knobs carry everywhere. Validated per side so the message names
+            // the side that is wrong: `source` is the REPLICA being read,
+            // `destination` this repository — and mixing them up is the likely
+            // authoring mistake.
+            if let Some(throttle) = seed.migrate.as_ref().and_then(|m| m.throttle.as_ref()) {
+                for (side, block) in [
+                    ("source", throttle.source.as_ref()),
+                    ("destination", throttle.destination.as_ref()),
+                ] {
+                    if let Some(block) = block {
+                        errs.extend(validate_throttle(
+                            &format!("spec.seed.migrate.throttle.{side}"),
+                            block,
+                        ));
+                    }
+                }
             }
         }
     }

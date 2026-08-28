@@ -31,6 +31,49 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
     };
     world.ensure(&[Need::Filesystem]).await.expect("fixtures");
     let client = world.client().clone();
+
+    // #374: the SOURCE repository carries a repository-wide throttle, so the
+    // replication mover — which opens its own connect to the source and reads the
+    // whole repository through it — must apply it. Created HERE rather than
+    // through `ensure_seed` (which hardcodes an empty overlay and is
+    // create-if-absent); no other scenario uses this repo, so pre-creating it is
+    // race-free. Non-binding at 100 MiB/s over a local hostPath.
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    ensure_repo(&client, "repl-src").await;
+    create_idempotent(
+        &repos,
+        &cr(repository_json(
+            "e2e-repl-src",
+            "repl-src",
+            serde_json::json!({
+                "moverDefaults": {
+                    "throttle": {
+                        "uploadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND,
+                        "downloadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND
+                    }
+                }
+            }),
+        )),
+        "create the throttled replication source Repository",
+    )
+    .await;
+    // Bare spec fields, not a `{"spec": ...}` wrapper — the wrapper is dropped
+    // silently and would leave the throttle assertion below vacuous.
+    let landed = repos
+        .get("e2e-repl-src")
+        .await
+        .expect("read back the throttled replication source Repository");
+    assert_eq!(
+        landed
+            .spec
+            .mover_defaults
+            .as_ref()
+            .and_then(|m| m.throttle.as_ref())
+            .and_then(|t| t.upload_bytes_per_second),
+        Some(consts::THROTTLE_BYTES_PER_SECOND),
+        "moverDefaults.throttle must survive onto the source Repository"
+    );
+
     // A source repo with a real snapshot to mirror.
     ensure_seed(
         &client,
@@ -138,6 +181,18 @@ async fn repository_replication_mirrors_to_second_filesystem_repo() {
     )
     .await
     .expect("the replication should run and stamp status.lastReplicated");
+
+    // #374 regression guard: the replication mover applied the SOURCE
+    // repository's throttle on its own connect. `sync-to` succeeds either way,
+    // so the mover's log line is the only proof the cap was in force.
+    kopiur_e2e::wait::wait_for_pod_log(
+        &client,
+        E2E_NAMESPACE,
+        &selector,
+        consts::THROTTLE_APPLIED_LOG,
+    )
+    .await
+    .expect("the replication mover must apply moverDefaults.throttle on its own connect (#374)");
 
     // kstatus consistency guard (regression: the same two-pass heal bug as
     // restore/snapshot). The mover stamps `phase: Succeeded` + `lastReplicated`;
@@ -381,6 +436,11 @@ async fn repository_replication_s3_to_s3_uses_destination_scoped_credentials() {
 /// It pins the halves a unit test cannot reach: the requested run rides the
 /// ordinary mover path (a real `sync-to`, tagged `run-trigger: manual` on its
 /// Job), and `status.manualRun` answers the exact timestamp requested.
+///
+/// It then pins issue #394 against a REAL apiserver: a follow-up request parked
+/// as `Pending` must carry no `completedAt` VALUE from the finished run, which
+/// only the explicit-null serialization achieves (the apiserver may delete the
+/// key or store the null; either way the stale stamp is gone).
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn repository_replication_runs_on_demand_from_the_run_requested_annotation() {
@@ -531,6 +591,62 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
     assert!(
         triggers.iter().any(|t| t == "manual"),
         "the requested run's Job must be tagged run-trigger: manual; got {triggers:?}"
+    );
+
+    // Issue #394: a FOLLOW-UP request must not inherit the finished run's
+    // `completedAt`. The non-terminal patch serializes an explicit null; the
+    // apiserver then either DELETES the key (plain RFC-7386) or stores the null
+    // verbatim — a nullable CRD field on k8s 1.33 was observed keeping it. Both
+    // converge on the property that matters and the assertion below tests
+    // exactly that: no stale timestamp survives under the fresh `Pending`.
+    //
+    // Suspending is what makes the park deterministic (#380 records an
+    // unanswered request as `Pending` and stops). Ordering hazard: the
+    // reconciler checks `spec.suspend` BEFORE the run request, but annotating an
+    // un-suspended CR can spawn the Job and record `Running` before the suspend
+    // lands — so both fields ride ONE patch.
+    let second_request = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    repls
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": {
+                    kopiur_api::consts::RUN_REQUESTED_ANNOTATION: second_request
+                } },
+                "spec": { "suspend": true }
+            })),
+        )
+        .await
+        .expect("suspend and re-request in one patch");
+
+    let parked = wait_until(
+        "the follow-up request parks as Pending on the suspended replication",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let repls = repls.clone();
+            let want = second_request.clone();
+            async move {
+                let s = status_json(&repls, name).await;
+                Ok(s.get("manualRun")
+                    .filter(|m| {
+                        m.get("phase").and_then(|p| p.as_str()) == Some("Pending")
+                            && m.get("requestedAt").and_then(|r| r.as_str()) == Some(want.as_str())
+                    })
+                    .cloned())
+            }
+        },
+    )
+    .await
+    .expect("the suspended replication should record the new request as Pending");
+    assert!(
+        parked
+            .get("completedAt")
+            .is_none_or(serde_json::Value::is_null),
+        "a non-terminal manualRun must carry NO completedAt VALUE — absent or an \
+         explicit null are both fine (the apiserver picks), but the previous run's \
+         stamp must not still be standing; got {parked}"
     );
 
     let _ = repls.delete(name, &DeleteParams::default()).await;

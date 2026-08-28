@@ -50,6 +50,23 @@ holding zero snapshots. `failurePolicy.activeDeadlineSeconds` defaults to **8640
 (24 h) while seeding, versus the 120 s a routine connect gets. See
 [Repositories → `seed`](../../repositories.md#seed--initialize-a-new-repository-from-a-replica).
 
+Capping the copy differs by mode. Blob mode uses `sync.maxDownloadSpeedBytesPerSecond`
+/ `maxUploadSpeedBytesPerSecond` — `kopia repository sync-to` takes real speed
+flags. Migrate mode's `kopia snapshot migrate` takes **none**, so
+`migrate.throttle` is applied as `kopia repository throttle set` on each
+connection before the copy runs, **per side**: `throttle.source` caps the
+replica's read connection and `throttle.destination` this repository's write
+connection, each a [`throttle`](shared-types.md#moverdefaults) block
+(`uploadBytesPerSecond`, `downloadBytesPerSecond`, `readOpsPerSecond`,
+`writeOpsPerSecond`; every set knob must be `>= 1`, webhook-enforced). Each side
+**overrides that side's repository's `moverDefaults.throttle` field by field** —
+a knob set here wins, a knob left unset keeps the repository's value — and only
+while the seed is armed; later connects are capped by `moverDefaults.throttle`
+alone. Two repositories, two connections, two independent blocks: the replica cap
+says nothing about this repository's and vice versa. Applying a cap to the
+read-only replica connection is supported (kopia accepts `throttle set` there).
+See [Throttling a seed](../../repositories.md#throttling-a-seed).
+
 ### `moverDefaults`
 
 Base mover configuration — security context, pod security context, resources,

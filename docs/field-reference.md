@@ -858,6 +858,32 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `latestOnly` | boolean | — | Copy only each source identity's most recent snapshot instead of its full history (`kopia snapshot migrate --latest`). Default `false` — a seed exists to recover history, so the full copy is the sane default; set this when you only need the latest restore point back quickly. |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
 | `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether the source's kopia **policies** are copied along with the snapshots. Defaults to `PolicyCopyMode::None` (an explicit `--no-policies`), not kopia's own copy-by-default: retention in a kopiur-managed repository is driven by `Snapshot` CRs, and importing the source's kopia-side policies could delete manifests behind the operator's back. |
+| `throttle` | [object](#repository-spec-seed-migrate-throttle) | — | Bandwidth/ops caps for THIS seed's copy, per side. A migrate seed opens two repositories under two kopia connections and `snapshot migrate` has no speed flags of its own, so each side is applied as `kopia repository throttle set` on that side's connection:<br>* `source` caps the REPLICA — the repository named by   `spec.seed.from.repository`, opened read-only — overriding **its**   `moverDefaults.throttle`; * `destination` caps THIS repository, the one being seeded, overriding   **its own** `moverDefaults.throttle`.<br>Each side overrides field by field: a knob set here wins, a knob left unset keeps that repository's default. Absent: both sides use their repository's defaults. Applies only while the seed is armed — an ordinary connect to the now-initialized repository is capped by `moverDefaults.throttle` alone. |
+
+###### `spec.seed.migrate.throttle` { #repository-spec-seed-migrate-throttle }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `destination` | [object](#repository-spec-seed-migrate-throttle-destination) | — | Caps for the DESTINATION (write) side, overriding the destination repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the destination connection the migrate writes through. |
+| `source` | [object](#repository-spec-seed-migrate-throttle-source) | — | Caps for the SOURCE (read) side, overriding the source repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the migrate's read-only source connection — accepted there, so a read-only source is throttled like any other. |
+
+###### `spec.seed.migrate.throttle.destination` { #repository-spec-seed-migrate-throttle-destination }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
+
+###### `spec.seed.migrate.throttle.source` { #repository-spec-seed-migrate-throttle-source }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
 ##### `spec.seed.sync` { #repository-spec-seed-sync }
 
@@ -1890,6 +1916,32 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `latestOnly` | boolean | — | Copy only each source identity's most recent snapshot instead of its full history (`kopia snapshot migrate --latest`). Default `false` — a seed exists to recover history, so the full copy is the sane default; set this when you only need the latest restore point back quickly. |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
 | `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether the source's kopia **policies** are copied along with the snapshots. Defaults to `PolicyCopyMode::None` (an explicit `--no-policies`), not kopia's own copy-by-default: retention in a kopiur-managed repository is driven by `Snapshot` CRs, and importing the source's kopia-side policies could delete manifests behind the operator's back. |
+| `throttle` | [object](#clusterrepository-spec-seed-migrate-throttle) | — | Bandwidth/ops caps for THIS seed's copy, per side. A migrate seed opens two repositories under two kopia connections and `snapshot migrate` has no speed flags of its own, so each side is applied as `kopia repository throttle set` on that side's connection:<br>* `source` caps the REPLICA — the repository named by   `spec.seed.from.repository`, opened read-only — overriding **its**   `moverDefaults.throttle`; * `destination` caps THIS repository, the one being seeded, overriding   **its own** `moverDefaults.throttle`.<br>Each side overrides field by field: a knob set here wins, a knob left unset keeps that repository's default. Absent: both sides use their repository's defaults. Applies only while the seed is armed — an ordinary connect to the now-initialized repository is capped by `moverDefaults.throttle` alone. |
+
+###### `spec.seed.migrate.throttle` { #clusterrepository-spec-seed-migrate-throttle }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `destination` | [object](#clusterrepository-spec-seed-migrate-throttle-destination) | — | Caps for the DESTINATION (write) side, overriding the destination repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the destination connection the migrate writes through. |
+| `source` | [object](#clusterrepository-spec-seed-migrate-throttle-source) | — | Caps for the SOURCE (read) side, overriding the source repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the migrate's read-only source connection — accepted there, so a read-only source is throttled like any other. |
+
+###### `spec.seed.migrate.throttle.destination` { #clusterrepository-spec-seed-migrate-throttle-destination }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
+
+###### `spec.seed.migrate.throttle.source` { #clusterrepository-spec-seed-migrate-throttle-source }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
 ##### `spec.seed.sync` { #clusterrepository-spec-seed-sync }
 
@@ -3077,7 +3129,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `sourceKind` | string | — | The pinned source kind (`SnapshotRef`/`FromPolicy`/`Identity`); backs the `SOURCE` printer column. |
 | `target` | [object](#restore-status-target) | — | Resolved target details (the PVC written to / populator handshake). |
 | `timing` | [object](#restore-status-timing) | — | Start/end timestamps for the restore run. |
-| `waitStartedAt` | string | — | When the `policy.waitTimeout` window OPENED (RFC3339) — the first reconcile on which the restore could actually proceed (its repository reached `Ready`, and for a `target.populator` a PVC already claims it), NOT when the Restore was created. If the referenced `Repository`/`SnapshotPolicy` object doesn't exist yet, the readiness gate falls through unverified and the anchor can be stamped as early as creation. Stamped once and then honored verbatim, so the window survives controller restarts and Job pod retries; cleared when a populator re-opens resolution for a re-created claim, so that claim gets the full window again. Absent means the window has not opened yet (or no `policy.waitTimeout` is configured, in which case there is no window to anchor). |
+| `waitStartedAt` | string | — | When the `policy.waitTimeout` window OPENED (RFC3339) — the first reconcile on which the restore could actually proceed (its repository reached `Ready`, and for a `target.populator` a PVC already claims it), NOT when the Restore was created. The window does NOT open while the referenced `Repository` object or `fromPolicy` `SnapshotPolicy` doesn't exist: the restore parks in `Pending` (`ReferentAvailable=False`, reason `RestoreReferentMissing`) and stays unstamped. It DOES still open for a `snapshotRef` whose `Snapshot` row doesn't exist yet (so `onMissingSnapshot` can fire for a ref that never appears) and for a restore whose mover Job already launched. Stamped once and then honored verbatim, so the window survives controller restarts and Job pod retries; cleared when a populator re-opens resolution for a re-created claim, so that claim gets the full window again. Absent means the window has not opened yet (or no `policy.waitTimeout` is configured, in which case there is no window to anchor). |
 
 #### `status.conditions[]` { #restore-status-conditions }
 
@@ -3757,6 +3809,32 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | --- | --- | --- | --- |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: number of snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
 | `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether kopia **policies** attached to the copied sources are also copied to the destination. Defaults to `PolicyCopyMode::None`. |
+| `throttle` | [object](#snapshotreplication-spec-migrate-throttle) | — | Bandwidth/ops caps for THIS replication's runs, per side. `snapshot migrate` has no speed flags, so each side is applied as `kopia repository throttle set` on that side's connection; `source` overrides the source repository's `moverDefaults.throttle` and `destination` the destination repository's, field by field (a field left unset keeps that repository's default). Absent: both sides use their repository's defaults. |
+
+##### `spec.migrate.throttle` { #snapshotreplication-spec-migrate-throttle }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `destination` | [object](#snapshotreplication-spec-migrate-throttle-destination) | — | Caps for the DESTINATION (write) side, overriding the destination repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the destination connection the migrate writes through. |
+| `source` | [object](#snapshotreplication-spec-migrate-throttle-source) | — | Caps for the SOURCE (read) side, overriding the source repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the migrate's read-only source connection — accepted there, so a read-only source is throttled like any other. |
+
+###### `spec.migrate.throttle.destination` { #snapshotreplication-spec-migrate-throttle-destination }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
+
+###### `spec.migrate.throttle.source` { #snapshotreplication-spec-migrate-throttle-source }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
 #### `spec.mover` { #snapshotreplication-spec-mover }
 

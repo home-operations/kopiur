@@ -24,7 +24,7 @@ use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
 use kube::api::Api;
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{RepositoryKind, RepositoryRef};
+use kopiur_api::common::{MoverDefaults, RepositoryKind, RepositoryRef, Throttle};
 use kopiur_api::seed::{SeedMode, SeedSource, SeedSpec, SeedStatus};
 use kopiur_mover::bootstrap::SeedOutcome;
 use kopiur_mover::jobs::VolumeMountSpec;
@@ -155,8 +155,61 @@ pub(crate) struct SeedSourceRepository<'a> {
     pub kind: RepositoryKind,
     /// The source CR's name.
     pub name: &'a str,
-    /// The source's resolved backend/encryption/CA surface.
+    /// The source's resolved backend/encryption/CA surface — and its
+    /// `moverDefaults`, which is where the REPLICA side's throttle comes from
+    /// (kopia's limits are per connection, so the replica's cap can only be the
+    /// replica's own default, never the seeded repository's).
     pub repo: &'a ResolvedRepository,
+}
+
+/// **Pure.** The per-CR override for ONE side of a migrate seed's copy, or
+/// `None` when this seed caps nothing (blob mode included — `spec.seed.migrate`
+/// is refused alongside `from.backend`, so the block cannot exist there).
+///
+/// Two named accessors rather than one indexed helper because the two sides are
+/// two different repositories with two different failure modes, and a caller
+/// that picked the wrong one would produce a run that caps the link it meant to
+/// leave alone.
+fn seed_source_throttle(seed: &SeedSpec) -> Option<&Throttle> {
+    seed.migrate
+        .as_ref()
+        .and_then(|m| m.throttle.as_ref())
+        .and_then(|t| t.source.as_ref())
+}
+
+/// The DESTINATION-side counterpart of [`seed_source_throttle`]: the override
+/// for THIS repository, the one being seeded.
+fn seed_destination_throttle(seed: &SeedSpec) -> Option<&Throttle> {
+    seed.migrate
+        .as_ref()
+        .and_then(|m| m.throttle.as_ref())
+        .and_then(|t| t.destination.as_ref())
+}
+
+/// **Pure.** The throttle a bootstrap work spec carries — the cap that lands on
+/// every connection the bootstrap mover opens to THIS repository.
+///
+/// Ordinarily that is just this repository's own `moverDefaults.throttle`. While
+/// a seed is ARMED it also picks up `spec.seed.migrate.throttle.destination`,
+/// field by field: a seeding bootstrap's local connect is the write side of the
+/// heaviest transfer kopiur performs, and `kopia snapshot migrate` has no speed
+/// flags of its own, so the limits persisted into that connection's config are
+/// the only cap it can honor.
+///
+/// Gated on `armed` deliberately. The destination override describes the SEED
+/// RUN, not the repository; leaving it in force on every later connect to the
+/// now-initialized repository would cap routine work with a number chosen for a
+/// one-time copy. `armed == false` therefore reproduces the pre-#374 value byte
+/// for byte.
+pub(crate) fn seed_bootstrap_throttle(
+    armed: bool,
+    seed: Option<&SeedSpec>,
+    defaults: Option<&MoverDefaults>,
+) -> kopiur_mover::workspec::ThrottleSpec {
+    io::merged_throttle(
+        defaults,
+        seed.filter(|_| armed).and_then(seed_destination_throttle),
+    )
 }
 
 /// **Pure.** Build the mover's seed payload from `spec.seed`.
@@ -181,11 +234,21 @@ pub(crate) fn seed_op_for(
     source: Option<&SeedSourceRepository<'_>>,
     resume: bool,
 ) -> Option<SeedOpSpec> {
-    let from = match (&seed.from, source) {
-        (SeedSource::Backend(backend), _) => SeedConnectSource::Backend(Box::new(
-            backend_to_repository_connect(backend, blob_ca_bundle_pem),
-        )),
-        (SeedSource::Repository(_), Some(src)) => {
+    // Resolved together with the source it belongs to, so the two can never
+    // describe different repositories: kopia's limits are per CONNECTION, and
+    // the replica's cap comes from the REPLICA's own `moverDefaults.throttle`
+    // (overlaid field-wise by `spec.seed.migrate.throttle.source`) — never from
+    // the repository being seeded. Blob mode caps its copy through `sync-to`'s
+    // own speed flags instead, so it carries none.
+    let (from, replica_throttle) = match (&seed.from, source) {
+        (SeedSource::Backend(backend), _) => (
+            SeedConnectSource::Backend(Box::new(backend_to_repository_connect(
+                backend,
+                blob_ca_bundle_pem,
+            ))),
+            Default::default(),
+        ),
+        (SeedSource::Repository(_), Some(src)) => (
             SeedConnectSource::Repository(Box::new(SeedRepositoryConnect {
                 kind: io::repo_kind_str(src.kind).to_string(),
                 name: src.name.to_string(),
@@ -194,8 +257,9 @@ pub(crate) fn seed_op_for(
                     &src.repo.backend,
                     src.repo.ca_bundle_pem.clone(),
                 ),
-            }))
-        }
+            })),
+            io::merged_throttle(src.repo.mover_defaults.as_ref(), seed_source_throttle(seed)),
+        ),
         (SeedSource::Repository(_), None) => return None,
     };
     Some(SeedOpSpec {
@@ -211,13 +275,14 @@ pub(crate) fn seed_op_for(
             max_download_speed_bytes_per_second: s.max_download_speed_bytes_per_second,
             max_upload_speed_bytes_per_second: s.max_upload_speed_bytes_per_second,
         }),
-        migrate: seed.migrate.map(|m| SeedMigrateSpec {
+        migrate: seed.migrate.as_ref().map(|m| SeedMigrateSpec {
             parallel: m.parallel,
             latest_only: m.latest_only,
             policies: crate::snapshot_replication::policy_copy_mode_spec(m.policies),
         }),
         allow_empty_source: seed.allow_empty_source,
         resume,
+        replica_throttle,
     })
 }
 
@@ -318,14 +383,43 @@ pub(crate) struct SeedSuccess {
 /// storage, not manifests, so there is no per-snapshot copy count; its
 /// `snapshotCount` is the SOURCE listing the mover took before the copy, which
 /// for a byte-for-byte mirror is also what this repository ends up holding).
-pub(crate) fn seed_success_fold(outcome: &SeedOutcome, now: &str) -> SeedSuccess {
+///
+/// # Why `existing` — the fold must be BYTE-STABLE across re-folds
+///
+/// `finalize_bootstrap` re-enters on EVERY reconcile for as long as the
+/// finished bootstrap Job lingers (it is deleted only on the probe arm), and it
+/// re-reads the same result ConfigMap each time — so a seeding Job's outcome is
+/// re-folded, unchanged, hundreds of times. Two properties make that pass a
+/// no-op under [`crate::io::status_patch_is_noop`], and both need `existing`:
+///
+/// * `seededAt` is stamped ONCE, at the first fold, and reused verbatim
+///   afterwards. Re-stamping `now` made every pass a fresh status write, which
+///   bumped `resourceVersion`, re-triggered this reconciler through its own
+///   primary watch and spun the repository at ~4 reconciles/second until the
+///   Job's TTL. (A seed happens exactly once, so "when it completed" is a fact,
+///   not a heartbeat — the same rule `seed_marker_patch` already applies to
+///   `startedAt`.)
+/// * the seed-attempt marker (`startedAt`) is carried FORWARD into the patch.
+///   A merge patch would preserve it either way, but the no-op guard compares
+///   the whole `seed` value: a partial sub-object can never equal the stored
+///   one, so omitting the marker re-writes forever on its own.
+pub(crate) fn seed_success_fold(
+    outcome: &SeedOutcome,
+    existing: Option<&SeedStatus>,
+    now: &str,
+) -> SeedSuccess {
     let mode = seed_mode_of(outcome);
     let mut status = serde_json::json!({
         "mode": mode,
         "source": outcome.source,
     });
+    if let Some(started_at) = existing.and_then(|s| s.started_at.as_deref()) {
+        status["startedAt"] = serde_json::Value::String(started_at.to_string());
+    }
     if outcome.performed {
-        status["seededAt"] = serde_json::Value::String(now.to_string());
+        // Set once; every later re-fold of the same lingering result reuses it.
+        let seeded_at = existing.and_then(|s| s.seeded_at.as_deref()).unwrap_or(now);
+        status["seededAt"] = serde_json::Value::String(seeded_at.to_string());
         if let Some(n) = outcome.snapshot_count {
             status["snapshotCount"] = serde_json::json!(n);
         }
@@ -1125,6 +1219,101 @@ mod tests {
         }
     }
 
+    /// The #374 seed glue guard: two repositories, two kopia connections, two
+    /// independently resolved caps — and neither side's knobs may reach the
+    /// other. A crossed merge is invisible in production until the wrong link
+    /// gets saturated, which is exactly what this feature exists to prevent.
+    #[test]
+    fn seed_throttles_resolve_per_side_from_each_repositorys_own_defaults() {
+        use kopiur_api::common::{MoverDefaults, Throttle};
+        let throttle = |up, down, r, w| Throttle {
+            upload_bytes_per_second: up,
+            download_bytes_per_second: down,
+            read_ops_per_second: r,
+            write_ops_per_second: w,
+        };
+        // The REPLICA brings its own defaults; so does the repository being
+        // seeded. The CR overrides ONE knob per side, so a correct merge shows
+        // the override AND that side's surviving default — and nothing else.
+        let mut src = resolved_source(s3("source-bucket"), Some("backups"));
+        src.mover_defaults = Some(MoverDefaults {
+            throttle: Some(throttle(None, Some(1), Some(2), None)),
+            ..Default::default()
+        });
+        let local_defaults = MoverDefaults {
+            throttle: Some(throttle(Some(3), None, None, Some(4))),
+            ..Default::default()
+        };
+        let seed = seed_spec(serde_json::json!({
+            "from": { "repository": { "name": "offsite" } },
+            "migrate": { "throttle": {
+                "source": { "downloadBytesPerSecond": 11 },
+                "destination": { "uploadBytesPerSecond": 22 },
+            } },
+        }));
+        let source = SeedSourceRepository {
+            kind: RepositoryKind::Repository,
+            name: "offsite",
+            repo: &src,
+        };
+        let op = seed_op_for(&seed, None, Some(&source), false).expect("migrate op");
+        // REPLICA side: the CR's download override wins, the replica repo's
+        // readOps default survives, and NOTHING from the local repository's
+        // defaults leaks in.
+        assert_eq!(op.replica_throttle.download_bytes_per_second, Some(11));
+        assert_eq!(op.replica_throttle.read_ops_per_second, Some(2));
+        assert_eq!(
+            op.replica_throttle.upload_bytes_per_second, None,
+            "the SEEDED repository's upload default must not reach the replica"
+        );
+        assert_eq!(
+            op.replica_throttle.write_ops_per_second, None,
+            "the SEEDED repository's writeOps default must not reach the replica"
+        );
+
+        // LOCAL (destination) side rides the bootstrap work spec's own throttle:
+        // the CR's upload override wins, this repository's writeOps default
+        // survives, and the REPLICA's knobs stay out.
+        let armed = seed_bootstrap_throttle(true, Some(&seed), Some(&local_defaults));
+        assert_eq!(armed.upload_bytes_per_second, Some(22));
+        assert_eq!(armed.write_ops_per_second, Some(4));
+        assert_eq!(
+            armed.download_bytes_per_second, None,
+            "the REPLICA's download default must not reach the seeded repository"
+        );
+        assert_eq!(armed.read_ops_per_second, None);
+
+        // NOT armed — every ordinary bootstrap, including every later connect to
+        // the now-initialized repository: byte-for-byte this repository's own
+        // defaults, with the seed-run override nowhere in sight.
+        let unarmed = seed_bootstrap_throttle(false, Some(&seed), Some(&local_defaults));
+        assert_eq!(unarmed.upload_bytes_per_second, Some(3));
+        assert_eq!(unarmed.write_ops_per_second, Some(4));
+        assert!(unarmed.download_bytes_per_second.is_none());
+
+        // A migrate seed that caps nothing leaves both sides on their
+        // repositories' defaults (and an all-empty pair skips `throttle set`).
+        let plain = seed_spec(serde_json::json!({
+            "from": { "repository": { "name": "offsite" } },
+        }));
+        let op = seed_op_for(&plain, None, Some(&source), false).expect("migrate op");
+        assert_eq!(op.replica_throttle.download_bytes_per_second, Some(1));
+        assert!(seed_bootstrap_throttle(true, Some(&plain), None).is_empty());
+
+        // BLOB mode has no source repository CR at all — its copy is capped by
+        // `sync-to`'s own speed flags — so the replica block stays empty rather
+        // than inheriting this repository's defaults.
+        let blob = seed_spec(serde_json::json!({
+            "from": { "backend": { "s3": { "bucket": "offsite" } } },
+            "sync": { "maxDownloadSpeedBytesPerSecond": 20000000 },
+        }));
+        let op = seed_op_for(&blob, None, None, false).expect("blob op");
+        assert!(op.replica_throttle.is_empty());
+        // …and admission refuses `migrate` beside `from.backend`, so a blob seed
+        // can never carry a destination override either.
+        assert!(seed_bootstrap_throttle(true, Some(&blob), None).is_empty());
+    }
+
     #[test]
     fn a_migrate_seed_without_a_resolved_source_yields_no_payload() {
         // Unreachable from the caller (it resolves or parks first) and
@@ -1316,7 +1505,7 @@ mod tests {
             412,
             Some(412),
         );
-        let fold = seed_success_fold(&performed, now);
+        let fold = seed_success_fold(&performed, None, now);
         assert_eq!(fold.reason, kopiur_api::consts::SEEDED_REASON);
         assert_eq!(fold.outcome, crate::metrics::SeedOutcomeLabel::Seeded);
         assert_eq!(fold.status["seed"]["seededAt"], serde_json::json!(now));
@@ -1334,7 +1523,7 @@ mod tests {
         // manifests — and the post-seed catalog listing reports the count on
         // storageStats instead.
         let blob = SeedOutcome::performed(SeedModeSpec::Blob, "S3".into(), 7, None);
-        let fold = seed_success_fold(&blob, now);
+        let fold = seed_success_fold(&blob, None, now);
         assert_eq!(fold.status["seed"]["snapshotCount"], serde_json::json!(7));
         assert!(fold.status["seed"].get("snapshotsCopied").is_none());
 
@@ -1342,7 +1531,7 @@ mod tests {
         // reporting 0 would be a lie), its own reason and metric label, and NO
         // Event — nothing happened.
         let noop = SeedOutcome::already_initialized(SeedModeSpec::Blob, "S3".into());
-        let fold = seed_success_fold(&noop, now);
+        let fold = seed_success_fold(&noop, None, now);
         assert_eq!(fold.reason, kopiur_api::consts::ALREADY_INITIALIZED_REASON);
         assert_eq!(
             fold.outcome,
@@ -1351,6 +1540,94 @@ mod tests {
         assert!(fold.status["seed"].get("seededAt").is_none());
         assert!(fold.status["seed"].get("snapshotCount").is_none());
         assert!(fold.event.is_none());
+    }
+
+    /// HOT-LOOP REGRESSION (#396 follow-up). `finalize_bootstrap` re-enters on
+    /// every reconcile while the finished bootstrap Job lingers and re-folds the
+    /// SAME `SeedOutcome` out of the same result ConfigMap. That steady-state
+    /// pass must be a no-op under `io::status_patch_is_noop`, or the write bumps
+    /// `resourceVersion`, the primary watch re-delivers the object and the
+    /// repository spins until the Job's TTL.
+    ///
+    /// Shaped like the e2e's `e2e-seed-mig-dst`: a completed MIGRATE seed on a
+    /// `Ready` repository. Both failure modes are covered — the wall clock
+    /// advancing between passes, and the marker (`startedAt`) the stored
+    /// sub-object carries but the fold used to omit.
+    #[test]
+    fn re_folding_a_finished_seed_is_a_byte_stable_no_op() {
+        use kopiur_api::repository::RepositoryStatus;
+
+        let outcome = SeedOutcome::performed(
+            SeedModeSpec::Migrate,
+            "Repository/e2e-seed-mig-src".into(),
+            1,
+            Some(1),
+        );
+        // The marker stamped by `seed_marker_patch` before the seeding Job ran.
+        let marker = SeedStatus {
+            started_at: Some("2026-08-26T03:33:20+00:00".into()),
+            ..Default::default()
+        };
+
+        // FIRST fold: nothing recorded yet, so `now` is what gets stamped.
+        let first = seed_success_fold(&outcome, Some(&marker), "2026-08-26T03:33:26+00:00");
+        assert_eq!(
+            first.status["seed"]["seededAt"],
+            serde_json::json!("2026-08-26T03:33:26+00:00"),
+            "the first fold stamps the completion time"
+        );
+        assert_eq!(
+            first.status["seed"]["startedAt"],
+            serde_json::json!("2026-08-26T03:33:20+00:00"),
+            "the seed-attempt marker rides the patch, or the no-op compare below \
+             can never hold"
+        );
+
+        // What that first pass persisted, read back the way the reconciler reads
+        // it (`serde_json::to_value(&repo.status)`).
+        let stored = RepositoryStatus {
+            phase: Some(kopiur_api::RepositoryPhase::Ready),
+            observed_generation: Some(1),
+            unique_id: Some("c36584a9".into()),
+            backend: Some("Filesystem".into()),
+            seed: Some(SeedStatus {
+                started_at: marker.started_at.clone(),
+                seeded_at: Some("2026-08-26T03:33:26+00:00".into()),
+                mode: Some(SeedMode::Migrate),
+                source: Some("Repository/e2e-seed-mig-src".into()),
+                snapshot_count: Some(1),
+                snapshots_copied: Some(1),
+            }),
+            ..Default::default()
+        };
+        let current = serde_json::to_value(Some(&stored)).expect("status serializes");
+        let existing = stored.seed.as_ref();
+
+        // EVERY later pass, minutes later on the wall clock, is a no-op.
+        let mut later = serde_json::json!({
+            "phase": "Ready",
+            "backend": "Filesystem",
+            "uniqueId": "c36584a9",
+            "observedGeneration": 1,
+        });
+        merge_seed_status(
+            &mut later,
+            &seed_success_fold(&outcome, existing, "2026-08-26T03:51:54+00:00").status,
+        );
+        assert!(
+            io::status_patch_is_noop(Some(&current), &later),
+            "the steady-state re-fold must not re-write status (hot loop): {later}"
+        );
+
+        // The standing no-op arm carries the marker forward too, so an
+        // `AlreadyInitialized` repository is equally quiet.
+        let adopted = SeedOutcome::already_initialized(SeedModeSpec::Blob, "S3".into());
+        let fold = seed_success_fold(&adopted, Some(&marker), "2026-08-26T03:51:54+00:00");
+        assert_eq!(
+            fold.status["seed"]["startedAt"],
+            serde_json::json!("2026-08-26T03:33:20+00:00")
+        );
+        assert!(fold.status["seed"].get("seededAt").is_none());
     }
 
     #[test]
@@ -1363,6 +1640,7 @@ mod tests {
         });
         let fold = seed_success_fold(
             &SeedOutcome::performed(SeedModeSpec::Blob, "S3".into(), 3, None),
+            None,
             "2026-08-17T03:00:00Z",
         );
         merge_seed_status(&mut patch, &fold.status);

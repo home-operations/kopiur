@@ -256,6 +256,34 @@ pub fn require_min(field: &str, value: i64, min: i64) -> Option<ValidationError>
     })
 }
 
+/// Validate every SET knob of a [`Throttle`](crate::common::Throttle): a cap is a
+/// positive rate, so each present field must be >= 1. `field` names the block's
+/// path for the message (e.g. `"SnapshotReplication spec.migrate.throttle.source"`),
+/// and each knob's own camelCase name is appended.
+///
+/// A `0` is refused rather than read as "unlimited": kopia's own "no limit" is the
+/// ABSENT field, so accepting `0` would give one wire value two plausible meanings
+/// (uncapped vs. stalled) — and the one it actually has in kopia is a hard stop.
+/// Exhaustively destructured, so a fifth knob cannot be added without deciding its
+/// bound here.
+pub fn validate_throttle(field: &str, throttle: &crate::common::Throttle) -> Vec<ValidationError> {
+    let crate::common::Throttle {
+        upload_bytes_per_second,
+        download_bytes_per_second,
+        read_ops_per_second,
+        write_ops_per_second,
+    } = throttle;
+    [
+        ("uploadBytesPerSecond", upload_bytes_per_second),
+        ("downloadBytesPerSecond", download_bytes_per_second),
+        ("readOpsPerSecond", read_ops_per_second),
+        ("writeOpsPerSecond", write_ops_per_second),
+    ]
+    .into_iter()
+    .filter_map(|(knob, value)| value.and_then(|v| require_min(&format!("{field}.{knob}"), v, 1)))
+    .collect()
+}
+
 /// Validate a `MoverSpec`. `context` names the owning resource for the message (e.g.
 /// `"Restore mover"`).
 ///

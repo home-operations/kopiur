@@ -105,7 +105,10 @@ exactly what they remove.
   `dataSourceRef` (see [deploy-or-restore](restores.md#deploy-or-restore-gitops)).
   Its `waitTimeout` window opens when the restore can first proceed, not when you
   applied it, so a populator that sits in Git for months does not arrive with its
-  window already spent.
+  window already spent. The same holds for apply ordering within one commit: a
+  `Restore` whose `Repository` or `SnapshotPolicy` hasn't landed yet parks in
+  `Pending` (`RestoreReferentMissing`) with the window still closed, and un-parks
+  by itself once the referenced object appears.
 
 `spec.seed` is also **mutable**: editing it mid-seed lets the running Job finish,
 discards its result as stale, and relaunches for the live spec — so a GitOps

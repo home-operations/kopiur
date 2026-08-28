@@ -33,6 +33,9 @@ Tuning for the underlying `kopia snapshot migrate`:
 | --- | --- |
 | `parallel` | Snapshots migrated concurrently (kopia default `1` — sequential; must be `>= 1` when set, webhook-enforced). The main knob for large first runs. |
 | `policies` | Whether kopia **policy** objects ride along: `none` (default — Kopiur pins retention CR-side, so imported kopia policies are usually unwanted), `copy` (copy where absent), `copyOverwrite` (copy and overwrite). |
+| `throttle.source` / `throttle.destination` | Bandwidth/ops caps for this replication's runs, **per side** — each a [`throttle`](shared-types.md#moverdefaults) block (`uploadBytesPerSecond`, `downloadBytesPerSecond`, `readOpsPerSecond`, `writeOpsPerSecond`; every set knob must be `>= 1`, webhook-enforced). Each side **overrides that side's repository's `moverDefaults.throttle` field by field** — a knob set here wins, a knob left unset keeps the repository's value. Absent: both sides use their repository's defaults. See [Throttling a replication](../../snapshot-replication.md#throttling-a-replication). |
+
+`kopia snapshot migrate` has **no speed flags of its own**, so `throttle` is not passed to the migrate command: each side is applied as `kopia repository throttle set` on that side's connection *before* the migrate runs, and kopia persists the limits into that connection's config for the migrate to pick up. Two repositories, two connections, two independent blocks — the source cap says nothing about the destination and vice versa. Applying a cap to the read-only source connection is supported (kopia accepts `throttle set` there), so a `mode: ReadOnly` source is throttled like any other.
 
 ### `pruning`
 

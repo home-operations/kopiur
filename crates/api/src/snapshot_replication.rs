@@ -20,7 +20,8 @@
 //! `Snapshot` CRs themselves) removes replicated data.
 
 use crate::common::{
-    CredentialProjection, CronSpec, MoverSpec, ReplicationManualRunStatus, RepositoryRef, Retention,
+    CredentialProjection, CronSpec, MigrateThrottle, MoverSpec, ReplicationManualRunStatus,
+    RepositoryRef, Retention,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
@@ -146,8 +147,9 @@ pub struct IdentityMatcher {
     pub source_path: Option<String>,
 }
 
-/// Tuning for `kopia snapshot migrate`. Pure scalars, so `Eq`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+/// Tuning for `kopia snapshot migrate`. Pure scalars + an optional throttle
+/// sub-object, so `Eq` but NOT `Copy` (`Throttle` isn't).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrateOptions {
     /// `--parallel`: number of snapshots migrated concurrently (kopia default
@@ -158,6 +160,14 @@ pub struct MigrateOptions {
     /// to the destination. Defaults to [`PolicyCopyMode::None`].
     #[serde(default)]
     pub policies: PolicyCopyMode,
+    /// Bandwidth/ops caps for THIS replication's runs, per side. `snapshot
+    /// migrate` has no speed flags, so each side is applied as `kopia repository
+    /// throttle set` on that side's connection; `source` overrides the source
+    /// repository's `moverDefaults.throttle` and `destination` the destination
+    /// repository's, field by field (a field left unset keeps that repository's
+    /// default). Absent: both sides use their repository's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle: Option<MigrateThrottle>,
 }
 
 /// How `kopia snapshot migrate` treats the source's kopia policies.
@@ -552,7 +562,7 @@ suspend: false
         assert!(ids.include[0].source_path.is_none());
         assert_eq!(ids.exclude[0].source_path.as_deref(), Some("/scratch/*"));
 
-        let migrate = spec.migrate.expect("migrate set");
+        let migrate = spec.migrate.clone().expect("migrate set");
         assert_eq!(migrate.parallel, Some(4));
         assert_eq!(migrate.policies, PolicyCopyMode::CopyOverwrite);
 

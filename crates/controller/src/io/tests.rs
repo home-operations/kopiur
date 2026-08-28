@@ -820,6 +820,99 @@ fn status_patch_noop_ignores_volatile_message_only_when_message_matches() {
     assert!(status_patch_is_noop(Some(&current), &desired));
 }
 
+/// The stored status a replication has after a run that finished: the previous
+/// request, terminal, with its completion stamp.
+fn finished_manual_run() -> serde_json::Value {
+    serde_json::json!({
+        "manualRun": {
+            "requestedAt": "2026-06-11T12:00:00Z",
+            "phase": "Succeeded",
+            "completedAt": "2026-06-11T12:01:42Z",
+        },
+    })
+}
+
+/// The `desired` payload `patch_manual_run` builds for a FOLLOW-UP request that
+/// has not started — built from the typed struct exactly as the controllers do.
+fn pending_manual_run_patch() -> serde_json::Value {
+    let manual = kopiur_api::common::ReplicationManualRunStatus {
+        requested_at: Some("2026-06-11T13:00:00Z".into()),
+        phase: Some(kopiur_api::common::ReplicationManualRunPhase::Pending),
+        completed_at: None,
+    };
+    serde_json::json!({ "manualRun": manual })
+}
+
+#[test]
+fn non_terminal_manual_run_patch_carries_an_explicit_null_completed_at() {
+    // #394, the fix itself at the layer that consumes it: `Value::Index` maps a
+    // MISSING key to `Null`, so this has to ask for the key with `.get()` —
+    // present-and-null is the whole point, and absent is the bug.
+    let desired = pending_manual_run_patch();
+    assert_eq!(
+        desired["manualRun"].get("completedAt"),
+        Some(&serde_json::Value::Null),
+        "a non-terminal manualRun must NAME completedAt so the merge-patch \
+         clears the previous run's stamp; got {desired}"
+    );
+}
+
+#[test]
+fn manual_run_patch_converges_after_clearing_a_stale_completed_at() {
+    // The #394 trap is a LOOP, not one pass, so this replays one: patch, let the
+    // apiserver apply RFC-7386, rebuild `current` the way the replication
+    // controllers do (re-serialize the TYPED status off the refreshed object),
+    // and demand the second pass write nothing.
+    //
+    // Without the explicit null, `desired` simply omits `completedAt`; a merge
+    // patch never removes what it omits, so the stale stamp SURVIVES, the
+    // rebuilt `current` still differs from `desired`, and every queued pass
+    // re-fires a PATCH the apiserver no-ops — forever.
+    let desired = pending_manual_run_patch();
+    let mut stored = finished_manual_run();
+    assert!(
+        !status_patch_is_noop(Some(&stored), &desired),
+        "answering a NEW request must write"
+    );
+
+    // The apiserver applies the merge patch (this is `Patch::Merge`). Given the
+    // explicit null it either DELETES the key — plain RFC-7386, what
+    // `json_patch::merge` models — or STORES the null verbatim; a nullable CRD
+    // field on k8s 1.33 was observed doing the latter. Both outcomes are
+    // replayed below, because the guard has to converge under either.
+    json_patch::merge(&mut stored, &desired);
+    assert!(
+        stored["manualRun"].get("completedAt").is_none(),
+        "the merge-patch must have cleared the stale stamp; got {stored}"
+    );
+
+    // Next reconcile: `current` is the typed status of the refreshed object,
+    // re-serialized — the exact round trip `patch_manual_run` performs.
+    let converges = |stored: &serde_json::Value| {
+        let typed: kopiur_api::common::ReplicationManualRunStatus =
+            serde_json::from_value(stored["manualRun"].clone()).expect("stored manualRun decodes");
+        let current = serde_json::json!({ "manualRun": typed });
+        assert!(
+            status_patch_is_noop(Some(&current), &desired),
+            "the guard must CONVERGE once the stamp is cleared; current {current}, \
+             desired {desired}"
+        );
+    };
+    converges(&stored);
+
+    // The other apiserver outcome: the null is STORED rather than deleted. It
+    // decodes to `None` just the same (`#[serde(default)]` on an `Option`), so
+    // the rebuilt `current` is identical and the guard converges here too.
+    let stored_null = serde_json::json!({
+        "manualRun": {
+            "requestedAt": "2026-06-11T13:00:00Z",
+            "phase": "Pending",
+            "completedAt": null,
+        },
+    });
+    converges(&stored_null);
+}
+
 #[test]
 fn terminal_gate_only_on_failed_at_current_generation() {
     use kopiur_api::RepositoryPhase;
@@ -3701,6 +3794,17 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         false,
         crate::consts::SOURCE_PVC_MISSING_REASON,
         "snapshot::handle_missing_source_pvc (computed polarity)",
+    ),
+    // `restore::park_on_missing_referent` via
+    // io::upsert_gate(&RESTORE_REFERENT_MISSING_GATE, ...) — the tri-state
+    // readiness gate's `Undetermined` arm (#393); cleared (True, reason
+    // `RestoreReferentFound`) by `restore::proceed_past_gate` /
+    // `plan::cleared_referent_conditions` once the referent exists.
+    (
+        crate::consts::RESTORE_REFERENT_AVAILABLE_CONDITION,
+        false,
+        crate::consts::RESTORE_REFERENT_MISSING_REASON,
+        "restore::park_on_missing_referent",
     ),
     // `repository::park_on_seed_source` +
     // `cluster_repository::park_cluster_on_seed_source`, both via

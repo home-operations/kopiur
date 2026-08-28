@@ -1476,6 +1476,61 @@ fn throttle_args_builds_per_second_flags_and_empties() {
     assert!(ThrottleArgs::default().args().is_empty());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn set_client_read_only_emits_the_matching_polarity_flag() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    // `repository_set_client_read_only` builds argv only — no parsing — so the
+    // assertion has to be on what the process is actually SPAWNED with. A shim
+    // standing in for `kopia` appends its argv to a file (issue #374).
+    let dir = std::env::temp_dir().join(format!("kopiur-setclient-{}", std::process::id()));
+    // The shim APPENDS, so a leftover argv.out from an earlier run in the same
+    // process-id directory would prepend phantom lines. Start from nothing.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("kopia");
+    let out = dir.join("argv.out");
+    {
+        let mut f = std::fs::File::create(&shim).unwrap();
+        write!(
+            f,
+            "#!/bin/sh\necho \"$@\" >> \"$KOPIUR_SETCLIENT_OUT\"\nexit 0\n"
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let client = KopiaClient::builder()
+        .binary(&shim)
+        .env("KOPIUR_SETCLIENT_OUT", out.to_str().unwrap())
+        .build();
+
+    // Both polarities: `true` parks the config read-only, `false` opens the
+    // flip window. kopia spells these as two distinct flags, not a negation of
+    // one — passing the wrong one silently leaves the bit where it was.
+    client.repository_set_client_read_only(false).await.unwrap();
+    client.repository_set_client_read_only(true).await.unwrap();
+
+    let lines: Vec<String> = std::fs::read_to_string(&out)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    // `--no-auto-maintenance` is the unconditional common arg every invocation
+    // carries; asserting the whole argv keeps it honest rather than substring-matching.
+    assert_eq!(
+        lines,
+        vec![
+            "repository set-client --read-write --no-auto-maintenance",
+            "repository set-client --read-only --no-auto-maintenance",
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn server_start_args_password_mode() {
     let spec = ServerStartSpec {

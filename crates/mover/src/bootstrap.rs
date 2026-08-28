@@ -1019,6 +1019,7 @@ mod tests {
             migrate: None,
             allow_empty_source: false,
             resume,
+            replica_throttle: Default::default(),
         }
     }
 

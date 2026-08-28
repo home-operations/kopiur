@@ -231,6 +231,95 @@ Both modes preserve each snapshot's `username@hostname:path` identity and its
 times, so seeded history stays restorable by `Restore.source.identity` and by
 `fromPolicy`.
 
+### Throttling a seed
+
+A seed is the single heaviest transfer Kopiur ever performs — a whole repository,
+pulled across a link that other people are also using, usually on the worst day
+you have had all year. Both modes can be capped, but they take different knobs
+because they are different kopia operations.
+
+**Blob mode** copies at the storage layer, so it uses `sync-to`'s own speed
+flags: `seed.sync.maxDownloadSpeedBytesPerSecond` and
+`maxUploadSpeedBytesPerSecond`.
+
+**Migrate mode** has no speed flags at all — `kopia snapshot migrate` offers
+none. The only lever is `kopia repository throttle set` on each *connection*, so
+the cap is expressed **per side**, because a migrate seed is two repositories:
+
+```yaml
+seed:
+    from:
+        repository: { kind: ClusterRepository, name: offsite }
+    migrate:
+        throttle:
+            source: # reading OUT of the replica (the off-site link)
+                downloadBytesPerSecond: 10485760 # 10 MiB/s
+                readOpsPerSecond: 100
+            destination: # writing INTO this repository (on-LAN, be generous)
+                uploadBytesPerSecond: 209715200 # 200 MiB/s
+```
+
+Each side takes the same four knobs as a repository's
+[`moverDefaults.throttle`](reference/crds/shared-types.md#moverdefaults):
+`uploadBytesPerSecond`, `downloadBytesPerSecond`, `readOpsPerSecond`,
+`writeOpsPerSecond`. Every knob you set must be at least `1` (a `0` is rejected at
+admission — kopia's "no limit" is the *absent* knob, not a zero).
+
+**Two layers, merged field by field.** Each repository can already declare
+`moverDefaults.throttle`, which every mover that touches it honors.
+`seed.migrate.throttle` sits on top of that, per side:
+
+- `throttle.source` overrides the **replica's** defaults — the repository named by
+  `seed.from.repository`, not this one;
+- `throttle.destination` overrides **this** repository's defaults;
+- the merge is per knob: a knob you set here wins, a knob you leave unset keeps
+  the repository's value. Pinning one knob never drops the repository's others;
+- omit `migrate.throttle` entirely and each side simply uses its own repository's
+  defaults.
+
+The two sides never mix — kopia's limits are **per connection**, and a migrate
+seed opens both repositories under two separate kopia configurations. The
+override applies only while the seed is **armed**: every later connect to the
+now-initialized repository is capped by `moverDefaults.throttle` alone, so a
+number chosen for a one-time copy does not go on constraining routine work.
+
+If any of the applications fails, the bootstrap **fails** rather than proceeding
+uncapped: saturating exactly the link you asked to protect is worse than not
+running. The mover logs `applied repository throttle` once per capped connection
+— three times for a healthy first migrate seed (the replica, this repository's
+seed-local connect, and the post-seed reconnect), and four when it is *resuming*
+an interrupted attempt, whose opening probe connect finds the repository already
+there and so gets capped too:
+
+```console
+$ kubectl -n billing logs job/rebuilt-nas-bootstrap | grep 'applied repository throttle'
+```
+
+/// warning | A byte cap bites much harder than its number suggests
+
+Byte-rate caps apply to **cold** backend traffic only — content already in the
+mover's kopia cache is served without touching the limiter, so a warm re-run can
+look entirely unthrottled. And on small-object workloads the effective throughput
+lands far below the nominal number: a measured 2 MB/s cap took ~14 s to move a
+28 KiB cold repository, while caps of 10 MB/s and above often did not bind at all
+at that size. Set these as a **ceiling for large transfers**, generously, and
+measure against your own data. A seed already runs against a 24 h deadline; a cap
+picked to "feel safe" is a good way to make that deadline the thing that fails.
+
+///
+
+/// warning | New CRD fields need `kubectl apply`, not just `helm upgrade`
+
+`seed.migrate.throttle` is a new CRD field. Helm's `crds/` directory is
+**install-only** — a `helm upgrade` never updates CRD schemas — so on a helm-CLI
+upgrade an apiserver running the old schema **silently prunes** the field from
+your manifest: the object admits cleanly, `kubectl get -o yaml` shows no
+`throttle`, and the seed runs uncapped with nothing to see. Apply the CRDs first
+(`kubectl apply --server-side -f deploy/crds/`), or use a GitOps flow with a
+`CreateReplace` CRD policy. See [CRD lifecycle](install.md#crd-lifecycle).
+
+///
+
 ### `create` and `seed` together
 
 | You set | What happens |
@@ -252,6 +341,7 @@ times, so seeded history stays restorable by `Restore.source.identity` and by
 | `seed.migrate.parallel` | kopia's `1` | Migrate mode only: snapshots migrated concurrently. |
 | `seed.migrate.latestOnly` | `false` | Copy only each identity's newest snapshot instead of its full history. |
 | `seed.migrate.policies` | `none` | Whether the source's **kopia-side** policies come along. Default is an explicit `--no-policies`, unlike kopia's own copy-by-default: retention here is driven by `Snapshot` CRs, and imported kopia policies could delete manifests behind the operator's back. |
+| `seed.migrate.throttle.source` / `.destination` | each repository's `moverDefaults.throttle` | Migrate mode only: bandwidth/ops caps for the seed run, **per side** — `source` for the replica, `destination` for this repository. Each overrides that side's repository's defaults field by field; every set knob must be `>= 1`. Armed seeds only. See [Throttling a seed](#throttling-a-seed). |
 | `seed.allowEmptySource` | `false` | Accept a source holding zero snapshots. Left at `false`, an empty source **fails the bootstrap** and retries. |
 | `seed.failurePolicy.activeDeadlineSeconds` | `86400` (24 h) | Wall-clock cap for the seeding Job. |
 | `seed.failurePolicy.backoffLimit` | as `bootstrap` | Pod retries within one seeding Job. |
