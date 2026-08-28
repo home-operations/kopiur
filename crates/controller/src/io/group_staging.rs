@@ -255,6 +255,72 @@ pub fn vgs_wait_outcome(
     }
 }
 
+/// Decide the outcome when the group IS `readyToUse` but THIS PVC's member
+/// snapshot did not resolve.
+///
+/// Sibling rule to [`vgs_wait_outcome`]'s "an error is never fatal on sight"
+/// (#198): a missing member is never fatal on sight either. The
+/// snapshot-controller publishes the per-PVC member `VolumeSnapshot`s — and the
+/// `status.volumeGroupSnapshotName` / `boundVolumeSnapshotContentName` bindings
+/// [`resolve_group_members`] maps through — ASYNCHRONOUSLY relative to the
+/// group's `readyToUse` flip, so the first reconcile after readiness can
+/// observe a ready group with a partial (even empty) member map. Going terminal
+/// on that sight spuriously fails the member's backup until the next scheduled
+/// run (observed live twice on 2026-08-28: the multi-pvc e2e shard lost this
+/// race in CI and on a fresh local cluster the same day).
+///
+/// The miss therefore waits on the SAME deadline the readiness wait ran on —
+/// `created_at + timeout`, anchored on the group's own `creationTimestamp`, so
+/// all N members stay coordination-free with byte-identical messages — and only
+/// its expiry makes the miss terminal. A genuinely excluded PVC (its labels
+/// stopped matching before capture, or the driver dropped it) still fails, with
+/// the full story, once the deadline passes.
+pub fn member_wait_outcome(
+    obs: &VgsObservation,
+    ns: &str,
+    name: &str,
+    pvc_namespace: &str,
+    pvc_name: &str,
+    timeout: Option<std::time::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> GroupStage {
+    let deadline = match (timeout, obs.created_at) {
+        (Some(t), Some(created)) => chrono::Duration::from_std(t).ok().map(|d| created + d),
+        _ => None,
+    };
+    if !deadline.is_some_and(|d| now >= d) {
+        let mut msg = format!(
+            "VolumeGroupSnapshot `{ns}/{name}` is readyToUse, but the member snapshot for \
+             PersistentVolumeClaim `{pvc_namespace}/{pvc_name}` is not visible yet — the \
+             snapshot-controller publishes member VolumeSnapshots and their content bindings \
+             asynchronously, so they can lag the group's readiness; waiting for it"
+        );
+        match deadline {
+            Some(d) => msg.push_str(&format!(
+                "; staging fails at {} if it never appears",
+                d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            )),
+            None => msg.push_str("; waiting indefinitely (spec.staging.timeout: 0)"),
+        }
+        return GroupStage::Waiting {
+            reason: crate::consts::GROUP_STAGING_WAITING_REASON,
+            message: msg,
+        };
+    }
+    GroupStage::Failed {
+        reason: crate::consts::REASON_GROUP_MEMBER_MISSING,
+        message: format!(
+            "VolumeGroupSnapshot `{ns}/{name}` became readyToUse but captured no member for \
+             PersistentVolumeClaim `{pvc_namespace}/{pvc_name}` within the staging deadline. Its \
+             labels most likely stopped matching the pvcSelector between expansion and capture \
+             (the snapshot-controller re-evaluates the selector when it creates the group), or \
+             the CSI driver excluded it. Check `kubectl -n {ns} get volumegroupsnapshot {name} -o \
+             yaml`, or set `groupBy: None`. This Snapshot is terminal — the next scheduled run \
+             retries."
+        ),
+    }
+}
+
 /// Read the group's observable state. `None` when the object is not there yet
 /// (an SSA still propagating), which the caller treats as "keep waiting".
 pub async fn read_group(
@@ -803,15 +869,21 @@ pub async fn resolve_group_stage(
                     Some(member) => Ok(GroupStage::Ready {
                         member: member.clone(),
                     }),
-                    // The group re-evaluates its selector at CREATE time, so the
-                    // captured set can differ from what the expander matched.
-                    // Name that rather than staging from a neighbour's snapshot.
-                    None => Ok(GroupStage::Failed {
-                        reason: crate::consts::REASON_GROUP_MEMBER_MISSING,
-                        message: format!(
-                            "VolumeGroupSnapshot `{ns}/{name}` became readyToUse but captured no                              member for PersistentVolumeClaim `{pvc_namespace}/{pvc_name}`. Its                              labels most likely stopped matching the pvcSelector between                              expansion and capture (the snapshot-controller re-evaluates the                              selector when it creates the group), or the CSI driver excluded it.                              Check `kubectl -n {ns} get volumegroupsnapshot {name} -o yaml`, or                              set `groupBy: None`. This Snapshot is terminal — the next scheduled                              run retries."
-                        ),
-                    }),
+                    // Not terminal on sight: the member snapshots lag the
+                    // group's readiness, and a genuinely excluded PVC (the
+                    // selector re-evaluates at CREATE time, so the captured set
+                    // can differ from what the expander matched) is named only
+                    // once the staging deadline passes — never staged from a
+                    // neighbour's snapshot. See [`member_wait_outcome`].
+                    None => Ok(member_wait_outcome(
+                        &obs,
+                        ns,
+                        name,
+                        pvc_namespace,
+                        pvc_name,
+                        timeout,
+                        chrono::Utc::now(),
+                    )),
                 }
             }
         },

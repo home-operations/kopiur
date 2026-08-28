@@ -117,6 +117,87 @@ fn the_waiting_message_is_deterministic_so_status_does_not_churn() {
     assert_eq!(a, vgs_wait_outcome(&o, "ns", "g", "c", Some(TEN_MIN), t(1)));
 }
 
+// --- a member missing from a READY group ------------------------------------
+
+#[test]
+fn a_missing_member_is_never_fatal_on_sight() {
+    // The multi-pvc e2e shard lost this race twice on 2026-08-28 (CI merge
+    // queue + a fresh local cluster): the group flipped readyToUse before the
+    // snapshot-controller published one member VolumeSnapshot's status
+    // bindings, and the instant-terminal verdict spuriously failed that PVC's
+    // backup until the next scheduled run. Inside the deadline the miss WAITS,
+    // exactly like a transient `status.error` does (#198).
+    let o = obs(true, None, Some(1));
+    match member_wait_outcome(&o, "ns", "g", "pns", "pvc", Some(TEN_MIN), t(1)) {
+        GroupStage::Waiting { reason, message } => {
+            assert_eq!(reason, crate::consts::GROUP_STAGING_WAITING_REASON);
+            assert!(message.contains("not visible yet"), "{message}");
+            assert!(
+                message.contains("asynchronously"),
+                "the WHY — member publication lags readiness: {message}"
+            );
+            assert!(
+                message.contains("staging fails at"),
+                "the wait must name its bound: {message}"
+            );
+        }
+        other => panic!("a member miss inside the deadline must WAIT, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_missing_member_goes_terminal_only_past_the_shared_deadline() {
+    // Same anchor as the readiness wait: the GROUP's creationTimestamp plus
+    // spec.staging.timeout. Past it, a still-absent member is a real exclusion
+    // and the message carries the full story and the escape hatch.
+    let o = obs(true, None, Some(1));
+    match member_wait_outcome(&o, "ns", "g", "pns", "pvc", Some(TEN_MIN), t(3)) {
+        GroupStage::Failed { reason, message } => {
+            assert_eq!(reason, crate::consts::REASON_GROUP_MEMBER_MISSING);
+            assert!(message.contains("captured no member"), "{message}");
+            assert!(
+                message.contains("groupBy: None"),
+                "must name the way out: {message}"
+            );
+            assert!(
+                message.contains("next scheduled run retries"),
+                "terminal semantics stay explicit: {message}"
+            );
+        }
+        other => panic!("past the deadline the miss must be terminal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_missing_member_with_no_deadline_waits_forever_and_does_not_churn() {
+    // `spec.staging.timeout: 0` and a not-yet-landed creationTimestamp both
+    // mean "no deadline", mirroring `vgs_wait_outcome`; and the message embeds
+    // no `now()`, so repeated reconciles inside the window are byte-identical
+    // (`patch_status_if_changed` stays a no-op).
+    let o = obs(true, None, Some(1));
+    match member_wait_outcome(&o, "ns", "g", "pns", "pvc", None, t(23)) {
+        GroupStage::Waiting { message, .. } => {
+            assert!(message.contains("indefinitely"), "{message}");
+        }
+        other => panic!("expected Waiting, got {other:?}"),
+    }
+    assert!(matches!(
+        member_wait_outcome(
+            &obs(true, None, None),
+            "ns",
+            "g",
+            "pns",
+            "pvc",
+            Some(TEN_MIN),
+            t(23)
+        ),
+        GroupStage::Waiting { .. }
+    ));
+    let a = member_wait_outcome(&o, "ns", "g", "pns", "pvc", Some(TEN_MIN), t(1));
+    let b = member_wait_outcome(&o, "ns", "g", "pns", "pvc", Some(TEN_MIN), t(1));
+    assert_eq!(a, b);
+}
+
 // --- member mapping ---------------------------------------------------------
 
 fn member(name: &str, group: &str, content: &str) -> MemberVs {
