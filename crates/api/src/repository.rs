@@ -132,7 +132,12 @@ pub struct BootstrapSpec {
     /// Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long
     /// a connect may run before the Job is marked failed (default 120s); raise it
     /// for a slow backend — e.g. an rclone remote whose repository metadata and
-    /// indexes load through kopia's embedded `rclone serve`/WebDAV bridge.
+    /// indexes load through kopia's embedded `rclone serve`/WebDAV bridge, or a
+    /// large repository whose cold-cache connect outgrows the default. The value
+    /// is a BASE, not a ceiling: after consecutive deadline-killed attempts the
+    /// operator escalates the effective deadline itself (doubling per attempt, up
+    /// to 30 minutes or the configured value, whichever is larger — never below
+    /// it), so a slow-but-alive backend self-heals without a spec edit.
     /// `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for
     /// shape parity but is not honored by the bootstrap Job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,8 +455,11 @@ pub struct RepositoryHealthProbeSpec {
     pub failure_threshold: Option<i64>,
     /// What sustained probe failure (past `failureThreshold`) does to the
     /// repository (default `Degrade`). `Degrade` moves it to `Degraded`,
-    /// pausing backups, maintenance, and replication until a re-connect
-    /// succeeds — recovery is automatic. `Alert` keeps the repository `Ready`
+    /// pausing backups and replication until a re-connect succeeds — recovery
+    /// is automatic. Maintenance also pauses when the backend is confirmed
+    /// unreachable or the repository vanished, but keeps running when the
+    /// degradation is a probe deadline kill (`ProbeDeadlineExceeded` — index
+    /// compaction is often the cure). `Alert` keeps the repository `Ready`
     /// and only raises the condition + Warning event + metric (the pre-breaker
     /// behavior); backups keep running against the failing backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -461,16 +469,20 @@ pub struct RepositoryHealthProbeSpec {
 
 /// What sustained backend-probe failure (past `failureThreshold`) does to the
 /// repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing
-/// backups, maintenance, and replication until a re-connect succeeds —
-/// recovery is automatic. `Alert` keeps the repository `Ready` and only raises
-/// the `BackendReachable` condition + Warning event + metric; backups keep
-/// running against the failing backend. Neither ever auto-recreates.
+/// backups and replication until a re-connect succeeds — recovery is
+/// automatic (maintenance also pauses for a confirmed-unreachable/vanished
+/// backend, but keeps running for a probe deadline kill, where index
+/// compaction is often the cure). `Alert` keeps the repository `Ready` and
+/// only raises the `BackendReachable` condition + Warning event + metric;
+/// backups keep running against the failing backend. Neither ever
+/// auto-recreates.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum ProbeOnFailure {
     /// Past `failureThreshold` consecutive failing probes, move the repository
-    /// to `Degraded` and pause backups, maintenance, and replication until a
-    /// re-connect succeeds (the repository circuit breaker). Recovery is
-    /// automatic — any successful connect returns the repository to `Ready`.
+    /// to `Degraded` and pause backups and replication until a re-connect
+    /// succeeds (the repository circuit breaker; maintenance pauses only for a
+    /// confirmed-unreachable/vanished backend, not a deadline kill). Recovery
+    /// is automatic — any successful connect returns the repository to `Ready`.
     #[default]
     Degrade,
     /// Alert-only: the repository stays `Ready` and only the `BackendReachable`
@@ -618,9 +630,12 @@ pub enum RepositoryPhase {
     Ready,
     /// Temporarily not fully operational, and self-healing: a retryable
     /// bootstrap/connect failure is being retried, or the backend health probe
-    /// exceeded its `failureThreshold` (the circuit breaker is open — backups,
-    /// maintenance, and replication are paused until a re-connect succeeds).
-    /// See the `BackendReachable` and `Ready` conditions for the cause.
+    /// exceeded its `failureThreshold` (the circuit breaker is open — backups
+    /// and replication are paused until a re-connect succeeds; maintenance
+    /// still runs for an already-bootstrapped repository unless the backend is
+    /// confirmed unreachable or the repository vanished, because index
+    /// compaction is often the cure). See the `BackendReachable` and `Ready`
+    /// conditions for the cause.
     Degraded,
     /// Connect/create failed; see conditions for the actionable reason.
     Failed,

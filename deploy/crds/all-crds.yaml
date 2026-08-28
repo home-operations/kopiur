@@ -520,7 +520,12 @@ spec:
                       Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long
                       a connect may run before the Job is marked failed (default 120s); raise it
                       for a slow backend — e.g. an rclone remote whose repository metadata and
-                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge.
+                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge, or a
+                      large repository whose cold-cache connect outgrows the default. The value
+                      is a BASE, not a ceiling: after consecutive deadline-killed attempts the
+                      operator escalates the effective deadline itself (doubling per attempt, up
+                      to 30 minutes or the configured value, whichever is larger — never below
+                      it), so a slow-but-alive backend self-heals without a spec edit.
                       `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for
                       shape parity but is not honored by the bootstrap Job.
                     nullable: true
@@ -753,10 +758,13 @@ spec:
                         description: |-
                           What sustained backend-probe failure (past `failureThreshold`) does to the
                           repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing
-                          backups, maintenance, and replication until a re-connect succeeds —
-                          recovery is automatic. `Alert` keeps the repository `Ready` and only raises
-                          the `BackendReachable` condition + Warning event + metric; backups keep
-                          running against the failing backend. Neither ever auto-recreates.
+                          backups and replication until a re-connect succeeds — recovery is
+                          automatic (maintenance also pauses for a confirmed-unreachable/vanished
+                          backend, but keeps running for a probe deadline kill, where index
+                          compaction is often the cure). `Alert` keeps the repository `Ready` and
+                          only raises the `BackendReachable` condition + Warning event + metric;
+                          backups keep running against the failing backend. Neither ever
+                          auto-recreates.
                         enum:
                         - Degrade
                         - Alert
@@ -4375,7 +4383,12 @@ spec:
                       Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long
                       a connect may run before the Job is marked failed (default 120s); raise it
                       for a slow backend — e.g. an rclone remote whose repository metadata and
-                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge.
+                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge, or a
+                      large repository whose cold-cache connect outgrows the default. The value
+                      is a BASE, not a ceiling: after consecutive deadline-killed attempts the
+                      operator escalates the effective deadline itself (doubling per attempt, up
+                      to 30 minutes or the configured value, whichever is larger — never below
+                      it), so a slow-but-alive backend self-heals without a spec edit.
                       `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for
                       shape parity but is not honored by the bootstrap Job.
                     nullable: true
@@ -4617,10 +4630,13 @@ spec:
                         description: |-
                           What sustained backend-probe failure (past `failureThreshold`) does to the
                           repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing
-                          backups, maintenance, and replication until a re-connect succeeds —
-                          recovery is automatic. `Alert` keeps the repository `Ready` and only raises
-                          the `BackendReachable` condition + Warning event + metric; backups keep
-                          running against the failing backend. Neither ever auto-recreates.
+                          backups and replication until a re-connect succeeds — recovery is
+                          automatic (maintenance also pauses for a confirmed-unreachable/vanished
+                          backend, but keeps running for a probe deadline kill, where index
+                          compaction is often the cure). `Alert` keeps the repository `Ready` and
+                          only raises the `BackendReachable` condition + Warning event + metric;
+                          backups keep running against the failing backend. Neither ever
+                          auto-recreates.
                         enum:
                         - Degrade
                         - Alert

@@ -68,11 +68,16 @@ const OPEN_HOLD: Duration = Duration::from_secs(150);
 /// Budget for the repository healing back to `Ready` after the selector is
 /// restored. Deliberately LONGER than `default_timeout()`: recovery rides the
 /// strict retry loop, whose launch-side holdoff backs off exponentially from
-/// 120s to a 600s cap per consecutive failure (`health::strict_retry_backoff`),
-/// so a heal landing just after a failed retry can legitimately wait the full
-/// 600s before the next (successful) connect even launches — plus Job
-/// schedule/run time and a watch-reconnect margin.
-const RECOVERY_TIMEOUT: Duration = Duration::from_secs(900);
+/// 120s toward the 1800s cap per consecutive failure
+/// (`health::strict_retry_backoff`, curve 120→240→480→960→1800 since #415).
+/// This scenario's outage window (trip at `failureThreshold: 2`, then
+/// `OPEN_HOLD` ≈ 150s of observation) lets the streak reach at most ~4 before
+/// the heal, so a heal landing just after a failed retry can legitimately wait
+/// up to backoff(3) = 960s before the next (successful) connect even launches
+/// — plus Job schedule/run time and a watch-reconnect margin. Reaching the
+/// 1800s rung would need ≥ 840s of post-open outage, which this scenario
+/// cannot produce.
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(1500);
 
 /// An S3 `Repository` on `bucket` with a fast probe cadence (`interval: 30s`,
 /// `failureThreshold: 2`) so the breaker trips within the e2e budget. The

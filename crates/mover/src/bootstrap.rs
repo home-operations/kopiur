@@ -624,10 +624,11 @@ pub fn already_initialized_outcome(
 /// ```
 /// use kopiur_mover::bootstrap::BootstrapResult;
 ///
-/// let r = BootstrapResult::ready(true, Some("deadbeef".into()), 3, vec![], false, 0, Some(7));
+/// let r =
+///     BootstrapResult::ready(true, Some("deadbeef".into()), Some(3), vec![], false, 0, Some(7));
 /// assert!(r.success && r.created);
 /// assert_eq!(r.unique_id.as_deref(), Some("deadbeef"));
-/// assert_eq!(r.snapshot_count, 3);
+/// assert_eq!(r.snapshot_count, Some(3));
 /// assert_eq!(r.index_blob_count, Some(7));
 ///
 /// let json = serde_json::to_string(&r).unwrap();
@@ -647,9 +648,16 @@ pub struct BootstrapResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_id: Option<String>,
     /// Total snapshots in the repository (authoritative; not affected by the
-    /// returned-entries cap OR the foreign-suffix prefilter).
-    #[serde(default)]
-    pub snapshot_count: i64,
+    /// returned-entries cap OR the foreign-suffix prefilter). `None` means the
+    /// listing DID NOT RUN this run (a `probe_only` bootstrap, #414 — the
+    /// listing is the O(snapshots) step a health probe doesn't need): the
+    /// controller must then leave `storageStats.snapshotCount` and the
+    /// discovered-Snapshot catalog untouched. Never `None` on a run that
+    /// listed — old movers always wrote the field, and only a new controller
+    /// ever arms `probe_only`, so version skew cannot produce a false `None`
+    /// on a listing run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_count: Option<i64>,
     /// Snapshot entries for the controller to materialize as discovered Snapshots.
     /// Empty when `scanCatalog` was off, or capped to [`MAX_RETURNED_SNAPSHOTS`]
     /// (after [`apply_foreign_prefilter`] ran, when armed).
@@ -715,11 +723,12 @@ pub struct BootstrapResult {
 }
 
 impl BootstrapResult {
-    /// A successful bootstrap outcome.
+    /// A successful bootstrap outcome. `snapshot_count: None` = the catalog
+    /// listing did not run (a `probe_only` bootstrap).
     pub fn ready(
         created: bool,
         unique_id: Option<String>,
-        snapshot_count: i64,
+        snapshot_count: Option<i64>,
         snapshots: Vec<SnapshotListEntry>,
         snapshots_truncated: bool,
         foreign_suffix_dropped: i64,
@@ -791,7 +800,7 @@ impl BootstrapResult {
             success: false,
             created: false,
             unique_id: None,
-            snapshot_count: 0,
+            snapshot_count: None,
             snapshots: Vec::new(),
             snapshots_truncated: false,
             foreign_suffix_dropped: 0,
@@ -1242,7 +1251,7 @@ mod tests {
 
     #[test]
     fn a_bootstrap_result_carries_its_seed_outcome_and_still_decodes_old_wire() {
-        let r = BootstrapResult::ready(false, Some("abc".into()), 3, vec![], false, 0, None)
+        let r = BootstrapResult::ready(false, Some("abc".into()), Some(3), vec![], false, 0, None)
             .with_seed(Some(SeedOutcome::performed(
                 crate::workspec::SeedModeSpec::Blob,
                 "S3".into(),
@@ -1464,13 +1473,21 @@ mod tests {
 
     #[test]
     fn ready_result_roundtrips_via_serde() {
-        let r = BootstrapResult::ready(true, Some("abc".into()), 3, vec![], false, 0, Some(42));
+        let r = BootstrapResult::ready(
+            true,
+            Some("abc".into()),
+            Some(3),
+            vec![],
+            false,
+            0,
+            Some(42),
+        );
         let back: BootstrapResult =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(back, r);
         assert!(back.success && back.created);
         assert_eq!(back.unique_id.as_deref(), Some("abc"));
-        assert_eq!(back.snapshot_count, 3);
+        assert_eq!(back.snapshot_count, Some(3));
         assert_eq!(back.foreign_suffix_dropped, 0);
         assert_eq!(back.index_blob_count, Some(42));
     }
@@ -1769,7 +1786,7 @@ mod tests {
         let unslimmed = BootstrapResult::ready(
             false,
             Some("u".into()),
-            raw.len() as i64,
+            Some(raw.len() as i64),
             raw.clone(),
             false,
             0,
@@ -1785,7 +1802,7 @@ mod tests {
         let result = BootstrapResult::ready(
             false,
             Some("u".into()),
-            slim.len() as i64,
+            Some(slim.len() as i64),
             slim,
             false,
             0,
@@ -1803,13 +1820,14 @@ mod tests {
         let slim: Vec<SnapshotListEntry> = (0..200)
             .map(|i| slim_catalog_entry(fat_entry(&format!("k{i}"))))
             .collect();
-        let result = BootstrapResult::ready(false, Some("u".into()), 200, slim, false, 0, Some(1));
+        let result =
+            BootstrapResult::ready(false, Some("u".into()), Some(200), slim, false, 0, Some(1));
         // A deliberately tiny budget forces trimming.
         let guarded = enforce_result_size_budget(result, 4_096);
         assert!(guarded.snapshots.len() < 200, "must have dropped entries");
         assert!(guarded.snapshots_truncated, "must flag the truncation");
         // The authoritative count is never rewritten by the size guard.
-        assert_eq!(guarded.snapshot_count, 200);
+        assert_eq!(guarded.snapshot_count, Some(200));
         assert!(
             serde_json::to_string(&guarded).unwrap().len() <= 4_096 || guarded.snapshots.is_empty(),
             "trims until it fits (or nothing is left to drop)"
@@ -1819,7 +1837,8 @@ mod tests {
     #[test]
     fn enforce_result_size_budget_is_a_noop_under_budget() {
         let slim = vec![slim_catalog_entry(fat_entry("k1"))];
-        let result = BootstrapResult::ready(false, Some("u".into()), 1, slim, false, 0, Some(1));
+        let result =
+            BootstrapResult::ready(false, Some("u".into()), Some(1), slim, false, 0, Some(1));
         let before = result.clone();
         let guarded = enforce_result_size_budget(result, RESULT_SIZE_BUDGET_BYTES);
         assert_eq!(

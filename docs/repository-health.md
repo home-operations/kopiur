@@ -17,10 +17,11 @@ re-testing the backend itself.
 | Check | Where it runs | Surfaced as | Gates |
 |---|---|---|---|
 | **Connectivity probe** (`kopia repository connect`) | Repository reconcile | `status.phase` (`Pending`→`Initializing`→`Ready`/`Degraded`/`Failed`) + `Ready`/`Stalled` conditions | Everything downstream keys off `phase == Ready` |
-| **Readiness gate** (`repository_ready`) | `Snapshot`, `Maintenance`, `SnapshotPolicy`, `RepositoryReplication`, `Restore` reconcilers | `RepositoryNotReady` / `WaitingForRepository` reason, held in `Pending`/`Reconciling` | Building & launching the mover Job |
+| **Readiness gate** (`repository_ready`) | `Snapshot`, `SnapshotPolicy`, `RepositoryReplication`, `Restore` reconcilers | `RepositoryNotReady` / `WaitingForRepository` reason, held in `Pending`/`Reconciling` | Building & launching the mover Job |
+| **Maintenance gate** (`maintenance_may_proceed`) | `Maintenance` reconciler | `WaitingForRepository` reason on `LeaseOwned` | Deliberately WIDER than the readiness gate ([#413](https://github.com/home-operations/kopiur/issues/413)): maintenance runs for any once-bootstrapped repository — `Degraded` included — unless the backend is confirmed unreachable/vanished or the phase is terminal, because index compaction is often the cure for a `Degraded`-because-slow repository |
 | **Backup preflight** (opt-in, `spec.preflight`) | `Snapshot` reconcile (before launch) | `PreflightFailed` reason, held in `Pending` then `Failed` after `timeout` | User-declared CEL preconditions (e.g. maintenance freshness) before the backup Job runs |
 | **Reactive re-probe on failure** | `Snapshot` reconciler → repository | `reverify-requested-at` annotation → `status.lastReverifyAt` | Forces a fresh connectivity probe within ~60s of a failed backup |
-| **Backend health probe** (default-ON, `spec.health.probe`) | Repository reconcile (post-`Ready`) | `BackendReachable` condition (`RepositoryVanished` / `BackendUnreachable`) + Warning Event + `kopiur_repository_health_probe_failures` | **The circuit breaker's sensor**: past `failureThreshold`, `onFailure: Degrade` (default) moves the repo to `Degraded` and pauses all consumers until a re-connect succeeds; `onFailure: Alert` keeps it advisory (repo stays `Ready`) |
+| **Backend health probe** (default-ON, `spec.health.probe`) | Repository reconcile (post-`Ready`) | `BackendReachable` condition (`RepositoryVanished` / `BackendUnreachable` / `ProbeDeadlineExceeded`) + Warning Event + `kopiur_repository_health_probe_failures` | **The circuit breaker's sensor**: past `failureThreshold`, `onFailure: Degrade` (default) moves the repo to `Degraded` and pauses backups/replication until a re-connect succeeds (maintenance also pauses for unreachable/vanished, but keeps running for a deadline kill); `onFailure: Alert` keeps it advisory (repo stays `Ready`) |
 | **Credentials available** | Mover preflight | `CredentialsAvailable=False` + Warning Event | The mover starting (the credential Secret must exist in the workload namespace) |
 | **Mover permitted** | Admission / reconcile | `MoverPermitted=False` | A privileged mover that wasn't opted in |
 | **Security-context compatibility** | Admission (advisory) + post-run | admission Warning + `SecurityContextCompatible=False` | Advisory — warns the mover UID likely can't read the source |
@@ -59,11 +60,16 @@ both are gated now.
   `catalog.periodicRefresh: true` additionally recycles the bootstrap Job every
   `catalog.refreshInterval` (default `1h`) for catalog freshness.
 - **While the circuit breaker is open** (phase `Degraded`), the repository retries the
-  connect itself on an exponential backoff — 120s doubling to a 600s cap per
-  consecutive failure — and **any** successful connect (probe or retry) heals it back
-  to `Ready` automatically. The phase holds `Degraded` **stably** between retries (no
-  `Initializing` flapping), so alerts with a `for:` clause and the consumer gates see
-  one coherent open state.
+  connect itself on an exponential backoff — 120s doubling to a 1800s cap per
+  consecutive failure (120→240→480→960→1800; every failed attempt re-arms the
+  hold-off, including a result-less Job kill, so a doomed loop decays to ~2
+  billed attempts/hour against a paid object store) — and **any** successful
+  connect (probe or retry) heals it back to `Ready` automatically. When the
+  failures are DEADLINE kills, the retry also escalates the bootstrap
+  deadline itself (doubling from the spec base up to 30m), so a
+  slow-but-alive backend self-heals without a spec edit. The phase holds
+  `Degraded` **stably** between retries (no `Initializing` flapping), so alerts
+  with a `for:` clause and the consumer gates see one coherent open state.
 
 ### Reactive re-probe (closing most of the latency window)
 
@@ -112,11 +118,17 @@ The full apply-ready example (Secret + Repository):
 
 - **`Degrade` (default) — the circuit breaker.** Past `failureThreshold`
   consecutive failed connects the repository moves to phase **`Degraded`**
-  (`BackendReachable=False`, `Ready=False`) and every consumer gate closes:
-  backups, maintenance, replication, and restores **pause** instead of burning
-  mover Jobs against a dead backend. Recovery is automatic — the repository
-  keeps re-connecting on a 120s→600s backoff, and any success heals it to
-  `Ready`, cleared streak and all. Nothing needs restarting or acknowledging.
+  (`BackendReachable=False`, `Ready=False`) and the consumer gates close:
+  backups, replication, and restores **pause** instead of burning mover Jobs
+  against a dead backend. Maintenance pauses only for a confirmed
+  unreachable/vanished backend — a repository that is `Degraded` because its
+  connects keep exceeding the bootstrap deadline (`ProbeDeadlineExceeded`)
+  **still gets maintenance**, because index compaction is usually the cure
+  for a slow connect ([#413](https://github.com/home-operations/kopiur/issues/413)).
+  Recovery is automatic — the repository keeps re-connecting on a 120s→1800s
+  backoff (with deadline escalation for timeout kills), and any success heals
+  it to `Ready`, cleared streak and all. Nothing needs restarting or
+  acknowledging.
 - **`Alert` — the opt-out.** The repository **stays `Ready`** even when the
   probe raises an alert, so backups keep running (and failing) against the
   unhealthy backend. This is the pre-breaker behavior for users who prefer
@@ -125,7 +137,7 @@ The full apply-ready example (Secret + Repository):
 Under either mode a failure surfaces as:
 
 - a `BackendReachable` **condition** (`True` healthy; `False` with reason
-  `RepositoryVanished` or `BackendUnreachable`),
+  `RepositoryVanished`, `BackendUnreachable`, or `ProbeDeadlineExceeded`),
 - a **Warning Event** (`kubectl describe`), fired once per episode (after the
   debounce, and again if the failure *reason* escalates),
 - the `kopiur_repository_health_probe_failures{kind,namespace,name,outcome}` metric.
@@ -148,18 +160,23 @@ On the wire this is visible as:
   live failure streak (a `0` after recovery means "healed"),
 - `kopiur_repository_breaker_open_since_timestamp_seconds{kind,namespace,name}` —
   exists **only while open**; `time() - metric` is the open duration,
+- `kopiur_repository_breaker_open{kind,namespace,name,reason}` — 1 for the same
+  open window, with the **cause** (`unreachable`/`vanished`/`timed_out`) so
+  alerting can split a hard outage from the self-healing slow-connect spiral,
 - `kopiur_snapshot_gated{namespace,policy}` — the parked-`Pending` population,
   draining to absence on recovery,
-- Helm alert rules `KopiurRepositoryBreakerOpen` (warning, 15m) and
+- Helm alert rules `KopiurRepositoryBreakerOpen` (warning, 15m — hard causes),
+  `KopiurRepositoryConnectSlow` (info, 30m — the `timed_out` cause), and
   `KopiurSnapshotsGated` (info, 30m) — see
   [observability](dev/observability.md).
 
-Two failures are reported distinctly, because they demand different responses:
+Three failures are reported distinctly, because they demand different responses:
 
 | Alert | Means | What to do |
 |---|---|---|
 | `RepositoryVanished` | backend **reachable**, kopia repository **absent** (format blob gone) | Verify the backend is *truly* empty before any re-create (see warning below) |
 | `BackendUnreachable` | backend unreachable, mount/path missing, or auth/lock failed | Fix the backend / credentials / volume; **not** a wipe |
+| `ProbeDeadlineExceeded` | the connect was **killed by the bootstrap Job deadline** — the backend may be reachable but slow (a cold cache over many index blobs) | Usually nothing: maintenance keeps running and kopiur escalates the deadline itself. To accelerate, raise `spec.bootstrap.failurePolicy.activeDeadlineSeconds` |
 
 /// warning | kopiur never auto-recreates a repository it once trusted
 
@@ -216,9 +233,20 @@ A probe also stands aside while a real (re-)bootstrap is in flight: a repository
 that is not `Ready` (a spec change is being applied, the bootstrap has failed,
 or the breaker is open) does not run the interval probe. While `Degraded` the
 **strict retry loop** is the sensor instead — same connect, same
-`consecutiveProbeFailures` streak, on the 120s→600s backoff — so the streak keeps
-counting across the whole outage and any success heals. `phase: Failed` /
+`consecutiveProbeFailures` streak, on the 120s→1800s backoff — so the streak
+keeps counting across the whole outage and any success heals. Since
+[#415](https://github.com/home-operations/kopiur/issues/415) a result-less Job
+failure (crash, eviction, deadline kill) feeds the same streak, so every retry
+route backs off instead of relaunching on a flat cadence. `phase: Failed` /
 `phase: Degraded` is the louder signal in that window.
+
+A pure probe run is also **cheap** regardless of catalog size: it skips the
+`kopia snapshot list` catalog step (the part of a full bootstrap whose cost
+scales with the number of snapshots) while keeping the connect — the actual
+health signal — plus the stale-maintenance-owner self-heal, `set-parameters`
+drift correction, and the index-blob count that feeds `IndexBlobHealth`. A
+launch that also owes catalog work (a scan request, a periodic refresh, a spec
+change) always runs the full bootstrap.
 
 [issue-273]: https://github.com/home-operations/kopiur/issues/273
 

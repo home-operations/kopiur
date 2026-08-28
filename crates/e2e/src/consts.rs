@@ -386,6 +386,11 @@ pub const BUCKETS: &[&str] = &[
     // in-binary ordering is not guaranteed.
     BUCKET_PROBE_CHURN_REPO,
     BUCKET_PROBE_CHURN_CREPO,
+    // Deadline-kill scenarios (crates/e2e/tests/bootstrap_deadline.rs, #413/#414/#415):
+    // one bucket per scenario — A re-bootstraps a Ready repository under an impossible
+    // 1s deadline; B is born under it and must never share A's kopia repository.
+    "kopiur-bootstrap-deadline-a",
+    "kopiur-bootstrap-deadline-b",
     // RepositoryReplication to an S3 destination (crates/e2e/tests/replication.rs,
     // the #200 regression guard): a filesystem source mirrors here, so `sync-to`
     // only succeeds if the destination backend's OWN S3 credentials are injected.

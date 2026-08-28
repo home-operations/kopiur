@@ -393,6 +393,30 @@ pub enum MoverError {
         source: Box<kube::Error>,
     },
 
+    /// A CR status READ (a GET on the `/status` subresource) failed. Distinct
+    /// from [`MoverError::StatusPatch`] so the log line names the call that was
+    /// actually rejected — #401's 403 was reported as "failed to PATCH" when
+    /// the rejected call was a GET, which sent the reporter debugging the wrong
+    /// request.
+    #[error(
+        "failed to read the status of {kind} {namespace}/{name} (GET on the status \
+         subresource): {source}. The mover reads status.resolved so a Job retry reuses the \
+         snapshot a prior attempt pinned; without it this run re-resolves from the \
+         repository. Requires `get` on the CRD's /status subresource in the kopiur-mover \
+         role (shipped by default)"
+    )]
+    StatusRead {
+        /// The target CR kind.
+        kind: String,
+        /// The target CR namespace.
+        namespace: String,
+        /// The target CR name.
+        name: String,
+        /// The underlying kube error (boxed, see [`MoverError::KubeClient`]).
+        #[source]
+        source: Box<kube::Error>,
+    },
+
     /// The bootstrap result could not be serialized.
     #[error("failed to serialize the bootstrap result: {source}")]
     ResultSerialize {
@@ -576,6 +600,7 @@ impl MoverError {
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }
             | MoverError::StatusPatch { .. }
+            | MoverError::StatusRead { .. }
             | MoverError::ResultSerialize { .. }
             | MoverError::ResultConfigMapPatch { .. }
             | MoverError::Telemetry(_)

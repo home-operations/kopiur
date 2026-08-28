@@ -492,6 +492,31 @@ pub(crate) fn drop_seed_condition(
         .collect()
 }
 
+/// #380: fold a bootstrap FAILURE's seed story into the conditions array (which
+/// a status patch replaces wholesale). A seed failure gets a `Seeded=False`
+/// condition beside `Bootstrapped=False`; a failure with NOTHING to do with the
+/// seed (an `AuthFailure` against this repository's own backend, a result-less
+/// Job) drops any standing `Seeded` condition instead — see
+/// [`drop_seed_condition`] for why a stale one lies. Shared by the
+/// `Repository`/`ClusterRepository` failure finalizers.
+pub(crate) fn seed_condition_fold(
+    generation: Option<i64>,
+    failure: &crate::io::BootstrapFailure,
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    match failure.seed_reason() {
+        Some(seed_reason) => crate::io::upsert_condition(
+            conditions,
+            kopiur_api::consts::SEEDED_CONDITION,
+            false,
+            seed_reason,
+            &failure.condition_message(),
+            generation,
+        ),
+        None => drop_seed_condition(conditions),
+    }
+}
+
 /// **Pure.** Whether a previously-recorded `Seeded=False` reason is one of the
 /// FAILURE reasons, as opposed to the park/progress ones.
 ///

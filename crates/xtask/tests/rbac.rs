@@ -234,6 +234,27 @@ fn mover_role_is_least_privilege() {
             rule_grants(&role_rules, "", "configmaps"),
             "{rel} must grant configmaps (bootstrap result write)"
         );
+        // #401: `get` on `{crd}/status` is LOAD-BEARING, not an unused verb —
+        // it authorizes the mover's `read_resolved` GET on the status
+        // subresource (restore-retry determinism). A "trim unused verbs" pass
+        // dropping it would silently kill that read again.
+        for verb in ["get", "patch"] {
+            assert!(
+                rule_grants_verb(
+                    &role_rules,
+                    "kopiur.home-operations.com",
+                    "restores/status",
+                    verb
+                ),
+                "{rel} must grant `{verb}` on restores/status (#401: get backs read_resolved)"
+            );
+        }
+        // ...and the base resource stays UNgranted: the mover reads through the
+        // subresource precisely so it never needs (and must never get) this.
+        assert!(
+            !rule_grants(&role_rules, "kopiur.home-operations.com", "restores"),
+            "{rel}: the mover must NOT be granted the base restores resource (#401)"
+        );
         // Least privilege: NONE of the operator's broad grants leak into the mover.
         for (g, r) in [
             ("batch", "jobs"),

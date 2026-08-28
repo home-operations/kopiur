@@ -634,6 +634,18 @@ pub struct BootstrapRepositoryOp {
     /// needs the same entries a namespaced `Repository` does.
     #[serde(default)]
     pub scan_catalog: bool,
+    /// This launch is a backend HEALTH PROBE of an already-Ready repository
+    /// with no catalog work due (#414): skip the `kopia snapshot list` catalog
+    /// step — the O(snapshots) part of a bootstrap a probe doesn't need — and
+    /// report `snapshot_count: None` so the controller leaves the prior
+    /// catalog/stats untouched. Everything else still runs: connect (the
+    /// actual health signal), the stale-maintenance-owner self-heal,
+    /// `set-parameters` drift correction, `repository status`, and the cheap
+    /// `index list` (which feeds `IndexBlobHealth` — the early warning this
+    /// mode exists to keep fresh). Absent on old work specs (serde default) —
+    /// old movers ignore it and simply do the full run.
+    #[serde(default)]
+    pub probe_only: bool,
     /// Create-time-fixed repository format knobs honored only when this bootstrap
     /// actually *creates* the repository (`auto_create` + connect-miss). The
     /// controller resolves these from `Repository.spec.create.{encryption,splitter,
