@@ -629,8 +629,9 @@ impl Metrics {
             .with_description(
                 "Total backend health-probe alerts raised (after the consecutive-failure \
                  debounce), labeled by kind and outcome (vanished = backend reachable but the \
-                 repository is absent; unreachable = backend/mount/auth failure). The repository \
-                 stays Ready — these are alerts, not outages, and kopiur never auto-recreates.",
+                 repository is absent; unreachable = backend/mount/auth failure; timed_out = \
+                 the probe Job was killed by its bootstrap deadline — the backend may be \
+                 reachable but slow). These are alerts, and kopiur never auto-recreates.",
             )
             .build();
         let breaker_trips = m
@@ -638,10 +639,12 @@ impl Metrics {
             .with_description(
                 "Total repository circuit-breaker openings: the backend health probe exceeded \
                  spec.health.probe.failureThreshold under onFailure: Degrade, moving the \
-                 repository to Degraded (backups, maintenance, and replication pause until a \
-                 connect succeeds; recovery is automatic). Labeled by kind \
-                 (Repository/ClusterRepository), namespace, name, and probe_kind \
-                 (vanished/unreachable — matching the health-probe-failure outcome label).",
+                 repository to Degraded (backups and replication pause until a connect \
+                 succeeds; maintenance also pauses for unreachable/vanished but keeps running \
+                 for timed_out, where index compaction is often the cure; recovery is \
+                 automatic). Labeled by kind (Repository/ClusterRepository), namespace, name, \
+                 and probe_kind (vanished/unreachable/timed_out — matching the \
+                 health-probe-failure outcome label).",
             )
             .build();
         let repository_seeds = m
@@ -1230,12 +1233,13 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_repository_consecutive_backend_failures")
                 .with_description(
-                    "Consecutive failed backend connects (health probe + strict \
-                     retries) from status.health.consecutiveProbeFailures, per \
-                     repository (kind/namespace/name; namespace is empty for a \
+                    "Consecutive failed backend connects (health probe, strict \
+                     retries, and result-less bootstrap failures since #415) from \
+                     status.health.consecutiveProbeFailures, per repository \
+                     (kind/namespace/name; namespace is empty for a \
                      ClusterRepository). Emitted whenever health status exists — a 0 \
-                     after recovery is informative — and absent when the probe has \
-                     never run; the series dies with the CR.",
+                     after recovery is informative — and absent when no probe or \
+                     failure fold has ever run; the series dies with the CR.",
                 )
                 .with_callback(move |o| {
                     for r in repositories.state() {
@@ -1316,6 +1320,56 @@ impl Metrics {
                                 ts,
                                 &repo_health_attrs("ClusterRepository", "", &r.name_any()),
                             );
+                        }
+                    }
+                })
+                .build();
+        }
+        // Breaker-open state with the CAUSE (#413/#414): value 1 for the same
+        // open window as the timestamp gauge above, plus a `reason` label
+        // (unreachable/vanished/timed_out) so alert rules can split a hard
+        // outage — backups, replication AND maintenance paused — from the
+        // self-healing slow-connect spiral, where maintenance keeps running
+        // and the deadline escalates automatically.
+        {
+            let repositories = stores.repositories.clone();
+            let cluster_repositories = stores.cluster_repositories.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_repository_breaker_open")
+                .with_description(
+                    "1 while the repository circuit breaker is open (phase Degraded with \
+                     BackendReachable=False), per repository (kind/namespace/name; namespace \
+                     is empty for a ClusterRepository), labeled by reason: unreachable or \
+                     vanished = hard outage (backups, replication and maintenance paused); \
+                     timed_out = the connect keeps exceeding the bootstrap deadline (backups/ \
+                     replication paused, maintenance still runs, the deadline escalates \
+                     automatically — usually self-healing). The series disappears when the \
+                     breaker closes.",
+                )
+                .with_callback(move |o| {
+                    for r in repositories.state() {
+                        let Some(st) = r.status.as_ref() else {
+                            continue;
+                        };
+                        if let Some(reason) = breaker_open_reason(st.phase.as_ref(), &st.conditions)
+                        {
+                            let [kind, ns, name] = repo_health_attrs(
+                                "Repository",
+                                &r.namespace().unwrap_or_default(),
+                                &r.name_any(),
+                            );
+                            o.observe(1, &[kind, ns, name, KeyValue::new("reason", reason)]);
+                        }
+                    }
+                    for r in cluster_repositories.state() {
+                        let Some(st) = r.status.as_ref() else {
+                            continue;
+                        };
+                        if let Some(reason) = breaker_open_reason(st.phase.as_ref(), &st.conditions)
+                        {
+                            let [kind, ns, name] =
+                                repo_health_attrs("ClusterRepository", "", &r.name_any());
+                            o.observe(1, &[kind, ns, name, KeyValue::new("reason", reason)]);
                         }
                     }
                 })
@@ -2215,6 +2269,38 @@ fn breaker_open_since(
         .first_failure_at
         .as_deref()
         .and_then(parse_unix_seconds)
+}
+
+/// The `reason` label for `kopiur_repository_breaker_open`: `Some` exactly for
+/// the same open window as [`breaker_open_since`] (phase `Degraded` +
+/// `BackendReachable=False`), carrying the failure kind so alerting can
+/// distinguish a hard outage (`unreachable`/`vanished` — backups, replication
+/// AND maintenance paused) from the self-healing slow-connect spiral
+/// (`timed_out` — maintenance keeps running, deadline escalation is automatic;
+/// issues #413/#414). Label values match `ProbeFailureKind::label()`; a reason
+/// this build has never seen maps to `other` rather than an unbounded label.
+fn breaker_open_reason(
+    phase: Option<&kopiur_api::RepositoryPhase>,
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> Option<&'static str> {
+    if phase != Some(&kopiur_api::RepositoryPhase::Degraded) {
+        return None;
+    }
+    let c = conditions
+        .iter()
+        .find(|c| c.type_ == crate::consts::BACKEND_REACHABLE_CONDITION && c.status == "False")?;
+    Some(match c.reason.as_str() {
+        r if r == crate::consts::BACKEND_UNREACHABLE_REASON => {
+            crate::health::ProbeFailureKind::Unreachable.label()
+        }
+        r if r == crate::consts::REPOSITORY_VANISHED_REASON => {
+            crate::health::ProbeFailureKind::Vanished.label()
+        }
+        r if r == crate::consts::PROBE_DEADLINE_EXCEEDED_REASON => {
+            crate::health::ProbeFailureKind::TimedOut.label()
+        }
+        _ => "other",
+    })
 }
 
 #[cfg(test)]
@@ -3751,6 +3837,53 @@ mod tests {
                 Some(&RepositoryPhase::Degraded),
                 Some(&no_first),
                 &unreachable
+            ),
+            None
+        );
+    }
+
+    /// The reason-labeled breaker gauge (#413/#414): same open window as the
+    /// timestamp gauge, with each `BackendReachable=False` reason mapped to
+    /// its stable label value and unknown reasons bounded to `other`.
+    #[test]
+    fn breaker_open_reason_maps_the_cause_within_the_open_window() {
+        use kopiur_api::RepositoryPhase;
+        let br_false =
+            |reason: &str| -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+                serde_json::from_value(serde_json::json!([{
+                    "type": "BackendReachable",
+                    "status": "False",
+                    "reason": reason,
+                    "message": "m",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z",
+                }]))
+                .unwrap()
+            };
+        let degraded = Some(&RepositoryPhase::Degraded);
+        assert_eq!(
+            breaker_open_reason(degraded, &br_false("BackendUnreachable")),
+            Some("unreachable")
+        );
+        assert_eq!(
+            breaker_open_reason(degraded, &br_false("RepositoryVanished")),
+            Some("vanished")
+        );
+        assert_eq!(
+            breaker_open_reason(degraded, &br_false("ProbeDeadlineExceeded")),
+            Some("timed_out")
+        );
+        // A future reason stays a BOUNDED label, never unbounded cardinality.
+        assert_eq!(
+            breaker_open_reason(degraded, &br_false("SomeFutureReason")),
+            Some("other")
+        );
+        // Same open-window rule as breaker_open_since: no condition, or not
+        // Degraded, → no series.
+        assert_eq!(breaker_open_reason(degraded, &[]), None);
+        assert_eq!(
+            breaker_open_reason(
+                Some(&RepositoryPhase::Ready),
+                &br_false("BackendUnreachable")
             ),
             None
         );

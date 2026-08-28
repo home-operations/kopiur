@@ -2271,7 +2271,14 @@ fn pvc_consumer_prefers_running_over_pending() {
 // future refactor could silently break into a panic. ---
 
 mod bootstrap_outcomes {
-    use super::super::events::{BootstrapFailure, BootstrapOutcome, bootstrap_outcome};
+    use super::super::events::{
+        BootstrapFailure, BootstrapOutcome, MoverJobTerminal, bootstrap_outcome,
+    };
+
+    /// A terminal Job failure that is NOT a deadline kill (crash/evict/etc.).
+    const JOB_FAILED: MoverJobTerminal = MoverJobTerminal::Failed {
+        deadline_exceeded: false,
+    };
     use kopiur_kopia::KopiaErrorClass;
     use kopiur_mover::bootstrap::BootstrapResult;
     use kopiur_mover::status::FailureBlock;
@@ -2281,7 +2288,7 @@ mod bootstrap_outcomes {
             success: true,
             created: true,
             unique_id: Some("uid-1".into()),
-            snapshot_count: 0,
+            snapshot_count: Some(0),
             snapshots: vec![],
             snapshots_truncated: false,
             foreign_suffix_dropped: 0,
@@ -2298,12 +2305,12 @@ mod bootstrap_outcomes {
     fn four_way_mapping() {
         // (None, job succeeded): the result ConfigMap hasn't propagated yet.
         assert!(matches!(
-            bootstrap_outcome(None, true, "boot-x", false),
+            bootstrap_outcome(None, MoverJobTerminal::Complete, "boot-x", false, 120),
             BootstrapOutcome::ResultPending
         ));
 
         // (None, job failed): result-less terminal failure, names the Job.
-        match bootstrap_outcome(None, false, "boot-x", false) {
+        match bootstrap_outcome(None, JOB_FAILED, "boot-x", false, 120) {
             BootstrapOutcome::Failed(BootstrapFailure::JobFailedWithoutResult { job_name }) => {
                 assert_eq!(job_name, "boot-x");
             }
@@ -2321,7 +2328,7 @@ mod bootstrap_outcomes {
             retry_recommended: false,
             op: None,
         });
-        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
+        match bootstrap_outcome(Some(bad), JOB_FAILED, "boot-x", false, 120) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, message }) => {
                 assert_eq!(class, KopiaErrorClass::AuthFailure);
                 assert_eq!(message, "invalid repository password");
@@ -2330,7 +2337,13 @@ mod bootstrap_outcomes {
         }
 
         // (Some successful, _): the success arm owns the result.
-        match bootstrap_outcome(Some(ok_result()), true, "boot-x", false) {
+        match bootstrap_outcome(
+            Some(ok_result()),
+            MoverJobTerminal::Complete,
+            "boot-x",
+            false,
+            120,
+        ) {
             BootstrapOutcome::Succeeded(r) => assert_eq!(r.unique_id.as_deref(), Some("uid-1")),
             _ => panic!("expected Succeeded"),
         }
@@ -2343,7 +2356,7 @@ mod bootstrap_outcomes {
         // never panic or silently succeed.
         let mut bad = ok_result();
         bad.success = false;
-        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
+        match bootstrap_outcome(Some(bad), JOB_FAILED, "boot-x", false, 120) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, message }) => {
                 assert_eq!(class, KopiaErrorClass::Unknown);
                 assert!(message.contains("bootstrap failed"));
@@ -2359,7 +2372,7 @@ mod bootstrap_outcomes {
         // BEFORE the generic Backend mapping) so the operator sees an actionable
         // "enable create" reason, not a bare kopia NotFound.
         let r = BootstrapResult::not_initialized();
-        match bootstrap_outcome(Some(r), false, "boot-x", false) {
+        match bootstrap_outcome(Some(r), JOB_FAILED, "boot-x", false, 120) {
             BootstrapOutcome::Failed(BootstrapFailure::RepositoryNotInitialized) => {}
             _ => panic!("expected RepositoryNotInitialized"),
         }
@@ -2488,14 +2501,26 @@ mod bootstrap_outcomes {
         // unknown `seed` field, fell into the create fallback, and initialized
         // an EMPTY repository. Accepting it would report Ready over a
         // repository with no history.
-        match bootstrap_outcome(Some(ok_result()), true, "boot-x", true) {
+        match bootstrap_outcome(
+            Some(ok_result()),
+            MoverJobTerminal::Complete,
+            "boot-x",
+            true,
+            120,
+        ) {
             BootstrapOutcome::Failed(BootstrapFailure::SeedMoverTooOld) => {}
             _ => panic!("a seed-armed success with no seed outcome must be refused"),
         }
 
         // The SAME result with no seed armed is an ordinary success — the guard
         // must not fire on every bootstrap in the fleet.
-        match bootstrap_outcome(Some(ok_result()), true, "boot-x", false) {
+        match bootstrap_outcome(
+            Some(ok_result()),
+            MoverJobTerminal::Complete,
+            "boot-x",
+            false,
+            120,
+        ) {
             BootstrapOutcome::Succeeded(_) => {}
             _ => panic!("an unarmed bootstrap is unaffected"),
         }
@@ -2507,7 +2532,7 @@ mod bootstrap_outcomes {
             SeedOutcome::already_initialized(SeedModeSpec::Blob, "S3".into()),
         ] {
             let r = ok_result().with_seed(Some(outcome));
-            match bootstrap_outcome(Some(r), true, "boot-x", true) {
+            match bootstrap_outcome(Some(r), MoverJobTerminal::Complete, "boot-x", true, 120) {
                 BootstrapOutcome::Succeeded(r) => assert!(r.seed.is_some()),
                 _ => panic!("an acknowledged seed must succeed"),
             }
@@ -2535,11 +2560,228 @@ mod bootstrap_outcomes {
             retry_recommended: false,
             op: None,
         });
-        match bootstrap_outcome(Some(bad), false, "boot-x", false) {
+        match bootstrap_outcome(Some(bad), JOB_FAILED, "boot-x", false, 120) {
             BootstrapOutcome::Failed(BootstrapFailure::Backend { class, .. }) => {
                 assert_eq!(class, KopiaErrorClass::NotFound);
             }
             _ => panic!("expected Backend NotFound"),
+        }
+    }
+}
+
+// --- mover_job_terminal + the deadline-kill classification (#414) and the
+// failure-route table (#415): the Job `Failed` condition's `reason` is finally
+// read, so "connect slower than activeDeadlineSeconds" stops masquerading as
+// "backend down / bad credentials", and route precedence is decided in one
+// tested place instead of two hand-copied `if` chains. ---
+
+mod job_terminal_and_routes {
+    use super::super::events::{
+        BootstrapFailure, BootstrapOutcome, FailureRoute, MoverJobTerminal, SeedFailure,
+        bootstrap_outcome, mover_job_terminal,
+    };
+    use k8s_openapi::api::batch::v1::{Job, JobCondition, JobStatus};
+    use kopiur_kopia::KopiaErrorClass;
+
+    fn job_with_condition(type_: &str, status: &str, reason: Option<&str>) -> Job {
+        Job {
+            status: Some(JobStatus {
+                conditions: Some(vec![JobCondition {
+                    type_: type_.into(),
+                    status: status.into(),
+                    reason: reason.map(Into::into),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mover_job_terminal_reads_the_failed_conditions_reason() {
+        // #414: a deadline kill is typed apart from every other failure mode.
+        assert_eq!(
+            mover_job_terminal(&job_with_condition(
+                "Failed",
+                "True",
+                Some("DeadlineExceeded")
+            )),
+            Some(MoverJobTerminal::Failed {
+                deadline_exceeded: true
+            })
+        );
+        // Backoff exhaustion (pod-level crashes) is NOT a deadline kill.
+        assert_eq!(
+            mover_job_terminal(&job_with_condition(
+                "Failed",
+                "True",
+                Some("BackoffLimitExceeded")
+            )),
+            Some(MoverJobTerminal::Failed {
+                deadline_exceeded: false
+            })
+        );
+        // A reason-less Failed condition falls back to the generic bucket.
+        assert_eq!(
+            mover_job_terminal(&job_with_condition("Failed", "True", None)),
+            Some(MoverJobTerminal::Failed {
+                deadline_exceeded: false
+            })
+        );
+        assert_eq!(
+            mover_job_terminal(&job_with_condition("Complete", "True", None)),
+            Some(MoverJobTerminal::Complete)
+        );
+        // A False condition is not terminal; no status at all is still running.
+        assert_eq!(
+            mover_job_terminal(&job_with_condition("Failed", "False", None)),
+            None
+        );
+        assert_eq!(mover_job_terminal(&Job::default()), None);
+        // Succeeded-count fallback when conditions aren't populated yet.
+        let counted = Job {
+            status: Some(JobStatus {
+                succeeded: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            mover_job_terminal(&counted),
+            Some(MoverJobTerminal::Complete)
+        );
+    }
+
+    #[test]
+    fn deadline_killed_job_is_its_own_bootstrap_failure() {
+        // #414: previously this Job produced `JobFailedWithoutResult` and, on
+        // the probe path, the "unreachable, the path/mount is missing, or
+        // credentials/lock failed" alert — none of which were true for a
+        // backend that was merely slow. The message must carry the what (the
+        // deadline kill and the real limit), the why (cold-cache connect
+        // scales with index blobs), and the fix (raise the deadline; run
+        // maintenance).
+        let out = bootstrap_outcome(
+            None,
+            MoverJobTerminal::Failed {
+                deadline_exceeded: true,
+            },
+            "repo-discovery",
+            false,
+            300,
+        );
+        let failure = match out {
+            BootstrapOutcome::Failed(f) => f,
+            _ => panic!("expected a Failed outcome"),
+        };
+        assert!(matches!(
+            failure,
+            BootstrapFailure::JobDeadlineExceeded { ref job_name, deadline_secs: 300 }
+                if job_name == "repo-discovery"
+        ));
+        assert_eq!(
+            failure.reason(),
+            crate::consts::BOOTSTRAP_DEADLINE_EXCEEDED_REASON
+        );
+        assert_ne!(failure.reason(), crate::consts::BOOTSTRAP_JOB_FAILED_REASON);
+        let msg = failure.condition_message();
+        assert!(msg.contains("activeDeadlineSeconds"), "{msg}");
+        assert!(msg.contains("(300s)"), "{msg}");
+        assert!(
+            msg.contains("spec.bootstrap.failurePolicy.activeDeadlineSeconds"),
+            "{msg}"
+        );
+        assert!(msg.contains("maintenance"), "{msg}");
+        assert!(msg.contains("progressively longer deadline"), "{msg}");
+
+        // A mover-written result always outranks the Job's infrastructure
+        // verdict: a deadline-killed Job that still managed to persist a
+        // typed failure keeps that classification.
+        let mut with_result = kopiur_mover::bootstrap::BootstrapResult::not_initialized();
+        with_result.success = false;
+        match bootstrap_outcome(
+            Some(with_result),
+            MoverJobTerminal::Failed {
+                deadline_exceeded: true,
+            },
+            "repo-discovery",
+            false,
+            300,
+        ) {
+            BootstrapOutcome::Failed(BootstrapFailure::RepositoryNotInitialized) => {}
+            _ => panic!("a persisted result must outrank the Job's deadline verdict"),
+        }
+    }
+
+    /// Every `BootstrapFailure` variant × bootstrapped ∈ {true, false} → its
+    /// retry route, in the ONE place precedence is decided (#415: the outage
+    /// sensor is checked first so it can never be shadowed into the
+    /// sensor-less recycle arm; the seed carve-out keeps the documented
+    /// flat/prompt DR retry cadence out of the exponential backoff).
+    #[test]
+    fn failure_route_truth_table() {
+        let backend = |class| BootstrapFailure::Backend {
+            class,
+            message: "m".into(),
+        };
+        let seed = BootstrapFailure::Seed {
+            failure: SeedFailure::SourceNotFound,
+            message: "m".into(),
+        };
+        let no_result = BootstrapFailure::JobFailedWithoutResult {
+            job_name: "j".into(),
+        };
+        let deadline = BootstrapFailure::JobDeadlineExceeded {
+            job_name: "j".into(),
+            deadline_secs: 120,
+        };
+        for bootstrapped in [false, true] {
+            // A backend outage feeds the sensor only once bootstrapped.
+            assert_eq!(
+                backend(KopiaErrorClass::RepositoryUnavailable).route(bootstrapped),
+                if bootstrapped {
+                    FailureRoute::OutageSensor
+                } else {
+                    FailureRoute::Terminal
+                }
+            );
+            // Non-outage backend verdicts park terminal either way.
+            assert_eq!(
+                backend(KopiaErrorClass::AuthFailure).route(bootstrapped),
+                FailureRoute::Terminal
+            );
+            // Result-less infrastructure failures recycle (with backoff, #415).
+            assert_eq!(no_result.route(bootstrapped), FailureRoute::Recycle);
+            // A deadline kill feeds the outage sensor once bootstrapped
+            // (#414: streak/backoff/breaker + deadline escalation see it);
+            // a never-bootstrapped repo keeps the plain recycle route.
+            assert_eq!(
+                deadline.route(bootstrapped),
+                if bootstrapped {
+                    FailureRoute::OutageSensor
+                } else {
+                    FailureRoute::Recycle
+                }
+            );
+            // Seed failures keep their own PROMPT retry route.
+            assert_eq!(seed.route(bootstrapped), FailureRoute::SeedRetry);
+            // The rest are terminal verdicts.
+            assert_eq!(
+                BootstrapFailure::RepositoryNotInitialized.route(bootstrapped),
+                FailureRoute::Terminal
+            );
+            assert_eq!(
+                BootstrapFailure::SeedMoverTooOld.route(bootstrapped),
+                FailureRoute::Terminal
+            );
+            assert_eq!(
+                BootstrapFailure::InternalInconsistency {
+                    message: "m".into()
+                }
+                .route(bootstrapped),
+                FailureRoute::Terminal
+            );
         }
     }
 }

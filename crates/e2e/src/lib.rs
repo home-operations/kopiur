@@ -210,6 +210,52 @@ pub async fn stall_apiserver(hold: Duration) -> anyhow::Result<()> {
     resumed
 }
 
+/// Silently DROP (or restore) all forwarded TCP traffic to `port` on the kind
+/// node — a network BLACKHOLE: connections hang (SYN retransmits, no RST),
+/// unlike a Service with no endpoints, which refuses fast. This is the shape a
+/// slow/tar-pitted backend presents, and the only way to make a mover's
+/// `kopia repository connect` deterministically outlive a short Job
+/// `activeDeadlineSeconds` (crates/e2e/tests/bootstrap_deadline.rs): against a
+/// healthy in-cluster MinIO the whole mover run frequently BEATS the Job
+/// controller's lazy deadline enforcement and persists a success result, which
+/// rightly outranks the Job's late `DeadlineExceeded` verdict.
+///
+/// Same host-side-mutation contract as [`flap_apiserver`]: the scenario using
+/// this MUST own its CI shard (every consumer of the ported service hangs while
+/// the rule stands), and MUST restore (`on: false`) before finishing — a leaked
+/// rule breaks every later scenario on a reused local cluster.
+pub async fn blackhole_tcp_port(port: u16, on: bool) -> anyhow::Result<()> {
+    let node = consts::KIND_CONTROL_PLANE_CONTAINER;
+    let action = if on { "-I" } else { "-D" };
+    let port = port.to_string();
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "exec", node, "iptables", "-w", action, "FORWARD", "-p", "tcp", "--dport", &port, "-j",
+            "DROP",
+        ])
+        .output()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "could not run `docker exec {node} iptables`: {e} — the blackhole scenario \
+                 needs host docker access to the kind node (is this the e2e harness host?)"
+            )
+        })?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`docker exec {node} iptables -w {action} FORWARD -p tcp --dport {port} -j DROP` \
+             failed (exit {:?}): {} — is the kind cluster `kopiur-e2e` running?",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    eprintln!(
+        "[blackhole_tcp_port] port {port}: {}",
+        if on { "DROPPING" } else { "restored" }
+    );
+    Ok(())
+}
+
 /// Ensure a `Namespace` named `ns` exists (idempotent: a 409 Conflict is treated
 /// as success). Used by the cross-namespace scenarios that run a workload + Snapshot
 /// in a namespace separate from the operator's.

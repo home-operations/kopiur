@@ -415,6 +415,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
             auto_create: true,
             scan_catalog: true,
+            probe_only: false,
             create_options: Default::default(),
             epoch_parameters: Default::default(),
             blob_retention: None,
@@ -502,6 +503,7 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     let op = BootstrapRepositoryOp {
         auto_create: true,
         scan_catalog: true,
+        probe_only: false,
         create_options: Default::default(),
         epoch_parameters: Default::default(),
         blob_retention: None,
@@ -524,6 +526,29 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     // would simply never read (it decodes what it recognizes and ignores the
     // rest), so this is still forward/backward compatible in practice.
     assert_eq!(v["restampPolicy"], "anyStale");
+}
+
+#[test]
+fn probe_only_defaults_off_for_old_work_specs() {
+    // #414 graceful decode: a work spec written by a controller that predates
+    // `probe_only` decodes to `false` — the full (listing) bootstrap, the old
+    // behavior. Only a NEW controller ever arms the flag, so version skew can
+    // never skip a listing the controller expected to consume.
+    let parsed: BootstrapRepositoryOp = serde_json::from_value(serde_json::json!({
+        "autoCreate": true,
+        "scanCatalog": true,
+    }))
+    .expect("old wire shape must decode");
+    assert!(!parsed.probe_only);
+    assert!(parsed.scan_catalog);
+    // And the flag round-trips when set.
+    let armed: BootstrapRepositoryOp = serde_json::from_value(serde_json::json!({
+        "autoCreate": false,
+        "scanCatalog": true,
+        "probeOnly": true,
+    }))
+    .expect("probeOnly wire shape must decode");
+    assert!(armed.probe_only);
 }
 
 #[test]
@@ -2547,6 +2572,7 @@ fn a_seeding_bootstrap_op_round_trips_and_elides_its_defaults() {
     let op = BootstrapRepositoryOp {
         auto_create: false,
         scan_catalog: true,
+        probe_only: false,
         create_options: Default::default(),
         epoch_parameters: Default::default(),
         blob_retention: None,

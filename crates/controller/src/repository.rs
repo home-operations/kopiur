@@ -956,6 +956,33 @@ async fn bootstrap_via_mover(
         .as_ref()
         .and_then(|s| s.health.as_ref())
         .and_then(|h| h.probe_attempt_at.clone());
+    // The effective bootstrap-Job deadline under escalation (#414): the spec
+    // base, doubled per consecutive DEADLINE-killed attempt (status-derived).
+    // Computed once, before the Job fetch, and used for BOTH the Job's
+    // `activeDeadlineSeconds` and the probe-attempt window below — the streak
+    // only grows between a launch and its poll, so the attempt window only
+    // ever widens relative to the running Job's real deadline (never the
+    // #273-class undercut).
+    let bootstrap_deadline_secs = health::escalated_bootstrap_deadline(
+        health::bootstrap_deadline_seconds(
+            repo.spec
+                .bootstrap
+                .as_ref()
+                .and_then(|b| b.failure_policy.as_ref())
+                .and_then(|fp| fp.active_deadline_seconds),
+        ),
+        health::timeout_streak(
+            repo.status
+                .as_ref()
+                .map(|s| s.conditions.as_slice())
+                .unwrap_or(&[]),
+            repo.status
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .and_then(|h| h.consecutive_probe_failures)
+                .unwrap_or(0),
+        ),
+    );
     let probe = health::probe_action(
         already_ready,
         bootstrapped_before,
@@ -968,13 +995,7 @@ async fn bootstrap_via_mover(
         kopiur_api::repository::RepositoryHealthProbeSpec::effective_interval(
             repo.spec.health.as_ref(),
         ),
-        health::probe_attempt_timeout(health::bootstrap_deadline_seconds(
-            repo.spec
-                .bootstrap
-                .as_ref()
-                .and_then(|b| b.failure_policy.as_ref())
-                .and_then(|fp| fp.active_deadline_seconds),
-        )),
+        health::probe_attempt_timeout(bootstrap_deadline_secs),
         chrono::Utc::now(),
     );
     let spec_changed =
@@ -1026,7 +1047,7 @@ async fn bootstrap_via_mover(
             io::delete_mover_run(&ctx.client, namespace, &job_name).await?;
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
-        return match crate::snapshot::job_terminal_state(&job) {
+        return match io::mover_job_terminal(&job) {
             // Still running: surface progress and poll. A catalog-refresh
             // re-run of an already-Ready repo keeps its phase — flapping
             // Ready→Initializing every refresh would be pure status churn —
@@ -1066,7 +1087,7 @@ async fn bootstrap_via_mover(
             // this arm stands down so `finalize_bootstrap` can consume it. Recycling
             // then too is the #273 livelock — it destroys the very result that would
             // have stamped `lastProbeAt` and cleared the gate.
-            Some(success) => {
+            Some(terminal) => {
                 let interval =
                     CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
                 if reverify
@@ -1096,9 +1117,35 @@ async fn bootstrap_via_mover(
                     io::delete_mover_run(&ctx.client, namespace, &job_name).await?;
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
+                // The deadline the Job actually ran with (exact even under
+                // deadline escalation), for the deadline-kill classification's
+                // condition message (#414).
+                let job_deadline_secs = job
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.active_deadline_seconds)
+                    .unwrap_or_else(|| {
+                        health::bootstrap_deadline_seconds(
+                            repo.spec
+                                .bootstrap
+                                .as_ref()
+                                .and_then(|b| b.failure_policy.as_ref())
+                                .and_then(|fp| fp.active_deadline_seconds),
+                        )
+                    });
                 finalize_bootstrap(
-                    ctx, repo, namespace, name, repo_uid, api, backend, &job_name, success,
-                    probe_run, seed_armed,
+                    ctx,
+                    repo,
+                    namespace,
+                    name,
+                    repo_uid,
+                    api,
+                    backend,
+                    &job_name,
+                    terminal,
+                    job_deadline_secs,
+                    probe_run,
+                    seed_armed,
                 )
                 .await
             }
@@ -1109,23 +1156,23 @@ async fn bootstrap_via_mover(
     // one (`ttlSecondsAfterFinished`). An already-Ready repo only re-creates it
     // when a re-run is actually warranted (`bootstrap_create_due`: catalog refresh
     // due, or spec changed) — re-creating unconditionally would pin the refresh
-    // cadence to the Job TTL instead of `catalog.refreshInterval`.
-    if !(reverify
-        || probe.launches()
-        || catalog::bootstrap_create_due(
-            repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
-            repo.metadata.generation,
-            repo.status.as_ref().and_then(|s| s.observed_generation),
-            last_refresh_at(repo),
-            CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
-            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
-            scan_requested_token(repo),
-            scan_requested_honored(repo),
-            scan_requested_attempt_at(repo),
-            kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
-            chrono::Utc::now(),
-        ))
-    {
+    // cadence to the Job TTL instead of `catalog.refreshInterval`. Hoisted into a
+    // variable because it also decides `probe_only` below (#414): a launch driven
+    // by catalog work must run the full mover, never the cheap probe mode.
+    let catalog_create_due = catalog::bootstrap_create_due(
+        repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
+        repo.metadata.generation,
+        repo.status.as_ref().and_then(|s| s.observed_generation),
+        last_refresh_at(repo),
+        CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
+        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+        scan_requested_token(repo),
+        scan_requested_honored(repo),
+        scan_requested_attempt_at(repo),
+        kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
+        chrono::Utc::now(),
+    );
+    if !(reverify || probe.launches() || catalog_create_due) {
         // The STEADY STATE of a Ready mover-bootstrapped repo (`bootstrap_create_due` is
         // true for any non-Ready phase, so nothing pre-bootstrap reaches here). Re-evaluate
         // maintenance coverage before parking — otherwise this repo's `MaintenanceConfigured`
@@ -1301,6 +1348,10 @@ async fn bootstrap_via_mover(
         namespace,
         create_enabled,
         true,
+        // Probe-only (#414): a probe-style launch with no catalog work due
+        // skips the O(snapshots) listing. A scan-token/refresh/spec-driven
+        // launch — even one that coincides with a due probe — runs in full.
+        probe_style_launch && !catalog_create_due,
         repo.spec.create.as_ref(),
         repo.spec.mover_defaults.as_ref(),
         cluster,
@@ -1445,9 +1496,10 @@ async fn bootstrap_via_mover(
             seed_armed,
             repo.spec.seed.as_ref(),
             JobLimits {
-                active_deadline_seconds: Some(health::bootstrap_deadline_seconds(
-                    bootstrap_fp.and_then(|fp| fp.active_deadline_seconds),
-                )),
+                // The spec base under deadline escalation (#414) — doubled per
+                // consecutive deadline-killed attempt, computed once above so
+                // the Job limit and the probe-attempt window cannot disagree.
+                active_deadline_seconds: Some(bootstrap_deadline_secs),
                 backoff_limit: bootstrap_fp
                     .and_then(|fp| fp.backoff_limit)
                     .unwrap_or(JobLimits::default().backoff_limit),
@@ -1631,6 +1683,10 @@ fn bootstrap_work_spec(
     namespace: &str,
     auto_create: bool,
     scan_catalog: bool,
+    // #414: this launch is a pure health probe (probe-style, no catalog work
+    // due) — the mover skips the `kopia snapshot list` catalog step and
+    // reports `snapshot_count: None`, decoupling probe cost from catalog size.
+    probe_only: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
     mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
     cluster: Option<&str>,
@@ -1664,6 +1720,7 @@ fn bootstrap_work_spec(
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
             auto_create,
             scan_catalog,
+            probe_only,
             // Create-time format knobs (encryption/splitter/hash/ECC) honored only
             // when the bootstrap creates the repo (ADR-0005 §13(a)).
             create_options: kopiur_mover::workspec::CreateOptionsSpec::from_create(create),
@@ -1777,7 +1834,12 @@ async fn finalize_bootstrap(
     api: &Api<Repository>,
     backend: &Backend,
     job_name: &str,
-    job_succeeded: bool,
+    // The Job's terminal state, WHY included (issue #414): a deadline kill is
+    // classified apart from a crashed/never-scheduled mover.
+    job_terminal: io::MoverJobTerminal,
+    // The `activeDeadlineSeconds` the Job actually ran with, for the
+    // deadline-kill condition message.
+    job_deadline_secs: i64,
     // True when this is a health-probe re-run of an already-`Ready` repo (same
     // spec): the result is interpreted as a probe (the `BackendReachable`
     // condition carries the outcome; the phase follows `health::breaker_verdict`
@@ -1799,7 +1861,13 @@ async fn finalize_bootstrap(
     // exhaustively-handled modes — never a silent `Failed/Unknown` with no
     // Event — and the success arm *owns* the result, so there is no
     // `.expect()` invariant to get wrong.
-    let result = match io::bootstrap_outcome(result, job_succeeded, job_name, seed_armed) {
+    let result = match io::bootstrap_outcome(
+        result,
+        job_terminal,
+        job_name,
+        seed_armed,
+        job_deadline_secs,
+    ) {
         // Result not visible yet (write/propagation race): requeue briefly rather
         // than guessing. A truly result-less Job stays terminal for the next pass.
         io::BootstrapOutcome::ResultPending => {
@@ -2028,7 +2096,7 @@ async fn finalize_bootstrap(
     if result.snapshots_truncated {
         tracing::warn!(
             repo = %name,
-            snapshot_count = result.snapshot_count,
+            snapshot_count = result.snapshot_count.unwrap_or(0),
             "catalog larger than the materialization cap; not all snapshots were materialized"
         );
     }
@@ -2042,16 +2110,24 @@ async fn finalize_bootstrap(
     // refresh — `repo` is the pre-reconcile cache, so its observedGeneration is
     // still the old one exactly once per spec change.
     let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-    if catalog::scan_due(
-        repo.metadata.generation,
-        repo.status.as_ref().and_then(|s| s.observed_generation),
-        last_refresh_at(repo),
-        interval,
-        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
-        scan_requested_token(repo),
-        scan_requested_honored(repo),
-        chrono::Utc::now(),
-    ) {
+    // `snapshot_count: None` = the listing DID NOT RUN (a probe-only result,
+    // #414) — running the scan over it would expire every discovered Snapshot
+    // and zero the stats against an empty list. Skipping leaves any pending
+    // scan-request token un-honored, so `bootstrap_recycle_due`'s token arm
+    // recycles the Job for a full run — the launch-side `probe_only` gating
+    // makes this arm unreachable in practice; this is its belt.
+    if let Some(snapshot_count) = result.snapshot_count
+        && catalog::scan_due(
+            repo.metadata.generation,
+            repo.status.as_ref().and_then(|s| s.observed_generation),
+            last_refresh_at(repo),
+            interval,
+            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+            scan_requested_token(repo),
+            scan_requested_honored(repo),
+            chrono::Utc::now(),
+        )
+    {
         run_catalog_scan(
             ctx,
             repo,
@@ -2059,7 +2135,7 @@ async fn finalize_bootstrap(
             name,
             repo_uid,
             &result.snapshots,
-            result.snapshot_count,
+            snapshot_count,
             result.snapshots_truncated,
             result.foreign_suffix_dropped,
         )
@@ -2124,98 +2200,169 @@ async fn finalize_bootstrap_failure(
     if probe_run {
         return finalize_probe_failure(ctx, repo, api, name, job_name, &failure).await;
     }
-    let reason = failure.reason();
-    // #380: a seed failure ALSO says something about the seed, so it gets a
-    // `Seeded=False` condition beside `Bootstrapped=False`. Folded into the
-    // same array both arms below build, because a conditions patch replaces the
-    // whole thing.
-    let seed_fold =
-        |conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]| match failure
-            .seed_reason()
-        {
-            Some(seed_reason) => io::upsert_condition(
-                conditions,
-                kopiur_api::consts::SEEDED_CONDITION,
-                false,
-                seed_reason,
-                &failure.condition_message(),
-                repo.metadata.generation,
-            ),
-            // A bootstrap that failed for a reason having NOTHING to do with
-            // the seed (an AuthFailure against this repository's own backend, a
-            // result-less Job) says nothing about the seed's state — so a
-            // `Seeded=False/Seeding` left standing from the in-flight pass would
-            // claim a copy is running beside a terminal `Failed`. Drop it; the
-            // real story is on `Bootstrapped` and `Ready`.
-            None => repo_seed::drop_seed_condition(conditions),
-        };
-    // A result-less Job failure carries no backend verdict (mover
-    // crashed / evicted / deadline / result write hit a down apiserver
-    // — the outage incident): recycle the dead Job and retry as
-    // `Degraded` (the retryable-class semantics of the in-process
-    // path) instead of parking `Failed` and re-reading the same Job
-    // every pass until its TTL reaps it. Guarded write + stable
-    // message keep repeats a no-op (no hot-loop).
-    if failure.recycles_for_retry() {
-        io::delete_mover_run(&ctx.client, namespace, job_name).await?;
-        let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
-        let conditions = seed_fold(&conditions);
-        let conditions = io::set_ready(
-            &conditions,
-            repo.metadata.generation,
-            io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
-            reason,
-            &failure.condition_message(),
-        );
-        let current = serde_json::to_value(&repo.status).ok();
-        let wrote = io::patch_status_if_changed(
-            api,
-            name,
-            current.as_ref(),
-            serde_json::json!({
-                "phase": "Degraded",
-                "backend": backend.kind_str(),
-                "observedGeneration": repo.metadata.generation,
-                "conditions": conditions,
-            }),
-        )
-        .await?;
-        if wrote {
-            failure.publish(ctx, &io::event_ref(repo), name).await;
-            repo_seed::record_seed_failure(
-                &ctx.metrics,
-                repo.spec.seed.as_ref(),
-                "Repository",
-                namespace,
-                name,
-                seed_armed,
-            );
-            tracing::warn!(
-                repo = %name,
-                reason,
-                "bootstrap Job failed; recycled it for retry"
-            );
-        }
-        return Ok(Action::requeue(Duration::from_secs(120)));
-    }
-    // A backend-outage verdict on a once-bootstrapped repo (#345 M4): recycle
-    // and retry as `Degraded`, feeding the unified backend sensor so the
-    // failure streak keeps climbing while the breaker is open.
     let bootstrapped = repo
         .status
         .as_ref()
         .and_then(|s| s.unique_id.as_deref())
         .is_some();
-    if failure.retryable_outage_for_bootstrapped(bootstrapped) {
-        return recycle_bootstrap_outage(
-            ctx, repo, namespace, name, api, backend, job_name, &failure,
-        )
-        .await;
+    // Route precedence lives in ONE tested place (`BootstrapFailure::route`,
+    // outage sensor first) — not in the ordering of `if` arms two hand-copied
+    // reconcilers must keep in sync.
+    match failure.route(bootstrapped) {
+        // A backend-outage verdict (or deadline kill) on a once-bootstrapped
+        // repo (#345 M4): recycle and retry as `Degraded`, feeding the unified
+        // backend sensor so the failure streak keeps climbing while the
+        // breaker is open.
+        io::FailureRoute::OutageSensor => {
+            recycle_bootstrap_outage(ctx, repo, namespace, name, api, backend, job_name, &failure)
+                .await
+        }
+        // A result-less Job failure carries no backend verdict (mover crashed /
+        // evicted / result write hit a down apiserver — the outage incident):
+        // recycle the dead Job and retry as `Degraded` instead of parking
+        // `Failed` until the Job's TTL reaps it. #415: the retry stamps the
+        // failure streak + `lastProbeAt` anchor so `strict_retry_holdoff`
+        // re-arms per failure (cadence 120→240→480→960→1800s, not the flat
+        // ~2.5-minute metronome of billed cold-cache connects).
+        io::FailureRoute::Recycle => {
+            recycle_failed_bootstrap(
+                ctx, repo, namespace, name, api, backend, job_name, &failure, seed_armed, true,
+            )
+            .await
+        }
+        // A seed failure retries PROMPTLY — flat ~120s cadence, no failure
+        // streak, no backoff: the documented DR contract
+        // (docs/scenarios/dr-with-replicated-repository.md) keeps seed retries
+        // fast because this is the flow you are in on the worst day of the
+        // year, and a seeding repository has no probe-health state to pollute.
+        io::FailureRoute::SeedRetry => {
+            recycle_failed_bootstrap(
+                ctx, repo, namespace, name, api, backend, job_name, &failure, seed_armed, false,
+            )
+            .await
+        }
+        io::FailureRoute::Terminal => {
+            park_terminal_bootstrap(
+                ctx, repo, namespace, name, api, backend, &failure, seed_armed,
+            )
+            .await
+        }
     }
+}
+
+/// The shared recycle-and-retry-as-`Degraded` write for a failed bootstrap
+/// ([`io::FailureRoute::Recycle`] / [`io::FailureRoute::SeedRetry`]).
+///
+/// `stamp_streak` is the #415 lever: the result-less route folds
+/// [`health::failure_streak_health`] into the patch (via the explicit-null
+/// builder — every health field is `skip_serializing_if`, so only the builder
+/// can clear `probeAttemptAt` through a merge patch, #273) and requeues on the
+/// exponential [`health::strict_retry_backoff`]; the seed route keeps its flat
+/// prompt 120s with no health stamping. With the streak, every cycle is a real
+/// status write, so the Event/metric/warn re-gate on the TRANSITION (into
+/// `Degraded`, or an escalation changing the `Bootstrapped=False` reason) —
+/// without that, a multi-day crash loop publishes a Warning per cycle.
+#[allow(clippy::too_many_arguments)]
+async fn recycle_failed_bootstrap(
+    ctx: &Context,
+    repo: &Repository,
+    namespace: &str,
+    name: &str,
+    api: &Api<Repository>,
+    backend: &Backend,
+    job_name: &str,
+    failure: &io::BootstrapFailure,
+    seed_armed: bool,
+    stamp_streak: bool,
+) -> Result<Action> {
+    io::delete_mover_run(&ctx.client, namespace, job_name).await?;
+    let reason = failure.reason();
     let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
-    let conditions = seed_fold(&conditions);
-    // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
-    // should fail its health check fast, not hang until timeout.
+    let conditions = repo_seed::seed_condition_fold(repo.metadata.generation, failure, &conditions);
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
+        reason,
+        &failure.condition_message(),
+    );
+    let mut patch = serde_json::json!({
+        "phase": "Degraded",
+        "backend": backend.kind_str(),
+        "observedGeneration": repo.metadata.generation,
+        "conditions": conditions,
+    });
+    let mut requeue = Duration::from_secs(120);
+    if stamp_streak {
+        let now = chrono::Utc::now().to_rfc3339();
+        let health = health::failure_streak_health(
+            repo.status.as_ref().and_then(|s| s.health.as_ref()),
+            &now,
+        );
+        requeue = health::strict_retry_backoff(
+            health
+                .consecutive_probe_failures
+                .unwrap_or(1)
+                .saturating_sub(1),
+        );
+        patch["health"] = health::probe_failure_health_patch(&health);
+    }
+    let current = serde_json::to_value(&repo.status).ok();
+    let wrote = io::patch_status_if_changed(api, name, current.as_ref(), patch).await?;
+    let transition = if stamp_streak {
+        let prior_degraded =
+            repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Degraded);
+        let prior_reason = repo
+            .status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .find(|c| c.type_ == REPOSITORY_BOOTSTRAPPED_CONDITION && c.status == "False")
+            .map(|c| c.reason.as_str());
+        !prior_degraded || prior_reason != Some(reason)
+    } else {
+        // Without a streak the guarded write itself identifies the transition.
+        true
+    };
+    if wrote && transition {
+        failure.publish(ctx, &io::event_ref(repo), name).await;
+        repo_seed::record_seed_failure(
+            &ctx.metrics,
+            repo.spec.seed.as_ref(),
+            "Repository",
+            namespace,
+            name,
+            seed_armed,
+        );
+        tracing::warn!(
+            repo = %name,
+            reason,
+            "bootstrap Job failed; recycled it for retry"
+        );
+    }
+    Ok(Action::requeue(requeue))
+}
+
+/// Park a non-retryable bootstrap verdict at terminal `Failed`
+/// ([`io::FailureRoute::Terminal`]) — kstatus-Stalled (issue #245) so Flux
+/// fails its health check fast instead of hanging until timeout. The guarded
+/// write fires the Event + warn only on the real transition (the message is
+/// stable, so re-reads are byte-stable no-ops — no hot loop, no Event spam).
+#[allow(clippy::too_many_arguments)]
+async fn park_terminal_bootstrap(
+    ctx: &Context,
+    repo: &Repository,
+    namespace: &str,
+    name: &str,
+    api: &Api<Repository>,
+    backend: &Backend,
+    failure: &io::BootstrapFailure,
+    seed_armed: bool,
+) -> Result<Action> {
+    let reason = failure.reason();
+    let conditions = bootstrap_condition(repo, false, reason, &failure.condition_message());
+    let conditions = repo_seed::seed_condition_fold(repo.metadata.generation, failure, &conditions);
     let conditions = io::set_ready(
         &conditions,
         repo.metadata.generation,
@@ -2223,9 +2370,6 @@ async fn finalize_bootstrap_failure(
         reason,
         &failure.condition_message(),
     );
-    // Guard the write so a re-confirmed failure fires the Event + warn log only
-    // on the real transition, not on every 120 s re-read (the message is stable,
-    // so this becomes a true no-op once written — no reconcile hot-loop).
     let current = serde_json::to_value(&repo.status).ok();
     let wrote = io::patch_status_if_changed(
         api,
@@ -2279,11 +2423,7 @@ async fn recycle_bootstrap_outage(
 ) -> Result<Action> {
     io::delete_mover_run(&ctx.client, namespace, job_name).await?;
     let reason = failure.reason();
-    let kind = if failure.is_repository_absent() {
-        health::ProbeFailureKind::Vanished
-    } else {
-        health::ProbeFailureKind::Unreachable
-    };
+    let kind = health::probe_failure_kind(failure);
     let now = chrono::Utc::now().to_rfc3339();
     let existing = repo
         .status
@@ -2437,11 +2577,7 @@ async fn finalize_probe_failure(
         .as_deref()
         .unwrap_or_default()
         .to_string();
-    let kind = if failure.is_repository_absent() {
-        health::ProbeFailureKind::Vanished
-    } else {
-        health::ProbeFailureKind::Unreachable
-    };
+    let kind = health::probe_failure_kind(failure);
     let existing = repo
         .status
         .as_ref()
@@ -2698,6 +2834,44 @@ mod tests {
         assert!(stale_bootstrap_job(Some("not-a-number"), Some(3)));
     }
 
+    /// #414: `probe_only` rides the bootstrap op verbatim, so a probe-style
+    /// launch with no catalog work due skips the O(snapshots) listing in the
+    /// mover — and any other launch keeps the full run.
+    #[test]
+    fn the_bootstrap_work_spec_threads_probe_only() {
+        use kopiur_api::backend::FilesystemBackend;
+        let backend = Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        });
+        let build = |probe_only: bool| {
+            let spec = bootstrap_work_spec(
+                &backend,
+                "nas",
+                "billing",
+                true,
+                true,
+                probe_only,
+                None,
+                None,
+                None,
+                ForeignSnapshots::Fallback,
+                false,
+                true,
+                false,
+                None,
+                None,
+                None,
+            );
+            match spec.operation {
+                Operation::BootstrapRepository(op) => op,
+                other => panic!("expected BootstrapRepository, got {other:?}"),
+            }
+        };
+        assert!(build(true).probe_only);
+        assert!(!build(false).probe_only);
+    }
+
     /// #380: the seed payload rides the bootstrap op, and only when armed.
     #[test]
     fn the_bootstrap_work_spec_carries_the_seed_payload_only_when_one_is_armed() {
@@ -2714,6 +2888,7 @@ mod tests {
                 "billing",
                 true,
                 true,
+                false,
                 None,
                 None,
                 None,
@@ -2861,8 +3036,8 @@ mod tests {
         });
         let prefilter = |cluster: Option<&str>, foreign: ForeignSnapshots| {
             let spec = bootstrap_work_spec(
-                &backend, "nas", "billing", true, true, None, None, cluster, foreign, false, true,
-                false, None, None, None,
+                &backend, "nas", "billing", true, true, false, None, None, cluster, foreign, false,
+                true, false, None, None, None,
             );
             match spec.operation {
                 Operation::BootstrapRepository(op) => op.catalog_foreign_prefilter_cluster,
@@ -2901,6 +3076,7 @@ mod tests {
                 "billing",
                 true,
                 true,
+                false,
                 None,
                 None,
                 cluster,

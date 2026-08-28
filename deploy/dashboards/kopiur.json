@@ -1437,7 +1437,7 @@
       "id": 76,
       "type": "timeseries",
       "title": "Health probe failures (rate by outcome)",
-      "description": "Backend health-probe alerts after the consecutive-failure debounce: vanished = backend reachable but the repository is absent; unreachable = backend/mount/auth failure.",
+      "description": "Backend health-probe alerts after the consecutive-failure debounce: vanished = backend reachable but the repository is absent; unreachable = backend/mount/auth failure; timed_out = the probe Job was killed by its bootstrap deadline (backend may be reachable but slow).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

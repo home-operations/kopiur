@@ -4787,26 +4787,11 @@ async fn assess_completed_backup(
 }
 
 /// Whether a Job reached a terminal state: `Some(true)` complete, `Some(false)`
-/// failed, `None` still running.
+/// failed, `None` still running. A thin wrapper over
+/// [`io::mover_job_terminal`] (which also carries WHY the Job failed, #414) so
+/// the two classifiers can never diverge.
 pub(crate) fn job_terminal_state(job: &Job) -> Option<bool> {
-    let status = job.status.as_ref()?;
-    let conditions = status.conditions.as_ref();
-    if let Some(conds) = conditions {
-        for c in conds {
-            if c.status == "True" {
-                match c.type_.as_str() {
-                    "Complete" => return Some(true),
-                    "Failed" => return Some(false),
-                    _ => {}
-                }
-            }
-        }
-    }
-    // Fall back to counts when conditions aren't populated yet.
-    if status.succeeded.unwrap_or(0) >= 1 {
-        return Some(true);
-    }
-    None
+    io::mover_job_terminal(job).map(|t| matches!(t, io::MoverJobTerminal::Complete))
 }
 
 /// Whether the staged-source teardown may proceed for a `Succeeded` Snapshot.

@@ -178,23 +178,40 @@ spec:
             summary: "kopiur leader Lease renewals are slow"
             description: "p99 Lease renew latency is {{`{{ $value }}`}}s against a 10s renew window. Healthy is single-digit milliseconds. If the API server is otherwise fine, the operator's lease traffic is most likely queueing in API Priority and Fairness — check that the kopiur FlowSchema exists (leaderElection.flowSchema.enabled)."
         - alert: KopiurRepositoryBreakerOpen
-          # The repository circuit breaker (#345) is open: the backend health probe
-          # exceeded spec.health.probe.failureThreshold under onFailure: Degrade, so
-          # the repository moved to Degraded and stays there STABLY while open (M4's
-          # launch-phase guarantee — no Initializing flap), which is what makes the
-          # `for:` clause meaningful. Narrower than KopiurRepositoryNotReady (which
-          # also matches Failed and pages critical): this one names the breaker
-          # specifically and explains that the pause is deliberate and self-healing.
-          # max-by for scrape-target-overlap identity hygiene, matching the other
-          # phase alerts; `kind` is kept so the description can point kubectl at the
-          # right resource.
-          expr: max by (kind, namespace, name) (kopiur_resource_phase{kind=~"Repository|ClusterRepository", phase="Degraded"}) == 1
+          # The repository circuit breaker (#345) is open for a HARD cause: the
+          # backend health probe exceeded spec.health.probe.failureThreshold under
+          # onFailure: Degrade with the backend confirmed unreachable or the
+          # repository vanished. Keyed on the reason-labeled breaker gauge
+          # (#413/#414) rather than bare phase=Degraded, so the self-healing
+          # slow-connect spiral pages separately (below) with the right
+          # remediation. The phase stays Degraded STABLY while open (M4's
+          # launch-phase guarantee — no Initializing flap), which is what makes
+          # the `for:` clause meaningful. max-by for scrape-target-overlap
+          # identity hygiene; `kind` is kept so the description can point kubectl
+          # at the right resource.
+          expr: max by (kind, namespace, name) (kopiur_repository_breaker_open{reason=~"unreachable|vanished|other"}) == 1
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: "Repository circuit breaker open for {{`{{ $labels.kind }}`}} {{`{{ $labels.namespace }}`}}/{{`{{ $labels.name }}`}}"
             description: "The backend health probe kept failing past its threshold, so kopiur opened the circuit breaker: backups, maintenance, and replication against this repository are paused (Snapshots park Pending, they are not lost). Recovery is automatic once a connect succeeds — nothing needs restarting. Run `kubectl describe {{`{{ $labels.kind }}`}} {{`{{ $labels.name }}`}}` and check the BackendReachable condition for the cause."
+        - alert: KopiurRepositoryConnectSlow
+          # The breaker is open because connects keep exceeding the bootstrap Job
+          # deadline (reason timed_out, #414) — the backend may be perfectly
+          # reachable but slow (a cold cache over a large index). This state is
+          # usually SELF-HEALING: maintenance keeps running (index compaction
+          # shrinks connect time, #413) and kopiur escalates the deadline itself
+          # (doubling per attempt up to 30m), so it pages info, not warning, with
+          # a longer `for:` — if it persists past the escalation ladder, the
+          # remediation is a spec edit, not a network hunt.
+          expr: max by (kind, namespace, name) (kopiur_repository_breaker_open{reason="timed_out"}) == 1
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "Repository connects keep exceeding the bootstrap deadline for {{`{{ $labels.kind }}`}} {{`{{ $labels.namespace }}`}}/{{`{{ $labels.name }}`}}"
+            description: "kopia repository connect keeps being killed by the bootstrap Job deadline, so the circuit breaker is open: backups and replication are paused (Snapshots park Pending), while maintenance keeps running and kopiur retries with a progressively longer deadline — this usually self-heals once a longer connect succeeds and index compaction catches up. If it persists, raise spec.bootstrap.failurePolicy.activeDeadlineSeconds and check that maintenance is actually completing (`kubectl describe {{`{{ $labels.kind }}`}} {{`{{ $labels.name }}`}}`, IndexBlobHealth and BackendReachable conditions)."
         - alert: KopiurSnapshotsGated
           # Sustained parked backups: Snapshots held Pending behind a not-Ready
           # repository (Ready reason RepositoryNotReady). These are deferrals, not

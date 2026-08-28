@@ -160,6 +160,14 @@ jobs:
           - shard: quiescence
             bins: "steady_state health_probe"
             backends: true
+          # Deadline-kill classification, maintenance exemption, relaunch holdoff
+          # and deadline escalation (#413/#414/#415). Own shard: the #415 guard
+          # asserts NO new discovery Job appears inside a 90s wall-clock window,
+          # so it must not compete for scheduler/apiserver latency with a noisy
+          # neighbor. backends: true for its MinIO buckets.
+          - shard: bootstrap-deadline
+            bins: "bootstrap_deadline"
+            backends: true
           # Mass-deletion protection + the batched delete dispatcher. Own shard:
           # throttle_caps_concurrent_batch_jobs patches the controller Deployment's
           # KOPIUR_MAX_CONCURRENT_DELETE_JOBS and waits out a rollout — it restores the

@@ -183,6 +183,50 @@ pub async fn repository_ready_cached(
     }
 }
 
+/// Store-backed MAINTENANCE gate (issue #413): whether the target repository
+/// accepts maintenance now, per [`crate::health::maintenance_may_proceed`] —
+/// keyed on bootstrapped-before + degradation cause, NOT strictly
+/// `phase == Ready` like [`repository_ready_cached`]. Maintenance is the one
+/// consumer deliberately EXEMPT from the #345 breaker's `Ready`-only gate,
+/// because for an index-blob-bloated repository maintenance is the cure and
+/// withholding it is a deadlock.
+///
+/// The Maintenance G7 gate is the sole consumer, and it is a launch-side gate
+/// (#382 M2 charter), so no live twin exists. Same staleness bound and same
+/// `MissingDependency` shape as [`repository_ready_cached`].
+pub async fn repository_maintainable_cached(
+    ctx: &Context,
+    repo_ref: &RepositoryRef,
+    default_ns: &str,
+) -> Result<bool> {
+    match repo_lookup(repo_ref, default_ns) {
+        RepoLookup::Namespaced { namespace, name } => {
+            let repo = fetch_repository(ctx, &namespace, &name)
+                .await?
+                .ok_or_else(|| {
+                    Error::MissingDependency(format!("Repository {namespace}/{name}"))
+                })?;
+            let status = repo.status.as_ref();
+            Ok(crate::health::maintenance_may_proceed(
+                status.and_then(|s| s.phase.as_ref()),
+                status.and_then(|s| s.unique_id.as_deref()),
+                status.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
+            ))
+        }
+        RepoLookup::Cluster { name } => {
+            let repo = fetch_cluster_repository(ctx, &name)
+                .await?
+                .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
+            let status = repo.status.as_ref();
+            Ok(crate::health::maintenance_may_proceed(
+                status.and_then(|s| s.phase.as_ref()),
+                status.and_then(|s| s.unique_id.as_deref()),
+                status.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
+            ))
+        }
+    }
+}
+
 /// **Pure** (#382 M3, audit C4). Whether a cached `Snapshot` row belongs to
 /// the namespaced label population `namespace` + `label_key=label_value`.
 ///
@@ -533,6 +577,106 @@ mod tests {
         // Absent repository: live-confirmed MissingDependency, same shape as
         // the live `repository_ready`.
         let err = repository_ready_cached(&ctx, &rref("gone"), "team-a")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::MissingDependency(ref m) if m.contains("Repository team-a/gone")),
+            "got {err:?}"
+        );
+    }
+
+    // --- repository_maintainable_cached: the #413 maintenance gate ----------
+
+    /// A Repository fixture with an arbitrary status body (the readiness
+    /// fixture above only sets `phase`; the maintenance gate also reads
+    /// `uniqueId` and `conditions`).
+    fn repository_with_status(ns: &str, name: &str, status: serde_json::Value) -> Repository {
+        let mut v = repository_json(ns, name, None);
+        v["status"] = status;
+        serde_json::from_value(v).expect("valid Repository fixture")
+    }
+
+    fn backend_reachable_false(reason: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "type": "BackendReachable",
+            "status": "False",
+            "reason": reason,
+            "message": "m",
+            "lastTransitionTime": "2026-08-27T00:00:00Z",
+        }])
+    }
+
+    #[tokio::test]
+    async fn repository_maintainable_cached_reads_the_gate_inputs_from_the_store() {
+        // #413 maintenance deadlock: Degraded-because-slow must not withhold
+        // the cure. The gate reads phase + uniqueId + conditions off the
+        // cached CR — all from the store, zero HTTP.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
+        let ctx = Context::test_context(client);
+        prime_repo_store(
+            &ctx,
+            vec![
+                repository("team-a", "ready", Some("Ready")),
+                repository("team-a", "cold", Some("Initializing")),
+                // Degraded + bootstrapped, no BackendReachable=False: the
+                // crash-loop / deadline-kill shape — maintenance proceeds.
+                repository_with_status(
+                    "team-a",
+                    "slow",
+                    serde_json::json!({ "phase": "Degraded", "uniqueId": "u1" }),
+                ),
+                // Degraded + bootstrapped + CONFIRMED unreachable: deferred.
+                repository_with_status(
+                    "team-a",
+                    "down",
+                    serde_json::json!({
+                        "phase": "Degraded",
+                        "uniqueId": "u2",
+                        "conditions": backend_reachable_false("BackendUnreachable"),
+                    }),
+                ),
+                // Degraded but never bootstrapped: nothing to maintain.
+                repository_with_status(
+                    "team-a",
+                    "unborn",
+                    serde_json::json!({ "phase": "Degraded" }),
+                ),
+            ],
+            true,
+        );
+
+        let rref = |name: &str| RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::Repository,
+            name: name.into(),
+            namespace: None,
+        };
+        let maintainable = |name: &str| {
+            let ctx = &ctx;
+            let rref = rref(name);
+            async move {
+                repository_maintainable_cached(ctx, &rref, "team-a")
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(maintainable("ready").await);
+        assert!(!maintainable("cold").await);
+        assert!(
+            maintainable("slow").await,
+            "#413: Degraded-because-slow gets maintenance"
+        );
+        assert!(
+            !maintainable("down").await,
+            "confirmed-unreachable stays deferred"
+        );
+        assert!(
+            !maintainable("unborn").await,
+            "never-bootstrapped stays deferred"
+        );
+        assert!(log.lock().unwrap().is_empty(), "all served from cache");
+        // Absent repository: same MissingDependency shape as the readiness gate.
+        let err = repository_maintainable_cached(&ctx, &rref("gone"), "team-a")
             .await
             .unwrap_err();
         assert!(
