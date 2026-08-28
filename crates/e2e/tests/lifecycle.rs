@@ -2751,6 +2751,7 @@ fn cluster_server_repository_json(name: &str) -> serde_json::Value {
                 "passwordSecretRef": { "name": kopiur_e2e::consts::SECRET_KOPIA_PW_ONLY, "key": "KOPIA_PASSWORD" }
             },
             "create": { "enabled": true },
+            "allowedNamespaces": { "all": true },
             "server": {
                 "namespace": CREPO_SERVER_NS,
                 "auth": { "insecure": { "acknowledgeInsecure": true } },
