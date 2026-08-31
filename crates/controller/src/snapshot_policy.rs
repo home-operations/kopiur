@@ -1564,6 +1564,10 @@ struct AdoptionOutcome {
     adopted: u64,
     requested_scan: bool,
     skipped_by_retention: u64,
+    /// This target's scan-outcome counts (pre-own-id/retention filters), summed
+    /// across targets into `status.adoption.lastScanMatched`/`lastScanUnmatched`.
+    identity_matched: u32,
+    unmatched: u32,
     identity: String,
 }
 
@@ -1660,32 +1664,6 @@ async fn adoption_pass_for_target(
         .await;
     }
 
-    // 7a. #380: a NON-EMPTY catalog with ZERO identity matches. The fork guards
-    //     are Update-gated and cannot fire on a fresh-cluster CREATE, so after a
-    //     disaster recovery this is the only signal that the recovered identity
-    //     does not match the one that wrote the history. Warning, because
-    //     silently starting a new chain beside recoverable history is a data
-    //     outcome, not a style issue. Deliberately NOT latched (see
-    //     `AdoptionPlan::no_adoptable_history`): it repeats while the mismatch
-    //     persists, and the apiserver aggregates the repeats into one counted
-    //     Event.
-    if plan.no_adoptable_history {
-        io::publish_warning_event(
-            ctx,
-            config,
-            crate::consts::NO_ADOPTABLE_HISTORY_REASON,
-            crate::consts::CHECK_IDENTITY_ACTION,
-            &crate::adoption::no_adoptable_history_message(&identity_str, &t.rref.name),
-        )
-        .await;
-        tracing::warn!(
-            policy = %name,
-            identity = %identity_str,
-            repository = %t.rref.name,
-            "repository holds discovered snapshots but none match this policy's identity"
-        );
-    }
-
     // 7. Adoption-wave observability (metric + Normal event).
     if adopted > 0 {
         ctx.metrics.inc_snapshots_adopted(namespace, name, adopted);
@@ -1704,6 +1682,8 @@ async fn adoption_pass_for_target(
         adopted,
         requested_scan: request_scan,
         skipped_by_retention: plan.skipped_by_retention,
+        identity_matched: plan.identity_matched,
+        unmatched: plan.unmatched,
         identity: identity_str,
     }))
 }
@@ -1815,6 +1795,15 @@ async fn run_adoption(
         .map(|o| o.identity.clone())
         .unwrap_or_default();
     let plan_skipped = outcomes.iter().map(|o| o.skipped_by_retention).sum::<u64>();
+    // Scan outcome, summed across the ready targets of THIS pass (a multi-repo
+    // policy reports one figure over its whole fleet, per the field contract).
+    // Saturating: the counts are inventory, and a wrapped total would be a lie.
+    let scan_matched = outcomes
+        .iter()
+        .fold(0u32, |acc, o| acc.saturating_add(o.identity_matched));
+    let scan_unmatched = outcomes
+        .iter()
+        .fold(0u32, |acc, o| acc.saturating_add(o.unmatched));
 
     // 7b. Retention-gate observability (adoption inv. 8). Transition-gated: the
     //     event and the status write fire when the withheld COUNT changes, so a
@@ -1829,6 +1818,13 @@ async fn run_adoption(
             .unwrap_or(0),
     );
     let skipped_changed = plan_skipped != prior_skipped;
+    // Same transition gate for the scan counts: they only move when the catalog
+    // moves, so a changed count is a real event and cannot self-trigger a
+    // reconcile loop (`io::patch_status_if_changed` no-ops an identical patch).
+    let prior_adoption = config.status.as_ref().and_then(|s| s.adoption.as_ref());
+    let scan_counts_changed = prior_adoption.and_then(|a| a.last_scan_matched)
+        != Some(scan_matched)
+        || prior_adoption.and_then(|a| a.last_scan_unmatched) != Some(scan_unmatched);
     if plan_skipped > 0 {
         tracing::debug!(
             policy = %name,
@@ -1850,17 +1846,21 @@ async fn run_adoption(
 
     // 8. `status.adoption` summary (guarded, prior-carrying — only touched when
     //    there is activity, so a steady-state pass writes nothing).
-    if adopted > 0 || any_scan || skipped_changed {
+    if adopted > 0 || any_scan || skipped_changed || scan_counts_changed {
         write_adoption_status(
             api,
             name,
             current,
             config,
-            adopted,
-            any_scan,
-            plan_skipped,
-            &now,
-            &identity_str,
+            AdoptionStatusWrite {
+                adopted,
+                request_scan: any_scan,
+                skipped_by_retention: plan_skipped,
+                scan_matched,
+                scan_unmatched,
+                now: &now,
+                identity: &identity_str,
+            },
         )
         .await?;
         return Ok(Some(std::time::Duration::from_secs(30)));
@@ -2059,22 +2059,40 @@ async fn adopt_one(
     Ok(())
 }
 
+/// One pass's inputs to [`write_adoption_status`] — one struct so the writer
+/// stays under the argument lint and a new recorded fact cannot be threaded to
+/// only some call sites.
+struct AdoptionStatusWrite<'a> {
+    adopted: u64,
+    request_scan: bool,
+    skipped_by_retention: u64,
+    /// Summed over the pass's targets, pre-own-id/retention filters.
+    scan_matched: u32,
+    scan_unmatched: u32,
+    now: &'a str,
+    identity: &'a str,
+}
+
 /// Merge-patch `status.adoption` with the pass's summary, carrying prior values
 /// forward for the fields this pass did not touch so [`io::patch_status_if_changed`]
 /// stays a no-op in steady state.
-#[allow(clippy::too_many_arguments)]
 async fn write_adoption_status(
     api: &Api<SnapshotPolicy>,
     name: &str,
     current: Option<&serde_json::Value>,
     config: &SnapshotPolicy,
-    adopted: u64,
-    request_scan: bool,
-    skipped_by_retention: u64,
-    now: &str,
-    identity: &str,
+    pass: AdoptionStatusWrite<'_>,
 ) -> Result<()> {
     use kopiur_api::snapshot_policy::AdoptionSummary;
+    let AdoptionStatusWrite {
+        adopted,
+        request_scan,
+        skipped_by_retention,
+        scan_matched,
+        scan_unmatched,
+        now,
+        identity,
+    } = pass;
     let prior = config.status.as_ref().and_then(|s| s.adoption.as_ref());
     let prior_total = prior.and_then(|a| a.total_adopted).unwrap_or(0);
     let summary = AdoptionSummary {
@@ -2092,6 +2110,11 @@ async fn write_adoption_status(
             prior.and_then(|a| a.last_adopted_count)
         },
         total_adopted: Some(prior_total + adopted),
+        // Also the CURRENT pass's observation, never prior-carried: a stale
+        // count read as live inventory would be worse than none. `0`/`0` is a
+        // real answer (empty catalog), which is why it is stamped, not elided.
+        last_scan_matched: Some(scan_matched),
+        last_scan_unmatched: Some(scan_unmatched),
         scan_requested_at: if request_scan {
             Some(now.to_string())
         } else {

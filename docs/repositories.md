@@ -835,6 +835,14 @@ Each `*Expr` is a CEL expression returning a **string**. CEL is sandboxed (no I/
 
 ///
 
+/// warning | Editing `identityDefaults` strands the history behind the old identity
+
+`identityDefaults` (and [`cluster`](#identitydefaultscluster--sharing-one-repository-across-clusters) below) are rendered into **every** consumer's kopia identity on every reconcile. Change one and the consumers that relied on it re-render: new snapshots land under the new `username@hostname:path`, and the existing history stays behind the old one — still restorable [by identity](restores.md#restoring-a-snapshot-kopiur-didnt-create), but no longer the same chain.
+
+On a live cluster the webhook's identity-fork guard challenges that edit and makes you acknowledge it with the `allow-identity-change` annotation. **On a freshly-rebuilt cluster nothing can**: the guard is update-gated, and after a disaster every `Repository` and `SnapshotPolicy` arrives as a CREATE, so a repository whose `identityDefaults` drifted from the pre-disaster manifests hands its consumers new identities with no complaint at all. That's why DR ends with a positive check rather than a warning to wait for — see [Scenario 10 → verification checklist](scenarios/dr-with-replicated-repository.md#verification-checklist).
+
+///
+
 ### `identityDefaults.cluster` — sharing one repository across clusters
 
 `cluster` is a distinct knob from the two CEL expressions above: an RFC 1123 label, **at most 32 characters**, with **no dots** (a dot is the delimiter `identityDefaults.cluster` reserves to split a hostname back into its namespace and cluster parts on the read path, so an embedded dot is rejected outright at admission rather than risked). Set it once per cluster that shares this repository:
@@ -854,6 +862,8 @@ Setting it changes three things:
 /// warning | Setting or changing `cluster` on a repository with consumer history is an identity change
 
 If any consumer `SnapshotPolicy` already has snapshot history, setting `identityDefaults.cluster` for the first time — or changing it — silently re-identifies every consumer that resolves the default hostname (no `hostnameExpr`, no per-policy `identity` override): new snapshots land under `<namespace>.<cluster>` while the old history stays under bare `<namespace>`, and both lineages keep competing in the **same** GFS timeline — Kopiur's retention buckets a policy's `Snapshot` CRs per (source, repository), never by kopia identity, so pre-flip and post-flip CRs of one source share a bucket and the pre-flip ones keep aging out normally rather than being frozen or orphaned outright. The webhook **rejects** this edit fleet-wide, exactly like any other `identityDefaults` change (see [Backups → identity](backups.md#identity--what-kopia-records-usernamehostnamepath)) — acknowledge it with the `allow-identity-change` annotation once you've read the consequences. For turning on multi-cluster sharing on a repository that's already in use, follow [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md), which walks the safe order of operations end to end.
+
+The guard only covers **edits**. Rebuilding a cluster re-creates this `Repository`, so a `cluster` value that drifted from the pre-disaster manifests — or went missing from them — silently re-identifies every consumer with nothing to challenge it. Restore `cluster` byte-for-byte during DR and then [verify adoption](scenarios/dr-with-replicated-repository.md#verification-checklist).
 
 ///
 
