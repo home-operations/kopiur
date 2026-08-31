@@ -234,6 +234,16 @@ pub(crate) const TRUNCATION_MARKER: &str = "…";
 /// `<op> failed (class X): kopia `…` failed (exit code N, class X): <detail>`.
 /// Both layers are peeled. A bare stderr fragment (no such framing) is returned
 /// unchanged.
+/// A `kube::Error::Api` `Display` appends a full ` (Status { … })` Debug dump of
+/// the response — noise in an operator note. Keep the human `ApiError: <msg>:
+/// <reason>` head and drop the debug tail.
+fn kube_error_brief(message: &str) -> &str {
+    match message.find(" (Status {") {
+        Some(i) => &message[..i],
+        None => message,
+    }
+}
+
 fn kopia_detail(message: &str) -> &str {
     let mut msg = message;
     // Peel one `… failed (…): ` layer at a time. The `"failed ("` guard on the
@@ -424,11 +434,11 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
             let (action, note) = backend_failure_event(class, &e.to_string(), uid);
             (class.as_str(), action, note)
         }
-        Error::Kube(_) => (
+        Error::Kube(e) => (
             KUBE_API_ERROR_REASON,
             CHECK_API_SERVER_ACTION,
             Diagnostic::new("a Kubernetes API call failed during reconcile")
-                .because(err.to_string())
+                .because(kube_error_brief(&e.to_string()).to_string())
                 .fix(
                     "usually transient — the reconcile retries automatically; if it persists, \
                      check the API server's health and the operator's RBAC",

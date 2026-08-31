@@ -126,7 +126,8 @@ fn trim_clause(s: &str) -> &str {
 ///   only ever live in `status.failure.stderrTail`, never in a built message,
 /// * a generic filler lead (`"error:"`, `"failed:"`, …) that buries the specific
 ///   problem behind a word truncation would waste,
-/// * absurd length (> 900 chars) — the anti-ramble backstop.
+/// * a message longer than [`MAX_MESSAGE_CHARS`] — the anti-ramble cap: an
+///   operator-facing message that long is narrating, not naming what's wrong.
 pub fn message_shape_issue(msg: &str) -> Option<String> {
     let trimmed = msg.trim();
     if trimmed.is_empty() {
@@ -163,14 +164,20 @@ pub fn message_shape_issue(msg: &str) -> Option<String> {
             ));
         }
     }
-    if trimmed.chars().count() > 900 {
+    if trimmed.chars().count() > MAX_MESSAGE_CHARS {
         return Some(format!(
-            "message is {} chars (> 900); likely a ramble — trim to what/why/fix",
+            "message is {} chars (> {MAX_MESSAGE_CHARS}); it is narrating, not naming what's \
+             wrong — lead with the specific fault, then a tight why + fix",
             trimmed.chars().count()
         ));
     }
     None
 }
+
+/// The most an operator-facing message may be: enough for a packed what/why/fix,
+/// short enough to read at a glance in `kubectl describe`. Past this a message is
+/// almost always explaining rather than saying what is wrong.
+pub const MAX_MESSAGE_CHARS: usize = 400;
 
 /// Detect a kopia per-attempt temp suffix like `.tmp.9f3ac1` (a `.tmp.` followed
 /// by hex). These are random per run and are the classic volatility that must

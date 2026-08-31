@@ -3020,12 +3020,17 @@ mod reconcile_failure_events {
                 "note for {err} should contain {note_phrase:?}: {}",
                 ev.note
             );
-            // The note always embeds the error's own message (the detail reaches
-            // the user).
-            assert!(
-                ev.note.contains(&err.to_string()),
-                "note for {err} should embed the error message"
-            );
+            // The note embeds the error's own message (the detail reaches the
+            // user) — for compact errors. A giant upstream Display (a raw kube
+            // Status debug dump) is summarized to stay under the ramble cap, so
+            // skip the strict containment there and rely on the phrase + shape
+            // checks below.
+            if err.to_string().chars().count() <= 200 {
+                assert!(
+                    ev.note.contains(&err.to_string()),
+                    "note for {err} should embed the error message"
+                );
+            }
             // ...and every variant's note is well-formed per the shared shape
             // checker (lead-with-specific, no doubled spaces, no volatile temp
             // fragments, not a ramble). This is the structural lint over the whole
