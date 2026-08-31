@@ -224,19 +224,28 @@ const EVENT_MESSAGE_BUDGET_BYTES: usize = 512;
 /// Appended to a string that was truncated, signalling the cut to readers.
 pub(crate) const TRUNCATION_MARKER: &str = "…";
 
-/// A [`KopiaError`](kopiur_kopia::KopiaError)'s `Display` is
-/// `kopia `{args}` failed ({code}, class {class}): {detail}`. When we embed it
-/// inside an Event note that *already* names the backend failure and its class,
-/// that leading framing is redundant — strip it to just the `{detail}` so the
-/// note reads as one sentence, not a nested one. A string that is not in that
-/// shape (a bare stderr fragment, a test input) is returned unchanged.
+/// Peel the `… failed (…): ` framing that a [`KopiaError`](kopiur_kopia::KopiaError)
+/// / `MoverError` `Display` wraps the real error in, down to the innermost human
+/// detail — so an Event note that *already* names the backend failure and its
+/// class reads as one sentence, not a nested one.
+///
+/// A bootstrap failure **nests** the two: the mover's `MoverError` frames a
+/// `KopiaError`, giving
+/// `<op> failed (class X): kopia `…` failed (exit code N, class X): <detail>`.
+/// Both layers are peeled. A bare stderr fragment (no such framing) is returned
+/// unchanged.
 fn kopia_detail(message: &str) -> &str {
-    if message.starts_with("kopia `") {
-        if let Some((_framing, detail)) = message.split_once("): ") {
-            return detail;
+    let mut msg = message;
+    // Peel one `… failed (…): ` layer at a time. The `"failed ("` guard on the
+    // text before each `"): "` boundary means we only strip real error framing,
+    // never a `"): "` that merely appears inside the innermost detail.
+    while let Some(boundary) = msg.find("): ") {
+        if !msg[..boundary].contains("failed (") {
+            break;
         }
+        msg = &msg[boundary + "): ".len()..];
     }
-    message
+    msg
 }
 
 /// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, appending
