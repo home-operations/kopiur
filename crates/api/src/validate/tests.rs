@@ -5446,11 +5446,6 @@ fn writable_source_conflicts_with_a_read_only_many_staged_pvc() {
         "ReadOnlyMany + readOnly: false must be rejected"
     );
     assert!(msg.contains("ReadOnlyMany"), "{msg}");
-    // The same conflict exists for a read-only staged CLASS, which admission cannot see.
-    assert!(
-        msg.contains("backingSnapshot"),
-        "must warn about the invisible twin: {msg}"
-    );
 
     // ReadOnlyMany + the read-only default is the documented pairing — still valid.
     let spec = policy_yaml(

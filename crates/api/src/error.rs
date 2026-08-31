@@ -344,11 +344,10 @@ pub enum ValidationError {
     /// `kopiur.home-operations.com/allow-identity-change` annotation
     /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
     #[error(
-        "this edit changes the policy's resolved kopia identity from {old:?} to {new:?}, but the \
-         policy already has snapshot history; new snapshots would land under a new kopia source \
-         while the old lineage's Snapshot CRs keep competing in the same GFS retention timeline \
-         (not independent retention), and restore/verify resolve only the new identity. To \
-         intentionally re-identify, set annotation \
+        "this edit changes the policy's resolved kopia identity ({old:?} → {new:?}) but it has \
+         snapshot history — new snapshots fork to a competing kopia lineage sharing the old one's \
+         GFS retention timeline (not independent retention), and restore/verify resolve only the \
+         new identity. Fix: acknowledge with annotation \
          kopiur.home-operations.com/allow-identity-change (any non-empty value)"
     )]
     IdentityWouldFork {
@@ -366,11 +365,10 @@ pub enum ValidationError {
     /// lineage would fork — with N members, the other N-1 may be unaffected.
     /// Same acknowledgement release as the single-repo variant.
     #[error(
-        "this edit changes the policy's resolved kopia identity in repository {repo} from \
-         {old:?} to {new:?}, but the policy already has snapshot history; new snapshots would \
-         land under a new kopia source while the old lineage's Snapshot CRs keep competing in \
-         the same GFS retention timeline (not independent retention), and restore/verify \
-         resolve only the new identity. To intentionally re-identify, set annotation \
+        "this edit changes the policy's resolved kopia identity in repository {repo} ({old:?} → \
+         {new:?}) but has snapshot history — new snapshots fork to a competing kopia lineage \
+         sharing the old one's GFS retention timeline, and restore/verify resolve only the new \
+         identity. Fix: acknowledge with annotation \
          kopiur.home-operations.com/allow-identity-change (any non-empty value)"
     )]
     IdentityWouldForkInRepository {
@@ -399,13 +397,11 @@ pub enum ValidationError {
     /// `kopiur.home-operations.com/allow-identity-change` annotation
     /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
     #[error(
-        "this edit changes identityDefaults, which would re-identify {} — new snapshots would \
-         fork to a new kopia lineage while the old and new lineages keep competing in the same \
-         GFS retention timeline (not independent retention), and restore/verify resolve only the \
-         new identity. To intentionally re-identify, set annotation \
-         kopiur.home-operations.com/allow-identity-change (any non-empty value, e.g. \
-         \"intentional\") on this repository; or pin an explicit spec.identity (both username \
-         AND hostname) on the affected policies first",
+        "this edit to identityDefaults would re-identify {} — new snapshots fork to a competing \
+         kopia lineage sharing the old one's GFS retention timeline, and restore/verify resolve \
+         only the new identity. Fix: acknowledge with annotation \
+         kopiur.home-operations.com/allow-identity-change (any non-empty value), or pin an \
+         explicit spec.identity (both username AND hostname) on those policies first",
         describe_identity_change_consumers(consumers)
     )]
     RepositoryIdentityWouldFork {
@@ -569,11 +565,9 @@ pub enum ValidationError {
     /// identities the destination does NOT merely mirror. Rejected as a
     /// data-loss combination.
     #[error(
-        "spec.selection overlaps {} — this replication would copy snapshots into kopia \
-         identities the destination's own SnapshotPolicies also write directly, and \
-         pruning: mirrorSource deletes any copy whose (identity, startTime) has vanished \
-         from the source, so a source-side deletion cascades into identities the destination \
-         does not merely mirror (a data-loss combination). Fix: exclude these identities via \
+        "spec.selection overlaps {} that the destination writes directly — pruning: mirrorSource \
+         deletes any copy whose (identity, startTime) vanished from the source, so a source-side \
+         deletion cascades into them (data loss). Fix: exclude them via \
          spec.selection.identities.exclude, or drop pruning: mirrorSource",
         describe_overlapping_identities(identities)
     )]
@@ -799,11 +793,11 @@ pub enum ValidationError {
     /// never silently switch it off by defaulting to `Ignore` — the choice is
     /// forced explicit instead.
     #[error(
-        "catalog.foreignSnapshots must be set explicitly: both identityDefaults.cluster and \
-         catalog.fallbackNamespace are set, so adopting a cluster identity must not silently \
-         change what the fallback collector does. `Ignore` stops materializing foreign \
-         snapshots (existing rows in fallbackNamespace age out under catalog.retain); \
-         `Fallback` keeps collecting them there. Set one explicitly"
+        "catalog.foreignSnapshots must be set explicitly — identityDefaults.cluster and \
+         catalog.fallbackNamespace are both set, so adopting a cluster identity must not silently \
+         change the fallback collector: set `Ignore` (stop materializing foreign snapshots; \
+         existing fallbackNamespace rows age out under catalog.retain) or `Fallback` (keep \
+         collecting them there)"
     )]
     ForeignSnapshotsChoiceRequired,
 
@@ -932,12 +926,10 @@ pub enum ValidationError {
     /// spec cannot name here, so a pinned namespace is a dead reference.
     #[error(
         "spec.seed.from.backend auth.secretRef {secret:?} pins namespace {namespace:?}, but a \
-         ClusterRepository's seeding mover resolves credentials in the namespace its bootstrap \
-         Job runs in — the operator's own namespace, unless \
-         encryption.passwordSecretRef.namespace pins another — so a namespace pinned here would \
-         be a dead reference the Job hangs on (CreateContainerConfigError). Fix: omit \
-         `namespace` and put the Secret alongside this repository's other credentials, in the \
-         same namespace as encryption.passwordSecretRef"
+         ClusterRepository's seeding mover reads it in the operator's own namespace (unless \
+         encryption.passwordSecretRef.namespace pins another) — a namespace pinned here is a dead \
+         reference the Job hangs on (CreateContainerConfigError). Fix: omit `namespace` and put \
+         the Secret alongside encryption.passwordSecretRef"
     )]
     SeedSourceSecretNamespaceForbidden {
         /// The referenced Secret name.
