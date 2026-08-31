@@ -184,12 +184,11 @@ fn cluster_secret_namespace(
         .map(str::to_string)
         .ok_or_else(|| {
             Error::Validation(
-                "ClusterRepository encryption.passwordSecretRef.namespace is not set and the \
-                 operator's own namespace is unknown (KOPIUR_NAMESPACE is unset), so there is no \
-                 namespace to read the repository's credential Secret from — a cluster-scoped \
-                 ClusterRepository has none of its own to fall back on. Set \
-                 encryption.passwordSecretRef.namespace to the Secret's namespace, or set \
-                 KOPIUR_NAMESPACE on the controller (the Helm chart does this automatically)."
+                "no namespace to read the ClusterRepository's credential Secret from: \
+                 encryption.passwordSecretRef.namespace is unset and the operator's namespace is \
+                 unknown (KOPIUR_NAMESPACE unset), and a cluster-scoped resource has none of its \
+                 own. Fix: set encryption.passwordSecretRef.namespace to the Secret's namespace, \
+                 or set KOPIUR_NAMESPACE on the controller (the Helm chart does this)."
                     .into(),
             )
         })
@@ -639,14 +638,11 @@ fn cluster_scan_requested_attempt_at(repo: &ClusterRepository) -> Option<&str> {
 /// actually expected there, not just the single-cluster remedies. Pure.
 fn unplaced_warning_message(hosts: &[&str]) -> String {
     format!(
-        "discovered snapshots were not materialized: identity hostname(s) [{}] name no \
-         existing namespace in spec.allowedNamespaces. Why: a ClusterRepository places each \
-         discovered Snapshot in the namespace its identity hostname names. Fix: create/allow \
-         those namespaces, or set spec.catalog.fallbackNamespace to collect foreign \
-         snapshots in one namespace; if this repository is shared across clusters, set \
-         identityDefaults.cluster and catalog.foreignSnapshots: Ignore so another cluster's \
-         snapshots are counted (status.catalog.foreignSnapshotCount) rather than surfaced \
-         as unplaced",
+        "discovered snapshots unplaced: identity hostname(s) [{}] match no namespace in \
+         spec.allowedNamespaces — each Snapshot is placed by its identity hostname. Fix: \
+         create/allow those namespaces, or set spec.catalog.fallbackNamespace to collect them \
+         in one namespace; if shared across clusters, set identityDefaults.cluster and \
+         catalog.foreignSnapshots: Ignore to count them instead",
         hosts.join(", ")
     )
 }

@@ -151,11 +151,10 @@ pub fn maintenance_condition(
             MAINTENANCE_APPLY_FAILED_REASON,
             format!(
                 "maintenance is ENABLED for {metric_kind} {name}, but the operator could not \
-                 apply its managed Maintenance in namespace {namespace}, and nothing else \
-                 covers this repository; kopia storage will not be reclaimed until this \
-                 succeeds. It is retried on every reconcile — if it persists, check that the \
-                 namespace exists and that the operator has RBAC to write Maintenance there; \
-                 the apply error itself is in the operator log"
+                 apply its managed Maintenance in namespace {namespace} and nothing else covers \
+                 this repository; kopia storage will not be reclaimed until it succeeds. It \
+                 retries every reconcile. Fix: check the namespace exists and the operator has \
+                 RBAC to write Maintenance there; the apply error itself is in the operator log"
             ),
             true,
         ),

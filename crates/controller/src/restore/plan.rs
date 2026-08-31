@@ -82,11 +82,11 @@ pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
 /// without this guard the reconcile just wedges on retried 403s while the
 /// consumer PVC sits Pending unexplained.
 pub fn populator_needs_cluster_scope_message() -> String {
-    "target.populator is not available in a namespaced install (installScope: namespaced): \
-     the volume-populator handshake reads StorageClasses and rebinds PersistentVolumes, \
-     which are cluster-scoped and cannot be granted by the install's Role RBAC. Use \
-     target.pvc or target.pvcRef for a direct restore, or reinstall with \
-     installScope=cluster to use the populator."
+    "target.populator is unavailable in a namespaced install (installScope: namespaced): its \
+     volume-populator handshake reads StorageClasses and rebinds PersistentVolumes, which are \
+     cluster-scoped and cannot be granted by the install's Role RBAC. Fix: use target.pvc or \
+     target.pvcRef for a direct restore, or reinstall with installScope=cluster to use the \
+     populator."
         .to_string()
 }
 /// Whether a `Restore` in `phase` has NOT yet launched its mover Job — the set the
@@ -235,11 +235,11 @@ pub(super) fn target_already_bound_message(
         None => "a PersistentVolume".to_string(),
     };
     format!(
-        "populator: the claiming PVC `{consumer_name}` is already bound to {volume}, so there \
-         is nothing to populate — the CSI volume-populator handover only applies to an UNBOUND \
-         claim. No prime PVC was provisioned and no restore ran; the live volume was not \
-         touched. To restore into this claim, delete the PVC and let it be re-created (keeping \
-         its dataSourceRef)."
+        "populator: claiming PVC `{consumer_name}` is already bound to {volume}, so there is \
+         nothing to populate — the CSI volume-populator handover only applies to an UNBOUND \
+         claim. No prime PVC was provisioned and no restore ran; the live volume was untouched. \
+         Fix: to restore into this claim, delete the PVC and let it be re-created (keeping its \
+         dataSourceRef)."
     )
 }
 
@@ -249,14 +249,13 @@ pub(super) fn target_already_bound_message(
 /// hide a full-size `Retain`ed volume the admin now owns. Pure.
 pub(super) fn lost_rebind_message(consumer_name: &str, kept_pv: &str) -> String {
     format!(
-        "populator: the claiming PVC `{consumer_name}` bound to a DIFFERENT volume than the one \
-         this restore prepared for it, so the handover was lost and can never complete — a \
-         volume-populator only fills an UNBOUND claim, and something else (a provisioner that \
-         ignores dataSourceRef, or an earlier bind) got there first. The restored data is NOT \
-         in the claim: it is on PersistentVolume `{kept_pv}`, which was kept (forced \
-         reclaimPolicy: Retain) rather than reclaimed. Recover it from there, or delete the \
-         claiming PVC and let it be re-created so the restore can run again — and delete \
-         `{kept_pv}` once you no longer need it."
+        "populator: claiming PVC `{consumer_name}` bound to a DIFFERENT volume than this restore \
+         prepared, so the handover was lost and can never complete — a volume-populator only \
+         fills an UNBOUND claim, and something else (a provisioner ignoring dataSourceRef, or an \
+         earlier bind) got there first. The restored data is NOT in the claim: it is on \
+         PersistentVolume `{kept_pv}`, kept (forced reclaimPolicy: Retain). Fix: recover it from \
+         there, or delete the claiming PVC to let the restore re-run — then delete `{kept_pv}` \
+         when done."
     )
 }
 
@@ -271,14 +270,14 @@ pub(super) fn populate_hijacked_message(consumer_name: &str, bound_volume: Optio
         None => "another PersistentVolume".to_string(),
     };
     format!(
-        "populator: the claiming PVC `{consumer_name}` was bound to {volume} while this restore \
-         was still writing its prime volume, so the restored data can never reach the claim — \
-         the app will come up on whatever that volume holds (an empty one, if a provisioner \
-         bound it without honoring the dataSourceRef). This cluster cannot complete a \
-         volume-populator handshake for that claim: check that the StorageClass's provisioner \
-         supports populators (AnyVolumeDataSource + a populator-aware external-provisioner). \
-         The in-flight restore was cancelled and its prime PVC left in place for inspection; a \
-         Failed Restore is terminal, so fix the provisioner and create a NEW Restore."
+        "populator: claiming PVC `{consumer_name}` was bound to {volume} while this restore was \
+         still writing its prime volume, so the restored data can never reach the claim — the \
+         app will come up on whatever that volume holds (empty, if a provisioner bound it \
+         ignoring the dataSourceRef). This cluster cannot complete the volume-populator \
+         handshake: check the StorageClass provisioner supports populators (AnyVolumeDataSource \
+         + a populator-aware external-provisioner). The in-flight restore was cancelled and its \
+         prime PVC left for inspection; a Failed Restore is terminal, so fix the provisioner and \
+         create a NEW Restore."
     )
 }
 
@@ -294,16 +293,15 @@ pub(super) fn reaped_populate_artifacts_note(
     kept_pv: Option<&str>,
 ) -> String {
     let mut note = format!(
-        "populator: reaped leftover populate artifacts ({}) for the claiming PVC \
-         `{consumer_name}`: the claim is already bound, so they could never be handed over to \
-         it and the prime volume would otherwise hold a full copy of the restored data forever.",
+        "populator: reaped leftover populate artifacts ({}) for claiming PVC `{consumer_name}`: \
+         the claim is already bound, so they could never be handed over and the prime volume \
+         would otherwise hold a full copy of the restored data forever.",
         artifacts.join(", ")
     );
     if let Some(pv) = kept_pv {
         note.push_str(&format!(
             " PersistentVolume `{pv}` holds the restored data and was KEPT (forced \
-             reclaimPolicy: Retain) rather than reclaimed — delete it manually if you do not \
-             want it."
+             reclaimPolicy: Retain) — delete it manually if you do not want it."
         ));
     }
     note
@@ -529,10 +527,10 @@ pub(super) fn referent_missing_restore_message(
     format!(
         "waiting for {kind} `{target}` to exist: the repository this restore connects to is \
          derived from it, so kopiur cannot verify the backend is reachable and will not launch \
-         the restore. The `policy.waitTimeout` window is NOT running while this is missing \
+         the restore. The policy.waitTimeout window is NOT running meanwhile \
          (status.waitStartedAt stays unstamped) — it opens once the {kind} exists and its \
-         repository becomes `Ready`. Create the {kind} (or repoint the Restore at one that \
-         exists) to proceed."
+         repository is `Ready`. Create the {kind} (or repoint the Restore at one that exists) \
+         to proceed."
     )
 }
 

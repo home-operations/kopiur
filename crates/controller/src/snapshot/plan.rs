@@ -520,12 +520,11 @@ pub fn mass_deletion_hold_message(
         RepositoryKind::ClusterRepository => "ClusterRepository",
     };
     format!(
-        "this snapshot's deletion is HELD by the mass-deletion breaker: {pending} pending external \
-         destructive deletions for {kind} `{}` are at/above its threshold of {threshold}. No kopia \
-         data has been deleted and this Snapshot keeps its finalizer. To APPROVE this wave (releases \
-         every currently-held deletion for the repository), run: {}. To release THIS Snapshot alone \
-         WITHOUT deleting its kopia snapshot, annotate it \
-         `{}: \"true\"`.",
+        "deletion HELD by the mass-deletion breaker: {pending} pending external destructive \
+         deletions for {kind} `{}` are at/above its threshold of {threshold}. No kopia data was \
+         deleted and this Snapshot keeps its finalizer. Fix: to APPROVE this wave (releases every \
+         held deletion for the repository), run: {}. To release THIS Snapshot alone WITHOUT \
+         deleting its kopia snapshot, annotate it `{}: \"true\"`.",
         repo.name,
         mass_deletion_ack_command(repo, ack_value),
         SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
@@ -546,11 +545,10 @@ pub fn schedule_cascade_retained_message(namespace: &str, name: &str) -> String 
         "Snapshot `{namespace}/{name}` was RETAINED, not deleted: its owning SnapshotSchedule \
          is gone/replaced and the schedule's `onScheduleDelete` is `Retain` (the safe default), \
          so the kopia snapshot is kept even though this Snapshot's deletionPolicy is `Delete`. It \
-         will be rediscovered as `origin: discovered` on the next catalog scan (e.g. a bootstrap, \
-         a spec change, or a recreated policy's automatic scan request — not necessarily on a \
-         timer, since periodic refresh is off by default) and auto-adopted by default once a \
-         SnapshotPolicy with a matching identity exists. To cascade deletes when a schedule is \
-         removed, set the schedule's `spec.deletion.onScheduleDelete: Delete`."
+         will be rediscovered as `origin: discovered` on the next catalog scan (a bootstrap, spec \
+         change, or recreated policy's scan request) and auto-adopted once a SnapshotPolicy with \
+         a matching identity exists. Fix: to cascade deletes when a schedule is removed, set the \
+         schedule's `spec.deletion.onScheduleDelete: Delete`."
     )
 }
 
@@ -570,15 +568,15 @@ pub fn policy_cascade_retained_message(
     let outcome = if snapshot_recorded {
         "its kopia snapshot was RETAINED in the repository, not deleted"
     } else {
-        "the kopia snapshot for this run was never completed (the run was cancelled mid-flight), \
-         so there was nothing in the repository to delete"
+        "the kopia snapshot for this run was never completed (cancelled mid-flight), so there \
+         was nothing in the repository to delete"
     };
     format!(
-        "Snapshot `{namespace}/{name}` was released, not deleted: its owning SnapshotPolicy is gone \
-         and the policy's `onPolicyDelete` is `Retain` (the safe default), so {outcome}. Any kopia \
-         snapshot it did create remains rediscoverable/adoptable by a future SnapshotPolicy with a \
-         matching identity (catalog scan / auto-adoption). To cascade deletes when a SnapshotPolicy is \
-         removed, set the policy's `spec.deletion.onPolicyDelete: Delete`."
+        "Snapshot `{namespace}/{name}` was released, not deleted: its owning SnapshotPolicy is \
+         gone and the policy's `onPolicyDelete` is `Retain` (the safe default), so {outcome}. Any \
+         kopia snapshot it created stays rediscoverable/adoptable by a future SnapshotPolicy with \
+         a matching identity (catalog scan / auto-adoption). Fix: to cascade deletes when a \
+         SnapshotPolicy is removed, set the policy's `spec.deletion.onPolicyDelete: Delete`."
     )
 }
 

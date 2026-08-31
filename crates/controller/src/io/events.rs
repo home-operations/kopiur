@@ -494,10 +494,9 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
             crate::consts::MISSING_RECORDED_IDENTITY_REASON,
             crate::consts::SET_EXPLICIT_MOVER_CONTEXT_ACTION,
             format!(
-                "{err}. The Restore holds (re-checked every few minutes) until a Snapshot CR \
-                 carrying status.recorded matches the source — the catalog scan materializes \
-                 and backfills rows automatically. To proceed without it, set \
-                 mover.securityContext explicitly or drop inheritSecurityContextFrom.snapshot."
+                "{err}. No Snapshot CR with status.recorded matches the source yet, so the \
+                 inherited mover identity is unknown. Fix: set mover.securityContext \
+                 explicitly, or drop inheritSecurityContextFrom.snapshot."
             ),
         ),
         // The DIRECT source PVC is gone. Same reason as the structural gate
@@ -907,17 +906,11 @@ impl SeedFailure {
 /// ([`BootstrapFailure::SeedMoverTooOld`]). Pure so its exact text is asserted;
 /// volatile-free so the guarded status write stays a no-op across repeats.
 pub fn seed_mover_too_old_message() -> String {
-    "spec.seed is set and this repository has never been initialized, but the bootstrap mover \
-     reported success without saying what it did about the seed — which means the running mover \
-     image predates spec.seed, silently ignored it, and initialized an EMPTY repository instead \
-     of copying your data in. kopiur refuses to report Ready over that, because an empty \
-     repository that looks healthy is exactly the failure spec.seed exists to prevent. Fix: \
-     upgrade the mover image (Helm `mover.image.tag`, or `KOPIUR_MOVER_IMAGE`) to the same \
-     version as the controller, delete the empty repository at the backend so the seed can run \
-     from scratch, then delete this repository\'s finished bootstrap Job \
-     (`kubectl -n <namespace> delete job <repository>-discovery`) — nothing recycles a terminal \
-     Job before its ~1h TTL, so without that last step the upgraded mover will not be given a \
-     chance to run for up to an hour."
+    "Repository bootstrapped with a mover image older than spec.seed: it ignored the seed and \
+     made an EMPTY repository, so kopiur refuses Ready. Fix: upgrade the mover image (Helm \
+     `mover.image.tag` or `KOPIUR_MOVER_IMAGE`) to the controller version, delete the empty \
+     repository at the backend, then `kubectl -n <namespace> delete job <repository>-discovery` \
+     (finished Jobs linger ~1h)."
         .to_string()
 }
 
@@ -1393,12 +1386,10 @@ pub fn bootstrap_job_failed_message(job_name: &str) -> String {
 /// no-op across repeated identical kills.
 pub fn bootstrap_deadline_exceeded_message(job_name: &str, deadline_secs: i64) -> String {
     format!(
-        "the repository bootstrap Job `{job_name}` was killed by its activeDeadlineSeconds \
-         ({deadline_secs}s) before kopia could report a verdict. The backend may be healthy but \
-         slow to open: a cold cache over a large repository (many index blobs) can make \
-         `kopia repository connect` alone exceed the deadline. Raise \
-         `spec.bootstrap.failurePolicy.activeDeadlineSeconds` to give the connect more time; \
-         repository maintenance (index compaction) reduces connect time. kopiur will retry with \
-         a progressively longer deadline."
+        "bootstrap Job `{job_name}` was killed by its activeDeadlineSeconds ({deadline_secs}s) \
+         before kopia connected — the backend may be slow to open, e.g. a cold cache over a \
+         large repository can make `kopia repository connect` alone exceed it. Fix: raise \
+         `spec.bootstrap.failurePolicy.activeDeadlineSeconds`, or run maintenance to compact \
+         indexes; kopiur retries with a progressively longer deadline."
     )
 }

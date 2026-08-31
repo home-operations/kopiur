@@ -218,11 +218,11 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
             io::ReadyOutcome::Stalled,
             REPLICATION_IDENTITY_OVERLAP_REASON,
             &format!(
-                "pruning: mirrorSource with a destination-side SnapshotPolicy writing the \
-                 same identities this replication selects ({}) — a source-side deletion \
-                 would cascade into identities the destination does not merely mirror. \
-                 Exclude those identities in spec.selection, re-identify the destination \
-                 policy, or switch pruning off mirrorSource",
+                "pruning: mirrorSource, but a destination-side SnapshotPolicy writes the same \
+                 identities this replication selects ({}) — a source-side deletion would cascade \
+                 into identities the destination does not merely mirror. Fix: exclude those \
+                 identities in spec.selection, re-identify the destination policy, or switch \
+                 pruning off mirrorSource",
                 identity_sample(identities)
             ),
             None,

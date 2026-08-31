@@ -212,10 +212,10 @@ const COPY_METHOD_DEFAULTED_NOTE: &str = "copyMethod defaulted to Snapshot as of
 /// support in their cluster, so it carries the full default-changed explanation.
 fn stack_missing_message(provisioner: &str) -> String {
     format!(
-        "the CSI snapshot stack is not installed (no VolumeSnapshotClass API), so \
-         copyMethod: Snapshot cannot run; install the external-snapshotter \
-         (snapshot-controller + CRDs) and a VolumeSnapshotClass for driver \
-         `{provisioner}`, or set copyMethod: Direct. {COPY_METHOD_DEFAULTED_NOTE}."
+        "CSI snapshot stack not installed (no VolumeSnapshotClass API), so copyMethod: Snapshot \
+         cannot run. Fix: install the external-snapshotter (snapshot-controller + CRDs) and a \
+         VolumeSnapshotClass for driver `{provisioner}`, or set copyMethod: Direct. \
+         {COPY_METHOD_DEFAULTED_NOTE}."
     )
 }
 
@@ -225,19 +225,19 @@ fn stack_missing_message(provisioner: &str) -> String {
 /// `Snapshot`, so an untouched policy lands here blindly.
 /// The namespaced-install refusal for a GROUP capture.
 fn namespaced_install_cannot_group_stage_message() -> String {
-    "this is a namespaced install (`installScope: namespaced`), whose Role RBAC cannot read the \
+    "namespaced install (`installScope: namespaced`): its Role RBAC cannot read the \
      cluster-scoped VolumeGroupSnapshotClass, VolumeSnapshotContent and PersistentVolume objects \
-     a `VolumeGroupSnapshot` capture needs to map group members back to their PVCs. Fix: set \
-     `groupBy: None` with `copyMethod: Direct` (accepting independent reads of the live \
-     volumes), or reinstall with installScope=cluster."
+     a `VolumeGroupSnapshot` capture needs to map group members to their PVCs. Fix: set \
+     `groupBy: None` with `copyMethod: Direct` (independent reads of the live volumes), or \
+     reinstall with installScope=cluster."
         .to_string()
 }
 
 fn namespaced_install_cannot_stage_message() -> String {
     format!(
-        "this is a namespaced install (installScope: namespaced), whose Role RBAC cannot \
-         read the cluster-scoped StorageClass/VolumeSnapshotClass objects CSI staging \
-         requires; set copyMethod: Direct, or reinstall with installScope=cluster. \
+        "namespaced install (installScope: namespaced): its Role RBAC cannot read the \
+         cluster-scoped StorageClass/VolumeSnapshotClass objects CSI staging requires. Fix: set \
+         copyMethod: Direct, or reinstall with installScope=cluster. \
          {COPY_METHOD_DEFAULTED_NOTE}."
     )
 }
@@ -570,10 +570,10 @@ pub(crate) fn staged_class_preflight(
         return Some((
             REASON_STAGED_CLASS_NOT_FOUND,
             format!(
-                "spec.staging.storageClassName `{override_class}` does not exist; create it, \
-                 point the override at an existing StorageClass of the source's CSI driver, \
-                 or remove the override to stage on the source PVC's own class. This \
-                 Snapshot is terminal — the next scheduled run (or a new Snapshot) retries"
+                "spec.staging.storageClassName `{override_class}` does not exist. Fix: create \
+                 it, point the override at an existing StorageClass of the source's CSI driver, \
+                 or remove the override to stage on the source PVC's own class. This Snapshot is \
+                 terminal — the next scheduled run (or a new Snapshot) retries"
             ),
         ));
     };
@@ -582,12 +582,11 @@ pub(crate) fn staged_class_preflight(
             REASON_STAGED_CLASS_MISMATCH,
             format!(
                 "spec.staging.storageClassName `{override_class}` is provisioned by `{op}`, \
-                 but the source PVC's CSI driver is `{sp}` — a VolumeSnapshot restore or \
-                 volume clone can only be provisioned by the source's own driver, so the \
-                 staged PVC would never bind. Point the override at a class of driver \
-                 `{sp}` (e.g. a CephFS `backingSnapshot: \"true\"` class of the same \
-                 driver), or remove the override. This Snapshot is terminal — the next \
-                 scheduled run (or a new Snapshot) retries"
+                 but the source PVC's CSI driver is `{sp}` — a snapshot restore/clone can only \
+                 be provisioned by the source's own driver, so the staged PVC would never bind. \
+                 Fix: point the override at a class of driver `{sp}` (e.g. a CephFS \
+                 `backingSnapshot: \"true\"` class), or remove the override. This Snapshot is \
+                 terminal — the next scheduled run (or a new Snapshot) retries"
             ),
         )),
         _ => None,
@@ -809,20 +808,20 @@ pub(crate) fn vs_wait_outcome(
             reason: REASON_VS_FAILED,
             message: format!(
                 "VolumeSnapshot `{ns}/{vs_name}` did not become readyToUse within {waited} \
-                 (spec.staging.timeout; default 10m) and last reported: {err}; check the \
-                 VolumeSnapshotClass `{class}` / CSI driver, or raise spec.staging.timeout \
-                 if the backend is just slow. This Snapshot is terminal — the next \
-                 scheduled run (or a new Snapshot) retries"
+                 (spec.staging.timeout; default 10m) and last reported: {err}. Fix: check the \
+                 VolumeSnapshotClass `{class}` / CSI driver, or raise spec.staging.timeout if \
+                 the backend is just slow. This Snapshot is terminal — the next scheduled run \
+                 (or a new Snapshot) retries"
             ),
         },
         None => VsWait::Failed {
             reason: REASON_STAGING_TIMEOUT,
             message: format!(
                 "VolumeSnapshot `{ns}/{vs_name}` did not become readyToUse within {waited} \
-                 (spec.staging.timeout; default 10m) and reported no error — the CSI driver \
-                 or snapshot-controller is stuck or very slow; check both, or raise \
-                 spec.staging.timeout if the backend is just slow. This Snapshot is \
-                 terminal — the next scheduled run (or a new Snapshot) retries"
+                 (spec.staging.timeout; default 10m) and reported no error — the CSI driver or \
+                 snapshot-controller is stuck or slow. Fix: check both, or raise \
+                 spec.staging.timeout if the backend is just slow. This Snapshot is terminal — \
+                 the next scheduled run (or a new Snapshot) retries"
             ),
         },
     }
@@ -954,12 +953,11 @@ pub(crate) fn pvc_bind_outcome(
         reason: REASON_STAGED_PVC_BIND_TIMEOUT,
         message: format!(
             "staged PVC `{ns}/{pvc_name}` did not reach Bound within {waited} \
-             (spec.staging.timeout; default 10m) — the CSI restore/clone from the source \
-             is still provisioning, or {} cannot provision it; check `kubectl describe \
-             pvc -n {ns} {pvc_name}` and the CSI provisioner logs, raise \
-             spec.staging.timeout if the copy is just slow, or (CephFS) stage on a \
-             `backingSnapshot: \"true\"` class via spec.staging.storageClassName for a \
-             near-instant shallow mount instead of a full clone. This Snapshot is \
+             (spec.staging.timeout; default 10m) — the CSI restore/clone is still \
+             provisioning, or {} cannot provision it. Fix: check `kubectl describe pvc -n {ns} \
+             {pvc_name}` and the CSI provisioner logs, raise spec.staging.timeout if the copy \
+             is slow, or (CephFS) stage on a `backingSnapshot: \"true\"` class via \
+             spec.staging.storageClassName for a near-instant shallow mount. This Snapshot is \
              terminal — the next scheduled run (or a new Snapshot) retries",
             bind_class_phrase(class)
         ),
