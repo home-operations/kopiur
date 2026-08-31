@@ -14,8 +14,8 @@ in-flight work counts, and anything reporting `Stalled=True`:
 ```console
 $ kubectl kopiur status -n media
 REPOSITORIES
-KIND        NAME  NAMESPACE  PHASE  BACKEND  MODE       SUSPENDED  MAINTENANCE
-Repository  nas   media      Ready  S3       ReadWrite  false      configured
+KIND        NAME  NAMESPACE  PHASE  BACKEND  MODE       SUSPENDED  MAINTENANCE  CLUSTER  FOREIGN  DISCOVERED
+Repository  nas   media      Ready  S3       ReadWrite  false      configured   -        -        0
 
 POLICIES
 NAME     NAMESPACE  REPOSITORY      SUSPENDED  LAST-SNAPSHOT  LAST-VERIFIED
@@ -23,6 +23,14 @@ nightly  media      Repository/nas  false      9h ago         -
 …
 IN FLIGHT: 0 snapshot(s), 0 restore(s)
 ```
+
+`DISCOVERED` is the repository's `status.catalog.discoveredBackupCount`: how
+many `Snapshot` CRs the last catalog scan materialized from snapshots already
+in the repository, and `-` when it has never been scanned. It is plain
+inventory, not a warning — a repository shared by several apps, or one
+re-seeded from a replica, legitimately carries a non-zero count. (`CLUSTER`
+and `FOREIGN` are the multi-cluster pair: this cluster's identity suffix, and
+how many snapshots the last scan attributed to another cluster.)
 
 `--repository NAME [--repository-kind …]` narrows everything to one
 repository and the policies/schedules/work attached to it. `-o yaml|json`
@@ -207,8 +215,8 @@ This arc runs against the shared CLI playground (`media` namespace, repository `
 ```console
 $ kubectl kopiur status -n media
 REPOSITORIES
-KIND        NAME  NAMESPACE  PHASE  BACKEND  MODE       SUSPENDED  MAINTENANCE
-Repository  nas   media      Ready  S3       ReadWrite  false      configured
+KIND        NAME  NAMESPACE  PHASE  BACKEND  MODE       SUSPENDED  MAINTENANCE  CLUSTER  FOREIGN  DISCOVERED
+Repository  nas   media      Ready  S3       ReadWrite  false      configured   -        -        0
 
 POLICIES
 NAME     NAMESPACE  REPOSITORY      SUSPENDED  LAST-SNAPSHOT  LAST-VERIFIED

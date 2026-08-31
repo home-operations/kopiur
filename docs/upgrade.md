@@ -6,6 +6,24 @@ the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which mo
 the CRDs between two Helm mechanisms and needs one deliberate step to avoid data
 loss. Read that section before you cross it.
 
+## After 0.10.5: the `NoAdoptableHistory` warning no longer exists (no action needed)
+
+Versions after 0.10.5 remove the `NoAdoptableHistory` Warning Event outright. There is nothing to apply — no schema change, no flag, no RBAC. The operator simply stops emitting it.
+
+**What changed.** A `SnapshotPolicy` with no history of its own, pointed at a repository that already holds `origin: discovered` snapshots belonging to something else, used to get a `NoAdoptableHistory` Warning Event on **every** reconcile — roughly every five minutes — until its own first backup landed, which on a daily cron is days. That is the ordinary shape of a shared repository: retire one app (the deletion cascade defaults to `Retain`, so its snapshots stay as discovered rows), add a different app against the same `ClusterRepository`, and the new app's policy warns indefinitely about history that was never meant for it.
+
+**Why it was removed rather than tuned.** The event existed to catch one disaster-recovery case: a rebuilt policy whose identity no longer matches the history it was meant to inherit. But a kopia identity is a pure function of Git-authored inputs — the policy's name and namespace, `spec.identity`, the repository's `identityDefaults` (including `cluster`), labels and annotations, the PVC name, `sourcePathOverride`. Nothing about the live cluster feeds it, so a GitOps re-apply cannot drift an identity on its own; every mismatch begins as a human edit to a manifest. The event could not tell that rare case apart from the common shared-repository one, and in practice it taught people to set `spec.adoption: Ignore` to make the noise stop — disabling the very adoption it was meant to protect.
+
+**Where the signal went.** From "wait for a warning that it didn't work" to "check that it did":
+
+- `status.adoption.lastScanMatched` / `status.adoption.lastScanUnmatched` on the `SnapshotPolicy` — how many discovered rows matched this policy's identity at the last adoption pass, and how many didn't. Both absent means no pass has run yet; `0`/`0` means the catalog was empty. A multi-repository policy sums across its ready targets.
+- `kubectl kopiur snapshots list -n <ns> --origin discovered --repository <repo>` — the history in that repository no live policy has claimed. Empty after a complete DR.
+- `status.adoption.totalAdopted` — omitted when unset, so **empty output means adoption never ran**, not `0`.
+
+Those are the checks in [Scenario 10 → verification checklist](scenarios/dr-with-replicated-repository.md#verification-checklist) and [Troubleshooting → adoption didn't happen](troubleshooting.md#adoption-didnt-happen).
+
+**If you set `spec.adoption: Ignore` (or `spec.catalog.adoption: Ignore` on the repository) solely to silence this warning, you can remove it now.** The warning was the defect; adoption itself was working correctly. Before you do, re-read the retention hazard in [Scenario 10](scenarios/dr-with-replicated-repository.md#hazards-to-review-before-you-apply) — an adopted snapshot comes under the policy's GFS retention, and that is the one substantive reason to keep `Ignore`.
+
 ## 0.10.0: SnapshotReplication, multi-repository fan-out, new RBAC, and a new Snapshot phase
 
 Four things to know before you cross this release.

@@ -68,6 +68,12 @@ pub struct RepoRow {
     /// repository has no `cluster` identity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub foreign_snapshots: Option<i64>,
+    /// `status.catalog.discoveredBackupCount` — how many `Snapshot` CRs the
+    /// last catalog scan materialized from history already in the repository;
+    /// absent when the repository has never been scanned. Plain inventory: a
+    /// non-zero count is normal for a shared or re-seeded repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovered: Option<i64>,
     /// The `Ready` condition message when the repo is NOT Ready.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
@@ -365,6 +371,7 @@ fn repo_row(
     conditions: &[Condition],
     cluster: Option<String>,
     foreign_snapshots: Option<i64>,
+    discovered: Option<i64>,
 ) -> RepoRow {
     let phase = phase.unwrap_or_else(|| EMPTY_CELL.into());
     let maintenance = condition(conditions, MAINTENANCE_CONFIGURED_CONDITION)
@@ -393,6 +400,7 @@ fn repo_row(
         maintenance,
         cluster,
         foreign_snapshots,
+        discovered,
         problem,
     }
 }
@@ -466,6 +474,9 @@ async fn gather(
             status
                 .and_then(|s| s.catalog.as_ref())
                 .and_then(|c| c.foreign_snapshot_count),
+            status
+                .and_then(|s| s.catalog.as_ref())
+                .and_then(|c| c.discovered_backup_count),
         ));
     }
     {
@@ -512,6 +523,9 @@ async fn gather(
                 status
                     .and_then(|s| s.catalog.as_ref())
                     .and_then(|c| c.foreign_snapshot_count),
+                status
+                    .and_then(|s| s.catalog.as_ref())
+                    .and_then(|c| c.discovered_backup_count),
             ));
         }
     }
@@ -730,6 +744,7 @@ pub fn render(report: &StatusReport, now: DateTime<Utc>) -> String {
             "MAINTENANCE",
             "CLUSTER",
             "FOREIGN",
+            "DISCOVERED",
         ]);
         for r in &report.repositories {
             t.push(vec![
@@ -743,6 +758,9 @@ pub fn render(report: &StatusReport, now: DateTime<Utc>) -> String {
                 r.maintenance.clone(),
                 r.cluster.clone().unwrap_or_else(|| EMPTY_CELL.into()),
                 r.foreign_snapshots
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| EMPTY_CELL.into()),
+                r.discovered
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| EMPTY_CELL.into()),
             ]);
@@ -942,6 +960,7 @@ mod tests {
                     maintenance: "configured".into(),
                     cluster: None,
                     foreign_snapshots: None,
+                    discovered: None,
                     problem: None,
                 },
                 RepoRow {
@@ -955,6 +974,7 @@ mod tests {
                     maintenance: "-".into(),
                     cluster: Some("east".into()),
                     foreign_snapshots: Some(3),
+                    discovered: Some(17),
                     problem: Some("credentials rejected; fix the Secret".into()),
                 },
             ],
@@ -1042,6 +1062,104 @@ mod tests {
                 .any(|l| l.contains("0 3 * * *") && l.ends_with('2')),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_discovered_column_shows_the_catalog_count_or_the_empty_cell() {
+        let text = render(&sample(), now());
+        assert!(text.contains("DISCOVERED"), "{text}");
+        // A scanned repository shows its count — plain inventory, no judgment.
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("ClusterRepository") && l.ends_with("17")),
+            "{text}"
+        );
+        // A never-scanned repository shows the empty-cell dash (the row's
+        // trailing columns are all unset, and Table strips trailing padding).
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("Repository ") && l.ends_with(EMPTY_CELL)),
+            "{text}"
+        );
+    }
+
+    /// `CatalogStatus` is shared by both repository kinds, so one accessor
+    /// chain serves `Repository` and `ClusterRepository` alike — this pins the
+    /// field path `gather` reads.
+    #[test]
+    fn the_discovered_count_comes_off_the_catalog_status_of_either_kind() {
+        let repo: Repository = serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "Repository",
+            "metadata": { "name": "nas", "namespace": "media" },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": { "passwordSecretRef": { "name": "creds" } }
+            },
+            "status": { "phase": "Ready", "catalog": { "discoveredBackupCount": 4 } },
+        }))
+        .expect("repository fixture");
+        let cluster_repo: ClusterRepository = serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "ClusterRepository",
+            "metadata": { "name": "offsite" },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": { "passwordSecretRef": { "name": "creds", "namespace": "kopiur" } },
+                "allowedNamespaces": { "all": true }
+            },
+            // Scanned, but nothing was there to materialize.
+            "status": { "phase": "Ready", "catalog": { "discoveredBackupCount": 0 } },
+        }))
+        .expect("cluster repository fixture");
+        // No catalog at all — never scanned.
+        let unscanned: Repository = serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "Repository",
+            "metadata": { "name": "fresh", "namespace": "media" },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": { "passwordSecretRef": { "name": "creds" } }
+            },
+            "status": { "phase": "Ready" },
+        }))
+        .expect("repository fixture");
+
+        // The accessor chain `gather` uses, per kind.
+        let ns_discovered = repo
+            .status
+            .as_ref()
+            .and_then(|s| s.catalog.as_ref())
+            .and_then(|c| c.discovered_backup_count);
+        let cluster_discovered = cluster_repo
+            .status
+            .as_ref()
+            .and_then(|s| s.catalog.as_ref())
+            .and_then(|c| c.discovered_backup_count);
+        let unscanned_discovered = unscanned
+            .status
+            .as_ref()
+            .and_then(|s| s.catalog.as_ref())
+            .and_then(|c| c.discovered_backup_count);
+        assert_eq!(ns_discovered, Some(4));
+        // A scanned-but-empty repository reports `0`, distinct from never-scanned.
+        assert_eq!(cluster_discovered, Some(0));
+        assert_eq!(unscanned_discovered, None);
+
+        let row = repo_row(
+            "Repository",
+            "nas".into(),
+            Some("media".into()),
+            Some("Ready".into()),
+            Some("Filesystem".into()),
+            "ReadWrite".into(),
+            false,
+            &[],
+            None,
+            None,
+            ns_discovered,
+        );
+        assert_eq!(row.discovered, Some(4));
     }
 
     #[test]
@@ -1257,8 +1375,10 @@ mod tests {
         );
         assert_eq!(v["repositories"][1]["cluster"], "east");
         assert_eq!(v["repositories"][1]["foreignSnapshots"], 3);
-        // Unset multi-cluster fields are elided, not `null`.
+        assert_eq!(v["repositories"][1]["discovered"], 17);
+        // Unset multi-cluster / catalog fields are elided, not `null`.
         assert!(v["repositories"][0].get("cluster").is_none());
         assert!(v["repositories"][0].get("foreignSnapshots").is_none());
+        assert!(v["repositories"][0].get("discovered").is_none());
     }
 }
