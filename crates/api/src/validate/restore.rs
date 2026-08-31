@@ -195,7 +195,11 @@ pub fn validate_restore_spec(spec: &RestoreSpec) -> Vec<ValidationError> {
     }
     if let Some(o) = &spec.options
         && let Some(p) = o.parallel
-        && let Some(e) = require_min("Restore spec.options.parallel", p.into(), 1)
+        && let Some(e) = require_min(
+            "Restore spec.options.parallel",
+            p.into(),
+            NumericBound::Count,
+        )
     {
         errs.push(e);
     }

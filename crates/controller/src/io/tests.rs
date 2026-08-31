@@ -43,7 +43,7 @@ fn backend_failure_access_denied_points_at_credentials_and_bucket() {
     assert_eq!(action, CHECK_CREDENTIALS_ACTION);
     assert!(note.contains("denied access"));
     assert!(note.contains("credentials Secret"));
-    assert!(note.contains("bucket/path"));
+    assert!(note.contains("bucket/container/path"));
 }
 
 #[test]
@@ -73,15 +73,22 @@ fn backend_failure_permission_denied_points_at_the_live_uid() {
 }
 
 #[test]
-fn backend_failure_other_classes_stay_generic_with_class_and_message() {
+fn backend_failure_other_classes_lead_with_the_specific_problem() {
+    // The note now leads with the human problem (not the bare class label — that
+    // is the Event `reason`, asserted at the call site) and embeds the detail.
     let (action, note) = backend_failure_event(
         KopiaErrorClass::RepositoryUnavailable,
         "connection refused",
         TEST_UID,
     );
     assert_eq!(action, CHECK_BACKEND_ACTION);
-    assert!(note.contains("RepositoryUnavailable"));
-    assert!(note.contains("connection refused"));
+    assert!(
+        note.starts_with("the repository backend is unreachable"),
+        "note should lead with the specific problem: {note}"
+    );
+    assert!(note.contains("connection refused"), "{note}");
+    // The message is well-formed per the shared shape checker.
+    assert_eq!(kopiur_api::message_shape_issue(&note), None, "{note}");
 }
 
 // --- note truncation: a huge kopia stderr tail must not blow past the
@@ -2988,10 +2995,21 @@ mod reconcile_failure_events {
                 "note for {err} should contain {note_phrase:?}: {}",
                 ev.note
             );
-            // The note always leads with the error's own message.
+            // The note always embeds the error's own message (the detail reaches
+            // the user).
             assert!(
                 ev.note.contains(&err.to_string()),
                 "note for {err} should embed the error message"
+            );
+            // ...and every variant's note is well-formed per the shared shape
+            // checker (lead-with-specific, no doubled spaces, no volatile temp
+            // fragments, not a ramble). This is the structural lint over the whole
+            // reconcile-event surface — a new variant with a sloppy note fails here.
+            assert_eq!(
+                kopiur_api::message_shape_issue(&ev.note),
+                None,
+                "event note for {err} is not well-formed: {}",
+                ev.note
             );
         }
     }

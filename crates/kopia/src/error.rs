@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::humanize::{exit_code_desc, humanize_tail};
+
 /// How many trailing lines of stderr we retain on a failed invocation. Kopia
 /// can print a lot of progress to stderr; the tail is where the actual error
 /// message lands.
@@ -128,13 +130,20 @@ impl KopiaErrorClass {
                  backing PVC/NFS export"
             }
             KopiaErrorClass::NotFound => {
-                "the requested repository path, snapshot, or target was not found"
+                "the requested repository path, snapshot, or target was not found; verify the \
+                 backend path/prefix and that the repository exists"
             }
             KopiaErrorClass::Locked => {
                 "a repository lock is held by another writer; it usually clears on retry"
             }
-            KopiaErrorClass::SourceError => "a source filesystem error occurred during upload",
-            KopiaErrorClass::Unknown => "an unclassified repository backend error occurred",
+            KopiaErrorClass::SourceError => {
+                "a source filesystem error occurred during upload; check the source volume and the \
+                 mover Job/pod logs"
+            }
+            KopiaErrorClass::Unknown => {
+                "an unclassified repository backend error occurred; see the mover Job/pod logs and \
+                 status.failure for detail"
+            }
         }
     }
 
@@ -315,7 +324,7 @@ impl fmt::Display for KopiaErrorClass {
 /// };
 /// assert_eq!(
 ///     err.to_string(),
-///     "kopia `snapshot create` exited with code Some(1) (class Locked): \
+///     "kopia `snapshot create` failed (exit code 1, class Locked): \
 ///      repository is locked by another process",
 /// );
 /// // The class drives the retry decision; the stderr tail is recoverable.
@@ -343,7 +352,18 @@ pub enum KopiaError {
 
     /// kopia ran but exited with a non-zero status. Carries everything needed
     /// to build a `status.failure` block.
-    #[error("kopia `{args}` exited with code {code:?} (class {class}): {stderr_tail}")]
+    ///
+    /// `Display` renders a clean exit code (no `Some(1)` `Debug` leak) and a
+    /// **humanized** stderr extract (progress noise dropped, volatile temp-path
+    /// fragments stripped) — this is what reaches Warning Events,
+    /// `status.failure.message`, and logs. The full raw tail is preserved in the
+    /// `stderr_tail` field (surfaced via `status.failure.stderrTail`) for
+    /// debugging; read it with [`stderr_tail`](Self::stderr_tail).
+    #[error(
+        "kopia `{args}` failed ({}, class {class}): {}",
+        exit_code_desc(.code),
+        humanize_tail(.stderr_tail)
+    )]
     NonZeroExit {
         /// The subcommand + args that were run (for diagnostics; secrets are
         /// passed via env, never argv).

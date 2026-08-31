@@ -3,6 +3,7 @@ use k8s_openapi::api::core::v1::ObjectReference;
 use kube::Resource;
 use kube::runtime::events::{Event, EventType, Recorder};
 
+use kopiur_api::Diagnostic;
 use kopiur_kopia::KopiaErrorClass;
 
 use crate::consts::{
@@ -223,6 +224,21 @@ const EVENT_MESSAGE_BUDGET_BYTES: usize = 512;
 /// Appended to a string that was truncated, signalling the cut to readers.
 pub(crate) const TRUNCATION_MARKER: &str = "…";
 
+/// A [`KopiaError`](kopiur_kopia::KopiaError)'s `Display` is
+/// `kopia `{args}` failed ({code}, class {class}): {detail}`. When we embed it
+/// inside an Event note that *already* names the backend failure and its class,
+/// that leading framing is redundant — strip it to just the `{detail}` so the
+/// note reads as one sentence, not a nested one. A string that is not in that
+/// shape (a bare stderr fragment, a test input) is returned unchanged.
+fn kopia_detail(message: &str) -> &str {
+    if message.starts_with("kopia `") {
+        if let Some((_framing, detail)) = message.split_once("): ") {
+            return detail;
+        }
+    }
+    message
+}
+
 /// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, appending
 /// [`TRUNCATION_MARKER`] when anything was dropped. The result is always
 /// `<= max` bytes (assuming `max >= TRUNCATION_MARKER.len()`).
@@ -258,42 +274,104 @@ pub(crate) fn backend_failure_event(
     message: &str,
     uid: u32,
 ) -> (&'static str, String) {
-    let message = truncate_for_note(message, EVENT_MESSAGE_BUDGET_BYTES);
+    // The detail is the kopia specifics (already humanized by `KopiaError`'s
+    // Display); strip its redundant framing and cap it so the remediation hint is
+    // never eaten when the whole note is finally clamped.
+    let detail = truncate_for_note(kopia_detail(message), EVENT_MESSAGE_BUDGET_BYTES);
+    // Each arm leads with the specific problem, states the kopia detail as the
+    // `because`, and ends with the concrete fix. Split per class (no OR catch-all)
+    // so a new `KopiaErrorClass` forces its own decision (ADR §5.5).
     let (action, note) = match class {
         KopiaErrorClass::AccessDenied => (
             CHECK_CREDENTIALS_ACTION,
-            format!(
-                "the storage backend denied access: {message}. The credentials Secret may lack \
-                 permission, or the configured bucket/container/path does not exist (some backends \
-                 report a missing bucket as \"Access Denied\"). Verify the credentials Secret and \
-                 that the bucket/path exists and is reachable."
-            ),
+            Diagnostic::new("the storage backend denied access")
+                .because(detail)
+                .fix(
+                    "verify the credentials Secret, and that the bucket/container/path exists and \
+                     is reachable — some backends report a missing bucket as \"Access Denied\"",
+                )
+                .to_string(),
         ),
         KopiaErrorClass::PermissionDenied => (
             CHECK_PERMISSIONS_ACTION,
-            format!(
-                "the repository path is not writable by the operator: {message}. The filesystem \
-                 export or PVC must be writable by the operator's UID ({uid}) — fix its \
-                 ownership/mode (e.g. `chown -R {uid} <path>`) and reconcile again."
-            ),
+            Diagnostic::new("the repository path is not writable by the operator")
+                .because(detail)
+                .fix(format!(
+                    "the filesystem export or PVC must be writable by the operator's UID ({uid}) \
+                     — fix its ownership/mode (e.g. `chown -R {uid} <path>`), then reconcile"
+                ))
+                .to_string(),
         ),
         KopiaErrorClass::AuthFailure => (
             CHECK_CREDENTIALS_ACTION,
-            format!(
-                "the repository password was rejected: {message}. Check the encryption password \
-                 Secret (the `KOPIA_PASSWORD` key) referenced by this repository."
-            ),
+            Diagnostic::new("the repository password was rejected")
+                .because(detail)
+                .fix(
+                    "check the encryption password Secret (the `KOPIA_PASSWORD` key) referenced by \
+                     this repository",
+                )
+                .to_string(),
         ),
-        KopiaErrorClass::RepositoryUnavailable
-        | KopiaErrorClass::NotFound
-        | KopiaErrorClass::Locked
-        | KopiaErrorClass::SourceError
-        | KopiaErrorClass::Unknown => (
+        KopiaErrorClass::RepositoryUnavailable => (
             CHECK_BACKEND_ACTION,
-            format!("repository backend error ({}): {message}", class.as_str()),
+            Diagnostic::new("the repository backend is unreachable")
+                .because(detail)
+                .fix("check the endpoint/network and credentials, then retry (the reconcile retries automatically)")
+                .to_string(),
+        ),
+        KopiaErrorClass::NotFound => (
+            CHECK_BACKEND_ACTION,
+            Diagnostic::new("the requested repository, snapshot, or path was not found")
+                .because(detail)
+                .fix(
+                    "verify the backend path/prefix and that the repository exists; for a first \
+                     bootstrap of an empty backend, set spec.create.enabled: true",
+                )
+                .to_string(),
+        ),
+        KopiaErrorClass::Locked => (
+            CHECK_BACKEND_ACTION,
+            Diagnostic::new("a repository lock is held by another writer")
+                .because(detail)
+                .fix("this usually clears on its own; the reconcile retries automatically")
+                .to_string(),
+        ),
+        KopiaErrorClass::SourceError => (
+            CHECK_BACKEND_ACTION,
+            Diagnostic::new("a source filesystem error occurred during upload")
+                .because(detail)
+                .fix("check the source volume and the mover Job/pod logs; the run retries")
+                .to_string(),
+        ),
+        KopiaErrorClass::Unknown => (
+            CHECK_BACKEND_ACTION,
+            Diagnostic::new("an unclassified repository backend error occurred")
+                .because(detail)
+                .fix("see the mover Job/pod logs and status.failure for detail")
+                .to_string(),
         ),
     };
     (action, truncate_for_note(&note, EVENT_NOTE_MAX_BYTES))
+}
+
+/// The Warning note for #258: a repository is `Ready` but its epoch/blob-retention
+/// parameters (`spec.parameters`) were not applied, so `status.parameters`
+/// silently disagrees with `spec`. Previously the note was the raw apply error
+/// with no framing; now the raw error goes to the operator log (the caller logs
+/// it) and this note carries the actionable what/why/fix. `err` is the apply
+/// error's detail, embedded as the `because` (framing-stripped + capped).
+pub(crate) fn epoch_parameters_not_applied_note(err: &str) -> String {
+    let detail = truncate_for_note(kopia_detail(err), EVENT_MESSAGE_BUDGET_BYTES);
+    let note = Diagnostic::new(
+        "the repository's epoch/blob-retention parameters (spec.parameters) were not applied",
+    )
+    .because(detail)
+    .fix(
+        "the repository is Ready but status.parameters now disagrees with spec; re-apply \
+         spec.parameters, and see the operator log for the underlying error",
+    )
+    .to_string();
+    truncate_for_note(&note, EVENT_NOTE_MAX_BYTES)
 }
 
 /// The operator's effective UID — the identity that writes a filesystem repo in
@@ -340,11 +418,13 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
         Error::Kube(_) => (
             KUBE_API_ERROR_REASON,
             CHECK_API_SERVER_ACTION,
-            format!(
-                "{err}. This is usually a transient API-server problem and the reconcile retries \
-                 automatically; if it persists, check the API server's health and the operator's \
-                 RBAC."
-            ),
+            Diagnostic::new("a Kubernetes API call failed during reconcile")
+                .because(err.to_string())
+                .fix(
+                    "usually transient — the reconcile retries automatically; if it persists, \
+                     check the API server's health and the operator's RBAC",
+                )
+                .to_string(),
         ),
         Error::Validation(_) => (
             INVALID_SPEC_REASON,

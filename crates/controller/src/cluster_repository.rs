@@ -335,13 +335,16 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             repo,
             "RepositoryServerDegraded",
             "CheckRepositoryServer",
-            &format!(
-                "the kopia repository server (spec.server) could not be reconciled: {e}. The \
-                 repository itself is unaffected — backups and restores continue. If its \
-                 credentials Secret lives in the server's namespace, pin it explicitly with \
+            &kopiur_api::Diagnostic::new(
+                "the kopia repository server (spec.server) could not be reconciled",
+            )
+            .because("the repository itself is unaffected — backups and restores continue")
+            .fix(
+                "if the server's credentials Secret lives in the server's namespace, pin it with \
                  encryption.passwordSecretRef.namespace (a ClusterRepository otherwise reads it \
-                 from the operator's namespace)."
-            ),
+                 from the operator's namespace); see the operator log for the underlying error",
+            )
+            .to_string(),
         )
         .await;
     }
@@ -1976,12 +1979,13 @@ async fn finalize_cluster_bootstrap(
     // with `status.parameters.epoch` silently disagreeing with `spec`. Say so out loud —
     // the whole point of #258 is that a user set a value expecting it to take effect.
     if let Some(err) = &result.epoch_error {
+        tracing::warn!(error = %err, repo = %repo.name_any(), "epoch/blob-retention parameters were not applied");
         io::publish_warning_event(
             ctx,
             repo,
             health::EPOCH_PARAMETERS_NOT_APPLIED_REASON,
             health::FIX_EPOCH_PARAMETERS_ACTION,
-            err,
+            &io::epoch_parameters_not_applied_note(err),
         )
         .await;
     }

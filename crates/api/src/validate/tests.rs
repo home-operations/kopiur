@@ -7025,3 +7025,70 @@ encryption: { passwordSecretRef: { name: s } }
         .is_empty()
     );
 }
+
+// --- Message-shape lint: the structural guard that keeps the what/why/fix,
+// lead-with-specific contract from rotting. `message_shape_issue` flags a
+// doubled space, a generic filler lead, a leaked volatile temp fragment, or a
+// ramble. Run it over the messages this overhaul reshaped. ---
+
+#[test]
+fn every_numeric_bound_message_is_well_formed() {
+    // Each NumericBound's rejection (the M3 require_min output) leads with the
+    // specific bound and carries a why.
+    for bound in [
+        NumericBound::Count,
+        NumericBound::RatePerSecond,
+        NumericBound::Megabytes,
+        NumericBound::Seconds,
+    ] {
+        let e = require_min("Test spec.field", 0, bound).expect("0 is below the minimum");
+        assert_eq!(
+            crate::message_shape_issue(&e.to_string()),
+            None,
+            "NumericBound::{bound:?} message not well-formed: {e}"
+        );
+    }
+    let e = require_min("Test spec.backoffLimit", -1, NumericBound::BackoffCount)
+        .expect("-1 is below the minimum");
+    assert_eq!(crate::message_shape_issue(&e.to_string()), None, "{e}");
+}
+
+#[test]
+fn representative_validation_error_messages_are_well_formed() {
+    // A cross-section of the ValidationError families (short field errors, bespoke
+    // long ones, unit variants). Not exhaustive, but broad enough that a sloppy
+    // new message in any of these shapes trips the lint.
+    let samples = vec![
+        ValidationError::MissingRequiredField {
+            field: "spec.backend".into(),
+        },
+        ValidationError::InvalidCron {
+            expr: "* *".into(),
+            reason: "expected 5 fields".into(),
+        },
+        ValidationError::DiscoveredMustRetain {
+            got: "Delete".into(),
+        },
+        ValidationError::Immutable {
+            field: "spec.backend.s3.bucket".into(),
+        },
+        ValidationError::MutuallyExclusive {
+            a: "pvc".into(),
+            b: "pvcSelector".into(),
+            context: "snapshot source".into(),
+        },
+        ValidationError::InsecureServerNotAcknowledged,
+        ValidationError::RestoreSourceRepositoryRequired,
+        ValidationError::InvalidFieldValue {
+            field: "snapshot source nfs.path".into(),
+            reason: "must be an absolute export path beginning with '/'".into(),
+        },
+    ];
+    for e in samples {
+        assert_eq!(
+            crate::message_shape_issue(&e.to_string()),
+            None,
+            "ValidationError message not well-formed: {e}"
+        );
+    }
+}

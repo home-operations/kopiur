@@ -175,7 +175,11 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     // knob, must be at least 1 (0 or negative disables the flag's own purpose).
     if let Some(u) = &spec.upload
         && let Some(mb) = u.limit_mb
-        && let Some(e) = require_min("SnapshotPolicy spec.upload.limitMb", mb, 1)
+        && let Some(e) = require_min(
+            "SnapshotPolicy spec.upload.limitMb",
+            mb,
+            NumericBound::Megabytes,
+        )
     {
         errs.push(e);
     }
@@ -232,7 +236,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 && let Some(e) = require_min(
                     "SnapshotPolicy spec.verification.quick.parallel",
                     p.into(),
-                    1,
+                    NumericBound::Count,
                 )
             {
                 errs.push(e);
@@ -241,7 +245,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 && let Some(e) = require_min(
                     "SnapshotPolicy spec.verification.quick.fileParallelism",
                     p.into(),
-                    1,
+                    NumericBound::Count,
                 )
             {
                 errs.push(e);
@@ -250,7 +254,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 && let Some(e) = require_min(
                     "SnapshotPolicy spec.verification.quick.fileQueueLength",
                     p.into(),
-                    1,
+                    NumericBound::Count,
                 )
             {
                 errs.push(e);
@@ -274,7 +278,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 && let Some(e) = require_min(
                     "SnapshotPolicy spec.verification.deep.parallel",
                     p.into(),
-                    1,
+                    NumericBound::Count,
                 )
             {
                 errs.push(e);

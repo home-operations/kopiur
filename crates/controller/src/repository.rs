@@ -1944,12 +1944,13 @@ async fn finalize_bootstrap(
     // with `status.parameters.epoch` silently disagreeing with `spec`. Say so out loud —
     // the whole point of #258 is that a user set a value expecting it to take effect.
     if let Some(err) = &result.epoch_error {
+        tracing::warn!(error = %err, repo = %repo.name_any(), "epoch/blob-retention parameters were not applied");
         io::publish_warning_event(
             ctx,
             repo,
             health::EPOCH_PARAMETERS_NOT_APPLIED_REASON,
             health::FIX_EPOCH_PARAMETERS_ACTION,
-            err,
+            &io::epoch_parameters_not_applied_note(err),
         )
         .await;
     }
