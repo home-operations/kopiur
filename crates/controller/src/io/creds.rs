@@ -488,10 +488,10 @@ async fn shrink_trailing_copies(
     }
 }
 
-/// The most projected copies one consumer can ever have — [`mover_creds_secret_refs`]
-/// yields the encryption-password Secret plus, only when it is differently named, the
-/// backend's auth Secret.
-const MAX_CREDS_IDX: usize = 1;
+/// The most projected copies one consumer can ever have — see
+/// [`kopiur_api::creds::MAX_CREDS_IDX`] (the bound lives next to
+/// [`mover_creds_secret_refs`], whose output it describes).
+const MAX_CREDS_IDX: usize = kopiur_api::creds::MAX_CREDS_IDX;
 
 /// **Pure.** Whether the trailing-copy shrink walk starting at `start_idx`
 /// (= the live source-ref count) cannot possibly find anything: the projector

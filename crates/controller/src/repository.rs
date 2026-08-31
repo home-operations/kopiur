@@ -625,7 +625,6 @@ async fn reconcile_repository_server(
         observed_namespace: observed_ns,
         owner,
         extra_labels: Default::default(),
-        creds_src_namespace: namespace.to_string(),
         repo_namespace: Some(namespace.to_string()),
         operator_namespace: ctx.operator_namespace.clone(),
         is_cluster: false,

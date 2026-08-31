@@ -91,10 +91,27 @@ feature. For a namespaced `Repository` the objects carry an `ownerReference` to
 the repository; a `ClusterRepository` cleans them up via a finalizer instead (see
 [ClusterRepository](#clusterrepository-server)).
 
+### How the server gets the repository credentials
+
+The server pod receives **every** credential `Secret` the repository references
+as environment variables (`envFrom`), exactly like a mover Job: the encryption
+password Secret (`KOPIA_PASSWORD`), plus the backend's `auth.secretRef` Secret
+when it is a different one. Keeping the password and the backend keys in
+separate Secrets is fully supported — the Deployment carries one `envFrom` entry
+per distinct Secret.
+
+For a backend using `auth.workloadIdentity` (S3, Azure, GCS) there is no backend
+Secret: the server pod runs **as the workload-identity ServiceAccount**, which
+must exist — with its cloud-federation annotations — in the namespace the server
+runs in (the repository's namespace, or `spec.server.namespace` for a
+`ClusterRepository`). Kopiur never creates that ServiceAccount; a missing one
+surfaces as an actionable error on the repository's `.status`. Azure pods get
+the `azure.workload.identity/use: "true"` opt-in label automatically.
+
 /// warning | The server needs `features.kopiaUi.enabled` in the chart
 
 Writing the generated-auth `Secret` (and, for a `ClusterRepository`, the
-cross-namespace credentials mirror) needs cluster-wide `secrets`
+cross-namespace credential mirrors) needs cluster-wide `secrets`
 `create`/`patch`/`delete` — **off by default** (least privilege). Set
 `features.kopiaUi.enabled: true` in the Helm chart. Without it the repository's
 `.status` surfaces an actionable `403` naming the flag. See
@@ -329,11 +346,15 @@ identical, flattened in):
 
 Because a cluster-scoped object can't own namespaced children via an
 `ownerReference`, the controller tracks and cleans up the server objects with a
-**finalizer + labels** instead. If the repository credentials Secret lives in a
-different namespace than the server, the operator mirrors it next to the server
-pod (`envFrom` can't cross namespaces). Changing `server.namespace` moves the
-server: the operator deletes the objects in the old namespace and recreates them
-in the new one (it tracks the last-applied namespace in `status.server.namespace`).
+**finalizer + labels** instead. Credential Secrets that live in a different
+namespace than the server are each mirrored next to the server pod (`envFrom`
+can't cross namespaces) — the password Secret **and** the backend `auth`
+Secret when they are separate. Each reference's source namespace is its own
+explicit `namespace`, falling back to the operator's namespace (the same rule
+the repository uses for bootstrap, so "absent" means one thing). Changing
+`server.namespace` moves the server: the operator deletes the objects — mirrors
+included — in the old namespace and recreates them in the new one (it tracks
+the last-applied namespace in `status.server.namespace`).
 
 ## Filesystem backends require ReadWriteMany
 

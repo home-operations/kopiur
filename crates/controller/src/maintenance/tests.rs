@@ -54,6 +54,17 @@ fn handled_at(ts: &str) -> RunStatus {
     }
 }
 
+// A fixed mid-slot instant (Saturday 12:02:33 UTC) for due_mode tests that
+// anchor lastRunAt/lastHandledAt relative to "now". With a live Utc::now(),
+// a run landing in the first second after a cron boundary (e.g. 03:15:00 for
+// `*/5 * * * *`) puts a genuinely new slot between the `now - 1s` anchor and
+// now, and due_mode rightly fires — a ~1/300 CI flake, not an operator bug.
+fn pinned_now() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-06-06T12:02:33Z")
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
 // Regression guard for the TTL-reap loop: a YIELDED slot advances
 // `lastHandledAt` but never `lastRunAt`. Once the slot's Job self-reaps
 // (ttlSecondsAfterFinished), the durable marker — not the Job's existence —
@@ -61,7 +72,7 @@ fn handled_at(ts: &str) -> RunStatus {
 // a yield Job every TTL period forever.
 #[test]
 fn handled_slot_does_not_refire_after_its_job_is_ttl_reaped() {
-    let now = Utc::now();
+    let now = pinned_now();
     let just = (now - chrono::Duration::seconds(1)).to_rfc3339();
     let status = MaintenanceStatus {
         quick: Some(handled_at(&just)),
@@ -81,7 +92,7 @@ fn handled_slot_does_not_refire_after_its_job_is_ttl_reaped() {
 // would march through the whole historic backlog one Job at a time.
 #[test]
 fn handling_a_year_old_slot_does_not_start_a_backlog_march() {
-    let now = Utc::now();
+    let now = pinned_now();
     // What record_handled_slot writes for the first-ever (year-old) slot:
     // the observation instant `now`, never the slot itself.
     let status = MaintenanceStatus {
@@ -142,7 +153,7 @@ fn first_ever_reconcile_is_due_and_prefers_full() {
 #[test]
 fn not_due_right_after_a_run() {
     // Both ran one second ago → next slots are in the future → nothing due.
-    let now = Utc::now();
+    let now = pinned_now();
     let just = (now - chrono::Duration::seconds(1)).to_rfc3339();
     let status = MaintenanceStatus {
         quick: Some(run_at(&just)),
@@ -159,7 +170,7 @@ fn not_due_right_after_a_run() {
 #[test]
 fn quick_due_when_full_recent() {
     // Full ran moments ago (not due), quick last ran long ago (due) → quick.
-    let now = Utc::now();
+    let now = pinned_now();
     let status = MaintenanceStatus {
         quick: Some(run_at(&(now - chrono::Duration::days(2)).to_rfc3339())),
         full: Some(run_at(&(now - chrono::Duration::seconds(1)).to_rfc3339())),
