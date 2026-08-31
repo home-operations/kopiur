@@ -198,10 +198,9 @@ pub enum CliError {
     /// session pod would.
     #[error(
         "the snapshot's repository ({repo}) lives in namespace {repo_namespace}, but the \
-         browse session pod runs in the snapshot's namespace ({session_namespace}) and is \
-         owned by the repository — Kubernetes forbids cross-namespace owners, so the session \
-         would be garbage-collected mid-read. \
-         Fix: run the command against a snapshot in the repository's namespace, or use --local"
+         browse session pod runs in the snapshot's namespace ({session_namespace}) — \
+         Kubernetes forbids cross-namespace owners, so the pod would be garbage-collected \
+         mid-read. Fix: browse a snapshot in the repository's namespace, or use --local"
     )]
     RepoOutsideSessionNamespace {
         /// `kind/name` of the repository.
@@ -446,12 +445,10 @@ pub enum CliError {
 
     /// `--local` cannot authenticate a workload-identity repository.
     #[error(
-        "--local cannot read repository {repository:?}: its backend authenticates via \
-         workload identity (ServiceAccount {service_account:?}), whose federated \
-         credentials only exist inside a pod running as that ServiceAccount — there \
-         is no credential Secret to copy onto this machine. \
-         Fix: drop --local and use the in-cluster session, which runs as the \
-         federated ServiceAccount"
+        "--local cannot read repository {repository:?}: its backend authenticates via workload \
+         identity (ServiceAccount {service_account:?}), whose federated credentials exist only \
+         inside a pod running as that ServiceAccount — there is no Secret to copy here. Fix: \
+         drop --local and use the in-cluster session, which runs as the federated ServiceAccount"
     )]
     LocalWorkloadIdentity {
         /// The repository name.

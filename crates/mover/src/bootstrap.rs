@@ -224,12 +224,10 @@ pub const SEED_SOURCE_NOT_FOUND_CLASS: &str = "SeedSourceNotFound";
 
 /// Stable, volatile-free actionable message for [`SEED_SOURCE_NOT_FOUND_CLASS`].
 /// Used verbatim as a condition message, so it carries no per-attempt detail.
-pub const SEED_SOURCE_NOT_FOUND_MESSAGE: &str = "spec.seed's source answered but holds no kopia repository (connect returned NotFound with \
-     kopia's `repository not initialized`), so there is nothing to seed this repository from. \
-     Check that spec.seed.from points at the bucket AND prefix a kopia repository actually \
-     lives under — a mirror written by a RepositoryReplication is rooted at the destination's \
-     own prefix, not its parent. The bootstrap retries automatically once the source is \
-     reachable";
+pub const SEED_SOURCE_NOT_FOUND_MESSAGE: &str = "spec.seed's source answered but holds no kopia repository (connect returned NotFound), so \
+     there is nothing to seed from. Fix: point spec.seed.from at the exact bucket AND prefix a \
+     kopia repository lives under — a RepositoryReplication mirror is rooted at the \
+     destination's own prefix, not its parent. Retries automatically once the source exists";
 
 /// Sentinel [`FailureBlock::kopia_error_class`] for a seed source that IS a
 /// kopia repository but holds zero snapshots, with `spec.seed.allowEmptySource`
@@ -242,12 +240,11 @@ pub const SEED_SOURCE_EMPTY_CLASS: &str = "SeedSourceEmpty";
 
 /// Stable, volatile-free actionable message for [`SEED_SOURCE_EMPTY_CLASS`],
 /// naming the explicit override.
-pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source is a kopia repository but holds zero snapshots, so seeding it would \
-     leave this repository empty while reporting it Ready. Check that spec.seed.from points at \
-     the intended mirror (an empty one is usually a wrong bucket/prefix or a replication that \
-     never ran); if the source really is meant to be empty, set spec.seed.allowEmptySource: \
-     true. The bootstrap retries automatically, so a mirror that fills up later seeds without \
-     further action";
+pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source is a kopia repository but holds zero snapshots, so seeding would report \
+     this repository Ready with no history. An empty source is usually a wrong bucket/prefix or \
+     a replication that never ran. Fix: point spec.seed.from at the intended mirror, or set \
+     spec.seed.allowEmptySource: true if it is meant to be empty. Retries automatically, so a \
+     mirror that fills later seeds on its own";
 
 /// Sentinel [`FailureBlock::kopia_error_class`] for the case a `spec.seed` was
 /// armed but the repository ends the bootstrap holding ZERO snapshots, with
@@ -277,16 +274,14 @@ pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source is a kopia repos
 pub const SEED_LEFT_EMPTY_CLASS: &str = "SeedLeftEmpty";
 
 /// Stable, volatile-free actionable message for [`SEED_LEFT_EMPTY_CLASS`].
-pub const SEED_LEFT_EMPTY_MESSAGE: &str = "spec.seed is set and this repository is initialized but holds ZERO snapshots, so reporting \
+pub const SEED_LEFT_EMPTY_MESSAGE: &str = "spec.seed is set but this repository is initialized and holds ZERO snapshots, so reporting \
      it Ready would hand you a repository with no history. This normally means an earlier seed \
-     attempt initialized the backend and then failed (a mover killed by the Job deadline, an \
-     OOM, or a copy that errored after `repository create`). Kopiur retries the seed itself — it \
-     records that an attempt started and resumes the copy on the next bootstrap, so no manual \
-     cleanup is needed and nothing at the backend should be deleted. If it keeps recurring, read \
-     the bootstrap Job's pod logs for why each attempt stops (a deadline too short for the \
-     repository's size is the usual cause — raise \
-     spec.seed.failurePolicy.activeDeadlineSeconds). If this repository really is meant to start \
-     out empty, set spec.seed.allowEmptySource: true";
+     attempt initialized the backend and then failed (Job deadline, OOM, or a copy that errored \
+     after `repository create`). Kopiur resumes the copy itself on the next bootstrap — no \
+     manual cleanup, and nothing at the backend should be deleted. Fix: if it keeps recurring, \
+     raise spec.seed.failurePolicy.activeDeadlineSeconds (a too-short deadline is the usual \
+     cause) and read the bootstrap Job's pod logs; or set spec.seed.allowEmptySource: true if it \
+     is meant to start empty";
 
 /// Whether a bootstrap must refuse to report success because a seed was armed
 /// yet the repository ends up empty. See [`SEED_LEFT_EMPTY_CLASS`] for the
@@ -861,10 +856,9 @@ impl BootstrapResult {
         BootstrapResult::sentinel(
             BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS,
             format!(
-                "the bootstrap mover reached a state it believes is impossible: {detail}. This \
-                 is a defect in kopiur, not a problem with this repository or its backend, so \
-                 retrying will reproduce it — the failure is terminal on purpose. Please report \
-                 it with the bootstrap Job's pod logs and the repository's spec"
+                "{detail}. This is a kopiur defect, not a repository or backend problem — \
+                 terminal on purpose (retrying reproduces it). Fix: report it with the \
+                 bootstrap Job's pod logs and the repository's spec"
             ),
             false,
         )
@@ -918,13 +912,12 @@ impl BootstrapResult {
             SEED_INCOMPLETE_CLASS,
             format!(
                 "seeding is incomplete: {missing} of {expected} expected snapshot(s) did not \
-                 arrive after `kopia snapshot migrate` (which exits 0 even when a per-source \
-                 migration fails — see the bootstrap Job's pod logs for kopia's per-source \
-                 errors). Missing (up to {cap} shown): {sample}. The bootstrap retries \
-                 automatically and migrate is idempotent by (identity, startTime), so it \
-                 resumes the copy and moves only what is still missing; if it never converges, \
-                 check the source repository's health with `kopia snapshot verify` and the \
-                 bootstrap Job's pod logs for kopia's per-source errors",
+                 arrive. `kopia snapshot migrate` exits 0 even when a per-source migration \
+                 fails, so the post-verify is the real success gate — see the bootstrap Job's \
+                 pod logs for kopia's per-source errors. Missing (up to {cap} shown): {sample}. \
+                 Retried automatically; migrate is idempotent by (identity, startTime), so it \
+                 copies only what is still missing. If it never converges, verify the source \
+                 with `kopia snapshot verify`",
                 cap = crate::error::MISSING_SAMPLE_CAP
             ),
             true,
