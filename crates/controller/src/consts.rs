@@ -608,17 +608,6 @@ pub const REPOSITORY_SEEDED_REASON: &str = "RepositorySeeded";
 /// immediately — so review retention/`defaultDeletionPolicy` before doing that.
 pub const REVIEW_SEEDED_HISTORY_ACTION: &str = "ReviewSeededHistory";
 
-/// `reason` for the Warning Event published when a `SnapshotPolicy`'s adoption
-/// pass finds a NON-EMPTY repository catalog but ZERO snapshots matching its
-/// identity (#380). The identity fork guards are Update-gated and cannot fire on
-/// a fresh-cluster CREATE, so after a disaster recovery a policy whose identity
-/// config differs even slightly from the pre-disaster one adopts nothing while
-/// looking perfectly healthy.
-pub const NO_ADOPTABLE_HISTORY_REASON: &str = "NoAdoptableHistory";
-/// `action` for [`NO_ADOPTABLE_HISTORY_REASON`]: the recovered identity must
-/// match the pre-disaster one byte for byte.
-pub const CHECK_IDENTITY_ACTION: &str = "CheckIdentityConfiguration";
-
 /// Condition type for the opt-in backend health probe (`spec.health.probe`).
 /// `True` = the last probe reached the backend and the kopia repository is
 /// present; `False` with reason [`REPOSITORY_VANISHED_REASON`] or

@@ -133,6 +133,13 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // delete (`polcasc-delete`), and simultaneous schedule+policy delete (`polcasc-simul`).
     "adopt-prune",
     "adopt-ignore",
+    // The "stay quiet" regression guard (adoption.rs:
+    // `foreign_history_policy_stays_quiet_and_adopts_nothing`): a retired policy's
+    // history sits as discovered rows while a NEW, zero-history policy of a
+    // different identity reconciles beside it. It asserts an ABSENCE (no warning
+    // event, no adoption) across a settle window, so any foreign traffic in the
+    // same kopia repo would make the proof meaningless — it needs its own repo.
+    "adopt-quiet",
     "polcasc-retain",
     "polcasc-delete",
     "polcasc-simul",

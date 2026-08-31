@@ -9018,6 +9018,35 @@ spec:
                     description: RFC3339 timestamp of the last adoption pass that adopted at least one snapshot.
                     nullable: true
                     type: string
+                  lastScanMatched:
+                    description: |-
+                      Discovered snapshots whose kopia identity matched this policy at the most
+                      recent adoption pass, counted BEFORE the own-id and retention filters —
+                      so it reads "history relevant to me exists in the catalog", independent
+                      of whether that pass adopted anything. A multi-repository policy SUMS
+                      this across the ready repositories of the pass. `0` together with
+                      `lastScanUnmatched: 0` means the catalog was empty at that pass; absent
+                      means no adoption pass has run yet. Neutral inventory, not a verdict:
+                      `0` matched beside a non-zero `lastScanUnmatched` is the ordinary shape
+                      of a new policy on a shared repository, and is also what a
+                      post-disaster-recovery identity mismatch looks like — compare
+                      `status.resolved.identity` with the pre-disaster configuration to tell
+                      them apart.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  lastScanUnmatched:
+                    description: |-
+                      Discovered snapshots the most recent adoption pass saw that did NOT match
+                      this policy's identity (other policies' or other clusters' history in a
+                      shared repository). Same counting rules as `lastScanMatched`: pre-filter,
+                      summed across a multi-repository policy's ready repositories, `0`/`0`
+                      for an empty catalog, absent when no pass has run.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
                   scanRequestedAt:
                     description: |-
                       RFC3339 token echoing an in-flight on-demand adoption scan request for
