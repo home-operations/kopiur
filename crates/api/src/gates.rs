@@ -528,6 +528,33 @@ pub const SEED_MOVER_TOO_OLD_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Warn,
 };
 
+/// A `Restore` whose repository referent does not exist (issue #393): the
+/// explicit `spec.repository` object, or the `source.fromPolicy`
+/// `SnapshotPolicy` the repository ref is derived from.
+///
+/// The readiness gate cannot verify a repository it cannot even look up, so the
+/// restore parks at `phase: Pending` and — critically — its
+/// `policy.waitTimeout` window is NOT opened (`status.waitStartedAt` stays
+/// unstamped) until the referent appears and its repository becomes `Ready`.
+/// Before #393 the gate fell through unverified here, so a slow-arriving
+/// referent silently spent the window; for a `fromPolicy` source, whose
+/// `onMissingSnapshot` defaults to `Continue`, a spent window means an EMPTY
+/// volume.
+///
+/// WARN, not Fail, for the reason [`POLICY_REPOSITORY_NOT_READY_GATE`] is:
+/// referents applied moments apart by GitOps are the ordinary case and resolve
+/// themselves within a requeue or two, so this must explain the park rather
+/// than independently turn a diagnostic red. What it must never be is INVISIBLE
+/// — a restore parked on a `SnapshotPolicy` that was never applied looks
+/// identical, by phase, to one that is simply still resolving.
+pub const RESTORE_REFERENT_MISSING_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotOrRestore,
+    condition: consts::RESTORE_REFERENT_AVAILABLE_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::RESTORE_REFERENT_MISSING_REASON,
+    severity: GateSeverity::Warn,
+};
+
 /// Every human-actionable structural gate kopiur's reconcilers can park an
 /// object on.
 ///
@@ -559,6 +586,7 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     SCHEDULE_FANOUT_CAPPED_GATE,
     POLICY_REPOSITORY_NOT_READY_GATE,
     SOURCE_PVC_MISSING_GATE,
+    RESTORE_REFERENT_MISSING_GATE,
     SEED_SOURCE_NOT_READY_GATE,
     SEED_SOURCE_AUTH_CONFLICT_GATE,
     SEEDING_GATE,
@@ -894,6 +922,13 @@ mod tests {
                 GateSeverity::Fail,
             ),
             (
+                consts::RESTORE_REFERENT_AVAILABLE_CONDITION,
+                CONDITION_FALSE,
+                consts::RESTORE_REFERENT_MISSING_REASON,
+                GateScope::SnapshotOrRestore,
+                GateSeverity::Warn,
+            ),
+            (
                 consts::SEEDED_CONDITION,
                 CONDITION_FALSE,
                 consts::WAITING_FOR_SEED_SOURCE_REASON,
@@ -965,6 +1000,47 @@ mod tests {
             assert_eq!(row.applies_to, *scope, "{condition}/{reason} scope");
             assert_eq!(row.severity, *severity, "{condition}/{reason} severity");
         }
+    }
+
+    /// The #393 park must be visible to `doctor` on a `Restore` — and must not
+    /// make any OTHER condition read as a gate.
+    ///
+    /// The registry's coarse [`StructuralGate::trips`] filter is
+    /// reason-agnostic, so a row registered on a condition other reconcilers
+    /// also write (`Ready`, `Resolved`, …) would make every unrelated reason on
+    /// that condition report as "a gate from a newer operator". This row's
+    /// condition is therefore written by exactly one gate and one reason.
+    #[test]
+    fn the_restore_referent_gate_is_restore_scoped_and_owns_its_condition() {
+        let row = STRUCTURAL_GATES
+            .iter()
+            .find(|g| g.reason == consts::RESTORE_REFERENT_MISSING_REASON)
+            .expect("the #393 referent-missing park must be registered");
+        // Reachable from a Restore (the only scope whose `covers_restore` is true).
+        assert!(row.applies_to.covers_restore());
+        assert_eq!(row.applies_to, GateScope::SnapshotOrRestore);
+        // Warn: referents applied moments apart by GitOps resolve themselves.
+        assert_eq!(row.severity, GateSeverity::Warn);
+        assert_eq!(row.condition, consts::RESTORE_REFERENT_AVAILABLE_CONDITION);
+        assert!(row.trips(consts::RESTORE_REFERENT_AVAILABLE_CONDITION, "False"));
+        assert!(!row.trips(consts::RESTORE_REFERENT_AVAILABLE_CONDITION, "True"));
+        // Exactly one row owns this condition, so the coarse filter can only
+        // fire for the one reason this build writes on it.
+        assert_eq!(
+            STRUCTURAL_GATES
+                .iter()
+                .filter(|g| g.condition == consts::RESTORE_REFERENT_AVAILABLE_CONDITION)
+                .count(),
+            1
+        );
+        // ...and it is NOT the `Ready` condition, which every Restore writes with
+        // many reasons — registering there would misreport all of them.
+        assert_ne!(row.condition, consts::READY_CONDITION);
+        assert!(
+            !STRUCTURAL_GATES
+                .iter()
+                .any(|g| g.condition == consts::READY_CONDITION)
+        );
     }
 
     #[test]

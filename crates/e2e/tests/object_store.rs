@@ -496,6 +496,17 @@ async fn s3_maintenance_runs_in_a_mover_job() {
     let repo_json = {
         let mut v = s3_repository_json("e2e-s3-maint", "kopiur-maint", "kopia-s3-creds", true);
         v["spec"]["maintenance"] = serde_json::json!({ "enabled": false });
+        // #374: a repository-wide throttle every mover flow must honor. This repo
+        // drives TWO of the flows that used to ignore it — the BOOTSTRAP Job below
+        // and the MAINTENANCE Job after it — and both are asserted at the mover's
+        // own log line further down. Deliberately non-binding (100 MiB/s against
+        // an in-cluster MinIO), so it proves the wiring without moving runtimes.
+        v["spec"]["moverDefaults"] = serde_json::json!({
+            "throttle": {
+                "uploadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND,
+                "downloadBytesPerSecond": consts::THROTTLE_BYTES_PER_SECOND
+            }
+        });
         v
     };
     repos
@@ -505,6 +516,19 @@ async fn s3_maintenance_runs_in_a_mover_job() {
     wait_phase(&repos, "e2e-s3-maint", "Ready")
         .await
         .expect("S3 Repository should reach Ready via the bootstrap Job");
+
+    // #374 regression guard, flow 1 of 2: the BOOTSTRAP mover applied the
+    // repository throttle. Before the fix, bootstrap connected on its own and
+    // silently dropped `spec.throttle` — the run still succeeded, which is
+    // exactly why only the mover's own log line can prove it.
+    kopiur_e2e::wait::wait_for_pod_log(
+        &client,
+        E2E_NAMESPACE,
+        "kopiur.home-operations.com/repository=e2e-s3-maint",
+        consts::THROTTLE_APPLIED_LOG,
+    )
+    .await
+    .expect("the bootstrap mover must apply moverDefaults.throttle on its own connect (#374)");
 
     // Create the explicit Maintenance; the controller spawns a per-slot mover Job.
     // (The operator honors an externally-authored Maintenance even when the repo
@@ -536,6 +560,19 @@ async fn s3_maintenance_runs_in_a_mover_job() {
     )
     .await
     .expect("a maintenance mover Job should run to completion");
+
+    // #374 regression guard, flow 2 of 2: the MAINTENANCE mover applied the same
+    // repository throttle on its own connect. A full maintenance rewrites and
+    // drops blobs, so this is real backend traffic that used to run uncapped.
+    kopiur_e2e::wait::wait_for_pod_log(
+        &client,
+        E2E_NAMESPACE,
+        "app.kubernetes.io/component=maintenance,\
+         kopiur.home-operations.com/maintenance=e2e-s3-maint",
+        consts::THROTTLE_APPLIED_LOG,
+    )
+    .await
+    .expect("the maintenance mover must apply moverDefaults.throttle on its own connect (#374)");
 
     // The mover ran `kopia maintenance` against S3 and PATCHed the status: the
     // first run is full (which also stamps quick), and the lease is owned. This

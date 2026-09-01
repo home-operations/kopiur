@@ -74,6 +74,50 @@ async fn verification_quick_with_success_expr_stamps_last_verified() {
     };
     world.ensure(&[Need::Filesystem]).await.expect("fixtures");
     let client = world.client().clone();
+
+    // #374: this repository carries a repository-wide throttle, so the verify
+    // mover — which owns its OWN connect and used to drop `spec.throttle` on the
+    // floor — must apply it. Created HERE rather than through `ensure_seed`,
+    // which hardcodes an empty overlay and is create-if-absent; this repo is
+    // used by no other scenario, so pre-creating it is race-free. The cap is
+    // deliberately non-binding (100 MiB/s over a local hostPath).
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    ensure_repo(&client, "verify").await;
+    create_idempotent(
+        &repos,
+        &cr(repository_json(
+            "e2e-verify-repo",
+            "verify",
+            serde_json::json!({
+                "moverDefaults": {
+                    "throttle": {
+                        "uploadBytesPerSecond": kopiur_e2e::consts::THROTTLE_BYTES_PER_SECOND,
+                        "downloadBytesPerSecond": kopiur_e2e::consts::THROTTLE_BYTES_PER_SECOND
+                    }
+                }
+            }),
+        )),
+        "create the throttled verify Repository",
+    )
+    .await;
+    // The overlay is BARE spec fields; a `{"spec": ...}` wrapper would be dropped
+    // by serde AND pruned by the apiserver, leaving a repo with no throttle and a
+    // test that asserts nothing. Read it back and prove the field landed.
+    let landed = repos
+        .get("e2e-verify-repo")
+        .await
+        .expect("read back the throttled verify Repository");
+    assert_eq!(
+        landed
+            .spec
+            .mover_defaults
+            .as_ref()
+            .and_then(|m| m.throttle.as_ref())
+            .and_then(|t| t.upload_bytes_per_second),
+        Some(kopiur_e2e::consts::THROTTLE_BYTES_PER_SECOND),
+        "moverDefaults.throttle must survive onto the Repository, or the assertion below is vacuous"
+    );
+
     // Seed a real snapshot so quick-verify has something to verify.
     ensure_seed(
         &client,
@@ -135,6 +179,18 @@ async fn verification_quick_with_success_expr_stamps_last_verified() {
     // mover contract (`operation.verify.tier.quick.*`).
     let selector = "app.kubernetes.io/component=verify,\
                     kopiur.home-operations.com/verify=e2e-verify-policy";
+
+    // #374 regression guard: the verify mover applied the repository throttle on
+    // its own connect. A capped repo whose verify Job ignores the cap still
+    // stamps `lastVerified`, so the mover's log line is the only proof.
+    kopiur_e2e::wait::wait_for_pod_log(
+        &client,
+        E2E_NAMESPACE,
+        selector,
+        kopiur_e2e::consts::THROTTLE_APPLIED_LOG,
+    )
+    .await
+    .expect("the verify mover must apply moverDefaults.throttle on its own connect (#374)");
     let spec = verify_work_spec_json(&client, selector).await;
     let quick = spec
         .pointer("/operation/verify/tier/quick")

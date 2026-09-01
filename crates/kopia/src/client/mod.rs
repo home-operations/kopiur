@@ -1415,6 +1415,42 @@ impl KopiaClient {
         self.run_ok(&args).await.map(|_| ())
     }
 
+    /// Flip the CONNECTED repository's client-side read-only bit
+    /// (`kopia repository set-client --read-only` / `--read-write`), issue #374.
+    ///
+    /// Three properties, all pinned against kopia 0.23.1 by
+    /// `crates/kopia/tests/integration_set_client_throttle.rs`:
+    ///
+    /// - **Works on a read-only connection.** `set-client` registers kopia's
+    ///   `repositoryReaderAction`, so it opens fine against a config connected with
+    ///   `--readonly` — unlike [`Self::repository_set_parameters`], which needs a real
+    ///   blob write and hard-errors there.
+    /// - **The bit lives in the local config, not the repository.** `read_only: true`
+    ///   writes `"readonly": true` into the `KOPIA_CONFIG_PATH` JSON; `false` removes the
+    ///   key. The test fingerprints every blob in the backend across the flip and requires
+    ///   it unchanged, so this never mutates shared state and needs no maintenance
+    ///   ownership/lease.
+    /// - **It is the "flip window" primitive** for a read-only-connected config that must
+    ///   run a write-requiring verb: flip read-write, run the verb, flip back. Note that
+    ///   [`Self::repository_throttle_set`] does *not* need this window — M3a measured it
+    ///   succeeding directly on a `--readonly` connection, and leaving the read-only bit
+    ///   intact, because it only rewrites the local config's `throttlingLimits`. The flip
+    ///   is defensive there, not required.
+    pub async fn repository_set_client_read_only(&self, read_only: bool) -> Result<(), KopiaError> {
+        let mode = if read_only {
+            "--read-only"
+        } else {
+            "--read-write"
+        };
+        self.run_ok(&[
+            "repository".to_string(),
+            "set-client".to_string(),
+            mode.to_string(),
+        ])
+        .await
+        .map(|_| ())
+    }
+
     /// Rewrite mutable repository parameters on the CONNECTED repository
     /// (`kopia repository set-parameters [flags]`), issue #258. No-op when nothing is set.
     ///

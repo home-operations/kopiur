@@ -1,7 +1,9 @@
+use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::ObjectReference;
 use kube::Resource;
 use kube::runtime::events::{Event, EventType, Recorder};
 
+use kopiur_api::Diagnostic;
 use kopiur_kopia::KopiaErrorClass;
 
 use crate::consts::{
@@ -222,6 +224,40 @@ const EVENT_MESSAGE_BUDGET_BYTES: usize = 512;
 /// Appended to a string that was truncated, signalling the cut to readers.
 pub(crate) const TRUNCATION_MARKER: &str = "…";
 
+/// Peel the `… failed (…): ` framing that a [`KopiaError`](kopiur_kopia::KopiaError)
+/// / `MoverError` `Display` wraps the real error in, down to the innermost human
+/// detail — so an Event note that *already* names the backend failure and its
+/// class reads as one sentence, not a nested one.
+///
+/// A bootstrap failure **nests** the two: the mover's `MoverError` frames a
+/// `KopiaError`, giving
+/// `<op> failed (class X): kopia `…` failed (exit code N, class X): <detail>`.
+/// Both layers are peeled. A bare stderr fragment (no such framing) is returned
+/// unchanged.
+/// A `kube::Error::Api` `Display` appends a full ` (Status { … })` Debug dump of
+/// the response — noise in an operator note. Keep the human `ApiError: <msg>:
+/// <reason>` head and drop the debug tail.
+fn kube_error_brief(message: &str) -> &str {
+    match message.find(" (Status {") {
+        Some(i) => &message[..i],
+        None => message,
+    }
+}
+
+fn kopia_detail(message: &str) -> &str {
+    let mut msg = message;
+    // Peel one `… failed (…): ` layer at a time. The `"failed ("` guard on the
+    // text before each `"): "` boundary means we only strip real error framing,
+    // never a `"): "` that merely appears inside the innermost detail.
+    while let Some(boundary) = msg.find("): ") {
+        if !msg[..boundary].contains("failed (") {
+            break;
+        }
+        msg = &msg[boundary + "): ".len()..];
+    }
+    msg
+}
+
 /// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, appending
 /// [`TRUNCATION_MARKER`] when anything was dropped. The result is always
 /// `<= max` bytes (assuming `max >= TRUNCATION_MARKER.len()`).
@@ -257,42 +293,104 @@ pub(crate) fn backend_failure_event(
     message: &str,
     uid: u32,
 ) -> (&'static str, String) {
-    let message = truncate_for_note(message, EVENT_MESSAGE_BUDGET_BYTES);
+    // The detail is the kopia specifics (already humanized by `KopiaError`'s
+    // Display); strip its redundant framing and cap it so the remediation hint is
+    // never eaten when the whole note is finally clamped.
+    let detail = truncate_for_note(kopia_detail(message), EVENT_MESSAGE_BUDGET_BYTES);
+    // Each arm leads with the specific problem, states the kopia detail as the
+    // `because`, and ends with the concrete fix. Split per class (no OR catch-all)
+    // so a new `KopiaErrorClass` forces its own decision (ADR §5.5).
     let (action, note) = match class {
         KopiaErrorClass::AccessDenied => (
             CHECK_CREDENTIALS_ACTION,
-            format!(
-                "the storage backend denied access: {message}. The credentials Secret may lack \
-                 permission, or the configured bucket/container/path does not exist (some backends \
-                 report a missing bucket as \"Access Denied\"). Verify the credentials Secret and \
-                 that the bucket/path exists and is reachable."
-            ),
+            Diagnostic::new("the storage backend denied access")
+                .because(detail)
+                .fix(
+                    "verify the credentials Secret, and that the bucket/container/path exists and \
+                     is reachable — some backends report a missing bucket as \"Access Denied\"",
+                )
+                .to_string(),
         ),
         KopiaErrorClass::PermissionDenied => (
             CHECK_PERMISSIONS_ACTION,
-            format!(
-                "the repository path is not writable by the operator: {message}. The filesystem \
-                 export or PVC must be writable by the operator's UID ({uid}) — fix its \
-                 ownership/mode (e.g. `chown -R {uid} <path>`) and reconcile again."
-            ),
+            Diagnostic::new("the repository path is not writable by the operator")
+                .because(detail)
+                .fix(format!(
+                    "the filesystem export or PVC must be writable by the operator's UID ({uid}) \
+                     — fix its ownership/mode (e.g. `chown -R {uid} <path>`), then reconcile"
+                ))
+                .to_string(),
         ),
         KopiaErrorClass::AuthFailure => (
             CHECK_CREDENTIALS_ACTION,
-            format!(
-                "the repository password was rejected: {message}. Check the encryption password \
-                 Secret (the `KOPIA_PASSWORD` key) referenced by this repository."
-            ),
+            Diagnostic::new("the repository password was rejected")
+                .because(detail)
+                .fix(
+                    "check the encryption password Secret (the `KOPIA_PASSWORD` key) referenced by \
+                     this repository",
+                )
+                .to_string(),
         ),
-        KopiaErrorClass::RepositoryUnavailable
-        | KopiaErrorClass::NotFound
-        | KopiaErrorClass::Locked
-        | KopiaErrorClass::SourceError
-        | KopiaErrorClass::Unknown => (
+        KopiaErrorClass::RepositoryUnavailable => (
             CHECK_BACKEND_ACTION,
-            format!("repository backend error ({}): {message}", class.as_str()),
+            Diagnostic::new("the repository backend is unreachable")
+                .because(detail)
+                .fix("check the endpoint/network and credentials, then retry (the reconcile retries automatically)")
+                .to_string(),
+        ),
+        KopiaErrorClass::NotFound => (
+            CHECK_BACKEND_ACTION,
+            Diagnostic::new("the requested repository, snapshot, or path was not found")
+                .because(detail)
+                .fix(
+                    "verify the backend path/prefix and that the repository exists; for a first \
+                     bootstrap of an empty backend, set spec.create.enabled: true",
+                )
+                .to_string(),
+        ),
+        KopiaErrorClass::Locked => (
+            CHECK_BACKEND_ACTION,
+            Diagnostic::new("a repository lock is held by another writer")
+                .because(detail)
+                .fix("this usually clears on its own; the reconcile retries automatically")
+                .to_string(),
+        ),
+        KopiaErrorClass::SourceError => (
+            CHECK_BACKEND_ACTION,
+            Diagnostic::new("a source filesystem error occurred during upload")
+                .because(detail)
+                .fix("check the source volume and the mover Job/pod logs; the run retries")
+                .to_string(),
+        ),
+        KopiaErrorClass::Unknown => (
+            CHECK_BACKEND_ACTION,
+            Diagnostic::new("an unclassified repository backend error occurred")
+                .because(detail)
+                .fix("see the mover Job/pod logs and status.failure for detail")
+                .to_string(),
         ),
     };
     (action, truncate_for_note(&note, EVENT_NOTE_MAX_BYTES))
+}
+
+/// The Warning note for #258: a repository is `Ready` but its epoch/blob-retention
+/// parameters (`spec.parameters`) were not applied, so `status.parameters`
+/// silently disagrees with `spec`. Previously the note was the raw apply error
+/// with no framing; now the raw error goes to the operator log (the caller logs
+/// it) and this note carries the actionable what/why/fix. `err` is the apply
+/// error's detail, embedded as the `because` (framing-stripped + capped).
+pub(crate) fn epoch_parameters_not_applied_note(err: &str) -> String {
+    let detail = truncate_for_note(kopia_detail(err), EVENT_MESSAGE_BUDGET_BYTES);
+    let note = Diagnostic::new(
+        "the repository's epoch/blob-retention parameters (spec.parameters) were not applied",
+    )
+    .because(detail)
+    .fix(
+        "the repository is Ready but status.parameters now disagrees with spec; re-apply \
+         spec.parameters, and see the operator log for the underlying error",
+    )
+    .to_string();
+    truncate_for_note(&note, EVENT_NOTE_MAX_BYTES)
 }
 
 /// The operator's effective UID — the identity that writes a filesystem repo in
@@ -336,14 +434,16 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
             let (action, note) = backend_failure_event(class, &e.to_string(), uid);
             (class.as_str(), action, note)
         }
-        Error::Kube(_) => (
+        Error::Kube(e) => (
             KUBE_API_ERROR_REASON,
             CHECK_API_SERVER_ACTION,
-            format!(
-                "{err}. This is usually a transient API-server problem and the reconcile retries \
-                 automatically; if it persists, check the API server's health and the operator's \
-                 RBAC."
-            ),
+            Diagnostic::new("a Kubernetes API call failed during reconcile")
+                .because(kube_error_brief(&e.to_string()).to_string())
+                .fix(
+                    "usually transient — the reconcile retries automatically; if it persists, \
+                     check the API server's health and the operator's RBAC",
+                )
+                .to_string(),
         ),
         Error::Validation(_) => (
             INVALID_SPEC_REASON,
@@ -394,10 +494,9 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
             crate::consts::MISSING_RECORDED_IDENTITY_REASON,
             crate::consts::SET_EXPLICIT_MOVER_CONTEXT_ACTION,
             format!(
-                "{err}. The Restore holds (re-checked every few minutes) until a Snapshot CR \
-                 carrying status.recorded matches the source — the catalog scan materializes \
-                 and backfills rows automatically. To proceed without it, set \
-                 mover.securityContext explicitly or drop inheritSecurityContextFrom.snapshot."
+                "{err}. No Snapshot CR with status.recorded matches the source yet, so the \
+                 inherited mover identity is unknown. Fix: set mover.securityContext \
+                 explicitly, or drop inheritSecurityContextFrom.snapshot."
             ),
         ),
         // The DIRECT source PVC is gone. Same reason as the structural gate
@@ -600,6 +699,57 @@ pub async fn publish_backend_failure(
     publish_warning(ctx, regarding, name, class.as_str(), action, note).await;
 }
 
+/// Terminal state of a mover Job, including WHY it failed (issue #414).
+///
+/// The one-bit `job_terminal_state` collapse threw the Job `Failed` condition's
+/// `reason` away, which made a deadline-killed bootstrap ("connect slower than
+/// `activeDeadlineSeconds`") indistinguishable from a crashed or never-scheduled
+/// mover ("backend/environment broken") — two failures with opposite
+/// remediations. This enum keeps the distinction typed end-to-end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoverJobTerminal {
+    /// The Job's `Complete` condition is `True` (or `status.succeeded >= 1`).
+    Complete,
+    /// The Job's `Failed` condition is `True`. `deadline_exceeded` is whether
+    /// that condition's `reason` is the upstream `DeadlineExceeded`
+    /// (`batchv1.JobReasonDeadlineExceeded`) — the Job was killed by its
+    /// `activeDeadlineSeconds`, not by its pods' own exits.
+    Failed {
+        /// `reason == "DeadlineExceeded"` on the `Failed` condition.
+        deadline_exceeded: bool,
+    },
+}
+
+/// Classify a mover Job's terminal state: `None` = still running. The typed
+/// sibling of `snapshot::job_terminal_state` (which now wraps this so the two
+/// can never diverge). Reads the `Failed` condition — not the newer
+/// `FailureTarget` — so classification lands exactly when the Job goes
+/// terminal; keeps the succeeded-count fallback for conditions not yet
+/// populated.
+pub fn mover_job_terminal(job: &Job) -> Option<MoverJobTerminal> {
+    let status = job.status.as_ref()?;
+    if let Some(conds) = status.conditions.as_ref() {
+        for c in conds {
+            if c.status == "True" {
+                match c.type_.as_str() {
+                    "Complete" => return Some(MoverJobTerminal::Complete),
+                    "Failed" => {
+                        return Some(MoverJobTerminal::Failed {
+                            deadline_exceeded: c.reason.as_deref() == Some("DeadlineExceeded"),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Fall back to counts when conditions aren't populated yet.
+    if status.succeeded.unwrap_or(0) >= 1 {
+        return Some(MoverJobTerminal::Complete);
+    }
+    None
+}
+
 /// Why an object-store repository bootstrap Job did not yield a healthy
 /// repository. Each variant maps **exhaustively** (ADR §5.5) to a
 /// `Bootstrapped=False` condition reason/message and a Warning Event, so a new
@@ -617,12 +767,30 @@ pub enum BootstrapFailure {
         message: String,
     },
     /// The bootstrap Job reached a terminal/failed state but wrote **no** result:
-    /// the mover pod crashed, was OOM-killed/evicted, exceeded its
-    /// `activeDeadlineSeconds`, or never scheduled (e.g. a missing mover
-    /// ServiceAccount). The cause lives in the Job's pod logs.
+    /// the mover pod crashed, was OOM-killed/evicted, or never scheduled (e.g. a
+    /// missing mover ServiceAccount). The cause lives in the Job's pod logs.
+    /// A deadline kill is its own [`JobDeadlineExceeded`](Self::JobDeadlineExceeded)
+    /// variant (issue #414); this bucket covers it only as the no-reason fallback
+    /// on a cluster whose Job `Failed` condition omits the reason string.
     JobFailedWithoutResult {
         /// The bootstrap Job's name, so the message can point an operator at it.
         job_name: String,
+    },
+    /// The bootstrap Job was killed by its `activeDeadlineSeconds` before the
+    /// mover could write a result (issue #414): the Job's `Failed` condition
+    /// carries `reason: DeadlineExceeded`. Distinct from
+    /// [`JobFailedWithoutResult`](Self::JobFailedWithoutResult) because the
+    /// remediation is the opposite of a backend hunt — the backend may be
+    /// healthy but *slow* (a cold-cache `kopia repository connect` scales with
+    /// index-blob count), so the fix is a longer deadline plus maintenance
+    /// (index compaction), and kopiur retries with a progressively longer
+    /// deadline itself.
+    JobDeadlineExceeded {
+        /// The bootstrap Job's name.
+        job_name: String,
+        /// The `activeDeadlineSeconds` the killed Job actually ran with (read
+        /// off its spec — exact even under deadline escalation).
+        deadline_secs: i64,
     },
     /// The mover connected and found **no** repository at the backend, but
     /// `spec.create.enabled` is `false`, so it declined to initialize one. Not a
@@ -738,17 +906,11 @@ impl SeedFailure {
 /// ([`BootstrapFailure::SeedMoverTooOld`]). Pure so its exact text is asserted;
 /// volatile-free so the guarded status write stays a no-op across repeats.
 pub fn seed_mover_too_old_message() -> String {
-    "spec.seed is set and this repository has never been initialized, but the bootstrap mover \
-     reported success without saying what it did about the seed — which means the running mover \
-     image predates spec.seed, silently ignored it, and initialized an EMPTY repository instead \
-     of copying your data in. kopiur refuses to report Ready over that, because an empty \
-     repository that looks healthy is exactly the failure spec.seed exists to prevent. Fix: \
-     upgrade the mover image (Helm `mover.image.tag`, or `KOPIUR_MOVER_IMAGE`) to the same \
-     version as the controller, delete the empty repository at the backend so the seed can run \
-     from scratch, then delete this repository\'s finished bootstrap Job \
-     (`kubectl -n <namespace> delete job <repository>-discovery`) — nothing recycles a terminal \
-     Job before its ~1h TTL, so without that last step the upgraded mover will not be given a \
-     chance to run for up to an hour."
+    "Repository bootstrapped with a mover image older than spec.seed: it ignored the seed and \
+     made an EMPTY repository, so kopiur refuses Ready. Fix: upgrade the mover image (Helm \
+     `mover.image.tag` or `KOPIUR_MOVER_IMAGE`) to the controller version, delete the empty \
+     repository at the backend, then `kubectl -n <namespace> delete job <repository>-discovery` \
+     (finished Jobs linger ~1h)."
         .to_string()
 }
 
@@ -761,6 +923,9 @@ impl BootstrapFailure {
         match self {
             BootstrapFailure::Backend { class, .. } => class.as_str(),
             BootstrapFailure::JobFailedWithoutResult { .. } => BOOTSTRAP_JOB_FAILED_REASON,
+            BootstrapFailure::JobDeadlineExceeded { .. } => {
+                crate::consts::BOOTSTRAP_DEADLINE_EXCEEDED_REASON
+            }
             BootstrapFailure::RepositoryNotInitialized => REPOSITORY_NOT_INITIALIZED_REASON,
             BootstrapFailure::Seed { failure, .. } => failure.reason(),
             BootstrapFailure::SeedMoverTooOld => kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON,
@@ -782,6 +947,7 @@ impl BootstrapFailure {
             }
             BootstrapFailure::Backend { .. }
             | BootstrapFailure::JobFailedWithoutResult { .. }
+            | BootstrapFailure::JobDeadlineExceeded { .. }
             | BootstrapFailure::RepositoryNotInitialized
             | BootstrapFailure::InternalInconsistency { .. } => None,
         }
@@ -806,6 +972,7 @@ impl BootstrapFailure {
             // path, whose remediation copy is about a WIPE.
             BootstrapFailure::Backend { .. }
             | BootstrapFailure::JobFailedWithoutResult { .. }
+            | BootstrapFailure::JobDeadlineExceeded { .. }
             | BootstrapFailure::Seed { .. }
             | BootstrapFailure::SeedMoverTooOld
             | BootstrapFailure::InternalInconsistency { .. } => false,
@@ -842,7 +1009,12 @@ impl BootstrapFailure {
     /// on every attempt, so retrying hides them behind a two-minute loop.
     pub fn recycles_for_retry(&self) -> bool {
         match self {
-            BootstrapFailure::JobFailedWithoutResult { .. } | BootstrapFailure::Seed { .. } => true,
+            BootstrapFailure::JobFailedWithoutResult { .. }
+            // A deadline kill is infrastructure eating the Job before a verdict
+            // existed — retryable by the same reasoning, and the retry gets a
+            // progressively longer deadline (issue #414).
+            | BootstrapFailure::JobDeadlineExceeded { .. }
+            | BootstrapFailure::Seed { .. } => true,
             BootstrapFailure::Backend { .. }
             | BootstrapFailure::RepositoryNotInitialized
             | BootstrapFailure::SeedMoverTooOld
@@ -851,8 +1023,9 @@ impl BootstrapFailure {
     }
 
     /// Whether this failed strict-bootstrap verdict should recycle-and-retry as
-    /// `Degraded` instead of parking terminal `Failed` — ONLY a backend verdict
-    /// of class `RepositoryUnavailable` on a repository that has bootstrapped
+    /// `Degraded` feeding the unified backend sensor, instead of parking
+    /// terminal `Failed` — a backend verdict of class `RepositoryUnavailable`,
+    /// or a Job-deadline kill (#414), on a repository that has bootstrapped
     /// before (`status.uniqueId` pinned). This is the strict-verdict half of the
     /// #345 circuit breaker: without it, a breaker-opened `Degraded` repository
     /// is overwritten to terminal `Failed` one pass later by its own strict
@@ -885,6 +1058,14 @@ impl BootstrapFailure {
                         | KopiaErrorClass::Unknown => false,
                     }
             }
+            // A deadline kill on a BOOTSTRAPPED repo joins the outage sensor
+            // (#414): `recycle_bootstrap_outage` folds it as
+            // `ProbeFailureKind::TimedOut`, so the streak/backoff/breaker
+            // machinery — and the deadline escalation keyed on the streak —
+            // see deadline kills. A never-bootstrapped repo keeps the plain
+            // recycle route (there is no sensor state to feed yet; the #415
+            // streak stamp there still arms the holdoff).
+            BootstrapFailure::JobDeadlineExceeded { .. } => bootstrapped,
             BootstrapFailure::JobFailedWithoutResult { .. }
             | BootstrapFailure::RepositoryNotInitialized
             // A seed failure only ever fires on a repository that has NEVER
@@ -898,6 +1079,25 @@ impl BootstrapFailure {
         }
     }
 
+    /// Which retry route a failed bootstrap takes. The single, tested place
+    /// route precedence lives (issue #415): the outage sensor is checked FIRST,
+    /// so a variant that both recycles and feeds the sensor can never be
+    /// silently shadowed into the sensor-less recycle arm; the seed carve-out
+    /// keeps its documented flat, prompt DR retry cadence
+    /// (`docs/scenarios/dr-with-replicated-repository.md`) out of the
+    /// exponential backoff.
+    pub fn route(&self, bootstrapped: bool) -> FailureRoute {
+        if self.retryable_outage_for_bootstrapped(bootstrapped) {
+            FailureRoute::OutageSensor
+        } else if matches!(self, BootstrapFailure::Seed { .. }) {
+            FailureRoute::SeedRetry
+        } else if self.recycles_for_retry() {
+            FailureRoute::Recycle
+        } else {
+            FailureRoute::Terminal
+        }
+    }
+
     /// The stable, actionable condition message (what failed / why / how to find
     /// the cause). Volatile-free so the guarded status write stays a no-op across
     /// repeated identical failures (no hot-loop — see [`crate::io::patch_status_if_changed`]).
@@ -907,6 +1107,10 @@ impl BootstrapFailure {
             BootstrapFailure::JobFailedWithoutResult { job_name } => {
                 bootstrap_job_failed_message(job_name)
             }
+            BootstrapFailure::JobDeadlineExceeded {
+                job_name,
+                deadline_secs,
+            } => bootstrap_deadline_exceeded_message(job_name, *deadline_secs),
             BootstrapFailure::RepositoryNotInitialized => {
                 kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string()
             }
@@ -936,6 +1140,24 @@ impl BootstrapFailure {
                     name,
                     BOOTSTRAP_JOB_FAILED_REASON,
                     CHECK_BACKEND_ACTION,
+                    note,
+                )
+                .await;
+            }
+            BootstrapFailure::JobDeadlineExceeded {
+                job_name,
+                deadline_secs,
+            } => {
+                let note = truncate_for_note(
+                    &bootstrap_deadline_exceeded_message(job_name, *deadline_secs),
+                    EVENT_NOTE_MAX_BYTES,
+                );
+                publish_warning(
+                    ctx,
+                    regarding,
+                    name,
+                    crate::consts::BOOTSTRAP_DEADLINE_EXCEEDED_REASON,
+                    crate::consts::RAISE_BOOTSTRAP_DEADLINE_ACTION,
                     note,
                 )
                 .await;
@@ -995,6 +1217,29 @@ impl BootstrapFailure {
     }
 }
 
+/// Which retry route a failed bootstrap takes ([`BootstrapFailure::route`]).
+/// A closed enum so the `Repository`/`ClusterRepository` finalizers `match` it
+/// exhaustively — route precedence is decided (and unit-tested) in exactly one
+/// place instead of two hand-copied `if` chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureRoute {
+    /// A retryable backend verdict (or deadline kill) on a once-bootstrapped
+    /// repository: recycle and retry as `Degraded`, feeding the unified backend
+    /// sensor (streak, breaker, exponential backoff) — the #345 M4 path.
+    OutageSensor,
+    /// A result-less infrastructure failure: recycle the dead Job and retry as
+    /// `Degraded` with the failure streak stamped so the strict-retry holdoff
+    /// backs off exponentially (issue #415).
+    Recycle,
+    /// A `spec.seed` failure: recycle and retry PROMPTLY (flat cadence, no
+    /// streak) — the documented DR contract keeps seed retries at roughly two
+    /// minutes because this is the flow you are in on the worst day of the
+    /// year (`docs/scenarios/dr-with-replicated-repository.md`).
+    SeedRetry,
+    /// A non-retryable verdict: park terminal `Failed` (kstatus-Stalled).
+    Terminal,
+}
+
 /// The terminal outcome of a repository bootstrap Job, derived purely from the
 /// `(result, job state)` pair. Exhaustive (ADR §5.5): the success arm **owns**
 /// the [`BootstrapResult`], so the reconciler binds it by `match` instead of
@@ -1012,7 +1257,7 @@ pub enum BootstrapOutcome {
     Succeeded(Box<kopiur_mover::bootstrap::BootstrapResult>),
 }
 
-/// Classify a bootstrap Job's `(result, job_succeeded)` into a
+/// Classify a bootstrap Job's `(result, job terminal state)` into a
 /// [`BootstrapOutcome`]. Pure, so the mapping is unit-tested.
 ///
 /// `seed_armed` is whether THIS launch carried a `spec.seed` payload (issue
@@ -1022,17 +1267,34 @@ pub enum BootstrapOutcome {
 /// the request — and it is refused here, before any caller can read `Ready` out
 /// of it. Passing `false` (a bootstrap that armed nothing) keeps the pre-#380
 /// mapping byte-for-byte.
+///
+/// `deadline_secs` is the `activeDeadlineSeconds` the Job actually ran with
+/// (read off its spec), carried into [`BootstrapFailure::JobDeadlineExceeded`]
+/// so the condition message names the real limit (issue #414). A mover-written
+/// result always outranks the Job's infrastructure verdict: the deadline arm is
+/// reachable only when the Job died result-less.
 pub fn bootstrap_outcome(
     result: Option<kopiur_mover::bootstrap::BootstrapResult>,
-    job_succeeded: bool,
+    job: MoverJobTerminal,
     job_name: &str,
     seed_armed: bool,
+    deadline_secs: i64,
 ) -> BootstrapOutcome {
     match result {
-        None if job_succeeded => BootstrapOutcome::ResultPending,
-        None => BootstrapOutcome::Failed(BootstrapFailure::JobFailedWithoutResult {
-            job_name: job_name.to_string(),
-        }),
+        None => match job {
+            MoverJobTerminal::Complete => BootstrapOutcome::ResultPending,
+            MoverJobTerminal::Failed {
+                deadline_exceeded: true,
+            } => BootstrapOutcome::Failed(BootstrapFailure::JobDeadlineExceeded {
+                job_name: job_name.to_string(),
+                deadline_secs,
+            }),
+            MoverJobTerminal::Failed {
+                deadline_exceeded: false,
+            } => BootstrapOutcome::Failed(BootstrapFailure::JobFailedWithoutResult {
+                job_name: job_name.to_string(),
+            }),
+        },
         // The mover declined to create an absent repo because `create.enabled` is
         // off: a kopiur policy outcome, not a kopia class. Keyed on the shared
         // sentinel label (checked before the generic Backend mapping) so it surfaces
@@ -1110,8 +1372,24 @@ pub fn bootstrap_outcome(
 pub fn bootstrap_job_failed_message(job_name: &str) -> String {
     format!(
         "the repository bootstrap Job `{job_name}` failed without writing a result — the mover \
-         pod crashed, was evicted, exceeded its deadline, or never scheduled (e.g. a missing mover \
-         ServiceAccount in this namespace). Inspect it with `kubectl describe job/{job_name}` and \
+         pod crashed, was evicted, or never scheduled (e.g. a missing mover ServiceAccount in \
+         this namespace). Inspect it with `kubectl describe job/{job_name}` and \
          `kubectl logs job/{job_name}` to find the underlying error."
+    )
+}
+
+/// The actionable message for a bootstrap Job killed by its
+/// `activeDeadlineSeconds` (issue #414). Pure so the exact text is
+/// unit-asserted; volatile-free per state — `deadline_secs` is the limit the
+/// killed Job ran with, which only changes when the spec (or the deadline
+/// escalation streak) actually changes, so the guarded status write stays a
+/// no-op across repeated identical kills.
+pub fn bootstrap_deadline_exceeded_message(job_name: &str, deadline_secs: i64) -> String {
+    format!(
+        "bootstrap Job `{job_name}` was killed by its activeDeadlineSeconds ({deadline_secs}s) \
+         before kopia connected — the backend may be slow to open, e.g. a cold cache over a \
+         large repository can make `kopia repository connect` alone exceed it. Fix: raise \
+         `spec.bootstrap.failurePolicy.activeDeadlineSeconds`, or run maintenance to compact \
+         indexes; kopiur retries with a progressively longer deadline."
     )
 }

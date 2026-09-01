@@ -25,7 +25,8 @@ pub use kopiur_api::consts::{
     OP_RESTORE_TARGET, ORIGIN_LABEL, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
     PRIVILEGED_MOVERS_ANNOTATION, READY_CONDITION, RECONCILING_CONDITION,
     REPOSITORIES_READY_CONDITION, REPOSITORY_NOT_READY_REASON, REPOSITORY_READ_ONLY_REASON,
-    REPOSITORY_UID_LABEL, REPOSITORY_WRITABLE_CONDITION, RUN_MODE_ANNOTATION,
+    REPOSITORY_UID_LABEL, REPOSITORY_WRITABLE_CONDITION, RESTORE_REFERENT_AVAILABLE_CONDITION,
+    RESTORE_REFERENT_FOUND_REASON, RESTORE_REFERENT_MISSING_REASON, RUN_MODE_ANNOTATION,
     RUN_REQUESTED_ANNOTATION, SCHEDULE_FANOUT_CAPPED_CONDITION, SCHEDULE_LABEL,
     SCHEDULE_RUNNABLE_CONDITION, SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SNAPSHOT_CLEANUP_FINALIZER,
     SNAPSHOT_ID_LABEL, SOURCE_PVC_AVAILABLE_CONDITION, SOURCE_PVC_MISSING_REASON,
@@ -255,11 +256,38 @@ pub const CHECK_CREDENTIALS_ACTION: &str = "CheckCredentials";
 
 /// Machine-readable `reason` (condition + Warning Event) when a bootstrap Job
 /// reaches a terminal/failed state but wrote **no** structured result — the mover
-/// pod crashed, was evicted, hit its [`BOOTSTRAP_JOB_DEADLINE_SECS`] deadline, or
-/// never scheduled (e.g. a missing mover ServiceAccount). Distinct from a kopia
-/// error class so the failure mode is not silently conflated with a backend
-/// rejection ([`crate::io::BootstrapFailure`]).
+/// pod crashed, was OOM-killed/evicted, or never scheduled (e.g. a missing mover
+/// ServiceAccount). A deadline kill carries its own
+/// [`BOOTSTRAP_DEADLINE_EXCEEDED_REASON`] (read off the Job's `Failed`
+/// condition), so this reason falls back to covering a deadline kill only on a
+/// cluster whose Job conditions omit the `DeadlineExceeded` reason string.
+/// Distinct from a kopia error class so the failure mode is not silently
+/// conflated with a backend rejection ([`crate::io::BootstrapFailure`]).
 pub const BOOTSTRAP_JOB_FAILED_REASON: &str = "BootstrapJobFailed";
+
+/// Machine-readable `reason` (condition + Warning Event) when a bootstrap Job
+/// was killed by its `activeDeadlineSeconds` before the mover could write a
+/// result (issue #414). Its own reason — NOT folded into
+/// [`BOOTSTRAP_JOB_FAILED_REASON`] — because the remediation is entirely
+/// different: the backend may be healthy but slow (a cold-cache
+/// `kopia repository connect` scales with index-blob count), so the fix is a
+/// longer deadline and index compaction, not a backend/credentials hunt.
+pub const BOOTSTRAP_DEADLINE_EXCEEDED_REASON: &str = "BootstrapDeadlineExceeded";
+
+/// `BackendReachable=False` (and breaker-open `Ready`) reason when the health
+/// probe / strict retry keeps being killed by the bootstrap Job deadline
+/// (issue #414): "connect slower than `activeDeadlineSeconds`" — NOT
+/// confirmation of an outage, so the maintenance gate
+/// (`health::maintenance_may_proceed`) deliberately lets maintenance keep
+/// running under this reason.
+pub const PROBE_DEADLINE_EXCEEDED_REASON: &str = "ProbeDeadlineExceeded";
+
+/// `LeaseOwned=False` (Maintenance) / `Ready=False` (RepositoryReplication)
+/// reason while the gate on the target repository holds. For maintenance the
+/// gate is `health::maintenance_may_proceed` (bootstrapped-before + degradation
+/// cause, issue #413); for replication it is strictly `phase == Ready` (the
+/// #345 breaker pauses replication).
+pub const WAITING_FOR_REPOSITORY_REASON: &str = "WaitingForRepository";
 
 /// [`OP_LABEL`] value for a populator `Restore`'s prime PVC and populate mover Job
 /// (distinct from the direct-target `restore` Jobs). ADR-0005 §9.
@@ -287,6 +315,13 @@ pub const ORPHANED_PRIME_REAPED_REASON: &str = "OrphanedPrimePvcReaped";
 /// `action` for the already-bound no-op / orphan-reap Events: to actually restore into the
 /// claim, delete it and let it be recreated (keeping its `dataSourceRef`).
 pub const RECREATE_CLAIM_TO_RESTORE_ACTION: &str = "RecreateClaimToRestore";
+/// Event `action` (remediation hint) for
+/// [`RESTORE_REFERENT_MISSING_REASON`]: create the referenced object, or repoint
+/// the `Restore` at one that exists. Published on the park TRANSITION only (the
+/// park itself re-patches an identical status every 15s, which is a server-side
+/// no-op) — it is what replaces the error metric + Warning Event the pre-#393
+/// unverified fall-through produced downstream.
+pub const CREATE_RESTORE_REFERENT_ACTION: &str = "CreateRestoreReferentOrFixTheReference";
 
 /// `Snapshot` condition tracking kopia-side pin reconciliation (ADR-0005 §13(c)).
 /// `True`/`False` mirrors `status.pinned` once a SnapshotPin mover Job ran;
@@ -505,6 +540,10 @@ pub const SET_SCRATCH_CAPACITY_ACTION: &str = "SetScratchCapacity";
 pub const CHECK_PERMISSIONS_ACTION: &str = "CheckPermissions";
 /// `action` for any other backend failure: check the backend configuration.
 pub const CHECK_BACKEND_ACTION: &str = "CheckBackend";
+/// `action` for a deadline-killed bootstrap/probe Job (issue #414): raise
+/// `spec.bootstrap.failurePolicy.activeDeadlineSeconds` (and let maintenance
+/// compact indexes so the connect gets faster).
+pub const RAISE_BOOTSTRAP_DEADLINE_ACTION: &str = "RaiseBootstrapDeadline";
 
 /// `SnapshotSchedule` warn-only condition: the schedule inherits its cron timezone
 /// from its target policies' repository `scheduleDefaults.timezone`, but the matched
@@ -568,17 +607,6 @@ pub const REPOSITORY_SEEDED_REASON: &str = "RepositorySeeded";
 /// re-applying `SnapshotPolicy`s, and GFS retention prunes beyond-budget points
 /// immediately — so review retention/`defaultDeletionPolicy` before doing that.
 pub const REVIEW_SEEDED_HISTORY_ACTION: &str = "ReviewSeededHistory";
-
-/// `reason` for the Warning Event published when a `SnapshotPolicy`'s adoption
-/// pass finds a NON-EMPTY repository catalog but ZERO snapshots matching its
-/// identity (#380). The identity fork guards are Update-gated and cannot fire on
-/// a fresh-cluster CREATE, so after a disaster recovery a policy whose identity
-/// config differs even slightly from the pre-disaster one adopts nothing while
-/// looking perfectly healthy.
-pub const NO_ADOPTABLE_HISTORY_REASON: &str = "NoAdoptableHistory";
-/// `action` for [`NO_ADOPTABLE_HISTORY_REASON`]: the recovered identity must
-/// match the pre-disaster one byte for byte.
-pub const CHECK_IDENTITY_ACTION: &str = "CheckIdentityConfiguration";
 
 /// Condition type for the opt-in backend health probe (`spec.health.probe`).
 /// `True` = the last probe reached the backend and the kopia repository is

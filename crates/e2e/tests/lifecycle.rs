@@ -2421,6 +2421,11 @@ async fn wait_managed_maintenance(
 /// Object-store (MinIO) backed: the server connects over the network, so — unlike a
 /// filesystem repo — it needs no ReadWriteMany repo volume (that path is covered by
 /// the controller's reconcile-time RWX check + unit tests).
+///
+/// The password and backend keys deliberately live in SEPARATE Secrets — the #416
+/// regression shape: a server injecting only the encryption Secret crashloops on
+/// `repository connect` (missing `AWS_*` keys), so `server_exposes_repository_ui`
+/// reaching a served UI IS the regression guard.
 fn server_repository_json(name: &str) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "kopiur.home-operations.com/v1alpha1",
@@ -2432,10 +2437,10 @@ fn server_repository_json(name: &str) -> serde_json::Value {
                 "endpoint": "minio.kopiur-e2e.svc.cluster.local:9000",
                 "region": "us-east-1",
                 "tls": { "disableTls": true },
-                "auth": { "secretRef": { "name": kopiur_e2e::consts::SECRET_S3_CREDS, "namespace": E2E_NAMESPACE } }
+                "auth": { "secretRef": { "name": kopiur_e2e::consts::SECRET_S3_KEYS_ONLY, "namespace": E2E_NAMESPACE } }
             }},
             "encryption": {
-                "passwordSecretRef": { "name": kopiur_e2e::consts::SECRET_S3_CREDS, "key": "KOPIA_PASSWORD" }
+                "passwordSecretRef": { "name": kopiur_e2e::consts::SECRET_KOPIA_PW_ONLY, "key": "KOPIA_PASSWORD" }
             },
             "create": { "enabled": true },
             "server": {
@@ -2448,10 +2453,17 @@ fn server_repository_json(name: &str) -> serde_json::Value {
 
 /// A read-only-UI variant of [`server_repository_json`]: `spec.server.readOnly: true`
 /// so the served kopia connection cannot mutate the repository. Distinct bucket/name
-/// from the read-write fixture so the two server tests don't collide.
+/// from the read-write fixture so the two server tests don't collide. Both secret
+/// refs are pinned back to the SINGLE shared Secret — the base fixture is now the
+/// split-secret (#416) shape, and this variant deliberately keeps the collapsed
+/// single-`envFrom` layout covered.
 fn server_readonly_repository_json(name: &str) -> serde_json::Value {
     let mut v = server_repository_json(name);
     v["spec"]["backend"]["s3"]["bucket"] = serde_json::json!("kopiur-server-ui-ro");
+    v["spec"]["backend"]["s3"]["auth"]["secretRef"]["name"] =
+        serde_json::json!(kopiur_e2e::consts::SECRET_S3_CREDS);
+    v["spec"]["encryption"]["passwordSecretRef"]["name"] =
+        serde_json::json!(kopiur_e2e::consts::SECRET_S3_CREDS);
     v["spec"]["server"]["readOnly"] = serde_json::json!(true);
     v
 }
@@ -2710,6 +2722,211 @@ async fn server_read_only_ui_connects_read_only() {
 
     // Cleanup.
     let _ = repos.delete(repo_name, &DeleteParams::default()).await;
+}
+
+/// The namespace the ClusterRepository server-mirror scenario places its server in.
+/// Deliberately FRESH (no mover has ever run there), so the scenario also proves the
+/// operator mints the mover ServiceAccount next to the server (#416): before the
+/// fix, the Deployment referenced a ServiceAccount that did not exist there.
+const CREPO_SERVER_NS: &str = "e2e-crepo-server";
+
+/// A `ClusterRepository` whose split password/backend Secrets carry NO namespace
+/// (defaulting to the operator's, per #232) while `spec.server.namespace` points at
+/// [`CREPO_SERVER_NS`] — every credential Secret is therefore cross-namespace from
+/// the server's point of view and must be mirrored next to it.
+fn cluster_server_repository_json(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "ClusterRepository",
+        "metadata": { "name": name },
+        "spec": {
+            "backend": { "s3": {
+                "bucket": "kopiur-crepo-server",
+                "endpoint": "minio.kopiur-e2e.svc.cluster.local:9000",
+                "region": "us-east-1",
+                "tls": { "disableTls": true },
+                "auth": { "secretRef": { "name": kopiur_e2e::consts::SECRET_S3_KEYS_ONLY } }
+            }},
+            "encryption": {
+                "passwordSecretRef": { "name": kopiur_e2e::consts::SECRET_KOPIA_PW_ONLY, "key": "KOPIA_PASSWORD" }
+            },
+            "create": { "enabled": true },
+            "allowedNamespaces": { "all": true },
+            "server": {
+                "namespace": CREPO_SERVER_NS,
+                "auth": { "insecure": { "acknowledgeInsecure": true } },
+                "service": { "type": "ClusterIP" }
+            }
+        }
+    })
+}
+
+/// #416 on a `ClusterRepository`: split password/backend Secrets in the operator
+/// namespace, server in a fresh namespace. The operator must mirror EACH credential
+/// Secret next to the server (the legacy idx-0 name plus the `-1` slot), point the
+/// Deployment's `envFrom` at both mirrors password-first, mint the mover
+/// ServiceAccount in the server namespace, and serve the UI — then reap everything
+/// on CR deletion (finalizer; a cluster-scoped owner cannot ownerRef namespaced
+/// children). Before the fix only the encryption Secret was mirrored, from the
+/// wrong namespace rule, and the SA was never minted.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn cluster_repository_server_mirrors_split_creds() {
+    use k8s_openapi::api::apps::v1::Deployment;
+    use k8s_openapi::api::core::v1::{Secret, Service};
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Minio])
+        .await
+        .expect("provision MinIO fixtures");
+    let client = world.client().clone();
+    ensure_namespace(&client, CREPO_SERVER_NS)
+        .await
+        .expect("create the fresh server namespace");
+
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let deps: Api<Deployment> = Api::namespaced(client.clone(), CREPO_SERVER_NS);
+    let svcs: Api<Service> = Api::namespaced(client.clone(), CREPO_SERVER_NS);
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), CREPO_SERVER_NS);
+    let sas: Api<ServiceAccount> = Api::namespaced(client.clone(), CREPO_SERVER_NS);
+
+    let repo_name = "e2e-crepo-srv";
+    let object_name = "e2e-crepo-srv-kopia-ui";
+    let mirror0 = "e2e-crepo-srv-kopia-ui-repo-creds";
+    let mirror1 = "e2e-crepo-srv-kopia-ui-repo-creds-1";
+
+    // 1. The ClusterRepository bootstraps and reaches Ready (creds default to the
+    //    operator namespace, #232), and the server comes up in the fresh namespace.
+    crepos
+        .create(
+            &PostParams::default(),
+            &cr(cluster_server_repository_json(repo_name)),
+        )
+        .await
+        .expect("create server ClusterRepository");
+    wait_phase(&crepos, repo_name, "Ready")
+        .await
+        .expect("server ClusterRepository should reach Ready");
+
+    // 2. BOTH credential Secrets are mirrored next to the server, password-first
+    //    slot order, carrying the source data keys.
+    let (m0, m1) = wait_until(
+        "both credential mirrors exist in the server namespace",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            match (
+                secrets.get_opt(mirror0).await?,
+                secrets.get_opt(mirror1).await?,
+            ) {
+                (Some(a), Some(b)) => Ok(Some((a, b))),
+                _ => Ok(None),
+            }
+        },
+    )
+    .await
+    .expect("operator should mirror every credential Secret next to the server");
+    let m0_keys: Vec<_> = m0.data.unwrap_or_default().into_keys().collect();
+    let m1_keys: Vec<_> = m1.data.unwrap_or_default().into_keys().collect();
+    assert_eq!(
+        m0_keys,
+        vec!["KOPIA_PASSWORD".to_string()],
+        "idx-0 mirror (legacy name) carries the password Secret's data"
+    );
+    assert_eq!(
+        m1_keys,
+        vec![
+            "AWS_ACCESS_KEY_ID".to_string(),
+            "AWS_SECRET_ACCESS_KEY".to_string()
+        ],
+        "idx-1 mirror carries the backend Secret's data"
+    );
+
+    // 3. The Deployment envFroms both mirrors in order, and its ServiceAccount
+    //    exists in the server namespace (minted by the operator — no mover has
+    //    ever run here).
+    let dep = deps.get(object_name).await.expect("server Deployment");
+    let pod = dep
+        .spec
+        .as_ref()
+        .unwrap()
+        .template
+        .spec
+        .as_ref()
+        .unwrap()
+        .clone();
+    let env_from_names: Vec<String> = pod.containers[0]
+        .env_from
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| e.secret_ref.map(|s| s.name))
+        .collect();
+    assert_eq!(
+        env_from_names,
+        vec![mirror0.to_string(), mirror1.to_string()],
+        "server envFrom must carry one entry per mirrored Secret, password first"
+    );
+    let sa_name = pod
+        .service_account_name
+        .expect("server pod should run as the configured mover ServiceAccount");
+    sas.get(&sa_name)
+        .await
+        .expect("the server's ServiceAccount must exist in the fresh server namespace");
+
+    // 4. The kopia server actually connects with the split credentials and serves
+    //    its UI through the apiserver Service proxy.
+    svcs.get(object_name)
+        .await
+        .expect("server Service should exist");
+    wait_deployment_available(&deps, object_name)
+        .await
+        .expect("server Deployment should become Available");
+    let ui = wait_until(
+        "cluster-repo kopia UI responds via the service proxy",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let path =
+                format!("/api/v1/namespaces/{CREPO_SERVER_NS}/services/{object_name}:http/proxy/");
+            let req = http::Request::get(path).body(Vec::new()).unwrap();
+            match client.request_text(req).await {
+                Ok(body) if !body.is_empty() => Ok(Some(body)),
+                Ok(_) | Err(_) => Ok(None),
+            }
+        },
+    )
+    .await
+    .expect("cluster-repo kopia UI should serve over HTTP through the service proxy");
+    let lower = ui.to_lowercase();
+    assert!(
+        lower.contains("kopia") || lower.contains("<!doctype") || lower.contains("<html"),
+        "proxied response should be the kopia web UI, got: {}",
+        ui.chars().take(200).collect::<String>()
+    );
+
+    // 5. Deleting the ClusterRepository reaps the Deployment, Service, and BOTH
+    //    mirrors via the finalizer (cluster-scoped owners can't ownerRef these).
+    crepos
+        .delete(repo_name, &DeleteParams::default())
+        .await
+        .expect("delete server ClusterRepository");
+    wait_until(
+        "server objects and credential mirrors are reaped on deletion",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let dep_gone = deps.get_opt(object_name).await?.is_none();
+            let m0_gone = secrets.get_opt(mirror0).await?.is_none();
+            let m1_gone = secrets.get_opt(mirror1).await?.is_none();
+            Ok((dep_gone && m0_gone && m1_gone).then_some(()))
+        },
+    )
+    .await
+    .expect("finalizer should delete the server Deployment and every credential mirror");
 }
 
 /// Compile-time guard that `Client` is reachable from this crate even when the

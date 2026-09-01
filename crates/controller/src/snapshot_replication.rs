@@ -218,11 +218,11 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
             io::ReadyOutcome::Stalled,
             REPLICATION_IDENTITY_OVERLAP_REASON,
             &format!(
-                "pruning: mirrorSource with a destination-side SnapshotPolicy writing the \
-                 same identities this replication selects ({}) — a source-side deletion \
-                 would cascade into identities the destination does not merely mirror. \
-                 Exclude those identities in spec.selection, re-identify the destination \
-                 policy, or switch pruning off mirrorSource",
+                "pruning: mirrorSource, but a destination-side SnapshotPolicy writes the same \
+                 identities this replication selects ({}) — a source-side deletion would cascade \
+                 into identities the destination does not merely mirror. Fix: exclude those \
+                 identities in spec.selection, re-identify the destination policy, or switch \
+                 pruning off mirrorSource",
                 identity_sample(identities)
             ),
             None,
@@ -1275,7 +1275,20 @@ pub fn build_snapshot_replication_work_spec(
 ) -> MoverWorkSpec {
     let selection = repl.spec.selection.as_ref();
     let (include, exclude) = selection_matchers(repl);
-    let migrate = repl.spec.migrate.unwrap_or_default();
+    let migrate = repl.spec.migrate.clone().unwrap_or_default();
+    // `snapshot migrate` has no speed flags: each side's cap must ride its own
+    // kopia connection, so resolve TWO specs — the source's from the source
+    // repository's `moverDefaults` and the destination's from the destination's,
+    // each overlaid field-wise by that side of `spec.migrate.throttle`.
+    let migrate_throttle = migrate.throttle.as_ref();
+    let source_throttle = io::merged_throttle(
+        source.mover_defaults.as_ref(),
+        migrate_throttle.and_then(|t| t.source.as_ref()),
+    );
+    let destination_throttle = io::merged_throttle(
+        dest.mover_defaults.as_ref(),
+        migrate_throttle.and_then(|t| t.destination.as_ref()),
+    );
     MoverWorkSpec {
         version: 1,
         operation: Operation::SnapshotReplicate(SnapshotReplicateOp {
@@ -1297,6 +1310,7 @@ pub fn build_snapshot_replication_work_spec(
             parallel: migrate.parallel,
             policies: policy_copy_mode_spec(migrate.policies),
             pruning: pruning_spec(repl.spec.pruning.as_ref()),
+            destination_throttle,
         }),
         // Replication does not snapshot; a stable sentinel identity (like
         // maintenance / blob replication).
@@ -1315,7 +1329,7 @@ pub fn build_snapshot_replication_work_spec(
         hook_plan: Default::default(),
         options: MoverOptions::default(),
         cache: Default::default(),
-        throttle: io::throttle_spec(source.mover_defaults.as_ref()),
+        throttle: source_throttle,
     }
 }
 
@@ -1831,17 +1845,47 @@ mod tests {
         r.spec.migrate = Some(MigrateOptions {
             parallel: Some(4),
             policies: PolicyCopyMode::CopyOverwrite,
+            // Per-side caps, each PARTIAL, over repositories that both carry
+            // their own `moverDefaults.throttle` below — so this asserts the
+            // full two-layer, two-side resolution, not just "the field arrived".
+            throttle: Some(kopiur_api::common::MigrateThrottle {
+                source: Some(kopiur_api::common::Throttle {
+                    download_bytes_per_second: Some(11),
+                    ..Default::default()
+                }),
+                destination: Some(kopiur_api::common::Throttle {
+                    upload_bytes_per_second: Some(22),
+                    ..Default::default()
+                }),
+            }),
         });
         r.spec.pruning = Some(Pruning::Retention(
             serde_json::from_value(serde_json::json!({ "keepDaily": 7, "keepWeekly": 4 })).unwrap(),
         ));
-        let ws = build_snapshot_replication_work_spec(
-            &r,
-            &sample_source(),
-            &sample_dest(),
-            "ns",
-            "offsite",
-        );
+        // Each repository brings its OWN moverDefaults.throttle; the CR's
+        // per-side override must win field-by-field WITHOUT dropping the rest,
+        // and the two sides must never cross (a source default landing on the
+        // destination block would be invisible in production until the wrong
+        // link got saturated).
+        let mut source = sample_source();
+        source.mover_defaults = Some(kopiur_api::common::MoverDefaults {
+            throttle: Some(kopiur_api::common::Throttle {
+                download_bytes_per_second: Some(1),
+                read_ops_per_second: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut dest = sample_dest();
+        dest.mover_defaults = Some(kopiur_api::common::MoverDefaults {
+            throttle: Some(kopiur_api::common::Throttle {
+                upload_bytes_per_second: Some(3),
+                write_ops_per_second: Some(4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let ws = build_snapshot_replication_work_spec(&r, &source, &dest, "ns", "offsite");
         match &ws.operation {
             Operation::SnapshotReplicate(op) => {
                 assert_eq!(op.include.len(), 1);
@@ -1859,9 +1903,32 @@ mod tests {
                     }
                     other => panic!("expected retention pruning, got {other:?}"),
                 }
+                // DESTINATION side: the CR's upload override wins, the dest
+                // repo's writeOps default survives, and NOTHING from the source
+                // repo's defaults leaks in.
+                assert_eq!(op.destination_throttle.upload_bytes_per_second, Some(22));
+                assert_eq!(op.destination_throttle.write_ops_per_second, Some(4));
+                assert_eq!(
+                    op.destination_throttle.download_bytes_per_second, None,
+                    "the SOURCE repo's download default must not reach the destination"
+                );
+                assert_eq!(
+                    op.destination_throttle.read_ops_per_second, None,
+                    "the SOURCE repo's readOps default must not reach the destination"
+                );
             }
             other => panic!("expected snapshot-replicate op, got {}", other.kind_str()),
         }
+        // SOURCE side rides the work spec's own throttle: CR override wins on
+        // download, the source repo's readOps default survives, and the DEST
+        // repo's upload/writeOps defaults stay out.
+        assert_eq!(ws.throttle.download_bytes_per_second, Some(11));
+        assert_eq!(ws.throttle.read_ops_per_second, Some(2));
+        assert_eq!(
+            ws.throttle.upload_bytes_per_second, None,
+            "the DESTINATION repo's upload default must not reach the source"
+        );
+        assert_eq!(ws.throttle.write_ops_per_second, None);
     }
 
     #[test]

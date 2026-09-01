@@ -262,11 +262,30 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // so a transient outage would permanently fail it. A not-Ready repository
     // therefore DEFERS (requeue); it never fakes a missing-snapshot outcome and
     // never launches a doomed Job.
-    if let Some(action) =
-        gate_on_repository_readiness(ctx, restore, &api, &namespace, &name).await?
-    {
-        return Ok(action);
-    }
+    //
+    // Matched exhaustively (CLAUDE.md), and both parking arms return BEFORE
+    // `ensure_wait_anchor` below — which is the whole of #393: a restore whose
+    // repository could not even be looked up must not open (and start spending)
+    // its `waitTimeout` window.
+    //
+    // The gate hands back THE `Restore` the rest of this pass must use, and
+    // `restore` is rebound to it: unchanged in the ordinary case, and a carried
+    // copy holding the cleared conditions when the gate cleared a stale
+    // `ReferentAvailable=False`. Every condition writer below rebuilds the array
+    // from this `restore`, and four of them (the gate parks in
+    // `run_restore_mover`) patch UNCONDITIONALLY — continuing from the
+    // reconcile-start copy would re-write the `False` just cleared and alternate
+    // the two writes on every requeue, forever. See `restore_with_conditions`.
+    let gated;
+    let restore = match gate_on_repository_readiness(ctx, restore, &api, &namespace, &name).await? {
+        RepositoryGate::Proceed(carried) => {
+            gated = carried;
+            gated.get()
+        }
+        RepositoryGate::Held(action) | RepositoryGate::Undetermined(action) => {
+            return Ok(action);
+        }
+    };
 
     // The claiming PVC, looked up ONCE per pass and shared by everything below that needs
     // it: the wait-window anchor (a populator with no claim cannot proceed, so its window
@@ -675,12 +694,11 @@ fn recorded_inherit_verdict(
             ok: false,
             reason: RECORDED_PINNED_NO_UID_REASON,
             message: format!(
-                "Snapshot `{snapshot}` recorded no pinned uid — and no gid/fsGroup beyond \
-                 the mover's own defaults — so inheriting it contributed nothing: the mover \
-                 runs as its image's uid {MOVER_NONROOT_ID}, an identity that did NOT come \
-                 from the backup ({provenance}). The backup mover's identity was \
-                 image-determined at backup time. Pin mover.securityContext.runAsUser on \
-                 this Restore if the restored files must be owned by a specific uid."
+                "Snapshot `{snapshot}` recorded no pinned uid (and no gid/fsGroup beyond the \
+                 mover's defaults), so inheriting it contributed nothing: the mover runs as its \
+                 image's uid {MOVER_NONROOT_ID}, which did NOT come from the backup \
+                 ({provenance}). Fix: pin mover.securityContext.runAsUser on this Restore if the \
+                 restored files must be owned by a specific uid."
             ),
         };
     }
@@ -710,10 +728,10 @@ fn recorded_inherit_verdict(
     // auditable per-restore, naming both the elevation and where it came from.
     let root_note = if uid == Some(0) {
         format!(
-            " The mover runs as ROOT (uid 0) because Snapshot `{snapshot}` recorded uid 0 \
-             — recorded metadata is repository data, forgeable by anyone with repository \
-             write credentials, so verify this snapshot is trusted; the run is additionally \
-             gated on the namespace's privileged-movers opt-in."
+            " The mover runs as ROOT (uid 0): Snapshot `{snapshot}` recorded uid 0, and \
+             recorded metadata is repository data forgeable by anyone with repository write \
+             access — verify this snapshot is trusted; the run is also gated on the namespace's \
+             privileged-movers opt-in."
         )
     } else {
         String::new()
@@ -3372,21 +3390,24 @@ async fn resolve_restore_repository(
 /// derivation rule (explicit `spec.repository` wins; `snapshotRef`/`fromPolicy`
 /// derive from the referent; a raw `identity` source has nothing to derive from).
 ///
-/// Returns `Ok(None)` whenever the ref cannot be determined: a missing
-/// `snapshotRef`/`fromPolicy` referent, a Snapshot with neither pin nor repository
-/// owner, or `identity` without the (required) explicit `spec.repository`.
-/// Deliberately NON-FATAL — a `snapshotRef` whose Snapshot CR does not exist yet is
-/// a supported shape (`resolve_snapshot` parks it on the `waitTimeout` window), so
-/// erroring here would break it; the other absences produce their canonical
-/// `MissingDependency`/`Validation` surfaces downstream. The gate simply does not
-/// engage until the repository is known.
+/// Returns a [`RepoRefLookup`], not an `Option`: "the ref cannot be determined"
+/// is several different situations and they do NOT get the same treatment
+/// (issue #393 — the old `Option` collapsed a `SnapshotPolicy` that was never
+/// applied together with a snapshot row the restore is legitimately waiting for,
+/// and let the gate fall through unverified for both). Each `get_opt` result is
+/// matched rather than chained through `and_then`, so "row missing" stays
+/// distinct from "row present but underivable"; the classification itself is
+/// pure and unit-tested ([`classify_snapshot_lookup`], [`classify_policy_lookup`]).
+///
+/// Still deliberately NON-FATAL: nothing here errors. The gate decides what each
+/// shape means.
 async fn restore_repository_ref(
     ctx: &Context,
     restore: &Restore,
     namespace: &str,
-) -> Result<Option<(RepositoryRef, String)>> {
+) -> Result<RepoRefLookup> {
     if let Some(rref) = &restore.spec.repository {
-        return Ok(Some((rref.clone(), namespace.to_string())));
+        return Ok(RepoRefLookup::Derived(rref.clone(), namespace.to_string()));
     }
     match &restore.spec.source {
         RestoreSource::SnapshotRef(sref) => {
@@ -3395,36 +3416,77 @@ async fn restore_repository_ref(
             // — the same base `resolve_restore_repository` uses.
             let snap_ns = sref.namespace.as_deref().unwrap_or(namespace);
             let snap_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), snap_ns);
-            Ok(snap_api
-                .get_opt(&sref.name)
-                .await?
-                .as_ref()
-                .and_then(repository_ref_from_snapshot)
-                .map(|rref| (rref, snap_ns.to_string())))
+            let snap = snap_api.get_opt(&sref.name).await?;
+            Ok(classify_snapshot_lookup(snap.as_ref(), snap_ns))
         }
         RestoreSource::FromPolicy(c) => {
             use kopiur_api::SnapshotPolicy;
             let cfg_ns = c.namespace.as_deref().unwrap_or(namespace);
             let cfg_api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), cfg_ns);
-            Ok(cfg_api.get_opt(&c.name).await?.and_then(|cfg| {
-                // Multi-repo fromPolicy with no explicit selection: the
-                // readiness gate cannot know which repository to wait on, and
-                // this contract is deliberately NON-FATAL — return None (never
-                // guess repository #1); `resolve_restore_repository` fails
-                // closed downstream with the valid choices listed.
-                kopiur_api::single_repository_ref(&cfg.spec)
-                    .ok()
-                    .map(|r| (r.clone(), cfg_ns.to_string()))
-            }))
+            let cfg = cfg_api.get_opt(&c.name).await?;
+            Ok(classify_policy_lookup(cfg.as_ref(), cfg_ns, &c.name))
         }
-        RestoreSource::Identity(_) => Ok(None),
+        // A raw identity source has nothing to derive from, and `spec.repository`
+        // is REQUIRED for it (checked above and refused downstream): a spec
+        // problem, never a missing object.
+        RestoreSource::Identity(_) => Ok(RepoRefLookup::NotDerivable),
     }
+}
+
+/// Where the repository-readiness gate leaves a restore on this pass — a
+/// TRI-STATE, because "the repository is not Ready" and "kopiur cannot tell
+/// whether it is Ready" are different answers with different consequences for
+/// the `waitTimeout` window (issue #393).
+///
+/// [`Self::Held`] and [`Self::Undetermined`] both park and both requeue; they
+/// are separate variants because they are separate *facts*, written with
+/// different reasons, and only one of them is a verified statement about a
+/// repository. Both stop the reconcile BEFORE [`ensure_wait_anchor`], so
+/// neither opens the window.
+///
+/// [`WaitWindow`] deliberately gains no variant for this: a parked restore never
+/// reaches the window machinery at all, so there is no third window state to
+/// model — the window is simply not open yet.
+///
+/// **Match this enum EXHAUSTIVELY.** Never `matches!(…)` it and never add a
+/// `_ =>` arm — a fourth outcome must force its caller to decide, at compile
+/// time, whether it proceeds or parks. COMPILER-ONLY guard: `cargo xtask
+/// check-phases` scans only the `*Phase` enums in `kopiur-api`.
+enum RepositoryGate<'a> {
+    /// The gate does not hold this restore: reconcile continues (and the
+    /// `waitTimeout` window may open).
+    ///
+    /// It carries **the `Restore` the rest of the pass must use** — borrowed
+    /// unchanged in the ordinary case, and an owned copy holding the cleared
+    /// conditions when this pass cleared a stale `ReferentAvailable=False`
+    /// ([`restore_with_conditions`]). Returning the object rather than a
+    /// "…and also remember to apply this" side value is deliberate: the caller
+    /// cannot obtain a `&Restore` to continue with WITHOUT taking the carried
+    /// one, so the clear cannot be silently dropped by a later edit. Dropping it
+    /// would let the unconditional downstream gate parks re-write the stale
+    /// `False` and alternate two writes forever — see [`restore_with_conditions`].
+    ///
+    /// [`CarriedRestore`], not `Cow<Restore>`: a `Cow`'s owned variant is stored
+    /// inline, and `Restore` is large enough that it would bloat every value of
+    /// this enum past `clippy::large_enum_variant` (denied workspace-wide) while
+    /// the sibling variants are one `Action` each. `CarriedRestore` boxes only
+    /// its owned arm, so this stays pointer-sized AND the borrowed path keeps
+    /// costing nothing.
+    Proceed(CarriedRestore<'a>),
+    /// VERIFIED not ready: the repository object exists and its phase is not
+    /// `Ready` (the backend is unreachable). Park + requeue.
+    Held(Action),
+    /// UNDETERMINED: an object the readiness check needs does not exist — the
+    /// `Repository`/`ClusterRepository` itself, or the `fromPolicy`
+    /// `SnapshotPolicy` its ref is derived from. Park + requeue; nothing is
+    /// claimed about the backend.
+    Undetermined(Action),
 }
 
 /// The Restore peer of the Snapshot reconciler's repository-readiness gate: hold a
 /// not-yet-launched restore in `Pending` (`Ready=False`/`RepositoryNotReady`,
 /// non-terminal) while its repository is not `Ready`, and requeue on the same 15s
-/// cadence. Returns `Some(requeue)` while gated, `None` to proceed.
+/// cadence. Returns a [`RepositoryGate`] the caller matches exhaustively.
 ///
 /// Two semantic notes, both deliberate:
 /// - **`spec.mode: ReadOnly` is a different axis.** The Snapshot reconciler's mode
@@ -3441,52 +3503,213 @@ async fn restore_repository_ref(
 ///   a repository outage can never fail a restore — or fake a `Continue` empty-volume
 ///   outcome — by silently burning the window while the backend is down.
 ///
+/// **Tri-state (issue #393).** "Ready", "not Ready" and "cannot tell" are three
+/// answers, and the gate used to give two: every cannot-tell shape fell through
+/// as if the repository had been verified, so `ensure_wait_anchor` stamped the
+/// window against nothing. Now a MISSING referent — the `Repository` object
+/// itself, or the `fromPolicy` `SnapshotPolicy` its ref derives from — parks as
+/// [`RepositoryGate::Undetermined`] with its own reason, no anchor stamped. Two
+/// cannot-tell shapes still deliberately proceed: a `snapshotRef` whose
+/// `Snapshot` row does not exist yet (that IS what the window waits for, and
+/// `onMissingSnapshot: Fail` must be able to fire for a typo'd ref) and a
+/// referent that exists but derives no single repository (a spec bug for
+/// downstream validation to fail closed on). See [`RepoRefLookup`].
+///
+/// **Wake-up contract.** The `Repository`/`ClusterRepository` → `Restore` watches
+/// cover only an explicit `spec.repository` (`watch::repository_to_restores`);
+/// there is NO `SnapshotPolicy` → `Restore` watch. An `Undetermined` park
+/// therefore un-parks on its own 15s requeue, not on an event — which is why
+/// every `Undetermined` arm must return a requeue. (Adding the missing watch is
+/// a possible follow-up; the requeue is correct either way.)
+///
 /// Only a restore that has NOT launched its mover Job is gated
 /// ([`restore_awaiting_launch`]); a `Restoring` restore's live Job is tracked to
 /// terminal, never re-gated, mirroring the Snapshot reconciler's ordering. (Narrow
 /// crash window: a Job created moments before the controller died — before the
 /// `Restoring` patch landed — is re-gated as `Pending`/`Resolving`; harmless, the
 /// Job runs to terminal on its own and is observed once the gate opens.)
-async fn gate_on_repository_readiness(
+async fn gate_on_repository_readiness<'a>(
     ctx: &Context,
-    restore: &Restore,
+    restore: &'a Restore,
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-) -> Result<Option<Action>> {
+) -> Result<RepositoryGate<'a>> {
     if !restore_awaiting_launch(restore.status.as_ref().and_then(|s| s.phase.as_ref())) {
-        return Ok(None);
+        return proceed_past_gate(restore, api, name).await;
     }
-    let Some((rref, base_ns)) = restore_repository_ref(ctx, restore, namespace).await? else {
-        return Ok(None);
+    let (rref, base_ns) = match restore_repository_ref(ctx, restore, namespace).await? {
+        RepoRefLookup::Derived(rref, base_ns) => (rref, base_ns),
+        // Both cannot-determine shapes that must NOT park — see the fn doc.
+        RepoRefLookup::SnapshotRowMissing | RepoRefLookup::NotDerivable => {
+            return proceed_past_gate(restore, api, name).await;
+        }
+        RepoRefLookup::ReferentMissing {
+            kind,
+            namespace: referent_ns,
+            name: referent,
+        } => {
+            return park_on_missing_referent(
+                ctx,
+                restore,
+                api,
+                name,
+                kind,
+                referent_ns.as_deref(),
+                &referent,
+            )
+            .await;
+        }
     };
     match io::repository_ready_cached(ctx, &rref, &base_ns).await {
-        Ok(true) => Ok(None),
+        Ok(true) => proceed_past_gate(restore, api, name).await,
         Ok(false) => {
             // patch-if-changed for byte-stability: the parked status is identical
             // across the 15s requeues, so a re-park is a server-side no-op — no
             // watch event, no self-trigger (the reconcile hot-loop rule).
             let current = serde_json::to_value(&restore.status).ok();
+            // The repository object EXISTS, so any `ReferentAvailable=False` from
+            // an earlier park is stale — clear it in this same patch rather than a
+            // second conditions write (a merge patch replaces the whole array).
+            let conditions = cleared_referent_conditions(restore)
+                .unwrap_or_else(|| existing_conditions(restore));
             io::patch_status_if_changed(
                 api,
                 name,
                 current.as_ref(),
-                restore_ready_status(
+                restore_ready_status_on(
                     restore,
+                    &conditions,
                     RestorePhase::Pending,
                     crate::consts::REPOSITORY_NOT_READY_REASON,
                     &repository_not_ready_restore_message(&rref.name),
                 ),
             )
             .await?;
-            Ok(Some(Action::requeue(std::time::Duration::from_secs(15))))
+            Ok(RepositoryGate::Held(Action::requeue(
+                std::time::Duration::from_secs(15),
+            )))
         }
-        // The repository OBJECT is missing (not merely unreachable): not this
-        // gate's call — fall through so the resolve/dispatch paths surface their
-        // canonical `MissingDependency` hold, exactly as before the gate existed.
-        Err(Error::MissingDependency(_)) => Ok(None),
+        // The repository OBJECT is missing (not merely unreachable): the readiness
+        // check answered nothing, so this is UNDETERMINED, not "proceed". Pre-#393
+        // it fell through here and the wait window opened against an unverified
+        // repository (#393).
+        Err(Error::MissingDependency(_)) => {
+            park_on_missing_referent(
+                ctx,
+                restore,
+                api,
+                name,
+                io::repo_kind_str(rref.kind),
+                repository_referent_namespace(&rref, &base_ns),
+                &rref.name,
+            )
+            .await
+        }
         Err(e) => Err(e),
     }
+}
+
+/// The namespace a missing repository referent was looked up in — `None` for a
+/// `ClusterRepository`, which is cluster-scoped and whose message must not
+/// invent one.
+fn repository_referent_namespace<'a>(rref: &'a RepositoryRef, base_ns: &'a str) -> Option<&'a str> {
+    match rref.kind {
+        kopiur_api::common::RepositoryKind::Repository => {
+            Some(rref.namespace.as_deref().unwrap_or(base_ns))
+        }
+        kopiur_api::common::RepositoryKind::ClusterRepository => None,
+    }
+}
+
+/// Leave the gate open, clearing a stale
+/// [`crate::consts::RESTORE_REFERENT_AVAILABLE_CONDITION`]
+/// `= False` from an earlier park first.
+///
+/// The clear is guarded on the condition actually being present-and-not-True, so
+/// the overwhelmingly common path (no such condition was ever written) costs
+/// nothing and the healthy wire never grows the condition. Without it the
+/// registry row — which is deliberately age-independent — would keep reporting a
+/// restore that proceeded hours ago as blocked.
+///
+/// The cleared array is not just written to the server: the returned
+/// [`RepositoryGate::Proceed`] carries a `Restore` holding it, which is the
+/// object the rest of the pass must build on. The downstream gate parks rebuild
+/// `conditions` from the `Restore` they are handed and patch it
+/// UNCONDITIONALLY, so continuing from the reconcile-start copy would re-write
+/// the `False` this just cleared — see [`restore_with_conditions`] for the write
+/// loop that prevents. Nothing was cleared ⇒ the original is borrowed, no clone.
+async fn proceed_past_gate<'a>(
+    restore: &'a Restore,
+    api: &Api<Restore>,
+    name: &str,
+) -> Result<RepositoryGate<'a>> {
+    let cleared = cleared_referent_conditions(restore);
+    if let Some(conditions) = &cleared {
+        io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
+    }
+    // One construction site, pure and total: a cleared pass CANNOT continue from
+    // the stale object, because that combination is unwritable here.
+    Ok(RepositoryGate::Proceed(carried_after_clear(
+        restore,
+        cleared.as_deref(),
+    )))
+}
+
+/// Park a restore whose repository referent does not exist (issue #393):
+/// `Pending` + the [`kopiur_api::gates::RESTORE_REFERENT_MISSING_GATE`] condition,
+/// requeue 15s, and NO wait anchor — the caller returns before
+/// [`ensure_wait_anchor`].
+///
+/// The Warning Event fires only on the park TRANSITION, gated by the same
+/// status-changed check as the patch: the park re-patches a byte-identical
+/// status every 15s (a server-side no-op), and Eventing that would be a
+/// once-per-requeue spam. It compensates for what the pre-#393 fall-through
+/// produced downstream — a `MissingDependency` error that `error_policy_for`
+/// counted and Evented — which a clean park would otherwise silently remove.
+async fn park_on_missing_referent(
+    ctx: &Context,
+    restore: &Restore,
+    api: &Api<Restore>,
+    name: &str,
+    kind: &str,
+    referent_namespace: Option<&str>,
+    referent: &str,
+) -> Result<RepositoryGate<'static>> {
+    let msg = referent_missing_restore_message(kind, referent_namespace, referent);
+    let conditions = io::upsert_gate(
+        &existing_conditions(restore),
+        &kopiur_api::gates::RESTORE_REFERENT_MISSING_GATE,
+        &msg,
+        restore.metadata.generation,
+    );
+    let current = serde_json::to_value(&restore.status).ok();
+    let changed = io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        restore_ready_status_on(
+            restore,
+            &conditions,
+            RestorePhase::Pending,
+            crate::consts::RESTORE_REFERENT_MISSING_REASON,
+            &msg,
+        ),
+    )
+    .await?;
+    if changed {
+        io::publish_warning_event(
+            ctx,
+            restore,
+            crate::consts::RESTORE_REFERENT_MISSING_REASON,
+            crate::consts::CREATE_RESTORE_REFERENT_ACTION,
+            &msg,
+        )
+        .await;
+    }
+    Ok(RepositoryGate::Undetermined(Action::requeue(
+        std::time::Duration::from_secs(15),
+    )))
 }
 
 /// Open the `waitTimeout` window if it is not open yet, and return where it stands for
@@ -3495,11 +3718,23 @@ async fn gate_on_repository_readiness(
 /// The window is stamped ONCE, into `status.waitStartedAt`, on the first pass that gets
 /// PAST [`gate_on_repository_readiness`] **and** — for a `target.populator` — has a PVC
 /// claiming this Restore (`consumer`). "Past the gate" is what the code enforces, and it is
-/// weaker than "the repository is Ready": the gate also declines to hold a restore whose
-/// mover Job is already live or settled ([`restore_awaiting_launch`]), and one whose
-/// `Repository` OBJECT is missing outright. Stamping in those cases is harmless — a live
-/// Job keeps the deadline it was dispatched with — and the ordering still guarantees the
-/// thing that matters: a restore parked waiting for its backend never opens a window.
+/// still slightly weaker than "the repository is Ready", but the gap is now deliberate and
+/// narrow (#393). The gate no longer lets a MISSING referent through: a `Repository`
+/// object that does not exist, or a `fromPolicy` `SnapshotPolicy` that does not exist,
+/// parks as [`RepositoryGate::Undetermined`] and never reaches this function.
+///
+/// What still gets past the gate unverified, on purpose:
+/// - a restore whose mover Job is already live or settled ([`restore_awaiting_launch`]) —
+///   a live Job keeps the deadline it was dispatched with;
+/// - a `snapshotRef` whose `Snapshot` ROW does not exist yet — that row is exactly what
+///   the window is waiting for, and parking instead would prevent `onMissingSnapshot:
+///   Fail` from ever firing for a typo'd ref;
+/// - a referent that exists but derives no single repository (a spec bug, failed closed
+///   downstream by `resolve_restore_repository`).
+///
+/// The ordering still guarantees the thing that matters, and now guarantees it for the
+/// slow-arriving-referent case too: a restore parked waiting for its backend — or for the
+/// object that names it — never opens a window.
 ///
 /// Both halves of the condition are about a restore that cannot yet do anything measuring
 /// a window it will need later:

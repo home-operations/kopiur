@@ -137,6 +137,46 @@ async fn children_of(client: &kube::Client, policy: &str) -> Vec<kopiur_api::Sna
         .items
 }
 
+/// Purge one scenario's leftovers from a previous try, so the e2e profile's
+/// nextest retries actually RE-RUN the scenario instead of dying in setup.
+///
+/// A panicked try skips the end-of-test cleanup and leaves three tripwires: the
+/// policy (the fresh `create` dies `AlreadyExists` — how a real CSI group-member
+/// flake turned into 3/3 shard failures on PR #417's merge queue), the schedule
+/// (its `runOnCreate` token is consumed, so even an idempotent create fires no
+/// new capture), and stale children (a terminal `Failed` member makes the
+/// all-Succeeded wait unwinnable). Deletion order mirrors the tests' own
+/// success-path cleanup — schedule first so nothing re-produces children — and
+/// then waits for the children to fully go (their finalizers release the
+/// kopia-side state through the batched delete path). A fresh cluster is a
+/// fast no-op.
+async fn clear_scenario_leftovers(client: &kube::Client, schedule: &str, policy: &str) {
+    let schedules: Api<kopiur_api::SnapshotSchedule> =
+        Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    for child in children_of(client, policy).await {
+        if let Some(n) = child.metadata.name {
+            let _ = backups.delete(&n, &DeleteParams::default()).await;
+        }
+    }
+    wait_until(
+        &format!("leftovers of scenario `{policy}` are gone"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let gone = schedules.get_opt(schedule).await?.is_none()
+                && policies.get_opt(policy).await?.is_none()
+                && children_of(client, policy).await.is_empty();
+            Ok(gone.then_some(()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("previous try's `{policy}` leftovers must clear: {e}"));
+}
+
 /// A `pvcSelector` policy fires one Snapshot per matched PVC, each backing up
 /// its OWN volume at its OWN kopia source path.
 ///
@@ -183,6 +223,7 @@ async fn a_pvc_selector_fans_out_to_one_snapshot_per_matched_pvc() {
     let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let schedules: Api<kopiur_api::SnapshotSchedule> =
         Api::namespaced(client.clone(), E2E_NAMESPACE);
+    clear_scenario_leftovers(&client, "e2e-fanout-schedule", "e2e-fanout-policy").await;
 
     let repo = "e2e-repo-multipvc-fanout";
     let _ = repos
@@ -335,6 +376,42 @@ async fn a_group_capture_is_shared_by_every_member_and_reaped_after() {
     let schedules: Api<kopiur_api::SnapshotSchedule> =
         Api::namespaced(client.clone(), E2E_NAMESPACE);
     let backups: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    clear_scenario_leftovers(&client, "e2e-group-schedule", "e2e-group-policy").await;
+    // A wedged try can also strand its VolumeGroupSnapshot (kopiur's reaper is
+    // keyed on the members it just deleted above), and one stale group breaks
+    // this test's "exactly ONE VolumeGroupSnapshot" invariant. Group names are
+    // schedule-prefixed (`<schedule>-<ts>-<hash>-grp`), so the sweep is scoped.
+    {
+        let vgs = volume_group_snapshots(&client);
+        for g in vgs.list(&ListParams::default()).await.expect("list").items {
+            if let Some(n) = g.metadata.name
+                && n.starts_with("e2e-group-schedule-")
+            {
+                let _ = vgs.delete(&n, &DeleteParams::default()).await;
+            }
+        }
+        wait_until(
+            "leftover VolumeGroupSnapshots are gone",
+            default_timeout(),
+            poll_interval(),
+            || async {
+                let none = !vgs
+                    .list(&ListParams::default())
+                    .await?
+                    .items
+                    .iter()
+                    .any(|g| {
+                        g.metadata
+                            .name
+                            .as_deref()
+                            .is_some_and(|n| n.starts_with("e2e-group-schedule-"))
+                    });
+                Ok(none.then_some(()))
+            },
+        )
+        .await
+        .expect("a previous try's VolumeGroupSnapshot must clear before a fresh capture");
+    }
 
     let repo = "e2e-repo-multipvc-group";
     let _ = repos

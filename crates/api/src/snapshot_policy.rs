@@ -1015,6 +1015,27 @@ pub struct AdoptionSummary {
     /// withheld. See the `AdoptionSkippedByRetention` event for the levers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_by_retention: Option<u32>,
+    /// Discovered snapshots whose kopia identity matched this policy at the most
+    /// recent adoption pass, counted BEFORE the own-id and retention filters —
+    /// so it reads "history relevant to me exists in the catalog", independent
+    /// of whether that pass adopted anything. A multi-repository policy SUMS
+    /// this across the ready repositories of the pass. `0` together with
+    /// `lastScanUnmatched: 0` means the catalog was empty at that pass; absent
+    /// means no adoption pass has run yet. Neutral inventory, not a verdict:
+    /// `0` matched beside a non-zero `lastScanUnmatched` is the ordinary shape
+    /// of a new policy on a shared repository, and is also what a
+    /// post-disaster-recovery identity mismatch looks like — compare
+    /// `status.resolved.identity` with the pre-disaster configuration to tell
+    /// them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_matched: Option<u32>,
+    /// Discovered snapshots the most recent adoption pass saw that did NOT match
+    /// this policy's identity (other policies' or other clusters' history in a
+    /// shared repository). Same counting rules as `lastScanMatched`: pre-filter,
+    /// summed across a multi-repository policy's ready repositories, `0`/`0`
+    /// for an empty catalog, absent when no pass has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_unmatched: Option<u32>,
     /// RFC3339 token echoing an in-flight on-demand adoption scan request for
     /// this policy's identity; cleared once honored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2339,6 +2360,8 @@ preflight:
              lastAdoptionAt: 2026-06-09T02:00:00Z\n  \
              lastAdoptedCount: 3\n  \
              totalAdopted: 42\n  \
+             lastScanMatched: 3\n  \
+             lastScanUnmatched: 7\n  \
              scanRequestedAt: 2026-06-10T00:00:00Z\n  \
              scanRequestedIdentity: postgres@billing\n",
         );
@@ -2346,6 +2369,8 @@ preflight:
         assert_eq!(a.last_adoption_at.as_deref(), Some("2026-06-09T02:00:00Z"));
         assert_eq!(a.last_adopted_count, Some(3));
         assert_eq!(a.total_adopted, Some(42));
+        assert_eq!(a.last_scan_matched, Some(3));
+        assert_eq!(a.last_scan_unmatched, Some(7));
         assert_eq!(a.scan_requested_at.as_deref(), Some("2026-06-10T00:00:00Z"));
         assert_eq!(
             a.scan_requested_identity.as_deref(),
@@ -2355,8 +2380,23 @@ preflight:
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["adoption"]["lastAdoptedCount"], 3);
         assert_eq!(json["adoption"]["totalAdopted"], 42);
+        assert_eq!(json["adoption"]["lastScanMatched"], 3);
+        assert_eq!(json["adoption"]["lastScanUnmatched"], 7);
         let reparsed: SnapshotPolicyStatus = serde_json::from_value(json).unwrap();
         assert_eq!(status, reparsed);
+
+        // A pass that saw an EMPTY catalog stamps an explicit 0/0 — it must
+        // survive the round-trip as `Some(0)`, distinct from "no pass yet".
+        let empty_scan: SnapshotPolicyStatus =
+            from_yaml("adoption:\n  lastScanMatched: 0\n  lastScanUnmatched: 0\n");
+        let a = empty_scan.adoption.as_ref().expect("adoption");
+        assert_eq!(
+            (a.last_scan_matched, a.last_scan_unmatched),
+            (Some(0), Some(0))
+        );
+        let wire = serde_json::to_value(&empty_scan).unwrap();
+        assert_eq!(wire["adoption"]["lastScanMatched"], 0);
+        assert_eq!(wire["adoption"]["lastScanUnmatched"], 0);
 
         // Absent ⇒ None, elided.
         let bare: SnapshotPolicyStatus = from_yaml("{}\n");

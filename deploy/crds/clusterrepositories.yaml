@@ -572,7 +572,12 @@ spec:
                       Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long
                       a connect may run before the Job is marked failed (default 120s); raise it
                       for a slow backend — e.g. an rclone remote whose repository metadata and
-                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge.
+                      indexes load through kopia's embedded `rclone serve`/WebDAV bridge, or a
+                      large repository whose cold-cache connect outgrows the default. The value
+                      is a BASE, not a ceiling: after consecutive deadline-killed attempts the
+                      operator escalates the effective deadline itself (doubling per attempt, up
+                      to 30 minutes or the configured value, whichever is larger — never below
+                      it), so a slow-but-alive backend self-heals without a spec edit.
                       `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for
                       shape parity but is not honored by the bootstrap Job.
                     nullable: true
@@ -814,10 +819,13 @@ spec:
                         description: |-
                           What sustained backend-probe failure (past `failureThreshold`) does to the
                           repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing
-                          backups, maintenance, and replication until a re-connect succeeds —
-                          recovery is automatic. `Alert` keeps the repository `Ready` and only raises
-                          the `BackendReachable` condition + Warning event + metric; backups keep
-                          running against the failing backend. Neither ever auto-recreates.
+                          backups and replication until a re-connect succeeds — recovery is
+                          automatic (maintenance also pauses for a confirmed-unreachable/vanished
+                          backend, but keeps running for a probe deadline kill, where index
+                          compaction is often the cure). `Alert` keeps the repository `Ready` and
+                          only raises the `BackendReachable` condition + Warning event + metric;
+                          backups keep running against the failing backend. Neither ever
+                          auto-recreates.
                         enum:
                         - Degrade
                         - Alert
@@ -2999,6 +3007,85 @@ spec:
                         - copy
                         - copyOverwrite
                         type: string
+                      throttle:
+                        description: |-
+                          Bandwidth/ops caps for THIS seed's copy, per side. A migrate seed opens
+                          two repositories under two kopia connections and `snapshot migrate` has
+                          no speed flags of its own, so each side is applied as `kopia repository
+                          throttle set` on that side's connection:
+
+                          * `source` caps the REPLICA — the repository named by
+                            `spec.seed.from.repository`, opened read-only — overriding **its**
+                            `moverDefaults.throttle`;
+                          * `destination` caps THIS repository, the one being seeded, overriding
+                            **its own** `moverDefaults.throttle`.
+
+                          Each side overrides field by field: a knob set here wins, a knob left
+                          unset keeps that repository's default. Absent: both sides use their
+                          repository's defaults. Applies only while the seed is armed — an
+                          ordinary connect to the now-initialized repository is capped by
+                          `moverDefaults.throttle` alone.
+                        nullable: true
+                        properties:
+                          destination:
+                            description: |-
+                              Caps for the DESTINATION (write) side, overriding the destination
+                              repository's `moverDefaults.throttle` field by field. Applied with
+                              `repository throttle set` on the destination connection the migrate
+                              writes through.
+                            nullable: true
+                            properties:
+                              downloadBytesPerSecond:
+                                description: Cap download throughput in bytes/sec (`--download-bytes-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              readOpsPerSecond:
+                                description: Cap read/list ops/sec (`--read-requests-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              uploadBytesPerSecond:
+                                description: Cap upload throughput in bytes/sec (`--upload-bytes-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              writeOpsPerSecond:
+                                description: Cap write ops/sec (`--write-requests-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                            type: object
+                          source:
+                            description: |-
+                              Caps for the SOURCE (read) side, overriding the source repository's
+                              `moverDefaults.throttle` field by field. Applied with `repository
+                              throttle set` on the migrate's read-only source connection — accepted
+                              there, so a read-only source is throttled like any other.
+                            nullable: true
+                            properties:
+                              downloadBytesPerSecond:
+                                description: Cap download throughput in bytes/sec (`--download-bytes-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              readOpsPerSecond:
+                                description: Cap read/list ops/sec (`--read-requests-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              uploadBytesPerSecond:
+                                description: Cap upload throughput in bytes/sec (`--upload-bytes-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                              writeOpsPerSecond:
+                                description: Cap write ops/sec (`--write-requests-per-second`).
+                                format: int64
+                                nullable: true
+                                type: integer
+                            type: object
+                        type: object
                     type: object
                   sync:
                     description: |-

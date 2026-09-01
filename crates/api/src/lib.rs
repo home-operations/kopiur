@@ -27,6 +27,7 @@ pub mod gates;
 pub mod identity;
 pub mod invariants;
 pub mod jitter;
+pub mod message;
 pub mod preflight;
 pub mod recorded;
 pub mod retention;
@@ -102,6 +103,7 @@ pub use identity::{
     validate_identity_expr,
 };
 pub use jitter::{offset as jitter_offset, substitute_h};
+pub use message::{Diagnostic, message_shape_issue};
 pub use preflight::{
     PreflightCheck, PreflightInputs, PreflightSpec, eval_preflight_expr, validate_preflight_expr,
 };

@@ -203,6 +203,14 @@ allow:
       Transition-only guard in `recycle_bootstrap_outage` and
       `finalize_probe_failure`: fire the breaker-trip Event and metric on the
       TRANSITION into `Degraded`, not on every reconcile that re-confirms it.
+  - file: crates/controller/src/repository.rs
+    snippet: "repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Degraded)"
+    reason: >-
+      Transition-only guard in the result-less Recycle arm of
+      `finalize_bootstrap_failure` (#415): the failure-streak stamp makes every
+      cycle a real status write, so the Event/metric/warn re-gate on "was it
+      already Degraded with this same reason". Any other phase — `Unknown`
+      included — correctly reads as a fresh transition and publishes.
   - file: crates/controller/src/cluster_repository.rs
     snippet: "prior_phase == Some(&RepositoryPhase::Degraded)"
     reason: >-
@@ -212,6 +220,11 @@ allow:
     reason: >-
       `ClusterRepository` mirror of the transition-only breaker-trip guard, in
       `recycle_cluster_bootstrap_outage` and `finalize_cluster_probe_failure`.
+  - file: crates/controller/src/cluster_repository.rs
+    snippet: "repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Degraded)"
+    reason: >-
+      `ClusterRepository` mirror of the #415 Recycle-arm transition guard in
+      `finalize_cluster_bootstrap_failure`.
   - file: crates/controller/src/metrics.rs
     snippet: "phase != Some(&kopiur_api::RepositoryPhase::Degraded)"
     reason: >-

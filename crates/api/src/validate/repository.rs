@@ -909,7 +909,11 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
     }
     if let Some(sync) = &spec.sync {
         if let Some(p) = sync.parallel
-            && let Some(e) = require_min("RepositoryReplication spec.sync.parallel", p.into(), 1)
+            && let Some(e) = require_min(
+                "RepositoryReplication spec.sync.parallel",
+                p.into(),
+                NumericBound::Count,
+            )
         {
             errs.push(e);
         }
@@ -917,7 +921,7 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
             && let Some(e) = require_min(
                 "RepositoryReplication spec.sync.maxDownloadSpeedBytesPerSecond",
                 s,
-                1,
+                NumericBound::RatePerSecond,
             )
         {
             errs.push(e);
@@ -926,7 +930,7 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
             && let Some(e) = require_min(
                 "RepositoryReplication spec.sync.maxUploadSpeedBytesPerSecond",
                 s,
-                1,
+                NumericBound::RatePerSecond,
             )
         {
             errs.push(e);
@@ -1027,10 +1031,32 @@ pub fn validate_snapshot_replication(spec: &SnapshotReplicationSpec) -> Vec<Vali
             }
         }
     }
-    if let Some(p) = spec.migrate.as_ref().and_then(|m| m.parallel)
-        && let Some(e) = require_min("SnapshotReplication spec.migrate.parallel", p.into(), 1)
-    {
-        errs.push(e);
+    if let Some(migrate) = spec.migrate.as_ref() {
+        if let Some(p) = migrate.parallel
+            && let Some(e) = require_min(
+                "SnapshotReplication spec.migrate.parallel",
+                p.into(),
+                NumericBound::Count,
+            )
+        {
+            errs.push(e);
+        }
+        // Per-side migrate caps: the same "a rate is >= 1" rule the throttle
+        // knobs carry everywhere, applied to each side independently so a
+        // message names the side that is wrong.
+        if let Some(throttle) = migrate.throttle.as_ref() {
+            for (side, block) in [
+                ("source", throttle.source.as_ref()),
+                ("destination", throttle.destination.as_ref()),
+            ] {
+                if let Some(block) = block {
+                    errs.extend(validate_throttle(
+                        &format!("SnapshotReplication spec.migrate.throttle.{side}"),
+                        block,
+                    ));
+                }
+            }
+        }
     }
     if let Some(pruning) = &spec.pruning {
         // Exhaustive: a new pruning mode cannot compile without deciding its
@@ -1430,9 +1456,28 @@ pub fn validate_repository_seed(
                 errs.push(e);
             }
             if let Some(p) = seed.migrate.as_ref().and_then(|m| m.parallel)
-                && let Some(e) = require_min("spec.seed.migrate.parallel", p.into(), 1)
+                && let Some(e) =
+                    require_min("spec.seed.migrate.parallel", p.into(), NumericBound::Count)
             {
                 errs.push(e);
+            }
+            // Per-side seed caps, the same "a rate is >= 1" rule the throttle
+            // knobs carry everywhere. Validated per side so the message names
+            // the side that is wrong: `source` is the REPLICA being read,
+            // `destination` this repository — and mixing them up is the likely
+            // authoring mistake.
+            if let Some(throttle) = seed.migrate.as_ref().and_then(|m| m.throttle.as_ref()) {
+                for (side, block) in [
+                    ("source", throttle.source.as_ref()),
+                    ("destination", throttle.destination.as_ref()),
+                ] {
+                    if let Some(block) = block {
+                        errs.extend(validate_throttle(
+                            &format!("spec.seed.migrate.throttle.{side}"),
+                            block,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1565,17 +1610,25 @@ fn inert_create_fields(create: Option<&CreateBehavior>) -> Vec<String> {
 fn validate_seed_sync_options(sync: &SeedSyncOptions) -> Vec<ValidationError> {
     let mut errs = Vec::new();
     if let Some(p) = sync.parallel
-        && let Some(e) = require_min("spec.seed.sync.parallel", p.into(), 1)
+        && let Some(e) = require_min("spec.seed.sync.parallel", p.into(), NumericBound::Count)
     {
         errs.push(e);
     }
     if let Some(s) = sync.max_download_speed_bytes_per_second
-        && let Some(e) = require_min("spec.seed.sync.maxDownloadSpeedBytesPerSecond", s, 1)
+        && let Some(e) = require_min(
+            "spec.seed.sync.maxDownloadSpeedBytesPerSecond",
+            s,
+            NumericBound::RatePerSecond,
+        )
     {
         errs.push(e);
     }
     if let Some(s) = sync.max_upload_speed_bytes_per_second
-        && let Some(e) = require_min("spec.seed.sync.maxUploadSpeedBytesPerSecond", s, 1)
+        && let Some(e) = require_min(
+            "spec.seed.sync.maxUploadSpeedBytesPerSecond",
+            s,
+            NumericBound::RatePerSecond,
+        )
     {
         errs.push(e);
     }

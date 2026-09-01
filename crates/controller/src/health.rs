@@ -22,8 +22,9 @@ use kopiur_api::repository::{ProbeOnFailure, RepositoryHealthStatus};
 
 use crate::consts::{
     BACKEND_REACHABLE_CONDITION, BACKEND_REACHABLE_REASON, BACKEND_UNREACHABLE_REASON,
-    CHECK_BACKEND_ACTION, INDEX_BLOB_HEALTH_CONDITION, REPOSITORY_VANISHED_REASON,
-    VERIFY_BACKEND_ACTION,
+    BOOTSTRAP_DEADLINE_EXCEEDED_REASON, CHECK_BACKEND_ACTION, INDEX_BLOB_HEALTH_CONDITION,
+    PROBE_DEADLINE_EXCEEDED_REASON, RAISE_BOOTSTRAP_DEADLINE_ACTION,
+    REPOSITORY_BOOTSTRAPPED_CONDITION, REPOSITORY_VANISHED_REASON, VERIFY_BACKEND_ACTION,
 };
 use crate::io;
 
@@ -138,14 +139,12 @@ pub fn reconcile_index_blob_health(
             // blobs by the gate alone — no maintenance schedule can help, which is exactly
             // the dead end #258 was reported from.
             let message = format!(
-                "repository has {count} content-index blobs (threshold {threshold}); kopia \
-                 maintenance is not compacting them. Ensure maintenance runs — if it is stuck on a \
-                 stale lease owner, set spec.maintenance.takeoverPolicy: Force once to recover. \
-                 If maintenance IS running, the epoch-advance gate is the usual cause on a busy \
-                 repository: an epoch cannot close before spec.parameters.epoch.minDuration \
-                 (kopia's default is 24h) and compaction trails two epochs behind, so lowering \
-                 it (e.g. 6h) lets blobs be compacted sooner. \
-                 Raise spec.health.indexBlobWarnThreshold (or set it to 0) to silence this."
+                "repository has {count} content-index blobs (threshold {threshold}); maintenance \
+                 is not compacting them. Fix: ensure maintenance runs — if stuck on a stale \
+                 lease, set spec.maintenance.takeoverPolicy: Force once; if it IS running, the \
+                 epoch gate is usually why — lower spec.parameters.epoch.minDuration (default \
+                 24h, e.g. 6h) so blobs compact. Raise spec.health.indexBlobWarnThreshold \
+                 (or 0) to silence."
             );
             let conditions = io::upsert_condition(
                 existing,
@@ -370,18 +369,47 @@ pub enum ProbeFailureKind {
     /// Backend unreachable, mount/path missing, or auth/lock failed — NOT a
     /// confirmed wipe. kopiur never treats it as one.
     Unreachable,
+    /// The probe/bootstrap Job was killed by its `activeDeadlineSeconds` before
+    /// kopia could report a verdict (issue #414): the backend may be reachable
+    /// but SLOW — a cold-cache `kopia repository connect` scales with
+    /// index-blob count. Counts toward the breaker threshold (a repository
+    /// that cannot be confirmed healthy pauses backups/replication), but
+    /// maintenance keeps running: index compaction is the cure
+    /// (`maintenance_may_proceed`), and the retry deadline escalates.
+    TimedOut,
 }
 
 impl ProbeFailureKind {
-    /// The stable metric-label value (`vanished` / `unreachable`), shared by the
-    /// `kopiur_repository_health_probe_failures` `outcome` label and the
-    /// `kopiur_repository_breaker_trips` `probe_kind` label so dashboards join
-    /// the two on identical values.
+    /// The stable metric-label value (`vanished` / `unreachable` /
+    /// `timed_out`), shared by the `kopiur_repository_health_probe_failures`
+    /// `outcome` label and the `kopiur_repository_breaker_trips` `probe_kind`
+    /// label so dashboards join the two on identical values.
     pub fn label(self) -> &'static str {
         match self {
             ProbeFailureKind::Vanished => "vanished",
             ProbeFailureKind::Unreachable => "unreachable",
+            ProbeFailureKind::TimedOut => "timed_out",
         }
+    }
+}
+
+/// Classify a [`crate::io::BootstrapFailure`] as the unified backend sensor's
+/// failure kind — the ONE place the mapping lives (it was four hand-copied
+/// two-way collapses across the twins before #414). Exhaustive: only the
+/// mover's genuine `RepositoryNotInitialized` sentinel may read as *vanished*
+/// (a wrong "absent" here could, in a future auto-recreate, be catastrophic),
+/// only a Job-deadline kill reads as *timed out*, and everything else is the
+/// conservative *unreachable*.
+pub fn probe_failure_kind(failure: &crate::io::BootstrapFailure) -> ProbeFailureKind {
+    use crate::io::BootstrapFailure;
+    match failure {
+        BootstrapFailure::RepositoryNotInitialized => ProbeFailureKind::Vanished,
+        BootstrapFailure::JobDeadlineExceeded { .. } => ProbeFailureKind::TimedOut,
+        BootstrapFailure::Backend { .. }
+        | BootstrapFailure::JobFailedWithoutResult { .. }
+        | BootstrapFailure::Seed { .. }
+        | BootstrapFailure::SeedMoverTooOld
+        | BootstrapFailure::InternalInconsistency { .. } => ProbeFailureKind::Unreachable,
     }
 }
 
@@ -585,9 +613,52 @@ pub fn success_fold(
     })
 }
 
-/// Fold a **failing** probe into the health state, applying the consecutive-failure
-/// debounce: the loud `BackendReachable=False` condition (and its Warning event)
-/// is raised only once `failure_threshold` consecutive failures have accrued, so a
+/// Fold ONE backend failure into the unified sensor's `status.health` state:
+/// streak = prior+1, `firstFailureAt` continues an active streak (fresh stamp
+/// on a new episode), `lastProbeAt` = now — the anchor
+/// [`strict_retry_holdoff`] measures the relaunch backoff from. Extracted from
+/// [`reconcile_probe_failure`] (which delegates) so the result-less recycle
+/// route can arm the SAME holdoff (#415: that route previously wrote no
+/// health at all, so the anchor went stale and the gate failed open into a
+/// flat ~2.5-minute relaunch metronome).
+///
+/// Widening note: this stamps `lastProbeAt` on repositories no probe ever ran
+/// against. That is safe for `health_probe_due`'s timer because `probe_action`
+/// requires `phase_is_ready` and every writer here also writes a non-Ready
+/// phase; and it is exactly what the holdoff needs (a per-failure anchor).
+/// `probe_attempt_at` is `None` here — callers MUST patch through
+/// [`probe_failure_health_patch`], which emits the explicit JSON null a typed
+/// `None` cannot express through a merge patch.
+pub fn failure_streak_health(
+    prior: Option<&RepositoryHealthStatus>,
+    now: &str,
+) -> RepositoryHealthStatus {
+    let prior_failures = prior
+        .and_then(|h| h.consecutive_probe_failures)
+        .unwrap_or(0)
+        .max(0);
+    let first_failure_at = prior
+        .and_then(|h| {
+            if prior_failures > 0 {
+                h.first_failure_at.clone()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| now.to_string());
+    RepositoryHealthStatus {
+        last_probe_at: Some(now.to_string()),
+        last_healthy_at: prior.and_then(|h| h.last_healthy_at.clone()),
+        consecutive_probe_failures: Some(prior_failures + 1),
+        first_failure_at: Some(first_failure_at),
+        probe_attempt_at: None,
+    }
+}
+
+/// Fold a **failing** probe into the health state (via
+/// [`failure_streak_health`]), applying the consecutive-failure debounce: the
+/// loud `BackendReachable=False` condition (and its Warning event) is raised
+/// only once `failure_threshold` consecutive failures have accrued, so a
 /// single transient blip never alarms or nudges a destructive manual recreate.
 ///
 /// **Phase is the caller's concern** and is mode-dependent since M4: the caller
@@ -611,31 +682,8 @@ pub fn reconcile_probe_failure(
     now: &str,
     generation: Option<i64>,
 ) -> ProbeUpdate {
-    let prior_failures = prior
-        .and_then(|h| h.consecutive_probe_failures)
-        .unwrap_or(0)
-        .max(0);
-    let consecutive = prior_failures + 1;
-    // Continue the streak's first-failure stamp; start a fresh one if the prior
-    // count was zero (a new episode).
-    let first_failure_at = prior
-        .and_then(|h| {
-            if prior_failures > 0 {
-                h.first_failure_at.clone()
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| now.to_string());
-    let health = RepositoryHealthStatus {
-        last_probe_at: Some(now.to_string()),
-        last_healthy_at: prior.and_then(|h| h.last_healthy_at.clone()),
-        consecutive_probe_failures: Some(consecutive),
-        first_failure_at: Some(first_failure_at),
-        // Retired by the caller through `probe_failure_health_patch`, which emits the
-        // explicit null this `None` cannot express through a merge patch.
-        probe_attempt_at: None,
-    };
+    let health = failure_streak_health(prior, now);
+    let consecutive = health.consecutive_probe_failures.unwrap_or(1);
 
     let threshold = failure_threshold.max(1);
     if consecutive < threshold {
@@ -653,23 +701,34 @@ pub fn reconcile_probe_failure(
             REPOSITORY_VANISHED_REASON,
             VERIFY_BACKEND_ACTION,
             format!(
-                "the kopia repository appears to have VANISHED: the backend is reachable but the \
-                 repository format blob is absent ({consecutive} consecutive failing health \
-                 probes). Data blobs may still remain — recreating would orphan them and destroy \
-                 restorability, so kopiur will NOT auto-recreate. Verify the backend is truly \
-                 empty (and that no other Repository/ClusterRepository points at the same backend) \
-                 before any deliberate re-create."
+                "kopia repository VANISHED: the backend is reachable but the format blob is \
+                 absent ({consecutive} consecutive failing probes). Data blobs may still remain, \
+                 so re-creating would orphan them and destroy restorability — kopiur will NOT \
+                 auto-recreate. Fix: verify the backend is truly empty (and no other \
+                 Repository/ClusterRepository points at it) before any deliberate re-create."
             ),
         ),
         ProbeFailureKind::Unreachable => (
             BACKEND_UNREACHABLE_REASON,
             CHECK_BACKEND_ACTION,
             format!(
-                "the repository backend could not be confirmed healthy ({consecutive} consecutive \
-                 failing health probes): it is unreachable, the path/mount is missing, or \
-                 credentials/lock failed. This is NOT treated as a wipe and kopiur never \
-                 auto-recreates (see the Ready condition for what kopiur is doing about it). \
-                 Check the backend, credentials, and any mounted volume."
+                "repository backend not confirmed healthy ({consecutive} consecutive failing \
+                 probes): unreachable, the path/mount is missing, or credentials/lock failed. \
+                 This is NOT treated as a wipe and kopiur never auto-recreates. Fix: check the \
+                 backend, credentials, and any mounted volume (see the Ready condition for what \
+                 kopiur is doing)."
+            ),
+        ),
+        ProbeFailureKind::TimedOut => (
+            PROBE_DEADLINE_EXCEEDED_REASON,
+            RAISE_BOOTSTRAP_DEADLINE_ACTION,
+            format!(
+                "backend health probe killed by its activeDeadlineSeconds ({consecutive} \
+                 consecutive deadline-killed probes) — the backend may be reachable but slow: a \
+                 cold cache over a large index makes connect exceed the deadline. This is NOT \
+                 evidence of an outage or wipe, and kopiur never auto-recreates. Fix: raise \
+                 spec.bootstrap.failurePolicy.activeDeadlineSeconds; maintenance shrinks connect \
+                 time and keeps running."
             ),
         ),
     };
@@ -704,9 +763,11 @@ pub fn reconcile_probe_failure(
 // The repository circuit breaker (#345 M4).
 //
 // The probe (and the strict retry loop) is the sensor; `breaker_verdict` is the
-// switch. Open = phase `Degraded`, which every consumer gate (backups,
-// maintenance, replication) already reads as "paused". Closed again by any
-// successful strict connect via `success_fold`'s Heal case.
+// switch. Open = phase `Degraded`, which the backup/replication consumer gates
+// read as "paused". Maintenance is deliberately EXEMPT since #413
+// (`maintenance_may_proceed`): it keeps running unless the backend is
+// confirmed unreachable/vanished, because index compaction is often the cure.
+// Closed again by any successful strict connect via `success_fold`'s Heal case.
 // ---------------------------------------------------------------------------
 
 /// What a threshold-crossing check decides for the repository phase. A closed
@@ -763,6 +824,7 @@ pub fn breaker_reason(kind: ProbeFailureKind) -> &'static str {
     match kind {
         ProbeFailureKind::Vanished => REPOSITORY_VANISHED_REASON,
         ProbeFailureKind::Unreachable => BACKEND_UNREACHABLE_REASON,
+        ProbeFailureKind::TimedOut => PROBE_DEADLINE_EXCEEDED_REASON,
     }
 }
 
@@ -772,6 +834,7 @@ pub fn breaker_action(kind: ProbeFailureKind) -> &'static str {
     match kind {
         ProbeFailureKind::Vanished => VERIFY_BACKEND_ACTION,
         ProbeFailureKind::Unreachable => CHECK_BACKEND_ACTION,
+        ProbeFailureKind::TimedOut => RAISE_BOOTSTRAP_DEADLINE_ACTION,
     }
 }
 
@@ -790,6 +853,13 @@ pub fn breaker_open_message(kind: ProbeFailureKind) -> &'static str {
             "the repository backend is unreachable — the circuit breaker is open: backups, \
              maintenance, and replication are paused until a connect succeeds; retrying with \
              backoff (recovery is automatic)"
+        }
+        ProbeFailureKind::TimedOut => {
+            "the repository connect keeps exceeding its bootstrap deadline — the circuit breaker \
+             is open: backups and replication are paused until a connect succeeds; maintenance \
+             still runs (index compaction shrinks connect time); retrying with backoff and a \
+             progressively longer deadline (recovery is automatic). Raise \
+             spec.bootstrap.failurePolicy.activeDeadlineSeconds if the backend is just slow"
         }
     }
 }
@@ -879,21 +949,30 @@ pub fn launch_phase(prior: Option<&RepositoryPhase>) -> &'static str {
     }
 }
 
+/// The single cap on the strict-retry relaunch backoff (and, through
+/// [`strict_retry_holdoff`], the launch gate), shared so the finalize requeue
+/// and the gate can never disagree. 1800s (#415, matching the default probe
+/// interval): against a paid-per-request object store every relaunch is a
+/// cold-cache `kopia repository connect` billed per attempt, so a doomed loop
+/// must decay to ~2 attempts/hour — while a healed backend is still noticed
+/// within 30 minutes worst case.
+pub const STRICT_RETRY_BACKOFF_CAP_SECS: u64 = 1800;
+
 /// Requeue for the strict recycle-retry loop while the backend is unavailable:
-/// exponential from 120s, doubling per consecutive failure, capped at 600s —
-/// `(120, 240, 480, 600, 600, …)` for inputs `0, 1, 2, 3, …` (negative/zero
-/// input → 120s). Bounds multi-day-outage Job churn (~144 Jobs/day worst case
-/// instead of 720) while keeping worst-case recovery detection ≤ 10m. The
-/// caller passes the number of failures *before* the retry being scheduled
-/// (post-fold streak minus one), so the first retry after a fresh failure
-/// waits the base 120s — matching the result-less recycle's flat cadence.
+/// exponential from 120s, doubling per consecutive failure, capped at
+/// [`STRICT_RETRY_BACKOFF_CAP_SECS`] — `(120, 240, 480, 960, 1800, 1800, …)`
+/// for inputs `0, 1, 2, 3, 4, …` (negative/zero input → 120s). Bounds
+/// multi-day-outage Job churn (~48 Jobs/day worst case instead of 720) while
+/// keeping worst-case recovery detection ≤ 30m. The caller passes the number
+/// of failures *before* the retry being scheduled (post-fold streak minus
+/// one), so the first retry after a fresh failure waits the base 120s.
 pub fn strict_retry_backoff(consecutive_failures: i64) -> std::time::Duration {
     const BASE_SECS: u64 = 120;
-    const CAP_SECS: u64 = 600;
-    // 2^3 * 120 = 960 already exceeds the cap, so clamping the exponent at 3
-    // keeps the shift small and overflow-free for any i64 input.
-    let exponent = consecutive_failures.clamp(0, 3) as u32;
-    std::time::Duration::from_secs((BASE_SECS << exponent).min(CAP_SECS))
+    // 120 << 4 = 1920 already exceeds the cap, so clamping the exponent at 4
+    // keeps the shift small and overflow-free for any i64 input (and any
+    // future cap value only needs a clamp bump the test derives).
+    let exponent = consecutive_failures.clamp(0, 4) as u32;
+    std::time::Duration::from_secs((BASE_SECS << exponent).min(STRICT_RETRY_BACKOFF_CAP_SECS))
 }
 
 /// How long a `Degraded` repository must still WAIT before relaunching its
@@ -908,8 +987,8 @@ pub fn strict_retry_backoff(consecutive_failures: i64) -> std::time::Duration {
 /// retry cycle relaunches the Job the moment the previous one is finalized,
 /// regardless of the requeue. Same launch-stamp discipline as
 /// [`crate::catalog::scan_requested_due`], keyed on `status.health.lastProbeAt`
-/// (which [`reconcile_probe_failure`] stamps on every failure fold, probe or
-/// strict).
+/// (which [`failure_streak_health`] stamps on every failure fold — probe,
+/// strict, or the result-less recycle route since #415).
 ///
 /// **Fails OPEN** on every edge: not `Degraded`, no recorded failure streak, an
 /// absent or unparseable stamp, or an elapsed backoff all mean "launch now" —
@@ -933,6 +1012,119 @@ pub fn strict_retry_holdoff(
         None
     } else {
         Some((due - now).to_std().unwrap_or(backoff))
+    }
+}
+
+/// The consecutive-failure streak attributable to Job-DEADLINE kills, derived
+/// from status alone: `consecutive_failures` iff the current `Bootstrapped` or
+/// `BackendReachable` `False` condition carries a deadline reason
+/// (`BootstrapDeadlineExceeded` / `ProbeDeadlineExceeded`), else `0` — a
+/// crash-loop or outage streak must never inflate the deadline.
+///
+/// Threshold nuance (documented, not a bug): on a bootstrapped repository with
+/// the default `failureThreshold: 3`, below-threshold probe failures leave
+/// conditions untouched (the debounce), so escalation only engages once the
+/// threshold crosses and the deadline reason lands on a condition. The
+/// never-bootstrapped recycle route writes its `Bootstrapped=False` reason on
+/// failure 1, so there escalation starts from attempt 2.
+pub fn timeout_streak(conditions: &[Condition], consecutive_failures: i64) -> i64 {
+    let deadline_reasoned = conditions.iter().any(|c| {
+        (c.type_ == REPOSITORY_BOOTSTRAPPED_CONDITION || c.type_ == BACKEND_REACHABLE_CONDITION)
+            && c.status == "False"
+            && (c.reason == BOOTSTRAP_DEADLINE_EXCEEDED_REASON
+                || c.reason == PROBE_DEADLINE_EXCEEDED_REASON)
+    });
+    if deadline_reasoned {
+        consecutive_failures.max(0)
+    } else {
+        0
+    }
+}
+
+/// The effective bootstrap-Job `activeDeadlineSeconds` under DEADLINE
+/// ESCALATION (#414): `base << min(timeout_streak, 4)`, capped at
+/// `max(base, STRICT_RETRY_BACKOFF_CAP_SECS)` — the operator applies the
+/// "raise activeDeadlineSeconds until one connect succeeds" remediation
+/// itself, in lockstep with the relaunch backoff (deadline ladder
+/// 120→240→480→960→1800 at the default base), so a slow-but-alive backend
+/// self-heals: one longer-deadline connect succeeds, maintenance (exempt from
+/// the breaker for deadline degradation) compacts the index, the streak
+/// resets, and the deadline returns to base. If even the 1800s rung fails, the
+/// backend is genuinely dark and the honest breaker state stands.
+///
+/// Never reduces: the cap includes `base`, so an explicit user override larger
+/// than the escalation cap is respected verbatim. `streak <= 0` → `base`.
+///
+/// Callers MUST feed the same status-derived value into
+/// [`probe_attempt_timeout`] as into the Job's limits — both are computed
+/// before the Job is fetched, and the streak only grows between a launch and
+/// its poll, so the computed attempt window only ever WIDENS relative to the
+/// running Job's real deadline. An attempt window narrower than the Job's
+/// deadline would recycle a live Job mid-connect (the #273 class).
+pub fn escalated_bootstrap_deadline(base_secs: i64, timeout_streak: i64) -> i64 {
+    let exponent = timeout_streak.clamp(0, 4) as u32;
+    let cap = (STRICT_RETRY_BACKOFF_CAP_SECS as i64).max(base_secs);
+    base_secs.saturating_mul(1_i64 << exponent).min(cap)
+}
+
+/// Whether the repository's backend is CONFIRMED down or wiped: a
+/// `BackendReachable=False` condition whose reason is `BackendUnreachable`
+/// (the probe's connect verdict says the backend is not answering) or
+/// `RepositoryVanished` (the backend answers but the kopia repository is
+/// gone). A deny-list on purpose: a deadline-killed probe
+/// (`ProbeDeadlineExceeded`, #414) says "connect slower than the Job
+/// deadline", which is NOT confirmation of an outage — and any future reason
+/// passes through as not-confirmed by construction, so the maintenance gate
+/// can never silently widen its own deny-list.
+pub fn backend_confirmed_down(conditions: &[Condition]) -> bool {
+    conditions
+        .iter()
+        .find(|c| c.type_ == BACKEND_REACHABLE_CONDITION)
+        .is_some_and(|c| {
+            c.status == "False"
+                && (c.reason == BACKEND_UNREACHABLE_REASON
+                    || c.reason == REPOSITORY_VANISHED_REASON)
+        })
+}
+
+/// Whether a `Maintenance` may spawn its mover Job against this repository —
+/// the G7 gate's predicate (issue #413).
+///
+/// Keyed on **bootstrapped-before** (`status.uniqueId` set), NOT on
+/// `phase == Ready`: an already-bootstrapped repository that went `Degraded`
+/// *because* its index blobs need compacting (the probe deadline-kill spiral)
+/// must still receive maintenance — maintenance IS the cure, and the
+/// maintenance Job's own deadline is the 48h mover default, not the probe's
+/// 120s. Deferring is reserved for the states where a maintenance pod is
+/// doomed or dangerous:
+///
+/// - never bootstrapped (`Pending`/`Initializing`, or no `uniqueId`) — there
+///   is nothing to maintain yet, spawning just produces a doomed pod;
+/// - `Degraded` with the backend CONFIRMED unreachable or the repository
+///   vanished ([`backend_confirmed_down`]) — the #345 breaker semantics;
+/// - terminal `Failed` — the verdict (bad credentials, locked, …) dooms a
+///   maintenance connect identically;
+/// - `Unknown` — a newer controller's phase; consumers must hold, not proceed.
+///
+/// A `Degraded` repo whose mover merely crash-loops (`BootstrapJobFailed`,
+/// OOM, bad image — no `BackendReachable=False` written) still gets
+/// maintenance: the Jobs are bounded (deterministic per-slot names +
+/// single-flight) and may well succeed. Exhaustive over [`RepositoryPhase`].
+pub fn maintenance_may_proceed(
+    phase: Option<&RepositoryPhase>,
+    unique_id: Option<&str>,
+    conditions: &[Condition],
+) -> bool {
+    match phase {
+        Some(RepositoryPhase::Ready) => true,
+        Some(RepositoryPhase::Degraded) => {
+            unique_id.is_some() && !backend_confirmed_down(conditions)
+        }
+        Some(RepositoryPhase::Pending)
+        | Some(RepositoryPhase::Initializing)
+        | Some(RepositoryPhase::Failed)
+        | Some(RepositoryPhase::Unknown(_))
+        | None => false,
     }
 }
 
@@ -1547,6 +1739,62 @@ mod tests {
         let ev = unreachable.event.unwrap();
         assert!(!ev.message.contains("VANISHED"));
         assert!(ev.message.contains("NOT treated as a wipe"));
+        // #414: the third kind — a deadline-killed probe — carries its own
+        // reason; it must claim neither a vanish nor an outage.
+        let timed_out = reconcile_probe_failure(
+            &[],
+            Some(&health_with_failures(0)),
+            ProbeFailureKind::TimedOut,
+            1,
+            &now,
+            None,
+        );
+        let c = timed_out
+            .conditions
+            .iter()
+            .find(|c| c.type_ == BACKEND_REACHABLE_CONDITION)
+            .unwrap();
+        assert_eq!(c.reason, PROBE_DEADLINE_EXCEEDED_REASON);
+        assert_ne!(c.reason, BACKEND_UNREACHABLE_REASON);
+        let ev = timed_out.event.unwrap();
+        assert_eq!(ev.action, RAISE_BOOTSTRAP_DEADLINE_ACTION);
+        assert!(!ev.message.contains("VANISHED"), "{}", ev.message);
+        assert!(
+            !ev.message.contains("credentials/lock failed"),
+            "{}",
+            ev.message
+        );
+    }
+
+    /// #414 message obligations for the deadline-kill probe alert: the what
+    /// (deadline kill + streak), the why (cold-cache connect scales with the
+    /// index), the not-an-outage disclaimer, and the fix (raise the deadline;
+    /// maintenance keeps running and shrinks connect time).
+    #[test]
+    fn deadline_kill_message_obligations() {
+        let now = t(100).to_rfc3339();
+        let upd = reconcile_probe_failure(
+            &[],
+            Some(&health_with_failures(2)),
+            ProbeFailureKind::TimedOut,
+            3,
+            &now,
+            None,
+        );
+        let msg = &upd.event.expect("threshold crossed → event").message;
+        assert!(msg.contains("activeDeadlineSeconds"), "{msg}");
+        assert!(
+            msg.contains("3 consecutive deadline-killed probes"),
+            "{msg}"
+        );
+        assert!(msg.contains("may be reachable but slow"), "{msg}");
+        assert!(msg.contains("NOT evidence of an outage"), "{msg}");
+        assert!(
+            msg.contains("spec.bootstrap.failurePolicy.activeDeadlineSeconds"),
+            "{msg}"
+        );
+        assert!(msg.contains("maintenance"), "{msg}");
+        assert!(msg.contains("keeps running"), "{msg}");
     }
 
     #[test]
@@ -1753,9 +2001,11 @@ mod tests {
 
     #[test]
     fn both_probe_failure_kinds_open_the_breaker() {
-        // `breaker_verdict` takes no kind on purpose: a vanished backend dooms
-        // backups exactly like an unreachable one. The kind-mapped surfaces
-        // (reason/action/message) must still be distinct and stable.
+        // `breaker_verdict` takes no kind on purpose: a backend that cannot be
+        // confirmed healthy dooms backups whether it vanished, refuses
+        // connections, or is merely too slow for the probe deadline. The
+        // kind-mapped surfaces (reason/action/message) must still be distinct
+        // and stable.
         assert_eq!(
             breaker_reason(ProbeFailureKind::Vanished),
             REPOSITORY_VANISHED_REASON
@@ -1765,6 +2015,10 @@ mod tests {
             BACKEND_UNREACHABLE_REASON
         );
         assert_eq!(
+            breaker_reason(ProbeFailureKind::TimedOut),
+            PROBE_DEADLINE_EXCEEDED_REASON
+        );
+        assert_eq!(
             breaker_action(ProbeFailureKind::Vanished),
             VERIFY_BACKEND_ACTION
         );
@@ -1772,15 +2026,52 @@ mod tests {
             breaker_action(ProbeFailureKind::Unreachable),
             CHECK_BACKEND_ACTION
         );
-        for kind in [ProbeFailureKind::Vanished, ProbeFailureKind::Unreachable] {
+        assert_eq!(
+            breaker_action(ProbeFailureKind::TimedOut),
+            RAISE_BOOTSTRAP_DEADLINE_ACTION
+        );
+        for kind in [
+            ProbeFailureKind::Vanished,
+            ProbeFailureKind::Unreachable,
+            ProbeFailureKind::TimedOut,
+        ] {
             let msg = breaker_open_message(kind);
             assert!(msg.contains("paused until a connect succeeds"), "{msg}");
             assert!(msg.contains("retrying with backoff"), "{msg}");
         }
+        // The two pre-#414 messages are pinned BYTE-IDENTICALLY: guarded no-op
+        // status writes (and any operator tooling matching on them) depend on
+        // the exact bytes not drifting when a new kind is added.
+        assert_eq!(
+            breaker_open_message(ProbeFailureKind::Vanished),
+            "the backend is reachable but the kopia repository is absent — the circuit breaker \
+             is open: backups, maintenance, and replication are paused until a connect succeeds; \
+             retrying with backoff (recovery is automatic; kopiur never auto-recreates)"
+        );
+        assert_eq!(
+            breaker_open_message(ProbeFailureKind::Unreachable),
+            "the repository backend is unreachable — the circuit breaker is open: backups, \
+             maintenance, and replication are paused until a connect succeeds; retrying with \
+             backoff (recovery is automatic)"
+        );
         // The vanished message must still refuse the destructive nudge.
         assert!(breaker_open_message(ProbeFailureKind::Vanished).contains("never auto-recreates"));
+        // Only the TimedOut message says maintenance keeps running (#413): the
+        // confirmed-down kinds really do pause maintenance, so their text must
+        // NOT be softened.
+        let timed_out = breaker_open_message(ProbeFailureKind::TimedOut);
+        assert!(timed_out.contains("maintenance still runs"), "{timed_out}");
+        assert!(
+            !timed_out.contains("maintenance, and replication are paused"),
+            "{timed_out}"
+        );
+        assert!(
+            timed_out.contains("spec.bootstrap.failurePolicy.activeDeadlineSeconds"),
+            "{timed_out}"
+        );
         assert_eq!(ProbeFailureKind::Vanished.label(), "vanished");
         assert_eq!(ProbeFailureKind::Unreachable.label(), "unreachable");
+        assert_eq!(ProbeFailureKind::TimedOut.label(), "timed_out");
     }
 
     #[test]
@@ -1801,7 +2092,11 @@ mod tests {
         assert_eq!(p.requeue, steady);
         // Open: Degraded + the byte-stable breaker message + a short hop into
         // the strict retry loop (which strict_retry_holdoff then governs).
-        for kind in [ProbeFailureKind::Vanished, ProbeFailureKind::Unreachable] {
+        for kind in [
+            ProbeFailureKind::Vanished,
+            ProbeFailureKind::Unreachable,
+            ProbeFailureKind::TimedOut,
+        ] {
             let p = probe_failure_phase(BreakerVerdict::Open, kind, steady);
             assert!(p.opened);
             assert_eq!(p.phase, RepositoryPhase::Degraded);
@@ -1838,14 +2133,22 @@ mod tests {
     }
 
     #[test]
-    fn strict_retry_backoff_doubles_from_120s_and_caps_at_600s() {
+    fn strict_retry_backoff_doubles_from_120s_and_caps_at_the_shared_cap() {
         let secs = |n: i64| strict_retry_backoff(n).as_secs();
         assert_eq!(secs(0), 120);
         assert_eq!(secs(1), 240);
         assert_eq!(secs(2), 480);
-        assert_eq!(secs(3), 600, "960 saturates at the cap");
-        assert_eq!(secs(4), 600);
-        assert_eq!(secs(1_000_000), 600, "huge streaks must not overflow");
+        assert_eq!(secs(3), 960);
+        // #415: the cap is the shared const (1800s = ~2 attempts/hour against
+        // a paid-per-request store), so the curve and any consumer deriving
+        // budgets from it can never disagree.
+        assert_eq!(secs(4), STRICT_RETRY_BACKOFF_CAP_SECS);
+        assert_eq!(secs(5), STRICT_RETRY_BACKOFF_CAP_SECS);
+        assert_eq!(
+            secs(1_000_000),
+            STRICT_RETRY_BACKOFF_CAP_SECS,
+            "huge streaks must not overflow"
+        );
         assert_eq!(secs(-1), 120, "negative input is the base");
         assert_eq!(secs(i64::MIN), 120);
     }
@@ -2022,5 +2325,329 @@ mod tests {
                 "streak {streak} must stay Ready under Alert"
             );
         }
+    }
+
+    /// #415 relaunch metronome, encoded as an executable regression. The
+    /// result-less recycle route used to write NO `status.health`: the
+    /// holdoff's `lastProbeAt` anchor went stale, `elapsed` exceeded any
+    /// backoff window, and the gate failed open into a fresh cold-cache
+    /// connect every ~2.5 minutes, forever (24 billed attempts/hour against
+    /// B2). With the route folding `failure_streak_health` per failure, the
+    /// holdoff re-arms each cycle and the cadence decays
+    /// 120→240→480→960→1800s.
+    #[test]
+    fn recycled_bootstrap_failures_rearm_the_holdoff() {
+        // The BUG, as the contrast case: streak recorded once (by the original
+        // probe failures), never re-stamped by the recycle route. Once the
+        // stale anchor's backoff window has elapsed, every subsequent pass
+        // launches immediately — the metronome.
+        let stale_anchor = t(0).to_rfc3339();
+        for pass in 1..5 {
+            let now = t(600 + pass * 150); // any time past the stale window
+            assert!(
+                strict_retry_holdoff(true, 3, Some(&stale_anchor), now).is_none(),
+                "pass {pass}: a never-re-stamped anchor fails open — the pre-fix bug"
+            );
+        }
+
+        // The FIX: each failed relaunch folds the streak++ and a fresh anchor,
+        // so the gate holds for the full (growing) backoff after every failure.
+        let mut health: Option<RepositoryHealthStatus> = None;
+        let mut clock = 0i64;
+        for (failure_n, expected_hold) in [(1, 120u64), (2, 240), (3, 480), (4, 960), (5, 1800)] {
+            let now = t(clock).to_rfc3339();
+            let folded = failure_streak_health(health.as_ref(), &now);
+            assert_eq!(folded.consecutive_probe_failures, Some(failure_n));
+            // Immediately after the failure the relaunch is gated for the full
+            // backoff window…
+            let held = strict_retry_holdoff(
+                true,
+                folded.consecutive_probe_failures.unwrap(),
+                folded.last_probe_at.as_deref(),
+                t(clock),
+            )
+            .unwrap_or_else(|| panic!("failure {failure_n} must re-arm the holdoff"));
+            assert_eq!(
+                held.as_secs(),
+                expected_hold,
+                "failure {failure_n} holds for the {expected_hold}s rung"
+            );
+            // …and releases once the window elapses (no wedge), which is when
+            // the next attempt launches (and, here, fails again).
+            assert!(
+                strict_retry_holdoff(
+                    true,
+                    folded.consecutive_probe_failures.unwrap(),
+                    folded.last_probe_at.as_deref(),
+                    t(clock + expected_hold as i64),
+                )
+                .is_none(),
+                "failure {failure_n}: the gate must release after {expected_hold}s"
+            );
+            clock += expected_hold as i64;
+            health = Some(folded);
+        }
+    }
+
+    /// The recycle route's fold IS the probe fold: `failure_streak_health`
+    /// must stay byte-equal to what `reconcile_probe_failure` records, across
+    /// prior-streak shapes, or the two writers drift apart.
+    #[test]
+    fn failure_streak_health_matches_the_probe_fold() {
+        let now = t(500).to_rfc3339();
+        for prior in [
+            None,
+            Some(health_with_failures(0)),
+            Some(health_with_failures(3)),
+            // A continuing streak with a missing firstFailureAt heals it.
+            Some(RepositoryHealthStatus {
+                last_probe_at: Some(t(100).to_rfc3339()),
+                last_healthy_at: None,
+                consecutive_probe_failures: Some(2),
+                first_failure_at: None,
+                probe_attempt_at: Some(t(90).to_rfc3339()),
+            }),
+        ] {
+            let folded = failure_streak_health(prior.as_ref(), &now);
+            let probe = reconcile_probe_failure(
+                &[],
+                prior.as_ref(),
+                ProbeFailureKind::Unreachable,
+                3,
+                &now,
+                None,
+            );
+            assert_eq!(folded, probe.health, "prior {prior:?}");
+        }
+    }
+
+    /// The recycle route's health patch must clear `probeAttemptAt` with an
+    /// explicit JSON null — every field is skip_serializing_if, so a direct
+    /// serialize can never clear it through a merge patch (the #273 class).
+    #[test]
+    fn recycle_route_health_patch_emits_the_explicit_null() {
+        let folded = failure_streak_health(Some(&health_with_failures(1)), &t(100).to_rfc3339());
+        let patch = probe_failure_health_patch(&folded);
+        assert!(
+            patch["probeAttemptAt"].is_null(),
+            "must be an explicit null, got {patch:?}"
+        );
+        assert_eq!(patch["consecutiveProbeFailures"].as_i64(), Some(2));
+        assert!(
+            patch["lastProbeAt"].is_string(),
+            "the holdoff anchor is stamped"
+        );
+        assert!(patch["firstFailureAt"].is_string());
+    }
+
+    /// The reset half of #415: after recycle-route failures, one successful
+    /// bootstrap folds Heal and nulls the streak/anchor, so the next episode
+    /// starts back at the 120s rung.
+    #[test]
+    fn success_clears_a_recycle_streak() {
+        let now = t(1_000).to_rfc3339();
+        let after_failures = failure_streak_health(
+            Some(&failure_streak_health(None, &t(500).to_rfc3339())),
+            &t(700).to_rfc3339(),
+        );
+        assert_eq!(after_failures.consecutive_probe_failures, Some(2));
+        let fold = success_fold(false, Some(&after_failures), true, &now)
+            .expect("a recorded streak must fold a Heal");
+        let patch = fold.health_patch;
+        assert!(patch["consecutiveProbeFailures"].is_null(), "{patch:?}");
+        assert!(patch["firstFailureAt"].is_null(), "{patch:?}");
+        assert!(patch["probeAttemptAt"].is_null(), "{patch:?}");
+    }
+
+    /// #414 deadline escalation: base << min(streak, 4), capped at
+    /// max(base, the shared backoff cap), never reducing an explicit override.
+    #[test]
+    fn escalated_deadline_ladder() {
+        // Default base: the ladder runs in lockstep with the relaunch backoff.
+        for (streak, expected) in [(0, 120), (1, 240), (2, 480), (3, 960), (4, 1800), (5, 1800)] {
+            assert_eq!(
+                escalated_bootstrap_deadline(120, streak),
+                expected,
+                "streak {streak}"
+            );
+        }
+        // An explicit override below the cap escalates from ITS base…
+        assert_eq!(escalated_bootstrap_deadline(900, 1), 1800);
+        // …and one above the cap is respected verbatim, never reduced.
+        assert_eq!(escalated_bootstrap_deadline(7_200, 0), 7_200);
+        assert_eq!(escalated_bootstrap_deadline(7_200, 3), 7_200);
+        // Degenerate inputs stay safe.
+        assert_eq!(escalated_bootstrap_deadline(120, -1), 120);
+        assert_eq!(escalated_bootstrap_deadline(120, i64::MAX), 1800);
+        assert_eq!(escalated_bootstrap_deadline(i64::MAX, 4), i64::MAX);
+        // The attempt window derived from the escalated value only ever widens
+        // as the streak grows — the #273-class undercut is unrepresentable.
+        for streak in 0..6 {
+            assert!(
+                probe_attempt_timeout(escalated_bootstrap_deadline(120, streak + 1))
+                    >= probe_attempt_timeout(escalated_bootstrap_deadline(120, streak))
+            );
+        }
+    }
+
+    /// Escalation is keyed on DEADLINE-reasoned failures only: a crash-loop or
+    /// outage streak must never inflate the deadline.
+    #[test]
+    fn timeout_streak_only_counts_deadline_reasons() {
+        let boot_false = |reason: &str| Condition {
+            type_: REPOSITORY_BOOTSTRAPPED_CONDITION.to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message: "m".to_string(),
+            last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ),
+            observed_generation: None,
+        };
+        // Deadline reasons on either condition count the full streak.
+        assert_eq!(
+            timeout_streak(&[boot_false(BOOTSTRAP_DEADLINE_EXCEEDED_REASON)], 3),
+            3
+        );
+        assert_eq!(
+            timeout_streak(
+                &[reachable_cond("False", PROBE_DEADLINE_EXCEEDED_REASON)],
+                2
+            ),
+            2
+        );
+        // Non-deadline reasons — and True conditions — contribute nothing.
+        assert_eq!(timeout_streak(&[boot_false("BootstrapJobFailed")], 3), 0);
+        assert_eq!(
+            timeout_streak(&[reachable_cond("False", BACKEND_UNREACHABLE_REASON)], 5),
+            0
+        );
+        assert_eq!(
+            timeout_streak(&[reachable_cond("True", BACKEND_REACHABLE_REASON)], 5),
+            0
+        );
+        assert_eq!(timeout_streak(&[], 5), 0);
+        // A negative streak clamps to zero.
+        assert_eq!(
+            timeout_streak(&[boot_false(BOOTSTRAP_DEADLINE_EXCEEDED_REASON)], -2),
+            0
+        );
+    }
+
+    /// The one `BootstrapFailure` → sensor-kind mapping (#414): only the
+    /// genuine not-initialized sentinel reads Vanished, only a deadline kill
+    /// reads TimedOut, everything else is the conservative Unreachable.
+    #[test]
+    fn probe_failure_kind_maps_each_failure_conservatively() {
+        use crate::io::{BootstrapFailure, SeedFailure};
+        use kopiur_kopia::KopiaErrorClass;
+        assert_eq!(
+            probe_failure_kind(&BootstrapFailure::RepositoryNotInitialized),
+            ProbeFailureKind::Vanished
+        );
+        assert_eq!(
+            probe_failure_kind(&BootstrapFailure::JobDeadlineExceeded {
+                job_name: "j".into(),
+                deadline_secs: 120,
+            }),
+            ProbeFailureKind::TimedOut
+        );
+        for failure in [
+            BootstrapFailure::Backend {
+                class: KopiaErrorClass::RepositoryUnavailable,
+                message: "m".into(),
+            },
+            BootstrapFailure::JobFailedWithoutResult {
+                job_name: "j".into(),
+            },
+            BootstrapFailure::Seed {
+                failure: SeedFailure::SourceNotFound,
+                message: "m".into(),
+            },
+            BootstrapFailure::SeedMoverTooOld,
+            BootstrapFailure::InternalInconsistency {
+                message: "m".into(),
+            },
+        ] {
+            assert_eq!(
+                probe_failure_kind(&failure),
+                ProbeFailureKind::Unreachable,
+                "{failure:?} must read as the conservative Unreachable"
+            );
+        }
+    }
+
+    /// #413 maintenance deadlock: Degraded-because-slow must not withhold the
+    /// cure. The full gate truth table — phase × bootstrapped-before ×
+    /// `BackendReachable` shape. The deny-list is exactly
+    /// {BackendUnreachable, RepositoryVanished}: every other reason (a
+    /// deadline-killed probe, a future reason this build has never seen)
+    /// passes through as "maintenance may proceed" by construction.
+    #[test]
+    fn maintenance_gate_truth_table() {
+        let br_false = |reason: &str| vec![reachable_cond("False", reason)];
+        let br_true = || vec![reachable_cond("True", BACKEND_REACHABLE_REASON)];
+        let uid = Some("uid-1");
+
+        // Ready proceeds regardless of uniqueId or conditions.
+        assert!(maintenance_may_proceed(
+            Some(&RepositoryPhase::Ready),
+            None,
+            &[]
+        ));
+        assert!(maintenance_may_proceed(
+            Some(&RepositoryPhase::Ready),
+            uid,
+            &br_false(BACKEND_UNREACHABLE_REASON)
+        ));
+
+        // Degraded + bootstrapped: proceeds unless confirmed down.
+        let degraded = Some(&RepositoryPhase::Degraded);
+        assert!(maintenance_may_proceed(degraded, uid, &[]));
+        assert!(maintenance_may_proceed(degraded, uid, &br_true()));
+        // The deadline-kill degradation (#414's reason) is NOT confirmation of
+        // an outage — maintenance runs; so does any future unlisted reason.
+        assert!(maintenance_may_proceed(
+            degraded,
+            uid,
+            &br_false(PROBE_DEADLINE_EXCEEDED_REASON)
+        ));
+        assert!(maintenance_may_proceed(
+            degraded,
+            uid,
+            &br_false("SomeFutureReason")
+        ));
+        // Confirmed unreachable / vanished: deferred (#345 breaker semantics).
+        assert!(!maintenance_may_proceed(
+            degraded,
+            uid,
+            &br_false(BACKEND_UNREACHABLE_REASON)
+        ));
+        assert!(!maintenance_may_proceed(
+            degraded,
+            uid,
+            &br_false(REPOSITORY_VANISHED_REASON)
+        ));
+        // Degraded but never bootstrapped: nothing to maintain, deferred.
+        assert!(!maintenance_may_proceed(degraded, None, &[]));
+
+        // Every other phase defers, bootstrapped or not.
+        for phase in [
+            None,
+            Some(&RepositoryPhase::Pending),
+            Some(&RepositoryPhase::Initializing),
+            Some(&RepositoryPhase::Failed),
+        ] {
+            assert!(
+                !maintenance_may_proceed(phase, uid, &[]),
+                "phase {phase:?} must defer"
+            );
+            assert!(!maintenance_may_proceed(phase, None, &[]));
+        }
+        let upgrading = RepositoryPhase::Unknown("Upgrading".into());
+        assert!(
+            !maintenance_may_proceed(Some(&upgrading), uid, &[]),
+            "an unknown (newer-controller) phase must hold, not proceed"
+        );
     }
 }

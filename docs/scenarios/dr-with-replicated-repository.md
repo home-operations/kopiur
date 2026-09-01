@@ -234,7 +234,10 @@ and re-anchors the next cron slot, which is what you want mid-incident.
    whole time waiting for the repository — and its `waitTimeout` window opens at
    that moment, not at creation, so a long seed does not spend it (see
    [Restores → `waitTimeout`](../restores.md#waittimeout--wait-before-giving-up)
-   and `status.waitStartedAt`).
+   and `status.waitStartedAt`). That holds from the very first second of the
+   bring-up: while the `Repository` (or the `SnapshotPolicy` a `fromPolicy`
+   restore names) has not been applied yet, the `Restore` parks with
+   `RestoreReferentMissing` and the window is not open either.
 
 ## Observability
 
@@ -338,12 +341,9 @@ cannot fire on a freshly-created `SnapshotPolicy` — so a rebuilt policy whose
 identity differs silently starts a **new** backup chain beside the history you
 just recovered.
 
-The one signal is a `NoAdoptableHistory` Warning Event: the repository holds
-discovered snapshots and none match this policy's identity. Compare
-`spec.identity` **and** the repository's `identityDefaults` (including
-`identityDefaults.cluster`, which suffixes the default hostname) against the
-pre-disaster manifests before re-applying, and pin `identity` explicitly in DR
-manifests so a rebuild into a differently-named namespace still resolves.
+**Nothing warns you when this happens.** A rebuilt policy that matches none of the recovered history is indistinguishable, from the operator's side, from a brand-new policy that simply has nothing to adopt yet — so it stays quiet and starts backing up. Verify **positively** that adoption happened ([checklist step 5](#verification-checklist) below); don't wait for a signal that it didn't.
+
+Compare `spec.identity` **and** the repository's `identityDefaults` (including `identityDefaults.cluster`, which suffixes the default hostname) against the pre-disaster manifests before re-applying, and pin `identity` explicitly in DR manifests so a rebuild into a differently-named namespace still resolves.
 
 ///
 
@@ -472,8 +472,19 @@ $ kubectl kopiur doctor -n billing
 # 4. The recovered history is visible as discovered snapshots:
 $ kubectl get snapshots -n billing -l kopiur.home-operations.com/origin=discovered
 
-# 5. Your policies MATCH that history (no NoAdoptableHistory warnings):
-$ kubectl get events -n billing --field-selector reason=NoAdoptableHistory
+# 5. Your policies MATCHED that history. Nothing warns you if they didn't, so
+#    check it positively — what did the last adoption pass actually see?
+$ kubectl get snapshotpolicy postgres-data -n billing \
+    -o jsonpath='{.status.adoption.lastScanMatched}{" matched / "}{.status.adoption.lastScanUnmatched}{" unmatched\n"}'
+#    lastScanMatched should cover the history this policy is meant to own; once
+#    every pre-disaster policy is back, lastScanUnmatched should be 0. Empty
+#    output for both means no adoption pass has run yet — not "nothing matched".
+$ kubectl get snapshotpolicy postgres-data -n billing -o jsonpath='{.status.adoption.totalAdopted}'
+#    Expect at least the number of snapshots this policy had before the disaster.
+#    The field is omitted when unset, so empty output means adoption never ran.
+$ kubectl kopiur snapshots list -n billing --origin discovered --repository nas-primary
+#    Expect NOTHING left here after a complete DR: every recovered snapshot has
+#    been claimed by a live policy. Rows that remain are history no policy matches.
 
 # 6. The app's PVC came back with data, not blank:
 $ kubectl get pvc,restore -n billing

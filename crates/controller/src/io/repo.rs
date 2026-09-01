@@ -7,7 +7,7 @@ use kopiur_api::backend::Backend;
 use kopiur_api::common::{
     CatalogBounds, DeletionProtectionSpec, Encryption, IdentityDefaults, MoverDefaults,
     NamespaceDeletePolicy, PhaseLabel, RepositoryKind, RepositoryMode, RepositoryRef,
-    ScheduleDefaults,
+    ScheduleDefaults, Throttle,
 };
 use kopiur_api::preflight::{PreflightInputs, UNKNOWN_AGE};
 use kopiur_api::repository::{RepositoryHealthStatus, RepositoryPhase, StorageStats};
@@ -34,6 +34,35 @@ pub const MAX_CA_BUNDLE_BYTES: usize = 64 * 1024;
 /// never inert; an absent throttle yields an empty spec (the mover skips the call).
 pub fn throttle_spec(defaults: Option<&MoverDefaults>) -> kopiur_mover::workspec::ThrottleSpec {
     kopiur_mover::workspec::ThrottleSpec::from_mover_defaults(defaults)
+}
+
+/// Resolve ONE side's throttle for a two-repository run (a `SnapshotReplication`
+/// migrate, a seed): that side's repository `moverDefaults.throttle` overlaid by
+/// the CR's own per-side override, **field by field**.
+///
+/// Field-wise, not block-wise, because the two layers answer different questions:
+/// the repository default says "never let anything hammer this backend harder
+/// than X", the CR override says "and this particular run is the one I want to
+/// hold back further". Replacing the whole block would silently drop the repo's
+/// other caps the moment a CR pinned one knob — the classic partial-override
+/// footgun that `resolve_mover` avoids for every other `moverDefaults` field.
+///
+/// Both absent ⇒ an empty spec, which the mover reads as "skip `throttle set`
+/// entirely" (kopia keeps whatever limits its config already carries).
+pub fn merged_throttle(
+    defaults: Option<&MoverDefaults>,
+    override_: Option<&Throttle>,
+) -> kopiur_mover::workspec::ThrottleSpec {
+    let base = throttle_spec(defaults);
+    let Some(o) = override_ else { return base };
+    kopiur_mover::workspec::ThrottleSpec {
+        upload_bytes_per_second: o.upload_bytes_per_second.or(base.upload_bytes_per_second),
+        download_bytes_per_second: o
+            .download_bytes_per_second
+            .or(base.download_bytes_per_second),
+        read_ops_per_second: o.read_ops_per_second.or(base.read_ops_per_second),
+        write_ops_per_second: o.write_ops_per_second.or(base.write_ops_per_second),
+    }
 }
 
 /// The credentials a mover Job needs, sourced from a repository's
@@ -880,6 +909,64 @@ mod tests {
         let refs = mover_creds_secret_refs(&backend, &enc("repo-pw", Some("kopiur-system")), None);
         let names: Vec<_> = refs.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["repo-pw", "s3-keys"]); // password first, order-stable
+    }
+
+    // --- merged_throttle (per-side override over that repo's moverDefaults) ---
+
+    fn throttle(up: Option<i64>, down: Option<i64>, r: Option<i64>, w: Option<i64>) -> Throttle {
+        Throttle {
+            upload_bytes_per_second: up,
+            download_bytes_per_second: down,
+            read_ops_per_second: r,
+            write_ops_per_second: w,
+        }
+    }
+
+    fn defaults_with(t: Throttle) -> MoverDefaults {
+        MoverDefaults {
+            throttle: Some(t),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merged_throttle_is_empty_when_neither_layer_sets_anything() {
+        assert!(merged_throttle(None, None).is_empty());
+        assert!(merged_throttle(Some(&MoverDefaults::default()), None).is_empty());
+        // An override present but all-None is still nothing to apply.
+        assert!(merged_throttle(None, Some(&Throttle::default())).is_empty());
+    }
+
+    #[test]
+    fn merged_throttle_falls_back_to_the_repository_defaults() {
+        let d = defaults_with(throttle(Some(1), Some(2), Some(3), Some(4)));
+        let out = merged_throttle(Some(&d), None);
+        assert_eq!(out.upload_bytes_per_second, Some(1));
+        assert_eq!(out.download_bytes_per_second, Some(2));
+        assert_eq!(out.read_ops_per_second, Some(3));
+        assert_eq!(out.write_ops_per_second, Some(4));
+    }
+
+    #[test]
+    fn merged_throttle_override_wins_field_by_field() {
+        // The footgun this exists to prevent: pinning ONE knob on the CR must not
+        // drop the repository's other three.
+        let d = defaults_with(throttle(Some(1), Some(2), Some(3), Some(4)));
+        let o = throttle(Some(99), None, None, Some(88));
+        let out = merged_throttle(Some(&d), Some(&o));
+        assert_eq!(out.upload_bytes_per_second, Some(99), "override wins");
+        assert_eq!(out.download_bytes_per_second, Some(2), "default survives");
+        assert_eq!(out.read_ops_per_second, Some(3), "default survives");
+        assert_eq!(out.write_ops_per_second, Some(88), "override wins");
+    }
+
+    #[test]
+    fn merged_throttle_override_alone_stands_without_defaults() {
+        let o = throttle(None, Some(7), None, None);
+        let out = merged_throttle(None, Some(&o));
+        assert_eq!(out.download_bytes_per_second, Some(7));
+        assert_eq!(out.upload_bytes_per_second, None);
+        assert!(!out.is_empty());
     }
 
     #[test]

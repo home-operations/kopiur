@@ -386,6 +386,36 @@ pub const SOURCE_PVC_AVAILABLE_CONDITION: &str = "SourcePvcAvailable";
 /// `reason`/Event reason for [`SOURCE_PVC_AVAILABLE_CONDITION`] = `False`.
 pub const SOURCE_PVC_MISSING_REASON: &str = "SourcePvcMissing";
 
+/// `Restore` condition recording whether the object this restore's repository
+/// is DERIVED from exists. Set `False` (with
+/// [`RESTORE_REFERENT_MISSING_REASON`]) when the readiness gate cannot even
+/// look up the repository because a referent is absent: the explicit
+/// `spec.repository` object itself, or the `source.fromPolicy` `SnapshotPolicy`
+/// the repository ref is read from (issue #393).
+///
+/// Its own condition rather than the `Ready` one: the registry's coarse
+/// [`crate::gates::StructuralGate::trips`] filter keys on condition+polarity,
+/// so registering a `Ready=False` row would make every unrelated `Ready=False`
+/// reason on a `Snapshot`/`Restore` read as an unknown gate from a newer
+/// operator. Only this gate ever writes this condition, so it cannot misfire.
+///
+/// Structural ([`crate::gates::RESTORE_REFERENT_MISSING_GATE`]): a referent
+/// that is never created never self-heals, and while it is missing the restore
+/// sits at `phase: Pending` with its `policy.waitTimeout` window deliberately
+/// NOT started — the phase-invisible park shape of #359.
+pub const RESTORE_REFERENT_AVAILABLE_CONDITION: &str = "ReferentAvailable";
+/// `reason`/Event reason for [`RESTORE_REFERENT_AVAILABLE_CONDITION`] =
+/// `False`. Distinct from [`REPOSITORY_NOT_READY_REASON`] on purpose: that one
+/// means "the repository object exists and its backend is unreachable", which
+/// would be a lie for a `SnapshotPolicy` that was never applied.
+pub const RESTORE_REFERENT_MISSING_REASON: &str = "RestoreReferentMissing";
+/// `reason` for [`RESTORE_REFERENT_AVAILABLE_CONDITION`] = `True`: the referent
+/// appeared on a later pass (the clear-side counterpart of
+/// [`RESTORE_REFERENT_MISSING_REASON`]; controller-internal remediation copy,
+/// like the `Snapshot` gate's `SourcePvcFound`). Written ONLY when the
+/// condition already exists — the healthy wire never grows the condition.
+pub const RESTORE_REFERENT_FOUND_REASON: &str = "RestoreReferentFound";
+
 /// `Snapshot` condition: this deletion is HELD by the mass-deletion breaker
 /// (`Repository`/`ClusterRepository` `spec.deletionProtection.threshold`)
 /// until acknowledged via [`ALLOW_MASS_DELETION_ANNOTATION`] on the

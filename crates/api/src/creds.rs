@@ -90,6 +90,13 @@ pub struct CredsSecretRef {
     pub namespace: Option<String>,
 }
 
+/// The highest per-repository credential-Secret index [`mover_creds_secret_refs`]
+/// can ever yield: the encryption-password Secret (idx 0) plus, only when it is
+/// differently named, the backend's auth Secret (idx 1). Every consumer that
+/// derives per-index resource names (projected copies, server mirrors) bounds
+/// its reap walks with this.
+pub const MAX_CREDS_IDX: usize = 1;
+
 /// The distinct credential Secrets a mover Job for `backend` + `encryption` needs
 /// as `envFrom`, each with its resolved *source* namespace: always the
 /// encryption-password Secret, plus the backend `auth` Secret when present and

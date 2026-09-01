@@ -16,7 +16,11 @@
 //! adoption (the cluster-wide-LIST guard). Scenario 4 proves the Phase-2
 //! `kopiur-meta` loop: the recorded backup-time mover identity + description ride
 //! the kopia snapshot itself, survive CR deletion, come back on the adopted row,
-//! and the scan BACKFILLS `status.recorded` onto rows that lack it.
+//! and the scan BACKFILLS `status.recorded` onto rows that lack it. Scenario 5 is
+//! the "stay quiet" regression guard for the REMOVED `NoAdoptableHistory` warning:
+//! a NEW zero-history policy sitting beside a RETIRED policy's foreign-identity
+//! discovered rows must publish no warning, adopt nothing, and record the outcome
+//! as neutral counters on `status.adoption`.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; skip gracefully off-cluster.
 
@@ -1679,6 +1683,358 @@ async fn recorded_meta_round_trips_through_deletion_and_adoption() {
             .await;
     }
     let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = wait_until(
+        "snapshot CRs drain before repo teardown",
+        Duration::from_secs(120),
+        poll_interval(),
+        || async {
+            let live = backups
+                .list(&ListParams::default().labels(&format!("{REPOSITORY_UID_LABEL}={repo_uid}")))
+                .await?
+                .items;
+            Ok(live.is_empty().then_some(()))
+        },
+    )
+    .await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 5 — a new policy beside FOREIGN history stays quiet (the field case).
+// ---------------------------------------------------------------------------
+
+const S5_SUBPATH: &str = "adopt-quiet";
+
+/// The reason literal of the **deleted** `NoAdoptableHistory` Warning event.
+///
+/// Unlike the literals at the top of this file, this one does NOT mirror a live
+/// controller const: `consts::NO_ADOPTABLE_HISTORY_REASON` was removed, and that
+/// removal is precisely what this scenario guards. The literal therefore lives
+/// here to be asserted **ABSENT** — if any future change re-introduces a Warning
+/// under this reason for a policy that merely sits beside someone else's history,
+/// the settle loop below fails.
+const NO_ADOPTABLE_HISTORY_REASON: &str = "NoAdoptableHistory";
+
+/// THE "STAY QUIET" REGRESSION GUARD (the HOPS field report, 2026-08-29).
+///
+/// The exact shape a real user hit on a shared repository: an app is retired, its
+/// `SnapshotPolicy` deleted with the safe-default `Retain` cascade, so its kopia
+/// history survives and re-materializes as `discovered` rows. A DIFFERENT app is
+/// then onboarded against the SAME repository — a brand-new policy with no history
+/// of its own, whose kopia identity cannot match the retired app's rows.
+///
+/// The old code answered that with an UNLATCHED `NoAdoptableHistory` Warning
+/// (`!matched_any && !has_history && catalog_non_empty`), re-emitted on every ~5
+/// minute policy reconcile until the new policy's first successful backup — days on
+/// a typical cron, and unfixable by the user except by disabling adoption entirely.
+/// This scenario pins the replacement contract: the operator says **nothing** and
+/// instead records neutral facts.
+///
+/// Fixture choices are load-bearing:
+/// - policy B differs from A only in `metadata.name`, which alone re-renders the
+///   kopia username (the resolver default) and therefore the whole identity — the
+///   same harness fact Scenario 1's negative control relies on. B deliberately
+///   keeps A's repository AND subpath: a different `subpath` would bind a
+///   different backing kopia repo (see `common`'s repo-isolation docs), so B would
+///   see an EMPTY catalog and the scenario would prove nothing;
+/// - the gate before the settle window is B's own `status.adoption` counters, not
+///   the `scanRequestedAt` stamp: that stamp is cleared once honored, so polling
+///   for it is inherently racy, while `lastScanUnmatched >= 1` positively proves
+///   B's adoption pass SAW the foreign rows — the exact state in which the deleted
+///   warning fired. Only then is a 60s window of silence meaningful.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn foreign_history_policy_stays_quiet_and_adopts_nothing() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, S5_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-adopt-quiet-repo";
+    // The RETIRED app (policy A) and the NEWLY-ONBOARDED one (policy B). The names
+    // differ ⇒ the resolved kopia usernames differ ⇒ the identities differ.
+    const RETIRED_POLICY: &str = "e2e-adopt-quiet-old";
+    const NEW_POLICY: &str = "e2e-adopt-quiet-new";
+    const RETIRED_SNAP: &str = "e2e-adopt-quiet-1";
+
+    // Fast catalog refresh so the retained snapshot re-materializes as a discovered
+    // row in seconds rather than an hour; maintenance off to cut Job churn.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                S5_SUBPATH,
+                serde_json::json!({
+                    "maintenance": { "enabled": false },
+                    "catalog": { "periodicRefresh": true, "refreshInterval": "30s" }
+                }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+
+    // --- The retired app: one real backup, then the policy is deleted -------------
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                RETIRED_POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create the retired-app SnapshotPolicy");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                RETIRED_SNAP,
+                RETIRED_POLICY,
+                serde_json::json!({ "deletionPolicy": "Retain" }),
+            )),
+        )
+        .await
+        .expect("create the retired app's Snapshot");
+    wait_phase(&backups, RETIRED_SNAP, "Succeeded")
+        .await
+        .expect("the retired app's Snapshot should Succeed");
+    let retired_identity = row_identity(
+        &backups
+            .get(RETIRED_SNAP)
+            .await
+            .expect("get the retired app's Snapshot"),
+    );
+    assert!(
+        retired_identity.starts_with(&format!("{RETIRED_POLICY}@")),
+        "the retired history must carry the retired policy's username \
+         (the whole premise that policy B cannot match it): {retired_identity}"
+    );
+
+    policies
+        .delete(RETIRED_POLICY, &DeleteParams::default())
+        .await
+        .expect("retire the app: delete its SnapshotPolicy");
+    wait_until(
+        "the retired policy + its config-labeled CR drain (Retain cascade)",
+        Duration::from_secs(240),
+        poll_interval(),
+        || async {
+            let children = config_labeled(&client, E2E_NAMESPACE, RETIRED_POLICY).await;
+            let gone = policies.get_opt(RETIRED_POLICY).await?.is_none();
+            Ok((children.is_empty() && gone).then_some(()))
+        },
+    )
+    .await
+    .expect("the retired policy and its config-labeled CR must drain");
+
+    let repo_uid = repos
+        .get(REPO)
+        .await
+        .expect("get Repository")
+        .uid()
+        .expect("Repository uid");
+
+    // The retained kopia snapshot comes back as a FOREIGN discovered row — the
+    // "someone else's history in my repository" the new app is about to meet.
+    wait_until(
+        "the retired app's kopia history re-materializes as a discovered row",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let client = client.clone();
+            let repo_uid = repo_uid.clone();
+            let want = retired_identity.clone();
+            async move {
+                let rows = discovered_rows(&client, E2E_NAMESPACE, &repo_uid).await;
+                Ok(rows.iter().any(|r| row_identity(r) == want).then_some(()))
+            }
+        },
+    )
+    .await
+    .expect("the Retain-cascaded history must re-materialize as a discovered row");
+
+    // --- The new app: zero history, different identity, SAME repository ----------
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                NEW_POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("onboard the new app: create its SnapshotPolicy");
+
+    // Fixture sanity: the new policy really resolves to a DIFFERENT kopia username
+    // (`metadata.name` is the resolver default), so it cannot adopt the foreign rows.
+    let new_username = wait_until(
+        "the new policy resolves its kopia identity",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(status_json(&policies, NEW_POLICY)
+                .await
+                .pointer("/resolved/identity/username")
+                .and_then(|v| v.as_str())
+                .map(str::to_string))
+        },
+    )
+    .await
+    .expect("the new policy must resolve an identity");
+    assert_eq!(
+        new_username, NEW_POLICY,
+        "the resolved username must default to metadata.name — the fixture's only \
+         lever for making the two identities differ"
+    );
+    assert_ne!(
+        new_username, RETIRED_POLICY,
+        "the two policies must resolve DIFFERENT identities or this scenario proves nothing"
+    );
+
+    // The new policy's adoption pass RAN and recorded what it saw: nothing of its
+    // own, and ≥1 foreign row. This is exactly the state that used to fire the
+    // `NoAdoptableHistory` Warning, so reaching it is what makes the silence below
+    // a genuine regression guard rather than a race the test won.
+    wait_until(
+        "the new policy records its scan outcome: 0 matched, ≥1 unmatched",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&policies, NEW_POLICY).await;
+            let matched = s
+                .pointer("/adoption/lastScanMatched")
+                .and_then(|v| v.as_i64());
+            let unmatched = s
+                .pointer("/adoption/lastScanUnmatched")
+                .and_then(|v| v.as_i64());
+            Ok((matched == Some(0) && unmatched.is_some_and(|n| n >= 1)).then_some(()))
+        },
+    )
+    .await
+    .expect(
+        "status.adoption must record the neutral scan outcome (lastScanMatched: 0, \
+         lastScanUnmatched: ≥1) — the readable fact that REPLACED the warning",
+    );
+
+    // Settle window: for ~60s the operator stays QUIET. Pre-removal code emitted the
+    // Warning within one reconcile of the rows materializing (the belt requeue after
+    // a scan request reconciles the policy promptly) and then re-emitted it on every
+    // steady ~5-minute pass, so this window catches both the first shot and a relapse
+    // into re-emission.
+    let settle_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        // (1) THE REGRESSION GUARD: no `NoAdoptableHistory` Warning on the new policy.
+        assert!(
+            !event_exists(
+                &client,
+                E2E_NAMESPACE,
+                NO_ADOPTABLE_HISTORY_REASON,
+                "SnapshotPolicy",
+                NEW_POLICY
+            )
+            .await,
+            "a new policy beside SOMEONE ELSE'S retained history must publish NO \
+             `{NO_ADOPTABLE_HISTORY_REASON}` Warning — that event was removed because it \
+             fires on the ordinary shared-repository case and cannot be silenced by the user"
+        );
+        // (2) It adopts nothing: no adoption event, and no `origin: adopted` row.
+        assert!(
+            !event_exists(
+                &client,
+                E2E_NAMESPACE,
+                SNAPSHOTS_ADOPTED_REASON,
+                "SnapshotPolicy",
+                NEW_POLICY
+            )
+            .await,
+            "the new policy must never adopt a foreign identity's history"
+        );
+        let adopted: Vec<Snapshot> = {
+            let api: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+            api.list(&ListParams::default().labels(&format!(
+                "{ORIGIN_LABEL}=adopted,{REPOSITORY_UID_LABEL}={repo_uid}"
+            )))
+            .await
+            .map(|l| l.items)
+            .unwrap_or_default()
+        };
+        assert!(
+            adopted.is_empty(),
+            "no `origin: adopted` row may appear — the only history here belongs to the \
+             RETIRED policy's identity: {:?}",
+            adopted.iter().map(|a| a.name_any()).collect::<Vec<_>>()
+        );
+        // (3) The foreign row is untouched: still present, still `discovered`.
+        let disc = discovered_rows(&client, E2E_NAMESPACE, &repo_uid).await;
+        let row = disc
+            .iter()
+            .find(|r| row_identity(r) == retired_identity)
+            .unwrap_or_else(|| {
+                panic!("the foreign row must STAY in the catalog: {retired_identity}")
+            });
+        assert_eq!(
+            status_origin(row),
+            "discovered",
+            "the foreign row must stay `discovered` (never re-attached to the new policy)"
+        );
+        if Instant::now() >= settle_deadline {
+            break;
+        }
+        tokio::time::sleep(poll_interval()).await;
+    }
+
+    // The counters are the durable, user-readable outcome — re-asserted AFTER the
+    // window so a later pass cannot have quietly rewritten them into a verdict.
+    let s = status_json(&policies, NEW_POLICY).await;
+    assert_eq!(
+        s.pointer("/adoption/lastScanMatched")
+            .and_then(|v| v.as_i64()),
+        Some(0),
+        "status.adoption.lastScanMatched must stay 0 — nothing in this repository is \
+         this policy's history: {s}"
+    );
+    assert!(
+        s.pointer("/adoption/lastScanUnmatched")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|n| n >= 1),
+        "status.adoption.lastScanUnmatched must record the foreign rows the pass saw: {s}"
+    );
+    assert_eq!(
+        s.pointer("/adoption/lastAdoptedCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        0,
+        "the new policy must have adopted nothing: {s}"
+    );
+
+    // Cleanup: discovered rows are forced-Retain (deleting them leaves kopia intact);
+    // Snapshot CRs BEFORE the Repository (finalizers need it).
+    for r in discovered_rows(&client, E2E_NAMESPACE, &repo_uid).await {
+        let _ = backups
+            .delete(&r.name_any(), &DeleteParams::default())
+            .await;
+    }
+    let _ = policies.delete(NEW_POLICY, &DeleteParams::default()).await;
     let _ = wait_until(
         "snapshot CRs drain before repo teardown",
         Duration::from_secs(120),

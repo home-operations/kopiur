@@ -5446,11 +5446,6 @@ fn writable_source_conflicts_with_a_read_only_many_staged_pvc() {
         "ReadOnlyMany + readOnly: false must be rejected"
     );
     assert!(msg.contains("ReadOnlyMany"), "{msg}");
-    // The same conflict exists for a read-only staged CLASS, which admission cannot see.
-    assert!(
-        msg.contains("backingSnapshot"),
-        "must warn about the invisible twin: {msg}"
-    );
 
     // ReadOnlyMany + the read-only default is the documented pairing — still valid.
     let spec = policy_yaml(
@@ -5832,6 +5827,7 @@ fn srepl_spec(source: RepositoryRef, dest: RepositoryRef, cron: &str) -> Snapsho
 
 #[test]
 fn srepl_valid_full_spec_has_no_errors() {
+    use crate::common::{MigrateThrottle, Throttle};
     use crate::snapshot_replication::{
         IdentityMatcher, IdentitySelection, MigrateOptions, PolicyCopyMode, Pruning, SelectionSpec,
     };
@@ -5860,6 +5856,17 @@ fn srepl_valid_full_spec_has_no_errors() {
     spec.migrate = Some(MigrateOptions {
         parallel: Some(4),
         policies: PolicyCopyMode::Copy,
+        throttle: Some(MigrateThrottle {
+            source: Some(Throttle {
+                download_bytes_per_second: Some(20 * 1024 * 1024),
+                ..Default::default()
+            }),
+            destination: Some(Throttle {
+                upload_bytes_per_second: Some(5 * 1024 * 1024),
+                write_ops_per_second: Some(50),
+                ..Default::default()
+            }),
+        }),
     });
     spec.pruning = Some(Pruning::Retention(Retention {
         keep_daily: Some(7),
@@ -6137,6 +6144,127 @@ fn srepl_migrate_parallel_zero_is_rejected() {
         ..Default::default()
     });
     assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_migrate_throttle_rejects_non_positive_rates_per_side() {
+    use crate::common::{MigrateThrottle, Throttle};
+    use crate::snapshot_replication::MigrateOptions;
+    let mut spec = srepl_spec(
+        srepl_ref(RepositoryKind::Repository, "a", None),
+        srepl_ref(RepositoryKind::Repository, "b", None),
+        "0 6 * * *",
+    );
+    // A zero on one side and a negative on the other: BOTH must be reported, and
+    // each message must name the side + the knob (a per-side cap is useless
+    // guidance if the operator can't tell which connection is wrong).
+    spec.migrate = Some(MigrateOptions {
+        throttle: Some(MigrateThrottle {
+            source: Some(Throttle {
+                download_bytes_per_second: Some(0),
+                ..Default::default()
+            }),
+            destination: Some(Throttle {
+                upload_bytes_per_second: Some(-1),
+                write_ops_per_second: Some(0),
+                ..Default::default()
+            }),
+        }),
+        ..Default::default()
+    });
+    let fields: Vec<String> = validate_snapshot_replication(&spec)
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, .. } => Some(field.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            "SnapshotReplication spec.migrate.throttle.source.downloadBytesPerSecond",
+            "SnapshotReplication spec.migrate.throttle.destination.uploadBytesPerSecond",
+            "SnapshotReplication spec.migrate.throttle.destination.writeOpsPerSecond",
+        ],
+        "every offending knob is named, source side first"
+    );
+
+    // 1 is the smallest accepted rate; unset knobs are always fine.
+    spec.migrate = Some(MigrateOptions {
+        throttle: Some(MigrateThrottle {
+            source: Some(Throttle {
+                download_bytes_per_second: Some(1),
+                ..Default::default()
+            }),
+            destination: Some(Throttle {
+                upload_bytes_per_second: Some(1),
+                read_ops_per_second: Some(1),
+                write_ops_per_second: Some(1),
+                ..Default::default()
+            }),
+        }),
+        ..Default::default()
+    });
+    assert!(validate_snapshot_replication(&spec).is_empty());
+
+    // An empty MigrateThrottle constrains nothing and is accepted (both sides
+    // simply inherit their repository's moverDefaults).
+    spec.migrate = Some(MigrateOptions {
+        throttle: Some(MigrateThrottle::default()),
+        ..Default::default()
+    });
+    assert!(validate_snapshot_replication(&spec).is_empty());
+}
+
+#[test]
+fn srepl_migrate_throttle_roundtrips_camel_case_through_the_apiserver_path() {
+    // YAML → JSON → typed, the way the cluster parses it (serde_yaml 0.9 would
+    // mis-encode the nested sub-objects).
+    use crate::snapshot_replication::SnapshotReplicationSpec;
+    use crate::testutil::from_yaml;
+    let spec: SnapshotReplicationSpec = from_yaml(
+        r#"
+sourceRef: { name: nas-primary }
+destinationRef: { name: offsite }
+schedule: { cron: "0 6 * * *" }
+migrate:
+  parallel: 2
+  throttle:
+    source:
+      downloadBytesPerSecond: 20971520
+      readOpsPerSecond: 200
+    destination:
+      uploadBytesPerSecond: 5242880
+      writeOpsPerSecond: 50
+"#,
+    );
+    let t = spec
+        .migrate
+        .as_ref()
+        .and_then(|m| m.throttle.as_ref())
+        .expect("migrate.throttle set");
+    let src = t.source.as_ref().expect("source side set");
+    assert_eq!(src.download_bytes_per_second, Some(20 * 1024 * 1024));
+    assert_eq!(src.read_ops_per_second, Some(200));
+    assert_eq!(src.upload_bytes_per_second, None);
+    let dst = t.destination.as_ref().expect("destination side set");
+    assert_eq!(dst.upload_bytes_per_second, Some(5 * 1024 * 1024));
+    assert_eq!(dst.write_ops_per_second, Some(50));
+
+    // Re-serializing keeps the camelCase wire shape and elides unset knobs.
+    let json = serde_json::to_value(&spec).expect("serialize");
+    assert_eq!(
+        json["migrate"]["throttle"]["source"]["readOpsPerSecond"],
+        200
+    );
+    assert!(
+        json["migrate"]["throttle"]["source"]
+            .get("uploadBytesPerSecond")
+            .is_none(),
+        "unset knobs are elided: {json}"
+    );
+    let reparsed: SnapshotReplicationSpec = serde_json::from_value(json).expect("reparse");
+    assert_eq!(spec, reparsed);
 }
 
 #[test]
@@ -6629,6 +6757,66 @@ fn seed_numeric_knobs_and_failure_policy_must_be_positive() {
 }
 
 #[test]
+fn a_seed_migrate_throttle_is_rejected_per_side_and_names_the_knob() {
+    // #374: a cap is a positive rate on either side. Both sides are checked
+    // independently and the message names the side, because "source" is the
+    // REPLICA and "destination" is this repository — mixing them up is the
+    // likely authoring mistake, and a message that only named the knob would
+    // not help at all.
+    let errs = validate_repository(&repo_with_seed(&format!(
+        "{MIGRATE_SEED}  migrate:\n    throttle:\n      source: {{ downloadBytesPerSecond: 0 }}\n      \
+         destination: {{ uploadBytesPerSecond: -1, writeOpsPerSecond: 0 }}\n"
+    )));
+    let fields: Vec<String> = errs
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, .. } => Some(field.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            "spec.seed.migrate.throttle.source.downloadBytesPerSecond",
+            "spec.seed.migrate.throttle.destination.uploadBytesPerSecond",
+            "spec.seed.migrate.throttle.destination.writeOpsPerSecond",
+        ],
+        "every offending knob is named, source side first: {errs:?}"
+    );
+
+    // 1 is the smallest accepted rate, unset knobs are always fine, and an
+    // empty block constrains nothing (both sides inherit their repository's
+    // moverDefaults).
+    assert!(
+        validate_repository(&repo_with_seed(&format!(
+            "{MIGRATE_SEED}  migrate:\n    throttle:\n      source: {{ downloadBytesPerSecond: 1 }}\n      \
+             destination: {{ uploadBytesPerSecond: 1, readOpsPerSecond: 1, writeOpsPerSecond: 1 }}\n"
+        )))
+        .is_empty()
+    );
+    assert!(
+        validate_repository(&repo_with_seed(&format!(
+            "{MIGRATE_SEED}  migrate: {{ throttle: {{}} }}\n"
+        )))
+        .is_empty()
+    );
+
+    // A throttle on a BLOB seed is refused as an inert field by the existing
+    // mode-pairing rule — `migrate` belongs to `from.repository`, throttle and
+    // all — rather than silently doing nothing.
+    let errs = validate_repository(&repo_with_seed(&format!(
+        "{BLOB_SEED}  migrate: {{ throttle: {{ source: {{ downloadBytesPerSecond: 1 }} }} }}\n"
+    )));
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::SeedTuningNotApplicable { field, .. } if field == "migrate"
+        )),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn a_cluster_repository_seed_ref_must_not_carry_a_namespace() {
     // `validate_repository_ref`'s existing rule reaches the seed source too.
     let errs = validate_repository(&repo_with_seed(
@@ -6831,4 +7019,71 @@ encryption: { passwordSecretRef: { name: s } }
         )
         .is_empty()
     );
+}
+
+// --- Message-shape lint: the structural guard that keeps the what/why/fix,
+// lead-with-specific contract from rotting. `message_shape_issue` flags a
+// doubled space, a generic filler lead, a leaked volatile temp fragment, or a
+// ramble. Run it over the messages this overhaul reshaped. ---
+
+#[test]
+fn every_numeric_bound_message_is_well_formed() {
+    // Each NumericBound's rejection (the M3 require_min output) leads with the
+    // specific bound and carries a why.
+    for bound in [
+        NumericBound::Count,
+        NumericBound::RatePerSecond,
+        NumericBound::Megabytes,
+        NumericBound::Seconds,
+    ] {
+        let e = require_min("Test spec.field", 0, bound).expect("0 is below the minimum");
+        assert_eq!(
+            crate::message_shape_issue(&e.to_string()),
+            None,
+            "NumericBound::{bound:?} message not well-formed: {e}"
+        );
+    }
+    let e = require_min("Test spec.backoffLimit", -1, NumericBound::BackoffCount)
+        .expect("-1 is below the minimum");
+    assert_eq!(crate::message_shape_issue(&e.to_string()), None, "{e}");
+}
+
+#[test]
+fn representative_validation_error_messages_are_well_formed() {
+    // A cross-section of the ValidationError families (short field errors, bespoke
+    // long ones, unit variants). Not exhaustive, but broad enough that a sloppy
+    // new message in any of these shapes trips the lint.
+    let samples = vec![
+        ValidationError::MissingRequiredField {
+            field: "spec.backend".into(),
+        },
+        ValidationError::InvalidCron {
+            expr: "* *".into(),
+            reason: "expected 5 fields".into(),
+        },
+        ValidationError::DiscoveredMustRetain {
+            got: "Delete".into(),
+        },
+        ValidationError::Immutable {
+            field: "spec.backend.s3.bucket".into(),
+        },
+        ValidationError::MutuallyExclusive {
+            a: "pvc".into(),
+            b: "pvcSelector".into(),
+            context: "snapshot source".into(),
+        },
+        ValidationError::InsecureServerNotAcknowledged,
+        ValidationError::RestoreSourceRepositoryRequired,
+        ValidationError::InvalidFieldValue {
+            field: "snapshot source nfs.path".into(),
+            reason: "must be an absolute export path beginning with '/'".into(),
+        },
+    ];
+    for e in samples {
+        assert_eq!(
+            crate::message_shape_issue(&e.to_string()),
+            None,
+            "ValidationError message not well-formed: {e}"
+        );
+    }
 }

@@ -133,6 +133,13 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // delete (`polcasc-delete`), and simultaneous schedule+policy delete (`polcasc-simul`).
     "adopt-prune",
     "adopt-ignore",
+    // The "stay quiet" regression guard (adoption.rs:
+    // `foreign_history_policy_stays_quiet_and_adopts_nothing`): a retired policy's
+    // history sits as discovered rows while a NEW, zero-history policy of a
+    // different identity reconciles beside it. It asserts an ABSENCE (no warning
+    // event, no adoption) across a settle window, so any foreign traffic in the
+    // same kopia repo would make the proof meaningless — it needs its own repo.
+    "adopt-quiet",
     "polcasc-retain",
     "polcasc-delete",
     "polcasc-simul",
@@ -144,6 +151,11 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // (repository Ready), not at the Restore's creation — needs its own repo, created
     // SUSPENDED so it is cold until the scenario releases it.
     "waitanchor",
+    // #393: the readiness gate must PARK (no `waitStartedAt`) while the repository
+    // referent does not exist. Distinct from `waitanchor`, whose repository
+    // pre-exists (suspended): here the `Repository` and the `SnapshotPolicy` are
+    // created MID-TEST, so the shard must start with no repository at all.
+    "waitref",
     // SnapshotReplication (issue #368, crates/e2e/tests/snapshot_replication.rs):
     // logical fs→fs replication. Each scenario needs its OWN source AND destination
     // kopia repository so copy/prune/idempotency counts never leak between scenarios:
@@ -241,6 +253,20 @@ pub const PV_SRC_EH: &str = "kopiur-e2e-src-eh";
 /// PVC (operator namespace) binding [`PV_SRC_EH`].
 pub const PVC_SRC_EH: &str = "e2e-src-eh";
 
+// --- Repository throttle (#374) ------------------------------------------------
+/// The mover's log line proving `moverDefaults.throttle` reached kopia on a
+/// connection (`crates/mover/src/main.rs::apply_repository_throttle`). Scenarios
+/// assert on THIS, not on timing: kopia's limits only bite cold-cache backend
+/// traffic, so a generous cap changes no runtime and a timing-based assertion
+/// would be a silent green. Keep in lockstep with the mover's `info!` message.
+pub const THROTTLE_APPLIED_LOG: &str = "applied repository throttle";
+
+/// A deliberately NON-BINDING throttle (100 MiB/s) for the scenarios that assert
+/// the throttle is applied at all. Generous on purpose: it must not move any
+/// scenario's runtime, and a low byte cap is punishing out of all proportion on
+/// the small-object workloads these fixtures produce.
+pub const THROTTLE_BYTES_PER_SECOND: i64 = 104_857_600;
+
 // --- Secrets -------------------------------------------------------------------
 /// Filesystem-backend credentials (just `KOPIA_PASSWORD`).
 pub const SECRET_FS_CREDS: &str = "kopia-creds";
@@ -249,6 +275,16 @@ pub const SECRET_FS_CREDS: &str = "kopia-creds";
 pub const SECRET_S3_CREDS: &str = "kopia-s3-creds";
 /// Valid S3 keys but a WRONG repo password — exercises the safe-create guard.
 pub const SECRET_S3_BADPW: &str = "kopia-s3-badpw";
+
+// --- Split-secret layout (#416) --------------------------------------------------
+// The password and the backend keys live in SEPARATE Secrets, so any pod that
+// env-injects only one of them fails to connect. The single-Secret fixture above
+// dedupes to one `envFrom` and therefore HID the class of bug where the second
+// Secret is dropped (the kopia UI server crashlooped exactly this way).
+/// AWS keys ONLY (no repo password) — pair with [`SECRET_KOPIA_PW_ONLY`].
+pub const SECRET_S3_KEYS_ONLY: &str = "kopia-s3-keys-only";
+/// Repo password ONLY (no backend keys) — pair with [`SECRET_S3_KEYS_ONLY`].
+pub const SECRET_KOPIA_PW_ONLY: &str = "kopia-password-only";
 
 // --- S3→S3 replication isolation (crates/e2e/tests/replication.rs, #200) ---------
 // Two DISJOINT, bucket-scoped MinIO users so a replication mover proves it uses the
@@ -341,6 +377,11 @@ pub const BUCKETS: &[&str] = &[
     // `server_read_only_ui_connects_read_only`): a distinct bucket so the
     // read-only and read-write server fixtures don't collide.
     "kopiur-server-ui-ro",
+    // #416: ClusterRepository web-UI server with SPLIT password/backend Secrets
+    // and `spec.server.namespace` set to a fresh namespace — proves the operator
+    // mirrors EACH credential Secret next to the server and mints the mover SA
+    // there (crates/e2e/tests/lifecycle.rs).
+    "kopiur-crepo-server",
     // Foreign-repo import scenarios (crates/e2e/tests/import.rs): repositories +
     // snapshots created by RAW kopia (the seeder pod), then adopted by kopiur.
     "kopiur-import",
@@ -367,6 +408,11 @@ pub const BUCKETS: &[&str] = &[
     // in-binary ordering is not guaranteed.
     BUCKET_PROBE_CHURN_REPO,
     BUCKET_PROBE_CHURN_CREPO,
+    // Deadline-kill scenarios (crates/e2e/tests/bootstrap_deadline.rs, #413/#414/#415):
+    // one bucket per scenario — A re-bootstraps a Ready repository under an impossible
+    // 1s deadline; B is born under it and must never share A's kopia repository.
+    "kopiur-bootstrap-deadline-a",
+    "kopiur-bootstrap-deadline-b",
     // RepositoryReplication to an S3 destination (crates/e2e/tests/replication.rs,
     // the #200 regression guard): a filesystem source mirrors here, so `sync-to`
     // only succeeds if the destination backend's OWN S3 credentials are injected.

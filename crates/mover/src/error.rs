@@ -399,11 +399,10 @@ pub enum MoverError {
     /// the rejected call was a GET, which sent the reporter debugging the wrong
     /// request.
     #[error(
-        "failed to read the status of {kind} {namespace}/{name} (GET on the status \
-         subresource): {source}. The mover reads status.resolved so a Job retry reuses the \
-         snapshot a prior attempt pinned; without it this run re-resolves from the \
-         repository. Requires `get` on the CRD's /status subresource in the kopiur-mover \
-         role (shipped by default)"
+        "failed to read the status of {kind} {namespace}/{name} (GET on the /status \
+         subresource): {source}. The mover reads status.resolved to reuse the snapshot a \
+         prior attempt pinned instead of re-resolving from the repository. Fix: grant `get` \
+         on the CRD's /status subresource in the kopiur-mover role (shipped by default)"
     )]
     StatusRead {
         /// The target CR kind.
@@ -464,10 +463,10 @@ pub enum MoverError {
     #[error(
         "the seed source repository's kopia password is missing: ${env_key} is unset, so \
          `spec.seed`'s source repository cannot be opened. The controller injects it from the \
-         SOURCE repository's encryption Secret — check that the source repository CR still \
-         exists and is readable, that its encryption Secret (or its projected copy) is present, \
-         and — for a cross-namespace source — that spec.seed.credentialProjection is enabled \
-         along with the operator's features.credentialProjection install flag"
+         SOURCE repository's encryption Secret. Fix: check the source repository CR exists and \
+         is readable and its encryption Secret (or its projected copy) is present; a \
+         cross-namespace source also needs spec.seed.credentialProjection and the operator's \
+         features.credentialProjection install flag"
     )]
     SeedPasswordMissing {
         /// The env var that should carry the seed source's password
@@ -482,10 +481,11 @@ pub enum MoverError {
     /// is the real success gate.
     #[error(
         "snapshot replication is incomplete: {missing} of {expected} expected snapshot(s) did \
-         not arrive on the destination after `kopia snapshot migrate` (which exits 0 even when \
-         a per-source migration fails — see the mover pod logs for kopia's per-source errors). \
-         Missing (up to {sample_cap} shown): {sample}. The run will be retried; migrate is \
-         idempotent by (identity, startTime), so a retry only copies what is still missing",
+         not arrive on the destination. `kopia snapshot migrate` exits 0 even when a per-source \
+         migration fails, so the post-verify is the real success gate — see the mover pod logs \
+         for kopia's per-source errors. Missing (up to {sample_cap} shown): {sample}. Retried \
+         automatically; migrate is idempotent by (identity, startTime), so it copies only what \
+         is still missing",
         sample_cap = MISSING_SAMPLE_CAP
     )]
     MigrateIncomplete {

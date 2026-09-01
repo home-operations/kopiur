@@ -82,11 +82,11 @@ pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
 /// without this guard the reconcile just wedges on retried 403s while the
 /// consumer PVC sits Pending unexplained.
 pub fn populator_needs_cluster_scope_message() -> String {
-    "target.populator is not available in a namespaced install (installScope: namespaced): \
-     the volume-populator handshake reads StorageClasses and rebinds PersistentVolumes, \
-     which are cluster-scoped and cannot be granted by the install's Role RBAC. Use \
-     target.pvc or target.pvcRef for a direct restore, or reinstall with \
-     installScope=cluster to use the populator."
+    "target.populator is unavailable in a namespaced install (installScope: namespaced): its \
+     volume-populator handshake reads StorageClasses and rebinds PersistentVolumes, which are \
+     cluster-scoped and cannot be granted by the install's Role RBAC. Fix: use target.pvc or \
+     target.pvcRef for a direct restore, or reinstall with installScope=cluster to use the \
+     populator."
         .to_string()
 }
 /// Whether a `Restore` in `phase` has NOT yet launched its mover Job — the set the
@@ -235,11 +235,11 @@ pub(super) fn target_already_bound_message(
         None => "a PersistentVolume".to_string(),
     };
     format!(
-        "populator: the claiming PVC `{consumer_name}` is already bound to {volume}, so there \
-         is nothing to populate — the CSI volume-populator handover only applies to an UNBOUND \
-         claim. No prime PVC was provisioned and no restore ran; the live volume was not \
-         touched. To restore into this claim, delete the PVC and let it be re-created (keeping \
-         its dataSourceRef)."
+        "populator: claiming PVC `{consumer_name}` is already bound to {volume}, so there is \
+         nothing to populate — the CSI volume-populator handover only applies to an UNBOUND \
+         claim. No prime PVC was provisioned and no restore ran; the live volume was untouched. \
+         Fix: to restore into this claim, delete the PVC and let it be re-created (keeping its \
+         dataSourceRef)."
     )
 }
 
@@ -249,14 +249,13 @@ pub(super) fn target_already_bound_message(
 /// hide a full-size `Retain`ed volume the admin now owns. Pure.
 pub(super) fn lost_rebind_message(consumer_name: &str, kept_pv: &str) -> String {
     format!(
-        "populator: the claiming PVC `{consumer_name}` bound to a DIFFERENT volume than the one \
-         this restore prepared for it, so the handover was lost and can never complete — a \
-         volume-populator only fills an UNBOUND claim, and something else (a provisioner that \
-         ignores dataSourceRef, or an earlier bind) got there first. The restored data is NOT \
-         in the claim: it is on PersistentVolume `{kept_pv}`, which was kept (forced \
-         reclaimPolicy: Retain) rather than reclaimed. Recover it from there, or delete the \
-         claiming PVC and let it be re-created so the restore can run again — and delete \
-         `{kept_pv}` once you no longer need it."
+        "populator: claiming PVC `{consumer_name}` bound to a DIFFERENT volume than this restore \
+         prepared, so the handover was lost and can never complete — a volume-populator only \
+         fills an UNBOUND claim, and something else (a provisioner ignoring dataSourceRef, or an \
+         earlier bind) got there first. The restored data is NOT in the claim: it is on \
+         PersistentVolume `{kept_pv}`, kept (forced reclaimPolicy: Retain). Fix: recover it from \
+         there, or delete the claiming PVC to let the restore re-run — then delete `{kept_pv}` \
+         when done."
     )
 }
 
@@ -271,14 +270,14 @@ pub(super) fn populate_hijacked_message(consumer_name: &str, bound_volume: Optio
         None => "another PersistentVolume".to_string(),
     };
     format!(
-        "populator: the claiming PVC `{consumer_name}` was bound to {volume} while this restore \
-         was still writing its prime volume, so the restored data can never reach the claim — \
-         the app will come up on whatever that volume holds (an empty one, if a provisioner \
-         bound it without honoring the dataSourceRef). This cluster cannot complete a \
-         volume-populator handshake for that claim: check that the StorageClass's provisioner \
-         supports populators (AnyVolumeDataSource + a populator-aware external-provisioner). \
-         The in-flight restore was cancelled and its prime PVC left in place for inspection; a \
-         Failed Restore is terminal, so fix the provisioner and create a NEW Restore."
+        "populator: claiming PVC `{consumer_name}` was bound to {volume} while this restore was \
+         still writing its prime volume, so the restored data can never reach the claim — the \
+         app will come up on whatever that volume holds (empty, if a provisioner bound it \
+         ignoring the dataSourceRef). This cluster cannot complete the volume-populator \
+         handshake: check the StorageClass provisioner supports populators (AnyVolumeDataSource \
+         + a populator-aware external-provisioner). The in-flight restore was cancelled and its \
+         prime PVC left for inspection; a Failed Restore is terminal, so fix the provisioner and \
+         create a NEW Restore."
     )
 }
 
@@ -294,16 +293,15 @@ pub(super) fn reaped_populate_artifacts_note(
     kept_pv: Option<&str>,
 ) -> String {
     let mut note = format!(
-        "populator: reaped leftover populate artifacts ({}) for the claiming PVC \
-         `{consumer_name}`: the claim is already bound, so they could never be handed over to \
-         it and the prime volume would otherwise hold a full copy of the restored data forever.",
+        "populator: reaped leftover populate artifacts ({}) for claiming PVC `{consumer_name}`: \
+         the claim is already bound, so they could never be handed over and the prime volume \
+         would otherwise hold a full copy of the restored data forever.",
         artifacts.join(", ")
     );
     if let Some(pv) = kept_pv {
         note.push_str(&format!(
             " PersistentVolume `{pv}` holds the restored data and was KEPT (forced \
-             reclaimPolicy: Retain) rather than reclaimed — delete it manually if you do not \
-             want it."
+             reclaimPolicy: Retain) — delete it manually if you do not want it."
         ));
     }
     note
@@ -411,6 +409,241 @@ pub(super) fn existing_conditions(restore: &Restore) -> Vec<Condition> {
         .map(|s| s.conditions.clone())
         .unwrap_or_default()
 }
+
+/// What the repository-readiness gate could learn about the repository a restore
+/// will connect to (issue #393) — the return of `super::restore_repository_ref`.
+///
+/// The point of the enum is that "no repository ref" is THREE different
+/// situations that the pre-#393 `Option<(RepositoryRef, String)>` collapsed into
+/// one `None`, and only some of them may fall through the gate unverified:
+///
+/// - [`Self::Derived`] — the ref is known; the gate goes on to check readiness.
+/// - [`Self::SnapshotRowMissing`] — a `snapshotRef` whose `Snapshot` CR does not
+///   exist (yet). Deliberately falls through: the `waitTimeout` window exists
+///   precisely to wait for that row, and `onMissingSnapshot: Fail` must be able
+///   to fire for a typo'd ref. Parking here would break both.
+/// - [`Self::ReferentMissing`] — a `fromPolicy` whose `SnapshotPolicy` does not
+///   exist. Nothing downstream can wait for it usefully, and letting the gate
+///   fall through stamps `status.waitStartedAt` against a repository nobody
+///   verified — the #393 bug.
+/// - [`Self::NotDerivable`] — the referent EXISTS but names no single repository
+///   (a `Snapshot` with neither pin nor repository owner, a multi-repository
+///   `fromPolicy` with no explicit selection, a raw `identity` source). That is a
+///   spec problem, not a missing object: it falls through to the downstream
+///   validation that fails closed and lists the valid choices. Parking would
+///   hide a permanent misconfiguration behind a "waiting…" message.
+///
+/// **Match this enum EXHAUSTIVELY.** Never `matches!(…)` it and never add a
+/// `_ =>` arm: the compiler's exhaustiveness check is the only thing that makes
+/// a fifth shape decide, at compile time, whether it may spend a restore's wait
+/// window. This is a COMPILER-ONLY guard: `cargo xtask check-phases` scans only
+/// the `*Phase` enums in `kopiur-api`, so nothing but exhaustiveness protects it
+/// — which is exactly why the rule is written down here (same convention as the
+/// `unreadable_phase` named predicate in `repository_replication`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RepoRefLookup {
+    /// The repository ref, plus the namespace it resolves relative to.
+    Derived(kopiur_api::common::RepositoryRef, String),
+    /// `snapshotRef` naming a `Snapshot` CR that does not exist — the shape the
+    /// `waitTimeout` window is FOR. The gate must not engage.
+    SnapshotRowMissing,
+    /// A referent object the repository ref is derived FROM does not exist.
+    /// `namespace` is `None` for a cluster-scoped referent.
+    ReferentMissing {
+        /// The referent's kind, for the message (`SnapshotPolicy`, …).
+        kind: &'static str,
+        /// The namespace it was looked up in; `None` when cluster-scoped.
+        namespace: Option<String>,
+        /// The referent's name.
+        name: String,
+    },
+    /// The referent exists but yields no single repository ref (or there is
+    /// nothing to derive from at all): a spec problem for downstream validation.
+    NotDerivable,
+}
+
+/// Classify a `snapshotRef` lookup: the fetched `Snapshot` (`None` ⇒ the row
+/// does not exist) into a [`RepoRefLookup`]. Pure.
+///
+/// A missing ROW is [`RepoRefLookup::SnapshotRowMissing`] — a supported,
+/// waited-for shape. A row that exists but carries no derivable repository
+/// (neither `status.resolved.repository`, nor `spec.repository`, nor a
+/// repository `ownerReference`) is [`RepoRefLookup::NotDerivable`]: the object
+/// is there, so nothing will appear later to fix it.
+pub(super) fn classify_snapshot_lookup(
+    snapshot: Option<&kopiur_api::Snapshot>,
+    snapshot_namespace: &str,
+) -> RepoRefLookup {
+    match snapshot {
+        None => RepoRefLookup::SnapshotRowMissing,
+        Some(snap) => match kopiur_api::snapshot::repository_ref_for(snap) {
+            Some(rref) => RepoRefLookup::Derived(rref, snapshot_namespace.to_string()),
+            None => RepoRefLookup::NotDerivable,
+        },
+    }
+}
+
+/// Classify a `fromPolicy` lookup: the fetched `SnapshotPolicy` (`None` ⇒ the
+/// object does not exist) into a [`RepoRefLookup`]. Pure.
+///
+/// A missing POLICY is [`RepoRefLookup::ReferentMissing`] — the gate parks. A
+/// policy that exists but fans out over several repositories with no explicit
+/// selection is [`RepoRefLookup::NotDerivable`]: the gate cannot know which
+/// repository to wait on and must never guess repository #1, so it falls through
+/// to `resolve_restore_repository`, which fails closed listing the valid choices.
+pub(super) fn classify_policy_lookup(
+    policy: Option<&kopiur_api::SnapshotPolicy>,
+    policy_namespace: &str,
+    policy_name: &str,
+) -> RepoRefLookup {
+    match policy {
+        None => RepoRefLookup::ReferentMissing {
+            kind: "SnapshotPolicy",
+            namespace: Some(policy_namespace.to_string()),
+            name: policy_name.to_string(),
+        },
+        Some(cfg) => match kopiur_api::single_repository_ref(&cfg.spec) {
+            Ok(rref) => RepoRefLookup::Derived(rref.clone(), policy_namespace.to_string()),
+            Err(_) => RepoRefLookup::NotDerivable,
+        },
+    }
+}
+
+/// Message for a restore parked because a referent it derives its repository
+/// from does not exist (issue #393). Pure so the text is unit-asserted.
+///
+/// Says what is missing (kind + namespaced name), why that blocks the restore,
+/// that the `waitTimeout` window is deliberately NOT running meanwhile, and how
+/// to clear it.
+pub(super) fn referent_missing_restore_message(
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> String {
+    let target = match namespace {
+        Some(ns) => format!("{ns}/{name}"),
+        None => name.to_string(),
+    };
+    format!(
+        "waiting for {kind} `{target}` to exist: the repository this restore connects to is \
+         derived from it, so kopiur cannot verify the backend is reachable and will not launch \
+         the restore. The policy.waitTimeout window is NOT running meanwhile \
+         (status.waitStartedAt stays unstamped) — it opens once the {kind} exists and its \
+         repository is `Ready`. Create the {kind} (or repoint the Restore at one that exists) \
+         to proceed."
+    )
+}
+
+/// A stale [`crate::consts::RESTORE_REFERENT_AVAILABLE_CONDITION`] = `False`
+/// left by an earlier park, flipped back to `True` — or `None` when there is
+/// nothing to clear (the healthy wire never grows the condition). Pure.
+///
+/// Without this the park's gate condition outlives the park: the registry row is
+/// age-independent, so `kubectl kopiur doctor` would keep reporting a restore
+/// that has long since proceeded as blocked on a referent that has existed for
+/// hours. Mirrors how the `MoverPermitted`/`CredentialsAvailable` gates clear.
+pub(super) fn cleared_referent_conditions(restore: &Restore) -> Option<Vec<Condition>> {
+    use crate::consts::{RESTORE_REFERENT_AVAILABLE_CONDITION, RESTORE_REFERENT_FOUND_REASON};
+    let existing = existing_conditions(restore);
+    if !existing
+        .iter()
+        .any(|c| c.type_ == RESTORE_REFERENT_AVAILABLE_CONDITION && c.status != "True")
+    {
+        return None;
+    }
+    Some(io::upsert_condition(
+        &existing,
+        RESTORE_REFERENT_AVAILABLE_CONDITION,
+        true,
+        RESTORE_REFERENT_FOUND_REASON,
+        "the referent the restore derives its repository from now exists",
+        restore.metadata.generation,
+    ))
+}
+
+/// `restore` with `conditions` substituted — the in-memory mirror of a status
+/// patch this pass has ALREADY made, so the rest of the pass builds on what the
+/// server now holds instead of the reconcile-start copy. Pure.
+///
+/// This is what keeps [`cleared_referent_conditions`] from starting a write
+/// loop. Nearly every condition writer downstream of the readiness gate rebuilds
+/// the array from the `restore` it was handed (a merge patch replaces the array
+/// wholesale, so it has to), and four of them — the `MissingCaBundle`,
+/// `MissingServiceAccount`, `PrivilegedMover` and `MissingCredentials` gate parks
+/// in `run_restore_mover` — patch UNCONDITIONALLY. Against a reconcile-start copy
+/// that still carries `ReferentAvailable=False`, a clear written earlier in the
+/// same pass would be re-written back to `False` by that park, then cleared again
+/// next pass: two resourceVersion-bumping writes per iteration, each waking the
+/// watch, forever — for exactly the GitOps bring-up (repository up, credentials
+/// Secret not yet) this feature exists to serve. Those parks are byte-identical
+/// no-ops today ONLY because nothing writes conditions before them; carrying the
+/// cleared copy forward preserves that.
+pub(super) fn restore_with_conditions(restore: &Restore, conditions: Vec<Condition>) -> Restore {
+    let mut carried = restore.clone();
+    let mut status = carried.status.take().unwrap_or_default();
+    status.conditions = conditions;
+    carried.status = Some(status);
+    carried
+}
+
+/// The `Restore` the rest of a reconcile pass must build on: the one the
+/// reconcile was handed, or — when the readiness gate cleared a stale
+/// `ReferentAvailable=False` — an owned copy carrying the cleared conditions.
+///
+/// A hand-written two-variant carrier rather than `Cow<'a, Restore>`, for one
+/// concrete reason: `Restore` is a large struct, so a `Cow` stores the owned
+/// variant INLINE and every value of the enum carrying it (here
+/// [`super::RepositoryGate`], whose other variants are one `Action` each) grows
+/// to that size — `clippy::large_enum_variant`, denied workspace-wide. Boxing
+/// the whole `Cow` (clippy's suggestion) would allocate on the borrowed path
+/// too, which is the overwhelmingly common one and must stay free. Boxing only
+/// [`Self::Cleared`] keeps the carrier pointer-sized in both arms: the unchanged
+/// path is still a bare borrow with no clone and no allocation, and the cleared
+/// path pays one `Box` on top of a `Restore` clone it was already making.
+///
+/// [`Self::get`] is an exhaustive `match`, so a third carrier shape would have
+/// to say which object the pass continues with.
+#[derive(Debug)]
+pub(super) enum CarriedRestore<'a> {
+    /// Nothing was cleared: the reconcile's own `Restore`, borrowed.
+    Unchanged(&'a Restore),
+    /// The gate cleared a stale gate condition: this copy mirrors the status
+    /// patch it just made, and is what every later writer must rebuild from.
+    Cleared(Box<Restore>),
+}
+
+impl CarriedRestore<'_> {
+    /// The `Restore` to continue the pass with. Exhaustive.
+    pub(super) fn get(&self) -> &Restore {
+        match self {
+            Self::Unchanged(restore) => restore,
+            Self::Cleared(restore) => restore,
+        }
+    }
+}
+
+/// The [`CarriedRestore`] for this pass, given what
+/// [`cleared_referent_conditions`] produced: the original borrowed when nothing
+/// was cleared (the overwhelmingly common path — no clone), an owned copy
+/// carrying the cleared conditions when something was. Pure and TOTAL.
+///
+/// The single construction site for the readiness gate's proceed payload, so the
+/// "cleared but continued from the stale copy" combination — the one that starts
+/// the alternating-write loop described on [`restore_with_conditions`] — has no
+/// place to be written. Both arms are unit-asserted.
+pub(super) fn carried_after_clear<'a>(
+    restore: &'a Restore,
+    cleared: Option<&[Condition]>,
+) -> CarriedRestore<'a> {
+    match cleared {
+        None => CarriedRestore::Unchanged(restore),
+        Some(conditions) => CarriedRestore::Cleared(Box::new(restore_with_conditions(
+            restore,
+            conditions.to_vec(),
+        ))),
+    }
+}
+
 /// Where the `waitTimeout` window is anchored: `status.waitStartedAt` once
 /// [`super::ensure_wait_anchor`] has stamped it, else `created_epoch`.
 ///
