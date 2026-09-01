@@ -277,13 +277,23 @@ fn plan_prune_or_external(f: &DeletionFacts<'_>) -> DeletionPlan {
 /// **data-safety** cell rather than a policy one. `concurrencyPolicy: Replace`
 /// only ever selects UNFINISHED children, so the victim normally owns no kopia
 /// snapshot at all and this executor just releases the finalizer either way.
-/// The cell matters solely in the TOCTOU window where a `Running` victim
-/// commits its manifest between the plan and the delete landing: that CR now
-/// owns a real, complete backup, and the user asked to cancel an *in-flight*
-/// run — not to destroy a finished one. `RetainSnapshot` leaks (the catalog
-/// re-discovers an unreferenced kopia snapshot, which maintenance/GFS then
-/// governs) instead of losing, which is the only defensible direction for
-/// backup software.
+/// The cell matters solely in the (sub-millisecond, after the executor's live
+/// phase re-check) window where a `Running` victim commits its manifest between
+/// selection and the delete landing: that CR now owns a real, complete backup,
+/// and the user asked to cancel an *in-flight* run — not to destroy a finished
+/// one. `RetainSnapshot` leaks instead of losing, which is the only defensible
+/// direction for backup software.
+///
+/// Be precise about what "leaks" means here, because the reclamation is NOT
+/// automatic: the kopia snapshot survives with no `Snapshot` CR referencing it,
+/// and kopiur does not track it again until the repository's catalog is
+/// re-scanned. `catalog.periodicRefresh` is **off by default**
+/// (`kopiur_api::common::CatalogBounds`), so nothing re-scans on a timer — the
+/// scan happens on a re-bootstrap (a repository spec change), a
+/// failure re-probe, or an explicit `catalog-scan-requested-at` request. Only
+/// after that scan does the snapshot become a `Discovered` row that adoption and
+/// GFS retention can govern. Until then it is untracked repository data, which
+/// is the correct trade for never destroying a completed backup.
 fn plan_prune(pruned: PrunedBy, policy: DeletionPolicy) -> DeletionPlan {
     match (pruned, policy) {
         (PrunedBy::Retention, DeletionPolicy::Delete) => DeletionPlan::DeleteSnapshot,

@@ -915,12 +915,22 @@ cancelled.
 
 `deletionPolicy` decides what happens to **finished** kopia snapshots. A run
 cancelled mid-upload never committed one, so there is nothing in the repository
-for the finalizer to remove; the CR is just released. The partial data the killed
-mover had already written is cleaned up by kopia's own checkpointing and garbage
-collection during [maintenance](maintenance.md) — you don't have to do anything.
-And if a run happens to finish in the instant between being picked for
-replacement and being deleted, Kopiur deliberately **keeps** that snapshot: you
-asked to cancel a run in progress, not to throw away a completed backup.
+for the finalizer to remove; the CR is just released. What the killed mover had
+already uploaded — data blobs, plus an incomplete manifest if it had checkpointed
+— is reclaimed by kopia's blob garbage collection when
+[maintenance](maintenance.md) next runs. You don't have to do anything.
+
+Before cancelling, Kopiur re-reads each run and skips any that has finished in
+the meantime, so a completed backup is not cancelled out from under you. In the
+sub-millisecond window where a run commits its snapshot right as the delete
+lands, Kopiur deliberately **keeps** that snapshot rather than deleting it — you
+asked to cancel a run in progress, not to throw away a completed backup. Note
+what "keeps" means: the snapshot stays in the repository with no `Snapshot` CR
+pointing at it, and Kopiur will not see it again until the repository's catalog
+is next scanned. That does **not** happen on a timer unless you enable
+`catalog.periodicRefresh` (off by default) — otherwise it waits for a repository
+spec change, a failure re-probe, or an on-demand scan request. Until then it is
+untracked data in your repository that retention will not prune.
 
 ///
 
@@ -935,7 +945,10 @@ asked to cancel a run in progress, not to throw away a completed backup.
   (`RepositorySlotAvailable=False`). It isn't running — it's waiting in line.
   Cancelling it would free nothing and the replacement would go straight to the
   back of the same line, so `Replace` behaves like `Forbid` until the queue
-  drains. This resolves itself.
+  drains. The schedule says so — `ReplacementHeld=True` in its conditions, plus
+  a one-off `WaitingForRepositorySlot` event — so a schedule that has quietly
+  stopped firing always tells you why. This one resolves itself; if it keeps
+  happening, raise the repository's mover concurrency.
 
 ### `policyRef` or `policySelector` — one recipe or many
 

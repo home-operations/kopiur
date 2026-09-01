@@ -76,14 +76,23 @@ schedule would trip its own breaker.
 /// warning | What is and isn't reclaimed
 
 `deletionPolicy` governs **committed** kopia snapshots. A run cancelled mid-flight
-has not committed one yet (`status.snapshot` is unset), so there is nothing for
-the finalizer to delete in the repository — the CR is simply released. The data
-the killed mover had already uploaded is reclaimed by kopia's own checkpointing
-and garbage collection during [maintenance](maintenance.md), not by the
-finalizer. In the rare race where a run commits its snapshot between being
-selected and being deleted, that snapshot is deliberately **kept** (it becomes an
-unreferenced snapshot the catalog rediscovers): you asked to cancel an in-flight
-run, not to destroy a finished backup.
+has not committed one (`status.snapshot` is unset), so there is nothing for the
+finalizer to delete in the repository — the CR is simply released. What the
+killed mover had already written (data blobs, and an incomplete manifest if it
+checkpointed) is reclaimed by kopia's blob garbage collection during
+[maintenance](maintenance.md), not by the finalizer.
+
+Each victim is re-read live and skipped if it has already finished, so the
+selection cannot cancel a completed backup. In the residual sub-millisecond race
+where a run commits its snapshot as the delete lands, that snapshot is
+deliberately **kept**: you asked to cancel an in-flight run, not to destroy a
+finished backup. It then exists as an unreferenced kopia snapshot that Kopiur no
+longer tracks — and reclaiming it is **not** automatic. Nothing re-scans the
+repository on a timer unless [`catalog.periodicRefresh`](repository.md) is
+enabled (it is off by default); otherwise the catalog is rescanned on a
+repository spec change (re-bootstrap), a failure re-probe, or an explicit
+on-demand scan request. Only after such a scan does the snapshot reappear as a
+`Discovered` row that adoption and GFS retention can govern.
 
 ///
 
@@ -99,8 +108,11 @@ rather than firing:
 - **A child parked behind the repository's concurrency cap.** A run holding
   `RepositorySlotAvailable=False` is *queued*, not running. Cancelling it would
   free no capacity and the replacement would immediately queue in its place, so
-  `Replace` degrades to `Forbid`-like behavior until the pool drains. This
-  clears on its own — no action needed.
+  `Replace` degrades to `Forbid`-like behavior until the pool drains. The
+  schedule records `ReplacementHeld=True` (reason `WaitingForRepositorySlot`)
+  and emits one `WaitingForRepositorySlot` Normal event on entering the hold —
+  not one per retry. Unlike `ScheduleRunnable=False` this is not a structural
+  gate: it clears on its own and needs no action.
 
 #### `schedule.startingDeadlineSeconds`
 
