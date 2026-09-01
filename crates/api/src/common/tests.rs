@@ -1553,3 +1553,93 @@ fn replication_manual_run_status_roundtrips_camel_case() {
         })
     );
 }
+
+// --- scheduleDefaults.jitter inheritance ---
+
+#[test]
+fn effective_jitter_prefers_own_then_repo_default() {
+    // Own wins outright, even when the repo sets a different window.
+    assert_eq!(
+        effective_jitter(Some("5m"), Some("1h")).as_deref(),
+        Some("5m")
+    );
+    // Absent own inherits the repository default.
+    assert_eq!(effective_jitter(None, Some("1h")).as_deref(), Some("1h"));
+    // Own with no repo default is still own.
+    assert_eq!(effective_jitter(Some("5m"), None).as_deref(), Some("5m"));
+    // Neither level sets one → no jitter (there is no built-in default window).
+    assert_eq!(effective_jitter(None, None), None);
+}
+
+#[test]
+fn effective_schedule_jitter_fans_out_like_effective_timezone() {
+    // Own wins, no lookups — matched policies are irrelevant.
+    assert_eq!(
+        effective_schedule_jitter(Some("5m"), &[Some("1h".into()), None]).as_deref(),
+        Some("5m")
+    );
+    // No matched policies → nothing to inherit.
+    assert_eq!(effective_schedule_jitter(None, &[]), None);
+    // One matched policy: a single policyRef can never disagree with itself.
+    assert_eq!(
+        effective_schedule_jitter(None, &[Some("1h".into())]).as_deref(),
+        Some("1h")
+    );
+    // Several matched policies, all agreeing → that window.
+    let agree = [Some("1h".into()), Some("1h".into()), Some("1h".into())];
+    assert_eq!(
+        effective_schedule_jitter(None, &agree).as_deref(),
+        Some("1h")
+    );
+    // All agreeing on "no default" is agreement too, resolving to no jitter.
+    assert_eq!(effective_schedule_jitter(None, &[None, None]), None);
+    // Disagreement → no jitter. Mixing a window with "no default" IS a
+    // disagreement, same as effective_timezone treats it.
+    assert_eq!(
+        effective_schedule_jitter(None, &[Some("1h".into()), None]),
+        None
+    );
+    assert_eq!(
+        effective_schedule_jitter(None, &[Some("1h".into()), Some("30m".into())]),
+        None
+    );
+}
+
+// --- moverDefaults podLabels/podAnnotations passthrough ---
+
+#[test]
+fn resolve_mover_passes_pod_metadata_through_from_defaults() {
+    use std::collections::BTreeMap;
+
+    // Absent on the repository → absent on the resolved mover (no empty maps that
+    // would render as `labels: {}` on every pod template).
+    let bare = resolve_mover(None, None, None, None, None, None);
+    assert!(bare.pod_labels.is_none());
+    assert!(bare.pod_annotations.is_none());
+
+    let labels = BTreeMap::from([(
+        "kueue.x-k8s.io/queue-name".to_string(),
+        "backups".to_string(),
+    )]);
+    let annotations =
+        BTreeMap::from([("sidecar.istio.io/inject".to_string(), "false".to_string())]);
+    let defaults = MoverDefaults {
+        pod_labels: Some(labels.clone()),
+        pod_annotations: Some(annotations.clone()),
+        ..Default::default()
+    };
+    // moverDefaults-only, like node_selector/tolerations/affinity: there is no
+    // recipe layer for these, so the repository's values pass through verbatim.
+    let m = resolve_mover(Some(&defaults), None, None, None, None, None);
+    assert_eq!(m.pod_labels.as_ref(), Some(&labels));
+    assert_eq!(m.pod_annotations.as_ref(), Some(&annotations));
+
+    // Setting one leaves the other absent.
+    let only_labels = MoverDefaults {
+        pod_labels: Some(labels.clone()),
+        ..Default::default()
+    };
+    let m = resolve_mover(Some(&only_labels), None, None, None, None, None);
+    assert_eq!(m.pod_labels.as_ref(), Some(&labels));
+    assert!(m.pod_annotations.is_none());
+}

@@ -98,6 +98,7 @@ fn sample_repository(name: &str) -> Repository {
             health: None,
             parameters: None,
             deletion_protection: None,
+            concurrency: None,
             server: None,
         },
     )
