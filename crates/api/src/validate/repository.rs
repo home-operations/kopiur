@@ -557,7 +557,7 @@ fn diff_immutable_repo_fields(
 /// #         backend: Backend::Filesystem(FilesystemBackend { path: "/r".into(), volume: None }),
 /// #         encryption: Encryption { password_secret_ref: SecretKeyRef { name: "s".into(), namespace: None, key: None } },
 /// #         create: Some(CreateBehavior { enabled: true, encryption: None, splitter: splitter.map(String::from), hash: None, ecc: None }),
-/// #         seed: None, bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, identity_defaults: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None, parameters: None, deletion_protection: None,
+/// #         seed: None, bootstrap: None, mover_defaults: None, schedule_defaults: None, catalog: None, identity_defaults: None, server: None, maintenance: None, on_namespace_delete: Default::default(), mode: Default::default(), suspend: false, health: None, parameters: None, deletion_protection: None, concurrency: None,
 /// #     }
 /// # }
 /// // Unchanged splitter → accepted.
@@ -655,6 +655,27 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
             .and_then(|d| d.timezone.as_deref()),
     ) {
         errs.push(e);
+    }
+    // `scheduleDefaults.jitter` is a NEW field, so both its parse and its 24h bound
+    // are safe in this shared aggregate: no stored `Repository` can carry a value
+    // these reject, and the reconciler re-running them can therefore brick nothing.
+    // (The 24h bound on the pre-existing per-cron `jitter` fields is a different
+    // story — see `validate::admission`.)
+    //
+    // Asymmetry worth naming: the `Repository` reconciler re-runs only a partial
+    // validator set while `ClusterRepository` re-runs the whole aggregate, so this
+    // rule is re-checked at reconcile for one kind and not the other. Acceptable —
+    // the webhook covers both kinds identically, and that is the gate.
+    if let Some(j) = spec
+        .schedule_defaults
+        .as_ref()
+        .and_then(|d| d.jitter.as_deref())
+        && let Err(e) = validate_jitter_bounds("spec.scheduleDefaults.jitter", j)
+    {
+        errs.push(e);
+    }
+    if let Some(md) = &spec.mover_defaults {
+        errs.extend(validate_pod_metadata(md));
     }
     // #380: `spec.seed` rules derivable from the spec alone. The namespaced arm
     // of the co-resident seed-Secret rule and the migrate-mode self-reference
@@ -1373,6 +1394,21 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
             .and_then(|d| d.timezone.as_deref()),
     ) {
         errs.push(e);
+    }
+    // Same new-field reasoning as `validate_repository` above: parse + 24h bound on
+    // `scheduleDefaults.jitter`, and the reserved-key rule on the new
+    // `moverDefaults.podLabels`/`podAnnotations`. This aggregate IS re-run whole at
+    // reconcile, which is exactly why only new-field rules may land in it.
+    if let Some(j) = spec
+        .schedule_defaults
+        .as_ref()
+        .and_then(|d| d.jitter.as_deref())
+        && let Err(e) = validate_jitter_bounds("spec.scheduleDefaults.jitter", j)
+    {
+        errs.push(e);
+    }
+    if let Some(md) = &spec.mover_defaults {
+        errs.extend(validate_pod_metadata(md));
     }
     // #380: same seed rules, cluster arm — a ClusterRepository's seed-source
     // Secret must not pin a namespace (its movers resolve credentials in the
