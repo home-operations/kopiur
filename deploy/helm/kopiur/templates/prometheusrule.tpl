@@ -227,4 +227,36 @@ spec:
           annotations:
             summary: "Backups in {{`{{ $labels.namespace }}`}} are parked behind a not-Ready repository"
             description: "{{`{{ $value }}`}} Snapshot(s) in {{`{{ $labels.namespace }}`}} have been held Pending for 30m because their repository is not Ready (see KopiurRepositoryBreakerOpen / the repository's BackendReachable condition). They will launch automatically once the repository recovers."
+        - alert: KopiurSnapshotWaitingForSlot
+          # A backup queued behind its repository's mover-Job concurrency cap
+          # (spec.concurrency.maxConcurrentJobs, or the cluster-wide
+          # KOPIUR_MAX_CONCURRENT_JOBS backstop) for 30m.
+          #
+          # Deliberately a SEPARATE alert from KopiurSnapshotsGated, on a separate
+          # gauge: a gated Snapshot is waiting on a BROKEN repository, a queued one
+          # is waiting on a WORKING repository that is merely busy. Same symptom
+          # (Pending, no Job), opposite remediation — one is "fix the backend", the
+          # other is "raise the cap or spread the schedules" — so folding them into
+          # one alert would send every reader down the wrong path half the time.
+          #
+          # PER-SERIES, not summed: kopiur_snapshot_waiting_for_slot is one series
+          # per queued CR, and 30m is a long time for ONE run to sit in line — the
+          # thing worth paging on is a queue that is not draining, which a summed
+          # depth cannot distinguish from a healthy queue with fast turnover. A run
+          # that gets its slot removes its own series (the gauge drains to absence,
+          # never to 0), so `for: 30m` means "this specific run never moved".
+          #
+          # max-by for scrape-target-overlap identity hygiene, matching
+          # KopiurRepositoryBreakerOpen; a deposed replica's stale sample is evicted
+          # by scrape staleness (~5m) long before the 30m `for:` completes.
+          #
+          # NOTE `namespace` here is the SNAPSHOT's namespace, not the repository's
+          # — the repository is named by repository_kind/repository.
+          expr: max by (repository_kind, repository, namespace, name) (kopiur_snapshot_waiting_for_slot) == 1
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Backup {{`{{ $labels.namespace }}/{{ $labels.name }}`}} has been queued for a mover slot for 30m"
+            description: "Snapshot {{`{{ $labels.namespace }}/{{ $labels.name }}`}} has been waiting 30m for a slot in {{`{{ $labels.repository_kind }} {{ $labels.repository }}`}}'s mover-Job pool. The repository is working — it is at its concurrency cap — and the run will start on its own when a slot frees; nothing is lost. If this persists, the cap is below what the schedules pointed at that repository need: raise spec.concurrency.maxConcurrentJobs (or the cluster-wide maxConcurrentJobs), spread the schedules with scheduleDefaults.jitter, or check for a wedged mover Job that is never terminating. Beware that while runs queue, a schedule with startingDeadlineSeconds set may be permanently SKIPPING slots (SkipExpiredSlot events)."
 {{- end }}

@@ -16,17 +16,17 @@ The pool is counted with a single label selector on `kopiur.home-operations.com/
 
 That is the deliberate choice, not an oversight. The alternative — treating an unlabeled Job as belonging to every repository — would count each one against every cap at once and park the entire fleet on upgrade. Over-admitting for one run window is strictly the better failure. It resolves itself with no intervention: every Job created after the upgrade carries the label.
 
-### An in-flight pre-upgrade Job may log a 422 until it finishes
+### In-flight pre-upgrade Jobs just drain — you do not have to quiesce first
 
-A `Job`'s pod template is immutable. If the operator re-applies a mover Job that was created *before* the upgrade — server-side apply now wants to add the pool label to its pod template — the API server refuses with a `422` (`field is immutable`), and the reconcile logs it and retries.
+A `Job`'s pod template is immutable, so a natural worry is that the operator will try to stamp the new pool label onto a mover Job that is already running and be refused with a `422`.
 
-This is a known class, not a new one: the same thing happens on any release that changes what a mover pod template contains (a mover-image bump is the usual one). It is self-clearing — the Job finishes, and its successor is created with the new template — and the work in flight is not affected. There is nothing to do but let those Jobs drain. If you would rather not see it at all, drain your schedules before upgrading.
+It does not. Every pooled spawn path checks whether its mover Job already exists and **returns before touching it** — the operator never re-applies an existing Job's pod template, on this upgrade or any other. A Job created by the previous version therefore runs to completion exactly as it is, unlabeled and (per the note above) uncounted, and its successor is created fresh with the new template. There is no error to see, nothing to retry, and no reason to drain your schedules before upgrading.
 
 ## Admission-only: jitter and deadline rules (re-apply only)
 
 Two rules now **tighten fields that already shipped**, so they are enforced by the admission webhook and deliberately **not** re-checked by the reconcilers:
 
-- A `jitter` window over **24h** is rejected — on `SnapshotSchedule.spec.schedule`, `SnapshotPolicy.spec.verification.{quick,deep}`, `Maintenance.spec.schedule.{quick,full}`, both replication kinds' `spec.schedule`, and a repository's `spec.scheduleDefaults`. Jitter is a spread *within* a cron period, not a schedule offset. (For `Maintenance` and `RepositoryReplication` the *parse* is new too — an unparseable window used to be accepted and silently degrade to no jitter at reconcile.)
+- A `jitter` window over **24h** is rejected on `SnapshotSchedule.spec.schedule`, `SnapshotPolicy.spec.verification.{quick,deep}`, `Maintenance.spec.schedule.{quick,full}`, and both replication kinds' `spec.schedule`. Jitter is a spread *within* a cron period, not a schedule offset. (For `Maintenance` and `RepositoryReplication` the *parse* is new too — an unparseable window used to be accepted and silently degrade to no jitter at reconcile.)
 - A **negative** `startingDeadlineSeconds` on a `SnapshotSchedule` is rejected. It is not "no deadline": the miss check is `now - slot > deadline`, so a negative value marks every slot expired the instant it fires and the schedule silently skips every run forever while reporting itself healthy. Omit the field for no deadline; `0` is legitimate.
 
 **Nothing breaks on upgrade.** A stored object carrying either value keeps reconciling exactly as it did before — a tightened rule that ran in the reconciler would stop backups on objects nobody touched, which is precisely the failure mode this split exists to prevent. The rejection lands on the next `kubectl apply` (or Flux/Argo reconcile) that writes that object.
@@ -39,6 +39,12 @@ $ grep -rn 'startingDeadlineSeconds: -' path/to/manifests
 ```
 
 The webhook's rejection names the exact field and value, so a surprise here is a clear message rather than a mystery.
+
+/// note | The repository-level `scheduleDefaults.jitter` is not in this bucket
+
+The same 24h cap applies to a `Repository`/`ClusterRepository`'s new `spec.scheduleDefaults.jitter`, but that field is enforced the ordinary way — webhook *and* reconciler. It is brand new, so no stored repository can be carrying a value it rejects; the admission-only split exists only for rules that tighten fields which already shipped. Nothing to grep for there.
+
+///
 
 ## After 0.10.5: the `NoAdoptableHistory` warning no longer exists (no action needed)
 

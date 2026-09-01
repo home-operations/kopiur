@@ -3164,19 +3164,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cluster_repository_with_a_reserved_pod_label_is_denied() {
+    async fn a_cluster_repository_with_reserved_pod_metadata_is_denied() {
         // The `ClusterRepository` mirror of the Repository case above. Both kinds
         // route through `validate_pod_metadata`, but through DIFFERENT dispatch
         // arms (`validate_cluster_repository` vs `validate_repository`), so only a
         // per-kind test proves the rule is actually wired into both.
-        let spec = json!({
-            "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
-            "encryption": { "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" } },
-            "allowedNamespaces": { "all": true },
-            "moverDefaults": { "podAnnotations": { "app.kubernetes.io/managed-by": "argocd" } },
-        });
+        //
+        // BOTH maps, separately: `validate_pod_metadata` walks `podLabels` and
+        // `podAnnotations` in one loop today, but a future split (they already
+        // differ in where they are applied — labels reach the Job, annotations are
+        // pod-template-only) could drop one arm, and a single-map test would not
+        // notice. The two reserved SHAPES are covered one each: the kopiur domain
+        // prefix and the exact `app.kubernetes.io/managed-by` key.
+        let base = |mover_defaults: serde_json::Value| {
+            json!({
+                "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+                "encryption": {
+                    "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" }
+                },
+                "allowedNamespaces": { "all": true },
+                "moverDefaults": mover_defaults,
+            })
+        };
         assert_denied_containing(
-            admission_request("ClusterRepository", spec),
+            admission_request(
+                "ClusterRepository",
+                base(json!({ "podLabels": { "kopiur.home-operations.com/config": "x" } })),
+            ),
+            "is reserved by kopiur",
+        )
+        .await;
+        assert_denied_containing(
+            admission_request(
+                "ClusterRepository",
+                base(json!({ "podAnnotations": { "app.kubernetes.io/managed-by": "argocd" } })),
+            ),
             "is reserved by kopiur",
         )
         .await;

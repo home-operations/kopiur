@@ -279,3 +279,41 @@ tests:
       - eval_time: 90m
         alertname: KopiurSnapshotsGated
         exp_alerts: []
+  # 9. Queued behind the repository concurrency cap. Distinct from scenario 8 in
+  #    both gauge and meaning: that repository is WORKING, just at its cap. The
+  #    alert is per-series (one queued run), because 30m is a long time for one
+  #    run to sit in line — a summed depth could not tell a stuck queue from a
+  #    healthy one with fast turnover.
+  #
+  #    `slow` waits the whole window and fires; `quick` gets its slot at 10m (the
+  #    series goes stale, since the gauge drains to ABSENCE rather than to 0) and
+  #    must never fire. Both live in the same namespace and repository, which is
+  #    exactly the case a summed expr would get wrong.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_snapshot_waiting_for_slot{repository_kind="Repository", repository="nas", namespace="billing", name="slow"}'
+        values: "1x59 stale"
+      - series: 'kopiur_snapshot_waiting_for_slot{repository_kind="Repository", repository="nas", namespace="billing", name="quick"}'
+        values: "1x10 stale"
+    alert_rule_test:
+      # Not yet: 20m of queueing is a busy repository, not an incident.
+      - eval_time: 20m
+        alertname: KopiurSnapshotWaitingForSlot
+        exp_alerts: []
+      # Past the window: only the run that never moved fires.
+      - eval_time: 45m
+        alertname: KopiurSnapshotWaitingForSlot
+        exp_alerts:
+          - exp_labels:
+              repository_kind: Repository
+              repository: nas
+              namespace: billing
+              name: slow
+              severity: warning
+            exp_annotations:
+              summary: "Backup billing/slow has been queued for a mover slot for 30m"
+              description: "Snapshot billing/slow has been waiting 30m for a slot in Repository nas's mover-Job pool. The repository is working — it is at its concurrency cap — and the run will start on its own when a slot frees; nothing is lost. If this persists, the cap is below what the schedules pointed at that repository need: raise spec.concurrency.maxConcurrentJobs (or the cluster-wide maxConcurrentJobs), spread the schedules with scheduleDefaults.jitter, or check for a wedged mover Job that is never terminating. Beware that while runs queue, a schedule with startingDeadlineSeconds set may be permanently SKIPPING slots (SkipExpiredSlot events)."
+      # Admitted / deleted → the series is gone and the alert resolves itself.
+      - eval_time: 90m
+        alertname: KopiurSnapshotWaitingForSlot
+        exp_alerts: []

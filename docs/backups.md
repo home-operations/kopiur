@@ -1036,7 +1036,9 @@ waiting for a mover slot on Repository billing/nas: 3/3 jobs running; restores a
 
 Two details in that message are worth knowing. The `(global …)` clause appears **only** when a cluster-wide cap is set; with no backstop configured it is omitted entirely rather than printed as noise. And when a run is held by the *global* cap alone — the repository itself has no `maxConcurrentJobs` — the per-repository denominator renders as `unlimited` (`0/unlimited jobs running (global 12/12)`), because quoting a per-repository number the repository never set would be a lie about which knob to turn.
 
-The moment a slot frees, the run launches and the condition heals to `True` / `SlotAcquired` (`holding a mover slot on Repository billing/nas`). A parked run re-checks about every 30–60 seconds, and a finishing Job wakes its repository's queue sooner than that. Both replication kinds park and heal identically; if the heal write itself fails, it is retried while the run is in flight and, failing that, at the next run's spawn — so a launched run never sits advertising a queue it already left.
+A parked run re-checks its repository's pool on its own timer, every 30–60 seconds (a deterministic per-object offset, so a queue of fifty runs doesn't wake as one herd). Nothing pushes it awake sooner: a mover Job's completion event routes only to the `Snapshot` that owns that Job, so it does **not** re-trigger the other runs queued behind it. Expect up to a minute of latency between a slot freeing and the next run taking it. When it does take it, the condition heals to `True` / `SlotAcquired` (`holding a mover slot on Repository billing/nas`).
+
+Both replication kinds park and heal identically; if the heal write itself fails, it is retried while the run is in flight and, failing that, at the next run's spawn — so a launched run never sits advertising a queue it already left.
 
 /// warning | A queued run has no deadline of its own
 
@@ -1047,6 +1049,8 @@ Parking is not a timeout: a run waits until a slot frees, however long that take
 ### Watching the queue
 
 `kopiur_snapshot_waiting_for_slot` is a gauge with one series per queued `Snapshot`, labeled `repository_kind`, `repository`, `namespace` and `name`. `sum by (repository) (kopiur_snapshot_waiting_for_slot)` is the live queue depth per repository, and it drains to *absence* — the series disappears the moment the run is admitted or deleted, rather than lingering at zero. Terminal Snapshots are excluded by design, so a finished run can never hold the gauge on.
+
+You don't have to build the query yourself. The chart's `PrometheusRule` (`monitoring.prometheusRule.enabled`) ships **`KopiurSnapshotWaitingForSlot`**, a warning that fires when one run has been queued for 30 minutes — per run, not per queue, because 30 minutes is a long time for a *single* backup to sit in line and a summed depth cannot tell a stuck queue from a busy one with healthy turnover. The Grafana dashboard (`monitoring.dashboards.enabled`) plots the depth per repository in its **Mover-slot queue depth** panel, next to the "Snapshots gated" panel it is deliberately not merged with.
 
 /// note | Its `namespace` label is the Snapshot's, not the repository's
 

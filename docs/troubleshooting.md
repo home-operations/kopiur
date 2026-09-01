@@ -141,13 +141,15 @@ The same condition appears on a `RepositoryReplication`/`SnapshotReplication` qu
 **When it is a real problem.** A queued run has no deadline — it waits indefinitely — so a queue that never drains looks identical to one that is merely long. Check the depth and whether it is moving:
 
 ```console
-$ kubectl get jobs -A -l app.kubernetes.io/managed-by=kopiur \
-    -l 'kopiur.home-operations.com/repo-pool' -o wide
+$ kubectl get jobs -A \
+    -l 'app.kubernetes.io/managed-by=kopiur,kopiur.home-operations.com/repo-pool' -o wide
 ```
 
 Every Job that occupies a pool slot carries `kopiur.home-operations.com/repo-pool` (its value is a hash of the repository, so the selector above lists the pooled Jobs across all repositories at once).
 
-or, on `/metrics`, `sum by (repository) (kopiur_snapshot_waiting_for_slot)` (see [Observability](dev/observability.md#metrics); note its `namespace` label is the *Snapshot's*, not the repository's). A depth that only grows means either the cap is below what your schedules actually need, or one pooled Job is wedged and never terminating — find it with `kubectl get jobs` above and treat it as a [stuck mover pod](#backup-or-restore-failed-with-moverpodwedged--the-pod-couldnt-start).
+or, on `/metrics`, `sum by (repository) (kopiur_snapshot_waiting_for_slot)` (see [Observability](dev/observability.md#metrics); note its `namespace` label is the *Snapshot's*, not the repository's). The chart plots exactly that in the Grafana dashboard's **Mover-slot queue depth** panel, and alerts on it: **`KopiurSnapshotWaitingForSlot`** fires when a single run has been queued for 30 minutes.
+
+A depth that only grows means either the cap is below what your schedules actually need, or one pooled Job is wedged and never terminating — find it with `kubectl get jobs` above and treat it as a [stuck mover pod](#backup-or-restore-failed-with-moverpodwedged--the-pod-couldnt-start).
 
 /// warning | A queued run plus a short `startingDeadlineSeconds` silently drops backups
 
@@ -735,8 +737,8 @@ $ kubectl get pods -n <ns> --selector=job-name=<job-name>                # job-n
 $ kubectl get jobs,pods -n <ns> -l kopiur.home-operations.com/config=<policy-name>
 
 # every mover Job currently occupying a repository concurrency slot, cluster-wide:
-$ kubectl get jobs -A -l app.kubernetes.io/managed-by=kopiur \
-    -l 'kopiur.home-operations.com/repo-pool'
+$ kubectl get jobs -A \
+    -l 'app.kubernetes.io/managed-by=kopiur,kopiur.home-operations.com/repo-pool'
 
 # confirm the mover RBAC was minted in the workload namespace:
 $ kubectl get serviceaccount,rolebinding -n <ns> -l app.kubernetes.io/component=mover

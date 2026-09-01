@@ -1462,13 +1462,36 @@
       ]
     },
     {
+      "id": 77,
+      "type": "timeseries",
+      "title": "Mover-slot queue depth (parked behind the repository concurrency cap)",
+      "description": "Snapshots queued behind their repository's spec.concurrency.maxConcurrentJobs (or the cluster-wide maxConcurrentJobs backstop) \u2014 RepositorySlotAvailable=False. Distinct from \"Snapshots gated\": that repository is not Ready, this one is working and merely at its cap. Store-backed, so the series drains to absence rather than to 0. The $namespace filter matches the SNAPSHOT's namespace, not the repository's.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 75
+      },
+      "targets": [
+        {
+          "expr": "sum by (repository_kind, repository) (kopiur_snapshot_waiting_for_slot{namespace=~\"$namespace\"})",
+          "legendFormat": "{{repository_kind}} {{repository}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Controller, Mover & Webhook",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 75
+        "y": 82
       },
       "id": 60
     },
@@ -1489,7 +1512,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 76
+        "y": 83
       },
       "targets": [
         {
@@ -1516,7 +1539,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 76
+        "y": 83
       },
       "targets": [
         {
@@ -1543,7 +1566,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 76
+        "y": 83
       },
       "targets": [
         {
@@ -1570,7 +1593,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 83
+        "y": 90
       },
       "targets": [
         {
@@ -1598,7 +1621,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 83
+        "y": 90
       },
       "targets": [
         {
@@ -1626,7 +1649,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 83
+        "y": 90
       },
       "targets": [
         {
@@ -1653,7 +1676,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 90
+        "y": 97
       },
       "targets": [
         {

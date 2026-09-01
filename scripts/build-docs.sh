@@ -37,10 +37,20 @@ echo "==> checking snippet SECTION and LINE-RANGE references (--strict only guar
 # the result still RENDERS — just half a comment block, silently, with nothing in
 # the build to notice. (It went unnoticed for several releases.) A range cannot be
 # checked for "shows the intended block", but it can be checked for the structural
-# property every intended block has: it must not begin or end HALF WAY THROUGH a
-# comment block. So the start line may be a comment only when the line above it is
-# not (i.e. it starts a comment block), and the end line must not be a comment or
-# blank at all. Every real drift so far violates one of those.
+# properties every intended block has. Three rules, each earned by an observed
+# drift, applied to EVERY line-range include on EVERY page under docs/:
+#
+#   1. The start line may be a comment only when the line above it is NOT — i.e.
+#      it starts a comment block rather than slicing one in half.
+#   2. The end line must not be a comment or blank — same rule, other end.
+#   3. A start line that is YAML (not a comment) must be at column 0, i.e. a
+#      top-level key. Rule 1+2 alone accept a range that begins in the MIDDLE of
+#      an indented block — `  minAvailable: 1` — which is exactly how
+#      feature-permissions.md ended up captioned "the two flags" over the
+#      controller's PodDisruptionBudget.
+#
+# None of this can prove a range shows the block its prose promises; after any
+# values.yaml edit, still re-read the rendered page.
 uv run python - <<'PYEOF'
 import pathlib, re, sys
 
@@ -56,9 +66,15 @@ def check_line_range(md, path, start, end):
         return
     first, last = lines[start - 1], lines[end - 1]
     prev = lines[start - 2] if start >= 2 else ""
-    if first.lstrip().startswith("#") and prev.lstrip().startswith("#"):
+    is_comment = first.lstrip().startswith("#")
+    if is_comment and prev.lstrip().startswith("#"):
         errors.append(f"{md}: range {start}:{end} STARTS mid-comment in {path} "
                       f"({first.strip()!r}) — the lines almost certainly shifted")
+    if not is_comment and first.strip() and first[:1].isspace():
+        errors.append(f"{md}: range {start}:{end} STARTS on an INDENTED key in "
+                      f"{path} ({first.strip()!r}) — a block include should begin "
+                      f"at a top-level key or its comment; the lines almost "
+                      f"certainly shifted")
     if not last.strip() or last.lstrip().startswith("#"):
         errors.append(f"{md}: range {start}:{end} ENDS on a comment/blank line in "
                       f"{path} ({last.strip()!r}) — the lines almost certainly shifted")
