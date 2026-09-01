@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.10.6](https://github.com/home-operations/kopiur/compare/0.10.5...0.10.6) (2026-09-01)
+
+
+### Features
+
+* **errors:** clarify user-facing Kubernetes error/warning messages ([#431](https://github.com/home-operations/kopiur/issues/431)) ([099d0a1](https://github.com/home-operations/kopiur/commit/099d0a1a47642352ed9b75a6fb2d327312d8db00))
+
+
+### Bug Fixes
+
+* **controller:** remove the NoAdoptableHistory warning event ([#429](https://github.com/home-operations/kopiur/issues/429)) ([a3dccb4](https://github.com/home-operations/kopiur/commit/a3dccb46cadd97aa774fdfa4338d3a60182b018b))
+* kopia UI server never received the backend auth Secret — split-secret creds, per-secret mirrors, server identity ([#416](https://github.com/home-operations/kopiur/issues/416)) ([#424](https://github.com/home-operations/kopiur/issues/424)) ([ab1327a](https://github.com/home-operations/kopiur/commit/ab1327a59442306173540e228d155068e3926218))
+* **rust:** update crate rcgen (0.14.9 → 0.14.10) ([#423](https://github.com/home-operations/kopiur/issues/423)) ([48c10a3](https://github.com/home-operations/kopiur/commit/48c10a369026e9dcc07186a367009133f35d3869))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action anchore/sbom-action (v0.24.0 → v0.24.1) ([#427](https://github.com/home-operations/kopiur/issues/427)) ([4aee76d](https://github.com/home-operations/kopiur/commit/4aee76d53e228aed40fe4dcf7a162cd5eb90d151))
+* **github-action:** update action anchore/sbom-action (v0.24.1 → v0.24.2) ([#432](https://github.com/home-operations/kopiur/issues/432)) ([0d029d4](https://github.com/home-operations/kopiur/commit/0d029d4dd63ddb3599000f693ae3cdfc0415ffd1))
+* **mise:** update tool aqua:astral-sh/uv (0.12.5 → 0.12.6) ([#422](https://github.com/home-operations/kopiur/issues/422)) ([d06d57c](https://github.com/home-operations/kopiur/commit/d06d57c18567350e1a7912846ab8a621bd5e5497))
+* **mise:** update tool aqua:astral-sh/uv (0.12.6 → 0.12.7) ([#428](https://github.com/home-operations/kopiur/issues/428)) ([36f8f56](https://github.com/home-operations/kopiur/commit/36f8f5690fb1b86d8886d02c5853f32ac0b0df61))
+* **mise:** update tool aqua:dadav/helm-schema (0.23.4 → 0.23.5) ([#412](https://github.com/home-operations/kopiur/issues/412)) ([c1ad2a1](https://github.com/home-operations/kopiur/commit/c1ad2a13ddd920a6a1998addee6c2fc8b12ee2e9))
+* **mise:** update tool kubectl (1.36.4 → 1.37.0) ([#426](https://github.com/home-operations/kopiur/issues/426)) ([08eb492](https://github.com/home-operations/kopiur/commit/08eb49285776da09dcdf20c3a598f4d51e30d8d3))
+* **mise:** update tool lefthook (2.1.11 → 2.1.12) ([#430](https://github.com/home-operations/kopiur/issues/430)) ([21312e5](https://github.com/home-operations/kopiur/commit/21312e500caf45db462b40aad5685f39a02d55e1))
+* **mise:** update tool node (24.19.0 → v24.20.0) ([#425](https://github.com/home-operations/kopiur/issues/425)) ([9e4ffb8](https://github.com/home-operations/kopiur/commit/9e4ffb8db77510e41c2a7c9defbcc6753ac26163))
+
 ## [0.10.5](https://github.com/home-operations/kopiur/compare/0.10.4...0.10.5) (2026-08-28)
 
 
