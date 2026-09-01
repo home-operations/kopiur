@@ -1605,6 +1605,88 @@ fn effective_schedule_jitter_fans_out_like_effective_timezone() {
     );
 }
 
+#[test]
+fn resolve_schedule_jitter_reports_the_disagreement_effective_jitter_swallows() {
+    // The whole reason the enum exists: `effective_schedule_jitter` maps BOTH of
+    // these to `None`, so a caller that wants to warn cannot tell them apart.
+    assert_eq!(
+        effective_schedule_jitter(None, &[None, None]),
+        effective_schedule_jitter(None, &[Some("1h".into()), Some("30m".into())]),
+    );
+    // The resolver keeps them distinct.
+    assert_eq!(
+        resolve_schedule_jitter(None, &[None, None]),
+        ScheduleJitterResolution::Agreed(None),
+        "unanimous 'no default' is agreement, not a disagreement"
+    );
+    assert_eq!(
+        resolve_schedule_jitter(None, &[Some("1h".into()), Some("30m".into())]),
+        ScheduleJitterResolution::Disagreed {
+            candidates: vec!["1h".into(), "30m".into()],
+        },
+    );
+    // Mixing a window with "no default" is a genuine disagreement, and the absent
+    // side is named so the log message is actionable.
+    assert_eq!(
+        resolve_schedule_jitter(None, &[Some("1h".into()), None]),
+        ScheduleJitterResolution::Disagreed {
+            candidates: vec!["(none)".into(), "1h".into()],
+        },
+    );
+}
+
+#[test]
+fn resolve_schedule_jitter_agrees_wherever_effective_schedule_jitter_returns_a_window() {
+    // Own wins, no lookups.
+    assert_eq!(
+        resolve_schedule_jitter(Some("5m"), &[Some("1h".into()), None]),
+        ScheduleJitterResolution::Agreed(Some("5m".into())),
+    );
+    // No matched policies → nothing to inherit.
+    assert_eq!(
+        resolve_schedule_jitter(None, &[]),
+        ScheduleJitterResolution::Agreed(None)
+    );
+    // A single policyRef can never disagree with itself.
+    assert_eq!(
+        resolve_schedule_jitter(None, &[Some("1h".into())]),
+        ScheduleJitterResolution::Agreed(Some("1h".into())),
+    );
+    // Several matched policies, all agreeing.
+    let agree = [Some("1h".into()), Some("1h".into()), Some("1h".into())];
+    assert_eq!(
+        resolve_schedule_jitter(None, &agree),
+        ScheduleJitterResolution::Agreed(Some("1h".into())),
+    );
+}
+
+#[test]
+fn effective_schedule_jitter_delegates_to_the_resolver() {
+    // The `Option`-returning function must stay a pure projection of the enum, so
+    // the two can never drift apart on a case.
+    let cases: [&[Option<String>]; 6] = [
+        &[],
+        &[None],
+        &[Some("1h".into())],
+        &[Some("1h".into()), Some("1h".into())],
+        &[Some("1h".into()), None],
+        &[Some("1h".into()), Some("30m".into())],
+    ];
+    for own in [None, Some("5m")] {
+        for candidates in cases {
+            let projected = match resolve_schedule_jitter(own, candidates) {
+                ScheduleJitterResolution::Agreed(w) => w,
+                ScheduleJitterResolution::Disagreed { .. } => None,
+            };
+            assert_eq!(
+                effective_schedule_jitter(own, candidates),
+                projected,
+                "own={own:?} candidates={candidates:?}"
+            );
+        }
+    }
+}
+
 // --- moverDefaults podLabels/podAnnotations passthrough ---
 
 #[test]
