@@ -306,6 +306,10 @@ jobs:
           # and waits out two more rollouts. Both restore on exit, but the
           # restarts inside those windows must not race another binary's
           # reconciles. Filesystem only (isolated repo subpaths per scenario).
+          # Also carries the `concurrencyPolicy: Replace` scenario, which runs an
+          # every-minute schedule and arms its own repository's mass-deletion
+          # breaker at threshold 1 — both scoped to `conc-replace`, but another
+          # binary sharing that repo would trip it.
           - shard: concurrency
             bins: "concurrency"
             backends: false

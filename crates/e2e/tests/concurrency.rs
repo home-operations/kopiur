@@ -16,7 +16,7 @@
 //! the fixture RESHAPES THE RUNNING OPERATOR (a Deployment rollout), and scenario
 //! 4 additionally patches the controller's env, this file owns its own CI shard.
 //!
-//! The four scenarios:
+//! The five scenarios:
 //!
 //! 1. `a_repository_cap_serializes_its_backups` — cap 1, two backups: never two
 //!    live at once, the loser surfaces `RepositorySlotAvailable=False`, BOTH
@@ -30,6 +30,16 @@
 //! 4. `the_env_backstop_serializes_across_repositories` —
 //!    `KOPIUR_MAX_CONCURRENT_JOBS=1` bounds the pool across DIFFERENT
 //!    repositories, which no per-repository cap can do.
+//! 5. `replace_cancels_the_running_backup_and_never_trips_the_breaker` —
+//!    `concurrencyPolicy: Replace` on an UNCAPPED repository: a genuinely
+//!    `Running` run is cancelled by the next slot, the cancellation is stamped
+//!    as an operator prune so the mass-deletion breaker never sees it, and the
+//!    replacement still backs something up.
+//!
+//! Scenario 5 lives here rather than beside the other schedule scenarios
+//! because it needs the same slow-mover fixture (a real backup finishes long
+//! before the next cron slot, so there would be nothing to replace) and
+//! therefore the same shard.
 
 #![cfg(all(unix, feature = "e2e"))]
 
@@ -40,10 +50,11 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
-use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use k8s_openapi::api::events::v1::Event;
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 
-use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
+use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy, SnapshotSchedule};
 use kopiur_e2e::slow_mover::{MoverOp, SlowMover, with_slow_mover_config};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, wait, wait_until};
 
@@ -100,10 +111,10 @@ async fn live_jobs(jobs: &Api<Job>, names: &[&str]) -> Result<usize, kube::Error
     Ok(live)
 }
 
-/// The `status` of the CR's `RepositorySlotAvailable` condition, or `None` when
-/// the condition is absent entirely — the distinction the uncapped scenario
-/// turns on (absent, never merely `True`).
-async fn slot_condition_status<K>(api: &Api<K>, name: &str) -> Option<String>
+/// The `status` of one of a CR's conditions, or `None` when the condition is
+/// absent entirely — a distinction several scenarios here turn on (absent, never
+/// merely `True`/`False`).
+async fn condition_status<K>(api: &Api<K>, name: &str, type_: &str) -> Option<String>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug,
     <K as kube::Resource>::DynamicType: Default,
@@ -114,10 +125,20 @@ where
         .and_then(|c| c.as_array())
         .and_then(|a| {
             a.iter()
-                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some(SLOT_CONDITION))
+                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some(type_))
         })
         .and_then(|c| c.get("status").and_then(|s| s.as_str()))
         .map(str::to_string)
+}
+
+/// [`condition_status`] for the gate's own condition — the one the first three
+/// scenarios read on nearly every poll.
+async fn slot_condition_status<K>(api: &Api<K>, name: &str) -> Option<String>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    condition_status(api, name, SLOT_CONDITION).await
 }
 
 /// Create a namespaced filesystem `Repository` over `subpath` with an optional
@@ -699,5 +720,472 @@ async fn the_env_backstop_serializes_across_repositories() -> anyhow::Result<()>
         &[BACKUP_A, BACKUP_B],
     )
     .await;
+    Ok(())
+}
+
+// --- 5. concurrencyPolicy: Replace cancels the in-flight run --------------------
+
+const REPLACE_SUBPATH: &str = "conc-replace";
+
+/// The label a `SnapshotSchedule` stamps on every `Snapshot` it produces.
+/// Spelled as a literal for the same reason [`MAX_CONCURRENT_JOBS_ENV`] is: the
+/// e2e crate does not depend on the controller, so a rename there must fail an
+/// e2e run loudly rather than silently select nothing.
+const SCHEDULE_LABEL: &str = "kopiur.home-operations.com/schedule";
+
+/// The `Repository` condition the mass-deletion breaker raises once pending
+/// EXTERNAL destructive `Snapshot` deletions reach `deletionProtection.threshold`.
+const MASS_DELETION_HELD_CONDITION: &str = "MassDeletionHeld";
+
+/// The per-`Snapshot` condition a HELD deletion carries while it waits for an
+/// acknowledgement.
+const DELETION_HELD_CONDITION: &str = "DeletionHeld";
+
+/// The condition `Replace` raises when it HOLDS a slot instead of replacing —
+/// the run it would cancel is itself parked behind the repository's mover-Job
+/// pool cap, so cancelling it would free no capacity. This scenario deliberately
+/// runs an UNCAPPED repository so that path is unreachable, and asserts the
+/// condition never appears: a regression that routed the fire through the hold
+/// would otherwise be free to masquerade as a pass.
+const REPLACEMENT_HELD_CONDITION: &str = "ReplacementHeld";
+
+/// The `Event` reason `Replace` publishes on the schedule when it cancels runs.
+const REPLACED_EVENT_REASON: &str = "ReplacedActiveRun";
+
+/// How long a backup mover holds its slot in the Replace scenario.
+///
+/// The whole scenario turns on ONE inequality: the run observed `Running` cannot
+/// possibly finish before the next cron slot arrives. An every-minute cron is
+/// the finest grain there is, so slots are 60s apart, and the worst case is
+/// observing the run at the very instant its mover started — anything over 60s
+/// makes the replacement inevitable rather than lucky. 150s leaves ~90s of
+/// margin for a loaded kind node, and is deliberately not "sleep and hope":
+/// nothing here waits out a duration, the margin only guarantees that the state
+/// the waits poll for actually comes to exist.
+const REPLACE_DELAY: Duration = Duration::from_secs(150);
+
+/// Names of this schedule's produced `Snapshot` children, by the label the
+/// schedule stamps (not a name prefix — the label is the population the
+/// controller's own concurrency gate reads).
+async fn schedule_children(
+    backups: &Api<Snapshot>,
+    schedule: &str,
+) -> Result<Vec<String>, kube::Error> {
+    let lp = ListParams::default().labels(&format!("{SCHEDULE_LABEL}={schedule}"));
+    Ok(backups
+        .list(&lp)
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|s| s.metadata.name)
+        .collect())
+}
+
+/// Set the repository's mass-deletion breaker threshold and verify it LANDED.
+///
+/// Read-back for the same reason `ensure_capped_repo` reads its cap back: a
+/// pruned or mis-shaped field would leave the breaker at its default of 10,
+/// where a single-victim replacement could never trip it — and the scenario's
+/// central negative assertion ("the breaker did not fire") would prove nothing.
+async fn set_deletion_threshold(
+    repos: &Api<Repository>,
+    name: &str,
+    threshold: u32,
+) -> anyhow::Result<()> {
+    repos
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "spec": { "deletionProtection": { "threshold": threshold } }
+            })),
+        )
+        .await?;
+    let got = repos
+        .get(name)
+        .await?
+        .spec
+        .deletion_protection
+        .as_ref()
+        .and_then(|d| d.threshold);
+    anyhow::ensure!(
+        got == Some(threshold),
+        "spec.deletionProtection.threshold must land on {name} as {threshold}, got {got:?}"
+    );
+    Ok(())
+}
+
+/// Delete `schedule` and every `Snapshot` it produced, and wait until they are
+/// all gone.
+///
+/// The `e2e` nextest profile retries a failed test IN PLACE, and a schedule left
+/// behind by a failed attempt is left SUSPENDED by this scenario's own body — a
+/// retry that merely tolerated `AlreadyExists` would then wait forever for a
+/// slot that can never fire. So the schedule is reset rather than reused. The
+/// caller MUST disarm the breaker first (threshold `0`): these are EXTERNAL
+/// destructive deletes, and with the breaker armed they would be held.
+async fn reset_replace_schedule(
+    schedules: &Api<SnapshotSchedule>,
+    backups: &Api<Snapshot>,
+    schedule: &str,
+) -> anyhow::Result<()> {
+    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
+    for name in schedule_children(backups, schedule).await? {
+        let _ = backups.delete(&name, &DeleteParams::default()).await;
+    }
+    wait_until(
+        &format!("leftovers of {schedule} are gone"),
+        Duration::from_secs(180),
+        INVARIANT_POLL,
+        || async {
+            let sched_gone = schedules.get_opt(schedule).await?.is_none();
+            let kids = schedule_children(backups, schedule).await?;
+            Ok((sched_gone && kids.is_empty()).then_some(()))
+        },
+    )
+    .await
+}
+
+/// `concurrencyPolicy: Replace` end to end, on an UNCAPPED repository.
+///
+/// The uncapped part is load-bearing, not incidental: with a pool cap in play a
+/// due slot whose would-be victim is PARKED behind that cap does not replace
+/// anything at all — it raises `ReplacementHeld` and waits, because cancelling a
+/// queued run frees no capacity. This scenario must exercise the REPLACEMENT, so
+/// the repository carries no cap and the victim is genuinely `Running` with a
+/// live mover Job before the next slot arrives (asserted, not assumed).
+///
+/// Five claims:
+///
+/// * **The prior run is cancelled.** Its mover Job is deleted and its CR goes
+///   away entirely — not merely terminating. Full disappearance is the sharp
+///   form: a HELD deletion would sit terminating forever.
+/// * **A `ReplacedActiveRun` Normal Event names the victim**, so an operator
+///   reading `kubectl describe` sees why a backup vanished mid-run instead of
+///   discovering a gap.
+/// * **The replacement really backs something up** — `Succeeded` with a real
+///   `kopiaSnapshotID`. A `Replace` that only cancelled would pass every
+///   liveness check and be a data-loss bug.
+/// * **The breaker never trips**, with `deletionProtection.threshold: 1` — the
+///   most sensitive setting there is, where ONE unstamped external delete would
+///   hold. That is the `pruned-by: replaced-run` stamping proof: without the
+///   stamp the victim classifies EXTERNAL, the repository raises
+///   `MassDeletionHeld=True`, the victim carries `DeletionHeld=True`, and the
+///   schedule wedges. At the default threshold of 10 this assertion would be
+///   vacuous, which is why the scenario arms the breaker deliberately.
+/// * **The schedule's status advances** — `lastSchedule` names the replacement
+///   slot and its child.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn replace_cancels_the_running_backup_and_never_trips_the_breaker() -> anyhow::Result<()> {
+    let Some(world) = World::connect().await else {
+        return Ok(());
+    };
+    world.ensure(&[Need::Filesystem]).await?;
+    let client: Client = world.client().clone();
+
+    const REPO: &str = "e2e-conc-repl-repo";
+    const POLICY: &str = "e2e-conc-repl-pol";
+    const SCHEDULE: &str = "e2e-conc-repl-sched";
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let events: Api<Event> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // No `spec.concurrency` at all (see the doc comment), managed maintenance
+    // off so the repository contributes no unrelated mover Jobs, and the breaker
+    // DISARMED for now so the retry reset below can delete leftovers.
+    ensure_repo(&client, REPLACE_SUBPATH).await;
+    create_idempotent(
+        &repos,
+        &cr(repository_json(
+            REPO,
+            REPLACE_SUBPATH,
+            serde_json::json!({
+                "deletionProtection": { "threshold": 0 },
+                "maintenance": { "enabled": false },
+            }),
+        )),
+        "create Repository",
+    )
+    .await;
+    set_deletion_threshold(&repos, REPO, 0).await?;
+    wait_phase(&repos, REPO, "Ready").await.expect("repo Ready");
+    ensure_policy(&client, POLICY, REPO).await;
+    reset_replace_schedule(&schedules, &backups, SCHEDULE).await?;
+    // ARM the breaker at its most sensitive setting, now that nothing is left to
+    // clean up. From here on ANY unstamped external destructive delete holds.
+    // The patch bumps the repository's generation, so wait out the reconcile it
+    // triggers before any backup depends on the repository being Ready.
+    set_deletion_threshold(&repos, REPO, 1).await?;
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("repo Ready after arming the breaker");
+
+    // Only backups crawl: the bootstrap already ran at full speed above, and a
+    // slow repository-side Job would add nothing but wall time.
+    let config = SlowMover::new(REPLACE_DELAY).ops(&[MoverOp::Snapshot]);
+    let result = with_slow_mover_config(&world, config, || async {
+        schedules
+            .create(
+                &PostParams::default(),
+                &cr::<SnapshotSchedule>(serde_json::json!({
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "SnapshotSchedule",
+                    "metadata": { "name": SCHEDULE, "namespace": E2E_NAMESPACE },
+                    "spec": {
+                        "policyRef": { "name": POLICY },
+                        "schedule": { "cron": "* * * * *", "concurrencyPolicy": "Replace" },
+                    }
+                })),
+            )
+            .await?;
+        // The field must have LANDED: a `concurrencyPolicy` pruned by a stale CRD
+        // schema would silently leave the schedule at the `Forbid` default, where
+        // nothing is ever replaced and this scenario would fail minutes later as
+        // "no replacement happened".
+        let created = schedules.get(SCHEDULE).await?;
+        anyhow::ensure!(
+            created.spec.schedule.concurrency_policy == kopiur_api::ConcurrencyPolicy::Replace,
+            "spec.schedule.concurrencyPolicy must land as Replace, got {:?}",
+            created.spec.schedule.concurrency_policy
+        );
+
+        // 1. A slot fires and its child reaches `Running` with a LIVE mover Job.
+        //    This is what makes the replacement about a genuinely in-flight run
+        //    rather than a `Pending` one that never started.
+        let victim = wait_until(
+            "a scheduled backup is Running with a live mover Job",
+            Duration::from_secs(300),
+            INVARIANT_POLL,
+            || async {
+                for name in schedule_children(&backups, SCHEDULE).await? {
+                    let running =
+                        status_json(&backups, &name).await["phase"].as_str() == Some("Running");
+                    if running && live_jobs(&jobs, &[name.as_str()]).await? == 1 {
+                        return Ok(Some(name));
+                    }
+                }
+                Ok(None)
+            },
+        )
+        .await?;
+
+        // 2. The NEXT slot must replace it. `REPLACE_DELAY` makes that a
+        //    certainty rather than a race: the victim cannot reach a terminal
+        //    phase before the slot 60s from now. Polled with the breaker and
+        //    hold invariants inline — `wait_until` treats an `Err` as "not ready
+        //    yet", so an assertion cannot live inside its closure.
+        let mut replacement = None;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            anyhow::ensure!(
+                condition_status(&repos, REPO, MASS_DELETION_HELD_CONDITION)
+                    .await
+                    .as_deref()
+                    != Some("True"),
+                "the mass-deletion breaker must NEVER hold a `Replace` cancellation: the \
+                 victim is stamped `pruned-by: replaced-run`, an OPERATOR prune, and \
+                 operator prunes are breaker-exempt everywhere"
+            );
+            anyhow::ensure!(
+                condition_status(&schedules, SCHEDULE, REPLACEMENT_HELD_CONDITION)
+                    .await
+                    .as_deref()
+                    != Some("True"),
+                "{REPLACEMENT_HELD_CONDITION} must be unreachable on an UNCAPPED \
+                 repository — if it fired, the victim was parked rather than Running \
+                 and this scenario tested the hold path, not the replacement"
+            );
+            let victim_going = match backups.get_opt(&victim).await? {
+                None => true,
+                Some(s) => s.metadata.deletion_timestamp.is_some(),
+            };
+            if victim_going {
+                // The NEWEST other child. Children are named
+                // `<schedule>-<YYYYmmddHHMMSS>` — fixed width, so lexicographic
+                // order IS chronological order. `max` rather than `find` because
+                // a poll that lagged a whole slot interval would otherwise be
+                // free to pick an already-superseded child and then assert
+                // "Succeeded" against a run that was itself cancelled.
+                replacement = schedule_children(&backups, SCHEDULE)
+                    .await?
+                    .into_iter()
+                    .filter(|n| *n != victim)
+                    .max();
+            }
+            if replacement.is_some() {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the next slot never replaced the Running backup `{victim}` \
+                 (victim still in flight: {})",
+                !victim_going
+            );
+            tokio::time::sleep(INVARIANT_POLL).await;
+        }
+        let replacement = replacement.expect("the loop only breaks with a replacement");
+
+        // 3. SUSPEND immediately, so the slot after this one cannot replace the
+        //    replacement in turn — every run takes `REPLACE_DELAY`, so an
+        //    unsuspended schedule would cancel each new run forever and nothing
+        //    would ever reach `Succeeded`. There is a full slot interval of
+        //    headroom: the replacement was detected within a poll of the fire.
+        schedules
+            .patch(
+                SCHEDULE,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({
+                    "spec": { "schedule": { "suspend": true } }
+                })),
+            )
+            .await?;
+
+        // 4. The victim's mover Job is gone — the run was STOPPED, not merely
+        //    forgotten. (The Job carries the same name as its Snapshot.)
+        wait_until(
+            &format!("the replaced run's mover Job ({victim}) is deleted"),
+            Duration::from_secs(180),
+            INVARIANT_POLL,
+            || async { Ok(jobs.get_opt(&victim).await?.is_none().then_some(())) },
+        )
+        .await?;
+
+        // 5. The victim's CR disappears ENTIRELY. This is the breaker-exempt
+        //    stamping proof in its sharpest form: with `threshold: 1`, an
+        //    unstamped external delete would be held and this CR would sit
+        //    terminating with `DeletionHeld=True` until acknowledged.
+        let mut gone = false;
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while !gone {
+            match backups.get_opt(&victim).await? {
+                None => gone = true,
+                Some(_) => {
+                    anyhow::ensure!(
+                        condition_status(&backups, &victim, DELETION_HELD_CONDITION)
+                            .await
+                            .as_deref()
+                            != Some("True"),
+                        "the replaced run's deletion must never be HELD: `Replace` stamps \
+                         `pruned-by: replaced-run`, which is breaker-exempt"
+                    );
+                }
+            }
+            anyhow::ensure!(
+                gone || Instant::now() < deadline,
+                "the replaced run `{victim}` never finished terminating — its finalizer \
+                 is stuck (a held deletion, or a mover teardown that never completed)"
+            );
+            if !gone {
+                tokio::time::sleep(INVARIANT_POLL).await;
+            }
+        }
+
+        // 6. The cancellation is VISIBLE: an Event on the schedule NAMING the run
+        //    it cancelled, so an operator reading `kubectl describe` learns why a
+        //    backup vanished mid-run instead of finding an unexplained gap.
+        //
+        //    The victim's name is part of the SELECTION, not just an assertion
+        //    afterwards: the `e2e` profile retries in place, victim names are
+        //    slot-stamped (fresh every attempt), and a stale Event from a
+        //    previous attempt would otherwise be picked up and then fail the
+        //    note check — turning a real pass into a spurious failure.
+        let ev = wait_until(
+            &format!("a {REPLACED_EVENT_REASON} Event names the cancelled run {victim}"),
+            Duration::from_secs(180),
+            INVARIANT_POLL,
+            || async {
+                let list = events.list(&ListParams::default()).await?;
+                Ok(list.items.into_iter().find(|e| {
+                    e.reason.as_deref() == Some(REPLACED_EVENT_REASON)
+                        && e.note.as_deref().is_some_and(|n| n.contains(&victim))
+                        && e.regarding.as_ref().is_some_and(|r| {
+                            r.kind.as_deref() == Some("SnapshotSchedule")
+                                && r.name.as_deref() == Some(SCHEDULE)
+                        })
+                }))
+            },
+        )
+        .await?;
+        anyhow::ensure!(
+            ev.type_.as_deref() == Some("Normal"),
+            "a planned cancellation is Normal, not a Warning: {:?}",
+            ev.type_
+        );
+
+        Ok(replacement)
+    })
+    .await;
+
+    // Asserted OUTSIDE the slow window, like the other scenarios here, so a
+    // fixture-restore failure can never be mistaken for a backup fault. The
+    // schedule is suspended by now, so nothing new fires while we wait.
+    let replacement = result?;
+    assert_real_snapshot(&backups, &replacement).await?;
+
+    // The schedule's own bookkeeping advanced to the slot that did the
+    // replacing. `lastSchedule.snapshotRef` names the child, and `at` is that
+    // child's slot — the Snapshot's name is `<schedule>-<YYYYmmddHHMMSS>` of the
+    // slot, so the two must agree digit for digit.
+    let slot_stamp = replacement
+        .strip_prefix(&format!("{SCHEDULE}-"))
+        .expect("a scheduled child is named <schedule>-<slot stamp>")
+        .to_string();
+    let last = wait_until(
+        "status.lastSchedule names the replacement slot",
+        Duration::from_secs(180),
+        INVARIANT_POLL,
+        || async {
+            let s = status_json(&schedules, SCHEDULE).await;
+            let named = s["lastSchedule"]["snapshotRef"]["name"].as_str() == Some(&replacement);
+            Ok(named.then(|| s["lastSchedule"].clone()))
+        },
+    )
+    .await?;
+    let at = last["at"].as_str().unwrap_or_default();
+    let at = chrono::DateTime::parse_from_rfc3339(at)
+        .unwrap_or_else(|e| panic!("lastSchedule.at must be RFC3339, got {at:?}: {e}"))
+        .with_timezone(&chrono::Utc);
+    anyhow::ensure!(
+        at.format("%Y%m%d%H%M%S").to_string() == slot_stamp,
+        "lastSchedule.at ({at}) must be the slot the replacement child is named for \
+         ({slot_stamp})"
+    );
+    // `lastSuccessfulSchedule` has no writer in this build; assert only that if
+    // one ever appears it is not AHEAD of the last fire (a lenient sanity bound
+    // that a future writer would still satisfy).
+    let st = status_json(&schedules, SCHEDULE).await;
+    if let Some(s) = st["lastSuccessfulSchedule"]["at"].as_str() {
+        let s = chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap_or_else(|e| panic!("lastSuccessfulSchedule.at must be RFC3339: {e}"))
+            .with_timezone(&chrono::Utc);
+        anyhow::ensure!(
+            s <= at,
+            "lastSuccessfulSchedule ({s}) cannot be later than lastSchedule ({at})"
+        );
+    }
+
+    // Final state: the breaker still shows no hold now that everything settled.
+    anyhow::ensure!(
+        condition_status(&repos, REPO, MASS_DELETION_HELD_CONDITION)
+            .await
+            .as_deref()
+            != Some("True"),
+        "the repository must not be holding deletions after a `Replace` cycle"
+    );
+
+    // Disarm the breaker BEFORE cleanup: the deletes below are external and
+    // destructive, and at `threshold: 1` they would be held (wedging every CR
+    // this scenario created behind an unacknowledged wave).
+    let _ = set_deletion_threshold(&repos, REPO, 0).await;
+    let _ = schedules.delete(SCHEDULE, &DeleteParams::default()).await;
+    let leftovers = schedule_children(&backups, SCHEDULE)
+        .await
+        .unwrap_or_default();
+    let leftovers: Vec<&str> = leftovers.iter().map(String::as_str).collect();
+    cleanup(&client, &[REPO], &[POLICY], &leftovers).await;
     Ok(())
 }

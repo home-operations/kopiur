@@ -222,6 +222,11 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "conc-uncapped",
     "conc-env-a",
     "conc-env-b",
+    // `concurrencyPolicy: Replace` (concurrency.rs scenario 5). Its own repo
+    // because it arms the mass-deletion breaker at `threshold: 1` — the most
+    // sensitive setting there is — and any other scenario's external Snapshot
+    // delete against a shared repository would trip it.
+    "conc-replace",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per
