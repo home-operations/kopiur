@@ -610,7 +610,7 @@ Precedence (resolved at reconcile time, not admission-pinned): the consuming cro
 
 A window over 24h is rejected (`jitter of 25h exceeds the 24h maximum`). Jitter shifts a firing *inside* its cron period; a window longer than a day is almost always someone trying to express "run it later", which is a cron change.
 
-`scheduleDefaults.jitter` is a **brand-new field**, so this rule is enforced in the ordinary way — by the webhook *and* re-checked by the reconciler — with nothing to worry about on upgrade: no stored repository can carry a value it rejects, because the field did not exist to be set. That is not true of the jitter windows on the **consuming** crons (`SnapshotSchedule`, verification, `Maintenance`, both replications), which already shipped: the same 24h cap tightens a field stored objects may already carry, so there it is deliberately admission-only. Same for a negative `startingDeadlineSeconds`. See [Upgrading](upgrade.md#admission-only-jitter-and-deadline-rules-re-apply-only).
+`scheduleDefaults.jitter` is a **brand-new field**, so there is nothing to worry about on upgrade: no stored repository can carry a value the rule rejects, because the field did not exist to be set. That is not true of the jitter windows on the **consuming** crons (`SnapshotSchedule`, verification, `Maintenance`, both replications), which already shipped: the same 24h cap tightens a field stored objects may already carry, so there it is deliberately enforced at admission only — a tightened rule that ran in the reconciler would stop backups on objects nobody touched. Same for a negative `startingDeadlineSeconds`. See [Upgrading](upgrade.md#admission-only-jitter-and-deadline-rules-re-apply-only).
 
 ///
 

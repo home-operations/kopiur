@@ -42,7 +42,7 @@ The webhook's rejection names the exact field and value, so a surprise here is a
 
 /// note | The repository-level `scheduleDefaults.jitter` is not in this bucket
 
-The same 24h cap applies to a `Repository`/`ClusterRepository`'s new `spec.scheduleDefaults.jitter`, but that field is enforced the ordinary way — webhook *and* reconciler. It is brand new, so no stored repository can be carrying a value it rejects; the admission-only split exists only for rules that tighten fields which already shipped. Nothing to grep for there.
+The same 24h cap applies to a `Repository`/`ClusterRepository`'s new `spec.scheduleDefaults.jitter`, but it needs none of the care above. The admission-only split exists to protect objects that were stored *before* a rule tightened; this field is brand new, so no stored repository can be carrying a value it rejects. Nothing to grep for there.
 
 ///
 
