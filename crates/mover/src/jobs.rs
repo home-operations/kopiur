@@ -313,6 +313,34 @@ pub struct MoverJobInputs<'a> {
     pub affinity: Option<Affinity>,
     /// Extra labels applied to both objects (origin/config/snapshot keys).
     pub labels: BTreeMap<String, String>,
+    /// User-supplied extra labels from the repository's `moverDefaults.podLabels`
+    /// (`kopiur_api::common::ResolvedMover::pod_labels`), applied to the pod
+    /// template AND the `Job` — the Job so `kubectl get jobs -l ...` and any
+    /// Job-level controller (Kueue) can select them, the pod so
+    /// `NetworkPolicy`/monitoring selectors match the thing that actually runs.
+    ///
+    /// Merged UNDERNEATH [`Self::labels`]/`managed-by`: a kopiur-managed key
+    /// always wins, so a user value can never break the selectors the controller
+    /// counts and reaps by. (Admission also rejects the reserved keys outright;
+    /// this is the defense-in-depth backstop for a stored/skew CR.)
+    ///
+    /// `None`/empty leaves both label sets byte-identical to what they were
+    /// before this field existed.
+    pub pod_labels: Option<BTreeMap<String, String>>,
+    /// User-supplied annotations from the repository's
+    /// `moverDefaults.podAnnotations`
+    /// (`kopiur_api::common::ResolvedMover::pod_annotations`), applied to the
+    /// **pod template only** — never mirrored onto the `Job`.
+    ///
+    /// Pod-only is the whole point: the common case is a sidecar-injection
+    /// opt-out (`sidecar.istio.io/inject: "false"`), which only means anything
+    /// on the pod a mesh webhook actually sees, and an injected sidecar that
+    /// never exits keeps a batch Job running forever. The `Job`'s own
+    /// annotations remain exactly [`Self::annotations`].
+    ///
+    /// `None`/empty leaves the pod template's `annotations` UNSET (not
+    /// `Some({})`), so the rendered Job is byte-identical to before.
+    pub pod_annotations: Option<BTreeMap<String, String>>,
     /// The source volume to back up (PVC or inline NFS), mounted at the snapshot source
     /// path (Snapshot ops) — read-only unless the recipe sets `source.readOnly: false`.
     /// `None` for restore / delete ops.
@@ -387,6 +415,29 @@ fn managed_labels(inputs: &MoverJobInputs<'_>) -> BTreeMap<String, String> {
     labels
         .entry(kopiur_api::consts::MANAGED_BY_LABEL.to_string())
         .or_insert_with(|| kopiur_api::consts::MANAGED_BY_VALUE.to_string());
+    labels
+}
+
+/// [`managed_labels`] laid over the user's `moverDefaults.podLabels`
+/// ([`MoverJobInputs::pod_labels`]) — the label set the mover **`Job` and its
+/// pod template** both carry.
+///
+/// Order is the invariant: the user map is the BASE and the kopiur-managed keys
+/// are `insert`ed on top, so a `podLabels` entry that collides with a key kopiur
+/// owns (`app.kubernetes.io/managed-by`, the origin/config/op/pool keys) is
+/// overwritten rather than winning. The controller counts, LISTs and reaps by
+/// those selectors; letting a user value through would make a mover invisible to
+/// its own reconciler.
+///
+/// The `Job` gets them as well as the pod so Job-level machinery — a Kueue
+/// `queue-name`, a `kubectl get jobs -l team=platform` — works without reaching
+/// through to pods. (Annotations are pod-only; see
+/// [`MoverJobInputs::pod_annotations`].)
+///
+/// No `podLabels` ⇒ exactly [`managed_labels`], byte for byte.
+fn job_and_pod_labels(inputs: &MoverJobInputs<'_>) -> BTreeMap<String, String> {
+    let mut labels = inputs.pod_labels.clone().unwrap_or_default();
+    labels.extend(managed_labels(inputs));
     labels
 }
 
@@ -644,7 +695,10 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
         metadata: ObjectMeta {
             name: Some(inputs.name.to_string()),
             namespace: Some(inputs.namespace.to_string()),
-            labels: Some(managed_labels(inputs)),
+            // moverDefaults.podLabels ride the Job too (selector ergonomics);
+            // podAnnotations deliberately do NOT — the Job keeps exactly the
+            // caller's own annotations.
+            labels: Some(job_and_pod_labels(inputs)),
             annotations: (!inputs.annotations.is_empty()).then(|| inputs.annotations.clone()),
             owner_references: Some(vec![inputs.owner.clone()]),
             ..Default::default()
@@ -662,7 +716,16 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
             ttl_seconds_after_finished: inputs.limits.ttl_seconds_after_finished.map(|t| t as i32),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
-                    labels: Some(managed_labels(inputs)),
+                    labels: Some(job_and_pod_labels(inputs)),
+                    // moverDefaults.podAnnotations land HERE and nowhere else:
+                    // a mesh/injection webhook only reads the pod. Absent or
+                    // empty stays UNSET (not `Some({})`) so a Job built without
+                    // podAnnotations serializes byte-identically to before.
+                    annotations: inputs
+                        .pod_annotations
+                        .as_ref()
+                        .filter(|a| !a.is_empty())
+                        .cloned(),
                     ..Default::default()
                 }),
                 spec: Some(pod_spec),
@@ -898,6 +961,8 @@ mod tests {
             node_selector: None,
             tolerations: None,
             affinity: None,
+            pod_labels: None,
+            pod_annotations: None,
             labels,
             source_volume: None,
             repo_volume: None,
@@ -1770,5 +1835,166 @@ mod tests {
             .map(|v| v.name.as_str())
             .collect();
         assert!(!names.contains(&"work-spec"), "volumes: {names:?}");
+    }
+
+    // --- moverDefaults.podLabels / podAnnotations passthrough (M6) ---------
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn job_labels(job: &Job) -> BTreeMap<String, String> {
+        job.metadata.labels.clone().unwrap_or_default()
+    }
+
+    fn pod_meta(job: &Job) -> ObjectMeta {
+        job.spec
+            .as_ref()
+            .unwrap()
+            .template
+            .metadata
+            .clone()
+            .expect("pod template metadata")
+    }
+
+    #[test]
+    fn pod_labels_land_on_both_the_pod_template_and_the_job() {
+        // A Kueue `queue-name` has to reach the pod (the scheduler reads it)
+        // AND the Job (`kubectl get jobs -l ...`, Job-level controllers).
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.pod_labels = Some(map(&[
+            ("kueue.x-k8s.io/queue-name", "backups"),
+            ("team", "platform"),
+        ]));
+        let job = build_job(&i).unwrap();
+
+        for (where_, labels) in [
+            ("Job", job_labels(&job)),
+            ("pod", pod_meta(&job).labels.unwrap()),
+        ] {
+            assert_eq!(
+                labels.get("kueue.x-k8s.io/queue-name").map(String::as_str),
+                Some("backups"),
+                "{where_}"
+            );
+            assert_eq!(
+                labels.get("team").map(String::as_str),
+                Some("platform"),
+                "{where_}"
+            );
+            // kopiur's own labels are still there, unharmed.
+            assert_eq!(
+                labels
+                    .get("kopiur.home-operations.com/origin")
+                    .map(String::as_str),
+                Some("scheduled"),
+                "{where_}"
+            );
+            assert_eq!(
+                labels
+                    .get(kopiur_api::consts::MANAGED_BY_LABEL)
+                    .map(String::as_str),
+                Some(kopiur_api::consts::MANAGED_BY_VALUE),
+                "{where_}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kopiur_managed_label_wins_over_a_colliding_pod_label() {
+        // Defense in depth behind the admission rejection: the controller LISTs,
+        // counts and reaps movers by these selectors, so a user value must never
+        // be able to overwrite one — even from a stored/skew CR.
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.pod_labels = Some(map(&[
+            ("kopiur.home-operations.com/origin", "hijacked"),
+            (kopiur_api::consts::MANAGED_BY_LABEL, "not-kopiur"),
+        ]));
+        let job = build_job(&i).unwrap();
+        for labels in [job_labels(&job), pod_meta(&job).labels.unwrap()] {
+            assert_eq!(
+                labels
+                    .get("kopiur.home-operations.com/origin")
+                    .map(String::as_str),
+                Some("scheduled"),
+            );
+            assert_eq!(
+                labels
+                    .get(kopiur_api::consts::MANAGED_BY_LABEL)
+                    .map(String::as_str),
+                Some(kopiur_api::consts::MANAGED_BY_VALUE),
+            );
+        }
+    }
+
+    #[test]
+    fn pod_annotations_land_on_the_pod_template_only() {
+        // Pod-only on purpose: a mesh webhook reads the POD, and an injected
+        // sidecar that never exits would keep the batch Job running forever.
+        // The Job's own annotations stay exactly `inputs.annotations`.
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.annotations = map(&[("kopiur.home-operations.com/slot", "2026-01-01T00:00:00Z")]);
+        i.pod_annotations = Some(map(&[("sidecar.istio.io/inject", "false")]));
+        let job = build_job(&i).unwrap();
+
+        assert_eq!(
+            pod_meta(&job).annotations.unwrap(),
+            map(&[("sidecar.istio.io/inject", "false")]),
+        );
+        assert_eq!(
+            job.metadata.annotations.unwrap(),
+            map(&[("kopiur.home-operations.com/slot", "2026-01-01T00:00:00Z")]),
+            "podAnnotations must NOT be mirrored onto the Job",
+        );
+    }
+
+    #[test]
+    fn absent_pod_metadata_renders_a_byte_identical_job() {
+        // Regression pin for the empty-stays-unset discipline: adding these two
+        // fields must not perturb a single existing mover Job. `None` and an
+        // EMPTY map both have to serialize exactly like the pre-M6 build.
+        let ws = sample_work_spec();
+        let baseline =
+            serde_json::to_string(&build_job(&inputs(&ws, JobLimits::default())).unwrap()).unwrap();
+
+        let mut empty = inputs(&ws, JobLimits::default());
+        empty.pod_labels = Some(BTreeMap::new());
+        empty.pod_annotations = Some(BTreeMap::new());
+        assert_eq!(
+            serde_json::to_string(&build_job(&empty).unwrap()).unwrap(),
+            baseline,
+            "an empty map must not differ from None",
+        );
+
+        // And specifically: the pod template carries NO `annotations` key at all
+        // (not `annotations: {}`, which would churn a server-side apply).
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
+        assert!(pod_meta(&job).annotations.is_none());
+        let v: serde_json::Value = serde_json::to_value(&job).unwrap();
+        assert!(
+            v["spec"]["template"]["metadata"]
+                .get("annotations")
+                .is_none(),
+            "{}",
+            v["spec"]["template"]["metadata"],
+        );
+    }
+
+    #[test]
+    fn the_result_config_map_does_not_take_pod_labels() {
+        // `podLabels` are POD metadata. The bootstrap result ConfigMap is not a
+        // pod, and its labels are what the controller reads it back by.
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.result_configmap = Some("nas-bootstrap-result");
+        i.pod_labels = Some(map(&[("team", "platform")]));
+        let cm = build_result_config_map(&i);
+        assert!(!cm.metadata.labels.unwrap().contains_key("team"));
     }
 }

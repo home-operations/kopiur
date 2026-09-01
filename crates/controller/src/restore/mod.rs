@@ -2569,6 +2569,10 @@ async fn run_restore_mover(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: mover_tolerations,
         affinity: mover_affinity,
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels: {
             let mut labels =
                 io::child_labels(&[(crate::consts::OP_LABEL, crate::consts::OP_RESTORE)]);

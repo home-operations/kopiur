@@ -210,16 +210,18 @@ allow:
   #     names the milestone that drains it, and the stale check fails the
   #     moment that milestone lands — so none of these can outlive the build.
   #
-  #     Three siblings are NOT listed, and it is worth saying why so nobody
-  #     "fixes" the omission: `concurrency`, `moverDefaults.podLabels` and
-  #     `scheduleDefaults.jitter` are equally inert today, but each reads as
-  #     wired through this check's documented name-collision under-reporting —
-  #     `concurrency` matches `ctrl_cfg.concurrency(..)` (reconcile
-  #     parallelism), `pod_labels` matches a local in
-  #     controller/src/server/mod.rs (the kopia UI server's pod labels), and
-  #     `jitter` matches the per-cron jitter the schedulers already read. An
-  #     entry for any of them would fail as STALE, so they cannot be listed;
-  #     the milestones below carry them anyway.
+  #     `moverDefaults.podLabels`/`podAnnotations` are gone from this list: M6
+  #     wired them (jobs.rs `job_and_pod_labels` / the pod-template annotations),
+  #     which is exactly the drainage the stale check exists to force.
+  #
+  #     Two siblings are still NOT listed, and it is worth saying why so nobody
+  #     "fixes" the omission: `concurrency` and `scheduleDefaults.jitter` are
+  #     equally inert today, but each reads as wired through this check's
+  #     documented name-collision under-reporting — `concurrency` matches
+  #     `ctrl_cfg.concurrency(..)` (reconcile parallelism) and `jitter` matches
+  #     the per-cron jitter the schedulers already read. An entry for either
+  #     would fail as STALE, so they cannot be listed; the milestones below
+  #     carry them anyway.
   # ==========================================================================
   - path: Repository.spec.concurrency.maxConcurrentJobs
     reason: >-
@@ -233,15 +235,3 @@ allow:
     reason: >-
       Same field on the cluster-scoped kind, same resolver, same M2 gate — a
       ClusterRepository's pool is counted by exactly the same code path.
-  - path: Repository.spec.moverDefaults.podAnnotations
-    reason: >-
-      Resolved by kopiur_api::common::resolve_mover into
-      ResolvedMover.pod_annotations (crates/api, not a consumer) and validated
-      at admission for reserved keys. The Job builder that stamps them onto the
-      mover POD TEMPLATE — pod-only, never mirrored onto the Job, so a mesh
-      sidecar opt-out reaches the webhook that reads it — ships in M4, together
-      with podLabels (equally inert today, unlistable per the section note).
-  - path: ClusterRepository.spec.moverDefaults.podAnnotations
-    reason: >-
-      Same field on the cluster-scoped kind; moverDefaults is one shared type
-      and one shared resolver, so it is drained by the same M4 change.

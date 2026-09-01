@@ -399,6 +399,22 @@ async fn create_session_job(
         node_selector: None,
         tolerations: None,
         affinity: None,
+        // The session pod skips every other `moverDefaults` layer (it is an
+        // interactive read-only pod on the hardened baseline), but pod
+        // labels/annotations are how the CLUSTER sees the pod: a Kueue/monitoring
+        // selector should find it, and a mesh sidecar opt-out matters MORE here
+        // than for a batch mover — an injected sidecar that never exits would
+        // outlive the session's TTL.
+        pod_labels: target
+            .repo
+            .mover_defaults
+            .as_ref()
+            .and_then(|d| d.pod_labels.clone()),
+        pod_annotations: target
+            .repo
+            .mover_defaults
+            .as_ref()
+            .and_then(|d| d.pod_annotations.clone()),
         labels,
         source_volume: None,
         repo_volume,
@@ -778,6 +794,7 @@ mod tests {
                         key: None,
                     },
                 },
+                mover_defaults: None,
             },
             ca_bundle_pem: None,
         };

@@ -1828,6 +1828,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: mover_tolerations,
         affinity: mover_affinity,
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         source_volume,
         repo_volume,
@@ -3790,6 +3794,10 @@ async fn build_batch_job(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         source_volume: None,
         repo_volume,
@@ -3988,6 +3996,10 @@ async fn reconcile_pin(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         source_volume: None,
         repo_volume,

@@ -4078,3 +4078,136 @@ mod missing_source_pvc {
         assert_eq!(written["reason"], gate.reason);
     }
 }
+
+// --- moverDefaults podLabels/podAnnotations reach a backup mover pod (M6) ---
+//
+// The reconciler's own Job-build path is async + kube IO, so this pins the pure
+// DATA PATH it is made of, end to end and in the same order: the repository's
+// `moverDefaults` → `resolve_mover` → the `MoverJobInputs` fields the backup
+// site sets → `build_job`. A field dropped at any link fails here.
+
+#[test]
+fn backup_mover_defaults_pod_metadata_reaches_the_pod_template() {
+    use kopiur_mover::jobs::{JobLimits, MoverJobInputs, build_job};
+
+    // Typed the cluster's way: JSON value -> typed (never serde_yaml straight
+    // into a typed value; see CLAUDE.md).
+    let defaults: kopiur_api::common::MoverDefaults = serde_json::from_value(serde_json::json!({
+        "podLabels": { "kueue.x-k8s.io/queue-name": "backups" },
+        "podAnnotations": { "sidecar.istio.io/inject": "false" },
+    }))
+    .expect("valid moverDefaults");
+    // Exactly what `build_backup_run` calls (recipe layers absent here).
+    let resolved_mover =
+        kopiur_api::common::resolve_mover(Some(&defaults), None, None, None, None, None);
+
+    // ... and exactly the two fields the backup site threads into the Job build.
+    let ws = sample_backup_work_spec();
+    let job = build_job(&MoverJobInputs {
+        name: "db-1",
+        namespace: "prod",
+        owner: kopiur_mover::jobs::owner_ref("Snapshot", "db-1", "uid-1"),
+        work_spec: &ws,
+        image: "ghcr.io/kopiur/mover:test",
+        image_pull_policy: None,
+        limits: JobLimits::default(),
+        resources: resolved_mover.resources.clone(),
+        security_context: resolved_mover.security_context.clone(),
+        pod_security_context: resolved_mover.pod_security_context.clone(),
+        node_selector: resolved_mover.node_selector.clone(),
+        tolerations: resolved_mover.tolerations.clone(),
+        affinity: resolved_mover.affinity.clone(),
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
+        labels: BTreeMap::new(),
+        source_volume: None,
+        repo_volume: None,
+        creds_secrets: Vec::new(),
+        result_configmap: None,
+        service_account: None,
+        passthrough_env: Vec::new(),
+        extra_env: Vec::new(),
+        annotations: BTreeMap::new(),
+        cache_volume: Default::default(),
+        scratch_volume: None,
+        readiness_exec: None,
+    })
+    .expect("the Job builds");
+
+    let pod_meta = job
+        .spec
+        .as_ref()
+        .expect("spec")
+        .template
+        .metadata
+        .as_ref()
+        .expect("pod template metadata");
+    assert_eq!(
+        pod_meta
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("kueue.x-k8s.io/queue-name"))
+            .map(String::as_str),
+        Some("backups"),
+        "moverDefaults.podLabels must reach the mover POD",
+    );
+    assert_eq!(
+        job.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("kueue.x-k8s.io/queue-name"))
+            .map(String::as_str),
+        Some("backups"),
+        "...and the Job, so a Job-level controller can select it",
+    );
+    assert_eq!(
+        pod_meta
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("sidecar.istio.io/inject"))
+            .map(String::as_str),
+        Some("false"),
+        "moverDefaults.podAnnotations must reach the mover POD",
+    );
+    assert!(
+        job.metadata.annotations.is_none(),
+        "...and must NOT be mirrored onto the Job",
+    );
+}
+
+/// A minimal backup work spec for the Job-build assertion above.
+fn sample_backup_work_spec() -> kopiur_mover::workspec::MoverWorkSpec {
+    use kopiur_mover::workspec::{
+        MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity, SnapshotOp,
+        TargetRef,
+    };
+    MoverWorkSpec {
+        version: 1,
+        operation: Operation::Snapshot(SnapshotOp {
+            source_path: "/data".into(),
+            tags: BTreeMap::new(),
+            policy: Default::default(),
+            fail_fast: None,
+            upload_limit_mb: None,
+            description: None,
+        }),
+        identity: ResolvedIdentity {
+            username: "db".into(),
+            hostname: "prod".into(),
+            source_path: "/data".into(),
+        },
+        repository: RepositoryConnect::Filesystem {
+            path: "/repo".into(),
+        },
+        target_ref: TargetRef {
+            api_version: crate::consts::API_VERSION.into(),
+            kind: "Snapshot".into(),
+            name: "db-1".into(),
+            namespace: "prod".into(),
+        },
+        hook_plan: Default::default(),
+        options: MoverOptions::default(),
+        cache: Default::default(),
+        throttle: Default::default(),
+    }
+}
