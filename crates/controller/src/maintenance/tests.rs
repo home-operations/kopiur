@@ -1,4 +1,5 @@
 use super::*;
+use crate::snapshot_schedule::{jitter_defaults, tz_defaults};
 use kopiur_api::common::{CronSpec, RepositoryKind, RepositoryRef};
 use kopiur_api::maintenance::RunStatus;
 use kopiur_api::{MaintenanceSpec, MaintenanceStatus, Ownership, TakeoverPolicy};
@@ -255,7 +256,7 @@ fn due_mode_falls_all_the_way_through_to_the_repo_default_timezone() {
         "UTC (no repo default) → 05:00 UTC has already passed"
     );
     assert!(
-        due_mode(&m, now, Some("America/Los_Angeles")).is_none(),
+        due_mode(&m, now, Some(&tz_defaults("America/Los_Angeles"))).is_none(),
         "repo scheduleDefaults.timezone must shift the evaluated slot when no \
          per-cron or schedule-level timezone is set"
     );
@@ -277,7 +278,7 @@ fn schedule_level_timezone_wins_over_repo_default() {
     // (America/Los_Angeles, which would push the slot hours into the future)
     // must be ignored.
     assert!(
-        due_mode(&m, now, Some("America/Los_Angeles")).is_some(),
+        due_mode(&m, now, Some(&tz_defaults("America/Los_Angeles"))).is_some(),
         "schedule-level timezone must win over the repo default"
     );
 }
@@ -295,8 +296,152 @@ fn per_cron_timezone_wins_over_repo_default() {
     m.spec.schedule.full.timezone = Some("UTC".into());
     // Per-cron UTC on full wins over BOTH the (absent) schedule-level timezone
     // and the repo default.
-    let (mode, _) = due_mode(&m, now, Some("America/Los_Angeles")).expect("full is due");
+    let (mode, _) =
+        due_mode(&m, now, Some(&tz_defaults("America/Los_Angeles"))).expect("full is due");
     assert_eq!(mode, MaintenanceMode::Full);
+}
+
+// --- scheduleDefaults.jitter two-level cascade -----------------------------
+// per-cron `jitter` -> repo `scheduleDefaults.jitter` -> no jitter.
+//
+// Asserted by COMPARING slots rather than hard-coding an offset: the offset is
+// `fnv1a(seed, slot)`-derived, so "the 1h window was applied" is proven by the
+// slot matching the one an explicit own `1h` produces, and differing from the
+// un-jittered one. Seed-independent, so it cannot rot if the fixture UID changes.
+
+/// The `after` anchor and cron every jitter test below shares.
+fn jitter_after() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-06-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+#[test]
+fn quick_cron_inherits_the_repo_default_jitter_when_it_sets_none() {
+    let after = jitter_after();
+    let m = maint_with("0 5 * * *", "0 3 * * *", None);
+    let bare = slot_for(&m, MaintenanceMode::Quick, after, None).unwrap();
+
+    let inherited = slot_for(
+        &m,
+        MaintenanceMode::Quick,
+        after,
+        Some(&jitter_defaults("1h")),
+    )
+    .unwrap();
+    assert_ne!(
+        inherited, bare,
+        "an inherited window must actually spread the slot"
+    );
+
+    // ...and it lands exactly where an explicitly-set own `1h` would.
+    let mut own = m.clone();
+    own.spec.schedule.quick.jitter = Some("1h".into());
+    assert_eq!(
+        inherited,
+        slot_for(&own, MaintenanceMode::Quick, after, None).unwrap(),
+        "inheritance must resolve to the same window as setting it directly"
+    );
+}
+
+#[test]
+fn full_cron_inherits_the_repo_default_jitter_too() {
+    // Both maintenance crons go through `slot_for`, so both inherit.
+    let after = jitter_after();
+    let m = maint_with("0 5 * * *", "0 3 * * *", None);
+    let bare = slot_for(&m, MaintenanceMode::Full, after, None).unwrap();
+    let inherited = slot_for(
+        &m,
+        MaintenanceMode::Full,
+        after,
+        Some(&jitter_defaults("1h")),
+    )
+    .unwrap();
+    assert_ne!(inherited, bare);
+    let mut own = m.clone();
+    own.spec.schedule.full.jitter = Some("1h".into());
+    assert_eq!(
+        inherited,
+        slot_for(&own, MaintenanceMode::Full, after, None).unwrap()
+    );
+}
+
+#[test]
+fn per_cron_jitter_wins_over_the_repo_default() {
+    let after = jitter_after();
+    let mut m = maint_with("0 5 * * *", "0 3 * * *", None);
+    m.spec.schedule.quick.jitter = Some("1h".into());
+    assert_eq!(
+        slot_for(
+            &m,
+            MaintenanceMode::Quick,
+            after,
+            Some(&jitter_defaults("10m"))
+        )
+        .unwrap(),
+        slot_for(&m, MaintenanceMode::Quick, after, None).unwrap(),
+        "an own per-cron jitter must ignore the repo default entirely"
+    );
+}
+
+#[test]
+fn neither_own_nor_repo_jitter_is_the_bare_cron_slot() {
+    let after = jitter_after();
+    let m = maint_with("0 5 * * *", "0 3 * * *", None);
+    let slot = slot_for(&m, MaintenanceMode::Quick, after, None).unwrap();
+    assert_eq!(
+        slot.to_rfc3339(),
+        "2026-06-09T05:00:00+00:00",
+        "no jitter anywhere → the exact cron instant"
+    );
+    // A repo that sets ONLY a timezone is the pre-jitter world: same instant,
+    // shifted purely by the zone (byte-identical regression).
+    assert_eq!(
+        slot_for(&m, MaintenanceMode::Quick, after, Some(&tz_defaults("UTC"))).unwrap(),
+        slot
+    );
+}
+
+/// **The materialized-default question, pinned.** `CronSpec.jitter` carries NO
+/// schemars/CRD default — `deploy/crds/maintenances.yaml` has no `default:` under
+/// either cron's `jitter`, so the apiserver never fills it in. The quick-30m /
+/// full-1h windows come from [`kopiur_api::default_maintenance_schedule`], which the
+/// controller's repository projection materializes INTO the owned `Maintenance`'s
+/// spec. So for an operator-managed `Maintenance` those windows are genuinely "own"
+/// and a repository default does not override them; inheritance only reaches an
+/// externally-authored `Maintenance` (or a `spec.maintenance.schedule` override) that
+/// omits `jitter`.
+#[test]
+fn the_managed_maintenance_default_windows_count_as_own_and_are_not_overridden() {
+    let after = jitter_after();
+    let mut m = maint_with("0 5 * * *", "0 3 * * *", None);
+    m.spec.schedule = kopiur_api::default_maintenance_schedule();
+    // Precondition: the projected default really does carry windows.
+    assert_eq!(m.spec.schedule.quick.jitter.as_deref(), Some("30m"));
+    assert_eq!(m.spec.schedule.full.jitter.as_deref(), Some("1h"));
+
+    for mode in [MaintenanceMode::Quick, MaintenanceMode::Full] {
+        assert_eq!(
+            slot_for(&m, mode, after, Some(&jitter_defaults("6h"))).unwrap(),
+            slot_for(&m, mode, after, None).unwrap(),
+            "a materialized spec window is `own` — the repo default must not override it"
+        );
+    }
+
+    // Contrast: strip the window and the SAME repository default now applies.
+    let mut bare = m.clone();
+    bare.spec.schedule.quick.jitter = None;
+    assert_ne!(
+        slot_for(
+            &bare,
+            MaintenanceMode::Quick,
+            after,
+            Some(&jitter_defaults("6h"))
+        )
+        .unwrap(),
+        slot_for(&bare, MaintenanceMode::Quick, after, None).unwrap(),
+        "a genuinely absent per-cron jitter must inherit"
+    );
 }
 
 // --- manual (annotation-requested) runs -----------------------------------
