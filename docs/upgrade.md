@@ -22,6 +22,12 @@ A `Job`'s pod template is immutable, so a natural worry is that the operator wil
 
 It does not. Every pooled spawn path checks whether its mover Job already exists and **returns before touching it** — the operator never re-applies an existing Job's pod template, on this upgrade or any other. A Job created by the previous version therefore runs to completion exactly as it is, unlabeled and (per the note above) uncounted, and its successor is created fresh with the new template. There is no error to see, nothing to retry, and no reason to drain your schedules before upgrading.
 
+### A leader failover has the same one-window shape
+
+The gate counts the pool by listing Jobs, and there is a gap between deciding to admit a run and that run's Job becoming visible to the next list. Within one operator process that gap is closed exactly: the leader keeps an in-memory record of the admissions it has granted, so two runs that start at the same instant cannot both read an empty pool. Only the leader reconciles, so there is never a second replica whose record this would have to agree with.
+
+A **leader failover** resets that record. The new leader begins from the listed Jobs alone, so for the length of one reconcile pass it can admit a run whose predecessor's Job the API has not published yet — the same brief over-admission as the pre-upgrade case above, bounded to the moment of the handover, and self-correcting on the next pass. As there, no cap is ever *under*-run: the record only ever adds to what the list shows, so losing it can never park a repository that has room.
+
 ## Admission-only: jitter and deadline rules (re-apply only)
 
 Two rules now **tighten fields that already shipped**, so they are enforced by the admission webhook and deliberately **not** re-checked by the reconcilers:
