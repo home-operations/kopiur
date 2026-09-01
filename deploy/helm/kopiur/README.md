@@ -1,8 +1,8 @@
 # kopiur
 
-![Version](https://img.shields.io/static/v1?label=Version&message=0.10.5&color=informational&style=flat-square) <!-- x-release-please-version -->
+![Version](https://img.shields.io/static/v1?label=Version&message=0.10.6&color=informational&style=flat-square) <!-- x-release-please-version -->
 ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
-![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.10.5&color=informational&style=flat-square) <!-- x-release-please-version -->
+![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.10.6&color=informational&style=flat-square) <!-- x-release-please-version -->
 
 Kopiur — a Kopia-native Kubernetes backup operator written in Rust.
 Installs the controller, admission webhook, the 8 kopiur.home-operations.com/v1alpha1 CRDs,
