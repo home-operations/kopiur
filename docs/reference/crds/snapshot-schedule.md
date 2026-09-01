@@ -54,9 +54,53 @@ What to do when a slot fires while a prior run from this schedule is still in fl
 
 - **`Forbid`** (default) — skip the new run and surface a condition, rather than let runs pile up.
 - **`Allow`** — start the new run alongside the in-flight one.
-- **`Replace`** — cancel the in-flight run and start the new one in its place.
+- **`Replace`** — cancel the in-flight run(s) and start the new one in their place.
 
 This default also materializes into the stored object and `kubectl explain`.
+
+##### What `Replace` actually does
+
+When a slot comes due and this schedule still has unfinished children (phase
+`Pending`, `Running`, or not yet stamped), the controller — in this order, per
+victim — deletes the run's **mover Job** (stopping the pod deterministically,
+rather than racing ownership garbage collection), then annotates the `Snapshot`
+CR with `kopiur.home-operations.com/pruned-by: replaced-run` and deletes it.
+Only then does it mint the new slot's `Snapshot`, in the same reconcile. One
+Normal event, `ReplacedActiveRun`, lists every run that was cancelled.
+
+The `replaced-run` stamp marks the deletion as an **operator prune**, so it is
+exempt from the repository's [mass-deletion breaker](repository.md) — without
+it, every `Replace` fire would look like an external mass deletion and a busy
+schedule would trip its own breaker.
+
+/// warning | What is and isn't reclaimed
+
+`deletionPolicy` governs **committed** kopia snapshots. A run cancelled mid-flight
+has not committed one yet (`status.snapshot` is unset), so there is nothing for
+the finalizer to delete in the repository — the CR is simply released. The data
+the killed mover had already uploaded is reclaimed by kopia's own checkpointing
+and garbage collection during [maintenance](maintenance.md), not by the
+finalizer. In the rare race where a run commits its snapshot between being
+selected and being deleted, that snapshot is deliberately **kept** (it becomes an
+unreferenced snapshot the catalog rediscovers): you asked to cancel an in-flight
+run, not to destroy a finished backup.
+
+///
+
+Two situations make `Replace` decline to replace anything, and in both it waits
+rather than firing:
+
+- **A child at an unrecognized phase.** If a run sits at a `status.phase` this
+  operator build does not know — almost always a newer operator wrote it — the
+  schedule refuses to delete what it cannot classify and instead raises
+  `ScheduleRunnable=False` with reason `BlockedOnUnreadableRun`, exactly as
+  `Forbid` does. Finish the operator upgrade, or delete that `Snapshot` if the
+  run is genuinely over.
+- **A child parked behind the repository's concurrency cap.** A run holding
+  `RepositorySlotAvailable=False` is *queued*, not running. Cancelling it would
+  free no capacity and the replacement would immediately queue in its place, so
+  `Replace` degrades to `Forbid`-like behavior until the pool drains. This
+  clears on its own — no action needed.
 
 #### `schedule.startingDeadlineSeconds`
 

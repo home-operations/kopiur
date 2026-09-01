@@ -386,6 +386,10 @@ pub const SOURCE_PVC_AVAILABLE_CONDITION: &str = "SourcePvcAvailable";
 /// `reason`/Event reason for [`SOURCE_PVC_AVAILABLE_CONDITION`] = `False`.
 pub const SOURCE_PVC_MISSING_REASON: &str = "SourcePvcMissing";
 
+/// Condition type: whether a mover-Job slot is available in the repository's
+/// concurrency pool (False reason WaitingForSlot while parked; heals to True).
+pub const REPOSITORY_SLOT_AVAILABLE_CONDITION: &str = "RepositorySlotAvailable";
+
 /// `Restore` condition recording whether the object this restore's repository
 /// is DERIVED from exists. Set `False` (with
 /// [`RESTORE_REFERENT_MISSING_REASON`]) when the readiness gate cannot even

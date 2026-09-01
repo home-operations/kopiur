@@ -341,6 +341,14 @@ pub enum PrunedBy {
     /// deliberately carry NO stamp, so a mass source-vanish classifies EXTERNAL
     /// and the dest repository's breaker holds it.)
     ReplicationRetention,
+    /// `SnapshotSchedule.spec.schedule.concurrencyPolicy: Replace` cancelled
+    /// this still-unfinished run so the newly-due slot could take its place.
+    /// An OPERATOR prune: bounded by construction (at most this schedule's own
+    /// unfinished children, at most one slot's worth per fire) and deliberate —
+    /// the user asked for cancel-the-old — so it is breaker-EXEMPT. Without the
+    /// stamp every `Replace` fire would classify EXTERNAL and a busy schedule
+    /// would trip its repository's mass-deletion breaker.
+    ReplacedRun,
 }
 
 impl PrunedBy {
@@ -353,6 +361,7 @@ impl PrunedBy {
         Self::FailedHistory,
         Self::PolicyCascade,
         Self::ReplicationRetention,
+        Self::ReplacedRun,
     ];
 
     /// The stable annotation value stamped by the operator before it deletes a
@@ -363,6 +372,7 @@ impl PrunedBy {
             Self::FailedHistory => "failed-history",
             Self::PolicyCascade => "policy-cascade",
             Self::ReplicationRetention => "replication-retention",
+            Self::ReplacedRun => "replaced-run",
         }
     }
 
@@ -374,6 +384,7 @@ impl PrunedBy {
             "failed-history" => Some(Self::FailedHistory),
             "policy-cascade" => Some(Self::PolicyCascade),
             "replication-retention" => Some(Self::ReplicationRetention),
+            "replaced-run" => Some(Self::ReplacedRun),
             _ => None,
         }
     }
@@ -1390,8 +1401,16 @@ onScheduleDelete: Delete
             PrunedBy::FailedHistory,
             PrunedBy::PolicyCascade,
             PrunedBy::ReplicationRetention,
+            PrunedBy::ReplacedRun,
         ];
         assert_eq!(PrunedBy::ALL, all, "PrunedBy::ALL must list every variant");
+        // The `concurrencyPolicy: Replace` stamp, pinned as a literal: it is a
+        // wire value the finalizer parses, so a rename would silently reclassify
+        // every replaced run as an EXTERNAL deletion and push the repository's
+        // mass-deletion breaker toward tripping on every busy schedule.
+        assert_eq!(PrunedBy::ReplacedRun.annotation_value(), "replaced-run");
+        assert_eq!(PrunedBy::parse("replaced-run"), Some(PrunedBy::ReplacedRun));
+        assert_eq!(PrunedBy::parse("replaced_run"), None);
         for variant in all {
             assert_eq!(
                 PrunedBy::parse(variant.annotation_value()),
