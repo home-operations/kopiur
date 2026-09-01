@@ -695,6 +695,16 @@ pub const KOPIA_BIN: &str = "/usr/local/bin/kopia";
 /// Swapped in at runtime by [`crate::slow_mover`], never by the chart.
 pub const SLOW_MOVER_IMAGE: &str = "kopiur/mover-slow:e2e";
 
+/// The mover image reference EXACTLY as the chart renders it into
+/// `KOPIUR_MOVER_IMAGE` (`deploy/e2e/values.yaml`, `mover.image`).
+///
+/// Same image as [`MOVER_IMAGE`] — containerd normalizes `kopiur/mover:e2e` to
+/// `docker.io/kopiur/mover:e2e` — but restoring the fixture writes THIS spelling
+/// so the Deployment goes back byte-identical to its installed state, leaving no
+/// phantom drift for a `helm diff`, a re-`helm upgrade`, or an assertion that
+/// reads the env value. A hermetic test keeps it in lockstep with the values file.
+pub const CHART_MOVER_IMAGE: &str = "docker.io/kopiur/mover:e2e";
+
 // --- operator Deployment (the chart's controller workload) ----------------------
 /// The operator controller `Deployment` the chart installs (`<release>-controller`,
 /// release `kopiur`) in [`OPERATOR_NS`]. Patch target for the scenarios that
@@ -825,6 +835,37 @@ mod tests {
             toml.contains("mise run //crates/e2e:image-mover-slow"),
             "nothing invokes the `image-mover-slow` task — CI shards skip `images` \
              (KOPIUR_E2E_SKIP_BUILD=1), so the build must hang off `images-load`"
+        );
+    }
+
+    /// [`CHART_MOVER_IMAGE`] must be exactly what `deploy/e2e/values.yaml`
+    /// renders, or restoring the fixture leaves the controller Deployment
+    /// subtly different from its helm-installed state.
+    #[test]
+    fn chart_mover_image_matches_the_e2e_values_file() {
+        let values = read("../../deploy/e2e/values.yaml");
+        // The `mover:` block's image repository + tag (the only
+        // `repository: docker.io/kopiur/mover` line in the file).
+        let repo = values
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix("repository: "))
+            .find(|r| r.ends_with("/mover"))
+            .unwrap_or_else(|| {
+                panic!("deploy/e2e/values.yaml has no mover image `repository:` line")
+            });
+        assert_eq!(
+            CHART_MOVER_IMAGE,
+            format!("{repo}:e2e"),
+            "CHART_MOVER_IMAGE drifted from deploy/e2e/values.yaml's mover.image — restoring the \
+             slow-mover fixture would write an env value the chart never rendered"
+        );
+        // Same image, two spellings: keep the tag identical so they cannot
+        // silently diverge to different builds.
+        assert!(
+            CHART_MOVER_IMAGE.ends_with(MOVER_IMAGE),
+            "CHART_MOVER_IMAGE ({CHART_MOVER_IMAGE}) must be the registry-qualified form of \
+             MOVER_IMAGE ({MOVER_IMAGE})"
         );
     }
 

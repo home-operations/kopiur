@@ -96,10 +96,9 @@ use common::{
 // `SNAPSHOT_CLEANUP_FINALIZER` are shared via `kopiur_api::consts` and imported above.
 const OP_SNAPSHOT_DELETE_BATCH: &str = "snapshot-delete-batch";
 const DELETE_MEMBERS_ANNOTATION: &str = "kopiur.home-operations.com/delete-members";
-/// The operator controller Deployment the chart installs (`<release>-controller`).
-const CONTROLLER_DEPLOYMENT: &str = "kopiur-controller";
-/// The controller container name in that Deployment (`deploy/helm/kopiur/templates/deployment.tpl`).
-const CONTROLLER_CONTAINER: &str = "controller";
+// The controller Deployment/container names moved to `kopiur_e2e::consts`
+// (imported below) once a third suite needed them.
+use e2e_consts::{CONTROLLER_CONTAINER, CONTROLLER_DEPLOYMENT};
 /// Env knob capping concurrent batch-delete Jobs (`crate::config::MAX_CONCURRENT_DELETE_JOBS_ENV`).
 const MAX_CONCURRENT_DELETE_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_DELETE_JOBS";
 

@@ -28,6 +28,29 @@
 //!    change. A repository whose Secret carries neither key falls back to the
 //!    image-baked [`DEFAULT_DELAY`].
 //!
+//! ## Name the right Secret, or the delay is silently 60s
+//!
+//! Channel 2 only reaches the repositories whose credentials Secret was named.
+//! [`enable`] defaults to [`DEFAULT_CREDS_SECRET`] (`kopia-creds`, the shared
+//! filesystem-backend Secret) — an **S3/MinIO repository is not covered by that
+//! default**; use [`SlowMover::creds_secrets`] with e.g. `kopia-s3-creds`.
+//! Getting it wrong is not silent: [`SlowMover::enable`] verifies every named
+//! Secret exists up front and fails with an actionable error naming the `Need`
+//! that provisions it, rather than leaving a scenario to wonder why its movers
+//! sleep 60s instead of the requested delay.
+//!
+//! ## Writing the Secret re-triggers Repository reconciles
+//!
+//! `Repository`/`ClusterRepository` **watch their credentials Secret's metadata**
+//! (`controller::controllers` wires `referent_meta::<Secret>` →
+//! `watch::secret_to_repositories`, so a content edit that does not bump the
+//! repo's `generation` still re-triggers a connect). Writing the delay knobs
+//! bumps the Secret's `resourceVersion`, so **enabling and restoring the fixture
+//! each cause a reconcile of every Repository referencing that Secret.** A
+//! scenario that counts Jobs, condition flips, or status transitions must expect
+//! that burst of operator activity at the fixture's two edges and not attribute
+//! it to its own subject.
+//!
 //! # Cancellation
 //!
 //! A sleeping mover pod terminates PROMPTLY on delete: the fixture entrypoint
@@ -218,31 +241,68 @@ impl SlowMover {
     /// Order matters: the Secret is written FIRST so no mover pod can be created
     /// against the fixture image before its delay value exists (a pod that
     /// raced it would silently sleep [`DEFAULT_DELAY`] instead).
+    ///
+    /// **Enable is all-or-nothing.** Any failure after the first mutation —
+    /// a Secret write partway through the list, or the rollout wait timing out
+    /// with the fixture image already patched in — best-effort restores
+    /// everything before propagating. Otherwise the error path would leak the
+    /// slow image with no guard in existence to put it back (the caller never
+    /// receives one), and every later scenario in the serial run would silently
+    /// get slow movers.
     pub async fn enable(self, world: &World) -> Result<SlowMoverGuard> {
         let client = world.client().clone();
-        let delay_secs = self.delay.as_secs();
+        // Fail fast and actionably rather than falling back to the 60s image
+        // default on a Secret that does not exist (see the module docs).
         for secret in &self.creds_secrets {
-            set_delay_knobs(
-                &client,
-                secret,
-                Some(delay_secs),
-                ops_value(&self.ops).as_deref(),
-            )
-            .await?;
+            require_creds_secret(&client, secret).await?;
         }
+
+        let delay_secs = self.delay.as_secs();
+        let ops = ops_value(&self.ops);
         eprintln!(
             "[slow_mover] enabling {} (delay {delay_secs}s, ops: {}, secrets: {:?})",
             consts::SLOW_MOVER_IMAGE,
-            ops_value(&self.ops).unwrap_or_else(|| "<all>".to_string()),
+            ops.clone().unwrap_or_else(|| "<all>".to_string()),
             self.creds_secrets,
         );
-        set_mover_image(&client, consts::SLOW_MOVER_IMAGE).await?;
+
+        if let Err(e) = enable_inner(&client, delay_secs, ops.as_deref(), &self.creds_secrets).await
+        {
+            eprintln!(
+                "[slow_mover] enable FAILED after mutating the cluster — best-effort restoring \
+                 so the rest of the run is unaffected: {e:#}"
+            );
+            if let Err(restore_err) = restore(&client, &self.creds_secrets).await {
+                eprintln!(
+                    "[slow_mover] WARNING: the best-effort restore ALSO failed: {restore_err:#} \
+                     — the operator may still be running {}",
+                    consts::SLOW_MOVER_IMAGE
+                );
+            }
+            return Err(e);
+        }
+
         Ok(SlowMoverGuard {
             client,
             creds_secrets: self.creds_secrets,
             restored: false,
         })
     }
+}
+
+/// The mutating half of [`SlowMover::enable`], split out so a failure anywhere
+/// in it lands on ONE caller-side restore instead of needing cleanup at each
+/// `?`. Knobs first, image second (see [`SlowMover::enable`]).
+async fn enable_inner(
+    client: &Client,
+    delay_secs: u64,
+    ops: Option<&str>,
+    creds_secrets: &[String],
+) -> Result<()> {
+    for secret in creds_secrets {
+        set_delay_knobs(client, secret, Some(delay_secs), ops).await?;
+    }
+    set_mover_image(client, consts::SLOW_MOVER_IMAGE).await
 }
 
 /// Make every mover Job sleep `delay` before doing its work, for repositories
@@ -257,7 +317,9 @@ pub async fn enable(world: &World, delay: Duration) -> Result<SlowMoverGuard> {
 /// Undo [`enable`]: put the real mover image back (rollout wait) and clear the
 /// delay knobs from [`DEFAULT_CREDS_SECRET`].
 ///
-/// Idempotent — safe to call when the fixture was never enabled, or twice.
+/// Idempotent — safe to call when the fixture was never enabled, or twice, or
+/// before the credentials Secret has been provisioned at all (clearing a knob
+/// from an absent Secret is treated as already-clear, not an error).
 /// Restores in the mirror order of [`SlowMover::enable`]: the image first, so no
 /// new mover can be created slow once this returns, then the Secret.
 ///
@@ -347,13 +409,31 @@ impl Drop for SlowMoverGuard {
 }
 
 /// Shared restore path: real image first (rollout wait), then clear the knobs.
+///
+/// Restores [`consts::CHART_MOVER_IMAGE`], the string the chart actually renders
+/// — NOT `consts::MOVER_IMAGE`. containerd resolves the two to the same image
+/// (`kopiur/mover:e2e` normalizes to `docker.io/kopiur/mover:e2e`), so either
+/// would run, but only the chart's exact spelling leaves the Deployment
+/// byte-identical to its installed state — so a `helm diff`, a re-`helm upgrade`,
+/// or a later assertion on the env value sees no phantom drift from the fixture.
+///
+/// Every Secret in the list is attempted even if an earlier one fails, so a
+/// partial enable cannot strand knobs on the untouched remainder; the FIRST
+/// error is returned once the sweep is done.
 async fn restore(client: &Client, creds_secrets: &[String]) -> Result<()> {
-    eprintln!("[slow_mover] restoring {}", consts::MOVER_IMAGE);
-    set_mover_image(client, consts::MOVER_IMAGE).await?;
+    eprintln!("[slow_mover] restoring {}", consts::CHART_MOVER_IMAGE);
+    let image = set_mover_image(client, consts::CHART_MOVER_IMAGE).await;
+    let mut first_err = image.err();
     for secret in creds_secrets {
-        set_delay_knobs(client, secret, None, None).await?;
+        if let Err(e) = set_delay_knobs(client, secret, None, None).await {
+            eprintln!("[slow_mover] could not clear the knobs on Secret {secret}: {e:#}");
+            first_err.get_or_insert(e);
+        }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Patch the controller Deployment's [`consts::MOVER_IMAGE_ENV`] and wait for the
@@ -433,6 +513,11 @@ fn rollout_complete(deployment: &Deployment, generation: i64) -> bool {
 /// manager would let a later `ensure` silently drop them mid-scenario.
 /// `stringData` is write-only (the API server folds it into `data`), hence the
 /// removal side patches `data` with nulls.
+///
+/// Clearing (`delay_secs: None`) tolerates a missing Secret — an absent Secret
+/// carries no knobs, which is the state the caller asked for — so [`disable`]
+/// stays idempotent before `World::ensure` has ever run. SETTING still errors on
+/// a missing Secret; that case is caught earlier by [`require_creds_secret`].
 async fn set_delay_knobs(
     client: &Client,
     secret: &str,
@@ -444,23 +529,66 @@ async fn set_delay_knobs(
         field_manager: Some("kopiur-e2e-slow-mover".to_string()),
         ..Default::default()
     };
-    let patch = match delay_secs {
+    let patch = delay_knob_patch(delay_secs, ops);
+    match api.patch(secret, &pp, &Patch::Merge(&patch)).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if tolerate_api_error(e.code, delay_secs.is_none()) => Ok(()),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "patching the slow-mover env knobs onto Secret {}/{secret}",
+                consts::OPERATOR_NS
+            )
+        }),
+    }
+}
+
+/// The JSON-merge patch body for [`set_delay_knobs`]. Pure, so the set/clear
+/// shapes are unit-tested without a cluster.
+fn delay_knob_patch(delay_secs: Option<u64>, ops: Option<&str>) -> serde_json::Value {
+    match delay_secs {
         Some(secs) => serde_json::json!({ "stringData": {
             DELAY_ENV: secs.to_string(),
             // An unset filter must CLEAR a previous one, not inherit it.
             DELAY_OPS_ENV: ops.unwrap_or_default(),
         }}),
         None => serde_json::json!({ "data": { DELAY_ENV: null, DELAY_OPS_ENV: null } }),
-    };
-    api.patch(secret, &pp, &Patch::Merge(&patch))
-        .await
-        .with_context(|| {
-            format!(
-                "patching the slow-mover env knobs onto Secret {}/{secret} — is it provisioned \
-                 (world.ensure(&[Need::Filesystem]))?",
-                consts::OPERATOR_NS
-            )
-        })?;
+    }
+}
+
+/// Whether an API error on the knob patch is benign: only a `404` while
+/// CLEARING, because an absent Secret already carries no knobs. A 404 while
+/// SETTING is a real misconfiguration and must surface.
+fn tolerate_api_error(code: u16, clearing: bool) -> bool {
+    code == 404 && clearing
+}
+
+/// Fail before mutating anything if a named credentials Secret does not exist.
+///
+/// Without this the fixture degrades SILENTLY: the repository's movers still run
+/// the slow image, but with no [`DELAY_ENV`] in their env they sleep the
+/// image-baked [`DEFAULT_DELAY`] (60s) instead of the requested delay, and a
+/// scenario sized around a 20s window just looks flaky. The classic case is an
+/// S3 repository left on the filesystem default (see the module docs).
+async fn require_creds_secret(client: &Client, secret: &str) -> Result<()> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), consts::OPERATOR_NS);
+    let found = api.get_opt(secret).await.with_context(|| {
+        format!(
+            "checking that credentials Secret {}/{secret} exists",
+            consts::OPERATOR_NS
+        )
+    })?;
+    anyhow::ensure!(
+        found.is_some(),
+        "the slow-mover fixture was pointed at credentials Secret {}/{secret}, which does not \
+         exist. Its movers would silently sleep the image default ({}s) instead of the requested \
+         delay. Provision it first (world.ensure(&[Need::Filesystem]) for `{}`, Need::Minio for \
+         `{}`), or name the Secret the repository under test actually uses via \
+         SlowMover::creds_secrets.",
+        consts::OPERATOR_NS,
+        DEFAULT_DELAY.as_secs(),
+        consts::SECRET_FS_CREDS,
+        consts::SECRET_S3_CREDS,
+    );
     Ok(())
 }
 
@@ -563,6 +691,45 @@ mod tests {
         let mut d = deployment(1, 1, 1, 1, 1);
         d.status = None;
         assert!(!rollout_complete(&d, 1));
+    }
+
+    /// Setting writes `stringData` (write-only, folded into `data` server-side);
+    /// clearing nulls the `data` keys. An unset ops filter must CLEAR a previous
+    /// one, not silently inherit it into the next window.
+    #[test]
+    fn delay_knob_patch_sets_via_string_data_and_clears_via_data_nulls() {
+        let set = delay_knob_patch(Some(45), Some("snapshot"));
+        assert_eq!(set["stringData"][DELAY_ENV], "45");
+        assert_eq!(set["stringData"][DELAY_OPS_ENV], "snapshot");
+        assert!(set.get("data").is_none(), "must not write `data` directly");
+
+        let unfiltered = delay_knob_patch(Some(45), None);
+        assert_eq!(
+            unfiltered["stringData"][DELAY_OPS_ENV], "",
+            "an unset filter must blank a previous one"
+        );
+
+        let clear = delay_knob_patch(None, None);
+        assert!(clear["data"][DELAY_ENV].is_null());
+        assert!(clear["data"][DELAY_OPS_ENV].is_null());
+        assert!(
+            clear.get("stringData").is_none(),
+            "clearing goes through `data` nulls; `stringData` cannot remove a key"
+        );
+    }
+
+    /// A missing Secret is only benign when CLEARING — otherwise the fixture
+    /// would degrade silently to the 60s image default.
+    #[test]
+    fn only_a_404_while_clearing_is_tolerated() {
+        assert!(tolerate_api_error(404, true));
+        assert!(!tolerate_api_error(404, false), "404 while setting is real");
+        assert!(
+            !tolerate_api_error(403, true),
+            "RBAC denial is never benign"
+        );
+        assert!(!tolerate_api_error(409, true));
+        assert!(!tolerate_api_error(500, true));
     }
 
     #[test]
