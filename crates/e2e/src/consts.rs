@@ -208,6 +208,20 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "seed-mig-dst",
     "seed-empty-src",
     "seed-empty-dst",
+    // Per-repository mover-Job concurrency (crates/e2e/tests/concurrency.rs).
+    // Every scenario asserts an INVARIANT over the live mover Jobs against ONE
+    // repository, so no two may share a repo — a neighbour's mover in the same
+    // pool would either break the "never two live" assertion or (worse) fill
+    // the cap and make a park look like the gate working when it was not.
+    //   conc-cap       maxConcurrentJobs=1, two backups serialized
+    //   conc-restore   cap=1 with a restore jumping the queue
+    //   conc-uncapped  the no-cap default (the condition must never appear)
+    //   conc-env-a/b   two SEPARATE repositories under the cluster-wide backstop
+    "conc-cap",
+    "conc-restore",
+    "conc-uncapped",
+    "conc-env-a",
+    "conc-env-b",
 ];
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per
