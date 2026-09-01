@@ -617,6 +617,39 @@ spec:
                         type: integer
                     type: object
                 type: object
+              concurrency:
+                description: Concurrency limits for mover Jobs against this repository (absent = unlimited).
+                nullable: true
+                properties:
+                  maxConcurrentJobs:
+                    description: |-
+                      Ceiling on how many of this repository's mover Jobs may be in flight at
+                      once. Backup snapshots, restores, and replication runs that READ FROM this
+                      repository all draw from ONE pool — a repository's backend (and the
+                      bandwidth to it) is the shared resource, so splitting the budget per work
+                      kind would let three "safe" limits still saturate it.
+
+                      Restores are **always admitted** and never parked: a restore is a recovery
+                      in progress, and holding one behind a queue of routine backups is exactly
+                      backwards. An in-flight restore still COUNTS toward the pool, so it
+                      displaces backups rather than adding to them.
+
+                      Excluded from the pool entirely: maintenance (already single-flight per
+                      repository), verification, pin, and snapshot-delete batch Jobs. These are
+                      operator-driven housekeeping that must not be starved by a saturated
+                      backup pool.
+
+                      Absent or `0` means unlimited — the default, and today's behavior.
+
+                      No schema `default:` is emitted for this field (api-conventions §4a):
+                      absent and `0` are the SAME state (unlimited), so a materialized default
+                      would stamp `{maxConcurrentJobs: 0}` onto every stored repository — GitOps
+                      diff noise for a value that changes nothing.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               create:
                 description: What to do when the repository does not yet exist (absent means it must already exist).
                 nullable: true
@@ -1849,6 +1882,39 @@ spec:
                     description: Pod `nodeSelector` for every mover.
                     nullable: true
                     type: object
+                  podAnnotations:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Extra annotations for every mover pod. Unlike `podLabels`
+                      these are **pod-template-only** — they are not mirrored onto the `Job`
+                      object, because the common case is a sidecar-injection opt-out
+                      (`sidecar.istio.io/inject: "false"`, `linkerd.io/inject: disabled`,
+                      `vault.hashicorp.com/agent-inject: "false"`) that only means anything on
+                      the pod a mesh webhook actually sees. A mover is a short-lived batch pod;
+                      an injected sidecar that never exits keeps its Job running forever.
+
+                      Same reserved keys as `podLabels`, rejected at admission.
+                    nullable: true
+                    type: object
+                  podLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Extra labels for every mover POD (and the `Job` that owns it), merged
+                      UNDER kopiur's own labels — a key kopiur sets always wins, so a
+                      user-supplied value can never break the selectors the controller counts
+                      and reaps by.
+
+                      This is the hook for cluster machinery that keys off pod labels and that
+                      kopiur has no field of its own for: a Kueue `kueue.x-k8s.io/queue-name` to
+                      put movers under a cluster queue, a monitoring/`NetworkPolicy` selector, a
+                      service-mesh exclusion label.
+
+                      Keys under `kopiur.home-operations.com/` and the exact key
+                      `app.kubernetes.io/managed-by` are reserved and rejected at admission.
+                    nullable: true
+                    type: object
                   podSecurityContext:
                     description: Pod security-context base (notably `fsGroup`) for every mover.
                     nullable: true
@@ -2325,11 +2391,26 @@ spec:
                 type: object
               scheduleDefaults:
                 description: |-
-                  Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
-                  their own equivalent field — verification, replication, and maintenance
-                  schedules today; set once here instead of repeating it on every cron.
+                  Scheduling defaults (`timezone`, `jitter`) inherited by consumers that don't
+                  set their own equivalent field — backup, verification, replication, and
+                  maintenance schedules; set once here instead of repeating it on every cron.
                 nullable: true
                 properties:
+                  jitter:
+                    description: |-
+                      Deterministic jitter window (Go-style duration, e.g. `10m`) applied to every
+                      consuming cron that doesn't set its own `jitter` — `SnapshotSchedule`,
+                      `Maintenance` (quick and full), `SnapshotPolicy` verification (quick and
+                      deep), and both replication kinds. Set once here instead of repeating it on
+                      every cron, so a whole repository's schedules spread their load off the
+                      top-of-the-hour thundering herd.
+
+                      The spread is deterministic per `(scheduleUID, slot)`, not random: the same
+                      slot always lands on the same instant, so a restart never re-rolls it.
+                      Capped at 24h by validation — jitter is a spread WITHIN a cron period, not a
+                      schedule offset.
+                    nullable: true
+                    type: string
                   timezone:
                     description: |-
                       IANA timezone name applied to every consuming cron that doesn't set its own
@@ -4480,6 +4561,39 @@ spec:
                         type: integer
                     type: object
                 type: object
+              concurrency:
+                description: Concurrency limits for mover Jobs against this repository (absent = unlimited).
+                nullable: true
+                properties:
+                  maxConcurrentJobs:
+                    description: |-
+                      Ceiling on how many of this repository's mover Jobs may be in flight at
+                      once. Backup snapshots, restores, and replication runs that READ FROM this
+                      repository all draw from ONE pool — a repository's backend (and the
+                      bandwidth to it) is the shared resource, so splitting the budget per work
+                      kind would let three "safe" limits still saturate it.
+
+                      Restores are **always admitted** and never parked: a restore is a recovery
+                      in progress, and holding one behind a queue of routine backups is exactly
+                      backwards. An in-flight restore still COUNTS toward the pool, so it
+                      displaces backups rather than adding to them.
+
+                      Excluded from the pool entirely: maintenance (already single-flight per
+                      repository), verification, pin, and snapshot-delete batch Jobs. These are
+                      operator-driven housekeeping that must not be starved by a saturated
+                      backup pool.
+
+                      Absent or `0` means unlimited — the default, and today's behavior.
+
+                      No schema `default:` is emitted for this field (api-conventions §4a):
+                      absent and `0` are the SAME state (unlimited), so a materialized default
+                      would stamp `{maxConcurrentJobs: 0}` onto every stored repository — GitOps
+                      diff noise for a value that changes nothing.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               create:
                 description: What to do when the repository does not yet exist (absent means it must already exist).
                 nullable: true
@@ -5713,6 +5827,39 @@ spec:
                     description: Pod `nodeSelector` for every mover.
                     nullable: true
                     type: object
+                  podAnnotations:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Extra annotations for every mover pod. Unlike `podLabels`
+                      these are **pod-template-only** — they are not mirrored onto the `Job`
+                      object, because the common case is a sidecar-injection opt-out
+                      (`sidecar.istio.io/inject: "false"`, `linkerd.io/inject: disabled`,
+                      `vault.hashicorp.com/agent-inject: "false"`) that only means anything on
+                      the pod a mesh webhook actually sees. A mover is a short-lived batch pod;
+                      an injected sidecar that never exits keeps its Job running forever.
+
+                      Same reserved keys as `podLabels`, rejected at admission.
+                    nullable: true
+                    type: object
+                  podLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Extra labels for every mover POD (and the `Job` that owns it), merged
+                      UNDER kopiur's own labels — a key kopiur sets always wins, so a
+                      user-supplied value can never break the selectors the controller counts
+                      and reaps by.
+
+                      This is the hook for cluster machinery that keys off pod labels and that
+                      kopiur has no field of its own for: a Kueue `kueue.x-k8s.io/queue-name` to
+                      put movers under a cluster queue, a monitoring/`NetworkPolicy` selector, a
+                      service-mesh exclusion label.
+
+                      Keys under `kopiur.home-operations.com/` and the exact key
+                      `app.kubernetes.io/managed-by` are reserved and rejected at admission.
+                    nullable: true
+                    type: object
                   podSecurityContext:
                     description: Pod security-context base (notably `fsGroup`) for every mover.
                     nullable: true
@@ -6189,11 +6336,26 @@ spec:
                 type: object
               scheduleDefaults:
                 description: |-
-                  Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
-                  their own equivalent field — verification, replication, and maintenance
-                  schedules today; set once here instead of repeating it on every cron.
+                  Scheduling defaults (`timezone`, `jitter`) inherited by consumers that don't
+                  set their own equivalent field — backup, verification, replication, and
+                  maintenance schedules; set once here instead of repeating it on every cron.
                 nullable: true
                 properties:
+                  jitter:
+                    description: |-
+                      Deterministic jitter window (Go-style duration, e.g. `10m`) applied to every
+                      consuming cron that doesn't set its own `jitter` — `SnapshotSchedule`,
+                      `Maintenance` (quick and full), `SnapshotPolicy` verification (quick and
+                      deep), and both replication kinds. Set once here instead of repeating it on
+                      every cron, so a whole repository's schedules spread their load off the
+                      top-of-the-hour thundering herd.
+
+                      The spread is deterministic per `(scheduleUID, slot)`, not random: the same
+                      slot always lands on the same instant, so a restart never re-rolls it.
+                      Capped at 24h by validation — jitter is a spread WITHIN a cron period, not a
+                      schedule offset.
+                    nullable: true
+                    type: string
                   timezone:
                     description: |-
                       IANA timezone name applied to every consuming cron that doesn't set its own
