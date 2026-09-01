@@ -450,17 +450,23 @@ pub const SOURCE_PVC_AVAILABLE_CONDITION: &str = "SourcePvcAvailable";
 /// `reason`/Event reason for [`SOURCE_PVC_AVAILABLE_CONDITION`] = `False`.
 pub const SOURCE_PVC_MISSING_REASON: &str = "SourcePvcMissing";
 
-/// `Snapshot`/`Restore` condition recording whether this run holds a slot in its
-/// repository's mover-Job pool (`spec.concurrency.maxConcurrentJobs`). `False`
-/// with [`WAITING_FOR_SLOT_REASON`] means the run is parked at `phase: Pending`
+/// Condition recording whether this run holds a slot in its repository's
+/// mover-Job pool (`spec.concurrency.maxConcurrentJobs`). `False` with
+/// [`WAITING_FOR_SLOT_REASON`] means the run is parked at `phase: Pending`
 /// because the pool is full; `True` with [`SLOT_ACQUIRED_REASON`] means it was
 /// admitted and its Job launched.
 ///
-/// **A `Restore` only ever carries the `True`/[`SLOT_ACQUIRED_REASON`] arm.**
-/// A restore is a recovery in progress, so it is ALWAYS admitted — holding one
-/// behind a queue of routine backups is exactly backwards. It still occupies a
-/// slot once running (so it displaces backups rather than adding to them), but
-/// it is never parked, and therefore never written at `False`.
+/// **Written by exactly three kinds — `Snapshot`, `RepositoryReplication` and
+/// `SnapshotReplication` — and each carries BOTH arms.** Those are the run kinds
+/// the gate can hold, so each can be parked at `False` and later healed to
+/// `True`.
+///
+/// **A `Restore` never carries this condition at all**, in either arm. A restore
+/// is a recovery in progress, so it is ALWAYS admitted — holding one behind a
+/// queue of routine backups is exactly backwards. Its mover Job is still
+/// labelled into the pool and still COUNTS against the cap (so a restore
+/// displaces backups rather than adding to them), but the restore reconciler
+/// never consults the gate and writes no slot condition of its own.
 ///
 /// **Deliberately NOT a [`crate::gates::StructuralGate`].** The registry's
 /// contract (see the `gates` module doc) is "blocked on something only a human

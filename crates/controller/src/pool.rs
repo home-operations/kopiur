@@ -400,9 +400,13 @@ pub fn waiting_for_slot_message(
 ///
 /// 30s matches the cadence a launched backup polls its Job at, so a freed slot
 /// is picked up about as fast as it is released, without a busy loop against the
-/// apiserver for a queue that may be minutes long. The real wake-up is usually
-/// sooner: a finishing mover Job is owned by its CR and its terminal event
-/// re-triggers that reconcile immediately.
+/// apiserver for a queue that may be minutes long.
+///
+/// This timer is the ONLY wake-up a parked run gets. A finishing mover Job is
+/// owned by the CR that launched it, so its terminal event re-triggers only that
+/// CR's reconcile — nothing pushes the runs QUEUED BEHIND it awake. Expect up to
+/// [`pool_wait_requeue`]'s window of latency between a slot freeing and the next
+/// run taking it.
 pub const POOL_WAIT_REQUEUE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The parked-run requeue: [`POOL_WAIT_REQUEUE`] plus a deterministic per-object

@@ -333,7 +333,7 @@ Every phase write also carries the [kstatus](gitops.md) conditions: `Completed` 
 
 ## A restore is never held behind a concurrency cap
 
-A [`Repository`'s `concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) bounds how many mover Jobs run against it at once, and backups queue behind it. **Restores never do.** A restore is a recovery in progress; holding one behind a queue of routine nightly backups is exactly backwards, so a restore is admitted at or over the cap and never carries a `RepositorySlotAvailable=False` condition.
+A [`Repository`'s `concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) bounds how many mover Jobs run against it at once, and backups queue behind it. **Restores never do.** A restore is a recovery in progress; holding one behind a queue of routine nightly backups is exactly backwards, so a restore is admitted at or over the cap and never carries a `RepositorySlotAvailable` condition at all — in either arm. Its Job still counts against the cap once it is running, so it displaces backups rather than adding to them.
 
 It does still **count**. A running restore occupies a slot like any other pooled Job, so while it runs it displaces backups rather than adding to them — which is what a cap is actually being asked for. If you set `maxConcurrentJobs: 3` and start three large restores, backups against that repository queue until the restores finish.
 
