@@ -116,6 +116,12 @@ webhook:
       value: "1"
 
 mover:
+  # NOTE: the concurrency/cancellation scenarios swap this image at RUNTIME for
+  # the `kopiur/mover-slow:e2e` fixture (a sleep wrapper over this same image) by
+  # patching KOPIUR_MOVER_IMAGE on the controller Deployment — see
+  # crates/e2e/src/slow_mover.rs. That fixture is built + kind-loaded by the
+  # `image-mover-slow`/`images-load` tasks in crates/e2e/mise.toml, so
+  # `pullPolicy: Never` covers it too. Nothing here needs to change for it.
   image:
     repository: docker.io/kopiur/mover
     tag: e2e

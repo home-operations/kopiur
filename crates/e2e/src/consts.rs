@@ -685,6 +685,31 @@ pub const MOVER_IMAGE: &str = "kopiur/mover:e2e";
 /// Path of the kopia binary inside [`MOVER_IMAGE`] (see docker/Dockerfile.mover).
 pub const KOPIA_BIN: &str = "/usr/local/bin/kopia";
 
+// --- slow-mover fixture (crates/e2e/src/slow_mover.rs) --------------------------
+/// The e2e-only SLOW mover image: [`MOVER_IMAGE`] with a busybox entrypoint that
+/// sleeps before exec'ing the real mover, so a mover Job holds its concurrency
+/// slot for a deterministic window (docker/Dockerfile.mover-slow). Built and
+/// kind-loaded by the `image-mover-slow`/`images-load` tasks in
+/// `crates/e2e/mise.toml`; a hermetic test in this module asserts that lockstep.
+///
+/// Swapped in at runtime by [`crate::slow_mover`], never by the chart.
+pub const SLOW_MOVER_IMAGE: &str = "kopiur/mover-slow:e2e";
+
+// --- operator Deployment (the chart's controller workload) ----------------------
+/// The operator controller `Deployment` the chart installs (`<release>-controller`,
+/// release `kopiur`) in [`OPERATOR_NS`]. Patch target for the scenarios that
+/// reshape the running operator (mover image, env knobs); always restore it.
+pub const CONTROLLER_DEPLOYMENT: &str = "kopiur-controller";
+/// The controller container's name inside [`CONTROLLER_DEPLOYMENT`]
+/// (`deploy/helm/kopiur/templates/deployment.tpl`) — the strategic-merge key for
+/// container-scoped patches.
+pub const CONTROLLER_CONTAINER: &str = "controller";
+/// Controller env naming the image used for mover Jobs
+/// (`crates::controller::config::MOVER_IMAGE_ENV`). Mirrored here as a DELIBERATE
+/// literal: the e2e crate does not depend on the controller crate, and this is a
+/// wire contract the harness writes — a rename must fail the e2e run loudly.
+pub const MOVER_IMAGE_ENV: &str = "KOPIUR_MOVER_IMAGE";
+
 // --- identity / apply ----------------------------------------------------------
 /// Distroless-nonroot uid the controller AND mover Jobs share so a hostPath repo
 /// (written 0700 by kopia) is accessible to both.
@@ -753,6 +778,87 @@ mod tests {
             in_mise.len(),
             seeded.len(),
             "duplicate in the node-seed loop"
+        );
+    }
+
+    fn e2e_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn read(rel: &str) -> String {
+        let path = e2e_dir().join(rel);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()))
+    }
+
+    /// The slow-mover fixture image must actually be BUILT and LOADED into kind
+    /// under exactly [`SLOW_MOVER_IMAGE`].
+    ///
+    /// Same failure mode as the subpath lockstep above, one layer up: a scenario
+    /// points `KOPIUR_MOVER_IMAGE` at a tag the harness never built, every mover
+    /// Job wedges in `ErrImageNeverPull`, and the only symptom is a timeout
+    /// minutes into a CI-only run. Caught here in the hermetic suite instead.
+    #[test]
+    fn slow_mover_image_is_built_and_loaded_by_the_mise_tasks() {
+        let toml = read("mise.toml");
+        assert!(
+            toml.contains(&format!("-t {SLOW_MOVER_IMAGE}")),
+            "crates/e2e/mise.toml no longer tags the slow-mover fixture `{SLOW_MOVER_IMAGE}` \
+             (expected a `docker build ... -t {SLOW_MOVER_IMAGE}` in the `image-mover-slow` task)"
+        );
+        let load = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("kind load docker-image"))
+            .unwrap_or_else(|| {
+                panic!("crates/e2e/mise.toml no longer has a `kind load docker-image` line")
+            });
+        for image in [MOVER_IMAGE, SLOW_MOVER_IMAGE] {
+            assert!(
+                load.split_whitespace().any(|w| w == image),
+                "`{image}` is not in the `kind load docker-image` line of crates/e2e/mise.toml, \
+                 so a pod referencing it can never start (pullPolicy is Never): {load}"
+            );
+        }
+        // The build step is only reachable once the real mover image exists, and
+        // `images-load` is the single step both the local and CI paths run.
+        assert!(
+            toml.contains("mise run //crates/e2e:image-mover-slow"),
+            "nothing invokes the `image-mover-slow` task — CI shards skip `images` \
+             (KOPIUR_E2E_SKIP_BUILD=1), so the build must hang off `images-load`"
+        );
+    }
+
+    /// The fixture image's build inputs must exist and stay wired to each other.
+    #[test]
+    fn slow_mover_dockerfile_wires_the_entrypoint_script() {
+        let dockerfile = read("../../docker/Dockerfile.mover-slow");
+        let script_path = "docker/slow-mover-entrypoint.sh";
+        assert!(
+            dockerfile.contains(script_path),
+            "docker/Dockerfile.mover-slow no longer COPYs {script_path}"
+        );
+        assert!(
+            dockerfile.contains(crate::slow_mover::DELAY_ENV),
+            "docker/Dockerfile.mover-slow no longer bakes a default \
+             {} — the fixture would fall back to the script's own default only",
+            crate::slow_mover::DELAY_ENV
+        );
+
+        let script = read("../../docker/slow-mover-entrypoint.sh");
+        for env in [
+            crate::slow_mover::DELAY_ENV,
+            crate::slow_mover::DELAY_OPS_ENV,
+        ] {
+            assert!(
+                script.contains(env),
+                "{script_path} never reads {env}, so the harness helper's knob is inert"
+            );
+        }
+        // The script must exec the real mover, not re-run itself.
+        assert!(
+            script.contains("exec \"$MOVER\" \"$@\"")
+                && script.contains("MOVER=/usr/local/bin/kopiur-mover"),
+            "{script_path} must end by exec'ing /usr/local/bin/kopiur-mover with the original argv"
         );
     }
 }
