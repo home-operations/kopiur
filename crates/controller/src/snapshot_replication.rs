@@ -441,19 +441,24 @@ async fn drive_schedule(
             // the source, so it draws on the source's budget. Consulted BEFORE
             // the spawn path projects credentials — a queued run must hold
             // nothing.
-            let heal = match replication_pool_gate(
+            // `_slot` holds this run's pool reservation until the Job exists —
+            // see `crate::pool::AdmissionLedger`. Bound with a name so it lives
+            // past the spawn rather than dropping at the end of the `match`.
+            let (heal, _slot) = match replication_pool_gate(
                 ctx,
                 api,
                 repl,
                 KIND_STR,
                 name,
+                namespace,
+                &job_name,
                 source,
                 &conditions_of(repl),
             )
             .await?
             {
                 ReplicationPoolGate::Parked(action) => return Ok(action),
-                ReplicationPoolGate::Admit { heal } => heal,
+                ReplicationPoolGate::Admit { heal, reservation } => (heal, reservation),
             };
             spawn_snapshot_replication_job(
                 ctx,
@@ -606,12 +611,14 @@ async fn handle_manual_run(
             // with a different Job name and bypasses no guarantee the cron path
             // has. A parked request is recorded `Pending` for the same reason
             // the single-flight arm above records one — so it stays visible.
-            let heal = match replication_pool_gate(
+            let (heal, _slot) = match replication_pool_gate(
                 ctx,
                 api,
                 repl,
                 KIND_STR,
                 name,
+                namespace,
+                &job_name,
                 source,
                 &conditions_of(repl),
             )
@@ -627,7 +634,7 @@ async fn handle_manual_run(
                     .await?;
                     return Ok(ManualRunVerdict::InFlight(action));
                 }
-                ReplicationPoolGate::Admit { heal } => heal,
+                ReplicationPoolGate::Admit { heal, reservation } => (heal, reservation),
             };
             spawn_snapshot_replication_job(
                 ctx,

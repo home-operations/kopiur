@@ -328,19 +328,24 @@ async fn drive_schedule(
             // The SOURCE repository's mover-Job pool, consulted BEFORE the spawn
             // path takes any side effect (credential projection, destination
             // Secret checks) that a queued run would hold for an unbounded time.
-            let heal = match replication_pool_gate(
+            // `_slot` holds this run's pool reservation until the Job exists —
+            // see `crate::pool::AdmissionLedger`. Bound with a name so it lives
+            // past the spawn rather than dropping at the end of the `match`.
+            let (heal, _slot) = match replication_pool_gate(
                 ctx,
                 api,
                 repl,
                 KIND_STR,
                 name,
+                namespace,
+                &job_name,
                 repo,
                 &conditions_of(repl),
             )
             .await?
             {
                 ReplicationPoolGate::Parked(action) => return Ok(action),
-                ReplicationPoolGate::Admit { heal } => heal,
+                ReplicationPoolGate::Admit { heal, reservation } => (heal, reservation),
             };
             spawn_replication_job(
                 ctx,
@@ -471,12 +476,14 @@ async fn handle_manual_run(
             // Same pool gate as the cron path: a REQUESTED run is a cron run
             // with a different Job name, and must not bypass any guarantee the
             // cron path has — least of all the one that bounds backend load.
-            let heal = match replication_pool_gate(
+            let (heal, _slot) = match replication_pool_gate(
                 ctx,
                 api,
                 repl,
                 KIND_STR,
                 name,
+                namespace,
+                &job_name,
                 repo,
                 &conditions_of(repl),
             )
@@ -495,7 +502,7 @@ async fn handle_manual_run(
                     .await?;
                     return Ok(ManualRunVerdict::InFlight(action));
                 }
-                ReplicationPoolGate::Admit { heal } => heal,
+                ReplicationPoolGate::Admit { heal, reservation } => (heal, reservation),
             };
             spawn_replication_job(
                 ctx,

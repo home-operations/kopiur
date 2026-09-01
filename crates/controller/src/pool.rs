@@ -14,12 +14,16 @@
 //! template.
 //!
 //! The second half of this module is the **admission gate** the label makes
-//! possible: [`pool_live_counts`] counts the pool with ONE selector, and
+//! possible: [`observe_live_pool`] counts the pool with ONE selector,
 //! [`pool_verdict`] — pure, exhaustive, no IO — decides whether a run may mint
-//! its mover Job now or must park. The two are deliberately split so every
+//! its mover Job now or must park, and [`AdmissionLedger`] makes the
+//! observe→decide→create sequence atomic so two simultaneous reconciles cannot
+//! both read an empty pool. The pieces are deliberately split so every
 //! interesting case is a table-driven unit test rather than a cluster fixture.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
 use k8s_openapi::api::batch::v1::Job;
 use kube::Api;
@@ -258,13 +262,14 @@ fn job_is_suspended(job: &Job) -> bool {
         })
 }
 
-/// Count the live pooled mover Jobs `(repo_live, global_live)` behind
-/// `repo_pool_value` (a [`repo_label`] value).
+/// Observe the live pooled mover Jobs behind `repo_pool_value` (a
+/// [`repo_label`] value) — the counts plus the identity of every pooled Job the
+/// LIST returned (see [`ObservedPool`]).
 ///
-/// **Costs nothing when uncapped.** Both caps `None` returns `(0, 0)` without
-/// touching the apiserver — the default install must not pay a LIST per
-/// reconcile for a feature it does not use. This mirrors the batch-delete
-/// throttle's `throttle_live_count`.
+/// **Costs nothing when uncapped.** Both caps `None` returns an empty
+/// [`ObservedPool`] without touching the apiserver — the default install must
+/// not pay a LIST per reconcile for a feature it does not use. This mirrors the
+/// batch-delete throttle's `throttle_live_count`.
 ///
 /// ONE LIST serves both numbers: an exists-selector on [`REPO_POOL_LABEL`]
 /// (plus the managed-by label, so a foreign Job that happens to carry the key
@@ -287,13 +292,13 @@ fn job_is_suspended(job: &Job) -> bool {
 /// Role RBAC is a permanent 403 that would wedge the reconcile — and it is the
 /// same scoping the batch-delete throttle and every other reconcile-time LIST
 /// already carries.
-pub async fn pool_live_counts(
+pub async fn observe_live_pool(
     ctx: &Context,
     repo_pool_value: &str,
     caps: PoolCaps,
-) -> Result<(usize, usize)> {
+) -> Result<ObservedPool> {
     if caps.is_uncapped() {
-        return Ok((0, 0));
+        return Ok(ObservedPool::default());
     }
     let selector = format!("{REPO_POOL_LABEL},{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}");
     let job_api: Api<Job> = crate::controllers::scoped_api(&ctx.client, &ctx.watch_scope);
@@ -301,20 +306,51 @@ pub async fn pool_live_counts(
         .list(&ListParams::default().labels(&selector))
         .await?
         .items;
-    Ok(count_pool(&jobs, repo_pool_value))
+    Ok(observe_pool(&jobs, repo_pool_value))
 }
 
-/// The in-memory half of [`pool_live_counts`], split out so the filtering rules
+/// One LIST's worth of pool truth: the two counts [`pool_verdict`] is measured
+/// against, plus the identity of every pooled Job the LIST actually returned.
+///
+/// `seen` is the half [`AdmissionLedger`] needs and the counts cannot supply. A
+/// reservation exists only to cover the window between "this reconcile decided
+/// to create a Job" and "that Job is visible to a LIST"; the moment the Job IS
+/// visible, the observation already accounts for it and the reservation must
+/// not be added on top. `seen` therefore holds EVERY pooled Job returned —
+/// terminal and suspended ones included, which the counts deliberately exclude
+/// — because a Job's mere existence is what proves its reservation is spent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedPool {
+    /// Live pooled Jobs against THIS repository.
+    pub repo_live: usize,
+    /// Live pooled Jobs across every repository in the watch scope.
+    pub global_live: usize,
+    /// `namespace/name` of every pooled Job the LIST returned, whatever its
+    /// state. Sorted (`BTreeSet`) so a `Debug` dump of a failing test is stable.
+    pub seen: BTreeSet<String>,
+}
+
+/// The `namespace/name` identity a pooled `Job` is reserved and swept under.
+///
+/// One spelling, shared by [`observe_pool`] and every gate call site: two
+/// spellings of "which Job is this" could drift, and a drifted key would make
+/// the [`AdmissionLedger`] sweep miss — leaking a reservation until its RAII
+/// guard drops.
+pub fn job_key(namespace: &str, name: &str) -> String {
+    format!("{namespace}/{name}")
+}
+
+/// The in-memory half of [`observe_live_pool`], split out so the filtering rules
 /// are unit-testable without a cluster.
 ///
-/// A Job with no [`REPO_POOL_LABEL`] contributes to NEITHER count. The LIST's
-/// exists-selector already excludes those, so this is belt-and-braces — but it
-/// is the belt that keeps the upgrade-skew contract true if this ever grows a
-/// store-backed caller whose input is not pre-filtered.
-pub fn count_pool(jobs: &[Job], repo_pool_value: &str) -> (usize, usize) {
-    let mut repo_live = 0;
-    let mut global_live = 0;
-    for job in jobs.iter().filter(|j| job_occupies_slot(j)) {
+/// A Job with no [`REPO_POOL_LABEL`] contributes to NEITHER count and is not
+/// `seen`. The LIST's exists-selector already excludes those, so this is
+/// belt-and-braces — but it is the belt that keeps the upgrade-skew contract
+/// true if this ever grows a store-backed caller whose input is not
+/// pre-filtered.
+pub fn observe_pool(jobs: &[Job], repo_pool_value: &str) -> ObservedPool {
+    let mut observed = ObservedPool::default();
+    for job in jobs {
         let Some(value) = job
             .metadata
             .labels
@@ -323,12 +359,249 @@ pub fn count_pool(jobs: &[Job], repo_pool_value: &str) -> (usize, usize) {
         else {
             continue;
         };
-        global_live += 1;
+        if let Some(name) = job.metadata.name.as_deref() {
+            observed.seen.insert(job_key(
+                job.metadata.namespace.as_deref().unwrap_or_default(),
+                name,
+            ));
+        }
+        if !job_occupies_slot(job) {
+            continue;
+        }
+        observed.global_live += 1;
         if value == repo_pool_value {
-            repo_live += 1;
+            observed.repo_live += 1;
         }
     }
-    (repo_live, global_live)
+    observed
+}
+
+/// The counts alone, for the call sites and tests that do not need `seen`.
+pub fn count_pool(jobs: &[Job], repo_pool_value: &str) -> (usize, usize) {
+    let observed = observe_pool(jobs, repo_pool_value);
+    (observed.repo_live, observed.global_live)
+}
+
+// --- the admission ledger: making observe→decide→create atomic ---------------
+
+/// Reservations, `pool key → the {namespace}/{name} of each Job promised but not
+/// yet observed`. A [`BTreeMap`]/[`BTreeSet`] rather than a hash map because the
+/// contents are tiny (one entry per in-flight admission) and a stable ordering
+/// makes a `Debug` dump of a failing test readable.
+type Reservations = BTreeMap<String, BTreeSet<String>>;
+
+/// Take the ledger lock, recovering from a poisoned mutex.
+///
+/// A poisoned lock here means some reconcile panicked while holding it. The
+/// guarded value is a plain set of strings with no broken invariant to inherit,
+/// and refusing to admit anything ever again would be a far worse failure than
+/// carrying on, so the poison is deliberately absorbed.
+fn lock_reservations(inner: &Mutex<Reservations>) -> std::sync::MutexGuard<'_, Reservations> {
+    inner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The in-process record of admissions this leader has GRANTED but whose Jobs a
+/// LIST cannot see yet.
+///
+/// **Why this exists.** [`observe_live_pool`] and the Job `apply` that follows
+/// it are separated by the whole launch path — mover-identity resolution,
+/// credential projection, source staging — many API round-trips wide. Two
+/// `Snapshot`s created a millisecond apart are reconciled concurrently
+/// (`KOPIUR_RECONCILE_CONCURRENCY`, default 8); both LIST an empty pool, both
+/// see `0 < 1`, both `Admit`, and a `maxConcurrentJobs: 1` repository runs two
+/// movers. The LIST is a read of the past; the ledger is the record of the
+/// decisions that have already been made against it. Decide and reserve happen
+/// under ONE lock ([`AdmissionLedger::admit`]) — that atomicity is the fix.
+///
+/// **Why in-process state is sound.** Only the LEADER reconciles (leader
+/// election), so there is never a second replica whose ledger this would have to
+/// agree with. On failover the new leader starts EMPTY, which reopens exactly
+/// the pre-fix window for the length of one reconcile pass — a bounded,
+/// once-per-failover overshoot rather than a steady-state one. The observed LIST
+/// remains the source of truth; the ledger only ever ADDS to it, so a lost
+/// ledger can over-admit but never under-admit (it cannot park a repository that
+/// has room).
+///
+/// **Why it cannot leak.** A granted reservation is handed back as an
+/// [`AdmissionGuard`] whose `Drop` releases it, so every exit from the launch
+/// path — Job applied, apply failed, mid-path error, early return — releases it
+/// exactly once, including on an unwinding panic. On top of that, every pass
+/// through [`admit`](Self::admit) sweeps any reservation whose Job the LIST can
+/// now SEE: observed truth supersedes a promise, so even a reservation somehow
+/// held past its Job's creation cannot park a repository forever.
+///
+/// Cheap to clone (one `Arc`), and never touched at all on the uncapped default
+/// path — [`admit_or_park`] checks [`PoolCaps::is_uncapped`] before the lock.
+#[derive(Debug, Clone, Default)]
+pub struct AdmissionLedger {
+    inner: Arc<Mutex<Reservations>>,
+}
+
+/// The [`AdmissionLedger`]'s answer for one run: [`pool_verdict`]'s decision
+/// taken against `observed + reservations`, with the reservation attached.
+#[derive(Debug)]
+pub enum LedgerVerdict {
+    /// Mint the mover Job now. `reservation` is `Some` for a class that
+    /// occupies a slot the moment it is promised, and MUST be held until the
+    /// Job exists; `None` for [`PoolClass::Restore`], which is admitted
+    /// unconditionally and so has no decision to protect.
+    Admit {
+        /// The held reservation — drop it once the Job is applied (or the
+        /// attempt failed).
+        reservation: Option<AdmissionGuard>,
+    },
+    /// Hold the run. Carries the EFFECTIVE counts (observed plus outstanding
+    /// reservations) that produced the decision, so the park message names the
+    /// numbers the gate actually judged against.
+    Park {
+        /// Effective live pooled Jobs against THIS repository.
+        repo_live: usize,
+        /// Effective live pooled Jobs across every repository.
+        global_live: usize,
+    },
+}
+
+/// A held pool reservation. Releases it on `Drop`.
+///
+/// RAII rather than an explicit release call because the launch path has many
+/// exits (a `?` on any of a dozen awaits, an early `return` on a missing
+/// dependency, a panic) and each one must release. A forgotten release would
+/// park the repository until the operator restarted.
+#[derive(Debug)]
+#[must_use = "the reservation is released when this guard drops; bind it for the \
+              whole window between the admission and the Job's creation"]
+pub struct AdmissionGuard {
+    inner: Arc<Mutex<Reservations>>,
+    pool_key: String,
+    job_key: String,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let mut held = lock_reservations(&self.inner);
+        if let Some(pool) = held.get_mut(&self.pool_key) {
+            pool.remove(&self.job_key);
+            // Prune the empty set so an install with many repositories does not
+            // accumulate one map entry per pool key it has ever admitted from.
+            if pool.is_empty() {
+                held.remove(&self.pool_key);
+            }
+        }
+    }
+}
+
+impl AdmissionLedger {
+    /// Decide and reserve **atomically**: sweep spent reservations, add the
+    /// outstanding ones to `observed`, run [`pool_verdict`] over the sum, and —
+    /// on `Admit` — record this run's reservation, all under one lock.
+    ///
+    /// `pool_key` is the [`repo_label`] value; `job_key` is [`job_key`] over the
+    /// namespace and name of the Job this run is about to create. The Job key is
+    /// the reservation's identity precisely because it is what the sweep can
+    /// match against [`ObservedPool::seen`] — and it makes a repeated reserve for
+    /// one run idempotent, since re-inserting the same key into the set is a
+    /// no-op.
+    ///
+    /// Exhaustive over [`PoolClass`]: a new pooled work kind cannot compile
+    /// until its reservation behavior is decided here.
+    pub fn admit(
+        &self,
+        pool_key: &str,
+        job_key: &str,
+        observed: &ObservedPool,
+        class: PoolClass,
+        caps: PoolCaps,
+    ) -> LedgerVerdict {
+        let mut held = lock_reservations(&self.inner);
+        sweep_observed(&mut held, &observed.seen);
+        let repo_reserved = held.get(pool_key).map_or(0, BTreeSet::len);
+        let global_reserved: usize = held.values().map(BTreeSet::len).sum();
+        let repo_live = observed.repo_live + repo_reserved;
+        let global_live = observed.global_live + global_reserved;
+        match pool_verdict(class, repo_live, global_live, caps) {
+            PoolVerdict::Park {
+                repo_live,
+                global_live,
+            } => LedgerVerdict::Park {
+                repo_live,
+                global_live,
+            },
+            PoolVerdict::Admit => {
+                let reservation = match class {
+                    // A restore is admitted at or over every cap, so there is no
+                    // decision for a reservation to protect. Reserving one would
+                    // only make the NEXT backup's effective count double-charge
+                    // a restore the LIST is about to show anyway.
+                    PoolClass::Restore => None,
+                    PoolClass::Backup | PoolClass::Replication => {
+                        held.entry(pool_key.to_string())
+                            .or_default()
+                            .insert(job_key.to_string());
+                        Some(AdmissionGuard {
+                            inner: Arc::clone(&self.inner),
+                            pool_key: pool_key.to_string(),
+                            job_key: job_key.to_string(),
+                        })
+                    }
+                };
+                LedgerVerdict::Admit { reservation }
+            }
+        }
+    }
+
+    /// Outstanding reservations, `pool key → job keys`. Test-only: production
+    /// code must read the ledger through [`admit`](Self::admit), which is the
+    /// only place the decide-and-reserve pair is atomic.
+    #[cfg(test)]
+    fn outstanding(&self) -> Reservations {
+        lock_reservations(&self.inner).clone()
+    }
+}
+
+/// Drop every reservation whose Job the LIST can now SEE.
+///
+/// The defensive half of the leak story (the [`AdmissionGuard`] is the primary
+/// one). A reservation is a promise that a Job is about to exist; once it DOES
+/// exist, the observation counts it and the promise is spent. Sweeping on the
+/// Job's existence — not its liveness — is deliberate: a Job already terminal
+/// (or TTL-suspended) means the run it stood for is over, so its reservation is
+/// stale either way.
+fn sweep_observed(held: &mut Reservations, seen: &BTreeSet<String>) {
+    if seen.is_empty() {
+        return;
+    }
+    held.retain(|_, pool| {
+        pool.retain(|job| !seen.contains(job));
+        !pool.is_empty()
+    });
+}
+
+/// The composed gate step: LIST the pool, then decide-and-reserve under the
+/// ledger's lock.
+///
+/// The two halves are one function because separating them is exactly the bug
+/// this closes — a caller that observed, then did something else, then decided,
+/// would reopen the window. Every pooled gate goes through here.
+///
+/// **The uncapped default touches neither the apiserver nor the lock.** Both
+/// caps `None` short-circuits to `Admit { reservation: None }` before the LIST,
+/// so an install that never asked for a cap pays one branch.
+pub async fn admit_or_park(
+    ctx: &Context,
+    pool_key: &str,
+    job_key: &str,
+    class: PoolClass,
+    caps: PoolCaps,
+) -> Result<LedgerVerdict> {
+    if caps.is_uncapped() {
+        return Ok(LedgerVerdict::Admit { reservation: None });
+    }
+    let observed = observe_live_pool(ctx, pool_key, caps).await?;
+    Ok(ctx
+        .pool_admissions
+        .admit(pool_key, job_key, &observed, class, caps))
 }
 
 /// Whether `RepositorySlotAvailable` is present AND `False` on a run's status —
@@ -954,6 +1227,389 @@ mod tests {
     #[test]
     fn an_empty_pool_counts_zero() {
         assert_eq!(count_pool(&[], "nas-abc"), (0, 0));
+    }
+
+    // --- the observation's `seen` set --------------------------------------
+
+    #[test]
+    fn every_pooled_job_is_seen_whatever_its_state() {
+        // `seen` is the LEDGER's input, not the cap's: a terminal or suspended
+        // Job proves its reservation is spent even though it occupies no slot.
+        // Getting this wrong would leave a spent reservation charged to the
+        // repository until its RAII guard dropped.
+        let jobs = vec![
+            job("live", Some("nas-abc")),
+            with_condition(job("done", Some("nas-abc")), "Complete", "True"),
+            with_condition(job("held", Some("nas-abc")), "Suspended", "True"),
+        ];
+        let observed = observe_pool(&jobs, "nas-abc");
+        assert_eq!((observed.repo_live, observed.global_live), (1, 1));
+        assert_eq!(
+            observed.seen,
+            ["backups/live", "backups/done", "backups/held"]
+                .into_iter()
+                .map(String::from)
+                .collect::<BTreeSet<_>>(),
+        );
+    }
+
+    #[test]
+    fn an_unlabeled_job_is_neither_counted_nor_seen() {
+        // The upgrade-skew contract extends to `seen`: an unlabeled Job is not
+        // in the pool at all, so it must not sweep anybody's reservation either.
+        let observed = observe_pool(&[job("legacy", None)], "nas-abc");
+        assert_eq!(observed, ObservedPool::default());
+    }
+
+    #[test]
+    fn a_job_of_another_repository_is_seen_globally() {
+        // The sweep is global by construction: the ledger holds reservations for
+        // every pool key, and one LIST covers them all.
+        let observed = observe_pool(&[job("theirs", Some("offsite-def"))], "nas-abc");
+        assert_eq!((observed.repo_live, observed.global_live), (0, 1));
+        assert!(observed.seen.contains("backups/theirs"));
+    }
+
+    // --- the admission ledger ------------------------------------------------
+
+    const POOL_A: &str = "nas-abc";
+    const POOL_B: &str = "offsite-def";
+
+    /// An observation of an EMPTY pool — the state both racing reconciles saw in
+    /// the bug this ledger exists to close.
+    fn empty() -> ObservedPool {
+        ObservedPool::default()
+    }
+
+    fn admit_backup(
+        ledger: &AdmissionLedger,
+        pool: &str,
+        job: &str,
+        observed: &ObservedPool,
+        caps: PoolCaps,
+    ) -> LedgerVerdict {
+        ledger.admit(pool, job, observed, PoolClass::Backup, caps)
+    }
+
+    fn is_admit(v: &LedgerVerdict) -> bool {
+        matches!(v, LedgerVerdict::Admit { .. })
+    }
+
+    /// The park's `(repo_live, global_live)`, or `None` on an admission.
+    ///
+    /// A helper rather than `assert_eq!` on the verdict itself because
+    /// [`LedgerVerdict`] deliberately is not `PartialEq`: it can carry an
+    /// [`AdmissionGuard`], and a comparable reservation is a copyable one.
+    fn park_counts(v: &LedgerVerdict) -> Option<(usize, usize)> {
+        match v {
+            LedgerVerdict::Admit { .. } => None,
+            LedgerVerdict::Park {
+                repo_live,
+                global_live,
+            } => Some((*repo_live, *global_live)),
+        }
+    }
+
+    #[test]
+    fn the_second_simultaneous_backup_parks_on_the_first_ones_reservation() {
+        // THE REGRESSION. Both reconciles LIST an empty pool (the first one's Job
+        // does not exist yet); without the ledger both would see `0 < 1` and both
+        // would launch against a `maxConcurrentJobs: 1` repository.
+        let ledger = AdmissionLedger::default();
+        let caps = repo_cap(1);
+        let first = admit_backup(&ledger, POOL_A, "ns/one", &empty(), caps);
+        assert!(is_admit(&first));
+        assert_eq!(
+            park_counts(&admit_backup(&ledger, POOL_A, "ns/two", &empty(), caps)),
+            // The park names the EFFECTIVE count: 0 observed + 1 reserved.
+            Some((1, 1)),
+        );
+    }
+
+    #[test]
+    fn releasing_the_reservation_frees_the_slot_again() {
+        let ledger = AdmissionLedger::default();
+        let caps = repo_cap(1);
+        let first = admit_backup(&ledger, POOL_A, "ns/one", &empty(), caps);
+        assert!(is_admit(&first));
+        assert_eq!(ledger.outstanding().len(), 1);
+        drop(first);
+        // The map entry is pruned, not left as an empty set.
+        assert!(ledger.outstanding().is_empty());
+        assert!(is_admit(&admit_backup(
+            &ledger,
+            POOL_A,
+            "ns/two",
+            &empty(),
+            caps
+        )));
+    }
+
+    #[test]
+    fn a_park_reserves_nothing() {
+        // A parked run holds no resources — that is the whole design — and a
+        // reservation is a resource. If a park left one behind, a full pool
+        // would never drain.
+        let ledger = AdmissionLedger::default();
+        let caps = repo_cap(1);
+        let observed = ObservedPool {
+            repo_live: 1,
+            global_live: 1,
+            seen: ["ns/running".to_string()].into_iter().collect(),
+        };
+        assert!(!is_admit(&admit_backup(
+            &ledger, POOL_A, "ns/two", &observed, caps
+        )));
+        assert!(ledger.outstanding().is_empty());
+    }
+
+    #[test]
+    fn re_reserving_one_run_is_idempotent() {
+        // The reservation is keyed on the JOB, so a run that somehow reaches the
+        // gate twice charges its repository once — never twice, which would park
+        // the pool one slot early.
+        let ledger = AdmissionLedger::default();
+        let caps = repo_cap(2);
+        let a = admit_backup(&ledger, POOL_A, "ns/one", &empty(), caps);
+        let b = admit_backup(&ledger, POOL_A, "ns/one", &empty(), caps);
+        assert!(is_admit(&a) && is_admit(&b));
+        let outstanding = ledger.outstanding();
+        assert_eq!(outstanding[POOL_A].len(), 1);
+        // A third, DIFFERENT run still fits under the cap of 2 — it would not if
+        // the two reserves for `ns/one` had each charged a slot.
+        let third = admit_backup(&ledger, POOL_A, "ns/two", &empty(), caps);
+        assert!(is_admit(&third));
+    }
+
+    #[test]
+    fn a_reservation_whose_job_is_now_visible_is_not_counted_twice() {
+        // The dedupe. Once the Job exists the observation counts it; adding the
+        // reservation on top would charge one run two slots and park a
+        // `maxConcurrentJobs: 2` repository after a single backup.
+        let ledger = AdmissionLedger::default();
+        let caps = repo_cap(2);
+        let held = admit_backup(&ledger, POOL_A, "ns/one", &empty(), caps);
+        assert!(is_admit(&held));
+        let observed = ObservedPool {
+            repo_live: 1,
+            global_live: 1,
+            seen: ["ns/one".to_string()].into_iter().collect(),
+        };
+        // BOUND, not a temporary: a verdict dropped at the end of its statement
+        // releases its reservation immediately, which would make the assertion
+        // below pass for the wrong reason.
+        let second = admit_backup(&ledger, POOL_A, "ns/two", &observed, caps);
+        assert!(is_admit(&second));
+        // ...and the spent reservation was swept, not merely ignored.
+        let outstanding = ledger.outstanding();
+        assert_eq!(
+            outstanding[POOL_A],
+            ["ns/two".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        );
+    }
+
+    #[test]
+    fn a_reservation_whose_job_finished_is_swept_even_though_it_is_not_live() {
+        // The leak backstop: a Job that ran to completion is `seen` but not
+        // counted, so a reservation still standing for it must be dropped or the
+        // repository would be short one slot until the guard dropped.
+        let ledger = AdmissionLedger::default();
+        let caps = repo_cap(1);
+        let held = admit_backup(&ledger, POOL_A, "ns/one", &empty(), caps);
+        assert!(is_admit(&held));
+        // The Job exists and has COMPLETED: zero live, but `seen`.
+        let observed = ObservedPool {
+            repo_live: 0,
+            global_live: 0,
+            seen: ["ns/one".to_string()].into_iter().collect(),
+        };
+        let second = admit_backup(&ledger, POOL_A, "ns/two", &observed, caps);
+        assert!(is_admit(&second));
+        let outstanding = ledger.outstanding();
+        assert_eq!(
+            outstanding[POOL_A],
+            ["ns/two".to_string()].into_iter().collect::<BTreeSet<_>>(),
+        );
+    }
+
+    #[test]
+    fn a_reservation_in_one_pool_does_not_park_another_repository() {
+        // The per-repository cap is per-repository: `repo_live` only sees this
+        // pool key's reservations.
+        let ledger = AdmissionLedger::default();
+        let caps = repo_cap(1);
+        let a = admit_backup(&ledger, POOL_A, "ns/a", &empty(), caps);
+        let b = admit_backup(&ledger, POOL_B, "ns/b", &empty(), caps);
+        assert!(is_admit(&a) && is_admit(&b));
+    }
+
+    #[test]
+    fn reservations_across_repositories_add_up_for_the_global_backstop() {
+        // The `the_env_backstop_serializes_across_repositories` scenario: two
+        // UNCAPPED repositories under `KOPIUR_MAX_CONCURRENT_JOBS=1`. The second
+        // run must see the first's reservation even though it is in another pool.
+        let ledger = AdmissionLedger::default();
+        let caps = global_cap(1);
+        let first = admit_backup(&ledger, POOL_A, "ns/a", &empty(), caps);
+        assert!(is_admit(&first));
+        assert_eq!(
+            park_counts(&admit_backup(&ledger, POOL_B, "ns/b", &empty(), caps)),
+            // No per-repo reservation in POOL_B, but one globally.
+            Some((0, 1)),
+        );
+    }
+
+    #[test]
+    fn a_restore_is_admitted_without_reserving() {
+        // A restore is admitted at or over every cap, so it has no decision to
+        // protect — and reserving one would double-charge the next backup, which
+        // the LIST is about to count anyway.
+        let ledger = AdmissionLedger::default();
+        let verdict = ledger.admit(POOL_A, "ns/r", &empty(), PoolClass::Restore, repo_cap(1));
+        assert!(matches!(
+            verdict,
+            LedgerVerdict::Admit { reservation: None }
+        ));
+        assert!(ledger.outstanding().is_empty());
+    }
+
+    #[test]
+    fn a_replication_reserves_like_a_backup() {
+        // Both parkable classes compete for the same budget, so both must hold
+        // the window between the decision and the Job.
+        let ledger = AdmissionLedger::default();
+        let caps = repo_cap(1);
+        let held = ledger.admit(POOL_A, "ns/repl", &empty(), PoolClass::Replication, caps);
+        assert!(is_admit(&held));
+        assert!(!is_admit(&admit_backup(
+            &ledger,
+            POOL_A,
+            "ns/backup",
+            &empty(),
+            caps
+        )));
+    }
+
+    #[test]
+    fn every_pool_class_has_a_decided_reservation_behavior() {
+        // The partition above (`PARKABLE`/`NEVER_PARKED`) is what the ledger's
+        // exhaustive `match` keys off: a parkable class reserves, a never-parked
+        // one does not. A new class cannot compile past that `match` undecided,
+        // and this pins the two halves to each other.
+        for c in ALL_CLASSES {
+            let ledger = AdmissionLedger::default();
+            let verdict = ledger.admit(POOL_A, "ns/x", &empty(), *c, repo_cap(1));
+            let reserved = !ledger.outstanding().is_empty();
+            assert!(is_admit(&verdict), "{c:?} at an empty pool must admit");
+            assert_eq!(reserved, PARKABLE.contains(c), "{c:?}");
+            assert_eq!(!reserved, NEVER_PARKED.contains(c), "{c:?}");
+        }
+    }
+
+    /// Decide-and-reserve is ATOMIC: N runners racing an empty pool with a cap
+    /// of 1 produce exactly one admission.
+    ///
+    /// A multi-thread runtime with a barrier, so the calls really do land
+    /// together rather than being serialized by a current-thread scheduler —
+    /// which is the shape of the production bug (`KOPIUR_RECONCILE_CONCURRENCY`
+    /// runs the reconciles on a multi-thread runtime).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exactly_one_of_many_racing_runs_is_admitted() {
+        const RUNNERS: usize = 16;
+        let ledger = AdmissionLedger::default();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(RUNNERS));
+        let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(RUNNERS);
+        for i in 0..RUNNERS {
+            let ledger = ledger.clone();
+            let barrier = barrier.clone();
+            let admitted = admitted.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let verdict = ledger.admit(
+                    POOL_A,
+                    &format!("ns/run-{i}"),
+                    &ObservedPool::default(),
+                    PoolClass::Backup,
+                    repo_cap(1),
+                );
+                match verdict {
+                    LedgerVerdict::Admit { reservation } => {
+                        admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // HOLD it, as the launch path does, until every runner
+                        // has decided — releasing early would let a later runner
+                        // legitimately take the freed slot and mask the race.
+                        Some(reservation)
+                    }
+                    LedgerVerdict::Park { .. } => None,
+                }
+            }));
+        }
+        let mut guards = Vec::new();
+        for h in handles {
+            guards.push(h.await.expect("runner"));
+        }
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "maxConcurrentJobs=1 admitted more than one racing run",
+        );
+        drop(guards);
+        assert!(ledger.outstanding().is_empty(), "every guard must release");
+    }
+
+    // --- the composed gate: the uncapped path is free -------------------------
+
+    /// Records `"<METHOD> <path>"` per request; answers everything `404`. The
+    /// same `tower::service_fn` harness the `snapshot_policy` tests use.
+    fn recording_client(log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> kube::Client {
+        use http::Response;
+        use kube::client::Body;
+        let svc = tower::service_fn(move |req: http::Request<Body>| {
+            let log = log.clone();
+            async move {
+                log.lock()
+                    .expect("log")
+                    .push(format!("{} {}", req.method(), req.uri().path()));
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(http::StatusCode::NOT_FOUND)
+                        .header("content-type", "application/json")
+                        .body(Body::from(b"{}".to_vec()))
+                        .expect("response"),
+                )
+            }
+        });
+        kube::Client::new(svc, "default")
+    }
+
+    #[tokio::test]
+    async fn the_uncapped_gate_lists_nothing_and_reserves_nothing() {
+        // The default install's contract: no LIST, no lock, no ledger entry —
+        // one branch. A regression here would put a Job LIST and a mutex on every
+        // backup reconcile in every install that never asked for a cap.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx = Context::test_context(recording_client(log.clone()));
+        let verdict = admit_or_park(
+            &ctx,
+            POOL_A,
+            "ns/one",
+            PoolClass::Backup,
+            PoolCaps::default(),
+        )
+        .await
+        .expect("uncapped admits");
+        assert!(matches!(
+            verdict,
+            LedgerVerdict::Admit { reservation: None }
+        ));
+        assert!(
+            log.lock().expect("log").is_empty(),
+            "the uncapped gate made API calls: {:?}",
+            log.lock().expect("log"),
+        );
+        assert!(ctx.pool_admissions.outstanding().is_empty());
     }
 
     // --- the park / heal messages -------------------------------------------

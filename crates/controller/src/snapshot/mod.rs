@@ -1149,10 +1149,18 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // projected credential Secrets, a quiesced database, a CSI VolumeSnapshot
     // and its staged PVC. Gating Job CREATION is the whole design — a parked run
     // takes no locks and holds no resources, it simply is not started yet.
-    let slot_heal = match pool_gate(ctx, &api, backup, &name, repo_ref, &repo).await? {
-        PoolGate::Parked(action) => return Ok(action),
-        PoolGate::Admit { heal } => heal,
-    };
+    // `_slot` is the pool RESERVATION, and its binding is load-bearing: it holds
+    // this run's claim on the repository for the whole window between the
+    // admission decision and the Job's creation below, so a concurrently
+    // reconciling Snapshot cannot LIST a pool that does not yet show us. Bound
+    // with a name (not `_`) so it lives to the end of `reconcile_inner` rather
+    // than dropping immediately; every exit from here on — including the `?`s —
+    // releases it exactly once.
+    let (slot_heal, _slot) =
+        match pool_gate(ctx, &api, backup, &name, &namespace, repo_ref, &repo).await? {
+            PoolGate::Parked(action) => return Ok(action),
+            PoolGate::Admit { heal, reservation } => (heal, reservation),
+        };
 
     let (mut work_spec, mut source_volume, repo_volume, _) =
         build_backup_run(backup, &config, &repo, &namespace, &name)?;
@@ -1893,7 +1901,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
 // --- Repository mover-Job pool gate -----------------------------------------
 
 /// The pool gate's verdict for one backup reconcile.
-#[derive(Debug, Clone)]
+///
+/// Deliberately NOT `Clone`: it may carry an [`crate::pool::AdmissionGuard`],
+/// and a reservation that can be duplicated is a reservation whose release is
+/// ambiguous.
+#[derive(Debug)]
 pub(super) enum PoolGate {
     /// Launch. `heal` is `true` when a `RepositorySlotAvailable=False` condition
     /// is currently standing and must be flipped to `True` — see
@@ -1901,6 +1913,10 @@ pub(super) enum PoolGate {
     Admit {
         /// Whether a standing park must be healed in the Job-creation patch.
         heal: bool,
+        /// This run's pool reservation, held until the mover Job exists. `None`
+        /// when the gate did not run (a resumed `Running` Snapshot) or the pool
+        /// is uncapped — neither took a slot that needs protecting.
+        reservation: Option<crate::pool::AdmissionGuard>,
     },
     /// Held behind the pool. The caller returns this `Action` and does nothing
     /// else: no Job, no staging, no credential projection.
@@ -1925,32 +1941,48 @@ async fn pool_gate(
     api: &Api<Snapshot>,
     backup: &Snapshot,
     name: &str,
+    namespace: &str,
     repo_ref: &RepositoryRef,
     repo: &ResolvedRepository,
 ) -> Result<PoolGate> {
     if !should_run_pool_gate(backup.status.as_ref().and_then(|s| s.phase.as_ref())) {
-        return Ok(PoolGate::Admit { heal: false });
+        return Ok(PoolGate::Admit {
+            heal: false,
+            reservation: None,
+        });
     }
     let caps = crate::pool::PoolCaps {
         repo: kopiur_api::consts::effective_max_concurrent_jobs(repo.concurrency.as_ref()),
         global: ctx.max_concurrent_jobs,
     };
-    // The uncapped default: `pool_live_counts` short-circuits without a LIST and
-    // `pool_verdict` cannot park, so the whole gate is a couple of branches and
-    // the produced status is byte-identical to a build without this feature.
+    // The uncapped default: `admit_or_park` short-circuits without a LIST and
+    // without touching the admission ledger, so the whole gate is a couple of
+    // branches and the produced status is byte-identical to a build without this
+    // feature.
     let pinned = repo.repository_ref();
-    let (repo_live, global_live) =
-        crate::pool::pool_live_counts(ctx, &crate::naming::repo_label(&pinned), caps).await?;
     let existing = backup
         .status
         .as_ref()
         .map(|s| s.conditions.clone())
         .unwrap_or_default();
-    match crate::pool::pool_verdict(crate::pool::PoolClass::Backup, repo_live, global_live, caps) {
-        crate::pool::PoolVerdict::Admit => Ok(PoolGate::Admit {
+    // A backup's mover Job is named after its `Snapshot` and lives in the
+    // Snapshot's namespace — the same identity `apply_mover_objects` creates it
+    // under below, which is what lets the ledger sweep recognize it.
+    let job = crate::pool::job_key(namespace, name);
+    match crate::pool::admit_or_park(
+        ctx,
+        &crate::naming::repo_label(&pinned),
+        &job,
+        crate::pool::PoolClass::Backup,
+        caps,
+    )
+    .await?
+    {
+        crate::pool::LedgerVerdict::Admit { reservation } => Ok(PoolGate::Admit {
             heal: crate::pool::slot_gate_is_false(&existing),
+            reservation,
         }),
-        crate::pool::PoolVerdict::Park {
+        crate::pool::LedgerVerdict::Park {
             repo_live,
             global_live,
         } => {

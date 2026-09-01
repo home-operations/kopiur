@@ -349,13 +349,16 @@ pub fn suspended_report(pending_request: bool) -> (&'static str, &'static str) {
 
 /// The pool gate's verdict for one replication reconcile — the replication peer
 /// of `crate::snapshot::PoolGate`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ReplicationPoolGate {
     /// Spawn the run. `heal` is `true` when a standing
     /// `RepositorySlotAvailable=False` must be flipped once the Job exists.
     Admit {
         /// Whether a previous park is still recorded and must be cleared.
         heal: bool,
+        /// This run's pool reservation, held until the replication Job exists.
+        /// `None` only when the pool is uncapped — nothing to protect.
+        reservation: Option<crate::pool::AdmissionGuard>,
     },
     /// Held behind the source repository's pool. Return this `Action` and spawn
     /// nothing: no Job, no credential projection, no destination Secret checks.
@@ -377,13 +380,19 @@ pub enum ReplicationPoolGate {
 /// it may sit queued for an unbounded time.
 ///
 /// `conditions` is the CR's current condition array; `kind`/`name` seed the
-/// deterministic requeue jitter.
+/// deterministic requeue jitter. `namespace`/`job_name` are the identity of the
+/// Job this run is about to spawn — the reservation the ledger holds until that
+/// Job exists is keyed on it, so it MUST be the name actually passed to the
+/// spawn below (cron and manual runs use different Job names).
+#[allow(clippy::too_many_arguments)]
 pub async fn replication_pool_gate<K>(
     ctx: &Context,
     api: &Api<K>,
     obj: &K,
     kind: &str,
     name: &str,
+    namespace: &str,
+    job_name: &str,
     source: &crate::io::ResolvedRepository,
     conditions: &[Condition],
 ) -> Result<ReplicationPoolGate>
@@ -399,17 +408,20 @@ where
         global: ctx.max_concurrent_jobs,
     };
     let pinned = source.repository_ref();
-    let (repo_live, global_live) =
-        crate::pool::pool_live_counts(ctx, &crate::naming::repo_label(&pinned), caps).await?;
     let heal = slot_gate_is_false(conditions);
-    match crate::pool::pool_verdict(
+    match crate::pool::admit_or_park(
+        ctx,
+        &crate::naming::repo_label(&pinned),
+        &crate::pool::job_key(namespace, job_name),
         crate::pool::PoolClass::Replication,
-        repo_live,
-        global_live,
         caps,
-    ) {
-        crate::pool::PoolVerdict::Admit => Ok(ReplicationPoolGate::Admit { heal }),
-        crate::pool::PoolVerdict::Park {
+    )
+    .await?
+    {
+        crate::pool::LedgerVerdict::Admit { reservation } => {
+            Ok(ReplicationPoolGate::Admit { heal, reservation })
+        }
+        crate::pool::LedgerVerdict::Park {
             repo_live,
             global_live,
         } => {

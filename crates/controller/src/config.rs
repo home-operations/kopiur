@@ -219,8 +219,9 @@ pub const DEFAULT_MAX_CONCURRENT_DELETE_JOBS: usize = 0;
 /// occupies a slot, so it displaces backups rather than adding to them.
 ///
 /// `0` (or unset) means UNCAPPED — the default, and today's behavior. Uncapped
-/// costs nothing: with neither cap set the gate performs no Job LIST at all
-/// (`crate::pool::pool_live_counts`). Reachable via the chart's top-level
+/// costs nothing: with neither cap set the gate performs no Job LIST at all and
+/// never touches the admission ledger (`crate::pool::admit_or_park`). Reachable
+/// via the chart's top-level
 /// `maxConcurrentJobs` value.
 pub const MAX_CONCURRENT_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_JOBS";
 

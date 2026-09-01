@@ -212,10 +212,19 @@ pub struct Context {
     /// primary knob; a run must satisfy both.
     ///
     /// `None` (the default) means UNCAPPED, and an uncapped install pays
-    /// nothing — with no repository cap either, `crate::pool::pool_live_counts`
-    /// returns `(0, 0)` without a LIST, so the gate is one branch. Restores are
-    /// never held by this cap (`crate::pool::pool_verdict`).
+    /// nothing — with no repository cap either, `crate::pool::admit_or_park`
+    /// short-circuits without a LIST and without touching
+    /// [`pool_admissions`](Self::pool_admissions), so the gate is one branch.
+    /// Restores are never held by this cap (`crate::pool::pool_verdict`).
     pub max_concurrent_jobs: Option<std::num::NonZeroUsize>,
+    /// In-process record of pool admissions GRANTED but whose mover Jobs are not
+    /// yet visible to a LIST, so the observe→decide→create sequence is atomic
+    /// and two simultaneous reconciles cannot both read an empty pool.
+    ///
+    /// Not configuration — runtime state, hence defaulted rather than passed to
+    /// [`Context::new`]. Sound because only the LEADER reconciles; see
+    /// [`crate::pool::AdmissionLedger`] for the failover semantics.
+    pub pool_admissions: crate::pool::AdmissionLedger,
     /// Shared informer cache of all `Snapshot` CRs, reused from the `Snapshot`
     /// controller's own reflector (`Controller::store()`). `OnceLock` because
     /// the `Context` is built (in `startup::run`) BEFORE `spawn_all` mints the
@@ -334,6 +343,7 @@ impl Context {
             watch_scope,
             max_concurrent_delete_jobs,
             max_concurrent_jobs,
+            pool_admissions: crate::pool::AdmissionLedger::default(),
             snapshot_store: Arc::new(OnceLock::new()),
             snapshot_synced: Arc::new(AtomicBool::new(false)),
             schedule_store: Arc::new(OnceLock::new()),
