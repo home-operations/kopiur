@@ -422,9 +422,9 @@ pub fn missing_workload_identity_sa_message(
     };
     format!(
         "backend auth.workloadIdentity names ServiceAccount `{sa}`, but it does not exist in \
-         namespace `{ns}` where the mover Job runs — Kopiur never creates it (its \
-         cloud-federation annotations are your contract with the cloud's identity webhook). Fix: \
-         create ServiceAccount `{sa}` in `{ns}` with the federation binding ({annotation})."
+         namespace `{ns}` where {consumer} runs — Kopiur never creates it (its cloud-federation \
+         annotations are your contract with the cloud's identity webhook). Fix: create \
+         ServiceAccount `{sa}` in `{ns}` with the federation binding ({annotation})."
     )
 }
 
