@@ -4493,17 +4493,17 @@ fn the_heal_is_needed_only_when_a_park_is_actually_standing() {
     // condition it never had, so its status stays byte-identical to a build
     // without the pool gate.
     let parked = backup_with_status(Some("Pending"), slot_condition("False", "WaitingForSlot"));
-    assert!(slot_gate_heal_needed(
+    assert!(crate::pool::slot_gate_is_false(
         &parked.status.as_ref().unwrap().conditions
     ));
 
     let admitted = backup_with_status(Some("Running"), slot_condition("True", "SlotAcquired"));
-    assert!(!slot_gate_heal_needed(
+    assert!(!crate::pool::slot_gate_is_false(
         &admitted.status.as_ref().unwrap().conditions
     ));
 
     let never_parked = backup_with_status(Some("Pending"), serde_json::json!([]));
-    assert!(!slot_gate_heal_needed(
+    assert!(!crate::pool::slot_gate_is_false(
         &never_parked.status.as_ref().unwrap().conditions
     ));
 }

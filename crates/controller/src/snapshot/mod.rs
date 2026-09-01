@@ -1145,7 +1145,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // projected credential Secrets, a quiesced database, a CSI VolumeSnapshot
     // and its staged PVC. Gating Job CREATION is the whole design — a parked run
     // takes no locks and holds no resources, it simply is not started yet.
-    let slot_heal = match pool_gate(ctx, &api, backup, &name, &namespace, repo_ref, &repo).await? {
+    let slot_heal = match pool_gate(ctx, &api, backup, &name, repo_ref, &repo).await? {
         PoolGate::Parked(action) => return Ok(action),
         PoolGate::Admit { heal } => heal,
     };
@@ -1869,7 +1869,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // so no later writer can resurrect the stale `False` (see `fold_slot_heal`).
     // `None` for every Snapshot that was never parked, which keeps this patch
     // byte-identical to a build without the pool gate.
-    if let Some(conditions) = fold_slot_heal(&api, backup, &name, &repo, repo_ref, slot_heal).await
+    if let Some(conditions) = fold_slot_heal(&api, backup, &name, &repo, slot_heal).await
         && let Some(obj) = status.as_object_mut()
     {
         obj.insert(
@@ -1918,7 +1918,6 @@ async fn pool_gate(
     api: &Api<Snapshot>,
     backup: &Snapshot,
     name: &str,
-    namespace: &str,
     repo_ref: &RepositoryRef,
     repo: &ResolvedRepository,
 ) -> Result<PoolGate> {
@@ -1942,7 +1941,7 @@ async fn pool_gate(
         .unwrap_or_default();
     match crate::pool::pool_verdict(crate::pool::PoolClass::Backup, repo_live, global_live, caps) {
         crate::pool::PoolVerdict::Admit => Ok(PoolGate::Admit {
-            heal: slot_gate_heal_needed(&existing),
+            heal: crate::pool::slot_gate_is_false(&existing),
         }),
         crate::pool::PoolVerdict::Park {
             repo_live,
@@ -1967,7 +1966,7 @@ async fn pool_gate(
             // Transition-gated: the Event fires once on ENTERING the queue, not
             // on every 30s re-check — a busy repository would otherwise flood
             // `kubectl describe` with identical notices.
-            if wrote && !slot_gate_heal_needed(&existing) {
+            if wrote && !crate::pool::slot_gate_is_false(&existing) {
                 io::publish_normal_event(
                     ctx,
                     backup,
@@ -1984,7 +1983,6 @@ async fn pool_gate(
                     "parking backup behind the repository mover-Job pool"
                 );
             }
-            let _ = namespace;
             Ok(PoolGate::Parked(Action::requeue(
                 crate::pool::pool_wait_requeue(
                     "Snapshot",
@@ -2018,7 +2016,6 @@ async fn fold_slot_heal(
     backup: &Snapshot,
     name: &str,
     repo: &ResolvedRepository,
-    repo_ref: &RepositoryRef,
     heal: bool,
 ) -> Option<Vec<Condition>> {
     if !heal {
@@ -2032,17 +2029,18 @@ async fn fold_slot_heal(
         .unwrap_or_default();
     // Re-check against the LIVE array: another writer (or a racing replica) may
     // already have healed it, and re-writing an unchanged condition is churn.
-    if !slot_gate_heal_needed(&existing) {
+    if !crate::pool::slot_gate_is_false(&existing) {
         return None;
     }
+    let pinned = repo.repository_ref();
     Some(io::upsert_condition(
         &existing,
         crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION,
         true,
         crate::consts::SLOT_ACQUIRED_REASON,
         &crate::pool::slot_acquired_message(
-            io::repo_kind_str(repo_ref.kind),
-            &crate::pool::repo_display(&repo.repository_ref()),
+            io::repo_kind_str(pinned.kind),
+            &crate::pool::repo_display(&pinned),
         ),
         backup.meta().generation,
     ))

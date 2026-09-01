@@ -322,6 +322,27 @@ pub fn count_pool(jobs: &[Job], repo_pool_value: &str) -> (usize, usize) {
     (repo_live, global_live)
 }
 
+/// Whether `RepositorySlotAvailable` is present AND `False` on a run's status —
+/// i.e. a park is currently standing and must be healed on admission.
+///
+/// "Only if PRESENT" is the load-bearing half, and it is why this is a
+/// three-state question rather than a boolean: a run that was never parked must
+/// not GROW a condition it never had, or every backup in every install that
+/// never asked for a cap would gain a status field (and a `resourceVersion`
+/// bump, and a GitOps diff). The `clear_source_pvc_gate_if_parked` discipline.
+///
+/// One definition, shared by the `Snapshot` gate and both replication gates: two
+/// spellings of "is this parked?" could drift, and the one that drifted would
+/// silently stop healing — leaving a launched run permanently reporting that it
+/// is queued.
+pub fn slot_gate_is_false(
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> bool {
+    conditions.iter().any(|c| {
+        c.type_ == kopiur_api::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION && c.status == "False"
+    })
+}
+
 /// How a repository is NAMED in a pool message: `namespace/name` for a
 /// namespaced `Repository`, bare `name` for a cluster-scoped one.
 ///

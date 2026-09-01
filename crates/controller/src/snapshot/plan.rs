@@ -1207,20 +1207,6 @@ pub(super) fn park_status(
     status
 }
 
-/// Whether the pool gate must HEAL a standing park on admission: the
-/// `RepositorySlotAvailable` condition is present AND `False`.
-///
-/// "Only if present" is the [`super::source_pvc_gate_clear_needed`] discipline:
-/// a Snapshot that was never parked must not grow a condition it never had, so
-/// the healthy wire stays byte-identical to a build without this feature.
-pub(super) fn slot_gate_heal_needed(
-    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
-) -> bool {
-    conditions.iter().any(|c| {
-        c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION && c.status == "False"
-    })
-}
-
 fn existing_conditions(
     backup: &Snapshot,
 ) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {

@@ -53,6 +53,7 @@ use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::metrics::{ReplicationKind, ReplicationRunOutcome, ReplicationRunTrigger};
 use crate::naming::short_hash;
+use crate::pool::slot_gate_is_false;
 use crate::snapshot::job_terminal_state;
 
 /// Every kind-specific string the shared plumbing needs, resolved by an
@@ -520,15 +521,6 @@ pub async fn heal_replication_slot_condition<K>(
             "could not clear RepositorySlotAvailable after admission; retried next reconcile"
         );
     }
-}
-
-/// Whether `RepositorySlotAvailable` is present AND `False` — the "only if
-/// present" discipline, so a run that was never parked never grows a condition
-/// it never had and its status stays byte-identical.
-pub fn slot_gate_is_false(conditions: &[Condition]) -> bool {
-    conditions.iter().any(|c| {
-        c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION && c.status == "False"
-    })
 }
 
 /// What one reconcile learned from listing this CR's mover Jobs.
