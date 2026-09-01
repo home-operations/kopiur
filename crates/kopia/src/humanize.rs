@@ -119,10 +119,7 @@ fn clean_line(line: &str) -> String {
 /// path segment (including its leading `/`) is excised, leaving the stable prefix.
 fn strip_volatile_paths(line: &str) -> String {
     let mut out = line.to_string();
-    loop {
-        let Some(marker) = find_volatile_marker(&out) else {
-            break;
-        };
+    while let Some(marker) = find_volatile_marker(&out) {
         // Segment start: the last '/' before the marker (drop it too), else the
         // marker itself.
         let seg_start = out[..marker].rfind('/').unwrap_or(marker);
