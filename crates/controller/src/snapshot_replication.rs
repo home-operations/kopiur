@@ -1026,6 +1026,16 @@ async fn spawn_snapshot_replication_job(
         SNAPSHOT_REPLICATION_INSTANCE_LABEL.to_string(),
         cr_name.to_string(),
     );
+    // Pool membership, on the SOURCE repository: `kopia snapshot migrate` reads
+    // the source and writes the destination from ONE pod, and a Job carries one
+    // pool label, so the source — the side whose read load the cap exists to
+    // bound — is the one that owns this run. Keyed off the RESOLVED source
+    // identity so a `sourceRef` written without a namespace still lands in that
+    // repository's pool rather than a pool of its own.
+    labels.extend(crate::pool::repo_pool_label(
+        crate::pool::MoverJobKind::SnapshotReplication,
+        &source.repository_ref(),
+    ));
     // The slot the run covers, plus WHAT asked for it — the Job outlives the
     // reconcile that made it, and the trigger has to survive with it for the
     // outcome metric to attribute cron vs manual.
@@ -1622,6 +1632,10 @@ mod tests {
                     namespace: None,
                     key: None,
                 },
+            },
+            kind: match ns {
+                Some(_) => kopiur_api::common::RepositoryKind::Repository,
+                None => kopiur_api::common::RepositoryKind::ClusterRepository,
             },
             repo_namespace: ns.map(str::to_string),
             mover_defaults: None,

@@ -2573,6 +2573,16 @@ async fn run_restore_mover(
             let mut labels =
                 io::child_labels(&[(crate::consts::OP_LABEL, crate::consts::OP_RESTORE)]);
             mover_identity.decorate_labels(&mut labels);
+            // Pool membership: a restore mover counts toward its repository's
+            // `spec.concurrency.maxConcurrentJobs`. Keyed off the RESOLVED
+            // repository identity — a restore often has no `spec.repository`
+            // at all (it derives one from a Snapshot or a policy), so the
+            // resolution is the only ref guaranteed to be normalized, and a
+            // denormalized one would split the repository's pool.
+            labels.extend(crate::pool::repo_pool_label(
+                crate::pool::MoverJobKind::Restore,
+                &repo.repository_ref(),
+            ));
             labels
         },
         // Restore writes INTO the target PVC, mounted read-write at /restore.

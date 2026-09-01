@@ -541,6 +541,16 @@ async fn spawn_replication_job(
         REPLICATION_COMPONENT.to_string(),
     );
     labels.insert(REPLICATION_INSTANCE_LABEL.to_string(), cr_name.to_string());
+    // Pool membership, on the SOURCE repository: a `sync-to` mirror reads the
+    // source repository, so it counts toward the SOURCE's
+    // `spec.concurrency.maxConcurrentJobs`. (The destination is an inline
+    // `Backend` on this CR — there is no repository object to have a pool.)
+    // Keyed off the RESOLVED source identity, so a `sourceRef` written without
+    // a namespace lands in the same pool as every other run against it.
+    labels.extend(crate::pool::repo_pool_label(
+        crate::pool::MoverJobKind::RepositoryReplication,
+        &repo.repository_ref(),
+    ));
     // The slot the run covers, plus WHAT asked for it — the Job outlives the
     // reconcile that made it, and the trigger has to survive with it for the
     // outcome metric to attribute cron vs manual.
@@ -964,6 +974,7 @@ mod tests {
                     key: None,
                 },
             },
+            kind: kopiur_api::common::RepositoryKind::Repository,
             repo_namespace: Some("ns".into()),
             mover_defaults: None,
             identity_defaults: None,

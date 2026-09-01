@@ -1704,6 +1704,15 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
 
     let mut labels = run_labels(&config, origin);
     mover_identity.decorate_labels(&mut labels);
+    // Pool membership: a backup mover counts toward its repository's
+    // `spec.concurrency.maxConcurrentJobs`. The value comes from the RESOLVED
+    // repository identity ([`io::ResolvedRepository::repository_ref`]), never
+    // the raw spec ref — a `Repository` ref with `namespace: None` would hash
+    // `repository:/name` and split one repository's pool in two.
+    labels.extend(crate::pool::repo_pool_label(
+        crate::pool::MoverJobKind::Backup,
+        &repo.repository_ref(),
+    ));
     let mut limits = job_limits(backup);
     // moverDefaults.ttlSecondsAfterFinished applies unless the recipe's FailurePolicy
     // already set a TTL (ADR-0005 §12).
@@ -2359,7 +2368,7 @@ pub(crate) async fn repo_mass_deletion_conditions(
     let (ack, _invalid) = parse_mass_deletion_ack(raw_ack, now);
     let threshold = kopiur_api::consts::effective_mass_deletion_threshold(deletion_protection);
     let state = store.state();
-    let key = repo_key(repo_ref);
+    let key = pinned_repo_key(repo_ref);
     // Only CONFIRMED-terminating namespaces feed the count-as-terminating plan
     // evaluation; an unreadable namespace must not flip a retain child into a
     // counted destructive delete (C1).
@@ -2445,7 +2454,7 @@ async fn resolve_breaker(
     let threshold =
         kopiur_api::consts::effective_mass_deletion_threshold(repo.deletion_protection.as_ref());
     let state = store.state();
-    let key = repo_key(repo_ref);
+    let key = pinned_repo_key(repo_ref);
     // Count in the REAL `(ns_terminating, ns_policy)` form so an external
     // destructive delete that only arises under an `onNamespaceDelete: Delete`
     // namespace teardown (a `policy-cascade`-stamped child) is counted — and thus
@@ -3496,7 +3505,7 @@ async fn fire_batch(
     views: &[BatchJobView],
 ) -> Result<Action> {
     use std::sync::atomic::Ordering;
-    let key = repo_key(repo_ref);
+    let key = pinned_repo_key(repo_ref);
     // Resolve which candidate namespaces are terminating BEFORE building the
     // counting set, so each member's plan is evaluated in its real
     // `(ns_terminating, ns_policy)` form. The resolution splits into CONFIRMED

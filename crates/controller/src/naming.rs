@@ -9,6 +9,8 @@
 //! (SipHash) is explicitly not guaranteed stable across Rust releases — a
 //! toolchain upgrade must never rename cluster objects.
 
+use kopiur_api::common::{RepositoryKind, RepositoryRef};
+
 /// Cap a generated object name at the 63-character DNS-label limit while keeping
 /// it unique and deterministic: long names keep their leading 46 characters plus
 /// a stable FNV-1a hash of the full name. A cross-namespace cascade-delete Job
@@ -36,6 +38,53 @@ pub fn short_hash(s: &str) -> String {
 /// legible; label-safe where the raw `Kind/ns/name` key is not.
 pub fn repo_tag6(repo_key: &str) -> String {
     short_hash(repo_key).chars().take(6).collect()
+}
+
+/// Stable per-repo key from a **normalized/pinned** [`RepositoryRef`]:
+/// `"repository:{ns}/{name}"` for a namespaced `Repository`,
+/// `"clusterrepository:{name}"` for a `ClusterRepository`. Distinguishes two
+/// `Repository`s of the same name in different namespaces, and a `Repository`
+/// from a `ClusterRepository` of the same name.
+///
+/// **Named `pinned_repo_key`, not `repo_key`, on purpose.**
+/// [`kopiur_api::common::repo_key`] is a DIFFERENT function with a different
+/// normalization (`"Repository/{ns}/{name}"`, and it takes the owning
+/// namespace as a second argument so it can normalize an unpinned ref itself).
+/// This one takes the ref alone and therefore requires the caller to have
+/// normalized already — pass a ref that has been through
+/// [`kopiur_api::common::normalized_repository_ref`] (equivalently
+/// `crate::snapshot::pinned_repository_ref`), or a `Repository` ref with an
+/// absent namespace degrades to the key `repository:/{name}`, which silently
+/// SPLITS a repository's pool/batch into two. The two spellings sitting in one
+/// crate under one name was the footgun; the rename is the fix.
+///
+/// An unpinned ref still degrades gracefully rather than panicking — the batch
+/// path's counting set deliberately relies on that (over-count is fail-safe).
+pub fn pinned_repo_key(r: &RepositoryRef) -> String {
+    match r.kind {
+        RepositoryKind::Repository => format!(
+            "repository:{}/{}",
+            r.namespace.as_deref().unwrap_or_default(),
+            r.name
+        ),
+        RepositoryKind::ClusterRepository => format!("clusterrepository:{}", r.name),
+    }
+}
+
+/// Label-value-safe short form of [`pinned_repo_key`] for Job labels:
+/// Kubernetes label values forbid `:`/`/`, so this hashes the key rather than
+/// embedding it verbatim. `<=40-char name prefix>-<hash8>`, always well under
+/// the 63-char label-value limit.
+///
+/// Two Job labels carry this value and both are load-bearing selectors:
+/// [`crate::consts::DELETE_REPO_LABEL`] (batch-delete single-flight) and
+/// [`kopiur_api::consts::REPO_POOL_LABEL`] (per-repository mover concurrency).
+/// Both count "the runs belonging to ONE repository", so the input ref must be
+/// normalized — see [`pinned_repo_key`].
+pub fn repo_label(r: &RepositoryRef) -> String {
+    let short: String = r.name.chars().take(40).collect();
+    let hash = short_hash(&pinned_repo_key(r));
+    format!("{short}-{hash}")
 }
 
 /// 64-bit FNV-1a over the string's bytes.

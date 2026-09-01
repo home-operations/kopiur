@@ -317,13 +317,23 @@ pub fn effective_max_concurrent_jobs(
 
 /// Pool-membership label stamped on every mover `Job` that counts toward its
 /// repository's `spec.concurrency.maxConcurrentJobs`: backup, restore, and the
-/// source side of a replication. The value is the pinned repository label (the
-/// same `<kind>-<name>` shape [`SESSION_REPO_LABEL`] carries), so one selector
-/// counts a repository's whole in-flight pool.
+/// SOURCE side of a `RepositoryReplication`/`SnapshotReplication`. One selector
+/// therefore counts a repository's whole in-flight pool.
 ///
-/// Maintenance, verification, pin, and snapshot-delete batch Jobs deliberately do
-/// NOT carry it — they are operator-driven housekeeping, excluded from the pool
-/// so a saturated backup queue can never starve them.
+/// The value is `kopiur_controller::naming::repo_label` over the repository's
+/// **normalized** ref — `<=40-char name prefix>-<hash8>`, the same value the
+/// batch-delete single-flight label `kopiur.home-operations.com/delete-repo`
+/// carries. Deliberately NOT the
+/// `<kind>-<name>` shape of [`SESSION_REPO_LABEL`]: that spelling cannot
+/// distinguish two `Repository`s of the same name in different namespaces, and
+/// merging their pools would silently halve each one's cap. The hash is over
+/// `repository:{ns}/{name}` / `clusterrepository:{name}`, so namespace and kind
+/// both discriminate.
+///
+/// Maintenance, verification, pin, snapshot-delete batch, bootstrap/discovery and
+/// browse-session Jobs deliberately do NOT carry it — they are operator-driven
+/// housekeeping (or an interactive session), excluded from the pool so a
+/// saturated backup queue can never starve them.
 pub const REPO_POOL_LABEL: &str = "kopiur.home-operations.com/repo-pool";
 
 /// `Repository`/`ClusterRepository` condition: pending external destructive

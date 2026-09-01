@@ -154,6 +154,7 @@ mod tests {
                     key: None,
                 },
             },
+            kind: kopiur_api::common::RepositoryKind::Repository,
             repo_namespace: Some("ns".into()),
             identity_defaults: None,
             schedule_defaults: None,

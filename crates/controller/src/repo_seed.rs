@@ -1109,6 +1109,10 @@ mod tests {
                     key: None,
                 },
             },
+            kind: match namespace {
+                Some(_) => kopiur_api::common::RepositoryKind::Repository,
+                None => kopiur_api::common::RepositoryKind::ClusterRepository,
+            },
             repo_namespace: namespace.map(str::to_string),
             mover_defaults: None,
             identity_defaults: None,

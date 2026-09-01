@@ -529,6 +529,7 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
                 key: Some("KOPIA_PASSWORD".into()),
             },
         },
+        kind: kopiur_api::common::RepositoryKind::Repository,
         repo_namespace: Some("media-ns".into()),
         mover_defaults: None,
         identity_defaults: None,
