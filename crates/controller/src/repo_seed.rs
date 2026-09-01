@@ -1128,6 +1128,7 @@ mod tests {
                 ..Default::default()
             },
             deletion_protection: None,
+            concurrency: None,
             mass_deletion_ack: None,
             catalog: None,
             ca_bundle_pem: Some("SOURCE-CA".into()),

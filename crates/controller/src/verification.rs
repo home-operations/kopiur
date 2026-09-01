@@ -1425,6 +1425,7 @@ mod tests {
             owner_ref: Default::default(),
             mode: RepositoryMode::ReadWrite,
             deletion_protection: None,
+            concurrency: None,
             mass_deletion_ack: None,
             catalog: None,
             ca_bundle_pem: None,

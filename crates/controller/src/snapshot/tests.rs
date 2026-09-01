@@ -539,6 +539,7 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
         credential_projection_allowed: false,
         owner_ref: Default::default(),
         deletion_protection: None,
+        concurrency: None,
         mass_deletion_ack: None,
         catalog: None,
         ca_bundle_pem: None,
@@ -4396,4 +4397,253 @@ fn sample_backup_work_spec() -> kopiur_mover::workspec::MoverWorkSpec {
         cache: Default::default(),
         throttle: Default::default(),
     }
+}
+
+// --- Repository mover-Job pool gate (M3) -------------------------------------
+
+/// A `Snapshot` whose status carries `conditions` and `phase`.
+fn backup_with_status(phase: Option<&str>, conditions: serde_json::Value) -> Snapshot {
+    let mut b = dummy_backup();
+    b.metadata.namespace = Some("apps".into());
+    b.metadata.generation = Some(1);
+    let mut status = serde_json::json!({ "conditions": conditions });
+    if let Some(p) = phase {
+        status["phase"] = serde_json::Value::String(p.to_string());
+    }
+    b.status = Some(serde_json::from_value(status).expect("status fixture"));
+    b
+}
+
+fn slot_condition(status: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "RepositorySlotAvailable",
+        "status": status,
+        "reason": reason,
+        "message": "waiting for a mover slot on Repository apps/nas: 1/1 jobs running; \
+                    restores are never held",
+        "lastTransitionTime": "2026-01-01T00:00:00Z",
+    }])
+}
+
+#[test]
+fn the_pool_gate_runs_only_at_first_launch() {
+    use kopiur_api::snapshot::SnapshotPhase as P;
+    // Gated: no status yet, or explicitly Pending.
+    assert!(should_run_pool_gate(None));
+    assert!(should_run_pool_gate(Some(&P::Pending)));
+    // NOT gated. `Running` is the load-bearing one: a resumed run already held
+    // a slot, and re-queuing it behind the backups that started after it both
+    // demotes a live backup to Pending and can hold the resume indefinitely.
+    for phase in [
+        P::Running,
+        P::Succeeded,
+        P::Failed,
+        P::Deleting,
+        P::Discovered,
+        P::Unchanged,
+        P::Unknown("FromTheFuture".into()),
+    ] {
+        assert!(!should_run_pool_gate(Some(&phase)), "{phase:?}");
+    }
+}
+
+#[test]
+fn the_pool_gate_and_preflight_gate_agree_on_which_phases_launch() {
+    // Both answer "is this a FIRST launch?", so a divergence would mean one
+    // gate re-opening on a phase the other considers in-flight — exactly the
+    // shape that would re-gate a resumed Running backup.
+    use kopiur_api::snapshot::SnapshotPhase as P;
+    for phase in [
+        None,
+        Some(P::Pending),
+        Some(P::Running),
+        Some(P::Succeeded),
+        Some(P::Failed),
+        Some(P::Deleting),
+        Some(P::Discovered),
+        Some(P::Unchanged),
+        Some(P::Unknown("x".into())),
+    ] {
+        assert_eq!(
+            should_run_pool_gate(phase.as_ref()),
+            should_run_preflight(phase.as_ref()),
+            "{phase:?}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_run_retried_through_pending_consults_the_gate() {
+    use kopiur_api::snapshot::SnapshotPhase as P;
+    // A retry is a run whose phase is back at Pending (a fresh Snapshot, or one
+    // reset by a retry path): it goes through the creation path, so it MUST be
+    // admitted through the pool like any other launch — a retry storm behind a
+    // saturated backend is precisely what the cap exists to bound.
+    assert!(should_run_pool_gate(Some(&P::Pending)));
+    // While the CR still SAYS Failed it mints no Job at all
+    // (`RunDecision::TerminalFailed`), so the gate correctly stays out of it.
+    assert!(!should_run_pool_gate(Some(&P::Failed)));
+    assert_eq!(run_decision(Some(&P::Failed)), RunDecision::TerminalFailed);
+    assert_eq!(run_decision(Some(&P::Pending)), RunDecision::Run);
+}
+
+#[test]
+fn the_heal_is_needed_only_when_a_park_is_actually_standing() {
+    // "Only if present": a Snapshot that was never parked must not grow a
+    // condition it never had, so its status stays byte-identical to a build
+    // without the pool gate.
+    let parked = backup_with_status(Some("Pending"), slot_condition("False", "WaitingForSlot"));
+    assert!(slot_gate_heal_needed(
+        &parked.status.as_ref().unwrap().conditions
+    ));
+
+    let admitted = backup_with_status(Some("Running"), slot_condition("True", "SlotAcquired"));
+    assert!(!slot_gate_heal_needed(
+        &admitted.status.as_ref().unwrap().conditions
+    ));
+
+    let never_parked = backup_with_status(Some("Pending"), serde_json::json!([]));
+    assert!(!slot_gate_heal_needed(
+        &never_parked.status.as_ref().unwrap().conditions
+    ));
+}
+
+#[test]
+fn the_park_status_pins_the_repository_and_parks_at_pending() {
+    let backup = backup_with_status(Some("Pending"), serde_json::json!([]));
+    let pinned = RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "nas".into(),
+        namespace: Some("apps".into()),
+    };
+    let status = park_status(&backup, "waiting for a mover slot", &pinned);
+    assert_eq!(status["phase"], "Pending");
+    // The pin is what makes a queued run attributable — the gauge labels from
+    // it, and it is the only place `kubectl get -o yaml` names the repository.
+    assert_eq!(status["resolved"]["repository"]["name"], "nas");
+    assert_eq!(status["resolved"]["repository"]["namespace"], "apps");
+    let conds = status["conditions"].as_array().expect("conditions");
+    let slot = conds
+        .iter()
+        .find(|c| c["type"] == "RepositorySlotAvailable")
+        .expect("the slot condition is written");
+    assert_eq!(slot["status"], "False");
+    assert_eq!(slot["reason"], "WaitingForSlot");
+}
+
+#[test]
+fn a_second_identical_parked_pass_is_a_no_op_status_patch() {
+    // The hot-loop guard: a queue may last minutes, and a status write that
+    // differed between identical passes would bump `resourceVersion`,
+    // re-trigger the primary watch and spin the reconciler for the whole wait.
+    let pinned = RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "nas".into(),
+        namespace: Some("apps".into()),
+    };
+    let message = crate::pool::waiting_for_slot_message(
+        "Repository",
+        "apps/nas",
+        1,
+        1,
+        crate::pool::PoolCaps {
+            repo: std::num::NonZeroUsize::new(1),
+            global: None,
+        },
+    );
+
+    // Pass 1 over a fresh Snapshot.
+    let first = backup_with_status(Some("Pending"), serde_json::json!([]));
+    let desired = park_status(&first, &message, &pinned);
+
+    // Pass 2 sees the status pass 1 wrote.
+    let mut second = first.clone();
+    let mut status_json = serde_json::to_value(second.status.as_ref().unwrap()).unwrap();
+    for (k, v) in desired.as_object().unwrap() {
+        status_json[k] = v.clone();
+    }
+    second.status = Some(serde_json::from_value(status_json.clone()).expect("round-trip"));
+
+    let again = park_status(&second, &message, &pinned);
+    assert!(
+        io::status_patch_is_noop(Some(&status_json), &again),
+        "an unchanged park must not write:\ncurrent={status_json}\ndesired={again}"
+    );
+    // And the repository pin is dropped from the second body entirely, since it
+    // already matches — that is what keeps the comparison honest for a run that
+    // later stamps a FULLER `resolved` block.
+    assert!(again.get("resolved").is_none(), "{again}");
+}
+
+#[test]
+fn the_park_status_restamps_the_pin_when_the_repository_changed() {
+    // A fan-out child re-pinned to a different repository must not keep
+    // advertising the old one while it queues.
+    let old = RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "old".into(),
+        namespace: Some("apps".into()),
+    };
+    let new = RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "new".into(),
+        namespace: Some("apps".into()),
+    };
+    let mut backup = backup_with_status(Some("Pending"), serde_json::json!([]));
+    let mut status_json = serde_json::to_value(backup.status.as_ref().unwrap()).unwrap();
+    status_json["resolved"] = serde_json::json!({ "repository": old });
+    backup.status = Some(serde_json::from_value(status_json).expect("round-trip"));
+
+    let status = park_status(&backup, "waiting", &new);
+    assert_eq!(status["resolved"]["repository"]["name"], "new");
+}
+
+#[test]
+fn the_heal_preserves_conditions_written_between_the_gate_and_the_job() {
+    // The audit-critical ordering. `fold_slot_heal` seeds from a LIVE re-read,
+    // so the array it produces still carries whatever the staging/credential
+    // writers put there after the gate ran. Seeding from the reconcile's stale
+    // copy instead would erase those AND resurrect the stale `False` onto a
+    // Snapshot whose Job is now running — a launched backup permanently
+    // reporting that it is queued.
+    let live_conditions: Vec<Condition> = serde_json::from_value(serde_json::json!([
+        {
+            "type": "RepositorySlotAvailable",
+            "status": "False",
+            "reason": "WaitingForSlot",
+            "message": "waiting for a mover slot",
+            "lastTransitionTime": "2026-01-01T00:00:00Z",
+        },
+        {
+            // Written by the staging path AFTER the gate admitted this run.
+            "type": "SourceStaged",
+            "status": "True",
+            "reason": "SourceStaged",
+            "message": "the source was staged",
+            "lastTransitionTime": "2026-01-01T00:00:05Z",
+        },
+    ]))
+    .expect("conditions fixture");
+
+    let healed = io::upsert_condition(
+        &live_conditions,
+        crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION,
+        true,
+        crate::consts::SLOT_ACQUIRED_REASON,
+        "holding a mover slot on Repository apps/nas",
+        Some(1),
+    );
+    let slot = healed
+        .iter()
+        .find(|c| c.type_ == "RepositorySlotAvailable")
+        .expect("the slot condition survives");
+    assert_eq!(slot.status, "True");
+    assert_eq!(slot.reason, "SlotAcquired");
+    assert!(
+        healed.iter().any(|c| c.type_ == "SourceStaged"),
+        "the interleaved writer's condition must survive the heal: {healed:?}"
+    );
+    // Order-stable: the heal replaces in place, so the array does not churn.
+    assert_eq!(healed[0].type_, "RepositorySlotAvailable");
+    assert_eq!(healed[1].type_, "SourceStaged");
 }

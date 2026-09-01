@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
@@ -34,9 +35,10 @@ use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
 use crate::metrics::{ReplicationKind, ReplicationRunTrigger};
 use crate::naming::short_hash;
 use crate::replication_run::{
-    RunObservation, RunRequest, RunStall, idle_report, manual_replication_job_name,
-    manual_run_request, manual_run_status, observe_and_count_runs, recorded_running,
-    run_job_annotations, suspended_manual_run, suspended_report,
+    ReplicationPoolGate, RunObservation, RunRequest, RunStall, heal_replication_slot_condition,
+    idle_report, manual_replication_job_name, manual_run_request, manual_run_status,
+    observe_and_count_runs, recorded_running, replication_pool_gate, run_job_annotations,
+    suspended_manual_run, suspended_report,
 };
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
@@ -302,6 +304,23 @@ async fn drive_schedule(
             if observed.has_active {
                 return Ok(Action::requeue(REQUEUE_RUNNING));
             }
+            // The SOURCE repository's mover-Job pool, consulted BEFORE the spawn
+            // path takes any side effect (credential projection, destination
+            // Secret checks) that a queued run would hold for an unbounded time.
+            let heal = match replication_pool_gate(
+                ctx,
+                api,
+                repl,
+                KIND_STR,
+                name,
+                repo,
+                &conditions_of(repl),
+            )
+            .await?
+            {
+                ReplicationPoolGate::Parked(action) => return Ok(action),
+                ReplicationPoolGate::Admit { heal } => heal,
+            };
             spawn_replication_job(
                 ctx,
                 namespace,
@@ -313,6 +332,7 @@ async fn drive_schedule(
                 ReplicationRunTrigger::Cron,
             )
             .await?;
+            heal_replication_slot_condition(api, repl, name, repo, conditions_of, heal).await;
             tracing::info!(replication = %name, slot = %slot.to_rfc3339(), "spawned replication Job");
             Ok(Action::requeue(REQUEUE_RUNNING))
         }
@@ -413,6 +433,35 @@ async fn handle_manual_run(
                 .await?;
                 return Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)));
             }
+            // Same pool gate as the cron path: a REQUESTED run is a cron run
+            // with a different Job name, and must not bypass any guarantee the
+            // cron path has — least of all the one that bounds backend load.
+            let heal = match replication_pool_gate(
+                ctx,
+                api,
+                repl,
+                KIND_STR,
+                name,
+                repo,
+                &conditions_of(repl),
+            )
+            .await?
+            {
+                ReplicationPoolGate::Parked(action) => {
+                    // Record the request as `Pending` for the same reason the
+                    // single-flight arm above does: a queued request must be
+                    // VISIBLE in status, not look like nothing happened.
+                    patch_manual_run(
+                        api,
+                        repl,
+                        name,
+                        manual_run_status(request, P::Pending, Utc::now()),
+                    )
+                    .await?;
+                    return Ok(ManualRunVerdict::InFlight(action));
+                }
+                ReplicationPoolGate::Admit { heal } => heal,
+            };
             spawn_replication_job(
                 ctx,
                 namespace,
@@ -424,6 +473,7 @@ async fn handle_manual_run(
                 ReplicationRunTrigger::Manual,
             )
             .await?;
+            heal_replication_slot_condition(api, repl, name, repo, conditions_of, heal).await;
             patch_manual_run(
                 api,
                 repl,
@@ -463,6 +513,22 @@ async fn patch_manual_run(
     )
     .await?;
     Ok(())
+}
+
+/// This CR's Kubernetes `kind`, as the seed component for the pool-wait requeue
+/// jitter — so a `RepositoryReplication` and a `Snapshot` of the same name in
+/// one namespace do not share a wake-up slot.
+const KIND_STR: &str = "RepositoryReplication";
+
+/// This CR's status conditions, or an empty array when it has no status yet.
+/// A plain `fn` (not a closure) so it can be handed to the shared
+/// `heal_replication_slot_condition`, which needs to re-extract them from a
+/// LIVE re-read rather than from the reconcile's stale copy.
+fn conditions_of(repl: &RepositoryReplication) -> Vec<Condition> {
+    repl.status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default()
 }
 
 /// The stored `status.phase` label when it is one this build cannot read.
@@ -988,6 +1054,7 @@ mod tests {
             owner_ref: Default::default(),
             mode: RepositoryMode::ReadWrite,
             deletion_protection: None,
+            concurrency: None,
             mass_deletion_ack: None,
             catalog: None,
             ca_bundle_pem: None,

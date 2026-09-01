@@ -456,6 +456,12 @@ pub const SOURCE_PVC_MISSING_REASON: &str = "SourcePvcMissing";
 /// because the pool is full; `True` with [`SLOT_ACQUIRED_REASON`] means it was
 /// admitted and its Job launched.
 ///
+/// **A `Restore` only ever carries the `True`/[`SLOT_ACQUIRED_REASON`] arm.**
+/// A restore is a recovery in progress, so it is ALWAYS admitted — holding one
+/// behind a queue of routine backups is exactly backwards. It still occupies a
+/// slot once running (so it displaces backups rather than adding to them), but
+/// it is never parked, and therefore never written at `False`.
+///
 /// **Deliberately NOT a [`crate::gates::StructuralGate`].** The registry's
 /// contract (see the `gates` module doc) is "blocked on something only a human
 /// can change" — a park that never self-heals. This one always does: the pool

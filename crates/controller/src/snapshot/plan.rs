@@ -1033,6 +1033,42 @@ pub(super) fn should_run_preflight(phase: Option<&SnapshotPhase>) -> bool {
     }
 }
 
+/// Whether the repository-pool slot gate should run for a `Snapshot` in
+/// `phase`: only at first launch (`None`/`Pending`), exactly like
+/// [`should_run_preflight`].
+///
+/// A `Running` Snapshot whose mover Job vanished takes the resume path
+/// (`run_decision == Run`) and is re-admitted UNCONDITIONALLY. Two reasons, and
+/// both are about not making a bad situation worse:
+///
+/// - Demoting `Running` → `Pending` would make a backup that was genuinely in
+///   flight look like it never started, and would flap `kubectl wait` and every
+///   Flux/Argo health check keyed on the phase.
+/// - The run it is resuming already HELD a slot. Re-queuing it behind runs that
+///   started later inverts the queue, and — when the pool is full of the very
+///   backups that started after it — can hold the resume indefinitely.
+///
+/// The pin/unpin path is out of the pool entirely
+/// ([`crate::pool::counts_toward_repo_pool`]), so it never reaches this gate;
+/// the terminal phases below never mint a mover Job at all.
+pub(super) fn should_run_pool_gate(phase: Option<&SnapshotPhase>) -> bool {
+    match phase {
+        None | Some(SnapshotPhase::Pending) => true,
+        Some(
+            SnapshotPhase::Running
+            | SnapshotPhase::Succeeded
+            | SnapshotPhase::Failed
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged,
+        ) => false,
+        // Never park a run off a phase this build cannot place in the
+        // lifecycle: `run_decision` already holds it (`Wait`), so opening a
+        // queue gate here could only add a misleading condition.
+        Some(SnapshotPhase::Unknown(_)) => false,
+    }
+}
+
 /// Whether a terminal steady-state pin arm (`pin_discovered_row`/
 /// `pin_adopted_row` in [`super`]) needs to patch status this reconcile: the
 /// observed phase hasn't already converged to the arm's `target` (`Discovered`
@@ -1119,6 +1155,70 @@ pub(super) fn snapshot_ready_status_with_condition(
         backup.meta().generation,
     );
     snapshot_ready_status_over(backup, &phase, reason, message, &seeded)
+}
+
+/// The status body written when the repository-pool gate PARKS a run: phase
+/// `Pending`, `RepositorySlotAvailable=False`/`WaitingForSlot` with `message`,
+/// the derived kstatus set — and `status.resolved.repository`, pinned HERE
+/// rather than at Job creation.
+///
+/// **Why stamp `resolved.repository` at park time.** Everything that observes a
+/// queued run keys off it: the `kopiur_snapshot_waiting_for_slot` gauge labels
+/// its series from it, and it is the only place a `kubectl get -o yaml` of a
+/// parked Snapshot says WHICH repository it is queued behind. The ordinary stamp
+/// happens in the Job-creation patch, which a parked run by definition never
+/// reaches — so without this, a queued backup would be observable only as an
+/// unattributed `Pending`.
+///
+/// **Byte-stability.** The `resolved` key is included ONLY when the pinned ref
+/// differs from what status already carries. `io::patch_status_if_changed`
+/// compares the keys present in the desired body, and a run that previously
+/// stamped the FULL `resolved` block (repository + sources + credentialProjection)
+/// would never compare equal to a repository-only body — so unconditionally
+/// including it would make every parked pass a real write, bumping
+/// `resourceVersion`, re-triggering the primary watch and hot-looping the
+/// reconciler for as long as the queue lasts.
+pub(super) fn park_status(
+    backup: &Snapshot,
+    message: &str,
+    pinned: &RepositoryRef,
+) -> serde_json::Value {
+    let mut status = snapshot_ready_status_with_condition(
+        backup,
+        SnapshotPhase::Pending,
+        crate::consts::WAITING_FOR_SLOT_REASON,
+        message,
+        crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION,
+        false,
+    );
+    let already = backup
+        .status
+        .as_ref()
+        .and_then(|s| s.resolved.as_ref())
+        .and_then(|r| r.repository.as_ref());
+    if already != Some(pinned)
+        && let Some(obj) = status.as_object_mut()
+    {
+        obj.insert(
+            "resolved".to_string(),
+            serde_json::json!({ "repository": pinned }),
+        );
+    }
+    status
+}
+
+/// Whether the pool gate must HEAL a standing park on admission: the
+/// `RepositorySlotAvailable` condition is present AND `False`.
+///
+/// "Only if present" is the [`super::source_pvc_gate_clear_needed`] discipline:
+/// a Snapshot that was never parked must not grow a condition it never had, so
+/// the healthy wire stays byte-identical to a build without this feature.
+pub(super) fn slot_gate_heal_needed(
+    conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> bool {
+    conditions.iter().any(|c| {
+        c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION && c.status == "False"
+    })
 }
 
 fn existing_conditions(

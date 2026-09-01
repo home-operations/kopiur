@@ -203,39 +203,3 @@ allow:
     reason: >-
       #346 — only meaningful for pvcSelector expansion, so it is inert for the
       same reason. Wired in M4.
-
-  # ==========================================================================
-  # (e) Per-repository mover-Job concurrency + jitter hardening: API surface
-  #     landed in M1 ahead of the controller work that reads it. Each entry
-  #     names the milestone that drains it, and the stale check fails the
-  #     moment that milestone lands — so none of these can outlive the build.
-  #
-  #     `moverDefaults.podLabels`/`podAnnotations` are gone from this list: M6
-  #     wired them (jobs.rs `job_and_pod_labels` / the pod-template annotations),
-  #     which is exactly the drainage the stale check exists to force.
-  #
-  #     Two siblings are still NOT listed, and it is worth saying why so nobody
-  #     "fixes" the omission: `concurrency` and `scheduleDefaults.jitter` are
-  #     equally inert today, but each reads as wired through this check's
-  #     documented name-collision under-reporting — `concurrency` matches
-  #     `ctrl_cfg.concurrency(..)` (reconcile parallelism) and `jitter` matches
-  #     the per-cron jitter the schedulers already read. An entry for either
-  #     would fail as STALE, so they cannot be listed; the milestones below
-  #     carry them anyway.
-  # ==========================================================================
-  - path: Repository.spec.concurrency.maxConcurrentJobs
-    reason: >-
-      Read today only by kopiur_api::consts::effective_max_concurrent_jobs,
-      which lives in crates/api and so does not count as a consumer. The
-      admission-side validation and the resolver ship in M1; the controller
-      slot gate that calls the resolver and parks a run behind
-      RepositorySlotAvailable=False ships in M2. M2's LABELING half landed
-      (pooled mover Jobs now carry REPO_POOL_LABEL, so the pool is countable
-      with one selector); the gate that READS the cap has not, which is why
-      this entry survives. Its parent `concurrency` is just as inert but
-      cannot be listed (see the section note).
-  - path: ClusterRepository.spec.concurrency.maxConcurrentJobs
-    reason: >-
-      Same field on the cluster-scoped kind, same resolver, same M2 gate — a
-      ClusterRepository's pool is counted by exactly the same code path.
-      Likewise: M2's labeling half landed; the gate that reads the cap has not.

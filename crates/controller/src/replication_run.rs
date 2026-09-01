@@ -37,8 +37,10 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::Api;
 use kube::api::{ListParams, Patch, PatchParams};
+use kube::runtime::controller::Action;
 
 use kopiur_api::common::{PhaseLabel, ReplicationManualRunPhase, ReplicationManualRunStatus};
 
@@ -340,6 +342,193 @@ pub fn suspended_report(pending_request: bool) -> (&'static str, &'static str) {
     } else {
         ("Suspended", "replication is suspended (spec.suspend)")
     }
+}
+
+// --- the source repository's mover-Job pool gate ------------------------------
+
+/// The pool gate's verdict for one replication reconcile — the replication peer
+/// of `crate::snapshot::PoolGate`.
+#[derive(Debug, Clone)]
+pub enum ReplicationPoolGate {
+    /// Spawn the run. `heal` is `true` when a standing
+    /// `RepositorySlotAvailable=False` must be flipped once the Job exists.
+    Admit {
+        /// Whether a previous park is still recorded and must be cleared.
+        heal: bool,
+    },
+    /// Held behind the source repository's pool. Return this `Action` and spawn
+    /// nothing: no Job, no credential projection, no destination Secret checks.
+    Parked(Action),
+}
+
+/// Consult the SOURCE repository's mover-Job pool before spawning a replication
+/// run, parking the CR when it is full.
+///
+/// The SOURCE is the right pool for both replication kinds: a `sync-to` mirror
+/// and a `snapshot migrate` both READ the source repository, and it is that
+/// backend (and the bandwidth to it) a `maxConcurrentJobs` protects. A
+/// `RepositoryReplication`'s destination is an inline `Backend` with no
+/// repository object to have a pool at all.
+///
+/// Call it immediately before the spawn — every step of the spawn path has
+/// external side effects (credential projection into the run namespace, a
+/// destination-Secret presence check) that a parked run must not perform, since
+/// it may sit queued for an unbounded time.
+///
+/// `conditions` is the CR's current condition array; `kind`/`name` seed the
+/// deterministic requeue jitter.
+pub async fn replication_pool_gate<K>(
+    ctx: &Context,
+    api: &Api<K>,
+    obj: &K,
+    kind: &str,
+    name: &str,
+    source: &crate::io::ResolvedRepository,
+    conditions: &[Condition],
+) -> Result<ReplicationPoolGate>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug
+        + serde::Serialize,
+{
+    let caps = crate::pool::PoolCaps {
+        repo: kopiur_api::consts::effective_max_concurrent_jobs(source.concurrency.as_ref()),
+        global: ctx.max_concurrent_jobs,
+    };
+    let pinned = source.repository_ref();
+    let (repo_live, global_live) =
+        crate::pool::pool_live_counts(ctx, &crate::naming::repo_label(&pinned), caps).await?;
+    let heal = slot_gate_is_false(conditions);
+    match crate::pool::pool_verdict(
+        crate::pool::PoolClass::Replication,
+        repo_live,
+        global_live,
+        caps,
+    ) {
+        crate::pool::PoolVerdict::Admit => Ok(ReplicationPoolGate::Admit { heal }),
+        crate::pool::PoolVerdict::Park {
+            repo_live,
+            global_live,
+        } => {
+            let message = crate::pool::waiting_for_slot_message(
+                crate::io::repo_kind_str(pinned.kind),
+                &crate::pool::repo_display(&pinned),
+                repo_live,
+                global_live,
+                caps,
+            );
+            let updated = crate::io::upsert_condition(
+                conditions,
+                crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION,
+                false,
+                crate::consts::WAITING_FOR_SLOT_REASON,
+                &message,
+                obj.meta().generation,
+            );
+            // Only the condition — the `Ready` condition, phase and
+            // `lastReplicated` are deliberately left alone: a queued run is not
+            // a failure and must not flip a health check. `upsert_condition`
+            // preserves `lastTransitionTime` while status+message are unchanged,
+            // so a steady-state park re-patches identical bytes.
+            let current =
+                serde_json::to_value(serde_json::json!({ "conditions": conditions })).ok();
+            let wrote = crate::io::patch_status_if_changed(
+                api,
+                name,
+                current.as_ref(),
+                serde_json::json!({ "conditions": updated }),
+            )
+            .await?;
+            // Transition-gated: fire once on entering the queue, not on every
+            // re-check of a queue that may last minutes.
+            if wrote && !heal {
+                crate::io::publish_normal_event(
+                    ctx,
+                    obj,
+                    crate::consts::WAITING_FOR_SLOT_REASON,
+                    "WaitForRepositorySlot",
+                    &message,
+                )
+                .await;
+                tracing::info!(
+                    replication = %name,
+                    repository = %pinned.name,
+                    repo_live,
+                    global_live,
+                    "parking replication behind the source repository's mover-Job pool"
+                );
+            }
+            Ok(ReplicationPoolGate::Parked(Action::requeue(
+                crate::pool::pool_wait_requeue(kind, obj.meta().namespace.as_deref(), name),
+            )))
+        }
+    }
+}
+
+/// Clear a standing `RepositorySlotAvailable=False` once the run's Job exists.
+///
+/// Seeded from a LIVE re-read, not the reconcile's (already stale) copy: a
+/// `conditions` patch replaces the whole array, and the spawn path between the
+/// gate and here can have written conditions of its own. Best-effort by
+/// contract — the Job is already created, and failing the reconcile over a
+/// cosmetic condition flip would re-run the gate against a pool the new Job is
+/// now in.
+pub async fn heal_replication_slot_condition<K>(
+    api: &Api<K>,
+    obj: &K,
+    name: &str,
+    source: &crate::io::ResolvedRepository,
+    conditions_of: fn(&K) -> Vec<Condition>,
+    heal: bool,
+) where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug
+        + serde::Serialize,
+{
+    if !heal {
+        return;
+    }
+    let Some(live) = crate::io::live_conditions_source(api, name, obj).await else {
+        return;
+    };
+    let existing = conditions_of(&live);
+    if !slot_gate_is_false(&existing) {
+        return;
+    }
+    let pinned = source.repository_ref();
+    let updated = crate::io::upsert_condition(
+        &existing,
+        crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION,
+        true,
+        crate::consts::SLOT_ACQUIRED_REASON,
+        &crate::pool::slot_acquired_message(
+            crate::io::repo_kind_str(pinned.kind),
+            &crate::pool::repo_display(&pinned),
+        ),
+        obj.meta().generation,
+    );
+    if let Err(e) =
+        crate::io::patch_status(api, name, serde_json::json!({ "conditions": updated })).await
+    {
+        tracing::debug!(
+            replication = %name,
+            error = %e,
+            "could not clear RepositorySlotAvailable after admission; retried next reconcile"
+        );
+    }
+}
+
+/// Whether `RepositorySlotAvailable` is present AND `False` — the "only if
+/// present" discipline, so a run that was never parked never grows a condition
+/// it never had and its status stays byte-identical.
+pub fn slot_gate_is_false(conditions: &[Condition]) -> bool {
+    conditions.iter().any(|c| {
+        c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION && c.status == "False"
+    })
 }
 
 /// What one reconcile learned from listing this CR's mover Jobs.

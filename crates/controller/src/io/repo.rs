@@ -141,6 +141,16 @@ pub struct ResolvedRepository {
     /// `None` → the breaker's default threshold applies
     /// (`kopiur_api::consts::effective_mass_deletion_threshold`).
     pub deletion_protection: Option<DeletionProtectionSpec>,
+    /// The repository's mover-Job concurrency pool (`spec.concurrency`), cloned
+    /// verbatim from either repo kind. `None` → uncapped
+    /// (`kopiur_api::consts::effective_max_concurrent_jobs` collapses an absent
+    /// block, an absent field and an explicit `0` to the same `None`).
+    ///
+    /// Resolved HERE, beside [`Self::deletion_protection`], rather than at each
+    /// gate site: the pool is a property of the REPOSITORY, and both repository
+    /// kinds must feed the same gate through the same field or a
+    /// `ClusterRepository`'s cap would silently not apply.
+    pub concurrency: Option<kopiur_api::common::ConcurrencySpec>,
     /// The RAW value of [`crate::consts::ALLOW_MASS_DELETION_ANNOTATION`] from
     /// the repository's `metadata.annotations`, if present. Deliberately
     /// unparsed here: parsing/clamping the RFC3339 ack (and rejecting a
@@ -331,6 +341,7 @@ pub(crate) fn resolved_from_namespaced(
         mode: repo.spec.mode,
         owner_ref,
         deletion_protection: repo.spec.deletion_protection,
+        concurrency: repo.spec.concurrency,
         mass_deletion_ack,
         catalog: repo.spec.catalog,
         ca_bundle_pem,
@@ -363,6 +374,7 @@ pub(crate) fn resolved_from_cluster(
         mode: repo.spec.mode,
         owner_ref,
         deletion_protection: repo.spec.deletion_protection,
+        concurrency: repo.spec.concurrency,
         mass_deletion_ack,
         catalog: repo.spec.catalog,
         ca_bundle_pem,
@@ -965,6 +977,86 @@ mod tests {
         assert_eq!(rref.kind, RepositoryKind::ClusterRepository);
         assert_eq!(rref.name, "shared");
         assert_eq!(rref.namespace, None, "the webhook forbids one");
+    }
+
+    // --- `concurrency` resolver parity (the pool gate's cap input) ---------
+
+    /// Both repository kinds must surface `spec.concurrency` through the SAME
+    /// `ResolvedRepository` field, or a `ClusterRepository`'s cap would be
+    /// silently ignored by a gate that only ever reads the resolved struct.
+    /// Parity is asserted here, at the projection, because that is the one
+    /// place the two kinds are still distinguishable.
+    #[test]
+    fn both_repository_kinds_resolve_their_concurrency_block() {
+        use kopiur_api::common::ConcurrencySpec;
+
+        let mut ns_repo = repo_cr("backups", "nas");
+        ns_repo.spec.concurrency = Some(ConcurrencySpec {
+            max_concurrent_jobs: Some(3),
+        });
+        let resolved =
+            resolved_from_namespaced(ns_repo, "backups".into(), None).expect("projection succeeds");
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref())
+                .map(|n| n.get()),
+            Some(3),
+        );
+
+        let mut cluster = cluster_repo_cr("shared");
+        cluster.spec.concurrency = Some(ConcurrencySpec {
+            max_concurrent_jobs: Some(3),
+        });
+        let resolved = resolved_from_cluster(cluster, None).expect("projection succeeds");
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref())
+                .map(|n| n.get()),
+            Some(3),
+            "a ClusterRepository's cap must resolve identically to a Repository's",
+        );
+    }
+
+    #[test]
+    fn an_absent_concurrency_block_resolves_to_uncapped_on_both_kinds() {
+        // The default install. `None` here is what makes the gate skip its Job
+        // LIST entirely, so this is a cost assertion as much as a semantic one.
+        let resolved = resolved_from_namespaced(repo_cr("backups", "nas"), "backups".into(), None)
+            .expect("projection succeeds");
+        assert_eq!(resolved.concurrency, None);
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref()),
+            None
+        );
+
+        let resolved =
+            resolved_from_cluster(cluster_repo_cr("shared"), None).expect("projection succeeds");
+        assert_eq!(resolved.concurrency, None);
+    }
+
+    #[test]
+    fn an_explicit_zero_concurrency_resolves_to_uncapped_on_both_kinds() {
+        // `0` is the disable sentinel the CRD documents; it must never reach a
+        // gate as `Some(0)`, which would read as "admit nothing".
+        use kopiur_api::common::ConcurrencySpec;
+        let zero = Some(ConcurrencySpec {
+            max_concurrent_jobs: Some(0),
+        });
+
+        let mut ns_repo = repo_cr("backups", "nas");
+        ns_repo.spec.concurrency = zero.clone();
+        let resolved =
+            resolved_from_namespaced(ns_repo, "backups".into(), None).expect("projection succeeds");
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref()),
+            None
+        );
+
+        let mut cluster = cluster_repo_cr("shared");
+        cluster.spec.concurrency = zero;
+        let resolved = resolved_from_cluster(cluster, None).expect("projection succeeds");
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref()),
+            None
+        );
     }
 
     #[test]
