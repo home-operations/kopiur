@@ -351,10 +351,15 @@ async fn controller_survives_an_apiserver_flap_and_converges() {
 
     // (d0) The Repository self-heals. A bootstrap Job that straddles the
     // outage fails WITHOUT a result (its result-ConfigMap write hits the dead
-    // apiserver, then the Job blows its deadline); the reconciler must recycle
-    // that verdict-less Job and retry — never park the repo at terminal
-    // `Failed` until the Job's TTL reap. Regression: the first CI run left
-    // flap-repo Failed for 7+ minutes and (d) below timed out.
+    // apiserver; the Job then dies by backoff or by its deadline); the
+    // reconciler must recycle that verdict-less Job and retry — never park the
+    // repo at terminal `Failed` until the Job's TTL reap. Since #414 a
+    // deadline-killed Job on this (bootstrapped, below-threshold) repo routes
+    // through the outage sensor's StayReady arm — which also recycles the Job
+    // and, below the failure threshold, keeps the phase `Ready` — while a
+    // backoff-killed one keeps the plain recycle route; both self-heal.
+    // Regression: the first CI run left flap-repo Failed for 7+ minutes and
+    // (d) below timed out.
     wait_phase(&repos, "flap-repo", "Ready")
         .await
         .expect("flap-repo must self-heal to Ready after the outage");

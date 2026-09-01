@@ -36,7 +36,7 @@
 //! standing in a GitOps manifest forever.
 
 use crate::backend::Backend;
-use crate::common::{CredentialProjection, FailurePolicy, RepositoryRef};
+use crate::common::{CredentialProjection, FailurePolicy, MigrateThrottle, RepositoryRef};
 use crate::snapshot_replication::PolicyCopyMode;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -246,7 +246,10 @@ pub struct SeedSyncOptions {
 }
 
 /// Migrate-mode tuning for `kopia snapshot migrate`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+///
+/// Scalars plus an optional throttle sub-object, so `Eq` but NOT `Copy`
+/// ([`Throttle`](crate::common::Throttle) isn't).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SeedMigrateOptions {
     /// `--parallel`: snapshots migrated concurrently (kopia default `1` —
@@ -267,6 +270,24 @@ pub struct SeedMigrateOptions {
     /// operator's back.
     #[serde(default)]
     pub policies: PolicyCopyMode,
+    /// Bandwidth/ops caps for THIS seed's copy, per side. A migrate seed opens
+    /// two repositories under two kopia connections and `snapshot migrate` has
+    /// no speed flags of its own, so each side is applied as `kopia repository
+    /// throttle set` on that side's connection:
+    ///
+    /// * `source` caps the REPLICA — the repository named by
+    ///   `spec.seed.from.repository`, opened read-only — overriding **its**
+    ///   `moverDefaults.throttle`;
+    /// * `destination` caps THIS repository, the one being seeded, overriding
+    ///   **its own** `moverDefaults.throttle`.
+    ///
+    /// Each side overrides field by field: a knob set here wins, a knob left
+    /// unset keeps that repository's default. Absent: both sides use their
+    /// repository's defaults. Applies only while the seed is armed — an
+    /// ordinary connect to the now-initialized repository is capped by
+    /// `moverDefaults.throttle` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throttle: Option<MigrateThrottle>,
 }
 
 /// What the last seed attempt did, pinned on `Repository`/`ClusterRepository`
@@ -499,6 +520,74 @@ credentialProjection:
             json.get("repository").is_some(),
             "wire key must be `repository`: {json}"
         );
+    }
+
+    #[test]
+    fn migrate_throttle_parses_per_side_and_round_trips() {
+        // Two repositories, two kopia connections, two independent caps — so
+        // the wire shape has to keep them apart. Parsed the cluster's way
+        // (YAML -> JSON value -> typed), which is also what proves the
+        // camelCase knob names survive.
+        let seed: SeedSpec = from_yaml(
+            r#"
+from:
+  repository:
+    name: offsite
+migrate:
+  parallel: 4
+  throttle:
+    source:
+      downloadBytesPerSecond: 20000000
+      readOpsPerSecond: 500
+    destination:
+      uploadBytesPerSecond: 10000000
+"#,
+        );
+        let throttle = seed
+            .migrate
+            .as_ref()
+            .and_then(|m| m.throttle.as_ref())
+            .expect("per-side migrate throttle");
+        let source = throttle.source.as_ref().expect("source side");
+        assert_eq!(source.download_bytes_per_second, Some(20_000_000));
+        assert_eq!(source.read_ops_per_second, Some(500));
+        assert_eq!(
+            source.upload_bytes_per_second, None,
+            "an unset knob stays unset rather than defaulting to a cap"
+        );
+        let destination = throttle.destination.as_ref().expect("destination side");
+        assert_eq!(destination.upload_bytes_per_second, Some(10_000_000));
+        assert_eq!(
+            destination.download_bytes_per_second, None,
+            "the SOURCE side's knobs must not leak into the destination"
+        );
+
+        let json = serde_json::to_value(&seed).expect("serialize");
+        assert_eq!(
+            json.pointer("/migrate/throttle/source/downloadBytesPerSecond"),
+            Some(&serde_json::json!(20_000_000)),
+            "{json}"
+        );
+        assert_eq!(
+            json.pointer("/migrate/throttle/destination/uploadBytesPerSecond"),
+            Some(&serde_json::json!(10_000_000)),
+            "{json}"
+        );
+        let reparsed: SeedSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(seed, reparsed);
+
+        // Absent on a migrate seed that does not cap anything: the common case
+        // must not grow a key (and must not show up in a GitOps diff).
+        let plain: SeedSpec = from_yaml(
+            r#"
+from:
+  repository:
+    name: offsite
+migrate:
+  parallel: 2
+"#,
+        );
+        assert!(plain.migrate.expect("migrate options").throttle.is_none());
     }
 
     #[test]

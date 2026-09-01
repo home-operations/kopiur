@@ -415,6 +415,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
             auto_create: true,
             scan_catalog: true,
+            probe_only: false,
             create_options: Default::default(),
             epoch_parameters: Default::default(),
             blob_retention: None,
@@ -502,6 +503,7 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     let op = BootstrapRepositoryOp {
         auto_create: true,
         scan_catalog: true,
+        probe_only: false,
         create_options: Default::default(),
         epoch_parameters: Default::default(),
         blob_retention: None,
@@ -524,6 +526,29 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     // would simply never read (it decodes what it recognizes and ignores the
     // rest), so this is still forward/backward compatible in practice.
     assert_eq!(v["restampPolicy"], "anyStale");
+}
+
+#[test]
+fn probe_only_defaults_off_for_old_work_specs() {
+    // #414 graceful decode: a work spec written by a controller that predates
+    // `probe_only` decodes to `false` — the full (listing) bootstrap, the old
+    // behavior. Only a NEW controller ever arms the flag, so version skew can
+    // never skip a listing the controller expected to consume.
+    let parsed: BootstrapRepositoryOp = serde_json::from_value(serde_json::json!({
+        "autoCreate": true,
+        "scanCatalog": true,
+    }))
+    .expect("old wire shape must decode");
+    assert!(!parsed.probe_only);
+    assert!(parsed.scan_catalog);
+    // And the flag round-trips when set.
+    let armed: BootstrapRepositoryOp = serde_json::from_value(serde_json::json!({
+        "autoCreate": false,
+        "scanCatalog": true,
+        "probeOnly": true,
+    }))
+    .expect("probeOnly wire shape must decode");
+    assert!(armed.probe_only);
 }
 
 #[test]
@@ -1687,6 +1712,11 @@ fn sample_snapshot_replicate_op() -> SnapshotReplicateOp {
             keep_weekly: Some(4),
             ..Default::default()
         }),
+        destination_throttle: ThrottleSpec {
+            upload_bytes_per_second: Some(5 * 1024 * 1024),
+            write_ops_per_second: Some(50),
+            ..Default::default()
+        },
     }
 }
 
@@ -1733,6 +1763,31 @@ fn snapshot_replicate_roundtrip_and_wire_shape() {
     assert_eq!(op["pruning"]["retention"]["keepDaily"], 7);
     assert_eq!(op["pruning"]["retention"]["keepWeekly"], 4);
     assert!(op["pruning"]["retention"].get("keepLatest").is_none());
+    // The DESTINATION-side cap rides the op (the source's rides the work spec's
+    // own `throttle`): two connections, two blocks, camelCase, unset knobs elided.
+    assert_eq!(op["destinationThrottle"]["uploadBytesPerSecond"], 5242880);
+    assert_eq!(op["destinationThrottle"]["writeOpsPerSecond"], 50);
+    assert!(
+        op["destinationThrottle"]
+            .get("downloadBytesPerSecond")
+            .is_none(),
+        "unset dest knobs are elided: {op}"
+    );
+}
+
+#[test]
+fn snapshot_replicate_empty_destination_throttle_is_elided_from_the_wire() {
+    // The common case must not grow a key: an all-None dest throttle is the
+    // mover's "skip `throttle set`" signal, so it serializes to nothing at all.
+    let op = SnapshotReplicateOp {
+        destination_throttle: ThrottleSpec::default(),
+        ..sample_snapshot_replicate_op()
+    };
+    let v = serde_json::to_value(&op).unwrap();
+    assert!(
+        v.get("destinationThrottle").is_none(),
+        "an empty dest throttle is elided: {v}"
+    );
 }
 
 #[test]
@@ -1774,6 +1829,10 @@ fn snapshot_replicate_old_wire_decodes_with_selection_and_pruning_defaulted() {
     assert!(op.pruning.is_none());
     assert_eq!(op.destination_repository.namespace, None);
     assert_eq!(op.source_repository.namespace, None);
+    // A spec stamped before `destinationThrottle` existed decodes to an empty
+    // block — i.e. an old controller driving a new mover leaves the destination
+    // uncapped rather than failing to decode.
+    assert!(op.destination_throttle.is_empty());
 }
 
 #[test]
@@ -2370,6 +2429,9 @@ fn blob_seed() -> SeedOpSpec {
         migrate: None,
         allow_empty_source: false,
         resume: false,
+        // Blob mode caps its copy through `sync-to`'s own speed flags above;
+        // there is no source repository CR to carry `moverDefaults`.
+        replica_throttle: ThrottleSpec::default(),
     }
 }
 
@@ -2392,6 +2454,11 @@ fn migrate_seed() -> SeedOpSpec {
         }),
         allow_empty_source: true,
         resume: false,
+        replica_throttle: ThrottleSpec {
+            download_bytes_per_second: Some(20 * 1024 * 1024),
+            read_ops_per_second: Some(200),
+            ..Default::default()
+        },
     }
 }
 
@@ -2517,6 +2584,55 @@ fn resume_rides_the_wire_and_defaults_off_on_old_specs() {
 }
 
 #[test]
+fn the_replica_throttle_rides_the_seed_op_and_defaults_empty_on_old_specs() {
+    // The SOURCE (replica) side's cap rides the op; THIS repository's side rides
+    // the work spec's own `throttle`. Two repositories, two kopia connections,
+    // two independent blocks — a migrate seed is the only flow that opens both.
+    let v = serde_json::to_value(migrate_seed()).unwrap();
+    assert_eq!(
+        v["replicaThrottle"]["downloadBytesPerSecond"],
+        20 * 1024 * 1024
+    );
+    assert_eq!(v["replicaThrottle"]["readOpsPerSecond"], 200);
+    assert!(
+        v["replicaThrottle"].get("uploadBytesPerSecond").is_none(),
+        "unset replica knobs are elided: {v}"
+    );
+    assert_eq!(
+        serde_json::from_value::<SeedOpSpec>(v).unwrap(),
+        migrate_seed()
+    );
+
+    // The common case must not grow a key: an all-None block is the mover's
+    // "skip `throttle set`" signal, so it serializes to nothing at all.
+    let uncapped = SeedOpSpec {
+        replica_throttle: ThrottleSpec::default(),
+        ..migrate_seed()
+    };
+    assert!(
+        serde_json::to_value(&uncapped)
+            .unwrap()
+            .get("replicaThrottle")
+            .is_none(),
+        "an empty replica throttle is elided from the wire"
+    );
+
+    // Old→new: a spec stamped before `replicaThrottle` existed decodes to an
+    // empty block, i.e. an old controller driving a new mover leaves the replica
+    // read uncapped rather than failing to decode.
+    let old: SeedOpSpec = serde_json::from_value(serde_json::json!({
+        "from": { "repository": {
+            "kind": "Repository",
+            "name": "offsite",
+            "connect": { "filesystem": { "path": "/mnt/offsite" } }
+        } },
+        "sourceDescription": "Repository/offsite"
+    }))
+    .unwrap();
+    assert!(old.replica_throttle.is_empty());
+}
+
+#[test]
 fn seed_migrate_policies_default_to_an_explicit_no_policies() {
     // kopia's OWN default copies the source's policies, retention included,
     // which would delete manifests behind the operator's back. The wire default
@@ -2547,6 +2663,7 @@ fn a_seeding_bootstrap_op_round_trips_and_elides_its_defaults() {
     let op = BootstrapRepositoryOp {
         auto_create: false,
         scan_catalog: true,
+        probe_only: false,
         create_options: Default::default(),
         epoch_parameters: Default::default(),
         blob_retention: None,

@@ -311,7 +311,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `failurePolicy` | [object](#repository-spec-bootstrap-failurepolicy) | — | Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long a connect may run before the Job is marked failed (default 120s); raise it for a slow backend — e.g. an rclone remote whose repository metadata and indexes load through kopia's embedded `rclone serve`/WebDAV bridge. `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for shape parity but is not honored by the bootstrap Job. |
+| `failurePolicy` | [object](#repository-spec-bootstrap-failurepolicy) | — | Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long a connect may run before the Job is marked failed (default 120s); raise it for a slow backend — e.g. an rclone remote whose repository metadata and indexes load through kopia's embedded `rclone serve`/WebDAV bridge, or a large repository whose cold-cache connect outgrows the default. The value is a BASE, not a ceiling: after consecutive deadline-killed attempts the operator escalates the effective deadline itself (doubling per attempt, up to 30 minutes or the configured value, whichever is larger — never below it), so a slow-but-alive backend self-heals without a spec edit. `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for shape parity but is not honored by the bootstrap Job. |
 
 ##### `spec.bootstrap.failurePolicy` { #repository-spec-bootstrap-failurepolicy }
 
@@ -376,7 +376,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `enabled` | boolean | `true` | Whether the probe runs (default `true`). `false` disables probing — and with it the circuit breaker, since the probe is its only sensor: a wiped or unreachable backend then goes unnoticed until the next backup fails. |
 | `failureThreshold` | integer | `3` | How many *consecutive* failing probes to require before the failure is acted on (default `3`): the loud `BackendReachable=False` condition + event fire, and — under `onFailure: Degrade` — the repository moves to `Degraded`. Debounces a single transient blip from alarming, tripping the breaker, or nudging a destructive manual recreate. Any success resets it. |
 | `interval` | string | `30m` | How often to re-probe the backend (Go-style duration like `30m` or `1h`; minimum `30s`, default `30m`). Inert when `enabled: false`. |
-| `onFailure` | enum: Degrade \| Alert | `Degrade` | What sustained backend-probe failure (past `failureThreshold`) does to the repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing backups, maintenance, and replication until a re-connect succeeds — recovery is automatic. `Alert` keeps the repository `Ready` and only raises the `BackendReachable` condition + Warning event + metric; backups keep running against the failing backend. Neither ever auto-recreates. |
+| `onFailure` | enum: Degrade \| Alert | `Degrade` | What sustained backend-probe failure (past `failureThreshold`) does to the repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing backups and replication until a re-connect succeeds — recovery is automatic (maintenance also pauses for a confirmed-unreachable/vanished backend, but keeps running for a probe deadline kill, where index compaction is often the cure). `Alert` keeps the repository `Ready` and only raises the `BackendReachable` condition + Warning event + metric; backups keep running against the failing backend. Neither ever auto-recreates. |
 
 #### `spec.identityDefaults` { #repository-spec-identitydefaults }
 
@@ -858,6 +858,32 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `latestOnly` | boolean | — | Copy only each source identity's most recent snapshot instead of its full history (`kopia snapshot migrate --latest`). Default `false` — a seed exists to recover history, so the full copy is the sane default; set this when you only need the latest restore point back quickly. |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
 | `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether the source's kopia **policies** are copied along with the snapshots. Defaults to `PolicyCopyMode::None` (an explicit `--no-policies`), not kopia's own copy-by-default: retention in a kopiur-managed repository is driven by `Snapshot` CRs, and importing the source's kopia-side policies could delete manifests behind the operator's back. |
+| `throttle` | [object](#repository-spec-seed-migrate-throttle) | — | Bandwidth/ops caps for THIS seed's copy, per side. A migrate seed opens two repositories under two kopia connections and `snapshot migrate` has no speed flags of its own, so each side is applied as `kopia repository throttle set` on that side's connection:<br>* `source` caps the REPLICA — the repository named by   `spec.seed.from.repository`, opened read-only — overriding **its**   `moverDefaults.throttle`; * `destination` caps THIS repository, the one being seeded, overriding   **its own** `moverDefaults.throttle`.<br>Each side overrides field by field: a knob set here wins, a knob left unset keeps that repository's default. Absent: both sides use their repository's defaults. Applies only while the seed is armed — an ordinary connect to the now-initialized repository is capped by `moverDefaults.throttle` alone. |
+
+###### `spec.seed.migrate.throttle` { #repository-spec-seed-migrate-throttle }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `destination` | [object](#repository-spec-seed-migrate-throttle-destination) | — | Caps for the DESTINATION (write) side, overriding the destination repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the destination connection the migrate writes through. |
+| `source` | [object](#repository-spec-seed-migrate-throttle-source) | — | Caps for the SOURCE (read) side, overriding the source repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the migrate's read-only source connection — accepted there, so a read-only source is throttled like any other. |
+
+###### `spec.seed.migrate.throttle.destination` { #repository-spec-seed-migrate-throttle-destination }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
+
+###### `spec.seed.migrate.throttle.source` { #repository-spec-seed-migrate-throttle-source }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
 ##### `spec.seed.sync` { #repository-spec-seed-sync }
 
@@ -1337,7 +1363,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `failurePolicy` | [object](#clusterrepository-spec-bootstrap-failurepolicy) | — | Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long a connect may run before the Job is marked failed (default 120s); raise it for a slow backend — e.g. an rclone remote whose repository metadata and indexes load through kopia's embedded `rclone serve`/WebDAV bridge. `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for shape parity but is not honored by the bootstrap Job. |
+| `failurePolicy` | [object](#clusterrepository-spec-bootstrap-failurepolicy) | — | Failure policy for the bootstrap Job. `activeDeadlineSeconds` caps how long a connect may run before the Job is marked failed (default 120s); raise it for a slow backend — e.g. an rclone remote whose repository metadata and indexes load through kopia's embedded `rclone serve`/WebDAV bridge, or a large repository whose cold-cache connect outgrows the default. The value is a BASE, not a ceiling: after consecutive deadline-killed attempts the operator escalates the effective deadline itself (doubling per attempt, up to 30 minutes or the configured value, whichever is larger — never below it), so a slow-but-alive backend self-heals without a spec edit. `backoffLimit` bounds retries. `podStartupDeadlineSeconds` is accepted for shape parity but is not honored by the bootstrap Job. |
 
 ##### `spec.bootstrap.failurePolicy` { #clusterrepository-spec-bootstrap-failurepolicy }
 
@@ -1408,7 +1434,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `enabled` | boolean | `true` | Whether the probe runs (default `true`). `false` disables probing — and with it the circuit breaker, since the probe is its only sensor: a wiped or unreachable backend then goes unnoticed until the next backup fails. |
 | `failureThreshold` | integer | `3` | How many *consecutive* failing probes to require before the failure is acted on (default `3`): the loud `BackendReachable=False` condition + event fire, and — under `onFailure: Degrade` — the repository moves to `Degraded`. Debounces a single transient blip from alarming, tripping the breaker, or nudging a destructive manual recreate. Any success resets it. |
 | `interval` | string | `30m` | How often to re-probe the backend (Go-style duration like `30m` or `1h`; minimum `30s`, default `30m`). Inert when `enabled: false`. |
-| `onFailure` | enum: Degrade \| Alert | `Degrade` | What sustained backend-probe failure (past `failureThreshold`) does to the repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing backups, maintenance, and replication until a re-connect succeeds — recovery is automatic. `Alert` keeps the repository `Ready` and only raises the `BackendReachable` condition + Warning event + metric; backups keep running against the failing backend. Neither ever auto-recreates. |
+| `onFailure` | enum: Degrade \| Alert | `Degrade` | What sustained backend-probe failure (past `failureThreshold`) does to the repository (default `Degrade`). `Degrade` moves it to `Degraded`, pausing backups and replication until a re-connect succeeds — recovery is automatic (maintenance also pauses for a confirmed-unreachable/vanished backend, but keeps running for a probe deadline kill, where index compaction is often the cure). `Alert` keeps the repository `Ready` and only raises the `BackendReachable` condition + Warning event + metric; backups keep running against the failing backend. Neither ever auto-recreates. |
 
 #### `spec.identityDefaults` { #clusterrepository-spec-identitydefaults }
 
@@ -1890,6 +1916,32 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `latestOnly` | boolean | — | Copy only each source identity's most recent snapshot instead of its full history (`kopia snapshot migrate --latest`). Default `false` — a seed exists to recover history, so the full copy is the sane default; set this when you only need the latest restore point back quickly. |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
 | `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether the source's kopia **policies** are copied along with the snapshots. Defaults to `PolicyCopyMode::None` (an explicit `--no-policies`), not kopia's own copy-by-default: retention in a kopiur-managed repository is driven by `Snapshot` CRs, and importing the source's kopia-side policies could delete manifests behind the operator's back. |
+| `throttle` | [object](#clusterrepository-spec-seed-migrate-throttle) | — | Bandwidth/ops caps for THIS seed's copy, per side. A migrate seed opens two repositories under two kopia connections and `snapshot migrate` has no speed flags of its own, so each side is applied as `kopia repository throttle set` on that side's connection:<br>* `source` caps the REPLICA — the repository named by   `spec.seed.from.repository`, opened read-only — overriding **its**   `moverDefaults.throttle`; * `destination` caps THIS repository, the one being seeded, overriding   **its own** `moverDefaults.throttle`.<br>Each side overrides field by field: a knob set here wins, a knob left unset keeps that repository's default. Absent: both sides use their repository's defaults. Applies only while the seed is armed — an ordinary connect to the now-initialized repository is capped by `moverDefaults.throttle` alone. |
+
+###### `spec.seed.migrate.throttle` { #clusterrepository-spec-seed-migrate-throttle }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `destination` | [object](#clusterrepository-spec-seed-migrate-throttle-destination) | — | Caps for the DESTINATION (write) side, overriding the destination repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the destination connection the migrate writes through. |
+| `source` | [object](#clusterrepository-spec-seed-migrate-throttle-source) | — | Caps for the SOURCE (read) side, overriding the source repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the migrate's read-only source connection — accepted there, so a read-only source is throttled like any other. |
+
+###### `spec.seed.migrate.throttle.destination` { #clusterrepository-spec-seed-migrate-throttle-destination }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
+
+###### `spec.seed.migrate.throttle.source` { #clusterrepository-spec-seed-migrate-throttle-source }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
 ##### `spec.seed.sync` { #clusterrepository-spec-seed-sync }
 
@@ -2451,6 +2503,8 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | --- | --- | --- | --- |
 | `lastAdoptedCount` | integer | —<br><sub>min 0</sub> | Number of discovered `Snapshot` CRs adopted by the last adoption pass. |
 | `lastAdoptionAt` | string | — | RFC3339 timestamp of the last adoption pass that adopted at least one snapshot. |
+| `lastScanMatched` | integer | —<br><sub>min 0</sub> | Discovered snapshots whose kopia identity matched this policy at the most recent adoption pass, counted BEFORE the own-id and retention filters — so it reads "history relevant to me exists in the catalog", independent of whether that pass adopted anything. A multi-repository policy SUMS this across the ready repositories of the pass. `0` together with `lastScanUnmatched: 0` means the catalog was empty at that pass; absent means no adoption pass has run yet. Neutral inventory, not a verdict: `0` matched beside a non-zero `lastScanUnmatched` is the ordinary shape of a new policy on a shared repository, and is also what a post-disaster-recovery identity mismatch looks like — compare `status.resolved.identity` with the pre-disaster configuration to tell them apart. |
+| `lastScanUnmatched` | integer | —<br><sub>min 0</sub> | Discovered snapshots the most recent adoption pass saw that did NOT match this policy's identity (other policies' or other clusters' history in a shared repository). Same counting rules as `lastScanMatched`: pre-filter, summed across a multi-repository policy's ready repositories, `0`/`0` for an empty catalog, absent when no pass has run. |
 | `scanRequestedAt` | string | — | RFC3339 token echoing an in-flight on-demand adoption scan request for this policy's identity; cleared once honored. |
 | `scanRequestedIdentity` | string | — | The resolved kopia identity the requested scan was scoped to, pinned at request time so a later identity-changing edit can't retarget an in-flight scan. |
 | `skippedByRetention` | integer | —<br><sub>min 0</sub> | Identity-matching discovered snapshots the last adoption pass left discovered because `spec.retention` would prune them immediately under the effective `deletionPolicy` (`Retain`/`Orphan` — a CR-only prune that would re-discover and re-adopt forever). `0`/absent when nothing was withheld. See the `AdoptionSkippedByRetention` event for the levers. |
@@ -3077,7 +3131,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `sourceKind` | string | — | The pinned source kind (`SnapshotRef`/`FromPolicy`/`Identity`); backs the `SOURCE` printer column. |
 | `target` | [object](#restore-status-target) | — | Resolved target details (the PVC written to / populator handshake). |
 | `timing` | [object](#restore-status-timing) | — | Start/end timestamps for the restore run. |
-| `waitStartedAt` | string | — | When the `policy.waitTimeout` window OPENED (RFC3339) — the first reconcile on which the restore could actually proceed (its repository reached `Ready`, and for a `target.populator` a PVC already claims it), NOT when the Restore was created. If the referenced `Repository`/`SnapshotPolicy` object doesn't exist yet, the readiness gate falls through unverified and the anchor can be stamped as early as creation. Stamped once and then honored verbatim, so the window survives controller restarts and Job pod retries; cleared when a populator re-opens resolution for a re-created claim, so that claim gets the full window again. Absent means the window has not opened yet (or no `policy.waitTimeout` is configured, in which case there is no window to anchor). |
+| `waitStartedAt` | string | — | When the `policy.waitTimeout` window OPENED (RFC3339) — the first reconcile on which the restore could actually proceed (its repository reached `Ready`, and for a `target.populator` a PVC already claims it), NOT when the Restore was created. The window does NOT open while the referenced `Repository` object or `fromPolicy` `SnapshotPolicy` doesn't exist: the restore parks in `Pending` (`ReferentAvailable=False`, reason `RestoreReferentMissing`) and stays unstamped. It DOES still open for a `snapshotRef` whose `Snapshot` row doesn't exist yet (so `onMissingSnapshot` can fire for a ref that never appears) and for a restore whose mover Job already launched. Stamped once and then honored verbatim, so the window survives controller restarts and Job pod retries; cleared when a populator re-opens resolution for a re-created claim, so that claim gets the full window again. Absent means the window has not opened yet (or no `policy.waitTimeout` is configured, in which case there is no window to anchor). |
 
 #### `status.conditions[]` { #restore-status-conditions }
 
@@ -3757,6 +3811,32 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | --- | --- | --- | --- |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: number of snapshots migrated concurrently (kopia default `1` — sequential). Must be &gt;= 1 when set. |
 | `policies` | enum: none \| copy \| copyOverwrite | `none` | Whether kopia **policies** attached to the copied sources are also copied to the destination. Defaults to `PolicyCopyMode::None`. |
+| `throttle` | [object](#snapshotreplication-spec-migrate-throttle) | — | Bandwidth/ops caps for THIS replication's runs, per side. `snapshot migrate` has no speed flags, so each side is applied as `kopia repository throttle set` on that side's connection; `source` overrides the source repository's `moverDefaults.throttle` and `destination` the destination repository's, field by field (a field left unset keeps that repository's default). Absent: both sides use their repository's defaults. |
+
+##### `spec.migrate.throttle` { #snapshotreplication-spec-migrate-throttle }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `destination` | [object](#snapshotreplication-spec-migrate-throttle-destination) | — | Caps for the DESTINATION (write) side, overriding the destination repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the destination connection the migrate writes through. |
+| `source` | [object](#snapshotreplication-spec-migrate-throttle-source) | — | Caps for the SOURCE (read) side, overriding the source repository's `moverDefaults.throttle` field by field. Applied with `repository throttle set` on the migrate's read-only source connection — accepted there, so a read-only source is throttled like any other. |
+
+###### `spec.migrate.throttle.destination` { #snapshotreplication-spec-migrate-throttle-destination }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
+
+###### `spec.migrate.throttle.source` { #snapshotreplication-spec-migrate-throttle-source }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `downloadBytesPerSecond` | integer | — | Cap download throughput in bytes/sec (`--download-bytes-per-second`). |
+| `readOpsPerSecond` | integer | — | Cap read/list ops/sec (`--read-requests-per-second`). |
+| `uploadBytesPerSecond` | integer | — | Cap upload throughput in bytes/sec (`--upload-bytes-per-second`). |
+| `writeOpsPerSecond` | integer | — | Cap write ops/sec (`--write-requests-per-second`). |
 
 #### `spec.mover` { #snapshotreplication-spec-mover }
 

@@ -233,6 +233,20 @@ impl World {
                 .into(),
             builders::opaque_secret(consts::OPERATOR_NS, consts::SECRET_S3_BADPW, &s3_badpw())
                 .into(),
+            // The #416 split layout: password and backend keys in SEPARATE Secrets,
+            // so a pod injecting only one of them cannot connect.
+            builders::opaque_secret(
+                consts::OPERATOR_NS,
+                consts::SECRET_S3_KEYS_ONLY,
+                &s3_keys_only(),
+            )
+            .into(),
+            builders::opaque_secret(
+                consts::OPERATOR_NS,
+                consts::SECRET_KOPIA_PW_ONLY,
+                &kopia_pw_only(),
+            )
+            .into(),
             // Bucket-scoped credentials for the S3→S3 replication isolation scenario.
             builders::opaque_secret(
                 consts::OPERATOR_NS,
@@ -570,6 +584,19 @@ fn s3_creds() -> [(&'static str, &'static str); 3] {
         (consts::KEY_AWS_ACCESS_KEY_ID, consts::MINIO_USER),
         (consts::KEY_AWS_SECRET_ACCESS_KEY, consts::MINIO_PASS),
     ]
+}
+
+/// AWS keys ONLY — the backend half of the #416 split-secret layout.
+fn s3_keys_only() -> [(&'static str, &'static str); 2] {
+    [
+        (consts::KEY_AWS_ACCESS_KEY_ID, consts::MINIO_USER),
+        (consts::KEY_AWS_SECRET_ACCESS_KEY, consts::MINIO_PASS),
+    ]
+}
+
+/// Repo password ONLY — the encryption half of the #416 split-secret layout.
+fn kopia_pw_only() -> [(&'static str, &'static str); 1] {
+    [(consts::KEY_KOPIA_PASSWORD, consts::KOPIA_PASSWORD)]
 }
 
 /// Valid S3 keys but a WRONG repo password (safe-create guard scenario).

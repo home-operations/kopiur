@@ -41,15 +41,15 @@ use kopiur_mover::resolve::{match_current_manifest, matches_source};
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::{
     SnapshotReplicationRunStats, StatusReporter, StatusUpdate, lease_blocked_body,
-    maintenance_failed_body, maintenance_ran_body, replicate_failed_body, replicate_ok_body,
-    snapshot_replicate_failed_body, snapshot_replicate_ok_body, split_api_version,
-    verify_failed_body, verify_ok_body,
+    maintenance_failed_body, maintenance_failed_body_from_mover, maintenance_ran_body,
+    replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
+    snapshot_replicate_ok_body, split_api_version, verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
     MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
-    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp, VerifyOp,
-    VerifyTier, maintenance_restamp_target,
+    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp, ThrottleSpec,
+    VerifyOp, VerifyTier, maintenance_restamp_target,
 };
 #[cfg(test)]
 use kopiur_mover::workspec::{SnapshotDeleteItem, SnapshotDeleteOp};
@@ -264,7 +264,25 @@ async fn run(cli: &MoverCli) -> Result<()> {
             Operation::BrowseSession(op) => {
                 run_browse_session_flow(&client, &spec, op, &connect).await
             }
-            _ => {
+            // Everything else shares ONE lifecycle: connect, apply the
+            // repository throttle, then run with periodic progress PATCHes.
+            //
+            // Listed variant by variant, NOT `_ =>`. The catch-all that used to
+            // stand here is exactly how #374 shipped: every flow above owns its
+            // own connect, and because the throttle lived only in this arm, a
+            // `moverDefaults.throttle` the controller faithfully put on the wire
+            // was silently inert for six of them. A new operation must now
+            // decide its throttle story to compile.
+            //
+            // `SnapshotDeleteBatch` and `SnapshotPin` reach here with a
+            // `Default` (empty) throttle from their controllers, so
+            // `apply_repository_throttle` is a no-op for them today — that is a
+            // controller-side gap, deliberately out of scope for this change.
+            Operation::Snapshot(_)
+            | Operation::Restore(_)
+            | Operation::SnapshotDelete(_)
+            | Operation::SnapshotDeleteBatch(_)
+            | Operation::SnapshotPin(_) => {
                 // A best-effort status reporter. If we cannot build a kube client
                 // (e.g. running outside a cluster), we log instead of failing.
                 // SnapshotDeleteBatch's targetRef names the Job itself — nothing
@@ -278,48 +296,23 @@ async fn run(cli: &MoverCli) -> Result<()> {
                 } else {
                     StatusReporter::try_new(&spec).await
                 };
-                match client.repository_connect(&connect, spec.cache).await {
+                // Connect AND throttle as one operation — see `connect_and_throttle`.
+                match connect_and_throttle(&client, &connect, spec.cache, &spec.throttle).await {
                     Err(e) => {
-                        terminal_failure(
-                            &reporter,
-                            MoverError::Kopia {
-                                op: KopiaOp::RepositoryConnect,
-                                source: e,
-                            },
-                        )
-                        .await
+                        terminal_failure(&reporter, e.into_mover_error(KopiaOp::RepositoryConnect))
+                            .await
                     }
-                    Ok(()) => {
-                        // Apply repository throttle (moverDefaults.throttle, ADR-0005
-                        // §13(e)) after connecting, before the data op. A throttle
-                        // failure is terminal: an un-throttled run could saturate the
-                        // link the user explicitly capped.
-                        if !spec.throttle.is_empty()
-                            && let Err(e) = client
-                                .repository_throttle_set(&spec.throttle.to_kopia())
-                                .await
-                        {
-                            return terminal_failure(
-                                &reporter,
-                                MoverError::Kopia {
-                                    op: KopiaOp::ThrottleSet,
-                                    source: e,
-                                },
-                            )
-                            .await;
+                    Ok(()) => match execute(&client, &spec, &reporter).await {
+                        Ok(update) => {
+                            reporter.report(&update).await;
+                            info!(
+                                phase = update.phase.as_deref().unwrap_or("done"),
+                                "operation succeeded"
+                            );
+                            Ok(())
                         }
-                        match execute(&client, &spec, &reporter).await {
-                            Ok(update) => {
-                                reporter.report(&update).await;
-                                info!(
-                                    phase = update.phase.as_deref().unwrap_or("done"),
-                                    "operation succeeded"
-                                );
-                                Ok(())
-                            }
-                            Err(e) => terminal_failure(&reporter, e).await,
-                        }
-                    }
+                        Err(e) => terminal_failure(&reporter, e).await,
+                    },
                 }
             }
         },
@@ -335,6 +328,143 @@ async fn run(cli: &MoverCli) -> Result<()> {
     metrics.shutdown();
 
     result
+}
+
+/// Why a repository connection is not usable for work: it never opened, or it
+/// opened UNCAPPED. Mirrors [`BootstrapConnectFailure`] and for the same reason
+/// — the two are different facts and some callers must tell them apart — but
+/// unlike bootstrap's, this one is generic over the calling flow's connect op
+/// label.
+enum ConnectFailure {
+    /// `repository connect` itself failed.
+    Connect(KopiaError),
+    /// The connection opened, but `repository throttle set` failed. Already
+    /// carries [`KopiaOp::ThrottleSet`].
+    Throttle(MoverError),
+}
+
+impl ConnectFailure {
+    /// The typed mover failure, labeled with the CALLING flow's connect op
+    /// (`MaintenanceConnect`, `VerifyConnect`, `ReplicateConnect`, …). A
+    /// throttle failure passes through with its own label intact, so a status
+    /// block always names the invocation that actually failed.
+    fn into_mover_error(self, connect_op: KopiaOp) -> MoverError {
+        match self {
+            ConnectFailure::Connect(source) => MoverError::Kopia {
+                op: connect_op,
+                source,
+            },
+            ConnectFailure::Throttle(e) => e,
+        }
+    }
+}
+
+/// Open a repository connection **and** apply its throttle, as ONE operation.
+///
+/// This is the funnel every flow that owns its own read-write connect goes
+/// through (the generic `run()` arm, maintenance, verify, replicate, and a
+/// seed's local repository); bootstrap has its own funnel,
+/// [`bootstrap_connect`], because its connect failure additionally feeds a
+/// create-vs-seed verdict.
+///
+/// **Why a funnel rather than two calls.** #374 was not a missing feature, it
+/// was six remembered call sites: `repository_connect` and `throttle set` were
+/// separate steps, so a flow could — and did — do the first and forget the
+/// second, and every test still passed because the run succeeded uncapped.
+/// Fusing them means a future flow cannot obtain a connection without also
+/// obtaining its cap. `connect_funnel_is_the_only_way_flows_connect` (below)
+/// makes an attempt to bypass it loud.
+async fn connect_and_throttle(
+    client: &KopiaClient,
+    connect: &ConnectSpec,
+    cache: kopiur_kopia::CacheTuning,
+    throttle: &ThrottleSpec,
+) -> std::result::Result<(), ConnectFailure> {
+    client
+        .repository_connect(connect, cache)
+        .await
+        .map_err(ConnectFailure::Connect)?;
+    apply_repository_throttle(client, throttle)
+        .await
+        .map_err(ConnectFailure::Throttle)
+}
+
+/// Apply the work spec's [`ThrottleSpec`] (`moverDefaults.throttle`, ADR-0005
+/// §13(e)) to the repository connection the caller just opened.
+///
+/// **The invariant: every mover flow that connects a repository applies the
+/// throttle to that connection.** Reached through one of the two funnels —
+/// [`connect_and_throttle`] or [`bootstrap_connect`] — never by a flow
+/// remembering to call this itself. #374 shipped because the `throttle set`
+/// lived in ONE connect arm of `run()`, while bootstrap, seed, maintenance,
+/// verify and replicate each open their own connection — so a cap the user
+/// configured and the controller faithfully put on the wire was inert for all
+/// of them. kopia's limits are per-CONNECTION (persisted into that connection's
+/// client config), so a second connect under a second config needs its own
+/// call; there is no repository-wide setting to inherit.
+///
+/// The connects that do NOT go through a funnel, each for a stated reason —
+/// keep this list in step with `connect_funnel_is_the_only_way_flows_connect`:
+///
+/// * **`kopiur-mover serve`** (the browse/UI kopia server) runs off a
+///   [`ServerWorkSpec`], which carries no throttle field at all. Nothing to
+///   apply until that wire type grows one.
+/// * **browse session** — its work spec is built by the CLI with
+///   `throttle: Default::default()`, so `spec.throttle` is structurally always
+///   empty; capping it means teaching the CLI to resolve `moverDefaults` first.
+/// * **snapshot-replication source and destination** — a dual connect under two
+///   kopia configs, so ONE funnel call cannot serve both: each side is connected
+///   directly and then throttled in place from its own resolved block (the work
+///   spec's `throttle` for the source, the op's `destinationThrottle` for the
+///   destination). Both applications are terminal, via the flow's `srepl_terminal`.
+/// * **a seed's SOURCE (replica) connect** — same shape: the seed holds its own
+///   repository and the replica open at once under two kopia configs, so the
+///   replica is connected directly and then throttled in place from the op's
+///   `replicaThrottle`. Terminal, and reported as the bootstrap's failure.
+///
+/// No limits set → no kopia process is spawned (the common case stays free).
+///
+/// A failure is TERMINAL for the run, never best-effort: continuing would
+/// saturate exactly the link the user capped, which is worse than not running.
+///
+/// The `info!` line is the observable proof the limits reached kopia — the e2e
+/// scenarios assert on it, and its ABSENCE is the version-skew signal for a new
+/// controller driving an old mover image. Emitted only after kopia accepted
+/// them, so it can never claim a throttle that is not in force. One line per
+/// APPLICATION, not per run: a flow that opens several connections logs it once
+/// per connection, which is what lets an e2e assert that every one of them was
+/// capped. A first migrate seed opens three (the replica, the seed's local
+/// client, the post-seed reconnect — its probe connect FAILS on the
+/// uninitialized backend, which is what arms the seed, so it never reaches its
+/// own application); a resuming one opens four, since that probe connect
+/// succeeds.
+///
+/// Applied on read-only connections too. `repository throttle set` registers a
+/// kopia *write* action, but is empirically accepted on a `--readonly` connect
+/// against kopia 0.23.1 — pinned by
+/// `crates/kopia/tests/integration_set_client_throttle.rs`, with `set-parameters`
+/// as the control probe that does hard-error there. So no read-write flip is
+/// needed anywhere, and `mode: ReadOnly` repositories are throttled like any
+/// other.
+async fn apply_repository_throttle(client: &KopiaClient, throttle: &ThrottleSpec) -> Result<()> {
+    if throttle.is_empty() {
+        return Ok(());
+    }
+    client
+        .repository_throttle_set(&throttle.to_kopia())
+        .await
+        .map_err(|source| MoverError::Kopia {
+            op: KopiaOp::ThrottleSet,
+            source,
+        })?;
+    info!(
+        upload = ?throttle.upload_bytes_per_second,
+        download = ?throttle.download_bytes_per_second,
+        read_ops = ?throttle.read_ops_per_second,
+        write_ops = ?throttle.write_ops_per_second,
+        "applied repository throttle"
+    );
+    Ok(())
 }
 
 /// Whether `run()`'s generic connect+execute path must hand-select the
@@ -1077,6 +1207,32 @@ fn identity_retention_policy(
     }
 }
 
+/// Why a bootstrap connect did not leave a usable, throttled connection.
+///
+/// The two are kept apart because only ONE of them is a verdict about the
+/// backend: [`bootstrap_connect_probe`] reads a `Connect` failure to decide
+/// whether this backend holds a repository, is uninitialized (create/seed it),
+/// or is simply unreachable. A throttle failure says nothing about any of that
+/// — folding it into the connect error would let a `NotFound`-classified
+/// throttle failure be read as "empty backend" and initialize a repository.
+enum BootstrapConnectFailure {
+    /// `repository connect` itself failed — the shape the probe classifies.
+    Connect(KopiaError),
+    /// The connection opened, but the repository throttle could not be applied.
+    /// Terminal for the bootstrap, and never a statement about the backend.
+    Throttle(MoverError),
+}
+
+impl BootstrapConnectFailure {
+    /// The terminal [`BootstrapResult`] this failure reports to the controller.
+    fn into_result(self) -> BootstrapResult {
+        match self {
+            BootstrapConnectFailure::Connect(e) => BootstrapResult::failed(&e),
+            BootstrapConnectFailure::Throttle(e) => BootstrapResult::from_mover_error(&e),
+        }
+    }
+}
+
 /// Connect for bootstrap, honoring [`BootstrapRepositoryOp::read_only`]
 /// (M6): a `mode: ReadOnly` repository's bootstrap connects with `--readonly`
 /// (`repository_connect_readonly`) instead of the normal read-write connect —
@@ -1084,17 +1240,30 @@ fn identity_retention_policy(
 /// ReadOnly consumer repo was exactly what let it clobber the primary's
 /// maintenance owner. Every other mover flow (restore, delete, snapshot)
 /// stays on the plain read-write connect regardless.
+///
+/// The ONE funnel for every bootstrap connect (probe, post-create reconnect,
+/// post-seed reconnect), so [`apply_repository_throttle`]'s no-exceptions
+/// invariant holds for all of them by construction rather than by three
+/// remembered call sites. The `--readonly` probe is throttled too: `throttle
+/// set` is accepted on a read-only connect (see `apply_repository_throttle`),
+/// and a bootstrap's catalog scan reads real backend traffic that a capped link
+/// must not carry unthrottled.
 async fn bootstrap_connect(
     client: &KopiaClient,
     spec: &ConnectSpec,
     cache: kopiur_kopia::CacheTuning,
     read_only: bool,
-) -> std::result::Result<(), KopiaError> {
-    if read_only {
+    throttle: &ThrottleSpec,
+) -> std::result::Result<(), BootstrapConnectFailure> {
+    let connected = if read_only {
         client.repository_connect_readonly(spec, cache).await
     } else {
         client.repository_connect(spec, cache).await
-    }
+    };
+    connected.map_err(BootstrapConnectFailure::Connect)?;
+    apply_repository_throttle(client, throttle)
+        .await
+        .map_err(BootstrapConnectFailure::Throttle)
 }
 
 /// How a seed step reports failure: `Ok` on success, or the terminal
@@ -1193,6 +1362,13 @@ fn seed_source_builder(
 /// `--persist-credentials` writes the password beside the config, which is what
 /// `snapshot migrate --source-config` reads in migrate mode; it is harmless in
 /// blob mode and kept symmetrical so both arms share this function.
+///
+/// The connection is capped in place from the op's `replicaThrottle` right after
+/// it opens — this is one of the connects that cannot go through
+/// [`connect_and_throttle`], because a seed holds two repositories open under two
+/// kopia configs and the work spec's own `throttle` belongs to the other one.
+/// Empty in blob mode (no source repository CR to take `moverDefaults` from; its
+/// caps ride `sync-to`'s own speed flags), so that arm spawns no kopia process.
 async fn seed_connect_source(
     spec: &MoverWorkSpec,
     seed: &workspec::SeedOpSpec,
@@ -1230,12 +1406,35 @@ async fn seed_connect_source(
         )
         .await
     {
-        Ok(()) => Ok(SeedSource {
-            client,
-            connect: source,
-        }),
-        Err(e) => Err(Box::new(seed_source_connect_failure(seed, &e))),
+        Ok(()) => {}
+        Err(e) => return Err(Box::new(seed_source_connect_failure(seed, &e))),
     }
+    // Cap the REPLICA read side on this connection, from the op's own
+    // `replicaThrottle` (the SOURCE repository's `moverDefaults.throttle`
+    // overlaid by `spec.seed.migrate.throttle.source`). kopia's limits are
+    // per-connection, so the cap the bootstrap put on THIS repository says
+    // nothing here — and in migrate mode `snapshot migrate` reopens this very
+    // config, which is the only lever it has (it carries no speed flags).
+    // Applied straight onto the read-only connect: `repository throttle set` is
+    // accepted there, so no read-write flip is involved.
+    //
+    // Deliberately BEFORE migrate mode's persisted-password probe: that probe's
+    // whole job is to prove the config `snapshot migrate` will reopen is usable,
+    // so it should see that config in its FINAL state — throttle limits written
+    // and all.
+    //
+    // Terminal, like every other throttle application: proceeding would pull a
+    // whole repository across exactly the link the user asked to protect, and a
+    // seed is the largest read kopiur ever makes of a replica that is usually
+    // still another cluster's live off-site copy.
+    if let Err(e) = apply_repository_throttle(&client, &seed.replica_throttle).await {
+        error!(class = %e.kopia_class(), "could not cap the seed source connection");
+        return Err(Box::new(BootstrapResult::from_mover_error(&e)));
+    }
+    Ok(SeedSource {
+        client,
+        connect: source,
+    })
 }
 
 /// Classify a failed seed-source connect. Split out so the "the backend
@@ -1473,16 +1672,22 @@ async fn seed_create_and_connect_local(
         .env_remove(kopiur_kopia::env::CACHE_DIRECTORY_ENV)
         .env("XDG_CACHE_HOME", &paths.local_xdg)
         .build();
-    match local_client
-        .repository_connect(local_connect, spec.cache)
-        .await
+    // Connect AND cap, as one operation. THIS repository's own
+    // `moverDefaults.throttle` goes on its own connection: a seed's local client
+    // runs under a separate kopia config from the bootstrap client the probe
+    // capped, and kopia's limits are per-config. `snapshot migrate` has no speed
+    // flags of its own, so the limits persisted into this config are the ONLY cap
+    // on the heaviest transfer kopiur performs. (The seed SOURCE's own cap is a
+    // separate knob on a separate connection — `replicaThrottle`, applied in
+    // `seed_connect_source`; kopia's limits never cross between the two.)
+    if let Err(e) =
+        connect_and_throttle(&local_client, local_connect, spec.cache, &spec.throttle).await
     {
-        Ok(()) => Ok(local_client),
-        Err(e) => {
-            error!(class = %e.class(), "could not connect the repository a migrate seed writes into");
-            Err(Box::new(BootstrapResult::failed(&e)))
-        }
+        let e = e.into_mover_error(KopiaOp::SeedLocalConnect);
+        error!(class = %e.kopia_class(), "could not open a capped connection to the repository a migrate seed writes into");
+        return Err(Box::new(BootstrapResult::from_mover_error(&e)));
     }
+    Ok(local_client)
 }
 
 /// The MANDATORY post-verify for a migrate-mode seed: how many snapshots
@@ -1763,15 +1968,19 @@ async fn bootstrap_create_arm(
     op: &BootstrapRepositoryOp,
     connect_spec: &ConnectSpec,
     cache: kopiur_kopia::CacheTuning,
+    throttle: &ThrottleSpec,
 ) -> SeedStep<()> {
+    // `repository create` runs before any connection exists to throttle; it
+    // writes one format blob, so there is nothing here for a bandwidth cap to
+    // bound. The reconnect below is throttled like every other connect.
     if let Err(ce) = client
         .repository_create(connect_spec, cache, &op.create_options())
         .await
     {
         return Err(Box::new(BootstrapResult::failed(&ce)));
     }
-    if let Err(ce) = bootstrap_connect(client, connect_spec, cache, op.read_only).await {
-        return Err(Box::new(BootstrapResult::failed(&ce)));
+    if let Err(ce) = bootstrap_connect(client, connect_spec, cache, op.read_only, throttle).await {
+        return Err(Box::new(ce.into_result()));
     }
     stamp_owner_on_new_repository(client, op.maintenance_owner.as_ref()).await;
     Ok(())
@@ -1828,8 +2037,10 @@ async fn bootstrap_seed_arm(
         workspec::SeedModeSpec::Blob => false,
         workspec::SeedModeSpec::Migrate => !local_initialized,
     };
-    if let Err(ce) = bootstrap_connect(client, connect_spec, cache, op.read_only).await {
-        return Err(Box::new(BootstrapResult::failed(&ce)));
+    if let Err(ce) =
+        bootstrap_connect(client, connect_spec, cache, op.read_only, &spec.throttle).await
+    {
+        return Err(Box::new(ce.into_result()));
     }
     if created {
         stamp_owner_on_new_repository(client, op.maintenance_owner.as_ref()).await;
@@ -1866,10 +2077,18 @@ async fn bootstrap_connect_probe(
     connect_spec: &ConnectSpec,
     cache: kopiur_kopia::CacheTuning,
     op: &BootstrapRepositoryOp,
-) -> BootstrapProbe {
-    let err = bootstrap_connect(client, connect_spec, cache, op.read_only)
-        .await
-        .err();
+    throttle: &ThrottleSpec,
+) -> SeedStep<BootstrapProbe> {
+    // Exhaustive over the failure shapes: a CONNECT failure is the probe's raw
+    // material (it decides initialized/uninitialized/create/seed), while a
+    // THROTTLE failure ends the bootstrap here — the connection is open but
+    // uncapped, and nothing about the backend has been learned that would
+    // justify creating or seeding a repository over it.
+    let err = match bootstrap_connect(client, connect_spec, cache, op.read_only, throttle).await {
+        Ok(()) => None,
+        Err(BootstrapConnectFailure::Connect(e)) => Some(e),
+        Err(e @ BootstrapConnectFailure::Throttle(_)) => return Err(Box::new(e.into_result())),
+    };
     let local_initialized = err.is_none();
     let uninitialized = err
         .as_ref()
@@ -1895,13 +2114,13 @@ async fn bootstrap_connect_probe(
         err.as_ref().map(KopiaError::class),
         uninitialized,
     );
-    BootstrapProbe {
+    Ok(BootstrapProbe {
         err,
         local_initialized,
         uninitialized,
         already_initialized,
         action,
-    }
+    })
 }
 
 /// The bootstrap routine: connect-first (adopt an existing repo), create only
@@ -1930,7 +2149,14 @@ async fn run_bootstrap(
     // maintenance forever.
     let mut seeded = false;
 
-    let probe = bootstrap_connect_probe(client, &connect_spec, cache, op).await;
+    // A throttle the connection could not accept ends the bootstrap here — the
+    // probe learned nothing about the backend, so there is no verdict to carry on
+    // with.
+    let probe =
+        match bootstrap_connect_probe(client, &connect_spec, cache, op, &spec.throttle).await {
+            Ok(p) => p,
+            Err(result) => return *result,
+        };
     let (connect_err, local_initialized, uninitialized) =
         (probe.err, probe.local_initialized, probe.uninitialized);
     // A successful connect over a NON-resuming armed seed is the documented
@@ -1960,7 +2186,9 @@ async fn run_bootstrap(
                 class = ?connect_err.as_ref().map(KopiaError::class),
                 "connect failed; attempting repository create"
             );
-            if let Err(result) = bootstrap_create_arm(client, op, &connect_spec, cache).await {
+            if let Err(result) =
+                bootstrap_create_arm(client, op, &connect_spec, cache, &spec.throttle).await
+            {
                 return *result;
             }
             created = true;
@@ -2139,14 +2367,23 @@ async fn run_bootstrap(
         .as_ref()
         .map(kopiur_mover::workspec::observed_blob_retention);
 
-    // Always list to report an authoritative snapshot count (unaffected by either
+    // List to report an authoritative snapshot count (unaffected by either
     // the foreign-suffix prefilter or the cap below); return the entries for
-    // materialization only when scanning is requested.
-    let listing = match client.snapshot_list(None).await {
-        Ok(l) => l,
-        Err(e) => return BootstrapResult::failed(&e),
+    // materialization only when scanning is requested. A `probe_only` run
+    // (#414) skips the listing entirely — it is the O(snapshots) step that
+    // makes probe cost scale with catalog size — and reports `None` so the
+    // controller leaves the prior catalog/stats untouched. A seed-armed run
+    // never skips (the seed verdict below needs repository contents, and a
+    // probe is only ever armed for an already-bootstrapped repository).
+    let (snapshot_count, listing) = if op.probe_only && op.seed.is_none() {
+        (None, Vec::new())
+    } else {
+        let l = match client.snapshot_list(None).await {
+            Ok(l) => l,
+            Err(e) => return BootstrapResult::failed(&e),
+        };
+        (Some(l.len() as i64), l)
     };
-    let snapshot_count = listing.len() as i64;
     // The seeding backstop (issue #380): refuse to report success on an EMPTY
     // repository when a seed was armed. Catches the one path the source-side
     // gates cannot see — an earlier seed that initialized the backend and then
@@ -2339,13 +2576,14 @@ async fn run_maintenance_flow(
     );
     // Connect first: for object stores this pod is the only place with repo
     // access, which is exactly why the lease decision is made here.
-    if let Err(e) = client.repository_connect(connect, spec.cache).await {
-        patch_maintenance_status(&spec.target_ref, &maintenance_failed_body(&e)).await;
-        error!(class = %e.class(), "maintenance connect failed");
-        return Err(MoverError::Kopia {
-            op: KopiaOp::MaintenanceConnect,
-            source: e,
-        });
+    // Connect AND cap, as one operation (`connect_and_throttle`): a full
+    // maintenance rewrites and drops blobs, so it is exactly the kind of backend
+    // traffic `moverDefaults.throttle` exists to bound.
+    if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
+        let e = e.into_mover_error(KopiaOp::MaintenanceConnect);
+        patch_maintenance_status(&spec.target_ref, &maintenance_failed_body_from_mover(&e)).await;
+        error!(class = %e.kopia_class(), "could not open a capped connection to the repository undergoing maintenance");
+        return Err(e);
     }
 
     // Assume the STABLE lease-derived client identity before anything else:
@@ -2494,13 +2732,14 @@ async fn run_verify_flow(
         policy = %spec.target_ref.name,
         "running verification"
     );
-    if let Err(e) = client.repository_connect(connect, spec.cache).await {
+    // Connect AND cap, as one operation: verification READS the repository — a
+    // deep verify scratch-restores a whole snapshot — so it is throttled like
+    // any other data flow.
+    if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
+        let e = e.into_mover_error(KopiaOp::VerifyConnect);
         patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
-        error!(class = %e.class(), "verify connect failed");
-        return Err(MoverError::Kopia {
-            op: KopiaOp::VerifyConnect,
-            source: e,
-        });
+        error!(class = %e.kopia_class(), "could not open a capped connection to the repository being verified");
+        return Err(e);
     }
 
     // Run the tier and collect the result environment for successExpr. A kopia
@@ -2738,13 +2977,15 @@ async fn run_replicate_flow(
     );
     // Connect to the source first (this pod is the only place with repo access for
     // object stores — the same rationale as maintenance/verify).
-    if let Err(e) = client.repository_connect(connect, spec.cache).await {
+    // Connect AND cap, as one operation: the source repository's own cap goes on
+    // the connection `repository sync-to` reads through — a whole-repository blob
+    // mirror is the single heaviest read this flow performs, and the source is
+    // often the link the user capped.
+    if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
+        let e = e.into_mover_error(KopiaOp::ReplicateConnect);
         patch_replicate_status(&spec.target_ref, &replicate_failed_body(&e.to_string())).await;
-        error!(class = %e.class(), "replication source connect failed");
-        return Err(MoverError::Kopia {
-            op: KopiaOp::ReplicateConnect,
-            source: e,
-        });
+        error!(class = %e.kopia_class(), "could not open a capped connection to the source repository a replication reads from");
+        return Err(e);
     }
 
     // The destination's credentials arrive under the KOPIUR_DEST_ env prefix so they
@@ -2845,6 +3086,12 @@ async fn srepl_terminal_kopia(
 
 /// PATCH a terminal failure body for a typed mover error in the snapshot
 /// replication flow (with whatever run counters exist) and return it.
+///
+/// A [`MoverError::Kopia`] arriving here (a throttle application, say) carries a
+/// `class` exactly like one going through [`srepl_terminal_kopia`], so it is
+/// logged with the same structured field — otherwise whether the operator can
+/// filter on `class` would depend on which helper the call site happened to
+/// pick. Non-kopia errors have no class to report and log plainly.
 async fn srepl_terminal(
     target: &workspec::TargetRef,
     err: MoverError,
@@ -2855,7 +3102,10 @@ async fn srepl_terminal(
         &snapshot_replicate_failed_body(&err.to_string(), stats),
     )
     .await;
-    error!("{err}");
+    match &err {
+        MoverError::Kopia { .. } => error!(class = %err.kopia_class(), "{err}"),
+        _ => error!("{err}"),
+    }
     Err(err)
 }
 
@@ -2933,6 +3183,22 @@ async fn srepl_connect_source(
     {
         srepl_terminal_kopia(&spec.target_ref, Op::SnapshotReplicateSourceConnect, e).await?;
         unreachable!("srepl_terminal_kopia always errors");
+    }
+
+    // Cap the SOURCE read side on this connection. `snapshot migrate` reopens
+    // this very config, and kopia persists the limits into it — that is the only
+    // lever migrate has, since it carries no speed flags of its own. Applied
+    // straight onto the read-only connect: `repository throttle set` is accepted
+    // there (pinned by the kopia crate's integration test), so no read-write
+    // flip is involved.
+    //
+    // Deliberately BEFORE the no-env-password probe below, not after: the probe's
+    // whole job is to prove the config migrate will reopen is usable, so it
+    // should see that config in its FINAL state — throttle limits written and
+    // all — rather than a state no later step ever runs against.
+    if let Err(e) = apply_repository_throttle(&source_client, &spec.throttle).await {
+        srepl_terminal(&spec.target_ref, e, None).await?;
+        unreachable!("srepl_terminal always errors");
     }
 
     let probe_client = srepl_client_builder(spec, kopia_binary)
@@ -3016,6 +3282,15 @@ async fn srepl_connect_dest(
     if let Err(e) = dest_client.repository_connect(&dest, spec.cache).await {
         srepl_terminal_kopia(&spec.target_ref, Op::SnapshotReplicateDestConnect, e).await?;
         unreachable!("srepl_terminal_kopia always errors");
+    }
+    // Cap the DESTINATION write side on ITS connection, from the op's own
+    // `destinationThrottle` (the destination repository's `moverDefaults`
+    // overlaid by `spec.migrate.throttle.destination`). kopia's limits are
+    // per-connection, so the source's cap above says nothing here — this is the
+    // block that keeps a migrate from saturating the off-site link it writes to.
+    if let Err(e) = apply_repository_throttle(&dest_client, &op.destination_throttle).await {
+        srepl_terminal(&spec.target_ref, e, None).await?;
+        unreachable!("srepl_terminal always errors");
     }
     Ok(dest_client)
 }
@@ -3351,6 +3626,12 @@ async fn run_browse_session_flow(
             source: e,
         });
     }
+    // NO throttle here, and not by oversight: a browse session's work spec is
+    // built by the CLI (`crates/cli/src/cmd/browse/session.rs`) with
+    // `throttle: Default::default()`, so `spec.throttle` is structurally always
+    // empty and the call would be a guaranteed no-op. The session's reads run
+    // through `kopia` invocations the CLI execs into this pod; giving them a cap
+    // means teaching the CLI to resolve the repository's `moverDefaults` first.
 
     // Signal readiness: the marker flips the pod Ready so the CLI knows the
     // session is exec-able. A marker that cannot be written would leave the
@@ -3640,36 +3921,241 @@ mod tests {
         assert!(!wants_log_only_reporter(&delete));
     }
 
-    // --- delete_one / delete_batch against a fake kopia binary ---
+    // --- a fake kopia binary, shared by the shim-driven test modules below ---
     //
     // Mirrors `crates/kopia/tests/fake_shim.rs`: a tiny shell script stands in
-    // for kopia so the self-heal gate and the attempt-all-then-fail loop are
-    // exercised through the real `KopiaClient` subprocess path with no real
-    // kopia binary.
+    // for kopia so a code path is exercised through the real `KopiaClient`
+    // subprocess path with no real kopia binary.
     #[cfg(unix)]
-    mod delete_shim_tests {
-        use std::os::unix::fs::PermissionsExt;
+    struct Shim {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
 
+    #[cfg(unix)]
+    fn shim(script: &str) -> Shim {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kopia-shim.sh");
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        Shim { _dir: dir, path }
+    }
+
+    #[cfg(unix)]
+    fn client_for(shim: &Shim) -> KopiaClient {
+        KopiaClient::builder().binary(shim.path.clone()).build()
+    }
+
+    // --- #374: the repository throttle every own-connect flow now applies ---
+
+    #[cfg(unix)]
+    mod throttle_tests {
         use super::*;
 
-        struct Shim {
-            _dir: tempfile::TempDir,
-            path: PathBuf,
+        fn full_throttle() -> ThrottleSpec {
+            ThrottleSpec {
+                upload_bytes_per_second: Some(1_000),
+                download_bytes_per_second: Some(2_000),
+                read_ops_per_second: Some(3),
+                write_ops_per_second: Some(4),
+            }
         }
 
-        fn shim(script: &str) -> Shim {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("kopia-shim.sh");
-            std::fs::write(&path, script).unwrap();
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-            Shim { _dir: dir, path }
+        /// An empty throttle must not spawn kopia at all: the common case (no
+        /// `moverDefaults.throttle`) now runs on EVERY connect, so a wasted
+        /// subprocess per connect would be the cost of the fix.
+        #[tokio::test]
+        async fn empty_throttle_never_invokes_kopia() {
+            let marker_dir = tempfile::tempdir().unwrap();
+            let marker = marker_dir.path().join("invoked");
+            let s = shim(&format!(
+                "#!/bin/sh\ntouch \"{}\"\nexit 0\n",
+                marker.display()
+            ));
+            apply_repository_throttle(&client_for(&s), &ThrottleSpec::default())
+                .await
+                .expect("an empty throttle is a no-op");
+            assert!(
+                !marker.exists(),
+                "an empty throttle must not spawn a kopia process"
+            );
         }
 
-        fn client_for(shim: &Shim) -> KopiaClient {
-            KopiaClient::builder().binary(shim.path.clone()).build()
+        /// Every configured limit reaches kopia's argv. The controller resolves
+        /// all four knobs; dropping one on the floor here would be #374 again,
+        /// one field at a time.
+        #[tokio::test]
+        async fn every_limit_reaches_kopia_argv() {
+            let argv_dir = tempfile::tempdir().unwrap();
+            let argv = argv_dir.path().join("argv");
+            let s = shim(&format!(
+                "#!/bin/sh\necho \"$*\" > \"{}\"\nexit 0\n",
+                argv.display()
+            ));
+            apply_repository_throttle(&client_for(&s), &full_throttle())
+                .await
+                .expect("throttle set succeeds");
+            let recorded = std::fs::read_to_string(&argv).expect("the shim recorded its argv");
+            for expected in [
+                "repository throttle set",
+                "--upload-bytes-per-second 1000",
+                "--download-bytes-per-second 2000",
+                "--read-requests-per-second 3",
+                "--write-requests-per-second 4",
+            ] {
+                assert!(
+                    recorded.contains(expected),
+                    "kopia argv must carry `{expected}`; got: {recorded}"
+                );
+            }
         }
+
+        /// A throttle kopia refused is TERMINAL and labeled `ThrottleSet` — the
+        /// run must not continue uncapped over the link the user capped, and the
+        /// persisted failure must name the invocation that failed rather than
+        /// the connect that preceded it.
+        #[tokio::test]
+        async fn a_refused_throttle_is_terminal_and_labeled() {
+            let s = shim("#!/bin/sh\necho 'nope' >&2\nexit 1\n");
+            let err = apply_repository_throttle(&client_for(&s), &full_throttle())
+                .await
+                .expect_err("a failing throttle set must surface");
+            assert!(
+                matches!(
+                    err,
+                    MoverError::Kopia {
+                        op: KopiaOp::ThrottleSet,
+                        ..
+                    }
+                ),
+                "expected a ThrottleSet kopia failure, got {err:?}"
+            );
+        }
+
+        /// This file, for the source-level ratchet below. `include_str!` is
+        /// relative to this file, so it is exactly the module being compiled.
+        const MAIN_RS: &str = include_str!("main.rs");
+
+        /// Every DIRECT `repository_connect*` call this file is allowed to
+        /// contain. Two are the funnels themselves; the rest are the connects
+        /// that legitimately do not carry a `MoverWorkSpec.throttle` — keep in
+        /// step with the exception list on `apply_repository_throttle`.
+        const SANCTIONED_DIRECT_CONNECTS: &[(&str, &str)] = &[
+            ("connect_and_throttle", "the funnel (1 call)"),
+            (
+                "bootstrap_connect",
+                "the bootstrap funnel (2 calls: rw + readonly)",
+            ),
+            (
+                "main_serve",
+                "kopia server start; ServerWorkSpec has no throttle field (2 calls)",
+            ),
+            (
+                "seed_connect_source",
+                "seed SOURCE/replica; dual-config connect, throttled in place from \
+                 op.replicaThrottle immediately after (1 call)",
+            ),
+            (
+                "srepl_connect_source",
+                "snapshot-replication source; dual-config connect, throttled in place \
+                 from spec.throttle immediately after (1 call)",
+            ),
+            (
+                "srepl_connect_dest",
+                "snapshot-replication destination; dual-config connect, throttled in \
+                 place from op.destinationThrottle immediately after (1 call)",
+            ),
+            (
+                "run_browse_session_flow",
+                "CLI-built work spec, throttle always empty (1 call)",
+            ),
+        ];
+
+        /// Total direct calls the sanctioned list above accounts for.
+        const SANCTIONED_DIRECT_CONNECT_CALLS: usize = 9;
+
+        /// **The #374 ratchet.** A mover flow must obtain its connection from
+        /// [`connect_and_throttle`] or [`bootstrap_connect`], so that "connects
+        /// a repository" and "applies the repository throttle" are one
+        /// operation. Nothing in the type system stops a new flow from calling
+        /// `client.repository_connect` directly and quietly shipping #374 again
+        /// — every hermetic gate would stay green, because an uncapped run
+        /// still succeeds. So the ratchet is source-level and deliberately
+        /// blunt: add a direct connect and this test fails, forcing the author
+        /// to either use a funnel or state why their connect carries no cap.
+        #[test]
+        fn connect_funnel_is_the_only_way_flows_connect() {
+            // Assembled at runtime, never written whole: a literal here would
+            // match THIS test's own source lines and inflate the count.
+            let base = ".repository_connect";
+            let patterns = [
+                format!("{base}("),
+                format!("{base}_readonly("),
+                format!("{base}_with("),
+            ];
+            let direct = MAIN_RS
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| patterns.iter().any(|p| l.contains(p.as_str())))
+                .count();
+            assert_eq!(
+                direct, SANCTIONED_DIRECT_CONNECT_CALLS,
+                "direct `repository_connect*` calls in this file changed ({direct} found, \
+                 {SANCTIONED_DIRECT_CONNECT_CALLS} sanctioned). A flow that connects a \
+                 repository must go through `connect_and_throttle` (or `bootstrap_connect`) \
+                 so it cannot get a connection without its throttle — that separation is \
+                 exactly how #374 shipped. If a new connect genuinely carries no \
+                 `MoverWorkSpec.throttle`, add it here AND to the exception list on \
+                 `apply_repository_throttle`, with the reason. Sanctioned today: \
+                 {SANCTIONED_DIRECT_CONNECTS:?}"
+            );
+        }
+
+        /// A throttle failure during bootstrap must never be reported as a
+        /// CONNECT verdict. `bootstrap_connect_probe` reads a connect failure to
+        /// decide whether to CREATE or SEED a repository over the backend; a
+        /// throttle failure says nothing about the backend, and conflating them
+        /// could initialize a repository on the strength of an unrelated error.
+        #[test]
+        fn connect_and_throttle_failures_report_differently() {
+            let kopia_err = KopiaError::NonZeroExit {
+                args: "repository connect filesystem".into(),
+                code: Some(1),
+                class: KopiaErrorClass::NotFound,
+                stderr_tail: "repository not initialized".into(),
+            };
+            let connect = BootstrapConnectFailure::Connect(kopia_err).into_result();
+            let cf = connect.failure.expect("a connect failure is reported");
+            assert_eq!(cf.kopia_error_class, "NotFound");
+            assert_eq!(cf.op, None, "a bare connect error carries no op label");
+
+            let throttled = BootstrapConnectFailure::Throttle(MoverError::Kopia {
+                op: KopiaOp::ThrottleSet,
+                source: KopiaError::NonZeroExit {
+                    args: "repository throttle set".into(),
+                    code: Some(1),
+                    class: KopiaErrorClass::RepositoryUnavailable,
+                    stderr_tail: "backend went away".into(),
+                },
+            })
+            .into_result();
+            let tf = throttled.failure.expect("a throttle failure is reported");
+            assert_eq!(tf.kopia_error_class, "RepositoryUnavailable");
+            assert_eq!(
+                tf.op.as_deref(),
+                Some(KopiaOp::ThrottleSet.as_str()),
+                "a throttle failure must name the throttle invocation, not the connect"
+            );
+        }
+    }
+
+    // --- delete_one / delete_batch against a fake kopia binary ---
+    #[cfg(unix)]
+    mod delete_shim_tests {
+        use super::*;
 
         #[tokio::test]
         async fn delete_one_skips_self_heal_when_anchor_has_no_start_time() {

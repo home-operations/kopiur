@@ -262,6 +262,8 @@ The 9 CRDs ship in the chart's special `crds/` directory. Helm treats that direc
 > ```
 >
 > A GitOps flow (Flux/Argo with a `CreateReplace` sync policy) applies CRD changes automatically. Anyone managing CRDs entirely out of band just applies `deploy/crds/` themselves — `helm install` skips the ones that already exist.
+>
+> Skipping this is usually **silent**, not loud: when a release adds a new spec field, an apiserver still running the old schema **prunes** that field out of every object you apply. The object admits cleanly, `kubectl get -o yaml` shows no trace of the field, and the feature you configured simply never happens. If a newly-documented field seems to be ignored, check the live CRD before anything else (`kubectl get crd <plural>.kopiur.home-operations.com -o yaml | grep <field>`); `kubectl kopiur doctor` flags known-stale schemas too.
 
 The CRDs and RBAC shipped by the chart are **generated** by `cargo xtask gen-crds` / `cargo xtask gen-rbac` and checked in under `deploy/crds/` and `deploy/rbac/`. Those xtasks are the source of truth.
 

@@ -1808,3 +1808,339 @@ async fn restore_wait_window_opens_when_the_repository_becomes_ready() {
 
     cleanup_restore(&restores, WA_RESTORE).await;
 }
+
+// --- #393: the readiness gate is TRI-STATE — a MISSING referent parks -------
+
+/// Isolated repo for the two referent-park scenarios: unlike [`WA_SUBPATH`], whose
+/// `Repository` pre-exists (created suspended), here the repository is created
+/// **mid-test** — the whole point is a `Restore` that arrives before the objects it
+/// derives its repository from. Subpath in `consts::REPO_SUBPATHS` + the mise
+/// node-seed list (LOCKSTEP).
+const WR_SUBPATH: &str = "waitref";
+/// Scenario 1: the `Repository` the Restore names explicitly.
+const WR_REPO: &str = "e2e-wr-repo";
+const WR_RESTORE: &str = "e2e-r-waitref";
+/// Scenario 2: a `fromPolicy` Restore with NO `spec.repository`, so the repository
+/// ref is derived from this `SnapshotPolicy` — which is what goes missing.
+const WR_CFG: &str = "e2e-wr-cfg";
+const WR_CFG_REPO: &str = "e2e-wr-cfg-repo";
+const WR_CFG_RESTORE: &str = "e2e-r-waitref-policy";
+/// The `waitTimeout` both scenarios configure. Long enough that the window cannot
+/// close mid-test (which would turn "the anchor stamped" into a race), and it only
+/// ever starts running after the assertions are done.
+const WR_WINDOW: &str = "10m";
+/// How long the park is observed to HOLD with no anchor — comfortably more than the
+/// gate's 15s requeue, so a gate that stamps `waitStartedAt` on a later pass (rather
+/// than only on the first) still fails this.
+const WR_PARK_PROBE_SECS: u64 = 45;
+
+/// The `Restore` under test for the referent scenarios: a direct `target.pvc` with a
+/// `waitTimeout`, plus the caller's `source`/`repository` fields.
+fn waitref_restore_json(name: &str, extra_spec: serde_json::Value) -> serde_json::Value {
+    let mut spec = serde_json::json!({
+        "policy": { "waitTimeout": WR_WINDOW },
+        "target": { "pvc": { "name": format!("{name}-dst"), "capacity": "1Gi", "accessModes": ["ReadWriteOnce"] } }
+    });
+    if let Some(extra) = extra_spec.as_object() {
+        for (k, v) in extra {
+            spec[k] = v.clone();
+        }
+    }
+    serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": spec
+    })
+}
+
+/// Poll until `status.waitStartedAt` is stamped, returning it.
+async fn wait_anchor_stamped(restores: &Api<Restore>, name: &str) -> anyhow::Result<String> {
+    wait_until(
+        &format!("{name} stamps status.waitStartedAt"),
+        default_timeout(),
+        poll_interval(),
+        || {
+            let restores = restores.clone();
+            let name = name.to_string();
+            async move {
+                let s = status_json(&restores, &name).await;
+                Ok(s.get("waitStartedAt")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string))
+            }
+        },
+    )
+    .await
+}
+
+/// #393 — the wait window must not open against a `Repository` that does not exist.
+///
+/// Pre-fix the readiness gate conflated "verified Ready" with three cannot-determine
+/// shapes: a missing `Repository` OBJECT made `repository_ready_cached` return
+/// `MissingDependency`, the gate fell through as if the repository had been checked,
+/// and `ensure_wait_anchor` stamped `status.waitStartedAt` ≈ the Restore's creation.
+/// A `Repository` that then took longer than `waitTimeout` to arrive (a GitOps apply
+/// ordering, a DR bring-up) found the window already spent.
+///
+/// Post-fix the gate parks: `Pending`, `ReferentAvailable=False` /
+/// `RestoreReferentMissing`, and NO anchor — asserted over a stable poll so a gate
+/// that merely stamps one pass later still fails. Creating the `Repository` releases
+/// it (this path also has a watch), and only THEN does the anchor appear.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn restore_parks_without_wait_anchor_until_its_repository_exists() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    common::ensure_repo(&client, WR_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Clean slate: the scenario is only meaningful while the Repository is ABSENT.
+    cleanup_restore(&restores, WR_RESTORE).await;
+    let _ = repos.delete(WR_REPO, &DeleteParams::default()).await;
+    wait_until(
+        "the waitref Repository is gone",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let repos = repos.clone();
+            async move { Ok(repos.get_opt(WR_REPO).await?.is_none().then_some(())) }
+        },
+    )
+    .await
+    .expect("the previous run's waitref Repository should be deleted");
+
+    // A Restore naming a Repository that does not exist. The source snapshotRef is
+    // deliberately a name that never appears: nothing about it must matter until the
+    // repository shows up.
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(waitref_restore_json(
+                WR_RESTORE,
+                serde_json::json!({
+                    "repository": { "kind": "Repository", "name": WR_REPO },
+                    "source": { "snapshotRef": { "name": "e2e-wr-never" } }
+                }),
+            )),
+        )
+        .await
+        .expect("create the Restore whose Repository does not exist yet");
+
+    wait_condition(&restores, WR_RESTORE, "ReferentAvailable", "False")
+        .await
+        .expect("a Restore whose Repository object is missing must park on the referent gate");
+    let parked = status_json(&restores, WR_RESTORE).await;
+    assert_eq!(
+        parked.get("phase").and_then(|v| v.as_str()),
+        Some("Pending"),
+        "the park is non-terminal: {parked}"
+    );
+    assert_eq!(
+        condition_reason(&parked, "ReferentAvailable"),
+        "RestoreReferentMissing",
+        "the park must use its OWN reason, not RepositoryNotReady (which would claim \
+         the backend was checked): {parked}"
+    );
+    assert_eq!(
+        condition_reason(&parked, "Ready"),
+        "RestoreReferentMissing",
+        "the Ready condition carries the same reason: {parked}"
+    );
+    let message = condition_field(&parked, "ReferentAvailable", "message");
+    assert!(
+        message.contains(WR_REPO),
+        "the message must name the missing object: {message}"
+    );
+    assert!(
+        parked.get("waitStartedAt").is_none(),
+        "the wait window must NOT open while the Repository object does not exist: {parked}"
+    );
+
+    // ...and it STAYS closed across several requeues (the pre-fix bug stamped on the
+    // very first pass, but a partial fix could stamp on a later one).
+    tokio::time::sleep(std::time::Duration::from_secs(WR_PARK_PROBE_SECS)).await;
+    let still_parked = status_json(&restores, WR_RESTORE).await;
+    assert!(
+        still_parked.get("waitStartedAt").is_none(),
+        "the park must hold the window closed for as long as the Repository is absent: \
+         {still_parked}"
+    );
+    assert_eq!(
+        still_parked.get("phase").and_then(|v| v.as_str()),
+        Some("Pending"),
+        "still parked, still non-terminal: {still_parked}"
+    );
+
+    // Create the Repository: it bootstraps, reaches Ready, and the gate opens.
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(common::repository_json(
+                WR_REPO,
+                WR_SUBPATH,
+                serde_json::json!({ "maintenance": { "enabled": false } }),
+            )),
+        )
+        .await
+        .expect("create the waitref Repository");
+    wait_phase(&repos, WR_REPO, "Ready")
+        .await
+        .expect("the waitref Repository should reach Ready");
+
+    // The anchor stamps only NOW — the same assertion shape as the #380 scenario.
+    let opened = wait_anchor_stamped(&restores, WR_RESTORE).await.expect(
+        "the released Restore must stamp status.waitStartedAt once its repository is Ready",
+    );
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&opened).is_ok(),
+        "waitStartedAt {opened} must be RFC3339"
+    );
+    // The gate condition clears rather than lingering as a phantom block for
+    // `kubectl kopiur doctor`.
+    wait_condition(&restores, WR_RESTORE, "ReferentAvailable", "True")
+        .await
+        .expect("the referent gate must clear once the Repository exists");
+
+    cleanup_restore(&restores, WR_RESTORE).await;
+    let _ = repos.delete(WR_REPO, &DeleteParams::default()).await;
+}
+
+/// #393 — the same park for a `fromPolicy` source whose `SnapshotPolicy` is missing,
+/// and the un-park path that has NO watch behind it.
+///
+/// This Restore sets no `spec.repository`, so the repository ref is DERIVED from the
+/// `SnapshotPolicy` — and there is no `SnapshotPolicy` → `Restore` watch
+/// (`watch::repository_to_restores` covers only an explicit `spec.repository`). The
+/// park therefore has to un-park on its own 15s requeue, which is exactly what this
+/// scenario proves: an `Undetermined` arm that forgot to requeue would park here
+/// FOREVER, and every phase-based check would report the Restore as merely "Pending".
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn restore_parks_when_frompolicy_names_a_missing_policy() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    common::ensure_repo(&client, WR_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Clean slate: the SnapshotPolicy must be ABSENT when the Restore is created.
+    cleanup_restore(&restores, WR_CFG_RESTORE).await;
+    let _ = configs.delete(WR_CFG, &DeleteParams::default()).await;
+    wait_until(
+        "the waitref SnapshotPolicy is gone",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let configs = configs.clone();
+            async move { Ok(configs.get_opt(WR_CFG).await?.is_none().then_some(())) }
+        },
+    )
+    .await
+    .expect("the previous run's waitref SnapshotPolicy should be deleted");
+
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(waitref_restore_json(
+                WR_CFG_RESTORE,
+                // No `spec.repository`: the repository is derived from the policy,
+                // which is the referent under test.
+                serde_json::json!({ "source": { "fromPolicy": { "name": WR_CFG } } }),
+            )),
+        )
+        .await
+        .expect("create the Restore whose SnapshotPolicy does not exist yet");
+
+    wait_condition(&restores, WR_CFG_RESTORE, "ReferentAvailable", "False")
+        .await
+        .expect("a fromPolicy Restore whose SnapshotPolicy is missing must park");
+    let parked = status_json(&restores, WR_CFG_RESTORE).await;
+    assert_eq!(
+        parked.get("phase").and_then(|v| v.as_str()),
+        Some("Pending"),
+        "the park is non-terminal: {parked}"
+    );
+    assert_eq!(
+        condition_reason(&parked, "ReferentAvailable"),
+        "RestoreReferentMissing",
+        "{parked}"
+    );
+    let message = condition_field(&parked, "ReferentAvailable", "message");
+    assert!(
+        message.contains("SnapshotPolicy") && message.contains(WR_CFG),
+        "the message must name the missing SnapshotPolicy, not a repository: {message}"
+    );
+    assert!(
+        parked.get("waitStartedAt").is_none(),
+        "the wait window must NOT open while the SnapshotPolicy does not exist: {parked}"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(WR_PARK_PROBE_SECS)).await;
+    let still_parked = status_json(&restores, WR_CFG_RESTORE).await;
+    assert!(
+        still_parked.get("waitStartedAt").is_none(),
+        "the park must hold the window closed for as long as the policy is absent: \
+         {still_parked}"
+    );
+
+    // Provide the referent (and the repository it names). NOTHING watches
+    // SnapshotPolicy on behalf of a Restore, so the un-park below can only come from
+    // the gate's own 15s requeue.
+    if repos.get_opt(WR_CFG_REPO).await.ok().flatten().is_none() {
+        let _ = repos
+            .create(
+                &PostParams::default(),
+                &cr(common::repository_json(
+                    WR_CFG_REPO,
+                    WR_SUBPATH,
+                    serde_json::json!({ "maintenance": { "enabled": false } }),
+                )),
+            )
+            .await;
+    }
+    wait_phase(&repos, WR_CFG_REPO, "Ready")
+        .await
+        .expect("the waitref policy Repository should reach Ready");
+    configs
+        .create(
+            &PostParams::default(),
+            &cr(common::snapshot_policy_json(
+                E2E_NAMESPACE,
+                WR_CFG,
+                "Repository",
+                WR_CFG_REPO,
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create the waitref SnapshotPolicy");
+
+    // Un-parked by the requeue: the anchor finally opens.
+    wait_anchor_stamped(&restores, WR_CFG_RESTORE).await.expect(
+        "the parked Restore must un-park on its own requeue once the SnapshotPolicy exists \
+             — there is no SnapshotPolicy watch to wake it",
+    );
+    wait_condition(&restores, WR_CFG_RESTORE, "ReferentAvailable", "True")
+        .await
+        .expect("the referent gate must clear once the SnapshotPolicy exists");
+
+    cleanup_restore(&restores, WR_CFG_RESTORE).await;
+    let _ = configs.delete(WR_CFG, &DeleteParams::default()).await;
+    let _ = repos.delete(WR_CFG_REPO, &DeleteParams::default()).await;
+}

@@ -12,8 +12,10 @@
 //!
 //! Hardening (see the design doc): per-slot deterministic Job names for
 //! idempotency (G1), `ttlSecondsAfterFinished` so finished Jobs self-reap (G2),
-//! single-flight via a label selector (G3), a repository-readiness gate (G7),
-//! a requeue cap so the lease/health is re-checked (G8), and transition-guarded
+//! single-flight via a label selector (G3), a repository gate keyed on
+//! bootstrapped-before + degradation cause (G7, issue #413 — a
+//! Degraded-because-slow repository still gets maintenance, its cure), a
+//! requeue cap so the lease/health is re-checked (G8), and transition-guarded
 //! status writes so the reconcile does not hot-loop on its own status (G6).
 
 use std::collections::BTreeMap;
@@ -120,17 +122,25 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
         .as_ref()
         .and_then(|d| d.timezone.as_deref());
 
-    // G7: an object-store repository must be bootstrapped (connected/created)
-    // before `kopia maintenance` can reach it. Spawning earlier just produces a
-    // doomed pod, so wait for the repository to report `Ready`.
-    if !io::repository_ready_cached(ctx, repo_ref, &namespace).await? {
+    // G7: wait unless maintenance can plausibly help (issue #413). The gate is
+    // keyed on bootstrapped-before + degradation cause
+    // (`health::maintenance_may_proceed`), NOT strictly `phase == Ready`: an
+    // already-bootstrapped repository that went `Degraded` because its index
+    // blobs need compacting must still receive maintenance — maintenance IS
+    // the cure, and withholding it deadlocks the repository. Deferral is
+    // reserved for a never-bootstrapped repo (a maintenance pod would be
+    // doomed), a CONFIRMED-unreachable/vanished backend (the #345 breaker
+    // semantics), and terminal/unknown phases.
+    if !io::repository_maintainable_cached(ctx, repo_ref, &namespace).await? {
         patch_condition_if_changed(
             &api,
             &name,
             maint,
             "False",
-            "WaitingForRepository",
-            "target repository is not Ready; deferring maintenance",
+            crate::consts::WAITING_FOR_REPOSITORY_REASON,
+            "target repository is not ready for maintenance: it has never bootstrapped, its \
+             backend is confirmed unreachable or the repository vanished, or it is in a terminal \
+             or unknown phase; deferring maintenance",
         )
         .await?;
         return Ok(Action::requeue(REQUEUE_NOT_READY));
@@ -139,10 +149,11 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let now = Utc::now();
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
 
-    // The repository is Ready and we got this far: mark Maintenance Ready (ADR-0005
-    // §2) so `kubectl wait --for=condition=Ready` works. Transition-guarded so it
-    // does not hot-loop on its own status. The mover still owns the `LeaseOwned`
-    // condition; `set_ready` upserts Ready/Reconciling/Stalled without clobbering it.
+    // The repository accepts maintenance and we got this far: mark Maintenance
+    // Ready (ADR-0005 §2) so `kubectl wait --for=condition=Ready` works.
+    // Transition-guarded so it does not hot-loop on its own status. The mover
+    // still owns the `LeaseOwned` condition; `set_ready` upserts
+    // Ready/Reconciling/Stalled without clobbering it.
     set_ready_if_changed(&api, &name, maint).await?;
 
     // An annotation-requested manual run takes precedence over waiting for the
@@ -985,10 +996,11 @@ async fn patch_condition_if_changed(
 }
 
 /// Upsert the kstatus `Ready` conditions (ADR-0005 §2) for a `Maintenance` that has
-/// reached a healthy reconciled state (its repository is Ready), but only when the
-/// `Ready` condition actually changes — so the controller does not hot-loop on its
-/// own status writes (G6). Preserves the mover-owned `LeaseOwned` condition via
-/// [`io::set_ready`]'s upsert.
+/// reached a healthy reconciled state (its repository accepts maintenance — Ready,
+/// or Degraded-but-curable per the #413 gate), but only when the `Ready` condition
+/// actually changes — so the controller does not hot-loop on its own status writes
+/// (G6). Preserves the mover-owned `LeaseOwned` condition via [`io::set_ready`]'s
+/// upsert.
 async fn set_ready_if_changed(
     api: &Api<Maintenance>,
     name: &str,
@@ -1029,7 +1041,7 @@ async fn set_ready_if_changed(
         None => (
             io::ReadyOutcome::Ready,
             "Reconciled",
-            "maintenance is reconciled; the repository is Ready".to_string(),
+            "maintenance is reconciled; the target repository accepts maintenance".to_string(),
         ),
     };
     // Transition guard (G6): only write when Ready does not already reflect

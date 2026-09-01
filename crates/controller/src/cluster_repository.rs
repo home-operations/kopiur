@@ -46,7 +46,7 @@ use crate::health;
 use crate::io;
 use crate::jobs::{self, JobLimits, MoverJobInputs};
 use crate::server::{
-    ServerReconcileCtx, generated_secret_name, mirrored_creds_secret_name, reconcile_server,
+    ServerReconcileCtx, delete_mirrored_creds, generated_secret_name, reconcile_server,
     server_object_name, server_status_json,
 };
 use crate::snapshot::backend_to_repository_connect;
@@ -760,21 +760,11 @@ async fn reconcile_cluster_server(
         (CLUSTER_REPOSITORY_UID_LABEL.to_string(), uid),
     ]);
 
-    // Which namespace the server MIRRORS the credentials Secret from. Same rule the
-    // repository itself uses (`cluster_secret_namespace`): the reference's explicit
-    // namespace, else the operator's — so "absent" means ONE thing on a ClusterRepository.
-    // Were this to keep defaulting to the server namespace while the repository defaulted
-    // to the operator's, a user who followed the documented default (Secret in the operator
-    // namespace) would bootstrap fine and then get a server pod wedged on a Secret that
-    // isn't in its namespace. The server namespace remains the last resort.
-    let creds = io::repo_credentials(&repo.spec.encryption);
-    let creds_src_namespace = creds
-        .namespace
-        .clone()
-        .or_else(|| ctx.operator_namespace.clone())
-        .or_else(|| desired_ns.clone())
-        .unwrap_or_default();
-
+    // Which namespace each credential Secret is mirrored from is decided per-ref
+    // by `server::plan_server_creds` (explicit ref namespace → operator namespace
+    // → server namespace as last resort — the same rule the repository itself
+    // uses via `cluster_secret_namespace`, so "absent" means ONE thing on a
+    // ClusterRepository).
     let rc = ServerReconcileCtx {
         client: &ctx.client,
         instance: name,
@@ -786,7 +776,6 @@ async fn reconcile_cluster_server(
         observed_namespace: observed_ns,
         owner: None,
         extra_labels,
-        creds_src_namespace,
         repo_namespace: None,
         operator_namespace: ctx.operator_namespace.clone(),
         is_cluster: true,
@@ -835,7 +824,7 @@ async fn handle_cluster_deletion(
             Some(&generated_secret_name(name)),
         )
         .await?;
-        io::delete_secret_if_present(&ctx.client, &ns, &mirrored_creds_secret_name(name)).await?;
+        delete_mirrored_creds(&ctx.client, &ns, name).await?;
     }
 
     // An in-flight bootstrap Job outlives its `ClusterRepository` (#380). A
@@ -1053,6 +1042,31 @@ async fn bootstrap_cluster_via_mover(
         .as_ref()
         .and_then(|s| s.health.as_ref())
         .and_then(|h| h.probe_attempt_at.clone());
+    // The effective bootstrap-Job deadline under escalation (#414) — see the
+    // namespaced twin: computed once, before the Job fetch, and shared by the
+    // Job's `activeDeadlineSeconds` and the probe-attempt window (the streak
+    // only grows between launch and poll, so the window only ever widens —
+    // never the #273-class undercut).
+    let bootstrap_deadline_secs = health::escalated_bootstrap_deadline(
+        health::bootstrap_deadline_seconds(
+            repo.spec
+                .bootstrap
+                .as_ref()
+                .and_then(|b| b.failure_policy.as_ref())
+                .and_then(|fp| fp.active_deadline_seconds),
+        ),
+        health::timeout_streak(
+            repo.status
+                .as_ref()
+                .map(|s| s.conditions.as_slice())
+                .unwrap_or(&[]),
+            repo.status
+                .as_ref()
+                .and_then(|s| s.health.as_ref())
+                .and_then(|h| h.consecutive_probe_failures)
+                .unwrap_or(0),
+        ),
+    );
     let probe = health::probe_action(
         already_ready,
         bootstrapped_before,
@@ -1065,13 +1079,7 @@ async fn bootstrap_cluster_via_mover(
         kopiur_api::repository::RepositoryHealthProbeSpec::effective_interval(
             repo.spec.health.as_ref(),
         ),
-        health::probe_attempt_timeout(health::bootstrap_deadline_seconds(
-            repo.spec
-                .bootstrap
-                .as_ref()
-                .and_then(|b| b.failure_policy.as_ref())
-                .and_then(|fp| fp.active_deadline_seconds),
-        )),
+        health::probe_attempt_timeout(bootstrap_deadline_secs),
         chrono::Utc::now(),
     );
     let spec_changed =
@@ -1114,7 +1122,7 @@ async fn bootstrap_cluster_via_mover(
             io::delete_mover_run(&ctx.client, &job_ns, &job_name).await?;
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
-        return match crate::snapshot::job_terminal_state(&job) {
+        return match io::mover_job_terminal(&job) {
             // Still running. A catalog-refresh re-run of an already-Ready repo
             // keeps its phase — flapping Ready→Initializing every refresh would
             // be pure status churn — and a Degraded repo's strict retry keeps
@@ -1144,7 +1152,7 @@ async fn bootstrap_cluster_via_mover(
             // is enabled": once the probe's own Job is launched, `probe_action` returns
             // `AwaitingResult` and this arm stands down so the result can be finalized.
             // Recycling then too is the #273 livelock.
-            Some(success) => {
+            Some(terminal) => {
                 let interval =
                     CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
                 if reverify
@@ -1174,8 +1182,33 @@ async fn bootstrap_cluster_via_mover(
                     io::delete_mover_run(&ctx.client, &job_ns, &job_name).await?;
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
+                // The deadline the Job actually ran with (exact even under
+                // deadline escalation), for the deadline-kill classification's
+                // condition message (#414).
+                let job_deadline_secs = job
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.active_deadline_seconds)
+                    .unwrap_or_else(|| {
+                        health::bootstrap_deadline_seconds(
+                            repo.spec
+                                .bootstrap
+                                .as_ref()
+                                .and_then(|b| b.failure_policy.as_ref())
+                                .and_then(|fp| fp.active_deadline_seconds),
+                        )
+                    });
                 finalize_cluster_bootstrap(
-                    ctx, repo, name, &job_ns, &job_name, api, backend, success, probe_run,
+                    ctx,
+                    repo,
+                    name,
+                    &job_ns,
+                    &job_name,
+                    api,
+                    backend,
+                    terminal,
+                    job_deadline_secs,
+                    probe_run,
                     seed_armed,
                 )
                 .await
@@ -1187,23 +1220,23 @@ async fn bootstrap_cluster_via_mover(
     // one (`ttlSecondsAfterFinished`). An already-Ready repo only re-creates it
     // when a re-run is actually warranted (`bootstrap_create_due`: catalog refresh
     // due, or spec changed) — re-creating unconditionally would pin the refresh
-    // cadence to the Job TTL instead of `catalog.refreshInterval`.
-    if !(reverify
-        || probe.launches()
-        || catalog::bootstrap_create_due(
-            repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
-            repo.metadata.generation,
-            repo.status.as_ref().and_then(|s| s.observed_generation),
-            cluster_last_refresh_at(repo),
-            CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
-            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
-            cluster_scan_requested_token(repo),
-            cluster_scan_requested_honored(repo),
-            cluster_scan_requested_attempt_at(repo),
-            kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
-            chrono::Utc::now(),
-        ))
-    {
+    // cadence to the Job TTL instead of `catalog.refreshInterval`. Hoisted into a
+    // variable because it also decides `probe_only` below (#414): a launch driven
+    // by catalog work must run the full mover, never the cheap probe mode.
+    let catalog_create_due = catalog::bootstrap_create_due(
+        repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
+        repo.metadata.generation,
+        repo.status.as_ref().and_then(|s| s.observed_generation),
+        cluster_last_refresh_at(repo),
+        CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref()),
+        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+        cluster_scan_requested_token(repo),
+        cluster_scan_requested_honored(repo),
+        cluster_scan_requested_attempt_at(repo),
+        kopiur_api::consts::DEFAULT_CATALOG_REFRESH_INTERVAL,
+        chrono::Utc::now(),
+    );
+    if !(reverify || probe.launches() || catalog_create_due) {
         // This is the STEADY STATE of a Ready object-store repo (`bootstrap_create_due` is
         // true for any non-Ready phase, so nothing that has yet to bootstrap gets here).
         // Re-evaluate maintenance coverage before parking: it is the only pass a repo whose
@@ -1379,8 +1412,14 @@ async fn bootstrap_cluster_via_mover(
         name,
         &job_ns,
         create_enabled,
+        // Probe-only (#414): see the namespaced twin.
+        probe_style_launch && !catalog_create_due,
         repo.spec.create.as_ref(),
-        repo.spec.mover_defaults.as_ref(),
+        crate::repo_seed::seed_bootstrap_throttle(
+            seed_armed,
+            repo.spec.seed.as_ref(),
+            repo.spec.mover_defaults.as_ref(),
+        ),
         cluster,
         foreign,
         read_only,
@@ -1498,9 +1537,10 @@ async fn bootstrap_cluster_via_mover(
             seed_armed,
             repo.spec.seed.as_ref(),
             JobLimits {
-                active_deadline_seconds: Some(health::bootstrap_deadline_seconds(
-                    bootstrap_fp.and_then(|fp| fp.active_deadline_seconds),
-                )),
+                // The spec base under deadline escalation (#414) — computed
+                // once above so the Job limit and the probe-attempt window
+                // cannot disagree.
+                active_deadline_seconds: Some(bootstrap_deadline_secs),
                 backoff_limit: bootstrap_fp
                     .and_then(|fp| fp.backoff_limit)
                     .unwrap_or(JobLimits::default().backoff_limit),
@@ -1620,8 +1660,13 @@ fn cluster_bootstrap_work_spec(
     name: &str,
     job_ns: &str,
     auto_create: bool,
+    // #414: this launch is a pure health probe — see the namespaced twin.
+    probe_only: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
-    mover_defaults: Option<&kopiur_api::common::MoverDefaults>,
+    // The cap for every connection this bootstrap opens to THIS repository,
+    // resolved by the caller through `repo_seed::seed_bootstrap_throttle` —
+    // identical rule to the `Repository` twin, so the two kinds cannot drift.
+    throttle: kopiur_mover::workspec::ThrottleSpec,
     cluster: Option<&str>,
     foreign: ForeignSnapshots,
     read_only: bool,
@@ -1656,6 +1701,7 @@ fn cluster_bootstrap_work_spec(
             // can materialize discovered Snapshots (placed per identity hostname —
             // see `crate::catalog`).
             scan_catalog: true,
+            probe_only,
             create_options: kopiur_mover::workspec::CreateOptionsSpec::from_create(create),
             // MUTABLE parameters (#258), re-applied on drift on every bootstrap — the
             // opposite of create_options. Empty for a ReadOnly repository: `set-parameters`
@@ -1694,7 +1740,7 @@ fn cluster_bootstrap_work_spec(
         options: MoverOptions::default(),
         // Bootstrap is a connect/create probe, not a data run: kopia defaults.
         cache: Default::default(),
-        throttle: io::throttle_spec(mover_defaults),
+        throttle,
     }
 }
 
@@ -1708,7 +1754,12 @@ async fn finalize_cluster_bootstrap(
     job_name: &str,
     api: &Api<ClusterRepository>,
     backend: &Backend,
-    job_succeeded: bool,
+    // The Job's terminal state, WHY included (issue #414): a deadline kill is
+    // classified apart from a crashed/never-scheduled mover.
+    job_terminal: io::MoverJobTerminal,
+    // The `activeDeadlineSeconds` the Job actually ran with, for the
+    // deadline-kill condition message.
+    job_deadline_secs: i64,
     // True when this is a health-probe re-run of an already-`Ready` ClusterRepository
     // (same spec): interpret the result as a probe (the phase follows
     // `health::breaker_verdict` — `Ready` under Alert/below-threshold, `Degraded`
@@ -1727,7 +1778,13 @@ async fn finalize_cluster_bootstrap(
     // exhaustively-handled modes — never a silent `Failed/Unknown` with no
     // Event — and the success arm *owns* the result, so there is no
     // `.expect()` invariant to get wrong.
-    let result = match io::bootstrap_outcome(result, job_succeeded, job_name, seed_armed) {
+    let result = match io::bootstrap_outcome(
+        result,
+        job_terminal,
+        job_name,
+        seed_armed,
+        job_deadline_secs,
+    ) {
         io::BootstrapOutcome::ResultPending => {
             tracing::warn!(repo = %name, "bootstrap Job complete but result not readable yet; requeueing");
             return Ok(Action::requeue(Duration::from_secs(5)));
@@ -1756,9 +1813,15 @@ async fn finalize_cluster_bootstrap(
     // conditions array and stamp the count onto storageStats (merge-patch
     // preserves snapshotCount below). Best-effort in the mover — `None` leaves the
     // prior condition/count. The Warning event fires only on the transition.
+    // `snapshot_count` is stamped only when the listing RAN (#414): a
+    // probe-only result reports `None`, and writing it unconditionally would
+    // reset the count to 0 on every probe (and poison the catalog gauge).
     let threshold = resolve_index_blob_warn_threshold(repo.spec.health.as_ref());
     let mut index_blob_event = None;
-    let mut storage_stats = serde_json::json!({ "snapshotCount": result.snapshot_count });
+    let mut storage_stats = serde_json::json!({});
+    if let Some(count) = result.snapshot_count {
+        storage_stats["snapshotCount"] = serde_json::json!(count);
+    }
     if let Some(count) = result.index_blob_count {
         let upd = health::reconcile_index_blob_health(
             &conditions,
@@ -1819,10 +1882,13 @@ async fn finalize_cluster_bootstrap(
     // #380: fold the seed outcome into the SAME conditions array — the
     // mover-skew guard has already refused a seed-armed success carrying no
     // outcome, so a present `result.seed` is proof the image understood it.
-    let seed_fold = result
-        .seed
-        .as_ref()
-        .map(|outcome| crate::repo_seed::seed_success_fold(outcome, &now));
+    let seed_fold = result.seed.as_ref().map(|outcome| {
+        crate::repo_seed::seed_success_fold(
+            outcome,
+            repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+            &now,
+        )
+    });
     let conditions = match seed_fold.as_ref() {
         Some(fold) => io::upsert_condition(
             &conditions,
@@ -1974,22 +2040,26 @@ async fn finalize_cluster_bootstrap(
     // covers the spec-change recycle (see the Repository twin): the fresh
     // result must be scanned NOW, not at the next timed refresh.
     let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-    if catalog::scan_due(
-        repo.metadata.generation,
-        repo.status.as_ref().and_then(|s| s.observed_generation),
-        cluster_last_refresh_at(repo),
-        interval,
-        CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
-        cluster_scan_requested_token(repo),
-        cluster_scan_requested_honored(repo),
-        chrono::Utc::now(),
-    ) {
+    // `snapshot_count: None` = the listing DID NOT RUN (a probe-only result,
+    // #414): never scan over it — see the Repository twin.
+    if let Some(snapshot_count) = result.snapshot_count
+        && catalog::scan_due(
+            repo.metadata.generation,
+            repo.status.as_ref().and_then(|s| s.observed_generation),
+            cluster_last_refresh_at(repo),
+            interval,
+            CatalogBounds::periodic_refresh_enabled(repo.spec.catalog.as_ref()),
+            cluster_scan_requested_token(repo),
+            cluster_scan_requested_honored(repo),
+            chrono::Utc::now(),
+        )
+    {
         run_cluster_catalog_scan(
             ctx,
             repo,
             name,
             &result.snapshots,
-            result.snapshot_count,
+            snapshot_count,
             result.snapshots_truncated,
             result.foreign_suffix_dropped,
         )
@@ -2013,11 +2083,13 @@ async fn finalize_cluster_bootstrap(
 
 /// Reflect a FAILED bootstrap Job into the `ClusterRepository` status — the
 /// failed arm of [`finalize_cluster_bootstrap`], mirroring the namespaced
-/// [`crate::repository`] twin's four exhaustive routes: probe-run →
-/// [`finalize_cluster_probe_failure`]; result-less → recycle as `Degraded`
-/// (flat 120s, untouched by M4); a `RepositoryUnavailable` verdict on a
-/// once-bootstrapped repo → [`recycle_cluster_bootstrap_outage`] (the #345
-/// strict-verdict reroute); everything else → terminal `Failed`.
+/// [`crate::repository`] twin's exhaustive routes: probe-run →
+/// [`finalize_cluster_probe_failure`]; a `RepositoryUnavailable` verdict or
+/// deadline kill on a once-bootstrapped repo →
+/// [`recycle_cluster_bootstrap_outage`] (the #345 strict-verdict reroute);
+/// result-less → recycle as `Degraded` with the failure streak stamped so the
+/// relaunch backs off exponentially (#415); a seed failure → recycle at the
+/// flat prompt DR cadence; everything else → terminal `Failed`.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_cluster_bootstrap_failure(
     ctx: &Context,
@@ -2040,95 +2112,150 @@ async fn finalize_cluster_bootstrap_failure(
         return finalize_cluster_probe_failure(ctx, repo, api, name, job_ns, job_name, &failure)
             .await;
     }
-    let reason = failure.reason();
-    // #380: a seed failure ALSO says something about the seed, so it gets a
-    // `Seeded=False` condition beside `Bootstrapped=False`, folded into the
-    // same array both arms build (a conditions patch replaces the whole thing).
-    let seed_fold =
-        |conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]| match failure
-            .seed_reason()
-        {
-            Some(seed_reason) => io::upsert_condition(
-                conditions,
-                kopiur_api::consts::SEEDED_CONDITION,
-                false,
-                seed_reason,
-                &failure.condition_message(),
-                repo.metadata.generation,
-            ),
-            // A bootstrap that failed for a reason having NOTHING to do with
-            // the seed (an AuthFailure against this repository's own backend, a
-            // result-less Job) says nothing about the seed's state — so a
-            // `Seeded=False/Seeding` left standing from the in-flight pass would
-            // claim a copy is running beside a terminal `Failed`. Drop it; the
-            // real story is on `Bootstrapped` and `Ready`.
-            None => crate::repo_seed::drop_seed_condition(conditions),
-        };
-    // A result-less Job failure carries no backend verdict (mover
-    // crashed / evicted / deadline / result write hit a down apiserver
-    // — the outage incident): recycle the dead Job and retry as
-    // `Degraded` instead of parking `Failed` until the Job's TTL
-    // finally reaps it. Mirrors `repository.rs::finalize_bootstrap_failure`.
-    if failure.recycles_for_retry() {
-        io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
-        let conditions =
-            cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
-        let conditions = seed_fold(&conditions);
-        let conditions = io::set_ready(
-            &conditions,
-            repo.metadata.generation,
-            io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
-            reason,
-            &failure.condition_message(),
-        );
-        let current = serde_json::to_value(&repo.status).ok();
-        let wrote = io::patch_status_if_changed(
-            api,
-            name,
-            current.as_ref(),
-            serde_json::json!({
-                "phase": "Degraded",
-                "backend": backend.kind_str(),
-                "observedGeneration": repo.metadata.generation,
-                "conditions": conditions,
-            }),
-        )
-        .await?;
-        if wrote {
-            failure.publish(ctx, &io::event_ref(repo), name).await;
-            crate::repo_seed::record_seed_failure(
-                &ctx.metrics,
-                repo.spec.seed.as_ref(),
-                "ClusterRepository",
-                "",
-                name,
-                seed_armed,
-            );
-            tracing::warn!(
-                repo = %name,
-                reason,
-                "ClusterRepository bootstrap Job failed; recycled it for retry"
-            );
-        }
-        return Ok(Action::requeue(Duration::from_secs(120)));
-    }
-    // A backend-outage verdict on a once-bootstrapped repo (#345 M4): recycle
-    // and retry as `Degraded`, feeding the unified backend sensor.
     let bootstrapped = repo
         .status
         .as_ref()
         .and_then(|s| s.unique_id.as_deref())
         .is_some();
-    if failure.retryable_outage_for_bootstrapped(bootstrapped) {
-        return recycle_cluster_bootstrap_outage(
-            ctx, repo, name, job_ns, job_name, api, backend, &failure,
-        )
-        .await;
+    // Route precedence lives in ONE tested place (`BootstrapFailure::route`,
+    // outage sensor first). Mirrors `repository.rs::finalize_bootstrap_failure`.
+    match failure.route(bootstrapped) {
+        // A backend-outage verdict (or deadline kill) on a once-bootstrapped
+        // repo (#345 M4): recycle and retry as `Degraded`, feeding the unified
+        // backend sensor.
+        io::FailureRoute::OutageSensor => {
+            recycle_cluster_bootstrap_outage(
+                ctx, repo, name, job_ns, job_name, api, backend, &failure,
+            )
+            .await
+        }
+        // Result-less: recycle as `Degraded` with the failure streak stamped so
+        // the relaunch backs off exponentially (#415).
+        io::FailureRoute::Recycle => {
+            recycle_failed_cluster_bootstrap(
+                ctx, repo, name, job_ns, job_name, api, backend, &failure, seed_armed, true,
+            )
+            .await
+        }
+        // A seed failure retries PROMPTLY — flat cadence, no streak (the
+        // documented DR contract; see the namespaced twin).
+        io::FailureRoute::SeedRetry => {
+            recycle_failed_cluster_bootstrap(
+                ctx, repo, name, job_ns, job_name, api, backend, &failure, seed_armed, false,
+            )
+            .await
+        }
+        io::FailureRoute::Terminal => {
+            park_terminal_cluster_bootstrap(ctx, repo, name, api, backend, &failure, seed_armed)
+                .await
+        }
     }
+}
+
+/// The shared recycle-and-retry-as-`Degraded` write for a failed
+/// `ClusterRepository` bootstrap — the twin of
+/// [`crate::repository`]'s `recycle_failed_bootstrap`; see its doc for the
+/// `stamp_streak` (#415) semantics and the transition-gated side effects.
+#[allow(clippy::too_many_arguments)]
+async fn recycle_failed_cluster_bootstrap(
+    ctx: &Context,
+    repo: &ClusterRepository,
+    name: &str,
+    job_ns: &str,
+    job_name: &str,
+    api: &Api<ClusterRepository>,
+    backend: &Backend,
+    failure: &io::BootstrapFailure,
+    seed_armed: bool,
+    stamp_streak: bool,
+) -> Result<Action> {
+    io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
+    let reason = failure.reason();
     let conditions = cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
-    let conditions = seed_fold(&conditions);
-    // A terminal bootstrap failure is kstatus-Stalled (issue #245): Flux
-    // should fail its health check fast, not hang until timeout.
+    let conditions =
+        crate::repo_seed::seed_condition_fold(repo.metadata.generation, failure, &conditions);
+    let conditions = io::set_ready(
+        &conditions,
+        repo.metadata.generation,
+        io::ready_outcome_for_phase(&RepositoryPhase::Degraded),
+        reason,
+        &failure.condition_message(),
+    );
+    let mut patch = serde_json::json!({
+        "phase": "Degraded",
+        "backend": backend.kind_str(),
+        "observedGeneration": repo.metadata.generation,
+        "conditions": conditions,
+    });
+    let mut requeue = Duration::from_secs(120);
+    if stamp_streak {
+        let now = chrono::Utc::now().to_rfc3339();
+        let health = health::failure_streak_health(
+            repo.status.as_ref().and_then(|s| s.health.as_ref()),
+            &now,
+        );
+        requeue = health::strict_retry_backoff(
+            health
+                .consecutive_probe_failures
+                .unwrap_or(1)
+                .saturating_sub(1),
+        );
+        patch["health"] = health::probe_failure_health_patch(&health);
+    }
+    let current = serde_json::to_value(&repo.status).ok();
+    let wrote = io::patch_status_if_changed(api, name, current.as_ref(), patch).await?;
+    let transition = if stamp_streak {
+        let prior_degraded =
+            repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Degraded);
+        let prior_reason = repo
+            .status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .find(|c| {
+                c.type_ == crate::consts::REPOSITORY_BOOTSTRAPPED_CONDITION && c.status == "False"
+            })
+            .map(|c| c.reason.as_str());
+        !prior_degraded || prior_reason != Some(reason)
+    } else {
+        true
+    };
+    if wrote && transition {
+        failure.publish(ctx, &io::event_ref(repo), name).await;
+        crate::repo_seed::record_seed_failure(
+            &ctx.metrics,
+            repo.spec.seed.as_ref(),
+            "ClusterRepository",
+            "",
+            name,
+            seed_armed,
+        );
+        tracing::warn!(
+            repo = %name,
+            reason,
+            "ClusterRepository bootstrap Job failed; recycled it for retry"
+        );
+    }
+    Ok(Action::requeue(requeue))
+}
+
+/// Park a non-retryable `ClusterRepository` bootstrap verdict at terminal
+/// `Failed` — the twin of [`crate::repository`]'s `park_terminal_bootstrap`
+/// (kstatus-Stalled, issue #245; transition-gated Event/warn).
+async fn park_terminal_cluster_bootstrap(
+    ctx: &Context,
+    repo: &ClusterRepository,
+    name: &str,
+    api: &Api<ClusterRepository>,
+    backend: &Backend,
+    failure: &io::BootstrapFailure,
+    seed_armed: bool,
+) -> Result<Action> {
+    let reason = failure.reason();
+    let conditions = cluster_bootstrap_condition(repo, false, reason, &failure.condition_message());
+    let conditions =
+        crate::repo_seed::seed_condition_fold(repo.metadata.generation, failure, &conditions);
     let conditions = io::set_ready(
         &conditions,
         repo.metadata.generation,
@@ -2136,9 +2263,6 @@ async fn finalize_cluster_bootstrap_failure(
         reason,
         &failure.condition_message(),
     );
-    // Guard the write so the Event + warn log fire only on the real transition,
-    // not on every 120 s re-read (the message is stable → a true no-op once
-    // written, so no reconcile hot-loop and no Event spam).
     let current = serde_json::to_value(&repo.status).ok();
     let wrote = io::patch_status_if_changed(
         api,
@@ -2188,11 +2312,7 @@ async fn recycle_cluster_bootstrap_outage(
 ) -> Result<Action> {
     io::delete_mover_run(&ctx.client, job_ns, job_name).await?;
     let reason = failure.reason();
-    let kind = if failure.is_repository_absent() {
-        health::ProbeFailureKind::Vanished
-    } else {
-        health::ProbeFailureKind::Unreachable
-    };
+    let kind = health::probe_failure_kind(failure);
     let now = chrono::Utc::now().to_rfc3339();
     let existing = repo
         .status
@@ -2331,11 +2451,7 @@ async fn finalize_cluster_probe_failure(
     job_name: &str,
     failure: &io::BootstrapFailure,
 ) -> Result<Action> {
-    let kind = if failure.is_repository_absent() {
-        health::ProbeFailureKind::Vanished
-    } else {
-        health::ProbeFailureKind::Unreachable
-    };
+    let kind = health::probe_failure_kind(failure);
     let existing = repo
         .status
         .as_ref()
@@ -2580,8 +2696,9 @@ mod tests {
                 "shared",
                 "kopia-system",
                 true,
+                false,
                 None,
-                None,
+                Default::default(),
                 None,
                 ForeignSnapshots::Fallback,
                 read_only,
@@ -2619,6 +2736,7 @@ mod tests {
                 migrate: None,
                 allow_empty_source: true,
                 resume: false,
+                replica_throttle: Default::default(),
             }),
         );
         let carried = armed.seed.expect("the seed rides the op");
@@ -2649,8 +2767,9 @@ mod tests {
                 "shared",
                 "kopia-system",
                 true,
+                false,
                 None,
-                None,
+                Default::default(),
                 cluster,
                 ForeignSnapshots::Fallback,
                 read_only,

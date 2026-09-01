@@ -87,8 +87,10 @@ rules:
   {{- end }}
   {{- if .Values.features.kopiaUi.enabled }}
   # kopia web-UI server (spec.server): create-once the generated-auth Secret, SSA the
-  # cross-namespace credentials mirror, and delete both on teardown / namespace
-  # migration (owner-ref GC can't reach a cluster-scoped owner's namespaced children).
+  # cross-namespace credential mirrors (one per distinct Secret the repository
+  # references — the password Secret plus a separate backend auth Secret), and delete
+  # all of them on teardown / namespace migration (owner-ref GC can't reach a
+  # cluster-scoped owner's namespaced children).
   - apiGroups: [""]
     resources:
       - secrets

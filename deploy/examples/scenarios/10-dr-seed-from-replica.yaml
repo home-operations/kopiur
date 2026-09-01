@@ -251,9 +251,10 @@ spec:
         name: postgres-data
   # Pin the identity to EXACTLY what the old cluster recorded. Seeding preserves
   # each snapshot's username@hostname:path, so this is what makes the recovered
-  # history resolvable — a mismatch silently finds nothing (kopiur raises a
-  # NoAdoptableHistory Warning event when a policy matches none of a non-empty
-  # catalog).
+  # history resolvable — a mismatch silently finds nothing and starts a NEW chain
+  # beside the history you just recovered. Nothing warns you, so verify after
+  # applying: status.adoption.lastScanMatched on this policy should cover the
+  # snapshots it owned before the disaster.
   identity:
     username: postgres-data
     hostname: billing

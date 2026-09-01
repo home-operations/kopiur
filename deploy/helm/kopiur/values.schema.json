@@ -58,7 +58,7 @@
           "properties": {
             "enabled": {
               "default": false,
-              "description": "Grant the operator `secrets` create+patch+delete so `spec.server` (the\nkopia web-UI) works: it creates a generated-auth Secret, mirrors a\nClusterRepository's credentials into the server namespace, and deletes both on\nteardown. SECURITY TRADE-OFF: grants unscoped create/delete on Secrets in any\nnamespace the operator manages.",
+              "description": "Grant the operator `secrets` create+patch+delete so `spec.server` (the\nkopia web-UI) works: it creates a generated-auth Secret, mirrors each of a\nClusterRepository's credential Secrets into the server namespace, and deletes\nall of them on teardown. SECURITY TRADE-OFF: grants unscoped create/delete on\nSecrets in any namespace the operator manages.",
               "title": "enabled",
               "type": "boolean"
             }

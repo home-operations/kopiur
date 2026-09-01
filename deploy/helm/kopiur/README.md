@@ -1,8 +1,8 @@
 # kopiur
 
-![Version](https://img.shields.io/static/v1?label=Version&message=0.10.4&color=informational&style=flat-square) <!-- x-release-please-version -->
+![Version](https://img.shields.io/static/v1?label=Version&message=0.10.5&color=informational&style=flat-square) <!-- x-release-please-version -->
 ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
-![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.10.4&color=informational&style=flat-square) <!-- x-release-please-version -->
+![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.10.5&color=informational&style=flat-square) <!-- x-release-please-version -->
 
 Kopiur — a Kopia-native Kubernetes backup operator written in Rust.
 Installs the controller, admission webhook, the 8 kopiur.home-operations.com/v1alpha1 CRDs,
@@ -74,7 +74,7 @@ The 9 CRDs ship in the chart's special `crds/` directory. Helm installs them on 
 | extraVolumeMounts | list | `[]` | Extra volume mounts on the controller container (pairs with extraVolumes). |
 | extraVolumes | list | `[]` | Extra volumes on the controller pod. Use this to make a filesystem-backend repository reachable in-process (hostPath/NFS/PVC) so the controller can run short idempotent kopia ops directly. The e2e harness uses a hostPath here. |
 | features.credentialProjection.enabled | bool | `false` | Grant the operator `secrets` create+patch+delete so `spec.credentialProjection` works: the operator copies a repository's credential Secret(s) into each mover Job's namespace (the chief win is a shared ClusterRepository whose Secret is pinned to one namespace) and cleans its copies up again (legacy-copy sweep, reap-on-shrink, reap-on-disable). SECURITY TRADE-OFF: `create` cannot be scoped to a Secret name, so the operator can write a Secret in any namespace it manages. |
-| features.kopiaUi.enabled | bool | `false` | Grant the operator `secrets` create+patch+delete so `spec.server` (the kopia web-UI) works: it creates a generated-auth Secret, mirrors a ClusterRepository's credentials into the server namespace, and deletes both on teardown. SECURITY TRADE-OFF: grants unscoped create/delete on Secrets in any namespace the operator manages. |
+| features.kopiaUi.enabled | bool | `false` | Grant the operator `secrets` create+patch+delete so `spec.server` (the kopia web-UI) works: it creates a generated-auth Secret, mirrors each of a ClusterRepository's credential Secrets into the server namespace, and deletes all of them on teardown. SECURITY TRADE-OFF: grants unscoped create/delete on Secrets in any namespace the operator manages. |
 | fullnameOverride | string | `""` | Override the full release-qualified name (defaults to "<release>-kopiur"). |
 | global.affinity | object | `{}` |  |
 | global.commonLabels | object | `{}` | Labels stamped on every rendered object (fleet-wide labelling). |

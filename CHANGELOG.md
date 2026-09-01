@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.5](https://github.com/home-operations/kopiur/compare/0.10.4...0.10.5) (2026-08-28)
+
+
+### Bug Fixes
+
+* deadline-killed bootstrap classification, maintenance gate exemption, relaunch backoff + self-healing escalation ([#417](https://github.com/home-operations/kopiur/issues/417)) ([ff8b396](https://github.com/home-operations/kopiur/commit/ff8b396e15e8d365a702b506cd615e681b045815))
+* manualRun explicit-null completedAt, tri-state Restore gate, throttle honored in every mover flow ([#394](https://github.com/home-operations/kopiur/issues/394), [#393](https://github.com/home-operations/kopiur/issues/393), [#374](https://github.com/home-operations/kopiur/issues/374)) ([#411](https://github.com/home-operations/kopiur/issues/411)) ([8f0399f](https://github.com/home-operations/kopiur/commit/8f0399fd48f68bdc0f77f53d2e9d590daf92fe01))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action jdx/mise-action (v4.2.5 → v4.3.0) ([#419](https://github.com/home-operations/kopiur/issues/419)) ([6234791](https://github.com/home-operations/kopiur/commit/6234791035ebde151c43b7128373867d220dcd90))
+
 ## [0.10.4](https://github.com/home-operations/kopiur/compare/0.10.3...0.10.4) (2026-08-24)
 
 

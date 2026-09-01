@@ -53,6 +53,7 @@ $ kubectl -n billing get snapshots -l kopiur.home-operations.com/origin=replicat
 | `selection.latestOnly` | `true` = only each identity's most recent snapshot (cheap seed); default `false` = full history. |
 | `migrate.parallel` | Snapshots migrated concurrently (kopia default: 1, sequential) — the main knob for large first runs. |
 | `migrate.policies` | Whether kopia **policies** ride along: `none` (default — a Kopiur-managed destination keeps retention CR-driven), `copy`, or `copyOverwrite`. |
+| `migrate.throttle.source` / `.destination` | Bandwidth/ops caps for this replication's runs, one block **per side** — see [Throttling a replication](#throttling-a-replication). Each overrides that side's repository's `moverDefaults.throttle` field by field. |
 | `pruning` | What happens to already-made copies on later runs: exactly one of `none` / `mirrorSource` / `retention` — see [Pruning](#pruning-the-copies). |
 | `mover` | Per-run mover overrides (resources, scheduling, security context). Inherits the source repository's `moverDefaults`. `inheritSecurityContextFrom` is rejected here, as for `RepositoryReplication` — there is no workload to inherit from. |
 | `credentialProjection` | Opt in to [credential projection](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) for a `ClusterRepository` source/destination whose Secret lives elsewhere. |
@@ -110,6 +111,90 @@ selection:
 
 Matching zero identities is a **successful no-op** (`NoIdentitiesMatched`), not an error — a fresh source simply has nothing to copy yet. Incomplete (interrupted) source snapshots are never copied.
 
+## Throttling a replication
+
+A replication is often the heaviest thing Kopiur does to your network: it reads a
+whole history out of one repository and writes it into another, frequently across
+a WAN link that other people are also using. `spec.migrate.throttle` caps it —
+**per side**, because a replication is two repositories.
+
+```yaml
+migrate:
+    throttle:
+        source: # reading out of nas-primary (on-LAN, be generous)
+            downloadBytesPerSecond: 209715200 # 200 MiB/s
+        destination: # writing to the off-site bucket (the scarce link)
+            uploadBytesPerSecond: 10485760 # 10 MiB/s
+            writeOpsPerSecond: 100
+```
+
+Each side takes the same four knobs as a repository's
+[`moverDefaults.throttle`](reference/crds/shared-types.md#moverdefaults):
+`uploadBytesPerSecond`, `downloadBytesPerSecond`, `readOpsPerSecond`,
+`writeOpsPerSecond`. Every knob you set must be at least `1` (a `0` is rejected at
+admission — kopia's "no limit" is the *absent* knob, not a zero).
+
+**Two layers, merged field by field.** Each repository can already declare
+`moverDefaults.throttle`, which every mover that touches it honors. `migrate.throttle`
+sits on top of that, per side:
+
+- `throttle.source` overrides the **source** repository's defaults;
+  `throttle.destination` overrides the **destination** repository's.
+- The merge is per knob: a knob you set here wins, a knob you leave unset keeps
+  the repository's value. Pinning one knob never drops the repository's others.
+- Omit `migrate.throttle` entirely and each side simply uses its own repository's
+  defaults.
+
+The two sides never mix. A cap on the source constrains only the read connection,
+because kopia's limits are **per connection** and a replication opens two of them
+under two separate kopia configurations.
+
+/// note | Why the cap isn't a flag on `snapshot migrate`
+
+`kopia snapshot migrate` has no speed options at all. The only lever kopia offers
+is `kopia repository throttle set`, which writes the limits into a *connection's*
+config — so Kopiur connects each side, applies that side's limits, and lets the
+migrate (which reopens those configs) inherit them. That is also why each side
+needs its own block: there is nothing repository-wide to inherit. Applying a cap
+to the read-only source connection is fine — kopia accepts `throttle set` there —
+so a `mode: ReadOnly` source is throttled like any other.
+
+If either application fails, the run **fails** rather than proceeding uncapped:
+saturating exactly the link you asked to protect is worse than not running. The
+mover logs `applied repository throttle` once per capped connection (twice for a
+healthy replication), which is the quickest way to confirm the limits landed:
+
+```console
+$ kubectl -n billing logs job/nas-primary-to-offsite-srepl-1765440000 | grep 'applied repository throttle'
+```
+
+///
+
+/// warning | A byte cap bites much harder than its number suggests
+
+Byte-rate caps apply to **cold** backend traffic only — content already in the
+mover's kopia cache is served without touching the limiter, so a warm re-run can
+look entirely unthrottled. And on small-object workloads the effective throughput
+lands far below the nominal number: a measured 2 MB/s cap took ~14 s to move a
+28 KiB cold repository, while caps of 10 MB/s and above often did not bind at all
+at that size. Set these as a **ceiling for large transfers**, generously, and
+measure against your own data — a number picked to "feel safe" can turn a nightly
+replication into one that never finishes.
+
+///
+
+/// warning | New CRD fields need `kubectl apply`, not just `helm upgrade`
+
+`migrate.throttle` is a new CRD field. Helm's `crds/` directory is **install-only**
+— a `helm upgrade` never updates CRD schemas — so on a helm-CLI upgrade an
+apiserver running the old schema **silently prunes** the field from your manifest:
+the object admits cleanly, `kubectl get -o yaml` shows no `throttle`, and the runs
+stay uncapped with nothing to see. Apply the CRDs first (`kubectl apply
+--server-side -f deploy/crds/`), or use a GitOps flow with a `CreateReplace` CRD
+policy. See [CRD lifecycle](install.md#crd-lifecycle).
+
+///
+
 ## Pruning the copies
 
 `pruning` is exactly one of three modes; **absent means `none`**. Whatever the mode, pruning only ever considers snapshots **this replication created** (the copy CRs it labels) — never the destination's own directly-written snapshots, and never another replication's copies.
@@ -137,7 +222,7 @@ Matching zero identities is a **successful no-op** (`NoIdentitiesMatched`), not 
 - **A dedicated mover ServiceAccount.** Replication movers create/patch/delete `Snapshot` CRs (the copies), which the ordinary backup mover must never be able to do — so they run as the dedicated `kopiur-snapshot-replication-mover` ServiceAccount with its own narrowly-scoped Role, generated alongside the rest of the [RBAC](rbac.md).
 - **No destination maintenance behind your back.** The mover always disables kopia's auto-maintenance; the destination's own [`Maintenance`](maintenance.md) remains the only compaction that runs there.
 - **Every run is counted.** `kopiur_replication_runs_total{kind,trigger,outcome}` records each finished run, so "the nightly copy has been failing" is alertable without watching conditions. `trigger` separates `cron` from the [requested](#run-it-now) runs.
-- **Size the first run.** A full-history first replication of a large repository moves everything once (idempotent thereafter). Raise `migrate.parallel`, consider `latestOnly: true` for seeding, and note the mover Job's deadline can be tuned via `mover`/`failurePolicy` knobs on big estates.
+- **Size the first run.** A full-history first replication of a large repository moves everything once (idempotent thereafter). Raise `migrate.parallel`, consider `latestOnly: true` for seeding, and note the mover Job's deadline can be tuned via `mover`/`failurePolicy` knobs on big estates. If that first run is what worries the network, cap it with [`migrate.throttle`](#throttling-a-replication) rather than by shrinking the selection — but leave headroom, or the deadline becomes the thing that fails.
 
 ## See also
 

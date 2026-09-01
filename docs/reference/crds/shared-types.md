@@ -100,10 +100,44 @@ cache. See [movers](../../movers.md).
   mover Job so finished Jobs self-GC. Defaults to 1h when neither the repo nor
   the recipe sets one.
 - **`throttle`** — repository throttle limits (`kopia repository throttle set`)
-  applied by every mover after it connects, so a run doesn't saturate the link or
-  hammer the object store: `uploadBytesPerSecond`, `downloadBytesPerSecond`,
-  `readOpsPerSecond`, `writeOpsPerSecond` (each unset leaves kopia's current
-  limit).
+  applied by every mover after it connects to this repository, so a run doesn't
+  saturate the link or hammer the object store: `uploadBytesPerSecond`,
+  `downloadBytesPerSecond`, `readOpsPerSecond`, `writeOpsPerSecond` (each unset
+  leaves kopia's current limit). Honored by the transfer movers — bootstrap,
+  backup, restore, maintenance, verification, repository replication, snapshot
+  replication and seed. kopia's limits are **per connection**, so a run that opens two
+  repositories caps each from *that* repository's own `moverDefaults`: a
+  [`SnapshotReplication`](snapshot-replication.md) caps its source connection
+  from the source repo's defaults and its destination connection from the
+  destination repo's, each overridable per CR via
+  [`spec.migrate.throttle`](snapshot-replication.md#migrate). A migrate-mode
+  [`seed`](repository.md#seed) is the same shape: the replica's connection is
+  capped from the *replica's* defaults and this repository's from its own, each
+  overridable while the seed is armed via `spec.seed.migrate.throttle.source` /
+  `.destination`.
+
+  Three things it does **not** cap today: the interactive
+  [`serve`/browse](../../server.md) session (a read-only UI session, not a batch
+  transfer); a `RepositoryReplication`'s **destination** side, because `kopia
+  repository sync-to` copies blobs without opening the destination as a
+  repository — its caps live on [`spec.sync`](repository-replication.md) instead;
+  and **batched snapshot deletions and pins**, whose work specs leave the throttle
+  block empty, so a repository-wide cap does not currently reach them (deletion
+  load is instead bounded by per-repository batching and the cluster-wide
+  `maxConcurrentDeleteJobs` backstop).
+
+/// warning | A byte cap bites much harder than its number suggests
+
+A `*BytesPerSecond` cap is enforced against **cold** backend traffic only —
+content already in the mover's kopia cache is read without touching the limiter,
+so a warm re-run can look completely unthrottled. And on small-object workloads
+the effective throughput lands far below the nominal rate: a measured 2 MB/s cap
+took ~14 s to move a 28 KiB cold repository, while caps of 10 MB/s and up often
+did not bind at all at that size. Treat these as a **ceiling for large transfers**
+— set them generously and verify against your own data, rather than tuning them
+down to a number that looks safe.
+
+///
 
 The `securityContext`/`podSecurityContext`/`resources`/`cache` fields resolve by
 field-wise merge: a repo-wide default composes with a partial per-recipe

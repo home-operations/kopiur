@@ -48,7 +48,7 @@ use kopiur_api::consts::{
     CONFIG_LABEL, ORIGIN_LABEL, REPOSITORY_UID_LABEL, SNAPSHOT_ID_LABEL, SNAPSHOT_REPLICATION_LABEL,
 };
 use kopiur_api::{Repository, Snapshot, SnapshotPolicy, SnapshotReplication};
-use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
+use kopiur_e2e::{E2E_NAMESPACE, Need, World, consts, default_timeout, poll_interval, wait_until};
 
 /// In-pod mount path every DESTINATION repository pins (see module docs).
 const DEST_REPO_PATH: &str = "/repo-dst";
@@ -217,6 +217,34 @@ async fn snapshot_replication_copies_history_between_filesystem_repos() {
 
     // 1. Source history: seed (repo + policy + snapshot 1), then a second
     //    distinct backup under the same policy.
+    //
+    //    The source repository is created HERE rather than by `ensure_seed` (which
+    //    is idempotent and will find it present) so it can carry its own
+    //    `moverDefaults.throttle` — the base layer the per-CR override below has to
+    //    merge over. Caps are deliberately GENEROUS (100 MiB/s, 10k ops/s): the
+    //    point is to prove the limits reach kopia on both connections, and a low
+    //    byte cap is far more punitive than nominal on a small-object cold-cache
+    //    migrate (a 2 MB/s cap measured ~14s for 28 KiB), which would only make
+    //    this scenario slow and flaky.
+    ensure_repo(&client, "srepl-src").await;
+    {
+        let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        create_idempotent(
+            &repos,
+            &cr(repository_json(
+                REPO_SRC,
+                "srepl-src",
+                serde_json::json!({
+                    "moverDefaults": { "throttle": {
+                        "downloadBytesPerSecond": 104857600,
+                        "readOpsPerSecond": 10000
+                    } }
+                }),
+            )),
+            "create source Repository with moverDefaults.throttle",
+        )
+        .await;
+    }
     ensure_seed(&client, REPO_SRC, POLICY, B1, "srepl-src").await;
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     create_idempotent(
@@ -274,7 +302,13 @@ async fn snapshot_replication_copies_history_between_filesystem_repos() {
         "srepl-dst",
         DST_SECRET,
         serde_json::json!({
-            "maintenance": { "enabled": false }
+            "maintenance": { "enabled": false },
+            // The DESTINATION's own defaults — a separate repository, so a
+            // separate throttle layer (kopia's limits are per connection).
+            "moverDefaults": { "throttle": {
+                "uploadBytesPerSecond": 104857600,
+                "writeOpsPerSecond": 10000
+            } }
         }),
     )
     .await;
@@ -291,12 +325,38 @@ async fn snapshot_replication_copies_history_between_filesystem_repos() {
             "spec": {
                 "sourceRef": { "kind": "Repository", "name": REPO_SRC },
                 "destinationRef": { "kind": "Repository", "name": REPO_DST },
-                "schedule": { "cron": "* * * * *" }
+                "schedule": { "cron": "* * * * *" },
+                // Per-CR, per-side overrides (#374). Each side sets ONE knob, so
+                // the merged block must also carry the knob that side's
+                // repository defaulted — the field-wise merge, end to end.
+                "migrate": { "throttle": {
+                    "source": { "downloadBytesPerSecond": 209715200 },
+                    "destination": { "uploadBytesPerSecond": 209715200 }
+                } }
             }
         })),
         "create SnapshotReplication",
     )
     .await;
+    // The CRD must actually carry the new fields — an apiserver whose CRD schema
+    // predates them PRUNES them silently, which is the exact #374 symptom this
+    // whole change is about. Read it back before asserting on downstream effects.
+    {
+        let live = serde_json::to_value(repls.get(REPL).await.expect("get SnapshotReplication"))
+            .unwrap_or_default();
+        assert_eq!(
+            live.pointer("/spec/migrate/throttle/source/downloadBytesPerSecond")
+                .and_then(|v| v.as_u64()),
+            Some(209715200),
+            "spec.migrate.throttle survived admission (a pruned field means a stale CRD): {live}"
+        );
+        assert_eq!(
+            live.pointer("/spec/migrate/throttle/destination/uploadBytesPerSecond")
+                .and_then(|v| v.as_u64()),
+            Some(209715200),
+            "{live}"
+        );
+    }
 
     // The per-slot mover Job's inline work-spec env is the controller↔mover
     // contract seam (mirrors the replication.rs #216 guard): the operation must
@@ -363,6 +423,53 @@ async fn snapshot_replication_copies_history_between_filesystem_repos() {
             "unset knob {absent} must be elided from the wire: {op}"
         );
     }
+    // Both merged throttle blocks ride the wire, one per connection: the SOURCE
+    // side on the work spec's own `throttle`, the DESTINATION side on the op's
+    // `destinationThrottle`. Each must show the CR's override AND the knob its
+    // own repository defaulted — and NOT the other repository's knobs, which is
+    // how a crossed-sides merge would show up.
+    let src_throttle = spec
+        .get("throttle")
+        .unwrap_or_else(|| panic!("work spec must carry the merged SOURCE throttle: {spec}"));
+    assert_eq!(
+        src_throttle
+            .get("downloadBytesPerSecond")
+            .and_then(|v| v.as_u64()),
+        Some(209715200),
+        "the CR's source override wins: {src_throttle}"
+    );
+    assert_eq!(
+        src_throttle
+            .get("readOpsPerSecond")
+            .and_then(|v| v.as_u64()),
+        Some(10000),
+        "the SOURCE repo's moverDefaults knob survives the partial override: {src_throttle}"
+    );
+    assert!(
+        src_throttle.get("uploadBytesPerSecond").is_none(),
+        "the DESTINATION repo's upload default must not cross into the source: {src_throttle}"
+    );
+    let dst_throttle = op
+        .get("destinationThrottle")
+        .unwrap_or_else(|| panic!("op must carry the merged DESTINATION throttle: {op}"));
+    assert_eq!(
+        dst_throttle
+            .get("uploadBytesPerSecond")
+            .and_then(|v| v.as_u64()),
+        Some(209715200),
+        "the CR's destination override wins: {dst_throttle}"
+    );
+    assert_eq!(
+        dst_throttle
+            .get("writeOpsPerSecond")
+            .and_then(|v| v.as_u64()),
+        Some(10000),
+        "the DESTINATION repo's moverDefaults knob survives: {dst_throttle}"
+    );
+    assert!(
+        dst_throttle.get("readOpsPerSecond").is_none(),
+        "the SOURCE repo's readOps default must not cross into the destination: {dst_throttle}"
+    );
 
     // 4. A run succeeds and records lastReplicated + the run counters. The
     //    counter assert tolerates an in-place nextest retry (copies may already
@@ -396,6 +503,29 @@ async fn snapshot_replication_copies_history_between_filesystem_repos() {
         copied + already,
         2,
         "the run must account for both source snapshots (copied {copied} + alreadyPresent {already}): {s1}"
+    );
+
+    // 4b. #374 regression guard: a run that succeeded must ALSO have capped both
+    //     of its connections. The srepl mover opens exactly TWO repositories —
+    //     the source (read-only, under its own kopia config, the only cap
+    //     `snapshot migrate` can honor on the read side) and the destination —
+    //     and neither goes through the generic connect funnel, so each is its own
+    //     chance to ship #374 again. The line is emitted once per APPLICATION and
+    //     only after kopia accepted the limits, so two occurrences in ONE pod can
+    //     only mean both connections were capped; counting per pod (not across
+    //     pods) is what keeps deleting ONE of the two applications from staying
+    //     green on a suite that runs several replication pods.
+    kopiur_e2e::wait::wait_for_pod_log_times(
+        &client,
+        E2E_NAMESPACE,
+        &selector,
+        consts::THROTTLE_APPLIED_LOG,
+        2,
+    )
+    .await
+    .expect(
+        "the snapshot-replication mover must cap BOTH the source and the destination \
+         connection (#374); one occurrence means one side's throttle is gone",
     );
 
     // kstatus two-pass heal guard: the mover stamps the terminal status, the

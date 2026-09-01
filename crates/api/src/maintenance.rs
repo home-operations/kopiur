@@ -609,7 +609,24 @@ pub struct ManualRunStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<ManualRunPhase>,
     /// RFC3339 instant the run reached a terminal phase.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Deliberately serialized EVEN WHEN `None` (no `skip_serializing_if`), for
+    // the same reason as `common::ReplicationManualRunStatus::completed_at`: a
+    // non-terminal phase emits `"completedAt": null` so the merge-patch CLEARS
+    // the previous run's stamp instead of leaving it standing over a fresh
+    // `Running` (#394). The apiserver answers that null by deleting the key
+    // (plain RFC-7386) or by storing the null verbatim — a nullable CRD field on
+    // k8s 1.33 was observed doing the latter — and both decode back to `None`,
+    // so no stale timestamp survives either way. Maintenance patches `manualRun`
+    // unconditionally (no noop guard), so here the stake is a truthful status
+    // rather than a non-converging write loop.
+    //
+    // This depends on `patch_status` sending `kube::api::Patch::Merge`
+    // (`crates/controller/src/io/apply.rs`). Under `Patch::Apply` an explicit
+    // null does NOT clear the field, and this contract silently breaks.
+    //
+    // Kept a plain comment rather than rustdoc on purpose: doc comments become
+    // the CRD `description` (`kubectl explain`, docs/field-reference.md).
+    #[serde(default)]
     pub completed_at: Option<String>,
 }
 
@@ -675,6 +692,64 @@ mod tests {
                 "{p:?}"
             );
         }
+    }
+
+    #[test]
+    fn manual_run_status_roundtrips_camel_case_and_nulls_a_missing_completion() {
+        // Parsed the cluster's way (YAML -> serde_json::Value -> typed), which
+        // is the only path that proves the camelCase wire names land.
+        let status: MaintenanceStatus = from_yaml(
+            "manualRun:\n  requestedAt: 2026-06-11T12:00:00Z\n  mode: full\n  phase: Succeeded\n  completedAt: 2026-06-11T12:01:42Z\n",
+        );
+        let manual = status.manual_run.expect("manualRun decodes");
+        assert_eq!(manual.requested_at.as_deref(), Some("2026-06-11T12:00:00Z"));
+        assert_eq!(manual.mode, Some(ManualRunMode::Full));
+        assert_eq!(manual.phase, Some(ManualRunPhase::Succeeded));
+        assert_eq!(manual.completed_at.as_deref(), Some("2026-06-11T12:01:42Z"));
+        let json = serde_json::to_value(&manual).unwrap();
+        assert_eq!(json["requestedAt"], "2026-06-11T12:00:00Z");
+        assert_eq!(json["mode"], "full");
+        assert_eq!(json["phase"], "Succeeded");
+        assert_eq!(json["completedAt"], "2026-06-11T12:01:42Z");
+
+        // #394: a non-terminal run emits an EXPLICIT null completedAt, so the
+        // merge-patch clears the previous run's stamp rather than leaving it
+        // standing over a fresh `Running`. Whether the apiserver deletes the key
+        // or stores the null, it decodes back to `None`.
+        let running = serde_json::to_value(ManualRunStatus {
+            requested_at: Some("2026-06-11T13:00:00Z".into()),
+            mode: Some(ManualRunMode::Quick),
+            phase: Some(ManualRunPhase::Running),
+            completed_at: None,
+        })
+        .unwrap();
+        assert_eq!(
+            running,
+            serde_json::json!({
+                "requestedAt": "2026-06-11T13:00:00Z",
+                "mode": "quick",
+                "phase": "Running",
+                "completedAt": null,
+            })
+        );
+        // The explicit null reads back as "no completion instant".
+        let back: ManualRunStatus = serde_json::from_value(running).unwrap();
+        assert!(back.completed_at.is_none());
+        assert_eq!(
+            serde_json::to_value(ManualRunStatus::default()).unwrap(),
+            serde_json::json!({ "completedAt": null })
+        );
+
+        // A status that never requested a run still has NO manualRun key —
+        // the parent field keeps its own skip_serializing_if.
+        let never: MaintenanceStatus = from_yaml("observedGeneration: 3\n");
+        assert!(never.manual_run.is_none());
+        assert!(
+            serde_json::to_value(&never)
+                .unwrap()
+                .get("manualRun")
+                .is_none()
+        );
     }
 
     #[test]

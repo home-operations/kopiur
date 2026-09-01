@@ -371,7 +371,7 @@ pub async fn ensure_snapshot_replication_mover_identity(
         .is_none()
     {
         return Err(Error::MissingDependency(
-            missing_workload_identity_sa_message(&sa_name, ns, *first_cloud),
+            missing_workload_identity_sa_message(&sa_name, ns, *first_cloud, WI_CONSUMER_MOVER),
         ));
     }
     let mut rb = build_mover_rolebinding(ns, &sa_name, role_kind, &dedicated);
@@ -401,12 +401,15 @@ fn short_hash(s: &str) -> String {
 }
 
 /// The actionable message for a workload-identity ServiceAccount that does not
-/// exist in the mover namespace (what / why / how-to-fix). Pure so the exact
-/// text is unit-asserted. `cloud` selects the annotation hint the user needs.
+/// exist in the consumer's namespace (what / why / how-to-fix). Pure so the exact
+/// text is unit-asserted. `cloud` selects the annotation hint the user needs;
+/// `consumer` names the pod that needs the SA (`"the mover Job"`, `"the kopia
+/// web-UI server (spec.server)"`) so the user knows WHICH namespace matters.
 pub fn missing_workload_identity_sa_message(
     sa: &str,
     ns: &str,
     cloud: kopiur_api::creds::WorkloadIdentityCloud,
+    consumer: &str,
 ) -> String {
     use kopiur_api::creds::WorkloadIdentityCloud;
     let annotation = match cloud {
@@ -419,11 +422,19 @@ pub fn missing_workload_identity_sa_message(
     };
     format!(
         "backend auth.workloadIdentity names ServiceAccount `{sa}`, but it does not exist in \
-         namespace `{ns}` where the mover Job runs. Kopiur never creates this ServiceAccount — \
+         namespace `{ns}` where {consumer} runs. Kopiur never creates this ServiceAccount — \
          its cloud-federation annotations are your contract with the cloud's identity webhook. \
          Fix: create ServiceAccount `{sa}` in `{ns}` with the federation binding ({annotation})."
     )
 }
+
+/// The consumer phrase every mover launch site passes to
+/// [`missing_workload_identity_sa_message`].
+pub const WI_CONSUMER_MOVER: &str = "the mover Job";
+
+/// The consumer phrase the kopia web-UI server passes to
+/// [`missing_workload_identity_sa_message`].
+pub const WI_CONSUMER_SERVER: &str = "the kopia web-UI server (spec.server)";
 
 /// The identity a mover Job runs as, resolved from the repository backend(s):
 /// either the user's workload-identity ServiceAccount or the operator-minted
@@ -507,7 +518,7 @@ pub async fn ensure_mover_identity(
     {
         let cloud = wi[0].1;
         return Err(Error::MissingDependency(
-            missing_workload_identity_sa_message(&sa_name, ns, cloud),
+            missing_workload_identity_sa_message(&sa_name, ns, cloud, WI_CONSUMER_MOVER),
         ));
     }
     let rb = build_wi_rolebinding(ns, &sa_name, role_kind, role_name);
@@ -517,6 +528,61 @@ pub async fn ensure_mover_identity(
     Ok(MoverRunIdentity {
         service_account: Some(sa_name),
         azure_workload_identity: azure,
+    })
+}
+
+/// Resolve the identity the kopia web-UI server Deployment runs as, in the server
+/// namespace `ns` — the server sibling of [`ensure_mover_identity`] (#416: the
+/// server used to receive `ctx.mover_service_account` verbatim, so a
+/// workload-identity backend could never connect and a `ClusterRepository` server
+/// in a namespace no mover had visited referenced a nonexistent SA).
+///
+/// * A backend with `auth.workloadIdentity` ⇒ the pod runs as the **user's**
+///   ServiceAccount, preflighted with a `get` and never applied (its
+///   cloud-federation annotations are user-owned; SSA would contend with them).
+///   Absent ⇒ [`Error::MissingDependency`] with the what/why/fix message. Unlike
+///   movers, NO RoleBinding is created: the `serve` entrypoint makes zero
+///   Kubernetes API calls, so binding the mover role's `*/status` PATCH verbs to
+///   a long-lived, user-facing pod would be a gratuitous privilege grant.
+/// * Otherwise, with a configured mover SA ⇒ the SA is minted (SA only — no
+///   RoleBinding, same least-privilege rationale) so the Deployment never
+///   references a ServiceAccount that does not exist. If a mover later runs in
+///   the namespace, [`ensure_mover_rbac`] adds its binding idempotently.
+/// * No workload identity and no configured SA ⇒ the namespace default SA.
+pub async fn ensure_server_identity(
+    client: &kube::Client,
+    ns: &str,
+    backend: &kopiur_api::backend::Backend,
+    ctx_sa: Option<&str>,
+) -> Result<MoverRunIdentity> {
+    use kopiur_api::creds::{WorkloadIdentityCloud, backend_workload_identity};
+    let Some((wi, cloud)) = backend_workload_identity(backend) else {
+        if let Some(sa_name) = ctx_sa {
+            let sa = build_mover_service_account(ns, sa_name);
+            let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), ns);
+            apply(&sa_api, sa_name, &sa).await?;
+        }
+        return Ok(MoverRunIdentity {
+            service_account: ctx_sa.map(str::to_string),
+            azure_workload_identity: false,
+        });
+    };
+    let sa_name = wi.service_account_name.clone();
+    // Preflight: the SA must already exist (user-created, cloud-annotated).
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), ns);
+    if sa_api
+        .get_opt(&sa_name)
+        .await
+        .map_err(Error::Kube)?
+        .is_none()
+    {
+        return Err(Error::MissingDependency(
+            missing_workload_identity_sa_message(&sa_name, ns, cloud, WI_CONSUMER_SERVER),
+        ));
+    }
+    Ok(MoverRunIdentity {
+        service_account: Some(sa_name),
+        azure_workload_identity: cloud == WorkloadIdentityCloud::Azure,
     })
 }
 

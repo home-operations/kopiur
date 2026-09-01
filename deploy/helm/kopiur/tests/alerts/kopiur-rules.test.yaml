@@ -194,17 +194,17 @@ tests:
             exp_annotations:
               summary: "Snapshot apps/daily-y failed"
               description: "Snapshot apps/daily-y is Failed and its policy has not completed a newer successful backup."
-  # 7. Repository circuit breaker open (#345): the Degraded phase is STABLE while
-  #    the breaker is open (M4), so the series holds 1 continuously and `for: 15m`
-  #    completes. Before the window it is pending, not firing; after recovery
-  #    (store-backed phase series flips to Ready — the Degraded series VANISHES,
-  #    it is never a 0) the alert resolves.
+  # 7. Repository circuit breaker open (#345, reason-split since #413/#414): the
+  #    breaker gauge exists ONLY while the breaker is open and carries the cause.
+  #    A HARD cause (unreachable/vanished) pages warning after 15m; the
+  #    slow-connect cause (timed_out) pages info after 30m via its own alert and
+  #    must NOT fire the hard one — maintenance keeps running there and the
+  #    deadline escalates, so the remediation text is different. The series
+  #    VANISHES on recovery (never a lingering 0), resolving both.
   - interval: 1m
     input_series:
-      - series: 'kopiur_resource_phase{kind="Repository", namespace="apps", name="nas", phase="Degraded"}'
+      - series: 'kopiur_repository_breaker_open{kind="Repository", namespace="apps", name="nas", reason="unreachable"}'
         values: "1x59 stale"
-      - series: 'kopiur_resource_phase{kind="Repository", namespace="apps", name="nas", phase="Ready"}'
-        values: "_x60 1x60"
     alert_rule_test:
       - eval_time: 10m
         alertname: KopiurRepositoryBreakerOpen
@@ -220,8 +220,38 @@ tests:
             exp_annotations:
               summary: "Repository circuit breaker open for Repository apps/nas"
               description: "The backend health probe kept failing past its threshold, so kopiur opened the circuit breaker: backups, maintenance, and replication against this repository are paused (Snapshots park Pending, they are not lost). Recovery is automatic once a connect succeeds — nothing needs restarting. Run `kubectl describe Repository nas` and check the BackendReachable condition for the cause."
+      - eval_time: 30m
+        alertname: KopiurRepositoryConnectSlow
+        exp_alerts: []
       - eval_time: 90m
         alertname: KopiurRepositoryBreakerOpen
+        exp_alerts: []
+  # 7b. Slow-connect breaker (#414): reason timed_out fires ONLY the info-level
+  #     KopiurRepositoryConnectSlow (after its longer 30m window) and never the
+  #     hard-outage alert.
+  - interval: 1m
+    input_series:
+      - series: 'kopiur_repository_breaker_open{kind="ClusterRepository", namespace="", name="b2", reason="timed_out"}'
+        values: "1x89 stale"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KopiurRepositoryConnectSlow
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: KopiurRepositoryBreakerOpen
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: KopiurRepositoryConnectSlow
+        exp_alerts:
+          - exp_labels:
+              kind: ClusterRepository
+              name: b2
+              severity: info
+            exp_annotations:
+              summary: "Repository connects keep exceeding the bootstrap deadline for ClusterRepository /b2"
+              description: "kopia repository connect keeps being killed by the bootstrap Job deadline, so the circuit breaker is open: backups and replication are paused (Snapshots park Pending), while maintenance keeps running and kopiur retries with a progressively longer deadline — this usually self-heals once a longer connect succeeds and index compaction catches up. If it persists, raise spec.bootstrap.failurePolicy.activeDeadlineSeconds and check that maintenance is actually completing (`kubectl describe ClusterRepository b2`, IndexBlobHealth and BackendReachable conditions)."
+      - eval_time: 120m
+        alertname: KopiurRepositoryConnectSlow
         exp_alerts: []
   # 8. Sustained parked backups (#345): kopiur_snapshot_gated is store-backed, so
   #    a parked population is a present series > 0 and recovery removes the series

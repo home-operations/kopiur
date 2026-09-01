@@ -51,6 +51,9 @@ rand = "0.10"
 
 [dev-dependencies]
 serial_test = { workspace = true }
+# Apply RFC-7386 merge patches the way the apiserver does, so the status-patch
+# convergence tests can replay a reconcile loop instead of asserting one pass.
+json-patch = { workspace = true }
 # Collect mock request bodies in the leader-election protocol tests.
 http-body-util = "0.1"
 # `test-util` enables paused tokio time (`start_paused`) so the renewal-loss
