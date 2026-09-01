@@ -2267,10 +2267,27 @@ fn gated_snapshot_counts(snapshots: &[Arc<Snapshot>]) -> Vec<GatedSnapshots> {
 /// runs held by preflight, staging or a not-Ready repository as pool queueing.
 /// Pure so the counting rule is unit-tested off-OTel.
 fn waiting_for_slot(s: &Snapshot) -> bool {
-    s.status.as_ref().is_some_and(|st| {
-        st.conditions.iter().any(|c| {
-            c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION && c.status == "False"
-        })
+    let Some(st) = s.status.as_ref() else {
+        return false;
+    };
+    // A TERMINAL run is not queued, whatever its conditions say. This is a
+    // bound, not a belt-and-braces check: if the Job-creation status patch fails
+    // AFTER `apply_mover_objects` succeeded, the Snapshot keeps a stale
+    // `RepositorySlotAvailable=False` and can never shed it — the next reconcile
+    // finds the Job already exists and returns long before the pool gate, so the
+    // heal never runs again. Without this the gauge would emit `1` for that run
+    // forever, including well past `Succeeded`, contradicting its own "the
+    // series drains to absence" contract and holding a queue-depth alert on.
+    //
+    // Uses `SnapshotPhase::is_terminal` rather than a local `matches!` so the
+    // partition stays in ONE exhaustive place: a new phase must be classified
+    // there (and `Unknown` deliberately counts as not-terminal, so a newer
+    // operator's genuinely-queued run stays visible).
+    if st.phase.as_ref().is_some_and(|p| p.is_terminal()) {
+        return false;
+    }
+    st.conditions.iter().any(|c| {
+        c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION && c.status == "False"
     })
 }
 
@@ -3662,6 +3679,75 @@ mod tests {
         let mut bare = snapshot_cr("apps", "bare", None, serde_json::json!({}));
         bare.status = None;
         assert!(!waiting_for_slot(&bare));
+    }
+
+    #[test]
+    fn a_terminal_snapshot_never_counts_as_queued_even_carrying_a_stale_false() {
+        // The bound on the one path that can strand the condition: the
+        // Job-creation status patch failing AFTER the Job was applied. That
+        // Snapshot keeps `RepositorySlotAvailable=False` and can never shed it
+        // (the next reconcile sees the Job and returns before the gate), so
+        // without the terminal check the gauge would emit 1 for it forever.
+        for phase in ["Succeeded", "Failed", "Unchanged", "Discovered"] {
+            let stranded = snapshot_cr(
+                "apps",
+                "stranded",
+                Some("daily"),
+                serde_json::json!({
+                    "phase": phase,
+                    "conditions": [{
+                        "type": "RepositorySlotAvailable",
+                        "status": "False",
+                        "reason": "WaitingForSlot",
+                        "message": "waiting for a mover slot",
+                        "lastTransitionTime": "2026-01-01T00:00:00Z",
+                    }],
+                }),
+            );
+            assert!(!waiting_for_slot(&stranded), "phase={phase}");
+        }
+        // Still in flight ⇒ genuinely queued, condition honored.
+        for phase in ["Pending", "Running"] {
+            let queued = snapshot_cr(
+                "apps",
+                "queued",
+                Some("daily"),
+                serde_json::json!({
+                    "phase": phase,
+                    "conditions": [{
+                        "type": "RepositorySlotAvailable",
+                        "status": "False",
+                        "reason": "WaitingForSlot",
+                        "message": "waiting for a mover slot",
+                        "lastTransitionTime": "2026-01-01T00:00:00Z",
+                    }],
+                }),
+            );
+            assert!(waiting_for_slot(&queued), "phase={phase}");
+        }
+    }
+
+    #[test]
+    fn a_succeeded_snapshot_with_a_stale_park_emits_no_series() {
+        // Same bound, asserted through the actual exposition rather than the
+        // predicate: the contract is "the series drains to absence".
+        let m = Metrics::new();
+        let (reader, mut writer) = reflector::store::<Snapshot>();
+        let mut stranded = queued_snapshot("apps", "stranded", "nas");
+        stranded.status.as_mut().unwrap().phase = Some(SnapshotPhase::Succeeded);
+        writer.apply_watcher_event(&watcher::Event::Apply(stranded));
+        let (_, repos, crepos, restores) = empty_stores();
+        m.register_resource_observers(ResourceStores {
+            snapshots: reader,
+            repositories: repos.0,
+            cluster_repositories: crepos.0,
+            restores: restores.0,
+        });
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert!(
+            !text.contains("kopiur_snapshot_waiting_for_slot{"),
+            "a Succeeded run carrying a stale park must emit NO series: {text}"
+        );
     }
 
     #[test]

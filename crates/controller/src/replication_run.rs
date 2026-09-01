@@ -476,6 +476,15 @@ where
 /// contract — the Job is already created, and failing the reconcile over a
 /// cosmetic condition flip would re-run the gate against a pool the new Job is
 /// now in.
+///
+/// **Also called from the in-flight arm**, and that is not redundant. Once the
+/// Job exists the reconcile returns at the `job_api.get_opt` branch and never
+/// reaches the gate again, so a heal that failed at spawn time would otherwise
+/// leave the CR advertising `False` for a whole schedule interval — until the
+/// NEXT run's spawn healed it. Re-attempting on the in-flight arm closes that
+/// window to one requeue. It costs nothing when there is nothing to heal: the
+/// caller computes `heal` from conditions it already holds, and this returns
+/// before any IO when it is `false`.
 pub async fn heal_replication_slot_condition<K>(
     api: &Api<K>,
     obj: &K,
@@ -518,7 +527,8 @@ pub async fn heal_replication_slot_condition<K>(
         tracing::debug!(
             replication = %name,
             error = %e,
-            "could not clear RepositorySlotAvailable after admission; retried next reconcile"
+            "could not clear RepositorySlotAvailable after admission; retried while the run \
+             is in flight, else cleared at the next run's spawn"
         );
     }
 }

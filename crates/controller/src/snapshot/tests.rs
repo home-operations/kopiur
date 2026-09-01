@@ -4475,10 +4475,11 @@ fn the_pool_gate_and_preflight_gate_agree_on_which_phases_launch() {
 #[test]
 fn a_failed_run_retried_through_pending_consults_the_gate() {
     use kopiur_api::snapshot::SnapshotPhase as P;
-    // A retry is a run whose phase is back at Pending (a fresh Snapshot, or one
-    // reset by a retry path): it goes through the creation path, so it MUST be
-    // admitted through the pool like any other launch — a retry storm behind a
-    // saturated backend is precisely what the cap exists to bound.
+    // A retry is a NEW Snapshot (that is how a retry happens — see
+    // `RunDecision::TerminalFailed`), so it arrives at the creation path with
+    // no phase or `Pending` and MUST be admitted through the pool like any
+    // other launch — a retry storm behind a saturated backend is precisely what
+    // the cap exists to bound.
     assert!(should_run_pool_gate(Some(&P::Pending)));
     // While the CR still SAYS Failed it mints no Job at all
     // (`RunDecision::TerminalFailed`), so the gate correctly stays out of it.

@@ -34,6 +34,7 @@ use crate::io::{self, ResolvedRepository};
 use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
 use crate::metrics::{ReplicationKind, ReplicationRunTrigger};
 use crate::naming::short_hash;
+use crate::pool::slot_gate_is_false;
 use crate::replication_run::{
     ReplicationPoolGate, RunObservation, RunRequest, RunStall, heal_replication_slot_condition,
     idle_report, manual_replication_job_name, manual_run_request, manual_run_status,
@@ -298,7 +299,23 @@ async fn drive_schedule(
                 nudge_repository_reverify(ctx, repl, name, namespace).await;
                 Ok(Action::requeue(REQUEUE_FAILED))
             }
-            None => Ok(Action::requeue(REQUEUE_RUNNING)),
+            // In flight. Re-attempt the admission heal here: once the Job
+            // exists this reconcile returns at THIS branch and never reaches
+            // the gate again, so a heal that failed at spawn time would leave
+            // the CR advertising `False` for a whole schedule interval. Free
+            // when there is nothing to heal.
+            None => {
+                heal_replication_slot_condition(
+                    api,
+                    repl,
+                    name,
+                    repo,
+                    conditions_of,
+                    slot_gate_is_false(&conditions_of(repl)),
+                )
+                .await;
+                Ok(Action::requeue(REQUEUE_RUNNING))
+            }
         },
         None => {
             if observed.has_active {
@@ -400,7 +417,21 @@ async fn handle_manual_run(
                     "requested replication Job failed; see the Job/pod logs",
                 ))))
             }
-            None => Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING))),
+            // In flight — same reasoning as the cron arm: this is the last
+            // branch a reconcile takes while the Job lives, so the heal has to
+            // be retried here or not at all.
+            None => {
+                heal_replication_slot_condition(
+                    api,
+                    repl,
+                    name,
+                    repo,
+                    conditions_of,
+                    slot_gate_is_false(&conditions_of(repl)),
+                )
+                .await;
+                Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)))
+            }
         },
         None if recorded_running(manual, request) => {
             // The Job was TTL-reaped before its terminal state was observed:

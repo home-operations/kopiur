@@ -278,6 +278,15 @@ fn job_is_suspended(job: &Job) -> bool {
 /// not counted, so an upgrade can briefly over-admit — strictly better than the
 /// alternative, where unlabeled Jobs would be counted against every repository
 /// at once and park the whole fleet.
+///
+/// **Scoped to [`Context::watch_scope`](crate::context::Context::watch_scope).**
+/// The LIST only sees the namespaces this install watches, so under a
+/// NAMESPACED install a `ClusterRepository`'s cap bounds the mover Jobs in the
+/// watched namespace, not every namespace using that repository. That is the
+/// only answer available — a cluster-wide LIST under a namespaced install's
+/// Role RBAC is a permanent 403 that would wedge the reconcile — and it is the
+/// same scoping the batch-delete throttle and every other reconcile-time LIST
+/// already carries.
 pub async fn pool_live_counts(
     ctx: &Context,
     repo_pool_value: &str,

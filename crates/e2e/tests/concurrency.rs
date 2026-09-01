@@ -439,25 +439,15 @@ async fn a_restore_is_never_queued_behind_backups() -> anyhow::Result<()> {
             )
             .await?;
 
-        // The restore's Job appears even though the pool is full. Generous
-        // window: the restore still resolves its source and stages a target PVC
-        // first, and none of that is what this asserts — the claim is that it is
-        // never HELD, i.e. it never carries the queued condition.
-        wait_until(
-            &format!("{RESTORE} mover Job created while the pool is full"),
-            Duration::from_secs(180),
-            INVARIANT_POLL,
-            || async { Ok(jobs.get_opt(RESTORE).await?.map(|_| ())) },
-        )
-        .await?;
-        anyhow::ensure!(
-            slot_condition_status(&restores, RESTORE).await.as_deref() != Some("False"),
-            "a Restore must NEVER carry {SLOT_CONDITION}=False — restores are \
-             admitted at and over the cap"
-        );
-
-        // And the co-created backup DID park, which is what proves the pool was
-        // genuinely full when the restore was let through.
+        // ORDER MATTERS, and it is the opposite of the narrative order.
+        //
+        // `PARKED` being queued is a TRANSIENT state — it lasts only until the
+        // holder's 45s mover finishes. `wait_until` cannot observe a state that
+        // has already passed, so polling for it AFTER a slow restore-Job wait
+        // would, on a loaded runner, start looking only once PARKED had already
+        // been admitted: it would burn its whole window and fail as "the backup
+        // never parked" when in fact the gate worked perfectly. Poll for the
+        // ephemeral fact FIRST, while the holder is still known to be running.
         wait_until(
             &format!("{PARKED} queued behind the full pool"),
             Duration::from_secs(180),
@@ -470,6 +460,25 @@ async fn a_restore_is_never_queued_behind_backups() -> anyhow::Result<()> {
             },
         )
         .await?;
+
+        // The restore's Job appears even though the pool is full — and the park
+        // just observed is what makes that non-vacuous. This half is safe to
+        // check second: a Job, once created, PERSISTS to its TTL, so unlike the
+        // park there is no window to miss. Generous window because the restore
+        // still resolves its source and stages a target PVC first; none of that
+        // is what this asserts — the claim is that it is never HELD.
+        wait_until(
+            &format!("{RESTORE} mover Job created while the pool is full"),
+            Duration::from_secs(180),
+            INVARIANT_POLL,
+            || async { Ok(jobs.get_opt(RESTORE).await?.map(|_| ())) },
+        )
+        .await?;
+        anyhow::ensure!(
+            slot_condition_status(&restores, RESTORE).await.as_deref() != Some("False"),
+            "a Restore must NEVER carry {SLOT_CONDITION}=False — restores are \
+             admitted at and over the cap"
+        );
 
         wait_phase(&restores, RESTORE, "Completed").await?;
         Ok(())
