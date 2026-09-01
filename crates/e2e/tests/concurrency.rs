@@ -16,7 +16,7 @@
 //! the fixture RESHAPES THE RUNNING OPERATOR (a Deployment rollout), and scenario
 //! 4 additionally patches the controller's env, this file owns its own CI shard.
 //!
-//! The four scenarios:
+//! The five scenarios:
 //!
 //! 1. `a_repository_cap_serializes_its_backups` — cap 1, two backups: never two
 //!    live at once, the loser surfaces `RepositorySlotAvailable=False`, BOTH
@@ -30,6 +30,18 @@
 //! 4. `the_env_backstop_serializes_across_repositories` —
 //!    `KOPIUR_MAX_CONCURRENT_JOBS=1` bounds the pool across DIFFERENT
 //!    repositories, which no per-repository cap can do.
+//! 5. `replace_cancels_the_running_backup_and_its_victim_is_breaker_exempt` —
+//!    `concurrencyPolicy: Replace` on an UNCAPPED repository: a genuinely
+//!    `Running` run is cancelled by the next slot, the replacement still backs
+//!    something up, and the cancellation sails through a mass-deletion breaker
+//!    that is DEMONSTRABLY firing at that moment (a decoy wave of manifest-owning
+//!    Snapshots is held on the same repository throughout) — the
+//!    `pruned-by: replaced-run` operator-prune exemption.
+//!
+//! Scenario 5 lives here rather than beside the other schedule scenarios
+//! because it needs the same slow-mover fixture (a real backup finishes long
+//! before the next cron slot, so there would be nothing to replace) and
+//! therefore the same shard.
 
 #![cfg(all(unix, feature = "e2e"))]
 
@@ -40,10 +52,11 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
-use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use k8s_openapi::api::events::v1::Event;
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, Client};
 
-use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
+use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy, SnapshotSchedule};
 use kopiur_e2e::slow_mover::{MoverOp, SlowMover, with_slow_mover_config};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, wait, wait_until};
 
@@ -100,24 +113,61 @@ async fn live_jobs(jobs: &Api<Job>, names: &[&str]) -> Result<usize, kube::Error
     Ok(live)
 }
 
-/// The `status` of the CR's `RepositorySlotAvailable` condition, or `None` when
-/// the condition is absent entirely — the distinction the uncapped scenario
-/// turns on (absent, never merely `True`).
+/// The `status` of one of a CR's conditions (`None` = the condition is absent, a
+/// distinction several scenarios here turn on), keeping an API error DISTINCT
+/// from an absent condition.
+///
+/// The distinction matters in exactly one direction. A never-`True` invariant
+/// read through the lossy [`condition_status`] can only be WEAKENED by a
+/// transient apiserver blip — a missed poll, and the states involved persist for
+/// many polls. A must-be-`True` invariant read the same way would see the blip as
+/// a violation and fail the run for it, so those callers use this form and skip
+/// the poll on `Err` instead.
+async fn condition_status_checked<K>(
+    api: &Api<K>,
+    name: &str,
+    type_: &str,
+) -> Result<Option<String>, kube::Error>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    let Some(obj) = api.get_opt(name).await? else {
+        return Ok(None);
+    };
+    let status = serde_json::to_value(&obj)
+        .ok()
+        .and_then(|v| v.get("status").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    Ok(status
+        .get("conditions")
+        .and_then(|c| c.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some(type_))
+        })
+        .and_then(|c| c.get("status").and_then(|s| s.as_str()))
+        .map(str::to_string))
+}
+
+/// [`condition_status_checked`] with an API error folded into "absent" — the
+/// best-effort form the never-`True` invariants and the uncapped scenario use.
+async fn condition_status<K>(api: &Api<K>, name: &str, type_: &str) -> Option<String>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    condition_status_checked(api, name, type_).await.ok()?
+}
+
+/// [`condition_status`] for the gate's own condition — the one the first three
+/// scenarios read on nearly every poll.
 async fn slot_condition_status<K>(api: &Api<K>, name: &str) -> Option<String>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + serde::Serialize + std::fmt::Debug,
     <K as kube::Resource>::DynamicType: Default,
 {
-    status_json(api, name)
-        .await
-        .get("conditions")
-        .and_then(|c| c.as_array())
-        .and_then(|a| {
-            a.iter()
-                .find(|c| c.get("type").and_then(|t| t.as_str()) == Some(SLOT_CONDITION))
-        })
-        .and_then(|c| c.get("status").and_then(|s| s.as_str()))
-        .map(str::to_string)
+    condition_status(api, name, SLOT_CONDITION).await
 }
 
 /// Create a namespaced filesystem `Repository` over `subpath` with an optional
@@ -699,5 +749,729 @@ async fn the_env_backstop_serializes_across_repositories() -> anyhow::Result<()>
         &[BACKUP_A, BACKUP_B],
     )
     .await;
+    Ok(())
+}
+
+// --- 5. concurrencyPolicy: Replace cancels the in-flight run --------------------
+
+const REPLACE_SUBPATH: &str = "conc-replace";
+
+/// The label a `SnapshotSchedule` stamps on every `Snapshot` it produces.
+/// Spelled as a literal for the same reason [`MAX_CONCURRENT_JOBS_ENV`] is: the
+/// e2e crate does not depend on the controller, so a rename there must fail an
+/// e2e run loudly rather than silently select nothing.
+const SCHEDULE_LABEL: &str = "kopiur.home-operations.com/schedule";
+
+/// The `Repository` condition the mass-deletion breaker raises once pending
+/// EXTERNAL destructive `Snapshot` deletions reach `deletionProtection.threshold`.
+const MASS_DELETION_HELD_CONDITION: &str = "MassDeletionHeld";
+
+/// The per-`Snapshot` condition a HELD deletion carries while it waits for an
+/// acknowledgement.
+const DELETION_HELD_CONDITION: &str = "DeletionHeld";
+
+/// The `reason` on [`DELETION_HELD_CONDITION`] when the breaker is what is
+/// holding (as opposed to any other future hold).
+const MASS_DELETION_BREAKER_REASON: &str = "MassDeletionBreaker";
+
+/// The condition `Replace` raises when it HOLDS a slot instead of replacing —
+/// the run it would cancel is itself parked behind the repository's mover-Job
+/// pool cap, so cancelling it would free no capacity. This scenario deliberately
+/// runs an UNCAPPED repository so that path is unreachable, and asserts the
+/// condition never appears: a regression that routed the fire through the hold
+/// would otherwise be free to masquerade as a pass.
+const REPLACEMENT_HELD_CONDITION: &str = "ReplacementHeld";
+
+/// The `Event` reason `Replace` publishes on the schedule when it cancels runs.
+const REPLACED_EVENT_REASON: &str = "ReplacedActiveRun";
+
+/// How long a backup mover holds its slot in the Replace scenario.
+///
+/// The whole scenario turns on ONE inequality: the run observed `Running` cannot
+/// possibly finish before the next cron slot arrives. An every-minute cron is
+/// the finest grain there is, so slots are 60s apart, and the worst case is
+/// observing the run at the very instant its mover started — anything over 60s
+/// makes the replacement inevitable rather than lucky. 150s leaves ~90s of
+/// margin for a loaded kind node, and is deliberately not "sleep and hope":
+/// nothing here waits out a duration, the margin only guarantees that the state
+/// the waits poll for actually comes to exist.
+const REPLACE_DELAY: Duration = Duration::from_secs(150);
+
+/// The three `Snapshot`s whose bulk deletion TRIPS the mass-deletion breaker for
+/// the Replace scenario's repository, so the victim's exemption is measured
+/// against a breaker that is demonstrably firing rather than one that could
+/// never have fired. See the scenario's doc comment for why a `Replace` victim
+/// cannot trip it itself.
+const DECOYS: [&str; 3] = [
+    "e2e-conc-repl-decoy-1",
+    "e2e-conc-repl-decoy-2",
+    "e2e-conc-repl-decoy-3",
+];
+
+/// Names of this schedule's produced `Snapshot` children, by the label the
+/// schedule stamps (not a name prefix — the label is the population the
+/// controller's own concurrency gate reads).
+async fn schedule_children(
+    backups: &Api<Snapshot>,
+    schedule: &str,
+) -> Result<Vec<String>, kube::Error> {
+    let lp = ListParams::default().labels(&format!("{SCHEDULE_LABEL}={schedule}"));
+    Ok(backups
+        .list(&lp)
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|s| s.metadata.name)
+        .collect())
+}
+
+/// Page the namespace's `Event`s in bounded chunks and return the first one
+/// matching `pred`.
+///
+/// Bounded rather than one unbounded LIST because this runs on every poll and
+/// the e2e namespace accumulates Events for the whole shard. Paged rather than
+/// simply capped so a busy namespace cannot push the Event we need off the end
+/// of the first page and turn a real pass into a timeout. No field selector:
+/// which fields `events.k8s.io/v1` makes selectable is version-dependent, and an
+/// unsupported one is a 400 that `wait_until` would swallow as "not ready yet"
+/// — a silent full-timeout failure.
+async fn find_event<P>(events: &Api<Event>, mut pred: P) -> Result<Option<Event>, kube::Error>
+where
+    P: FnMut(&Event) -> bool,
+{
+    let mut token: Option<String> = None;
+    loop {
+        let mut lp = ListParams::default().limit(EVENT_PAGE_SIZE);
+        if let Some(t) = &token {
+            lp = lp.continue_token(t);
+        }
+        let page = events.list(&lp).await?;
+        if let Some(found) = page.items.into_iter().find(&mut pred) {
+            return Ok(Some(found));
+        }
+        match page.metadata.continue_.filter(|c| !c.is_empty()) {
+            Some(c) => token = Some(c),
+            None => return Ok(None),
+        }
+    }
+}
+
+/// Per-request Event page size for [`find_event`].
+const EVENT_PAGE_SIZE: u32 = 500;
+
+/// Set the repository's mass-deletion breaker threshold and verify it LANDED.
+///
+/// Read-back for the same reason `ensure_capped_repo` reads its cap back: a
+/// pruned or mis-shaped field would leave the breaker at its default of 10,
+/// where the decoy wave below could not trip it — and the scenario's exemption
+/// proof would degrade back into proving nothing.
+async fn set_deletion_threshold(
+    repos: &Api<Repository>,
+    name: &str,
+    threshold: u32,
+) -> anyhow::Result<()> {
+    repos
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "spec": { "deletionProtection": { "threshold": threshold } }
+            })),
+        )
+        .await?;
+    let got = repos
+        .get(name)
+        .await?
+        .spec
+        .deletion_protection
+        .as_ref()
+        .and_then(|d| d.threshold);
+    anyhow::ensure!(
+        got == Some(threshold),
+        "spec.deletionProtection.threshold must land on {name} as {threshold}, got {got:?}"
+    );
+    Ok(())
+}
+
+/// Delete `schedule`, every `Snapshot` it produced, and the named `decoys`, then
+/// wait until all of them are gone.
+///
+/// The `e2e` nextest profile retries a failed test IN PLACE, and a schedule left
+/// behind by a failed attempt is left SUSPENDED by this scenario's own body — a
+/// retry that merely tolerated `AlreadyExists` would then wait forever for a
+/// slot that can never fire. So the schedule is reset rather than reused, and the
+/// decoys are re-seeded fresh (a leftover decoy still terminating from a previous
+/// attempt would keep the wave held and desynchronize this attempt's arming).
+///
+/// The caller MUST disarm the breaker first (threshold `0`): these are EXTERNAL
+/// destructive deletes, which are exactly what an armed breaker holds.
+async fn reset_replace_fixtures(
+    schedules: &Api<SnapshotSchedule>,
+    backups: &Api<Snapshot>,
+    schedule: &str,
+    decoys: &[&str],
+) -> anyhow::Result<()> {
+    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
+    for name in schedule_children(backups, schedule).await? {
+        let _ = backups.delete(&name, &DeleteParams::default()).await;
+    }
+    for name in decoys {
+        let _ = backups.delete(name, &DeleteParams::default()).await;
+    }
+    wait_until(
+        &format!("leftovers of {schedule} (and its decoys) are gone"),
+        Duration::from_secs(300),
+        INVARIANT_POLL,
+        || async {
+            if schedules.get_opt(schedule).await?.is_some() {
+                return Ok(None);
+            }
+            if !schedule_children(backups, schedule).await?.is_empty() {
+                return Ok(None);
+            }
+            for name in decoys {
+                if backups.get_opt(name).await?.is_some() {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(()))
+        },
+    )
+    .await
+}
+
+/// `concurrencyPolicy: Replace` end to end, on an UNCAPPED repository.
+///
+/// The uncapped part is load-bearing, not incidental: with a pool cap in play a
+/// due slot whose would-be victim is PARKED behind that cap does not replace
+/// anything at all — it raises `ReplacementHeld` and waits, because cancelling a
+/// queued run frees no capacity. This scenario must exercise the REPLACEMENT, so
+/// the repository carries no cap and the victim is genuinely `Running` with a
+/// live mover Job before the next slot arrives (asserted, not assumed).
+///
+/// Five claims:
+///
+/// * **The prior run is cancelled.** Its mover Job is deleted and its CR goes
+///   away entirely — not merely terminating. Full disappearance is the sharp
+///   form: a HELD deletion would sit terminating forever.
+/// * **A `ReplacedActiveRun` Normal Event names the victim**, so an operator
+///   reading `kubectl describe` sees why a backup vanished mid-run instead of
+///   discovering a gap.
+/// * **The replacement really backs something up** — `Succeeded` with a real
+///   `kopiaSnapshotID`. A `Replace` that only cancelled would pass every
+///   liveness check and be a data-loss bug.
+/// * **The victim is EXEMPT from a breaker that is demonstrably firing** — the
+///   `pruned-by: replaced-run` stamping proof. Read the mechanism carefully,
+///   because the obvious version of this assertion is vacuous:
+///
+///   `pending_members` (`controller::snapshot::batch`) only counts a terminating
+///   `Snapshot` that owns a `status.snapshot.kopiaSnapshotID`. A `Replace` victim
+///   is unfinished BY CONSTRUCTION — its mover was still running, so it committed
+///   no manifest — and therefore can never contribute to the breaker's pending
+///   count no matter how it is classified. Arming a low threshold and asserting
+///   "nothing was held" would pass just as happily with the stamp stripped out.
+///
+///   So the breaker is tripped by something that CAN count: [`DECOYS`], three
+///   previously-`Succeeded` Snapshots (real manifests, `deletionPolicy: Delete`)
+///   on this same repository, bulk-deleted into a HELD wave at
+///   `deletionProtection.threshold: 1`. The scenario then asserts BOTH halves at
+///   once — the decoy wave stays HELD (`DeletionHeld=True`/`MassDeletionBreaker`,
+///   repo `MassDeletionHeld=True`) for the whole replacement window, while the
+///   `Replace` victim sails straight through it and disappears entirely, never
+///   carrying `DeletionHeld`.
+///
+///   That makes stripping the stamp a FAILING mutation. Unstamped, the victim's
+///   `counts_toward_breaker` is `true` (`breaker_relevant(None)`, and its plan at
+///   `BreakerState::Allowed` is `DeleteSnapshot`: `Origin::Scheduled` with no
+///   `spec.deletionPolicy` resolves to `Delete`), so `breaker_applies` holds and
+///   the repo-wide state the decoys already pushed to `Held` routes it to
+///   `plan_external(Delete, Held)` → `HoldSnapshotDeletion`. That executor keeps
+///   the finalizer and writes `DeletionHeld=True` BEFORE any manifest check (the
+///   "no recorded kopia snapshot → just release" short-circuit lives inside the
+///   `DeleteSnapshot` executor, which a Hold never reaches) — so the victim would
+///   sit terminating forever and two assertions here would fail.
+/// * **The schedule's status advances** — `lastSchedule` names the replacement
+///   slot and its child.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn replace_cancels_the_running_backup_and_its_victim_is_breaker_exempt() -> anyhow::Result<()>
+{
+    let Some(world) = World::connect().await else {
+        return Ok(());
+    };
+    world.ensure(&[Need::Filesystem]).await?;
+    let client: Client = world.client().clone();
+
+    const REPO: &str = "e2e-conc-repl-repo";
+    const POLICY: &str = "e2e-conc-repl-pol";
+    const DECOY_POLICY: &str = "e2e-conc-repl-dec-pol";
+    const SCHEDULE: &str = "e2e-conc-repl-sched";
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let events: Api<Event> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // No `spec.concurrency` at all (see the doc comment), managed maintenance
+    // off so the repository contributes no unrelated mover Jobs, and the breaker
+    // DISARMED for now so the retry reset below can delete leftovers. The fast
+    // catalog refresh is the same knob `mass_deletion`'s breaker scenarios use:
+    // the repository's `MassDeletionHeld` condition is written LAZILY on the
+    // repo's own reconcile cadence, so without a prompt re-reconcile the arming
+    // handshake below would sit waiting on a condition that is merely late.
+    ensure_repo(&client, REPLACE_SUBPATH).await;
+    create_idempotent(
+        &repos,
+        &cr(repository_json(
+            REPO,
+            REPLACE_SUBPATH,
+            serde_json::json!({
+                "deletionProtection": { "threshold": 0 },
+                "maintenance": { "enabled": false },
+                "catalog": { "periodicRefresh": true, "refreshInterval": "30s" },
+            }),
+        )),
+        "create Repository",
+    )
+    .await;
+    set_deletion_threshold(&repos, REPO, 0).await?;
+    wait_phase(&repos, REPO, "Ready").await.expect("repo Ready");
+    ensure_policy(&client, POLICY, REPO).await;
+    // The decoys get their OWN policy with a roomy `keepLatest`, mirroring
+    // `mass_deletion`'s manual-vs-scheduled split: retention is label-scoped, so
+    // this keeps the schedule's GFS prune (which is breaker-EXEMPT and would
+    // quietly drain the wave) away from the decoy set entirely.
+    let decoy_policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    create_idempotent(
+        &decoy_policies,
+        &cr(snapshot_policy_json(
+            E2E_NAMESPACE,
+            DECOY_POLICY,
+            "Repository",
+            REPO,
+            serde_json::json!({
+                "identity": { "username": DECOY_POLICY, "hostname": "e2e" },
+                "retention": { "keepLatest": 20 },
+            }),
+        )),
+        "create decoy SnapshotPolicy",
+    )
+    .await;
+    reset_replace_fixtures(&schedules, &backups, SCHEDULE, &DECOYS).await?;
+
+    // Seed the decoys at FULL SPEED (outside the fixture window) so each owns a
+    // real kopia manifest — the property `pending_members` requires before a
+    // terminating Snapshot counts toward the breaker at all.
+    for name in DECOYS {
+        create_idempotent(
+            &backups,
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                name,
+                DECOY_POLICY,
+                serde_json::json!({ "deletionPolicy": "Delete" }),
+            )),
+            "create decoy Snapshot",
+        )
+        .await;
+    }
+    for name in DECOYS {
+        assert_real_snapshot(&backups, name).await?;
+    }
+
+    // ARM the breaker at its most sensitive setting, now that nothing is left to
+    // clean up. The patch bumps the repository's generation, so wait out the
+    // reconcile it triggers before any backup depends on the repository.
+    set_deletion_threshold(&repos, REPO, 1).await?;
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("repo Ready after arming the breaker");
+
+    // TRIP the breaker: bulk-delete the decoys into a wave that must be HELD.
+    // Three of them against `threshold: 1` for the reason `mass_deletion`'s
+    // scenarios use a margin — a delete whose reconcile beats the reflector's
+    // view of its own deletionTimestamp could momentarily count zero pending and
+    // slip through; the survivors still satisfy `1 >= 1`.
+    for name in DECOYS {
+        backups.delete(name, &DeleteParams::default()).await?;
+    }
+    // Settle the deletionTimestamps before reading the breaker, the same guard
+    // `mass_deletion::delete_snapshots_and_settle` applies: a loaded box must not
+    // let a delete slip past a threshold check before the API even shows it.
+    wait_until(
+        "every decoy shows a deletionTimestamp",
+        Duration::from_secs(120),
+        INVARIANT_POLL,
+        || async {
+            for name in DECOYS {
+                match backups.get_opt(name).await? {
+                    // Already drained (it beat the breaker) counts as settled.
+                    None => continue,
+                    Some(s) if s.metadata.deletion_timestamp.is_some() => continue,
+                    Some(_) => return Ok(None),
+                }
+            }
+            Ok(Some(()))
+        },
+    )
+    .await?;
+    wait_condition(&repos, REPO, MASS_DELETION_HELD_CONDITION, "True")
+        .await
+        .expect(
+            "the decoy wave must trip the repository breaker — without a FIRING breaker the \
+             victim's exemption below would prove nothing",
+        );
+    let held_decoy = wait_until(
+        "a decoy Snapshot is HELD by the mass-deletion breaker",
+        Duration::from_secs(300),
+        INVARIANT_POLL,
+        || async {
+            for name in DECOYS {
+                if condition_status(&backups, name, DELETION_HELD_CONDITION)
+                    .await
+                    .as_deref()
+                    == Some("True")
+                {
+                    return Ok(Some(name));
+                }
+            }
+            Ok(None)
+        },
+    )
+    .await?;
+    let held = wait_condition(&backups, held_decoy, DELETION_HELD_CONDITION, "True").await?;
+    anyhow::ensure!(
+        held["reason"].as_str() == Some(MASS_DELETION_BREAKER_REASON),
+        "the decoy must be held by the BREAKER specifically, got {held}"
+    );
+
+    // Only backups crawl: the bootstrap already ran at full speed above, and a
+    // slow repository-side Job would add nothing but wall time.
+    let config = SlowMover::new(REPLACE_DELAY).ops(&[MoverOp::Snapshot]);
+    let result = with_slow_mover_config(&world, config, || async {
+        schedules
+            .create(
+                &PostParams::default(),
+                &cr::<SnapshotSchedule>(serde_json::json!({
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "SnapshotSchedule",
+                    "metadata": { "name": SCHEDULE, "namespace": E2E_NAMESPACE },
+                    "spec": {
+                        "policyRef": { "name": POLICY },
+                        "schedule": { "cron": "* * * * *", "concurrencyPolicy": "Replace" },
+                    }
+                })),
+            )
+            .await?;
+        // The field must have LANDED: a `concurrencyPolicy` pruned by a stale CRD
+        // schema would silently leave the schedule at the `Forbid` default, where
+        // nothing is ever replaced and this scenario would fail minutes later as
+        // "no replacement happened".
+        let created = schedules.get(SCHEDULE).await?;
+        anyhow::ensure!(
+            created.spec.schedule.concurrency_policy == kopiur_api::ConcurrencyPolicy::Replace,
+            "spec.schedule.concurrencyPolicy must land as Replace, got {:?}",
+            created.spec.schedule.concurrency_policy
+        );
+
+        // 1. A slot fires and its child reaches `Running` with a LIVE mover Job.
+        //    This is what makes the replacement about a genuinely in-flight run
+        //    rather than a `Pending` one that never started.
+        let victim = wait_until(
+            "a scheduled backup is Running with a live mover Job",
+            Duration::from_secs(300),
+            INVARIANT_POLL,
+            || async {
+                for name in schedule_children(&backups, SCHEDULE).await? {
+                    let running =
+                        status_json(&backups, &name).await["phase"].as_str() == Some("Running");
+                    if running && live_jobs(&jobs, &[name.as_str()]).await? == 1 {
+                        return Ok(Some(name));
+                    }
+                }
+                Ok(None)
+            },
+        )
+        .await?;
+
+        // 2. The NEXT slot must replace it. `REPLACE_DELAY` makes that a
+        //    certainty rather than a race: the victim cannot reach a terminal
+        //    phase before the slot 60s from now. Polled with the breaker and
+        //    hold invariants inline — `wait_until` treats an `Err` as "not ready
+        //    yet", so an assertion cannot live inside its closure.
+        //
+        //    The never-`True` invariants read conditions through
+        //    `condition_status`, which reports an API error as "condition
+        //    absent" — best-effort polling, in keeping with `wait_until`'s own
+        //    blip tolerance. A missed poll can only WEAKEN such an assertion,
+        //    never invent a violation, and the states involved persist for many
+        //    polls. The must-be-`True` breaker check is the other polarity, so it
+        //    goes through `condition_status_checked` and skips the poll on an
+        //    API error rather than reading the blip as the breaker relaxing.
+        let mut replacement = None;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            // The breaker must still be FIRING throughout, or the victim's
+            // clean exit below proves nothing about its exemption.
+            if let Ok(held) =
+                condition_status_checked(&repos, REPO, MASS_DELETION_HELD_CONDITION).await
+            {
+                anyhow::ensure!(
+                    held.as_deref() == Some("True"),
+                    "the decoy wave must stay HELD for the whole replacement window — a \
+                     breaker that fell back below threshold would make the victim's \
+                     exemption vacuous"
+                );
+            }
+            anyhow::ensure!(
+                condition_status(&backups, &victim, DELETION_HELD_CONDITION)
+                    .await
+                    .as_deref()
+                    != Some("True"),
+                "the `Replace` victim must be EXEMPT from the (currently firing) \
+                 mass-deletion breaker: it is stamped `pruned-by: replaced-run`, an \
+                 OPERATOR prune, and operator prunes are never held"
+            );
+            anyhow::ensure!(
+                condition_status(&schedules, SCHEDULE, REPLACEMENT_HELD_CONDITION)
+                    .await
+                    .as_deref()
+                    != Some("True"),
+                "{REPLACEMENT_HELD_CONDITION} must be unreachable on an UNCAPPED \
+                 repository — if it fired, the victim was parked rather than Running \
+                 and this scenario tested the hold path, not the replacement"
+            );
+            let victim_going = match backups.get_opt(&victim).await? {
+                None => true,
+                Some(s) => s.metadata.deletion_timestamp.is_some(),
+            };
+            if victim_going {
+                // The newest child NEWER THAN the victim. Children are named
+                // `<schedule>-<YYYYmmddHHMMSS>` — fixed width, so lexicographic
+                // order IS chronological order. Strictly-newer rather than
+                // merely not-equal: a child OLDER than the victim can only be
+                // one wedged from an earlier slot, and picking it would fail
+                // this scenario for something it is not testing. `max` rather
+                // than `find` because a poll that lagged a whole slot interval
+                // would otherwise be free to pick an already-superseded child
+                // and then assert "Succeeded" against a run that was itself
+                // cancelled.
+                replacement = schedule_children(&backups, SCHEDULE)
+                    .await?
+                    .into_iter()
+                    .filter(|n| n.as_str() > victim.as_str())
+                    .max();
+            }
+            if replacement.is_some() {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the next slot never replaced the Running backup `{victim}` \
+                 (victim still in flight: {})",
+                !victim_going
+            );
+            tokio::time::sleep(INVARIANT_POLL).await;
+        }
+        let replacement = replacement.expect("the loop only breaks with a replacement");
+
+        // 3. SUSPEND immediately, so the slot after this one cannot replace the
+        //    replacement in turn — every run takes `REPLACE_DELAY`, so an
+        //    unsuspended schedule would cancel each new run forever and nothing
+        //    would ever reach `Succeeded`. There is a full slot interval of
+        //    headroom: the replacement was detected within a poll of the fire.
+        schedules
+            .patch(
+                SCHEDULE,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({
+                    "spec": { "schedule": { "suspend": true } }
+                })),
+            )
+            .await?;
+
+        // 4. The victim's mover Job is gone — the run was STOPPED, not merely
+        //    forgotten. (The Job carries the same name as its Snapshot.)
+        wait_until(
+            &format!("the replaced run's mover Job ({victim}) is deleted"),
+            Duration::from_secs(180),
+            INVARIANT_POLL,
+            || async { Ok(jobs.get_opt(&victim).await?.is_none().then_some(())) },
+        )
+        .await?;
+
+        // 5. The victim's CR disappears ENTIRELY, WHILE the decoy wave is still
+        //    held on this very repository. That pairing is the whole exemption
+        //    proof: unstamped, the victim would take `plan_external(Delete,
+        //    Held)` → `HoldSnapshotDeletion`, keep its finalizer, and sit here
+        //    terminating with `DeletionHeld=True` forever.
+        let mut gone = false;
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while !gone {
+            if let Ok(held) =
+                condition_status_checked(&repos, REPO, MASS_DELETION_HELD_CONDITION).await
+            {
+                anyhow::ensure!(
+                    held.as_deref() == Some("True"),
+                    "the decoy wave must still be HELD while the victim drains — otherwise \
+                     the victim merely outlived the breaker instead of being exempt from it"
+                );
+            }
+            match backups.get_opt(&victim).await? {
+                None => gone = true,
+                Some(_) => {
+                    anyhow::ensure!(
+                        condition_status(&backups, &victim, DELETION_HELD_CONDITION)
+                            .await
+                            .as_deref()
+                            != Some("True"),
+                        "the replaced run's deletion must never be HELD: `Replace` stamps \
+                         `pruned-by: replaced-run`, which is breaker-exempt"
+                    );
+                }
+            }
+            anyhow::ensure!(
+                gone || Instant::now() < deadline,
+                "the replaced run `{victim}` never finished terminating — its finalizer \
+                 is stuck (a held deletion, or a mover teardown that never completed)"
+            );
+            if !gone {
+                tokio::time::sleep(INVARIANT_POLL).await;
+            }
+        }
+
+        // 6. The cancellation is VISIBLE: an Event on the schedule NAMING the run
+        //    it cancelled, so an operator reading `kubectl describe` learns why a
+        //    backup vanished mid-run instead of finding an unexplained gap.
+        //
+        //    The victim's name is part of the SELECTION, not just an assertion
+        //    afterwards: the `e2e` profile retries in place, victim names are
+        //    slot-stamped (fresh every attempt), and a stale Event from a
+        //    previous attempt would otherwise be picked up and then fail the
+        //    note check — turning a real pass into a spurious failure.
+        let ev = wait_until(
+            &format!("a {REPLACED_EVENT_REASON} Event names the cancelled run {victim}"),
+            Duration::from_secs(180),
+            INVARIANT_POLL,
+            || async {
+                find_event(&events, |e| {
+                    e.reason.as_deref() == Some(REPLACED_EVENT_REASON)
+                        && e.note.as_deref().is_some_and(|n| n.contains(&victim))
+                        && e.regarding.as_ref().is_some_and(|r| {
+                            r.kind.as_deref() == Some("SnapshotSchedule")
+                                && r.name.as_deref() == Some(SCHEDULE)
+                        })
+                })
+                .await
+            },
+        )
+        .await?;
+        anyhow::ensure!(
+            ev.type_.as_deref() == Some("Normal"),
+            "a planned cancellation is Normal, not a Warning: {:?}",
+            ev.type_
+        );
+
+        Ok(replacement)
+    })
+    .await;
+
+    // UNCONDITIONAL, before ANY `?` on the body's result — the
+    // `set_global_job_cap` restore discipline, applied to this scenario's own two
+    // cluster-visible mutations. A body failure before step 3 would otherwise
+    // leave BOTH of them live: an unsuspended `* * * * *` `Replace` schedule that
+    // keeps minting slow mover Jobs (which
+    // `the_env_backstop_serializes_across_repositories` then has to share its
+    // cluster-wide pool of 1 with, so that scenario fails for a reason that has
+    // nothing to do with it), and an armed threshold-1 breaker that holds every
+    // later external delete on this repository. Suspend rather than delete: the
+    // assertions below still need the schedule's status.
+    let suspended = schedules
+        .patch(
+            SCHEDULE,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "schedule": { "suspend": true } } })),
+        )
+        .await;
+    let disarmed = set_deletion_threshold(&repos, REPO, 0).await;
+
+    // Asserted OUTSIDE the slow window, like the other scenarios here, so a
+    // fixture-restore failure can never be mistaken for a backup fault. The
+    // schedule is suspended by now, so nothing new fires while we wait.
+    let replacement = result?;
+    suspended?;
+    disarmed?;
+    assert_real_snapshot(&backups, &replacement).await?;
+
+    // The schedule's own bookkeeping advanced to the slot that did the
+    // replacing. `lastSchedule.snapshotRef` names the child, and `at` is that
+    // child's slot — the Snapshot's name is `<schedule>-<YYYYmmddHHMMSS>` of the
+    // slot, so the two must agree digit for digit.
+    let slot_stamp = replacement
+        .strip_prefix(&format!("{SCHEDULE}-"))
+        .expect("a scheduled child is named <schedule>-<slot stamp>")
+        .to_string();
+    let last = wait_until(
+        "status.lastSchedule names the replacement slot",
+        Duration::from_secs(180),
+        INVARIANT_POLL,
+        || async {
+            let s = status_json(&schedules, SCHEDULE).await;
+            let named = s["lastSchedule"]["snapshotRef"]["name"].as_str() == Some(&replacement);
+            Ok(named.then(|| s["lastSchedule"].clone()))
+        },
+    )
+    .await?;
+    let at = last["at"].as_str().unwrap_or_default();
+    let at = chrono::DateTime::parse_from_rfc3339(at)
+        .unwrap_or_else(|e| panic!("lastSchedule.at must be RFC3339, got {at:?}: {e}"))
+        .with_timezone(&chrono::Utc);
+    anyhow::ensure!(
+        at.format("%Y%m%d%H%M%S").to_string() == slot_stamp,
+        "lastSchedule.at ({at}) must be the slot the replacement child is named for \
+         ({slot_stamp})"
+    );
+    // `lastSuccessfulSchedule` has no writer in this build; assert only that if
+    // one ever appears it is not AHEAD of the last fire (a lenient sanity bound
+    // that a future writer would still satisfy).
+    let st = status_json(&schedules, SCHEDULE).await;
+    if let Some(s) = st["lastSuccessfulSchedule"]["at"].as_str() {
+        let s = chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap_or_else(|e| panic!("lastSuccessfulSchedule.at must be RFC3339: {e}"))
+            .with_timezone(&chrono::Utc);
+        anyhow::ensure!(
+            s <= at,
+            "lastSuccessfulSchedule ({s}) cannot be later than lastSchedule ({at})"
+        );
+    }
+
+    // RELEASE the wave. The breaker was already disarmed unconditionally above,
+    // which drops `unacked_pending >= threshold` and lets the held decoys drain
+    // on their own (`repo_mass_deletion_condition` is `held: false` whenever the
+    // threshold is `0`) — no `allow-mass-deletion` ack needed. Wait for it, so
+    // cleanup does not race a still-terminating wave.
+    let _ = wait_until(
+        "the released decoy wave drains once the breaker is disarmed",
+        Duration::from_secs(300),
+        INVARIANT_POLL,
+        || async {
+            for name in DECOYS {
+                if backups.get_opt(name).await?.is_some() {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(()))
+        },
+    )
+    .await;
+
+    let _ = schedules.delete(SCHEDULE, &DeleteParams::default()).await;
+    let leftovers = schedule_children(&backups, SCHEDULE)
+        .await
+        .unwrap_or_default();
+    let mut leftovers: Vec<&str> = leftovers.iter().map(String::as_str).collect();
+    leftovers.extend(DECOYS);
+    cleanup(&client, &[REPO], &[POLICY, DECOY_POLICY], &leftovers).await;
     Ok(())
 }

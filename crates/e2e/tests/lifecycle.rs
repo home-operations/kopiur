@@ -1481,6 +1481,198 @@ async fn schedule_inherits_repository_timezone_default() {
     );
 }
 
+/// Recover the cron slot a pinned `at` was jittered off, and assert the pin is
+/// EXACTLY `slot + jitter_offset(uid, slot, window)`.
+///
+/// Deriving the slot from the pin rather than from the test's own clock is what
+/// makes this exact rather than approximately-right: the controller computed its
+/// slot from ITS `now`, and a test that recomputed "the next 03:00 after my now"
+/// would disagree with it for the one second per day the two straddle. The
+/// offset is in `[0, window)`, so the slot is the unique cron occurrence in
+/// `(at - window, at]` — found by asking for the first occurrence strictly after
+/// `at - window - 1s`, which the previous day's slot is 24h below.
+///
+/// The equality is the whole assertion: it fails if the window was not inherited
+/// (offset computed against no window at all), if it was inherited but recorded
+/// only decoratively, or if the seed drifted off `metadata.uid`.
+fn assert_pinned_jitter(pin: &kopiur_api::snapshot_schedule::ScheduleRef, uid: &str, window: &str) {
+    use chrono::Timelike;
+
+    assert_eq!(
+        pin.jitter.as_deref(),
+        Some(window),
+        "nextSchedule must record the jitter window it was spread by"
+    );
+    let secs = kopiur_api::parse_go_duration(window)
+        .unwrap_or_else(|| panic!("{window} must be a Go duration"));
+    let at = pin.at.as_deref().expect("pin carries an instant");
+    let at = chrono::DateTime::parse_from_rfc3339(at)
+        .unwrap_or_else(|e| panic!("pin is RFC3339, got {at:?}: {e}"))
+        .with_timezone(&chrono::Utc);
+
+    // The same 5-field parser the controller uses — not croner's defaults, which
+    // would also accept seconds/year fields and shift every field's meaning.
+    let cron = kopiur_api::jitter::cron_parser()
+        .parse(JITTER_CRON)
+        .unwrap_or_else(|e| panic!("{JITTER_CRON} parses: {e}"));
+    let search_from =
+        at - chrono::Duration::from_std(secs).expect("window fits") - chrono::Duration::seconds(1);
+    let slot = cron
+        .find_next_occurrence(&search_from, false)
+        .unwrap_or_else(|e| panic!("no cron occurrence after {search_from}: {e}"));
+    assert_eq!(
+        (slot.hour(), slot.minute(), slot.second()),
+        (3, 0, 0),
+        "the recovered slot must be the 03:00 UTC cron slot (got {slot}); the pin \
+         {at} is not within one {window} window of any slot"
+    );
+
+    let offset = kopiur_api::jitter_offset(uid, slot.timestamp(), secs);
+    let expected = slot + chrono::Duration::from_std(offset).expect("offset fits");
+    assert_eq!(
+        at,
+        expected,
+        "the pinned slot must be exactly cron({JITTER_CRON}) + \
+         jitter_offset(uid={uid}, slot={}, window={window}) = {expected}; got {at} \
+         (offset {offset:?})",
+        slot.timestamp()
+    );
+}
+
+/// The cron both jitter-inheritance schedules use: a daily slot far from any
+/// boundary this suite could be running near, so the slot recovered from a pin
+/// is unambiguous.
+const JITTER_CRON: &str = "0 3 * * *";
+
+/// A `SnapshotSchedule` with no `spec.schedule.jitter` inherits its deterministic
+/// jitter window from its target policy's repository `scheduleDefaults.jitter` —
+/// the jitter half of the same inheritance
+/// `schedule_inherits_repository_timezone_default` covers for the timezone.
+///
+/// Both halves are asserted, and the second is the sharp one:
+///
+/// 1. `status.nextSchedule.jitter` RECORDS the inherited `10m` (a pin with no
+///    recorded window can never be invalidated by a later `scheduleDefaults`
+///    edit — `pin_needs_recompute`'s jitter arm only fires on a pinned window
+///    that differs — so recording it is load-bearing, not cosmetic).
+/// 2. The pinned instant was actually SPREAD by that window: it equals
+///    `cron slot + kopiur_api::jitter_offset(scheduleUID, slot, 10m)` exactly,
+///    recomputed here with the same `kopiur_api` functions the controller calls.
+///    An operator that inherited the window into status but computed the slot
+///    un-jittered passes (1) and fails (2).
+///
+/// The control case rides along: a sibling schedule over the SAME repository
+/// that sets its own `spec.schedule.jitter: 1h` must pin its own window, not the
+/// repository default — inheritance is a fallback, never an override.
+///
+/// Both schedules are `suspend: true`: the pin is written on the first reconcile
+/// regardless, and no run is needed to prove how a slot was computed.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn schedule_inherits_repository_jitter_default() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-jit-repo";
+    const POLICY: &str = "e2e-jit-cfg";
+    const INHERITS: &str = "e2e-jit-sched";
+    const OVERRIDES: &str = "e2e-jit-own-sched";
+    const REPO_WINDOW: &str = "10m";
+    const OWN_WINDOW: &str = "1h";
+
+    // The repository default. No `scheduleDefaults.timezone`, so the effective
+    // zone stays UTC and the only inherited input under test is the window.
+    let mut repo = repository_json(REPO);
+    repo["spec"]["scheduleDefaults"] = serde_json::json!({ "jitter": REPO_WINDOW });
+    let _ = repos.create(&PostParams::default(), &cr(repo)).await;
+    let _ = configs
+        .create(
+            &PostParams::default(),
+            &cr(backup_config_json(POLICY, REPO, "e2e-src")),
+        )
+        .await;
+    // The referents must be READABLE before the schedules exist. A first pin
+    // written while `resolve_effective_schedule` is degraded records NO window,
+    // and an absent recorded window never invalidates the pin — so that pin
+    // would stay un-jittered forever and this scenario would fail as "no
+    // inheritance" when the real fault was creation order.
+    repos.get(REPO).await.expect("repository is readable");
+    configs.get(POLICY).await.expect("policy is readable");
+
+    // Create-or-adopt: the `e2e` nextest profile retries a failed test IN PLACE,
+    // and a schedule left behind by a previous attempt is perfectly usable here
+    // (its pin is deterministic and stable, so re-asserting it proves the same
+    // thing). A bare `.expect("create")` would instead turn every retry into an
+    // `AlreadyExists` panic that buries the real first failure.
+    let create_schedule = |name: &'static str, own: Option<&'static str>| {
+        let schedules = schedules.clone();
+        async move {
+            let body = cr::<SnapshotSchedule>(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "SnapshotSchedule",
+                "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "policyRef": { "name": POLICY },
+                    "schedule": { "cron": JITTER_CRON, "suspend": true, "jitter": own },
+                }
+            }));
+            match schedules.create(&PostParams::default(), &body).await {
+                Ok(created) => created,
+                Err(kube::Error::Api(e)) if e.reason == "AlreadyExists" => schedules
+                    .get(name)
+                    .await
+                    .unwrap_or_else(|e| panic!("read back existing SnapshotSchedule {name}: {e}")),
+                Err(e) => panic!("create SnapshotSchedule {name}: {e}"),
+            }
+        }
+    };
+    let inherits = create_schedule(INHERITS, None).await;
+    let overrides = create_schedule(OVERRIDES, Some(OWN_WINDOW)).await;
+    let inherits_uid = inherits.uid().expect("created CR carries a uid");
+    let overrides_uid = overrides.uid().expect("created CR carries a uid");
+
+    let pinned = |name: &'static str, want_window: &'static str| {
+        let schedules = schedules.clone();
+        async move {
+            wait_until(
+                &format!("{name} pins nextSchedule with jitter={want_window}"),
+                default_timeout(),
+                poll_interval(),
+                || async {
+                    let s = schedules.get(name).await?;
+                    Ok(s.status
+                        .and_then(|st| st.next_schedule)
+                        .filter(|n| n.at.is_some() && n.jitter.as_deref() == Some(want_window)))
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name} must pin a slot carrying jitter={want_window}: {e}"))
+        }
+    };
+
+    // 1. Inheritance: the repository default reached both the record AND the math.
+    assert_pinned_jitter(
+        &pinned(INHERITS, REPO_WINDOW).await,
+        &inherits_uid,
+        REPO_WINDOW,
+    );
+    // 2. Control: an own window OVERRIDES the repository default outright.
+    assert_pinned_jitter(
+        &pinned(OVERRIDES, OWN_WINDOW).await,
+        &overrides_uid,
+        OWN_WINDOW,
+    );
+}
+
 /// A `policySelector` schedule with NO `spec.schedule.timezone` fans out to
 /// policies whose repositories DISAGREE on `scheduleDefaults.timezone` — pure
 /// logic in `kopiur_api::common::effective_timezone` (GitHub #174 item 3):
