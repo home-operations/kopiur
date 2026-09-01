@@ -175,7 +175,11 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     // knob, must be at least 1 (0 or negative disables the flag's own purpose).
     if let Some(u) = &spec.upload
         && let Some(mb) = u.limit_mb
-        && let Some(e) = require_min("SnapshotPolicy spec.upload.limitMb", mb, 1)
+        && let Some(e) = require_min(
+            "SnapshotPolicy spec.upload.limitMb",
+            mb,
+            NumericBound::Megabytes,
+        )
     {
         errs.push(e);
     }
@@ -232,7 +236,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 && let Some(e) = require_min(
                     "SnapshotPolicy spec.verification.quick.parallel",
                     p.into(),
-                    1,
+                    NumericBound::Count,
                 )
             {
                 errs.push(e);
@@ -241,7 +245,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 && let Some(e) = require_min(
                     "SnapshotPolicy spec.verification.quick.fileParallelism",
                     p.into(),
-                    1,
+                    NumericBound::Count,
                 )
             {
                 errs.push(e);
@@ -250,7 +254,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 && let Some(e) = require_min(
                     "SnapshotPolicy spec.verification.quick.fileQueueLength",
                     p.into(),
-                    1,
+                    NumericBound::Count,
                 )
             {
                 errs.push(e);
@@ -274,7 +278,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 && let Some(e) = require_min(
                     "SnapshotPolicy spec.verification.deep.parallel",
                     p.into(),
-                    1,
+                    NumericBound::Count,
                 )
             {
                 errs.push(e);
@@ -386,9 +390,7 @@ fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
                      [ReadOnlyMany]: the staged PVC is read-only, so mounting it read-write \
                      fails at the kubelet and the backup never starts. Drop ReadOnlyMany (a \
                      read-write staged PVC is what lets the kubelet apply fsGroup), or drop \
-                     readOnly: false. The same conflict exists — invisibly here, because the \
-                     class is only resolvable in-cluster — with a read-only staged class such \
-                     as a rook-ceph CephFS class with backingSnapshot: \"true\""
+                     readOnly: false"
                 .to_string(),
         });
     }
@@ -663,10 +665,9 @@ pub fn snapshot_tag_error(key: &str, value: &str) -> Option<String> {
     }
     if key.contains(':') {
         return Some(format!(
-            "tag key {key:?} contains a colon — kopia splits each `--tags` argument on the \
-             first colon, so this key would be stored mangled (everything after the colon \
-             becomes part of the value) and can collide with kopiur's reserved `kopiur:config` \
-             tag, which makes kopia fail the snapshot create with a duplicate-tag error. Use a \
+            "tag key {key:?} contains a colon — kopia splits each `--tags` arg on the first \
+             colon, so the text after it becomes the value and can collide with the reserved \
+             `kopiur:config` tag, failing snapshot create with a duplicate-tag error. Use a \
              colon-free key."
         ));
     }

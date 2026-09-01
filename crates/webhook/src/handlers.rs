@@ -1813,7 +1813,7 @@ mod tests {
         assert!(
             resp.result
                 .message
-                .contains("competing in the same GFS retention timeline"),
+                .contains("competing kopia lineage sharing the old one's GFS retention timeline"),
             "{:?}",
             resp.result.message
         );

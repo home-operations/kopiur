@@ -491,12 +491,11 @@ pub(super) fn job_limits(backup: &Snapshot) -> JobLimits {
 /// grace window — what failed, why, and how to fix it (the what/why/fix rule).
 pub(crate) fn wedged_pod_message(reason: &str, detail: &str, grace_seconds: i64) -> String {
     format!(
-        "the mover pod has been stuck ({reason}) for over {grace_seconds}s and cannot start: \
-         {detail}. Common causes: the resolved mover securityContext is invalid for the \
-         namespace's Pod Security policy (e.g. an inherited root UID without a privileged-mover \
-         opt-in), the mover image is unavailable, or the source volume cannot be scheduled. Fix \
-         the mover config (securityContext / inheritSecurityContextFrom / image) or the namespace \
-         policy, then re-run (a new Snapshot/Restore, or the next maintenance slot). Tune the \
+        "mover pod stuck ({reason}) for over {grace_seconds}s and cannot start: {detail}. Usual \
+         causes: an invalid securityContext for the namespace's Pod Security policy (e.g. \
+         inherited root UID, no privileged-mover opt-in), an unavailable image, or an \
+         unschedulable source volume. Fix: correct the mover config (securityContext / \
+         inheritSecurityContextFrom / image) or the namespace policy, then re-run; tune the \
          window with spec.failurePolicy.podStartupDeadlineSeconds."
     )
 }

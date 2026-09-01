@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use kopiur_api::common::ResolvedIdentity;
 use kopiur_api::restore::{ResolutionOutcome, ResolvedRestore, RestorePhase};
 use kopiur_api::snapshot::SnapshotInfo;
-use kopiur_api::{PhaseLabel, SnapshotStats, SnapshotTiming};
+use kopiur_api::{Diagnostic, PhaseLabel, SnapshotStats, SnapshotTiming};
 use kopiur_kopia::{KopiaError, MaintenanceMode, SnapshotCreateResult};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -767,7 +767,7 @@ pub fn lease_blocked_body(owner: &str, reason: &str, message: &str) -> serde_jso
 
 /// `{ "status": ... }` body for a failed kopia maintenance call.
 pub fn maintenance_failed_body(e: &KopiaError) -> serde_json::Value {
-    maintenance_failure_body(e.class(), &e.to_string())
+    maintenance_failure_body(e.class(), "run")
 }
 
 /// [`maintenance_failed_body`] for a maintenance step whose typed cause is a
@@ -777,21 +777,31 @@ pub fn maintenance_failed_body(e: &KopiaError) -> serde_json::Value {
 /// ([`MoverError::kopia_class`](crate::error::MoverError::kopia_class)) so the
 /// controller's retry hint cannot drift from the message.
 pub fn maintenance_failed_body_from_mover(e: &MoverError) -> serde_json::Value {
-    maintenance_failure_body(e.kopia_class(), &e.to_string())
+    maintenance_failure_body(e.kopia_class(), "throttle")
 }
 
 /// The one `MaintenanceFailed` condition body, so the two constructors above
-/// cannot drift in reason, wording or timestamp shape.
-fn maintenance_failure_body(
-    class: kopiur_kopia::KopiaErrorClass,
-    message: &str,
-) -> serde_json::Value {
+/// cannot drift in reason, wording or timestamp shape. `step` names which
+/// maintenance step failed (`"run"` vs the post-connect `"throttle"`), so the
+/// condition still tells them apart.
+///
+/// The message is built from the STABLE per-class [`summary`](kopiur_kopia::KopiaErrorClass::summary)
+/// — not the raw error `Display` — for the same two reasons repository conditions
+/// use it (see `repository.rs`): it is actionable per class, and it is byte-stable
+/// across repeated failures, so re-patching an unchanged `MaintenanceFailed` does
+/// not churn status. The volatile kopia detail (stderr tail, exit code) stays in
+/// the Job/pod logs. This replaces the old triple-nested
+/// `maintenance failed (class X): <op> failed (class X): kopia … failed (…): …`.
+fn maintenance_failure_body(class: kopiur_kopia::KopiaErrorClass, step: &str) -> serde_json::Value {
+    let message = Diagnostic::new(format!("kopia maintenance {step} failed"))
+        .because(class.summary())
+        .to_string();
     serde_json::json!({
         "status": {
             "conditions": [lease_condition_body(
                 "False",
                 "MaintenanceFailed",
-                &format!("maintenance failed (class {class}): {message}"),
+                &message,
                 &chrono::Utc::now(),
             )],
         }
@@ -1089,18 +1099,34 @@ mod tests {
             assert_eq!(cond["type"], kopiur_api::maintenance::LEASE_OWNED_CONDITION);
             assert_eq!(cond["status"], "False");
             assert_eq!(cond["reason"], "MaintenanceFailed");
+            let msg = cond["message"].as_str().expect("message is a string");
+            // The class semantics survive via the stable per-class summary (not the
+            // raw `class Locked` label, which is the machine-readable retry hint the
+            // controller derives separately) — an operator reads what to do.
             assert!(
-                cond["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("class Locked")),
-                "the condition message must carry the real kopia class: {cond}"
+                msg.contains("a repository lock is held by another writer"),
+                "the condition must carry the actionable class summary: {msg}"
+            );
+            // ...and it is well-formed per the shared shape checker (no nested
+            // `failed (class X): …` framing, no volatile stderr tail).
+            assert_eq!(
+                kopiur_api::message_shape_issue(msg),
+                None,
+                "maintenance condition message not well-formed: {msg}"
             );
         }
+        // The two steps are still distinguishable in `kubectl describe`.
+        assert!(
+            from_kopia["status"]["conditions"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("maintenance run failed")),
+            "the run step must be named"
+        );
         assert!(
             from_mover["status"]["conditions"][0]["message"]
                 .as_str()
-                .is_some_and(|m| m.contains("repository throttle set")),
-            "a throttle failure must name the invocation that failed"
+                .is_some_and(|m| m.contains("maintenance throttle failed")),
+            "the throttle step must be named"
         );
     }
 

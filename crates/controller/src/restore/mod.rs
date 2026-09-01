@@ -694,12 +694,11 @@ fn recorded_inherit_verdict(
             ok: false,
             reason: RECORDED_PINNED_NO_UID_REASON,
             message: format!(
-                "Snapshot `{snapshot}` recorded no pinned uid — and no gid/fsGroup beyond \
-                 the mover's own defaults — so inheriting it contributed nothing: the mover \
-                 runs as its image's uid {MOVER_NONROOT_ID}, an identity that did NOT come \
-                 from the backup ({provenance}). The backup mover's identity was \
-                 image-determined at backup time. Pin mover.securityContext.runAsUser on \
-                 this Restore if the restored files must be owned by a specific uid."
+                "Snapshot `{snapshot}` recorded no pinned uid (and no gid/fsGroup beyond the \
+                 mover's defaults), so inheriting it contributed nothing: the mover runs as its \
+                 image's uid {MOVER_NONROOT_ID}, which did NOT come from the backup \
+                 ({provenance}). Fix: pin mover.securityContext.runAsUser on this Restore if the \
+                 restored files must be owned by a specific uid."
             ),
         };
     }
@@ -729,10 +728,10 @@ fn recorded_inherit_verdict(
     // auditable per-restore, naming both the elevation and where it came from.
     let root_note = if uid == Some(0) {
         format!(
-            " The mover runs as ROOT (uid 0) because Snapshot `{snapshot}` recorded uid 0 \
-             — recorded metadata is repository data, forgeable by anyone with repository \
-             write credentials, so verify this snapshot is trusted; the run is additionally \
-             gated on the namespace's privileged-movers opt-in."
+            " The mover runs as ROOT (uid 0): Snapshot `{snapshot}` recorded uid 0, and \
+             recorded metadata is repository data forgeable by anyone with repository write \
+             access — verify this snapshot is trusted; the run is also gated on the namespace's \
+             privileged-movers opt-in."
         )
     } else {
         String::new()

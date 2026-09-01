@@ -242,17 +242,71 @@ pub fn validate_access_modes(field: &str, modes: &[PvcAccessMode]) -> Vec<Valida
     errs
 }
 
-/// A numeric knob must be at least `min` — the shared one-liner behind every
-/// `Option<u32>` count / `Option<i64>` bytes-per-second field (e.g.
-/// `RepositoryReplication.spec.sync.parallel`), so the rule and its message
-/// shape are written once instead of re-derived per field. `field` names the
+/// The semantic class of a numeric lower-bound, so [`require_min`] can attach the
+/// right minimum AND a one-line *why* without every caller re-deriving it — the
+/// difference between the old terse `"must be >= 1 (got 0)"` and a message that
+/// says why 0 is refused and what to do instead. Exhaustive `min`/`because`, so a
+/// new bound cannot be added without deciding both (mirrors the type-safety
+/// thesis: a knob's meaning is not free-text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericBound {
+    /// A worker/parallelism count (`parallel`, `fileParallelism`, …). 0 does no work.
+    Count,
+    /// A per-second cap (bytes/s or ops/s). kopia reads an ABSENT field as "no limit".
+    RatePerSecond,
+    /// A megabyte size cap (e.g. `upload.limitMb`).
+    Megabytes,
+    /// A number of seconds — a Job/pod deadline.
+    Seconds,
+    /// A retry backoff count, which legitimately allows 0.
+    BackoffCount,
+}
+
+impl NumericBound {
+    /// The inclusive minimum this bound enforces.
+    pub fn min(self) -> i64 {
+        match self {
+            NumericBound::BackoffCount => 0,
+            NumericBound::Count
+            | NumericBound::RatePerSecond
+            | NumericBound::Megabytes
+            | NumericBound::Seconds => 1,
+        }
+    }
+
+    /// Why the minimum exists — the `because` clause of the rejection message.
+    pub fn because(self) -> &'static str {
+        match self {
+            NumericBound::Count => "0 would do no work; set a positive count",
+            NumericBound::RatePerSecond => {
+                "kopia treats an ABSENT field, not 0, as \"no limit\"; 0 would stall the transfer, \
+                 so omit the field to run uncapped"
+            }
+            NumericBound::Megabytes => {
+                "0 would cap the upload at nothing; omit the field to leave it uncapped"
+            }
+            NumericBound::Seconds => {
+                "a non-positive deadline is rejected by the kubelet (or fails the pod immediately)"
+            }
+            NumericBound::BackoffCount => "a negative retry budget is meaningless",
+        }
+    }
+}
+
+/// A numeric knob must meet its [`NumericBound`]'s minimum — the shared one-liner
+/// behind every `Option<u32>` count / `Option<i64>` rate field (e.g.
+/// `RepositoryReplication.spec.sync.parallel`), so the rule, its minimum, AND its
+/// rationale are written once instead of re-derived per field. `field` names the
 /// exact path for the message (e.g. `"RepositoryReplication spec.sync.parallel"`).
 /// Callers only invoke this for a `Some` value — an absent knob is always valid
 /// and never reaches this helper.
-pub fn require_min(field: &str, value: i64, min: i64) -> Option<ValidationError> {
+pub fn require_min(field: &str, value: i64, bound: NumericBound) -> Option<ValidationError> {
+    let min = bound.min();
     (value < min).then(|| ValidationError::InvalidFieldValue {
         field: field.to_string(),
-        reason: format!("must be >= {min} (got {value})"),
+        reason: crate::message::Diagnostic::new(format!("must be at least {min} (got {value})"))
+            .because(bound.because())
+            .to_string(),
     })
 }
 
@@ -280,7 +334,9 @@ pub fn validate_throttle(field: &str, throttle: &crate::common::Throttle) -> Vec
         ("writeOpsPerSecond", write_ops_per_second),
     ]
     .into_iter()
-    .filter_map(|(knob, value)| value.and_then(|v| require_min(&format!("{field}.{knob}"), v, 1)))
+    .filter_map(|(knob, value)| {
+        value.and_then(|v| require_min(&format!("{field}.{knob}"), v, NumericBound::RatePerSecond))
+    })
     .collect()
 }
 
@@ -355,31 +411,36 @@ pub fn validate_resources(resources: &ResourceRequirements, context: &str) -> Va
 /// `backoffLimit` must be non-negative. `context` names the owner (e.g. `"Snapshot"`).
 pub fn validate_failure_policy(fp: &FailurePolicy, context: &str) -> ValidationResult {
     if let Some(d) = fp.active_deadline_seconds
-        && d <= 0
+        && let Some(e) = require_min(
+            &format!("{context} failurePolicy.activeDeadlineSeconds"),
+            d,
+            NumericBound::Seconds,
+        )
     {
-        return Err(ValidationError::InvalidFieldValue {
-            field: format!("{context} failurePolicy.activeDeadlineSeconds"),
-            reason: format!("must be a positive number of seconds (got {d})"),
-        });
+        return Err(e);
     }
     if let Some(g) = fp.pod_startup_deadline_seconds
         && g <= 0
     {
+        // Bespoke `because`: this deadline has a meaning worth naming beyond the
+        // generic Seconds rationale.
         return Err(ValidationError::InvalidFieldValue {
             field: format!("{context} failurePolicy.podStartupDeadlineSeconds"),
-            reason: format!(
-                "must be a positive number of seconds (got {g}); it bounds how long a \
-                 non-starting mover pod is tolerated before the run fails"
-            ),
+            reason: crate::message::Diagnostic::new(format!("must be at least 1 second (got {g})"))
+                .because(
+                    "it bounds how long a non-starting mover pod is tolerated before the run fails",
+                )
+                .to_string(),
         });
     }
     if let Some(b) = fp.backoff_limit
-        && b < 0
+        && let Some(e) = require_min(
+            &format!("{context} failurePolicy.backoffLimit"),
+            b.into(),
+            NumericBound::BackoffCount,
+        )
     {
-        return Err(ValidationError::InvalidFieldValue {
-            field: format!("{context} failurePolicy.backoffLimit"),
-            reason: format!("must be >= 0 (got {b})"),
-        });
+        return Err(e);
     }
     Ok(())
 }

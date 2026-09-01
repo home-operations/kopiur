@@ -139,14 +139,12 @@ pub fn reconcile_index_blob_health(
             // blobs by the gate alone — no maintenance schedule can help, which is exactly
             // the dead end #258 was reported from.
             let message = format!(
-                "repository has {count} content-index blobs (threshold {threshold}); kopia \
-                 maintenance is not compacting them. Ensure maintenance runs — if it is stuck on a \
-                 stale lease owner, set spec.maintenance.takeoverPolicy: Force once to recover. \
-                 If maintenance IS running, the epoch-advance gate is the usual cause on a busy \
-                 repository: an epoch cannot close before spec.parameters.epoch.minDuration \
-                 (kopia's default is 24h) and compaction trails two epochs behind, so lowering \
-                 it (e.g. 6h) lets blobs be compacted sooner. \
-                 Raise spec.health.indexBlobWarnThreshold (or set it to 0) to silence this."
+                "repository has {count} content-index blobs (threshold {threshold}); maintenance \
+                 is not compacting them. Fix: ensure maintenance runs — if stuck on a stale \
+                 lease, set spec.maintenance.takeoverPolicy: Force once; if it IS running, the \
+                 epoch gate is usually why — lower spec.parameters.epoch.minDuration (default \
+                 24h, e.g. 6h) so blobs compact. Raise spec.health.indexBlobWarnThreshold \
+                 (or 0) to silence."
             );
             let conditions = io::upsert_condition(
                 existing,
@@ -703,36 +701,34 @@ pub fn reconcile_probe_failure(
             REPOSITORY_VANISHED_REASON,
             VERIFY_BACKEND_ACTION,
             format!(
-                "the kopia repository appears to have VANISHED: the backend is reachable but the \
-                 repository format blob is absent ({consecutive} consecutive failing health \
-                 probes). Data blobs may still remain — recreating would orphan them and destroy \
-                 restorability, so kopiur will NOT auto-recreate. Verify the backend is truly \
-                 empty (and that no other Repository/ClusterRepository points at the same backend) \
-                 before any deliberate re-create."
+                "kopia repository VANISHED: the backend is reachable but the format blob is \
+                 absent ({consecutive} consecutive failing probes). Data blobs may still remain, \
+                 so re-creating would orphan them and destroy restorability — kopiur will NOT \
+                 auto-recreate. Fix: verify the backend is truly empty (and no other \
+                 Repository/ClusterRepository points at it) before any deliberate re-create."
             ),
         ),
         ProbeFailureKind::Unreachable => (
             BACKEND_UNREACHABLE_REASON,
             CHECK_BACKEND_ACTION,
             format!(
-                "the repository backend could not be confirmed healthy ({consecutive} consecutive \
-                 failing health probes): it is unreachable, the path/mount is missing, or \
-                 credentials/lock failed. This is NOT treated as a wipe and kopiur never \
-                 auto-recreates (see the Ready condition for what kopiur is doing about it). \
-                 Check the backend, credentials, and any mounted volume."
+                "repository backend not confirmed healthy ({consecutive} consecutive failing \
+                 probes): unreachable, the path/mount is missing, or credentials/lock failed. \
+                 This is NOT treated as a wipe and kopiur never auto-recreates. Fix: check the \
+                 backend, credentials, and any mounted volume (see the Ready condition for what \
+                 kopiur is doing)."
             ),
         ),
         ProbeFailureKind::TimedOut => (
             PROBE_DEADLINE_EXCEEDED_REASON,
             RAISE_BOOTSTRAP_DEADLINE_ACTION,
             format!(
-                "the backend health probe was killed by its activeDeadlineSeconds before kopia \
-                 finished connecting ({consecutive} consecutive deadline-killed probes). The \
-                 backend may be reachable but slow — a cold cache over a large index makes \
-                 `kopia repository connect` exceed the deadline. This is NOT evidence of an \
-                 outage or a wipe, and kopiur never auto-recreates. Raise \
-                 spec.bootstrap.failurePolicy.activeDeadlineSeconds; maintenance (index \
-                 compaction) shrinks connect time and keeps running."
+                "backend health probe killed by its activeDeadlineSeconds ({consecutive} \
+                 consecutive deadline-killed probes) — the backend may be reachable but slow: a \
+                 cold cache over a large index makes connect exceed the deadline. This is NOT \
+                 evidence of an outage or wipe, and kopiur never auto-recreates. Fix: raise \
+                 spec.bootstrap.failurePolicy.activeDeadlineSeconds; maintenance shrinks connect \
+                 time and keeps running."
             ),
         ),
     };

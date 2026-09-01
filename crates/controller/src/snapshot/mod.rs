@@ -4577,12 +4577,11 @@ fn inherit_verdict(
             reason: INHERIT_FALLBACK_REASON,
             action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
             message: format!(
-                "the mover runs as {} from this recipe's explicit mover securityContext, \
-                 not from the workload: {reason}. An explicit context that pins an \
-                 identity is the deliberate fallback, so the run proceeded — but it is \
-                 not tracking the workload. Scale the workload up or fix the selector to \
-                 resume inheriting, or drop inheritSecurityContextFrom if the explicit \
-                 context is the intent.",
+                "mover runs as {} from this recipe's explicit mover securityContext, not from \
+                 the workload: {reason}. The explicit context is a deliberate fallback so the \
+                 run proceeded, but it is not tracking the workload. Fix: scale the workload up \
+                 or fix the selector to resume inheriting, or drop inheritSecurityContextFrom if \
+                 the explicit context is intended.",
                 identity()
             ),
         }),
@@ -4597,14 +4596,13 @@ fn inherit_verdict(
             reason: INHERIT_PINNED_NO_UID_REASON,
             action: PIN_WORKLOAD_RUN_AS_USER_ACTION,
             message: format!(
-                "inheriting from pod `{pod}`{} copied nothing: the pod pins no runAsUser, \
-                 and no runAsGroup/fsGroup/supplementalGroups beyond the mover's own \
-                 defaults, so its identity lives in its container image, which Kopiur \
-                 cannot read from the pod spec. The mover therefore runs as {} — an \
-                 identity that did NOT come from the workload — and will likely fail to \
-                 read the source with permission denied. Set runAsUser on the workload, \
-                 or pin mover.securityContext.runAsUser in this recipe (it merges with, \
-                 and overrides, inherited values).",
+                "inheriting from pod `{pod}`{} copied nothing: the pod pins no runAsUser, and no \
+                 runAsGroup/fsGroup/supplementalGroups beyond the mover's defaults, so its \
+                 identity lives in its container image, which Kopiur cannot read from the pod \
+                 spec. The mover therefore runs as {} — not from the workload — and will likely \
+                 fail to read the source (permission denied). Fix: set runAsUser on the \
+                 workload, or pin mover.securityContext.runAsUser in this recipe (it overrides \
+                 inherited values).",
                 container
                     .as_deref()
                     .map(|c| format!(" (container `{c}`)"))
@@ -4649,12 +4647,11 @@ fn inherit_verdict(
                 reason: INHERIT_OVERRIDDEN_REASON,
                 action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
                 message: format!(
-                    "the mover runs as {}, not the uid {inherited_uid} it inherited from \
-                     pod `{pod}`: this recipe's explicit {field} overrides the inherited \
-                     value — an explicit field always wins — so \
-                     inheritSecurityContextFrom will not follow the workload if its uid \
-                     changes. Remove {field} to track the workload, or drop \
-                     inheritSecurityContextFrom to stop implying that it does.",
+                    "mover runs as {}, not the uid {inherited_uid} it inherited from pod \
+                     `{pod}`: this recipe's explicit {field} overrides the inherited value (an \
+                     explicit field always wins), so inheritSecurityContextFrom will not follow \
+                     the workload if its uid changes. Fix: Remove {field} to track the workload, \
+                     or drop inheritSecurityContextFrom to stop implying it does.",
                     identity()
                 ),
             })
@@ -4741,10 +4738,10 @@ async fn assess_completed_backup(
         return;
     }
     let msg = format!(
-        "the backup completed but {failed} source entr{} could not be read and were EXCLUDED \
-         from the snapshot — it is INCOMPLETE. This is usually a UID/GID mismatch: match the \
-         mover to the workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching \
-         runAsUser; otherwise fix the source file permissions",
+        "backup completed but {failed} source entr{} could not be read and were EXCLUDED — the \
+         snapshot is INCOMPLETE. Usually a UID/GID mismatch. Fix: match the mover to the \
+         workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching runAsUser, else \
+         fix the source file permissions",
         if failed == 1 { "y" } else { "ies" },
     );
     let existing = backup

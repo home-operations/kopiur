@@ -386,11 +386,10 @@ fn schedule_ready_status(
             BLOCKED_ON_UNREADABLE_RUN_REASON,
             format!(
                 "Snapshot `{}` holds this schedule's concurrency gate at phase `{}`, which this \
-                 kopiur build does not recognize — most likely a newer operator wrote it. This \
-                 build can never observe that run finish, so under \
-                 `concurrencyPolicy: Forbid` NO FURTHER BACKUPS WILL RUN for this schedule. \
-                 Finish the operator upgrade (or delete Snapshot `{}` if the run is genuinely \
-                 over) to release the gate.",
+                 kopiur build does not recognize (most likely a newer operator wrote it). This \
+                 build can never observe that run finish, so under `concurrencyPolicy: Forbid` NO \
+                 FURTHER BACKUPS WILL RUN for this schedule. Fix: Finish the operator upgrade, or \
+                 delete Snapshot `{}` if the run is genuinely over, to release the gate.",
                 b.snapshot, b.phase, b.snapshot
             ),
         ),

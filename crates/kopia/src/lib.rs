@@ -4,6 +4,7 @@
 pub mod client;
 pub mod env;
 pub mod error;
+pub mod humanize;
 pub mod model;
 pub mod selection;
 pub mod session;
@@ -17,6 +18,7 @@ pub use client::{
 pub use error::{
     KopiaError, KopiaErrorClass, notfound_is_uninitialized, snapshot_skipped_unchanged,
 };
+pub use humanize::{exit_code_desc, humanize_tail};
 pub use model::{
     BlobRetention, ClientOptions, ContentFormat, DirEntry, DirManifest, DirSummary, DirSummaryLite,
     EntryError, IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceSchedule,

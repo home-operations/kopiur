@@ -422,9 +422,9 @@ pub fn missing_workload_identity_sa_message(
     };
     format!(
         "backend auth.workloadIdentity names ServiceAccount `{sa}`, but it does not exist in \
-         namespace `{ns}` where {consumer} runs. Kopiur never creates this ServiceAccount — \
-         its cloud-federation annotations are your contract with the cloud's identity webhook. \
-         Fix: create ServiceAccount `{sa}` in `{ns}` with the federation binding ({annotation})."
+         namespace `{ns}` where {consumer} runs — Kopiur never creates it (its cloud-federation \
+         annotations are your contract with the cloud's identity webhook). Fix: create \
+         ServiceAccount `{sa}` in `{ns}` with the federation binding ({annotation})."
     )
 }
 
@@ -620,13 +620,12 @@ pub async fn namespace_allows_privileged_movers(client: &kube::Client, ns: &str)
 /// its name, so the message names the right object to fix.
 pub fn privileged_mover_message(kind: &str, name: &str, ns: &str, mover_sa: &str) -> String {
     format!(
-        "{kind} `{name}` requests a privileged mover (e.g. `runAsUser: 0`, \
-         `privileged: true`, added capabilities, or `privilegedMode`), but namespace `{ns}` has \
-         not opted in. A tenant with access to `{ns}` could reuse the minted `{mover_sa}` \
-         ServiceAccount to run pods at that privilege, so an elevated mover requires an explicit \
-         per-namespace opt-in. Fix: a cluster admin annotates the namespace — `kubectl annotate \
-         namespace {ns} {PRIVILEGED_MOVERS_ANNOTATION}=true` — or remove the elevated \
-         securityContext/privilegedMode from the {kind} `spec.mover`."
+        "{kind} `{name}` requests a privileged mover (e.g. `runAsUser: 0`, `privileged: true`, \
+         added capabilities, or `privilegedMode`), but namespace `{ns}` has not opted in — a \
+         tenant with access to `{ns}` could reuse the minted `{mover_sa}` ServiceAccount at that \
+         privilege. Fix: a cluster admin runs `kubectl annotate namespace {ns} \
+         {PRIVILEGED_MOVERS_ANNOTATION}=true`, or remove the elevated securityContext/\
+         privilegedMode from the {kind} `spec.mover`."
     )
 }
 

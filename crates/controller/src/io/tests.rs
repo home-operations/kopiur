@@ -43,7 +43,7 @@ fn backend_failure_access_denied_points_at_credentials_and_bucket() {
     assert_eq!(action, CHECK_CREDENTIALS_ACTION);
     assert!(note.contains("denied access"));
     assert!(note.contains("credentials Secret"));
-    assert!(note.contains("bucket/path"));
+    assert!(note.contains("bucket/container/path"));
 }
 
 #[test]
@@ -73,15 +73,47 @@ fn backend_failure_permission_denied_points_at_the_live_uid() {
 }
 
 #[test]
-fn backend_failure_other_classes_stay_generic_with_class_and_message() {
+fn backend_failure_unwraps_nested_bootstrap_framing() {
+    // A bootstrap failure passes a MoverError string that WRAPS a KopiaError, so
+    // the raw message carries two `… failed (…): ` layers. Both must be peeled or
+    // the Event note reads as a nested essay (greptile P2).
+    let nested = "repository bootstrap failed (class PermissionDenied): kopia `repository \
+                  connect` failed (exit code 1, class PermissionDenied): unable to create \
+                  directory /repo: permission denied";
+    let (_action, note) =
+        backend_failure_event(KopiaErrorClass::PermissionDenied, nested, TEST_UID);
+    assert!(
+        note.contains("unable to create directory /repo: permission denied"),
+        "innermost detail lost: {note}"
+    );
+    assert!(
+        !note.contains("bootstrap failed (class"),
+        "outer MoverError framing leaked: {note}"
+    );
+    assert!(
+        !note.contains("kopia `repository connect`"),
+        "inner KopiaError framing leaked: {note}"
+    );
+    assert_eq!(kopiur_api::message_shape_issue(&note), None, "{note}");
+}
+
+#[test]
+fn backend_failure_other_classes_lead_with_the_specific_problem() {
+    // The note now leads with the human problem (not the bare class label — that
+    // is the Event `reason`, asserted at the call site) and embeds the detail.
     let (action, note) = backend_failure_event(
         KopiaErrorClass::RepositoryUnavailable,
         "connection refused",
         TEST_UID,
     );
     assert_eq!(action, CHECK_BACKEND_ACTION);
-    assert!(note.contains("RepositoryUnavailable"));
-    assert!(note.contains("connection refused"));
+    assert!(
+        note.starts_with("the repository backend is unreachable"),
+        "note should lead with the specific problem: {note}"
+    );
+    assert!(note.contains("connection refused"), "{note}");
+    // The message is well-formed per the shared shape checker.
+    assert_eq!(kopiur_api::message_shape_issue(&note), None, "{note}");
 }
 
 // --- note truncation: a huge kopia stderr tail must not blow past the
@@ -3003,10 +3035,26 @@ mod reconcile_failure_events {
                 "note for {err} should contain {note_phrase:?}: {}",
                 ev.note
             );
-            // The note always leads with the error's own message.
-            assert!(
-                ev.note.contains(&err.to_string()),
-                "note for {err} should embed the error message"
+            // The note embeds the error's own message (the detail reaches the
+            // user) — for compact errors. A giant upstream Display (a raw kube
+            // Status debug dump) is summarized to stay under the ramble cap, so
+            // skip the strict containment there and rely on the phrase + shape
+            // checks below.
+            if err.to_string().chars().count() <= 200 {
+                assert!(
+                    ev.note.contains(&err.to_string()),
+                    "note for {err} should embed the error message"
+                );
+            }
+            // ...and every variant's note is well-formed per the shared shape
+            // checker (lead-with-specific, no doubled spaces, no volatile temp
+            // fragments, not a ramble). This is the structural lint over the whole
+            // reconcile-event surface — a new variant with a sloppy note fails here.
+            assert_eq!(
+                kopiur_api::message_shape_issue(&ev.note),
+                None,
+                "event note for {err} is not well-formed: {}",
+                ev.note
             );
         }
     }

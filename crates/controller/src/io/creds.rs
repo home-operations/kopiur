@@ -36,19 +36,18 @@ pub struct CredsContext<'a> {
 pub fn missing_creds_message(secret: &str, job_ns: &str, ctx: &CredsContext) -> String {
     let mut msg = format!(
         "credentials Secret `{secret}` does not exist in namespace `{job_ns}`, where the mover \
-         Job runs and loads it via envFrom — Kubernetes envFrom is namespace-local and cannot \
-         read a Secret from another namespace."
+         Job runs and loads it via envFrom — envFrom is namespace-local and cannot read a Secret \
+         from another namespace."
     );
     match ctx.repo_secret_namespace {
         // Cross-namespace mismatch (typically a ClusterRepository whose Secret is
         // pinned to the operator namespace): name both ends and offer both fixes.
         Some(src) if src != job_ns => {
             msg.push_str(&format!(
-                " The referenced {kind} `{name}` keeps that Secret in namespace `{src}`. \
-                 Fix: create a Secret named `{secret}` in namespace `{job_ns}` carrying the same \
-                 keys (e.g. `KOPIA_PASSWORD`, plus backend keys like `AWS_ACCESS_KEY_ID`/\
-                 `AWS_SECRET_ACCESS_KEY`), or back up with a namespaced Repository whose secret \
-                 lives in `{job_ns}`.",
+                " The {kind} `{name}` keeps that Secret in namespace `{src}`. Fix: create a \
+                 Secret `{secret}` in `{job_ns}` with the same keys (e.g. `KOPIA_PASSWORD`, plus \
+                 backend keys like `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), or use a \
+                 namespaced Repository whose secret lives in `{job_ns}`.",
                 kind = ctx.repo_kind,
                 name = ctx.repo_name,
             ));
@@ -56,9 +55,9 @@ pub fn missing_creds_message(secret: &str, job_ns: &str, ctx: &CredsContext) -> 
         // Same-namespace reference: the Secret simply isn't there yet.
         _ => {
             msg.push_str(&format!(
-                " The {kind} `{name}` references it from namespace `{job_ns}`. \
-                 Fix: create a Secret named `{secret}` in namespace `{job_ns}` carrying the \
-                 repository credentials (e.g. `KOPIA_PASSWORD`, plus any backend keys).",
+                " The {kind} `{name}` references it from namespace `{job_ns}`. Fix: create a \
+                 Secret `{secret}` in `{job_ns}` with the repository credentials (e.g. \
+                 `KOPIA_PASSWORD`, plus any backend keys).",
                 kind = ctx.repo_kind,
                 name = ctx.repo_name,
             ));
@@ -342,10 +341,10 @@ fn projection_name_conflict_message(
             .to_string(),
     };
     format!(
-        "cannot project credentials for {kind} `{name}`: the target Secret `{proj_name}` in \
-         namespace `{job_ns}` already exists and {holder}. Overwriting it would hand one \
-         consumer's runs another owner's (or the user's) Secret. Fix: rename one of the \
-         colliding resources, or delete the conflicting Secret if it is stale.",
+        "credential projection blocked for {kind} `{name}`: target Secret `{proj_name}` in \
+         namespace `{job_ns}` already exists and {holder}, and overwriting it would hand one \
+         consumer another owner's (or the user's) Secret. Fix: rename one of the colliding \
+         resources, or delete the conflicting Secret if it is stale.",
         kind = ctx.repo_kind,
         name = ctx.repo_name,
     )
@@ -887,9 +886,9 @@ fn projection_denied_message(
     let (why, fix) = match reason {
         ProjectionDenyReason::ConsumerNotOptedIn => (
             "the consumer has not opted in to credential projection",
-            "set `spec.credentialProjection.enabled: true` on this SnapshotPolicy/Restore \
-             (and ensure the ClusterRepository owner sets `credentialProjection.allowed: true`), \
-             or create the Secret in the mover namespace yourself",
+            "set `spec.credentialProjection.enabled: true` on this SnapshotPolicy/Restore (owner \
+             must also set `credentialProjection.allowed: true`), or create the Secret in the \
+             mover namespace yourself",
         ),
         ProjectionDenyReason::OwnerNotAllowed => (
             "the ClusterRepository owner has not allowed credential projection",
@@ -898,9 +897,8 @@ fn projection_denied_message(
         ),
     };
     format!(
-        "credential Secret `{secret}` lives in namespace `{src_ns}` but the mover Job runs in \
-         `{job_ns}`, and projecting it across namespaces is not permitted: {why}. The referenced \
-         {kind} `{name}` is the source. Fix: {fix}.",
+        "cross-namespace credential projection denied for `{secret}`: it lives in `{src_ns}` but \
+         the mover Job runs in `{job_ns}`, and {why}. Source: {kind} `{name}`. Fix: {fix}.",
         kind = ctx.repo_kind,
         name = ctx.repo_name,
     )
@@ -912,8 +910,8 @@ fn projection_denied_message(
 fn projection_unresolved_ns_message(secret: &str, ctx: &CredsContext) -> String {
     format!(
         "credential Secret `{secret}` for {kind} `{name}` has no resolvable source namespace, so \
-         credential projection cannot read it to copy into the mover Job's namespace. Fix: set an \
-         explicit `namespace` on the Secret reference (a {kind} reference must pin one), or disable \
+         projection cannot read it to copy into the mover Job's namespace. Fix: set an explicit \
+         `namespace` on the Secret reference (a {kind} reference must pin one), or disable \
          `spec.credentialProjection` and manage the Secret in each mover namespace yourself.",
         kind = ctx.repo_kind,
         name = ctx.repo_name,
@@ -929,10 +927,10 @@ fn projection_source_missing_message(
     ctx: &CredsContext,
 ) -> String {
     format!(
-        "credential Secret `{secret}` was not found in source namespace `{src_ns}`, so the \
-         {kind} `{name}` cannot project it into namespace `{job_ns}` where the mover Job runs. \
-         Fix: create Secret `{secret}` in `{src_ns}` carrying the repository credentials (e.g. \
-         `KOPIA_PASSWORD`, plus backend keys like `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`).",
+        "credential Secret `{secret}` not found in source namespace `{src_ns}`, so {kind} \
+         `{name}` cannot project it into `{job_ns}` where the mover Job runs. Fix: create Secret \
+         `{secret}` in `{src_ns}` with the repository credentials (e.g. `KOPIA_PASSWORD`, plus \
+         backend keys like `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`).",
         kind = ctx.repo_kind,
         name = ctx.repo_name,
     )
