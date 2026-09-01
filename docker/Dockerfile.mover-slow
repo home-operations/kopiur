@@ -1,0 +1,44 @@
+# The `mover-slow` E2E FIXTURE image — never built by a release workflow.
+#
+# Same mover image, wrapped: the entrypoint sleeps a deterministic number of
+# seconds and then `exec`s the real `/usr/local/bin/kopiur-mover` with the
+# original argv. Everything else (kopiur-mover, kopia, rclone, the nonroot uid)
+# is inherited unchanged from MOVER_IMAGE, so a slow mover Job behaves exactly
+# like a normal one — it just holds its concurrency slot long enough for a
+# scenario to observe the queue.
+#
+# Why a busybox wrapper: the mover runtime is `gcr.io/distroless/cc-debian13`,
+# which has NO shell, so `ENTRYPOINT ["sh", "-c", ...]` cannot work. The
+# smallest thing that does is a statically-linked busybox (the official busybox
+# image is `FROM scratch`, so /bin/busybox has no interpreter or libc to bring
+# along) copied in beside a script. No Rust rebuild, no second toolchain.
+#
+# Build (see crates/e2e/mise.toml `image-mover-slow`): the base is the LOCAL
+# `:e2e` mover image, so this must run after `//crates/e2e:images` (or after the
+# CI shard `docker load`s the mover tarball).
+#
+#   docker build -f docker/Dockerfile.mover-slow \
+#     --build-arg MOVER_IMAGE=kopiur/mover:e2e -t kopiur/mover-slow:e2e .
+#
+# syntax=docker/dockerfile:1
+
+ARG MOVER_IMAGE=kopiur/mover:e2e
+# Same digest-pinned busybox the harness already preloads onto the kind node
+# (crates/e2e/src/consts.rs::BUSYBOX_IMAGE / the `node-seed` mise task), so this
+# build reuses a layer the e2e host has anyway. Pinned by digest — no `:latest`.
+ARG BUSYBOX_IMAGE=busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028
+
+FROM ${BUSYBOX_IMAGE} AS busybox
+
+FROM ${MOVER_IMAGE} AS runtime
+# Default delay when the pod env does not override it. A scenario overrides it
+# per repository by putting KOPIUR_E2E_MOVER_DELAY_SECONDS in that repository's
+# credentials Secret (mover pods `envFrom` the whole Secret, and pod env beats
+# image ENV) — see crates/e2e/src/slow_mover.rs.
+ARG DELAY_SECONDS=60
+ENV KOPIUR_E2E_MOVER_DELAY_SECONDS=${DELAY_SECONDS}
+COPY --from=busybox /bin/busybox /kopiur-e2e/busybox
+# Read by `busybox sh <script>`, so it needs no exec bit (and none is asserted,
+# keeping the checked-in file mode irrelevant to the build).
+COPY docker/slow-mover-entrypoint.sh /kopiur-e2e/entrypoint.sh
+ENTRYPOINT ["/kopiur-e2e/busybox", "sh", "/kopiur-e2e/entrypoint.sh"]
