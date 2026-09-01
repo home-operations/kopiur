@@ -894,6 +894,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     )
                     .await?;
                 }
+                // LAST status write of this arm, deliberately: clear a park left
+                // standing by a Job-creation patch that failed after the Job was
+                // already created. See `heal_slot_condition_in_flight`.
+                heal_slot_condition_in_flight(&api, backup, &name).await;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
         }
@@ -1869,13 +1873,16 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // so no later writer can resurrect the stale `False` (see `fold_slot_heal`).
     // `None` for every Snapshot that was never parked, which keeps this patch
     // byte-identical to a build without the pool gate.
-    if let Some(conditions) = fold_slot_heal(&api, backup, &name, &repo, slot_heal).await
+    let pinned = repo.repository_ref();
+    if let Some(conditions) = fold_slot_heal(&api, backup, &name, &pinned, slot_heal).await
         && let Some(obj) = status.as_object_mut()
+        // Serializing a `Vec<Condition>` cannot fail — but a `null` fallback
+        // here would DELETE the whole conditions array in the merge patch, so
+        // on Err we skip the key entirely and leave the standing park for the
+        // in-flight heal to clear on the next pass.
+        && let Ok(value) = serde_json::to_value(&conditions)
     {
-        obj.insert(
-            "conditions".to_string(),
-            serde_json::to_value(&conditions).unwrap_or(serde_json::Value::Null),
-        );
+        obj.insert("conditions".to_string(), value);
     }
     io::patch_status(&api, &name, status).await?;
     tracing::info!(backup = %name, "created mover Job for backup");
@@ -2015,7 +2022,7 @@ async fn fold_slot_heal(
     api: &Api<Snapshot>,
     backup: &Snapshot,
     name: &str,
-    repo: &ResolvedRepository,
+    pinned: &RepositoryRef,
     heal: bool,
 ) -> Option<Vec<Condition>> {
     if !heal {
@@ -2029,21 +2036,93 @@ async fn fold_slot_heal(
         .unwrap_or_default();
     // Re-check against the LIVE array: another writer (or a racing replica) may
     // already have healed it, and re-writing an unchanged condition is churn.
-    if !crate::pool::slot_gate_is_false(&existing) {
+    slot_heal_conditions(&existing, pinned, backup.meta().generation)
+}
+
+/// The pure core of the heal: the conditions array that clears a standing
+/// `RepositorySlotAvailable=False`, or `None` when no park is standing (so the
+/// caller writes nothing at all and the status stays byte-identical to a build
+/// without the pool gate).
+pub(super) fn slot_heal_conditions(
+    existing: &[Condition],
+    pinned: &RepositoryRef,
+    generation: Option<i64>,
+) -> Option<Vec<Condition>> {
+    if !crate::pool::slot_gate_is_false(existing) {
         return None;
     }
-    let pinned = repo.repository_ref();
     Some(io::upsert_condition(
-        &existing,
+        existing,
         crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION,
         true,
         crate::consts::SLOT_ACQUIRED_REASON,
         &crate::pool::slot_acquired_message(
             io::repo_kind_str(pinned.kind),
-            &crate::pool::repo_display(&pinned),
+            &crate::pool::repo_display(pinned),
         ),
-        backup.meta().generation,
+        generation,
     ))
+}
+
+/// Which repository an IN-FLIGHT backup must heal its slot condition against,
+/// or `None` when there is nothing to heal.
+///
+/// Pure and IO-free by design — it is the fast path that keeps
+/// [`heal_slot_condition_in_flight`] free for the overwhelming majority of runs
+/// (every backup that was never parked). The repository comes from
+/// `status.resolved.repository`, which both the park write and the Job-creation
+/// patch pin, so no recipe resolution is needed here; a run with a standing park
+/// but no pin (impossible via either writer) is left alone rather than guessed at.
+pub(super) fn in_flight_heal_target(backup: &Snapshot) -> Option<RepositoryRef> {
+    let status = backup.status.as_ref()?;
+    if !crate::pool::slot_gate_is_false(&status.conditions) {
+        return None;
+    }
+    status.resolved.as_ref()?.repository.clone()
+}
+
+/// Re-attempt the admission heal from the IN-FLIGHT arm — the mirror of
+/// `replication_run::heal_replication_slot_condition`, for backups.
+///
+/// **Why the launch-path heal is not enough.** [`fold_slot_heal`] rides the
+/// Job-creation status patch, which is issued AFTER `apply_mover_objects` has
+/// already created the Job. If that patch fails, the Job exists but the CR still
+/// says `RepositorySlotAvailable=False`, and every later reconcile returns at the
+/// "Job exists, non-terminal" branch above — it never reaches the pool gate
+/// again, so nothing ever clears the park. The consequences are all real
+/// misreporting, not cosmetics: `kopiur_snapshot_waiting_for_slot` keeps counting
+/// a running backup as queued, `KopiurSnapshotWaitingForSlot` false-pages after
+/// 30m, and `concurrencyPolicy: Replace` reads the child as parked and degrades
+/// to `ReplacementHeld` instead of replacing it. Re-attempting here closes the
+/// window to one requeue.
+///
+/// Called LAST in the arm, after the `Running` patch, for the reason
+/// [`fold_slot_heal`] documents: a `conditions` patch REPLACES the array and the
+/// `Running` writer seeds from the reconcile's stale copy, so a heal written
+/// before it would simply be clobbered. The array written here is seeded from a
+/// live re-read for the same reason.
+///
+/// Best-effort by contract: the Job is already running, and failing the reconcile
+/// over a cosmetic condition flip would only re-run the arm against the same
+/// state. Costs nothing when there is nothing to heal — [`in_flight_heal_target`]
+/// answers from the object already in hand, before any IO.
+async fn heal_slot_condition_in_flight(api: &Api<Snapshot>, backup: &Snapshot, name: &str) {
+    let Some(pinned) = in_flight_heal_target(backup) else {
+        return;
+    };
+    let Some(conditions) = fold_slot_heal(api, backup, name, &pinned, true).await else {
+        return;
+    };
+    if let Err(e) =
+        io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await
+    {
+        tracing::debug!(
+            backup = %name,
+            error = %e,
+            "could not clear a stale RepositorySlotAvailable=False on an in-flight backup; \
+             retried on the next reconcile of this run"
+        );
+    }
 }
 
 // --- Missing-source-PVC bounded outcome (#382 M5) ---------------------------

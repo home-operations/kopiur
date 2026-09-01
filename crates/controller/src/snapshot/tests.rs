@@ -4648,3 +4648,104 @@ fn the_heal_preserves_conditions_written_between_the_gate_and_the_job() {
     assert_eq!(healed[0].type_, "RepositorySlotAvailable");
     assert_eq!(healed[1].type_, "SourceStaged");
 }
+
+/// The fixture for the in-flight heal window: a Snapshot the Job-creation patch
+/// FAILED on — the Job exists (so later passes return at the "Job exists,
+/// non-terminal" arm and never see the pool gate again), but the CR still
+/// carries the park.
+fn in_flight_backup(phase: &str, conditions: serde_json::Value) -> Snapshot {
+    let mut backup = backup_with_status(Some(phase), conditions);
+    let mut status_json = serde_json::to_value(backup.status.as_ref().unwrap()).unwrap();
+    status_json["resolved"] = serde_json::json!({
+        "repository": RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: Some("apps".into()),
+        }
+    });
+    backup.status = Some(serde_json::from_value(status_json).expect("round-trip"));
+    backup
+}
+
+#[test]
+fn an_in_flight_run_heals_a_park_the_job_creation_patch_left_standing() {
+    // The window: `apply_mover_objects` succeeded, the Job-creation status patch
+    // did not. Without the in-flight heal NOTHING ever clears the park — the
+    // reconcile returns at the "Job exists, non-terminal" arm forever, the
+    // `kopiur_snapshot_waiting_for_slot` gauge counts a RUNNING backup as
+    // queued, `KopiurSnapshotWaitingForSlot` false-pages at 30m, and
+    // `concurrencyPolicy: Replace` reads the child as parked and stalls at
+    // `ReplacementHeld`.
+    let backup = in_flight_backup("Running", slot_condition("False", "WaitingForSlot"));
+
+    let pinned = in_flight_heal_target(&backup)
+        .expect("a Running Snapshot with a standing park must be healed");
+    // Healed against the repository the park/Job-creation writers PINNED, so no
+    // recipe resolution is needed on this path.
+    assert_eq!(pinned.name, "nas");
+    assert_eq!(pinned.namespace.as_deref(), Some("apps"));
+
+    let healed = slot_heal_conditions(
+        &backup.status.as_ref().unwrap().conditions,
+        &pinned,
+        backup.meta().generation,
+    )
+    .expect("a standing park produces a heal patch");
+    let slot = healed
+        .iter()
+        .find(|c| c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION)
+        .expect("the slot condition is rewritten");
+    assert_eq!(slot.status, "True");
+    assert_eq!(slot.reason, crate::consts::SLOT_ACQUIRED_REASON);
+    assert_eq!(slot.message, "holding a mover slot on Repository apps/nas");
+}
+
+#[test]
+fn a_clean_in_flight_run_does_no_work_at_all() {
+    // The zero-cost half of the contract. A backup that was never parked (or was
+    // already healed) must not trigger the live re-read, must not patch, and must
+    // leave its status byte-identical to a build without the pool gate.
+    for conditions in [
+        slot_condition("True", "SlotAcquired"),
+        serde_json::json!([]),
+    ] {
+        let backup = in_flight_backup("Running", conditions);
+        assert!(
+            in_flight_heal_target(&backup).is_none(),
+            "no park is standing, so the heal must short-circuit before any IO: {:?}",
+            backup.status
+        );
+        // And the pure core agrees: nothing to write, so no patch body exists.
+        let pinned = RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: Some("apps".into()),
+        };
+        assert!(
+            slot_heal_conditions(
+                &backup.status.as_ref().unwrap().conditions,
+                &pinned,
+                backup.meta().generation,
+            )
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn the_in_flight_heal_needs_the_pinned_repository() {
+    // Belt-and-braces: both the park write and the Job-creation patch pin
+    // `resolved.repository`, so a standing park without one is unreachable — but
+    // if it ever happened we leave the condition alone rather than guessing a
+    // repository into a user-visible message.
+    let backup = backup_with_status(Some("Running"), slot_condition("False", "WaitingForSlot"));
+    assert!(
+        backup
+            .status
+            .as_ref()
+            .and_then(|s| s.resolved.as_ref())
+            .and_then(|r| r.repository.as_ref())
+            .is_none()
+    );
+    assert!(in_flight_heal_target(&backup).is_none());
+}
