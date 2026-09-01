@@ -4086,6 +4086,167 @@ mod missing_source_pvc {
 // `moverDefaults` → `resolve_mover` → the `MoverJobInputs` fields the backup
 // site sets → `build_job`. A field dropped at any link fails here.
 
+/// Render a mover Job the way a reconciler does — the real label set from that
+/// site's own label builder, through the real `build_job`.
+fn render_mover_job(
+    labels: BTreeMap<String, String>,
+    resolved_mover: &kopiur_api::common::ResolvedMover,
+) -> k8s_openapi::api::batch::v1::Job {
+    use kopiur_mover::jobs::{JobLimits, MoverJobInputs, build_job};
+    let ws = sample_backup_work_spec();
+    build_job(&MoverJobInputs {
+        name: "job-1",
+        namespace: "prod",
+        owner: kopiur_mover::jobs::owner_ref("Snapshot", "db-1", "uid-1"),
+        work_spec: &ws,
+        image: "ghcr.io/kopiur/mover:test",
+        image_pull_policy: None,
+        limits: JobLimits::default(),
+        resources: resolved_mover.resources.clone(),
+        security_context: resolved_mover.security_context.clone(),
+        pod_security_context: resolved_mover.pod_security_context.clone(),
+        node_selector: resolved_mover.node_selector.clone(),
+        tolerations: resolved_mover.tolerations.clone(),
+        affinity: resolved_mover.affinity.clone(),
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
+        labels,
+        source_volume: None,
+        repo_volume: None,
+        creds_secrets: Vec::new(),
+        result_configmap: None,
+        service_account: None,
+        passthrough_env: Vec::new(),
+        extra_env: Vec::new(),
+        annotations: BTreeMap::new(),
+        cache_volume: Default::default(),
+        scratch_volume: None,
+        readiness_exec: None,
+    })
+    .expect("the Job builds")
+}
+
+fn rendered_labels(job: &k8s_openapi::api::batch::v1::Job) -> BTreeMap<String, String> {
+    job.metadata.labels.clone().unwrap_or_default()
+}
+
+fn rendered_pod_labels(job: &k8s_openapi::api::batch::v1::Job) -> BTreeMap<String, String> {
+    job.spec
+        .as_ref()
+        .expect("spec")
+        .template
+        .metadata
+        .as_ref()
+        .expect("pod template metadata")
+        .labels
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The one repository every pool-label assertion below is keyed to, in the
+/// NORMALIZED form `ResolvedRepository::repository_ref` produces.
+fn pool_repo_ref() -> kopiur_api::common::RepositoryRef {
+    resolved_s3_repo().repository_ref()
+}
+
+// --- POOL LABEL: presence on the backup site, absence on excluded sites ----
+//
+// These render each reconciler's OWN label builder (`backup_job_labels`,
+// `batch_job_labels`, `maintenance_job_labels` — the exact functions the
+// reconcilers call) through the real `build_job`, so the assertion is about
+// the Job a reconciler actually produces, not about `pool::repo_pool_label`
+// in isolation.
+
+#[test]
+fn a_rendered_backup_job_carries_the_pool_label_on_both_job_and_pod() {
+    use kopiur_api::consts::REPO_POOL_LABEL;
+
+    let repo_ref = pool_repo_ref();
+    let cfg = config_with_source(
+        "media",
+        kopiur_api::snapshot_policy::Source {
+            pvc: None,
+            pvc_selector: None,
+            nfs: Some(kopiur_api::backend::NfsVolume {
+                server: "expanse.internal".into(),
+                path: "/mnt/eros/Media".into(),
+            }),
+            source_path_override: None,
+            source_path_strategy: None,
+            ..Default::default()
+        },
+    );
+    let labels = backup_job_labels(&cfg, Origin::Scheduled, &repo_ref);
+    let resolved_mover = kopiur_api::common::resolve_mover(None, None, None, None, None, None);
+    let job = render_mover_job(labels, &resolved_mover);
+
+    let expected = crate::naming::repo_label(&repo_ref);
+    assert_eq!(
+        rendered_labels(&job)
+            .get(REPO_POOL_LABEL)
+            .map(String::as_str),
+        Some(expected.as_str()),
+        "the backup Job must be countable in its repository's pool",
+    );
+    assert_eq!(
+        rendered_pod_labels(&job)
+            .get(REPO_POOL_LABEL)
+            .map(String::as_str),
+        Some(expected.as_str()),
+        "...and so must its pod",
+    );
+    // The value is the RESOLVED repository's hash, not a raw-spec-ref hash: a
+    // `namespace: None` ref would land this run in a pool of its own.
+    let denormalized = kopiur_api::common::RepositoryRef {
+        namespace: None,
+        ..repo_ref.clone()
+    };
+    assert_ne!(expected, crate::naming::repo_label(&denormalized));
+}
+
+#[test]
+fn a_rendered_snapdel_batch_job_carries_no_pool_label() {
+    use kopiur_api::consts::REPO_POOL_LABEL;
+
+    let repo_ref = pool_repo_ref();
+    let labels = batch_job_labels(&repo_ref);
+    let resolved_mover = kopiur_api::common::resolve_mover(None, None, None, None, None, None);
+    let job = render_mover_job(labels, &resolved_mover);
+
+    assert!(
+        !rendered_labels(&job).contains_key(REPO_POOL_LABEL),
+        "a batch delete must not compete with backups for the pool: {:?}",
+        rendered_labels(&job),
+    );
+    assert!(!rendered_pod_labels(&job).contains_key(REPO_POOL_LABEL));
+    // It DOES carry the repo hash under its own key — the two labels share a
+    // value shape, so this pins that they are not the same label.
+    assert_eq!(
+        rendered_labels(&job)
+            .get(crate::consts::DELETE_REPO_LABEL)
+            .map(String::as_str),
+        Some(crate::naming::repo_label(&repo_ref).as_str()),
+    );
+}
+
+#[test]
+fn a_rendered_maintenance_job_carries_no_pool_label() {
+    use kopiur_api::consts::REPO_POOL_LABEL;
+
+    // Maintenance is the CURE for an overloaded repository; parking it behind a
+    // saturated backup pool would make a struggling repo unmaintainable.
+    let labels = crate::maintenance::maintenance_job_labels("nas-maint");
+    let resolved_mover = kopiur_api::common::resolve_mover(None, None, None, None, None, None);
+    let job = render_mover_job(labels, &resolved_mover);
+
+    assert!(
+        !rendered_labels(&job).contains_key(REPO_POOL_LABEL),
+        "{:?}",
+        rendered_labels(&job),
+    );
+    assert!(!rendered_pod_labels(&job).contains_key(REPO_POOL_LABEL));
+}
+
 #[test]
 fn backup_mover_defaults_pod_metadata_reaches_the_pod_template() {
     use kopiur_mover::jobs::{JobLimits, MoverJobInputs, build_job};

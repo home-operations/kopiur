@@ -465,6 +465,56 @@ pub(super) fn run_labels(config: &SnapshotPolicy, origin: Origin) -> BTreeMap<St
     labels
 }
 
+/// The label set a BACKUP mover `Job` (and its pod) carries, before the mover
+/// identity decorates it: [`run_labels`] plus the repository-pool membership
+/// label, since a backup counts toward its repository's
+/// `spec.concurrency.maxConcurrentJobs`.
+///
+/// `repo_ref` MUST be the NORMALIZED identity of the repository that actually
+/// resolved (`io::ResolvedRepository::repository_ref`), never a raw spec ref —
+/// a `Repository` ref with `namespace: None` hashes `repository:/name` and
+/// would split one repository's pool in two.
+///
+/// Extracted from the reconciler so the exact set is assertable without a
+/// cluster (the caller only adds `MoverIdentity::decorate_labels` on top).
+pub(super) fn backup_job_labels(
+    config: &SnapshotPolicy,
+    origin: Origin,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+) -> BTreeMap<String, String> {
+    let mut labels = run_labels(config, origin);
+    labels.extend(crate::pool::repo_pool_label(
+        crate::pool::MoverJobKind::Backup,
+        repo_ref,
+    ));
+    labels
+}
+
+/// The label set a batched snapshot-DELETE mover `Job` carries: managed-by
+/// (added by `build_job`) plus the batch op and the repo hash, so the
+/// dispatcher can LIST one repository's batch Jobs.
+///
+/// Notably it carries [`crate::consts::DELETE_REPO_LABEL`] — the same
+/// `repo_label` value the pool label uses — but NOT
+/// [`kopiur_api::consts::REPO_POOL_LABEL`]: a batch delete is already
+/// single-flighted per repository by its own dispatcher and it REDUCES
+/// repository load, so holding it behind backups would grow the backlog it
+/// exists to drain ([`crate::pool::counts_toward_repo_pool`]).
+pub(super) fn batch_job_labels(
+    repo_ref: &kopiur_api::common::RepositoryRef,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            crate::consts::OP_LABEL.to_string(),
+            crate::consts::OP_SNAPSHOT_DELETE_BATCH.to_string(),
+        ),
+        (
+            crate::consts::DELETE_REPO_LABEL.to_string(),
+            crate::naming::repo_label(repo_ref),
+        ),
+    ])
+}
+
 pub(super) fn origin_str(origin: Origin) -> &'static str {
     match origin {
         Origin::Scheduled => "scheduled",

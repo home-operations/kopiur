@@ -33,11 +33,16 @@ pub struct RepoHandle {
     pub encryption: Encryption,
     /// The repository's `moverDefaults`. A browse session deliberately applies
     /// none of the placement/resource/security layers (it is an interactive
-    /// read-only pod on the hardened baseline), but it DOES honor
-    /// `podLabels`/`podAnnotations`: those are how a cluster's own machinery
-    /// sees a pod at all — a mesh sidecar that never exits would keep the
-    /// session Job alive past its TTL, and a monitoring/`NetworkPolicy`
-    /// selector that skips session pods leaves a blind spot.
+    /// read-only pod on the hardened baseline), and it takes only
+    /// **`podAnnotations`** from this — a mesh sidecar that never exits would
+    /// keep the session Job alive past its TTL.
+    ///
+    /// `podLabels` are deliberately NOT applied, and the asymmetry is the
+    /// point: the canonical `podLabels` value is a Kueue
+    /// `kueue.x-k8s.io/queue-name`, which would park a human's interactive
+    /// browse session behind the nightly backup queue — the same reason
+    /// `kopiur_controller::pool` keeps `BrowseSession` out of the repository
+    /// concurrency pool.
     pub mover_defaults: Option<MoverDefaults>,
 }
 

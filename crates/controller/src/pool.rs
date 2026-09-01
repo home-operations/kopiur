@@ -114,9 +114,10 @@ mod tests {
     use super::*;
     use kopiur_api::common::RepositoryKind;
 
-    /// Every variant, so the truth-table tests below are provably exhaustive:
-    /// a new `MoverJobKind` that is not added here fails
-    /// `every_kind_is_covered_by_the_truth_tables`.
+    /// Every variant, so the truth-table tests below are provably exhaustive.
+    /// Kept honest by [`assert_all_is_every_variant`], which destructures the
+    /// enum exhaustively — a variant added to `MoverJobKind` but not to this
+    /// list fails to COMPILE, rather than slipping through a length check.
     const ALL: &[MoverJobKind] = &[
         MoverJobKind::Backup,
         MoverJobKind::Restore,
@@ -154,10 +155,42 @@ mod tests {
         }
     }
 
+    /// The COMPILE-TIME half of the exhaustiveness guard.
+    ///
+    /// `ALL` is a hand-written list, so a length check alone proves nothing: a
+    /// new `MoverJobKind` added to none of the three consts would keep
+    /// `ALL.len() == IN_POOL.len() + OUT_OF_POOL.len()` true and sail through.
+    /// This `match` has no `_ =>` arm and names each variant exactly as `ALL`
+    /// does, so adding a variant to the enum breaks the BUILD here until it is
+    /// listed — which is what forces it into a partition, and from there into
+    /// [`counts_toward_repo_pool`]'s truth table below.
+    fn assert_all_is_every_variant(k: MoverJobKind) {
+        // Mirrors `ALL`, in order. Keep the two in sync.
+        match k {
+            MoverJobKind::Backup => assert_eq!(ALL[0], k),
+            MoverJobKind::Restore => assert_eq!(ALL[1], k),
+            MoverJobKind::RepositoryReplication => assert_eq!(ALL[2], k),
+            MoverJobKind::SnapshotReplication => assert_eq!(ALL[3], k),
+            MoverJobKind::Maintenance => assert_eq!(ALL[4], k),
+            MoverJobKind::Verification => assert_eq!(ALL[5], k),
+            MoverJobKind::Pin => assert_eq!(ALL[6], k),
+            MoverJobKind::SnapshotDeleteBatch => assert_eq!(ALL[7], k),
+            MoverJobKind::Discovery => assert_eq!(ALL[8], k),
+            MoverJobKind::BrowseSession => assert_eq!(ALL[9], k),
+        }
+    }
+
     #[test]
     fn every_kind_is_covered_by_the_truth_tables() {
-        // `ALL` is hand-written, so guard it against a variant added to the
-        // enum but not to the tests: the two partitions must reconstruct it.
+        // Compile-time: `ALL` really is every variant, in the stated order (a
+        // new variant fails to compile in `assert_all_is_every_variant`; a
+        // REORDERED or duplicated `ALL` fails the index assertions here).
+        assert_eq!(ALL.len(), 10, "ALL and the destructure must stay in step");
+        for k in ALL {
+            assert_all_is_every_variant(*k);
+        }
+        // Run-time: each variant sits in exactly one partition, and
+        // `counts_toward_repo_pool` agrees with that partition.
         assert_eq!(ALL.len(), IN_POOL.len() + OUT_OF_POOL.len());
         for k in ALL {
             assert!(

@@ -1702,17 +1702,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         }
     };
 
-    let mut labels = run_labels(&config, origin);
+    let mut labels = backup_job_labels(&config, origin, &repo.repository_ref());
     mover_identity.decorate_labels(&mut labels);
-    // Pool membership: a backup mover counts toward its repository's
-    // `spec.concurrency.maxConcurrentJobs`. The value comes from the RESOLVED
-    // repository identity ([`io::ResolvedRepository::repository_ref`]), never
-    // the raw spec ref — a `Repository` ref with `namespace: None` would hash
-    // `repository:/name` and split one repository's pool in two.
-    labels.extend(crate::pool::repo_pool_label(
-        crate::pool::MoverJobKind::Backup,
-        &repo.repository_ref(),
-    ));
     let mut limits = job_limits(backup);
     // moverDefaults.ttlSecondsAfterFinished applies unless the recipe's FailurePolicy
     // already set a TTL (ADR-0005 §12).
@@ -3738,13 +3729,9 @@ async fn build_batch_job(
         cache: Default::default(),
         throttle: Default::default(),
     };
-    // Labels: managed-by (added by `build_job`) + the batch op + the repo hash (so
-    // the dispatcher can LIST one repository's batch Jobs). Annotation: the SORTED
-    // member UID set — the single source of truth for "which Snapshots".
-    let mut labels = BTreeMap::from([
-        (OP_LABEL.to_string(), OP_SNAPSHOT_DELETE_BATCH.to_string()),
-        (DELETE_REPO_LABEL.to_string(), repo_label(repo_ref)),
-    ]);
+    // Annotation: the SORTED member UID set — the single source of truth for
+    // "which Snapshots".
+    let mut labels = batch_job_labels(repo_ref);
     let mut uids: Vec<&str> = members.iter().map(|m| m.uid.as_str()).collect();
     uids.sort_unstable();
     let annotations = BTreeMap::from([(DELETE_MEMBERS_ANNOTATION.to_string(), uids.join(","))]);

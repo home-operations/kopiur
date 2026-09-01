@@ -545,6 +545,24 @@ fn maintenance_op(maint: &Maintenance, mode: MaintenanceMode) -> MaintenanceOp {
     }
 }
 
+/// The label set a maintenance mover `Job` (and its pod) carries.
+///
+/// Extracted from [`spawn_maintenance_job`] so the exact set is assertable
+/// without a cluster — most importantly that it does NOT carry
+/// [`kopiur_api::consts::REPO_POOL_LABEL`]. Maintenance is the *cure* for an
+/// overloaded repository, so parking it behind a saturated backup pool would
+/// make a struggling repository permanently unmaintainable
+/// ([`crate::pool::counts_toward_repo_pool`]).
+pub(super) fn maintenance_job_labels(cr_name: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        COMPONENT_LABEL.to_string(),
+        MAINTENANCE_COMPONENT.to_string(),
+    );
+    labels.insert(MAINTENANCE_INSTANCE_LABEL.to_string(), cr_name.to_string());
+    labels
+}
+
 /// Build + apply the per-slot work-spec ConfigMap and mover Job.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_maintenance_job(
@@ -588,12 +606,7 @@ async fn spawn_maintenance_job(
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
 
-    let mut labels = BTreeMap::new();
-    labels.insert(
-        COMPONENT_LABEL.to_string(),
-        MAINTENANCE_COMPONENT.to_string(),
-    );
-    labels.insert(MAINTENANCE_INSTANCE_LABEL.to_string(), cr_name.to_string());
+    let mut labels = maintenance_job_labels(cr_name);
 
     let mut annotations = BTreeMap::new();
     annotations.insert(MAINTENANCE_SLOT_ANNOTATION.to_string(), slot.to_rfc3339());
