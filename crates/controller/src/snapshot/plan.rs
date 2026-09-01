@@ -188,14 +188,17 @@ fn plan_ns_terminating(f: &DeletionFacts<'_>) -> DeletionPlan {
 ///   reclaim. So an explicit ns-delete opt-in WINS over the implicit stamp.
 ///   (The retain-wins-ties rule is only for schedule-vs-policy cascade races,
 ///   NOT for an explicit namespace-delete opt-in.)
-/// - `Some(Retention | FailedHistory | ReplicationRetention)` → a genuine
-///   operator prune keeps its prune semantics ([`plan_prune`]): never held;
-///   effective policy decides.
+/// - `Some(Retention | FailedHistory | ReplicationRetention | ReplacedRun)` → a
+///   genuine operator prune keeps its prune semantics ([`plan_prune`]): never
+///   held; effective policy decides.
 fn plan_ns_delete(f: &DeletionFacts<'_>) -> DeletionPlan {
     match pruned_by(f.annotations) {
         None | Some(PrunedBy::PolicyCascade) => plan_external(f.policy, f.breaker),
         Some(
-            p @ (PrunedBy::Retention | PrunedBy::FailedHistory | PrunedBy::ReplicationRetention),
+            p @ (PrunedBy::Retention
+            | PrunedBy::FailedHistory
+            | PrunedBy::ReplicationRetention
+            | PrunedBy::ReplacedRun),
         ) => plan_prune(p, f.policy),
     }
 }
@@ -252,7 +255,7 @@ fn plan_prune_or_external(f: &DeletionFacts<'_>) -> DeletionPlan {
 /// Step 4: operator prune. NEVER held — retention/history-limit pruning must
 /// keep working during an incident; its own rate is bounded elsewhere.
 ///
-/// **Exhaustive over both [`PrunedBy`] and [`DeletionPolicy`]** (a flat 4×3
+/// **Exhaustive over both [`PrunedBy`] and [`DeletionPolicy`]** (a flat 5×3
 /// match, no catch-all): a new variant of either enum fails to compile until
 /// every cell is decided (ADR §5.5).
 ///
@@ -262,12 +265,35 @@ fn plan_prune_or_external(f: &DeletionFacts<'_>) -> DeletionPlan {
 /// | `FailedHistory` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
 /// | `PolicyCascade` | [`RetainSnapshotOnPolicyDelete`](DeletionPlan::RetainSnapshotOnPolicyDelete) | `RetainSnapshot` | `OrphanSnapshot` |
 /// | `ReplicationRetention` | `DeleteSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
+/// | `ReplacedRun` | `RetainSnapshot` | `RetainSnapshot` | `OrphanSnapshot` |
 ///
 /// The `PolicyCascade`/`Delete` cell is the one loud downgrade: a policy
 /// cascade prune under `onPolicyDelete: Retain` never contacts the
 /// repository, even though the Snapshot's own effective policy asked for
 /// `Delete` — that is the entire reason the finalizer stamps `policy-cascade`
 /// instead of leaving the annotation absent.
+///
+/// `ReplacedRun`/`Delete` is the second, quieter downgrade, and it is a
+/// **data-safety** cell rather than a policy one. `concurrencyPolicy: Replace`
+/// only ever selects UNFINISHED children, so the victim normally owns no kopia
+/// snapshot at all and this executor just releases the finalizer either way.
+/// The cell matters solely in the (sub-millisecond, after the executor's live
+/// phase re-check) window where a `Running` victim commits its manifest between
+/// selection and the delete landing: that CR now owns a real, complete backup,
+/// and the user asked to cancel an *in-flight* run — not to destroy a finished
+/// one. `RetainSnapshot` leaks instead of losing, which is the only defensible
+/// direction for backup software.
+///
+/// Be precise about what "leaks" means here, because the reclamation is NOT
+/// automatic: the kopia snapshot survives with no `Snapshot` CR referencing it,
+/// and kopiur does not track it again until the repository's catalog is
+/// re-scanned. `catalog.periodicRefresh` is **off by default**
+/// (`kopiur_api::common::CatalogBounds`), so nothing re-scans on a timer — the
+/// scan happens on a re-bootstrap (a repository spec change), a
+/// failure re-probe, or an explicit `catalog-scan-requested-at` request. Only
+/// after that scan does the snapshot become a `Discovered` row that adoption and
+/// GFS retention can govern. Until then it is untracked repository data, which
+/// is the correct trade for never destroying a completed backup.
 fn plan_prune(pruned: PrunedBy, policy: DeletionPolicy) -> DeletionPlan {
     match (pruned, policy) {
         (PrunedBy::Retention, DeletionPolicy::Delete) => DeletionPlan::DeleteSnapshot,
@@ -288,6 +314,15 @@ fn plan_prune(pruned: PrunedBy, policy: DeletionPolicy) -> DeletionPlan {
         (PrunedBy::ReplicationRetention, DeletionPolicy::Delete) => DeletionPlan::DeleteSnapshot,
         (PrunedBy::ReplicationRetention, DeletionPolicy::Retain) => DeletionPlan::RetainSnapshot,
         (PrunedBy::ReplicationRetention, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
+        // `concurrencyPolicy: Replace` cancelling an in-flight run. The victim
+        // is unfinished by construction (no manifest, so the executor just
+        // releases the finalizer); `Retain` on the `Delete` cell is the guard
+        // for the race where it committed one after all — never destroy a
+        // backup that finished while we were deciding to cancel it.
+        (PrunedBy::ReplacedRun, DeletionPolicy::Delete | DeletionPolicy::Retain) => {
+            DeletionPlan::RetainSnapshot
+        }
+        (PrunedBy::ReplacedRun, DeletionPolicy::Orphan) => DeletionPlan::OrphanSnapshot,
     }
 }
 
@@ -339,10 +374,10 @@ pub fn owner_state_from(fetched: Option<&SnapshotSchedule>, owner: &OwnerReferen
 /// The `pruned-by` stamp is **exhaustively** classified (no catch-all), because
 /// not every stamp is breaker-exempt:
 ///
-/// - `Retention` / `FailedHistory` / `ReplicationRetention` are OPERATOR
-///   prunes — bounded, deliberate, steady-state deletes whose rate is governed
-///   elsewhere; they are exempt EVERYWHERE (retention must keep working during
-///   an incident, never held).
+/// - `Retention` / `FailedHistory` / `ReplicationRetention` / `ReplacedRun`
+///   are OPERATOR prunes — bounded, deliberate, steady-state deletes whose rate
+///   is governed elsewhere; they are exempt EVERYWHERE (retention must keep
+///   working during an incident, never held).
 /// - `PolicyCascade` and unstamped (`None`) are NOT exempt: they fall through to
 ///   the plan check. A `policy-cascade`-stamped child is quiet-retained in
 ///   steady state (its plan is `RetainSnapshotOnPolicyDelete`, not
@@ -371,12 +406,17 @@ pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
 /// — as opposed to an exempt OPERATOR prune. **Exhaustive over [`PrunedBy`]** (no
 /// catch-all):
 ///
-/// - `Retention` / `FailedHistory` / `ReplicationRetention` → `false`:
-///   operator prunes, exempt everywhere. `ReplicationRetention` mirrors
+/// - `Retention` / `FailedHistory` / `ReplicationRetention` / `ReplacedRun` →
+///   `false`: operator prunes, exempt everywhere. `ReplicationRetention` mirrors
 ///   `Retention` deliberately: a replication's own bounded GFS prune of its
 ///   copies must keep working during an incident. (Its `mirrorSource` sibling
 ///   mode stamps NOTHING, so a mass source-vanish classifies EXTERNAL and the
 ///   dest breaker holds it — that asymmetry is the ransomware guard.)
+///   `ReplacedRun` is `concurrencyPolicy: Replace` cancelling this schedule's
+///   own still-unfinished run so the newly-due slot can take its place: the
+///   user asked for cancel-the-old, and the victim set is bounded by
+///   construction (one schedule's unfinished children, at most one slot's worth
+///   per fire), so holding it behind the breaker would only wedge the schedule.
 /// - `None` (unstamped) / `PolicyCascade` → `true`: breaker-relevant. A
 ///   `PolicyCascade` member only ever reaches the destructive `DeleteSnapshot`
 ///   plan (and so the counting set) under an `onNamespaceDelete: Delete` namespace
@@ -390,9 +430,12 @@ pub fn counts_toward_breaker(f: DeletionFacts<'_>) -> bool {
 /// breaker relevance is decided here (ADR §5.5).
 pub fn breaker_relevant(pruned: Option<PrunedBy>) -> bool {
     match pruned {
-        Some(PrunedBy::Retention | PrunedBy::FailedHistory | PrunedBy::ReplicationRetention) => {
-            false
-        }
+        Some(
+            PrunedBy::Retention
+            | PrunedBy::FailedHistory
+            | PrunedBy::ReplicationRetention
+            | PrunedBy::ReplacedRun,
+        ) => false,
         None | Some(PrunedBy::PolicyCascade) => true,
     }
 }

@@ -473,6 +473,24 @@ pub const WAITING_FOR_SLOT_REASON: &str = "WaitingForSlot";
 /// a slot in the repository's mover-Job pool (or the pool is uncapped).
 pub const SLOT_ACQUIRED_REASON: &str = "SlotAcquired";
 
+/// `SnapshotSchedule` condition recording that `concurrencyPolicy: Replace` is
+/// holding a due slot because the run it would replace is itself parked behind
+/// its repository's mover-Job concurrency cap
+/// ([`REPOSITORY_SLOT_AVAILABLE_CONDITION`] = `False`). Cancelling a queued run
+/// frees no capacity and the replacement would re-queue behind it, so `Replace`
+/// degrades to `Forbid`-like waiting until the pool drains.
+///
+/// Deliberately **not** a registered structural gate
+/// ([`crate::gates::STRUCTURAL_GATES`]): unlike `ScheduleRunnable=False`, this
+/// state needs no human — it clears by itself the moment a slot frees up. It
+/// exists so the wait is visible in `status` and so the accompanying Normal
+/// event fires once on entering the hold rather than on every requeue.
+pub const SCHEDULE_REPLACEMENT_HELD_CONDITION: &str = "ReplacementHeld";
+/// `reason`/Event reason for [`SCHEDULE_REPLACEMENT_HELD_CONDITION`] = `True`.
+pub const WAITING_FOR_REPOSITORY_SLOT_REASON: &str = "WaitingForRepositorySlot";
+/// `reason` for [`SCHEDULE_REPLACEMENT_HELD_CONDITION`] = `False` (not held).
+pub const REPLACEMENT_NOT_HELD_REASON: &str = "ReplacementNotHeld";
+
 /// `Restore` condition recording whether the object this restore's repository
 /// is DERIVED from exists. Set `False` (with
 /// [`RESTORE_REFERENT_MISSING_REASON`]) when the readiness gate cannot even

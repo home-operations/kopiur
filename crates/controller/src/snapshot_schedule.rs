@@ -199,8 +199,14 @@ pub fn missed_deadline(
 }
 
 /// Whether a new run may start given the concurrency policy and whether a run
-/// is currently active. `Forbid` skips when active; `Allow`/`Replace` proceed
-/// (`Replace`'s cancel-the-old behavior is the caller's IO responsibility).
+/// is currently active. `Forbid` skips when active; `Allow`/`Replace` proceed.
+///
+/// `Replace` returning `true` here is deliberate and is only half the answer:
+/// it means "a due slot is not simply skipped", not "fire unconditionally".
+/// What the replacement actually does with the in-flight run — and the two
+/// cases where it must NOT fire after all (an unreadable-phase child, and a
+/// child parked behind the repository concurrency cap) — is decided by
+/// [`replace_plan`], which the reconciler consults before it commits the Fire.
 pub fn concurrency_allows(policy: ConcurrencyPolicy, run_active: bool) -> bool {
     match policy {
         ConcurrencyPolicy::Forbid => !run_active,
@@ -328,7 +334,7 @@ pub fn should_run_on_create(schedule: &ScheduleSpec, already_ran: bool) -> bool 
 fn schedule_ready_status(
     schedule: &SnapshotSchedule,
     ambiguity: Option<&TimezoneAmbiguity>,
-    blocked: Option<&UnreadableRun>,
+    hold: Option<ScheduleHold<'_>>,
     fanout_cap: Option<&[FanoutCapSkip]>,
 ) -> (serde_json::Value, i64) {
     use crate::consts::{
@@ -336,6 +342,18 @@ fn schedule_ready_status(
         SCHEDULE_FANOUT_CAPPED_CONDITION, SCHEDULE_RUNNABLE_CONDITION,
         SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION, SCHEDULE_TIMEZONE_AMBIGUOUS_REASON,
         SCHEDULE_TIMEZONE_RESOLVED_REASON,
+    };
+    use kopiur_api::consts::{
+        REPLACEMENT_NOT_HELD_REASON, SCHEDULE_REPLACEMENT_HELD_CONDITION,
+        WAITING_FOR_REPOSITORY_SLOT_REASON,
+    };
+    // Split the one hold into the two independent conditions it feeds, so each
+    // is written from a single place with BOTH polarities (a set-only condition
+    // would report a resolved outage forever). Exhaustive over `ScheduleHold`.
+    let (blocked, parked) = match hold {
+        None => (None, None),
+        Some(ScheduleHold::Unreadable(b)) => (Some(b), None),
+        Some(ScheduleHold::ParkedRun(name)) => (None, Some(name)),
     };
     let existing = schedule
         .status
@@ -406,6 +424,33 @@ fn schedule_ready_status(
         &runnable_message,
         Some(generation),
     );
+    // The `Replace`-held-by-a-parked-run marker. Both polarities, same reason as
+    // the runnable gate: it is the transition guard for the Normal event, so a
+    // stale `True` would suppress the event forever once the pool drained and
+    // re-saturated. NOT a structural gate — it needs no human and self-clears.
+    let (parked_reason, parked_message) = match parked {
+        Some(run) => (
+            WAITING_FOR_REPOSITORY_SLOT_REASON,
+            format!(
+                "concurrencyPolicy: Replace is holding this slot: the run it would replace \
+                 (`{run}`) is itself queued behind its repository's mover-Job concurrency cap, \
+                 so cancelling it would free no capacity and the replacement would re-queue \
+                 behind it. This clears itself when the pool drains — no action needed."
+            ),
+        ),
+        None => (
+            REPLACEMENT_NOT_HELD_REASON,
+            "no replacement is held behind the repository's concurrency cap".to_string(),
+        ),
+    };
+    let conditions = io::upsert_condition(
+        &conditions,
+        SCHEDULE_REPLACEMENT_HELD_CONDITION,
+        parked.is_some(),
+        parked_reason,
+        &parked_message,
+        Some(generation),
+    );
     // Fan-out cap condition (#368): asserted (both polarities, so a fixed
     // recipe self-clears) ONLY on fire passes — `None` on wait/hold passes
     // leaves the recorded value untouched, so the condition persists between
@@ -450,6 +495,37 @@ fn schedule_ready_status(
         }
     };
     (serde_json::json!(conditions), generation)
+}
+
+/// Why a DUE slot is being held shut this reconcile — the single input to the
+/// two hold conditions [`schedule_ready_status`] writes. An enum rather than two
+/// `Option`s because the states are mutually exclusive by construction
+/// ([`replace_plan`] returns one plan) and an exhaustive match is what forces a
+/// future hold to declare which condition surfaces it.
+#[derive(Debug, Clone, Copy)]
+enum ScheduleHold<'a> {
+    /// A run at a phase this build cannot read — `ScheduleRunnable=False`, the
+    /// registered structural gate. Needs a human; never self-clears.
+    Unreadable(&'a UnreadableRun),
+    /// `concurrencyPolicy: Replace` waiting on a run parked behind its
+    /// repository's concurrency cap — `ReplacementHeld=True`. Self-clears.
+    ParkedRun(&'a str),
+}
+
+/// Whether `status.conditions` already records the `Replace`-held-by-parked-run
+/// state. The transition guard for its Normal Event, mirroring
+/// [`recorded_blocked_on_unreadable`]: the held branch re-runs on every requeue
+/// (at the 1s floor, since the slot is already due), so an Event per pass would
+/// bury the namespace's event log within seconds.
+fn recorded_held_by_parked_run(schedule: &SnapshotSchedule) -> bool {
+    schedule
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.type_ == kopiur_api::consts::SCHEDULE_REPLACEMENT_HELD_CONDITION)
+        .is_some_and(|c| c.status == "True")
 }
 
 /// Whether `status.conditions` already records the blocked-on-unreadable-run
@@ -613,11 +689,35 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // Is a run currently active (an unfinished Snapshot owned by this
         // schedule)? Classified from the children slice fetched once above; a
         // list failure fails CLOSED here (propagates), never "no active runs".
-        let runs = match children {
-            Ok(ref items) => classify_active_runs(items),
+        let items = match children {
+            Ok(items) => items,
             Err(e) => return Err(e),
         };
+        let runs = classify_active_runs(&items);
         let disposition = slot_disposition(&schedule.spec.schedule, slot, now, runs.active);
+        // `concurrencyPolicy: Replace` — what to do with the runs this slot is
+        // about to replace, decided from the SAME children slice (no extra
+        // LIST). Computed BEFORE the blocker filter below because two of its
+        // outcomes must convert this Fire into a Wait: `BlockedUnreadable`
+        // (fail closed — never delete an unclassifiable run) folds into the
+        // very same `ScheduleRunnable` gate `Forbid` uses, and
+        // `HeldByParkedRun` holds the slot while the repository's mover-Job
+        // concurrency pool is saturated. Exhaustive over the policy so a new
+        // variant must state its replacement semantics before this compiles.
+        let replace = match schedule.spec.schedule.concurrency_policy {
+            ConcurrencyPolicy::Forbid | ConcurrencyPolicy::Allow => None,
+            ConcurrencyPolicy::Replace => (disposition == SlotDisposition::Fire && runs.active)
+                .then(|| replace_plan(&items, slot)),
+        };
+        // The two refuse-to-fire plans downgrade the disposition, so the
+        // pin is kept and the requeue re-enters (exactly the `Wait` contract).
+        let (disposition, parked_hold) = match &replace {
+            None | Some(ReplacePlan::Clear | ReplacePlan::Delete(_)) => (disposition, None),
+            Some(ReplacePlan::BlockedUnreadable(_)) => (SlotDisposition::Wait, None),
+            Some(ReplacePlan::HeldByParkedRun(name)) => {
+                (SlotDisposition::Wait, Some(name.as_str()))
+            }
+        };
         // The blocker only MATTERS when it is actually holding a due slot shut:
         // under `concurrencyPolicy: Allow` an unreadable run does not block, and
         // a suspended or not-yet-due schedule is not being held by anything.
@@ -628,6 +728,14 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 && !schedule.spec.schedule.suspend
                 && should_fire_now(slot, now)
         });
+        // The ONE hold fact every status write below asserts (or clears). The
+        // unreadable gate wins when both could apply — `replace_plan` already
+        // gives it precedence, so this only re-states that ordering.
+        let hold = match (blocker, parked_hold) {
+            (Some(b), _) => Some(ScheduleHold::Unreadable(b)),
+            (None, Some(p)) => Some(ScheduleHold::ParkedRun(p)),
+            (None, None) => None,
+        };
         // A slot expired past `startingDeadlineSeconds` must re-pin forward, or the
         // wait branch below computes `(slot - now)` for a past instant and requeues
         // at the 1s floor forever with the pin stuck on the expired slot. Skip it
@@ -636,7 +744,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         if disposition == SlotDisposition::SkipExpired {
             let next = next_fire(&schedule.spec.schedule.cron, jitter_window, &seed, now, tz)?;
             let (conditions, generation) =
-                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker, None);
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), hold, None);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -668,6 +776,19 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
         }
         if disposition == SlotDisposition::Fire {
+            // `concurrencyPolicy: Replace`: cancel the runs this slot replaces
+            // BEFORE minting, so the old mover is stopped rather than left
+            // racing the new one. Exhaustive — the two hold variants are
+            // unreachable here (they downgraded the disposition to `Wait`
+            // above), but they are STATED rather than swept into a catch-all so
+            // a future plan variant must decide its fire-time behavior.
+            match &replace {
+                None | Some(ReplacePlan::Clear) => {}
+                Some(ReplacePlan::Delete(victims)) => {
+                    replace_active_runs(ctx, schedule, &namespace, &snap_api, victims).await?;
+                }
+                Some(ReplacePlan::BlockedUnreadable(_) | ReplacePlan::HeldByParkedRun(_)) => {}
+            }
             // Fire one Snapshot per resolved policy (single policyRef, or each
             // policySelector match — ADR-0005 §10). The single-ref form keeps the
             // slot-stamped name for lastSchedule.snapshotRef.
@@ -682,7 +803,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             let (conditions, generation) = schedule_ready_status(
                 schedule,
                 tz_ambiguity.as_ref(),
-                blocker,
+                hold,
                 Some(&outcome.cap_skipped),
             );
             io::patch_status(
@@ -709,8 +830,12 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // removed, so it is surfaced on the SnapshotSchedule itself: a registered
         // structural gate (`ScheduleRunnable=False`) plus a one-shot Warning Event.
         if let Some(blocked) = blocker {
-            let (conditions, generation) =
-                schedule_ready_status(schedule, tz_ambiguity.as_ref(), Some(blocked), None);
+            let (conditions, generation) = schedule_ready_status(
+                schedule,
+                tz_ambiguity.as_ref(),
+                Some(ScheduleHold::Unreadable(blocked)),
+                None,
+            );
             io::patch_status(
                 &api,
                 &sched_name,
@@ -757,13 +882,19 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // pass is skipped entirely (it asserts nothing about ambiguity).
         // The runnable gate rides along for the same reason: `blocker` is `None`
         // here, so a schedule that was blocked and is now free clears the gate on
-        // the first pass after the blocking Snapshot goes away.
+        // the first pass after the blocking Snapshot goes away. The
+        // `ReplacementHeld` marker rides along too, in BOTH directions, so
+        // entering the hold records it (arming the event's transition guard) and
+        // the pool draining clears it.
+        let held_recorded = recorded_held_by_parked_run(schedule);
+        let held_now = parked_hold.is_some();
         if matches!(resolution, TimezoneResolution::Resolved { .. })
             && (tz_ambiguity.is_some() != recorded_tz_ambiguous(schedule)
-                || recorded_blocked_on_unreadable(schedule))
+                || recorded_blocked_on_unreadable(schedule)
+                || held_now != held_recorded)
         {
             let (conditions, generation) =
-                schedule_ready_status(schedule, tz_ambiguity.as_ref(), blocker, None);
+                schedule_ready_status(schedule, tz_ambiguity.as_ref(), hold, None);
             io::patch_status(
                 &api,
                 &sched_name,
@@ -773,6 +904,36 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 }),
             )
             .await?;
+        }
+        // `Replace` is declining to fire a DUE slot. That is benign and
+        // self-clearing (unlike the unreadable hold above), so it is a Normal
+        // event rather than a Warning + structural gate — but it must not be
+        // INVISIBLE: a schedule that silently stops firing is the #359 shape,
+        // and a debug log alone leaves an operator watching `kubectl get
+        // snapshots` with no explanation. Transition-gated on the condition just
+        // written, so it fires once on entering the hold, not once per 1s requeue.
+        if let Some(parked) = parked_hold {
+            if !held_recorded {
+                io::publish_normal_event(
+                    ctx,
+                    schedule,
+                    kopiur_api::consts::WAITING_FOR_REPOSITORY_SLOT_REASON,
+                    "AwaitRepositorySlot",
+                    &format!(
+                        "concurrencyPolicy: Replace is holding this slot: the run it would \
+                         replace (`{parked}`) is itself queued behind its repository's mover-Job \
+                         concurrency cap, so cancelling it would free no capacity. Backups \
+                         resume automatically when the pool drains; raise the repository's \
+                         mover concurrency if this persists."
+                    ),
+                )
+                .await;
+            }
+            tracing::debug!(
+                namespace = %namespace, schedule = %sched_name, parked_run = %parked,
+                "concurrencyPolicy: Replace is holding this slot behind the repository's \
+                 mover-Job concurrency cap"
+            );
         }
         let until = (slot - now).to_std().unwrap_or(StdDuration::from_secs(1));
         return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
@@ -918,6 +1079,280 @@ pub fn classify_active_runs(items: &[Snapshot]) -> ActiveRuns {
         out.active |= unfinished;
     }
     out
+}
+
+/// What `concurrencyPolicy: Replace` must do with a due slot, given this
+/// schedule's children. Four outcomes, because "cancel the old one" has two
+/// distinct ways of being the wrong move — and both must stop the fire, not
+/// just skip the deletes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplacePlan {
+    /// Nothing unfinished is in flight — fire normally, delete nothing.
+    Clear,
+    /// Delete exactly these children (sorted, so a fire is deterministic
+    /// regardless of LIST/store order), then fire.
+    Delete(Vec<String>),
+    /// A child sits at a phase THIS build cannot read. Fail closed exactly like
+    /// [`classify_active_runs`]: never delete what cannot be classified — the
+    /// run may be live, written by a newer operator. Handled like `Forbid`'s
+    /// hold (the `ScheduleRunnable=False` gate), so the operator sees the wedge
+    /// instead of `Replace` silently destroying an in-flight newer-operator run.
+    BlockedUnreadable(UnreadableRun),
+    /// A child is parked behind its repository's mover-Job concurrency cap
+    /// ([`kopiur_api::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION`] = `False`),
+    /// carrying its name. Such a child is QUEUED, not running: deleting it
+    /// would free nothing and the replacement would immediately park in the
+    /// same queue — a delete-mint-park livelock that burns a CR per slot and
+    /// never makes progress — while minting a sibling beside it is precisely
+    /// the pileup the cap exists to prevent. So `Replace` degrades to
+    /// `Forbid`-like behavior while the pool is saturated: no deletes, no fire,
+    /// wait for the slot. Self-clears the moment the pool drains.
+    HeldByParkedRun(String),
+}
+
+/// **Pure.** Whether `snapshot` was created strictly BEFORE `slot` — i.e. it
+/// belongs to an earlier slot and is therefore a legitimate replacement victim.
+/// A missing `creationTimestamp` answers `false` (fail closed: an undatable row
+/// is never cancelled). See [`replace_plan`] for why this cut is exact.
+fn created_before_slot(snapshot: &Snapshot, slot: DateTime<Utc>) -> bool {
+    snapshot
+        .creation_timestamp()
+        .and_then(|t| DateTime::<Utc>::from_timestamp(t.0.as_second(), 0))
+        .is_some_and(|created| created < slot)
+}
+
+/// **Pure.** Whether a `Snapshot` is parked behind its repository's mover-Job
+/// concurrency cap — i.e. it holds
+/// [`REPOSITORY_SLOT_AVAILABLE_CONDITION`](kopiur_api::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION)
+/// at `False`. Callers scope this to the UNFINISHED, non-terminating children:
+/// a long-finished run whose last recorded conditions still carry a stale
+/// `False` must never hold a schedule shut forever.
+fn parked_behind_slot(snapshot: &Snapshot) -> bool {
+    snapshot
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .any(|c| {
+            c.type_ == kopiur_api::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION
+                && c.status == "False"
+        })
+}
+
+/// **Pure.** Decide what `concurrencyPolicy: Replace` does with a due slot,
+/// from this schedule's `Snapshot` children. Split from the IO so the whole
+/// truth table — including both refuse-to-fire cases — is unit-tested without
+/// a cluster, exactly like [`classify_active_runs`] beside it.
+///
+/// "Unfinished" is the SAME set the concurrency gate uses (`None` / `Pending` /
+/// `Running`), matched exhaustively so a new phase must state which side of the
+/// replacement it falls on before this compiles. Rows already terminating
+/// (`deletionTimestamp` set) are skipped — they are on their way out and
+/// re-deleting them is a no-op that would only pad the event.
+///
+/// **Precedence is fail-closed first.** An `Unknown` phase short-circuits to
+/// [`ReplacePlan::BlockedUnreadable`] even when known-unfinished (or parked)
+/// children are also present: the unreadable row is the one that needs a human,
+/// and deleting its siblings while it is un-classifiable would be acting on a
+/// half-understood picture. A parked child then wins over the delete set for
+/// the livelock reason in [`ReplacePlan::HeldByParkedRun`].
+///
+/// ## `slot` is a data-safety filter, not a convenience
+///
+/// `Replace` must only ever cancel runs from a PREVIOUS slot. Without this
+/// filter a **retried** fire silently eats its own output: if the first attempt
+/// minted the child and then failed before the status patch landed (a mid
+/// fan-out error, or a 409 on the status patch), the pin is still un-advanced,
+/// so the retry re-enters with `disposition == Fire`, sees its own brand-new
+/// `Pending` child as "an in-flight run", kills that child's mover Job, deletes
+/// the CR — and then [`slot_fire_blocked_by_terminating`] skips the re-fire
+/// because the slot twin is terminating. The eventual status patch still stamps
+/// the slot as fired. Net effect: the slot is recorded as run and **no backup
+/// exists**. Silent data loss, once per retried fire.
+///
+/// The cut is `creationTimestamp >= slot` and it is exact, not heuristic: a fire
+/// re-pins `nextSchedule` via `next_fire(.., after = now, ..)`, which is always
+/// strictly LATER than the `now` at which that fire minted its children (cron
+/// occurrences are minute-granular and jitter only adds). So every child of an
+/// earlier slot was created strictly before the currently-pinned `slot`
+/// instant, and every child of THIS slot at or after it — including a
+/// late-firing catch-up slot, whose successor pin is computed from `now`, not
+/// from the slot.
+///
+/// A child with **no** `creationTimestamp` is skipped too (fail closed): an
+/// undatable row cannot be proven to belong to a previous slot, and the cost of
+/// being wrong is asymmetric — wrongly skipping degrades `Replace` to `Allow`
+/// for one slot, wrongly deleting destroys a run.
+pub fn replace_plan(items: &[Snapshot], slot: DateTime<Utc>) -> ReplacePlan {
+    use kopiur_api::SnapshotPhase;
+    let mut victims: Vec<String> = Vec::new();
+    let mut parked: Option<String> = None;
+    for b in items {
+        if b.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        // Never cancel this slot's own output (see the doc above). Applied
+        // BEFORE the phase match so a retry's own child cannot even raise the
+        // unreadable/parked holds — it is not a "previous run" at all, and the
+        // re-fire's server-side apply converges on it idempotently.
+        if !created_before_slot(b, slot) {
+            continue;
+        }
+        let unfinished = match b.status.as_ref().and_then(|s| s.phase.as_ref()) {
+            None | Some(SnapshotPhase::Pending | SnapshotPhase::Running) => true,
+            Some(
+                SnapshotPhase::Succeeded
+                | SnapshotPhase::Failed
+                | SnapshotPhase::Deleting
+                | SnapshotPhase::Discovered
+                | SnapshotPhase::Unchanged,
+            ) => false,
+            // Fail CLOSED, and louder than every other outcome: this build
+            // cannot tell whether the run is live, so it must neither delete it
+            // nor mint beside it. Reports the FIRST such child (matching
+            // `classify_active_runs`) so the two gates name the same object.
+            Some(SnapshotPhase::Unknown(raw)) => {
+                return ReplacePlan::BlockedUnreadable(UnreadableRun {
+                    snapshot: b.name_any(),
+                    phase: raw.clone(),
+                });
+            }
+        };
+        if !unfinished {
+            continue;
+        }
+        if parked.is_none() && parked_behind_slot(b) {
+            parked = Some(b.name_any());
+        }
+        victims.push(b.name_any());
+    }
+    if let Some(name) = parked {
+        return ReplacePlan::HeldByParkedRun(name);
+    }
+    if victims.is_empty() {
+        return ReplacePlan::Clear;
+    }
+    victims.sort();
+    ReplacePlan::Delete(victims)
+}
+
+/// **Pure.** Whether a victim read LIVE is still cancellable: it must exist, not
+/// already be terminating, and still be unfinished (`None` / `Pending` /
+/// `Running` — the same set [`replace_plan`] selects on, matched exhaustively so
+/// a new phase must state its answer here too).
+///
+/// The phase re-check is the point. `replace_plan` runs against a possibly
+/// store-derived slice, and a `Running` victim can commit its kopia snapshot and
+/// flip to `Succeeded` in the window between that selection and this delete.
+/// Existence-and-not-terminating alone would happily cancel it — deleting the CR
+/// of a **completed** backup and leaving its kopia snapshot unreferenced. This
+/// collapses that window to the sub-millisecond gap between this GET and the
+/// delete below.
+///
+/// `Unknown` answers `false` for the usual reason: never destroy a run whose
+/// phase this build cannot interpret.
+fn still_replaceable(live: Option<&Snapshot>) -> bool {
+    use kopiur_api::SnapshotPhase;
+    let Some(row) = live else {
+        return false;
+    };
+    if row.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+    match row.status.as_ref().and_then(|s| s.phase.as_ref()) {
+        None | Some(SnapshotPhase::Pending | SnapshotPhase::Running) => true,
+        Some(
+            SnapshotPhase::Succeeded
+            | SnapshotPhase::Failed
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged
+            | SnapshotPhase::Unknown(_),
+        ) => false,
+    }
+}
+
+/// Execute a [`ReplacePlan::Delete`]: cancel each victim run, then report the
+/// names actually removed (a victim the live read says is gone, terminating, or
+/// already finished is skipped and never appears in the Event).
+///
+/// Per victim, in this order:
+///
+/// 1. **Live-verify** (#382 C2): `children` may be reflector-store-derived —
+///    trust the cache to SELECT, verify live before DESTROYING. A row that
+///    vanished, started terminating, **or has since finished** is skipped, so a
+///    stale store cannot re-delete an already-replaced run nor cancel a run that
+///    completed after the snapshot was taken ([`still_replaceable`]).
+/// 2. **Delete the mover Job first.** The Job carries the SAME name as its
+///    `Snapshot` (see `snapshot::launch`'s `apply_mover_objects`). This is a
+///    BACKGROUND delete (matching every other `delete_mover_run` caller), so the
+///    pod is reaped asynchronously rather than synchronously — the guarantee is
+///    ordering, not instantaneous death. What it buys is that the Job is
+///    explicitly targeted *before* the CR goes away: deleting the CR first would
+///    leave the mover's teardown entirely to ownerRef GC, and the `Snapshot`
+///    finalizer releases immediately while `status.snapshot` is absent (the
+///    normal mid-run state), so the CR can be fully gone with nothing having
+///    asked the mover to stop.
+/// 3. **Stamp then delete the CR** with [`PrunedBy::ReplacedRun`], so the
+///    finalizer classifies this as an OPERATOR prune. A bare delete would
+///    classify EXTERNAL and every `Replace` fire would push the repository's
+///    mass-deletion breaker toward tripping.
+///
+/// Every step is 404-tolerant (a victim that vanished mid-loop is a no-op
+/// success); a non-404 failure propagates so the reconcile retries WITHOUT
+/// having minted the replacement.
+///
+/// Note what this does **not** reclaim: a killed mid-run mover may have left
+/// partial upload data (and, if it checkpointed, an incomplete manifest) in the
+/// repository. There is no committed kopia snapshot (`status.snapshot` is
+/// unset), so the finalizer has nothing to delete; those blobs are reclaimed by
+/// kopia's blob garbage collection during `Maintenance`, not here.
+async fn replace_active_runs(
+    ctx: &Context,
+    schedule: &SnapshotSchedule,
+    namespace: &str,
+    api: &Api<Snapshot>,
+    victims: &[String],
+) -> Result<Vec<String>> {
+    let mut deleted: Vec<String> = Vec::new();
+    for name in victims {
+        let live = api.get_opt(name).await?;
+        if !still_replaceable(live.as_ref()) {
+            tracing::debug!(
+                schedule = %schedule.name_any(), snapshot = %name,
+                "skipping replacement victim: gone, terminating, or no longer in flight on live verify"
+            );
+            continue;
+        }
+        io::delete_mover_run(&ctx.client, namespace, name).await?;
+        io::annotate_then_delete_snapshot(api, name, PrunedBy::ReplacedRun).await?;
+        tracing::info!(
+            schedule = %schedule.name_any(), snapshot = %name,
+            "cancelled an in-flight run (concurrencyPolicy: Replace)"
+        );
+        deleted.push(name.clone());
+    }
+    // ONE Event per fire listing every name — a per-victim Event would multiply
+    // a fan-out schedule's slot into an event storm, and this is a single
+    // transition (this slot replaced those runs), not N independent facts.
+    if !deleted.is_empty() {
+        io::publish_normal_event(
+            ctx,
+            schedule,
+            "ReplacedActiveRun",
+            "ReplaceInFlightRun",
+            &format!(
+                "concurrencyPolicy: Replace — cancelled {} in-flight run(s) so this slot could \
+                 take their place: {}. Their mover Jobs were deleted; no committed kopia \
+                 snapshot existed to reclaim.",
+                deleted.len(),
+                deleted.join(", ")
+            ),
+        )
+        .await;
+    }
+    Ok(deleted)
 }
 
 /// This schedule's produced `Snapshot` children (the `SCHEDULE_LABEL`
@@ -2765,12 +3200,34 @@ mod tests {
             phase,
             ..Default::default()
         });
+        // Every fixture is a PRIOR slot's child by default (2023-11-14, far
+        // before `REPLACE_SLOT`), so `replace_plan`'s own-slot filter treats it
+        // as a legitimate victim. Tests that need this slot's own child use
+        // `created_at`.
+        s.metadata.creation_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+        ));
         if deleting {
             s.metadata.deletion_timestamp =
                 Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
                     k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
                 ));
         }
+        s
+    }
+
+    /// The slot every `replace_plan` test fires. Children from `run_in_phase`
+    /// predate it; `created_at` builds one that does not.
+    fn replace_slot() -> DateTime<Utc> {
+        at(2026, 8, 4, 3, 0)
+    }
+
+    /// `run_in_phase` with an explicit creation instant, for the own-slot filter.
+    fn created_at(name: &str, phase: Option<SnapshotPhase>, created: DateTime<Utc>) -> Snapshot {
+        let mut s = run_in_phase(name, phase, false);
+        s.metadata.creation_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::from_second(created.timestamp()).unwrap(),
+        ));
         s
     }
 
@@ -2883,7 +3340,8 @@ mod tests {
             snapshot: "nightly-20260807".into(),
             phase: "Quiescing".into(),
         };
-        let (conditions, _) = schedule_ready_status(&sched, None, Some(&blocked), None);
+        let (conditions, _) =
+            schedule_ready_status(&sched, None, Some(ScheduleHold::Unreadable(&blocked)), None);
         let conds: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> =
             serde_json::from_value(conditions).unwrap();
         let gate = conds
@@ -3065,5 +3523,766 @@ mod tests {
             requests.iter().all(|r| r.starts_with("GET ")),
             "vanished rows must produce NO stamp/delete traffic: {requests:?}"
         );
+    }
+
+    // --- M4: `concurrencyPolicy: Replace` -----------------------------------
+
+    /// [`run_in_phase`] plus a `RepositorySlotAvailable=False` condition — a
+    /// child parked behind its repository's mover-Job concurrency cap.
+    fn parked_run(name: &str, phase: Option<SnapshotPhase>) -> Snapshot {
+        let mut s = run_in_phase(name, phase, false);
+        s.status.as_mut().unwrap().conditions =
+            vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition {
+                type_: kopiur_api::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION.into(),
+                status: "False".into(),
+                reason: "WaitingForSlot".into(),
+                message: "queued behind the repository's mover-Job concurrency cap".into(),
+                last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+                ),
+                observed_generation: None,
+            }];
+        s
+    }
+
+    #[test]
+    fn replace_plan_truth_table() {
+        // Nothing at all → fire normally, delete nothing.
+        assert_eq!(replace_plan(&[], replace_slot()), ReplacePlan::Clear);
+
+        // Only terminal children → nothing to replace.
+        for terminal in [
+            SnapshotPhase::Succeeded,
+            SnapshotPhase::Failed,
+            SnapshotPhase::Deleting,
+            SnapshotPhase::Discovered,
+            SnapshotPhase::Unchanged,
+        ] {
+            assert_eq!(
+                replace_plan(
+                    &[run_in_phase("a", Some(terminal.clone()), false)],
+                    replace_slot()
+                ),
+                ReplacePlan::Clear,
+                "{terminal:?}"
+            );
+        }
+
+        // The unfinished set matches the concurrency gate's (`None`, Pending,
+        // Running) and comes back SORTED, so a fire is deterministic however
+        // the store/LIST ordered the rows.
+        assert_eq!(
+            replace_plan(
+                &[
+                    run_in_phase("z-running", Some(SnapshotPhase::Running), false),
+                    run_in_phase("m-statusless", None, false),
+                    run_in_phase("done", Some(SnapshotPhase::Succeeded), false),
+                    run_in_phase("a-pending", Some(SnapshotPhase::Pending), false),
+                ],
+                replace_slot()
+            ),
+            ReplacePlan::Delete(vec![
+                "a-pending".into(),
+                "m-statusless".into(),
+                "z-running".into()
+            ])
+        );
+
+        // Rows already terminating are skipped: their finalizer is draining and
+        // re-deleting them would only pad the Event.
+        assert_eq!(
+            replace_plan(
+                &[
+                    run_in_phase("draining", Some(SnapshotPhase::Running), true),
+                    run_in_phase("live", Some(SnapshotPhase::Running), false),
+                ],
+                replace_slot()
+            ),
+            ReplacePlan::Delete(vec!["live".into()])
+        );
+        assert_eq!(
+            replace_plan(
+                &[run_in_phase("draining", Some(SnapshotPhase::Running), true)],
+                replace_slot()
+            ),
+            ReplacePlan::Clear,
+            "a lone terminating child leaves nothing to replace"
+        );
+    }
+
+    /// **The silent-slot-loss regression.** `Replace` must never cancel the
+    /// child THIS slot just minted. Without the `slot` filter, a retried fire
+    /// (first attempt minted the child, then errored mid-fan-out or hit a 409 on
+    /// the status patch, leaving the pin un-advanced) re-enters with
+    /// `disposition == Fire`, sees its own brand-new `Pending` child as an
+    /// in-flight run, kills its mover Job and CR — after which
+    /// `slot_fire_blocked_by_terminating` skips the re-fire and the status patch
+    /// still records the slot as fired. Slot recorded, no backup. Once per retry.
+    #[test]
+    fn replace_plan_never_cancels_this_slots_own_children() {
+        let slot = replace_slot();
+
+        // A child minted AT the slot instant (the retry case) is not a previous
+        // run: skipped entirely, so the plan is Clear and the re-fire's
+        // server-side apply converges on it.
+        assert_eq!(
+            replace_plan(
+                &[created_at("own", Some(SnapshotPhase::Pending), slot)],
+                slot
+            ),
+            ReplacePlan::Clear,
+            "the current slot's own child must never be a victim"
+        );
+        // Minted a moment AFTER the slot instant (the ordinary case — the fire
+        // happens at `now >= slot`): still this slot's own.
+        assert_eq!(
+            replace_plan(
+                &[created_at(
+                    "own",
+                    Some(SnapshotPhase::Running),
+                    slot + chrono::Duration::seconds(30)
+                )],
+                slot
+            ),
+            ReplacePlan::Clear
+        );
+        // One second BEFORE the slot is a previous slot's run — still replaced.
+        assert_eq!(
+            replace_plan(
+                &[created_at(
+                    "prior",
+                    Some(SnapshotPhase::Running),
+                    slot - chrono::Duration::seconds(1)
+                )],
+                slot
+            ),
+            ReplacePlan::Delete(vec!["prior".into()])
+        );
+        // Mixed: only the prior-slot child is cancelled, and the fire proceeds.
+        assert_eq!(
+            replace_plan(
+                &[
+                    created_at("own", Some(SnapshotPhase::Pending), slot),
+                    created_at(
+                        "prior",
+                        Some(SnapshotPhase::Running),
+                        slot - chrono::Duration::hours(24)
+                    ),
+                ],
+                slot
+            ),
+            ReplacePlan::Delete(vec!["prior".into()])
+        );
+        // The own-slot filter runs BEFORE the phase match, so this slot's own
+        // child can raise neither hold — a retry must not wedge on its own output.
+        let mut own_unknown = created_at("own", Some(SnapshotPhase::Unknown("Odd".into())), slot);
+        own_unknown.metadata.name = Some("own".into());
+        assert_eq!(replace_plan(&[own_unknown], slot), ReplacePlan::Clear);
+        let mut own_parked = parked_run("own", Some(SnapshotPhase::Pending));
+        own_parked.metadata.creation_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_second(slot.timestamp()).unwrap(),
+            ));
+        assert_eq!(replace_plan(&[own_parked], slot), ReplacePlan::Clear);
+
+        // Fail closed on an UNDATABLE row: it cannot be proven to belong to a
+        // previous slot, and wrongly deleting a run is far worse than wrongly
+        // degrading one slot to `Allow`.
+        let mut undated = run_in_phase("undated", Some(SnapshotPhase::Running), false);
+        undated.metadata.creation_timestamp = None;
+        assert_eq!(
+            replace_plan(&[undated], slot),
+            ReplacePlan::Clear,
+            "a child with no creationTimestamp must never be cancelled"
+        );
+    }
+
+    #[test]
+    fn replace_plan_fails_closed_on_an_unreadable_child() {
+        // An unreadable phase wins over known-unfinished siblings: Replace must
+        // never DELETE what it cannot classify (the run may be live, written by
+        // a newer operator), and it must not mint beside it either — so the
+        // whole slot is handed to the same `ScheduleRunnable` gate `Forbid` uses.
+        assert_eq!(
+            replace_plan(
+                &[
+                    run_in_phase("running-sibling", Some(SnapshotPhase::Running), false),
+                    run_in_phase(
+                        "nightly-20260807",
+                        Some(SnapshotPhase::Unknown("Quiescing".into())),
+                        false,
+                    ),
+                    run_in_phase("pending-sibling", Some(SnapshotPhase::Pending), false),
+                ],
+                replace_slot()
+            ),
+            ReplacePlan::BlockedUnreadable(UnreadableRun {
+                snapshot: "nightly-20260807".into(),
+                phase: "Quiescing".into(),
+            }),
+            "an Unknown phase must beat known-unfinished children (fail closed)"
+        );
+
+        // Fail-closed outranks the parked hold too — the unreadable row is the
+        // one that needs a human, and it names the same object `classify_active_runs`
+        // names, so the two gates never disagree.
+        assert_eq!(
+            replace_plan(
+                &[
+                    parked_run("parked", Some(SnapshotPhase::Pending)),
+                    run_in_phase(
+                        "skewed",
+                        Some(SnapshotPhase::Unknown("Quiescing".into())),
+                        false
+                    ),
+                ],
+                replace_slot()
+            ),
+            ReplacePlan::BlockedUnreadable(UnreadableRun {
+                snapshot: "skewed".into(),
+                phase: "Quiescing".into(),
+            })
+        );
+
+        // A TERMINATING unreadable row is skipped like any other terminating
+        // row — it is not a blocker, so the live sibling is replaced normally.
+        assert_eq!(
+            replace_plan(
+                &[
+                    run_in_phase(
+                        "skewed",
+                        Some(SnapshotPhase::Unknown("Quiescing".into())),
+                        true
+                    ),
+                    run_in_phase("live", Some(SnapshotPhase::Running), false),
+                ],
+                replace_slot()
+            ),
+            ReplacePlan::Delete(vec!["live".into()])
+        );
+    }
+
+    #[test]
+    fn replace_plan_holds_while_a_child_is_parked_behind_the_repository_cap() {
+        // A parked child is QUEUED, not running. Deleting it frees no slot and
+        // the replacement parks right behind it — a delete-mint-park livelock
+        // that burns a CR per slot forever.
+        assert_eq!(
+            replace_plan(
+                &[parked_run("queued", Some(SnapshotPhase::Pending))],
+                replace_slot()
+            ),
+            ReplacePlan::HeldByParkedRun("queued".into())
+        );
+
+        // The audit-critical case: a parked child alongside a genuinely RUNNING
+        // sibling still holds — nothing is deleted. Minting beside the queue is
+        // exactly the pileup the repository cap exists to prevent.
+        let plan = replace_plan(
+            &[
+                run_in_phase("running-sibling", Some(SnapshotPhase::Running), false),
+                parked_run("queued", Some(SnapshotPhase::Pending)),
+            ],
+            replace_slot(),
+        );
+        assert_eq!(plan, ReplacePlan::HeldByParkedRun("queued".into()));
+        assert!(
+            !matches!(plan, ReplacePlan::Delete(_)),
+            "a parked child must delete NOTHING, not even a running sibling"
+        );
+
+        // `True` (the healed state) is not parked, so the pool draining lets the
+        // very next reconcile replace normally — the hold self-clears.
+        let mut healed = parked_run("healed", Some(SnapshotPhase::Running));
+        healed.status.as_mut().unwrap().conditions[0].status = "True".into();
+        assert_eq!(
+            replace_plan(&[healed], replace_slot()),
+            ReplacePlan::Delete(vec!["healed".into()])
+        );
+
+        // A stale `False` on a FINISHED child must never hold the schedule: the
+        // parked check is scoped to the unfinished, non-terminating set.
+        assert_eq!(
+            replace_plan(
+                &[parked_run("stale", Some(SnapshotPhase::Succeeded))],
+                replace_slot()
+            ),
+            ReplacePlan::Clear
+        );
+    }
+
+    /// A mock client that answers per `(method, path)` and logs every request,
+    /// so the replacement's ORDER (verify → Job delete → stamp → CR delete) is
+    /// asserted rather than assumed.
+    fn scripted_client<F>(log: Arc<std::sync::Mutex<Vec<String>>>, respond: F) -> kube::Client
+    where
+        F: Fn(&http::Method, &str) -> (StatusCode, serde_json::Value) + Send + Sync + 'static,
+    {
+        let respond = Arc::new(respond);
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            let respond = respond.clone();
+            async move {
+                let (method, path) = (req.method().clone(), req.uri().path().to_string());
+                log.lock().unwrap().push(format!("{method} {path}"));
+                let (status, body) = respond(&method, &path);
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+            }
+        });
+        kube::Client::new(svc, "default")
+    }
+
+    fn ok_status() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Success", "code": 200,
+        })
+    }
+
+    fn live_snapshot_body(ns: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": crate::consts::API_VERSION,
+            "kind": "Snapshot",
+            "metadata": { "name": name, "namespace": ns, "uid": format!("uid-{name}") },
+            "spec": {},
+        })
+    }
+
+    fn schedule_fixture(ns: &str, name: &str, policy: ConcurrencyPolicy) -> SnapshotSchedule {
+        let mut s = SnapshotSchedule::new(
+            name,
+            kopiur_api::SnapshotScheduleSpec {
+                schedule: schedule_spec("0 3 * * *", false, policy, None),
+                policy_ref: Some(PolicyRef {
+                    name: "pg".into(),
+                    namespace: None,
+                }),
+                policy_selector: None,
+                failed_jobs_history_limit: None,
+                deletion: None,
+            },
+        );
+        s.metadata.namespace = Some(ns.into());
+        s.metadata.uid = Some(format!("uid-{name}"));
+        s
+    }
+
+    /// A `SnapshotSchedule` with `nextSchedule` already pinned to a PAST slot in
+    /// a fixed zone, so `reconcile_inner` enters the pinned-slot branch with
+    /// `disposition == Fire` and no timezone lookups (an explicit
+    /// `schedule.timezone` short-circuits `resolve_effective_timezone`).
+    fn pinned_schedule(ns: &str, name: &str, slot: DateTime<Utc>) -> SnapshotSchedule {
+        let mut s = schedule_fixture(ns, name, ConcurrencyPolicy::Replace);
+        s.spec.schedule.timezone = Some("UTC".into());
+        s.metadata.generation = Some(3);
+        s.status = Some(kopiur_api::SnapshotScheduleStatus {
+            next_schedule: Some(kopiur_api::snapshot_schedule::ScheduleRef {
+                at: Some(slot.to_rfc3339()),
+                timezone: Some("UTC".into()),
+                snapshot_ref: None,
+            }),
+            ..Default::default()
+        });
+        s
+    }
+
+    /// A minimal `SnapshotPolicy` body the fire path can read (no pvcSelector ⇒
+    /// no PVC listing, one unpinned child).
+    fn policy_body(ns: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": crate::consts::API_VERSION,
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": name, "namespace": ns, "uid": "uid-pg" },
+            "spec": { "repository": { "name": "repo" } },
+        })
+    }
+
+    /// **The deliverable-4 wiring test, and the CRITICAL-1 regression guard.**
+    ///
+    /// Drives the real `reconcile_inner` for a `Replace` schedule whose pinned
+    /// slot is due and which has one `Running` child from a PREVIOUS slot. It
+    /// asserts the whole wired path in one pass: the old run's mover Job is
+    /// deleted, its CR is stamped `pruned-by: replaced-run` and deleted, a
+    /// `ReplacedActiveRun` event is published, and the new slot's child is minted
+    /// — all before the schedule's status patch.
+    ///
+    /// The second half is the regression: the freshly-minted child is fed back in
+    /// and the SAME reconcile is retried (the crashed-before-status-patch shape).
+    /// The retry must cancel NOTHING — pre-fix it would delete its own output and
+    /// the slot would be recorded as fired with no backup behind it.
+    #[tokio::test]
+    async fn reconcile_replace_cancels_the_prior_run_mints_the_new_one_and_never_eats_its_own() {
+        let slot = at(2026, 8, 4, 3, 0);
+        let ns = "apps";
+        let new_child = scheduled_backup_name("nightly", slot);
+
+        // One request log per pass, plus a switchable children population.
+        let run_pass = |children: Vec<Snapshot>| async move {
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let client = scripted_client(log.clone(), move |method, path| {
+                if path.contains("/snapshotpolicies/") {
+                    return (StatusCode::OK, policy_body("apps", "pg"));
+                }
+                if path.contains("/snapshotschedules/") {
+                    return (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": crate::consts::API_VERSION,
+                            "kind": "SnapshotSchedule",
+                            "metadata": { "name": "nightly", "namespace": "apps", "uid": "uid-nightly" },
+                            "spec": { "schedule": { "cron": "0 3 * * *" }, "policyRef": { "name": "pg" } },
+                        }),
+                    );
+                }
+                if method != http::Method::DELETE && path.contains("/snapshots/") {
+                    return (StatusCode::OK, live_snapshot_body("apps", "prior-run"));
+                }
+                (StatusCode::OK, ok_status())
+            });
+            let ctx = Context::test_context(client);
+            // A synced store serves the children AND `slot_twin` (so the new
+            // child's absence is read from the cache, no extra GET).
+            prime_snapshot_store(&ctx, children, true);
+            let schedule = pinned_schedule("apps", "nightly", slot);
+            let action = reconcile_inner(&schedule, &ctx).await;
+            let requests = log.lock().unwrap().clone();
+            (action, requests)
+        };
+
+        // --- Pass 1: a PRIOR slot's Running child is replaced -----------------
+        let mut prior = created_at(
+            "prior-run",
+            Some(SnapshotPhase::Running),
+            slot - chrono::Duration::hours(24),
+        );
+        prior.metadata.namespace = Some(ns.into());
+        prior.metadata.labels = Some(BTreeMap::from([(
+            crate::consts::SCHEDULE_LABEL.to_string(),
+            "nightly".to_string(),
+        )]));
+        prior.spec.on_schedule_delete = Some(ScheduleDeletePolicy::Retain);
+
+        let (action, requests) = run_pass(vec![prior.clone()]).await;
+        assert!(action.is_ok(), "reconcile failed: {action:?}");
+
+        let joined = requests.join("\n");
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.starts_with("DELETE ") && r.contains("/jobs/prior-run")),
+            "the prior run's mover Job must be deleted:\n{joined}"
+        );
+        let stamp = requests
+            .iter()
+            .position(|r| r.starts_with("PATCH ") && r.contains("/snapshots/prior-run"))
+            .expect("the prior run must be stamped pruned-by");
+        let cr_delete = requests
+            .iter()
+            .position(|r| r.starts_with("DELETE ") && r.contains("/snapshots/prior-run"))
+            .expect("the prior run's CR must be deleted");
+        assert!(stamp < cr_delete, "stamp before delete:\n{joined}");
+        assert!(
+            requests.iter().any(|r| r.contains("/events")),
+            "a ReplacedActiveRun event must be published:\n{joined}"
+        );
+        // The new slot's child is minted in the SAME pass...
+        let mint = requests
+            .iter()
+            .position(|r| r.starts_with("PATCH ") && r.contains(&format!("/snapshots/{new_child}")))
+            .unwrap_or_else(|| panic!("the new slot child must be minted:\n{joined}"));
+        // ...after the cancellation, and before the schedule's status patch.
+        assert!(cr_delete < mint, "cancel before mint:\n{joined}");
+        let status = requests
+            .iter()
+            .position(|r| r.contains("/snapshotschedules/nightly/status"))
+            .expect("the schedule status must be patched");
+        assert!(mint < status, "mint before the status patch:\n{joined}");
+
+        // --- Pass 2: the RETRY, with this slot's own child present ------------
+        // Exactly the crashed-before-the-status-patch state: the pin is still on
+        // `slot`, so the retry re-enters at `Fire` and sees its own minted child.
+        let mut own = created_at(&new_child, Some(SnapshotPhase::Pending), slot);
+        own.metadata.namespace = Some(ns.into());
+        own.metadata.labels = Some(BTreeMap::from([(
+            crate::consts::SCHEDULE_LABEL.to_string(),
+            "nightly".to_string(),
+        )]));
+        own.spec.on_schedule_delete = Some(ScheduleDeletePolicy::Retain);
+
+        let (action, requests) = run_pass(vec![own]).await;
+        assert!(action.is_ok(), "retry reconcile failed: {action:?}");
+        let joined = requests.join("\n");
+        assert!(
+            !requests.iter().any(|r| r.starts_with("DELETE ")),
+            "a retry must cancel NOTHING — it would be deleting its own just-minted \
+             child, and the slot would be recorded as fired with no backup:\n{joined}"
+        );
+        assert!(
+            !requests.iter().any(|r| r.contains("/events")),
+            "no run was replaced, so no ReplacedActiveRun event:\n{joined}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.starts_with("PATCH ") && r.contains(&format!("/snapshots/{new_child}"))),
+            "the retry re-applies the same child idempotently:\n{joined}"
+        );
+    }
+
+    /// The executor's contract, in order: live-verify, then STOP THE MOVER, then
+    /// stamp `pruned-by: replaced-run`, then delete the CR. Job-before-CR is the
+    /// load-bearing half — the finalizer releases immediately while
+    /// `status.snapshot` is absent (the normal mid-run state), so a CR deleted
+    /// first would be gone while its mover kept uploading.
+    #[tokio::test]
+    async fn replace_active_runs_stops_the_mover_then_stamps_and_deletes_the_cr() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = scripted_client(log.clone(), |method, path| {
+            // The live-verify GET and the `pruned-by` stamp PATCH both need a
+            // real `Snapshot` back; every delete (Job, ConfigMap, CR) answers
+            // with a bare Status.
+            if method != http::Method::DELETE && path.contains("/snapshots/") {
+                (StatusCode::OK, live_snapshot_body("apps", "nightly-run"))
+            } else {
+                (StatusCode::OK, ok_status())
+            }
+        });
+        let ctx = Context::test_context(client);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "apps");
+        let schedule = schedule_fixture("apps", "nightly", ConcurrencyPolicy::Replace);
+
+        let deleted =
+            replace_active_runs(&ctx, &schedule, "apps", &api, &["nightly-run".to_string()])
+                .await
+                .expect("replacement succeeds");
+        assert_eq!(deleted, vec!["nightly-run".to_string()]);
+
+        let requests = log.lock().unwrap().clone();
+        // 1. live verify (GET the Snapshot)
+        assert!(
+            requests[0].starts_with("GET ") && requests[0].ends_with("/snapshots/nightly-run"),
+            "the live verify must come first: {requests:?}"
+        );
+        // 2. the mover Job — SAME name as the Snapshot — dies before the CR.
+        let job_delete = requests
+            .iter()
+            .position(|r| r.starts_with("DELETE ") && r.contains("/jobs/nightly-run"))
+            .expect("the mover Job must be deleted");
+        // 3. the stamp, 4. the CR delete.
+        let stamp = requests
+            .iter()
+            .position(|r| r.starts_with("PATCH ") && r.contains("/snapshots/nightly-run"))
+            .expect("the pruned-by stamp must be applied");
+        let cr_delete = requests
+            .iter()
+            .position(|r| r.starts_with("DELETE ") && r.contains("/snapshots/nightly-run"))
+            .expect("the Snapshot CR must be deleted");
+        assert!(
+            job_delete < stamp && stamp < cr_delete,
+            "order must be Job delete → stamp → CR delete, got {requests:?}"
+        );
+    }
+
+    /// #382 C2: a victim the LIVE read says is gone (or terminating) is skipped
+    /// entirely — no Job delete, no stamp, no CR delete, and crucially no Event,
+    /// so a stale reflector snapshot cannot re-announce an already-replaced run.
+    #[tokio::test]
+    async fn replace_active_runs_skips_a_victim_that_is_already_gone() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = logging_client(
+            log.clone(),
+            StatusCode::NOT_FOUND,
+            serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404,
+            }),
+        );
+        let ctx = Context::test_context(client);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "apps");
+        let schedule = schedule_fixture("apps", "nightly", ConcurrencyPolicy::Replace);
+
+        let deleted = replace_active_runs(&ctx, &schedule, "apps", &api, &["vanished".to_string()])
+            .await
+            .expect("a vanished victim is not an error");
+        assert!(
+            deleted.is_empty(),
+            "a skipped victim must not be reported as replaced (no Event names it)"
+        );
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one verify GET and nothing else, got {requests:?}"
+        );
+        assert!(requests[0].starts_with("GET "), "{requests:?}");
+    }
+
+    /// The live verify re-checks PHASE, not just existence. A `Running` victim
+    /// can commit its kopia snapshot and flip to `Succeeded` between the
+    /// (possibly store-derived) selection and this delete; cancelling it then
+    /// deletes the CR of a COMPLETED backup and leaves its snapshot unreferenced.
+    #[test]
+    fn still_replaceable_requires_the_victim_to_be_unfinished() {
+        // Gone / terminating — the pre-existing #382 C2 rules.
+        assert!(!still_replaceable(None));
+        assert!(!still_replaceable(Some(&run_in_phase(
+            "draining",
+            Some(SnapshotPhase::Running),
+            true
+        ))));
+        // Still in flight ⇒ cancellable.
+        for unfinished in [
+            None,
+            Some(SnapshotPhase::Pending),
+            Some(SnapshotPhase::Running),
+        ] {
+            assert!(
+                still_replaceable(Some(&run_in_phase("live", unfinished.clone(), false))),
+                "{unfinished:?}"
+            );
+        }
+        // Finished after the selection ⇒ NOT cancellable. `Succeeded` is the
+        // data-loss case this guard exists for.
+        for finished in [
+            SnapshotPhase::Succeeded,
+            SnapshotPhase::Failed,
+            SnapshotPhase::Deleting,
+            SnapshotPhase::Discovered,
+            SnapshotPhase::Unchanged,
+            SnapshotPhase::Unknown("Quiescing".into()),
+        ] {
+            assert!(
+                !still_replaceable(Some(&run_in_phase("done", Some(finished.clone()), false))),
+                "{finished:?} must not be cancelled"
+            );
+        }
+    }
+
+    /// End-to-end through the executor: a victim that finished after selection
+    /// costs exactly one GET and is neither cancelled nor announced.
+    #[tokio::test]
+    async fn replace_active_runs_skips_a_victim_that_finished_after_selection() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut succeeded = live_snapshot_body("apps", "nightly-run");
+        succeeded["status"] = serde_json::json!({ "phase": "Succeeded" });
+        let client = scripted_client(log.clone(), move |_m, _p| {
+            (StatusCode::OK, succeeded.clone())
+        });
+        let ctx = Context::test_context(client);
+        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "apps");
+        let schedule = schedule_fixture("apps", "nightly", ConcurrencyPolicy::Replace);
+
+        let deleted =
+            replace_active_runs(&ctx, &schedule, "apps", &api, &["nightly-run".to_string()])
+                .await
+                .expect("a finished victim is not an error");
+        assert!(
+            deleted.is_empty(),
+            "a backup that completed after selection must never be cancelled"
+        );
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "one verify GET, then nothing — no Job delete, no stamp, no CR delete: {requests:?}"
+        );
+        assert!(requests[0].starts_with("GET "), "{requests:?}");
+    }
+
+    /// The plan drives the disposition, and only for `Replace`: `Forbid` and
+    /// `Allow` must be byte-identical to their pre-M4 behavior (no plan is even
+    /// computed for them, so no victim can ever be selected).
+    #[test]
+    fn only_replace_computes_a_plan_and_forbid_allow_are_unchanged() {
+        let slot = at(2026, 8, 4, 3, 0);
+        let due = at(2026, 8, 4, 3, 5);
+        let in_flight = [run_in_phase("run", Some(SnapshotPhase::Running), false)];
+        let runs = classify_active_runs(&in_flight);
+        assert!(runs.active);
+
+        // Forbid: an active run still simply waits — the pinned slot is the
+        // single catch-up, no deletes, exactly as before.
+        assert_eq!(
+            slot_disposition(
+                &schedule_spec("0 3 * * *", false, ConcurrencyPolicy::Forbid, None),
+                slot,
+                due,
+                runs.active
+            ),
+            SlotDisposition::Wait
+        );
+        // Allow: the declared-overlap contract — fires alongside, no deletes.
+        assert_eq!(
+            slot_disposition(
+                &schedule_spec("0 3 * * *", false, ConcurrencyPolicy::Allow, None),
+                slot,
+                due,
+                runs.active
+            ),
+            SlotDisposition::Fire
+        );
+        // Replace: also Fire from `slot_disposition`'s point of view (that is
+        // what `concurrency_allows` returning true means) — the replacement is
+        // then what `replace_plan` decides on the SAME children.
+        assert_eq!(
+            slot_disposition(
+                &schedule_spec("0 3 * * *", false, ConcurrencyPolicy::Replace, None),
+                slot,
+                due,
+                runs.active
+            ),
+            SlotDisposition::Fire
+        );
+        assert_eq!(
+            replace_plan(&in_flight, replace_slot()),
+            ReplacePlan::Delete(vec!["run".into()])
+        );
+    }
+
+    /// The wiring invariant the reconciler leans on: when `replace_plan` says
+    /// `BlockedUnreadable`, `classify_active_runs` must independently produce
+    /// the SAME `UnreadableRun`. The Fire→Wait downgrade re-uses
+    /// `runs.unreadable` (not the plan's copy) to feed the `ScheduleRunnable`
+    /// gate, so if the two ever picked different children — or one found a
+    /// blocker the other didn't — `Replace` would downgrade to Wait with an
+    /// EMPTY blocker and hang at the 1s requeue floor with nothing explaining why.
+    #[test]
+    fn replace_and_classify_agree_on_the_unreadable_blocker() {
+        let children = [
+            run_in_phase("finished", Some(SnapshotPhase::Succeeded), false),
+            run_in_phase("also-running", Some(SnapshotPhase::Running), false),
+            run_in_phase(
+                "skewed-a",
+                Some(SnapshotPhase::Unknown("Quiescing".into())),
+                false,
+            ),
+            run_in_phase(
+                "skewed-b",
+                Some(SnapshotPhase::Unknown("Draining".into())),
+                false,
+            ),
+        ];
+        let runs = classify_active_runs(&children);
+        let blocker = runs.unreadable.expect("the gate must name a blocker");
+        assert_eq!(
+            replace_plan(&children, replace_slot()),
+            ReplacePlan::BlockedUnreadable(blocker.clone()),
+            "both kernels must name the FIRST unreadable child"
+        );
+        assert_eq!(blocker.snapshot, "skewed-a");
+
+        // And the converse: no unreadable child ⇒ neither reports one, so the
+        // downgrade never fires and the plan is free to delete.
+        let readable = [run_in_phase("run", Some(SnapshotPhase::Running), false)];
+        assert_eq!(classify_active_runs(&readable).unreadable, None);
+        assert!(matches!(
+            replace_plan(&readable, replace_slot()),
+            ReplacePlan::Delete(_)
+        ));
     }
 }

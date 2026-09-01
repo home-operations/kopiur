@@ -1326,7 +1326,7 @@ fn operator_pruned_bypasses_guard_and_breaker() {
     }
 }
 
-// -- plan_prune: the variant-aware (PrunedBy × DeletionPolicy) 4×3 matrix (M2) --
+// -- plan_prune: the variant-aware (PrunedBy × DeletionPolicy) 5×3 matrix (M2) --
 
 #[test]
 fn plan_prune_matrix_covers_every_prunedby_x_policy_cell() {
@@ -1392,6 +1392,26 @@ fn plan_prune_matrix_covers_every_prunedby_x_policy_cell() {
         ),
         (
             PrunedBy::ReplicationRetention,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
+        // `concurrencyPolicy: Replace` cancelling an in-flight run. The second
+        // (quieter) downgrade: the victim is unfinished by construction and so
+        // owns no kopia snapshot, and in the race where it committed one after
+        // all we must NOT destroy it — the user asked to cancel a run in
+        // progress, not to delete a backup that had just finished.
+        (
+            PrunedBy::ReplacedRun,
+            DeletionPolicy::Delete,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::ReplacedRun,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::ReplacedRun,
             DeletionPolicy::Orphan,
             DeletionPlan::OrphanSnapshot,
         ),
@@ -2386,8 +2406,8 @@ fn breaker_relevant_classifies_every_pruned_by_variant() {
     // so a new variant cannot ship without a deliberate row here (the match in
     // `breaker_relevant` won't compile until classified, and this won't pass
     // until the expected set is updated). Operator prunes (retention,
-    // failed-history, replication-retention) are exempt; unstamped and
-    // policy-cascade count.
+    // failed-history, replication-retention, replaced-run) are exempt;
+    // unstamped and policy-cascade count.
     use kopiur_api::snapshot::PrunedBy;
     assert!(super::plan::breaker_relevant(None), "unstamped is external");
     let relevant: Vec<_> = PrunedBy::ALL
@@ -2403,7 +2423,12 @@ fn breaker_relevant_classifies_every_pruned_by_variant() {
         .collect();
     assert_eq!(
         exempt,
-        ["retention", "failed-history", "replication-retention"]
+        [
+            "retention",
+            "failed-history",
+            "replication-retention",
+            "replaced-run"
+        ]
     );
 }
 

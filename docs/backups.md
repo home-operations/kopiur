@@ -874,7 +874,7 @@ is described in the table below.
 | `schedule.timezone`                | IANA timezone the cron is evaluated in. Absent, it inherits the target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once), else UTC (see the tip below).                                                          |
 | `schedule.runOnCreate`             | `false` (default) means applying the schedule does **not** fire immediately — GitOps-friendly. Set `true` to backup the moment it's created. |
 | `schedule.suspend`                 | `true` pauses future firings (in-flight and past runs are untouched).                                                                        |
-| `schedule.concurrencyPolicy`       | What to do if a run is still in flight: `Forbid` (default, skip), `Allow` (run anyway), `Replace` (cancel the old one).                      |
+| `schedule.concurrencyPolicy`       | What to do if a run is still in flight: `Forbid` (default, skip), `Allow` (run anyway), `Replace` (cancel the old one — see below).           |
 | `schedule.startingDeadlineSeconds` | If a slot is missed by more than this (operator was down), skip it rather than fire late.                                                    |
 | `failedJobsHistoryLimit`           | How many **failed** `Snapshot` CRs from this schedule to keep. Successful retention is GFS on the `SnapshotPolicy`.                              |
 
@@ -892,6 +892,63 @@ back to UTC and raises a `TimezoneDefaultAmbiguous` condition telling you to
 set `schedule.timezone` explicitly. `schedule.timezone`, when set, always wins.
 
 ///
+
+### What `concurrencyPolicy: Replace` really cancels
+
+A slot that comes due while this schedule's previous run is still unfinished
+(`Pending` or `Running`) doesn't just get to skip the queue — under `Replace`
+the controller **deletes the old run before minting the new one**, in this order:
+
+1. Deletes the run's **mover Job**, so the pod doing the upload stops right away
+   rather than lingering while ownership garbage collection catches up.
+2. Marks the old `Snapshot` CR `pruned-by: replaced-run` and deletes it. That
+   marking is what tells the deletion machinery this was *your operator doing its
+   job*, not someone mass-deleting backups — so it doesn't count against the
+   repository's mass-deletion breaker. (Without it, a busy `Replace` schedule
+   would trip its own safety breaker.)
+3. Fires the new slot, in the same pass.
+
+You'll see one `ReplacedActiveRun` event on the schedule listing what was
+cancelled.
+
+/// warning | Cancelling a run doesn't delete a backup — because there isn't one yet
+
+`deletionPolicy` decides what happens to **finished** kopia snapshots. A run
+cancelled mid-upload never committed one, so there is nothing in the repository
+for the finalizer to remove; the CR is just released. What the killed mover had
+already uploaded — data blobs, plus an incomplete manifest if it had checkpointed
+— is reclaimed by kopia's blob garbage collection when
+[maintenance](maintenance.md) next runs. You don't have to do anything.
+
+Before cancelling, Kopiur re-reads each run and skips any that has finished in
+the meantime, so a completed backup is not cancelled out from under you. In the
+sub-millisecond window where a run commits its snapshot right as the delete
+lands, Kopiur deliberately **keeps** that snapshot rather than deleting it — you
+asked to cancel a run in progress, not to throw away a completed backup. Note
+what "keeps" means: the snapshot stays in the repository with no `Snapshot` CR
+pointing at it, and Kopiur will not see it again until the repository's catalog
+is next scanned. That does **not** happen on a timer unless you enable
+`catalog.periodicRefresh` (off by default) — otherwise it waits for a repository
+spec change, a failure re-probe, or an on-demand scan request. Until then it is
+untracked data in your repository that retention will not prune.
+
+///
+
+`Replace` will also decline to replace anything and simply wait, in two cases:
+
+- **The old run's phase is one this operator doesn't recognize** — nearly always
+  because a newer Kopiur wrote it during a partial upgrade. Rather than delete a
+  run it can't understand, the schedule stops and raises
+  `ScheduleRunnable=False` (`BlockedOnUnreadableRun`) so you can see it. Finish
+  the upgrade, or delete that `Snapshot` if the run is really over.
+- **The old run is queued behind the repository's concurrency cap**
+  (`RepositorySlotAvailable=False`). It isn't running — it's waiting in line.
+  Cancelling it would free nothing and the replacement would go straight to the
+  back of the same line, so `Replace` behaves like `Forbid` until the queue
+  drains. The schedule says so — `ReplacementHeld=True` in its conditions, plus
+  a one-off `WaitingForRepositorySlot` event — so a schedule that has quietly
+  stopped firing always tells you why. This one resolves itself; if it keeps
+  happening, raise the repository's mover concurrency.
 
 ### `policyRef` or `policySelector` — one recipe or many
 
