@@ -734,6 +734,10 @@ $ kubectl get pods -n <ns> --selector=job-name=<job-name>                # job-n
 # or list every mover Job/pod for a policy at once:
 $ kubectl get jobs,pods -n <ns> -l kopiur.home-operations.com/config=<policy-name>
 
+# every mover Job currently occupying a repository concurrency slot, cluster-wide:
+$ kubectl get jobs -A -l app.kubernetes.io/managed-by=kopiur \
+    -l 'kopiur.home-operations.com/repo-pool'
+
 # confirm the mover RBAC was minted in the workload namespace:
 $ kubectl get serviceaccount,rolebinding -n <ns> -l app.kubernetes.io/component=mover
 

@@ -538,9 +538,11 @@ spawn a verify Job that failed hard against an empty repository (GitHub #168).
 
 It is validated at admission, so a typo or out-of-scope variable is rejected on `kubectl apply`. See the [verification-drill scenario](scenarios/verification-drills.md).
 
-/// tip | A timezone for the verify crons
+/// tip | A timezone (and jitter) for the verify crons
 
 Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { schedule: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago } }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick.schedule`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once) (set it once there instead of repeating it on every policy), else UTC.
+
+`jitter` inherits from the repository the same way, and with the same precedence — per-cron value first, else [`scheduleDefaults.jitter`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once), else no spread. Verification runs are outside the [mover-Job concurrency pool](#limiting-concurrent-jobs-per-repository), so they are never queued behind backups; spreading them is about not stacking them on each other. A window over 24h is rejected at admission.
 
 ///
 
@@ -1024,8 +1026,8 @@ A `Snapshot` that arrives at a full pool is **parked before its Job is created**
 
 ```console
 $ kubectl get snapshot -n billing
-NAME                        PHASE     REPOSITORY   AGE
-postgres-data-20260901-02   Pending   nas          40s
+NAME                        PHASE     ORIGIN      SNAPSHOT   AGE
+postgres-data-20260901-02   Pending   scheduled              40s
 
 $ kubectl get snapshot postgres-data-20260901-02 -n billing \
     -o jsonpath='{.status.conditions[?(@.type=="RepositorySlotAvailable")].message}{"\n"}'
