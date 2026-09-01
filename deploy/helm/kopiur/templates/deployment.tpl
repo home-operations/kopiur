@@ -114,6 +114,13 @@ spec:
             # opt-in backstop.
             - name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
               value: {{ .Values.maxConcurrentDeleteJobs | quote }}
+            # Cluster-wide cap on concurrently running POOLED mover Jobs
+            # (backups, restores, replication sources) across every
+            # repository — the backstop beneath each repository's own
+            # spec.concurrency.maxConcurrentJobs. 0 = uncapped (default);
+            # restores are always admitted and never queued.
+            - name: KOPIUR_MAX_CONCURRENT_JOBS
+              value: {{ .Values.maxConcurrentJobs | quote }}
             # Per-controller cap on concurrent reconciles. Bounds apiserver
             # load and fds during re-list storms/outages; 0 = unbounded (the
             # pre-fix behavior; not recommended).
