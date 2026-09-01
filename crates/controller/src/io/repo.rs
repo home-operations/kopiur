@@ -1042,7 +1042,7 @@ mod tests {
         });
 
         let mut ns_repo = repo_cr("backups", "nas");
-        ns_repo.spec.concurrency = zero.clone();
+        ns_repo.spec.concurrency = zero;
         let resolved =
             resolved_from_namespaced(ns_repo, "backups".into(), None).expect("projection succeeds");
         assert_eq!(
