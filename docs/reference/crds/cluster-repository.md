@@ -21,13 +21,26 @@ a namespace is rejected on apply.
 ## `spec`
 
 Fields shared with `Repository` — `backend`, `create`, `moverDefaults`,
-`scheduleDefaults`, `catalog`, `maintenance`, `onNamespaceDelete`, `mode`,
-`suspend`, `health`, `parameters` — behave exactly as on the
+`scheduleDefaults`, `concurrency`, `catalog`, `maintenance`, `onNamespaceDelete`,
+`mode`, `suspend`, `health`, `parameters` — behave exactly as on the
 [Repository](repository.md) page. (`parameters.epoch` is worth calling out for a
 shared repository: it describes the repository itself, so declare it on the cluster
 that owns it — two clusters declaring different values will fight over them, and a
 `mode: ReadOnly` consumer is rejected for declaring any.)
 The differences and additions:
+
+/// note | What `concurrency.maxConcurrentJobs` counts under a namespaced install
+
+The cap is enforced by listing this repository's in-flight pooled mover Jobs, and
+that list is scoped to the namespaces the operator watches. Under an
+`installScope: namespaced` install, a `ClusterRepository`'s cap therefore bounds
+the pooled Jobs **in the watched namespace**, not every namespace using the
+repository. It is the only answer available — a cluster-wide list under a
+namespaced install's `Role` RBAC is a permanent 403 that would wedge the reconcile
+— and it is the same scoping every other reconcile-time list already carries. A
+cluster-scoped install (the default) counts every namespace, as you would expect.
+
+///
 
 ### `encryption`
 

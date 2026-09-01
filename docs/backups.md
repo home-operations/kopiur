@@ -540,7 +540,7 @@ It is validated at admission, so a typo or out-of-scope variable is rejected on 
 
 /// tip | A timezone for the verify crons
 
-Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { schedule: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago } }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick.schedule`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once) (set it once there instead of repeating it on every policy), else UTC.
+Each verification cron is a `CronSpec`, so it takes the same `timezone` as a backup schedule: `quick: { schedule: { cron: "0 4 * * *", jitter: 30m, timezone: America/Chicago } }` evaluates `0 4 * * *` as 4 a.m. **Chicago time** (DST-correct), not UTC. Set it per cron (`quick.schedule`, `deep.schedule`); absent falls back to the target repository's [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once) (set it once there instead of repeating it on every policy), else UTC.
 
 ///
 
@@ -870,26 +870,19 @@ is described in the table below.
 | Field                              | What it does                                                                                                                                 |
 | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `schedule.cron`                    | When to fire. Supports Jenkins-style **`H`** (see below).                                                                                    |
-| `schedule.jitter`                  | Spread firings over a window (e.g. `30m`), so many schedules don't all hit at once.                                                          |
-| `schedule.timezone`                | IANA timezone the cron is evaluated in. Absent, it inherits the target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once), else UTC (see the tip below).                                                          |
+| `schedule.jitter`                  | Spread firings over a window (e.g. `30m`), so many schedules don't all hit at once. Absent, it inherits the target policy's repository [`scheduleDefaults.jitter`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once) (see the tip below). Capped at 24h at admission. |
+| `schedule.timezone`                | IANA timezone the cron is evaluated in. Absent, it inherits the target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once), else UTC (see the tip below).                                                          |
 | `schedule.runOnCreate`             | `false` (default) means applying the schedule does **not** fire immediately — GitOps-friendly. Set `true` to backup the moment it's created. |
 | `schedule.suspend`                 | `true` pauses future firings (in-flight and past runs are untouched).                                                                        |
 | `schedule.concurrencyPolicy`       | What to do if a run is still in flight: `Forbid` (default, skip), `Allow` (run anyway), `Replace` (cancel the old one — see below).           |
 | `schedule.startingDeadlineSeconds` | If a slot is missed by more than this (operator was down), skip it rather than fire late.                                                    |
 | `failedJobsHistoryLimit`           | How many **failed** `Snapshot` CRs from this schedule to keep. Successful retention is GFS on the `SnapshotPolicy`.                              |
 
-/// tip | The cron timezone can be inherited from the repository
+/// tip | The cron timezone and jitter can both be inherited from the repository
 
-Leave `schedule.timezone` unset and the schedule evaluates its cron in the
-target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-once)
-(else UTC) — set the zone once on the repository instead of on every schedule.
-The resolved zone is recorded in `status.nextSchedule.timezone`; if you later
-change the repository default, the schedule re-reconciles (a referent watch)
-and **recomputes its pinned slot** in the new zone rather than waiting for the
-stale slot to fire. A `policySelector` schedule whose matched policies'
-repositories disagree on the zone can't be resolved unambiguously — it falls
-back to UTC and raises a `TimezoneDefaultAmbiguous` condition telling you to
-set `schedule.timezone` explicitly. `schedule.timezone`, when set, always wins.
+Leave `schedule.timezone` unset and the schedule evaluates its cron in the target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once) (else UTC) — set the zone once on the repository instead of on every schedule. The resolved zone is recorded in `status.nextSchedule.timezone`; if you later change the repository default, the schedule re-reconciles (a referent watch) and **recomputes its pinned slot** in the new zone rather than waiting for the stale slot to fire. A `policySelector` schedule whose matched policies' repositories disagree on the zone can't be resolved unambiguously — it falls back to UTC and raises a `TimezoneDefaultAmbiguous` condition telling you to set `schedule.timezone` explicitly. `schedule.timezone`, when set, always wins.
+
+`schedule.jitter` inherits the same way, from [`scheduleDefaults.jitter`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once), with one difference: there is no built-in fallback. Absent at both levels simply means no spread. The window actually used is pinned in `status.nextSchedule.jitter`, and changing it (at either level) invalidates the pinned slot and recomputes it in the new window — so an edit takes effect on the *next* firing, not an arbitrary number of firings later. Matched policies whose repositories disagree on the window resolve to **no jitter** and log why, recommending an explicit `schedule.jitter`; disagreement is not a value you can average.
 
 ///
 
@@ -983,6 +976,100 @@ postgres-data-nightly   postgres-data   H 2 * * *   false       6d
 $ kubectl get snapshotschedule postgres-data-nightly -n billing \
     -o jsonpath='{.status.nextSchedule.at}{"\n"}{.status.consecutiveFailures}{"\n"}'
 ```
+
+## Limiting concurrent jobs per repository
+
+Nothing above bounds how many mover Jobs hit one repository at the same time. Twenty schedules that all fire at 02:00 produce twenty movers, all uploading to the same bucket, all competing for the same node pool. `spec.concurrency.maxConcurrentJobs` on the [`Repository`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) (or `ClusterRepository`) is the ceiling:
+
+```yaml
+spec:
+    concurrency:
+        maxConcurrentJobs: 3 # absent or 0 = unlimited (the default)
+```
+
+Absent, or `0`, means unlimited — which is the default and the behavior every previous release had. Setting it costs nothing until it binds.
+
+### One pool, not one per work kind
+
+A repository has **one** budget, and backups, restores and the *source* side of both replication kinds all draw from it. That is deliberate: the shared resource is the repository's backend and the bandwidth to it, so three separately "safe" limits — three backups, three restores, three replications — would still saturate it. One number, one answer to "how much can hit this backend at once".
+
+| Draws from the pool | Outside the pool |
+| --- | --- |
+| Backup movers (`Snapshot`) | `Maintenance` (quick and full) |
+| Restore movers (`Restore`, including the populator Job) | `SnapshotPolicy` verification (quick and deep) |
+| `RepositoryReplication` reading this repository | Snapshot pin/unpin |
+| `SnapshotReplication` reading this repository | Batched snapshot deletions (`snapdel-*`) |
+| | Repository bootstrap / catalog scan (`<name>-discovery`) |
+| | `kubectl kopiur browse` session pods |
+
+Each exclusion is a decision, not an oversight. Maintenance is the *cure* for an overloaded repository, so queuing it behind a full backup pool would make a struggling repository permanently unmaintainable. Deletions *reduce* load and are already batched one-Job-per-repository. Bootstrap is what makes a repository `Ready` in the first place — gating it on a pool that only fills once the repository is ready would deadlock a fresh one. A browse session is a human waiting at a terminal.
+
+/// tip | Restores are never queued
+
+A restore is a recovery in progress. Holding one behind a queue of routine nightly backups is exactly backwards, so a restore is **always admitted**, at or over the cap. It still *counts* while it runs — its Job carries the pool label like any other — so an in-flight restore displaces backups rather than adding to them. That is what a cap is actually asked for.
+
+///
+
+### The cluster-wide backstop
+
+A second, optional cap sits beneath the per-repository one: the Helm value `maxConcurrentJobs` (env `KOPIUR_MAX_CONCURRENT_JOBS`, default `0` = uncapped) bounds the same pool across **every** repository. Reach for it when the constraint is the node pool rather than any one backend. A run must satisfy both caps; whichever it meets first holds it. See [Installation → runtime tuning](install.md#runtime-tuning).
+
+### What a queued run looks like
+
+A `Snapshot` that arrives at a full pool is **parked before its Job is created** — no mover pod, no credential projection, no source staging, no side effects at all. It reports:
+
+- `status.phase: Pending`
+- `RepositorySlotAvailable=False`, reason `WaitingForSlot`, with a message naming the numbers: `waiting for a mover slot on Repository billing/nas: 3/3 jobs running (global 8/12); restores are never held`
+- a Normal event carrying the same message
+
+```console
+$ kubectl get snapshot -n billing
+NAME                        PHASE     REPOSITORY   AGE
+postgres-data-20260901-02   Pending   nas          40s
+
+$ kubectl get snapshot postgres-data-20260901-02 -n billing \
+    -o jsonpath='{.status.conditions[?(@.type=="RepositorySlotAvailable")].message}{"\n"}'
+waiting for a mover slot on Repository billing/nas: 3/3 jobs running; restores are never held
+```
+
+Two details in that message are worth knowing. The `(global …)` clause appears **only** when a cluster-wide cap is set; with no backstop configured it is omitted entirely rather than printed as noise. And when a run is held by the *global* cap alone — the repository itself has no `maxConcurrentJobs` — the per-repository denominator renders as `unlimited` (`0/unlimited jobs running (global 12/12)`), because quoting a per-repository number the repository never set would be a lie about which knob to turn.
+
+The moment a slot frees, the run launches and the condition heals to `True` / `SlotAcquired` (`holding a mover slot on Repository billing/nas`). A parked run re-checks about every 30–60 seconds, and a finishing Job wakes its repository's queue sooner than that. Both replication kinds park and heal identically; if the heal write itself fails, it is retried while the run is in flight and, failing that, at the next run's spawn — so a launched run never sits advertising a queue it already left.
+
+/// warning | A queued run has no deadline of its own
+
+Parking is not a timeout: a run waits until a slot frees, however long that takes, and no amount of waiting fails it. That is the right default (a backup deferred by ten minutes is still a backup), but it means a cap set too low, or a wedged mover Job that never terminates, shows up as a queue that never drains rather than as a failure. Watch `kopiur_snapshot_waiting_for_slot` (below), and see [Troubleshooting → a run stuck `Pending` with `WaitingForSlot`](troubleshooting.md#repositoryslotavailablefalse--queued-behind-the-repositorys-concurrency-cap).
+
+///
+
+### Watching the queue
+
+`kopiur_snapshot_waiting_for_slot` is a gauge with one series per queued `Snapshot`, labeled `repository_kind`, `repository`, `namespace` and `name`. `sum by (repository) (kopiur_snapshot_waiting_for_slot)` is the live queue depth per repository, and it drains to *absence* — the series disappears the moment the run is admitted or deleted, rather than lingering at zero. Terminal Snapshots are excluded by design, so a finished run can never hold the gauge on.
+
+/// note | Its `namespace` label is the Snapshot's, not the repository's
+
+This is a per-CR gauge, so `namespace`/`name` identify the queued **`Snapshot`**, while `repository_kind`/`repository` identify what it is queued behind. That differs from the repository-family metrics, whose `namespace` is the repository's own. Joining the two families on `namespace` will silently produce nothing useful — join on `repository` instead.
+
+///
+
+### Jobs a queueing system has suspended don't count
+
+A `Job` with `spec.suspend: true` (or a `Suspended=True` condition) has no pod and is doing no work, so it does **not** occupy a slot. This matters if you run [Kueue](movers.md#putting-movers-under-a-queueing-system-kueue) or a similar admission controller: those systems hold work by flipping exactly that field. Counting suspended Jobs would let a queueing system's backlog fill Kopiur's pool, and the two would deadlock each other — Kopiur parking new runs behind Jobs Kueue is holding, forever.
+
+### How the cap interacts with `concurrencyPolicy`
+
+A `SnapshotSchedule` applies its `concurrencyPolicy` to *its own* previous run; the cap applies to the repository. They compose, and two combinations surprise people:
+
+- **`Forbid` (the default) + a full pool.** The previous run is parked, not finished, so `Forbid` skips the new slot — as designed. A parked child therefore holds the next slot, and the one after, until the queue drains. This is the cap doing its job: the alternative would be an unbounded pile of `Pending` Snapshots for a repository that is already at capacity.
+- **`Replace` + a parked victim.** Cancelling a queued run frees nothing (it holds no slot) and the replacement would re-queue behind the same line, so `Replace` degrades to `Forbid`-like waiting. The schedule says so: `ReplacementHeld=True` with a one-off `WaitingForRepositorySlot` event. It clears itself once a slot frees. See [what `Replace` really cancels](#what-concurrencypolicy-replace-really-cancels).
+
+/// warning | A cap plus `startingDeadlineSeconds` turns a throughput limit into skipped runs
+
+`startingDeadlineSeconds` exists to stop a schedule firing a stale slot after the operator was down. It does not know *why* a slot went unfired. While a schedule is held — by `Forbid` behind a parked run, or by `ReplacementHeld` — its due slots keep aging, and any slot that ages past the deadline is **skipped permanently** (a `SkipExpiredSlot` event), not deferred.
+
+So a repository cap combined with a short `startingDeadlineSeconds` does not slow backups down; it drops them. If you set both, make the deadline comfortably longer than the longest queue you expect to form, or leave `startingDeadlineSeconds` unset (no deadline) and let queued runs simply run late.
+
+///
 
 ## Putting it together
 

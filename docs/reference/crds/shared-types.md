@@ -95,6 +95,17 @@ cache. See [movers](../../movers.md).
   scratch volume.
 - **`nodeSelector`**, **`tolerations`**, **`affinity`** — pod scheduling for
   every mover.
+- **`podLabels`** — extra labels for every mover **pod**, mirrored onto the owning
+  `Job` as well. The hook for cluster machinery that keys off pod labels and that
+  Kopiur has no field of its own for: a Kueue `kueue.x-k8s.io/queue-name`, a
+  monitoring or `NetworkPolicy` selector, a mesh exclusion label. Merged **under**
+  Kopiur's own labels, so a user value can never break the selectors the
+  controller counts and reaps by.
+- **`podAnnotations`** — extra annotations for every mover pod, **pod-template
+  only** (not mirrored onto the `Job`). The canonical use is a sidecar-injection
+  opt-out (`sidecar.istio.io/inject: "false"`), which only means anything on the
+  pod a mesh webhook actually sees — and it matters here because an injected
+  sidecar that never exits keeps a short-lived mover Job running forever.
 - **`sourceColocation`** — RWO source-PVC node co-location (see below).
 - **`ttlSecondsAfterFinished`** — `Job.spec.ttlSecondsAfterFinished` for every
   mover Job so finished Jobs self-GC. Defaults to 1h when neither the repo nor
@@ -136,6 +147,21 @@ took ~14 s to move a 28 KiB cold repository, while caps of 10 MB/s and up often
 did not bind at all at that size. Treat these as a **ceiling for large transfers**
 — set them generously and verify against your own data, rather than tuning them
 down to a number that looks safe.
+
+///
+
+/// warning | Reserved pod-metadata keys are rejected, not ignored
+
+Keys under `kopiur.home-operations.com/`, and the exact key
+`app.kubernetes.io/managed-by`, are refused at admission in both `podLabels` and
+`podAnnotations`. Since user metadata merges under Kopiur's own, such a key would
+be silently dropped at render time and the manifest would claim a label the pod
+never carries — so it is rejected on apply instead.
+
+An interactive `kubectl kopiur browse` session pod is asymmetric on purpose: it
+applies `podAnnotations` and ignores `podLabels`. A mesh sidecar would outlive the
+session's TTL, while a batch queue-name label would put a human waiting at a
+terminal behind a nightly backup window.
 
 ///
 
@@ -366,7 +392,68 @@ quick/full schedules.
   placeholder for deterministic per-schedule jitter.
 - **`jitter`** — optional deterministic jitter window as a Go-style duration
   string (e.g. `30m`), derived from `(scheduleUID, slot)` so it is stable across
-  restarts.
+  restarts. Absent, it inherits the repository's
+  [`scheduleDefaults.jitter`](#scheduledefaults); absent at both levels means no
+  spread. Capped at 24h at admission.
+- **`timezone`** — optional IANA zone the cron is evaluated in. Absent, it uses
+  the enclosing schedule's timezone, else the repository's
+  [`scheduleDefaults.timezone`](#scheduledefaults), else UTC.
+
+## ScheduleDefaults
+
+Repository-level scheduling defaults (`Repository`/`ClusterRepository`
+`spec.scheduleDefaults`), inherited at reconcile time by every cron consumer that
+does not set its own equivalent field: `SnapshotSchedule`, `SnapshotPolicy`
+verification (quick and deep), `Maintenance` (quick and full), and both
+replication kinds. A sub-object rather than two leaf fields, so a future default
+slots in without an API break — which is exactly how `jitter` joined `timezone`.
+
+- **`timezone`** — IANA zone name (e.g. `America/New_York`), validated at
+  admission against the same `chrono-tz` database the scheduler uses. Fallback
+  beneath it: UTC.
+- **`jitter`** — Go-style duration (e.g. `10m`). The spread is deterministic per
+  `(scheduleUID, slot)`, not random, so a restart or an HA failover never re-rolls
+  it. There is **no** fallback beneath it: absent at both levels means no spread.
+  Capped at 24h at admission — jitter is a spread within a cron period, not a
+  schedule offset.
+
+Precedence at both levels is the same: the consuming cron's own value wins, else
+this default, else the built-in fallback (if any). A `SnapshotSchedule` resolves
+its **target policy's** repository, so a `policySelector` schedule can see several
+candidate defaults; disagreement resolves to UTC (timezone) or to no jitter
+(jitter), each with a diagnostic recommending an explicit per-schedule value. See
+[Repositories → `scheduleDefaults`](../../repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once).
+
+## ConcurrencySpec
+
+Concurrency limits for the mover Jobs a repository runs
+(`Repository`/`ClusterRepository` `spec.concurrency`).
+
+- **`maxConcurrentJobs`** — ceiling on this repository's in-flight mover Jobs.
+  Absent or `0` means **unlimited**, which is the default. No schema `default:` is
+  emitted for the field precisely because absent and `0` are the same state — a
+  materialized default would stamp `{maxConcurrentJobs: 0}` onto every stored
+  repository for no behavior change at all.
+
+One pool per repository, not one per work kind: **backups**, **restores**, and the
+**source** side of `RepositoryReplication` and `SnapshotReplication` all draw from
+it, because the repository's backend and the bandwidth to it are the shared
+resource. Outside the pool entirely: maintenance (already single-flight per
+repository, and the cure for an overloaded one), verification, pin, batched
+snapshot deletions, repository bootstrap/catalog scans, and `kubectl kopiur browse`
+session pods.
+
+Restores are **always admitted** — a recovery in progress must not queue behind
+routine backups — but a running restore still occupies a slot, so it displaces
+backups rather than adding to them. A `Job` a queueing system has suspended
+(`spec.suspend: true`) occupies no slot, so Kueue and Kopiur cannot deadlock each
+other.
+
+A cluster-wide backstop, `KOPIUR_MAX_CONCURRENT_JOBS` (Helm
+[`maxConcurrentJobs`](../../install.md#runtime-tuning), default `0` = uncapped),
+bounds the same pool across every repository; a run must satisfy both caps. With
+no cap set anywhere the gate costs one branch and no API call. See
+[Backups → limiting concurrent jobs per repository](../../backups.md#limiting-concurrent-jobs-per-repository).
 
 ## RepositoryRef
 

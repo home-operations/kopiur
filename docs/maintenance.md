@@ -114,9 +114,17 @@ Set `spec.maintenance` on the `Repository`/`ClusterRepository` to override the s
 | `takeoverPolicy` | Ownership-lease policy (see [Ownership](#ownership-and-shared-repositories)).                                             |
 | `namespace`      | **`ClusterRepository` only** — which namespace the managed `Maintenance` lives in (defaults to the operator's namespace). |
 
-/// tip | Timezone cascades three levels
+/// tip | Timezone and jitter both cascade to the repository
 
-`quick.timezone`/`full.timezone` (per-cron) wins; else the shared `schedule.timezone`; else the target repository's `scheduleDefaults.timezone` ([Repositories → `scheduleDefaults`](repositories.md#scheduledefaults--set-the-cron-timezone-once)); else UTC. Set it once on the repository instead of repeating it on every `Maintenance`.
+`quick.timezone`/`full.timezone` (per-cron) wins; else the shared `schedule.timezone`; else the target repository's `scheduleDefaults.timezone` ([Repositories → `scheduleDefaults`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once)); else UTC. Set it once on the repository instead of repeating it on every `Maintenance`.
+
+`jitter` inherits the same way, per cron: `quick.jitter`/`full.jitter` wins, else the repository's `scheduleDefaults.jitter`, else no spread (there is no built-in default window). A window over 24h — at either level — is rejected at admission. Note that a `Maintenance`'s jitter has never been validated at all before this: a garbage window used to be accepted and silently degrade to no jitter at reconcile, so both the parse and the 24h bound are new rejections, and both are [admission-only](upgrade.md#admission-only-jitter-and-deadline-rules-re-apply-only) — a stored `Maintenance` carrying one keeps maintaining itself (unspread) until someone edits it.
+
+///
+
+/// note | Maintenance never queues behind a repository's concurrency cap
+
+A `Repository`'s [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) bounds backups, restores and replication. Maintenance is **excluded from that pool entirely**, and deliberately so: maintenance is the *cure* for an overloaded repository — it compacts indexes and drops unreferenced blobs — so queuing it behind a saturated backup pool would make a struggling repository permanently unmaintainable. It is also already single-flight per repository via its own ownership lease, which is the limit that actually matters here. Verification, pin and batched snapshot deletions are outside the pool for the same family of reasons.
 
 ///
 

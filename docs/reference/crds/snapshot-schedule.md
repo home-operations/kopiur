@@ -28,6 +28,14 @@ The cron expression, with Jenkins-style `H` substitution — `H` picks a determi
 
 A deterministic offset (Go-style duration, e.g. `30m`) added to each firing, derived from `(scheduleUID, slot)` so it's stable across restarts rather than random.
 
+When **absent**, the schedule inherits its target policy's repository [`scheduleDefaults.jitter`](repository.md#scheduledefaults), resolved at slot-computation time exactly as `timezone` is (following `policyRef` or each `policySelector` match). Unlike `timezone` there is no built-in fallback: absent at both levels means no spread. The resolved window is recorded in [`status.nextSchedule.jitter`](#status), and a change at either level re-triggers the schedule (referent watch) and recomputes the pinned slot in the new window. Matched policies whose repositories **disagree** on the window resolve to no jitter and log the candidate windows, recommending an explicit `schedule.jitter`.
+
+/// warning | Capped at 24h, at admission only
+
+A window over 24h is rejected by the webhook (`jitter of 25h exceeds the 24h maximum`) — jitter is a spread *within* a cron period, not a schedule offset. The rule is **admission-only**: it tightens a field that already shipped, so a stored schedule carrying an over-cap window keeps reconciling rather than being bricked by an upgrade. The next apply that touches it must satisfy the cap. Same treatment for the verification, maintenance and replication jitter windows.
+
+///
+
 #### `schedule.timezone`
 
 The IANA timezone the cron is evaluated in (e.g. `America/Los_Angeles`). When set,
@@ -116,7 +124,15 @@ rather than firing:
 
 #### `schedule.startingDeadlineSeconds`
 
-If a slot is missed by more than this many seconds (e.g. the operator was down), skip it instead of firing late.
+If a slot is missed by more than this many seconds (e.g. the operator was down), skip it instead of firing late. Omit the field for no deadline; `0` (fire only exactly on time) is legitimate.
+
+/// warning | Must be `>= 0`, and it interacts badly with a concurrency cap
+
+A **negative** deadline is not "no deadline". The miss check is `now - slot > deadline`, so a negative value marks every slot expired the instant it fires: the schedule then skips every run forever while reporting itself perfectly healthy. The webhook rejects it — [admission-only](../../upgrade.md#admission-only-jitter-and-deadline-rules-re-apply-only), like the jitter cap, so a stored schedule keeps reconciling (badly, but visibly) until it is re-applied.
+
+Separately: a deadline does not know *why* a slot went unfired. Slots held by `Forbid` behind a run [queued on the repository's concurrency cap](../../backups.md#limiting-concurrent-jobs-per-repository) — or by `ReplacementHeld` — keep aging, and any that ages past the deadline is permanently skipped (`SkipExpiredSlot`), not deferred. Combining a cap with a short deadline turns a throughput limit into dropped runs.
+
+///
 
 ### `failedJobsHistoryLimit`
 
@@ -128,9 +144,9 @@ The maximum number of *failed* `Snapshot` CRs from this schedule to retain (defa
 | --- | --- |
 | `observedGeneration` | The `metadata.generation` this status reflects, for staleness detection. |
 | `lastSchedule` | The most recent firing (cron + jitter, pinned), and the `Snapshot` it produced. |
-| `nextSchedule` | The next firing slot the controller has computed, plus the `timezone` it was computed in (so an effective-timezone change can invalidate and recompute the pinned slot). |
+| `nextSchedule` | The next firing slot the controller has computed, plus the `timezone` and `jitter` it was computed with (so a change to either can invalidate and recompute the pinned slot). |
 | `lastSuccessfulSchedule` | The most recent firing whose `Snapshot` succeeded. |
 | `consecutiveFailures` | Count of back-to-back failed runs; resets on success. Drives alerting. |
 | `conditions` | Standard Kubernetes conditions surfacing schedule health. |
 
-Each schedule slot is recorded as an `at` (the RFC3339 instant it fired or is scheduled to) plus an optional `snapshotRef` naming the `Snapshot` CR that slot produced. `nextSchedule` additionally records the `timezone` the slot was computed in; if the schedule's effective timezone later changes (a `schedule.timezone` edit or an inherited repository `scheduleDefaults.timezone` change), the controller detects the mismatch and recomputes the pinned slot in the new zone.
+Each schedule slot is recorded as an `at` (the RFC3339 instant it fired or is scheduled to) plus an optional `snapshotRef` naming the `Snapshot` CR that slot produced. All three slots share one schema, so `timezone` and `jitter` appear on each — but the controller only ever **writes** them on `nextSchedule`: they describe a pin it may still have to invalidate, not a record of a slot that already fired. If the schedule's effective timezone or jitter later changes (a `schedule.timezone`/`schedule.jitter` edit, or an inherited repository `scheduleDefaults` change), the controller detects the mismatch and recomputes the pinned slot in the new zone/window. An absent recorded value is treated as "unchanged", so a pin written by an older operator is never churned on upgrade.

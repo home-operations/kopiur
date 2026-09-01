@@ -589,48 +589,67 @@ Co-location lets the mover read a **live** volume — that snapshot is crash-con
 
 ///
 
-## `scheduleDefaults` — set the cron timezone once
+## `scheduleDefaults` — set the cron timezone and jitter once
 
-Every cron-driven consumer of a repository (`SnapshotPolicy.spec.verification`,
-`RepositoryReplication.spec.schedule`, `Maintenance.spec.schedule`, and
-`SnapshotSchedule.spec.schedule` — the recurring-backup cron) takes its own
-optional `timezone`. Repeating the same IANA zone on every one of them is
-tedious and easy to drift. Set it **once** on the repository instead:
+Every cron-driven consumer of a repository (`SnapshotPolicy.spec.verification`, `RepositoryReplication.spec.schedule`, `SnapshotReplication.spec.schedule`, `Maintenance.spec.schedule`, and `SnapshotSchedule.spec.schedule` — the recurring-backup cron) takes its own optional `timezone` and `jitter`. Repeating the same values on every one of them is tedious and easy to drift. Set them **once** on the repository instead:
 
 ```yaml
 spec:
     scheduleDefaults:
         timezone: America/New_York # IANA name, validated at admission
+        jitter: 10m # Go-style duration; max 24h, enforced at admission
 ```
 
-Precedence (resolved at reconcile time, not admission-pinned): the consuming
-cron's own `timezone` wins when set, else `scheduleDefaults.timezone` here,
-else UTC. `Maintenance` already cascades per-cron → schedule-level before
-falling to the repo default, so this becomes the **third and final** level for
-it.
+Precedence (resolved at reconcile time, not admission-pinned): the consuming cron's own value wins when set, else the `scheduleDefaults` value here, else the built-in fallback. For `timezone` that fallback is UTC; for `jitter` there is none — absent at both levels simply means no spread. `Maintenance` already cascades per-cron → schedule-level before falling to the repo default, so this becomes the **third and final** level for it.
 
-/// note | How `SnapshotSchedule` inherits
+### What `jitter` buys you
 
-A `SnapshotSchedule` with no `spec.schedule.timezone` resolves its **target
-policy's** repository `scheduleDefaults.timezone` (following `policyRef`, or each
-`policySelector` match) at slot-computation time. The resolved zone is recorded in
-`status.nextSchedule.timezone`, and editing `scheduleDefaults.timezone` re-triggers
-the affected schedules (a repository referent watch) and recomputes the pinned
-slot in the new zone — you don't have to touch each schedule.
+`jitter` spreads each firing over a window instead of stacking every schedule on the top of the hour. The spread is **deterministic**, derived from `(schedule UID, slot)` rather than a random draw: the same slot always lands on the same instant, so a controller restart or an HA failover never re-rolls it and every replica computes the same answer. Setting `jitter: 10m` once on a repository de-synchronizes every schedule that repository serves — which is the cheapest thing you can do to stop a 02:00 thundering herd against one backend.
 
-For a `policySelector` schedule whose matched policies' repositories **disagree**
-on the zone, there is no single right answer: the schedule falls back to UTC and
-raises a `TimezoneDefaultAmbiguous` condition recommending you set
-`spec.schedule.timezone` explicitly.
+/// warning | Jitter is a spread within a period, not a schedule offset
+
+A window over 24h is rejected at admission (`jitter of 25h exceeds the 24h maximum`). Jitter shifts a firing *inside* its cron period; a window longer than a day is almost always someone trying to express "run it later", which is a cron change.
+
+This rule is **admission-only**. A repository already stored with an over-cap window keeps reconciling exactly as before — a tightened rule must never brick a running backup. The next `kubectl apply` that touches it is what has to satisfy the cap. Same for a negative `startingDeadlineSeconds` on a `SnapshotSchedule`. See [Upgrading](upgrade.md#admission-only-jitter-and-deadline-rules-re-apply-only).
 
 ///
 
-A complete, apply-ready example — a `Repository` with `scheduleDefaults.timezone`,
-a `SnapshotPolicy.spec.verification.quick` cron, and a `SnapshotSchedule` that all
-inherit it:
+/// note | How `SnapshotSchedule` inherits
+
+A `SnapshotSchedule` with no `spec.schedule.timezone` / `spec.schedule.jitter` resolves its **target policy's** repository `scheduleDefaults` (following `policyRef`, or each `policySelector` match) at slot-computation time. The resolved values are recorded in `status.nextSchedule.timezone` and `status.nextSchedule.jitter`, and editing either default re-triggers the affected schedules (a repository referent watch) and recomputes the pinned slot in the new zone/window — you don't have to touch each schedule, and the edit lands on the next firing rather than an arbitrary number of firings later.
+
+For a `policySelector` schedule whose matched policies' repositories **disagree**, there is no single right answer. A timezone disagreement falls back to UTC and raises a `TimezoneDefaultAmbiguous` condition; a jitter disagreement resolves to **no jitter** and logs the candidate windows. Both recommend the same fix: set `spec.schedule.timezone` / `spec.schedule.jitter` explicitly.
+
+///
+
+A complete, apply-ready example — a `Repository` with `scheduleDefaults.timezone`, a `SnapshotPolicy.spec.verification.quick` cron, and a `SnapshotSchedule` that all inherit it:
 
 ```yaml
 --8<-- "deploy/examples/29-repo-schedule-timezone.yaml"
+```
+
+## `concurrency` — cap the mover Jobs one repository runs at once
+
+By default a repository runs as many mover Jobs at once as its consumers ask for. `maxConcurrentJobs` puts a ceiling on that:
+
+```yaml
+spec:
+    concurrency:
+        maxConcurrentJobs: 3 # absent or 0 = unlimited (the default)
+```
+
+Backups, restores, and the source side of both replication kinds draw from **one** pool per repository — the backend and the bandwidth to it are the shared resource, so a separate budget per work kind would let three "safe" limits still saturate it. Maintenance, verification, pin, batched snapshot deletions, bootstrap/catalog scans and `kubectl kopiur browse` sessions are outside the pool entirely. Restores are always admitted (never queued) but do occupy a slot while they run, so a restore displaces backups rather than adding to them.
+
+A run that arrives at a full pool is parked **before its Job is created** — `phase: Pending` plus `RepositorySlotAvailable=False` (`WaitingForSlot`) naming the counts — and launches automatically when a slot frees. The full behavior, the metric to watch, and how the cap composes with `concurrencyPolicy` and `startingDeadlineSeconds` are in [Backups → limiting concurrent jobs per repository](backups.md#limiting-concurrent-jobs-per-repository).
+
+A cluster-wide backstop, the Helm value [`maxConcurrentJobs`](install.md#runtime-tuning), bounds the same pool across every repository for operators whose constraint is the node pool rather than any one backend. A run must satisfy both.
+
+### A tuned repository, end to end
+
+Concurrency, `scheduleDefaults` and `moverDefaults.podLabels` are the three knobs you reach for once a repository has real load on it. Applied together:
+
+```yaml
+--8<-- "deploy/examples/43-tuned-repository.yaml"
 ```
 
 ## `onNamespaceDelete` — what `kubectl delete ns` does to snapshots
@@ -906,6 +925,9 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `moverDefaults`                                        | Base security context / resources / cache for every mover. |
 | `parameters.epoch.minDuration`                          | Lower it (e.g. `6h`) when index blobs stay in the thousands despite maintenance running. |
 | `scheduleDefaults.timezone`                             | Cron timezone inherited by verification/replication/maintenance and `SnapshotSchedule` crons. |
+| `scheduleDefaults.jitter`                               | Deterministic firing spread (e.g. `10m`, max 24h) inherited by the same crons — de-synchronizes a whole repository's schedules in one line. |
+| `concurrency.maxConcurrentJobs`                         | Ceiling on this repository's in-flight mover Jobs (backups + restores + replication source side). Absent/`0` = unlimited. |
+| `moverDefaults.podLabels` / `podAnnotations`            | Extra labels/annotations on every mover pod — a Kueue queue name, a `NetworkPolicy` selector, a sidecar-injection opt-out. |
 | `onNamespaceDelete`                                    | `Orphan` (default) / `Delete` on namespace delete.|
 | `deletionProtection.threshold`                          | Mass-deletion breaker: HOLD external destructive Snapshot deletions at/above this count (default 10; `0` disables). |
 | `mode`                                                 | `ReadWrite` (default) / `ReadOnly`.               |
