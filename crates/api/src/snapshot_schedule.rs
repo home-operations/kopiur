@@ -214,7 +214,11 @@ pub struct ScheduleRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
     /// The deterministic jitter window (Go-style duration, e.g. `10m`) the cron was
-    /// spread by when this slot was pinned (`nextSchedule` only). Recorded for the
+    /// spread by when this slot was pinned. This struct is shared by `nextSchedule`,
+    /// `lastSchedule` and `lastSuccessfulSchedule`, so the field appears on all
+    /// three, but the controller only ever WRITES it on `nextSchedule` — it is a
+    /// property of a pin the controller may still have to invalidate, not a record
+    /// of a slot that already fired. Recorded for the
     /// same reason as the pinned `timezone`: the window may be INHERITED from the
     /// target repository's `scheduleDefaults.jitter`, so a change to that default (or
     /// to `spec.schedule.jitter`) must invalidate the pinned wall-clock slot and
