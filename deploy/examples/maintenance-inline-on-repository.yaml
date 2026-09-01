@@ -39,7 +39,7 @@ spec:
     passwordSecretRef:
       name: nas-primary-kopia
       key: KOPIA_PASSWORD
-  # Tune maintenance while keeping it operator-managed. Absent ⇒ the defaults.
+  # Tune maintenance while keeping it operator-managed.
   maintenance:
     enabled: true
     schedule:
