@@ -19,6 +19,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
+use kopiur_api::common::ScheduleDefaults;
 use kopiur_api::{RepositoryReplication, RepositoryReplicationPhase, validate};
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, ReplicateOp, ResolvedIdentity, TargetRef,
@@ -213,12 +214,10 @@ async fn drive_schedule(
     observed: RunObservation,
 ) -> Result<Action> {
     let now = Utc::now();
-    // GitHub #174 item 3: `spec.schedule.timezone` wins; else the source
-    // repository's `scheduleDefaults.timezone`; else UTC.
-    let repo_tz = repo
-        .schedule_defaults
-        .as_ref()
-        .and_then(|d| d.timezone.as_deref());
+    // GitHub #174 item 3, both scheduling inputs: `spec.schedule.timezone` wins,
+    // else the source repository's `scheduleDefaults.timezone`, else UTC; and
+    // `spec.schedule.jitter` wins, else `scheduleDefaults.jitter`, else no jitter.
+    let repo_defaults = repo.schedule_defaults.as_ref();
 
     // An annotation-requested run takes precedence over waiting for the next
     // cron slot — but flows through the SAME spawn path (mover, gates,
@@ -250,7 +249,7 @@ async fn drive_schedule(
         Err(e) => return Err(e),
     };
 
-    let Some(slot) = due_slot(repl, now, repo_tz) else {
+    let Some(slot) = due_slot(repl, now, repo_defaults) else {
         // Nothing due: report Ready/Idle — or, if a requested run left a stall,
         // report THAT instead. One `Ready` writer per reconcile.
         let (ready, reason, message) = idle_report(stall.as_ref());
@@ -268,7 +267,12 @@ async fn drive_schedule(
             (!ready).then_some(RepositoryReplicationPhase::Failed),
         )
         .await?;
-        return Ok(Action::requeue(cap(next_wakeup(repl, now, None, repo_tz))));
+        return Ok(Action::requeue(cap(next_wakeup(
+            repl,
+            now,
+            None,
+            repo_defaults,
+        ))));
     };
 
     let job_name = replication_job_name(name, slot);
@@ -281,7 +285,7 @@ async fn drive_schedule(
                 repl,
                 now,
                 Some(slot),
-                repo_tz,
+                repo_defaults,
             )))),
             // Failure: the failed Job lingers to its TTL as the bounded-retry
             // backoff (and keeps the pod logs).
@@ -856,14 +860,14 @@ pub fn build_replication_work_spec(
 
 /// The replication slot due now (cron + jitter strictly after the last run), or
 /// `None` if not yet due. Pure given the CR, `now`, and the source repository's
-/// `scheduleDefaults.timezone` (`repo_tz`, GitHub #174 item 3).
+/// `scheduleDefaults` (`repo_defaults`, GitHub #174 item 3 — timezone and jitter).
 pub fn due_slot(
     repl: &RepositoryReplication,
     now: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Option<DateTime<Utc>> {
     let after = last_run_at(repl).unwrap_or_else(|| now - chrono::Duration::days(365));
-    match slot_for(repl, after, repo_tz) {
+    match slot_for(repl, after, repo_defaults) {
         Ok(slot) if now >= slot => Some(slot),
         _ => None,
     }
@@ -894,22 +898,24 @@ fn replication_creds_env_from(
 
 /// The next cron slot for this replication strictly after `after` (croner + jitter,
 /// seeded by the CR UID). `spec.schedule.timezone` wins; else the source
-/// repository's `scheduleDefaults.timezone`; else UTC.
+/// repository's `scheduleDefaults.timezone`; else UTC. Likewise
+/// `spec.schedule.jitter` wins; else the source repository's
+/// `scheduleDefaults.jitter`; else no jitter.
 fn slot_for(
     repl: &RepositoryReplication,
     after: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Result<DateTime<Utc>> {
     let seed = repl.uid().unwrap_or_else(|| repl.name_any());
-    let jitter = repl
-        .spec
-        .schedule
-        .jitter
-        .as_deref()
-        .and_then(parse_go_duration);
+    let jitter = kopiur_api::common::effective_jitter(
+        repl.spec.schedule.jitter.as_deref(),
+        repo_defaults.and_then(|d| d.jitter.as_deref()),
+    )
+    .as_deref()
+    .and_then(parse_go_duration);
     let tz = kopiur_api::common::resolve_tz_with_default(
         repl.spec.schedule.timezone.as_deref(),
-        repo_tz,
+        repo_defaults.and_then(|d| d.timezone.as_deref()),
     );
     next_fire(&repl.spec.schedule.cron, jitter, &seed, after, tz)
 }
@@ -930,10 +936,10 @@ fn next_wakeup(
     repl: &RepositoryReplication,
     now: DateTime<Utc>,
     handled: Option<DateTime<Utc>>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Duration {
     let after = handled.unwrap_or_else(|| last_run_at(repl).unwrap_or(now));
-    match slot_for(repl, after, repo_tz) {
+    match slot_for(repl, after, repo_defaults) {
         Ok(slot) if slot > now => (slot - now)
             .to_std()
             .unwrap_or(REQUEUE_CAP)
@@ -1024,6 +1030,7 @@ pub fn error_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_schedule::{jitter_defaults, tz_defaults};
     use kopiur_api::backend::{Backend, FilesystemBackend, S3Backend};
     use kopiur_api::common::{
         CronSpec, Encryption, RepositoryKind, RepositoryMode, RepositoryRef, SecretKeyRef,
@@ -1184,8 +1191,66 @@ mod tests {
             "UTC (no repo default) → 05:00 UTC has already passed"
         );
         assert!(
-            due_slot(&r, now, Some("America/Los_Angeles")).is_none(),
+            due_slot(&r, now, Some(&tz_defaults("America/Los_Angeles"))).is_none(),
             "repo scheduleDefaults.timezone must shift the evaluated slot"
+        );
+    }
+
+    // --- scheduleDefaults.jitter cascade --------------------------------------
+    // `spec.schedule.jitter` -> source repo `scheduleDefaults.jitter` -> none.
+    // Asserted by comparing slots (the offset is `fnv1a(seed, slot)`-derived, so
+    // "the window was applied" is proven by matching an explicit own value and
+    // differing from the un-jittered slot) — seed-independent, so it cannot rot.
+
+    /// The `after` anchor the jitter tests below share.
+    fn jitter_after() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn slot_for_inherits_the_source_repo_default_jitter() {
+        let after = jitter_after();
+        let r = repl_with("0 5 * * *", None);
+        let bare = slot_for(&r, after, None).unwrap();
+        let inherited = slot_for(&r, after, Some(&jitter_defaults("1h"))).unwrap();
+        assert_ne!(
+            inherited, bare,
+            "an inherited window must actually spread the slot"
+        );
+        let mut own = repl_with("0 5 * * *", None);
+        own.spec.schedule.jitter = Some("1h".into());
+        assert_eq!(
+            inherited,
+            slot_for(&own, after, None).unwrap(),
+            "inheritance must resolve to the same window as setting it directly"
+        );
+    }
+
+    #[test]
+    fn slot_for_own_jitter_wins_over_the_repo_default() {
+        let after = jitter_after();
+        let mut r = repl_with("0 5 * * *", None);
+        r.spec.schedule.jitter = Some("1h".into());
+        assert_eq!(
+            slot_for(&r, after, Some(&jitter_defaults("10m"))).unwrap(),
+            slot_for(&r, after, None).unwrap(),
+            "an own `spec.schedule.jitter` must ignore the repo default entirely"
+        );
+    }
+
+    #[test]
+    fn slot_for_with_neither_jitter_is_the_bare_cron_slot() {
+        let after = jitter_after();
+        let r = repl_with("0 5 * * *", None);
+        let slot = slot_for(&r, after, None).unwrap();
+        assert_eq!(slot.to_rfc3339(), "2026-06-09T05:00:00+00:00");
+        // Byte-identical regression: a timezone-only repo default is the
+        // pre-jitter world and must not move the slot.
+        assert_eq!(
+            slot_for(&r, after, Some(&tz_defaults("UTC"))).unwrap(),
+            slot
         );
     }
 

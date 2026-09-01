@@ -24,7 +24,7 @@ use k8s_openapi::api::batch::v1::Job;
 use kube::api::ListParams;
 use kube::{Api, ResourceExt};
 
-use kopiur_api::common::{CronSpec, ScratchDefaults};
+use kopiur_api::common::{CronSpec, ScheduleDefaults, ScratchDefaults};
 use kopiur_api::{Origin, Snapshot, SnapshotPolicy, Verification};
 use kopiur_mover::workspec::{
     DeepVerify, MoverOptions, MoverWorkSpec, Operation, QuickVerify, ResolvedIdentity, TargetRef,
@@ -91,15 +91,26 @@ fn tier_after(last_verified: Option<DateTime<Utc>>) -> DateTime<Utc> {
 
 /// The next cron slot for a verification `CronSpec` strictly after `after`, seeded by
 /// the policy UID for a stable per-replica spread and evaluated in the cron's own
-/// `timezone` (absent ⇒ the repository's `scheduleDefaults.timezone`, else UTC).
+/// `timezone` (absent ⇒ the repository's `scheduleDefaults.timezone`, else UTC),
+/// spread by the cron's own `jitter` (absent ⇒ the repository's
+/// `scheduleDefaults.jitter`, else no jitter). Both tiers (quick and deep) run
+/// through here, so both inherit.
 fn slot_for(
     seed: &str,
     spec: &CronSpec,
     after: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Result<DateTime<Utc>> {
-    let jitter = spec.jitter.as_deref().and_then(parse_go_duration);
-    let tz = kopiur_api::common::resolve_tz_with_default(spec.timezone.as_deref(), repo_tz);
+    let jitter = kopiur_api::common::effective_jitter(
+        spec.jitter.as_deref(),
+        repo_defaults.and_then(|d| d.jitter.as_deref()),
+    )
+    .as_deref()
+    .and_then(parse_go_duration);
+    let tz = kopiur_api::common::resolve_tz_with_default(
+        spec.timezone.as_deref(),
+        repo_defaults.and_then(|d| d.timezone.as_deref()),
+    );
     next_fire(&spec.cron, jitter, seed, after, tz)
 }
 
@@ -158,7 +169,7 @@ pub fn discovered_probe_scope(repo_namespace: Option<&str>) -> DiscoveredProbeSc
 /// Decide which verification tier is due now, preferring deep (it subsumes quick).
 /// Returns the tier + its scheduled slot, or `None` if nothing is due. Pure given
 /// the policy's `verification`, the seed, the last-verified time, `now`, the
-/// repository's `scheduleDefaults.timezone` (`repo_tz`, GitHub #174 item 3), and
+/// repository's `scheduleDefaults` (`repo_defaults`, GitHub #174 item 3), and
 /// whether verification is `unlocked` ([`verification_unlocked`]) — a locked policy
 /// is never due (the #168 gate), so the catch-up slot is not consumed until a
 /// snapshot exists.
@@ -167,7 +178,7 @@ pub fn due_tier(
     seed: &str,
     last_verified: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
     unlocked: bool,
 ) -> Option<(VerifyTierKind, DateTime<Utc>)> {
     if !unlocked {
@@ -175,7 +186,7 @@ pub fn due_tier(
     }
     let after = tier_after(last_verified);
     if let Some(d) = &verification.deep
-        && let Ok(slot) = slot_for(seed, &d.schedule, after, repo_tz)
+        && let Ok(slot) = slot_for(seed, &d.schedule, after, repo_defaults)
         && now >= slot
     {
         return Some((VerifyTierKind::Deep, slot));
@@ -186,7 +197,7 @@ pub fn due_tier(
     // new writes with the old shape are rejected at admission.
     if let Some(q) = &verification.quick
         && let Some(schedule) = &q.schedule
-        && let Ok(slot) = slot_for(seed, schedule, after, repo_tz)
+        && let Ok(slot) = slot_for(seed, schedule, after, repo_defaults)
         && now >= slot
     {
         return Some((VerifyTierKind::Quick, slot));
@@ -201,7 +212,7 @@ pub fn next_verify_wakeup(
     seed: &str,
     last_verified: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Duration {
     let after = tier_after(last_verified);
     let mut earliest: Option<DateTime<Utc>> = None;
@@ -215,7 +226,7 @@ pub fn next_verify_wakeup(
     .into_iter()
     .flatten()
     {
-        if let Ok(slot) = slot_for(seed, spec, after, repo_tz) {
+        if let Ok(slot) = slot_for(seed, spec, after, repo_defaults) {
             earliest = Some(earliest.map_or(slot, |e| e.min(slot)));
         }
     }
@@ -246,11 +257,11 @@ fn idle_requeue(
     seed: &str,
     last_verified: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
     unlocked: bool,
 ) -> Duration {
     if unlocked {
-        next_verify_wakeup(verification, seed, last_verified, now, repo_tz).min(REQUEUE_CAP)
+        next_verify_wakeup(verification, seed, last_verified, now, repo_defaults).min(REQUEUE_CAP)
     } else {
         REQUEUE_GATED
     }
@@ -335,12 +346,10 @@ pub async fn verify_step(
     let now = Utc::now();
     let last_verified = target.last_verified;
     let repo6 = target.repo_key.as_deref().map(crate::naming::repo_tag6);
-    // GitHub #174 item 3: a per-cron `timezone` wins; else the repository's
-    // `scheduleDefaults.timezone`; else UTC.
-    let repo_tz = repo
-        .schedule_defaults
-        .as_ref()
-        .and_then(|d| d.timezone.as_deref());
+    // GitHub #174 item 3, both scheduling inputs: a per-cron `timezone` wins, else
+    // the repository's `scheduleDefaults.timezone`, else UTC; and a per-cron
+    // `jitter` wins, else `scheduleDefaults.jitter`, else no jitter.
+    let repo_defaults = repo.schedule_defaults.as_ref();
 
     // #168 gate: never schedule a verify before a verifiable snapshot exists — the
     // tier_after catch-up would otherwise fire a Job on the first reconcile, before
@@ -361,8 +370,14 @@ pub async fn verify_step(
     };
     let unlocked = verification_unlocked(has_successful, has_discovered);
 
-    let Some((tier, slot)) = due_tier(verification, &seed, last_verified, now, repo_tz, unlocked)
-    else {
+    let Some((tier, slot)) = due_tier(
+        verification,
+        &seed,
+        last_verified,
+        now,
+        repo_defaults,
+        unlocked,
+    ) else {
         if !unlocked {
             tracing::debug!(
                 policy = %name,
@@ -375,7 +390,7 @@ pub async fn verify_step(
             &seed,
             last_verified,
             now,
-            repo_tz,
+            repo_defaults,
             unlocked,
         )));
     };
@@ -388,7 +403,8 @@ pub async fn verify_step(
             // The terminal Job (its env carries the whole run spec) self-reaps
             // via its TTL — it is the slot-handled marker until then.
             Some(true) => Ok(Some(
-                next_verify_wakeup(verification, &seed, Some(now), now, repo_tz).min(REQUEUE_CAP),
+                next_verify_wakeup(verification, &seed, Some(now), now, repo_defaults)
+                    .min(REQUEUE_CAP),
             )),
             // Failure: the failed Job lingers to its TTL as the bounded-retry
             // backoff (and keeps the pod logs).
@@ -911,6 +927,7 @@ async fn has_active_verify_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_schedule::{jitter_defaults, tz_defaults};
     use kopiur_api::common::CronSpec;
     use kopiur_api::snapshot_policy::{DeepVerification, QuickVerification};
 
@@ -1132,7 +1149,7 @@ mod tests {
                 "seed",
                 last_verified,
                 now,
-                Some("America/Los_Angeles"),
+                Some(&tz_defaults("America/Los_Angeles")),
                 true
             )
             .is_none(),
@@ -1163,11 +1180,126 @@ mod tests {
                 "seed",
                 last_verified,
                 now,
-                Some("America/Los_Angeles"),
+                Some(&tz_defaults("America/Los_Angeles")),
                 true
             )
             .is_some(),
             "the CronSpec's own timezone must win over the repo default"
+        );
+    }
+
+    // --- scheduleDefaults.jitter cascade --------------------------------------
+    // per-cron `jitter` -> repo `scheduleDefaults.jitter` -> none, for BOTH the
+    // quick and deep tiers (they share `slot_for`). Asserted by comparing slots:
+    // the offset is `fnv1a(seed, slot)`-derived, so "the window was applied" is
+    // proven by matching an explicit own value and differing from the un-jittered
+    // slot — seed-independent, so it cannot rot.
+
+    /// The `after` anchor the jitter tests below share.
+    fn jitter_after() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn cron_spec(cron: &str, jitter: Option<&str>) -> CronSpec {
+        CronSpec {
+            cron: cron.into(),
+            jitter: jitter.map(str::to_string),
+            timezone: None,
+        }
+    }
+
+    #[test]
+    fn slot_for_inherits_the_repo_default_jitter_for_both_tiers() {
+        let after = jitter_after();
+        // One `CronSpec` shape drives both tiers, so a single pair of assertions
+        // covers quick and deep; the seed is the only thing that differs and it is
+        // held constant here.
+        for seed in ["policy-uid-quick", "policy-uid-deep"] {
+            let bare = slot_for(seed, &cron_spec("0 5 * * *", None), after, None).unwrap();
+            let inherited = slot_for(
+                seed,
+                &cron_spec("0 5 * * *", None),
+                after,
+                Some(&jitter_defaults("1h")),
+            )
+            .unwrap();
+            assert_ne!(
+                inherited, bare,
+                "an inherited window must actually spread the slot ({seed})"
+            );
+            assert_eq!(
+                inherited,
+                slot_for(seed, &cron_spec("0 5 * * *", Some("1h")), after, None).unwrap(),
+                "inheritance must resolve to the same window as setting it directly ({seed})"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_for_own_jitter_wins_over_the_repo_default() {
+        let after = jitter_after();
+        let spec = cron_spec("0 5 * * *", Some("1h"));
+        assert_eq!(
+            slot_for("seed", &spec, after, Some(&jitter_defaults("10m"))).unwrap(),
+            slot_for("seed", &spec, after, None).unwrap(),
+            "an own per-cron jitter must ignore the repo default entirely"
+        );
+    }
+
+    #[test]
+    fn slot_for_with_neither_jitter_is_the_bare_cron_slot() {
+        let after = jitter_after();
+        let spec = cron_spec("0 5 * * *", None);
+        let slot = slot_for("seed", &spec, after, None).unwrap();
+        assert_eq!(slot.to_rfc3339(), "2026-06-09T05:00:00+00:00");
+        // Byte-identical regression: a timezone-only repo default is the
+        // pre-jitter world and must not move the slot.
+        assert_eq!(
+            slot_for("seed", &spec, after, Some(&tz_defaults("UTC"))).unwrap(),
+            slot
+        );
+    }
+
+    #[test]
+    fn due_tier_honors_an_inherited_jitter_window() {
+        // The wiring, through the public entry point: at 05:15 the un-jittered
+        // 05:00 slot is due, but a 1h inherited window pushes this seed's slot past
+        // `now` — so the tier is NOT yet due. (The offset for this seed/slot is
+        // asserted to be >15m by the first assertion pair, which is what makes the
+        // second one meaningful.)
+        let now = DateTime::parse_from_rfc3339("2026-06-09T05:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let last_verified = Some(now - chrono::Duration::hours(6));
+        let v = verification(Some("0 5 * * *"), None);
+        assert!(
+            due_tier(&v, "seed", last_verified, now, None, true).is_some(),
+            "un-jittered: 05:00 has passed"
+        );
+        let jittered = slot_for(
+            "seed",
+            &cron_spec("0 5 * * *", None),
+            now - chrono::Duration::hours(6),
+            Some(&jitter_defaults("1h")),
+        )
+        .unwrap();
+        assert!(
+            jittered > now,
+            "fixture precondition: this seed's 1h offset must exceed 15m (got {jittered})"
+        );
+        assert!(
+            due_tier(
+                &v,
+                "seed",
+                last_verified,
+                now,
+                Some(&jitter_defaults("1h")),
+                true
+            )
+            .is_none(),
+            "an inherited jitter window must move the tier's due decision"
         );
     }
 

@@ -213,6 +213,21 @@ pub struct ScheduleRef {
     /// pins written before this field existed (treated as "unchanged").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    /// The deterministic jitter window (Go-style duration, e.g. `10m`) the cron was
+    /// spread by when this slot was pinned. This struct is shared by `nextSchedule`,
+    /// `lastSchedule` and `lastSuccessfulSchedule`, so the field appears on all
+    /// three, but the controller only ever WRITES it on `nextSchedule` — it is a
+    /// property of a pin the controller may still have to invalidate, not a record
+    /// of a slot that already fired. Recorded for the
+    /// same reason as the pinned `timezone`: the window may be INHERITED from the
+    /// target repository's `scheduleDefaults.jitter`, so a change to that default (or
+    /// to `spec.schedule.jitter`) must invalidate the pinned wall-clock slot and
+    /// recompute it in the new window — otherwise the edit would only take effect an
+    /// arbitrary slot later. Absent both when no jitter applies and on legacy pins
+    /// written before this field existed; an absent recorded window is treated as
+    /// "unchanged" so an upgrade never churns an established pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter: Option<String>,
 }
 
 /// A by-name reference to a `Snapshot` CR created by a schedule slot.
@@ -491,5 +506,59 @@ nextSchedule:
         assert!(bare.next_schedule.as_ref().unwrap().timezone.is_none());
         let bare_json = serde_json::to_value(&bare).unwrap();
         assert!(bare_json["nextSchedule"].get("timezone").is_none());
+    }
+
+    #[test]
+    fn next_schedule_jitter_round_trips() {
+        // The pinned-slot jitter window (recorded so a change to the effective
+        // window — including one inherited from the repository's
+        // `scheduleDefaults.jitter` — can invalidate the pin) parses from YAML and
+        // serializes back unchanged, alongside the timezone.
+        let status: SnapshotScheduleStatus = from_yaml(
+            r#"
+nextSchedule:
+  at: 2026-05-25T09:00:00Z
+  timezone: America/Chicago
+  jitter: 30m
+"#,
+        );
+        let pin = status.next_schedule.as_ref().unwrap();
+        assert_eq!(pin.jitter.as_deref(), Some("30m"));
+        assert_eq!(pin.timezone.as_deref(), Some("America/Chicago"));
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["nextSchedule"]["jitter"], "30m");
+        let reparsed: SnapshotScheduleStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status, reparsed);
+    }
+
+    #[test]
+    fn next_schedule_absent_jitter_decodes_and_stays_absent() {
+        // Upgrade path: a pin STORED before `jitter` existed must decode (never a
+        // deserialization error that would poison the watcher) and must serialize
+        // back with no `jitter` key at all — not `null`, which a merge patch would
+        // treat as a deliberate deletion and which would also change the stored
+        // object's bytes for every pre-upgrade schedule.
+        let legacy: SnapshotScheduleStatus = from_yaml(
+            r#"
+nextSchedule:
+  at: 2026-05-25T09:00:00Z
+  timezone: America/Chicago
+"#,
+        );
+        let pin = legacy.next_schedule.as_ref().unwrap();
+        assert!(pin.jitter.is_none());
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json["nextSchedule"].get("jitter").is_none());
+
+        // The oldest shape (no timezone either) still decodes.
+        let oldest: SnapshotScheduleStatus =
+            from_yaml("nextSchedule: { at: 2026-05-25T09:00:00Z }\n");
+        let pin = oldest.next_schedule.as_ref().unwrap();
+        assert!(pin.jitter.is_none() && pin.timezone.is_none());
+        assert_eq!(
+            serde_json::to_value(&oldest).unwrap()["nextSchedule"],
+            serde_json::json!({ "at": "2026-05-25T09:00:00Z" }),
+            "a legacy pin must round-trip byte-identically"
+        );
     }
 }

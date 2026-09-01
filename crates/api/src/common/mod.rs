@@ -1040,16 +1040,107 @@ pub fn effective_schedule_jitter(
     own: Option<&str>,
     candidates: &[Option<String>],
 ) -> Option<String> {
-    if own.is_some() {
-        return own.map(str::to_string);
-    }
-    let first = candidates.first()?;
-    if candidates.iter().all(|c| c == first) {
-        first.clone()
-    } else {
-        None
+    match resolve_schedule_jitter(own, candidates) {
+        ScheduleJitterResolution::Agreed(window) => window,
+        ScheduleJitterResolution::Disagreed { .. } => None,
     }
 }
+
+/// The outcome of [`resolve_schedule_jitter`] — the fan-out jitter resolution
+/// WITH the ambiguity signal [`effective_schedule_jitter`] throws away.
+///
+/// `effective_schedule_jitter` collapses a disagreement to `None`, which is
+/// indistinguishable from "everyone agreed there is no jitter" — so a caller that
+/// wants to warn an operator about the disagreement cannot see it. This enum is
+/// the resolver's real return type; the `Option`-returning function delegates to
+/// it for the callers that genuinely don't care. Exhaustive `match` at the call
+/// site is what makes "we resolved to no jitter" and "we gave up on disagreeing
+/// defaults" two decisions instead of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleJitterResolution {
+    /// Every candidate agreed (or `own` won outright, or there was nothing to
+    /// inherit): this is the effective window, `None` meaning no jitter.
+    Agreed(Option<String>),
+    /// Matched policies' repositories set *differing* `scheduleDefaults.jitter`
+    /// values, so no window can be chosen unambiguously — the effective window is
+    /// `None` (no jitter) and the caller should warn, recommending an explicit
+    /// `spec.schedule.jitter`.
+    Disagreed {
+        /// The distinct candidates (sorted) that disagreed, for the log message.
+        /// A repository setting no default renders as `(none)` — mixing "a window"
+        /// with "no default" is a genuine disagreement, so it must be visible.
+        candidates: Vec<String>,
+    },
+}
+
+/// **Pure.** The jitter counterpart of [`effective_timezone`], reporting
+/// disagreement instead of silently swallowing it (see
+/// [`ScheduleJitterResolution`]). `own` is the schedule's own
+/// `spec.schedule.jitter`; `candidates` carries one entry per matched target
+/// policy repository (`None` = that repository sets no default).
+///
+/// Rules (the reconciler does the GETs and passes the data in):
+/// - `own` set → that window wins, no lookups, never ambiguous.
+/// - `own` unset, **no** candidates → `Agreed(None)`.
+/// - `own` unset, all candidates equal → `Agreed(that value)` (possibly `None`).
+/// - `own` unset, candidates differ → `Disagreed` (effective window: no jitter).
+///
+/// A single `policyRef` over a single-repository policy therefore never disagrees.
+///
+/// ```
+/// use kopiur_api::common::{ScheduleJitterResolution, resolve_schedule_jitter};
+///
+/// // Own jitter wins outright.
+/// assert_eq!(
+///     resolve_schedule_jitter(Some("5m"), &[]),
+///     ScheduleJitterResolution::Agreed(Some("5m".to_string())),
+/// );
+/// // Unset own, one agreeing default across matched policies.
+/// let defs = [Some("1h".to_string()), Some("1h".to_string())];
+/// assert_eq!(
+///     resolve_schedule_jitter(None, &defs),
+///     ScheduleJitterResolution::Agreed(Some("1h".to_string())),
+/// );
+/// // Unset own, disagreeing defaults → reported, not silently dropped.
+/// let defs = [Some("1h".to_string()), None];
+/// assert_eq!(
+///     resolve_schedule_jitter(None, &defs),
+///     ScheduleJitterResolution::Disagreed {
+///         candidates: vec!["(none)".to_string(), "1h".to_string()],
+///     },
+/// );
+/// ```
+pub fn resolve_schedule_jitter(
+    own: Option<&str>,
+    candidates: &[Option<String>],
+) -> ScheduleJitterResolution {
+    if let Some(own) = own {
+        return ScheduleJitterResolution::Agreed(Some(own.to_string()));
+    }
+    let Some(first) = candidates.first() else {
+        // Nothing matched → nothing to inherit.
+        return ScheduleJitterResolution::Agreed(None);
+    };
+    if candidates.iter().all(|c| c == first) {
+        return ScheduleJitterResolution::Agreed(first.clone());
+    }
+    let mut distinct: Vec<String> = candidates
+        .iter()
+        .map(|c| {
+            c.clone()
+                .unwrap_or_else(|| JITTER_NONE_CANDIDATE.to_string())
+        })
+        .collect();
+    distinct.sort();
+    distinct.dedup();
+    ScheduleJitterResolution::Disagreed {
+        candidates: distinct,
+    }
+}
+
+/// How "this repository sets no `scheduleDefaults.jitter`" renders in a
+/// [`ScheduleJitterResolution::Disagreed`] candidate list.
+const JITTER_NONE_CANDIDATE: &str = "(none)";
 
 /// Resolve a consuming cron's own optional IANA timezone against a repository-level
 /// default, falling back to UTC (mirrors [`resolve_tz`]): `own` wins when set, else
