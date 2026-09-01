@@ -479,6 +479,29 @@ deletionProtection:
     }
 
     #[test]
+    fn concurrency_max_concurrent_jobs_emits_no_schema_default() {
+        // The `ClusterRepository` mirror of the `Repository` guard. Both kinds
+        // embed the SAME `ConcurrencySpec`, but each generates its own CRD schema,
+        // so a schemars `default` added to the shared struct would materialize on
+        // both — and a guard that only watched one kind would let it through on the
+        // other. §4a: absent ≡ 0 ≡ unlimited, so a server-side default would stamp
+        // `{maxConcurrentJobs: 0}` onto every stored cluster repository for no
+        // behavior change at all.
+        let json = serde_json::to_value(ClusterRepository::crd()).unwrap();
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let field = &spec["properties"]["concurrency"]["properties"]["maxConcurrentJobs"];
+        assert!(
+            !field.is_null(),
+            "the field itself must exist in the schema: {spec}"
+        );
+        assert!(
+            field.get("default").is_none(),
+            "maxConcurrentJobs must NOT carry a schema default: {field}"
+        );
+        assert_eq!(crate::consts::effective_max_concurrent_jobs(None), None);
+    }
+
+    #[test]
     fn concurrency_round_trips_on_cluster_repository() {
         use crate::common::ConcurrencySpec;
         use crate::consts::effective_max_concurrent_jobs;

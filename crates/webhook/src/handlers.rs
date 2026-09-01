@@ -3164,6 +3164,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cluster_repository_with_a_reserved_pod_label_is_denied() {
+        // The `ClusterRepository` mirror of the Repository case above. Both kinds
+        // route through `validate_pod_metadata`, but through DIFFERENT dispatch
+        // arms (`validate_cluster_repository` vs `validate_repository`), so only a
+        // per-kind test proves the rule is actually wired into both.
+        let spec = json!({
+            "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+            "encryption": { "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" } },
+            "allowedNamespaces": { "all": true },
+            "moverDefaults": { "podAnnotations": { "app.kubernetes.io/managed-by": "argocd" } },
+        });
+        assert_denied_containing(
+            admission_request("ClusterRepository", spec),
+            "is reserved by kopiur",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cluster_repository_with_an_over_cap_schedule_defaults_jitter_is_denied() {
+        let spec = json!({
+            "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+            "encryption": { "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" } },
+            "allowedNamespaces": { "all": true },
+            "scheduleDefaults": { "jitter": "48h" },
+        });
+        assert_denied_containing(
+            admission_request("ClusterRepository", spec),
+            "spec.scheduleDefaults.jitter",
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn a_repository_with_concurrency_and_pod_metadata_is_admitted() {
         // The happy path for everything M1 adds, end to end through the webhook.
         let spec = json!({

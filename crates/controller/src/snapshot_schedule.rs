@@ -1837,11 +1837,12 @@ async fn resolve_effective_schedule(
 ) -> ScheduleResolution {
     let own_tz = schedule.spec.schedule.timezone.as_deref();
     let own_jitter = schedule.spec.schedule.jitter.as_deref();
-    if own_tz.is_some() && own_jitter.is_some() {
+    // Both halves set explicitly ⇒ nothing to inherit, so skip the referent lookup.
+    if let (Some(tz), Some(jitter)) = (own_tz, own_jitter) {
         return ScheduleResolution::Resolved {
-            tz: resolve_tz(own_tz),
+            tz: resolve_tz(Some(tz)),
             ambiguity: None,
-            jitter: own_jitter.map(str::to_string),
+            jitter: Some(jitter.to_string()),
         };
     }
     let Some(defaults) = matched_repo_schedule_defaults(ctx, schedule, namespace).await else {

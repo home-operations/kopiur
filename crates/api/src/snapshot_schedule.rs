@@ -205,8 +205,12 @@ pub struct ScheduleRef {
     /// The `Snapshot` CR this slot produced, when one was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_ref: Option<SnapshotReference>,
-    /// The IANA timezone the cron was evaluated in when this slot was pinned
-    /// (`nextSchedule` only). Recorded so the controller can detect an
+    /// The IANA timezone the cron was evaluated in when this slot was pinned. This
+    /// struct is shared by `nextSchedule`, `lastSchedule` and
+    /// `lastSuccessfulSchedule`, so the field appears on all three, but the
+    /// controller only ever WRITES it on `nextSchedule` — it is a property of a pin
+    /// the controller may still have to invalidate, not a record of a slot that
+    /// already fired. Recorded so the controller can detect an
     /// effective-timezone change — a `spec.schedule.timezone` edit or a change to
     /// the target repository's `scheduleDefaults.timezone` — and invalidate the
     /// pinned wall-clock slot, recomputing it in the new zone. Absent on legacy

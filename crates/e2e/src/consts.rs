@@ -859,18 +859,28 @@ mod tests {
     fn chart_mover_image_matches_the_e2e_values_file() {
         let values = read("../../deploy/e2e/values.yaml");
         // The `mover:` block's image repository + tag (the only
-        // `repository: docker.io/kopiur/mover` line in the file).
-        let repo = values
-            .lines()
-            .map(str::trim)
+        // `repository: docker.io/kopiur/mover` line in the file). The TAG is read
+        // from the file too rather than hardcoded: a values-file retag would
+        // otherwise leave this assertion passing against a tag the chart no longer
+        // renders, which is the exact drift it exists to catch.
+        let mut lines = values.lines().map(str::trim);
+        let repo = lines
+            .by_ref()
             .filter_map(|l| l.strip_prefix("repository: "))
             .find(|r| r.ends_with("/mover"))
             .unwrap_or_else(|| {
                 panic!("deploy/e2e/values.yaml has no mover image `repository:` line")
             });
+        // The `tag:` immediately following that repository line, inside the same
+        // `mover.image` block.
+        let tag = lines
+            .find_map(|l| l.strip_prefix("tag: "))
+            .unwrap_or_else(|| {
+                panic!("deploy/e2e/values.yaml's mover image block has no `tag:` line")
+            });
         assert_eq!(
             CHART_MOVER_IMAGE,
-            format!("{repo}:e2e"),
+            format!("{repo}:{tag}"),
             "CHART_MOVER_IMAGE drifted from deploy/e2e/values.yaml's mover.image — restoring the \
              slow-mover fixture would write an env value the chart never rendered"
         );
