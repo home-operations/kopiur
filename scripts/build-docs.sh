@@ -26,27 +26,61 @@ SITE_DOMAIN="kopiur.home-operations.com"
 echo "==> cargo doc (workspace, no deps)"
 cargo doc --no-deps --workspace --locked
 
-echo "==> checking snippet SECTION references (--strict only guards file paths)"
+echo "==> checking snippet SECTION and LINE-RANGE references (--strict only guards file paths)"
 # pymdownx.snippets' check_paths fails the build on a missing FILE, but a
 # `--8<-- "file.yaml:section"` whose section marker was renamed/removed renders
 # as a silently EMPTY code block — exactly the docs/manifest drift the snippet
 # convention exists to prevent. Verify every section reference resolves.
+#
+# LINE-RANGE includes (`file.yaml:89:239`) rot the same way, and worse: inserting
+# a value anywhere in deploy/helm/kopiur/values.yaml shifts every later range, and
+# the result still RENDERS — just half a comment block, silently, with nothing in
+# the build to notice. (It went unnoticed for several releases.) A range cannot be
+# checked for "shows the intended block", but it can be checked for the structural
+# property every intended block has: it must not begin or end HALF WAY THROUGH a
+# comment block. So the start line may be a comment only when the line above it is
+# not (i.e. it starts a comment block), and the end line must not be a comment or
+# blank at all. Every real drift so far violates one of those.
 uv run python - <<'PYEOF'
 import pathlib, re, sys
 
 errors = []
+
+
+def check_line_range(md, path, start, end):
+    """Structural sanity for a `file:start:end` include; see the note above."""
+    lines = path.read_text().splitlines()
+    if not (1 <= start <= end <= len(lines)):
+        errors.append(f"{md}: range {start}:{end} is outside {path} "
+                      f"(the file has {len(lines)} lines)")
+        return
+    first, last = lines[start - 1], lines[end - 1]
+    prev = lines[start - 2] if start >= 2 else ""
+    if first.lstrip().startswith("#") and prev.lstrip().startswith("#"):
+        errors.append(f"{md}: range {start}:{end} STARTS mid-comment in {path} "
+                      f"({first.strip()!r}) — the lines almost certainly shifted")
+    if not last.strip() or last.lstrip().startswith("#"):
+        errors.append(f"{md}: range {start}:{end} ENDS on a comment/blank line in "
+                      f"{path} ({last.strip()!r}) — the lines almost certainly shifted")
+
+
 for md in pathlib.Path("docs").rglob("*.md"):
     for ref in re.findall(r'--8<--\s+"([^":]+):([^"]+)"', md.read_text()):
         path, section = pathlib.Path(ref[0]), ref[1]
-        if re.fullmatch(r"\d*(:\d*)?", section):
-            continue  # a LINE-RANGE include (file:5:8), not a named section
         if not path.is_file():
             continue  # missing files are check_paths' job; don't double-report
+        if re.fullmatch(r"\d*(:\d*)?", section):
+            start, _, end = section.partition(":")
+            # Open-ended forms (`:8`, `5:`) are legal in pymdownx; only check a
+            # fully-specified range, which is the only form this repo uses.
+            if start and end:
+                check_line_range(md, path, int(start), int(end))
+            continue
         if f"--8<-- [start:{section}]" not in path.read_text():
             errors.append(f"{md}: section '{section}' not found in {path} "
                           f"(expected a '# --8<-- [start:{section}]' marker)")
 if errors:
-    print("snippet section check FAILED:", *errors, sep="\n  ", file=sys.stderr)
+    print("snippet reference check FAILED:", *errors, sep="\n  ", file=sys.stderr)
     sys.exit(1)
 PYEOF
 

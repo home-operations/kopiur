@@ -206,18 +206,27 @@ If you use the [web UI](server.md) (`spec.server` on a `Repository`/`ClusterRepo
 
 ## Runtime tuning
 
-The chart's defaults are sized for a typical homelab-to-mid-size cluster; four
+The chart's defaults are sized for a typical homelab-to-mid-size cluster; a handful of
 top-level values tune the controller's runtime footprint and API-server load
 (full rationale in the
 [developer docs](dev/watch-and-reconcile.md#memory-footprint)):
 
-| Value | Default | What it does |
-|---|---|---|
-| `workerThreads` | `2` | Tokio worker threads. The controller is I/O-bound; raise only for a reconcile-heavy deployment. |
-| `streamingLists` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists when the apiserver *answers* with a pre-1.32 version; a startup probe that fails to answer keeps the configured value, since a transport failure is not evidence about the server's version. |
-| `reconcileConcurrency` | `8` | Per-controller cap on concurrent reconciles. Bounds API-server load and file descriptors during re-list storms and API-server outages. `0` = unbounded (not recommended). |
-| `maxConcurrentDeleteJobs` | `0` (uncapped) | Opt-in backstop on concurrent snapshot-delete batch Jobs; batching per repository is the primary protection. |
-| `leaderElection.flowSchema.enabled` | `true` | Give the controller's leader-election Lease its own API Priority and Fairness lane. See below. |
+| Value | Env var | Default | What it does |
+|---|---|---|---|
+| `workerThreads` | `KOPIUR_WORKER_THREADS` | `2` | Tokio worker threads. The controller is I/O-bound; raise only for a reconcile-heavy deployment. |
+| `streamingLists` | `KOPIUR_STREAMING_LISTS` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists when the apiserver *answers* with a pre-1.32 version; a startup probe that fails to answer keeps the configured value, since a transport failure is not evidence about the server's version. |
+| `reconcileConcurrency` | `KOPIUR_RECONCILE_CONCURRENCY` | `8` | Per-controller cap on concurrent reconciles. Bounds API-server load and file descriptors during re-list storms and API-server outages. `0` = unbounded (not recommended). |
+| `maxConcurrentDeleteJobs` | `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` | `0` (uncapped) | Opt-in backstop on concurrent snapshot-delete batch Jobs; batching per repository is the primary protection. |
+| `maxConcurrentJobs` | `KOPIUR_MAX_CONCURRENT_JOBS` | `0` (uncapped) | Opt-in cluster-wide backstop on concurrent **pooled** mover Jobs — backups, restores, and the source side of either replication — across all repositories. The per-repository [`spec.concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) is the primary knob; a run must satisfy both. |
+| `leaderElection.flowSchema.enabled` | — | `true` | Give the controller's leader-election Lease its own API Priority and Fairness lane. See below. |
+
+/// note | Which of the two job caps to reach for
+
+`maxConcurrentJobs` here is the **cluster-operator's** backstop: set it when the node pool cannot host N movers no matter which repositories they belong to. Set the per-repository `spec.concurrency.maxConcurrentJobs` when one **backend** is the thing that must not be saturated — that is the knob most people want, and it is the one whose numbers appear in a queued run's status message. Leaving this one at `0` costs nothing: with no cap set anywhere the operator makes no extra API calls at all.
+
+Restores are always admitted and never queued (though a running restore still occupies a slot); maintenance, verification, pin and snapshot-delete Jobs are outside the pool entirely. See [Backups → limiting concurrent jobs per repository](backups.md#limiting-concurrent-jobs-per-repository).
+
+///
 
 /// note | Why the chart ships a FlowSchema
 

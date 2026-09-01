@@ -163,6 +163,30 @@ keeping Kopiur's own retention pruning unaffected:
   exactly the blast-radius coupling a per-repository mechanism should avoid. The cap
   exists for an operator who wants an extra global throttle on top, not as the
   mechanism doing the real work.
+- **All three job caps share one shape: the per-repository knob is primary, the
+  cluster-wide one is an opt-in backstop, and uncapped is the safe default.** The
+  operator now carries three interacting caps, and it is worth reading them as one
+  design rather than three accidents:
+
+  | Cap | Scope | Default | Role |
+  |---|---|---|---|
+  | `spec.concurrency.maxConcurrentJobs` | one repository's pooled movers (backup + restore + replication source) | absent/`0` = unlimited | **Primary.** The unit of contention is a repository's backend and the bandwidth to it, so the limit belongs on the repository. |
+  | `KOPIUR_MAX_CONCURRENT_JOBS` | the same pool, across every repository | `0` = uncapped | Backstop for the cluster operator whose constraint is the node pool, not any one backend. |
+  | `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` | `snapdel-*` batch Jobs, across every repository | `0` = uncapped | Backstop on top of per-repository batching (above). |
+
+  The two cluster-wide caps default to uncapped for the same reason: a global limit
+  couples repositories that share nothing, so one slow or failing repository can
+  head-of-line-block every other repository behind it. That is acceptable as a
+  deliberate opt-in ("my nodes cannot host more than N movers") and unacceptable as
+  a default. The per-repository cap has no such coupling, which is why it is the one
+  documented as the knob to reach for.
+
+  The deletion cap sits outside the mover pool entirely rather than sharing it, and
+  that asymmetry is the same call made twice: a deletion **reduces** repository load
+  and is already single-flighted per repository, so queuing it behind a saturated
+  backup pool would grow the backlog it exists to drain. Maintenance is excluded for
+  the identical reason — it is the cure for an overloaded repository. A cap that can
+  starve its own remedy is not a throttle, it is a deadlock.
 - **The pending COUNT is inclusive; the fire SET is exclusive** — two intentionally
   opposite polarities over the same pending `Snapshot`s. The breaker counts a
   maximally-inclusive set (an unpinned or possibly-cascade-guarded CR is
