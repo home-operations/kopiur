@@ -307,10 +307,10 @@ features:
     enabled: false
   kopiaUi:
     # -- Grant the operator `secrets` create+patch+delete so `spec.server` (the
-    # kopia web-UI) works: it creates a generated-auth Secret, mirrors a
-    # ClusterRepository's credentials into the server namespace, and deletes both on
-    # teardown. SECURITY TRADE-OFF: grants unscoped create/delete on Secrets in any
-    # namespace the operator manages.
+    # kopia web-UI) works: it creates a generated-auth Secret, mirrors each of a
+    # ClusterRepository's credential Secrets into the server namespace, and deletes
+    # all of them on teardown. SECURITY TRADE-OFF: grants unscoped create/delete on
+    # Secrets in any namespace the operator manages.
     enabled: false
 
 # =============================================================================

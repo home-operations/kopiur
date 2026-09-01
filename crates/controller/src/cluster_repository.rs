@@ -46,7 +46,7 @@ use crate::health;
 use crate::io;
 use crate::jobs::{self, JobLimits, MoverJobInputs};
 use crate::server::{
-    ServerReconcileCtx, generated_secret_name, mirrored_creds_secret_name, reconcile_server,
+    ServerReconcileCtx, delete_mirrored_creds, generated_secret_name, reconcile_server,
     server_object_name, server_status_json,
 };
 use crate::snapshot::backend_to_repository_connect;
@@ -759,21 +759,11 @@ async fn reconcile_cluster_server(
         (CLUSTER_REPOSITORY_UID_LABEL.to_string(), uid),
     ]);
 
-    // Which namespace the server MIRRORS the credentials Secret from. Same rule the
-    // repository itself uses (`cluster_secret_namespace`): the reference's explicit
-    // namespace, else the operator's — so "absent" means ONE thing on a ClusterRepository.
-    // Were this to keep defaulting to the server namespace while the repository defaulted
-    // to the operator's, a user who followed the documented default (Secret in the operator
-    // namespace) would bootstrap fine and then get a server pod wedged on a Secret that
-    // isn't in its namespace. The server namespace remains the last resort.
-    let creds = io::repo_credentials(&repo.spec.encryption);
-    let creds_src_namespace = creds
-        .namespace
-        .clone()
-        .or_else(|| ctx.operator_namespace.clone())
-        .or_else(|| desired_ns.clone())
-        .unwrap_or_default();
-
+    // Which namespace each credential Secret is mirrored from is decided per-ref
+    // by `server::plan_server_creds` (explicit ref namespace → operator namespace
+    // → server namespace as last resort — the same rule the repository itself
+    // uses via `cluster_secret_namespace`, so "absent" means ONE thing on a
+    // ClusterRepository).
     let rc = ServerReconcileCtx {
         client: &ctx.client,
         instance: name,
@@ -785,7 +775,6 @@ async fn reconcile_cluster_server(
         observed_namespace: observed_ns,
         owner: None,
         extra_labels,
-        creds_src_namespace,
         repo_namespace: None,
         operator_namespace: ctx.operator_namespace.clone(),
         is_cluster: true,
@@ -834,7 +823,7 @@ async fn handle_cluster_deletion(
             Some(&generated_secret_name(name)),
         )
         .await?;
-        io::delete_secret_if_present(&ctx.client, &ns, &mirrored_creds_secret_name(name)).await?;
+        delete_mirrored_creds(&ctx.client, &ns, name).await?;
     }
 
     // An in-flight bootstrap Job outlives its `ClusterRepository` (#380). A

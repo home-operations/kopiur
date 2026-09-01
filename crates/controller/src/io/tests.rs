@@ -1695,14 +1695,29 @@ fn missing_wi_sa_message_is_actionable_per_cloud() {
         ),
         (WorkloadIdentityCloud::Gcs, "iam.gke.io/gcp-service-account"),
     ] {
-        let msg = missing_workload_identity_sa_message("backup-mover", "trilium", cloud);
-        // What: the exact SA and namespace.
+        let msg =
+            missing_workload_identity_sa_message("backup-mover", "trilium", cloud, "the mover Job");
+        // What: the exact SA and namespace, and WHICH pod needs it there.
         assert!(msg.contains("`backup-mover`"), "{msg}");
         assert!(msg.contains("`trilium`"), "{msg}");
+        assert!(msg.contains("where the mover Job runs"), "{msg}");
         // Why: kopiur never creates it.
         assert!(msg.contains("never creates"), "{msg}");
         // Fix: the cloud-specific federation annotation.
         assert!(msg.contains(annotation), "{msg}");
+
+        // The server variant names the server, so the user fixes the RIGHT
+        // namespace (#416: a ClusterRepository server may run far from any mover).
+        let server_msg = missing_workload_identity_sa_message(
+            "backup-mover",
+            "trilium",
+            cloud,
+            WI_CONSUMER_SERVER,
+        );
+        assert!(
+            server_msg.contains("where the kopia web-UI server (spec.server) runs"),
+            "{server_msg}"
+        );
     }
 }
 

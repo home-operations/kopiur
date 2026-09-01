@@ -1,4 +1,6 @@
 use super::*;
+use crate::jobs::CredsEnvFrom;
+use kopiur_api::creds::CredsSecretRef;
 
 fn api_error(code: u16) -> crate::error::Error {
     use kube::core::Status;
@@ -56,7 +58,8 @@ fn inputs<'a>(ns: &'a str, auth: ResolvedAuth) -> ServerBuildInputs<'a> {
         service_type: "ClusterIP",
         service_annotations: BTreeMap::new(),
         auth,
-        creds_secret: "nas-creds",
+        creds_secrets: vec![CredsEnvFrom::plain("nas-creds")],
+        azure_workload_identity: false,
         repo_volume: None,
         resources: None,
         security_context: None,
@@ -252,14 +255,81 @@ fn deployment_password_auth_injects_server_password_env_from_secret() {
         .unwrap();
     assert_eq!(sk.name, "nas-kopia-ui-auth");
     assert_eq!(sk.key, "password");
-    // Repo creds via envFrom (KOPIA_PASSWORD + backend creds).
+    // Repo creds via envFrom. The common single-Secret layout emits exactly ONE
+    // entry — pinned so the #416 fix cannot churn existing single-secret
+    // Deployments on upgrade (identical envFrom ⇒ SSA no-op ⇒ no pod roll).
+    let env_from = c.env_from.as_ref().unwrap();
+    assert_eq!(env_from.len(), 1);
+    assert_eq!(env_from[0].secret_ref.as_ref().unwrap().name, "nas-creds");
+}
+
+#[test]
+fn deployment_env_from_includes_every_creds_secret_in_order() {
+    // Regression (#416): the server used to env-inject only the encryption
+    // Secret, so a repo whose password and backend keys live in SEPARATE
+    // Secrets crashlooped on `repository connect` (missing AWS_* keys). The
+    // server now follows the mover contract: one envFrom per distinct Secret,
+    // password first (crates/mover/src/jobs.rs).
+    let mut i = inputs("ns", gen_auth());
+    i.creds_secrets = vec![
+        CredsEnvFrom::plain("nas-password"),
+        CredsEnvFrom::plain("nas-s3-keys"),
+    ];
+    let dep = build_server_deployment(&i);
+    let c = &dep.spec.unwrap().template.spec.unwrap().containers[0];
+    let env_from = c.env_from.as_ref().unwrap();
+    assert_eq!(env_from.len(), 2);
+    let names: Vec<&str> = env_from
+        .iter()
+        .map(|e| e.secret_ref.as_ref().unwrap().name.as_str())
+        .collect();
+    assert_eq!(names, vec!["nas-password", "nas-s3-keys"]);
+    for e in env_from {
+        assert_eq!(e.secret_ref.as_ref().unwrap().optional, Some(false));
+        assert!(e.prefix.is_none(), "server creds are always unprefixed");
+    }
+}
+
+#[test]
+fn deployment_sets_azure_workload_identity_label_only_when_flagged() {
+    // Azure workload identity injects credentials via a mutating webhook that
+    // only acts on pods carrying the opt-in label — same contract as movers
+    // (`MoverRunIdentity::decorate_labels`). Non-Azure servers must NOT carry
+    // it (a label change would roll every existing Deployment on upgrade).
+    let plain = build_server_deployment(&inputs("ns", gen_auth()));
+    let plain_labels = plain
+        .spec
+        .unwrap()
+        .template
+        .metadata
+        .unwrap()
+        .labels
+        .unwrap();
+    assert!(!plain_labels.contains_key(kopiur_api::consts::AZURE_WORKLOAD_IDENTITY_LABEL));
+
+    let mut i = inputs("ns", gen_auth());
+    i.azure_workload_identity = true;
+    let dep = build_server_deployment(&i);
+    let spec = dep.spec.unwrap();
+    let labels = spec
+        .template
+        .metadata
+        .as_ref()
+        .unwrap()
+        .labels
+        .clone()
+        .unwrap();
     assert_eq!(
-        c.env_from.as_ref().unwrap()[0]
-            .secret_ref
-            .as_ref()
+        labels.get(kopiur_api::consts::AZURE_WORKLOAD_IDENTITY_LABEL),
+        Some(&kopiur_api::consts::AZURE_WORKLOAD_IDENTITY_LABEL_VALUE.to_string())
+    );
+    // The selector must never grow the label (selectors are immutable in-place).
+    assert!(
+        !spec
+            .selector
+            .match_labels
             .unwrap()
-            .name,
-        "nas-creds"
+            .contains_key(kopiur_api::consts::AZURE_WORKLOAD_IDENTITY_LABEL)
     );
 }
 
@@ -455,4 +525,209 @@ fn plan_teardown_when_disabled_but_observed() {
 #[test]
 fn plan_noop_when_nothing_desired_or_observed() {
     assert_eq!(plan_server(None, None), ServerAction::Noop);
+}
+
+// --- plan_server_creds ---
+
+fn cref(name: &str, ns: Option<&str>) -> CredsSecretRef {
+    CredsSecretRef {
+        name: name.into(),
+        namespace: ns.map(str::to_string),
+    }
+}
+
+#[test]
+fn mirror_name_idx0_is_the_exact_legacy_name() {
+    // ON-CLUSTER NAME. idx 0 must stay byte-identical to the pre-#416 single
+    // mirror name: a rename would orphan the copy on every deployed
+    // ClusterRepository server and roll its pod for nothing.
+    assert_eq!(
+        mirrored_creds_secret_name("nas", 0),
+        "nas-kopia-ui-repo-creds"
+    );
+    assert_eq!(
+        mirrored_creds_secret_name("nas", 1),
+        "nas-kopia-ui-repo-creds-1"
+    );
+}
+
+#[test]
+fn creds_plan_namespaced_is_always_direct_with_no_reap() {
+    // A namespaced Repository's secrets are same-namespace by construction
+    // (movers likewise require same-ns without projection); mirrors never
+    // existed for namespaced repos, so nothing to reap.
+    let plan = plan_server_creds(
+        "nas",
+        "backups",
+        &[cref("nas-password", None), cref("nas-s3-keys", None)],
+        false,
+        None,
+    );
+    assert_eq!(
+        plan.sources,
+        vec![
+            ServerCredsSource::Direct {
+                name: "nas-password".into()
+            },
+            ServerCredsSource::Direct {
+                name: "nas-s3-keys".into()
+            },
+        ]
+    );
+    assert!(plan.reap.is_empty());
+}
+
+#[test]
+fn creds_plan_cluster_split_cross_ns_mirrors_both() {
+    // The #416 shape on a ClusterRepository: password and backend keys in two
+    // Secrets, both defaulting to the operator namespace, server elsewhere —
+    // BOTH must be mirrored (the second used to be dropped entirely).
+    let plan = plan_server_creds(
+        "nas",
+        "storage",
+        &[cref("repo-password", None), cref("backend-creds", None)],
+        true,
+        Some("kopiur-system"),
+    );
+    assert_eq!(
+        plan.sources,
+        vec![
+            ServerCredsSource::Mirrored {
+                src_namespace: "kopiur-system".into(),
+                src_name: "repo-password".into(),
+                mirror_name: "nas-kopia-ui-repo-creds".into(),
+            },
+            ServerCredsSource::Mirrored {
+                src_namespace: "kopiur-system".into(),
+                src_name: "backend-creds".into(),
+                mirror_name: "nas-kopia-ui-repo-creds-1".into(),
+            },
+        ]
+    );
+    assert!(plan.reap.is_empty());
+}
+
+#[test]
+fn creds_plan_cluster_single_cross_ns_keeps_legacy_name_and_reaps_second_slot() {
+    // Migration: an existing single-secret cluster server keeps its exact
+    // mirror name (SSA no-op, no orphan), and the unused second slot is reaped.
+    let plan = plan_server_creds(
+        "nas",
+        "storage",
+        &[cref("repo-creds", Some("infra"))],
+        true,
+        Some("kopiur-system"),
+    );
+    assert_eq!(
+        plan.sources,
+        vec![ServerCredsSource::Mirrored {
+            src_namespace: "infra".into(),
+            src_name: "repo-creds".into(),
+            mirror_name: "nas-kopia-ui-repo-creds".into(),
+        }]
+    );
+    assert_eq!(plan.reap, vec!["nas-kopia-ui-repo-creds-1".to_string()]);
+}
+
+#[test]
+fn creds_plan_cluster_same_ns_is_direct_and_reaps_both_slots() {
+    // Secrets already living in the server namespace need no copy; stale
+    // mirrors from a previous cross-ns topology must not outlive the move.
+    let plan = plan_server_creds(
+        "nas",
+        "storage",
+        &[
+            cref("repo-password", Some("storage")),
+            cref("backend-creds", Some("storage")),
+        ],
+        true,
+        Some("kopiur-system"),
+    );
+    assert_eq!(
+        plan.sources,
+        vec![
+            ServerCredsSource::Direct {
+                name: "repo-password".into()
+            },
+            ServerCredsSource::Direct {
+                name: "backend-creds".into()
+            },
+        ]
+    );
+    assert_eq!(
+        plan.reap,
+        vec![
+            "nas-kopia-ui-repo-creds".to_string(),
+            "nas-kopia-ui-repo-creds-1".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn creds_plan_cluster_mixed_direct_and_mirrored() {
+    // ref0 already in the server namespace (Direct), ref1 defaulting to the
+    // operator namespace (Mirrored under its OWN index name); the unused idx-0
+    // slot is reaped.
+    let plan = plan_server_creds(
+        "nas",
+        "storage",
+        &[
+            cref("repo-password", Some("storage")),
+            cref("backend-creds", None),
+        ],
+        true,
+        Some("kopiur-system"),
+    );
+    assert_eq!(
+        plan.sources,
+        vec![
+            ServerCredsSource::Direct {
+                name: "repo-password".into()
+            },
+            ServerCredsSource::Mirrored {
+                src_namespace: "kopiur-system".into(),
+                src_name: "backend-creds".into(),
+                mirror_name: "nas-kopia-ui-repo-creds-1".into(),
+            },
+        ]
+    );
+    assert_eq!(plan.reap, vec!["nas-kopia-ui-repo-creds".to_string()]);
+}
+
+#[test]
+fn creds_plan_reap_never_names_a_live_source_secret() {
+    // Collision guard: a cluster repo whose ACTUAL same-ns credentials Secret
+    // happens to be named like a mirror slot must not have it reaped — that
+    // would delete the user's live Secret on every reconcile.
+    let plan = plan_server_creds(
+        "nas",
+        "storage",
+        &[cref("nas-kopia-ui-repo-creds", Some("storage"))],
+        true,
+        Some("kopiur-system"),
+    );
+    assert_eq!(
+        plan.sources,
+        vec![ServerCredsSource::Direct {
+            name: "nas-kopia-ui-repo-creds".into()
+        }]
+    );
+    assert_eq!(
+        plan.reap,
+        vec!["nas-kopia-ui-repo-creds-1".to_string()],
+        "the colliding slot name must be excluded; the other slot still reaps"
+    );
+}
+
+#[test]
+fn creds_plan_cluster_falls_back_to_server_ns_last() {
+    // No explicit ref namespace and no operator namespace: the server
+    // namespace is the documented last resort — which makes the ref Direct.
+    let plan = plan_server_creds("nas", "storage", &[cref("repo-creds", None)], true, None);
+    assert_eq!(
+        plan.sources,
+        vec![ServerCredsSource::Direct {
+            name: "repo-creds".into()
+        }]
+    );
 }

@@ -172,9 +172,17 @@ pub struct ServerBuildInputs<'a> {
     pub service_annotations: BTreeMap<String, String>,
     /// Resolved auth.
     pub auth: ResolvedAuth,
-    /// Repository credentials Secret (KOPIA_PASSWORD + backend creds), env-injected
-    /// via `envFrom` exactly like the mover Job.
-    pub creds_secret: &'a str,
+    /// Repository credential Secrets (`KOPIA_PASSWORD` + backend keys), env-injected
+    /// via one `envFrom` entry each, password-first — the same contract as the mover
+    /// Job ([`crate::jobs::MoverJobInputs::creds_secrets`]). Never empty (the
+    /// encryption password Secret always exists). Injecting only the encryption
+    /// Secret used to drop a split layout's backend keys entirely (#416).
+    pub creds_secrets: Vec<crate::jobs::CredsEnvFrom>,
+    /// Whether the backend federates via **Azure** workload identity, in which case
+    /// the pod template must carry the azure-workload-identity opt-in label — the
+    /// Azure webhook only injects the credential env into labeled pods (same
+    /// contract as mover Jobs, [`crate::io::MoverRunIdentity::decorate_labels`]).
+    pub azure_workload_identity: bool,
     /// The repo volume for the filesystem backend (PVC must be ReadWriteMany, or an
     /// inline NFS export), mounted RW. `None` for object-store backends.
     pub repo_volume: Option<ServerRepoVolume>,
@@ -407,14 +415,21 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
         });
     }
 
-    // Repo creds (KOPIA_PASSWORD + backend creds) via envFrom — same as the mover.
-    let env_from = vec![EnvFromSource {
-        secret_ref: Some(SecretEnvSource {
-            name: inputs.creds_secret.to_string(),
-            optional: Some(false),
-        }),
-        ..Default::default()
-    }];
+    // Repo creds (KOPIA_PASSWORD + backend creds) via envFrom — one entry per
+    // distinct Secret, exactly like the mover Job, so an object-store repo whose
+    // password and backend keys live in separate Secrets both reach kopia (#416).
+    let env_from: Vec<EnvFromSource> = inputs
+        .creds_secrets
+        .iter()
+        .map(|c| EnvFromSource {
+            prefix: c.prefix.clone(),
+            secret_ref: Some(SecretEnvSource {
+                name: c.name.clone(),
+                optional: Some(false),
+            }),
+            ..Default::default()
+        })
+        .collect();
 
     let probe = Probe {
         tcp_socket: Some(TCPSocketAction {
@@ -457,6 +472,18 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
         ..Default::default()
     };
 
+    // Pod-template labels: the shared object labels, plus the Azure
+    // workload-identity opt-in when the backend federates via Azure (label-gated
+    // webhook; never on the immutable selector, and absent otherwise so non-Azure
+    // Deployments stay byte-identical across upgrades).
+    let mut pod_labels = object_labels(inputs.instance, &inputs.extra_labels);
+    if inputs.azure_workload_identity {
+        pod_labels.insert(
+            kopiur_api::consts::AZURE_WORKLOAD_IDENTITY_LABEL.to_string(),
+            kopiur_api::consts::AZURE_WORKLOAD_IDENTITY_LABEL_VALUE.to_string(),
+        );
+    }
+
     Deployment {
         metadata: inputs.meta(&name),
         spec: Some(DeploymentSpec {
@@ -473,7 +500,7 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
             },
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
-                    labels: Some(object_labels(inputs.instance, &inputs.extra_labels)),
+                    labels: Some(pod_labels),
                     // The server reads its work spec from the mounted ConfigMap,
                     // and a ConfigMap content change never restarts a running
                     // pod — so the template pins a hash of the spec: any change
@@ -565,10 +592,136 @@ pub fn plan_server(desired_ns: Option<&str>, observed_ns: Option<&str>) -> Serve
     }
 }
 
-/// The operator-owned mirror of a `ClusterRepository`'s credentials Secret, placed
-/// in the server namespace (envFrom needs a same-namespace Secret).
-pub fn mirrored_creds_secret_name(instance: &str) -> String {
-    format!("{instance}-kopia-ui-repo-creds")
+/// The operator-owned mirror of a `ClusterRepository`'s `idx`-th credential Secret
+/// (see [`kopiur_api::creds::mover_creds_secret_refs`] for the index order:
+/// password first, backend auth second), placed in the server namespace (envFrom
+/// needs a same-namespace Secret).
+///
+/// ON-CLUSTER NAME: idx 0 keeps the exact pre-#416 single-mirror name so every
+/// deployed single-secret cluster server upgrades with an SSA no-op (no orphaned
+/// copy, no pod roll); higher indices append `-{idx}`.
+pub fn mirrored_creds_secret_name(instance: &str, idx: usize) -> String {
+    match idx {
+        0 => format!("{instance}-kopia-ui-repo-creds"),
+        n => format!("{instance}-kopia-ui-repo-creds-{n}"),
+    }
+}
+
+/// How the server Deployment obtains one credential Secret for `envFrom`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerCredsSource {
+    /// The Secret already lives in the server namespace: envFrom it by name.
+    Direct {
+        /// Name of the Secret in the server namespace.
+        name: String,
+    },
+    /// Cross-namespace (`ClusterRepository` only): SSA-copy
+    /// `{src_namespace}/{src_name}` into the server namespace as `mirror_name`,
+    /// then envFrom the mirror.
+    Mirrored {
+        /// Namespace the source Secret is read from.
+        src_namespace: String,
+        /// Name of the source Secret.
+        src_name: String,
+        /// Deterministic per-index mirror name in the server namespace.
+        mirror_name: String,
+    },
+}
+
+impl ServerCredsSource {
+    /// The Secret name the Deployment's `envFrom` references (the mirror for a
+    /// cross-namespace source).
+    pub fn env_from_name(&self) -> &str {
+        match self {
+            ServerCredsSource::Direct { name } => name,
+            ServerCredsSource::Mirrored { mirror_name, .. } => mirror_name,
+        }
+    }
+}
+
+/// The full per-reconcile credential plan for the server Deployment: how each
+/// distinct Secret reaches the pod, and which stale mirror slots to delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerCredsPlan {
+    /// One entry per distinct credential Secret, password-first (envFrom order).
+    pub sources: Vec<ServerCredsSource>,
+    /// Mirror-slot names NOT used this round, deleted best-effort so a stale
+    /// copy of live credentials never outlives a topology change (2→1 refs,
+    /// cross-ns → same-ns move). Always empty for a namespaced `Repository`
+    /// (mirrors never existed there). Never contains a name this round's
+    /// `sources` reference — a user Secret that happens to share a mirror-slot
+    /// name must not be reaped out from under the running server.
+    pub reap: Vec<String>,
+}
+
+/// Plan how the server Deployment obtains its credential Secrets.
+///
+/// * Namespaced `Repository` (`is_cluster: false`): every ref is [`Direct`] — the
+///   secrets are same-namespace by construction (movers likewise require same-ns
+///   without projection). A namespaced repo whose ref pins a *foreign* namespace
+///   plus `spec.server` remains unsupported, exactly as before #416.
+/// * `ClusterRepository`: each ref's source namespace is the reference's explicit
+///   `namespace`, else `operator_namespace` — the same rule the repository itself
+///   uses (`cluster_secret_namespace`), so "absent" means ONE thing on a
+///   ClusterRepository. Were this to default to the server namespace while the
+///   repository defaulted to the operator's, a user following the documented
+///   default (Secret in the operator namespace) would bootstrap fine and then get
+///   a server pod wedged on a Secret that isn't in its namespace. The server
+///   namespace remains the last resort. A source already in the server namespace
+///   is [`Direct`]; anything else is [`Mirrored`] under its index's
+///   [`mirrored_creds_secret_name`].
+///
+/// [`Direct`]: ServerCredsSource::Direct
+/// [`Mirrored`]: ServerCredsSource::Mirrored
+pub fn plan_server_creds(
+    instance: &str,
+    server_ns: &str,
+    refs: &[kopiur_api::creds::CredsSecretRef],
+    is_cluster: bool,
+    operator_namespace: Option<&str>,
+) -> ServerCredsPlan {
+    let sources: Vec<ServerCredsSource> = refs
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            if !is_cluster {
+                return ServerCredsSource::Direct {
+                    name: r.name.clone(),
+                };
+            }
+            let src_ns = r
+                .namespace
+                .as_deref()
+                .or(operator_namespace)
+                .unwrap_or(server_ns);
+            if src_ns == server_ns {
+                ServerCredsSource::Direct {
+                    name: r.name.clone(),
+                }
+            } else {
+                ServerCredsSource::Mirrored {
+                    src_namespace: src_ns.to_string(),
+                    src_name: r.name.clone(),
+                    mirror_name: mirrored_creds_secret_name(instance, idx),
+                }
+            }
+        })
+        .collect();
+
+    // Reap every mirror slot this round did not claim — except a name that
+    // collides with a live envFrom source (deleting the user's actual Secret
+    // every reconcile would break the repository; the collision guard is why
+    // this is set arithmetic, not "slots beyond len()").
+    let reap = if is_cluster {
+        (0..=kopiur_api::creds::MAX_CREDS_IDX)
+            .map(|idx| mirrored_creds_secret_name(instance, idx))
+            .filter(|slot| !sources.iter().any(|s| s.env_from_name() == slot))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    ServerCredsPlan { sources, reap }
 }
 
 /// The status block the reconciler pins after a successful ensure.
@@ -622,8 +775,6 @@ pub struct ServerReconcileCtx<'a> {
     pub owner: Option<OwnerReference>,
     /// Back-reference labels (cluster-repository name/UID) for `ClusterRepository`.
     pub extra_labels: BTreeMap<String, String>,
-    /// Namespace the repository credentials Secret lives in.
-    pub creds_src_namespace: String,
     /// The repository's OWN namespace (`Some` for a namespaced `Repository`,
     /// `None` for a `ClusterRepository`) — the referrer namespace for resolving
     /// the backend's `tls.caBundleRef` ConfigMap (see
@@ -729,12 +880,27 @@ async fn teardown_in(
     io::delete_server_objects(rc.client, namespace, name, Some(gen_secret))
         .await
         .map_err(|e| map_server_secret_error(e, gen_secret, namespace))?;
-    // The mirrored creds Secret (cluster-repo cross-namespace case) is operator-owned.
+    // The mirrored creds Secrets (cluster-repo cross-namespace case) are
+    // operator-owned; delete every slot.
     if rc.is_cluster {
-        let mirror_name = mirrored_creds_secret_name(rc.instance);
-        io::delete_secret_if_present(rc.client, namespace, &mirror_name)
+        delete_mirrored_creds(rc.client, namespace, rc.instance).await?;
+    }
+    Ok(())
+}
+
+/// Delete every credential-mirror slot (`0..=MAX_CREDS_IDX`) of `instance`'s
+/// server in `namespace`. Shared by [`teardown_in`] and the `ClusterRepository`
+/// finalizer so the two delete paths cannot drift; 404s are no-ops.
+pub async fn delete_mirrored_creds(
+    client: &kube::Client,
+    namespace: &str,
+    instance: &str,
+) -> crate::error::Result<()> {
+    for idx in 0..=kopiur_api::creds::MAX_CREDS_IDX {
+        let name = mirrored_creds_secret_name(instance, idx);
+        crate::io::delete_secret_if_present(client, namespace, &name)
             .await
-            .map_err(|e| map_server_secret_error(e, &mirror_name, namespace))?;
+            .map_err(|e| map_server_secret_error(e, &name, namespace))?;
     }
     Ok(())
 }
@@ -806,31 +972,70 @@ async fn ensure_in(
         _ => None,
     };
 
-    // Credentials Secret the Deployment env-injects (KOPIA_PASSWORD + backend creds).
-    // For a ClusterRepository the source Secret may live in another namespace, which
-    // envFrom can't reach — mirror it into the server namespace.
-    let creds_secret = io::repo_credentials(rc.encryption).secret_name;
-    let creds_secret_name = if rc.is_cluster && rc.creds_src_namespace != namespace {
-        let mirror_name = mirrored_creds_secret_name(rc.instance);
-        let mut labels = selector_labels(rc.instance);
-        labels.extend(rc.extra_labels.clone());
-        let dst = k8s_openapi::api::core::v1::Secret {
-            metadata: ObjectMeta {
-                name: Some(mirror_name.clone()),
-                namespace: Some(namespace.to_string()),
-                labels: Some(labels),
-                owner_references: rc.owner.clone().map(|o| vec![o]),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        io::mirror_secret(rc.client, &rc.creds_src_namespace, &creds_secret, dst)
-            .await
-            .map_err(|e| map_server_secret_error(e, &mirror_name, namespace))?;
-        mirror_name
-    } else {
-        creds_secret
-    };
+    // Credential Secrets the Deployment env-injects (KOPIA_PASSWORD + backend
+    // creds): EVERY distinct Secret the repository references, resolved by the
+    // same helper every mover uses — injecting only the encryption Secret used to
+    // drop a split layout's backend keys entirely (#416). Cross-namespace sources
+    // (ClusterRepository) are mirrored into the server namespace, which envFrom
+    // can't otherwise reach; mirror slots not used this round are reaped.
+    let refs = io::mover_creds_secret_refs(rc.backend, rc.encryption, rc.repo_namespace.as_deref());
+    let creds_plan = plan_server_creds(
+        rc.instance,
+        namespace,
+        &refs,
+        rc.is_cluster,
+        rc.operator_namespace.as_deref(),
+    );
+    for source in &creds_plan.sources {
+        match source {
+            ServerCredsSource::Direct { .. } => {}
+            ServerCredsSource::Mirrored {
+                src_namespace,
+                src_name,
+                mirror_name,
+            } => {
+                let mut labels = selector_labels(rc.instance);
+                labels.extend(rc.extra_labels.clone());
+                let dst = k8s_openapi::api::core::v1::Secret {
+                    metadata: ObjectMeta {
+                        name: Some(mirror_name.clone()),
+                        namespace: Some(namespace.to_string()),
+                        labels: Some(labels),
+                        owner_references: rc.owner.clone().map(|o| vec![o]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                io::mirror_secret(rc.client, src_namespace, src_name, dst)
+                    .await
+                    .map_err(|e| map_server_secret_error(e, mirror_name, namespace))?;
+            }
+        }
+    }
+    for stale in &creds_plan.reap {
+        // Best-effort: a failed reap must not wedge the server ensure — the
+        // mirror is operator-owned and the next reconcile retries.
+        if let Err(e) = io::delete_secret_if_present(rc.client, namespace, stale).await {
+            tracing::warn!(
+                secret = %stale,
+                namespace,
+                error = %e,
+                "failed to reap a stale kopia web-UI credential mirror; will retry next reconcile"
+            );
+        }
+    }
+    let creds_secrets = io::plain_creds(
+        creds_plan
+            .sources
+            .iter()
+            .map(|s| s.env_from_name().to_string())
+            .collect(),
+    );
+
+    // The identity the server pod runs as: the backend's workload-identity SA
+    // (preflighted), or the minted mover SA, or the namespace default.
+    let identity =
+        io::ensure_server_identity(rc.client, namespace, rc.backend, rc.service_account).await?;
 
     // Resolve auth → builder form + (for Generate) the credentials to mint once.
     let (auth, generated_secret_ref) = resolve_auth(rc, namespace, server).await?;
@@ -861,14 +1066,15 @@ async fn ensure_in(
         extra_labels: rc.extra_labels.clone(),
         image: rc.image,
         image_pull_policy: rc.image_pull_policy,
-        service_account: rc.service_account,
+        service_account: identity.service_account.as_deref(),
         repository,
         read_only,
         port,
         service_type,
         service_annotations,
         auth: auth.clone(),
-        creds_secret: &creds_secret_name,
+        creds_secrets,
+        azure_workload_identity: identity.azure_workload_identity,
         repo_volume,
         resources: server.resources.clone(),
         security_context: server.security_context.clone(),
