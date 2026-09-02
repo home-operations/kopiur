@@ -25,6 +25,7 @@ use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Pod;
 
 use kopiur_api::{Repository, Snapshot, SnapshotPolicy};
+use kopiur_e2e::consts::CONTROLLER_DEPLOYMENT;
 use kopiur_e2e::{
     E2E_NAMESPACE, Need, World, apply_secret, default_timeout, poll_interval, wait_until,
 };
@@ -32,8 +33,6 @@ use kopiur_e2e::{
 /// The election Lease name: the chart sets `KOPIUR_LEASE_NAME` to the release
 /// fullname, and the harness installs release `kopiur`.
 const LEASE_NAME: &str = "kopiur";
-/// The controller Deployment (`<fullname>-controller`).
-const CONTROLLER_DEPLOYMENT: &str = "kopiur-controller";
 /// The repository password Secret the chart-installed operator reads.
 const CREDS_SECRET: &str = "kopia-creds";
 

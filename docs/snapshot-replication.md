@@ -48,7 +48,7 @@ $ kubectl -n billing get snapshots -l kopiur.home-operations.com/origin=replicat
 | Field | What it does |
 | --- | --- |
 | `sourceRef` / `destinationRef` | The two repositories (`kind` defaults to `Repository`; both must exist, differ, and be `Ready`; the destination must be writable). |
-| `schedule.cron` / `jitter` | When replication runs (Jenkins-style `H` supported). Run it **after** your backup window so each night's snapshots are there to copy. |
+| `schedule.cron` / `jitter` | When replication runs (Jenkins-style `H` supported). Run it **after** your backup window so each night's snapshots are there to copy. An absent `jitter` inherits the **source** repository's [`scheduleDefaults.jitter`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once), as `timezone` already did; both are capped at 24h at admission. |
 | `selection.identities.include` / `exclude` | Which kopia identities to copy — see [Selecting what to copy](#selecting-what-to-copy). Omit `selection` entirely to copy **every** identity's full history. |
 | `selection.latestOnly` | `true` = only each identity's most recent snapshot (cheap seed); default `false` = full history. |
 | `migrate.parallel` | Snapshots migrated concurrently (kopia default: 1, sequential) — the main knob for large first runs. |
@@ -110,6 +110,12 @@ selection:
 ```
 
 Matching zero identities is a **successful no-op** (`NoIdentitiesMatched`), not an error — a fresh source simply has nothing to copy yet. Incomplete (interrupted) source snapshots are never copied.
+
+## It draws from the source repository's concurrency pool
+
+`kopia snapshot migrate` reads the **source** repository, so a run counts against that repository's [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) alongside its backups and restores — the destination's own cap does not gate it. Throttling (below) shapes *how hard* one run pulls; the cap bounds *how many* things pull at once.
+
+A run that arrives at a full pool is parked before its mover Job is created, with no side effects of any kind, and reports `RepositorySlotAvailable=False` (reason `WaitingForSlot`). It launches on its own when a slot frees, and the condition heals to `True` / `SlotAcquired` — retried while the run is in flight, else at the next run's spawn, if that heal write ever fails. See [Backups → limiting concurrent jobs per repository](backups.md#limiting-concurrent-jobs-per-repository).
 
 ## Throttling a replication
 

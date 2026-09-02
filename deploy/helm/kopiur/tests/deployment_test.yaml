@@ -142,6 +142,33 @@ tests:
             name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
             value: "5"
 
+  # The repository mover-Job pool backstop. Distinct env from the delete-job
+  # cap: they bound two different pools, and a chart that rendered one value
+  # into both would silently throttle backups with a delete cap.
+  - it: defaults the pooled mover-Job concurrency backstop to uncapped (0)
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MAX_CONCURRENT_JOBS
+            value: "0"
+
+  - it: renders a custom maxConcurrentJobs
+    set:
+      maxConcurrentJobs: 3
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MAX_CONCURRENT_JOBS
+            value: "3"
+      # The delete-job cap must be untouched by it.
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MAX_CONCURRENT_DELETE_JOBS
+            value: "0"
+
   # The apiserver-outage EMFILE fix: the reconcile cap defaults BOUNDED
   # (unlike the delete-job cap, which has batching as its primary protection).
   - it: defaults the reconcile concurrency cap to 8 per controller

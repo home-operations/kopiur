@@ -1,0 +1,134 @@
+# Example 43 — A repository tuned for real load: concurrency, jitter, pod labels
+#
+# The three knobs you reach for once a repository has more than a handful of
+# schedules pointed at it, applied together:
+#
+#   * spec.concurrency.maxConcurrentJobs — ONE pool per repository. Backups,
+#     restores and the SOURCE side of both replication kinds draw from it;
+#     maintenance, verification, pin, batched snapshot deletions, bootstrap and
+#     `kubectl kopiur browse` sessions do not. Absent or 0 means unlimited (the
+#     default). Restores are always admitted but still occupy a slot, so a
+#     restore displaces backups rather than adding to them.
+#   * spec.scheduleDefaults.{timezone,jitter} — inherited at reconcile time by
+#     every cron consumer that doesn't set its own value: SnapshotSchedule,
+#     SnapshotPolicy verification, Maintenance (quick + full), and both
+#     replication kinds. The consumer's own value always wins.
+#   * spec.moverDefaults.{podLabels,podAnnotations} — stamped on every mover
+#     pod. Labels are mirrored onto the Job as well; annotations are
+#     pod-template-only. Both merge UNDER kopiur's own keys, and keys under
+#     `kopiur.home-operations.com/` (plus `app.kubernetes.io/managed-by`) are
+#     rejected at admission rather than silently dropped.
+#
+# Field shapes verified against crates/api (externally-tagged backend: the
+# bucket lives under `backend.s3`, NOT `backend: { kind: S3 }`).
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nas-primary-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas-primary
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: my-backups
+      prefix: prod/
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: nas-primary-creds
+  encryption:
+    passwordSecretRef:
+      name: nas-primary-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+
+  # At most three mover Jobs against this repository at a time. A fourth run is
+  # PARKED before its Job is created — phase Pending plus
+  # RepositorySlotAvailable=False (reason WaitingForSlot), naming the counts —
+  # and launches by itself the moment a slot frees. There is no park deadline:
+  # a queued run waits, it does not fail. Watch the queue with
+  # `sum by (repository) (kopiur_snapshot_waiting_for_slot)`.
+  concurrency:
+    maxConcurrentJobs: 3
+
+  # Set once here, inherited by every cron below that omits its own value.
+  # jitter is DETERMINISTIC per (schedule UID, slot) — a restart or an HA
+  # failover never re-rolls it — and is capped at 24h at admission.
+  scheduleDefaults:
+    timezone: America/New_York
+    jitter: 10m
+
+  moverDefaults:
+    podLabels:
+      # Hand every mover Job to a Kueue LocalQueue. Kueue admits work by
+      # flipping `spec.suspend`, and a SUSPENDED Job has no pod and so does not
+      # occupy one of the three slots above — the two queues cannot deadlock
+      # each other. See docs/movers.md for the manageJobsWithoutQueueName hazard.
+      kueue.x-k8s.io/queue-name: backups
+      # A selector your NetworkPolicy / monitoring can key off.
+      egress-to-object-store: "true"
+    podAnnotations:
+      # Keep the service mesh out of a short-lived batch pod: an injected
+      # sidecar that never exits keeps the Job running forever.
+      sidecar.istio.io/inject: "false"
+
+  # Maintenance is outside the concurrency pool on purpose — it is the CURE for
+  # an overloaded repository, so it must never queue behind a full backup pool.
+  # Neither cron sets a timezone or jitter, so both inherit from
+  # scheduleDefaults above.
+  maintenance:
+    enabled: true
+    schedule:
+      quick: { cron: "0 */6 * * *" }
+      full: { cron: "0 3 * * *" }
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    kind: Repository
+    name: nas-primary
+  sources:
+    - pvc:
+        name: postgres-data
+  retention:
+    keepDaily: 14
+    keepWeekly: 4
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: postgres-data-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: postgres-data
+  schedule:
+    # Neither timezone nor jitter here: "H 2 * * *" fires ~2 a.m.
+    # America/New_York, spread over 10m, both inherited from the target policy's
+    # repository. The resolved pair is pinned to status.nextSchedule.{timezone,
+    # jitter}; editing either default re-triggers this schedule and recomputes
+    # the pinned slot, so the change lands on the NEXT firing.
+    cron: "H 2 * * *"
+    # Forbid (the default) skips a slot while this schedule's previous run is
+    # unfinished — including while that run is merely QUEUED behind the
+    # concurrency cap above. Deliberately no startingDeadlineSeconds: a deadline
+    # shorter than the longest queue would turn a throughput limit into
+    # permanently skipped runs.
+    concurrencyPolicy: Forbid

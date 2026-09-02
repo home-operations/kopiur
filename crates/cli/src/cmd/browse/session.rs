@@ -15,7 +15,7 @@ use kube::ResourceExt;
 use kube::api::{Api, AttachParams, DeleteParams, ListParams, LogParams, PostParams};
 use tokio::io::AsyncReadExt;
 
-use kopiur_api::common::RepositoryKind;
+use kopiur_api::common::{MoverDefaults, RepositoryKind};
 use kopiur_api::consts::{SESSION_BROWSE, SESSION_LABEL, SESSION_REPO_LABEL};
 use kopiur_kopia::SessionCmd;
 use kopiur_mover::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
@@ -83,6 +83,44 @@ pub fn session_labels(kind: RepositoryKind, name: &str) -> BTreeMap<String, Stri
             session_repo_label_value(kind, name),
         ),
     ])
+}
+
+/// Which of a repository's `moverDefaults` pod-metadata fields a browse SESSION
+/// pod takes, as `(pod_labels, pod_annotations)`.
+///
+/// **ASYMMETRIC ON PURPOSE: annotations yes, labels no.**
+///
+/// `podAnnotations` are applied because the canonical use is a mesh sidecar
+/// opt-out (`sidecar.istio.io/inject: "false"`), and that matters MORE for a
+/// session than for a batch mover: an injected sidecar that never exits would
+/// outlive the session's TTL and leave a pod running after the user's command
+/// returned.
+///
+/// `podLabels` are NOT applied, because the canonical `podLabels` value is a
+/// Kueue `kueue.x-k8s.io/queue-name` — which would park a human's interactive
+/// `kubectl kopiur browse` behind the nightly backup queue. That is the same
+/// hazard `kopiur_controller::pool` avoids by excluding `BrowseSession` from
+/// the repository concurrency pool: a person waiting at a terminal is not batch
+/// work, and the field alone cannot tell admission which it is.
+///
+/// A pure fn (not an inline expression at the Job-build site) so the asymmetry
+/// is assertable without a cluster.
+pub fn session_pod_metadata(defaults: Option<&MoverDefaults>) -> SessionPodMetadata {
+    SessionPodMetadata {
+        pod_labels: None,
+        pod_annotations: defaults.and_then(|d| d.pod_annotations.clone()),
+    }
+}
+
+/// What [`session_pod_metadata`] decides a session pod carries. `pod_labels` is
+/// a field rather than an omission so the deliberate `None` is visible at the
+/// Job-build site and cannot be "fixed" by someone who assumes it was forgotten.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionPodMetadata {
+    /// Always `None` — see [`session_pod_metadata`].
+    pub pod_labels: Option<BTreeMap<String, String>>,
+    /// `moverDefaults.podAnnotations`, passed through.
+    pub pod_annotations: Option<BTreeMap<String, String>>,
 }
 
 /// The `session-repo` label value, `<Kind>-<name>`, clamped to the 63-char
@@ -366,6 +404,7 @@ async fn create_session_job(
     // is no credential Secret to envFrom. Static-Secret repos keep no SA (the
     // session pod never talks to the kube API; the namespace default suffices).
     let workload_identity = kopiur_api::creds::backend_workload_identity(&target.repo.backend);
+    let session_pod_meta = session_pod_metadata(target.repo.mover_defaults.as_ref());
     let mut labels = labels.clone();
     if matches!(
         workload_identity,
@@ -399,6 +438,9 @@ async fn create_session_job(
         node_selector: None,
         tolerations: None,
         affinity: None,
+        // Annotations yes, labels no — see `session_pod_metadata` for why.
+        pod_labels: session_pod_meta.pod_labels,
+        pod_annotations: session_pod_meta.pod_annotations,
         labels,
         source_volume: None,
         repo_volume,
@@ -691,6 +733,38 @@ mod tests {
     }
 
     #[test]
+    fn a_browse_session_takes_pod_annotations_but_never_pod_labels() {
+        // The asymmetry is deliberate and load-bearing: a Kueue queue-name on an
+        // interactive session pod would park a human's `kubectl kopiur browse`
+        // behind the nightly backup queue.
+        let defaults: kopiur_api::common::MoverDefaults =
+            serde_json::from_value(serde_json::json!({
+                "podLabels": { "kueue.x-k8s.io/queue-name": "backups" },
+                "podAnnotations": { "sidecar.istio.io/inject": "false" },
+            }))
+            .expect("valid moverDefaults");
+
+        let meta = session_pod_metadata(Some(&defaults));
+        assert_eq!(
+            meta.pod_labels, None,
+            "a Kueue queue-name must never reach an interactive session pod",
+        );
+        assert_eq!(
+            meta.pod_annotations
+                .as_ref()
+                .and_then(|a| a.get("sidecar.istio.io/inject"))
+                .map(String::as_str),
+            Some("false"),
+            "a mesh opt-out MUST reach it — an injected sidecar outlives the TTL",
+        );
+
+        // No moverDefaults at all leaves both unset.
+        let bare = session_pod_metadata(None);
+        assert_eq!(bare.pod_labels, None);
+        assert_eq!(bare.pod_annotations, None);
+    }
+
+    #[test]
     fn session_labels_carry_the_wire_contract_keys() {
         let labels = session_labels(RepositoryKind::Repository, "nas");
         assert_eq!(labels[SESSION_LABEL], "browse");
@@ -778,6 +852,7 @@ mod tests {
                         key: None,
                     },
                 },
+                mover_defaults: None,
             },
             ca_bundle_pem: None,
         };

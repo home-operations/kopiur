@@ -97,7 +97,7 @@ The full apply-ready manifest — including the destination-backend `Secret` —
 | --- | --- |
 | `sourceRef` | The repository to mirror from (`Repository`/`ClusterRepository`; `kind` defaults to `Repository`). |
 | `destination` | The backend to mirror to. Externally tagged (`destination.s3`, `destination.filesystem`, …). Must differ from the source backend. Its `auth.secretRef` supplies the destination backend's **own** access credentials — see [Destination credentials](#destination-credentials). |
-| `schedule.cron` / `jitter` | When replication runs (Jenkins-style `H` supported, like a `SnapshotSchedule`). |
+| `schedule.cron` / `jitter` | When replication runs (Jenkins-style `H` supported, like a `SnapshotSchedule`). An absent `jitter` inherits the **source** repository's [`scheduleDefaults.jitter`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once), as `timezone` already did; both are capped at 24h at admission. |
 | `mover` | Per-run mover overrides (resources, scheduling, security context). Inherits the source repository's `moverDefaults`. |
 | `suspend` | Pause replication without deleting the CR. |
 | `sync` | Tuning knobs for the underlying `kopia repository sync-to` invocation — see [Tuning the sync](#tuning-the-sync) below. |
@@ -136,6 +136,14 @@ destination's copies too on the next scheduled run. It is named `deleteExtra` he
 rather than being mistaken for a leftover default.
 
 ///
+
+## Replication draws from the source repository's concurrency pool
+
+A replication run reads the **source** repository, so it counts against that repository's [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) alongside its backups and restores. The source is the right pool for it: `sync-to` reads every blob out of that backend, and a destination described by an inline `destination` block has no repository object to have a pool of its own.
+
+Like a backup, a replication run that arrives at a full pool is **parked before anything happens** — no mover Job, no credential projection, not even the destination-Secret presence check, because a queued run may wait an unbounded time and must not leave side effects behind while it does. It reports `RepositorySlotAvailable=False` (reason `WaitingForSlot`) naming the counts, and launches by itself when a slot frees.
+
+The condition heals to `True` / `SlotAcquired` once the Job exists. If that heal write fails, it is retried while the run is still in flight and, failing that, at the next run's spawn — so a running replication never sits advertising a queue it already left.
 
 ## Destination credentials
 

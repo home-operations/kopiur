@@ -204,6 +204,33 @@ pub const MAX_CONCURRENT_DELETE_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_DELETE_J
 /// [`ControllerConfig::max_concurrent_delete_jobs`]`: None`.
 pub const DEFAULT_MAX_CONCURRENT_DELETE_JOBS: usize = 0;
 
+/// Cluster-wide cap on concurrently running **pooled mover Jobs** — backups,
+/// restores and the source side of either replication — across EVERY
+/// repository. The same pool a repository's own
+/// `spec.concurrency.maxConcurrentJobs` bounds, one level up.
+///
+/// **The per-repository CRD field is the primary knob**; this is the
+/// cluster-operator's backstop for a node pool that cannot host N movers no
+/// matter which repositories they belong to. A run must satisfy BOTH: whichever
+/// cap it meets first holds it.
+///
+/// Restores are ALWAYS admitted and never held by either cap (a recovery in
+/// progress must not queue behind routine backups); a running restore still
+/// occupies a slot, so it displaces backups rather than adding to them.
+///
+/// `0` (or unset) means UNCAPPED — the default, and today's behavior. Uncapped
+/// costs nothing: with neither cap set the gate performs no Job LIST at all and
+/// never touches the admission ledger (`crate::pool::admit_or_park`). Reachable
+/// via the chart's top-level
+/// `maxConcurrentJobs` value.
+pub const MAX_CONCURRENT_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_JOBS";
+
+/// Fallback (raw, `0`-sentinel) cap when [`MAX_CONCURRENT_JOBS_ENV`] is unset:
+/// uncapped, i.e. every repository's own `spec.concurrency` is the only bound.
+/// [`ControllerArgs::resolve`] turns this sentinel into
+/// [`ControllerConfig::max_concurrent_jobs`]`: None`.
+pub const DEFAULT_MAX_CONCURRENT_JOBS: usize = 0;
+
 /// Per-controller cap on concurrently running reconciles (the operator runs 8
 /// controllers, so the process-wide worst case is 8× this). Unlike
 /// [`MAX_CONCURRENT_DELETE_JOBS_ENV`] — where batching is the primary
@@ -468,6 +495,18 @@ pub struct ControllerArgs {
           default_value_t = DEFAULT_MAX_CONCURRENT_DELETE_JOBS,
           value_parser = parse_max_concurrent_delete_jobs)]
     pub max_concurrent_delete_jobs: usize,
+
+    /// Cluster-wide cap on concurrently running pooled mover Jobs (backups,
+    /// restores, replication sources) across every repository — the backstop
+    /// under each repository's own `spec.concurrency.maxConcurrentJobs`. `0`
+    /// (the default) means uncapped; restores are always admitted. Raw `usize`,
+    /// `0`-sentinel — resolved to
+    /// [`ControllerConfig::max_concurrent_jobs`]`: Option<NonZeroUsize>` in
+    /// [`ControllerArgs::resolve`].
+    #[arg(long, env = MAX_CONCURRENT_JOBS_ENV,
+          default_value_t = DEFAULT_MAX_CONCURRENT_JOBS,
+          value_parser = parse_max_concurrent_jobs)]
+    pub max_concurrent_jobs: usize,
 
     /// Per-controller cap on concurrently running reconciles. `0` means
     /// unbounded (the pre-fix behavior; not recommended — see
@@ -805,6 +844,15 @@ pub struct ControllerConfig {
     /// primary protection; this is an opt-in backstop. `Option<NonZeroUsize>`
     /// so "no cap" can't be mistaken for "cap of zero" at any call site.
     pub max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
+    /// Cluster-wide cap on concurrently running POOLED mover Jobs (backup,
+    /// restore, replication-source) across every repository — the backstop
+    /// beneath each repository's own `spec.concurrency.maxConcurrentJobs`, which
+    /// remains the primary knob. `None` (the default) means UNCAPPED, and an
+    /// uncapped install pays nothing: the gate skips its Job LIST entirely when
+    /// neither cap is set. Restores are never held by either cap.
+    /// `Option<NonZeroUsize>` so "no cap" can't be mistaken for "cap of zero" —
+    /// which would mean a cluster that never runs another mover.
+    pub max_concurrent_jobs: Option<std::num::NonZeroUsize>,
     /// Per-controller cap on concurrently running reconciles. `None` means
     /// UNBOUNDED (the explicit `0` escape hatch — the pre-fix behavior, not
     /// recommended); the default is BOUNDED at
@@ -911,6 +959,8 @@ impl ControllerArgs {
             max_concurrent_delete_jobs: std::num::NonZeroUsize::new(
                 self.max_concurrent_delete_jobs,
             ),
+            // `0` ⇔ `None` (uncapped): the per-repository cap is the only bound.
+            max_concurrent_jobs: std::num::NonZeroUsize::new(self.max_concurrent_jobs),
             reconcile_concurrency: std::num::NonZeroU16::new(self.reconcile_concurrency),
             // `0` ⇔ `None` (park indefinitely, never flip to Failed).
             source_pvc_deadline: (self.source_pvc_deadline_seconds > 0)
@@ -980,6 +1030,27 @@ fn parse_max_concurrent_delete_jobs(value: &str) -> Result<usize, String> {
             "KOPIUR_MAX_CONCURRENT_DELETE_JOBS='{value}' is not a valid job count; use a \
              non-negative integer (0 = uncapped, the default); unset it to use the default \
              {DEFAULT_MAX_CONCURRENT_DELETE_JOBS}"
+        )
+    })
+}
+
+/// Value parser for [`MAX_CONCURRENT_JOBS_ENV`]. Empty means "unset" (→ the
+/// default, uncapped); `0` is explicitly valid and ALSO means uncapped, matching
+/// the CRD field it backstops (`kopiur_api::consts::effective_max_concurrent_jobs`
+/// collapses `0` to `None` for exactly the same reason). Only garbage (not a
+/// non-negative integer) is rejected — loudly, because silently defaulting a
+/// typo'd cap to "uncapped" would leave an operator believing a backstop is in
+/// place that is not.
+fn parse_max_concurrent_jobs(value: &str) -> Result<usize, String> {
+    if value.is_empty() {
+        return Ok(DEFAULT_MAX_CONCURRENT_JOBS);
+    }
+    value.parse::<usize>().map_err(|_| {
+        format!(
+            "KOPIUR_MAX_CONCURRENT_JOBS='{value}' is not a valid job count; use a non-negative \
+             integer (0 = uncapped, the default) — this is the CLUSTER-WIDE backstop under each \
+             repository's spec.concurrency.maxConcurrentJobs; unset it to use the default \
+             {DEFAULT_MAX_CONCURRENT_JOBS}"
         )
     })
 }
@@ -1456,6 +1527,73 @@ mod tests {
             resolve(&["--max-concurrent-delete-jobs", "10"]).max_concurrent_delete_jobs,
             std::num::NonZeroUsize::new(10)
         );
+    }
+
+    // --- KOPIUR_MAX_CONCURRENT_JOBS: the cluster-wide POOL backstop under each
+    // repository's own spec.concurrency.maxConcurrentJobs. Same `0`-means-
+    // uncapped idiom as the delete-job cap and as the CRD field it backstops. ---
+
+    #[test]
+    #[serial]
+    fn max_concurrent_jobs_defaults_to_uncapped() {
+        // The default install must be byte-identical to pre-feature behavior:
+        // `None` here is what makes the gate skip its Job LIST entirely.
+        assert_eq!(resolve(&[]).max_concurrent_jobs, None);
+    }
+
+    #[test]
+    #[serial]
+    fn max_concurrent_jobs_zero_means_uncapped() {
+        assert_eq!(
+            resolve(&["--max-concurrent-jobs", "0"]).max_concurrent_jobs,
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn max_concurrent_jobs_garbage_fails_loudly() {
+        // A typo'd backstop must not silently become "no backstop": the
+        // operator would believe a cap is in place that is not.
+        let err =
+            ControllerArgs::try_parse_from(["kopiur-controller", "--max-concurrent-jobs", "lots"])
+                .expect_err("garbage job count must not silently default");
+        let msg = err.to_string();
+        assert!(msg.contains("KOPIUR_MAX_CONCURRENT_JOBS='lots'"), "{msg}");
+        assert!(msg.contains("0 = uncapped"), "{msg}");
+        // The message must point at the primary knob, not just itself.
+        assert!(
+            msg.contains("spec.concurrency.maxConcurrentJobs"),
+            "the error must name the per-repository field it backstops: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn max_concurrent_jobs_flag_overrides_the_default() {
+        assert_eq!(
+            resolve(&["--max-concurrent-jobs", "4"]).max_concurrent_jobs,
+            std::num::NonZeroUsize::new(4)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn max_concurrent_jobs_is_distinct_from_the_delete_job_cap() {
+        // Two different pools, two different env vars — a rename that collapsed
+        // them would silently throttle backups with a delete cap (or vice versa).
+        let cfg = resolve(&[
+            "--max-concurrent-jobs",
+            "2",
+            "--max-concurrent-delete-jobs",
+            "7",
+        ]);
+        assert_eq!(cfg.max_concurrent_jobs, std::num::NonZeroUsize::new(2));
+        assert_eq!(
+            cfg.max_concurrent_delete_jobs,
+            std::num::NonZeroUsize::new(7)
+        );
+        assert_ne!(MAX_CONCURRENT_JOBS_ENV, MAX_CONCURRENT_DELETE_JOBS_ENV);
     }
 
     // --- kube client timeouts (apiserver-outage incident): the defaults were

@@ -67,7 +67,7 @@ each `repository` is a **full registry + path** string:
 - **mover** — `mover.image.*` (its own `mover.image.pullPolicy`).
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:71:83"
+--8<-- "deploy/helm/kopiur/values.yaml:62:86"
 ```
 
 Each image takes a `tag` (defaults to the chart's `appVersion` when empty) or a
@@ -136,7 +136,7 @@ namespaces it manages, so each is gated behind a Helm flag — the chart does
 names match the CRD field that triggers them.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:239:253"
+--8<-- "deploy/helm/kopiur/values.yaml:303:332"
 ```
 
 | CRD field you set… | …needs this Helm flag | Grants `secrets` |
@@ -159,7 +159,7 @@ symptom→fix loop.
 ## ServiceAccount
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:216:224"
+--8<-- "deploy/helm/kopiur/values.yaml:290:301"
 ```
 
 Set `serviceAccount.create: false` to bring your own. The `annotations` map is
@@ -174,7 +174,7 @@ The controller's knobs live at the **root** of the values file (no `controller.`
 prefix): a root-level workload key applies to the controller alone.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:89:162"
+--8<-- "deploy/helm/kopiur/values.yaml:89:239"
 ```
 
 The operator itself. The settings worth knowing:
@@ -213,6 +213,30 @@ and racing status writes. Only disable it at `replicaCount: 1`.
 - **`workerThreads`** — Tokio worker threads for the controller runtime
   (default `2`). The controller is I/O-bound, so a small pool is ample; raise
   only for a reconcile-heavy deployment.
+- **`reconcileConcurrency`** — per-controller cap on concurrently running
+  reconciles (default `8`; the operator runs 8 controllers, so ≤64 process-wide).
+  This is the one cap on this page that is **bounded by default**, because
+  unbounded reconcile concurrency is what let an apiserver flap exhaust the
+  controller's file descriptors within seconds. `0` = unbounded, not recommended.
+- **`maxConcurrentJobs`** — cluster-wide cap on **pooled mover Jobs**: backup
+  snapshots, restores, and the source side of either replication, counted across
+  all repositories (default `0` = uncapped). This is the cluster-operator's
+  *backstop*; the primary knob is each repository's own
+  [`spec.concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once).
+  A run must satisfy both, and whichever cap it meets first parks it. Reach for
+  this one when the **node pool** cannot host N movers regardless of which
+  repositories they belong to; reach for the per-repository field when one
+  **backend** is the thing that must not be saturated. Restores are always
+  admitted and never queued (a running restore still occupies a slot);
+  maintenance, verification, pin and snapshot-delete Jobs are outside the pool
+  entirely. Leaving it at `0` costs nothing — with no cap set anywhere the
+  operator performs no extra API calls at all.
+- **`maxConcurrentDeleteJobs`** — cluster-wide cap on concurrent `snapdel-*`
+  batch-delete Jobs (default `0` = uncapped). A *separate* pool from
+  `maxConcurrentJobs`: a deletion reduces repository load and is already batched
+  one-Job-per-repository, so queuing it behind backups would grow the backlog it
+  exists to drain. It does not gate whether a deletion is *allowed* — that is
+  `deletionProtection.threshold` on the repository.
 - **`extraVolumes` / `extraVolumeMounts`** — the way to make a **filesystem
   backend** reachable in-process (hostPath / NFS / PVC), so the controller can
   run its short idempotent kopia ops. The e2e harness uses a hostPath here.
@@ -241,7 +265,7 @@ ceiling first. See `crates/e2e/tests/lifecycle.rs`.
 ### Controller port & probes
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:186:211"
+--8<-- "deploy/helm/kopiur/values.yaml:263:288"
 ```
 
 The controller has a single operational port, `metrics.port` (default `8081`),
@@ -279,7 +303,7 @@ it), `webhook.replicaCount`, scheduling (`webhook.nodeSelector` /
 security](#pod-security)). A root-level workload key never touches it.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:381:427"
+--8<-- "deploy/helm/kopiur/values.yaml:454:509"
 ```
 
 - **`enabled`** — when `false`, validation falls back to the controller's
@@ -297,7 +321,7 @@ security](#pod-security)). A root-level workload key never touches it.
 ### Webhook TLS
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:480:510"
+--8<-- "deploy/helm/kopiur/values.yaml:562:592"
 ```
 
 The webhook **always** serves TLS (Kubernetes requires HTTPS for admission);
@@ -316,7 +340,7 @@ TLS](install.md#webhook-tls).
 ## Monitoring (Prometheus & Grafana)
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:321:373"
+--8<-- "deploy/helm/kopiur/values.yaml:391:452"
 ```
 
 All metrics are under the `kopiur_` namespace and served via a Prometheus **pull**
@@ -365,7 +389,7 @@ The webhook's own HTTPS scrape lives separately under
 ## OpenTelemetry (OTLP)
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:297:310"
+--8<-- "deploy/helm/kopiur/values.yaml:367:389"
 ```
 
 Off by default. Metrics are **always** available via the `/metrics` pull endpoint;
@@ -382,7 +406,7 @@ and a sample collector config.
 ## Logging
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:279:286"
+--8<-- "deploy/helm/kopiur/values.yaml:348:365"
 ```
 
 Controls the stdout (`kubectl logs`) logging every component writes. The
@@ -441,7 +465,7 @@ a filesystem/NFS-backed repository for in-process kopia ops) never loosens the
 webhook.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:164:184"
+--8<-- "deploy/helm/kopiur/values.yaml:241:261"
 ```
 
 Defaults for both: non-root **uid/gid 65534 (nobody)**, `runAsNonRoot`, a
@@ -450,7 +474,7 @@ filesystem, and all capabilities dropped (the images are `distroless:nonroot`).
 The webhook's own block:
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:428:444"
+--8<-- "deploy/helm/kopiur/values.yaml:510:526"
 ```
 
 /// note | This is the operator's security context, not the mover's

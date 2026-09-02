@@ -22,6 +22,7 @@ use crate::snapshot_policy::Source;
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use kube_quantity::ParsedQuantity;
 
+mod admission;
 mod backend;
 mod identity;
 mod repository;
@@ -29,6 +30,7 @@ mod restore;
 mod snapshot;
 mod snapshot_replication_overlap;
 
+pub use admission::*;
 pub use backend::*;
 pub use identity::*;
 pub use repository::*;
@@ -559,6 +561,109 @@ pub fn validate_jitter(field: &str, jitter: Option<&str>) -> ValidationResult {
         });
     }
     Ok(())
+}
+
+/// The largest jitter window any cron may carry: 24 hours.
+///
+/// Jitter is a deterministic spread WITHIN a cron period, not an offset that moves
+/// the schedule. Beyond a day the spread exceeds every cadence kopiur schedules
+/// (the coarsest built-in default is a daily full maintenance), so a larger value
+/// is always a misunderstanding — typically an attempt to say "run 30h after the
+/// slot", which jitter cannot express.
+pub const MAX_JITTER: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+/// Validate a **present** Go-style `jitter` duration: it must parse (same parser
+/// [`validate_jitter`] and the scheduler use) AND must not exceed [`MAX_JITTER`].
+///
+/// The bounds half is a TIGHTENING of an existing rule, so it is admission-only —
+/// the controller re-runs the shared aggregates as a hard stop at reconcile, and
+/// adding this to one of them would brick a stored CR carrying an over-24h jitter
+/// rather than merely refusing the next edit. Call it from the webhook's per-kind
+/// `validate_*_admission_extras`, never from a shared aggregate.
+///
+/// Takes a bare `&str` (not `Option<&str>`) because every caller is already inside
+/// an `if let Some(j)` over the field it is checking.
+///
+/// ```
+/// use kopiur_api::validate::validate_jitter_bounds;
+///
+/// assert!(validate_jitter_bounds("spec.schedule.jitter", "10m").is_ok());
+/// // Exactly the cap is fine; a second past it is not.
+/// assert!(validate_jitter_bounds("spec.schedule.jitter", "24h").is_ok());
+/// assert!(validate_jitter_bounds("spec.schedule.jitter", "86401s").is_err());
+/// // Garbage is rejected by the parse half.
+/// assert!(validate_jitter_bounds("spec.schedule.jitter", "soon").is_err());
+/// ```
+pub fn validate_jitter_bounds(field: &str, jitter: &str) -> ValidationResult {
+    // Parse first, reusing `validate_jitter` so a typo reads identically whichever
+    // validator catches it. Its `None` arm is the only unparseable case, so a bare
+    // `let else` back into that same error keeps this panic-free rather than
+    // leaning on an `expect` that "cannot" fire.
+    let Some(parsed) = crate::duration::parse_go_duration(jitter) else {
+        validate_jitter(field, Some(jitter))?;
+        // Unreachable in practice (validate_jitter rejects exactly what fails to
+        // parse) — but expressed as a value, not a panic: this is backup software.
+        return Ok(());
+    };
+    if parsed > MAX_JITTER {
+        return Err(ValidationError::InvalidFieldValue {
+            field: field.to_string(),
+            reason: format!(
+                "jitter of {jitter} exceeds the 24h maximum — jitter is a per-slot spread \
+                 within a cron period, not a schedule offset; use a window smaller than the \
+                 cron period (e.g. 10m), or move the offset into the cron expression"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Keys a user may not set in `moverDefaults.podLabels`/`podAnnotations`: anything
+/// under kopiur's own domain prefix, plus the exact `app.kubernetes.io/managed-by`
+/// key.
+///
+/// Both are keys the controller stamps itself. Extra pod metadata merges UNDER
+/// kopiur's, so a collision is silently DROPPED at render time — the manifest would
+/// claim a label the pod never carries. Reject it instead of ignoring it (the same
+/// reasoning as the replication mover's `inheritSecurityContextFrom` refusal).
+const RESERVED_POD_METADATA_KEYS: &[&str] = &["app.kubernetes.io/managed-by"];
+
+/// kopiur's own label/annotation domain prefix. Everything under it is
+/// operator-owned wire contract (see [`crate::consts`]).
+const KOPIUR_KEY_PREFIX: &str = "kopiur.home-operations.com/";
+
+/// Validate `moverDefaults.podLabels`/`podAnnotations` key sets, accumulating every
+/// reserved key so a user fixes them all in one apply.
+///
+/// New fields, so this is safe in the shared repository aggregates the controller
+/// re-runs: no stored object can carry a key this rejects.
+pub fn validate_pod_metadata(defaults: &crate::common::MoverDefaults) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    for (field, map) in [
+        ("moverDefaults.podLabels", defaults.pod_labels.as_ref()),
+        (
+            "moverDefaults.podAnnotations",
+            defaults.pod_annotations.as_ref(),
+        ),
+    ] {
+        let Some(map) = map else { continue };
+        for key in map.keys() {
+            let reserved = key.starts_with(KOPIUR_KEY_PREFIX)
+                || RESERVED_POD_METADATA_KEYS.contains(&key.as_str());
+            if reserved {
+                errs.push(ValidationError::InvalidFieldValue {
+                    field: format!("{field}[{key:?}]"),
+                    reason: format!(
+                        "{key:?} is reserved by kopiur — the operator stamps this key on every \
+                         mover pod and its own value wins the merge, so the value here would be \
+                         silently dropped. Use a key outside `{KOPIUR_KEY_PREFIX}` (and not \
+                         `app.kubernetes.io/managed-by`)"
+                    ),
+                });
+            }
+        }
+    }
+    errs
 }
 
 /// Validate an optional IANA timezone name against the same `chrono-tz` database the

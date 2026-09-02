@@ -217,7 +217,13 @@ async fn handle_snapshot_policy(
             source,
         })?;
 
-    let errs = api::validate::validate_backup_config(&spec);
+    let mut errs = api::validate::validate_backup_config(&spec);
+    // Admission-ONLY extras (see `api::validate::admission`): rules that tighten a
+    // pre-existing field, kept out of the shared aggregate the reconciler re-runs
+    // so they refuse the next bad edit without bricking a stored CR.
+    errs.extend(api::validate::validate_backup_config_admission_extras(
+        &spec,
+    ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -603,7 +609,12 @@ fn handle_snapshot_schedule(
             source,
         })?;
 
-    let errs = api::validate::validate_backup_schedule(&spec);
+    let mut errs = api::validate::validate_backup_schedule(&spec);
+    // Admission-only: the jitter 24h cap and the non-negative
+    // `startingDeadlineSeconds` rule, both tightenings over stored fields.
+    errs.extend(api::validate::validate_backup_schedule_admission_extras(
+        &spec,
+    ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -716,7 +727,10 @@ async fn handle_maintenance(
             source,
         })?;
 
-    let errs = api::validate::validate_maintenance(&spec);
+    let mut errs = api::validate::validate_maintenance(&spec);
+    // Admission-only: the quick/full jitter windows, which the shared aggregate has
+    // never validated at all — so PARSE and bound are both new rejections here.
+    errs.extend(api::validate::validate_maintenance_admission_extras(&spec));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -781,7 +795,9 @@ async fn handle_repository_replication(
             source,
         })?;
 
-    let errs = api::validate::validate_repository_replication(&spec);
+    let mut errs = api::validate::validate_repository_replication(&spec);
+    // Admission-only: the schedule jitter, never validated by the shared aggregate.
+    errs.extend(api::validate::validate_repository_replication_admission_extras(&spec));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -846,7 +862,9 @@ async fn handle_snapshot_replication(
             source,
         })?;
 
-    let errs = api::validate::validate_snapshot_replication(&spec);
+    let mut errs = api::validate::validate_snapshot_replication(&spec);
+    // Admission-only: the jitter 24h cap (the parse half is already shared).
+    errs.extend(api::validate::validate_snapshot_replication_admission_extras(&spec));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -2994,6 +3012,225 @@ mod tests {
         let spec = json!({
             "backend": { "s3": { "bucket": "live", "endpoint": "s3.local" } },
             "encryption": { "passwordSecretRef": { "name": "creds" } },
+        });
+        let resp = dispatch(&admission_request("Repository", spec), None).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    // --- M1: admission-only extras are actually wired into each handler --------
+    //
+    // The `api::validate::admission` rules are useless unless the per-kind handler
+    // calls them, and a missed call site is invisible to the api crate's own unit
+    // tests (the pure fn passes; nobody runs it). These go through `dispatch`, the
+    // real entry point, so they fail if a handler drops its extras call.
+
+    /// Assert a request is denied with a message containing `needle`.
+    async fn assert_denied_containing(req: AdmissionRequest<DynamicObject>, needle: &str) {
+        let resp = dispatch(&req, None).await;
+        assert!(!resp.allowed, "must be denied");
+        let msg = resp.result.message;
+        assert!(
+            msg.contains(needle),
+            "denial message {msg:?} lacks {needle:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schedule_with_an_over_cap_jitter_is_denied() {
+        let spec = json!({
+            "policyRef": { "name": "pg" },
+            "schedule": { "cron": "0 2 * * *", "jitter": "25h" },
+        });
+        assert_denied_containing(
+            admission_request("SnapshotSchedule", spec),
+            "exceeds the 24h maximum",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_schedule_with_a_negative_starting_deadline_is_denied() {
+        let spec = json!({
+            "policyRef": { "name": "pg" },
+            "schedule": { "cron": "0 2 * * *", "startingDeadlineSeconds": -1 },
+        });
+        assert_denied_containing(
+            admission_request("SnapshotSchedule", spec),
+            "SkipExpired forever",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_schedule_is_still_admitted() {
+        // Regression guard: the extras must not reject the shapes users already run.
+        let spec = json!({
+            "policyRef": { "name": "pg" },
+            "schedule": { "cron": "0 2 * * *", "jitter": "30m", "startingDeadlineSeconds": 300 },
+        });
+        let resp = dispatch(&admission_request("SnapshotSchedule", spec), None).await;
+        assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    #[tokio::test]
+    async fn a_policy_with_an_over_cap_verification_jitter_is_denied() {
+        let spec = json!({
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{ "pvc": { "name": "data" } }],
+            "verification": {
+                "quick": { "schedule": { "cron": "0 4 * * *", "jitter": "30h" } },
+            },
+        });
+        assert_denied_containing(
+            admission_request("SnapshotPolicy", spec),
+            "spec.verification.quick.schedule.jitter",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_maintenance_with_a_garbage_jitter_is_denied() {
+        // `validate_maintenance` never looked at these fields, so this denial only
+        // exists because the handler calls the extras.
+        let spec = json!({
+            "repository": { "kind": "Repository", "name": "nas" },
+            "ownership": { "owner": "kopiur/nas" },
+            "schedule": {
+                "quick": { "cron": "0 */6 * * *", "jitter": "nonsense" },
+                "full": { "cron": "0 3 * * 0", "jitter": "1h" },
+            },
+        });
+        assert_denied_containing(
+            admission_request("Maintenance", spec),
+            "spec.schedule.quick.jitter",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_repository_replication_with_an_over_cap_jitter_is_denied() {
+        let spec = json!({
+            "sourceRef": { "kind": "Repository", "name": "nas" },
+            "destination": { "filesystem": { "path": "/mirror" } },
+            "schedule": { "cron": "0 4 * * *", "jitter": "48h" },
+        });
+        assert_denied_containing(
+            admission_request("RepositoryReplication", spec),
+            "exceeds the 24h maximum",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_replication_with_an_over_cap_jitter_is_denied() {
+        let spec = json!({
+            "sourceRef": { "kind": "Repository", "name": "nas" },
+            "destinationRef": { "kind": "Repository", "name": "offsite" },
+            "schedule": { "cron": "0 4 * * *", "jitter": "30h" },
+        });
+        assert_denied_containing(
+            admission_request("SnapshotReplication", spec),
+            "exceeds the 24h maximum",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_a_reserved_pod_label_is_denied() {
+        let spec = json!({
+            "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+            "moverDefaults": { "podLabels": { "kopiur.home-operations.com/config": "x" } },
+        });
+        assert_denied_containing(
+            admission_request("Repository", spec),
+            "is reserved by kopiur",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_an_over_cap_schedule_defaults_jitter_is_denied() {
+        let spec = json!({
+            "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+            "scheduleDefaults": { "jitter": "25h" },
+        });
+        assert_denied_containing(
+            admission_request("Repository", spec),
+            "spec.scheduleDefaults.jitter",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cluster_repository_with_reserved_pod_metadata_is_denied() {
+        // The `ClusterRepository` mirror of the Repository case above. Both kinds
+        // route through `validate_pod_metadata`, but through DIFFERENT dispatch
+        // arms (`validate_cluster_repository` vs `validate_repository`), so only a
+        // per-kind test proves the rule is actually wired into both.
+        //
+        // BOTH maps, separately: `validate_pod_metadata` walks `podLabels` and
+        // `podAnnotations` in one loop today, but a future split (they already
+        // differ in where they are applied — labels reach the Job, annotations are
+        // pod-template-only) could drop one arm, and a single-map test would not
+        // notice. The two reserved SHAPES are covered one each: the kopiur domain
+        // prefix and the exact `app.kubernetes.io/managed-by` key.
+        let base = |mover_defaults: serde_json::Value| {
+            json!({
+                "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+                "encryption": {
+                    "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" }
+                },
+                "allowedNamespaces": { "all": true },
+                "moverDefaults": mover_defaults,
+            })
+        };
+        assert_denied_containing(
+            admission_request(
+                "ClusterRepository",
+                base(json!({ "podLabels": { "kopiur.home-operations.com/config": "x" } })),
+            ),
+            "is reserved by kopiur",
+        )
+        .await;
+        assert_denied_containing(
+            admission_request(
+                "ClusterRepository",
+                base(json!({ "podAnnotations": { "app.kubernetes.io/managed-by": "argocd" } })),
+            ),
+            "is reserved by kopiur",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cluster_repository_with_an_over_cap_schedule_defaults_jitter_is_denied() {
+        let spec = json!({
+            "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+            "encryption": { "passwordSecretRef": { "name": "creds", "namespace": "kopiur-system" } },
+            "allowedNamespaces": { "all": true },
+            "scheduleDefaults": { "jitter": "48h" },
+        });
+        assert_denied_containing(
+            admission_request("ClusterRepository", spec),
+            "spec.scheduleDefaults.jitter",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_concurrency_and_pod_metadata_is_admitted() {
+        // The happy path for everything M1 adds, end to end through the webhook.
+        let spec = json!({
+            "backend": { "s3": { "bucket": "b", "endpoint": "https://minio" } },
+            "encryption": { "passwordSecretRef": { "name": "creds" } },
+            "concurrency": { "maxConcurrentJobs": 3 },
+            "scheduleDefaults": { "timezone": "America/Chicago", "jitter": "10m" },
+            "moverDefaults": {
+                "podLabels": { "kueue.x-k8s.io/queue-name": "backups" },
+                "podAnnotations": { "sidecar.istio.io/inject": "false" },
+            },
         });
         let resp = dispatch(&admission_request("Repository", spec), None).await;
         assert!(resp.allowed, "{:?}", resp.result.message);

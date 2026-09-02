@@ -297,6 +297,24 @@ jobs:
           - shard: repo-breaker
             bins: "repo_breaker"
             backends: true
+          # Per-repository mover-Job concurrency (spec.concurrency.maxConcurrentJobs
+          # + the KOPIUR_MAX_CONCURRENT_JOBS backstop). Own shard for two
+          # independent reasons: every scenario swaps the operator's
+          # KOPIUR_MOVER_IMAGE for the slow-mover fixture and waits out a
+          # rollout (so the whole cluster's movers crawl inside the window),
+          # and the backstop scenario additionally patches the controller's env
+          # and waits out two more rollouts. Both restore on exit, but the
+          # restarts inside those windows must not race another binary's
+          # reconciles. Filesystem only (isolated repo subpaths per scenario).
+          # Also carries the `concurrencyPolicy: Replace` scenario, which runs an
+          # every-minute schedule and deliberately TRIPS its own repository's
+          # mass-deletion breaker (threshold 1 + a held decoy wave) so the
+          # replaced run's operator-prune exemption is measured against a breaker
+          # that is actually firing. Both are scoped to `conc-replace`, but any
+          # other binary sharing that repo would be caught in the held wave.
+          - shard: concurrency
+            bins: "concurrency"
+            backends: false
           # Namespaced install (installScope=namespaced, Role-only RBAC): the
           # operator must reconcile its release namespace (the pre-scoping
           # controller sat Ready-but-inert on 403'd cluster-wide watches) and

@@ -4,7 +4,7 @@
 //! fn just fetches and delegates.
 
 use kopiur_api::backend::Backend;
-use kopiur_api::common::{Encryption, RepositoryKind};
+use kopiur_api::common::{Encryption, MoverDefaults, RepositoryKind};
 use kopiur_api::creds::mover_creds_secret_refs;
 use kopiur_api::{ClusterRepository, Repository, Snapshot};
 use kube::Api;
@@ -31,6 +31,19 @@ pub struct RepoHandle {
     pub backend: Backend,
     /// The encryption (password Secret) settings.
     pub encryption: Encryption,
+    /// The repository's `moverDefaults`. A browse session deliberately applies
+    /// none of the placement/resource/security layers (it is an interactive
+    /// read-only pod on the hardened baseline), and it takes only
+    /// **`podAnnotations`** from this — a mesh sidecar that never exits would
+    /// keep the session Job alive past its TTL.
+    ///
+    /// `podLabels` are deliberately NOT applied, and the asymmetry is the
+    /// point: the canonical `podLabels` value is a Kueue
+    /// `kueue.x-k8s.io/queue-name`, which would park a human's interactive
+    /// browse session behind the nightly backup queue — the same reason
+    /// `kopiur_controller::pool` keeps `BrowseSession` out of the repository
+    /// concurrency pool.
+    pub mover_defaults: Option<MoverDefaults>,
 }
 
 /// A fully-resolved browse target: the kopia snapshot id plus its repository.
@@ -162,6 +175,7 @@ pub async fn resolve(ctx: &KubeCtx, snapshot_name: &str) -> Result<BrowseTarget,
                 namespace: Some(repo_ns),
                 backend: r.spec.backend.clone(),
                 encryption: r.spec.encryption.clone(),
+                mover_defaults: r.spec.mover_defaults.clone(),
             }
         }
         RepositoryKind::ClusterRepository => {
@@ -183,6 +197,7 @@ pub async fn resolve(ctx: &KubeCtx, snapshot_name: &str) -> Result<BrowseTarget,
                 namespace: None,
                 backend: r.spec.backend.clone(),
                 encryption: r.spec.encryption.clone(),
+                mover_defaults: r.spec.mover_defaults.clone(),
             }
         }
     };
@@ -385,6 +400,7 @@ pub async fn resolve_repo(
                 namespace: Some(ns),
                 backend: r.spec.backend.clone(),
                 encryption: r.spec.encryption.clone(),
+                mover_defaults: r.spec.mover_defaults.clone(),
             })
         }
         RepositoryKind::ClusterRepository => {
@@ -406,6 +422,7 @@ pub async fn resolve_repo(
                 namespace: None,
                 backend: r.spec.backend.clone(),
                 encryption: r.spec.encryption.clone(),
+                mover_defaults: r.spec.mover_defaults.clone(),
             })
         }
     }
@@ -482,6 +499,7 @@ mod tests {
                     namespace: secret_ns.map(str::to_string),
                 },
             },
+            mover_defaults: None,
         }
     }
 

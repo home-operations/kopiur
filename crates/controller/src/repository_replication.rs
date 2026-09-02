@@ -15,9 +15,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
+use kopiur_api::common::ScheduleDefaults;
 use kopiur_api::{RepositoryReplication, RepositoryReplicationPhase, validate};
 use kopiur_mover::workspec::{
     MoverOptions, MoverWorkSpec, Operation, ReplicateOp, ResolvedIdentity, TargetRef,
@@ -33,10 +35,12 @@ use crate::io::{self, ResolvedRepository};
 use crate::jobs::{self, JobLimits, MoverJobInputs, VolumeMountSpec};
 use crate::metrics::{ReplicationKind, ReplicationRunTrigger};
 use crate::naming::short_hash;
+use crate::pool::slot_gate_is_false;
 use crate::replication_run::{
-    RunObservation, RunRequest, RunStall, idle_report, manual_replication_job_name,
-    manual_run_request, manual_run_status, observe_and_count_runs, recorded_running,
-    run_job_annotations, suspended_manual_run, suspended_report,
+    ReplicationPoolGate, RunObservation, RunRequest, RunStall, heal_replication_slot_condition,
+    idle_report, manual_replication_job_name, manual_run_request, manual_run_status,
+    observe_and_count_runs, recorded_running, replication_pool_gate, run_job_annotations,
+    suspended_manual_run, suspended_report,
 };
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
@@ -210,12 +214,10 @@ async fn drive_schedule(
     observed: RunObservation,
 ) -> Result<Action> {
     let now = Utc::now();
-    // GitHub #174 item 3: `spec.schedule.timezone` wins; else the source
-    // repository's `scheduleDefaults.timezone`; else UTC.
-    let repo_tz = repo
-        .schedule_defaults
-        .as_ref()
-        .and_then(|d| d.timezone.as_deref());
+    // GitHub #174 item 3, both scheduling inputs: `spec.schedule.timezone` wins,
+    // else the source repository's `scheduleDefaults.timezone`, else UTC; and
+    // `spec.schedule.jitter` wins, else `scheduleDefaults.jitter`, else no jitter.
+    let repo_defaults = repo.schedule_defaults.as_ref();
 
     // An annotation-requested run takes precedence over waiting for the next
     // cron slot — but flows through the SAME spawn path (mover, gates,
@@ -247,7 +249,7 @@ async fn drive_schedule(
         Err(e) => return Err(e),
     };
 
-    let Some(slot) = due_slot(repl, now, repo_tz) else {
+    let Some(slot) = due_slot(repl, now, repo_defaults) else {
         // Nothing due: report Ready/Idle — or, if a requested run left a stall,
         // report THAT instead. One `Ready` writer per reconcile.
         let (ready, reason, message) = idle_report(stall.as_ref());
@@ -265,7 +267,12 @@ async fn drive_schedule(
             (!ready).then_some(RepositoryReplicationPhase::Failed),
         )
         .await?;
-        return Ok(Action::requeue(cap(next_wakeup(repl, now, None, repo_tz))));
+        return Ok(Action::requeue(cap(next_wakeup(
+            repl,
+            now,
+            None,
+            repo_defaults,
+        ))));
     };
 
     let job_name = replication_job_name(name, slot);
@@ -278,7 +285,7 @@ async fn drive_schedule(
                 repl,
                 now,
                 Some(slot),
-                repo_tz,
+                repo_defaults,
             )))),
             // Failure: the failed Job lingers to its TTL as the bounded-retry
             // backoff (and keeps the pod logs).
@@ -296,12 +303,50 @@ async fn drive_schedule(
                 nudge_repository_reverify(ctx, repl, name, namespace).await;
                 Ok(Action::requeue(REQUEUE_FAILED))
             }
-            None => Ok(Action::requeue(REQUEUE_RUNNING)),
+            // In flight. Re-attempt the admission heal here: once the Job
+            // exists this reconcile returns at THIS branch and never reaches
+            // the gate again, so a heal that failed at spawn time would leave
+            // the CR advertising `False` for a whole schedule interval. Free
+            // when there is nothing to heal.
+            None => {
+                heal_replication_slot_condition(
+                    api,
+                    repl,
+                    name,
+                    repo,
+                    conditions_of,
+                    slot_gate_is_false(&conditions_of(repl)),
+                )
+                .await;
+                Ok(Action::requeue(REQUEUE_RUNNING))
+            }
         },
         None => {
             if observed.has_active {
                 return Ok(Action::requeue(REQUEUE_RUNNING));
             }
+            // The SOURCE repository's mover-Job pool, consulted BEFORE the spawn
+            // path takes any side effect (credential projection, destination
+            // Secret checks) that a queued run would hold for an unbounded time.
+            // `_slot` holds this run's pool reservation until the Job exists —
+            // see `crate::pool::AdmissionLedger`. Bound with a name so it lives
+            // past the spawn rather than dropping at the end of the `match`.
+            let (heal, _slot) = match replication_pool_gate(
+                ctx,
+                api,
+                repl,
+                KIND_STR,
+                name,
+                namespace,
+                &job_name,
+                repo,
+                &conditions_of(repl),
+            )
+            .await?
+            {
+                ReplicationPoolGate::Parked(action) => return Ok(action),
+                ReplicationPoolGate::Admit { heal, reservation } => (heal, reservation),
+            };
             spawn_replication_job(
                 ctx,
                 namespace,
@@ -313,6 +358,7 @@ async fn drive_schedule(
                 ReplicationRunTrigger::Cron,
             )
             .await?;
+            heal_replication_slot_condition(api, repl, name, repo, conditions_of, heal).await;
             tracing::info!(replication = %name, slot = %slot.to_rfc3339(), "spawned replication Job");
             Ok(Action::requeue(REQUEUE_RUNNING))
         }
@@ -380,7 +426,21 @@ async fn handle_manual_run(
                     "requested replication Job failed; see the Job/pod logs",
                 ))))
             }
-            None => Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING))),
+            // In flight — same reasoning as the cron arm: this is the last
+            // branch a reconcile takes while the Job lives, so the heal has to
+            // be retried here or not at all.
+            None => {
+                heal_replication_slot_condition(
+                    api,
+                    repl,
+                    name,
+                    repo,
+                    conditions_of,
+                    slot_gate_is_false(&conditions_of(repl)),
+                )
+                .await;
+                Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)))
+            }
         },
         None if recorded_running(manual, request) => {
             // The Job was TTL-reaped before its terminal state was observed:
@@ -413,6 +473,37 @@ async fn handle_manual_run(
                 .await?;
                 return Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)));
             }
+            // Same pool gate as the cron path: a REQUESTED run is a cron run
+            // with a different Job name, and must not bypass any guarantee the
+            // cron path has — least of all the one that bounds backend load.
+            let (heal, _slot) = match replication_pool_gate(
+                ctx,
+                api,
+                repl,
+                KIND_STR,
+                name,
+                namespace,
+                &job_name,
+                repo,
+                &conditions_of(repl),
+            )
+            .await?
+            {
+                ReplicationPoolGate::Parked(action) => {
+                    // Record the request as `Pending` for the same reason the
+                    // single-flight arm above does: a queued request must be
+                    // VISIBLE in status, not look like nothing happened.
+                    patch_manual_run(
+                        api,
+                        repl,
+                        name,
+                        manual_run_status(request, P::Pending, Utc::now()),
+                    )
+                    .await?;
+                    return Ok(ManualRunVerdict::InFlight(action));
+                }
+                ReplicationPoolGate::Admit { heal, reservation } => (heal, reservation),
+            };
             spawn_replication_job(
                 ctx,
                 namespace,
@@ -424,6 +515,7 @@ async fn handle_manual_run(
                 ReplicationRunTrigger::Manual,
             )
             .await?;
+            heal_replication_slot_condition(api, repl, name, repo, conditions_of, heal).await;
             patch_manual_run(
                 api,
                 repl,
@@ -463,6 +555,22 @@ async fn patch_manual_run(
     )
     .await?;
     Ok(())
+}
+
+/// This CR's Kubernetes `kind`, as the seed component for the pool-wait requeue
+/// jitter — so a `RepositoryReplication` and a `Snapshot` of the same name in
+/// one namespace do not share a wake-up slot.
+const KIND_STR: &str = "RepositoryReplication";
+
+/// This CR's status conditions, or an empty array when it has no status yet.
+/// A plain `fn` (not a closure) so it can be handed to the shared
+/// `heal_replication_slot_condition`, which needs to re-extract them from a
+/// LIVE re-read rather than from the reconcile's stale copy.
+fn conditions_of(repl: &RepositoryReplication) -> Vec<Condition> {
+    repl.status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default()
 }
 
 /// The stored `status.phase` label when it is one this build cannot read.
@@ -541,6 +649,16 @@ async fn spawn_replication_job(
         REPLICATION_COMPONENT.to_string(),
     );
     labels.insert(REPLICATION_INSTANCE_LABEL.to_string(), cr_name.to_string());
+    // Pool membership, on the SOURCE repository: a `sync-to` mirror reads the
+    // source repository, so it counts toward the SOURCE's
+    // `spec.concurrency.maxConcurrentJobs`. (The destination is an inline
+    // `Backend` on this CR — there is no repository object to have a pool.)
+    // Keyed off the RESOLVED source identity, so a `sourceRef` written without
+    // a namespace lands in the same pool as every other run against it.
+    labels.extend(crate::pool::repo_pool_label(
+        crate::pool::MoverJobKind::RepositoryReplication,
+        &repo.repository_ref(),
+    ));
     // The slot the run covers, plus WHAT asked for it — the Job outlives the
     // reconcile that made it, and the trigger has to survive with it for the
     // outcome metric to attribute cron vs manual.
@@ -681,6 +799,10 @@ async fn spawn_replication_job(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         source_volume: dest_volume,
         repo_volume,
@@ -745,14 +867,14 @@ pub fn build_replication_work_spec(
 
 /// The replication slot due now (cron + jitter strictly after the last run), or
 /// `None` if not yet due. Pure given the CR, `now`, and the source repository's
-/// `scheduleDefaults.timezone` (`repo_tz`, GitHub #174 item 3).
+/// `scheduleDefaults` (`repo_defaults`, GitHub #174 item 3 — timezone and jitter).
 pub fn due_slot(
     repl: &RepositoryReplication,
     now: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Option<DateTime<Utc>> {
     let after = last_run_at(repl).unwrap_or_else(|| now - chrono::Duration::days(365));
-    match slot_for(repl, after, repo_tz) {
+    match slot_for(repl, after, repo_defaults) {
         Ok(slot) if now >= slot => Some(slot),
         _ => None,
     }
@@ -783,22 +905,24 @@ fn replication_creds_env_from(
 
 /// The next cron slot for this replication strictly after `after` (croner + jitter,
 /// seeded by the CR UID). `spec.schedule.timezone` wins; else the source
-/// repository's `scheduleDefaults.timezone`; else UTC.
+/// repository's `scheduleDefaults.timezone`; else UTC. Likewise
+/// `spec.schedule.jitter` wins; else the source repository's
+/// `scheduleDefaults.jitter`; else no jitter.
 fn slot_for(
     repl: &RepositoryReplication,
     after: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Result<DateTime<Utc>> {
     let seed = repl.uid().unwrap_or_else(|| repl.name_any());
-    let jitter = repl
-        .spec
-        .schedule
-        .jitter
-        .as_deref()
-        .and_then(parse_go_duration);
+    let jitter = kopiur_api::common::effective_jitter(
+        repl.spec.schedule.jitter.as_deref(),
+        repo_defaults.and_then(|d| d.jitter.as_deref()),
+    )
+    .as_deref()
+    .and_then(parse_go_duration);
     let tz = kopiur_api::common::resolve_tz_with_default(
         repl.spec.schedule.timezone.as_deref(),
-        repo_tz,
+        repo_defaults.and_then(|d| d.timezone.as_deref()),
     );
     next_fire(&repl.spec.schedule.cron, jitter, &seed, after, tz)
 }
@@ -819,10 +943,10 @@ fn next_wakeup(
     repl: &RepositoryReplication,
     now: DateTime<Utc>,
     handled: Option<DateTime<Utc>>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Duration {
     let after = handled.unwrap_or_else(|| last_run_at(repl).unwrap_or(now));
-    match slot_for(repl, after, repo_tz) {
+    match slot_for(repl, after, repo_defaults) {
         Ok(slot) if slot > now => (slot - now)
             .to_std()
             .unwrap_or(REQUEUE_CAP)
@@ -913,6 +1037,7 @@ pub fn error_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_schedule::{jitter_defaults, tz_defaults};
     use kopiur_api::backend::{Backend, FilesystemBackend, S3Backend};
     use kopiur_api::common::{
         CronSpec, Encryption, RepositoryKind, RepositoryMode, RepositoryRef, SecretKeyRef,
@@ -964,6 +1089,7 @@ mod tests {
                     key: None,
                 },
             },
+            kind: kopiur_api::common::RepositoryKind::Repository,
             repo_namespace: Some("ns".into()),
             mover_defaults: None,
             identity_defaults: None,
@@ -973,6 +1099,7 @@ mod tests {
             owner_ref: Default::default(),
             mode: RepositoryMode::ReadWrite,
             deletion_protection: None,
+            concurrency: None,
             mass_deletion_ack: None,
             catalog: None,
             ca_bundle_pem: None,
@@ -1026,9 +1153,21 @@ mod tests {
         assert!(due_slot(&r, Utc::now(), None).is_some());
     }
 
+    // A fixed mid-slot instant (Saturday 12:02:33 UTC) for tests that anchor a
+    // last-run time relative to "now". With a live Utc::now(), a run landing in
+    // the first second after a cron boundary (e.g. 05:15:00 for `*/5 * * * *`)
+    // puts a genuinely new slot between the `now - 1s` anchor and now, and the
+    // kernel rightly fires — a ~1/300 CI flake, not an operator bug. Same
+    // pinning as `maintenance::tests::pinned_now`.
+    fn pinned_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-06T12:02:33Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn not_due_right_after_a_run() {
-        let now = Utc::now();
+        let now = pinned_now();
         let just = (now - chrono::Duration::seconds(1)).to_rfc3339();
         let status = RepositoryReplicationStatus {
             last_replicated: Some(just),
@@ -1071,8 +1210,66 @@ mod tests {
             "UTC (no repo default) → 05:00 UTC has already passed"
         );
         assert!(
-            due_slot(&r, now, Some("America/Los_Angeles")).is_none(),
+            due_slot(&r, now, Some(&tz_defaults("America/Los_Angeles"))).is_none(),
             "repo scheduleDefaults.timezone must shift the evaluated slot"
+        );
+    }
+
+    // --- scheduleDefaults.jitter cascade --------------------------------------
+    // `spec.schedule.jitter` -> source repo `scheduleDefaults.jitter` -> none.
+    // Asserted by comparing slots (the offset is `fnv1a(seed, slot)`-derived, so
+    // "the window was applied" is proven by matching an explicit own value and
+    // differing from the un-jittered slot) — seed-independent, so it cannot rot.
+
+    /// The `after` anchor the jitter tests below share.
+    fn jitter_after() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn slot_for_inherits_the_source_repo_default_jitter() {
+        let after = jitter_after();
+        let r = repl_with("0 5 * * *", None);
+        let bare = slot_for(&r, after, None).unwrap();
+        let inherited = slot_for(&r, after, Some(&jitter_defaults("1h"))).unwrap();
+        assert_ne!(
+            inherited, bare,
+            "an inherited window must actually spread the slot"
+        );
+        let mut own = repl_with("0 5 * * *", None);
+        own.spec.schedule.jitter = Some("1h".into());
+        assert_eq!(
+            inherited,
+            slot_for(&own, after, None).unwrap(),
+            "inheritance must resolve to the same window as setting it directly"
+        );
+    }
+
+    #[test]
+    fn slot_for_own_jitter_wins_over_the_repo_default() {
+        let after = jitter_after();
+        let mut r = repl_with("0 5 * * *", None);
+        r.spec.schedule.jitter = Some("1h".into());
+        assert_eq!(
+            slot_for(&r, after, Some(&jitter_defaults("10m"))).unwrap(),
+            slot_for(&r, after, None).unwrap(),
+            "an own `spec.schedule.jitter` must ignore the repo default entirely"
+        );
+    }
+
+    #[test]
+    fn slot_for_with_neither_jitter_is_the_bare_cron_slot() {
+        let after = jitter_after();
+        let r = repl_with("0 5 * * *", None);
+        let slot = slot_for(&r, after, None).unwrap();
+        assert_eq!(slot.to_rfc3339(), "2026-06-09T05:00:00+00:00");
+        // Byte-identical regression: a timezone-only repo default is the
+        // pre-jitter world and must not move the slot.
+        assert_eq!(
+            slot_for(&r, after, Some(&tz_defaults("UTC"))).unwrap(),
+            slot
         );
     }
 

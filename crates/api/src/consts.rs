@@ -272,6 +272,70 @@ pub fn effective_mass_deletion_threshold(p: Option<&crate::common::DeletionProte
         .unwrap_or(DEFAULT_MASS_DELETION_THRESHOLD)
 }
 
+/// The effective per-repository mover-Job concurrency cap:
+/// `concurrency.maxConcurrentJobs` when set to a NON-ZERO value, else `None`
+/// (uncapped). An absent `concurrency` block, an absent `maxConcurrentJobs`, and
+/// an explicit `0` all mean the same thing — no limit — so all three collapse to
+/// `None`.
+///
+/// Deliberately returns an `Option<NonZeroUsize>` rather than the plain scalar
+/// [`effective_mass_deletion_threshold`] returns for its neighbouring breaker.
+/// That resolver can use `0` as its own disable sentinel because the value it
+/// yields is a *count to compare against*; here the value is a *capacity*, and
+/// `Some(0)` would read as "admit nothing" — a repository that never runs a Job
+/// again. Encoding "uncapped" in the `Option` and non-zero-ness in the type makes
+/// that state unrepresentable rather than merely untested, and the caller's
+/// `match`/`if let` is then forced to spell out the uncapped path.
+///
+/// ```
+/// use kopiur_api::common::ConcurrencySpec;
+/// use kopiur_api::consts::effective_max_concurrent_jobs;
+///
+/// // No block at all, no field, and an explicit 0 are the same state: uncapped.
+/// assert_eq!(effective_max_concurrent_jobs(None), None);
+/// assert_eq!(
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: None })),
+///     None,
+/// );
+/// assert_eq!(
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(0) })),
+///     None,
+/// );
+/// // A positive value caps the pool.
+/// assert_eq!(
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(3) }))
+///         .map(|n| n.get()),
+///     Some(3),
+/// );
+/// ```
+pub fn effective_max_concurrent_jobs(
+    spec: Option<&crate::common::ConcurrencySpec>,
+) -> Option<std::num::NonZeroUsize> {
+    spec.and_then(|c| c.max_concurrent_jobs)
+        .and_then(|n| std::num::NonZeroUsize::new(n as usize))
+}
+
+/// Pool-membership label stamped on every mover `Job` that counts toward its
+/// repository's `spec.concurrency.maxConcurrentJobs`: backup, restore, and the
+/// SOURCE side of a `RepositoryReplication`/`SnapshotReplication`. One selector
+/// therefore counts a repository's whole in-flight pool.
+///
+/// The value is `kopiur_controller::naming::repo_label` over the repository's
+/// **normalized** ref — `<=40-char name prefix>-<hash8>`, the same value the
+/// batch-delete single-flight label `kopiur.home-operations.com/delete-repo`
+/// carries. Deliberately NOT the
+/// `<kind>-<name>` shape of [`SESSION_REPO_LABEL`]: that spelling cannot
+/// distinguish two `Repository`s of the same name in different namespaces, and
+/// merging their pools would silently halve each one's cap. The hash is over
+/// `repository:{ns}/{name}` / `clusterrepository:{name}`, so namespace and kind
+/// both discriminate.
+///
+/// Maintenance, verification, pin, snapshot-delete batch, bootstrap/discovery and
+/// browse-session Jobs deliberately do NOT carry it — they are operator-driven
+/// housekeeping (or an interactive session), excluded from the pool so a
+/// saturated backup queue can never starve them.
+pub const REPO_POOL_LABEL: &str = "kopiur.home-operations.com/repo-pool";
+
 /// `Repository`/`ClusterRepository` condition: pending external destructive
 /// deletions for this repository are at/above the breaker threshold and held.
 pub const MASS_DELETION_HELD_CONDITION: &str = "MassDeletionHeld";
@@ -385,6 +449,59 @@ pub const FANOUT_TOO_LARGE_REASON: &str = "FanoutTooLarge";
 pub const SOURCE_PVC_AVAILABLE_CONDITION: &str = "SourcePvcAvailable";
 /// `reason`/Event reason for [`SOURCE_PVC_AVAILABLE_CONDITION`] = `False`.
 pub const SOURCE_PVC_MISSING_REASON: &str = "SourcePvcMissing";
+
+/// Condition recording whether this run holds a slot in its repository's
+/// mover-Job pool (`spec.concurrency.maxConcurrentJobs`). `False` with
+/// [`WAITING_FOR_SLOT_REASON`] means the run is parked at `phase: Pending`
+/// because the pool is full; `True` with [`SLOT_ACQUIRED_REASON`] means it was
+/// admitted and its Job launched.
+///
+/// **Written by exactly three kinds — `Snapshot`, `RepositoryReplication` and
+/// `SnapshotReplication` — and each carries BOTH arms.** Those are the run kinds
+/// the gate can hold, so each can be parked at `False` and later healed to
+/// `True`.
+///
+/// **A `Restore` never carries this condition at all**, in either arm. A restore
+/// is a recovery in progress, so it is ALWAYS admitted — holding one behind a
+/// queue of routine backups is exactly backwards. Its mover Job is still
+/// labelled into the pool and still COUNTS against the cap (so a restore
+/// displaces backups rather than adding to them), but the restore reconciler
+/// never consults the gate and writes no slot condition of its own.
+///
+/// **Deliberately NOT a [`crate::gates::StructuralGate`].** The registry's
+/// contract (see the `gates` module doc) is "blocked on something only a human
+/// can change" — a park that never self-heals. This one always does: the pool
+/// drains as in-flight Jobs finish, and the parked run is admitted on a later
+/// pass with no human action at all. Registering it would make `kubectl kopiur
+/// doctor` report a wedge every time a busy repository is merely doing its job,
+/// which is the exact inverse of the false-green defect the registry exists to
+/// prevent. A pool that never drains is a *stuck Job* problem, and doctor's
+/// existing stuck/failure checks are what surface that.
+pub const REPOSITORY_SLOT_AVAILABLE_CONDITION: &str = "RepositorySlotAvailable";
+/// `reason` for [`REPOSITORY_SLOT_AVAILABLE_CONDITION`] = `False`: the
+/// repository's mover-Job pool is at its cap and this run is queued behind it.
+pub const WAITING_FOR_SLOT_REASON: &str = "WaitingForSlot";
+/// `reason` for [`REPOSITORY_SLOT_AVAILABLE_CONDITION`] = `True`: this run holds
+/// a slot in the repository's mover-Job pool (or the pool is uncapped).
+pub const SLOT_ACQUIRED_REASON: &str = "SlotAcquired";
+
+/// `SnapshotSchedule` condition recording that `concurrencyPolicy: Replace` is
+/// holding a due slot because the run it would replace is itself parked behind
+/// its repository's mover-Job concurrency cap
+/// ([`REPOSITORY_SLOT_AVAILABLE_CONDITION`] = `False`). Cancelling a queued run
+/// frees no capacity and the replacement would re-queue behind it, so `Replace`
+/// degrades to `Forbid`-like waiting until the pool drains.
+///
+/// Deliberately **not** a registered structural gate
+/// ([`crate::gates::STRUCTURAL_GATES`]): unlike `ScheduleRunnable=False`, this
+/// state needs no human — it clears by itself the moment a slot frees up. It
+/// exists so the wait is visible in `status` and so the accompanying Normal
+/// event fires once on entering the hold rather than on every requeue.
+pub const SCHEDULE_REPLACEMENT_HELD_CONDITION: &str = "ReplacementHeld";
+/// `reason`/Event reason for [`SCHEDULE_REPLACEMENT_HELD_CONDITION`] = `True`.
+pub const WAITING_FOR_REPOSITORY_SLOT_REASON: &str = "WaitingForRepositorySlot";
+/// `reason` for [`SCHEDULE_REPLACEMENT_HELD_CONDITION`] = `False` (not held).
+pub const REPLACEMENT_NOT_HELD_REASON: &str = "ReplacementNotHeld";
 
 /// `Restore` condition recording whether the object this restore's repository
 /// is DERIVED from exists. Set `False` (with
@@ -559,8 +676,47 @@ mod tests {
             PRUNED_BY_ANNOTATION,
             ALLOW_MASS_DELETION_ANNOTATION,
             PRIVILEGED_MOVERS_ANNOTATION,
+            REPO_POOL_LABEL,
         ] {
             assert!(s.starts_with(crate::GROUP), "{s} must be group-prefixed");
         }
+    }
+
+    #[test]
+    fn effective_max_concurrent_jobs_truth_table() {
+        use crate::common::ConcurrencySpec;
+
+        let cap = |n: Option<u32>| {
+            effective_max_concurrent_jobs(Some(&ConcurrencySpec {
+                max_concurrent_jobs: n,
+            }))
+            .map(|v| v.get())
+        };
+
+        // All three spellings of "unlimited" collapse to the same `None`: no
+        // `concurrency` block, a block with no field, and an explicit `0`.
+        assert_eq!(effective_max_concurrent_jobs(None), None);
+        assert_eq!(cap(None), None);
+        assert_eq!(cap(Some(0)), None);
+
+        // A positive value is the cap, verbatim — 1 (fully serialized) included.
+        assert_eq!(cap(Some(1)), Some(1));
+        assert_eq!(cap(Some(4)), Some(4));
+        assert_eq!(cap(Some(1000)), Some(1000));
+        assert_eq!(cap(Some(u32::MAX)), Some(u32::MAX as usize));
+    }
+
+    #[test]
+    fn the_slot_condition_is_deliberately_not_a_structural_gate() {
+        // A parked-for-a-slot run self-heals as the pool drains, so registering it
+        // would make `doctor` cry wedge over a merely busy repository — the inverse
+        // of the false-green defect the registry exists for. Pinned so a later
+        // "every condition should be a gate" tidy-up has to read the reasoning.
+        assert!(
+            !crate::gates::STRUCTURAL_GATES
+                .iter()
+                .any(|g| g.condition == REPOSITORY_SLOT_AVAILABLE_CONDITION),
+            "RepositorySlotAvailable must not be a structural gate: it self-heals"
+        );
     }
 }

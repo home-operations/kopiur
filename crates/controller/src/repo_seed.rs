@@ -1109,6 +1109,10 @@ mod tests {
                     key: None,
                 },
             },
+            kind: match namespace {
+                Some(_) => kopiur_api::common::RepositoryKind::Repository,
+                None => kopiur_api::common::RepositoryKind::ClusterRepository,
+            },
             repo_namespace: namespace.map(str::to_string),
             mover_defaults: None,
             identity_defaults: None,
@@ -1124,6 +1128,7 @@ mod tests {
                 ..Default::default()
             },
             deletion_protection: None,
+            concurrency: None,
             mass_deletion_ack: None,
             catalog: None,
             ca_bundle_pem: Some("SOURCE-CA".into()),

@@ -894,6 +894,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     )
                     .await?;
                 }
+                // LAST status write of this arm, deliberately: clear a park left
+                // standing by a Job-creation patch that failed after the Job was
+                // already created. See `heal_slot_condition_in_flight`.
+                heal_slot_condition_in_flight(&api, backup, &name).await;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
         }
@@ -1136,6 +1140,27 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             io::patch_status(&api, &name, serde_json::json!({ "preflightSince": null })).await?;
         }
     }
+
+    // Repository mover-Job pool gate (`spec.concurrency.maxConcurrentJobs` +
+    // the KOPIUR_MAX_CONCURRENT_JOBS backstop). Placed HERE, immediately after
+    // preflight and BEFORE `build_backup_run`, because this is the last point in
+    // the launch path with ZERO external side effects. Everything below it
+    // acquires something a parked run would strand for an unbounded time:
+    // projected credential Secrets, a quiesced database, a CSI VolumeSnapshot
+    // and its staged PVC. Gating Job CREATION is the whole design — a parked run
+    // takes no locks and holds no resources, it simply is not started yet.
+    // `_slot` is the pool RESERVATION, and its binding is load-bearing: it holds
+    // this run's claim on the repository for the whole window between the
+    // admission decision and the Job's creation below, so a concurrently
+    // reconciling Snapshot cannot LIST a pool that does not yet show us. Bound
+    // with a name (not `_`) so it lives to the end of `reconcile_inner` rather
+    // than dropping immediately; every exit from here on — including the `?`s —
+    // releases it exactly once.
+    let (slot_heal, _slot) =
+        match pool_gate(ctx, &api, backup, &name, &namespace, repo_ref, &repo).await? {
+            PoolGate::Parked(action) => return Ok(action),
+            PoolGate::Admit { heal, reservation } => (heal, reservation),
+        };
 
     let (mut work_spec, mut source_volume, repo_volume, _) =
         build_backup_run(backup, &config, &repo, &namespace, &name)?;
@@ -1702,7 +1727,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         }
     };
 
-    let mut labels = run_labels(&config, origin);
+    let mut labels = backup_job_labels(&config, origin, &repo.repository_ref());
     mover_identity.decorate_labels(&mut labels);
     let mut limits = job_limits(backup);
     // moverDefaults.ttlSecondsAfterFinished applies unless the recipe's FailurePolicy
@@ -1819,6 +1844,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: mover_tolerations,
         affinity: mover_affinity,
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         source_volume,
         repo_volume,
@@ -1835,26 +1864,297 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let job = jobs::build_job(&inputs)?;
     io::apply_mover_objects(&ctx.client, &namespace, &name, None, &job).await?;
 
-    io::patch_status(
-        &api,
-        &name,
-        serde_json::json!({
-            "phase": "Running",
-            "origin": origin_str(origin),
-            // Freeze the run's resolved values (ADR §3.4). The deletion path
-            // reads `resolved.repository` so cleanup still works once the
-            // recipe is gone — the namespace-deletion cascade usually reaps the
-            // SnapshotPolicy (no finalizer) before this Snapshot's finalizer runs.
-            "resolved": resolved_run_status(&config, &namespace, &work_spec, repo_ref),
-            // The SAME value written into the kopia `kopiur-meta` tag above —
-            // single source, so tag and status cannot diverge.
-            "recorded": recorded,
-        }),
-    )
-    .await?;
+    let mut status = serde_json::json!({
+        "phase": "Running",
+        "origin": origin_str(origin),
+        // Freeze the run's resolved values (ADR §3.4). The deletion path
+        // reads `resolved.repository` so cleanup still works once the
+        // recipe is gone — the namespace-deletion cascade usually reaps the
+        // SnapshotPolicy (no finalizer) before this Snapshot's finalizer runs.
+        "resolved": resolved_run_status(&config, &namespace, &work_spec, repo_ref),
+        // The SAME value written into the kopia `kopiur-meta` tag above —
+        // single source, so tag and status cannot diverge.
+        "recorded": recorded,
+    });
+    // A previously PARKED run has just been admitted: flip
+    // `RepositorySlotAvailable` to True here, in the pass's LAST status write,
+    // so no later writer can resurrect the stale `False` (see `fold_slot_heal`).
+    // `None` for every Snapshot that was never parked, which keeps this patch
+    // byte-identical to a build without the pool gate.
+    let pinned = repo.repository_ref();
+    if let Some(conditions) = fold_slot_heal(&api, backup, &name, &pinned, slot_heal).await
+        && let Some(obj) = status.as_object_mut()
+        // Serializing a `Vec<Condition>` cannot fail — but a `null` fallback
+        // here would DELETE the whole conditions array in the merge patch, so
+        // on Err we skip the key entirely and leave the standing park for the
+        // in-flight heal to clear on the next pass.
+        && let Ok(value) = serde_json::to_value(&conditions)
+    {
+        obj.insert("conditions".to_string(), value);
+    }
+    io::patch_status(&api, &name, status).await?;
     tracing::info!(backup = %name, "created mover Job for backup");
 
     Ok(Action::requeue(Duration::from_secs(30)))
+}
+
+// --- Repository mover-Job pool gate -----------------------------------------
+
+/// The pool gate's verdict for one backup reconcile.
+///
+/// Deliberately NOT `Clone`: it may carry an [`crate::pool::AdmissionGuard`],
+/// and a reservation that can be duplicated is a reservation whose release is
+/// ambiguous.
+#[derive(Debug)]
+pub(super) enum PoolGate {
+    /// Launch. `heal` is `true` when a `RepositorySlotAvailable=False` condition
+    /// is currently standing and must be flipped to `True` — see
+    /// [`fold_slot_heal`] for why the flip is deferred rather than written here.
+    Admit {
+        /// Whether a standing park must be healed in the Job-creation patch.
+        heal: bool,
+        /// This run's pool reservation, held until the mover Job exists. `None`
+        /// when the gate did not run (a resumed `Running` Snapshot) or the pool
+        /// is uncapped — neither took a slot that needs protecting.
+        reservation: Option<crate::pool::AdmissionGuard>,
+    },
+    /// Held behind the pool. The caller returns this `Action` and does nothing
+    /// else: no Job, no staging, no credential projection.
+    Parked(Action),
+}
+
+/// Decide whether this backup may mint its mover Job now.
+///
+/// Only consulted at first launch ([`should_run_pool_gate`]); a resumed
+/// `Running` Snapshot is admitted unconditionally, and no terminal phase reaches
+/// here at all.
+///
+/// On a park this writes `phase: Pending` + `RepositorySlotAvailable=False`
+/// (through [`park_status`], which also pins `resolved.repository` so the queued
+/// run is attributable), publishes a transition-gated Normal event, and requeues
+/// on the deterministic jittered pool cadence. The status write goes through
+/// `patch_status_if_changed`, so a second pass with unchanged counts is a true
+/// no-op — no `resourceVersion` bump, no watch re-trigger, no hot loop while a
+/// long queue drains.
+async fn pool_gate(
+    ctx: &Context,
+    api: &Api<Snapshot>,
+    backup: &Snapshot,
+    name: &str,
+    namespace: &str,
+    repo_ref: &RepositoryRef,
+    repo: &ResolvedRepository,
+) -> Result<PoolGate> {
+    if !should_run_pool_gate(backup.status.as_ref().and_then(|s| s.phase.as_ref())) {
+        return Ok(PoolGate::Admit {
+            heal: false,
+            reservation: None,
+        });
+    }
+    let caps = crate::pool::PoolCaps {
+        repo: kopiur_api::consts::effective_max_concurrent_jobs(repo.concurrency.as_ref()),
+        global: ctx.max_concurrent_jobs,
+    };
+    // The uncapped default: `admit_or_park` short-circuits without a LIST and
+    // without touching the admission ledger, so the whole gate is a couple of
+    // branches and the produced status is byte-identical to a build without this
+    // feature.
+    let pinned = repo.repository_ref();
+    let existing = backup
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    // A backup's mover Job is named after its `Snapshot` and lives in the
+    // Snapshot's namespace — the same identity `apply_mover_objects` creates it
+    // under below, which is what lets the ledger sweep recognize it.
+    let job = crate::pool::job_key(namespace, name);
+    match crate::pool::admit_or_park(
+        ctx,
+        &crate::naming::repo_label(&pinned),
+        &job,
+        crate::pool::PoolClass::Backup,
+        caps,
+    )
+    .await?
+    {
+        crate::pool::LedgerVerdict::Admit { reservation } => Ok(PoolGate::Admit {
+            heal: crate::pool::slot_gate_is_false(&existing),
+            reservation,
+        }),
+        crate::pool::LedgerVerdict::Park {
+            repo_live,
+            global_live,
+        } => {
+            let repo_kind = io::repo_kind_str(repo_ref.kind);
+            let message = crate::pool::waiting_for_slot_message(
+                repo_kind,
+                &crate::pool::repo_display(&pinned),
+                repo_live,
+                global_live,
+                caps,
+            );
+            let current = serde_json::to_value(&backup.status).ok();
+            let wrote = io::patch_status_if_changed(
+                api,
+                name,
+                current.as_ref(),
+                park_status(backup, &message, &pinned),
+            )
+            .await?;
+            // Transition-gated: the Event fires once on ENTERING the queue, not
+            // on every 30s re-check — a busy repository would otherwise flood
+            // `kubectl describe` with identical notices.
+            if wrote && !crate::pool::slot_gate_is_false(&existing) {
+                io::publish_normal_event(
+                    ctx,
+                    backup,
+                    crate::consts::WAITING_FOR_SLOT_REASON,
+                    "WaitForRepositorySlot",
+                    &message,
+                )
+                .await;
+                tracing::info!(
+                    backup = %name,
+                    repository = %repo_ref.name,
+                    repo_live,
+                    global_live,
+                    "parking backup behind the repository mover-Job pool"
+                );
+            }
+            Ok(PoolGate::Parked(Action::requeue(
+                crate::pool::pool_wait_requeue(
+                    "Snapshot",
+                    backup.meta().namespace.as_deref(),
+                    name,
+                ),
+            )))
+        }
+    }
+}
+
+/// Fold the `RepositorySlotAvailable=True`/`SlotAcquired` heal into the
+/// Job-creation status patch — the LAST status write of the launch pass.
+///
+/// **Ordering is the whole point.** Every condition writer in this reconcile
+/// seeds its array from `backup`, the reflector's (already stale by then) copy,
+/// and a `conditions` patch REPLACES the array. Writing the heal early would
+/// have it clobbered by any later writer — and worse, that later writer would
+/// resurrect the stale `False` onto a Snapshot whose Job is now running, leaving
+/// a launched backup permanently reporting that it is queued. So the heal is
+/// decided at the gate and APPLIED here, seeded from a live re-read
+/// ([`io::live_conditions_source`]) that already includes whatever the staging
+/// and credential writers put there in between.
+///
+/// Returns `None` when no heal is needed — the overwhelmingly common case (a
+/// Snapshot that was never parked), which keeps the Job-creation patch
+/// byte-identical to a build without this feature. Also `None` when the object
+/// vanished mid-reconcile; there is nothing to patch.
+async fn fold_slot_heal(
+    api: &Api<Snapshot>,
+    backup: &Snapshot,
+    name: &str,
+    pinned: &RepositoryRef,
+    heal: bool,
+) -> Option<Vec<Condition>> {
+    if !heal {
+        return None;
+    }
+    let live = io::live_conditions_source(api, name, backup).await?;
+    let existing = live
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    // Re-check against the LIVE array: another writer (or a racing replica) may
+    // already have healed it, and re-writing an unchanged condition is churn.
+    slot_heal_conditions(&existing, pinned, backup.meta().generation)
+}
+
+/// The pure core of the heal: the conditions array that clears a standing
+/// `RepositorySlotAvailable=False`, or `None` when no park is standing (so the
+/// caller writes nothing at all and the status stays byte-identical to a build
+/// without the pool gate).
+pub(super) fn slot_heal_conditions(
+    existing: &[Condition],
+    pinned: &RepositoryRef,
+    generation: Option<i64>,
+) -> Option<Vec<Condition>> {
+    if !crate::pool::slot_gate_is_false(existing) {
+        return None;
+    }
+    Some(io::upsert_condition(
+        existing,
+        crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION,
+        true,
+        crate::consts::SLOT_ACQUIRED_REASON,
+        &crate::pool::slot_acquired_message(
+            io::repo_kind_str(pinned.kind),
+            &crate::pool::repo_display(pinned),
+        ),
+        generation,
+    ))
+}
+
+/// Which repository an IN-FLIGHT backup must heal its slot condition against,
+/// or `None` when there is nothing to heal.
+///
+/// Pure and IO-free by design — it is the fast path that keeps
+/// [`heal_slot_condition_in_flight`] free for the overwhelming majority of runs
+/// (every backup that was never parked). The repository comes from
+/// `status.resolved.repository`, which both the park write and the Job-creation
+/// patch pin, so no recipe resolution is needed here; a run with a standing park
+/// but no pin (impossible via either writer) is left alone rather than guessed at.
+pub(super) fn in_flight_heal_target(backup: &Snapshot) -> Option<RepositoryRef> {
+    let status = backup.status.as_ref()?;
+    if !crate::pool::slot_gate_is_false(&status.conditions) {
+        return None;
+    }
+    status.resolved.as_ref()?.repository.clone()
+}
+
+/// Re-attempt the admission heal from the IN-FLIGHT arm — the mirror of
+/// `replication_run::heal_replication_slot_condition`, for backups.
+///
+/// **Why the launch-path heal is not enough.** [`fold_slot_heal`] rides the
+/// Job-creation status patch, which is issued AFTER `apply_mover_objects` has
+/// already created the Job. If that patch fails, the Job exists but the CR still
+/// says `RepositorySlotAvailable=False`, and every later reconcile returns at the
+/// "Job exists, non-terminal" branch above — it never reaches the pool gate
+/// again, so nothing ever clears the park. The consequences are all real
+/// misreporting, not cosmetics: `kopiur_snapshot_waiting_for_slot` keeps counting
+/// a running backup as queued, `KopiurSnapshotWaitingForSlot` false-pages after
+/// 30m, and `concurrencyPolicy: Replace` reads the child as parked and degrades
+/// to `ReplacementHeld` instead of replacing it. Re-attempting here closes the
+/// window to one requeue.
+///
+/// Called LAST in the arm, after the `Running` patch, for the reason
+/// [`fold_slot_heal`] documents: a `conditions` patch REPLACES the array and the
+/// `Running` writer seeds from the reconcile's stale copy, so a heal written
+/// before it would simply be clobbered. The array written here is seeded from a
+/// live re-read for the same reason.
+///
+/// Best-effort by contract: the Job is already running, and failing the reconcile
+/// over a cosmetic condition flip would only re-run the arm against the same
+/// state. Costs nothing when there is nothing to heal — [`in_flight_heal_target`]
+/// answers from the object already in hand, before any IO.
+async fn heal_slot_condition_in_flight(api: &Api<Snapshot>, backup: &Snapshot, name: &str) {
+    let Some(pinned) = in_flight_heal_target(backup) else {
+        return;
+    };
+    let Some(conditions) = fold_slot_heal(api, backup, name, &pinned, true).await else {
+        return;
+    };
+    if let Err(e) =
+        io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await
+    {
+        tracing::debug!(
+            backup = %name,
+            error = %e,
+            "could not clear a stale RepositorySlotAvailable=False on an in-flight backup; \
+             retried on the next reconcile of this run"
+        );
+    }
 }
 
 // --- Missing-source-PVC bounded outcome (#382 M5) ---------------------------
@@ -2359,7 +2659,7 @@ pub(crate) async fn repo_mass_deletion_conditions(
     let (ack, _invalid) = parse_mass_deletion_ack(raw_ack, now);
     let threshold = kopiur_api::consts::effective_mass_deletion_threshold(deletion_protection);
     let state = store.state();
-    let key = repo_key(repo_ref);
+    let key = pinned_repo_key(repo_ref);
     // Only CONFIRMED-terminating namespaces feed the count-as-terminating plan
     // evaluation; an unreadable namespace must not flip a retain child into a
     // counted destructive delete (C1).
@@ -2445,7 +2745,7 @@ async fn resolve_breaker(
     let threshold =
         kopiur_api::consts::effective_mass_deletion_threshold(repo.deletion_protection.as_ref());
     let state = store.state();
-    let key = repo_key(repo_ref);
+    let key = pinned_repo_key(repo_ref);
     // Count in the REAL `(ns_terminating, ns_policy)` form so an external
     // destructive delete that only arises under an `onNamespaceDelete: Delete`
     // namespace teardown (a `policy-cascade`-stamped child) is counted — and thus
@@ -3496,7 +3796,7 @@ async fn fire_batch(
     views: &[BatchJobView],
 ) -> Result<Action> {
     use std::sync::atomic::Ordering;
-    let key = repo_key(repo_ref);
+    let key = pinned_repo_key(repo_ref);
     // Resolve which candidate namespaces are terminating BEFORE building the
     // counting set, so each member's plan is evaluated in its real
     // `(ns_terminating, ns_policy)` form. The resolution splits into CONFIRMED
@@ -3725,13 +4025,9 @@ async fn build_batch_job(
         cache: Default::default(),
         throttle: Default::default(),
     };
-    // Labels: managed-by (added by `build_job`) + the batch op + the repo hash (so
-    // the dispatcher can LIST one repository's batch Jobs). Annotation: the SORTED
-    // member UID set — the single source of truth for "which Snapshots".
-    let mut labels = BTreeMap::from([
-        (OP_LABEL.to_string(), OP_SNAPSHOT_DELETE_BATCH.to_string()),
-        (DELETE_REPO_LABEL.to_string(), repo_label(repo_ref)),
-    ]);
+    // Annotation: the SORTED member UID set — the single source of truth for
+    // "which Snapshots".
+    let mut labels = batch_job_labels(repo_ref);
     let mut uids: Vec<&str> = members.iter().map(|m| m.uid.as_str()).collect();
     uids.sort_unstable();
     let annotations = BTreeMap::from([(DELETE_MEMBERS_ANNOTATION.to_string(), uids.join(","))]);
@@ -3781,6 +4077,10 @@ async fn build_batch_job(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         source_volume: None,
         repo_volume,
@@ -3979,6 +4279,10 @@ async fn reconcile_pin(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         source_volume: None,
         repo_volume,

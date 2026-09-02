@@ -174,6 +174,28 @@ and runtime are sized. The levers, all in `spawn_all`/`main.rs`/`config.rs`:
   recommended) — see [API-outage resilience](#api-outage-resilience) for why the
   default is bounded.
 
+Two more env knobs are not memory levers but belong in the same list, because they
+are the other two things the operator will refuse to start more of. Both default to
+uncapped, and both cost **zero** API calls while uncapped:
+
+- **Delete-Job cap.** `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` / `maxConcurrentDeleteJobs`
+  (default `0` = uncapped) bounds concurrent `snapdel-*` batch Jobs across every
+  repository. Batching itself — one Job per repository per accumulation window, not
+  one per `Snapshot` — is the primary protection, so this is an opt-in backstop for
+  a resource-constrained cluster rather than a load-bearing safety mechanism; a
+  small value risks head-of-line-blocking every other repository's deletions behind
+  one slow or failing one. It does **not** gate whether a deletion is allowed —
+  that is `deletionProtection.threshold` on the repository (ADR-0006).
+- **Pooled mover-Job cap.** `KOPIUR_MAX_CONCURRENT_JOBS` / `maxConcurrentJobs`
+  (default `0` = uncapped) bounds the same pool a repository's own
+  `spec.concurrency.maxConcurrentJobs` bounds — backups, restores, and the source
+  side of either replication — but across **all** repositories. The per-repository
+  field is the primary knob; this is the cluster-operator's backstop beneath it,
+  and a run must satisfy both. Counting is one label-selector LIST on
+  `kopiur.home-operations.com/repo-pool` per gated reconcile, short-circuited
+  entirely when neither cap is set, and scoped to the install's watch scope like
+  every other reconcile-time list (`crates/controller/src/pool.rs`).
+
 Observe it: `kopiur_process_resident_memory_bytes` (an observable gauge sampled from
 `/proc/self/statm` at scrape time) exposes the controller's RSS on `/metrics` and
 guards these wins against regressions.

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kopiur_api::Snapshot;
-use kopiur_api::common::{NamespaceDeletePolicy, RepositoryKind, RepositoryRef};
+use kopiur_api::common::{NamespaceDeletePolicy, RepositoryRef};
 use kopiur_mover::workspec::SnapshotAnchor;
 use kube::{Resource, ResourceExt};
 
@@ -25,33 +25,13 @@ use super::plan::{
     pruned_by, resolve_origin, schedule_owner_ref,
 };
 
-/// Stable per-repo key from the `status.resolved.repository` pin:
-/// `"repository:{ns}/{name}"` for a namespaced `Repository`,
-/// `"clusterrepository:{name}"` for a `ClusterRepository`. Distinguishes two
-/// `Repository`s of the same name in different namespaces, and a `Repository`
-/// from a `ClusterRepository` of the same name. Intended for PINNED refs
-/// (always namespace-populated for `Repository`, per `pinned_repository_ref`);
-/// an unpinned ref's empty namespace degrades gracefully instead of panicking.
-pub fn repo_key(r: &RepositoryRef) -> String {
-    match r.kind {
-        RepositoryKind::Repository => format!(
-            "repository:{}/{}",
-            r.namespace.as_deref().unwrap_or_default(),
-            r.name
-        ),
-        RepositoryKind::ClusterRepository => format!("clusterrepository:{}", r.name),
-    }
-}
-
-/// Label-value-safe short form of [`repo_key`] for Job labels: Kubernetes
-/// label values forbid `:`/`/`, so this hashes the key rather than embedding
-/// it verbatim. `<=40-char name prefix>-<hash8>`, always well under the
-/// 63-char label-value limit.
-pub fn repo_label(r: &RepositoryRef) -> String {
-    let short: String = r.name.chars().take(40).collect();
-    let hash = crate::naming::short_hash(&repo_key(r));
-    format!("{short}-{hash}")
-}
+/// The per-repository key + label helpers now live in [`crate::naming`] (the
+/// home of `short_hash`/`capped_name`), because the repo-pool concurrency
+/// label needs the SAME hash the batch path uses and neither owns the other.
+/// Re-exported here so `crate::snapshot::{pinned_repo_key, repo_label}` — the
+/// path every existing call site and test uses via `pub use batch::*` — keeps
+/// resolving.
+pub use crate::naming::{pinned_repo_key, repo_label};
 
 /// One member of a pending batch delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,10 +119,10 @@ fn repo_matches(backup: &Snapshot, key: &str) -> bool {
         .and_then(|s| s.resolved.as_ref())
         .and_then(|r| r.repository.as_ref())
     {
-        return repo_key(pinned) == key;
+        return pinned_repo_key(pinned) == key;
     }
     match backup.spec.repository.as_ref() {
-        Some(pinned) => repo_key(pinned) == key,
+        Some(pinned) => pinned_repo_key(pinned) == key,
         None => true,
     }
 }
@@ -813,7 +793,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use kopiur_api::common::RepositoryRef;
+    use kopiur_api::common::{RepositoryKind, RepositoryRef};
     use kopiur_api::snapshot::SnapshotSpec;
     use kopiur_api::{DeletionPolicy, Snapshot};
 
@@ -825,27 +805,27 @@ mod tests {
         }
     }
 
-    // --- repo_key / repo_label -----------------------------------------
+    // --- pinned_repo_key / repo_label -----------------------------------------
 
     #[test]
-    fn repo_key_shapes() {
+    fn pinned_repo_key_shapes() {
         assert_eq!(
-            repo_key(&repo(RepositoryKind::Repository, Some("backups"), "nas")),
+            pinned_repo_key(&repo(RepositoryKind::Repository, Some("backups"), "nas")),
             "repository:backups/nas"
         );
         assert_eq!(
-            repo_key(&repo(RepositoryKind::ClusterRepository, None, "shared")),
+            pinned_repo_key(&repo(RepositoryKind::ClusterRepository, None, "shared")),
             "clusterrepository:shared"
         );
     }
 
     #[test]
-    fn repo_key_distinguishes_namespace_and_kind() {
+    fn pinned_repo_key_distinguishes_namespace_and_kind() {
         let a = repo(RepositoryKind::Repository, Some("ns-a"), "nas");
         let b = repo(RepositoryKind::Repository, Some("ns-b"), "nas");
         let c = repo(RepositoryKind::ClusterRepository, None, "nas");
-        assert_ne!(repo_key(&a), repo_key(&b));
-        assert_ne!(repo_key(&a), repo_key(&c));
+        assert_ne!(pinned_repo_key(&a), pinned_repo_key(&b));
+        assert_ne!(pinned_repo_key(&a), pinned_repo_key(&c));
     }
 
     #[test]
@@ -884,9 +864,9 @@ mod tests {
                 description: None,
             },
         );
-        assert!(repo_matches(&backup, &repo_key(&pinned)));
+        assert!(repo_matches(&backup, &pinned_repo_key(&pinned)));
         let other = repo(RepositoryKind::ClusterRepository, None, "offsite");
-        assert!(!repo_matches(&backup, &repo_key(&other)));
+        assert!(!repo_matches(&backup, &pinned_repo_key(&other)));
 
         // The run-time status pin stays authoritative once present: a stale or
         // divergent spec pin must not override what the run actually targeted.
@@ -897,8 +877,8 @@ mod tests {
             }),
             ..Default::default()
         });
-        assert!(repo_matches(&backup, &repo_key(&other)));
-        assert!(!repo_matches(&backup, &repo_key(&pinned)));
+        assert!(repo_matches(&backup, &pinned_repo_key(&other)));
+        assert!(!repo_matches(&backup, &pinned_repo_key(&pinned)));
     }
 
     #[test]

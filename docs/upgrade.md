@@ -6,6 +6,52 @@ the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which mo
 the CRDs between two Helm mechanisms and needs one deliberate step to avoid data
 loss. Read that section before you cross it.
 
+## Per-repository mover concurrency: what the first reconcile after the upgrade does
+
+The release that adds [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) needs **no action**: with no cap set anywhere — the default — the gate costs one branch and performs no extra API calls, and nothing about backups changes. The notes below matter only once you set a cap, and only across the upgrade itself.
+
+### Pre-upgrade mover Jobs are invisible to the counter
+
+The pool is counted with a single label selector on `kopiur.home-operations.com/repo-pool`, a label the previous version never stamped. A mover Job that was already running when you upgraded therefore **does not count** against its repository's cap, so for the length of those Jobs' runs the operator can briefly over-admit — you might see four movers against a `maxConcurrentJobs: 3` repository until the pre-upgrade ones finish.
+
+That is the deliberate choice, not an oversight. The alternative — treating an unlabeled Job as belonging to every repository — would count each one against every cap at once and park the entire fleet on upgrade. Over-admitting for one run window is strictly the better failure. It resolves itself with no intervention: every Job created after the upgrade carries the label.
+
+### In-flight pre-upgrade Jobs just drain — you do not have to quiesce first
+
+A `Job`'s pod template is immutable, so a natural worry is that the operator will try to stamp the new pool label onto a mover Job that is already running and be refused with a `422`.
+
+It does not. Every pooled spawn path checks whether its mover Job already exists and **returns before touching it** — the operator never re-applies an existing Job's pod template, on this upgrade or any other. A Job created by the previous version therefore runs to completion exactly as it is, unlabeled and (per the note above) uncounted, and its successor is created fresh with the new template. There is no error to see, nothing to retry, and no reason to drain your schedules before upgrading.
+
+### A leader failover has the same one-window shape
+
+The gate counts the pool by listing Jobs, and there is a gap between deciding to admit a run and that run's Job becoming visible to the next list. Within one operator process that gap is closed exactly: the leader keeps an in-memory record of the admissions it has granted, so two runs that start at the same instant cannot both read an empty pool. Only the leader reconciles, so there is never a second replica whose record this would have to agree with.
+
+A **leader failover** resets that record. The new leader begins from the listed Jobs alone, so for the length of one reconcile pass it can admit a run whose predecessor's Job the API has not published yet — the same brief over-admission as the pre-upgrade case above, bounded to the moment of the handover, and self-correcting on the next pass. As there, no cap is ever *under*-run: the record only ever adds to what the list shows, so losing it can never park a repository that has room.
+
+## Admission-only: jitter and deadline rules (re-apply only)
+
+Two rules now **tighten fields that already shipped**, so they are enforced by the admission webhook and deliberately **not** re-checked by the reconcilers:
+
+- A `jitter` window over **24h** is rejected on `SnapshotSchedule.spec.schedule`, `SnapshotPolicy.spec.verification.{quick,deep}`, `Maintenance.spec.schedule.{quick,full}`, and both replication kinds' `spec.schedule`. Jitter is a spread *within* a cron period, not a schedule offset. (For `Maintenance` and `RepositoryReplication` the *parse* is new too — an unparseable window used to be accepted and silently degrade to no jitter at reconcile.)
+- A **negative** `startingDeadlineSeconds` on a `SnapshotSchedule` is rejected. It is not "no deadline": the miss check is `now - slot > deadline`, so a negative value marks every slot expired the instant it fires and the schedule silently skips every run forever while reporting itself healthy. Omit the field for no deadline; `0` is legitimate.
+
+**Nothing breaks on upgrade.** A stored object carrying either value keeps reconciling exactly as it did before — a tightened rule that ran in the reconciler would stop backups on objects nobody touched, which is precisely the failure mode this split exists to prevent. The rejection lands on the next `kubectl apply` (or Flux/Argo reconcile) that writes that object.
+
+So the practical shape is: **a GitOps repo containing one of these values will fail to apply after the upgrade, while the running cluster carries on**. Grep your manifests before you roll:
+
+```console
+$ grep -rn 'jitter:' path/to/manifests   # anything over 24h
+$ grep -rn 'startingDeadlineSeconds: -' path/to/manifests
+```
+
+The webhook's rejection names the exact field and value, so a surprise here is a clear message rather than a mystery.
+
+/// note | The repository-level `scheduleDefaults.jitter` is not in this bucket
+
+The same 24h cap applies to a `Repository`/`ClusterRepository`'s new `spec.scheduleDefaults.jitter`, but it needs none of the care above. The admission-only split exists to protect objects that were stored *before* a rule tightened; this field is brand new, so no stored repository can be carrying a value it rejects. Nothing to grep for there.
+
+///
+
 ## After 0.10.5: the `NoAdoptableHistory` warning no longer exists (no action needed)
 
 Versions after 0.10.5 remove the `NoAdoptableHistory` Warning Event outright. There is nothing to apply — no schema change, no flag, no RBAC. The operator simply stops emitting it.

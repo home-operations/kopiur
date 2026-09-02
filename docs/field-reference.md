@@ -31,6 +31,7 @@ This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen
 | `encryption` | [object](#repository-spec-encryption) | **required** | Repository password (a Secret reference). |
 | `bootstrap` | [object](#repository-spec-bootstrap) | — | Tuning for the bootstrap/discovery mover Job (`&lt;name&gt;-discovery`) that connects/creates an object-store repository the operator cannot reach in-process (and re-runs for catalog re-scans). |
 | `catalog` | [object](#repository-spec-catalog) | — | Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog. |
+| `concurrency` | [object](#repository-spec-concurrency) | — | Concurrency limits for mover Jobs against this repository (absent = unlimited). |
 | `create` | [object](#repository-spec-create) | — | What to do when the repository does not yet exist (absent means it must already exist). |
 | `deletionProtection` | [object](#repository-spec-deletionprotection) | — | Mass-deletion circuit breaker for this repository's Snapshots. |
 | `health` | [object](#repository-spec-health) | — | Repository health thresholds (tunes the index-blob-count warning). |
@@ -40,7 +41,7 @@ This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen
 | `moverDefaults` | [object](#repository-spec-moverdefaults) | — | Base mover configuration inherited by every mover this repository spawns. |
 | `onNamespaceDelete` | enum: Orphan \| Delete | `Orphan` | What happens to this repository's snapshots when a consuming namespace is deleted. |
 | `parameters` | [object](#repository-spec-parameters) | — | Mutable kopia repository parameters, re-applied on bootstrap whenever they drift. |
-| `scheduleDefaults` | [object](#repository-spec-scheduledefaults) | — | Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set their own equivalent field — verification, replication, and maintenance schedules today; set once here instead of repeating it on every cron. |
+| `scheduleDefaults` | [object](#repository-spec-scheduledefaults) | — | Scheduling defaults (`timezone`, `jitter`) inherited by consumers that don't set their own equivalent field — backup, verification, replication, and maintenance schedules; set once here instead of repeating it on every cron. |
 | `seed` | [object](#repository-spec-seed) | — | Initialize this repository from an existing replica on its FIRST bootstrap (issue #380) — a disaster-recovery entry point.<br>Armed only while the repository has never been initialized (`status.uniqueId` unset) **and** the mover's connect reports the backend uninitialized; on an already-initialized repository it is a documented no-op (`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave standing in a GitOps manifest. When armed it also replaces `spec.create`'s fallback: the repository is seeded or the bootstrap fails, never silently created empty. |
 | `server` | [object](#repository-spec-server) | — | Optional kopia web-UI server, exposed via a `Service` in this namespace. |
 | `suspend` | boolean | — | Pause this repository: skip connect/bootstrap and maintenance projection. |
@@ -339,6 +340,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `maxAgeDays` | integer | — | Expire discovered `Snapshot` CRs older than this many days (minimum 1); kopia snapshots untouched. |
 | `perIdentity` | integer | — | Keep the most-recent N discovered `Snapshot` CRs per identity; `0` disables materialization. |
 
+#### `spec.concurrency` { #repository-spec-concurrency }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `maxConcurrentJobs` | integer | —<br><sub>min 0</sub> | Ceiling on how many of this repository's mover Jobs may be in flight at once. Backup snapshots, restores, and replication runs that READ FROM this repository all draw from ONE pool — a repository's backend (and the bandwidth to it) is the shared resource, so splitting the budget per work kind would let three "safe" limits still saturate it.<br>Restores are **always admitted** and never parked: a restore is a recovery in progress, and holding one behind a queue of routine backups is exactly backwards. An in-flight restore still COUNTS toward the pool, so it displaces backups rather than adding to them.<br>Excluded from the pool entirely: maintenance (already single-flight per repository), verification, pin, and snapshot-delete batch Jobs. These are operator-driven housekeeping that must not be starved by a saturated backup pool.<br>Absent or `0` means unlimited — the default, and today's behavior.<br>No schema `default:` is emitted for this field (api-conventions §4a): absent and `0` are the SAME state (unlimited), so a materialized default would stamp `{maxConcurrentJobs: 0}` onto every stored repository — GitOps diff noise for a value that changes nothing. |
+
 #### `spec.create` { #repository-spec-create }
 
 | Field | Type | Default | Description |
@@ -481,6 +488,8 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `affinity` | core/v1 Affinity | — | Pod affinity for every mover. |
 | `cache` | [object](#repository-spec-moverdefaults-cache) | — | kopia cache defaults for every mover. |
 | `nodeSelector` | map[string]string | — | Pod `nodeSelector` for every mover. |
+| `podAnnotations` | map[string]string | — | Extra annotations for every mover pod. Unlike `podLabels` these are **pod-template-only** — they are not mirrored onto the `Job` object, because the common case is a sidecar-injection opt-out (`sidecar.istio.io/inject: "false"`, `linkerd.io/inject: disabled`, `vault.hashicorp.com/agent-inject: "false"`) that only means anything on the pod a mesh webhook actually sees. A mover is a short-lived batch pod; an injected sidecar that never exits keeps its Job running forever.<br>Same reserved keys as `podLabels`, rejected at admission. |
+| `podLabels` | map[string]string | — | Extra labels for every mover POD (and the `Job` that owns it), merged UNDER kopiur's own labels — a key kopiur sets always wins, so a user-supplied value can never break the selectors the controller counts and reaps by.<br>This is the hook for cluster machinery that keys off pod labels and that kopiur has no field of its own for: a Kueue `kueue.x-k8s.io/queue-name` to put movers under a cluster queue, a monitoring/`NetworkPolicy` selector, a service-mesh exclusion label.<br>Keys under `kopiur.home-operations.com/` and the exact key `app.kubernetes.io/managed-by` are reserved and rejected at admission. |
 | `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security-context base (notably `fsGroup`) for every mover. |
 | `resources` | core/v1 ResourceRequirements | — | Resource requests/limits base for the mover container. |
 | `scratch` | [object](#repository-spec-moverdefaults-scratch) | — | Defaults for the deep-verification scratch (restore-test) volume. |
@@ -566,6 +575,7 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `jitter` | string | — | Deterministic jitter window (Go-style duration, e.g. `10m`) applied to every consuming cron that doesn't set its own `jitter` — `SnapshotSchedule`, `Maintenance` (quick and full), `SnapshotPolicy` verification (quick and deep), and both replication kinds. Set once here instead of repeating it on every cron, so a whole repository's schedules spread their load off the top-of-the-hour thundering herd.<br>The spread is deterministic per `(scheduleUID, slot)`, not random: the same slot always lands on the same instant, so a restart never re-rolls it. Capped at 24h by validation — jitter is a spread WITHIN a cron period, not a schedule offset. |
 | `timezone` | string | — | IANA timezone name applied to every consuming cron that doesn't set its own `timezone` (e.g. `America/New_York`). Set once here instead of repeating it on every `SnapshotPolicy.verification`, `RepositoryReplication.schedule`, and `Maintenance.schedule` cron. |
 
 #### `spec.seed` { #repository-spec-seed }
@@ -1072,6 +1082,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `encryption` | [object](#clusterrepository-spec-encryption) | **required** | Repository password (a Secret reference that must carry an explicit `namespace`). |
 | `bootstrap` | [object](#clusterrepository-spec-bootstrap) | — | Tuning for the bootstrap/discovery mover Job (`&lt;name&gt;-discovery`) that connects/creates an object-store repository the operator cannot reach in-process (and re-runs for catalog re-scans). |
 | `catalog` | [object](#clusterrepository-spec-catalog) | — | Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog. |
+| `concurrency` | [object](#clusterrepository-spec-concurrency) | — | Concurrency limits for mover Jobs against this repository (absent = unlimited). |
 | `create` | [object](#clusterrepository-spec-create) | — | What to do when the repository does not yet exist (absent means it must already exist). |
 | `credentialProjection` | [object](#clusterrepository-spec-credentialprojection) | — | Repository-owner gate for projecting credential Secrets into a foreign consumer namespace. |
 | `deletionProtection` | [object](#clusterrepository-spec-deletionprotection) | — | Mass-deletion circuit breaker for this repository's Snapshots. |
@@ -1082,7 +1093,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `moverDefaults` | [object](#clusterrepository-spec-moverdefaults) | — | Base mover configuration inherited by every mover this repository spawns. |
 | `onNamespaceDelete` | enum: Orphan \| Delete | `Orphan` | What happens to this repository's snapshots when a consuming namespace is deleted. |
 | `parameters` | [object](#clusterrepository-spec-parameters) | — | Mutable kopia repository parameters, re-applied on bootstrap whenever they drift. |
-| `scheduleDefaults` | [object](#clusterrepository-spec-scheduledefaults) | — | Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set their own equivalent field — verification, replication, and maintenance schedules today; set once here instead of repeating it on every cron. |
+| `scheduleDefaults` | [object](#clusterrepository-spec-scheduledefaults) | — | Scheduling defaults (`timezone`, `jitter`) inherited by consumers that don't set their own equivalent field — backup, verification, replication, and maintenance schedules; set once here instead of repeating it on every cron. |
 | `seed` | [object](#clusterrepository-spec-seed) | — | Initialize this repository from an existing replica on its FIRST bootstrap (issue #380) — a disaster-recovery entry point.<br>Armed only while the repository has never been initialized (`status.uniqueId` unset) **and** the mover's connect reports the backend uninitialized; on an already-initialized repository it is a documented no-op (`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave standing in a GitOps manifest. When armed it also replaces `spec.create`'s fallback: the repository is seeded or the bootstrap fails, never silently created empty. |
 | `server` | [object](#clusterrepository-spec-server) | — | Optional kopia web-UI server (the target `namespace` is required). |
 | `suspend` | boolean | — | Pause this cluster repository: skip connect/bootstrap and maintenance projection. |
@@ -1391,6 +1402,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | `maxAgeDays` | integer | — | Expire discovered `Snapshot` CRs older than this many days (minimum 1); kopia snapshots untouched. |
 | `perIdentity` | integer | — | Keep the most-recent N discovered `Snapshot` CRs per identity; `0` disables materialization. |
 
+#### `spec.concurrency` { #clusterrepository-spec-concurrency }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `maxConcurrentJobs` | integer | —<br><sub>min 0</sub> | Ceiling on how many of this repository's mover Jobs may be in flight at once. Backup snapshots, restores, and replication runs that READ FROM this repository all draw from ONE pool — a repository's backend (and the bandwidth to it) is the shared resource, so splitting the budget per work kind would let three "safe" limits still saturate it.<br>Restores are **always admitted** and never parked: a restore is a recovery in progress, and holding one behind a queue of routine backups is exactly backwards. An in-flight restore still COUNTS toward the pool, so it displaces backups rather than adding to them.<br>Excluded from the pool entirely: maintenance (already single-flight per repository), verification, pin, and snapshot-delete batch Jobs. These are operator-driven housekeeping that must not be starved by a saturated backup pool.<br>Absent or `0` means unlimited — the default, and today's behavior.<br>No schema `default:` is emitted for this field (api-conventions §4a): absent and `0` are the SAME state (unlimited), so a materialized default would stamp `{maxConcurrentJobs: 0}` onto every stored repository — GitOps diff noise for a value that changes nothing. |
+
 #### `spec.create` { #clusterrepository-spec-create }
 
 | Field | Type | Default | Description |
@@ -1539,6 +1556,8 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `affinity` | core/v1 Affinity | — | Pod affinity for every mover. |
 | `cache` | [object](#clusterrepository-spec-moverdefaults-cache) | — | kopia cache defaults for every mover. |
 | `nodeSelector` | map[string]string | — | Pod `nodeSelector` for every mover. |
+| `podAnnotations` | map[string]string | — | Extra annotations for every mover pod. Unlike `podLabels` these are **pod-template-only** — they are not mirrored onto the `Job` object, because the common case is a sidecar-injection opt-out (`sidecar.istio.io/inject: "false"`, `linkerd.io/inject: disabled`, `vault.hashicorp.com/agent-inject: "false"`) that only means anything on the pod a mesh webhook actually sees. A mover is a short-lived batch pod; an injected sidecar that never exits keeps its Job running forever.<br>Same reserved keys as `podLabels`, rejected at admission. |
+| `podLabels` | map[string]string | — | Extra labels for every mover POD (and the `Job` that owns it), merged UNDER kopiur's own labels — a key kopiur sets always wins, so a user-supplied value can never break the selectors the controller counts and reaps by.<br>This is the hook for cluster machinery that keys off pod labels and that kopiur has no field of its own for: a Kueue `kueue.x-k8s.io/queue-name` to put movers under a cluster queue, a monitoring/`NetworkPolicy` selector, a service-mesh exclusion label.<br>Keys under `kopiur.home-operations.com/` and the exact key `app.kubernetes.io/managed-by` are reserved and rejected at admission. |
 | `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security-context base (notably `fsGroup`) for every mover. |
 | `resources` | core/v1 ResourceRequirements | — | Resource requests/limits base for the mover container. |
 | `scratch` | [object](#clusterrepository-spec-moverdefaults-scratch) | — | Defaults for the deep-verification scratch (restore-test) volume. |
@@ -1624,6 +1643,7 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `jitter` | string | — | Deterministic jitter window (Go-style duration, e.g. `10m`) applied to every consuming cron that doesn't set its own `jitter` — `SnapshotSchedule`, `Maintenance` (quick and full), `SnapshotPolicy` verification (quick and deep), and both replication kinds. Set once here instead of repeating it on every cron, so a whole repository's schedules spread their load off the top-of-the-hour thundering herd.<br>The spread is deterministic per `(scheduleUID, slot)`, not random: the same slot always lands on the same instant, so a restart never re-rolls it. Capped at 24h by validation — jitter is a spread WITHIN a cron period, not a schedule offset. |
 | `timezone` | string | — | IANA timezone name applied to every consuming cron that doesn't set its own `timezone` (e.g. `America/New_York`). Set once here instead of repeating it on every `SnapshotPolicy.verification`, `RepositoryReplication.schedule`, and `Maintenance.schedule` cron. |
 
 #### `spec.seed` { #clusterrepository-spec-seed }
@@ -2902,8 +2922,9 @@ Externally tagged — set **exactly one** of: `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `at` | string | — | The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias. |
+| `jitter` | string | — | The deterministic jitter window (Go-style duration, e.g. `10m`) the cron was spread by when this slot was pinned. This struct is shared by `nextSchedule`, `lastSchedule` and `lastSuccessfulSchedule`, so the field appears on all three, but the controller only ever WRITES it on `nextSchedule` — it is a property of a pin the controller may still have to invalidate, not a record of a slot that already fired. Recorded for the same reason as the pinned `timezone`: the window may be INHERITED from the target repository's `scheduleDefaults.jitter`, so a change to that default (or to `spec.schedule.jitter`) must invalidate the pinned wall-clock slot and recompute it in the new window — otherwise the edit would only take effect an arbitrary slot later. Absent both when no jitter applies and on legacy pins written before this field existed; an absent recorded window is treated as "unchanged" so an upgrade never churns an established pin. |
 | `snapshotRef` | [object](#snapshotschedule-status-lastschedule-snapshotref) | — | The `Snapshot` CR this slot produced, when one was created. |
-| `timezone` | string | — | The IANA timezone the cron was evaluated in when this slot was pinned (`nextSchedule` only). Recorded so the controller can detect an effective-timezone change — a `spec.schedule.timezone` edit or a change to the target repository's `scheduleDefaults.timezone` — and invalidate the pinned wall-clock slot, recomputing it in the new zone. Absent on legacy pins written before this field existed (treated as "unchanged"). |
+| `timezone` | string | — | The IANA timezone the cron was evaluated in when this slot was pinned. This struct is shared by `nextSchedule`, `lastSchedule` and `lastSuccessfulSchedule`, so the field appears on all three, but the controller only ever WRITES it on `nextSchedule` — it is a property of a pin the controller may still have to invalidate, not a record of a slot that already fired. Recorded so the controller can detect an effective-timezone change — a `spec.schedule.timezone` edit or a change to the target repository's `scheduleDefaults.timezone` — and invalidate the pinned wall-clock slot, recomputing it in the new zone. Absent on legacy pins written before this field existed (treated as "unchanged"). |
 
 ##### `status.lastSchedule.snapshotRef` { #snapshotschedule-status-lastschedule-snapshotref }
 
@@ -2916,8 +2937,9 @@ Externally tagged — set **exactly one** of: `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `at` | string | — | The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias. |
+| `jitter` | string | — | The deterministic jitter window (Go-style duration, e.g. `10m`) the cron was spread by when this slot was pinned. This struct is shared by `nextSchedule`, `lastSchedule` and `lastSuccessfulSchedule`, so the field appears on all three, but the controller only ever WRITES it on `nextSchedule` — it is a property of a pin the controller may still have to invalidate, not a record of a slot that already fired. Recorded for the same reason as the pinned `timezone`: the window may be INHERITED from the target repository's `scheduleDefaults.jitter`, so a change to that default (or to `spec.schedule.jitter`) must invalidate the pinned wall-clock slot and recompute it in the new window — otherwise the edit would only take effect an arbitrary slot later. Absent both when no jitter applies and on legacy pins written before this field existed; an absent recorded window is treated as "unchanged" so an upgrade never churns an established pin. |
 | `snapshotRef` | [object](#snapshotschedule-status-lastsuccessfulschedule-snapshotref) | — | The `Snapshot` CR this slot produced, when one was created. |
-| `timezone` | string | — | The IANA timezone the cron was evaluated in when this slot was pinned (`nextSchedule` only). Recorded so the controller can detect an effective-timezone change — a `spec.schedule.timezone` edit or a change to the target repository's `scheduleDefaults.timezone` — and invalidate the pinned wall-clock slot, recomputing it in the new zone. Absent on legacy pins written before this field existed (treated as "unchanged"). |
+| `timezone` | string | — | The IANA timezone the cron was evaluated in when this slot was pinned. This struct is shared by `nextSchedule`, `lastSchedule` and `lastSuccessfulSchedule`, so the field appears on all three, but the controller only ever WRITES it on `nextSchedule` — it is a property of a pin the controller may still have to invalidate, not a record of a slot that already fired. Recorded so the controller can detect an effective-timezone change — a `spec.schedule.timezone` edit or a change to the target repository's `scheduleDefaults.timezone` — and invalidate the pinned wall-clock slot, recomputing it in the new zone. Absent on legacy pins written before this field existed (treated as "unchanged"). |
 
 ##### `status.lastSuccessfulSchedule.snapshotRef` { #snapshotschedule-status-lastsuccessfulschedule-snapshotref }
 
@@ -2930,8 +2952,9 @@ Externally tagged — set **exactly one** of: `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `at` | string | — | The RFC3339 instant this slot fired (or is scheduled to); also accepts the `scheduledAt` alias. |
+| `jitter` | string | — | The deterministic jitter window (Go-style duration, e.g. `10m`) the cron was spread by when this slot was pinned. This struct is shared by `nextSchedule`, `lastSchedule` and `lastSuccessfulSchedule`, so the field appears on all three, but the controller only ever WRITES it on `nextSchedule` — it is a property of a pin the controller may still have to invalidate, not a record of a slot that already fired. Recorded for the same reason as the pinned `timezone`: the window may be INHERITED from the target repository's `scheduleDefaults.jitter`, so a change to that default (or to `spec.schedule.jitter`) must invalidate the pinned wall-clock slot and recompute it in the new window — otherwise the edit would only take effect an arbitrary slot later. Absent both when no jitter applies and on legacy pins written before this field existed; an absent recorded window is treated as "unchanged" so an upgrade never churns an established pin. |
 | `snapshotRef` | [object](#snapshotschedule-status-nextschedule-snapshotref) | — | The `Snapshot` CR this slot produced, when one was created. |
-| `timezone` | string | — | The IANA timezone the cron was evaluated in when this slot was pinned (`nextSchedule` only). Recorded so the controller can detect an effective-timezone change — a `spec.schedule.timezone` edit or a change to the target repository's `scheduleDefaults.timezone` — and invalidate the pinned wall-clock slot, recomputing it in the new zone. Absent on legacy pins written before this field existed (treated as "unchanged"). |
+| `timezone` | string | — | The IANA timezone the cron was evaluated in when this slot was pinned. This struct is shared by `nextSchedule`, `lastSchedule` and `lastSuccessfulSchedule`, so the field appears on all three, but the controller only ever WRITES it on `nextSchedule` — it is a property of a pin the controller may still have to invalidate, not a record of a slot that already fired. Recorded so the controller can detect an effective-timezone change — a `spec.schedule.timezone` edit or a change to the target repository's `scheduleDefaults.timezone` — and invalidate the pinned wall-clock slot, recomputing it in the new zone. Absent on legacy pins written before this field existed (treated as "unchanged"). |
 
 ##### `status.nextSchedule.snapshotRef` { #snapshotschedule-status-nextschedule-snapshotref }
 

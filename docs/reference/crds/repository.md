@@ -70,21 +70,38 @@ See [Throttling a seed](../../repositories.md#throttling-a-seed).
 ### `moverDefaults`
 
 Base mover configuration — security context, pod security context, resources,
-cache, `nodeSelector`/`tolerations`/`affinity`, Job TTL — inherited by **every**
-mover this repository spawns (bootstrap, backup, restore, maintenance). Each recipe
-can override fields per-mover; the merge is field-wise. See [Movers](../../movers.md).
+cache, `nodeSelector`/`tolerations`/`affinity`, `podLabels`/`podAnnotations`,
+Job TTL — inherited by **every** mover this repository spawns (bootstrap, backup,
+restore, maintenance). Each recipe can override fields per-mover; the merge is
+field-wise. See [Movers](../../movers.md) and
+[MoverDefaults](shared-types.md#moverdefaults).
 
 ### `scheduleDefaults`
 
 Repo-level scheduling defaults inherited at reconcile time by consumers that don't
 set their own equivalent field: `SnapshotPolicy.spec.verification`,
-`RepositoryReplication.spec.schedule`, `Maintenance.spec.schedule`, and
-`SnapshotSchedule.spec.schedule` all fall back to `scheduleDefaults.timezone` when
-their own `timezone` is absent (the consuming cron's own value always wins). A
-`SnapshotSchedule` resolves its target policy's repository default, records the
-zone in `status.nextSchedule.timezone`, and is re-triggered by a repository
-referent watch when the default changes.
-See [Repositories → `scheduleDefaults`](../../repositories.md#scheduledefaults--set-the-cron-timezone-once).
+`RepositoryReplication.spec.schedule`, `SnapshotReplication.spec.schedule`,
+`Maintenance.spec.schedule`, and `SnapshotSchedule.spec.schedule` all fall back to
+`scheduleDefaults.timezone` and `scheduleDefaults.jitter` when their own value is
+absent (the consuming cron's own value always wins). The fallback beneath
+`timezone` is UTC; beneath `jitter` there is none — absent at both levels means no
+spread. A `SnapshotSchedule` resolves its target policy's repository defaults,
+records both in `status.nextSchedule.{timezone,jitter}`, and is re-triggered by a
+repository referent watch when either default changes (recomputing the pinned
+slot). `jitter` is capped at 24h at admission.
+See [Repositories → `scheduleDefaults`](../../repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once)
+and [ScheduleDefaults](shared-types.md#scheduledefaults).
+
+### `concurrency`
+
+Concurrency limits for the mover Jobs this repository runs. `maxConcurrentJobs` is
+the ceiling; absent or `0` means unlimited (the default, and the behavior of every
+release before it existed). Backups, restores and the source side of both
+replication kinds share ONE pool; maintenance, verification, pin, batched snapshot
+deletions, bootstrap/catalog scans and browse sessions are excluded. Restores are
+always admitted but still occupy a slot.
+See [ConcurrencySpec](shared-types.md#concurrencyspec) and
+[Backups → limiting concurrent jobs per repository](../../backups.md#limiting-concurrent-jobs-per-repository).
 
 ### `catalog`
 

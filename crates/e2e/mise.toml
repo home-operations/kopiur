@@ -22,6 +22,29 @@ mise run //:image-controller
 mise run //:image-webhook
 mise run //:image-mover
 """
+# NOTE: the e2e-only `mover-slow` fixture image is NOT built here — it derives
+# FROM the mover image, and CI shards skip this task entirely
+# (KOPIUR_E2E_SKIP_BUILD=1) and side-load the mover tarball instead. It is built
+# by `images-load`, the one step both paths run once `kopiur/mover:e2e` exists in
+# the local docker daemon.
+
+[tasks.image-mover-slow]
+description = "Build the e2e-only SLOW mover fixture image (kopiur/mover-slow:e2e) FROM the local kopiur/mover:e2e"
+dir = "{{config_root}}/../.."
+run = """
+set -eu
+# The fixture wraps the REAL mover image, so that image must already be in the
+# local daemon — built by `//crates/e2e:images` locally, or `docker load`ed from
+# the shared build job's tarball in CI.
+docker image inspect kopiur/mover:e2e >/dev/null 2>&1 || {
+  echo "error: kopiur/mover:e2e is not in the local docker daemon — run 'mise run //crates/e2e:images' first (CI side-loads it from the e2e-images job's tarball)" >&2
+  exit 1
+}
+# Cheap: two COPY layers over the existing mover image (no Rust rebuild).
+docker build -f docker/Dockerfile.mover-slow \
+  --build-arg "MOVER_IMAGE=kopiur/mover:e2e" \
+  -t kopiur/mover-slow:e2e .
+"""
 
 [tasks.cluster-create]
 description = "Create (or reuse) the ephemeral kopiur-e2e kind cluster"
@@ -52,12 +75,17 @@ kind export kubeconfig --name "$CLUSTER" --kubeconfig "$KUBECONFIG"
 """
 
 [tasks.images-load]
-description = "Load the locally-built :e2e component images into the kind cluster"
+description = "Load the locally-built :e2e component images (plus the mover-slow e2e fixture) into the kind cluster"
 dir = "{{config_root}}/../.."
 env = { KUBECONFIG = "{{config_root}}/../../target/e2e/kubeconfig" }
 run = """
 set -eu
-kind load docker-image kopiur/controller:e2e kopiur/webhook:e2e kopiur/mover:e2e --name kopiur-e2e
+# Build the slow-mover fixture HERE rather than in `images`: this is the single
+# step every path runs (local `:test` and every CI shard, which skips `images`)
+# once kopiur/mover:e2e exists locally. Keep the tag in lockstep with
+# crates/e2e/src/consts.rs::SLOW_MOVER_IMAGE (a hermetic test asserts it).
+mise run //crates/e2e:image-mover-slow
+kind load docker-image kopiur/controller:e2e kopiur/webhook:e2e kopiur/mover:e2e kopiur/mover-slow:e2e --name kopiur-e2e
 """
 
 [tasks.minio-preload]
@@ -108,7 +136,7 @@ docker exec "$NODE" sh -c '
   # PVC ROOT is the kopia repo — a subdir under one shared PVC gives no isolation.
   # Each scenario binds its own PVC over one of these dirs. KEEP IN LOCKSTEP with
   # crates/e2e/src/consts.rs::REPO_SUBPATHS.
-  for s in moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate repl-src repl-dst repl-s3-src repl-run-src repl-run-dst projgate hooks gfs errh colocation colocation-off colocation-missing copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-heldprune adopt-prune adopt-ignore adopt-quiet polcasc-retain polcasc-delete polcasc-simul recrestore waitanchor waitref multipvc-fanout multipvc-group unchanged-dedup unchanged-default srepl-src srepl-dst srepl-coex-src srepl-coex-dst srepl-sel-src srepl-sel-dst srepl-susp-src srepl-susp-dst srepl-run-src srepl-run-dst mrepo-a mrepo-b mrepo-ret-a mrepo-ret-b mrepo-down-a mrepo-down-b mrepo-rest-a mrepo-rest-b seed-primary seed-mirror seed-blob seed-mig-src seed-mig-dst seed-empty-src seed-empty-dst; do
+  for s in moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate repl-src repl-dst repl-s3-src repl-run-src repl-run-dst projgate hooks gfs errh colocation colocation-off colocation-missing copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-heldprune adopt-prune adopt-ignore adopt-quiet polcasc-retain polcasc-delete polcasc-simul recrestore waitanchor waitref multipvc-fanout multipvc-group unchanged-dedup unchanged-default srepl-src srepl-dst srepl-coex-src srepl-coex-dst srepl-sel-src srepl-sel-dst srepl-susp-src srepl-susp-dst srepl-run-src srepl-run-dst mrepo-a mrepo-b mrepo-ret-a mrepo-ret-b mrepo-down-a mrepo-down-b mrepo-rest-a mrepo-rest-b seed-primary seed-mirror seed-blob seed-mig-src seed-mig-dst seed-empty-src seed-empty-dst conc-cap conc-counted conc-restore conc-uncapped conc-env-a conc-env-b conc-replace; do
     mkdir -p "/kopiur-e2e/repos/$s"
   done
   # Source dir with one UNREADABLE file for the errorHandling.ignoreFileErrors

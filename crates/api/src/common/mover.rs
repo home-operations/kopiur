@@ -126,6 +126,31 @@ pub struct MoverDefaults {
     /// Repository throttle limits applied by every mover after it connects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle: Option<Throttle>,
+    /// Extra labels for every mover POD (and the `Job` that owns it), merged
+    /// UNDER kopiur's own labels — a key kopiur sets always wins, so a
+    /// user-supplied value can never break the selectors the controller counts
+    /// and reaps by.
+    ///
+    /// This is the hook for cluster machinery that keys off pod labels and that
+    /// kopiur has no field of its own for: a Kueue `kueue.x-k8s.io/queue-name` to
+    /// put movers under a cluster queue, a monitoring/`NetworkPolicy` selector, a
+    /// service-mesh exclusion label.
+    ///
+    /// Keys under `kopiur.home-operations.com/` and the exact key
+    /// `app.kubernetes.io/managed-by` are reserved and rejected at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_labels: Option<BTreeMap<String, String>>,
+    /// Extra annotations for every mover pod. Unlike `podLabels`
+    /// these are **pod-template-only** — they are not mirrored onto the `Job`
+    /// object, because the common case is a sidecar-injection opt-out
+    /// (`sidecar.istio.io/inject: "false"`, `linkerd.io/inject: disabled`,
+    /// `vault.hashicorp.com/agent-inject: "false"`) that only means anything on
+    /// the pod a mesh webhook actually sees. A mover is a short-lived batch pod;
+    /// an injected sidecar that never exits keeps its Job running forever.
+    ///
+    /// Same reserved keys as `podLabels`, rejected at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_annotations: Option<BTreeMap<String, String>>,
 }
 
 /// Built-in default `Job.spec.ttlSecondsAfterFinished` (1h) applied to a mover Job
@@ -213,6 +238,12 @@ pub struct ResolvedMover {
     pub ttl_seconds_after_finished: Option<i64>,
     /// Resolved repository throttle (`moverDefaults.throttle`), if any. §13(e).
     pub throttle: Option<Throttle>,
+    /// Extra pod (and Job) labels from `moverDefaults.podLabels`, merged UNDER
+    /// kopiur's own labels by the caller — kopiur-managed keys always win.
+    pub pod_labels: Option<BTreeMap<String, String>>,
+    /// Extra pod-template annotations from `moverDefaults.podAnnotations`
+    /// (pod-only; never mirrored onto the `Job`).
+    pub pod_annotations: Option<BTreeMap<String, String>>,
 }
 
 /// Resolve the effective mover configuration via the layer merge
@@ -234,8 +265,9 @@ pub struct ResolvedMover {
 ///   and a partial recipe context can only tighten.
 /// - `recipe_resources`/`recipe_cache`: from `mover.resources` / `mover.cache`.
 ///
-/// `node_selector`/`tolerations`/`affinity`/`ttl` flow from `moverDefaults` (no per-recipe
-/// surface for the first three today; TTL is overridable by the caller post-resolve).
+/// `node_selector`/`tolerations`/`affinity`/`pod_labels`/`pod_annotations`/`ttl` flow from
+/// `moverDefaults` (no per-recipe surface for the first five today; TTL is overridable by
+/// the caller post-resolve).
 pub fn resolve_mover(
     defaults: Option<&MoverDefaults>,
     recipe_sc: Option<&SecurityContext>,
@@ -297,6 +329,8 @@ pub fn resolve_mover(
                 .unwrap_or(DEFAULT_JOB_TTL_SECONDS),
         ),
         throttle: defaults.and_then(|d| d.throttle.clone()),
+        pod_labels: defaults.and_then(|d| d.pod_labels.clone()),
+        pod_annotations: defaults.and_then(|d| d.pod_annotations.clone()),
     }
 }
 

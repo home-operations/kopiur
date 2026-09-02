@@ -331,6 +331,16 @@ Phases: `Pending` → `Resolving` (pinning the source snapshot) → `Restoring` 
 
 Every phase write also carries the [kstatus](gitops.md) conditions: `Completed` ⇒ `Ready=True`, `Failed` ⇒ `Stalled=True` (a Restore is one-shot — fix the cause and create a new Restore), anything in flight ⇒ `Reconciling=True`. So `kubectl wait --for=condition=Ready restore/<name>` and Flux/Argo health checks gate on a restore the same way they do on every other kopiur kind, and domain conditions (`Resolved`, `MoverPermitted`, `CredentialsAvailable`, `AwaitingClaim`) survive phase transitions alongside them.
 
+## A restore is never held behind a concurrency cap
+
+A [`Repository`'s `concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) bounds how many mover Jobs run against it at once, and backups queue behind it. **Restores never do.** A restore is a recovery in progress; holding one behind a queue of routine nightly backups is exactly backwards, so a restore is admitted at or over the cap and never carries a `RepositorySlotAvailable` condition at all — in either arm.
+
+It does still **count**, and it counts from the moment the operator decides to run it — not from the moment its Job shows up in `kubectl get jobs`. A restore occupies a slot like any other pooled Job, so it displaces backups rather than adding to them, which is what a cap is actually being asked for. If you set `maxConcurrentJobs: 3` and start three large restores, backups against that repository queue until the restores finish.
+
+The "from the moment of the decision" part is not a detail. A restore that only became countable once its Job existed would be invisible for the short window in which the operator is still resolving its source, staging its target PVC and projecting credentials — and a backup reconciling in that window would read spare capacity and start a second mover beside the recovery. A restore reserves its slot up front, so the cap holds even when a restore and a backup arrive at the same instant.
+
+Nothing about this needs configuration; it is the fixed behavior of the pool. See [Backups → limiting concurrent jobs per repository](backups.md#limiting-concurrent-jobs-per-repository) for the whole picture.
+
 ## Credentials in a fresh namespace — `credentialProjection`
 
 A restore mover loads the repository credentials via `envFrom` from a Secret **in its own namespace**. Restoring into a namespace that has never run a backup (disaster recovery, a clone target) won't have one. Set `credentialProjection.enabled: true` and the operator copies the referenced repository's Secret into the mover's namespace for the run — owned by the `Restore`, garbage-collected with it ([example 17](examples.md#example-17--restore-from-a-shared-repo-projection)):

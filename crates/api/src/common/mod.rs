@@ -842,6 +842,36 @@ fn default_mass_deletion_threshold() -> Option<u32> {
     Some(crate::consts::DEFAULT_MASS_DELETION_THRESHOLD)
 }
 
+/// Concurrency limits for mover Jobs against this repository.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ConcurrencySpec {
+    /// Ceiling on how many of this repository's mover Jobs may be in flight at
+    /// once. Backup snapshots, restores, and replication runs that READ FROM this
+    /// repository all draw from ONE pool — a repository's backend (and the
+    /// bandwidth to it) is the shared resource, so splitting the budget per work
+    /// kind would let three "safe" limits still saturate it.
+    ///
+    /// Restores are **always admitted** and never parked: a restore is a recovery
+    /// in progress, and holding one behind a queue of routine backups is exactly
+    /// backwards. An in-flight restore still COUNTS toward the pool, so it
+    /// displaces backups rather than adding to them.
+    ///
+    /// Excluded from the pool entirely: maintenance (already single-flight per
+    /// repository), verification, pin, and snapshot-delete batch Jobs. These are
+    /// operator-driven housekeeping that must not be starved by a saturated
+    /// backup pool.
+    ///
+    /// Absent or `0` means unlimited — the default, and today's behavior.
+    ///
+    /// No schema `default:` is emitted for this field (api-conventions §4a):
+    /// absent and `0` are the SAME state (unlimited), so a materialized default
+    /// would stamp `{maxConcurrentJobs: 0}` onto every stored repository — GitOps
+    /// diff noise for a value that changes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_jobs: Option<u32>,
+}
+
 /// Repository access mode; `ReadOnly` serves restores only (no backups, no maintenance).
 ///
 /// ```
@@ -912,14 +942,16 @@ pub fn resolve_tz(name: Option<&str>) -> chrono_tz::Tz {
 
 /// Repo-level scheduling defaults, inherited at reconcile time by consumers that
 /// don't set their own equivalent field (ADR §2.2 principle 10: sub-object, not a
-/// leaf field, so future defaults — e.g. jitter — slot in without API breakage).
+/// leaf field, so a new default slots in without API breakage — which is exactly
+/// how `jitter` joined `timezone` here).
 ///
 /// Consumed by `SnapshotPolicy` verification, `RepositoryReplication`,
 /// `Maintenance` scheduling, and `SnapshotSchedule` (the recurring-backup cron) —
 /// all of which resolve their repository in-reconciler via
 /// [`crate::common::RepositoryRef`]. The `SnapshotSchedule` consumer resolves its
 /// target policy's repository default at slot-computation time (see
-/// [`effective_timezone`]) and is re-triggered by a repository referent watch.
+/// [`effective_timezone`] / [`effective_schedule_jitter`]) and is re-triggered by
+/// a repository referent watch.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleDefaults {
@@ -929,7 +961,186 @@ pub struct ScheduleDefaults {
     /// `Maintenance.schedule` cron.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    /// Deterministic jitter window (Go-style duration, e.g. `10m`) applied to every
+    /// consuming cron that doesn't set its own `jitter` — `SnapshotSchedule`,
+    /// `Maintenance` (quick and full), `SnapshotPolicy` verification (quick and
+    /// deep), and both replication kinds. Set once here instead of repeating it on
+    /// every cron, so a whole repository's schedules spread their load off the
+    /// top-of-the-hour thundering herd.
+    ///
+    /// The spread is deterministic per `(scheduleUID, slot)`, not random: the same
+    /// slot always lands on the same instant, so a restart never re-rolls it.
+    /// Capped at 24h by validation — jitter is a spread WITHIN a cron period, not a
+    /// schedule offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter: Option<String>,
 }
+
+/// **Pure.** Resolve a consuming cron's own optional `jitter` against a
+/// repository-level `scheduleDefaults.jitter`: `own` wins when set, else
+/// `repo_default`, else `None` (no jitter). Mirrors [`resolve_tz_with_default`]'s
+/// shape for the timezone half of `scheduleDefaults`, minus a built-in fallback —
+/// there is no "default jitter", absent simply means no spread.
+///
+/// The returned string is still the user's raw text; the scheduler parses it with
+/// `crate::duration::parse_go_duration` exactly as it does an own-set value, and
+/// the admission webhook has already rejected an unparseable or over-24h value at
+/// BOTH levels (`validate_jitter` + `validate_jitter_bounds`).
+///
+/// ```
+/// use kopiur_api::common::effective_jitter;
+///
+/// // The schedule's own jitter wins, even over a repo default.
+/// assert_eq!(effective_jitter(Some("5m"), Some("1h")).as_deref(), Some("5m"));
+/// // Absent own jitter inherits the repo default.
+/// assert_eq!(effective_jitter(None, Some("1h")).as_deref(), Some("1h"));
+/// // Both absent → no jitter.
+/// assert_eq!(effective_jitter(None, None), None);
+/// ```
+pub fn effective_jitter(own: Option<&str>, repo_default: Option<&str>) -> Option<String> {
+    own.or(repo_default).map(str::to_string)
+}
+
+/// **Pure.** Decide the effective jitter window for a `SnapshotSchedule`, given the
+/// schedule's own `spec.schedule.jitter` (`own`) and the `scheduleDefaults.jitter`
+/// of each *matched* target policy's repository (`candidates`, one entry per
+/// matched policy; `None` = that repo sets no default).
+///
+/// The jitter counterpart of [`effective_timezone`], and deliberately the same
+/// fan-out shape — but it returns a bare `Option<String>` rather than a
+/// `(value, ambiguity)` pair, because there is no fallback value to report an
+/// ambiguity *against*: disagreement resolves to "no jitter", which is exactly what
+/// `None` already means. The caller logs the warn; this function just resolves.
+///
+/// Rules (the reconciler does the GETs and passes the data in):
+/// - `own` set → that window wins, no lookups.
+/// - `own` unset, **no** matched policies → `None`.
+/// - `own` unset, all matched policies agree → that value (which may itself be
+///   `None`, i.e. no repo sets a default).
+/// - `own` unset, matched policies disagree → `None` (no jitter). Mixing "a window"
+///   with "no default" is a genuine disagreement, same as [`effective_timezone`].
+///
+/// A single `policyRef` therefore never disagrees (one repository).
+///
+/// ```
+/// use kopiur_api::common::effective_schedule_jitter;
+///
+/// // Own jitter wins outright.
+/// assert_eq!(effective_schedule_jitter(Some("5m"), &[]).as_deref(), Some("5m"));
+///
+/// // Unset own, one agreeing default across matched policies.
+/// let defs = [Some("1h".to_string()), Some("1h".to_string())];
+/// assert_eq!(effective_schedule_jitter(None, &defs).as_deref(), Some("1h"));
+///
+/// // Unset own, disagreeing defaults → no jitter.
+/// let defs = [Some("1h".to_string()), None];
+/// assert_eq!(effective_schedule_jitter(None, &defs), None);
+/// ```
+pub fn effective_schedule_jitter(
+    own: Option<&str>,
+    candidates: &[Option<String>],
+) -> Option<String> {
+    match resolve_schedule_jitter(own, candidates) {
+        ScheduleJitterResolution::Agreed(window) => window,
+        ScheduleJitterResolution::Disagreed { .. } => None,
+    }
+}
+
+/// The outcome of [`resolve_schedule_jitter`] — the fan-out jitter resolution
+/// WITH the ambiguity signal [`effective_schedule_jitter`] throws away.
+///
+/// `effective_schedule_jitter` collapses a disagreement to `None`, which is
+/// indistinguishable from "everyone agreed there is no jitter" — so a caller that
+/// wants to warn an operator about the disagreement cannot see it. This enum is
+/// the resolver's real return type; the `Option`-returning function delegates to
+/// it for the callers that genuinely don't care. Exhaustive `match` at the call
+/// site is what makes "we resolved to no jitter" and "we gave up on disagreeing
+/// defaults" two decisions instead of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScheduleJitterResolution {
+    /// Every candidate agreed (or `own` won outright, or there was nothing to
+    /// inherit): this is the effective window, `None` meaning no jitter.
+    Agreed(Option<String>),
+    /// Matched policies' repositories set *differing* `scheduleDefaults.jitter`
+    /// values, so no window can be chosen unambiguously — the effective window is
+    /// `None` (no jitter) and the caller should warn, recommending an explicit
+    /// `spec.schedule.jitter`.
+    Disagreed {
+        /// The distinct candidates (sorted) that disagreed, for the log message.
+        /// A repository setting no default renders as `(none)` — mixing "a window"
+        /// with "no default" is a genuine disagreement, so it must be visible.
+        candidates: Vec<String>,
+    },
+}
+
+/// **Pure.** The jitter counterpart of [`effective_timezone`], reporting
+/// disagreement instead of silently swallowing it (see
+/// [`ScheduleJitterResolution`]). `own` is the schedule's own
+/// `spec.schedule.jitter`; `candidates` carries one entry per matched target
+/// policy repository (`None` = that repository sets no default).
+///
+/// Rules (the reconciler does the GETs and passes the data in):
+/// - `own` set → that window wins, no lookups, never ambiguous.
+/// - `own` unset, **no** candidates → `Agreed(None)`.
+/// - `own` unset, all candidates equal → `Agreed(that value)` (possibly `None`).
+/// - `own` unset, candidates differ → `Disagreed` (effective window: no jitter).
+///
+/// A single `policyRef` over a single-repository policy therefore never disagrees.
+///
+/// ```
+/// use kopiur_api::common::{ScheduleJitterResolution, resolve_schedule_jitter};
+///
+/// // Own jitter wins outright.
+/// assert_eq!(
+///     resolve_schedule_jitter(Some("5m"), &[]),
+///     ScheduleJitterResolution::Agreed(Some("5m".to_string())),
+/// );
+/// // Unset own, one agreeing default across matched policies.
+/// let defs = [Some("1h".to_string()), Some("1h".to_string())];
+/// assert_eq!(
+///     resolve_schedule_jitter(None, &defs),
+///     ScheduleJitterResolution::Agreed(Some("1h".to_string())),
+/// );
+/// // Unset own, disagreeing defaults → reported, not silently dropped.
+/// let defs = [Some("1h".to_string()), None];
+/// assert_eq!(
+///     resolve_schedule_jitter(None, &defs),
+///     ScheduleJitterResolution::Disagreed {
+///         candidates: vec!["(none)".to_string(), "1h".to_string()],
+///     },
+/// );
+/// ```
+pub fn resolve_schedule_jitter(
+    own: Option<&str>,
+    candidates: &[Option<String>],
+) -> ScheduleJitterResolution {
+    if let Some(own) = own {
+        return ScheduleJitterResolution::Agreed(Some(own.to_string()));
+    }
+    let Some(first) = candidates.first() else {
+        // Nothing matched → nothing to inherit.
+        return ScheduleJitterResolution::Agreed(None);
+    };
+    if candidates.iter().all(|c| c == first) {
+        return ScheduleJitterResolution::Agreed(first.clone());
+    }
+    let mut distinct: Vec<String> = candidates
+        .iter()
+        .map(|c| {
+            c.clone()
+                .unwrap_or_else(|| JITTER_NONE_CANDIDATE.to_string())
+        })
+        .collect();
+    distinct.sort();
+    distinct.dedup();
+    ScheduleJitterResolution::Disagreed {
+        candidates: distinct,
+    }
+}
+
+/// How "this repository sets no `scheduleDefaults.jitter`" renders in a
+/// [`ScheduleJitterResolution::Disagreed`] candidate list.
+const JITTER_NONE_CANDIDATE: &str = "(none)";
 
 /// Resolve a consuming cron's own optional IANA timezone against a repository-level
 /// default, falling back to UTC (mirrors [`resolve_tz`]): `own` wins when set, else

@@ -124,6 +124,59 @@ $ kubectl get repository <repo> -n <ns>   # fix the backend; watch PHASE return 
 
 When a backup *does* fail because the backend went away mid-run, the operator nudges the repository to re-probe connectivity immediately (rather than waiting for the next catalog refresh), so the gate engages within ~60s instead of up to an hour.
 
+### `RepositorySlotAvailable=False` — queued behind the repository's concurrency cap
+
+The repository's [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) (or the cluster-wide [`maxConcurrentJobs`](install.md#runtime-tuning) backstop) is full, so this run is **queued, not broken**. Nothing was created for it — no mover Job, no credential copy, no staged volume — and it launches by itself when a slot frees.
+
+```console
+$ kubectl get snapshot <name> -n <ns> \
+    -o jsonpath='{.status.conditions[?(@.type=="RepositorySlotAvailable")].message}{"\n"}'
+waiting for a mover slot on Repository billing/nas: 3/3 jobs running; restores are never held
+```
+
+The message names the numbers: live pooled Jobs over the cap, plus a `(global n/N)` clause when a cluster-wide cap is also set. If the denominator reads `unlimited`, the repository itself has **no** cap and it is the global backstop holding the run — turn that knob, not the repository's.
+
+The same condition appears on a `RepositoryReplication`/`SnapshotReplication` queued behind its **source** repository. A `Restore` never carries it: restores are always admitted.
+
+**When it is a real problem.** A queued run has no deadline — it waits indefinitely — so a queue that never drains looks identical to one that is merely long. Check the depth and whether it is moving:
+
+```console
+$ kubectl get jobs -A \
+    -l 'app.kubernetes.io/managed-by=kopiur,kopiur.home-operations.com/repo-pool' -o wide
+```
+
+Every Job that occupies a pool slot carries `kopiur.home-operations.com/repo-pool` (its value is a hash of the repository, so the selector above lists the pooled Jobs across all repositories at once).
+
+or, on `/metrics`, `sum by (repository) (kopiur_snapshot_waiting_for_slot)` (see [Observability](dev/observability.md#metrics); note its `namespace` label is the *Snapshot's*, not the repository's). The chart plots exactly that in the Grafana dashboard's **Mover-slot queue depth** panel, and alerts on it: **`KopiurSnapshotWaitingForSlot`** fires when a single run has been queued for 30 minutes.
+
+A depth that only grows means either the cap is below what your schedules actually need, or one pooled Job is wedged and never terminating — find it with `kubectl get jobs` above and treat it as a [stuck mover pod](#backup-or-restore-failed-with-moverpodwedged--the-pod-couldnt-start).
+
+/// warning | A queued run plus a short `startingDeadlineSeconds` silently drops backups
+
+While a schedule's previous run is queued, `concurrencyPolicy: Forbid` (the default) skips each new slot. Those skipped slots keep aging, and any that ages past `startingDeadlineSeconds` is **permanently skipped** with a `SkipExpiredSlot` event rather than deferred. If you see `SkipExpiredSlot` events on a schedule whose runs are queueing, that is the interaction — lengthen the deadline well past your worst queue, or remove it and let queued runs simply run late.
+
+///
+
+### `ReplacementHeld=True` — a `Replace` schedule stopped firing
+
+A `SnapshotSchedule` with `concurrencyPolicy: Replace` normally cancels its unfinished previous run and starts the new one. It refuses to when that run is itself **parked** behind the repository's concurrency cap: cancelling a queued run frees no capacity, and the replacement would go straight to the back of the same line. So `Replace` degrades to `Forbid`-like waiting and says so.
+
+```console
+$ kubectl get snapshotschedule <name> -n <ns> \
+    -o jsonpath='{.status.conditions[?(@.type=="ReplacementHeld")]}{"\n"}'
+{"type":"ReplacementHeld","status":"True","reason":"WaitingForRepositorySlot", ...}
+```
+
+There is also a one-off `WaitingForRepositorySlot` Normal event on the schedule when it enters the hold — a schedule that has quietly stopped firing always tells you why.
+
+**This clears itself** the moment a slot frees; it is not a wedge and needs no human, which is why it is not a structural gate. If it keeps recurring, the repository's cap is below what its schedules need — raise `concurrency.maxConcurrentJobs`, or spread the schedules with [`scheduleDefaults.jitter`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once). The one thing to watch for while it holds is the `startingDeadlineSeconds` interaction in the warning above: held slots expire like any other.
+
+/// note | Not to be confused with `BlockedOnUnreadableRun`
+
+`Replace` also declines to cancel a run whose `status.phase` this operator version does not recognize — nearly always a partial upgrade, where a newer Kopiur wrote the phase. That one raises `ScheduleRunnable=False` (`BlockedOnUnreadableRun`) and **does** need you: finish the upgrade, or delete that `Snapshot` if the run is really over.
+
+///
+
 ### `CredentialsAvailable=False` — Secret missing in the workload namespace
 
 The mover loads credentials with `envFrom`, which is **namespace-local**, so the credential Secret must exist in the namespace where the data (and the mover Job) live — not just where the repository is defined.
@@ -682,6 +735,10 @@ $ kubectl get snapshot <name> -n <ns> -o jsonpath='{.status.job.name}'   # Snaps
 $ kubectl get pods -n <ns> --selector=job-name=<job-name>                # job-name = above, or the Restore name
 # or list every mover Job/pod for a policy at once:
 $ kubectl get jobs,pods -n <ns> -l kopiur.home-operations.com/config=<policy-name>
+
+# every mover Job currently occupying a repository concurrency slot, cluster-wide:
+$ kubectl get jobs -A \
+    -l 'app.kubernetes.io/managed-by=kopiur,kopiur.home-operations.com/repo-pool'
 
 # confirm the mover RBAC was minted in the workload namespace:
 $ kubectl get serviceaccount,rolebinding -n <ns> -l app.kubernetes.io/component=mover

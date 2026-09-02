@@ -368,6 +368,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         config.operator_namespace.clone(),
         config.watch_scope.clone(),
         config.max_concurrent_delete_jobs,
+        config.max_concurrent_jobs,
         config.source_pvc_deadline,
     ));
 

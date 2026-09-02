@@ -27,6 +27,7 @@ use kube::api::{DeleteParams, ListParams};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
+use kopiur_api::common::ScheduleDefaults;
 use kopiur_api::{Maintenance, validate};
 use kopiur_kopia::MaintenanceMode;
 use kopiur_mover::workspec::{
@@ -114,13 +115,11 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let repo_ref = &maint.spec.repository;
     // Launch-side (Job spawn inputs) — store-backed point read (#382 M2).
     let repo = io::resolve_repository_ref_cached(ctx, repo_ref, &namespace).await?;
-    // GitHub #174 item 3: the last of the three cascade levels (per-cron →
-    // schedule-level → repo scheduleDefaults.timezone → UTC), resolved in
-    // `slot_for`.
-    let repo_tz = repo
-        .schedule_defaults
-        .as_ref()
-        .and_then(|d| d.timezone.as_deref());
+    // GitHub #174 item 3: the last of the cascade levels for BOTH scheduling
+    // inputs — timezone (per-cron → schedule-level → repo
+    // `scheduleDefaults.timezone` → UTC) and jitter (per-cron → repo
+    // `scheduleDefaults.jitter` → none) — resolved in `slot_for`.
+    let repo_defaults = repo.schedule_defaults.as_ref();
 
     // G7: wait unless maintenance can plausibly help (issue #413). The gate is
     // keyed on bootstrapped-before + degradation cause
@@ -188,8 +187,13 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     }
 
     // Nothing due → sleep until the earliest next slot (capped).
-    let Some((mode, slot)) = due_mode(maint, now, repo_tz) else {
-        return Ok(Action::requeue(cap(next_wakeup(maint, now, None, repo_tz))));
+    let Some((mode, slot)) = due_mode(maint, now, repo_defaults) else {
+        return Ok(Action::requeue(cap(next_wakeup(
+            maint,
+            now,
+            None,
+            repo_defaults,
+        ))));
     };
 
     let job_name = maintenance_job_name(&name, mode, slot);
@@ -207,7 +211,7 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
                     maint,
                     now,
                     Some((mode, slot)),
-                    repo_tz,
+                    repo_defaults,
                 ))))
             }
             // Failed: surface the condition once (transition-guarded) and re-check.
@@ -545,6 +549,24 @@ fn maintenance_op(maint: &Maintenance, mode: MaintenanceMode) -> MaintenanceOp {
     }
 }
 
+/// The label set a maintenance mover `Job` (and its pod) carries.
+///
+/// Extracted from [`spawn_maintenance_job`] so the exact set is assertable
+/// without a cluster — most importantly that it does NOT carry
+/// [`kopiur_api::consts::REPO_POOL_LABEL`]. Maintenance is the *cure* for an
+/// overloaded repository, so parking it behind a saturated backup pool would
+/// make a struggling repository permanently unmaintainable
+/// ([`crate::pool::counts_toward_repo_pool`]).
+pub(super) fn maintenance_job_labels(cr_name: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        COMPONENT_LABEL.to_string(),
+        MAINTENANCE_COMPONENT.to_string(),
+    );
+    labels.insert(MAINTENANCE_INSTANCE_LABEL.to_string(), cr_name.to_string());
+    labels
+}
+
 /// Build + apply the per-slot work-spec ConfigMap and mover Job.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_maintenance_job(
@@ -588,12 +610,7 @@ async fn spawn_maintenance_job(
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
 
-    let mut labels = BTreeMap::new();
-    labels.insert(
-        COMPONENT_LABEL.to_string(),
-        MAINTENANCE_COMPONENT.to_string(),
-    );
-    labels.insert(MAINTENANCE_INSTANCE_LABEL.to_string(), cr_name.to_string());
+    let mut labels = maintenance_job_labels(cr_name);
 
     let mut annotations = BTreeMap::new();
     annotations.insert(MAINTENANCE_SLOT_ANNOTATION.to_string(), slot.to_rfc3339());
@@ -728,6 +745,10 @@ async fn spawn_maintenance_job(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         source_volume: None,
         repo_volume,
@@ -765,16 +786,16 @@ fn maintenance_job_limits(maint: &Maintenance) -> JobLimits {
 }
 
 /// Choose the maintenance pass due now, preferring full (it subsumes quick).
-/// Returns the mode and its scheduled slot, or `None` if nothing is due. `repo_tz`
-/// is the target repository's `scheduleDefaults.timezone` (GitHub #174 item 3),
-/// the last of three cascade levels (see [`slot_for`]).
+/// Returns the mode and its scheduled slot, or `None` if nothing is due.
+/// `repo_defaults` is the target repository's `scheduleDefaults` (GitHub #174 item
+/// 3), the last cascade level for both timezone and jitter (see [`slot_for`]).
 fn due_mode(
     maint: &Maintenance,
     now: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Option<(MaintenanceMode, DateTime<Utc>)> {
     for mode in [MaintenanceMode::Full, MaintenanceMode::Quick] {
-        if let Ok(slot) = slot_for(maint, mode, mode_after(maint, mode), repo_tz)
+        if let Ok(slot) = slot_for(maint, mode, mode_after(maint, mode), repo_defaults)
             && now >= slot
         {
             return Some((mode, slot));
@@ -798,20 +819,35 @@ fn mode_after(maint: &Maintenance, mode: MaintenanceMode) -> DateTime<Utc> {
 }
 
 /// The next cron slot for `mode` strictly after `after` (croner + jitter, seeded
-/// by the CR UID for a stable per-replica spread). `repo_tz` is the target
-/// repository's `scheduleDefaults.timezone` (GitHub #174 item 3).
+/// by the CR UID for a stable per-replica spread). `repo_defaults` is the target
+/// repository's `scheduleDefaults` (GitHub #174 item 3), the inherited fallback for
+/// BOTH the timezone and the jitter window.
+///
+/// Jitter inheritance note: the operator-managed `Maintenance` carries the
+/// materialized quick-30m / full-1h windows from
+/// [`kopiur_api::default_maintenance_schedule`] in its own spec, so those count as
+/// "own" and a repository default does NOT override them. Inheritance only fills a
+/// GENUINELY absent per-cron `jitter` — an externally-authored `Maintenance`, or a
+/// repository whose `spec.maintenance.schedule` override omits it.
 fn slot_for(
     maint: &Maintenance,
     mode: MaintenanceMode,
     after: DateTime<Utc>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Result<DateTime<Utc>> {
     let seed = maint.uid().unwrap_or_else(|| maint.name_any());
     let spec = match mode {
         MaintenanceMode::Quick => &maint.spec.schedule.quick,
         MaintenanceMode::Full => &maint.spec.schedule.full,
     };
-    let jitter = spec.jitter.as_deref().and_then(parse_go_duration);
+    // Two-level cascade: this cron's own `jitter` wins; else the target
+    // repository's `scheduleDefaults.jitter`; else no jitter.
+    let jitter = kopiur_api::common::effective_jitter(
+        spec.jitter.as_deref(),
+        repo_defaults.and_then(|d| d.jitter.as_deref()),
+    )
+    .as_deref()
+    .and_then(parse_go_duration);
     // Three-level cascade: per-cron `timezone` wins; else the schedule-level
     // shared timezone; else the target repository's `scheduleDefaults.timezone`;
     // else UTC.
@@ -819,7 +855,10 @@ fn slot_for(
         .timezone
         .as_deref()
         .or(maint.spec.schedule.timezone.as_deref());
-    let tz = kopiur_api::common::resolve_tz_with_default(own, repo_tz);
+    let tz = kopiur_api::common::resolve_tz_with_default(
+        own,
+        repo_defaults.and_then(|d| d.timezone.as_deref()),
+    );
     next_fire(&spec.cron, jitter, &seed, after, tz)
 }
 
@@ -895,7 +934,7 @@ fn next_wakeup(
     maint: &Maintenance,
     now: DateTime<Utc>,
     handled: Option<(MaintenanceMode, DateTime<Utc>)>,
-    repo_tz: Option<&str>,
+    repo_defaults: Option<&ScheduleDefaults>,
 ) -> Duration {
     let mut earliest: Option<DateTime<Utc>> = None;
     for mode in [MaintenanceMode::Quick, MaintenanceMode::Full] {
@@ -903,7 +942,7 @@ fn next_wakeup(
             Some((hm, hs)) if hm == mode => hs,
             _ => mode_after(maint, mode),
         };
-        if let Ok(slot) = slot_for(maint, mode, after, repo_tz) {
+        if let Ok(slot) = slot_for(maint, mode, after, repo_defaults) {
             earliest = Some(earliest.map_or(slot, |e| e.min(slot)));
         }
     }

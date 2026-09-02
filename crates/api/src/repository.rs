@@ -2,9 +2,9 @@
 
 use crate::backend::Backend;
 use crate::common::{
-    CatalogBounds, CreateBehavior, DeletionProtectionSpec, Encryption, FailurePolicy,
-    IdentityDefaults, MoverDefaults, NamespaceDeletePolicy, RepositoryMode, ScheduleDefaults,
-    default_namespace_delete_policy, default_repository_mode,
+    CatalogBounds, ConcurrencySpec, CreateBehavior, DeletionProtectionSpec, Encryption,
+    FailurePolicy, IdentityDefaults, MoverDefaults, NamespaceDeletePolicy, RepositoryMode,
+    ScheduleDefaults, default_namespace_delete_policy, default_repository_mode,
 };
 use crate::maintenance::RepositoryMaintenanceSpec;
 use crate::seed::{SeedSpec, SeedStatus};
@@ -77,9 +77,9 @@ pub struct RepositorySpec {
     /// Base mover configuration inherited by every mover this repository spawns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mover_defaults: Option<MoverDefaults>,
-    /// Scheduling defaults (e.g. `timezone`) inherited by consumers that don't set
-    /// their own equivalent field — verification, replication, and maintenance
-    /// schedules today; set once here instead of repeating it on every cron.
+    /// Scheduling defaults (`timezone`, `jitter`) inherited by consumers that don't
+    /// set their own equivalent field — backup, verification, replication, and
+    /// maintenance schedules; set once here instead of repeating it on every cron.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_defaults: Option<ScheduleDefaults>,
     /// Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.
@@ -108,6 +108,9 @@ pub struct RepositorySpec {
     /// Mass-deletion circuit breaker for this repository's Snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_protection: Option<DeletionProtectionSpec>,
+    /// Concurrency limits for mover Jobs against this repository (absent = unlimited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<ConcurrencySpec>,
     /// Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only).
     #[serde(default = "default_repository_mode")]
     #[schemars(default = "default_repository_mode")]
@@ -1071,6 +1074,170 @@ health:
                 .is_none(),
             "absent deletionProtection must be elided"
         );
+    }
+
+    #[test]
+    fn concurrency_max_concurrent_jobs_emits_no_schema_default() {
+        // The §4a inverse of `deletion_protection_threshold_schema_default_matches_the_constant`.
+        // A schema `default:` is materialized SERVER-SIDE at admission, so emitting
+        // one here would stamp `{maxConcurrentJobs: 0}` onto every stored repository
+        // — GitOps diff noise for a value that is definitionally identical to the
+        // field being absent. Absent ≡ 0 ≡ unlimited, so there is nothing for a
+        // default to disambiguate. Pinned so a later "every field should have a
+        // default" pass has to read this reasoning first.
+        let json = serde_json::to_value(Repository::crd()).unwrap();
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let field = &spec["properties"]["concurrency"]["properties"]["maxConcurrentJobs"];
+        assert!(
+            !field.is_null(),
+            "the field itself must exist in the schema: {spec}"
+        );
+        assert!(
+            field.get("default").is_none(),
+            "maxConcurrentJobs must NOT carry a schema default: {field}"
+        );
+        // And the resolver agrees that all three spellings mean the same thing.
+        assert_eq!(crate::consts::effective_max_concurrent_jobs(None), None);
+    }
+
+    #[test]
+    fn concurrency_round_trips_and_zero_is_unlimited() {
+        use crate::common::ConcurrencySpec;
+        use crate::consts::effective_max_concurrent_jobs;
+
+        let head = "backend: { filesystem: { path: /repo } }\n\
+                    encryption: { passwordSecretRef: { name: s } }\n";
+
+        let spec: RepositorySpec =
+            from_yaml(&format!("{head}concurrency:\n  maxConcurrentJobs: 2\n"));
+        assert_eq!(
+            spec.concurrency,
+            Some(ConcurrencySpec {
+                max_concurrent_jobs: Some(2)
+            })
+        );
+        assert_eq!(
+            effective_max_concurrent_jobs(spec.concurrency.as_ref()).map(|n| n.get()),
+            Some(2)
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["concurrency"]["maxConcurrentJobs"], 2);
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Explicit 0 = unlimited; it survives the round trip as written (nothing
+        // normalizes it away) and resolves to uncapped, NOT to a zero-capacity pool.
+        let zero: RepositorySpec =
+            from_yaml(&format!("{head}concurrency:\n  maxConcurrentJobs: 0\n"));
+        assert_eq!(
+            zero.concurrency.and_then(|c| c.max_concurrent_jobs),
+            Some(0)
+        );
+        assert_eq!(
+            effective_max_concurrent_jobs(zero.concurrency.as_ref()),
+            None
+        );
+
+        // An empty `concurrency: {}` block is legal and also means unlimited.
+        let empty: RepositorySpec = from_yaml(&format!("{head}concurrency: {{}}\n"));
+        assert_eq!(
+            empty.concurrency,
+            Some(ConcurrencySpec {
+                max_concurrent_jobs: None
+            })
+        );
+        assert_eq!(
+            effective_max_concurrent_jobs(empty.concurrency.as_ref()),
+            None
+        );
+
+        // Absent stays None and is elided.
+        let bare: RepositorySpec = from_yaml(head);
+        assert!(bare.concurrency.is_none());
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("concurrency")
+                .is_none(),
+            "absent concurrency must be elided"
+        );
+    }
+
+    #[test]
+    fn schedule_defaults_jitter_round_trips() {
+        let head = "backend: { filesystem: { path: /repo } }\n\
+                    encryption: { passwordSecretRef: { name: s } }\n";
+        let spec: RepositorySpec = from_yaml(&format!(
+            "{head}scheduleDefaults:\n  timezone: America/Chicago\n  jitter: 10m\n"
+        ));
+        let sd = spec.schedule_defaults.as_ref().expect("scheduleDefaults");
+        assert_eq!(sd.jitter.as_deref(), Some("10m"));
+        assert_eq!(sd.timezone.as_deref(), Some("America/Chicago"));
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["scheduleDefaults"]["jitter"], "10m");
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // A jitter-only scheduleDefaults is legal (the two knobs are independent).
+        let jitter_only: RepositorySpec =
+            from_yaml(&format!("{head}scheduleDefaults:\n  jitter: 1h\n"));
+        let sd = jitter_only
+            .schedule_defaults
+            .as_ref()
+            .expect("scheduleDefaults");
+        assert_eq!(sd.jitter.as_deref(), Some("1h"));
+        assert!(sd.timezone.is_none());
+        assert!(
+            serde_json::to_value(&jitter_only).unwrap()["scheduleDefaults"]
+                .get("timezone")
+                .is_none(),
+            "absent timezone must be elided"
+        );
+    }
+
+    #[test]
+    fn mover_defaults_pod_metadata_round_trips() {
+        let spec: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             moverDefaults:\n\
+             \x20 podLabels:\n\
+             \x20   kueue.x-k8s.io/queue-name: backups\n\
+             \x20   team: platform\n\
+             \x20 podAnnotations:\n\
+             \x20   sidecar.istio.io/inject: \"false\"\n",
+        );
+        let md = spec.mover_defaults.as_ref().expect("moverDefaults");
+        let labels = md.pod_labels.as_ref().expect("podLabels");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(
+            labels.get("kueue.x-k8s.io/queue-name").map(String::as_str),
+            Some("backups")
+        );
+        assert_eq!(labels.get("team").map(String::as_str), Some("platform"));
+        assert_eq!(
+            md.pod_annotations
+                .as_ref()
+                .and_then(|m| m.get("sidecar.istio.io/inject"))
+                .map(String::as_str),
+            Some("false")
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["moverDefaults"]["podLabels"]["team"], "platform");
+        let reparsed: RepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent stays absent and is elided on both keys.
+        let bare: RepositorySpec = from_yaml(
+            "backend: { filesystem: { path: /repo } }\n\
+             encryption: { passwordSecretRef: { name: s } }\n\
+             moverDefaults: { ttlSecondsAfterFinished: 60 }\n",
+        );
+        let md = bare.mover_defaults.as_ref().expect("moverDefaults");
+        assert!(md.pod_labels.is_none() && md.pod_annotations.is_none());
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json["moverDefaults"].get("podLabels").is_none());
+        assert!(json["moverDefaults"].get("podAnnotations").is_none());
     }
 
     #[test]

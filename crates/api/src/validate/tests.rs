@@ -1624,6 +1624,7 @@ fn repository_inline_retention_hook_passes_today() {
         health: None,
         parameters: None,
         deletion_protection: None,
+        concurrency: None,
     };
     assert!(validate_repository_no_inline_retention(&spec).is_ok());
 }
@@ -2282,6 +2283,7 @@ fn repo_spec_with_maintenance(m: Option<RepositoryMaintenanceSpec>) -> Repositor
         health: None,
         parameters: None,
         deletion_protection: None,
+        concurrency: None,
     }
 }
 
@@ -2381,6 +2383,7 @@ fn cluster_repository_rejects_all_false() {
         health: None,
         parameters: None,
         deletion_protection: None,
+        concurrency: None,
         credential_projection: None,
     };
     assert!(!validate_cluster_repository(&spec).is_empty());
@@ -2424,6 +2427,7 @@ fn cluster_repository_rejects_bad_identity_expr() {
         health: None,
         parameters: None,
         deletion_protection: None,
+        concurrency: None,
         credential_projection: None,
     };
     let errs = validate_cluster_repository(&spec);
@@ -2477,6 +2481,7 @@ fn repo_spec_create(
         health: None,
         parameters: None,
         deletion_protection: None,
+        concurrency: None,
     }
 }
 
@@ -2539,6 +2544,7 @@ fn cluster_repository_immutability_allows_changed_password_secret_ref() {
         health: None,
         parameters: None,
         deletion_protection: None,
+        concurrency: None,
         credential_projection: None,
     };
     assert!(
@@ -2639,6 +2645,7 @@ fn cluster_repository_immutability_rejects_changed_splitter() {
         health: None,
         parameters: None,
         deletion_protection: None,
+        concurrency: None,
         credential_projection: None,
     };
     let old = mk("FIXED-4M");
@@ -4585,6 +4592,7 @@ fn cluster_repository_rejects_bad_cluster_name() {
         health: None,
         parameters: None,
         deletion_protection: None,
+        concurrency: None,
         credential_projection: None,
     };
     let errs = validate_cluster_repository(&spec);
@@ -7084,6 +7092,521 @@ fn representative_validation_error_messages_are_well_formed() {
             crate::message_shape_issue(&e.to_string()),
             None,
             "ValidationError message not well-formed: {e}"
+        );
+    }
+}
+
+// === M1: jitter bounds, startingDeadlineSeconds, pod metadata ===============
+//
+// The load-bearing property under test in this section is the ADMISSION-ONLY
+// ratchet: every one of these tightening rules must reject at the webhook AND be
+// invisible to the shared aggregate the reconciler re-runs, so a stored CR that
+// violates one keeps reconciling instead of hard-stopping. Each rejection test is
+// therefore paired with a regression pin proving the aggregate still accepts it.
+
+fn yaml<T: serde::de::DeserializeOwned>(s: &str) -> T {
+    crate::testutil::from_yaml(s)
+}
+
+// --- validate_jitter_bounds (the shared primitive) -------------------------
+
+#[test]
+fn jitter_bounds_accepts_up_to_24h_and_rejects_beyond() {
+    // Exactly the cap is valid — the bound is inclusive.
+    for ok in ["1s", "10m", "1h", "23h", "24h", "1440m", "86400s", "86400"] {
+        assert!(
+            validate_jitter_bounds("spec.schedule.jitter", ok).is_ok(),
+            "{ok} must be accepted"
+        );
+    }
+    // One second past it is not, in every spelling of the same duration.
+    for bad in ["25h", "86401s", "86401", "1441m"] {
+        let err = validate_jitter_bounds("spec.schedule.jitter", bad)
+            .expect_err("over-cap jitter must be rejected");
+        let ValidationError::InvalidFieldValue { field, reason } = &err else {
+            panic!("expected InvalidFieldValue, got {err:?}");
+        };
+        assert_eq!(field, "spec.schedule.jitter");
+        // What / why / fix, all three present.
+        assert!(reason.contains("exceeds the 24h maximum"), "{reason}");
+        assert!(reason.contains("per-slot spread"), "{reason}");
+        assert!(reason.contains("move the offset into the cron"), "{reason}");
+    }
+}
+
+#[test]
+fn jitter_bounds_rejects_garbage_with_the_shared_parse_message() {
+    // The parse half runs first and reports exactly what `validate_jitter` reports,
+    // so a typo reads identically whichever validator caught it.
+    // NB "10 m" is deliberately absent: `parse_go_duration` trims inside the unit
+    // split, so it parses as 10m. That is pre-existing parser leniency, not
+    // something these bounds introduce.
+    for bad in ["every-hour", "", "  ", "-5m", "9999999999999999h", "1.5h"] {
+        let err = validate_jitter_bounds("spec.schedule.jitter", bad)
+            .expect_err("unparseable jitter must be rejected");
+        let ValidationError::InvalidFieldValue { reason, .. } = &err else {
+            panic!("expected InvalidFieldValue, got {err:?}");
+        };
+        assert!(
+            reason.contains("is not a valid duration"),
+            "{bad:?}: {reason}"
+        );
+    }
+}
+
+#[test]
+fn max_jitter_is_exactly_24h() {
+    // T2-T5 wire this const into schedule resolution; pin the number itself so a
+    // "round it up a bit" edit has to change a test that says why.
+    assert_eq!(MAX_JITTER, std::time::Duration::from_secs(86_400));
+}
+
+// --- SnapshotSchedule: jitter cap + startingDeadlineSeconds ----------------
+
+fn schedule_yaml(extra: &str) -> SnapshotScheduleSpec {
+    yaml(&format!(
+        "policyRef: {{ name: pg }}\nschedule:\n  cron: \"0 2 * * *\"\n{extra}"
+    ))
+}
+
+#[test]
+fn schedule_over_cap_jitter_is_admission_only() {
+    let spec = schedule_yaml("  jitter: 25h\n");
+    // Webhook path rejects.
+    let errs = validate_backup_schedule_admission_extras(&spec);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. } if field == "spec.schedule.jitter"
+        )),
+        "{errs:?}"
+    );
+    // Ratchet pin: the shared aggregate the reconciler re-runs still accepts it, so
+    // a stored schedule with a 25h jitter keeps firing instead of hard-stopping.
+    assert!(
+        validate_backup_schedule(&spec).is_empty(),
+        "the shared aggregate must NOT gain the bound"
+    );
+
+    // Regression: an ordinary jitter passes both paths.
+    let ok = schedule_yaml("  jitter: 30m\n");
+    assert!(validate_backup_schedule_admission_extras(&ok).is_empty());
+    assert!(validate_backup_schedule(&ok).is_empty());
+    // And absent jitter is fine everywhere.
+    let bare = schedule_yaml("");
+    assert!(validate_backup_schedule_admission_extras(&bare).is_empty());
+    assert!(validate_backup_schedule(&bare).is_empty());
+}
+
+#[test]
+fn schedule_negative_starting_deadline_is_admission_only() {
+    for bad in [-1i64, -30, i64::MIN] {
+        let spec = schedule_yaml(&format!("  startingDeadlineSeconds: {bad}\n"));
+        let errs = validate_backup_schedule_admission_extras(&spec);
+        let [ValidationError::InvalidFieldValue { field, reason }] = errs.as_slice() else {
+            panic!("expected exactly one InvalidFieldValue, got {errs:?}");
+        };
+        assert_eq!(field, "spec.schedule.startingDeadlineSeconds");
+        assert!(reason.contains("must be >= 0"), "{reason}");
+        assert!(reason.contains("SkipExpired forever"), "{reason}");
+        // Ratchet pin: a stored schedule with a negative deadline must still
+        // reconcile (visibly skipping) rather than stop dead.
+        assert!(
+            validate_backup_schedule(&spec).is_empty(),
+            "the shared aggregate must still accept {bad}"
+        );
+    }
+
+    // 0 and positive values are legitimate and accepted.
+    for ok in [0i64, 1, 300, i64::MAX] {
+        let spec = schedule_yaml(&format!("  startingDeadlineSeconds: {ok}\n"));
+        assert!(
+            validate_backup_schedule_admission_extras(&spec).is_empty(),
+            "{ok} must be accepted"
+        );
+    }
+    // Absent is accepted (no deadline).
+    assert!(validate_backup_schedule_admission_extras(&schedule_yaml("")).is_empty());
+}
+
+#[test]
+fn schedule_extras_accumulate_both_problems_in_one_apply() {
+    // Both rules are independent, so a spec violating both reports both.
+    let spec = schedule_yaml("  jitter: 48h\n  startingDeadlineSeconds: -1\n");
+    let errs = validate_backup_schedule_admission_extras(&spec);
+    assert_eq!(errs.len(), 2, "{errs:?}");
+}
+
+// --- SnapshotPolicy verification jitter -----------------------------------
+
+#[test]
+fn verification_over_cap_jitter_is_admission_only() {
+    let mk = |j: &str| -> SnapshotPolicySpec {
+        yaml(&format!(
+            "repository: {{ kind: Repository, name: nas }}\n\
+             sources: [{{ pvc: {{ name: data }} }}]\n\
+             verification:\n\
+             \x20 quick: {{ schedule: {{ cron: \"0 4 * * *\", jitter: {j} }} }}\n\
+             \x20 deep: {{ schedule: {{ cron: \"0 5 * * 0\", jitter: {j} }} }}\n"
+        ))
+    };
+
+    let bad = mk("30h");
+    let errs = validate_backup_config_admission_extras(&bad);
+    let fields: Vec<&str> = errs
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            "spec.verification.quick.schedule.jitter",
+            "spec.verification.deep.schedule.jitter"
+        ],
+        "both tiers must be checked: {errs:?}"
+    );
+    // Ratchet pin: the aggregate parses jitter but does NOT bound it.
+    assert!(
+        validate_backup_config(&bad).is_empty(),
+        "the shared aggregate must NOT gain the bound"
+    );
+
+    // Regression: valid windows still pass both paths.
+    let ok = mk("30m");
+    assert!(validate_backup_config_admission_extras(&ok).is_empty());
+    assert!(validate_backup_config(&ok).is_empty());
+
+    // A policy with no verification block at all has nothing to check.
+    let none: SnapshotPolicySpec = yaml(
+        "repository: { kind: Repository, name: nas }\n\
+         sources: [{ pvc: { name: data } }]\n",
+    );
+    assert!(validate_backup_config_admission_extras(&none).is_empty());
+}
+
+// --- Maintenance quick/full jitter (never validated before) ---------------
+
+fn maintenance_yaml(quick_j: &str, full_j: &str) -> crate::maintenance::MaintenanceSpec {
+    yaml(&format!(
+        "repository: {{ kind: Repository, name: nas }}\n\
+         ownership: {{ owner: kopiur/nas }}\n\
+         schedule:\n\
+         \x20 quick: {{ cron: \"0 */6 * * *\", jitter: {quick_j} }}\n\
+         \x20 full: {{ cron: \"0 3 * * 0\", jitter: {full_j} }}\n"
+    ))
+}
+
+#[test]
+fn maintenance_jitter_parse_and_bounds_are_admission_only() {
+    // Garbage AND over-cap are both new rejections here: `validate_maintenance`
+    // checks the crons and timezone only, so stored objects carrying either exist
+    // and currently degrade silently to no jitter.
+    for (q, f) in [("nonsense", "1h"), ("30m", "48h"), ("bogus", "72h")] {
+        let spec = maintenance_yaml(q, f);
+        let errs = validate_maintenance_admission_extras(&spec);
+        assert!(!errs.is_empty(), "{q}/{f} must be rejected at admission");
+        // Ratchet pin: the aggregate the reconciler re-runs still accepts it, so a
+        // stored Maintenance keeps running (unspread) rather than hard-stopping.
+        assert!(
+            validate_maintenance(&spec).is_empty(),
+            "the shared aggregate must still accept {q}/{f}: {:?}",
+            validate_maintenance(&spec)
+        );
+    }
+
+    // Both tiers are named individually so a user knows which to fix.
+    let errs = validate_maintenance_admission_extras(&maintenance_yaml("bad", "also-bad"));
+    let fields: Vec<&str> = errs
+        .iter()
+        .filter_map(|e| match e {
+            ValidationError::InvalidFieldValue { field, .. } => Some(field.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        ["spec.schedule.quick.jitter", "spec.schedule.full.jitter"]
+    );
+
+    // Regression: the shipped defaults (30m quick / 1h full) still pass.
+    let ok = maintenance_yaml("30m", "1h");
+    assert!(validate_maintenance_admission_extras(&ok).is_empty());
+    assert!(validate_maintenance(&ok).is_empty());
+
+    // Absent jitter on both tiers is fine.
+    let bare: crate::maintenance::MaintenanceSpec = yaml(
+        "repository: { kind: Repository, name: nas }\n\
+         ownership: { owner: kopiur/nas }\n\
+         schedule:\n\
+         \x20 quick: { cron: \"0 */6 * * *\" }\n\
+         \x20 full: { cron: \"0 3 * * 0\" }\n",
+    );
+    assert!(validate_maintenance_admission_extras(&bare).is_empty());
+}
+
+// --- RepositoryReplication schedule jitter (never validated before) -------
+
+fn repo_replication_yaml(jitter: &str) -> RepositoryReplicationSpec {
+    yaml(&format!(
+        "sourceRef: {{ kind: Repository, name: nas }}\n\
+         destination: {{ filesystem: {{ path: /mirror }} }}\n\
+         schedule: {{ cron: \"0 4 * * *\", jitter: {jitter} }}\n"
+    ))
+}
+
+#[test]
+fn repository_replication_jitter_parse_and_bounds_are_admission_only() {
+    for bad in ["nonsense", "36h", "9999999999999999h"] {
+        let spec = repo_replication_yaml(bad);
+        let errs = validate_repository_replication_admission_extras(&spec);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field, .. } if field == "spec.schedule.jitter"
+            )),
+            "{bad} must be rejected: {errs:?}"
+        );
+        // Ratchet pin.
+        assert!(
+            validate_repository_replication(&spec).is_empty(),
+            "the shared aggregate must still accept {bad}: {:?}",
+            validate_repository_replication(&spec)
+        );
+    }
+
+    // Regression: a valid window passes both paths.
+    let ok = repo_replication_yaml("1h");
+    assert!(validate_repository_replication_admission_extras(&ok).is_empty());
+    assert!(validate_repository_replication(&ok).is_empty());
+}
+
+// --- SnapshotReplication schedule jitter (parse already shared) -----------
+
+fn snapshot_replication_yaml(jitter: &str) -> SnapshotReplicationSpec {
+    yaml(&format!(
+        "sourceRef: {{ kind: Repository, name: nas }}\n\
+         destinationRef: {{ kind: Repository, name: offsite }}\n\
+         schedule: {{ cron: \"0 4 * * *\", jitter: {jitter} }}\n"
+    ))
+}
+
+#[test]
+fn snapshot_replication_over_cap_jitter_is_admission_only() {
+    let spec = snapshot_replication_yaml("30h");
+    let errs = validate_snapshot_replication_admission_extras(&spec);
+    assert!(!errs.is_empty(), "over-cap jitter must be rejected");
+    // Ratchet pin: the aggregate parses jitter (and always has) but must not bound it.
+    assert!(
+        validate_snapshot_replication(&spec).is_empty(),
+        "the shared aggregate must NOT gain the bound: {:?}",
+        validate_snapshot_replication(&spec)
+    );
+
+    // Regression: a valid window passes both; garbage is still caught by the
+    // aggregate's pre-existing parse rule (proving we didn't move that check).
+    let ok = snapshot_replication_yaml("30m");
+    assert!(validate_snapshot_replication_admission_extras(&ok).is_empty());
+    assert!(validate_snapshot_replication(&ok).is_empty());
+    assert!(!validate_snapshot_replication(&snapshot_replication_yaml("bogus")).is_empty());
+}
+
+// --- scheduleDefaults.jitter: a NEW field, so shared is safe --------------
+
+#[test]
+fn repository_schedule_defaults_jitter_is_validated_by_the_shared_aggregate() {
+    let mk = |j: &str| -> RepositorySpec {
+        yaml(&format!(
+            "backend: {{ filesystem: {{ path: /repo }} }}\n\
+             encryption: {{ passwordSecretRef: {{ name: s }} }}\n\
+             scheduleDefaults: {{ jitter: {j} }}\n"
+        ))
+    };
+    // A new field can safely tighten the shared aggregate: no stored Repository can
+    // carry a value it rejects, so the reconciler re-running it bricks nothing.
+    for bad in ["nonsense", "25h"] {
+        let errs = validate_repository(&mk(bad));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field, .. }
+                    if field == "spec.scheduleDefaults.jitter"
+            )),
+            "{bad} must be rejected: {errs:?}"
+        );
+    }
+    assert!(validate_repository(&mk("10m")).is_empty());
+    assert!(validate_repository(&mk("24h")).is_empty());
+}
+
+#[test]
+fn cluster_repository_schedule_defaults_jitter_is_validated_by_the_shared_aggregate() {
+    let mk = |j: &str| -> ClusterRepositorySpec {
+        yaml(&format!(
+            "backend: {{ filesystem: {{ path: /repo }} }}\n\
+             encryption: {{ passwordSecretRef: {{ name: s, namespace: kopia-system }} }}\n\
+             allowedNamespaces: {{ all: true }}\n\
+             scheduleDefaults: {{ jitter: {j} }}\n"
+        ))
+    };
+    for bad in ["nonsense", "25h"] {
+        let errs = validate_cluster_repository(&mk(bad));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field, .. }
+                    if field == "spec.scheduleDefaults.jitter"
+            )),
+            "{bad} must be rejected: {errs:?}"
+        );
+    }
+    assert!(validate_cluster_repository(&mk("10m")).is_empty());
+    assert!(validate_cluster_repository(&mk("24h")).is_empty());
+}
+
+// --- validate_pod_metadata -----------------------------------------------
+
+#[test]
+fn pod_metadata_rejects_reserved_keys_and_accepts_ordinary_ones() {
+    use crate::common::MoverDefaults;
+
+    let md = |labels: &[(&str, &str)], annotations: &[(&str, &str)]| MoverDefaults {
+        pod_labels: Some(
+            labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ),
+        pod_annotations: Some(
+            annotations
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ),
+        ..Default::default()
+    };
+
+    // The real-world keys this field exists for all pass.
+    let ok = md(
+        &[
+            ("kueue.x-k8s.io/queue-name", "backups"),
+            ("team", "platform"),
+            ("app.kubernetes.io/part-of", "kopiur"),
+        ],
+        &[
+            ("sidecar.istio.io/inject", "false"),
+            ("linkerd.io/inject", "disabled"),
+        ],
+    );
+    assert!(
+        validate_pod_metadata(&ok).is_empty(),
+        "{:?}",
+        validate_pod_metadata(&ok)
+    );
+
+    // kopiur's own domain is reserved on BOTH maps — the operator's value wins the
+    // merge, so accepting one would silently drop what the manifest asked for.
+    let reserved = md(
+        &[(crate::consts::REPO_POOL_LABEL, "Repository-nas")],
+        &[(crate::consts::RUN_REQUESTED_ANNOTATION, "now")],
+    );
+    let errs = validate_pod_metadata(&reserved);
+    assert_eq!(errs.len(), 2, "{errs:?}");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. } if field.starts_with("moverDefaults.podLabels[")
+        )),
+        "{errs:?}"
+    );
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. }
+                if field.starts_with("moverDefaults.podAnnotations[")
+        )),
+        "{errs:?}"
+    );
+
+    // The exact `app.kubernetes.io/managed-by` key is reserved, while its siblings
+    // under the same prefix are not — the rule is one key, not the whole prefix.
+    let managed_by = md(&[("app.kubernetes.io/managed-by", "me")], &[]);
+    assert_eq!(validate_pod_metadata(&managed_by).len(), 1);
+    let sibling = md(&[("app.kubernetes.io/managed-by-something", "me")], &[]);
+    assert!(validate_pod_metadata(&sibling).is_empty());
+
+    // No maps at all → nothing to check.
+    assert!(validate_pod_metadata(&MoverDefaults::default()).is_empty());
+}
+
+#[test]
+fn repository_aggregates_reject_reserved_pod_metadata_keys() {
+    // Wired into BOTH repo aggregates (safe: brand-new fields).
+    let repo: RepositorySpec = yaml(
+        "backend: { filesystem: { path: /repo } }\n\
+         encryption: { passwordSecretRef: { name: s } }\n\
+         moverDefaults: { podLabels: { \"kopiur.home-operations.com/config\": x } }\n",
+    );
+    assert!(
+        validate_repository(&repo).iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidFieldValue { field, .. } if field.starts_with("moverDefaults.podLabels[")
+        )),
+        "{:?}",
+        validate_repository(&repo)
+    );
+
+    let cluster: ClusterRepositorySpec = yaml(
+        "backend: { filesystem: { path: /repo } }\n\
+         encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }\n\
+         allowedNamespaces: { all: true }\n\
+         moverDefaults: { podAnnotations: { \"kopiur.home-operations.com/run-mode\": full } }\n",
+    );
+    assert!(
+        validate_cluster_repository(&cluster)
+            .iter()
+            .any(|e| matches!(
+                e,
+                ValidationError::InvalidFieldValue { field, .. }
+                    if field.starts_with("moverDefaults.podAnnotations[")
+            )),
+        "{:?}",
+        validate_cluster_repository(&cluster)
+    );
+}
+
+#[test]
+fn m1_admission_messages_are_well_formed() {
+    // The three messages this milestone adds go through the same shape lint as
+    // every other operator-facing string: no doubled space, no generic filler
+    // lead, no ramble.
+    let over_cap = validate_jitter_bounds("spec.schedule.jitter", "25h")
+        .expect_err("over-cap jitter must be rejected");
+    let negative_deadline = validate_backup_schedule_admission_extras(&schedule_yaml(
+        "  startingDeadlineSeconds: -1\n",
+    ))
+    .pop()
+    .expect("a negative deadline must be rejected");
+    let reserved = {
+        let md = crate::common::MoverDefaults {
+            pod_labels: Some(
+                [(crate::consts::REPO_POOL_LABEL.to_string(), "x".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        validate_pod_metadata(&md)
+            .pop()
+            .expect("a reserved key must be rejected")
+    };
+    for e in [over_cap, negative_deadline, reserved] {
+        assert_eq!(
+            crate::message_shape_issue(&e.to_string()),
+            None,
+            "M1 message not well-formed: {e}"
         );
     }
 }

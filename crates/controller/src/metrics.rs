@@ -1217,6 +1217,39 @@ impl Metrics {
                 })
                 .build();
         }
+        // Snapshots parked behind a FULL repository mover-Job pool
+        // (`spec.concurrency.maxConcurrentJobs` / KOPIUR_MAX_CONCURRENT_JOBS):
+        // `RepositorySlotAvailable=False`. Sibling of `kopiur_snapshot_gated`,
+        // and deliberately a SEPARATE series: a not-Ready repository is a fault
+        // to investigate, a full pool is the cap doing its job. Conflating them
+        // would make a correctly-throttled fleet indistinguishable from a broken
+        // one on the same alert.
+        //
+        // Observable, so the series vanishes the moment the run is admitted or
+        // deleted — a sync gauge could only zero it, and a lingering
+        // `waiting_for_slot == 0` line per Snapshot ever queued is exactly the
+        // #172/#175 staleness this family was rewritten to avoid.
+        {
+            let snapshots = stores.snapshots.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_snapshot_waiting_for_slot")
+                .with_description(
+                    "1 for each Snapshot queued behind its repository's mover-Job concurrency \
+                     cap (RepositorySlotAvailable=False), labeled \
+                     repository_kind/repository/namespace/name from the park-time \
+                     status.resolved.repository pin (unpinned → the \"unknown\" bucket). \
+                     Store-backed: the series exists only while the run is queued, so \
+                     `sum by (repository)` is the live queue depth and drains to absence.",
+                )
+                .with_callback(move |o| {
+                    for s in snapshots.state() {
+                        if waiting_for_slot(&s) {
+                            o.observe(1, &waiting_for_slot_attrs(&s));
+                        }
+                    }
+                })
+                .build();
+        }
         // Repository circuit-breaker observability (M6, #345), over BOTH
         // repository stores. `kind`/`namespace`/`name` labeling matches
         // `kopiur_resource_phase`: a ClusterRepository carries namespace="".
@@ -2223,6 +2256,73 @@ fn gated_snapshot_counts(snapshots: &[Arc<Snapshot>]) -> Vec<GatedSnapshots> {
         .collect();
     out.sort_by(|a, b| (&a.namespace, &a.policy).cmp(&(&b.namespace, &b.policy)));
     out
+}
+
+/// Whether a `Snapshot` is currently queued behind its repository's mover-Job
+/// pool: `RepositorySlotAvailable=False`.
+///
+/// Keyed on the CONDITION alone, not on the phase. The condition is written and
+/// cleared by exactly one place (the pool gate), whereas `Pending` is shared by
+/// half a dozen unrelated waits — so a phase check here would silently count
+/// runs held by preflight, staging or a not-Ready repository as pool queueing.
+/// Pure so the counting rule is unit-tested off-OTel.
+fn waiting_for_slot(s: &Snapshot) -> bool {
+    let Some(st) = s.status.as_ref() else {
+        return false;
+    };
+    // A TERMINAL run is not queued, whatever its conditions say. This is a
+    // bound, not a belt-and-braces check: if the Job-creation status patch fails
+    // AFTER `apply_mover_objects` succeeded, the Snapshot keeps a stale
+    // `RepositorySlotAvailable=False` and can never shed it — the next reconcile
+    // finds the Job already exists and returns long before the pool gate, so the
+    // heal never runs again. Without this the gauge would emit `1` for that run
+    // forever, including well past `Succeeded`, contradicting its own "the
+    // series drains to absence" contract and holding a queue-depth alert on.
+    //
+    // Uses `SnapshotPhase::is_terminal` rather than a local `matches!` so the
+    // partition stays in ONE exhaustive place: a new phase must be classified
+    // there (and `Unknown` deliberately counts as not-terminal, so a newer
+    // operator's genuinely-queued run stays visible).
+    if st.phase.as_ref().is_some_and(|p| p.is_terminal()) {
+        return false;
+    }
+    st.conditions.iter().any(|c| {
+        c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION && c.status == "False"
+    })
+}
+
+/// Attributes for `kopiur_snapshot_waiting_for_slot`: the repository the run is
+/// queued behind (from the park-time `status.resolved.repository` pin, or the
+/// conservative "unknown" bucket) plus the Snapshot's own identity.
+///
+/// `name` is included even though the repository is what an operator alerts on:
+/// this is a per-CR gauge (hence the SINGULAR metric name), and without the CR's
+/// name every queued Snapshot in one namespace would emit the SAME attribute
+/// set — an observable gauge keeps one point per attribute set, so the series
+/// would read `1` whether one run or fifty were queued, and `sum by
+/// (repository)` could never be the queue depth it is documented to be.
+fn waiting_for_slot_attrs(s: &Snapshot) -> Vec<KeyValue> {
+    let pinned = s
+        .status
+        .as_ref()
+        .and_then(|st| st.resolved.as_ref())
+        .and_then(|r| r.repository.as_ref());
+    let (kind, repository) = match pinned {
+        Some(r) => (
+            match r.kind {
+                RepositoryKind::Repository => "Repository",
+                RepositoryKind::ClusterRepository => "ClusterRepository",
+            },
+            r.name.clone(),
+        ),
+        None => ("unknown", "unknown".to_string()),
+    };
+    vec![
+        KeyValue::new("repository_kind", kind),
+        KeyValue::new("repository", repository),
+        KeyValue::new("namespace", s.namespace().unwrap_or_default()),
+        KeyValue::new("name", s.name_any()),
+    ]
 }
 
 /// `kind`/`namespace`/`name` attributes for the repository breaker gauges,
@@ -3525,6 +3625,217 @@ mod tests {
                 }],
             }),
         )
+    }
+
+    /// A Snapshot parked by the pool gate: `RepositorySlotAvailable=False` plus
+    /// the park-time `status.resolved.repository` pin the gauge labels from.
+    fn queued_snapshot(ns: &str, name: &str, repo: &str) -> Snapshot {
+        snapshot_cr(
+            ns,
+            name,
+            Some("daily"),
+            serde_json::json!({
+                "phase": "Pending",
+                "resolved": { "repository": { "kind": "Repository", "name": repo, "namespace": ns } },
+                "conditions": [{
+                    "type": "RepositorySlotAvailable",
+                    "status": "False",
+                    "reason": "WaitingForSlot",
+                    "message": "waiting for a mover slot",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z",
+                }],
+            }),
+        )
+    }
+
+    #[test]
+    fn waiting_for_slot_predicate_keys_on_the_condition_not_the_phase() {
+        assert!(waiting_for_slot(&queued_snapshot("apps", "q1", "nas")));
+        // A Pending Snapshot held for a DIFFERENT reason is NOT pool-queued —
+        // the whole point of keying on the condition rather than the phase.
+        assert!(!waiting_for_slot(&gated_snapshot(
+            "apps",
+            "g",
+            Some("daily")
+        )));
+        // Admitted: the condition flipped True.
+        let admitted = snapshot_cr(
+            "apps",
+            "a",
+            Some("daily"),
+            serde_json::json!({
+                "phase": "Running",
+                "conditions": [{
+                    "type": "RepositorySlotAvailable",
+                    "status": "True",
+                    "reason": "SlotAcquired",
+                    "message": "holding a mover slot",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z",
+                }],
+            }),
+        );
+        assert!(!waiting_for_slot(&admitted));
+        // Never parked: no condition at all.
+        let mut bare = snapshot_cr("apps", "bare", None, serde_json::json!({}));
+        bare.status = None;
+        assert!(!waiting_for_slot(&bare));
+    }
+
+    #[test]
+    fn a_terminal_snapshot_never_counts_as_queued_even_carrying_a_stale_false() {
+        // The bound on the one path that can strand the condition: the
+        // Job-creation status patch failing AFTER the Job was applied. That
+        // Snapshot keeps `RepositorySlotAvailable=False` and can never shed it
+        // (the next reconcile sees the Job and returns before the gate), so
+        // without the terminal check the gauge would emit 1 for it forever.
+        for phase in ["Succeeded", "Failed", "Unchanged", "Discovered"] {
+            let stranded = snapshot_cr(
+                "apps",
+                "stranded",
+                Some("daily"),
+                serde_json::json!({
+                    "phase": phase,
+                    "conditions": [{
+                        "type": "RepositorySlotAvailable",
+                        "status": "False",
+                        "reason": "WaitingForSlot",
+                        "message": "waiting for a mover slot",
+                        "lastTransitionTime": "2026-01-01T00:00:00Z",
+                    }],
+                }),
+            );
+            assert!(!waiting_for_slot(&stranded), "phase={phase}");
+        }
+        // Still in flight ⇒ genuinely queued, condition honored.
+        for phase in ["Pending", "Running"] {
+            let queued = snapshot_cr(
+                "apps",
+                "queued",
+                Some("daily"),
+                serde_json::json!({
+                    "phase": phase,
+                    "conditions": [{
+                        "type": "RepositorySlotAvailable",
+                        "status": "False",
+                        "reason": "WaitingForSlot",
+                        "message": "waiting for a mover slot",
+                        "lastTransitionTime": "2026-01-01T00:00:00Z",
+                    }],
+                }),
+            );
+            assert!(waiting_for_slot(&queued), "phase={phase}");
+        }
+    }
+
+    #[test]
+    fn a_succeeded_snapshot_with_a_stale_park_emits_no_series() {
+        // Same bound, asserted through the actual exposition rather than the
+        // predicate: the contract is "the series drains to absence".
+        let m = Metrics::new();
+        let (reader, mut writer) = reflector::store::<Snapshot>();
+        let mut stranded = queued_snapshot("apps", "stranded", "nas");
+        stranded.status.as_mut().unwrap().phase = Some(SnapshotPhase::Succeeded);
+        writer.apply_watcher_event(&watcher::Event::Apply(stranded));
+        let (_, repos, crepos, restores) = empty_stores();
+        m.register_resource_observers(ResourceStores {
+            snapshots: reader,
+            repositories: repos.0,
+            cluster_repositories: crepos.0,
+            restores: restores.0,
+        });
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert!(
+            !text.contains("kopiur_snapshot_waiting_for_slot{"),
+            "a Succeeded run carrying a stale park must emit NO series: {text}"
+        );
+    }
+
+    #[test]
+    fn waiting_for_slot_emits_one_series_per_queued_snapshot() {
+        // Per-CR: two runs queued behind ONE repository must be two series, or
+        // `sum by (repository)` could never be the queue depth it documents.
+        let m = Metrics::new();
+        let (reader, mut writer) = reflector::store::<Snapshot>();
+        for cr in [
+            queued_snapshot("apps", "q1", "nas"),
+            queued_snapshot("apps", "q2", "nas"),
+        ] {
+            writer.apply_watcher_event(&watcher::Event::Apply(cr));
+        }
+        let (_, repos, crepos, restores) = empty_stores();
+        m.register_resource_observers(ResourceStores {
+            snapshots: reader,
+            repositories: repos.0,
+            cluster_repositories: crepos.0,
+            restores: restores.0,
+        });
+
+        let text = String::from_utf8(m.gather()).unwrap();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("kopiur_snapshot_waiting_for_slot{"))
+            .collect();
+        assert_eq!(lines.len(), 2, "one series per queued Snapshot: {text}");
+        for l in &lines {
+            assert!(l.contains("repository=\"nas\""), "{l}");
+            assert!(l.contains("repository_kind=\"Repository\""), "{l}");
+            assert!(l.contains("namespace=\"apps\""), "{l}");
+            assert!(l.trim_end().ends_with(" 1"), "{l}");
+        }
+    }
+
+    #[test]
+    fn waiting_for_slot_series_disappear_once_admitted() {
+        // Store-backed: the whole reason this is an OBSERVABLE gauge. A sync
+        // gauge could only zero the series, leaving a stale line per Snapshot
+        // that was ever queued (#172/#175).
+        let m = Metrics::new();
+        let (reader, mut writer) = reflector::store::<Snapshot>();
+        let cr = queued_snapshot("apps", "q1", "nas");
+        writer.apply_watcher_event(&watcher::Event::Apply(cr.clone()));
+        let (_, repos, crepos, restores) = empty_stores();
+        m.register_resource_observers(ResourceStores {
+            snapshots: reader,
+            repositories: repos.0,
+            cluster_repositories: crepos.0,
+            restores: restores.0,
+        });
+        assert!(
+            String::from_utf8(m.gather())
+                .unwrap()
+                .contains("kopiur_snapshot_waiting_for_slot{")
+        );
+
+        writer.apply_watcher_event(&watcher::Event::Delete(cr));
+        let text = String::from_utf8(m.gather()).unwrap();
+        assert!(
+            !text.contains("kopiur_snapshot_waiting_for_slot{"),
+            "the series must be ABSENT, not 0: {text}"
+        );
+    }
+
+    #[test]
+    fn waiting_for_slot_falls_back_to_the_unknown_bucket_when_unpinned() {
+        use opentelemetry::Value;
+        // A run parked by an older kopiur (or before the park-time pin landed)
+        // must still be countable — as "unknown", never as a per-repo guess.
+        let attrs = waiting_for_slot_attrs(&snapshot_cr(
+            "apps",
+            "legacy",
+            None,
+            serde_json::json!({
+                "phase": "Pending",
+                "conditions": [{
+                    "type": "RepositorySlotAvailable",
+                    "status": "False",
+                    "reason": "WaitingForSlot",
+                    "message": "waiting for a mover slot",
+                    "lastTransitionTime": "2026-01-01T00:00:00Z",
+                }],
+            }),
+        ));
+        assert_eq!(attrs[0].value, Value::from("unknown"));
+        assert_eq!(attrs[1].value, Value::from("unknown"));
     }
 
     #[test]

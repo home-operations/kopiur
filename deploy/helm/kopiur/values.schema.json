@@ -271,6 +271,13 @@
       "title": "maxConcurrentDeleteJobs",
       "type": "integer"
     },
+    "maxConcurrentJobs": {
+      "default": 0,
+      "description": "0 = uncapped (default); set to bound how many POOLED mover Jobs — backup\nsnapshots, restores, and the source side of either replication — may run at\nonce across ALL repositories. This is the cluster-operator BACKSTOP beneath\neach repository's own spec.concurrency.maxConcurrentJobs, which stays the\nprimary knob: a run must satisfy both, and whichever cap it meets first\nholds it. Set this when the node pool cannot host N movers no matter which\nrepositories they belong to; set the per-repository field when one BACKEND\nis the thing that must not be saturated. Restores are ALWAYS admitted and\nnever queued (a recovery in progress must not wait behind routine backups),\nthough a running restore still occupies a slot and so displaces backups.\nMaintenance, verification, pin and snapshot-delete Jobs are outside the pool\nentirely. Leaving this at 0 costs nothing: with no cap set anywhere the\noperator performs no extra API calls at all.",
+      "minimum": 0,
+      "title": "maxConcurrentJobs",
+      "type": "integer"
+    },
     "metrics": {
       "description": "=============================================================================\nController port \u0026 probes\n=============================================================================",
       "properties": {

@@ -312,6 +312,57 @@ $ kubectl -n media get snapshot <new-name> \
 
 Re-add the annotation (re-apply the bundle's `namespace` section, or `kubectl annotate … =true`) and the blocked Snapshot proceeds within seconds — no re-apply needed.
 
+## Extra pod labels & annotations
+
+Cluster machinery frequently keys off pod metadata that Kopiur has no field of its own for — a queueing system's queue name, a `NetworkPolicy` or monitoring selector, a service-mesh exclusion. `moverDefaults.podLabels` and `moverDefaults.podAnnotations` on the `Repository`/`ClusterRepository` put arbitrary keys on **every** mover that repository spawns:
+
+```yaml
+spec:
+    moverDefaults:
+        podLabels:
+            kueue.x-k8s.io/queue-name: backups
+            egress-to-object-store: "true"
+        podAnnotations:
+            sidecar.istio.io/inject: "false"
+```
+
+Both maps merge **under** Kopiur's own metadata: a key Kopiur sets always wins, so nothing you put here can break the selectors the controller counts and reaps by. Because a silently-losing key would be a manifest that claims a label the pod never carries, keys under `kopiur.home-operations.com/` and the exact key `app.kubernetes.io/managed-by` are **rejected at admission** rather than dropped at render time.
+
+/// note | Labels reach the Job too; annotations are pod-template-only
+
+`podLabels` are mirrored onto the `Job` object *and* its pod template, because label selectors are how you find a workload's Jobs from the outside. `podAnnotations` are applied to the **pod template only**. That asymmetry is deliberate: the canonical annotation is a sidecar-injection opt-out (`sidecar.istio.io/inject: "false"`, `linkerd.io/inject: disabled`, `vault.hashicorp.com/agent-inject: "false"`), which only means anything on the pod a mesh's webhook actually sees. It matters for movers specifically — a mover is a short-lived batch pod, and an injected sidecar that never exits keeps its Job running forever.
+
+///
+
+/// note | A `kubectl kopiur browse` session takes the annotations but not the labels
+
+An interactive [browse/serve session](server.md) pod applies `podAnnotations` and deliberately ignores `podLabels`. The reason each way round is the same one: an injected sidecar matters *more* for a session than for a batch mover (it would outlive the session's TTL and leave a pod running after your command returned), while the canonical `podLabels` value routes work through a batch queueing system — and a human waiting at a terminal must not be queued behind a nightly backup window.
+
+///
+
+### Putting movers under a queueing system (Kueue)
+
+`podLabels` is how you hand mover Jobs to [Kueue](https://kueue.sigs.k8s.io/) or a similar batch admission controller:
+
+```yaml
+spec:
+    moverDefaults:
+        podLabels:
+            kueue.x-k8s.io/queue-name: backups # a LocalQueue in the mover's namespace
+```
+
+This composes correctly with a repository's own [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once). Kueue admits work by flipping `spec.suspend` on the Job, and a **suspended Job has no pod and occupies no slot** in Kopiur's pool. Without that rule the two systems would deadlock each other: Kopiur would park new runs behind Jobs that Kueue was holding, forever.
+
+/// warning | `manageJobsWithoutQueueName` will swallow every mover, labeled or not
+
+If your Kueue is configured with `manageJobsWithoutQueueName: true`, it suspends **every** Job in scope — including the mover Jobs Kopiur creates for repositories where you never set a queue-name label, and including the ones you did not intend to queue. Those Jobs then wait for a Kueue admission that may never come, and because a suspended Job holds no slot, Kopiur sees no queue and reports nothing wrong: backups simply never start.
+
+The `Snapshot` stays `Pending` with its Job created but suspended. Either leave `manageJobsWithoutQueueName: false` (the default) and label deliberately, or make sure every repository whose movers land in Kueue's scope sets a `kueue.x-k8s.io/queue-name` that resolves to a real `LocalQueue` with quota.
+
+///
+
+The complete tuned repository — concurrency, `scheduleDefaults`, and these labels together — is [example 43](repositories.md#a-tuned-repository-end-to-end).
+
 ## Run artifacts & cleanup
 
 A mover run is exactly **one Kubernetes object: the `Job`**. The controller embeds the run's instructions (the *work spec*, serialized JSON) directly in the Job's pod environment as `KOPIUR_WORK_SPEC` — there is no per-run ConfigMap, Secret, or other sidecar object. That means:

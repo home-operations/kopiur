@@ -205,6 +205,26 @@ pub struct Context {
     /// repository's deletions behind one slow/failing one. Consulted by the
     /// batch dispatcher's throttle (`crate::snapshot::throttle_verdict`).
     pub max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
+    /// Cluster-wide cap on concurrently running POOLED mover Jobs — backups,
+    /// restores and the source side of either replication — across every
+    /// repository (`KOPIUR_MAX_CONCURRENT_JOBS`). The backstop beneath each
+    /// repository's own `spec.concurrency.maxConcurrentJobs`, which stays the
+    /// primary knob; a run must satisfy both.
+    ///
+    /// `None` (the default) means UNCAPPED, and an uncapped install pays
+    /// nothing — with no repository cap either, `crate::pool::admit_or_park`
+    /// short-circuits without a LIST and without touching
+    /// [`pool_admissions`](Self::pool_admissions), so the gate is one branch.
+    /// Restores are never held by this cap (`crate::pool::pool_verdict`).
+    pub max_concurrent_jobs: Option<std::num::NonZeroUsize>,
+    /// In-process record of pool admissions GRANTED but whose mover Jobs are not
+    /// yet visible to a LIST, so the observe→decide→create sequence is atomic
+    /// and two simultaneous reconciles cannot both read an empty pool.
+    ///
+    /// Not configuration — runtime state, hence defaulted rather than passed to
+    /// [`Context::new`]. Sound because only the LEADER reconciles; see
+    /// [`crate::pool::AdmissionLedger`] for the failover semantics.
+    pub pool_admissions: crate::pool::AdmissionLedger,
     /// Shared informer cache of all `Snapshot` CRs, reused from the `Snapshot`
     /// controller's own reflector (`Controller::store()`). `OnceLock` because
     /// the `Context` is built (in `startup::run`) BEFORE `spawn_all` mints the
@@ -301,6 +321,7 @@ impl Context {
         operator_namespace: Option<String>,
         watch_scope: crate::config::WatchScope,
         max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
+        max_concurrent_jobs: Option<std::num::NonZeroUsize>,
         source_pvc_deadline: Option<std::time::Duration>,
     ) -> Self {
         Context {
@@ -321,6 +342,8 @@ impl Context {
             operator_namespace,
             watch_scope,
             max_concurrent_delete_jobs,
+            max_concurrent_jobs,
+            pool_admissions: crate::pool::AdmissionLedger::default(),
             snapshot_store: Arc::new(OnceLock::new()),
             snapshot_synced: Arc::new(AtomicBool::new(false)),
             schedule_store: Arc::new(OnceLock::new()),
@@ -413,6 +436,9 @@ impl Context {
             Arc::new(AtomicBool::new(false)),
             None,
             crate::config::WatchScope::Cluster,
+            None,
+            // Uncapped pool: the neutral default, so a test context exercises
+            // the zero-cost path the default install takes.
             None,
             Some(crate::consts::DEFAULT_SOURCE_PVC_DEADLINE),
         )

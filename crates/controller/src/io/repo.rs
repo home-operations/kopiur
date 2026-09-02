@@ -89,6 +89,11 @@ pub struct RepoCredentials {
 /// it is handled here.
 #[derive(Debug, Clone)]
 pub struct ResolvedRepository {
+    /// Which CRD kind this repository actually resolved to. Typed (not the
+    /// `owner_ref.kind` string) so [`ResolvedRepository::repository_ref`] can
+    /// rebuild a `RepositoryRef` by exhaustive `match` rather than by parsing
+    /// a string with a fallback.
+    pub kind: RepositoryKind,
     /// The repository's storage backend (normalized from either CRD).
     pub backend: Backend,
     /// The repository's encryption/password configuration.
@@ -136,6 +141,16 @@ pub struct ResolvedRepository {
     /// `None` → the breaker's default threshold applies
     /// (`kopiur_api::consts::effective_mass_deletion_threshold`).
     pub deletion_protection: Option<DeletionProtectionSpec>,
+    /// The repository's mover-Job concurrency pool (`spec.concurrency`), cloned
+    /// verbatim from either repo kind. `None` → uncapped
+    /// (`kopiur_api::consts::effective_max_concurrent_jobs` collapses an absent
+    /// block, an absent field and an explicit `0` to the same `None`).
+    ///
+    /// Resolved HERE, beside [`Self::deletion_protection`], rather than at each
+    /// gate site: the pool is a property of the REPOSITORY, and both repository
+    /// kinds must feed the same gate through the same field or a
+    /// `ClusterRepository`'s cap would silently not apply.
+    pub concurrency: Option<kopiur_api::common::ConcurrencySpec>,
     /// The RAW value of [`crate::consts::ALLOW_MASS_DELETION_ANNOTATION`] from
     /// the repository's `metadata.annotations`, if present. Deliberately
     /// unparsed here: parsing/clamping the RFC3339 ack (and rejecting a
@@ -158,6 +173,39 @@ pub struct ResolvedRepository {
     /// projection ([`kopiur_mover::repo_meta::backend_to_repository_connect`])
     /// requires the value as a parameter, and this field is the single source.
     pub ca_bundle_pem: Option<String>,
+}
+
+impl ResolvedRepository {
+    /// The **normalized** [`RepositoryRef`] naming the repository this actually
+    /// resolved to: a namespaced `Repository` carries its effective namespace
+    /// explicitly, a `ClusterRepository` carries none. Identical to running the
+    /// consumer's spec ref through
+    /// [`kopiur_api::common::normalized_repository_ref`] against the namespace
+    /// the resolution used — but derived from the RESOLUTION, so a caller
+    /// cannot accidentally key off a raw spec ref whose `namespace` is `None`.
+    ///
+    /// This is the input every per-repository *identity* keys off:
+    /// [`crate::naming::pinned_repo_key`] and, through it,
+    /// [`crate::naming::repo_label`] — the value of the
+    /// [`kopiur_api::consts::REPO_POOL_LABEL`] concurrency-pool label. A
+    /// denormalized ref there would hash `repository:/name` and split one
+    /// repository's pool in two, so every pool-label site goes through here.
+    ///
+    /// Exhaustive over [`RepositoryKind`].
+    pub fn repository_ref(&self) -> RepositoryRef {
+        match self.kind {
+            RepositoryKind::Repository => RepositoryRef {
+                kind: RepositoryKind::Repository,
+                name: self.owner_ref.name.clone(),
+                namespace: self.repo_namespace.clone(),
+            },
+            RepositoryKind::ClusterRepository => RepositoryRef {
+                kind: RepositoryKind::ClusterRepository,
+                name: self.owner_ref.name.clone(),
+                namespace: None,
+            },
+        }
+    }
 }
 
 /// Which API a [`RepositoryRef`] resolves against, derived purely from `kind`.
@@ -278,6 +326,7 @@ pub(crate) fn resolved_from_namespaced(
     let owner_ref = super::owner_ref_for(&repo, "Repository")?;
     let mass_deletion_ack = mass_deletion_ack(&repo);
     Ok(ResolvedRepository {
+        kind: RepositoryKind::Repository,
         repo_namespace: Some(namespace),
         backend: repo.spec.backend,
         encryption: repo.spec.encryption,
@@ -292,6 +341,7 @@ pub(crate) fn resolved_from_namespaced(
         mode: repo.spec.mode,
         owner_ref,
         deletion_protection: repo.spec.deletion_protection,
+        concurrency: repo.spec.concurrency,
         mass_deletion_ack,
         catalog: repo.spec.catalog,
         ca_bundle_pem,
@@ -308,6 +358,7 @@ pub(crate) fn resolved_from_cluster(
     let owner_ref = super::owner_ref_for(&repo, "ClusterRepository")?;
     let mass_deletion_ack = mass_deletion_ack(&repo);
     Ok(ResolvedRepository {
+        kind: RepositoryKind::ClusterRepository,
         repo_namespace: None,
         backend: repo.spec.backend,
         encryption: repo.spec.encryption,
@@ -323,6 +374,7 @@ pub(crate) fn resolved_from_cluster(
         mode: repo.spec.mode,
         owner_ref,
         deletion_protection: repo.spec.deletion_protection,
+        concurrency: repo.spec.concurrency,
         mass_deletion_ack,
         catalog: repo.spec.catalog,
         ca_bundle_pem,
@@ -860,6 +912,151 @@ mod tests {
                 key: None,
             },
         }
+    }
+
+    // --- ResolvedRepository::repository_ref (the pool/batch identity) ------
+
+    /// Build a `Repository` CR shell with just the fields the projection reads.
+    fn repo_cr(ns: &str, name: &str) -> Repository {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "Repository",
+            "metadata": { "name": name, "namespace": ns, "uid": "uid-1" },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": { "passwordSecretRef": { "name": "pw" } },
+            },
+        }))
+        .expect("valid Repository fixture")
+    }
+
+    fn cluster_repo_cr(name: &str) -> ClusterRepository {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "ClusterRepository",
+            "metadata": { "name": name, "uid": "uid-2" },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": {
+                    "passwordSecretRef": { "name": "pw", "namespace": "kopiur-system" },
+                },
+                "allowedNamespaces": { "all": true },
+            },
+        }))
+        .expect("valid ClusterRepository fixture")
+    }
+
+    #[test]
+    fn a_namespaced_resolution_yields_a_namespace_pinned_ref() {
+        // The pool/batch identity must be NORMALIZED: a namespaced Repository
+        // always carries the namespace it actually resolved in, so
+        // `repo_label` cannot hash `repository:/nas` and split its pool.
+        let resolved = resolved_from_namespaced(repo_cr("backups", "nas"), "backups".into(), None)
+            .expect("projection succeeds");
+        let rref = resolved.repository_ref();
+        assert_eq!(rref.kind, RepositoryKind::Repository);
+        assert_eq!(rref.name, "nas");
+        assert_eq!(rref.namespace.as_deref(), Some("backups"));
+        // Identical to running a bare spec ref through the shared normal form.
+        let raw = RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: None,
+        };
+        assert_eq!(
+            rref,
+            kopiur_api::common::normalized_repository_ref(&raw, "backups")
+        );
+    }
+
+    #[test]
+    fn a_cluster_resolution_yields_a_namespace_free_ref() {
+        let resolved =
+            resolved_from_cluster(cluster_repo_cr("shared"), None).expect("projection succeeds");
+        let rref = resolved.repository_ref();
+        assert_eq!(rref.kind, RepositoryKind::ClusterRepository);
+        assert_eq!(rref.name, "shared");
+        assert_eq!(rref.namespace, None, "the webhook forbids one");
+    }
+
+    // --- `concurrency` resolver parity (the pool gate's cap input) ---------
+
+    /// Both repository kinds must surface `spec.concurrency` through the SAME
+    /// `ResolvedRepository` field, or a `ClusterRepository`'s cap would be
+    /// silently ignored by a gate that only ever reads the resolved struct.
+    /// Parity is asserted here, at the projection, because that is the one
+    /// place the two kinds are still distinguishable.
+    #[test]
+    fn both_repository_kinds_resolve_their_concurrency_block() {
+        use kopiur_api::common::ConcurrencySpec;
+
+        let mut ns_repo = repo_cr("backups", "nas");
+        ns_repo.spec.concurrency = Some(ConcurrencySpec {
+            max_concurrent_jobs: Some(3),
+        });
+        let resolved =
+            resolved_from_namespaced(ns_repo, "backups".into(), None).expect("projection succeeds");
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref())
+                .map(|n| n.get()),
+            Some(3),
+        );
+
+        let mut cluster = cluster_repo_cr("shared");
+        cluster.spec.concurrency = Some(ConcurrencySpec {
+            max_concurrent_jobs: Some(3),
+        });
+        let resolved = resolved_from_cluster(cluster, None).expect("projection succeeds");
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref())
+                .map(|n| n.get()),
+            Some(3),
+            "a ClusterRepository's cap must resolve identically to a Repository's",
+        );
+    }
+
+    #[test]
+    fn an_absent_concurrency_block_resolves_to_uncapped_on_both_kinds() {
+        // The default install. `None` here is what makes the gate skip its Job
+        // LIST entirely, so this is a cost assertion as much as a semantic one.
+        let resolved = resolved_from_namespaced(repo_cr("backups", "nas"), "backups".into(), None)
+            .expect("projection succeeds");
+        assert_eq!(resolved.concurrency, None);
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref()),
+            None
+        );
+
+        let resolved =
+            resolved_from_cluster(cluster_repo_cr("shared"), None).expect("projection succeeds");
+        assert_eq!(resolved.concurrency, None);
+    }
+
+    #[test]
+    fn an_explicit_zero_concurrency_resolves_to_uncapped_on_both_kinds() {
+        // `0` is the disable sentinel the CRD documents; it must never reach a
+        // gate as `Some(0)`, which would read as "admit nothing".
+        use kopiur_api::common::ConcurrencySpec;
+        let zero = Some(ConcurrencySpec {
+            max_concurrent_jobs: Some(0),
+        });
+
+        let mut ns_repo = repo_cr("backups", "nas");
+        ns_repo.spec.concurrency = zero;
+        let resolved =
+            resolved_from_namespaced(ns_repo, "backups".into(), None).expect("projection succeeds");
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref()),
+            None
+        );
+
+        let mut cluster = cluster_repo_cr("shared");
+        cluster.spec.concurrency = zero;
+        let resolved = resolved_from_cluster(cluster, None).expect("projection succeeds");
+        assert_eq!(
+            kopiur_api::consts::effective_max_concurrent_jobs(resolved.concurrency.as_ref()),
+            None
+        );
     }
 
     #[test]

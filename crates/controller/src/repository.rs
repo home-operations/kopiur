@@ -1515,6 +1515,10 @@ async fn bootstrap_via_mover(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: resolved_mover.tolerations.clone(),
         affinity: resolved_mover.affinity.clone(),
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
         annotations: bootstrap_generation_annotation(repo.metadata.generation),
         // The bootstrap's own `repo_volume` slot is taken, so a filesystem seed

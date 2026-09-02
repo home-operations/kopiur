@@ -76,3 +76,19 @@ tests:
       - equal:
           path: spec.groups[0].rules[11].labels.severity
           value: info
+  - it: ships a queued-behind-the-concurrency-cap alert on the waiting-for-slot gauge
+    set:
+      monitoring.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[0].rules[12].alert
+          value: KopiurSnapshotWaitingForSlot
+      - matchRegex:
+          path: spec.groups[0].rules[12].expr
+          pattern: max by \(repository_kind, repository, namespace, name\) \(kopiur_snapshot_waiting_for_slot\) == 1
+      - equal:
+          path: spec.groups[0].rules[12].for
+          value: 30m
+      - equal:
+          path: spec.groups[0].rules[12].labels.severity
+          value: warning

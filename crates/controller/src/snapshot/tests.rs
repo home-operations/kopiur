@@ -529,6 +529,7 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
                 key: Some("KOPIA_PASSWORD".into()),
             },
         },
+        kind: kopiur_api::common::RepositoryKind::Repository,
         repo_namespace: Some("media-ns".into()),
         mover_defaults: None,
         identity_defaults: None,
@@ -538,6 +539,7 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
         credential_projection_allowed: false,
         owner_ref: Default::default(),
         deletion_protection: None,
+        concurrency: None,
         mass_deletion_ack: None,
         catalog: None,
         ca_bundle_pem: None,
@@ -1325,7 +1327,7 @@ fn operator_pruned_bypasses_guard_and_breaker() {
     }
 }
 
-// -- plan_prune: the variant-aware (PrunedBy × DeletionPolicy) 4×3 matrix (M2) --
+// -- plan_prune: the variant-aware (PrunedBy × DeletionPolicy) 5×3 matrix (M2) --
 
 #[test]
 fn plan_prune_matrix_covers_every_prunedby_x_policy_cell() {
@@ -1391,6 +1393,26 @@ fn plan_prune_matrix_covers_every_prunedby_x_policy_cell() {
         ),
         (
             PrunedBy::ReplicationRetention,
+            DeletionPolicy::Orphan,
+            DeletionPlan::OrphanSnapshot,
+        ),
+        // `concurrencyPolicy: Replace` cancelling an in-flight run. The second
+        // (quieter) downgrade: the victim is unfinished by construction and so
+        // owns no kopia snapshot, and in the race where it committed one after
+        // all we must NOT destroy it — the user asked to cancel a run in
+        // progress, not to delete a backup that had just finished.
+        (
+            PrunedBy::ReplacedRun,
+            DeletionPolicy::Delete,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::ReplacedRun,
+            DeletionPolicy::Retain,
+            DeletionPlan::RetainSnapshot,
+        ),
+        (
+            PrunedBy::ReplacedRun,
             DeletionPolicy::Orphan,
             DeletionPlan::OrphanSnapshot,
         ),
@@ -2385,8 +2407,8 @@ fn breaker_relevant_classifies_every_pruned_by_variant() {
     // so a new variant cannot ship without a deliberate row here (the match in
     // `breaker_relevant` won't compile until classified, and this won't pass
     // until the expected set is updated). Operator prunes (retention,
-    // failed-history, replication-retention) are exempt; unstamped and
-    // policy-cascade count.
+    // failed-history, replication-retention, replaced-run) are exempt;
+    // unstamped and policy-cascade count.
     use kopiur_api::snapshot::PrunedBy;
     assert!(super::plan::breaker_relevant(None), "unstamped is external");
     let relevant: Vec<_> = PrunedBy::ALL
@@ -2402,7 +2424,12 @@ fn breaker_relevant_classifies_every_pruned_by_variant() {
         .collect();
     assert_eq!(
         exempt,
-        ["retention", "failed-history", "replication-retention"]
+        [
+            "retention",
+            "failed-history",
+            "replication-retention",
+            "replaced-run"
+        ]
     );
 }
 
@@ -4076,4 +4103,649 @@ mod missing_source_pvc {
         assert_eq!(written["status"], gate.blocked_status);
         assert_eq!(written["reason"], gate.reason);
     }
+}
+
+// --- moverDefaults podLabels/podAnnotations reach a backup mover pod (M6) ---
+//
+// The reconciler's own Job-build path is async + kube IO, so this pins the pure
+// DATA PATH it is made of, end to end and in the same order: the repository's
+// `moverDefaults` → `resolve_mover` → the `MoverJobInputs` fields the backup
+// site sets → `build_job`. A field dropped at any link fails here.
+
+/// Render a mover Job the way a reconciler does — the real label set from that
+/// site's own label builder, through the real `build_job`.
+fn render_mover_job(
+    labels: BTreeMap<String, String>,
+    resolved_mover: &kopiur_api::common::ResolvedMover,
+) -> k8s_openapi::api::batch::v1::Job {
+    use kopiur_mover::jobs::{JobLimits, MoverJobInputs, build_job};
+    let ws = sample_backup_work_spec();
+    build_job(&MoverJobInputs {
+        name: "job-1",
+        namespace: "prod",
+        owner: kopiur_mover::jobs::owner_ref("Snapshot", "db-1", "uid-1"),
+        work_spec: &ws,
+        image: "ghcr.io/kopiur/mover:test",
+        image_pull_policy: None,
+        limits: JobLimits::default(),
+        resources: resolved_mover.resources.clone(),
+        security_context: resolved_mover.security_context.clone(),
+        pod_security_context: resolved_mover.pod_security_context.clone(),
+        node_selector: resolved_mover.node_selector.clone(),
+        tolerations: resolved_mover.tolerations.clone(),
+        affinity: resolved_mover.affinity.clone(),
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
+        labels,
+        source_volume: None,
+        repo_volume: None,
+        creds_secrets: Vec::new(),
+        result_configmap: None,
+        service_account: None,
+        passthrough_env: Vec::new(),
+        extra_env: Vec::new(),
+        annotations: BTreeMap::new(),
+        cache_volume: Default::default(),
+        scratch_volume: None,
+        readiness_exec: None,
+    })
+    .expect("the Job builds")
+}
+
+fn rendered_labels(job: &k8s_openapi::api::batch::v1::Job) -> BTreeMap<String, String> {
+    job.metadata.labels.clone().unwrap_or_default()
+}
+
+fn rendered_pod_labels(job: &k8s_openapi::api::batch::v1::Job) -> BTreeMap<String, String> {
+    job.spec
+        .as_ref()
+        .expect("spec")
+        .template
+        .metadata
+        .as_ref()
+        .expect("pod template metadata")
+        .labels
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The one repository every pool-label assertion below is keyed to, in the
+/// NORMALIZED form `ResolvedRepository::repository_ref` produces.
+fn pool_repo_ref() -> kopiur_api::common::RepositoryRef {
+    resolved_s3_repo().repository_ref()
+}
+
+// --- POOL LABEL: presence on the backup site, absence on excluded sites ----
+//
+// These render each reconciler's OWN label builder (`backup_job_labels`,
+// `batch_job_labels`, `maintenance_job_labels` — the exact functions the
+// reconcilers call) through the real `build_job`, so the assertion is about
+// the Job a reconciler actually produces, not about `pool::repo_pool_label`
+// in isolation.
+
+#[test]
+fn a_rendered_backup_job_carries_the_pool_label_on_both_job_and_pod() {
+    use kopiur_api::consts::REPO_POOL_LABEL;
+
+    let repo_ref = pool_repo_ref();
+    let cfg = config_with_source(
+        "media",
+        kopiur_api::snapshot_policy::Source {
+            pvc: None,
+            pvc_selector: None,
+            nfs: Some(kopiur_api::backend::NfsVolume {
+                server: "expanse.internal".into(),
+                path: "/mnt/eros/Media".into(),
+            }),
+            source_path_override: None,
+            source_path_strategy: None,
+            ..Default::default()
+        },
+    );
+    let labels = backup_job_labels(&cfg, Origin::Scheduled, &repo_ref);
+    let resolved_mover = kopiur_api::common::resolve_mover(None, None, None, None, None, None);
+    let job = render_mover_job(labels, &resolved_mover);
+
+    let expected = crate::naming::repo_label(&repo_ref);
+    assert_eq!(
+        rendered_labels(&job)
+            .get(REPO_POOL_LABEL)
+            .map(String::as_str),
+        Some(expected.as_str()),
+        "the backup Job must be countable in its repository's pool",
+    );
+    assert_eq!(
+        rendered_pod_labels(&job)
+            .get(REPO_POOL_LABEL)
+            .map(String::as_str),
+        Some(expected.as_str()),
+        "...and so must its pod",
+    );
+    // The value is the RESOLVED repository's hash, not a raw-spec-ref hash: a
+    // `namespace: None` ref would land this run in a pool of its own.
+    let denormalized = kopiur_api::common::RepositoryRef {
+        namespace: None,
+        ..repo_ref.clone()
+    };
+    assert_ne!(expected, crate::naming::repo_label(&denormalized));
+}
+
+#[test]
+fn a_rendered_snapdel_batch_job_carries_no_pool_label() {
+    use kopiur_api::consts::REPO_POOL_LABEL;
+
+    let repo_ref = pool_repo_ref();
+    let labels = batch_job_labels(&repo_ref);
+    let resolved_mover = kopiur_api::common::resolve_mover(None, None, None, None, None, None);
+    let job = render_mover_job(labels, &resolved_mover);
+
+    assert!(
+        !rendered_labels(&job).contains_key(REPO_POOL_LABEL),
+        "a batch delete must not compete with backups for the pool: {:?}",
+        rendered_labels(&job),
+    );
+    assert!(!rendered_pod_labels(&job).contains_key(REPO_POOL_LABEL));
+    // It DOES carry the repo hash under its own key — the two labels share a
+    // value shape, so this pins that they are not the same label.
+    assert_eq!(
+        rendered_labels(&job)
+            .get(crate::consts::DELETE_REPO_LABEL)
+            .map(String::as_str),
+        Some(crate::naming::repo_label(&repo_ref).as_str()),
+    );
+}
+
+#[test]
+fn a_rendered_maintenance_job_carries_no_pool_label() {
+    use kopiur_api::consts::REPO_POOL_LABEL;
+
+    // Maintenance is the CURE for an overloaded repository; parking it behind a
+    // saturated backup pool would make a struggling repo unmaintainable.
+    let labels = crate::maintenance::maintenance_job_labels("nas-maint");
+    let resolved_mover = kopiur_api::common::resolve_mover(None, None, None, None, None, None);
+    let job = render_mover_job(labels, &resolved_mover);
+
+    assert!(
+        !rendered_labels(&job).contains_key(REPO_POOL_LABEL),
+        "{:?}",
+        rendered_labels(&job),
+    );
+    assert!(!rendered_pod_labels(&job).contains_key(REPO_POOL_LABEL));
+}
+
+#[test]
+fn backup_mover_defaults_pod_metadata_reaches_the_pod_template() {
+    use kopiur_mover::jobs::{JobLimits, MoverJobInputs, build_job};
+
+    // Typed the cluster's way: JSON value -> typed (never serde_yaml straight
+    // into a typed value; see CLAUDE.md).
+    let defaults: kopiur_api::common::MoverDefaults = serde_json::from_value(serde_json::json!({
+        "podLabels": { "kueue.x-k8s.io/queue-name": "backups" },
+        "podAnnotations": { "sidecar.istio.io/inject": "false" },
+    }))
+    .expect("valid moverDefaults");
+    // Exactly what `build_backup_run` calls (recipe layers absent here).
+    let resolved_mover =
+        kopiur_api::common::resolve_mover(Some(&defaults), None, None, None, None, None);
+
+    // ... and exactly the two fields the backup site threads into the Job build.
+    let ws = sample_backup_work_spec();
+    let job = build_job(&MoverJobInputs {
+        name: "db-1",
+        namespace: "prod",
+        owner: kopiur_mover::jobs::owner_ref("Snapshot", "db-1", "uid-1"),
+        work_spec: &ws,
+        image: "ghcr.io/kopiur/mover:test",
+        image_pull_policy: None,
+        limits: JobLimits::default(),
+        resources: resolved_mover.resources.clone(),
+        security_context: resolved_mover.security_context.clone(),
+        pod_security_context: resolved_mover.pod_security_context.clone(),
+        node_selector: resolved_mover.node_selector.clone(),
+        tolerations: resolved_mover.tolerations.clone(),
+        affinity: resolved_mover.affinity.clone(),
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
+        labels: BTreeMap::new(),
+        source_volume: None,
+        repo_volume: None,
+        creds_secrets: Vec::new(),
+        result_configmap: None,
+        service_account: None,
+        passthrough_env: Vec::new(),
+        extra_env: Vec::new(),
+        annotations: BTreeMap::new(),
+        cache_volume: Default::default(),
+        scratch_volume: None,
+        readiness_exec: None,
+    })
+    .expect("the Job builds");
+
+    let pod_meta = job
+        .spec
+        .as_ref()
+        .expect("spec")
+        .template
+        .metadata
+        .as_ref()
+        .expect("pod template metadata");
+    assert_eq!(
+        pod_meta
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("kueue.x-k8s.io/queue-name"))
+            .map(String::as_str),
+        Some("backups"),
+        "moverDefaults.podLabels must reach the mover POD",
+    );
+    assert_eq!(
+        job.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("kueue.x-k8s.io/queue-name"))
+            .map(String::as_str),
+        Some("backups"),
+        "...and the Job, so a Job-level controller can select it",
+    );
+    assert_eq!(
+        pod_meta
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("sidecar.istio.io/inject"))
+            .map(String::as_str),
+        Some("false"),
+        "moverDefaults.podAnnotations must reach the mover POD",
+    );
+    assert!(
+        job.metadata.annotations.is_none(),
+        "...and must NOT be mirrored onto the Job",
+    );
+}
+
+/// A minimal backup work spec for the Job-build assertion above.
+fn sample_backup_work_spec() -> kopiur_mover::workspec::MoverWorkSpec {
+    use kopiur_mover::workspec::{
+        MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity, SnapshotOp,
+        TargetRef,
+    };
+    MoverWorkSpec {
+        version: 1,
+        operation: Operation::Snapshot(SnapshotOp {
+            source_path: "/data".into(),
+            tags: BTreeMap::new(),
+            policy: Default::default(),
+            fail_fast: None,
+            upload_limit_mb: None,
+            description: None,
+        }),
+        identity: ResolvedIdentity {
+            username: "db".into(),
+            hostname: "prod".into(),
+            source_path: "/data".into(),
+        },
+        repository: RepositoryConnect::Filesystem {
+            path: "/repo".into(),
+        },
+        target_ref: TargetRef {
+            api_version: crate::consts::API_VERSION.into(),
+            kind: "Snapshot".into(),
+            name: "db-1".into(),
+            namespace: "prod".into(),
+        },
+        hook_plan: Default::default(),
+        options: MoverOptions::default(),
+        cache: Default::default(),
+        throttle: Default::default(),
+    }
+}
+
+// --- Repository mover-Job pool gate (M3) -------------------------------------
+
+/// A `Snapshot` whose status carries `conditions` and `phase`.
+fn backup_with_status(phase: Option<&str>, conditions: serde_json::Value) -> Snapshot {
+    let mut b = dummy_backup();
+    b.metadata.namespace = Some("apps".into());
+    b.metadata.generation = Some(1);
+    let mut status = serde_json::json!({ "conditions": conditions });
+    if let Some(p) = phase {
+        status["phase"] = serde_json::Value::String(p.to_string());
+    }
+    b.status = Some(serde_json::from_value(status).expect("status fixture"));
+    b
+}
+
+fn slot_condition(status: &str, reason: &str) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "RepositorySlotAvailable",
+        "status": status,
+        "reason": reason,
+        "message": "waiting for a mover slot on Repository apps/nas: 1/1 jobs running; \
+                    restores are never held",
+        "lastTransitionTime": "2026-01-01T00:00:00Z",
+    }])
+}
+
+#[test]
+fn the_pool_gate_runs_only_at_first_launch() {
+    use kopiur_api::snapshot::SnapshotPhase as P;
+    // Gated: no status yet, or explicitly Pending.
+    assert!(should_run_pool_gate(None));
+    assert!(should_run_pool_gate(Some(&P::Pending)));
+    // NOT gated. `Running` is the load-bearing one: a resumed run already held
+    // a slot, and re-queuing it behind the backups that started after it both
+    // demotes a live backup to Pending and can hold the resume indefinitely.
+    for phase in [
+        P::Running,
+        P::Succeeded,
+        P::Failed,
+        P::Deleting,
+        P::Discovered,
+        P::Unchanged,
+        P::Unknown("FromTheFuture".into()),
+    ] {
+        assert!(!should_run_pool_gate(Some(&phase)), "{phase:?}");
+    }
+}
+
+#[test]
+fn the_pool_gate_and_preflight_gate_agree_on_which_phases_launch() {
+    // Both answer "is this a FIRST launch?", so a divergence would mean one
+    // gate re-opening on a phase the other considers in-flight — exactly the
+    // shape that would re-gate a resumed Running backup.
+    use kopiur_api::snapshot::SnapshotPhase as P;
+    for phase in [
+        None,
+        Some(P::Pending),
+        Some(P::Running),
+        Some(P::Succeeded),
+        Some(P::Failed),
+        Some(P::Deleting),
+        Some(P::Discovered),
+        Some(P::Unchanged),
+        Some(P::Unknown("x".into())),
+    ] {
+        assert_eq!(
+            should_run_pool_gate(phase.as_ref()),
+            should_run_preflight(phase.as_ref()),
+            "{phase:?}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_run_retried_through_pending_consults_the_gate() {
+    use kopiur_api::snapshot::SnapshotPhase as P;
+    // A retry is a NEW Snapshot (that is how a retry happens — see
+    // `RunDecision::TerminalFailed`), so it arrives at the creation path with
+    // no phase or `Pending` and MUST be admitted through the pool like any
+    // other launch — a retry storm behind a saturated backend is precisely what
+    // the cap exists to bound.
+    assert!(should_run_pool_gate(Some(&P::Pending)));
+    // While the CR still SAYS Failed it mints no Job at all
+    // (`RunDecision::TerminalFailed`), so the gate correctly stays out of it.
+    assert!(!should_run_pool_gate(Some(&P::Failed)));
+    assert_eq!(run_decision(Some(&P::Failed)), RunDecision::TerminalFailed);
+    assert_eq!(run_decision(Some(&P::Pending)), RunDecision::Run);
+}
+
+#[test]
+fn the_heal_is_needed_only_when_a_park_is_actually_standing() {
+    // "Only if present": a Snapshot that was never parked must not grow a
+    // condition it never had, so its status stays byte-identical to a build
+    // without the pool gate.
+    let parked = backup_with_status(Some("Pending"), slot_condition("False", "WaitingForSlot"));
+    assert!(crate::pool::slot_gate_is_false(
+        &parked.status.as_ref().unwrap().conditions
+    ));
+
+    let admitted = backup_with_status(Some("Running"), slot_condition("True", "SlotAcquired"));
+    assert!(!crate::pool::slot_gate_is_false(
+        &admitted.status.as_ref().unwrap().conditions
+    ));
+
+    let never_parked = backup_with_status(Some("Pending"), serde_json::json!([]));
+    assert!(!crate::pool::slot_gate_is_false(
+        &never_parked.status.as_ref().unwrap().conditions
+    ));
+}
+
+#[test]
+fn the_park_status_pins_the_repository_and_parks_at_pending() {
+    let backup = backup_with_status(Some("Pending"), serde_json::json!([]));
+    let pinned = RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "nas".into(),
+        namespace: Some("apps".into()),
+    };
+    let status = park_status(&backup, "waiting for a mover slot", &pinned);
+    assert_eq!(status["phase"], "Pending");
+    // The pin is what makes a queued run attributable — the gauge labels from
+    // it, and it is the only place `kubectl get -o yaml` names the repository.
+    assert_eq!(status["resolved"]["repository"]["name"], "nas");
+    assert_eq!(status["resolved"]["repository"]["namespace"], "apps");
+    let conds = status["conditions"].as_array().expect("conditions");
+    let slot = conds
+        .iter()
+        .find(|c| c["type"] == "RepositorySlotAvailable")
+        .expect("the slot condition is written");
+    assert_eq!(slot["status"], "False");
+    assert_eq!(slot["reason"], "WaitingForSlot");
+}
+
+#[test]
+fn a_second_identical_parked_pass_is_a_no_op_status_patch() {
+    // The hot-loop guard: a queue may last minutes, and a status write that
+    // differed between identical passes would bump `resourceVersion`,
+    // re-trigger the primary watch and spin the reconciler for the whole wait.
+    let pinned = RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "nas".into(),
+        namespace: Some("apps".into()),
+    };
+    let message = crate::pool::waiting_for_slot_message(
+        "Repository",
+        "apps/nas",
+        1,
+        1,
+        crate::pool::PoolCaps {
+            repo: std::num::NonZeroUsize::new(1),
+            global: None,
+        },
+    );
+
+    // Pass 1 over a fresh Snapshot.
+    let first = backup_with_status(Some("Pending"), serde_json::json!([]));
+    let desired = park_status(&first, &message, &pinned);
+
+    // Pass 2 sees the status pass 1 wrote.
+    let mut second = first.clone();
+    let mut status_json = serde_json::to_value(second.status.as_ref().unwrap()).unwrap();
+    for (k, v) in desired.as_object().unwrap() {
+        status_json[k] = v.clone();
+    }
+    second.status = Some(serde_json::from_value(status_json.clone()).expect("round-trip"));
+
+    let again = park_status(&second, &message, &pinned);
+    assert!(
+        io::status_patch_is_noop(Some(&status_json), &again),
+        "an unchanged park must not write:\ncurrent={status_json}\ndesired={again}"
+    );
+    // And the repository pin is dropped from the second body entirely, since it
+    // already matches — that is what keeps the comparison honest for a run that
+    // later stamps a FULLER `resolved` block.
+    assert!(again.get("resolved").is_none(), "{again}");
+}
+
+#[test]
+fn the_park_status_restamps_the_pin_when_the_repository_changed() {
+    // A fan-out child re-pinned to a different repository must not keep
+    // advertising the old one while it queues.
+    let old = RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "old".into(),
+        namespace: Some("apps".into()),
+    };
+    let new = RepositoryRef {
+        kind: RepositoryKind::Repository,
+        name: "new".into(),
+        namespace: Some("apps".into()),
+    };
+    let mut backup = backup_with_status(Some("Pending"), serde_json::json!([]));
+    let mut status_json = serde_json::to_value(backup.status.as_ref().unwrap()).unwrap();
+    status_json["resolved"] = serde_json::json!({ "repository": old });
+    backup.status = Some(serde_json::from_value(status_json).expect("round-trip"));
+
+    let status = park_status(&backup, "waiting", &new);
+    assert_eq!(status["resolved"]["repository"]["name"], "new");
+}
+
+#[test]
+fn the_heal_preserves_conditions_written_between_the_gate_and_the_job() {
+    // The audit-critical ordering. `fold_slot_heal` seeds from a LIVE re-read,
+    // so the array it produces still carries whatever the staging/credential
+    // writers put there after the gate ran. Seeding from the reconcile's stale
+    // copy instead would erase those AND resurrect the stale `False` onto a
+    // Snapshot whose Job is now running — a launched backup permanently
+    // reporting that it is queued.
+    let live_conditions: Vec<Condition> = serde_json::from_value(serde_json::json!([
+        {
+            "type": "RepositorySlotAvailable",
+            "status": "False",
+            "reason": "WaitingForSlot",
+            "message": "waiting for a mover slot",
+            "lastTransitionTime": "2026-01-01T00:00:00Z",
+        },
+        {
+            // Written by the staging path AFTER the gate admitted this run.
+            "type": "SourceStaged",
+            "status": "True",
+            "reason": "SourceStaged",
+            "message": "the source was staged",
+            "lastTransitionTime": "2026-01-01T00:00:05Z",
+        },
+    ]))
+    .expect("conditions fixture");
+
+    let healed = io::upsert_condition(
+        &live_conditions,
+        crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION,
+        true,
+        crate::consts::SLOT_ACQUIRED_REASON,
+        "holding a mover slot on Repository apps/nas",
+        Some(1),
+    );
+    let slot = healed
+        .iter()
+        .find(|c| c.type_ == "RepositorySlotAvailable")
+        .expect("the slot condition survives");
+    assert_eq!(slot.status, "True");
+    assert_eq!(slot.reason, "SlotAcquired");
+    assert!(
+        healed.iter().any(|c| c.type_ == "SourceStaged"),
+        "the interleaved writer's condition must survive the heal: {healed:?}"
+    );
+    // Order-stable: the heal replaces in place, so the array does not churn.
+    assert_eq!(healed[0].type_, "RepositorySlotAvailable");
+    assert_eq!(healed[1].type_, "SourceStaged");
+}
+
+/// The fixture for the in-flight heal window: a Snapshot the Job-creation patch
+/// FAILED on — the Job exists (so later passes return at the "Job exists,
+/// non-terminal" arm and never see the pool gate again), but the CR still
+/// carries the park.
+fn in_flight_backup(phase: &str, conditions: serde_json::Value) -> Snapshot {
+    let mut backup = backup_with_status(Some(phase), conditions);
+    let mut status_json = serde_json::to_value(backup.status.as_ref().unwrap()).unwrap();
+    status_json["resolved"] = serde_json::json!({
+        "repository": RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: Some("apps".into()),
+        }
+    });
+    backup.status = Some(serde_json::from_value(status_json).expect("round-trip"));
+    backup
+}
+
+#[test]
+fn an_in_flight_run_heals_a_park_the_job_creation_patch_left_standing() {
+    // The window: `apply_mover_objects` succeeded, the Job-creation status patch
+    // did not. Without the in-flight heal NOTHING ever clears the park — the
+    // reconcile returns at the "Job exists, non-terminal" arm forever, the
+    // `kopiur_snapshot_waiting_for_slot` gauge counts a RUNNING backup as
+    // queued, `KopiurSnapshotWaitingForSlot` false-pages at 30m, and
+    // `concurrencyPolicy: Replace` reads the child as parked and stalls at
+    // `ReplacementHeld`.
+    let backup = in_flight_backup("Running", slot_condition("False", "WaitingForSlot"));
+
+    let pinned = in_flight_heal_target(&backup)
+        .expect("a Running Snapshot with a standing park must be healed");
+    // Healed against the repository the park/Job-creation writers PINNED, so no
+    // recipe resolution is needed on this path.
+    assert_eq!(pinned.name, "nas");
+    assert_eq!(pinned.namespace.as_deref(), Some("apps"));
+
+    let healed = slot_heal_conditions(
+        &backup.status.as_ref().unwrap().conditions,
+        &pinned,
+        backup.meta().generation,
+    )
+    .expect("a standing park produces a heal patch");
+    let slot = healed
+        .iter()
+        .find(|c| c.type_ == crate::consts::REPOSITORY_SLOT_AVAILABLE_CONDITION)
+        .expect("the slot condition is rewritten");
+    assert_eq!(slot.status, "True");
+    assert_eq!(slot.reason, crate::consts::SLOT_ACQUIRED_REASON);
+    assert_eq!(slot.message, "holding a mover slot on Repository apps/nas");
+}
+
+#[test]
+fn a_clean_in_flight_run_does_no_work_at_all() {
+    // The zero-cost half of the contract. A backup that was never parked (or was
+    // already healed) must not trigger the live re-read, must not patch, and must
+    // leave its status byte-identical to a build without the pool gate.
+    for conditions in [
+        slot_condition("True", "SlotAcquired"),
+        serde_json::json!([]),
+    ] {
+        let backup = in_flight_backup("Running", conditions);
+        assert!(
+            in_flight_heal_target(&backup).is_none(),
+            "no park is standing, so the heal must short-circuit before any IO: {:?}",
+            backup.status
+        );
+        // And the pure core agrees: nothing to write, so no patch body exists.
+        let pinned = RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: Some("apps".into()),
+        };
+        assert!(
+            slot_heal_conditions(
+                &backup.status.as_ref().unwrap().conditions,
+                &pinned,
+                backup.meta().generation,
+            )
+            .is_none()
+        );
+    }
+}
+
+#[test]
+fn the_in_flight_heal_needs_the_pinned_repository() {
+    // Belt-and-braces: both the park write and the Job-creation patch pin
+    // `resolved.repository`, so a standing park without one is unreachable — but
+    // if it ever happened we leave the condition alone rather than guessing a
+    // repository into a user-visible message.
+    let backup = backup_with_status(Some("Running"), slot_condition("False", "WaitingForSlot"));
+    assert!(
+        backup
+            .status
+            .as_ref()
+            .and_then(|s| s.resolved.as_ref())
+            .and_then(|r| r.repository.as_ref())
+            .is_none()
+    );
+    assert!(in_flight_heal_target(&backup).is_none());
 }

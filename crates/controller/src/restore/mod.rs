@@ -2062,6 +2062,57 @@ pub(super) fn restore_target_pvc_race_error(pvc_ns: &str, pvc_name: &str) -> Err
     ))
 }
 
+/// Take this restore's slot in the repository's mover-Job pool, for the whole
+/// window between the launch decision and the Job's creation.
+///
+/// **Unconditional by construction.** A restore is a recovery in progress, so it
+/// is admitted at and over every cap: there is no verdict here, no
+/// `RepositorySlotAvailable` condition, no Event, and no requeue. That is a TYPE
+/// property, not a runtime one — [`crate::pool::reserve_slot`] hands back the
+/// guard directly, so this path never holds a value with a `Park` variant it
+/// would have to dispose of via `unreachable!()` or a `_ =>`.
+///
+/// **What "never parked" does NOT mean is "never counted".** A restore that took
+/// no reservation was invisible between its own admission and its Job appearing
+/// in a LIST, and a `Snapshot` reconciling in that window read spare capacity and
+/// launched beside it — two movers on a `maxConcurrentJobs: 1` repository. The
+/// reservation makes the in-flight restore visible to concurrent admissions, so
+/// it DISPLACES routine work (as documented) from the decision onward rather than
+/// only once its Job exists.
+///
+/// `job_name` MUST be the name of the Job this dispatch actually applies — the
+/// direct restore's (`{restore}`) or the populator's (`{restore}-populate`).
+/// [`run_restore_mover`] threads ONE binding into both this call and
+/// `apply_mover_objects`, which is what keeps the reservation matchable by the
+/// ledger's observed-Job sweep; a second spelling could drift and leave a
+/// reservation only the guard's `Drop` clears.
+///
+/// The pool key is the RESOLVED repository identity, for the same reason the
+/// Job's pool label is: a restore often carries no `spec.repository` at all (it
+/// derives one from a `Snapshot` or a policy), so the resolution is the only ref
+/// guaranteed to be normalized — and a denormalized one would silently split the
+/// repository's pool in two.
+///
+/// `Ok(None)` means the UNCAPPED default: no LIST, no lock, no ledger entry. It
+/// never means "this restore was held".
+async fn reserve_restore_slot(
+    ctx: &Context,
+    repo: &ResolvedRepository,
+    namespace: &str,
+    job_name: &str,
+) -> Result<Option<crate::pool::AdmissionGuard>> {
+    crate::pool::reserve_slot(
+        ctx,
+        &crate::naming::repo_label(&repo.repository_ref()),
+        &crate::pool::job_key(namespace, job_name),
+        crate::pool::PoolCaps {
+            repo: kopiur_api::consts::effective_max_concurrent_jobs(repo.concurrency.as_ref()),
+            global: ctx.max_concurrent_jobs,
+        },
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_restore_mover(
     ctx: &Context,
@@ -2129,6 +2180,19 @@ async fn run_restore_mover(
         }
         Err(e) => return Err(e),
     };
+
+    // Repository mover-Job pool RESERVATION.
+    //
+    // Placed HERE — right after the repository resolves (the first point the
+    // pool key and the caps are even known) and BEFORE `ensure_mover_identity`
+    // mints anything — so the reservation covers the WHOLE window between this
+    // decision and `apply_mover_objects` far below.
+    //
+    // `_slot` is bound with a NAME (not `_`) so it lives to the end of this
+    // function rather than dropping at the end of the statement; every exit
+    // from here on — the `?`s, the early returns, an unwinding panic — releases
+    // it exactly once. See [`reserve_restore_slot`] for why it is unconditional.
+    let _slot = reserve_restore_slot(ctx, &repo, namespace, job_name).await?;
 
     // The restore mover Job runs in this (workload) namespace: resolve its run
     // identity here — the user's workload-identity SA (preflighted + bound to the
@@ -2569,10 +2633,24 @@ async fn run_restore_mover(
         node_selector: resolved_mover.node_selector.clone(),
         tolerations: mover_tolerations,
         affinity: mover_affinity,
+        // moverDefaults.podLabels/podAnnotations, applied to EVERY mover pod
+        // (podLabels also to the Job; podAnnotations pod-only).
+        pod_labels: resolved_mover.pod_labels.clone(),
+        pod_annotations: resolved_mover.pod_annotations.clone(),
         labels: {
             let mut labels =
                 io::child_labels(&[(crate::consts::OP_LABEL, crate::consts::OP_RESTORE)]);
             mover_identity.decorate_labels(&mut labels);
+            // Pool membership: a restore mover counts toward its repository's
+            // `spec.concurrency.maxConcurrentJobs`. Keyed off the RESOLVED
+            // repository identity — a restore often has no `spec.repository`
+            // at all (it derives one from a Snapshot or a policy), so the
+            // resolution is the only ref guaranteed to be normalized, and a
+            // denormalized one would split the repository's pool.
+            labels.extend(crate::pool::repo_pool_label(
+                crate::pool::MoverJobKind::Restore,
+                &repo.repository_ref(),
+            ));
             labels
         },
         // Restore writes INTO the target PVC, mounted read-write at /restore.
