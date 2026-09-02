@@ -25,7 +25,7 @@
 //! 2. `a_restore_is_never_queued_behind_backups` — cap 1 with a backup holding
 //!    the slot: a Restore gets its Job immediately while a further backup parks,
 //!    and the restore completes.
-//! 2b. `a_running_restore_holds_the_slot_and_a_backup_queues_behind_it` — the
+//!    2b. `a_running_restore_holds_the_slot_and_a_backup_queues_behind_it` — the
 //!    OTHER direction, and the one the pool cap is actually sold on: a slow
 //!    restore holds the only slot, a backup created against it parks with
 //!    `WaitingForSlot`, the two pooled Jobs are never both live, and the backup
