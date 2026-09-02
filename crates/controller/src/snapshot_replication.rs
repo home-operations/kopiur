@@ -1841,9 +1841,21 @@ mod tests {
         assert!(due_slot(&r, Utc::now(), None).is_some());
     }
 
+    // A fixed mid-slot instant (Saturday 12:02:33 UTC) for tests that anchor a
+    // last-run time relative to "now". With a live Utc::now(), a run landing in
+    // the first second after a cron boundary (e.g. 05:15:00 for `*/5 * * * *`)
+    // puts a genuinely new slot between the `now - 1s` anchor and now, and the
+    // kernel rightly fires — a ~1/300 CI flake, not an operator bug. Same
+    // pinning as `maintenance::tests::pinned_now`.
+    fn pinned_now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-06-06T12:02:33Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn not_due_right_after_a_run() {
-        let now = Utc::now();
+        let now = pinned_now();
         let just = (now - chrono::Duration::seconds(1)).to_rfc3339();
         let status = SnapshotReplicationStatus {
             last_replicated: Some(just),
