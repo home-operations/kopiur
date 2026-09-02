@@ -155,7 +155,7 @@ pub enum PoolClass {
 /// Both are `Option<NonZeroUsize>` because "uncapped" and "cap of zero" must not
 /// be confusable at a call site: a `Some(0)` here would mean "admit nothing",
 /// i.e. a repository that never runs another Job. `None` on BOTH is the default
-/// install, and [`pool_live_counts`] short-circuits it without a LIST.
+/// install, and [`observe_live_pool`] short-circuits it without a LIST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PoolCaps {
     /// The per-repository cap (`spec.concurrency.maxConcurrentJobs`), the
@@ -190,7 +190,7 @@ pub enum PoolVerdict {
 }
 
 /// Decide whether a pooled run may launch. **Pure** — the counting is
-/// [`pool_live_counts`]'s job — so the whole truth table is a unit test.
+/// [`observe_live_pool`]'s job — so the whole truth table is a unit test.
 ///
 /// [`PoolClass::Restore`] is `Admit` unconditionally, at or over either cap. A
 /// restore is a recovery in progress; queueing one behind routine backups is
@@ -292,6 +292,16 @@ fn job_is_suspended(job: &Job) -> bool {
 /// Role RBAC is a permanent 403 that would wedge the reconcile — and it is the
 /// same scoping the batch-delete throttle and every other reconcile-time LIST
 /// already carries.
+///
+/// **INVARIANT: this LIST must be a quorum read.** The `ListParams` below must
+/// never set `resourceVersion`, `.at("0")`, or a `version_match` — that is not
+/// an oversight to "optimize" later. [`AdmissionLedger::admit`]'s
+/// reservation-release story depends on this call seeing a just-created Job
+/// the instant it exists: a watch-cache read can lag behind the apiserver, so
+/// it could miss a Job whose reservation was already dropped (because minting
+/// that Job was itself the release). The next reconcile's LIST would then
+/// undercount, re-admit into the same slot, and reopen the exact double-
+/// admission race the ledger exists to close.
 pub async fn observe_live_pool(
     ctx: &Context,
     repo_pool_value: &str,
@@ -588,6 +598,14 @@ fn sweep_observed(held: &mut Reservations, seen: &BTreeSet<String>) {
 /// **The uncapped default touches neither the apiserver nor the lock.** Both
 /// caps `None` short-circuits to `Admit { reservation: None }` before the LIST,
 /// so an install that never asked for a cap pays one branch.
+///
+/// **INVARIANT: the LIST inside [`observe_live_pool`] must be a quorum read**
+/// (no `resourceVersion`/`.at("0")`/`version_match`). [`AdmissionLedger::admit`]
+/// releases a run's reservation the moment its Job shows up in
+/// `observed.seen`; if that LIST could serve a stale watch-cache view, a
+/// just-created Job's reservation could already be dropped while the Job
+/// itself stays invisible to the next caller's count — undercounting the pool
+/// and reopening the admission race this ledger closed.
 pub async fn admit_or_park(
     ctx: &Context,
     pool_key: &str,
@@ -1126,7 +1144,7 @@ mod tests {
         );
     }
 
-    // --- pool_live_counts filtering ----------------------------------------
+    // --- observe_live_pool filtering (job_occupies_slot / count_pool / observe_pool) ---
 
     fn job(name: &str, pool: Option<&str>) -> Job {
         let mut j: Job = serde_json::from_value(serde_json::json!({

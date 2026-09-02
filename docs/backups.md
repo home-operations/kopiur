@@ -1036,6 +1036,8 @@ waiting for a mover slot on Repository billing/nas: 3/3 jobs running; restores a
 
 Two details in that message are worth knowing. The `(global …)` clause appears **only** when a cluster-wide cap is set; with no backstop configured it is omitted entirely rather than printed as noise. And when a run is held by the *global* cap alone — the repository itself has no `maxConcurrentJobs` — the per-repository denominator renders as `unlimited` (`0/unlimited jobs running (global 12/12)`), because quoting a per-repository number the repository never set would be a lie about which knob to turn.
 
+The numbers in that message are EFFECTIVE counts — listed Jobs plus admissions already granted but not yet visible as Jobs (see the in-flight note just below) — so a parked run can briefly report `1/1 jobs running` a moment before `kubectl get jobs` shows the Job that number is counting.
+
 /// note | Two backups submitted at the same instant still serialize
 
 A cap that was only ever checked by listing Jobs would leak: two `Snapshot`s created a millisecond apart are reconciled concurrently, both would list a pool that neither one's Job has appeared in yet, and both would launch. The gate therefore also counts the admissions the operator has already granted but whose Jobs the API has not published yet — the decision and that record are taken together, so exactly one of the two is admitted and the other parks normally.
