@@ -638,7 +638,7 @@ spec:
         maxConcurrentJobs: 3 # absent or 0 = unlimited (the default)
 ```
 
-Backups, restores, and the source side of both replication kinds draw from **one** pool per repository — the backend and the bandwidth to it are the shared resource, so a separate budget per work kind would let three "safe" limits still saturate it. Maintenance, verification, pin, batched snapshot deletions, bootstrap/catalog scans and `kubectl kopiur browse` sessions are outside the pool entirely. Restores are always admitted (never queued) but do occupy a slot while they run, so a restore displaces backups rather than adding to them.
+Backups, restores, and the source side of both replication kinds draw from **one** pool per repository — the backend and the bandwidth to it are the shared resource, so a separate budget per work kind would let three "safe" limits still saturate it. Maintenance, verification, pin, batched snapshot deletions, bootstrap/catalog scans and `kubectl kopiur browse` sessions are outside the pool entirely. Restores are always admitted (never queued) but do occupy a slot — from the instant they are admitted, not merely once their Job is visible — so a restore displaces backups rather than adding to them.
 
 A run that arrives at a full pool is parked **before its Job is created** — `phase: Pending` plus `RepositorySlotAvailable=False` (`WaitingForSlot`) naming the counts — and launches automatically when a slot frees. The full behavior, the metric to watch, and how the cap composes with `concurrencyPolicy` and `startingDeadlineSeconds` are in [Backups → limiting concurrent jobs per repository](backups.md#limiting-concurrent-jobs-per-repository).
 

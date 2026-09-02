@@ -16,7 +16,7 @@
 //! the fixture RESHAPES THE RUNNING OPERATOR (a Deployment rollout), and scenario
 //! 4 additionally patches the controller's env, this file owns its own CI shard.
 //!
-//! The five scenarios:
+//! The six scenarios:
 //!
 //! 1. `a_repository_cap_serializes_its_backups` — cap 1, two backups: never two
 //!    live at once, the loser surfaces `RepositorySlotAvailable=False`, BOTH
@@ -25,6 +25,11 @@
 //! 2. `a_restore_is_never_queued_behind_backups` — cap 1 with a backup holding
 //!    the slot: a Restore gets its Job immediately while a further backup parks,
 //!    and the restore completes.
+//! 2b. `a_running_restore_holds_the_slot_and_a_backup_queues_behind_it` — the
+//!    OTHER direction, and the one the pool cap is actually sold on: a slow
+//!    restore holds the only slot, a backup created against it parks with
+//!    `WaitingForSlot`, the two pooled Jobs are never both live, and the backup
+//!    still succeeds (with its park healed) once the restore finishes.
 //! 3. `an_uncapped_repository_never_grows_the_slot_condition` — the default
 //!    install must be indistinguishable from a build without the feature.
 //! 4. `the_env_backstop_serializes_across_repositories` —
@@ -541,6 +546,192 @@ async fn a_restore_is_never_queued_behind_backups() -> anyhow::Result<()> {
 
     let _ = restores.delete(RESTORE, &DeleteParams::default()).await;
     cleanup(&client, &[REPO], &[POLICY], &[SEED, HOLDER, PARKED]).await;
+    Ok(())
+}
+
+// --- 2b. the other direction: a restore HOLDS the slot -------------------------
+
+const COUNTED_SUBPATH: &str = "conc-counted";
+
+/// The half of the restore contract scenario 2 never exercises: a restore
+/// **occupies** the slot it was never held from.
+///
+/// Scenario 2 proves a restore is not queued *behind* a backup. This proves a
+/// backup is queued behind a *restore* — which is the claim `maxConcurrentJobs`
+/// is actually sold on ("a restore displaces backups rather than adding to
+/// them"), and the claim that broke when the restore path took no admission
+/// reservation at all.
+///
+/// With `maxConcurrentJobs: 1` and the slow-mover fixture delaying
+/// [`MoverOp::Restore`], a `Restore` holds the only slot for a long, observable
+/// window. Four claims:
+///
+/// * **Never two live pooled Jobs at once**, polled every second for the whole
+///   window. A restore that did not count would let the backup start beside it,
+///   and this is what would catch it.
+/// * The backup surfaces `RepositorySlotAvailable=False`/`WaitingForSlot`, so
+///   the queueing is visible rather than inferred from timing.
+/// * The restore reaches `Completed` — a cap must not have slowed the recovery
+///   down, only the work behind it.
+/// * The backup then **succeeds with a real kopia snapshot** and its condition
+///   heals to `True`. A cap that serialized by dropping the loser would satisfy
+///   the invariant and be a data-loss bug.
+///
+/// **Why the restore is started FIRST rather than simultaneously with the
+/// backup.** Admission is first-come: whichever run reaches the gate first takes
+/// the slot, and a restore that lost that race is — correctly, by design —
+/// admitted over the cap beside the backup. Racing them here would test
+/// scheduler luck, not the invariant. The genuinely simultaneous, pre-Job
+/// window is a sub-millisecond one that no cluster fixture can hit reliably;
+/// `crates/controller/src/pool.rs` owns it with a barriered ledger test
+/// (`racing_backups_all_park_on_an_in_flight_restores_reservation`), which is
+/// exactly the split this file's header describes.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn a_running_restore_holds_the_slot_and_a_backup_queues_behind_it() -> anyhow::Result<()> {
+    let Some(world) = World::connect().await else {
+        return Ok(());
+    };
+    world.ensure(&[Need::Filesystem]).await?;
+    let client: Client = world.client().clone();
+
+    const REPO: &str = "e2e-conc-cnt-repo";
+    const POLICY: &str = "e2e-conc-cnt-pol";
+    const SEED: &str = "e2e-conc-cnt-seed";
+    const QUEUED: &str = "e2e-conc-cnt-queued";
+    const RESTORE: &str = "e2e-conc-cnt-restore";
+
+    ensure_capped_repo(&client, REPO, COUNTED_SUBPATH, Some(1)).await;
+    ensure_policy(&client, POLICY, REPO).await;
+
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Seed a real snapshot to restore FROM, at full speed (outside the fixture).
+    create_backup(&backups, SEED, POLICY).await;
+    assert_real_snapshot(&backups, SEED).await?;
+
+    // BOTH ops are slowed: the restore so it holds the slot long enough to
+    // observe, the backup so that if it ever did start beside the restore its
+    // Job would still be live on the next poll instead of finishing between two
+    // of them and hiding the violation.
+    let config = SlowMover::new(BACKUP_DELAY).ops(&[MoverOp::Restore, MoverOp::Snapshot]);
+    let result = with_slow_mover_config(&world, config, || async {
+        restores
+            .create(
+                &PostParams::default(),
+                &cr(serde_json::json!({
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "Restore",
+                    "metadata": { "name": RESTORE, "namespace": E2E_NAMESPACE },
+                    "spec": {
+                        "repository": { "kind": "Repository", "name": REPO },
+                        "source": { "snapshotRef": { "name": SEED } },
+                        "target": { "pvc": {
+                            "name": format!("{RESTORE}-dst"),
+                            "capacity": "1Gi",
+                            "accessModes": ["ReadWriteOnce"],
+                        }},
+                    }
+                })),
+            )
+            .await?;
+
+        // The restore takes the only slot. Generous window: it resolves its
+        // source and stages a target PVC before its mover Job exists, and none
+        // of that is what this scenario asserts.
+        wait_until(
+            &format!("{RESTORE} holds the only slot"),
+            Duration::from_secs(180),
+            INVARIANT_POLL,
+            || async { Ok((live_jobs(&jobs, &[RESTORE]).await? == 1).then_some(())) },
+        )
+        .await?;
+
+        // Only now ask for a backup, so its gate runs against a pool the restore
+        // is demonstrably occupying.
+        create_backup(&backups, QUEUED, POLICY).await;
+
+        // THE INVARIANT, and the park, in ONE explicit loop.
+        //
+        // Not `wait_until`: that helper SWALLOWS a poll error and retries to its
+        // deadline, so an `ensure!` violation inside it would be reported as a
+        // timeout rather than as the invariant breach it is. Scenario 1 owns the
+        // same shape for the same reason.
+        //
+        // The park is recorded as it is SEEN rather than waited for afterwards:
+        // it is an ephemeral state that ends when the restore's mover finishes,
+        // and a second pass looking for it could start after it had already
+        // passed — the `a_restore_is_never_queued_behind_backups` ordering
+        // lesson.
+        let mut saw_queued = false;
+        let deadline = Instant::now() + Duration::from_secs(420);
+        loop {
+            let live = live_jobs(&jobs, &[RESTORE, QUEUED]).await?;
+            anyhow::ensure!(
+                live <= 1,
+                "maxConcurrentJobs=1 ran {live} pooled Jobs at once: a restore and \
+                 a backup were both admitted against one repository"
+            );
+            saw_queued |= slot_condition_status(&backups, QUEUED).await.as_deref() == Some("False");
+            let restore_phase = status_json(&restores, RESTORE).await["phase"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            anyhow::ensure!(
+                restore_phase != "Failed",
+                "the restore must not fail: a cap may queue work behind a recovery, \
+                 never break it"
+            );
+            if restore_phase == "Completed" {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the restore never completed: phase={restore_phase:?}"
+            );
+            tokio::time::sleep(INVARIANT_POLL).await;
+        }
+        anyhow::ensure!(
+            saw_queued,
+            "a backup created against a repository whose ONLY slot is held by a \
+             running restore MUST surface {SLOT_CONDITION}=False — if it never \
+             did, the restore was not counted and the gate never ran"
+        );
+        anyhow::ensure!(
+            slot_condition_status(&restores, RESTORE).await.as_deref() != Some("False"),
+            "a Restore must NEVER carry {SLOT_CONDITION}=False — restores are \
+             admitted at and over the cap"
+        );
+        Ok(())
+    })
+    .await;
+
+    result?;
+    // The queued backup drains once the restore releases the slot, really backs
+    // something up, and its park heals rather than sticking to a running run.
+    assert_real_snapshot(&backups, QUEUED).await?;
+    // Polled, not read once: the heal rides the Job-creation status patch and the
+    // mover's own terminal patch lands moments later, so a single read taken
+    // between the two would be a coin flip rather than a claim. It must REACH
+    // `True` — a stuck `False` (the heal-ordering regression) still fails.
+    wait_until(
+        &format!("{QUEUED} heals {SLOT_CONDITION} once it is admitted"),
+        Duration::from_secs(120),
+        INVARIANT_POLL,
+        || async {
+            Ok(
+                (condition_status_checked(&backups, QUEUED, SLOT_CONDITION).await?
+                    == Some("True".into()))
+                .then_some(()),
+            )
+        },
+    )
+    .await?;
+
+    let _ = restores.delete(RESTORE, &DeleteParams::default()).await;
+    cleanup(&client, &[REPO], &[POLICY], &[SEED, QUEUED]).await;
     Ok(())
 }
 

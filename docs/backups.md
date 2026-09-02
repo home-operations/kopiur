@@ -1008,7 +1008,7 @@ Each exclusion is a decision, not an oversight. Maintenance is the *cure* for an
 
 /// tip | Restores are never queued
 
-A restore is a recovery in progress. Holding one behind a queue of routine nightly backups is exactly backwards, so a restore is **always admitted**, at or over the cap. It still *counts* while it runs — its Job carries the pool label like any other — so an in-flight restore displaces backups rather than adding to them. That is what a cap is actually asked for.
+A restore is a recovery in progress. Holding one behind a queue of routine nightly backups is exactly backwards, so a restore is **always admitted**, at or over the cap. It still *counts* — its Job carries the pool label like any other, and it takes its slot from the instant the operator admits it rather than from the instant that Job becomes visible — so an in-flight restore displaces backups rather than adding to them. That is what a cap is actually asked for, and it is why a restore and a backup submitted at the same moment do not both start on a `maxConcurrentJobs: 1` repository.
 
 ///
 
@@ -1041,6 +1041,8 @@ The numbers in that message are EFFECTIVE counts — listed Jobs plus admissions
 /// note | Two backups submitted at the same instant still serialize
 
 A cap that was only ever checked by listing Jobs would leak: two `Snapshot`s created a millisecond apart are reconciled concurrently, both would list a pool that neither one's Job has appeared in yet, and both would launch. The gate therefore also counts the admissions the operator has already granted but whose Jobs the API has not published yet — the decision and that record are taken together, so exactly one of the two is admitted and the other parks normally.
+
+Restores are recorded the same way, even though they are never held: "never queued" and "never counted" are different claims, and only the first one is true of a restore. A restore takes its slot when it is admitted, so a backup arriving in the window before the restore's Job exists parks behind it rather than starting beside it.
 
 The one place the count can still run over is a **leader failover**, where the incoming leader starts from the listed Jobs alone: for the length of one reconcile pass it can admit a run whose predecessor's Job is not visible yet. It self-corrects on the next pass, and it can never go the other way — a lost record over-admits, it never parks a repository that has room. See [Upgrading → a leader failover has the same one-window shape](upgrade.md#a-leader-failover-has-the-same-one-window-shape).
 

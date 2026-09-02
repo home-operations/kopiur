@@ -218,6 +218,7 @@ pub const REPO_SUBPATHS: &[&str] = &[
     //   conc-uncapped  the no-cap default (the condition must never appear)
     //   conc-env-a/b   two SEPARATE repositories under the cluster-wide backstop
     "conc-cap",
+    "conc-counted",
     "conc-restore",
     "conc-uncapped",
     "conc-env-a",

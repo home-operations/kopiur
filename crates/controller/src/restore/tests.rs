@@ -1710,3 +1710,205 @@ fn absent_restore_target_pvc_stays_a_transient_race() {
     assert!(err.to_string().contains("app/restored-data"));
     assert!(err.to_string().contains("race"));
 }
+
+// --- the restore's repository mover-Job pool reservation ----------------------
+//
+// The reconciler-level half of the P1 guard (`crate::pool` owns the ledger's own
+// truth table). What can only be checked HERE is that the restore path takes a
+// slot at all, and takes it under the key the observed-Job sweep will match: the
+// name of the Job this dispatch actually applies. `run_restore_mover` threads ONE
+// `job_name` binding into both `reserve_restore_slot` and `apply_mover_objects`,
+// and these tests pin both flavors of that name — the direct restore's
+// (`{restore}`) and the populator's (`{restore}-populate`).
+
+/// A resolved namespaced `Repository` named `nas` in `backups`, with `cap` as its
+/// `spec.concurrency.maxConcurrentJobs` (`None` = uncapped, the default install).
+fn pooled_repo(cap: Option<u32>) -> crate::io::ResolvedRepository {
+    use kopiur_api::backend::{Backend, FilesystemBackend};
+    use kopiur_api::common::{Encryption, RepositoryKind, SecretKeyRef};
+    crate::io::ResolvedRepository {
+        backend: Backend::Filesystem(FilesystemBackend {
+            path: "/repo".into(),
+            volume: None,
+        }),
+        mover_defaults: None,
+        encryption: Encryption {
+            password_secret_ref: SecretKeyRef {
+                name: "creds".into(),
+                namespace: None,
+                key: None,
+            },
+        },
+        kind: RepositoryKind::Repository,
+        repo_namespace: Some("backups".into()),
+        identity_defaults: None,
+        schedule_defaults: None,
+        on_namespace_delete: Default::default(),
+        mode: Default::default(),
+        credential_projection_allowed: false,
+        // `repository_ref()` reads the repository's NAME off here, and the pool
+        // key is a hash of it — a blank one would silently key every test repo
+        // to the same pool.
+        owner_ref: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            name: "nas".into(),
+            ..Default::default()
+        },
+        deletion_protection: None,
+        concurrency: cap.map(|c| kopiur_api::common::ConcurrencySpec {
+            max_concurrent_jobs: Some(c),
+        }),
+        mass_deletion_ack: None,
+        catalog: None,
+        ca_bundle_pem: None,
+    }
+}
+
+/// A `kube::Client` that answers every request with an EMPTY `JobList` — the
+/// pool a first-instant admission actually observes, and the state a concurrent
+/// backup would read while this restore's Job does not exist yet.
+fn empty_job_list_client() -> kube::Client {
+    use http::Response;
+    use kube::client::Body;
+    let svc = tower::service_fn(move |_req: http::Request<Body>| async move {
+        let body = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "JobList",
+            "metadata": {},
+            "items": [],
+        })
+        .to_string();
+        Ok::<_, std::convert::Infallible>(
+            Response::builder()
+                .status(http::StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(body.into_bytes()))
+                .expect("response"),
+        )
+    });
+    kube::Client::new(svc, "default")
+}
+
+/// The reservation the restore gate records for `job_name`, as
+/// `pool key → job keys`.
+async fn restore_reservation_keys(
+    ctx: &Context,
+    repo: &crate::io::ResolvedRepository,
+    job_name: &str,
+) -> Vec<(String, Vec<String>)> {
+    let slot = reserve_restore_slot(ctx, repo, "apps", job_name)
+        .await
+        .expect("the restore gate never fails on a healthy LIST");
+    assert!(
+        slot.is_some(),
+        "a capped repository must hand the restore a slot guard to hold"
+    );
+    let held = ctx.pool_admissions.outstanding_for_test();
+    // Drop AFTER reading: a guard released at the end of its statement would
+    // make every assertion below pass against a gate that reserved nothing.
+    drop(slot);
+    assert!(
+        ctx.pool_admissions.outstanding_for_test().is_empty(),
+        "the guard must release the restore's slot on drop"
+    );
+    held.into_iter()
+        .map(|(pool, jobs)| (pool, jobs.into_iter().collect()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_direct_restore_reserves_its_slot_under_its_own_job_name() {
+    // A direct restore's mover Job is named after the `Restore` itself, so the
+    // reservation must be keyed `{namespace}/{restore}` — anything else is a
+    // promise the observed-Job sweep can never retire.
+    let ctx = Context::test_context(empty_job_list_client());
+    let repo = pooled_repo(Some(1));
+    assert_eq!(
+        restore_reservation_keys(&ctx, &repo, "db-recovery").await,
+        vec![(
+            crate::naming::repo_label(&repo.repository_ref()),
+            vec!["apps/db-recovery".to_string()],
+        )],
+    );
+}
+
+#[tokio::test]
+async fn a_populating_restore_reserves_its_slot_under_the_populate_job_name() {
+    // The populator's Job is `{restore}-populate`, NOT the Restore's own name.
+    // Keying the reservation off the CR here was the drift this pins against:
+    // the sweep matches `ObservedPool::seen`, which holds Job names.
+    let ctx = Context::test_context(empty_job_list_client());
+    let repo = pooled_repo(Some(1));
+    assert_eq!(
+        restore_reservation_keys(&ctx, &repo, "db-recovery-populate").await,
+        vec![(
+            crate::naming::repo_label(&repo.repository_ref()),
+            vec!["apps/db-recovery-populate".to_string()],
+        )],
+    );
+}
+
+#[tokio::test]
+async fn a_reserved_restore_slot_parks_a_concurrent_backup_at_a_cap_of_one() {
+    // The P1 at the reconciler's own gate: while the restore holds its slot —
+    // and the LIST still shows an EMPTY pool, because the restore's Job does
+    // not exist yet — a `Snapshot` arriving at the same repository must park.
+    let ctx = Context::test_context(empty_job_list_client());
+    let repo = pooled_repo(Some(1));
+    let pool_key = crate::naming::repo_label(&repo.repository_ref());
+    let caps = crate::pool::PoolCaps {
+        repo: std::num::NonZeroUsize::new(1),
+        global: None,
+    };
+
+    let slot = reserve_restore_slot(&ctx, &repo, "apps", "db-recovery")
+        .await
+        .expect("restore gate")
+        .expect("a capped repository hands out a guard");
+    let verdict = crate::pool::admit_or_park(
+        &ctx,
+        &pool_key,
+        "apps/nightly",
+        crate::pool::PoolClass::Backup,
+        caps,
+    )
+    .await
+    .expect("backup gate");
+    assert!(
+        matches!(
+            verdict,
+            crate::pool::LedgerVerdict::Park {
+                repo_live: 1,
+                global_live: 1,
+            }
+        ),
+        "a backup ran beside an in-flight restore: {verdict:?}"
+    );
+
+    // Once the restore's window closes, the slot is the backup's.
+    drop(slot);
+    assert!(matches!(
+        crate::pool::admit_or_park(
+            &ctx,
+            &pool_key,
+            "apps/nightly",
+            crate::pool::PoolClass::Backup,
+            caps,
+        )
+        .await
+        .expect("backup gate"),
+        crate::pool::LedgerVerdict::Admit { .. }
+    ));
+}
+
+#[tokio::test]
+async fn an_uncapped_repository_leaves_the_restore_path_untouched() {
+    // The default install: no cap anywhere, so the restore gate makes no API
+    // call, takes no lock and records nothing. `None` here is "no budget",
+    // never "held" — a restore has no park outcome to represent.
+    let ctx = Context::test_context(empty_job_list_client());
+    let slot = reserve_restore_slot(&ctx, &pooled_repo(None), "apps", "db-recovery")
+        .await
+        .expect("restore gate");
+    assert!(slot.is_none());
+    assert!(ctx.pool_admissions.outstanding_for_test().is_empty());
+}
