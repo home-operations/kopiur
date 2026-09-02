@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.7](https://github.com/home-operations/kopiur/compare/0.10.6...0.10.7) (2026-09-02)
+
+
+### Features
+
+* per-repository mover-Job concurrency limits + jitter hardening ([#437](https://github.com/home-operations/kopiur/issues/437)) ([1529aa9](https://github.com/home-operations/kopiur/commit/1529aa91973b055f113f59f816371f663d5cf1b2))
+
 ## [0.10.6](https://github.com/home-operations/kopiur/compare/0.10.5...0.10.6) (2026-09-01)
 
 
