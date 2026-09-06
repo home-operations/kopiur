@@ -108,7 +108,7 @@ Set `spec.maintenance` on the `Repository`/`ClusterRepository` to override the s
 | Field            | Purpose                                                                                                                   |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`        | Default `true`. Set `false` to opt out (see [Disabling](#disabling-maintenance)).                                         |
-| `schedule`       | Override `quick`/`full` cron + jitter (and `timezone`). Absent ⇒ the defaults above.                                      |
+| `schedule`       | Override `quick`/`full` cron + jitter (and `timezone`).                                                                   |
 | `mover`          | Pod overrides for the maintenance Job (resources, scheduling, security context).                                          |
 | `failurePolicy`  | `backoffLimit` / `activeDeadlineSeconds` for the Job.                                                                     |
 | `takeoverPolicy` | Ownership-lease policy (see [Ownership](#ownership-and-shared-repositories)).                                             |
