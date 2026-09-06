@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.10.8](https://github.com/home-operations/kopiur/compare/0.10.7...0.10.8) (2026-09-06)
+
+
+### Bug Fixes
+
+* **container:** update image busybox (9532d8c → dc2d74b) ([#439](https://github.com/home-operations/kopiur/issues/439)) ([0bad734](https://github.com/home-operations/kopiur/commit/0bad734b080c9948f9488f02f85bb41edd23020c))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action actions/deploy-pages (v5.0.0 → v5.0.1) ([#444](https://github.com/home-operations/kopiur/issues/444)) ([f601ebd](https://github.com/home-operations/kopiur/commit/f601ebdbfdd72030c5a926a397f6e056fd510a42))
+* **github-action:** update action helm/kind-action (v1.14.0 → v1.15.0) ([#446](https://github.com/home-operations/kopiur/issues/446)) ([94ab9de](https://github.com/home-operations/kopiur/commit/94ab9de1bd4bcc32795db0c110cfd54ab82a42d9))
+* **mise:** update mise tools ([#399](https://github.com/home-operations/kopiur/issues/399)) ([ffae98a](https://github.com/home-operations/kopiur/commit/ffae98a2582cf4320c5499b7f4d8c74410bc98c5))
+* **mise:** update tool aqua:astral-sh/uv (0.12.7 → 0.12.8) ([#442](https://github.com/home-operations/kopiur/issues/442)) ([8954063](https://github.com/home-operations/kopiur/commit/89540637659e2ea226ec6947290bab7a47eab8ef))
+* **mise:** update tool aqua:astral-sh/uv (0.12.8 → 0.12.9) ([#445](https://github.com/home-operations/kopiur/issues/445)) ([5a88ac6](https://github.com/home-operations/kopiur/commit/5a88ac617576649fce2994d98391b94035410fda))
+* **mise:** update tool zizmor (1.29.0 → 1.30.0) ([#441](https://github.com/home-operations/kopiur/issues/441)) ([908a427](https://github.com/home-operations/kopiur/commit/908a427aa3296270f66c12eafd5224c889a9cbd1))
+
 ## [0.10.7](https://github.com/home-operations/kopiur/compare/0.10.6...0.10.7) (2026-09-02)
 
 
