@@ -11494,8 +11494,8 @@ spec:
             - target
             type: object
             x-kubernetes-validations:
-            - message: exactly one of target.pvc, target.pvcRef, target.populator
-              rule: '[has(self.target.pvc), has(self.target.pvcRef), has(self.target.populator)].filter(x, x).size() == 1'
+            - message: exactly one of target.pvc, target.pvcRef, target.populator, target.streamExec
+              rule: '[has(self.target.pvc), has(self.target.pvcRef), has(self.target.populator), has(self.target.streamExec)].filter(x, x).size() == 1'
           status:
             description: Observed state of a Restore, written by the controller/mover.
             nullable: true

@@ -3000,7 +3000,7 @@ Externally tagged — set **exactly one** of: `pvc`.
 
 **Validation rules** (enforced at admission):
 
-- exactly one of target.pvc, target.pvcRef, target.populator
+- exactly one of target.pvc, target.pvcRef, target.populator, target.streamExec
 
 #### `spec.source` { #restore-spec-source }
 

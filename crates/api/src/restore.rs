@@ -26,12 +26,18 @@ use serde::{Deserialize, Serialize};
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 // §15: operator-authored CEL in the CRD schema — exactly one of
-// target.pvc/target.pvcRef/target.populator. Validates in the apiserver + CI
-// (`kubeconform`), complementing the webhook. `target` is required so `has(self.target)`
-// is always true; the rule counts the present sub-keys.
+// target.pvc/target.pvcRef/target.populator/target.streamExec. Validates in the
+// apiserver + CI (`kubeconform`), complementing the webhook. `target` is required so
+// `has(self.target)` is always true; the rule counts the present sub-keys.
+//
+// MUST list every `RestoreTarget` variant. The Rust enum being exhaustive does NOT
+// keep this in step — a variant added there but not here is rejected by the API
+// SERVER before the webhook or any reconciler ever sees it, with a message naming
+// only the old variants. (That is exactly how `streamExec` first failed on a real
+// cluster.) `restore_target_cel_rule_lists_every_variant` is the guard.
 #[schemars(extend("x-kubernetes-validations" = [{
-    "rule": "[has(self.target.pvc), has(self.target.pvcRef), has(self.target.populator)].filter(x, x).size() == 1",
-    "message": "exactly one of target.pvc, target.pvcRef, target.populator"
+    "rule": "[has(self.target.pvc), has(self.target.pvcRef), has(self.target.populator), has(self.target.streamExec)].filter(x, x).size() == 1",
+    "message": "exactly one of target.pvc, target.pvcRef, target.populator, target.streamExec"
 }]))]
 #[serde(rename_all = "camelCase")]
 /// Desired state of a Restore: where to read from, where to write to, and how to behave when the snapshot is missing.
@@ -1508,5 +1514,76 @@ claims:
             ["properties"]["source"]["properties"]["fromPolicy"]["properties"]["sourcePath"];
         assert_eq!(field["type"], "string", "got {field}");
         assert_eq!(field["maxLength"], 4096, "got {field}");
+    }
+}
+
+#[cfg(test)]
+mod cel_guard_tests {
+    use super::*;
+    use kube::CustomResourceExt;
+
+    /// The CRD's operator-authored CEL rule must name EVERY `RestoreTarget` variant.
+    ///
+    /// This is not redundant with the enum being exhaustive. The CEL rule lives in the
+    /// generated schema and is enforced by the API SERVER, before the webhook or any
+    /// reconciler runs — so a variant added to the Rust enum but missing from the rule
+    /// compiles, passes every unit test, and is then rejected at `kubectl apply` with a
+    /// message listing only the old variants. That is precisely how `streamExec` failed
+    /// the first time it was applied to a real cluster.
+    ///
+    /// Driving the expectation off `kind_str()` means a new variant fails HERE, with an
+    /// instruction, rather than in someone's cluster.
+    #[test]
+    fn restore_target_cel_rule_lists_every_variant() {
+        use crate::common::ObjectRef;
+
+        // One value per variant, so adding a variant makes this match fail to compile
+        // and forces the author to extend the list.
+        let all = [
+            RestoreTarget::Pvc(PvcTemplate {
+                name: "p".into(),
+                capacity: None,
+                storage_class_name: None,
+                access_modes: Vec::new(),
+            }),
+            RestoreTarget::PvcRef(ObjectRef {
+                name: "p".into(),
+                namespace: None,
+            }),
+            RestoreTarget::Populator(PopulatorTarget {}),
+            RestoreTarget::StreamExec(StreamExecTarget {
+                file_name: "f.sql".into(),
+                workload_exec: crate::snapshot_policy::StreamExec {
+                    pod_selector: Default::default(),
+                    container: None,
+                    command: vec!["true".into()],
+                    timeout: None,
+                },
+            }),
+        ];
+
+        let crd = serde_json::to_value(Restore::crd()).expect("CRD serializes");
+        let schema = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let rules = schema["x-kubernetes-validations"]
+            .as_array()
+            .expect("the spec carries operator-authored CEL validations");
+        let rule = rules
+            .iter()
+            .find_map(|r| r["rule"].as_str())
+            .expect("a CEL rule is present");
+
+        for target in &all {
+            // `kind_str` is PascalCase; the wire key is camelCase.
+            let kind = target.kind_str();
+            let mut wire = kind.to_string();
+            wire[..1].make_ascii_lowercase();
+            assert!(
+                rule.contains(&format!("has(self.target.{wire})")),
+                "the RestoreSpec CEL rule does not mention `target.{wire}`, so the API server \
+                 will REJECT that target before the webhook ever sees it. Add \
+                 `has(self.target.{wire})` to the rule (and its message) in restore.rs, then \
+                 re-run `mise run gen`.\nrule: {rule}"
+            );
+        }
     }
 }
