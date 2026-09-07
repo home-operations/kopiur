@@ -720,6 +720,21 @@ pub async fn csi_pvc_with_data(client: &Client, name: &str, label_value: &str, m
     use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    // A seed Pod left `Succeeded` by a previous call makes the next
+    // `pods.create` fail `AlreadyExists` behind the `let _ =` below — so a fresh
+    // PVC would bind EMPTY and every marker assertion downstream would fail for
+    // a reason that has nothing to do with what the test covers. Clear it, and
+    // wait: `create` on a still-terminating name is rejected too.
+    let seed = format!("{name}-seed");
+    let _ = pods.delete(&seed, &DeleteParams::default()).await;
+    wait_until(
+        &format!("seed pod {seed} is gone"),
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(pods.get_opt(&seed).await?.is_none().then_some(())) },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("a previous seed pod for {name} must clear: {e}"));
     let _ = pvcs
         .create(
             &PostParams::default(),
@@ -742,7 +757,7 @@ pub async fn csi_pvc_with_data(client: &Client, name: &str, label_value: &str, m
             &PostParams::default(),
             &cr(serde_json::json!({
                 "apiVersion": "v1", "kind": "Pod",
-                "metadata": { "name": format!("{name}-seed"), "namespace": E2E_NAMESPACE },
+                "metadata": { "name": seed, "namespace": E2E_NAMESPACE },
                 "spec": {
                     "restartPolicy": "Never",
                     "containers": [{
@@ -772,6 +787,86 @@ pub async fn csi_pvc_with_data(client: &Client, name: &str, label_value: &str, m
     )
     .await
     .unwrap_or_else(|e| panic!("PVC {name} should bind: {e}"));
+    // Bound is NOT the same as seeded: an `Immediate` class binds the PVC before
+    // the seed pod has written anything. Wait for the WRITE, or a backup taken
+    // straight after this call can capture an empty volume.
+    kopiur_e2e::wait::pod_succeeded(client, E2E_NAMESPACE, &seed)
+        .await
+        .unwrap_or_else(|e| panic!("the seed pod for {name} must write {marker:?}: {e}"));
+}
+
+/// The `Snapshot` CRs a policy produced, by its config label.
+pub async fn children_of(client: &Client, policy: &str) -> Vec<Snapshot> {
+    let api: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    api.list(
+        &kube::api::ListParams::default()
+            .labels(&format!("kopiur.home-operations.com/config={policy}")),
+    )
+    .await
+    .expect("list Snapshots")
+    .items
+}
+
+/// Purge one scenario's schedule, policy and produced `Snapshot` CRs, so a
+/// re-run — a nextest retry, or a second call from a sibling test in the same
+/// shard — actually RE-RUNS the scenario instead of dying in setup.
+///
+/// A panicked (or simply a preceding) try leaves three tripwires: the policy
+/// (the fresh `create` dies `AlreadyExists`), the schedule (its `runOnCreate`
+/// token is consumed, so even an idempotent create fires no new capture), and
+/// stale children (which make an "exactly N children" wait unwinnable, and a
+/// terminal `Failed` member makes an all-Succeeded wait unwinnable). Deletion
+/// order matters — schedule first, so nothing re-produces children — and then it
+/// waits for the children to fully go (their finalizers release the kopia-side
+/// state through the batched delete path). A fresh cluster is a fast no-op.
+pub async fn clear_scenario_leftovers(client: &Client, schedule: &str, policy: &str) {
+    let schedules: Api<kopiur_api::SnapshotSchedule> =
+        Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    for child in children_of(client, policy).await {
+        if let Some(n) = child.metadata.name {
+            let _ = backups.delete(&n, &DeleteParams::default()).await;
+        }
+    }
+    wait_until(
+        &format!("leftovers of scenario `{policy}` are gone"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let gone = schedules.get_opt(schedule).await?.is_none()
+                && policies.get_opt(policy).await?.is_none()
+                && children_of(client, policy).await.is_empty();
+            Ok(gone.then_some(()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("previous try's `{policy}` leftovers must clear: {e}"));
+}
+
+/// Delete a PVC and its seed Pod and WAIT for both to go, so the next
+/// [`csi_pvc_with_data`] starts from nothing rather than adopting a volume whose
+/// labels or contents belong to a previous scenario.
+pub async fn drop_csi_pvc(client: &Client, name: &str) {
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let seed = format!("{name}-seed");
+    let _ = pods.delete(&seed, &DeleteParams::default()).await;
+    let _ = pvcs.delete(name, &DeleteParams::default()).await;
+    wait_until(
+        &format!("PVC {name} and its seed pod are gone"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let gone = pvcs.get_opt(name).await?.is_none() && pods.get_opt(&seed).await?.is_none();
+            Ok(gone.then_some(()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("PVC {name} must be deleted before it is re-seeded: {e}"));
 }
 
 /// A populator `Restore` reading `seed` out of `repo` (`target.populator: {}`).

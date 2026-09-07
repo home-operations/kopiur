@@ -1023,6 +1023,289 @@ pub fn claims_summary(aggregate: &ClaimsAggregate) -> (&'static str, String) {
     (reason, message)
 }
 
+/// The prime PVC name for a claimant uid. ONE spelling, because the reaper has
+/// to name the same object the driver created, and the legacy-adoption rule
+/// reads it back off a LIST.
+pub fn prime_pvc_name(consumer_uid: &str) -> String {
+    format!("prime-{consumer_uid}")
+}
+
+/// Whether a restore mover `Job`'s NAME is re-used across runs.
+///
+/// Closed (and not a `bool`) because the two answers change how a TERMINATING
+/// Job is read, and getting that backwards loses data either way: treat a
+/// re-used name as fresh and a reaped-then-re-populated claim reads the outgoing
+/// Job's `Succeeded` as its own, rebinding a still-empty prime; treat a fresh
+/// name as re-used and a direct restore's TTL-reaped Job has its outcome dropped
+/// and the whole restore re-runs over a target the workload may already be
+/// writing to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobNameReuse {
+    /// One run, one name — a direct restore (`{restore}`) or a per-claim
+    /// populate (`{restore}-populate-{fnv8(uid)}`, #443). A terminating Job
+    /// under this name IS this run's, and its mover writes
+    /// `status.claims.<pvc>`.
+    Fresh,
+    /// The pre-#443 shared populate name `{restore}-populate`, reached only when
+    /// driving a claim adopted from a legacy status. A terminating Job under it
+    /// may belong to a PREVIOUS claim, so wait for the delete to land and create
+    /// a fresh one — and its mover, which has no `claimKey`, pins the TOP-LEVEL
+    /// `status.resolved`.
+    LegacyShared,
+}
+
+/// The `status.resolved` a finalizing claim may read, in preference order.
+/// Pure + exhaustive over [`JobNameReuse`].
+///
+/// A `Fresh` claim's mover writes `status.claims.<pvc>.resolved` and nothing
+/// else, so it reads its own record and NEVER the top level — that is C1's
+/// `resolved_at` no-fallback rule, and relaxing it would let one claim inherit a
+/// sibling's (or a legacy) pin and report the wrong snapshot.
+///
+/// A `LegacyShared` claim is the one exception, and it is why this function
+/// exists (#443 review item 5): the adopted `{restore}-populate` Job's work spec
+/// carries no `claimKey`, so when its DEFERRED source resolves the mover pins
+/// the TOP-LEVEL `status.resolved`. Adoption snapshots that field exactly once —
+/// on the first post-upgrade pass, when it is typically still unpinned — so
+/// without this fallback the finalize would read `None` and record
+/// `NoSnapshotContinue` / "provisioned an empty volume" over a restore that
+/// genuinely ran.
+pub fn claim_finalize_pin(
+    reuse: JobNameReuse,
+    claim_pin: Option<kopiur_api::restore::ResolvedRestore>,
+    prev_pin: Option<kopiur_api::restore::ResolvedRestore>,
+    top_level: Option<kopiur_api::restore::ResolvedRestore>,
+) -> Option<kopiur_api::restore::ResolvedRestore> {
+    let own = claim_pin.or(prev_pin);
+    match reuse {
+        JobNameReuse::Fresh => own,
+        JobNameReuse::LegacyShared => own.or(top_level),
+    }
+}
+
+/// Whether a SETTLED claim's leftover populate artifacts may be swept on the
+/// steady pass. Pure + exhaustive over the record's phase.
+///
+/// This is NARROWER than [`claim_artifacts_reapable`] on purpose, and the
+/// difference is the #443 review's item 2. The steady sweep exists for ONE
+/// shape: a `Populated`/`AlreadyBound` claim whose finalize crashed between
+/// stripping the PV annotation and deleting the prime, leaving an orphan nothing
+/// else will collect.
+///
+/// A **`Failed`** claim's artifacts are emphatically NOT that. Its record names
+/// its mover `Job` and tells the user to read the Job/pod logs; restore movers
+/// carry no TTL, so pre-#443 that Job (and the partially-written prime) survived
+/// until the user acted, because `Failed` was terminal at the reconcile guard.
+/// Sweeping them 120 s later would delete the evidence the message points at.
+/// They are reclaimed when the claim is re-armed or its record is dropped — i.e.
+/// when the user deletes and re-creates the claiming PVC, which is exactly the
+/// documented remedy.
+pub fn settled_artifacts_reapable(record: &RestoreClaimStatus) -> bool {
+    match record.phase.as_ref() {
+        Some(RestoreClaimPhase::Populated | RestoreClaimPhase::AlreadyBound) => {
+            claim_artifacts_reapable(record.reason.as_deref())
+        }
+        Some(RestoreClaimPhase::Failed) => false,
+        // Not reachable: `claim_drive` only answers `Settled` for a phase that
+        // `RestoreClaimPhase::is_terminal` accepts, which is exactly the three
+        // arms above. Encoded as "leave it alone" rather than a panic — a
+        // hand-patched status must not be able to crash the reconcile loop, and
+        // never touching an artifact is the safe answer to a state we did not
+        // predict.
+        None
+        | Some(
+            RestoreClaimPhase::Pending
+            | RestoreClaimPhase::Populating
+            | RestoreClaimPhase::Rebinding
+            | RestoreClaimPhase::Unknown(_),
+        ) => false,
+    }
+}
+
+/// Whether `status` looks like it was written by a PRE-fan-out operator at all —
+/// the gate on legacy adoption (#443 review item 8).
+///
+/// Without it, a brand-new `Restore`'s very first claim would "adopt" the
+/// `Pending`/`AwaitingPvcDataSourceRef` park a zero-claim pass just wrote,
+/// spending a `{restore}-populate` Job GET and logging that a pre-fan-out status
+/// was adopted when none existed. The two real legacy signals are a pinned
+/// top-level `status.resolved` (which only the pre-fan-out path ever wrote) and
+/// a phase past resolution.
+///
+/// `status.target.pvcPrime` is deliberately NOT a signal: the zero-claim park
+/// writes the sentinel `awaiting-claim` there on every new populator.
+pub fn is_legacy_populator_status(status: &kopiur_api::RestoreStatus) -> bool {
+    if !status.claims.is_empty() {
+        return false;
+    }
+    if status.resolved.is_some() {
+        return true;
+    }
+    // Exhaustive: a new phase has to decide whether reaching it implies the
+    // pre-fan-out driver ran.
+    match status.phase.as_ref() {
+        Some(RestorePhase::Restoring | RestorePhase::Completed | RestorePhase::Failed) => true,
+        None | Some(RestorePhase::Pending | RestorePhase::Resolving) => false,
+        // A phase this build cannot read is not evidence of a LEGACY write — it
+        // is evidence of a NEWER one, which would have written `claims`.
+        Some(RestorePhase::Unknown(_)) => false,
+    }
+}
+
+/// Which claimant a LEGACY (pre-fan-out) status belongs to — the one claim the
+/// old single-claim driver was actually about. Pure.
+///
+/// Nothing records it: the pre-fan-out code took the first LIST hit. So it is
+/// inferred, in order:
+///
+/// 1. **A surviving `prime-<uid>`.** The prime is uid-keyed, so this names the
+///    claim mid-handshake exactly, bound or not.
+/// 2. **Exactly one BOUND claimant.** Only a bound claim can have been
+///    populated, and the old driver could only ever populate one — so with a
+///    single bound claimant it is unambiguous however many claimants there are.
+///    This is the #443 reporter's own post-upgrade state (N claimants, one
+///    populated): adopting nothing there relabels the populated PVC
+///    `TargetAlreadyBound` — "no restore ran, delete the PVC" — over the volume
+///    holding the restored data.
+///
+/// A LONE claimant that is UNBOUND is deliberately NOT adopted. Pre-#443 that
+/// shape (a `Completed` populator whose claim was deleted and re-applied) was
+/// re-populated on the next pass; adopting `Populated` onto it would settle a
+/// claim that never got its volume.
+pub fn legacy_claimant<'a>(
+    consumers: &'a [PersistentVolumeClaim],
+    live_primes: &std::collections::BTreeSet<String>,
+) -> Option<&'a PersistentVolumeClaim> {
+    use kube::ResourceExt;
+    if let Some(mid_handshake) = consumers.iter().find(|c| {
+        c.uid()
+            .is_some_and(|uid| live_primes.contains(&prime_pvc_name(&uid)))
+    }) {
+        return Some(mid_handshake);
+    }
+    let mut bound = consumers.iter().filter(|c| pvc_is_bound(c));
+    match (bound.next(), bound.next()) {
+        (Some(only_bound), None) => Some(only_bound),
+        // Zero bound (nothing was ever populated) or several (the old driver
+        // could not have populated more than one, so the extras were bound by
+        // something else and we cannot tell which is ours): adopt nothing and
+        // let every claimant drive fresh.
+        (None, _) | (Some(_), Some(_)) => None,
+    }
+}
+
+/// The status body for a populator `Restore` that NOTHING claims: the
+/// Restore-level `AwaitingClaim=True` park, plus an explicit JSON `null` for
+/// every claim record whose claimant is gone. Pure.
+///
+/// The nulls are the whole point (#443 review item 1). The pre-fix zero-claimant
+/// branch wrote the park and dropped the reaper's `gone` list on the floor, so
+/// the stale records survived — and the next pass, 30 s later, re-reaped them
+/// and re-published `OrphanedPrimePvcReaped`, forever, for every app torn down
+/// with its populator left standing. Writing the nulls in the SAME patch makes
+/// the second pass a server-side no-op under
+/// [`crate::io::status_merge_patch_is_noop`].
+///
+/// `target.pvcPrime: awaiting-claim` is the pre-#443 sentinel, kept verbatim so
+/// the zero-claim surface consumers already watch does not change.
+pub fn awaiting_claim_status(
+    restore: &Restore,
+    reason: &str,
+    message: &str,
+    gone: &[String],
+) -> serde_json::Value {
+    let conditions = io::upsert_condition(
+        &existing_conditions(restore),
+        "AwaitingClaim",
+        true,
+        reason,
+        message,
+        restore.metadata.generation,
+    );
+    let mut status =
+        restore_ready_status_on(restore, &conditions, RestorePhase::Pending, reason, message);
+    status["target"] = serde_json::json!({ "pvcPrime": "awaiting-claim" });
+    if !gone.is_empty() {
+        let mut nulls = serde_json::Map::new();
+        for claim in gone {
+            nulls.insert(claim.clone(), serde_json::Value::Null);
+        }
+        status["claims"] = serde_json::Value::Object(nulls);
+    }
+    status
+}
+
+/// Whether a fan-out pass has nothing observable left to do — the gate on
+/// SKIPPING the cluster-wide `PersistentVolume` LIST, which is the expensive
+/// read on this path. Pure.
+///
+/// Quiet means: no record to drop, every claim `Settled`, and no prime of any of
+/// them still standing. A prime that will NEVER be reaped (a hijacked populate's,
+/// kept on purpose — [`claim_artifacts_reapable`]) counts as absent: otherwise it
+/// would buy one cluster-wide LIST every 600 s, forever, for a claim whose
+/// artifacts nothing will ever collect.
+///
+/// `live` is `(claim name, claimant uid)` in the pass's drive order, paired with
+/// `plans` positionally.
+pub fn pass_is_all_quiet(
+    gone: &[String],
+    plans: &[ClaimDrive],
+    live: &[(String, String)],
+    prev: &std::collections::BTreeMap<String, RestoreClaimStatus>,
+    live_primes: &std::collections::BTreeSet<String>,
+) -> bool {
+    gone.is_empty()
+        && plans.iter().all(|d| *d == ClaimDrive::Settled)
+        && live.iter().all(|(claim, uid)| {
+            !live_primes.contains(&prime_pvc_name(uid))
+                || !claim_artifacts_reapable(prev.get(claim).and_then(|r| r.reason.as_deref()))
+        })
+}
+
+/// The end-of-pass status body for a fanned-out populator: the AGGREGATE phase,
+/// the kstatus trio, `AwaitingClaim=False`, and every claim merge — plus an
+/// explicit `null` for each record whose claimant is gone. Pure.
+///
+/// ONE body per pass, built in ONE place, because the fan-out has N claims and
+/// only one conditions array: a per-claim `conditions` patch would replace that
+/// array wholesale and erase the sibling written moments earlier (the
+/// condition-writers-clobber class). Per-claim detail lives under `claims.<pvc>`
+/// via [`claim_merge_body`], which never names a mover-owned key.
+pub fn fanout_status(
+    restore: &Restore,
+    prev: &std::collections::BTreeMap<String, RestoreClaimStatus>,
+    next: &std::collections::BTreeMap<String, RestoreClaimStatus>,
+    gone: &[String],
+) -> serde_json::Value {
+    let aggregate = aggregate_claims(next);
+    let (reason, message) = claims_summary(&aggregate);
+    let conditions = io::upsert_condition(
+        &existing_conditions(restore),
+        "AwaitingClaim",
+        false,
+        crate::consts::CLAIMS_OBSERVED_REASON,
+        "at least one PersistentVolumeClaim claims this Restore; status.claims carries the \
+         per-claim state",
+        restore.metadata.generation,
+    );
+    let mut status = restore_ready_status_on(
+        restore,
+        &conditions,
+        aggregate_phase(&aggregate),
+        reason,
+        &message,
+    );
+    let mut merges = serde_json::Map::new();
+    for (claim, record) in next {
+        merges.insert(claim.clone(), claim_merge_body(prev.get(claim), record));
+    }
+    for claim in gone {
+        merges.insert(claim.clone(), serde_json::Value::Null);
+    }
+    status["claims"] = serde_json::Value::Object(merges);
+    status
+}
+
 /// What this pass must do with one claim record. Pure model, matched
 /// exhaustively by the driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
