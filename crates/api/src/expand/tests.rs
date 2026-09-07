@@ -964,9 +964,12 @@ fn restore_path_override_wins_over_every_derivation() {
 
 #[test]
 fn restore_path_for_a_plain_policy_is_byte_identical_to_the_legacy_answer() {
-    // Rule (2): no selector anywhere ⇒ the pre-#443 answer, which is exactly what
+    // Rule (3): no selector anywhere ⇒ the pre-#443 answer, which is exactly what
     // `config_identity` + `resolve_identity` produced. Asserted against the SAME
-    // call the backup side makes, so a drift in either shows up here.
+    // call the backup side makes, so a drift in either shows up here. The
+    // exact-match rule (2) now runs first, and this must stay byte-identical: for
+    // `target_name == "data"` (2) matches and builds the same string, and for
+    // `"restored-copy"` it misses and (3) answers as it always did.
     for target_name in ["data", "restored-copy"] {
         let p = policy_with(vec![pvc_source("data")]);
         let legacy = effective_source(&p, None)
@@ -991,6 +994,61 @@ fn restore_path_for_a_plain_policy_is_byte_identical_to_the_legacy_answer() {
     assert_eq!(
         restore_source_path(&p, None, &target("billing", "data")).unwrap(),
         RestoreSourcePath::PolicySource(Some("/srv/pg".into()))
+    );
+}
+
+#[test]
+fn restore_path_picks_the_matching_plain_source_not_the_first_one() {
+    // Rule (2) BEFORE rule (3). Validation admits N plain `pvc:` sources on one
+    // policy, and the backup side fans them out under one `user@host` with a path
+    // each. If the first-source fallback ran first, restoring `redis` would read
+    // `/pvc/pgdata` — a wrong-but-non-empty path, the #443 hazard class without a
+    // selector in sight.
+    let p = policy_with(vec![pvc_source("pgdata"), pvc_source("redis")]);
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "redis")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/pvc/redis".into())),
+        "the SECOND plain source must win when it names the target"
+    );
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/pvc/pgdata".into()))
+    );
+
+    // A target matching NO plain source keeps the documented `sources[0]`
+    // fallback (rule 3) — the pre-#443 answer, which is what makes "restore into
+    // a differently-named scratch volume" keep working. Rule (5) is reserved for
+    // shapes where no path can be derived at all, not for this one.
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "scratch")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/pvc/pgdata".into())),
+        "a non-matching target falls back to sources[0], by design"
+    );
+
+    // The matched source's own `sourcePathOverride` travels with it — the whole
+    // point is to read what THAT source wrote.
+    let over = policy_with(vec![
+        pvc_source("pgdata"),
+        with_override(pvc_source("redis"), "/srv/redis"),
+    ]);
+    assert_eq!(
+        restore_source_path(&over, None, &target("billing", "redis")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/srv/redis".into()))
+    );
+
+    // An `nfs` source ahead of the matching `pvc:` no longer shadows it either.
+    let mixed = policy_with(vec![nfs_source("/export/media"), pvc_source("redis")]);
+    assert_eq!(
+        restore_source_path(&mixed, None, &target("billing", "redis")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/pvc/redis".into()))
+    );
+
+    // Cross-namespace still misses (2): a plain source addresses the POLICY's
+    // namespace, so a same-named PVC elsewhere is a different volume and the
+    // fallback applies unchanged.
+    assert_eq!(
+        restore_source_path(&p, None, &target("payments", "redis")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/pvc/pgdata".into()))
     );
 }
 
@@ -1053,7 +1111,7 @@ fn restore_path_derives_per_pvc_from_the_selector_strategy() {
 
 #[test]
 fn restore_path_prefers_an_exact_plain_pvc_source_over_the_selector_derivation() {
-    // Rule (3): a policy that names this very PVC explicitly AND fans out over a
+    // Rule (2): a policy that names this very PVC explicitly AND fans out over a
     // selector — the exact match wins, override included, because that source is
     // literally the one that backed this volume up.
     let p = policy_with(vec![

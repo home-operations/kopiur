@@ -86,8 +86,8 @@ If no matching snapshot exists yet, `onMissingSnapshot` applies (`Continue` come
 A [`pvcSelector` policy](backups.md#sources--what-to-back-up) covers **several** volumes, each backed up under its own kopia source path (`/pvc/<name>` under `sourcePathStrategy: PvcName`, `/pvc/<namespace>/<name>` under `PvcNamespacedName`). A `fromPolicy` restore therefore has to say which one it wants — and by default it does not have to say it out loud, because Kopiur derives it from the PVC being filled:
 
 1. `source.fromPolicy.sourcePath`, if you set it, wins outright.
-2. Otherwise, if the policy has **no** selector sources, the restore reads the single source's own path — exactly what it always did.
-3. Otherwise, if a plain `pvc:` source in the policy names **exactly** this target (same name, same namespace), that source's path is used.
+2. Otherwise, if a plain `pvc:` source in the policy names **exactly** this target (same name, same namespace), that source's path is used. An exact match beats every derivation *and* the fallback below.
+3. Otherwise, if the policy has **no** selector sources, the restore reads `sources[0]`'s own path — exactly what it always did.
 4. Otherwise, if every selector source agrees on `(sourcePathStrategy, sourcePathOverride)` **and** that override is unset, the path is derived from the **target PVC's name** through the same code the backup side used — so the two strings cannot drift.
 5. Otherwise it **fails closed**: the claim goes `Failed` with reason `SourcePathAmbiguous`, and the message tells you to set `source.fromPolicy.sourcePath` (e.g. `/pvc/postgres-data`).
 
@@ -104,13 +104,15 @@ source:
 
 A restore with **no** source path becomes the kopia filter `username@hostname:` — an *empty* path, which matches every member of the policy. Before Kopiur derived the path per PVC, restoring one volume of a multi-PVC policy took the newest snapshot of **any** member, so a volume could come back holding a different volume's data, with a green `Completed` over it. Rule 5 exists so that Kopiur refuses rather than guesses.
 
+The same hazard exists **without a selector**: a policy may list several plain `pvc:` sources, each backed up under its own path. That is why rule 2 runs before rule 3 — for `sources: [{pvc: {name: a}}, {pvc: {name: b}}]`, restoring into PVC `b` reads `/pvc/b`, not `sources[0]`'s `/pvc/a`. A target that matches **no** plain source still falls back to `sources[0]` (rule 3), which is what keeps "restore this policy's data into a differently-named scratch volume" working; name the member you want with `sourcePath` if that is not what you meant.
+
 ///
 
 /// warning | A cross-namespace `pvcRef` must set `sourcePath` explicitly
 
-Rules 3 and 4 both address the policy's **own** namespace. Rule 3 requires the target's namespace to match the policy's — a same-named PVC in another namespace is a different volume. Rule 4 derives from the TARGET's namespace, so a `target.pvcRef` in namespace `staging` against a policy in `billing` with `sourcePathStrategy: PvcNamespacedName` derives `/pvc/staging/<name>`, a path the repository has never seen (the backup wrote `/pvc/billing/<name>`) — you get `SnapshotNotFound`, or an empty volume under `Continue`.
+Rules 2 and 4 both address the policy's **own** namespace. Rule 2 requires the target's namespace to match the policy's — a same-named PVC in another namespace is a different volume. Rule 4 derives from the TARGET's namespace, so a `target.pvcRef` in namespace `staging` against a policy in `billing` with `sourcePathStrategy: PvcNamespacedName` derives `/pvc/staging/<name>`, a path the repository has never seen (the backup wrote `/pvc/billing/<name>`) — you get `SnapshotNotFound`, or an empty volume under `Continue`.
 
-This also changes one previously-working shape on upgrade: a **mixed** policy (a plain `pvc:` source plus a selector) restoring cross-namespace used to fall back to the plain source's path. It now derives from the target instead. Set `sourcePath` explicitly for any cross-namespace restore against a selector or mixed policy:
+This also changes two previously-working shapes on upgrade. A **mixed** policy (a plain `pvc:` source plus a selector) restoring cross-namespace used to fall back to the plain source's path; it now derives from the target instead. And a policy with **several plain sources** restoring into a PVC that one of them names used to read `sources[0]`'s path; it now reads the matching source's path (this one is the bug fix — the old answer was another volume's data). Set `sourcePath` explicitly for any cross-namespace restore against a selector or mixed policy:
 
 ```yaml
 source:

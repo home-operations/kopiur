@@ -269,13 +269,14 @@ fn source_shape(source: &Source) -> SourceShape<'_> {
 /// The rule, in order:
 ///
 /// 1. `override_` (`source.fromPolicy.sourcePath`) wins outright.
-/// 2. The policy has **no selector sources** ⇒ [`RestoreSourcePath::PolicySource`]
+/// 2. A plain `pvc:` source addressing EXACTLY this target (same name, same
+///    namespace) ⇒ that source's own path. An exact match beats every
+///    derivation AND the first-source fallback.
+/// 3. The policy has **no selector sources** ⇒ [`RestoreSourcePath::PolicySource`]
 ///    of `sources[0]`'s own path — byte-identical to what `config_identity` +
 ///    `resolve_identity` produced before this function existed, for the plain
 ///    `pvc:`, `nfs` and `sourcePathOverride` shapes alike (and `None` for a
 ///    zero-source legacy object).
-/// 3. A plain `pvc:` source addressing EXACTLY this target (same name, same
-///    namespace) ⇒ that source's own path. An exact match beats a derivation.
 /// 4. Every selector source agrees on `(sourcePathStrategy, sourcePathOverride)`
 ///    **and that override is `None`** ⇒
 ///    [`RestoreSourcePath::DerivedFromTarget`], built through
@@ -283,6 +284,28 @@ fn source_shape(source: &Source) -> SourceShape<'_> {
 ///    makes, so the two strings cannot drift.
 /// 5. Anything else ⇒ a named error telling the user to set
 ///    `fromPolicy.sourcePath`.
+///
+/// **(2) is deliberately ahead of (3).** Validation admits N plain `pvc:`
+/// sources on one policy (`validate::snapshot` only requires "at least one"),
+/// and the backup side fans them out under one `user@host` with a path each. If
+/// the first-source fallback ran first, a policy with `sources: [pvc: a, pvc: b]`
+/// would restore `/pvc/a` into PVC `b` — the exact cross-volume hazard this
+/// function exists to close, just without a selector in sight. Putting the exact
+/// match first is byte-identical for every SINGLE-source shape: a lone plain
+/// `pvc:` source whose name equals the target builds the same
+/// `EffectiveSource` (same index, same `PvcTargetRef`, same override, same
+/// strategy — `strategy_for` is `PvcName` for any non-selector source) and so
+/// the same string; an `nfs` source, a differently-named target and a
+/// cross-namespace target all miss (2) and fall through to (3) untouched.
+///
+/// **A target matching NO plain source still falls back to `sources[0]`** under
+/// (3) — e.g. `[pvc: a, pvc: b]` restoring into a PVC named `c` reads `/pvc/a`.
+/// That is deliberate, not an oversight: it is the pre-#443 answer, it is what
+/// makes "restore this policy's data into a differently-named scratch volume"
+/// keep working, and (5) is reserved for the shapes where a path genuinely
+/// cannot be derived (disagreeing selectors, a flattening selector override) —
+/// not for a multi-source policy where `sources[0]` is a defined, if arbitrary,
+/// answer. Set `fromPolicy.sourcePath` to name the member you want.
 ///
 /// A selector carrying `sourcePathOverride: Some(o)` is deliberately NOT
 /// per-PVC: `kopia_source_path` returns the override before it ever looks at the
@@ -336,24 +359,11 @@ pub fn restore_source_path(
     let policy_ns = policy.namespace().unwrap_or_default();
     let shapes: Vec<SourceShape<'_>> = policy.spec.sources.iter().map(source_shape).collect();
 
-    // (2) No selector anywhere: the pre-#443 answer, verbatim (including the
-    // zero-source legacy tolerance, where `sources.first()` is `None`).
-    let has_selector = shapes
-        .iter()
-        .any(|s| matches!(s, SourceShape::Selector { .. }));
-    if !has_selector {
-        let Some(first) = policy.spec.sources.first() else {
-            return Ok(RestoreSourcePath::PolicySource(None));
-        };
-        let eff = effective_source(policy, None)?;
-        return Ok(RestoreSourcePath::PolicySource(
-            eff.kopia_source_path(strategy_for(first)),
-        ));
-    }
-
-    // (3) An exact plain-`pvc:` match. Same namespace is required: a plain source
-    // always addresses the POLICY's namespace, so a same-named PVC in another
-    // namespace is a different volume.
+    // (2) An exact plain-`pvc:` match, BEFORE the first-source fallback: a policy
+    // may carry several plain `pvc:` sources, and `sources[0]` would then be
+    // another volume's path. Same namespace is required: a plain source always
+    // addresses the POLICY's namespace, so a same-named PVC in another namespace
+    // is a different volume.
     if policy_ns == target.namespace
         && let Some(index) = shapes.iter().position(|s| match s {
             SourceShape::Pvc { name } => *name == target.name,
@@ -370,6 +380,23 @@ pub fn restore_source_path(
         };
         return Ok(RestoreSourcePath::PolicySource(
             eff.kopia_source_path(strategy_for(source)),
+        ));
+    }
+
+    // (3) No selector anywhere: the pre-#443 answer, verbatim (including the
+    // zero-source legacy tolerance, where `sources.first()` is `None`). Reached
+    // only when (2) did not match, so a target that names one of the policy's
+    // plain sources never lands here.
+    let has_selector = shapes
+        .iter()
+        .any(|s| matches!(s, SourceShape::Selector { .. }));
+    if !has_selector {
+        let Some(first) = policy.spec.sources.first() else {
+            return Ok(RestoreSourcePath::PolicySource(None));
+        };
+        let eff = effective_source(policy, None)?;
+        return Ok(RestoreSourcePath::PolicySource(
+            eff.kopia_source_path(strategy_for(first)),
         ));
     }
 
