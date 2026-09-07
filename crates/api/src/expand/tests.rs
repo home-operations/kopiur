@@ -1000,10 +1000,15 @@ fn restore_path_for_a_plain_policy_is_byte_identical_to_the_legacy_answer() {
 #[test]
 fn restore_path_picks_the_matching_plain_source_not_the_first_one() {
     // Rule (2) BEFORE rule (3). Validation admits N plain `pvc:` sources on one
-    // policy, and the backup side fans them out under one `user@host` with a path
-    // each. If the first-source fallback ran first, restoring `redis` would read
-    // `/pvc/pgdata` — a wrong-but-non-empty path, the #443 hazard class without a
-    // selector in sight.
+    // policy, but today only the FIRST is captured: `expand_sources` returns
+    // `None` without a `pvcSelector`, so a selector-free policy mints one
+    // unpinned child at index 0 (a pre-existing backup-side limitation, tracked
+    // separately). That is what makes the fallback dangerous rather than merely
+    // arbitrary: if it answered for every target, restoring `redis` would read
+    // `/pvc/pgdata` — a real path holding ANOTHER volume's data, the #443 hazard
+    // class without a selector in sight. Resolving `/pvc/redis` instead surfaces
+    // `SnapshotNotFound` (or an empty volume under `Continue`), which is the
+    // honest answer.
     let p = policy_with(vec![pvc_source("pgdata"), pvc_source("redis")]);
     assert_eq!(
         restore_source_path(&p, None, &target("billing", "redis")).unwrap(),
@@ -1036,7 +1041,8 @@ fn restore_path_picks_the_matching_plain_source_not_the_first_one() {
         RestoreSourcePath::PolicySource(Some("/srv/redis".into()))
     );
 
-    // An `nfs` source ahead of the matching `pvc:` no longer shadows it either.
+    // An `nfs` source ahead of the matching `pvc:` no longer shadows it either —
+    // that shape used to restore an NFS export's contents into a PVC.
     let mixed = policy_with(vec![nfs_source("/export/media"), pvc_source("redis")]);
     assert_eq!(
         restore_source_path(&mixed, None, &target("billing", "redis")).unwrap(),

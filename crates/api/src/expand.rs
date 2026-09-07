@@ -287,13 +287,21 @@ fn source_shape(source: &Source) -> SourceShape<'_> {
 ///
 /// **(2) is deliberately ahead of (3).** Validation admits N plain `pvc:`
 /// sources on one policy (`validate::snapshot` only requires "at least one"),
-/// and the backup side fans them out under one `user@host` with a path each. If
-/// the first-source fallback ran first, a policy with `sources: [pvc: a, pvc: b]`
-/// would restore `/pvc/a` into PVC `b` — the exact cross-volume hazard this
-/// function exists to close, just without a selector in sight. Putting the exact
-/// match first is byte-identical for every SINGLE-source shape: a lone plain
-/// `pvc:` source whose name equals the target builds the same
-/// `EffectiveSource` (same index, same `PvcTargetRef`, same override, same
+/// but today only the FIRST is ever captured: [`expand_sources`] returns `None`
+/// unless some source carries a `pvcSelector`, so a selector-free policy mints
+/// one unpinned child and `effective_source(policy, None)` resolves index 0.
+/// (A pre-existing backup-side limitation, tracked separately — not something
+/// this function can fix.) That is precisely why the fallback must not answer
+/// for every target: `sources: [pvc: a, pvc: b]` restoring into PVC `b` used to
+/// resolve `/pvc/a`, a path that is real but holds ANOTHER volume's data, and
+/// filled `b` with it under a green `Completed`. With the exact match first, `b`
+/// resolves `/pvc/b` — never written — so the restore fails honestly with
+/// `SnapshotNotFound`, or comes up empty under `Continue`. The same applies to
+/// `[nfs, pvc: a]` restoring `a`, which used to read the NFS export path.
+///
+/// Putting the exact match first is byte-identical for every SINGLE-source
+/// shape: a lone plain `pvc:` source whose name equals the target builds the
+/// same `EffectiveSource` (same index, same `PvcTargetRef`, same override, same
 /// strategy — `strategy_for` is `PvcName` for any non-selector source) and so
 /// the same string; an `nfs` source, a differently-named target and a
 /// cross-namespace target all miss (2) and fall through to (3) untouched.
@@ -361,9 +369,10 @@ pub fn restore_source_path(
 
     // (2) An exact plain-`pvc:` match, BEFORE the first-source fallback: a policy
     // may carry several plain `pvc:` sources, and `sources[0]` would then be
-    // another volume's path. Same namespace is required: a plain source always
-    // addresses the POLICY's namespace, so a same-named PVC in another namespace
-    // is a different volume.
+    // another volume's path — wrong-but-real data, rather than the honest
+    // `SnapshotNotFound` the unwritten path yields. Same namespace is required:
+    // a plain source always addresses the POLICY's namespace, so a same-named
+    // PVC in another namespace is a different volume.
     if policy_ns == target.namespace
         && let Some(index) = shapes.iter().position(|s| match s {
             SourceShape::Pvc { name } => *name == target.name,
