@@ -190,48 +190,29 @@ pub fn reconcile_index_blob_health(
 // under either policy.
 // ---------------------------------------------------------------------------
 
-/// **Part A — the data-safety invariant.** kopiur auto-creates a kopia
-/// repository ONLY on the very first bootstrap. Once a repository has reached
-/// `Ready` it carries a pinned `status.uniqueId` forever, so a later connect
-/// failure (a wiped or unreachable backend) must NEVER be "fixed" by silently
-/// creating a fresh empty repository over it — that destroys restorability.
-/// Re-creation of a once-good repository is a deliberate human action.
+/// **Part A — the data-safety invariant.** WHY a bootstrap may (or may not)
+/// create a kopia repository at the backend.
 ///
-/// Returns whether `create` may be attempted: the bool adapter over
-/// [`create_gate`], kept because most call sites only need the yes/no. `create`
-/// is permitted when the spec opted in (`create.enabled`) AND either this
-/// repository was never successfully bootstrapped (`uniqueId` unset) or the human
-/// acknowledged a deliberate re-initialize of THIS pinned id (issue #435 — see
-/// [`kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION`]). Used at every create
-/// site (the in-process bare-path connect, the mover work-spec builder, and the
-/// no-Job re-create path) in both reconcilers.
-///
-/// ```
-/// use kopiur_controller::health::auto_create_allowed;
-/// assert!(auto_create_allowed(true, None, None));            // first bootstrap, opted in
-/// assert!(!auto_create_allowed(true, Some("abc123"), None)); // once-Ready: never recreate
-/// assert!(!auto_create_allowed(false, None, None));          // not opted in
-/// // ...unless the human acked THIS pinned id (issue #435).
-/// assert!(auto_create_allowed(true, Some("abc123"), Some("abc123")));
-/// ```
-pub fn auto_create_allowed(
-    spec_create_enabled: bool,
-    unique_id: Option<&str>,
-    reinit_ack: Option<&str>,
-) -> bool {
-    matches!(
-        create_gate(spec_create_enabled, unique_id, reinit_ack),
-        CreateGate::Allowed { .. }
-    )
-}
-
-/// WHY a bootstrap may (or may not) create a kopia repository at the backend.
+/// kopiur auto-creates a kopia repository ONLY on the very first bootstrap. Once
+/// a repository has reached `Ready` it carries a pinned `status.uniqueId`
+/// forever, so a later connect failure (a wiped or unreachable backend) must
+/// NEVER be "fixed" by silently creating a fresh empty repository over it — that
+/// destroys restorability. Re-creation of a once-good repository is a deliberate
+/// human action, spelled
+/// [`kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION`].
 ///
 /// The typed replacement for the old fused `spec_enabled && unique_id.is_none()`
 /// bool (issue #435). The bool answered "may I create?" but threw away the
 /// reason, so the mover could only ever say "set `spec.create.enabled: true`" —
 /// wrong, and actively misleading, for the user whose bucket was deleted after
 /// the repository had been `Ready` with `create.enabled: true` all along.
+///
+/// **This enum is not, on its own, a create permission.** It knows nothing about
+/// the phase, and `Allowed { via_reinit_ack: true }` on a `Ready` repository must
+/// NOT create (review C1 — a standing ack would otherwise let an ordinary health
+/// probe re-create a wiped backend and freeze the old id). Every create decision
+/// goes through [`effective_create`], which folds in `reinit_requested`. There is
+/// deliberately no `pub` helper that answers "may create?" without the phase.
 ///
 /// Exhaustive on purpose: every create site matches it, so a new blocking reason
 /// cannot be added without every message deciding what to say.
@@ -298,6 +279,29 @@ pub struct EffectiveCreate {
 /// `Ready`, which under the default `onFailure: Degrade` is one probe failure
 /// away and under `Alert` never happens at all — the Alert contract ("never
 /// auto-recreates, whatever else is true") therefore survives a standing ack.
+///
+/// ```
+/// use kopiur_controller::health::{create_gate, effective_create};
+///
+/// // First bootstrap, opted in: create.
+/// let first = create_gate(true, None, None);
+/// assert!(effective_create(first, false).allowed);
+///
+/// // Once-Ready (pinned uniqueId), no ack: NEVER create. The data-safety
+/// // invariant, and it does not care what the phase says.
+/// let pinned = create_gate(true, Some("abc123"), None);
+/// assert!(!effective_create(pinned, false).allowed);
+/// assert!(!effective_create(pinned, true).allowed);
+///
+/// // Not opted in: never create.
+/// assert!(!effective_create(create_gate(false, None, None), false).allowed);
+///
+/// // Acked THIS pinned id — and the phase is what decides. Dormant while the
+/// // repository is healthy; a permission only once it has left `Ready`.
+/// let acked = create_gate(true, Some("abc123"), Some("abc123"));
+/// assert!(!effective_create(acked, false).allowed); // Ready: a no-op
+/// assert!(effective_create(acked, true).allowed);   // Failed/Degraded: re-initialize
+/// ```
 pub fn effective_create(gate: CreateGate, reinit_requested: bool) -> EffectiveCreate {
     use kopiur_mover::workspec::CreateBlock;
     let allow = |allowed: bool, block: Option<CreateBlock>| EffectiveCreate { allowed, block };
@@ -1060,7 +1064,7 @@ pub enum BreakerVerdict {
 /// pausing is equally right — and the breaker's own strict re-check escalates a
 /// *real* wipe to terminal `Failed` anyway: while `Degraded`, the strict retry
 /// bootstrap runs with auto-create forbidden (pinned `uniqueId`, see
-/// [`auto_create_allowed`]), so a truly absent repository comes back as the
+/// [`effective_create`]), so a truly absent repository comes back as the
 /// `RepositoryNotInitialized` verdict, which
 /// [`BootstrapFailure::retryable_outage_for_bootstrapped`](crate::io::BootstrapFailure::retryable_outage_for_bootstrapped)
 /// refuses to recycle — parking the repository visibly at `Failed` instead of
@@ -1496,24 +1500,46 @@ mod tests {
         assert!(upd.event.is_none());
     }
 
-    // ---- Part A: auto_create_allowed ---------------------------------------
+    // ---- Part A: the create decision ---------------------------------------
 
+    /// The Part A truth table, end to end: spec flag + pin + ack + PHASE ⇒ may
+    /// this launch create?
+    ///
+    /// It reads through `create_gate` → `effective_create` because that is the
+    /// only path production has. The `auto_create_allowed` bool adapter this test
+    /// used to call was deleted after review round 1: it answered "may create?"
+    /// without the phase, which is precisely the question that has no safe answer
+    /// — its own doctest asserted `(true, Some(id), Some(id)) == true`, the
+    /// "Ready + standing ack ⇒ create" verdict C1 forbids. Keeping a `pub` helper
+    /// that can be asked the phase-blind question is how the next call site gets
+    /// it wrong.
     #[test]
     fn auto_create_only_on_first_bootstrap() {
-        // Opted in, never bootstrapped → may create (first bootstrap).
-        assert!(auto_create_allowed(true, None, None));
-        // Once-Ready (pinned uniqueId) → NEVER create, even though create.enabled.
-        // This is the load-bearing data-safety invariant.
-        assert!(!auto_create_allowed(true, Some("kopia-unique-id"), None));
+        let may_create = |spec: bool, pin: Option<&str>, ack: Option<&str>, reinit: bool| {
+            effective_create(create_gate(spec, pin, ack), reinit).allowed
+        };
+        let id = Some("kopia-unique-id");
+
+        // Opted in, never bootstrapped → may create (first bootstrap). No phase
+        // can change that: a repository with no pin has nothing to protect.
+        assert!(may_create(true, None, None, false));
+        assert!(may_create(true, None, None, true));
+
+        // Once-Ready (pinned uniqueId) → NEVER create, even though
+        // create.enabled. The load-bearing data-safety invariant.
+        assert!(!may_create(true, id, None, false));
+        assert!(!may_create(true, id, None, true));
+
         // Not opted in → never create regardless.
-        assert!(!auto_create_allowed(false, None, None));
-        assert!(!auto_create_allowed(false, Some("kopia-unique-id"), None));
-        // ...and the ONE way through the pin: the human acked THIS id (#435).
-        assert!(auto_create_allowed(
-            true,
-            Some("kopia-unique-id"),
-            Some("kopia-unique-id")
-        ));
+        assert!(!may_create(false, None, None, false));
+        assert!(!may_create(false, id, None, false));
+        assert!(!may_create(false, id, id, false));
+
+        // The ONE way through the pin: the human acked THIS id (#435) AND the
+        // repository has left `Ready`. The ack alone is not enough — see
+        // `an_ack_grants_create_only_once_the_repository_has_left_ready`.
+        assert!(!may_create(true, id, id, false));
+        assert!(may_create(true, id, id, true));
     }
 
     #[test]
