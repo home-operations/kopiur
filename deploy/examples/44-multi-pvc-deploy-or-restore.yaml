@@ -1,0 +1,143 @@
+# Example 44 — Deploy-or-restore for a MULTI-PVC app (one Restore, N volumes)
+#
+# Example 05 is deploy-or-restore for a single volume. This is the same pattern
+# for an app whose data lives on several PVCs — a database plus its uploads
+# directory, say — backed up by ONE `pvcSelector` policy.
+#
+# The point: you still write exactly ONE `Restore`. A populator Restore is
+# claimed by EVERY PVC whose `spec.dataSourceRef` names it, and each claim is
+# populated independently — its own prime PVC, its own mover Job, and its own
+# per-PVC kopia source path. `status.claims.<pvc>` carries one record per claim.
+#
+# The per-PVC path is the load-bearing part, and it is derived from the
+# CLAIMING PVC's name via the policy's `sourcePathStrategy`. With
+# `sourcePathStrategy: PvcName` the policy backed `postgres-data` up under
+# `/pvc/postgres-data` and `postgres-uploads` under `/pvc/postgres-uploads`, so
+# each claim below reads its own volume's history. Without that derivation a
+# restore would filter on an EMPTY path, which matches every member — and one
+# PVC could come back holding another's data.
+#
+# Kopiur fails CLOSED when it cannot derive a single path (selector sources that
+# disagree on `sourcePathStrategy`/`sourcePathOverride`, or that share one
+# override): the affected claim goes `Failed` with reason `SourcePathAmbiguous`
+# and the message names `source.fromPolicy.sourcePath` as the fix. Set that
+# field to pin one member explicitly, e.g. `sourcePath: /pvc/postgres-data`.
+#
+# Cost: N claims means N pooled mover Jobs. Restores are admitted at and over a
+# repository's `concurrency.maxConcurrentJobs`, so a large fan-out displaces
+# routine backups until it finishes. That is deliberate — a recovery outranks a
+# nightly — but size the cap knowing it.
+#
+# Prerequisites: Kubernetes >= 1.24 (AnyVolumeDataSource) and a
+# populator-aware CSI provisioner (its external-provisioner must defer to
+# `dataSourceRef` rather than binding the claim to an empty volume).
+#
+# --8<-- [start:policy]
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: billing-app
+  namespace: billing
+spec:
+  repository:
+    kind: Repository
+    name: nas-primary
+  sources:
+    # Every PVC labelled `backup: billing` is captured. Each becomes its own
+    # Snapshot CR, its own kopia snapshot and its own retention bucket.
+    - pvcSelector:
+        labelSelector:
+          matchLabels:
+            backup: billing
+      # `/pvc/<name>` — this is what makes a per-PVC RESTORE path derivable.
+      # `PvcNamespacedName` (`/pvc/<namespace>/<name>`) works the same way.
+      sourcePathStrategy: PvcName
+  # Capture each PVC independently: works on any snapshot-capable driver and
+  # with `copyMethod: Direct`. Use `VolumeGroupSnapshot` (the default) when the
+  # volumes must agree with each other — the restore side is identical.
+  groupBy: None
+# --8<-- [end:policy]
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: billing-app-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: billing-app
+  schedule:
+    cron: "H 2 * * *"
+    jitter: 30m
+    runOnCreate: false
+# --8<-- [start:restore]
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: billing-app-restore
+  namespace: billing
+spec:
+  source:
+    fromPolicy:
+      name: billing-app
+      offset: 0 # 0 = latest, 1 = previous, ...
+      # sourcePath: /pvc/postgres-data
+      #   Pins EVERY claim of this Restore to ONE member path. Leave it unset
+      #   for the per-PVC derivation above (which is what a multi-PVC app
+      #   wants); set it only to force one member — for a cross-namespace
+      #   `target.pvcRef`, or when the policy's selectors are ambiguous.
+  # PASSIVE populator: this Restore does nothing on its own. Every PVC below
+  # claims it, and each is populated as it is provisioned.
+  target:
+    populator: {}
+  policy:
+    onMissingSnapshot: Continue # fresh repository ⇒ empty volumes, not a failure
+    waitTimeout: 5m # per claim: a PVC applied later gets its own full window
+# --8<-- [end:restore]
+# --8<-- [start:claims]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: billing
+  # The SAME label the policy selects on, so this volume keeps being backed up
+  # once it is restored.
+  labels:
+    backup: billing
+spec:
+  storageClassName: fast-ssd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  # Claims the Restore above. Its data comes from /pvc/postgres-data — derived
+  # from THIS PVC's name, not from whichever member happens to be newest.
+  dataSourceRef:
+    apiGroup: kopiur.home-operations.com
+    kind: Restore
+    name: billing-app-restore
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-uploads
+  namespace: billing
+  labels:
+    backup: billing
+spec:
+  storageClassName: fast-ssd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Gi
+  # The SAME Restore, a second claim. Its data comes from /pvc/postgres-uploads.
+  dataSourceRef:
+    apiGroup: kopiur.home-operations.com
+    kind: Restore
+    name: billing-app-restore
+# --8<-- [end:claims]

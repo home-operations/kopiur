@@ -2199,6 +2199,16 @@ pub fn config_identity(
 /// sources but derives no path falls back to `/data`, the same fallback the
 /// mover identity takes on the backup side, so the two agree on what such a
 /// policy was recorded under.
+///
+/// **Callers MUST pass the derived path for any policy carrying a `pvcSelector`
+/// source.** A selector source has no `pvc`, no `nfs` and no override, so
+/// `None` there does NOT reproduce `config_identity`'s pathless identity: it
+/// takes the `/data` fallback, a path a selector policy was never recorded
+/// under (the backup side always passes a per-member fan-out pin), so every
+/// lookup misses. Fail closed on
+/// [`kopiur_api::expand::restore_source_path`]'s error instead of calling this
+/// with `None` — that is the #443 cross-volume guard, and the fan-out driver
+/// does exactly that.
 pub fn config_identity_for_path(
     config: &SnapshotPolicy,
     namespace: &str,

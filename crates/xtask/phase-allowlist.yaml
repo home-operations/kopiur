@@ -254,27 +254,6 @@ allow:
       Write-dedupe before PATCHing `Completed` in `drive_direct_restore` — the
       no-selection deploy-or-restore arm and the `MoverOutcome::Succeeded` arm.
   - file: crates/controller/src/restore/mod.rs
-    snippet: "restore.status.as_ref().and_then(|s| s.phase.as_ref()) != Some(&RestorePhase::Failed)"
-    reason: >-
-      The same write-dedupe on `fail_populate_hijacked`, where the phase is read
-      inline rather than from a local binding.
-  - file: crates/controller/src/restore/mod.rs
-    snippet: "phase == Some(&RestorePhase::Completed)"
-    reason: >-
-      Two deliberately NARROW definitions. `pinned_decision`'s legacy
-      stuck-populator back-fill is keyed to the ONE historical shape — a
-      `Completed` populator with no `status.resolved`; widening it would infer
-      "empty volume" for states that never had that bug, a data-loss direction
-      (#233). `reconcile_inner`'s `noop_already_bound` is defined as exactly
-      `Completed` plus a bound target.
-  - file: crates/controller/src/restore/mod.rs
-    snippet: "restore.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Completed)"
-    reason: >-
-      The `settled` steady-state exit in `drive_populator_restore`
-      (`settled_over_bound_claim`) and `complete_populator_already_bound`. Both
-      are paired with `kstatus_settled_for(&Completed)`, which is where the
-      classification actually lives.
-  - file: crates/controller/src/restore/mod.rs
     snippet: "phase == &RestorePhase::Completed"
     reason: >-
       `steady_terminal_restore` wording pick. The caller already classified this

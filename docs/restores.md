@@ -81,6 +81,50 @@ If no matching snapshot exists yet, `onMissingSnapshot` applies (`Continue` come
 
 ///
 
+#### `sourcePath` — which volume of a multi-PVC policy to read
+
+A [`pvcSelector` policy](backups.md#sources--what-to-back-up) covers **several** volumes, each backed up under its own kopia source path (`/pvc/<name>` under `sourcePathStrategy: PvcName`, `/pvc/<namespace>/<name>` under `PvcNamespacedName`). A `fromPolicy` restore therefore has to say which one it wants — and by default it does not have to say it out loud, because Kopiur derives it from the PVC being filled:
+
+1. `source.fromPolicy.sourcePath`, if you set it, wins outright.
+2. Otherwise, if the policy has **no** selector sources, the restore reads the single source's own path — exactly what it always did.
+3. Otherwise, if a plain `pvc:` source in the policy names **exactly** this target (same name, same namespace), that source's path is used.
+4. Otherwise, if every selector source agrees on `(sourcePathStrategy, sourcePathOverride)` **and** that override is unset, the path is derived from the **target PVC's name** through the same code the backup side used — so the two strings cannot drift.
+5. Otherwise it **fails closed**: the claim goes `Failed` with reason `SourcePathAmbiguous`, and the message tells you to set `source.fromPolicy.sourcePath` (e.g. `/pvc/postgres-data`).
+
+```yaml
+source:
+    fromPolicy:
+        name: billing-app
+        # Pin ONE member. Leave unset to derive the path from the PVC being
+        # filled — which is what a multi-PVC populator wants.
+        sourcePath: /pvc/postgres-data
+```
+
+/// danger | Why this is not cosmetic
+
+A restore with **no** source path becomes the kopia filter `username@hostname:` — an *empty* path, which matches every member of the policy. Before Kopiur derived the path per PVC, restoring one volume of a multi-PVC policy took the newest snapshot of **any** member, so a volume could come back holding a different volume's data, with a green `Completed` over it. Rule 5 exists so that Kopiur refuses rather than guesses.
+
+///
+
+/// warning | A cross-namespace `pvcRef` must set `sourcePath` explicitly
+
+Rules 3 and 4 both address the policy's **own** namespace. Rule 3 requires the target's namespace to match the policy's — a same-named PVC in another namespace is a different volume. Rule 4 derives from the TARGET's namespace, so a `target.pvcRef` in namespace `staging` against a policy in `billing` with `sourcePathStrategy: PvcNamespacedName` derives `/pvc/staging/<name>`, a path the repository has never seen (the backup wrote `/pvc/billing/<name>`) — you get `SnapshotNotFound`, or an empty volume under `Continue`.
+
+This also changes one previously-working shape on upgrade: a **mixed** policy (a plain `pvc:` source plus a selector) restoring cross-namespace used to fall back to the plain source's path. It now derives from the target instead. Set `sourcePath` explicitly for any cross-namespace restore against a selector or mixed policy:
+
+```yaml
+source:
+    fromPolicy:
+        name: billing-app
+        namespace: billing
+        sourcePath: /pvc/billing/postgres-data # what the BACKUP wrote
+target:
+    pvcRef:
+        name: postgres-data # in this Restore's namespace
+```
+
+///
+
 ### `identity` — a raw kopia identity
 
 For snapshots written by a foreign kopia client, or ones that have aged out of the catalog ([example 13](examples.md#example-13--restore-by-raw-kopia-identity)). You give the raw `username@hostname:path`. This mode **requires** an explicit `spec.repository` (there's no `Snapshot`/`SnapshotPolicy` to infer it from).
@@ -130,6 +174,28 @@ Set `target.populator: {}` and the `Restore` becomes a **passive volume-populato
 target:
     populator: {} # explicit passive-populator mode
 ```
+
+**One `Restore`, every claim.** A populator `Restore` is claimed by *every* PVC whose `spec.dataSourceRef` names it — not just the first one. Each claim is driven independently: its own prime PVC, its own mover `Job`, its own [per-PVC source path](#sourcepath--which-volume-of-a-multi-pvc-policy-to-read), its own `waitTimeout` window, and its own record under `status.claims.<pvc>`:
+
+```console
+$ kubectl get restore billing-app-restore -n billing -o jsonpath='{.status.claims}' | jq
+{
+  "postgres-data":    { "phase": "Populated", "sourcePath": "/pvc/postgres-data",    "reason": "RestoreSucceeded" },
+  "postgres-uploads": { "phase": "Populating", "sourcePath": "/pvc/postgres-uploads", "reason": "PopulatingPrimePvc" }
+}
+```
+
+The `Restore`'s own `PHASE` is the **aggregate**: `Completed` once every claim settled, `Failed` if any claim failed, `Restoring`/`Pending` while work is outstanding. A per-claim phase is one of `Pending`, `Populating`, `Rebinding`, `Populated`, `AlreadyBound`, `Failed`.
+
+/// note | A failed claim stalls the Restore — and its siblings keep going
+
+One claim failing (a wedged mover pod, an ambiguous source path, `onMissingSnapshot: Fail` with nothing to restore) makes the whole `Restore` report `Failed`/`Stalled=True`, so `kubectl wait` and Flux/Argo see the failure. It does **not** stop the other claims: they carry on being populated, and `status.claims` says exactly which one is stuck and why.
+
+**To re-arm a failed claim, delete and re-create its PVC** (keeping the `dataSourceRef`). A re-created PVC gets a new uid, which is what tells Kopiur to reap the dead claim's prime PVC/Job/volume and start that claim over from a clean record. You do not touch the `Restore`, and the healthy claims are undisturbed.
+
+The one exception is a *hijacked* populate — a provisioner bound the claim to some other volume while the restore was still writing. There the prime PVC is deliberately **kept** (it holds the half-written data) and never reaped; the claim's reason is `PopulateHijacked` and the message tells you what to check.
+
+///
 
 /// warning | `target` is required — the empty-`target` form is gone
 
@@ -271,6 +337,24 @@ The volume-populator handshake relies on the `AnyVolumeDataSource` feature (GA f
 
 ///
 
+### Deploy-or-restore for a multi-PVC app
+
+An app whose data lives on several PVCs needs exactly the same three objects — a `pvcSelector` policy, a schedule, and **one** `Restore` — because a populator `Restore` serves every claim. Each PVC below reads its own volume's history, derived from its own name:
+
+```yaml
+--8<-- "deploy/examples/44-multi-pvc-deploy-or-restore.yaml:policy"
+```
+
+```yaml
+--8<-- "deploy/examples/44-multi-pvc-deploy-or-restore.yaml:restore"
+```
+
+```yaml
+--8<-- "deploy/examples/44-multi-pvc-deploy-or-restore.yaml:claims"
+```
+
+The full manifest (with the schedule, and the commentary on the failure modes) is [`deploy/examples/44-multi-pvc-deploy-or-restore.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/44-multi-pvc-deploy-or-restore.yaml). Watch it land with `kubectl get restore <name> -o jsonpath='{.status.claims}'`; the cost is [N pooled movers](#a-restore-is-never-held-behind-a-concurrency-cap).
+
 ## Restoring a snapshot Kopiur didn't create
 
 Snapshots written by a foreign kopia client, or predating your install, are materialized as **discovered** `Snapshot` CRs (`origin=discovered`, forced `deletionPolicy: Retain`) in the repository's namespace. Restore them two ways (see [example 07](examples.md#example-07--restore-a-discovered-backup)):
@@ -338,6 +422,8 @@ A [`Repository`'s `concurrency.maxConcurrentJobs`](repositories.md#concurrency--
 It does still **count**, and it counts from the moment the operator decides to run it — not from the moment its Job shows up in `kubectl get jobs`. A restore occupies a slot like any other pooled Job, so it displaces backups rather than adding to them, which is what a cap is actually being asked for. If you set `maxConcurrentJobs: 3` and start three large restores, backups against that repository queue until the restores finish.
 
 The "from the moment of the decision" part is not a detail. A restore that only became countable once its Job existed would be invisible for the short window in which the operator is still resolving its source, staging its target PVC and projecting credentials — and a backup reconciling in that window would read spare capacity and start a second mover beside the recovery. A restore reserves its slot up front, so the cap holds even when a restore and a backup arrive at the same instant.
+
+**N claims ⇒ N pooled movers.** A populator `Restore` over a multi-PVC app runs one mover per claiming PVC, and each takes its own slot on the same terms as above: admitted at and over the cap, counted from the decision. So a ten-volume recovery displaces routine backups against that repository until it finishes. There is no per-`Restore` cap — a recovery is not the thing to throttle — but size `maxConcurrentJobs` knowing that one `Restore` can be worth ten movers.
 
 Nothing about this needs configuration; it is the fixed behavior of the pool. See [Backups → limiting concurrent jobs per repository](backups.md#limiting-concurrent-jobs-per-repository) for the whole picture.
 

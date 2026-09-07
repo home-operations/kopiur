@@ -20,16 +20,10 @@
 mod common;
 
 use common::*;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
-
-/// The storage class the `snapshot-stack` mise task installs.
-const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
-
-/// The label KEY a `pvcSelector` matches on, mirroring example 04.
-const BACKUP_LABEL_KEY: &str = "backup";
 
 /// The two scenarios below use DIFFERENT label values on purpose.
 ///
@@ -38,7 +32,9 @@ const BACKUP_LABEL_KEY: &str = "backup";
 /// the fan-out scenario's selector match four PVCs instead of two, so it would
 /// fail on a count assertion that has nothing to do with what it tests, and only
 /// in whichever order nextest happened to pick. Distinct values also mean a
-/// crashed run cannot poison its sibling.
+/// crashed run cannot poison its sibling. `populator_fanout.rs` uses a THIRD
+/// value for the same reason. (`BACKUP_LABEL_KEY` and `csi_pvc_with_data` are
+/// shared, in `common`.)
 const FANOUT_LABEL_VALUE: &str = "fanout";
 /// See [`FANOUT_LABEL_VALUE`].
 const GROUP_LABEL_VALUE: &str = "group";
@@ -53,64 +49,6 @@ fn volume_group_snapshots(client: &kube::Client) -> Api<DynamicObject> {
         "volumegroupsnapshots",
     );
     Api::namespaced_with(client.clone(), E2E_NAMESPACE, &ar)
-}
-
-/// Create a CSI PVC carrying the selector label, and seed it so it binds.
-async fn csi_pvc_with_data(client: &kube::Client, name: &str, marker: &str) {
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let _ = pvcs
-        .create(
-            &PostParams::default(),
-            &cr(serde_json::json!({
-                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-                "metadata": {
-                    "name": name, "namespace": E2E_NAMESPACE,
-                    "labels": { BACKUP_LABEL_KEY: GROUP_LABEL_VALUE },
-                },
-                "spec": {
-                    "accessModes": ["ReadWriteOnce"],
-                    "storageClassName": CSI_STORAGE_CLASS,
-                    "resources": { "requests": { "storage": "64Mi" } },
-                },
-            })),
-        )
-        .await;
-    let _ = pods
-        .create(
-            &PostParams::default(),
-            &cr(serde_json::json!({
-                "apiVersion": "v1", "kind": "Pod",
-                "metadata": { "name": format!("{name}-seed"), "namespace": E2E_NAMESPACE },
-                "spec": {
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "seed", "image": kopiur_e2e::consts::BUSYBOX_IMAGE,
-                        "imagePullPolicy": "IfNotPresent",
-                        "command": ["sh", "-c", format!("echo {marker} > /data/marker.txt")],
-                        "volumeMounts": [{ "name": "d", "mountPath": "/data" }],
-                    }],
-                    "volumes": [{ "name": "d", "persistentVolumeClaim": { "claimName": name } }],
-                },
-            })),
-        )
-        .await;
-    wait_until(
-        &format!("PVC {name} Bound"),
-        default_timeout(),
-        poll_interval(),
-        || async {
-            let bound = pvcs
-                .get_opt(name)
-                .await?
-                .and_then(|p| p.status.and_then(|s| s.phase))
-                .as_deref()
-                == Some("Bound");
-            Ok(bound.then_some(()))
-        },
-    )
-    .await
-    .unwrap_or_else(|e| panic!("PVC {name} should bind: {e}"));
 }
 
 /// Fail fast if the created policy is not actually a selector policy.
@@ -368,7 +306,7 @@ async fn a_group_capture_is_shared_by_every_member_and_reaped_after() {
 
     ensure_repo(&client, "multipvc-group").await;
     for (name, marker) in [("e2e-grp-a", "alpha"), ("e2e-grp-b", "bravo")] {
-        csi_pvc_with_data(&client, name, marker).await;
+        csi_pvc_with_data(&client, name, GROUP_LABEL_VALUE, marker).await;
     }
 
     let repos: Api<kopiur_api::Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);

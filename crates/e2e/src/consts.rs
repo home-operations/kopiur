@@ -105,6 +105,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // #346 multi-PVC fan-out + VolumeGroupSnapshot group staging.
     "multipvc-fanout",
     "multipvc-group",
+    // #443: the populator fan-out scenario needs its own repo so no other
+    // scenario's snapshots land under the same identity and confuse a
+    // per-member path assertion.
+    "populator-fanout",
     // #351 kopia-deduped (Unchanged) runs.
     "unchanged-dedup",
     "unchanged-default",

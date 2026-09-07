@@ -261,6 +261,19 @@ jobs:
             bins: "multi_pvc_group"
             backends: false
             csi: true
+          # #443 populator fan-out: ONE populator Restore fills EVERY claiming
+          # PVC, each from its own per-PVC kopia source path. Its own shard
+          # because it deletes and re-creates the source PVCs a selector policy
+          # matches — any scenario sharing the namespace and the `backup=` label
+          # space would see its volumes disappear mid-run — and because the
+          # cross-volume assertion needs a populator-aware CSI provisioner
+          # (the static hostPath PVCs share one source dir, so they cannot prove
+          # isolation). No group-snapshot CRDs: `groupBy: None` + `copyMethod:
+          # Direct`.
+          - shard: populator-fanout
+            bins: "populator_fanout"
+            backends: false
+            csi: true
           # securityContext-compatibility pipeline: pvcConsumer auto-derive + the
           # SecurityContextCompatible reconcile condition. Filesystem only.
           - shard: security-context-compat
