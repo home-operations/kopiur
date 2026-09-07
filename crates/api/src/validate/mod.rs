@@ -158,14 +158,20 @@ fn validate_stream_source(source: &Source, stream: &StreamSource) -> ValidationR
 
     // PVC-only knobs. A stream source mounts nothing, so `readOnly` has no volume to
     // apply to, `acknowledgeLiveMutation` acknowledges a mutation that cannot happen,
-    // and `sourcePathStrategy` derives a path from a PVC that does not exist. Reject
-    // rather than ignore: silently accepting a field that does nothing is how a user
-    // comes to believe a protection is in place when it is not.
-    if source.read_only.is_some() {
+    // and `sourcePathStrategy` derives a path from a PVC that does not exist.
+    //
+    // CRITICALLY, two of these carry a SCHEMA DEFAULT (`readOnly: true`,
+    // `sourcePathStrategy: PvcName`), which the API server materializes onto every
+    // source before admission ever sees it. So `is_some()` is NOT a signal that the
+    // user wrote the field — on a stream source it is always true, and checking it
+    // rejects every valid policy. Reject only the values that would actually MEAN
+    // something; a materialized default is inert and indistinguishable from absence.
+    if source.read_only == Some(false) {
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.sources[].readOnly".to_string(),
-            reason: "readOnly does not apply to a stream source: nothing is mounted — the \
-                     mover execs a command and pipes its stdout into kopia. Remove readOnly"
+            reason: "readOnly: false does not apply to a stream source: nothing is mounted — \
+                     the mover execs a command and pipes its stdout into kopia, so there is no \
+                     volume to make writable. Remove readOnly"
                 .to_string(),
         });
     }
@@ -178,7 +184,12 @@ fn validate_stream_source(source: &Source, stream: &StreamSource) -> ValidationR
                 .to_string(),
         });
     }
-    if source.source_path_strategy.is_some() {
+    // Same materialized-default reasoning: only a NON-default strategy is a real
+    // request. `PvcName` is what the API server stamps on everything.
+    if source
+        .source_path_strategy
+        .is_some_and(|s| s != crate::snapshot_policy::SourcePathStrategy::PvcName)
+    {
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.sources[].sourcePathStrategy".to_string(),
             reason: "sourcePathStrategy derives a kopia path from a matched PVC's name and \

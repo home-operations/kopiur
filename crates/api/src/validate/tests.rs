@@ -7648,3 +7648,134 @@ fn m1_admission_messages_are_well_formed() {
         );
     }
 }
+
+// --- stream sources -------------------------------------------------------
+//
+// These go through the YAML→JSON→typed bridge (the API-server path) rather than
+// building `Source` literals, because the bug they guard only exists on that path:
+// `readOnly` and `sourcePathStrategy` carry SCHEMA DEFAULTS the API server
+// materializes onto every source before admission runs, so a hand-built literal
+// with `read_only: None` cannot reproduce what the cluster actually sends.
+
+/// The shape the API server delivers: the policy as written, plus the defaults it
+/// stamps in. Anything asserting "the user did not set this" must be tested here.
+fn stream_source_as_served(extra: &str) -> Source {
+    let yaml = format!(
+        r#"
+stream:
+  fileName: postgres.sql
+  workloadExec:
+    podSelector:
+      matchLabels: {{ app: postgres }}
+    container: postgres
+    command: ["sh", "-ec", "pg_dumpall"]
+# --- materialized by the API server from the CRD schema defaults ---
+readOnly: true
+sourcePathStrategy: PvcName
+{extra}
+"#
+    );
+    crate::testutil::from_yaml(&yaml)
+}
+
+/// The regression this file exists for: a stream policy written WITHOUT any
+/// PVC-only field must still be accepted after the API server has defaulted
+/// `readOnly: true` and `sourcePathStrategy: PvcName` onto it.
+///
+/// This failed against a real cluster — every valid stream policy was rejected with
+/// "readOnly does not apply to a stream source" for a field the user never wrote.
+#[test]
+fn a_stream_source_survives_the_api_servers_materialized_defaults() {
+    let source = stream_source_as_served("");
+    assert!(
+        validate_source(&source).is_ok(),
+        "materialized schema defaults must not be mistaken for user intent: {:?}",
+        validate_source(&source)
+    );
+}
+
+/// The value that would actually mean something is still refused.
+#[test]
+fn read_only_false_is_rejected_on_a_stream_source() {
+    let mut source = stream_source_as_served("");
+    source.read_only = Some(false);
+    let err = validate_source(&source).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("readOnly: false does not apply"), "{msg}");
+    assert!(msg.contains("nothing is mounted"), "{msg}");
+}
+
+/// A non-default path strategy is a real request, and meaningless here.
+#[test]
+fn a_non_default_source_path_strategy_is_rejected_on_a_stream_source() {
+    let mut source = stream_source_as_served("");
+    source.source_path_strategy =
+        Some(crate::snapshot_policy::SourcePathStrategy::PvcNamespacedName);
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("sourcePathStrategy"), "{err}");
+}
+
+/// `acknowledgeLiveMutation` has NO schema default, so its presence IS user intent.
+#[test]
+fn acknowledge_live_mutation_is_rejected_on_a_stream_source() {
+    let source = stream_source_as_served("acknowledgeLiveMutation: true");
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("acknowledgeLiveMutation"), "{err}");
+}
+
+/// A path-shaped `fileName` is a security problem, not a style one: kopia stores it
+/// verbatim as the entry name, so a restore would write outside its destination.
+#[test]
+fn a_path_shaped_file_name_is_rejected() {
+    for bad in ["../escape.sql", "sub/dir.sql", "/abs.sql", ".", "..", ""] {
+        let mut source = stream_source_as_served("");
+        source.stream.as_mut().unwrap().file_name = bad.to_string();
+        let err =
+            validate_source(&source).expect_err(&format!("`{bad}` must be rejected as a fileName"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("single file name") || msg.contains("not a usable file name"),
+            "`{bad}`: {msg}"
+        );
+    }
+}
+
+/// An empty selector matches every pod in the namespace — never what was meant.
+#[test]
+fn an_empty_pod_selector_is_rejected() {
+    let source: Source = crate::testutil::from_yaml(
+        r#"
+stream:
+  fileName: postgres.sql
+  workloadExec:
+    podSelector: {}
+    command: ["pg_dumpall"]
+readOnly: true
+"#,
+    );
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("matches EVERY pod"), "{err}");
+}
+
+/// A stream source cannot share a policy with other sources: expansion only fans out
+/// selector sources, so the others would be silently skipped.
+#[test]
+fn a_stream_source_must_be_its_policys_only_source() {
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - pvc: { name: data }
+  - stream:
+      fileName: postgres.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: postgres } }
+        command: ["pg_dumpall"]
+"#,
+    );
+    let errs = validate_backup_config(&spec);
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("only source")),
+        "expected an only-source rejection, got {errs:?}"
+    );
+}
