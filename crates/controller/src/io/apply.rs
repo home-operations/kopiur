@@ -122,6 +122,16 @@ pub fn status_merge_patch_is_noop(
 /// [`crate::io::upsert_condition`] preserves `lastTransitionTime` while the status is
 /// unchanged. The returned bool lets the caller fire its Warning Event only on a
 /// real transition.
+///
+/// The no-op test is [`status_merge_patch_is_noop`] — full RFC-7386 semantics,
+/// i.e. exactly what the API server would do with this body. The shallow
+/// [`status_patch_is_noop`] agrees with it on every FLAT status (asserted in
+/// `io::tests`), and the two differ only where the deep one is right: a PARTIAL
+/// sub-object patch (the fanned-out populator's `claims: { "<one pvc>": {…} }`,
+/// #443) and an explicit `null` (a merge DELETES that key). Using the shallow
+/// predicate there would make every pass a write, bumping `resourceVersion`,
+/// waking the watch and re-triggering the reconcile — the very hot-loop this
+/// function exists to break.
 pub async fn patch_status_if_changed<K>(
     api: &Api<K>,
     name: &str,
@@ -131,7 +141,7 @@ pub async fn patch_status_if_changed<K>(
 where
     K: Resource + DeserializeOwned + Clone + std::fmt::Debug,
 {
-    if status_patch_is_noop(current, &desired) {
+    if status_merge_patch_is_noop(current, &desired) {
         return Ok(false);
     }
     patch_status(api, name, desired).await?;

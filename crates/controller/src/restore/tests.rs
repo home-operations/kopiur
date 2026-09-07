@@ -2074,8 +2074,10 @@ fn claims_summary_names_the_counts_the_stragglers_and_the_failures() {
     ]);
     let (reason, message) = claims_summary(&aggregate_claims(&mixed));
     assert_eq!(reason, crate::consts::RESTORE_CLAIM_FAILED_REASON);
-    assert!(message.starts_with("2/4 claims populated"), "{message}");
-    assert!(message.contains("populating: c"), "{message}");
+    assert!(message.starts_with("2/4 claims settled"), "{message}");
+    assert!(message.contains("populated: 2"), "{message}");
+    // "in flight", not "populating": the list carries Pending claims too.
+    assert!(message.contains("in flight: c"), "{message}");
     assert!(message.contains("failed: d (MoverJobFailed)"), "{message}");
     // The fix a human acts on: siblings keep going, re-create the failed claim.
     assert!(message.contains("re-create that claiming PVC"), "{message}");
@@ -2087,7 +2089,7 @@ fn claims_summary_names_the_counts_the_stragglers_and_the_failures() {
         claim(Some(P::Populated), None),
     )])));
     assert_eq!(reason, crate::consts::RESTORE_POPULATED_REASON);
-    assert_eq!(message, "1/1 claims populated");
+    assert_eq!(message, "1/1 claims settled; populated: 1");
 
     let (reason, _) = claims_summary(&aggregate_claims(&claims(&[(
         "a",
@@ -2101,7 +2103,10 @@ fn claims_summary_names_the_counts_the_stragglers_and_the_failures() {
         "a",
         claim(Some(P::AlreadyBound), None),
     )])));
-    assert_eq!(message, "0/1 claims populated; already bound: 1");
+    // Counted as SETTLED (it is a success) but never as populated — saying
+    // "1/1 populated" over a claim nothing was written to would be a lie, and
+    // "0/1 settled" beside Ready=True reads as a contradiction.
+    assert_eq!(message, "1/1 claims settled; already bound: 1");
 
     // Zero claims points at the missing dataSourceRef, and says the window has
     // not started.

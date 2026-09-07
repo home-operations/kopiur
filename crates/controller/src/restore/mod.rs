@@ -30,12 +30,15 @@ use kopiur_mover::workspec::{
 
 use crate::config;
 use crate::consts::{
-    ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CREDENTIALS_AVAILABLE_CONDITION,
+    ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, AWAITING_POD_SCHEDULE_REASON,
+    AWAITING_PVC_DATA_SOURCE_REF_REASON, CREDENTIALS_AVAILABLE_CONDITION,
     CREDENTIALS_PROJECTED_REASON, INHERIT_FALLBACK_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
-    MISSING_RECORDED_IDENTITY_REASON, MOVER_PERMITTED_CONDITION, ORPHANED_PRIME_REAPED_REASON,
-    POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON, RECORDED_APPLIED_REASON,
-    RECORDED_PINNED_NO_UID_REASON, RECREATE_CLAIM_TO_RESTORE_ACTION,
-    RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION, RESTORE_TARGET_ALREADY_BOUND_REASON,
+    MISSING_RECORDED_IDENTITY_REASON, MOVER_JOB_FAILED_REASON, MOVER_PERMITTED_CONDITION,
+    MOVER_POD_WEDGED_REASON, NO_SNAPSHOT_CONTINUE_REASON, ORPHANED_PRIME_REAPED_REASON,
+    POPULATE_HIJACKED_REASON, POPULATING_PRIME_PVC_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+    RECORDED_APPLIED_REASON, RECORDED_PINNED_NO_UID_REASON, RECREATE_CLAIM_TO_RESTORE_ACTION,
+    RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION, RESTORE_SNAPSHOT_NOT_FOUND_REASON,
+    RESTORE_SOURCE_RESOLVED_REASON, RESTORE_TARGET_ALREADY_BOUND_REASON,
     SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
     SET_EXPLICIT_MOVER_CONTEXT_ACTION,
 };
@@ -355,7 +358,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                     let mut status = restore_ready_status(
                         restore,
                         RestorePhase::Resolving,
-                        "SourceResolved",
+                        RESTORE_SOURCE_RESOLVED_REASON,
                         "the restore source resolved to a concrete kopia snapshot \
                          (pinned to status.resolved)",
                     );
@@ -424,7 +427,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                                 &existing_conditions(restore),
                                 "Resolved",
                                 false,
-                                "SnapshotNotFound",
+                                RESTORE_SNAPSHOT_NOT_FOUND_REASON,
                                 msg,
                                 restore.metadata.generation,
                             );
@@ -435,7 +438,7 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
                                     restore,
                                     &conditions,
                                     RestorePhase::Failed,
-                                    "SnapshotNotFound",
+                                    RESTORE_SNAPSHOT_NOT_FOUND_REASON,
                                     msg,
                                 ),
                             )
@@ -862,7 +865,7 @@ async fn drive_populator_restore(
             api,
             restore,
             name,
-            "AwaitingPvcDataSourceRef",
+            AWAITING_PVC_DATA_SOURCE_REF_REASON,
             "passive populator: awaiting a PVC dataSourceRef to claim this Restore",
         )
         .await?;
@@ -986,7 +989,7 @@ async fn drive_populator_restore(
             api,
             restore,
             name,
-            "AwaitingPodSchedule",
+            AWAITING_POD_SCHEDULE_REASON,
             "populator: waiting for a pod to schedule the claiming PVC (WaitForFirstConsumer)",
         )
         .await?;
@@ -1028,7 +1031,7 @@ async fn drive_populator_restore(
                         restore_ready_status(
                             restore,
                             RestorePhase::Restoring,
-                            "PopulatingPrimePvc",
+                            POPULATING_PRIME_PVC_REASON,
                             "populator: restoring the snapshot into the prime PVC",
                         ),
                     )
@@ -1045,7 +1048,7 @@ async fn drive_populator_restore(
                         restore_ready_status(
                             restore,
                             RestorePhase::Failed,
-                            "MoverJobFailed",
+                            MOVER_JOB_FAILED_REASON,
                             "the populator restore mover Job failed; see the Job/pod logs, fix \
                              the cause, and re-create the claiming PVC — a Failed Restore is \
                              terminal",
@@ -1064,7 +1067,7 @@ async fn drive_populator_restore(
                         restore_ready_status(
                             restore,
                             RestorePhase::Failed,
-                            "MoverPodWedged",
+                            MOVER_POD_WEDGED_REASON,
                             &message,
                         ),
                     )
@@ -1086,7 +1089,7 @@ async fn drive_populator_restore(
                 restore_ready_status(
                     restore,
                     RestorePhase::Restoring,
-                    "NoSnapshotContinue",
+                    NO_SNAPSHOT_CONTINUE_REASON,
                     "populator: no snapshot found; provisioning an empty volume \
                      (deploy-or-restore)",
                 ),
@@ -1153,7 +1156,7 @@ async fn finalize_populator_success(
             &existing_conditions(restore),
             "Resolved",
             true,
-            "NoSnapshotContinue",
+            NO_SNAPSHOT_CONTINUE_REASON,
             msg,
             restore.metadata.generation,
         );
@@ -1161,7 +1164,7 @@ async fn finalize_populator_success(
             restore,
             &conditions,
             RestorePhase::Completed,
-            "NoSnapshotContinue",
+            NO_SNAPSHOT_CONTINUE_REASON,
             msg,
         )
     };
@@ -1720,7 +1723,7 @@ fn restore_success_status(
                 &existing_conditions(restore),
                 "Resolved",
                 true,
-                "NoSnapshotContinue",
+                NO_SNAPSHOT_CONTINUE_REASON,
                 msg,
                 restore.metadata.generation,
             );
@@ -1728,7 +1731,7 @@ fn restore_success_status(
                 restore,
                 &conditions,
                 RestorePhase::Completed,
-                "NoSnapshotContinue",
+                NO_SNAPSHOT_CONTINUE_REASON,
                 msg,
             )
         }
@@ -1801,7 +1804,7 @@ async fn drive_direct_restore(
                 &existing_conditions(restore),
                 "Resolved",
                 true,
-                "NoSnapshotContinue",
+                NO_SNAPSHOT_CONTINUE_REASON,
                 msg,
                 restore.metadata.generation,
             );
@@ -1812,7 +1815,7 @@ async fn drive_direct_restore(
                     restore,
                     &conditions,
                     RestorePhase::Completed,
-                    "NoSnapshotContinue",
+                    NO_SNAPSHOT_CONTINUE_REASON,
                     msg,
                 ),
             )
@@ -1874,7 +1877,7 @@ async fn drive_direct_restore(
                     restore_ready_status(
                         &live,
                         RestorePhase::Failed,
-                        "MoverJobFailed",
+                        MOVER_JOB_FAILED_REASON,
                         "the restore mover Job failed; see the Job/pod logs for the \
                          cause, fix it, and create a NEW Restore — a Failed Restore \
                          is terminal and never retries",
@@ -1921,7 +1924,12 @@ async fn drive_direct_restore(
                 io::patch_status(
                     api,
                     name,
-                    restore_ready_status(restore, RestorePhase::Failed, "MoverPodWedged", &message),
+                    restore_ready_status(
+                        restore,
+                        RestorePhase::Failed,
+                        MOVER_POD_WEDGED_REASON,
+                        &message,
+                    ),
                 )
                 .await?;
             }
@@ -1991,7 +1999,7 @@ async fn steady_terminal_restore(
             restore_ready_status(
                 &live,
                 phase.clone(),
-                "MoverJobFailed",
+                MOVER_JOB_FAILED_REASON,
                 "the restore mover reported a terminal failure; see \
                  status.failure / status.logTail for the cause, fix it, and \
                  create a NEW Restore — a Failed Restore is terminal and \

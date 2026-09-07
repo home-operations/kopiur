@@ -722,7 +722,7 @@ pub(super) fn wait_park_report(
 ) -> (&'static str, String, u64) {
     match window {
         WaitWindow::Open(_) => (
-            "WaitingForSnapshot",
+            crate::consts::WAITING_FOR_SNAPSHOT_REASON,
             format!(
                 "no snapshot matched the restore source yet; waiting up to waitTimeout \
                  ({}) from when the wait window opened (status.waitStartedAt) for it to \
@@ -732,7 +732,7 @@ pub(super) fn wait_park_report(
             remaining.clamp(1, 15),
         ),
         WaitWindow::AwaitingClaim(_) => (
-            "AwaitingPvcDataSourceRef",
+            crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON,
             "passive populator: no PersistentVolumeClaim claims this Restore yet \
              (spec.dataSourceRef), so there is nothing to populate and the waitTimeout \
              window has NOT started — it opens when a claim appears, and \
@@ -1006,12 +1006,24 @@ pub fn claims_summary(aggregate: &ClaimsAggregate) -> (&'static str, String) {
                 .to_string(),
         );
     };
-    let mut message = format!("{}/{} claims populated", tally.populated, tally.total);
+    // "settled", not "populated": `already_bound` claims are settled successes
+    // that populated nothing (#233), so counting only `populated` against the
+    // total renders a healthy all-no-op restore as "0/1" beside `Ready=True`,
+    // which reads as a contradiction. The breakdown follows on the same line.
+    let settled = tally.populated + tally.already_bound;
+    let mut message = format!("{}/{} claims settled", settled, tally.total);
+    if tally.populated > 0 {
+        message.push_str(&format!("; populated: {}", tally.populated));
+    }
     if tally.already_bound > 0 {
         message.push_str(&format!("; already bound: {}", tally.already_bound));
     }
     if !tally.in_flight.is_empty() {
-        message.push_str(&format!("; populating: {}", tally.in_flight.join(", ")));
+        // "in flight", not "populating": this list also carries `Pending` claims
+        // (one parked on `AwaitingPodSchedule`, say), and reporting a claim that
+        // has not started as "populating" sends the reader looking for a mover
+        // Job that does not exist.
+        message.push_str(&format!("; in flight: {}", tally.in_flight.join(", ")));
     }
     if !tally.failed.is_empty() {
         let failed: Vec<String> = tally
@@ -1071,9 +1083,14 @@ pub enum ClaimDrive {
 /// Decide what to do with one claim record against the live claimant's uid.
 /// Pure.
 ///
-/// A record with no uid at all (a hand-patched or half-written entry) is DRIVEN
-/// rather than re-armed: there is nothing to reap under an unknown uid, and
-/// driving re-derives the record from the observed handshake.
+/// A record with no uid at all (a hand-patched or half-written entry) is never
+/// RE-ARMED: there is nothing to reap under an unknown uid. It is then judged on
+/// its phase like any other record — DRIVEN when unsettled (so the observed
+/// handshake re-derives it), and [`ClaimDrive::Settled`] when its phase is
+/// already terminal, which is the conservative direction: re-driving a record
+/// that reads `Populated` would re-provision a prime over a claim that is done.
+/// Only reachable via a hand-patched status — [`adopt_legacy_claim`] and the
+/// driver both always seed the uid.
 pub fn claim_drive(record: Option<&RestoreClaimStatus>, live_uid: &str) -> ClaimDrive {
     let Some(record) = record else {
         return ClaimDrive::Drive;
