@@ -44,6 +44,7 @@ fn from_config() -> RestoreSource {
         namespace: None,
         as_of: None,
         offset: 0,
+        source_path: None,
     })
 }
 fn identity() -> RestoreSource {

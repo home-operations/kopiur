@@ -111,6 +111,27 @@ pub struct FromPolicy {
     #[serde(default = "default_offset")]
     #[schemars(default = "default_offset")]
     pub offset: i64,
+    /// The kopia source path to restore FROM, overriding the path kopiur derives
+    /// from the policy.
+    ///
+    /// Normally the path is derived: a policy with one plain `pvc:`/`nfs` source
+    /// contributes its own path, and a `pvcSelector` policy contributes the path
+    /// its `sourcePathStrategy` would have produced for the PVC being restored
+    /// (`/pvc/<name>` or `/pvc/<namespace>/<name>`) — the same rule the backup
+    /// side used when it wrote the snapshot, so a fan-out restore fills each PVC
+    /// from ITS OWN snapshot instead of the newest snapshot of any member.
+    ///
+    /// Set this when the derivation is ambiguous or wrong: selector sources that
+    /// disagree on `sourcePathStrategy`/`sourcePathOverride` (kopiur fails closed
+    /// rather than guess), a policy whose selector sources share one
+    /// `sourcePathOverride`, or a cross-namespace `target.pvcRef` whose derived
+    /// `/pvc/<namespace>/<name>` names a namespace the repository never saw.
+    ///
+    /// Mirrors `IdentitySource::source_path`: it selects which kopia source to
+    /// READ, it does not change where the data is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
+    pub source_path: Option<String>,
 }
 
 /// serde/schemars `default` for [`FromPolicy::offset`] — `0`, the latest snapshot
@@ -451,6 +472,214 @@ pub struct RestoreStatus {
     /// Structured terminal-failure detail (kopia error class, stderr tail, retry hint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<crate::common::FailureBlock>,
+    /// Per-claimant state for a `target.populator` restore, keyed by the claiming
+    /// PVC's name (#443).
+    ///
+    /// A populator `Restore` is claimed by EVERY PVC whose `spec.dataSourceRef`
+    /// names it, not just the first, and each claimant gets its own prime PVC, its
+    /// own mover `Job` and its own kopia source path — so each needs its own state.
+    /// A **map**, not a list, because an RFC-7386 merge patch merges map keys but
+    /// REPLACES arrays: N concurrent populate movers each patch only their own key
+    /// and can never clobber a sibling (the same reason as
+    /// `SnapshotPolicyStatus.verificationStamps`).
+    ///
+    /// Absent for a direct `target.pvc`/`target.pvcRef` restore, which keeps using
+    /// the top-level `resolved`/`target`/`waitStartedAt`/`logTail`/`failure`.
+    ///
+    /// The schema renders as an object with `additionalProperties`, which PRUNES
+    /// unknown keys — so every field any writer (controller or mover) puts under
+    /// `claims.<pvc>` must exist on `RestoreClaimStatus`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub claims: std::collections::BTreeMap<String, RestoreClaimStatus>,
+}
+
+/// The state of ONE claiming PVC of a `target.populator` restore (#443).
+///
+/// Written by the controller (every field except `resolved`/`observedAt`/
+/// `logTail`/`failure`) and by that claim's mover `Job`, which nests its status
+/// patch under `status.claims.<pvc>` and deliberately omits `phase` — the
+/// controller owns claim phase exactly as it owns the top-level one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreClaimStatus {
+    /// `metadata.uid` of the claiming PVC this record describes. A record whose
+    /// uid no longer matches the live claimant is STALE — the PVC was deleted and
+    /// re-created — so the claim re-arms and the old claim's prime PVC / Job / PV
+    /// are reaped under the recorded uid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// Lifecycle phase of this claim; absent means "not observed yet".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<RestoreClaimPhase>,
+    /// Machine-readable reason for the current phase (`PopulatingPrimePvc`,
+    /// `MoverJobFailed`, `SourcePathAmbiguous`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Human-readable what / why / fix for the current phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The kopia source path this claim restores FROM, derived from the policy's
+    /// `sourcePathStrategy` (or pinned from `source.fromPolicy.sourcePath`).
+    /// Recorded so a fan-out restore is auditable: each claim shows which member's
+    /// data it read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    /// The source this claim resolved and pinned; never re-resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ResolvedRestore>,
+    /// The prime PVC provisioned for this claim's populate handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_prime: Option<String>,
+    /// The mover `Job` populating this claim's prime PVC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    /// When THIS claim's `policy.waitTimeout` window opened (RFC3339) — the first
+    /// pass on which this claim could actually proceed. Per-claim because
+    /// claimants appear at different times: a sibling created an hour later gets
+    /// its own full window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_started_at: Option<String>,
+    /// When this claim's mover last patched (RFC3339). Mover-owned: every
+    /// `StatusUpdate` carries it, and the field must exist here or the schema's
+    /// `additionalProperties` pruning would silently drop the mover's whole patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    /// The last lines of this claim's mover output, written once at its terminal
+    /// transition. Mover-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_tail: Option<String>,
+    /// Structured terminal-failure detail for this claim. Mover-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::common::FailureBlock>,
+}
+
+/// Lifecycle phase of ONE claiming PVC of a populator `Restore` (#443).
+///
+/// Deliberately a separate closed enum from [`RestorePhase`]: a claim has states
+/// the Restore does not (`Rebinding`, `AlreadyBound`), and the Restore-level
+/// phase is the AGGREGATE over these. Named `*Phase` on purpose, so
+/// `cargo xtask check-phases` polices every branch on it.
+///
+/// ```
+/// use kopiur_api::RestoreClaimPhase;
+///
+/// assert_eq!(serde_json::to_value(RestoreClaimPhase::Populating).unwrap(), "Populating");
+/// // An unrecognized phase from a newer operator decodes instead of erroring.
+/// let p: RestoreClaimPhase = serde_json::from_value(serde_json::json!("Staging")).unwrap();
+/// assert_eq!(p, RestoreClaimPhase::Unknown("Staging".into()));
+/// assert_eq!(serde_json::to_value(&p).unwrap(), "Staging");
+/// assert!(!p.is_terminal());
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum RestoreClaimPhase {
+    /// Observed, but nothing has run for it yet — waiting on a scheduling hint
+    /// (`WaitForFirstConsumer`), on the repository, or on the source snapshot.
+    #[default]
+    Pending,
+    /// A mover `Job` is writing this claim's prime PVC.
+    Populating,
+    /// The prime volume is written and its `PersistentVolume` was rebound to the
+    /// claim; waiting for the PV controller to complete the bind.
+    Rebinding,
+    /// The claim is bound to the volume this restore populated. Terminal.
+    Populated,
+    /// The claim was ALREADY bound when first observed, so there was nothing to
+    /// populate — a CSI volume-populator only fills an UNBOUND claim. A truthful
+    /// terminal no-op (#233): no prime PVC, no mover run.
+    AlreadyBound,
+    /// This claim terminally failed; `reason`/`message` say why. Terminal for the
+    /// CLAIM only — siblings keep going, and re-creating this claiming PVC
+    /// re-arms it.
+    Failed,
+    /// A phase string this build does not recognize (newer operator, or legacy
+    /// stored data). Decode-compat only — hidden from the CRD schema, never
+    /// produced by this build, never terminal.
+    Unknown(String),
+}
+
+crate::common::phase_serde!(
+    RestoreClaimPhase,
+    "Lifecycle phase of one claiming PVC of a populator restore."
+);
+
+impl RestoreClaimPhase {
+    /// Whether this claim reached an end state and the operator will do no
+    /// further work on it of its own accord.
+    ///
+    /// `Failed` IS terminal here even though a populator `Restore` as a whole no
+    /// longer short-circuits on `Failed`: the failure is scoped to this claim, and
+    /// what re-arms it is deleting and re-creating the claiming PVC (which mints a
+    /// new uid, hence a new record) — never a re-drive of the old one.
+    ///
+    /// Pure + exhaustive, so the single definition lives in one tested place.
+    ///
+    /// ```
+    /// use kopiur_api::RestoreClaimPhase;
+    ///
+    /// assert!(RestoreClaimPhase::Populated.is_terminal());
+    /// assert!(RestoreClaimPhase::AlreadyBound.is_terminal());
+    /// assert!(RestoreClaimPhase::Failed.is_terminal());
+    /// assert!(!RestoreClaimPhase::Pending.is_terminal());
+    /// assert!(!RestoreClaimPhase::Populating.is_terminal());
+    /// assert!(!RestoreClaimPhase::Rebinding.is_terminal());
+    /// assert!(!RestoreClaimPhase::Unknown("Staging".into()).is_terminal());
+    /// ```
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Populated | Self::AlreadyBound | Self::Failed => true,
+            Self::Pending | Self::Populating | Self::Rebinding => false,
+            // Conservative surface-it policy, same as `RestorePhase::is_terminal`:
+            // a phase this build cannot interpret is never reported as finished.
+            Self::Unknown(_) => false,
+        }
+    }
+
+    /// Whether this phase is the **decode sentinel** — a value the running build
+    /// cannot interpret, kept verbatim by [`Unknown`](Self::Unknown) instead of
+    /// failing the whole typed `list()`/watch for the Kind.
+    ///
+    /// ```
+    /// use kopiur_api::RestoreClaimPhase;
+    ///
+    /// assert!(RestoreClaimPhase::Unknown("Staging".into()).is_unknown());
+    /// assert!(!RestoreClaimPhase::Populated.is_unknown());
+    /// ```
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::Unknown(_) => true,
+            Self::Pending
+            | Self::Populating
+            | Self::Rebinding
+            | Self::Populated
+            | Self::AlreadyBound
+            | Self::Failed => false,
+        }
+    }
+}
+
+impl crate::common::PhaseLabel for RestoreClaimPhase {
+    const ALL: &'static [Self] = &[
+        Self::Pending,
+        Self::Populating,
+        Self::Rebinding,
+        Self::Populated,
+        Self::AlreadyBound,
+        Self::Failed,
+    ];
+    fn label(&self) -> &str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Populating => "Populating",
+            Self::Rebinding => "Rebinding",
+            Self::Populated => "Populated",
+            Self::AlreadyBound => "AlreadyBound",
+            Self::Failed => "Failed",
+            Self::Unknown(s) => s,
+        }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
+    }
 }
 
 /// Which outcome the source resolution pinned, once and never re-resolved.
@@ -846,6 +1075,7 @@ policy: { onMissingSnapshot: Continue }
                 namespace: None,
                 as_of: None,
                 offset: 0,
+                source_path: None,
             }),
             target: RestoreTarget::Populator(PopulatorTarget {}),
             options: None,
@@ -1048,5 +1278,210 @@ mover:
             serde_json::to_value(RestorePhase::Completed).unwrap(),
             "Completed"
         );
+    }
+
+    // --- #443: per-claim status ------------------------------------------
+
+    #[test]
+    fn restore_claim_phase_all_covers_every_variant_uniquely() {
+        // Same tripwire as `RestorePhase`: every canonical variant is in ALL with
+        // a unique, non-empty label. A variant added without updating ALL fails
+        // here (and `label`'s exhaustive match won't compile at all).
+        let labels: Vec<&str> = RestoreClaimPhase::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(RestoreClaimPhase::ALL.len(), 6);
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "phase labels must be unique");
+        assert!(RestoreClaimPhase::ALL.contains(&RestoreClaimPhase::default()));
+    }
+
+    #[test]
+    fn restore_claim_terminal_set_is_pinned() {
+        // Driven off ALL so a new variant must be classified deliberately.
+        let terminal: Vec<&str> = RestoreClaimPhase::ALL
+            .iter()
+            .filter(|p| p.is_terminal())
+            .map(|p| p.label())
+            .collect();
+        assert_eq!(terminal, ["Populated", "AlreadyBound", "Failed"]);
+        let in_flight: Vec<&str> = RestoreClaimPhase::ALL
+            .iter()
+            .filter(|p| !p.is_terminal())
+            .map(|p| p.label())
+            .collect();
+        assert_eq!(in_flight, ["Pending", "Populating", "Rebinding"]);
+        // The decode sentinel is never in ALL and never terminal.
+        assert!(!RestoreClaimPhase::ALL.iter().any(|p| p.is_unknown()));
+    }
+
+    #[test]
+    fn restore_claim_phase_round_trips_and_tolerates_an_unknown_value() {
+        for p in RestoreClaimPhase::ALL {
+            let json = serde_json::to_value(p).expect("serialize");
+            assert_eq!(json, p.label());
+            let back: RestoreClaimPhase = serde_json::from_value(json).expect("decode");
+            assert_eq!(&back, p);
+        }
+        // A phase written by a newer operator must not poison the typed watch.
+        let unknown: RestoreClaimPhase =
+            serde_json::from_value(serde_json::json!("Quiescing")).expect("decodes");
+        assert_eq!(unknown, RestoreClaimPhase::Unknown("Quiescing".into()));
+        assert!(unknown.is_unknown());
+        assert!(!unknown.is_terminal());
+        // …and is echoed back verbatim, so a read-modify-write never mutates it.
+        assert_eq!(serde_json::to_value(&unknown).unwrap(), "Quiescing");
+    }
+
+    #[test]
+    fn restore_claim_phase_schema_publishes_only_canonical_values() {
+        // `Unknown` is a decode-compat artifact, never an admissible write.
+        let crd = Restore::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let phase = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"]["claims"]["additionalProperties"]["properties"]["phase"];
+        let values: Vec<String> = phase["enum"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            values,
+            RestoreClaimPhase::canonical(),
+            "claim phase schema must be exactly the canonical set; got {phase}"
+        );
+    }
+
+    #[test]
+    fn restore_status_claims_render_as_an_additional_properties_map() {
+        // The map schema is what makes N concurrent movers safe (merge-patch
+        // merges map keys, replaces arrays). `additionalProperties` PRUNES unknown
+        // keys, so the per-claim object must declare every field any writer sets —
+        // including the mover-owned `observedAt`, which every `StatusUpdate`
+        // carries and whose absence would drop the mover's whole patch.
+        let crd = Restore::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let claims = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"]["claims"];
+        assert_eq!(claims["type"], "object", "got {claims}");
+        let props = claims["additionalProperties"]["properties"]
+            .as_object()
+            .expect("per-claim properties");
+        for key in [
+            "uid",
+            "phase",
+            "reason",
+            "message",
+            "sourcePath",
+            "resolved",
+            "pvcPrime",
+            "job",
+            "waitStartedAt",
+            "observedAt",
+            "logTail",
+            "failure",
+        ] {
+            assert!(props.contains_key(key), "missing `{key}` in {claims}");
+        }
+    }
+
+    #[test]
+    fn restore_status_claims_round_trip_through_the_apiserver_shape() {
+        let status: RestoreStatus = from_yaml(
+            r#"
+phase: Restoring
+claims:
+  data-0:
+    uid: 11111111-2222-3333-4444-555555555555
+    phase: Populated
+    reason: RestoreSucceeded
+    sourcePath: /pvc/data-0
+    pvcPrime: prime-1111
+    job: r-populate-deadbeef
+    observedAt: "2026-09-01T00:00:00Z"
+    resolved:
+      resolution: Snapshot
+      kopiaSnapshotID: k1
+  data-1:
+    uid: 66666666-2222-3333-4444-555555555555
+    phase: Failed
+    reason: MoverJobFailed
+"#,
+        );
+        assert_eq!(status.claims.len(), 2);
+        let a = &status.claims["data-0"];
+        assert_eq!(a.phase, Some(RestoreClaimPhase::Populated));
+        assert_eq!(a.source_path.as_deref(), Some("/pvc/data-0"));
+        assert_eq!(a.job.as_deref(), Some("r-populate-deadbeef"));
+        assert_eq!(
+            a.resolved
+                .as_ref()
+                .and_then(|r| r.kopia_snapshot_id.as_deref()),
+            Some("k1")
+        );
+        assert_eq!(
+            status.claims["data-1"].phase,
+            Some(RestoreClaimPhase::Failed)
+        );
+
+        // Structural round-trip: what we serialize decodes back identically.
+        let json = serde_json::to_value(&status).expect("serialize");
+        let reparsed: RestoreStatus = serde_json::from_value(json).expect("reparse");
+        assert_eq!(status, reparsed);
+
+        // An empty map is omitted entirely, so a DIRECT restore's status is
+        // byte-identical to what it was before #443.
+        let direct = RestoreStatus::default();
+        let json = serde_json::to_value(&direct).expect("serialize");
+        assert!(
+            json.get("claims").is_none(),
+            "an empty claims map must not be written: {json}"
+        );
+    }
+
+    #[test]
+    fn from_policy_round_trips_with_and_without_source_path() {
+        let with: RestoreSpec = from_yaml(
+            "source: { fromPolicy: { name: pg, sourcePath: /pvc/pgdata } }\n\
+             target: { populator: {} }\n",
+        );
+        match &with.source {
+            RestoreSource::FromPolicy(c) => {
+                assert_eq!(c.source_path.as_deref(), Some("/pvc/pgdata"));
+                assert_eq!(c.offset, 0);
+            }
+            other => panic!("expected FromPolicy, got {}", other.kind_str()),
+        }
+        let json = serde_json::to_value(&with).expect("serialize");
+        assert_eq!(json["source"]["fromPolicy"]["sourcePath"], "/pvc/pgdata");
+        let reparsed: RestoreSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(with, reparsed);
+
+        // Absent stays absent on the wire — no new key on an existing object.
+        let without: RestoreSpec =
+            from_yaml("source: { fromPolicy: { name: pg } }\ntarget: { populator: {} }\n");
+        match &without.source {
+            RestoreSource::FromPolicy(c) => assert_eq!(c.source_path, None),
+            other => panic!("expected FromPolicy, got {}", other.kind_str()),
+        }
+        let json = serde_json::to_value(&without).expect("serialize");
+        assert!(
+            json["source"]["fromPolicy"].get("sourcePath").is_none(),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn from_policy_source_path_is_a_bounded_string_in_the_crd_schema() {
+        let crd = Restore::crd();
+        let json = serde_json::to_value(&crd).expect("serialize CRD");
+        let field = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["source"]["properties"]["fromPolicy"]["properties"]["sourcePath"];
+        assert_eq!(field["type"], "string", "got {field}");
+        assert_eq!(field["maxLength"], 4096, "got {field}");
     }
 }

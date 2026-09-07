@@ -919,3 +919,280 @@ fn mint_cells_multi_repo_rederives_group_names_per_repository() {
     assert_ne!(g0.volume_group_snapshot_name, legacy);
     assert_ne!(g1.volume_group_snapshot_name, legacy);
 }
+
+// --- restore_source_path (#443): which member fills THIS pvc ----------------
+
+fn nfs_source(path: &str) -> Source {
+    Source {
+        pvc: None,
+        pvc_selector: None,
+        nfs: Some(crate::backend::NfsVolume {
+            server: "nas.lan".into(),
+            path: path.to_string(),
+        }),
+        read_only: None,
+        acknowledge_live_mutation: None,
+        source_path_override: None,
+        source_path_strategy: None,
+    }
+}
+
+fn with_override(mut s: Source, over: &str) -> Source {
+    s.source_path_override = Some(over.to_string());
+    s
+}
+
+#[test]
+fn restore_path_override_wins_over_every_derivation() {
+    // Rule (1): an explicit `fromPolicy.sourcePath` is never second-guessed —
+    // not even by a policy whose selectors WOULD have derived a path.
+    let p = policy_with(vec![selector_source(
+        Some(SourcePathStrategy::PvcNamespacedName),
+        vec![],
+    )]);
+    assert_eq!(
+        restore_source_path(&p, Some("/pvc/other"), &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::Override("/pvc/other".into())
+    );
+    // …and on a policy with no sources at all, where nothing could be derived.
+    let empty = policy_with(vec![]);
+    assert_eq!(
+        restore_source_path(&empty, Some("/data"), &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::Override("/data".into())
+    );
+}
+
+#[test]
+fn restore_path_for_a_plain_policy_is_byte_identical_to_the_legacy_answer() {
+    // Rule (2): no selector anywhere ⇒ the pre-#443 answer, which is exactly what
+    // `config_identity` + `resolve_identity` produced. Asserted against the SAME
+    // call the backup side makes, so a drift in either shows up here.
+    for target_name in ["data", "restored-copy"] {
+        let p = policy_with(vec![pvc_source("data")]);
+        let legacy = effective_source(&p, None)
+            .unwrap()
+            .kopia_source_path(SourcePathStrategy::PvcName);
+        assert_eq!(
+            restore_source_path(&p, None, &target("billing", target_name)).unwrap(),
+            RestoreSourcePath::PolicySource(legacy.clone())
+        );
+        assert_eq!(legacy.as_deref(), Some("/pvc/data"));
+    }
+
+    // An `nfs` source contributes its export path.
+    let p = policy_with(vec![nfs_source("/export/media")]);
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "media")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/export/media".into()))
+    );
+
+    // A `sourcePathOverride` on a plain source is still that source's own path.
+    let p = policy_with(vec![with_override(pvc_source("data"), "/srv/pg")]);
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "data")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/srv/pg".into()))
+    );
+}
+
+#[test]
+fn restore_path_tolerates_a_zero_source_legacy_policy() {
+    // Admission forbids a source-less policy, but a hand-patched legacy object may
+    // still carry one — and `config_identity` tolerates it (identity-only match).
+    // A working restore must not turn into a terminal error on upgrade.
+    let p = policy_with(vec![]);
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::PolicySource(None)
+    );
+}
+
+#[test]
+fn restore_path_derives_per_pvc_from_the_selector_strategy() {
+    // Rule (4): THE #443 FIX. Each claimant reads its own member path, derived
+    // through the same `kopia_source_path` call the backup made.
+    let by_name = policy_with(vec![selector_source(
+        Some(SourcePathStrategy::PvcName),
+        vec![],
+    )]);
+    assert_eq!(
+        restore_source_path(&by_name, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/pgdata".into())
+    );
+    assert_eq!(
+        restore_source_path(&by_name, None, &target("billing", "redis")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/redis".into())
+    );
+
+    // An absent strategy defaults to PvcName, exactly as `strategy_for` says.
+    let defaulted = policy_with(vec![selector_source(None, vec![])]);
+    assert_eq!(
+        restore_source_path(&defaulted, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/pgdata".into())
+    );
+
+    // PvcNamespacedName carries the TARGET's namespace.
+    let namespaced = policy_with(vec![selector_source(
+        Some(SourcePathStrategy::PvcNamespacedName),
+        vec!["billing", "payments"],
+    )]);
+    assert_eq!(
+        restore_source_path(&namespaced, None, &target("payments", "pgdata")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/payments/pgdata".into())
+    );
+
+    // Two selectors that AGREE are not ambiguous.
+    let agreeing = policy_with(vec![
+        selector_source(Some(SourcePathStrategy::PvcName), vec!["billing"]),
+        selector_source(Some(SourcePathStrategy::PvcName), vec!["payments"]),
+    ]);
+    assert_eq!(
+        restore_source_path(&agreeing, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/pgdata".into())
+    );
+}
+
+#[test]
+fn restore_path_prefers_an_exact_plain_pvc_source_over_the_selector_derivation() {
+    // Rule (3): a policy that names this very PVC explicitly AND fans out over a
+    // selector — the exact match wins, override included, because that source is
+    // literally the one that backed this volume up.
+    let p = policy_with(vec![
+        with_override(pvc_source("pgdata"), "/srv/pg"),
+        selector_source(Some(SourcePathStrategy::PvcNamespacedName), vec![]),
+    ]);
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/srv/pg".into()))
+    );
+    // A different PVC falls through to the selector derivation.
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "redis")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/billing/redis".into())
+    );
+    // A same-NAME PVC in another namespace is a DIFFERENT volume: a plain source
+    // always addresses the policy's own namespace, so it must not match.
+    assert_eq!(
+        restore_source_path(&p, None, &target("payments", "pgdata")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/payments/pgdata".into())
+    );
+}
+
+#[test]
+fn restore_path_fails_closed_when_the_selectors_disagree() {
+    // Rule (5): differing strategies have no per-PVC answer. Guessing would risk
+    // restoring another volume's data, so this is a named, actionable error.
+    let p = policy_with(vec![
+        selector_source(Some(SourcePathStrategy::PvcName), vec![]),
+        selector_source(Some(SourcePathStrategy::PvcNamespacedName), vec![]),
+    ]);
+    let err = restore_source_path(&p, None, &target("billing", "pgdata")).unwrap_err();
+    let ValidationError::InvalidFieldValue { field, reason } = &err else {
+        panic!("expected InvalidFieldValue, got {err:?}");
+    };
+    assert_eq!(field, "spec.source.fromPolicy.sourcePath");
+    assert!(reason.contains("`app`"), "names the policy: {reason}");
+    assert!(
+        reason.contains("source.fromPolicy.sourcePath"),
+        "names the fix field: {reason}"
+    );
+    assert!(
+        reason.contains("/pvc/<name>"),
+        "shows the fix shape: {reason}"
+    );
+    // The override clears it.
+    assert_eq!(
+        restore_source_path(&p, Some("/pvc/pgdata"), &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::Override("/pvc/pgdata".into())
+    );
+}
+
+#[test]
+fn restore_path_fails_closed_on_a_shared_selector_source_path_override() {
+    // A selector with a `sourcePathOverride` flattens EVERY matched PVC onto one
+    // kopia path (`kopia_source_path` returns the override before it looks at the
+    // PVC), so "which member is this?" genuinely has no answer — even though the
+    // selectors agree with each other.
+    let p = policy_with(vec![with_override(
+        selector_source(Some(SourcePathStrategy::PvcName), vec![]),
+        "/data",
+    )]);
+    let err = restore_source_path(&p, None, &target("billing", "pgdata")).unwrap_err();
+    assert!(
+        matches!(&err, ValidationError::InvalidFieldValue { field, .. }
+            if field == "spec.source.fromPolicy.sourcePath"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn restore_path_ignores_nfs_and_malformed_siblings_of_a_selector() {
+    // An `nfs` source is never addressed by a PVC target, and a source with none
+    // of pvc/pvcSelector/nfs (hand-patched legacy) contributes nothing — neither
+    // makes the selector derivation ambiguous.
+    let mut malformed = pvc_source("x");
+    malformed.pvc = None;
+    let p = policy_with(vec![
+        nfs_source("/export/media"),
+        malformed,
+        selector_source(Some(SourcePathStrategy::PvcName), vec![]),
+    ]);
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/pgdata".into())
+    );
+}
+
+#[test]
+fn restore_source_path_accessors_are_exhaustive_over_provenance() {
+    assert_eq!(RestoreSourcePath::Override("/a".into()).path(), Some("/a"));
+    assert_eq!(
+        RestoreSourcePath::DerivedFromTarget("/b".into()).path(),
+        Some("/b")
+    );
+    assert_eq!(
+        RestoreSourcePath::PolicySource(Some("/c".into())).path(),
+        Some("/c")
+    );
+    assert_eq!(RestoreSourcePath::PolicySource(None).path(), None);
+    assert_eq!(RestoreSourcePath::PolicySource(None).into_path(), None);
+    assert_eq!(
+        RestoreSourcePath::Override("/a".into()).into_path(),
+        Some("/a".to_string())
+    );
+}
+
+// --- populate_job_name ------------------------------------------------------
+
+#[test]
+fn populate_job_name_is_capped_and_injective_per_claimant() {
+    // The Job name becomes a `batch.kubernetes.io/job-name` LABEL value, capped
+    // at 63 bytes by Kubernetes; a longer one silently breaks pod lookup.
+    let long = "r".repeat(253);
+    let n = populate_job_name(&long, "uid-a");
+    assert!(n.len() <= 63, "{} chars: {n}", n.len());
+    assert!(n.contains("-populate-"));
+
+    // Injectivity is what makes N claimants of ONE Restore produce N Jobs — the
+    // pre-#443 bare `<restore>-populate` is exactly why only one could be filled.
+    let mut seen = std::collections::BTreeSet::new();
+    for i in 0..64 {
+        let uid = format!("2f0b9a{i}-c0de-4b1a-9f00-000000000000");
+        let name = populate_job_name("restore-pg", &uid);
+        assert!(name.len() <= 63);
+        assert!(seen.insert(name), "collision at {i}");
+    }
+    // A re-created claim (new uid) gets a FRESH Job rather than adopting the dead
+    // claim's.
+    assert_ne!(
+        populate_job_name("restore-pg", "uid-a"),
+        populate_job_name("restore-pg", "uid-b")
+    );
+    // …and two different Restores never share one.
+    assert_ne!(
+        populate_job_name("restore-pg", "uid-a"),
+        populate_job_name("restore-redis", "uid-a")
+    );
+    // A clip must not leave a trailing dash before the marker.
+    let dashy = format!("{}-", "r".repeat(60));
+    assert!(!populate_job_name(&dashy, "uid").contains("--populate-"));
+}

@@ -81,6 +81,10 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
             namespace: args.policy_namespace.clone(),
             as_of: args.as_of.clone(),
             offset: args.offset.unwrap_or(0),
+            // The per-PVC path override (#443) has no CLI flag yet: the derivation
+            // covers every shape `kubectl kopiur restore` can build today, and an
+            // ambiguous policy fails closed naming the field to set in YAML.
+            source_path: None,
         }),
         (None, None, Some(identity)) => RestoreSource::Identity(IdentitySource {
             username: identity.username.clone(),

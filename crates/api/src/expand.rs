@@ -26,6 +26,21 @@
 //! no expansion code existed anywhere, so `build_backup_run` hit its
 //! `_ =>` arm and returned `invariant violated … This is likely a bug in
 //! kopiur`. That is #346.
+//!
+//! # The restore side (#443)
+//!
+//! Expansion is only half the story. A selector policy writes N kopia sources,
+//! one per member path; a RESTORE against that policy must read exactly ONE of
+//! them, chosen by the PVC it is filling. [`restore_source_path`] is that
+//! inverse: it re-derives a member's path from the policy's own
+//! `sourcePathStrategy`, so the restore's kopia filter names the same path the
+//! backup wrote. Without it the filter is `user@host:` with no path, which
+//! matches EVERY member — and the newest of them wins, so one PVC could be
+//! filled with another PVC's data.
+//!
+//! It lives here, next to [`EffectiveSource::kopia_source_path`] and
+//! [`strategy_for`], on purpose: the backup path and the restore path are then
+//! literally the same code, and the two strings cannot drift.
 
 use std::collections::BTreeMap;
 
@@ -151,6 +166,300 @@ pub fn strategy_for(source: &Source) -> SourcePathStrategy {
     } else {
         SourcePathStrategy::PvcName
     }
+}
+
+// --- the restore side: which member path fills THIS pvc (#443) ---------------
+
+/// Where a restore's kopia source path came from — the result of
+/// [`restore_source_path`].
+///
+/// The provenance is kept (rather than collapsed to an `Option<String>`) because
+/// the three cases mean different things to a human reading `status`, and to the
+/// reconciler: an [`Override`](Self::Override) is what the user asked for and is
+/// never second-guessed; a [`PolicySource`](Self::PolicySource) reproduces the
+/// pre-#443 behavior byte-for-byte; and a
+/// [`DerivedFromTarget`](Self::DerivedFromTarget) is the new per-PVC derivation
+/// that makes a fan-out restore read the right member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreSourcePath {
+    /// `source.fromPolicy.sourcePath` — the user named the path explicitly.
+    Override(String),
+    /// The governing plain (`pvc:`/`nfs`) source's own path.
+    ///
+    /// `None` is the identity-only form (kopia `username@hostname`, matching any
+    /// path): a policy with **zero** sources, which admission forbids but a
+    /// hand-patched legacy object may still carry. Tolerated exactly as
+    /// `config_identity` tolerates it — a working restore must not become a
+    /// terminal error on an upgrade.
+    PolicySource(Option<String>),
+    /// The selector `sourcePathStrategy` applied to the PVC being restored — the
+    /// same code path the backup used, so the strings cannot drift.
+    DerivedFromTarget(String),
+}
+
+impl RestoreSourcePath {
+    /// The path to filter kopia snapshots by, if any. Exhaustive.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Override(p) | Self::DerivedFromTarget(p) => Some(p),
+            Self::PolicySource(p) => p.as_deref(),
+        }
+    }
+
+    /// Consume into the owned path, if any. Exhaustive.
+    pub fn into_path(self) -> Option<String> {
+        match self {
+            Self::Override(p) | Self::DerivedFromTarget(p) => Some(p),
+            Self::PolicySource(p) => p,
+        }
+    }
+}
+
+/// A total classification of one `SnapshotPolicy` source, for the restore-path
+/// derivation.
+///
+/// The point of the enum is that "not a selector" is not one thing: a plain
+/// `pvc:` source can match the restore target by NAME (and then contributes its
+/// own path, override included), while `nfs` and a malformed source contribute
+/// nothing at all. Matched exhaustively, so a fourth source shape has to decide
+/// what it means for a restore before it compiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceShape<'a> {
+    /// A plain `pvc:` source, with the PVC name it addresses (always in the
+    /// policy's own namespace).
+    Pvc { name: &'a str },
+    /// A `pvcSelector` source: the knobs that decide each member's path.
+    Selector {
+        /// The strategy this selector derives member paths with.
+        strategy: SourcePathStrategy,
+        /// A `sourcePathOverride` that would apply to EVERY member — which is
+        /// exactly what makes the selector non-per-PVC.
+        source_path_override: Option<&'a str>,
+    },
+    /// An `nfs` export: never addressed by a PVC target.
+    Nfs,
+    /// None of `pvc`/`pvcSelector`/`nfs` is set. Admission forbids it; a
+    /// hand-patched object may carry it. Contributes nothing.
+    Invalid,
+}
+
+/// Classify one source. Pure and total.
+fn source_shape(source: &Source) -> SourceShape<'_> {
+    if source.pvc_selector.is_some() {
+        return SourceShape::Selector {
+            strategy: strategy_for(source),
+            source_path_override: source.source_path_override.as_deref(),
+        };
+    }
+    match (&source.pvc, &source.nfs) {
+        (Some(p), _) => SourceShape::Pvc { name: &p.name },
+        (None, Some(_)) => SourceShape::Nfs,
+        (None, None) => SourceShape::Invalid,
+    }
+}
+
+/// The kopia source path a restore of `target` should read from `policy` (#443).
+///
+/// This is the cross-volume fix. `RestoreSelector.source_path: None` becomes the
+/// kopia filter `username@hostname:` — an EMPTY path, which matches every member
+/// path of a selector policy — so before this, restoring one PVC of a multi-PVC
+/// policy took the newest snapshot of *any* member and could fill a volume with
+/// another volume's data.
+///
+/// The rule, in order:
+///
+/// 1. `override_` (`source.fromPolicy.sourcePath`) wins outright.
+/// 2. The policy has **no selector sources** ⇒ [`RestoreSourcePath::PolicySource`]
+///    of `sources[0]`'s own path — byte-identical to what `config_identity` +
+///    `resolve_identity` produced before this function existed, for the plain
+///    `pvc:`, `nfs` and `sourcePathOverride` shapes alike (and `None` for a
+///    zero-source legacy object).
+/// 3. A plain `pvc:` source addressing EXACTLY this target (same name, same
+///    namespace) ⇒ that source's own path. An exact match beats a derivation.
+/// 4. Every selector source agrees on `(sourcePathStrategy, sourcePathOverride)`
+///    **and that override is `None`** ⇒
+///    [`RestoreSourcePath::DerivedFromTarget`], built through
+///    [`EffectiveSource::kopia_source_path`] — the same call the backup side
+///    makes, so the two strings cannot drift.
+/// 5. Anything else ⇒ a named error telling the user to set
+///    `fromPolicy.sourcePath`.
+///
+/// A selector carrying `sourcePathOverride: Some(o)` is deliberately NOT
+/// per-PVC: `kopia_source_path` returns the override before it ever looks at the
+/// PVC, so every member was backed up under the one path `o` and no derivation
+/// can tell them apart. That falls to (5) rather than silently returning `o`,
+/// because "which member is this?" genuinely has no answer.
+///
+/// Matching is by **strategy rule, not by claimant labels**: a `target.pvc` has
+/// no labels to match against, and a claimant's labels may have changed since the
+/// backup was taken. This function is therefore pure over the policy + target
+/// alone.
+///
+/// The namespace in `target` is the TARGET's namespace. For a cross-namespace
+/// `target.pvcRef` under a `pvcNamespacedName` strategy that derives
+/// `/pvc/<target-ns>/<name>`, which may be a path the repository never saw — use
+/// the override there.
+///
+/// ```
+/// # use kopiur_api::expand::{restore_source_path, RestoreSourcePath};
+/// # use kopiur_api::snapshot::PvcTargetRef;
+/// # use kopiur_api::SnapshotPolicy;
+/// let policy: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+///     "apiVersion": "kopiur.home-operations.com/v1alpha1",
+///     "kind": "SnapshotPolicy",
+///     "metadata": { "name": "app", "namespace": "db" },
+///     "spec": {
+///         "repository": { "name": "r" },
+///         "sources": [{
+///             "pvcSelector": { "matchLabels": { "app": "web" } },
+///             "sourcePathStrategy": "PvcName",
+///         }],
+///     },
+/// }))
+/// .unwrap();
+/// let target = PvcTargetRef { namespace: "db".into(), name: "data-1".into() };
+/// assert_eq!(
+///     restore_source_path(&policy, None, &target).unwrap(),
+///     RestoreSourcePath::DerivedFromTarget("/pvc/data-1".into())
+/// );
+/// ```
+pub fn restore_source_path(
+    policy: &SnapshotPolicy,
+    override_: Option<&str>,
+    target: &PvcTargetRef,
+) -> Result<RestoreSourcePath, ValidationError> {
+    // (1) An explicit override is never second-guessed.
+    if let Some(o) = override_ {
+        return Ok(RestoreSourcePath::Override(o.to_string()));
+    }
+
+    let policy_ns = policy.namespace().unwrap_or_default();
+    let shapes: Vec<SourceShape<'_>> = policy.spec.sources.iter().map(source_shape).collect();
+
+    // (2) No selector anywhere: the pre-#443 answer, verbatim (including the
+    // zero-source legacy tolerance, where `sources.first()` is `None`).
+    let has_selector = shapes
+        .iter()
+        .any(|s| matches!(s, SourceShape::Selector { .. }));
+    if !has_selector {
+        let Some(first) = policy.spec.sources.first() else {
+            return Ok(RestoreSourcePath::PolicySource(None));
+        };
+        let eff = effective_source(policy, None)?;
+        return Ok(RestoreSourcePath::PolicySource(
+            eff.kopia_source_path(strategy_for(first)),
+        ));
+    }
+
+    // (3) An exact plain-`pvc:` match. Same namespace is required: a plain source
+    // always addresses the POLICY's namespace, so a same-named PVC in another
+    // namespace is a different volume.
+    if policy_ns == target.namespace
+        && let Some(index) = shapes.iter().position(|s| match s {
+            SourceShape::Pvc { name } => *name == target.name,
+            SourceShape::Selector { .. } | SourceShape::Nfs | SourceShape::Invalid => false,
+        })
+    {
+        let source = &policy.spec.sources[index];
+        let eff = EffectiveSource {
+            index,
+            pvc: Some(target.clone()),
+            nfs_path: None,
+            source_path_override: source.source_path_override.clone(),
+            read_only: snapshot_policy::source_read_only(source),
+        };
+        return Ok(RestoreSourcePath::PolicySource(
+            eff.kopia_source_path(strategy_for(source)),
+        ));
+    }
+
+    // (4) Every selector agrees, and none of them flattens its members onto one
+    // shared path.
+    let mut agreed: Option<(SourcePathStrategy, Option<&str>)> = None;
+    for shape in &shapes {
+        let (strategy, over) = match shape {
+            SourceShape::Selector {
+                strategy,
+                source_path_override,
+            } => (*strategy, *source_path_override),
+            SourceShape::Pvc { .. } | SourceShape::Nfs | SourceShape::Invalid => continue,
+        };
+        match agreed {
+            None => agreed = Some((strategy, over)),
+            Some(prev) if prev == (strategy, over) => {}
+            Some(_) => return Err(ambiguous_source_path(policy)),
+        }
+    }
+    match agreed {
+        Some((strategy, None)) => {
+            let eff = EffectiveSource {
+                // The index is inert here: the path comes from the target PVC and
+                // the agreed strategy, not from the source's own `pvc`/`nfs`.
+                index: 0,
+                pvc: Some(target.clone()),
+                nfs_path: None,
+                source_path_override: None,
+                read_only: true,
+            };
+            // A PVC-bearing `EffectiveSource` with no override always yields a
+            // path, so the `None` arm is unreachable — but returning the fail-
+            // closed error rather than unwrapping keeps the function total.
+            eff.kopia_source_path(strategy)
+                .map(RestoreSourcePath::DerivedFromTarget)
+                .ok_or_else(|| ambiguous_source_path(policy))
+        }
+        // (5) A shared `sourcePathOverride`, or (defensively) no selector at all
+        // after the `has_selector` check.
+        Some((_, Some(_))) | None => Err(ambiguous_source_path(policy)),
+    }
+}
+
+/// The fail-closed error for (5) of [`restore_source_path`] — what / why / fix.
+fn ambiguous_source_path(policy: &SnapshotPolicy) -> ValidationError {
+    ValidationError::InvalidFieldValue {
+        field: "spec.source.fromPolicy.sourcePath".to_string(),
+        reason: format!(
+            "SnapshotPolicy `{}`'s selector sources do not yield a per-PVC kopia source path \
+             (they differ in sourcePathStrategy/sourcePathOverride, or share one \
+             sourcePathOverride under which every matched PVC was backed up). Restoring \
+             without a path would match the newest snapshot of ANY member and could fill this \
+             volume with another volume's data, so kopiur fails closed. Fix: set \
+             source.fromPolicy.sourcePath explicitly (e.g. /pvc/<name>) to name the member to \
+             restore.",
+            policy.name_any()
+        ),
+    }
+}
+
+/// The deterministic name of the populate mover `Job` for one claiming PVC.
+///
+/// `<restore>-populate-<h8>`, capped at [`MAX_CHILD_NAME`] (63) — a Job name
+/// becomes a `batch.kubernetes.io/job-name` label value, which Kubernetes caps
+/// at 63 bytes.
+///
+/// `<h8>` is 8 hex of FNV-1a over the claiming PVC's `metadata.uid` and is
+/// **never** clipped: it is what makes N claimants of one `Restore` produce N
+/// distinct Jobs, and what makes a DELETED-and-re-created claim (a new uid) get a
+/// fresh Job instead of adopting the dead claim's. The pre-#443 name was the
+/// bare `<restore>-populate`, which is why only one claimant could ever be
+/// populated; that legacy name is still driven for an adopted in-flight claim
+/// (see the controller's `JobNameReuse`), never minted anew.
+///
+/// ```
+/// # use kopiur_api::expand::populate_job_name;
+/// let n = populate_job_name("restore-pg", "9f1c-uid");
+/// assert!(n.starts_with("restore-pg-populate-"));
+/// assert!(n.len() <= 63);
+/// // Distinct claimants never collide.
+/// assert_ne!(n, populate_job_name("restore-pg", "other-uid"));
+/// ```
+pub fn populate_job_name(restore: &str, consumer_uid: &str) -> String {
+    const MARKER: &str = "-populate-";
+    let tag = fnv8(consumer_uid);
+    let keep = MAX_CHILD_NAME.saturating_sub(MARKER.len() + tag.len());
+    format!("{}{MARKER}{tag}", clip(restore, keep).trim_end_matches('-'))
+        .trim_matches('-')
+        .to_string()
 }
 
 /// Render a `LabelSelector` as the API server's selector string.
