@@ -1061,7 +1061,7 @@ impl PassCache {
     }
 
     /// The `fromPolicy` referents for this pass, fetched at most once.
-    async fn from_policy_referents(
+    async fn policy_referents(
         &mut self,
         ctx: &Context,
         restore: &Restore,
@@ -4189,9 +4189,7 @@ async fn resolve_snapshot(
             // The referents come from the PASS cache: every claim of a fanned-out
             // populator derives its path from the SAME policy, so N claims must not
             // mean N SnapshotPolicy GETs plus N repository resolutions per requeue.
-            let referents = cache
-                .from_policy_referents(ctx, restore, namespace, c)
-                .await?;
+            let referents = cache.policy_referents(ctx, restore, namespace, c).await?;
             let cfg_ns = referents.namespace.as_str();
             // The PER-PVC identity (#443). A selector policy resolves no path at
             // all through `config_identity`, and `RestoreSelector.source_path:

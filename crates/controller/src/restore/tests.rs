@@ -827,28 +827,6 @@ fn populator_handshake_covers_every_binding_ordering() {
     );
 }
 
-/// A populator Restore that is `Completed` with `Ready=True/<reason>`, parsed the
-/// cluster's way (JSON → typed).
-fn completed_populator_with_ready_reason(reason: &str) -> Restore {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "kopiur.home-operations.com/v1alpha1",
-        "kind": "Restore",
-        "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
-        "spec": {
-            "source": { "snapshotRef": { "name": "b" } },
-            "target": { "populator": {} }
-        },
-        "status": {
-            "phase": "Completed",
-            "conditions": [{
-                "type": "Ready", "status": "True", "reason": reason, "message": "m",
-                "lastTransitionTime": "2026-01-01T00:00:00Z"
-            }]
-        }
-    }))
-    .expect("valid Restore")
-}
-
 /// The no-op and reap messages are what a human reads when 49 prime PVCs vanish, so the
 /// what/why/fix text is asserted like any other behavior.
 #[test]
