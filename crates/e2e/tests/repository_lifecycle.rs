@@ -16,22 +16,11 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 use k8s_openapi::api::events::v1::Event;
-use k8s_openapi::api::storage::v1::StorageClass;
 use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{
     E2E_NAMESPACE, Need, World, builders, default_timeout, poll_interval,
     scrape_controller_metrics, wait, wait_until,
 };
-
-/// CSI hostpath StorageClass installed by the `snapshot-stack` harness step — a
-/// populator-aware provisioner (its external-provisioner defers to `dataSourceRef`).
-/// `Immediate` binding (provisions the prime PVC as soon as it's created).
-const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
-/// The `WaitForFirstConsumer` variant over the same hostpath provisioner (also installed
-/// by `snapshot-stack`). Exercises the populator handshake's late-binding path: the claim
-/// only gets a `selected-node` once a pod schedules it, which the controller pins the
-/// prime PVC to. See [`restore_populator_wffc_binds_pvc_and_restores_data`].
-const CSI_STORAGE_CLASS_WFFC: &str = "csi-hostpath-sc-wffc";
 
 /// `Restore.spec.target.populator: {}` (ADR-0005 §9): the explicit passive-populator
 /// target form is accepted and threads through to a restore mover Job. (The empty
@@ -84,35 +73,6 @@ async fn restore_populator_target_form_is_accepted() {
     let _ = restores.delete(name, &DeleteParams::default()).await;
 }
 
-/// Whether `storage_class` is present (proceed with the test). If it's absent we either
-/// HARD-FAIL or skip: a `csi: true` CI shard installs the snapshot stack and sets
-/// `KOPIUR_E2E_REQUIRE_CSI=1`, so there an absent class is a real setup failure and must
-/// NOT silently pass — a silent skip once let a populator regression ship green (#121).
-/// Without that env (local dev with no snapshot stack) we skip gracefully.
-async fn csi_class_present_or_skip(client: &kube::Client, storage_class: &str) -> bool {
-    let scs: Api<StorageClass> = Api::all(client.clone());
-    if scs
-        .get_opt(storage_class)
-        .await
-        .expect("list storageclasses")
-        .is_some()
-    {
-        return true;
-    }
-    let require = std::env::var("KOPIUR_E2E_REQUIRE_CSI").is_ok_and(|v| v == "1");
-    assert!(
-        !require,
-        "storageclass {storage_class} absent but KOPIUR_E2E_REQUIRE_CSI=1 — this shard must \
-         install the CSI snapshot stack (mise run //crates/e2e:snapshot-stack) before the \
-         populator/copyMethod tests; refusing to silently skip (cf. #121)"
-    );
-    eprintln!(
-        "skipping populator test: storageclass {storage_class} absent \
-         (run `mise run //crates/e2e:snapshot-stack`)"
-    );
-    false
-}
-
 /// Shared body for the populator data-integrity tests (ADR-0005 §9): given an
 /// already-seeded `repo`/`seed`, create a populator `Restore`, a claiming PVC whose
 /// `dataSourceRef` points at it on `storage_class`, and a reader pod that asserts the
@@ -133,121 +93,31 @@ async fn assert_populator_binds_and_restores(
     populated.cleanup(client).await;
 }
 
-/// The objects a [`populate_claim`] run left behind, so a caller can keep inspecting them
-/// (and clean up when done) instead of tearing them down immediately.
-struct PopulatedClaim {
-    restore: String,
-    claim: String,
-    reader: String,
-}
-
-impl PopulatedClaim {
-    async fn cleanup(&self, client: &kube::Client) {
-        let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-        let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-        let _ = pods.delete(&self.reader, &DeleteParams::default()).await;
-        let _ = pvcs.delete(&self.claim, &DeleteParams::default()).await;
-        let _ = restores
-            .delete(&self.restore, &DeleteParams::default())
-            .await;
-    }
-}
-
-/// Drive one populator handshake to completion and LEAVE the objects in place (the caller
-/// owns cleanup). Body of [`assert_populator_binds_and_restores`], split out so the #233
-/// regression test can keep the now-BOUND claim and then delete + re-create the `Restore`
-/// over it — the exact GitOps sequence that used to orphan a full-size prime PVC.
+/// One populator `Restore` + one claiming PVC, driven to completion — the
+/// single-claim shape most of these scenarios want, over the N-claim
+/// [`populate_claims`] the fan-out (#443) generalized it into. The reader asserts
+/// `a.txt`, which is "hello kopiur e2e" in the seed source.
 async fn populate_claim(
     client: &kube::Client,
     storage_class: &str,
     repo: &str,
     seed: &str,
     prefix: &str,
-) -> PopulatedClaim {
-    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+) -> PopulatedClaims {
     let restore_name = format!("{prefix}-restore");
-    restores
-        .create(
-            &PostParams::default(),
-            &cr(populator_restore_json(&restore_name, repo, seed)),
-        )
-        .await
-        .expect("create populator Restore");
-
-    // The claiming PVC: its dataSourceRef points at the Restore, so a populator-aware
-    // provisioner defers to the handshake instead of binding it to an empty volume.
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let claim = format!("{prefix}-data");
-    pvcs.create(
-        &PostParams::default(),
-        &cr(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "PersistentVolumeClaim",
-            "metadata": { "name": claim, "namespace": E2E_NAMESPACE },
-            "spec": {
-                "accessModes": ["ReadWriteOnce"],
-                "storageClassName": storage_class,
-                "resources": { "requests": { "storage": "1Gi" } },
-                "dataSourceRef": {
-                    "apiGroup": "kopiur.home-operations.com",
-                    "kind": "Restore",
-                    "name": restore_name,
-                }
-            }
-        })),
+    populate_claims(
+        client,
+        storage_class,
+        &restore_name,
+        populator_restore_json(&restore_name, repo, seed),
+        &[ClaimSpec {
+            name: &claim,
+            path: "a.txt",
+            expect: "hello kopiur e2e",
+        }],
     )
     .await
-    .expect("create claiming PVC");
-
-    // One pod does double duty: scheduling it produces the `selected-node` a
-    // WaitForFirstConsumer claim needs (the controller pins the prime PVC to it), and it
-    // asserts the restored bytes — `a.txt` is "hello kopiur e2e" in the seed source. It
-    // can only run once the claim binds, so its success proves both the bind and the data.
-    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let reader = format!("{prefix}-reader");
-    pods.create(
-        &PostParams::default(),
-        &builders::one_shot_pod(
-            E2E_NAMESPACE,
-            &reader,
-            &[
-                "sh",
-                "-c",
-                "test \"$(cat /mnt/a.txt)\" = 'hello kopiur e2e'",
-            ],
-            &[(claim.as_str(), "/mnt")],
-        ),
-    )
-    .await
-    .expect("create reader pod");
-
-    wait::pod_succeeded(client, E2E_NAMESPACE, &reader)
-        .await
-        .expect("the claiming PVC binds and a.txt is restored into it");
-    wait_phase(&restores, &restore_name, "Completed")
-        .await
-        .expect("the populator Restore reaches Completed once the claim is bound");
-
-    PopulatedClaim {
-        restore: restore_name,
-        claim,
-        reader,
-    }
-}
-
-/// A populator `Restore` reading `seed` out of `repo` (`target.populator: {}`).
-fn populator_restore_json(name: &str, repo: &str, seed: &str) -> serde_json::Value {
-    serde_json::json!({
-        "apiVersion": "kopiur.home-operations.com/v1alpha1",
-        "kind": "Restore",
-        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
-        "spec": {
-            "repository": { "kind": "Repository", "name": repo },
-            "source": { "snapshotRef": { "name": seed } },
-            "target": { "populator": {} }
-        }
-    })
 }
 
 /// ADR-0005 §9 end-to-end (Immediate binding): a PVC whose `dataSourceRef` claims a
@@ -380,7 +250,7 @@ async fn recreated_populator_restore_over_bound_claim_is_noop_and_reaps_orphaned
     .await;
 
     let claim = pvcs
-        .get(&populated.claim)
+        .get(&populated.claims[0])
         .await
         .expect("the claiming PVC exists");
     let consumer_uid = claim.metadata.uid.clone().expect("claim uid");
@@ -472,18 +342,28 @@ async fn recreated_populator_restore_over_bound_claim_is_noop_and_reaps_orphaned
 
     // 7. No mover ran: a full restore into an unadoptable prime is exactly the wasted work
     //    (49 pointless repository reads, at fleet scale) the fix eliminates.
-    let populate_job = format!("{}-populate", populated.restore);
+    //    Matched by PREFIX, not by the exact legacy name: since #443 each claim's
+    //    populate Job is `{restore}-populate-{hash(claim uid)}`, so a `get_opt` on the
+    //    bare `{restore}-populate` would return `None` no matter how many movers ran
+    //    and this assertion would silently stop guarding anything.
+    let populate_prefix = format!("{}-populate", populated.restore);
+    let stray: Vec<String> = jobs
+        .list(&ListParams::default())
+        .await
+        .expect("list jobs")
+        .items
+        .into_iter()
+        .filter_map(|j| j.metadata.name)
+        .filter(|n| n.starts_with(&populate_prefix))
+        .collect();
     assert!(
-        jobs.get_opt(&populate_job)
-            .await
-            .expect("list jobs")
-            .is_none(),
-        "no populate Job may be created for an already-bound claim ({populate_job} exists)"
+        stray.is_empty(),
+        "no populate Job may be created for an already-bound claim, found {stray:?}"
     );
 
     // 8. The live volume was never touched.
     let after = pvcs
-        .get(&populated.claim)
+        .get(&populated.claims[0])
         .await
         .expect("claim still exists");
     assert_eq!(
