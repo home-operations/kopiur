@@ -1508,8 +1508,10 @@ async fn reap_gone_claims(
 /// adopting nothing relabels the populated PVC `TargetAlreadyBound`, "no restore
 /// ran, delete the PVC", over the volume holding the restored data.
 ///
-/// Gated by [`is_legacy_populator_status`], so a brand-new `Restore`'s first
-/// claim does not "adopt" the `Pending` park a zero-claim pass just wrote.
+/// Gated by [`legacy_adoption`], so a brand-new `Restore`'s first claim does not
+/// "adopt" the `Pending` park a zero-claim pass just wrote — while an in-flight
+/// legacy populate, whose status the old operator never got to advance, is still
+/// recognized by its live `prime-<uid>` and driven under its own Job name.
 async fn adopt_legacy_claims(
     ctx: &Context,
     restore: &Restore,
@@ -1523,9 +1525,15 @@ async fn adopt_legacy_claims(
     let Some(status) = restore.status.as_ref() else {
         return Ok(adopted);
     };
-    if !prev.is_empty() || !is_legacy_populator_status(status) {
+    if !prev.is_empty() {
         return Ok(adopted);
     }
+    // Exhaustive: a new adoption signal must decide what it means here.
+    let evidence = match legacy_adoption(status, &claimants.consumers, &claimants.primes) {
+        LegacyAdoption::PreFanoutStatus => "pre-fan-out status",
+        LegacyAdoption::InFlightPrime => "a live prime for a live claimant",
+        LegacyAdoption::No => return Ok(adopted),
+    };
     let Some(consumer) = legacy_claimant(&claimants.consumers, &claimants.primes) else {
         return Ok(adopted);
     };
@@ -1539,7 +1547,7 @@ async fn adopt_legacy_claims(
         .map(|_| legacy_job.as_str());
     if let Some(record) = adopt_legacy_claim(status, consumer, legacy) {
         tracing::info!(
-            %namespace, restore = %name, claim = %consumer.name_any(),
+            %namespace, restore = %name, claim = %consumer.name_any(), %evidence,
             "populator: adopted a pre-fan-out Restore status into status.claims"
         );
         adopted.insert(consumer.name_any(), record);

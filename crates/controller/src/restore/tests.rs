@@ -866,6 +866,163 @@ fn only_a_pre_fanout_status_is_adopted() {
     }))));
 }
 
+/// #443 final review, Important 2 — the status alone is not a sufficient
+/// adoption signal, so [`legacy_adoption`] adds a second one.
+///
+/// The pre-fan-out pass was `ensure_prime_pvc` → `run_restore_mover` (creates
+/// `{restore}-populate`) → `patch_status(Restoring)`. A `helm upgrade` rollout
+/// terminates the old operator at an ARBITRARY instant, so an in-flight populate
+/// is routinely left with the prime AND the Job created and the status still
+/// `Pending`. Gating on the status alone skipped adoption there and drove the
+/// claim `Fresh`, launching a SECOND mover into the prime `{restore}-populate`
+/// was still writing.
+///
+/// `status.target.pvcPrime` cannot be that signal: the legacy driver only ever
+/// wrote the `awaiting-claim` sentinel there, never a real prime name.
+#[test]
+fn an_in_flight_legacy_populate_is_adopted_from_its_live_prime() {
+    let status = |v: serde_json::Value| -> kopiur_api::RestoreStatus {
+        serde_json::from_value(v).expect("valid RestoreStatus")
+    };
+    let primes = |names: &[&str]| -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    };
+    let claimants = vec![adoption_claimant("data", "uid-a", false)];
+
+    // 1. A terminal legacy status adopts on the status alone, prime or not.
+    for phase in ["Restoring", "Completed", "Failed"] {
+        assert_eq!(
+            legacy_adoption(
+                &status(serde_json::json!({ "phase": phase })),
+                &claimants,
+                &primes(&[])
+            ),
+            LegacyAdoption::PreFanoutStatus,
+            "{phase}"
+        );
+    }
+
+    // 2. THE UPGRADE WINDOW: the old operator created `prime-uid-a` and the
+    //    `{restore}-populate` Job, then died before writing `Restoring`. The
+    //    status is the ordinary zero-claim park — sentinel included, which is
+    //    why the sentinel is useless as a signal — and the live prime is the
+    //    only evidence there is.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({
+                "phase": "Pending",
+                "target": { "pvcPrime": "awaiting-claim" }
+            })),
+            &claimants,
+            &primes(&["prime-uid-a"])
+        ),
+        LegacyAdoption::InFlightPrime
+    );
+    // …and with no phase written at all, which is the same window one patch
+    // earlier.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({})),
+            &claimants,
+            &primes(&["prime-uid-a"])
+        ),
+        LegacyAdoption::InFlightPrime
+    );
+
+    // 3. A brand-new `Restore`: no prime, no legacy status. Adopting here would
+    //    "adopt" the park a zero-claim pass just wrote.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({
+                "phase": "Pending",
+                "target": { "pvcPrime": "awaiting-claim" }
+            })),
+            &claimants,
+            &primes(&[])
+        ),
+        LegacyAdoption::No
+    );
+
+    // 4. A prime whose claimant is GONE is an orphan for the reaper, not an
+    //    in-flight handshake — the prime name is uid-keyed, so it cannot belong
+    //    to any live claimant here.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({ "phase": "Pending" })),
+            &claimants,
+            &primes(&["prime-uid-departed"])
+        ),
+        LegacyAdoption::No
+    );
+
+    // 5. A status that already carries `claims` is a NEWER write, never legacy —
+    //    otherwise every ordinary in-flight fan-out pass, which always has a live
+    //    prime for a live claimant, would re-adopt itself.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({
+                "phase": "Restoring",
+                "claims": { "data": { "phase": "Populating" } }
+            })),
+            &claimants,
+            &primes(&["prime-uid-a"])
+        ),
+        LegacyAdoption::No
+    );
+}
+
+/// The adopted record must carry the legacy Job even when the status has no
+/// phase — that `job` field is the whole point of adopting in the upgrade
+/// window, because it is what drives the claim `LegacyShared` instead of
+/// `Fresh`. And the `awaiting-claim` PARK SENTINEL must never be copied into the
+/// record as if it were a prime name.
+#[test]
+fn an_adopted_in_flight_claim_records_the_legacy_job_and_drops_the_sentinel() {
+    let status = |v: serde_json::Value| -> kopiur_api::RestoreStatus {
+        serde_json::from_value(v).expect("valid RestoreStatus")
+    };
+    let consumer = adoption_claimant("data", "uid-a", false);
+
+    let record = adopt_legacy_claim(
+        &status(serde_json::json!({
+            "phase": "Pending",
+            "target": { "pvcPrime": AWAITING_CLAIM_SENTINEL }
+        })),
+        &consumer,
+        Some("r-populate"),
+    )
+    .expect("an in-flight legacy claim adopts");
+    assert_eq!(record.job.as_deref(), Some("r-populate"));
+    assert_eq!(record.phase, Some(kopiur_api::RestoreClaimPhase::Pending));
+    assert_eq!(
+        record.pvc_prime, None,
+        "the park sentinel is not a prime name and must not outlive adoption"
+    );
+    assert_eq!(record.uid.as_deref(), Some("uid-a"));
+
+    // No phase at all still adopts, conservatively, as `Pending`.
+    let no_phase = adopt_legacy_claim(
+        &status(serde_json::json!({})),
+        &consumer,
+        Some("r-populate"),
+    )
+    .expect("a phase-less legacy status still adopts");
+    assert_eq!(no_phase.phase, Some(kopiur_api::RestoreClaimPhase::Pending));
+    assert_eq!(no_phase.job.as_deref(), Some("r-populate"));
+
+    // A REAL prime name is still carried through untouched.
+    let real = adopt_legacy_claim(
+        &status(serde_json::json!({
+            "phase": "Restoring",
+            "target": { "pvcPrime": "prime-uid-a" }
+        })),
+        &consumer,
+        None,
+    )
+    .expect("adopts");
+    assert_eq!(real.pvc_prime.as_deref(), Some("prime-uid-a"));
+}
+
 /// #443 review item 5 — an adopted `{restore}-populate` Job carries no
 /// `claimKey`, so when its DEFERRED source resolves the mover pins the
 /// TOP-LEVEL `status.resolved`. Adoption snapshots that field exactly once (when
@@ -2620,10 +2777,23 @@ fn adopt_legacy_claim_only_fires_on_a_legacy_shaped_status() {
         .insert("data".into(), claim(Some(P::Populated), None));
     assert_eq!(adopt_legacy_claim(&fanned, &claimant("u1"), None), None);
 
-    // No phase at all (a brand-new Restore) → nothing to adopt; the driver
-    // creates the record from the observed handshake instead.
+    // No phase at all now ADOPTS (#443 final review, Important 2). It used to
+    // return `None` on the theory that a phase-less status is a brand-new
+    // `Restore` — but a brand-new `Restore` no longer reaches this function at
+    // all: [`legacy_adoption`] answers `No` for it. The only caller that gets
+    // here with no phase is the upgrade window, where the old operator created
+    // the prime and the `{restore}-populate` Job and died before its first
+    // status patch. Refusing there drives the claim `Fresh` and puts a SECOND
+    // mover into that prime.
     let fresh = kopiur_api::RestoreStatus::default();
-    assert_eq!(adopt_legacy_claim(&fresh, &claimant("u1"), None), None);
+    let adopted_fresh = adopt_legacy_claim(&fresh, &claimant("u1"), Some("r-populate"))
+        .expect("the upgrade window adopts on the prime signal");
+    assert_eq!(
+        adopted_fresh.phase,
+        Some(P::Pending),
+        "drive it, do not settle it"
+    );
+    assert_eq!(adopted_fresh.job.as_deref(), Some("r-populate"));
 
     // An in-flight legacy populate is driven under ITS OWN Job name, so a second
     // mover is never launched into the same prime PVC.

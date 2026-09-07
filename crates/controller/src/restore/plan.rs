@@ -1152,6 +1152,74 @@ pub fn is_legacy_populator_status(status: &kopiur_api::RestoreStatus) -> bool {
     }
 }
 
+/// Why this pass adopts (or does not adopt) a pre-fan-out status into
+/// `status.claims`. The gate on [`super::adopt_legacy_claims`], pure and
+/// exhaustive (#443 final review, Important 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyAdoption {
+    /// The status itself is a pre-fan-out write — a pinned top-level
+    /// `resolved`, or a phase past resolution. See
+    /// [`is_legacy_populator_status`].
+    PreFanoutStatus,
+    /// The status says nothing, but a LIVE `prime-<uid>` this `Restore` owns
+    /// stands for a LIVE claimant: the old operator got as far as creating the
+    /// prime (and, right behind it, the `{restore}-populate` Job) and was
+    /// terminated before it could write `Restoring`.
+    InFlightPrime,
+    /// No evidence of a pre-fan-out pass. Drive every claim fresh.
+    No,
+}
+
+/// Whether to adopt a pre-fan-out status, and on what evidence. Pure.
+///
+/// [`is_legacy_populator_status`] alone is not enough. The pre-#443 pass was
+/// `ensure_prime_pvc` → `run_restore_mover` (creates `{restore}-populate`) →
+/// `patch_status(Restoring)`. A `helm upgrade` rollout terminates the old
+/// operator at an ARBITRARY instant, not only on a crash — so an in-flight
+/// populate is routinely left with the prime and the Job created and the status
+/// still `Pending`/`AwaitingPvcDataSourceRef`, with no top-level `resolved`.
+/// Gating on the status alone skips adoption there, drives the claim `Fresh`,
+/// and launches a SECOND mover under `populate_job_name(uid)` into the very
+/// prime `{restore}-populate` is still writing: two kopia restores into one
+/// filesystem, which is what [`super::JobNameReuse::LegacyShared`] exists to
+/// prevent.
+///
+/// A live prime is the sound second signal. `status.target.pvcPrime` is NOT:
+/// the pre-fan-out driver only ever wrote the literal `awaiting-claim` sentinel
+/// there, so "set and not the sentinel" is never true for a legacy object.
+/// Legacy primes carry the same `op=restore-populate` label and `Restore`
+/// ownerRef as new ones, so they are already in `claimants.primes`, and the
+/// prime name is uid-keyed — so requiring a LIVE claimant for it distinguishes
+/// an in-flight handshake from an orphan the reaper should collect.
+///
+/// Over-adopting on this signal is harmless: a NEW-code prime caught in its own
+/// `ensure_prime_pvc`→patch window seeds a `Pending` record with the live uid
+/// and no legacy Job, which drives `Fresh` under its per-uid name exactly as
+/// before.
+pub fn legacy_adoption(
+    status: &kopiur_api::RestoreStatus,
+    consumers: &[PersistentVolumeClaim],
+    live_primes: &std::collections::BTreeSet<String>,
+) -> LegacyAdoption {
+    use kube::ResourceExt;
+    // Anything already fanned out is emphatically not legacy. (Checked here as
+    // well as inside `is_legacy_populator_status`, because the prime signal
+    // below would otherwise fire on every ordinary in-flight fan-out pass.)
+    if !status.claims.is_empty() {
+        return LegacyAdoption::No;
+    }
+    if is_legacy_populator_status(status) {
+        return LegacyAdoption::PreFanoutStatus;
+    }
+    if consumers.iter().any(|c| {
+        c.uid()
+            .is_some_and(|uid| live_primes.contains(&prime_pvc_name(&uid)))
+    }) {
+        return LegacyAdoption::InFlightPrime;
+    }
+    LegacyAdoption::No
+}
+
 /// Which claimant a LEGACY (pre-fan-out) status belongs to — the one claim the
 /// old single-claim driver was actually about. Pure.
 ///
@@ -1194,6 +1262,13 @@ pub fn legacy_claimant<'a>(
     }
 }
 
+/// The `status.target.pvcPrime` value a zero-claim populator parks with. It is a
+/// SENTINEL, not a prime name — the pre-fan-out driver never wrote a real
+/// `prime-<uid>` there — which is why it is neither an adoption signal
+/// ([`legacy_adoption`]) nor a value worth copying into a claim record
+/// ([`adopt_legacy_claim`]).
+pub const AWAITING_CLAIM_SENTINEL: &str = "awaiting-claim";
+
 /// The status body for a populator `Restore` that NOTHING claims: the
 /// Restore-level `AwaitingClaim=True` park, plus an explicit JSON `null` for
 /// every claim record whose claimant is gone. Pure.
@@ -1224,7 +1299,7 @@ pub fn awaiting_claim_status(
     );
     let mut status =
         restore_ready_status_on(restore, &conditions, RestorePhase::Pending, reason, message);
-    status["target"] = serde_json::json!({ "pvcPrime": "awaiting-claim" });
+    status["target"] = serde_json::json!({ "pvcPrime": AWAITING_CLAIM_SENTINEL });
     if !gone.is_empty() {
         let mut nulls = serde_json::Map::new();
         for claim in gone {
@@ -1504,8 +1579,8 @@ pub fn claim_artifacts_reapable(reason: Option<&str>) -> bool {
 /// Seed a claim record from a LEGACY single-claim `Restore` status — the upgrade
 /// path (#443).
 ///
-/// Fires only when `status.claims` is empty and the object already carries a
-/// phase, i.e. a `Restore` written by a pre-fan-out operator. Existing
+/// Fires only when `status.claims` is empty, i.e. a `Restore` written by a
+/// pre-fan-out operator. Existing
 /// single-PVC populators then keep working with zero spec change and no status
 /// regression: an in-flight populate is adopted and driven (under its legacy Job
 /// name, via `legacy_job`, so a second mover is never launched into the same
@@ -1525,15 +1600,26 @@ pub fn adopt_legacy_claim(
     if !status.claims.is_empty() {
         return None;
     }
-    let phase = status.phase.as_ref()?;
     let ready = status
         .conditions
         .iter()
         .find(|c| c.type_ == crate::consts::READY_CONDITION);
     let reason = ready.map(|c| c.reason.as_str());
+    // A status with NO phase at all still adopts, because adoption on the
+    // [`LegacyAdoption::InFlightPrime`] signal is exactly the case where the old
+    // operator was terminated before it wrote one. What the record is FOR there
+    // is its `job` field: without it the claim drives `Fresh` and a second mover
+    // enters the prime. `Pending` is what `legacy_claim_phase` maps an
+    // unreadable phase to anyway — drive the claim, do not settle it.
+    let phase = status
+        .phase
+        .as_ref()
+        .map_or(RestoreClaimPhase::Pending, |p| {
+            legacy_claim_phase(p, reason)
+        });
     Some(RestoreClaimStatus {
         uid: consumer.metadata.uid.clone(),
-        phase: Some(legacy_claim_phase(phase, reason)),
+        phase: Some(phase),
         reason: reason.map(str::to_string),
         message: ready.map(|c| c.message.clone()),
         source_path: status
@@ -1542,7 +1628,15 @@ pub fn adopt_legacy_claim(
             .and_then(|r| r.identity.as_ref())
             .and_then(|i| i.source_path.clone()),
         resolved: status.resolved.clone(),
-        pvc_prime: status.target.as_ref().and_then(|t| t.pvc_prime.clone()),
+        // `awaiting-claim` is the zero-claim PARK sentinel, not a prime name.
+        // Copying it verbatim leaves the literal string in
+        // `status.claims.<pvc>.pvcPrime` of a `Settled` record forever, for
+        // every legacy Restore that was ever parked at zero claims.
+        pvc_prime: status
+            .target
+            .as_ref()
+            .and_then(|t| t.pvc_prime.clone())
+            .filter(|p| p != AWAITING_CLAIM_SENTINEL),
         job: legacy_job.map(str::to_string),
         wait_started_at: status.wait_started_at.clone(),
         // Mover-owned; a controller-side adoption never claims to have written
