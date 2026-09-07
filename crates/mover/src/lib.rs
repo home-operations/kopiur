@@ -12,4 +12,5 @@ pub mod repo_meta;
 pub mod resolve;
 pub mod serve;
 pub mod status;
+pub mod stream;
 pub mod workspec;

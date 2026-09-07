@@ -102,12 +102,107 @@ impl Operation {
     }
 }
 
+/// How a [`SnapshotOp`]'s bytes are produced. Resolved from
+/// [`SnapshotOp::stdin`] by [`snapshot_input`].
+///
+/// An enum rather than an `Option` check at each use site: the two inputs need
+/// completely different execution (walk a mounted path vs. exec a pod and pipe its
+/// stdout), and matching exhaustively is what stops a future third input from
+/// silently falling into the filesystem path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotInput<'a> {
+    /// Snapshot whatever is mounted at `source_path` (the PVC/NFS path).
+    Filesystem,
+    /// Exec a command in a workload pod and pipe its stdout into kopia; nothing is
+    /// mounted and `source_path` is the VIRTUAL root the artifact is recorded under.
+    Stream(&'a StreamProducerSpec),
+}
+
+/// THE resolver for how a backup run gets its bytes.
+pub fn snapshot_input(op: &SnapshotOp) -> SnapshotInput<'_> {
+    match &op.stdin {
+        Some(spec) => SnapshotInput::Stream(spec),
+        None => SnapshotInput::Filesystem,
+    }
+}
+
+/// Produce a backup's bytes by exec'ing a command in a running workload pod.
+///
+/// The controller resolves the selector into this spec at plan time and the mover
+/// re-resolves the pod at exec time — the Job can start minutes after the Snapshot
+/// CR was written, by which point the pod may have been rescheduled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamProducerSpec {
+    /// Namespace to resolve `pod_selector` in.
+    pub namespace: String,
+    /// Rendered label-selector query (`k=v,...`) identifying the workload pod.
+    pub pod_selector: String,
+    /// Container to exec in; absent uses the pod's default container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// argv to run. Element 0 is the program; this is not a shell line.
+    pub command: Vec<String>,
+    /// Name of the single virtual file the stdout is stored as.
+    pub file_name: String,
+    /// Wall-clock bound on the producer, in seconds.
+    pub timeout_seconds: u64,
+}
+
+/// Consume a restored virtual file by feeding it to a command's stdin in a running
+/// pod — the mirror of [`StreamProducerSpec`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamConsumerSpec {
+    /// Namespace to resolve `pod_selector` in.
+    pub namespace: String,
+    /// Rendered label-selector query identifying the target pod.
+    pub pod_selector: String,
+    /// Container to exec in; absent uses the pod's default container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// argv to run; it receives the restored bytes on stdin.
+    pub command: Vec<String>,
+    /// Which virtual file inside the snapshot to read back.
+    pub file_name: String,
+    /// Wall-clock bound on the consumer, in seconds.
+    pub timeout_seconds: u64,
+}
+
+/// Where a [`RestoreOp`] writes. Resolved from [`RestoreOp::stdout`] by
+/// [`restore_output`]; exhaustive for the same reason as [`SnapshotInput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutput<'a> {
+    /// Write the snapshot's files into the mounted `target_path`.
+    Filesystem,
+    /// Stream one virtual file into a command's stdin in a workload pod.
+    Stream(&'a StreamConsumerSpec),
+}
+
+/// THE resolver for where a restore run puts its bytes.
+pub fn restore_output(op: &RestoreOp) -> RestoreOutput<'_> {
+    match &op.stdout {
+        Some(spec) => RestoreOutput::Stream(spec),
+        None => RestoreOutput::Filesystem,
+    }
+}
+
 /// Payload for a backup run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotOp {
     /// Absolute path inside the mover pod to snapshot (e.g. `/data`).
+    ///
+    /// With `stdin` set this is instead the VIRTUAL root kopia records the streamed
+    /// artifact under (e.g. `/stream/postgres.sql`); nothing is read from the pod's
+    /// filesystem.
     pub source_path: String,
+    /// Present ⇒ this run's bytes come from a command's stdout rather than from a
+    /// mounted path. Read it through [`snapshot_input`], which turns it into the
+    /// exhaustively-matched [`SnapshotInput`]. `#[serde(default)]` so work-spec JSON
+    /// written before this field existed still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<StreamProducerSpec>,
     /// Tags to attach to the snapshot (`key:value` pairs).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
@@ -455,7 +550,14 @@ pub struct RestoreOp {
     /// Which snapshot to restore: a controller-resolved id, or an in-Job selector.
     pub source: RestoreSelection,
     /// Absolute path inside the mover pod to restore into (e.g. `/data`).
+    ///
+    /// Ignored when `stdout` is set: a stream restore writes to no filesystem at all.
     pub target_path: String,
+    /// Present ⇒ restore ONE virtual file out of the snapshot and pipe it into a
+    /// command's stdin instead of writing files to `target_path`. Read it through
+    /// [`restore_output`]. `#[serde(default)]` so older work-spec JSON still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<StreamConsumerSpec>,
     /// Stable identity anchors for the referenced snapshot, used to self-heal a
     /// stale id (kopia rewrites the manifest id on pin) when a
     /// [`RestoreSelection::Snapshot`] restore reports the id not found. Empty ⇒ no
@@ -521,6 +623,7 @@ impl RestoreOp {
     ///
     /// let op = RestoreOp {
     ///     source: RestoreSelection::Snapshot("k1".into()),
+    ///     stdout: None,
     ///     target_path: "/data".into(),
     ///     anchor: Default::default(),
     ///     ignore_permission_errors: Some(false),
@@ -2311,6 +2414,7 @@ impl Default for MoverOptions {
 /// let spec = MoverWorkSpec {
 ///     version: 1,
 ///     operation: Operation::Snapshot(SnapshotOp {
+///         stdin: None,
 ///         source_path: "/data".into(),
 ///         tags: BTreeMap::new(),
 ///         policy: Default::default(),

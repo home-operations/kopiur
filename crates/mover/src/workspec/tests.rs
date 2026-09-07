@@ -38,6 +38,7 @@ fn backup_roundtrip() {
     let spec = MoverWorkSpec {
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {
+            stdin: None,
             source_path: "/data".into(),
             tags,
             policy: Default::default(),
@@ -69,6 +70,7 @@ fn snapshot_op_create_knobs_roundtrip_wire_shape_and_map_to_kopia() {
     // names, and `create_options()` carries them into the kopia client's
     // `SnapshotCreateOptions` unchanged.
     let op = SnapshotOp {
+        stdin: None,
         source_path: "/data".into(),
         tags: BTreeMap::new(),
         policy: Default::default(),
@@ -117,6 +119,7 @@ fn restore_roundtrip() {
     let spec = MoverWorkSpec {
         version: 2,
         operation: Operation::Restore(RestoreOp {
+            stdout: None,
             source: RestoreSelection::Snapshot("abc123".into()),
             target_path: "/data".into(),
             anchor: SnapshotAnchor {
@@ -212,6 +215,7 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
     let spec = MoverWorkSpec {
         version: 2,
         operation: Operation::Restore(RestoreOp {
+            stdout: None,
             source: RestoreSelection::Resolve(RestoreSelector {
                 username: "restore".into(),
                 hostname: "prod".into(),
@@ -752,6 +756,7 @@ fn externally_tagged_operation_shape() {
     let spec = MoverWorkSpec {
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {
+            stdin: None,
             source_path: "/data".into(),
             tags: BTreeMap::new(),
             policy: Default::default(),
@@ -927,6 +932,7 @@ fn object_store_backends_convert_and_roundtrip() {
 fn restore_op_maps_options_and_defaults_absent() {
     // Options present → mapped onto the kopia client options.
     let op = RestoreOp {
+        stdout: None,
         source: RestoreSelection::Snapshot("s".into()),
         target_path: "/data".into(),
         anchor: SnapshotAnchor::default(),

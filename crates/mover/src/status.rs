@@ -168,6 +168,10 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::RestoreNoSnapshot { .. }
             | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::ScratchNotWritable { .. }
+            // A failed dump command / unresolvable pod is the user's config, not a
+            // transient fault: re-running the same Job re-runs the same command.
+            | MoverError::StreamPodResolve { .. }
+            | MoverError::StreamExecFailed { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }

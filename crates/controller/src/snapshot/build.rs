@@ -61,55 +61,96 @@ pub(super) fn build_backup_run(
     // `/pvc/<ns>/<name>` under `sourcePathStrategy: PvcNamespacedName` for a
     // selector source); NFS: the export path by default; either overridable by
     // `sourcePathOverride`.
-    let (source_path, source_volume) = match (&eff.pvc, &source.nfs) {
-        (Some(pvc), None) => {
-            let path = eff
-                .kopia_source_path(strategy)
-                .unwrap_or_else(|| format!("/pvc/{}", pvc.name));
-            (
-                path.clone(),
-                VolumeMountSpec::pvc(pvc.name.clone(), path, read_only),
-            )
-        }
-        (None, Some(nfs)) => {
-            // The export's server-side path (`nfs.path`) is what the volume is
-            // mounted FROM; it is NOT necessarily a valid in-container mount
-            // path. An NFSv4 pseudo-root export ("/") must not be mounted at "/"
-            // in the container — that mounts over the rootfs and the pod fails to
-            // start. Remap a "/" target to a safe path; kopia snapshots there.
-            let requested = source
+    // Exhaustive over the source form (no `_ =>`): a new source kind cannot compile
+    // until it decides what path kopia records and what — if anything — is mounted.
+    let (source_path, source_volume, stdin) = match kopiur_api::source_shape(source)
+        .map_err(|e| Error::Validation(e.to_string()))?
+    {
+        // A stream source mounts NOTHING. `source_path` is the virtual root
+        // (`/stream/<fileName>` unless overridden) that kopia records the artifact
+        // under, and the bytes arrive on the mover's stdin from a pod exec.
+        kopiur_api::SourceShape::Stream(stream) => {
+            let path = source
                 .source_path_override
                 .clone()
-                .unwrap_or_else(|| nfs.path.clone());
-            let mount_path = if requested == "/" {
-                crate::consts::NFS_SOURCE_MOUNT_PATH.to_string()
-            } else {
-                requested
-            };
+                .unwrap_or_else(|| kopiur_api::stream_source_path(stream));
+            let selector = io::label_selector_to_string(&stream.workload_exec.pod_selector);
             (
-                mount_path.clone(),
-                VolumeMountSpec::nfs(nfs.server.clone(), nfs.path.clone(), mount_path, read_only),
+                path,
+                None,
+                Some(kopiur_mover::workspec::StreamProducerSpec {
+                    namespace: namespace.to_string(),
+                    pod_selector: selector,
+                    container: stream.workload_exec.container.clone(),
+                    command: stream.workload_exec.command.clone(),
+                    file_name: stream.file_name.clone(),
+                    timeout_seconds: stream
+                        .workload_exec
+                        .timeout
+                        .as_deref()
+                        .and_then(kopiur_api::duration::parse_go_duration)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(kopiur_api::snapshot_policy::DEFAULT_STREAM_TIMEOUT_SECS),
+                }),
             )
         }
-        // A `pvcSelector` source reaches here ONLY when this Snapshot carries no
-        // `spec.source` pin — i.e. someone applied a bare `policyRef` Snapshot
-        // against a selector policy, or edited a `pvc:` policy into a selector
-        // after its Snapshots existed (which admission never sees). Refuse with
-        // the fix rather than the old `invariant violated … please report it`,
-        // which is what #346 actually looked like to users.
-        (None, None) if source.pvc_selector.is_some() => {
-            return Err(Error::Validation(format!(
-                "SnapshotPolicy `{}` source #{} is a `pvcSelector`, which expands to one Snapshot                  per matched PVC — but this Snapshot carries no `spec.source` saying which PVC it                  covers, so there is nothing unambiguous to back up. Create it with `kubectl                  kopiur snapshot now --policy {0}` or let a SnapshotSchedule fire it; both expand                  the selector for you.",
-                config.name_any(),
-                eff.index,
-            )));
-        }
-        // Genuinely mutually-exclusive/empty shapes, which admission does reject.
-        _ => {
-            return Err(Error::Invariant(
-                "backup mover path requires exactly one of source.pvc or source.nfs".into(),
-            ));
-        }
+        _ => match (&eff.pvc, &source.nfs) {
+            (Some(pvc), None) => {
+                let path = eff
+                    .kopia_source_path(strategy)
+                    .unwrap_or_else(|| format!("/pvc/{}", pvc.name));
+                (
+                    path.clone(),
+                    Some(VolumeMountSpec::pvc(pvc.name.clone(), path, read_only)),
+                    None,
+                )
+            }
+            (None, Some(nfs)) => {
+                // The export's server-side path (`nfs.path`) is what the volume is
+                // mounted FROM; it is NOT necessarily a valid in-container mount
+                // path. An NFSv4 pseudo-root export ("/") must not be mounted at "/"
+                // in the container — that mounts over the rootfs and the pod fails to
+                // start. Remap a "/" target to a safe path; kopia snapshots there.
+                let requested = source
+                    .source_path_override
+                    .clone()
+                    .unwrap_or_else(|| nfs.path.clone());
+                let mount_path = if requested == "/" {
+                    crate::consts::NFS_SOURCE_MOUNT_PATH.to_string()
+                } else {
+                    requested
+                };
+                (
+                    mount_path.clone(),
+                    Some(VolumeMountSpec::nfs(
+                        nfs.server.clone(),
+                        nfs.path.clone(),
+                        mount_path,
+                        read_only,
+                    )),
+                    None,
+                )
+            }
+            // A `pvcSelector` source reaches here ONLY when this Snapshot carries no
+            // `spec.source` pin — i.e. someone applied a bare `policyRef` Snapshot
+            // against a selector policy, or edited a `pvc:` policy into a selector
+            // after its Snapshots existed (which admission never sees). Refuse with
+            // the fix rather than the old `invariant violated … please report it`,
+            // which is what #346 actually looked like to users.
+            (None, None) if source.pvc_selector.is_some() => {
+                return Err(Error::Validation(format!(
+                    "SnapshotPolicy `{}` source #{} is a `pvcSelector`, which expands to one Snapshot                  per matched PVC — but this Snapshot carries no `spec.source` saying which PVC it                  covers, so there is nothing unambiguous to back up. Create it with `kubectl                  kopiur snapshot now --policy {0}` or let a SnapshotSchedule fire it; both expand                  the selector for you.",
+                    config.name_any(),
+                    eff.index,
+                )));
+            }
+            // Genuinely mutually-exclusive/empty shapes, which admission does reject.
+            _ => {
+                return Err(Error::Invariant(
+                    "backup mover path requires exactly one of source.pvc or source.nfs".into(),
+                ));
+            }
+        },
     };
 
     let creds_secrets = io::plain_creds(io::mover_creds_secrets(&repo.backend, &repo.encryption));
@@ -127,6 +168,7 @@ pub(super) fn build_backup_run(
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {
             source_path: source_path.clone(),
+            stdin,
             tags: tags_for(backup, config),
             // Flattened SnapshotPolicy policy knobs → kopia `policy set` flags
             // (compression / files / errorHandling / upload / extraArgs). Wired so
@@ -163,7 +205,6 @@ pub(super) fn build_backup_run(
         throttle: crate::io::throttle_spec(repo.mover_defaults.as_ref()),
     };
 
-    let source_volume = Some(source_volume);
     let repo_volume =
         io::filesystem_repo_mount_source(&repo.backend).map(|source| VolumeMountSpec {
             source,

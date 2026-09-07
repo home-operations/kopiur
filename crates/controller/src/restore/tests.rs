@@ -2288,6 +2288,7 @@ fn restore_flags_enable_file_deletion_regression() {
     // End-to-end through the mover's RestoreOp -> kopia client RestoreOptions ->
     // argv, proving the whole chain (not just this one hop).
     let op = RestoreOp {
+        stdout: None,
         source: RestoreSelection::Snapshot("s".into()),
         target_path: "/data".into(),
         anchor: Default::default(),

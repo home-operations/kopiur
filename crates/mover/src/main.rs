@@ -589,15 +589,65 @@ async fn run_operation(
             // real duration — kopia hashes the whole tree even when it decides
             // not to write a manifest, so this is not free and is worth showing.
             let started_at = chrono::Utc::now();
-            let outcome = client
-                .snapshot_create_outcome_with(
-                    &op.source_path,
-                    &op.tags,
-                    Some(&override_source),
-                    &op.create_options(),
-                )
-                .await
-                .map_err(kopia(KopiaOp::SnapshotCreate))?;
+            // Exhaustive: where the bytes come from decides the whole execution.
+            // A filesystem run walks the mounted path; a stream run execs a command
+            // in a workload pod and pipes its stdout in. A new input kind cannot
+            // compile until it is given one.
+            let outcome = match kopiur_mover::workspec::snapshot_input(op) {
+                kopiur_mover::workspec::SnapshotInput::Filesystem => client
+                    .snapshot_create_outcome_with(
+                        &op.source_path,
+                        &op.tags,
+                        Some(&override_source),
+                        &op.create_options(),
+                    )
+                    .await
+                    .map_err(kopia(KopiaOp::SnapshotCreate))?,
+                kopiur_mover::workspec::SnapshotInput::Stream(producer) => {
+                    let kube_client =
+                        kube::Client::try_default()
+                            .await
+                            .map_err(|e| MoverError::KubeClient {
+                                source: Box::new(e),
+                            })?;
+                    // `failure` is how the producer's verdict escapes the closure:
+                    // the kopia runner only learns Commit/Abort, and the actionable
+                    // text has to reach the status. It holds ONLY the verdict and a
+                    // bounded stderr tail — never the dumped bytes.
+                    let mut failure: Option<String> = None;
+                    let res = client
+                        .snapshot_create_stdin_outcome_with(
+                            &op.source_path,
+                            &producer.file_name,
+                            &op.tags,
+                            Some(&override_source),
+                            &op.create_options(),
+                            async |stdin: &mut tokio::process::ChildStdin| {
+                                Ok(kopiur_mover::stream::feed_from_pod(
+                                    &kube_client,
+                                    producer,
+                                    stdin,
+                                    &mut failure,
+                                )
+                                .await)
+                            },
+                        )
+                        .await;
+                    match res {
+                        Ok(o) => o,
+                        Err(e) => {
+                            // A producer failure is the user's dump command, not
+                            // kopia: report it as such so the status names the right
+                            // thing to fix. kopia aborted before writing a manifest,
+                            // so nothing partial survives either way.
+                            return Err(match failure {
+                                Some(detail) => MoverError::StreamExecFailed { detail },
+                                None => kopia(KopiaOp::SnapshotCreate)(e),
+                            });
+                        }
+                    }
+                }
+            };
             // Exhaustive: a deduped run and a real one are BOTH successes but are
             // not interchangeable, and the difference is invisible in the happy
             // path. Matching here is what stops a run that owns no manifest from
@@ -647,6 +697,13 @@ async fn run_operation(
             Ok(StatusUpdate::succeeded_backup(&result, chrono::Utc::now()))
         }
         Operation::Restore(op) => {
+            // Where the bytes GO is decided first: a stream restore never touches a
+            // filesystem, so it does not share the mounted-target machinery below.
+            if let kopiur_mover::workspec::RestoreOutput::Stream(consumer) =
+                kopiur_mover::workspec::restore_output(op)
+            {
+                return restore_stream(client, op, consumer).await;
+            }
             // Exactly one source kind (externally tagged): a controller-resolved id,
             // or an in-Job selector to resolve here. Exhaustive — a new variant
             // can't compile until handled.
@@ -755,6 +812,82 @@ async fn run_operation(
 /// `NotFound`, re-resolve the live id from the snapshot's stable anchors
 /// ([`RestoreOp::anchor`]) and retry once. Returns the id actually restored (for
 /// `status.logTail`).
+/// Restore ONE virtual file out of a snapshot straight into a command's stdin.
+///
+/// Resolves the snapshot to its ROOT OBJECT id (not the manifest id — kopia's
+/// `<root>/<name>` sub-path form only accepts the former; a manifest id fails with
+/// "parent is not a directory") and streams `kopia show <root>/<fileName>` into the
+/// exec. Both halves must succeed: a `psql` that died halfway leaves a half-loaded
+/// database, and calling that a completed restore would be worse than failing.
+async fn restore_stream(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    consumer: &kopiur_mover::workspec::StreamConsumerSpec,
+) -> Result<StatusUpdate> {
+    // Only a controller-resolved id is supported: the deferred `Resolve` path pins
+    // its choice through the StatusReporter, which this path does not carry. The
+    // controller resolves a streamExec restore to a concrete snapshot before the Job.
+    let snapshot_id = match &op.source {
+        RestoreSelection::Snapshot(id) => id.clone(),
+        RestoreSelection::Resolve(sel) => {
+            let filter = SnapshotSource {
+                host: sel.hostname.clone(),
+                user_name: sel.username.clone(),
+                path: sel.source_path.clone().unwrap_or_default(),
+            };
+            let mut list = client
+                .snapshot_list(Some(&filter))
+                .await
+                .map_err(|source| MoverError::Kopia {
+                    op: KopiaOp::RestoreSnapshotList,
+                    source,
+                })?;
+            list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
+            let cutoff = sel
+                .as_of
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            let candidates = filter_as_of(list, cutoff);
+            pick_offset(candidates, sel.offset)
+                .ok_or_else(|| MoverError::RestoreNoSnapshot {
+                    identity: filter.identity(),
+                })?
+                .id
+        }
+    };
+
+    // The sub-path form needs the ROOT ENTRY object id, so look the snapshot up.
+    let listed = client
+        .snapshot_list_all()
+        .await
+        .map_err(|source| MoverError::Kopia {
+            op: KopiaOp::RestoreSnapshotList,
+            source,
+        })?;
+    let root_obj = listed
+        .iter()
+        .find(|e| e.id == snapshot_id)
+        .and_then(|e| e.root_entry.as_ref())
+        .map(|r| r.obj.clone())
+        .ok_or_else(|| MoverError::StreamExecFailed {
+            detail: format!(
+                "snapshot `{snapshot_id}` could not be resolved to a root object, so the file \
+                 `{}` inside it cannot be addressed",
+                consumer.file_name
+            ),
+        })?;
+    let object_id = format!("{root_obj}/{}", consumer.file_name);
+
+    let kube_client = kube::Client::try_default()
+        .await
+        .map_err(|e| MoverError::KubeClient {
+            source: Box::new(e),
+        })?;
+    kopiur_mover::stream::restore_into_pod(&kube_client, client, consumer, &object_id).await?;
+    Ok(StatusUpdate::completed(&snapshot_id, chrono::Utc::now()))
+}
+
 async fn restore_with_heal(
     client: &KopiaClient,
     op: &RestoreOp,

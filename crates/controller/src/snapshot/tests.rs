@@ -4371,6 +4371,7 @@ fn sample_backup_work_spec() -> kopiur_mover::workspec::MoverWorkSpec {
     MoverWorkSpec {
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {
+            stdin: None,
             source_path: "/data".into(),
             tags: BTreeMap::new(),
             policy: Default::default(),
