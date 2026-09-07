@@ -29,7 +29,7 @@ use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kopiur_api::{Restore, Snapshot, SnapshotPolicy, SnapshotSchedule};
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 use kube::ResourceExt;
-use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use kube::api::{Api, DeleteParams, PostParams};
 
 /// A THIRD distinct `backup=` label value, alongside `multi_pvc_group.rs`'s
 /// `fanout` and `group`.
@@ -83,28 +83,35 @@ fn selector_policy_json(name: &str, strategy: &str, extra: serde_json::Value) ->
     )
 }
 
-/// The `Snapshot` CRs a policy produced, by its config label.
-async fn children_of(client: &kube::Client, policy: &str) -> Vec<Snapshot> {
-    let api: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    api.list(&ListParams::default().labels(&format!("kopiur.home-operations.com/config={policy}")))
-        .await
-        .expect("list Snapshots")
-        .items
-}
-
 /// Back the two labelled source PVCs up under one selector policy, then DELETE
 /// them — the disaster this file recovers from. Leaves the repository holding
 /// one kopia source path per volume.
 ///
-/// Idempotent enough to survive a re-run: the repo/policy creates tolerate an
-/// existing object, and the source PVCs are re-created each time.
+/// **Fully idempotent, because every test in this file calls it.** Three things
+/// make that true, and each was a real failure in review:
+///
+/// * `clear_scenario_leftovers` drops the schedule, the policy and the previous
+///   call's `Snapshot` CRs. Without it the children accumulate (children are
+///   `Retain`ed on schedule deletion) and the "exactly two children" wait can
+///   never be satisfied a second time.
+/// * `drop_csi_pvc` removes each source PVC **and its seed Pod**, and waits.
+///   Without it the `Succeeded` seed Pod survives, the next `create` fails
+///   `AlreadyExists`, the fresh PVC binds EMPTY, and every marker assertion in
+///   the file fails for a reason unrelated to what it tests. It also clears a
+///   PVC left behind unlabelled by test 2's `target.pvc`, which would otherwise
+///   make the selector match one volume instead of two.
+/// * `csi_pvc_with_data` now waits for its seed Pod to SUCCEED, not merely for
+///   the PVC to bind, so the backup below can never capture an empty volume.
 async fn seed_two_member_backups(client: &kube::Client) {
     ensure_repo(client, REPO_SUBPATH).await;
+    clear_scenario_leftovers(client, SCHEDULE, POLICY).await;
+    for (name, _) in SOURCES {
+        drop_csi_pvc(client, name).await;
+    }
     let repos: Api<kopiur_api::Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let schedules: Api<SnapshotSchedule> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
 
     create_idempotent(
         &repos,
@@ -179,23 +186,11 @@ async fn seed_two_member_backups(client: &kube::Client) {
     );
 
     // Stop the schedule so nothing re-snapshots the restored volumes mid-test,
-    // and delete the sources: the restore has to bring them back.
+    // and delete the sources (with their seed pods): the restore has to bring
+    // them back.
     let _ = schedules.delete(SCHEDULE, &DeleteParams::default()).await;
     for (name, _) in SOURCES {
-        let _ = pvcs.delete(name, &DeleteParams::default()).await;
-        let _ = pvcs
-            .delete(&format!("{name}-seed"), &DeleteParams::default())
-            .await;
-    }
-    for (name, _) in SOURCES {
-        wait_until(
-            &format!("source PVC {name} is gone"),
-            default_timeout(),
-            poll_interval(),
-            || async { Ok(pvcs.get_opt(name).await?.is_none().then_some(())) },
-        )
-        .await
-        .unwrap_or_else(|e| panic!("source PVC {name} must be deleted before the restore: {e}"));
+        drop_csi_pvc(client, name).await;
     }
 }
 
@@ -454,6 +449,15 @@ async fn a_direct_target_derives_its_member_path_and_honors_the_override() {
 
     let _ = restores.delete(derived, &DeleteParams::default()).await;
     let _ = restores.delete(overridden, &DeleteParams::default()).await;
+    // Both target PVCs were created by the OPERATOR (`target.pvc`), so neither
+    // carries the selector label. Leaving `alpha` behind would make the next
+    // `seed_two_member_backups` adopt an unlabelled volume and fan out to ONE
+    // member instead of two — `drop_csi_pvc` there also covers it, but a test
+    // that cleans up its own objects does not depend on that.
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    for pvc in [alpha, overridden_pvc] {
+        let _ = pvcs.delete(pvc, &DeleteParams::default()).await;
+    }
 }
 
 /// Run a one-shot pod asserting `claim`'s `marker.txt` holds `expect`.
@@ -586,10 +590,14 @@ async fn an_ambiguous_policy_fails_the_claim_closed_and_names_the_fix() {
     let _ = policies.delete(ambiguous, &DeleteParams::default()).await;
 }
 
-/// **Test 4 — sibling isolation and re-arm.** One claim fails (its
-/// `fromPolicy.sourcePath` names a member that does not exist, under
-/// `onMissingSnapshot: Fail`) while its sibling still binds; deleting and
-/// re-creating the failed PVC re-arms that claim.
+/// **Test 4 — sibling isolation and re-arm.** One claim fails while its sibling
+/// still binds; deleting and re-creating the failed PVC re-arms that claim.
+///
+/// The failure is induced by the claim's NAME, not by an override: this claiming
+/// PVC is called `e2e-popfan-missing`, so the per-PVC derivation resolves
+/// `/pvc/e2e-popfan-missing` — a member path the policy never backed up — and
+/// `onMissingSnapshot: Fail` with a short `waitTimeout` turns that into a
+/// terminal claim failure inside the test's budget.
 ///
 /// This is the behavior the `phase_is_terminal_at_guard` relaxation exists for:
 /// before #443 a `Failed` populator short-circuited the whole reconcile, so the

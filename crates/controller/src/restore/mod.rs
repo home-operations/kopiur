@@ -31,16 +31,16 @@ use kopiur_mover::workspec::{
 
 use crate::config;
 use crate::consts::{
-    ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CLAIMS_OBSERVED_REASON,
-    CREDENTIALS_AVAILABLE_CONDITION, CREDENTIALS_PROJECTED_REASON, INHERIT_FALLBACK_REASON,
-    MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION, MISSING_RECORDED_IDENTITY_REASON,
-    MOVER_JOB_FAILED_REASON, MOVER_PERMITTED_CONDITION, MOVER_POD_WEDGED_REASON,
-    NO_SNAPSHOT_CONTINUE_REASON, ORPHANED_PRIME_REAPED_REASON, POPULATE_HIJACKED_REASON,
-    PRIVILEGED_MOVER_NOT_PERMITTED_REASON, RECORDED_APPLIED_REASON, RECORDED_PINNED_NO_UID_REASON,
-    RECREATE_CLAIM_TO_RESTORE_ACTION, RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION,
-    RESTORE_SNAPSHOT_NOT_FOUND_REASON, RESTORE_SOURCE_RESOLVED_REASON,
-    SECURITY_CONTEXT_COMPATIBLE_REASON, SECURITY_CONTEXT_INHERITED_CONDITION,
-    SET_EXPLICIT_MOVER_CONTEXT_ACTION, SOURCE_PATH_AMBIGUOUS_REASON,
+    ALLOW_PRIVILEGED_MOVER_ACTION, API_VERSION, CREDENTIALS_AVAILABLE_CONDITION,
+    CREDENTIALS_PROJECTED_REASON, INHERIT_FALLBACK_REASON, MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
+    MISSING_RECORDED_IDENTITY_REASON, MOVER_JOB_FAILED_REASON, MOVER_PERMITTED_CONDITION,
+    MOVER_POD_WEDGED_REASON, NO_SNAPSHOT_CONTINUE_REASON, ORPHANED_PRIME_REAPED_REASON,
+    POPULATE_HIJACKED_REASON, PRIVILEGED_MOVER_NOT_PERMITTED_REASON, RECORDED_APPLIED_REASON,
+    RECORDED_PINNED_NO_UID_REASON, RECREATE_CLAIM_TO_RESTORE_ACTION,
+    RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION, RESTORE_SNAPSHOT_NOT_FOUND_REASON,
+    RESTORE_SOURCE_RESOLVED_REASON, SECURITY_CONTEXT_COMPATIBLE_REASON,
+    SECURITY_CONTEXT_INHERITED_CONDITION, SET_EXPLICIT_MOVER_CONTEXT_ACTION,
+    SOURCE_PATH_AMBIGUOUS_REASON,
 };
 use crate::context::Context;
 use crate::error::{Error, Result, error_policy_for};
@@ -78,22 +78,15 @@ pub enum Resolution {
 ///   legacy pin written before that field existed still reads correctly) → [`Resolution::Snapshot`].
 /// - Otherwise → `None` (resolve now).
 ///
-/// `phase` is taken but deliberately unused for the decision: a direct restore is
-/// TERMINAL at the reconcile guard once `Completed`/`Failed`
-/// ([`phase_is_terminal_at_guard`]), so it can never reach resolution in a
-/// settled phase, and there is nothing here to back-fill from. The populator's
+/// It takes NO phase. A direct restore is TERMINAL at the reconcile guard once
+/// `Completed`/`Failed` ([`phase_is_terminal_at_guard`]), so it can never reach
+/// resolution in a settled phase, and there is nothing here to back-fill from.
+/// The populator's
 /// three-way `Completed` reading — including the pre-fix back-fill and the #233
 /// already-bound carve-out — is per claim now, in
 /// [`plan::claim_pinned_decision`], keyed on the claim's own pin and phase
 /// rather than on the whole `Restore`'s (#443).
-fn pinned_decision(
-    resolved: Option<&ResolvedRestore>,
-    phase: Option<&RestorePhase>,
-) -> Option<Resolution> {
-    // `phase` is accepted so the signature still documents WHAT the decision is
-    // made against, and so a future arm that needs it does not have to re-thread
-    // it; today the pin alone decides.
-    let _ = phase;
+fn pinned_decision(resolved: Option<&ResolvedRestore>) -> Option<Resolution> {
     match resolved {
         Some(r) if r.resolution == Some(ResolutionOutcome::NoSnapshot) => Some(Resolution::Empty),
         Some(r) => r.kopia_snapshot_id.clone().map(Resolution::Snapshot),
@@ -358,12 +351,12 @@ async fn drive_direct_target(
     // ADR §4.6: the resolution is pinned ONCE and never re-resolved — a restore must
     // not silently retarget when newer snapshots appear mid-flight. The pinned decision
     // is a snapshot id OR a deliberate "no snapshot, deploy-or-restore" (`Resolution`);
-    // `pinned_decision` reads it (incl. legacy pins + the pre-fix stuck-populator
-    // back-fill), returning `None` only when the source still has to be resolved.
+    // `pinned_decision` reads it (incl. legacy pins written before the
+    // `resolution` field existed), returning `None` only when the source still
+    // has to be resolved.
     let resolved = restore.status.as_ref().and_then(|s| s.resolved.as_ref());
-    let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
 
-    let decision = match pinned_decision(resolved, phase) {
+    let decision = match pinned_decision(resolved) {
         Some(d) => d,
         None => {
             // The per-PVC derivation can refuse (a selector policy that names no
@@ -872,28 +865,6 @@ async fn report_restore_recorded_inherit(
     }
 }
 
-/// Mirrors the pre-handshake stub's status shape so consumers see a stable surface.
-async fn park_awaiting_claim(
-    api: &Api<Restore>,
-    restore: &Restore,
-    name: &str,
-    reason: &str,
-    msg: &str,
-) -> Result<()> {
-    let conditions = io::upsert_condition(
-        &existing_conditions(restore),
-        "AwaitingClaim",
-        true,
-        reason,
-        msg,
-        restore.metadata.generation,
-    );
-    let mut status =
-        restore_ready_status_on(restore, &conditions, RestorePhase::Pending, reason, msg);
-    status["target"] = serde_json::json!({ "pvcPrime": "awaiting-claim" });
-    io::patch_status(api, name, status).await
-}
-
 // --- #443: the fanned-out populator driver ---------------------------------
 //
 // A populator `Restore` is claimed by EVERY PVC whose `spec.dataSourceRef` names
@@ -925,12 +896,6 @@ impl Claimants {
     fn prime_live(&self, uid: &str) -> bool {
         self.primes.contains(&prime_pvc_name(uid))
     }
-}
-
-/// The prime PVC name for a claimant uid. One spelling, because the reaper has
-/// to name the same object the driver created.
-fn prime_pvc_name(consumer_uid: &str) -> String {
-    format!("prime-{consumer_uid}")
 }
 
 /// LIST the namespace once and split it into the PVCs claiming this `Restore`
@@ -1130,11 +1095,30 @@ impl ClaimContext<'_> {
 }
 
 /// What one claim's pass produced: the record to merge, how soon to come back,
-/// and an Event to publish IF the claim actually transitioned.
+/// an Event to publish IF the claim actually transitioned, and any teardown that
+/// must be SEQUENCED AFTER the status patch.
 struct ClaimOutcome {
     record: kopiur_api::RestoreClaimStatus,
     requeue: u64,
     event: Option<ClaimEvent>,
+    /// Deferred teardown for a completed handshake — see [`PostPatchFinalize`].
+    after_patch: Option<PostPatchFinalize>,
+}
+
+/// A completed handshake's teardown, held back until the end-of-pass status
+/// patch has landed.
+///
+/// It exists because ORDER is a data-safety property here: `finalize_populator`
+/// strips the rebind annotation that identifies our PV, so it must never run
+/// before the status write that records the restore as having happened. The
+/// pre-#443 `finalize_populator_success` patched-then-finalized inline; the
+/// fan-out has one status write per pass, so the finalize is carried out of the
+/// per-claim driver and replayed after it.
+struct PostPatchFinalize {
+    job: String,
+    prime: String,
+    /// The PV whose stashed original reclaim policy to restore.
+    pv: String,
 }
 
 /// A Warning Event a claim wants published, gated by [`claim_transition`] so the
@@ -1158,8 +1142,15 @@ struct ClaimEvent {
 /// instead — an exhaustive [`ClaimReason::artifacts_reapable`] match, never a
 /// string compare that would silently stop matching if the literal moved.
 ///
-/// Best-effort by construction (every delete tolerates an absent object), so it
-/// is safe on a partially-completed handshake.
+/// **Idempotent, and silent when there is nothing to do.** It first LOOKS at
+/// what actually exists and returns early — no deletes, no Event — when the
+/// claim's artifacts are already gone. That matters twice: the ordinary "app
+/// uninstalled" and "PVC re-applied over a `Populated` claim" flows would
+/// otherwise publish a Warning saying a prime PVC and a mover Job were reaped
+/// when both were finalized long ago; and the zero-claimant pass calls this for
+/// every stale record it drops, which must not become a per-heartbeat write.
+/// Every delete still tolerates an absent object, so it is safe on a
+/// partially-completed handshake.
 async fn reap_claim_artifacts(
     ctx: &Context,
     restore: &Restore,
@@ -1179,6 +1170,16 @@ async fn reap_claim_artifacts(
     }
     let prime = prime_pvc_name(uid);
     let job = populate_job_name(&restore.name_any(), uid);
+    // Legacy artifacts: a claim adopted from a pre-#443 status was driven under
+    // the SHARED `{restore}-populate` name, so its Job/ConfigMap live there.
+    let legacy_job = legacy_populate_job_name(&restore.name_any());
+
+    let survivors = surviving_populate_artifacts(ctx, namespace, &prime, &job, &legacy_job).await?;
+    // Nothing of ours is left and no PV of ours needs settling: say nothing.
+    if survivors.described.is_empty() && pv.is_none() {
+        return Ok(());
+    }
+
     // A lost rebind's PV holds real restored data: force `Retain` so tearing the
     // claim down never reclaims it. With no PV of ours there is nothing to settle.
     let action = match pv {
@@ -1186,20 +1187,10 @@ async fn reap_claim_artifacts(
         None => PrimePvAction::Leave,
     };
     finalize_populator(ctx, namespace, &job, &prime, action).await?;
-    // Legacy artifacts: a claim adopted from a pre-#443 status was driven under
-    // the SHARED `{restore}-populate` name, so its Job/ConfigMap live there.
-    let legacy_job = legacy_populate_job_name(&restore.name_any());
-    if legacy_job != job {
+    if survivors.legacy_job {
         io::delete_mover_run(&ctx.client, namespace, &legacy_job).await?;
     }
-    let note = reaped_populate_artifacts_note(
-        &[
-            format!("prime PVC `{prime}`"),
-            format!("populate Job `{job}`"),
-        ],
-        claim_name,
-        pv,
-    );
+    let note = reaped_populate_artifacts_note(&survivors.described, claim_name, pv);
     tracing::info!(%namespace, restore = %restore.name_any(), claim = %claim_name, "{note}");
     io::publish_warning_event(
         ctx,
@@ -1210,6 +1201,63 @@ async fn reap_claim_artifacts(
     )
     .await;
     Ok(())
+}
+
+/// Which of one claim's populate artifacts are still standing (and not already
+/// terminating).
+///
+/// Split out of [`reap_claim_artifacts`] so the reaper stays one decision — "is
+/// there anything to do, and may I do it?" — and so the *reporting* of what was
+/// reaped names only what actually existed. An object already being deleted is
+/// NOT an artifact to reap: re-issuing the delete (and re-publishing the Event)
+/// on every pass while it sits on a finalizer would be pure churn.
+struct SurvivingArtifacts {
+    /// Human-readable descriptions, for the Event/log note. Empty ⇒ nothing left.
+    described: Vec<String>,
+    /// Whether the shared pre-#443 `{restore}-populate` Job is among them.
+    legacy_job: bool,
+}
+
+async fn surviving_populate_artifacts(
+    ctx: &Context,
+    namespace: &str,
+    prime: &str,
+    job: &str,
+    legacy_job: &str,
+) -> Result<SurvivingArtifacts> {
+    use k8s_openapi::api::batch::v1::Job;
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+
+    let live = |meta: &kube::core::ObjectMeta| meta.deletion_timestamp.is_none();
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    let mut described = Vec::new();
+    if pvc_api
+        .get_opt(prime)
+        .await?
+        .is_some_and(|p| live(&p.metadata))
+    {
+        described.push(format!("prime PVC `{prime}`"));
+    }
+    if job_api
+        .get_opt(job)
+        .await?
+        .is_some_and(|j| live(&j.metadata))
+    {
+        described.push(format!("populate Job `{job}`"));
+    }
+    let legacy = legacy_job != job
+        && job_api
+            .get_opt(legacy_job)
+            .await?
+            .is_some_and(|j| live(&j.metadata));
+    if legacy {
+        described.push(format!("legacy populate Job `{legacy_job}`"));
+    }
+    Ok(SurvivingArtifacts {
+        described,
+        legacy_job: legacy,
+    })
 }
 
 /// The pre-#443 populate `Job` name — ONE name shared by every claim the
@@ -1244,14 +1292,17 @@ async fn drive_populator_fanout(
         .unwrap_or_default();
 
     // Zero claimants: the standing GitOps populator nothing has applied a
-    // `dataSourceRef` for yet. Keep the pre-#443 Restore-level park verbatim
-    // (`AwaitingClaim=True` + `target.pvcPrime: awaiting-claim`), and reap any
-    // record left by a claimant that has since been deleted.
+    // `dataSourceRef` for yet — or an app that has been torn down with its
+    // populator left standing (the documented "living source" pattern).
+    //
+    // It is an END-OF-PASS writer like the N≥1 branch below, and that is
+    // load-bearing: it must NULL the records of claimants that are gone in the
+    // SAME patch that parks. Writing the park alone left them standing, so the
+    // next pass 30 s later re-reaped them and re-published
+    // `OrphanedPrimePvcReaped`, forever. With the nulls, the second pass is a
+    // server-side no-op under the deep merge predicate.
     if claimants.consumers.is_empty() {
-        reap_gone_claims(ctx, restore, namespace, &prev, &[]).await?;
-        let (reason, msg) = claims_summary(&ClaimsAggregate::NoClaims);
-        park_awaiting_claim(api, restore, name, reason, &msg).await?;
-        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+        return park_unclaimed_populator(ctx, restore, api, namespace, name, &prev).await;
     }
 
     // The upgrade path: a `Restore` written by a pre-fan-out operator carries
@@ -1276,14 +1327,11 @@ async fn drive_populator_fanout(
     let live_names: Vec<&str> = live.iter().map(|(n, _)| n.as_str()).collect();
     let gone = reap_gone_claims(ctx, restore, namespace, &prev, &live_names).await?;
 
-    // The cluster-wide `PersistentVolume` LIST is the expensive read on this
-    // path, so skip it entirely on the steady heartbeat: every claim settled,
-    // no prime of any of them still standing, and nothing to reap. Mirrors the
-    // pre-#443 `settled_over_bound_claim` shortcut, per claim.
-    let all_quiet = gone.is_empty()
-        && plans.iter().all(|d| *d == ClaimDrive::Settled)
-        && live.iter().all(|(_, uid)| !claimants.prime_live(uid));
-    let rebound = if all_quiet {
+    // Skip the cluster-wide `PersistentVolume` LIST — the expensive read on this
+    // path — on the steady heartbeat. Mirrors the pre-#443
+    // `settled_over_bound_claim` shortcut, per claim; the rule is pure and
+    // unit-tested in [`pass_is_all_quiet`].
+    let rebound = if pass_is_all_quiet(&gone, &plans, &live, &prev, &claimants.primes) {
         std::collections::BTreeMap::new()
     } else {
         our_rebound_pvs(ctx, namespace).await?
@@ -1293,6 +1341,7 @@ async fn drive_populator_fanout(
     let mut next: std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus> =
         std::collections::BTreeMap::new();
     let mut events: Vec<(String, ClaimEvent)> = Vec::new();
+    let mut finalizers: Vec<(String, PostPatchFinalize)> = Vec::new();
     let mut requeue = 600u64;
 
     for ((claim, uid), drive) in live.into_iter().zip(plans) {
@@ -1316,46 +1365,23 @@ async fn drive_populator_fanout(
         {
             events.push((claim.clone(), event));
         }
+        if let Some(finalize) = outcome.after_patch {
+            finalizers.push((claim.clone(), finalize));
+        }
         next.insert(claim, outcome.record);
     }
 
-    // ONE status patch per pass: phase + observedGeneration + conditions + every
-    // claim merge (and an explicit `null` for each gone claim). Building it here
-    // rather than at each decision point is what keeps the single-conditions-
-    // writer rule: a per-claim `conditions` patch would replace the whole array
-    // and erase the sibling written moments earlier.
-    let aggregate = aggregate_claims(&next);
-    let (reason, message) = claims_summary(&aggregate);
-    let conditions = io::upsert_condition(
-        &existing_conditions(restore),
-        "AwaitingClaim",
-        false,
-        CLAIMS_OBSERVED_REASON,
-        "at least one PersistentVolumeClaim claims this Restore; status.claims carries the \
-         per-claim state",
-        restore.metadata.generation,
-    );
-    let mut status = restore_ready_status_on(
-        restore,
-        &conditions,
-        aggregate_phase(&aggregate),
-        reason,
-        &message,
-    );
-    let mut merges = serde_json::Map::new();
-    for (claim, record) in &next {
-        merges.insert(claim.clone(), claim_merge_body(prev.get(claim), record));
-    }
-    for claim in gone {
-        merges.insert(claim, serde_json::Value::Null);
-    }
-    status["claims"] = serde_json::Value::Object(merges);
+    // ONE status patch per pass — see [`fanout_status`] for why it is built in a
+    // single pure place rather than at each decision point.
     let current = restore
         .status
         .as_ref()
         .map(serde_json::to_value)
         .transpose()?;
+    let status = fanout_status(restore, &prev, &next, &gone);
     io::patch_status_if_changed(api, name, current.as_ref(), status).await?;
+
+    run_deferred_finalizers(ctx, namespace, name, finalizers).await?;
 
     for (claim, event) in events {
         tracing::warn!(%namespace, restore = %name, %claim, "{}", event.message);
@@ -1364,8 +1390,84 @@ async fn drive_populator_fanout(
     Ok(Action::requeue(std::time::Duration::from_secs(requeue)))
 }
 
+/// Tear down the artifacts of every handshake that completed on this pass —
+/// ONLY after the end-of-pass status patch has landed.
+///
+/// The ordering is a data-safety property, not tidiness. `finalize_populator`
+/// strips the rebind annotation — the only evidence the bound PV came from US —
+/// so a crash between the strip and the status write would leave a restore that
+/// genuinely ran looking like a claim we never touched: the next pass would read
+/// it as `NothingToPopulate` and relabel it `TargetAlreadyBound` ("no restore
+/// ran; delete the PVC"), over the volume holding the freshly restored data.
+/// Deferring past the patch restores the pre-#443 ordering (status first,
+/// teardown second) while keeping ONE conditions writer per pass; a crash before
+/// this point simply replays the finalize.
+async fn run_deferred_finalizers(
+    ctx: &Context,
+    namespace: &str,
+    name: &str,
+    finalizers: Vec<(String, PostPatchFinalize)>,
+) -> Result<()> {
+    for (claim, finalize) in finalizers {
+        finalize_populator(
+            ctx,
+            namespace,
+            &finalize.job,
+            &finalize.prime,
+            PrimePvAction::RestoreOriginalPolicy(&finalize.pv),
+        )
+        .await?;
+        tracing::debug!(%namespace, restore = %name, %claim, "populator: finalized the handshake");
+    }
+    Ok(())
+}
+
+/// The pass for a populator NOTHING claims: reap the artifacts of every record
+/// whose claimant is gone, then write the `AwaitingClaim=True` park AND those
+/// records' `null`s in ONE patch.
+///
+/// Splitting it out keeps [`drive_populator_fanout`] to the N≥1 story, but the
+/// pairing is the point: writing the park alone left the stale records standing,
+/// so the next pass 30 s later re-reaped them and re-published
+/// `OrphanedPrimePvcReaped`, forever, for every app torn down with its populator
+/// left in place. With the nulls in the same body the second pass is a
+/// server-side no-op under the deep merge predicate.
+async fn park_unclaimed_populator(
+    ctx: &Context,
+    restore: &Restore,
+    api: &Api<Restore>,
+    namespace: &str,
+    name: &str,
+    prev: &std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus>,
+) -> Result<Action> {
+    let gone = reap_gone_claims(ctx, restore, namespace, prev, &[]).await?;
+    let (reason, msg) = claims_summary(&ClaimsAggregate::NoClaims);
+    let current = restore
+        .status
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
+    io::patch_status_if_changed(
+        api,
+        name,
+        current.as_ref(),
+        awaiting_claim_status(restore, reason, &msg, &gone),
+    )
+    .await?;
+    Ok(Action::requeue(std::time::Duration::from_secs(30)))
+}
+
 /// Reap (and name for nulling) every claim record whose claimant is no longer
 /// live. Returns the record keys to delete from `status.claims`.
+///
+/// The PV is passed as `None` — [`PrimePvAction::Leave`] — DELIBERATELY. A PV we
+/// rebound was already forced `Retain` at rebind time and keeps that setting, so
+/// the restored data survives the claimant's deletion; the only residue is a
+/// stale `populator-original-reclaim-policy` annotation on an orphan PV, which
+/// [`our_rebound_pvs`] indexes harmlessly (the uid can never match again). Do
+/// NOT "fix" this into [`PrimePvAction::RestoreOriginalPolicy`]: that puts the
+/// class default (usually `Delete`) back on a `Released` volume and reaps the
+/// data with it.
 async fn reap_gone_claims(
     ctx: &Context,
     restore: &Restore,
@@ -1398,11 +1500,16 @@ async fn reap_gone_claims(
 /// Seed `status.claims` from a LEGACY single-claim status, for the ONE claimant
 /// the legacy handshake was actually about (#443's upgrade path).
 ///
-/// Which claimant that is, is not recorded anywhere — the pre-#443 code just
-/// took the first LIST hit — so it is inferred from the artifact that IS
-/// uid-keyed: the legacy prime PVC `prime-<uid>`. Failing that, a lone claimant
-/// is unambiguous. With several claimants and no surviving prime there is
-/// nothing to adopt: none of them was ever populated, so they all drive fresh.
+/// The selection rule is pure and unit-tested ([`legacy_claimant`]): a surviving
+/// uid-keyed `prime-<uid>` names the claim mid-handshake; failing that, exactly
+/// one BOUND claimant is unambiguous however many claimants there are, because
+/// the pre-fan-out driver could only ever populate one. That second arm is the
+/// #443 reporter's own post-upgrade state — N claimants, one populated — where
+/// adopting nothing relabels the populated PVC `TargetAlreadyBound`, "no restore
+/// ran, delete the PVC", over the volume holding the restored data.
+///
+/// Gated by [`is_legacy_populator_status`], so a brand-new `Restore`'s first
+/// claim does not "adopt" the `Pending` park a zero-claim pass just wrote.
 async fn adopt_legacy_claims(
     ctx: &Context,
     restore: &Restore,
@@ -1416,14 +1523,10 @@ async fn adopt_legacy_claims(
     let Some(status) = restore.status.as_ref() else {
         return Ok(adopted);
     };
-    if !prev.is_empty() || status.phase.is_none() {
+    if !prev.is_empty() || !is_legacy_populator_status(status) {
         return Ok(adopted);
     }
-    let only_one = claimants.consumers.len() == 1;
-    let Some(consumer) = claimants.consumers.iter().find(|c| {
-        c.uid()
-            .is_some_and(|uid| claimants.prime_live(&uid) || only_one)
-    }) else {
+    let Some(consumer) = legacy_claimant(&claimants.consumers, &claimants.primes) else {
         return Ok(adopted);
     };
     // Drive an in-flight legacy populate under its OWN name, never a second
@@ -1463,13 +1566,21 @@ async fn drive_one_claim(
     let record = prev.get(claim);
     match drive {
         // Terminal under the LIVE claimant's uid. Nothing to do — except finish
-        // a reap whose best-effort delete did not land (the crash-recovery case:
-        // `finalize` stripped the PV annotation, then the controller died before
-        // deleting the prime). Reason-gated, so a hijacked populate's prime is
-        // never swept out from under the admin.
+        // a reap whose best-effort delete did not land: a `Populated`/
+        // `AlreadyBound` claim whose finalize stripped the PV annotation and
+        // then died before deleting the prime, leaving an orphan nothing else
+        // collects.
+        //
+        // Gated by [`settled_artifacts_reapable`], which is NARROWER than the
+        // reaper's own reason gate: a `Failed` claim's mover Job and prime are
+        // the evidence its own message points the user at ("see the Job/pod
+        // logs"), restore movers carry no TTL, and pre-#443 both survived until
+        // the user acted. They are reclaimed on re-arm or when the record is
+        // dropped — i.e. when the user follows the documented remedy and
+        // re-creates the claiming PVC.
         ClaimDrive::Settled => {
             let carried = record.cloned().unwrap_or_default();
-            if claimants.prime_live(uid) {
+            if claimants.prime_live(uid) && settled_artifacts_reapable(&carried) {
                 reap_claim_artifacts(
                     ctx,
                     restore,
@@ -1485,6 +1596,7 @@ async fn drive_one_claim(
                 record: carried,
                 requeue: 600,
                 event: None,
+                after_patch: None,
             })
         }
         // The claimant was deleted and re-created: reap the dead claim's
@@ -1516,6 +1628,7 @@ async fn drive_one_claim(
                 },
                 requeue: 5,
                 event: None,
+                after_patch: None,
             })
         }
         ClaimDrive::Drive => {
@@ -1562,7 +1675,7 @@ async fn drive_claim(
         // The handover landed: restore the PV's reclaim policy, GC the
         // artifacts, record the claim as populated.
         PopulatorHandshake::FinalizeRebound { pv } => {
-            claim_finalize_rebound(ctx, restore, api, namespace, cc, &pv).await
+            claim_finalize_rebound(restore, api, cc, &pv).await
         }
         // Rebind issued; wait for the PV controller to bind our PV to the claim.
         PopulatorHandshake::AwaitingBind => Ok(ClaimOutcome {
@@ -1577,6 +1690,7 @@ async fn drive_claim(
             ),
             requeue: 5,
             event: None,
+            after_patch: None,
         }),
         // #233 per claim: the claim is already bound, so there is nothing to
         // populate. Complete as a truthful no-op and reap anything that can
@@ -1606,24 +1720,35 @@ async fn drive_claim(
 /// records `NoSnapshotContinue`, so an empty outcome is self-describing rather
 /// than claiming data was written.
 async fn claim_finalize_rebound(
-    ctx: &Context,
     restore: &Restore,
     api: &Api<Restore>,
-    namespace: &str,
     cc: &ClaimContext<'_>,
     pv_name: &str,
 ) -> Result<ClaimOutcome> {
-    // Re-read the claim's pin fresh: for a deferred restore the MOVER pins it
-    // (under `status.claims.<pvc>.resolved`) in its own terminal PATCH, which
-    // the cached `restore` may not yet reflect when a PVC/PV bind event triggers
-    // this finalize.
-    let live = api
+    // Re-read the pin FRESH: for a deferred restore the MOVER pins it in its own
+    // terminal PATCH, which the cached `restore` may not yet reflect when a
+    // PVC/PV bind event triggers this finalize.
+    //
+    // WHERE it pins depends on the Job, which is why `claim_finalize_pin` is an
+    // exhaustive match on [`JobNameReuse`] rather than an `or_else` chain: a
+    // `Fresh` claim's mover writes `status.claims.<pvc>.resolved` and must never
+    // read the top level (that would let it inherit a sibling's pin), while an
+    // adopted `LegacyShared` Job carries no `claimKey` and therefore pins the
+    // TOP-LEVEL `status.resolved` — without that fallback an in-flight legacy
+    // restore finalizes as "provisioned an empty volume" over a real one.
+    let live_status = api
         .get_opt(&restore.name_any())
         .await?
-        .and_then(|r| r.status)
-        .and_then(|s| s.claims.get(&cc.consumer_name).cloned())
-        .and_then(|c| c.resolved)
-        .or_else(|| cc.prev.and_then(|p| p.resolved.clone()));
+        .and_then(|r| r.status);
+    let live = claim_finalize_pin(
+        cc.job_reuse,
+        live_status
+            .as_ref()
+            .and_then(|s| s.claims.get(&cc.consumer_name).cloned())
+            .and_then(|c| c.resolved),
+        cc.prev.and_then(|p| p.resolved.clone()),
+        live_status.and_then(|s| s.resolved),
+    );
     let restored =
         live.as_ref().and_then(|r| r.resolution) == Some(kopiur_api::ResolutionOutcome::Snapshot);
     let (reason, message) = if restored {
@@ -1644,28 +1769,27 @@ async fn claim_finalize_rebound(
             ),
         )
     };
-    // Tear the artifacts down AFTER deciding, and record the outcome in the same
-    // end-of-pass patch: `finalize_populator` strips the rebind annotation (the
-    // only evidence the bound PV came from US), so a crash between the two would
-    // otherwise leave a restore that genuinely ran looking like a claim we never
-    // touched — and the next pass would relabel it `TargetAlreadyBound`.
-    finalize_populator(
-        ctx,
-        namespace,
-        &cc.job_name,
-        &cc.prime_name,
-        PrimePvAction::RestoreOriginalPolicy(pv_name),
-    )
-    .await?;
     let mut record = cc.record(RestoreClaimPhase::Populated, reason, message);
     record.resolved = live;
-    // The handshake is over: the prime and the Job are gone.
+    // The handshake is over: the prime and the Job go with it.
     record.pvc_prime = None;
     record.job = None;
+    // The teardown is DEFERRED past the end-of-pass status patch, and the order
+    // is a data-safety property, not a tidiness one: `finalize_populator` strips
+    // the rebind annotation — the only evidence the bound PV came from US — so
+    // running it before the status write would leave a crash in between looking
+    // like a claim we never touched, and the next pass would relabel it
+    // `TargetAlreadyBound` ("no restore ran; delete the PVC") over the volume
+    // holding the freshly restored data. See [`PostPatchFinalize`].
     Ok(ClaimOutcome {
         record,
         requeue: 600,
         event: None,
+        after_patch: Some(PostPatchFinalize {
+            job: cc.job_name.clone(),
+            prime: cc.prime_name.clone(),
+            pv: pv_name.to_string(),
+        }),
     })
 }
 
@@ -1753,6 +1877,7 @@ async fn claim_already_bound(
         record,
         requeue: 600,
         event,
+        after_patch: None,
     })
 }
 
@@ -1794,6 +1919,7 @@ async fn fail_populate_hijacked(
     Ok(ClaimOutcome {
         record,
         requeue: 600,
+        after_patch: None,
         event: Some(ClaimEvent {
             reason: POPULATE_HIJACKED_REASON,
             action: RECREATE_CLAIM_TO_RESTORE_ACTION,
@@ -1885,6 +2011,7 @@ async fn claim_populate(
             record,
             requeue: 15,
             event: None,
+            after_patch: None,
         });
     }
 
@@ -1954,6 +2081,7 @@ async fn claim_populate(
                     record,
                     requeue: 120,
                     event: None,
+                    after_patch: None,
                 });
             }
             MoverOutcome::Wedged { message } => {
@@ -1963,6 +2091,10 @@ async fn claim_populate(
                     message,
                 );
                 record.pvc_prime = Some(cc.prime_name.clone());
+                // Name the Job explicitly: on the FIRST pass that observes the
+                // wedge there is no prior record to carry it forward from, and
+                // the whole point of the record is to say which pod is stuck.
+                record.job = Some(cc.job_name.clone());
                 record.resolved = resolved_pin;
                 record.source_path = source_path;
                 record.wait_started_at = wait_started_at;
@@ -1970,6 +2102,7 @@ async fn claim_populate(
                     record,
                     requeue: 120,
                     event: None,
+                    after_patch: None,
                 });
             }
             // Mover done: fall through to the rebind.
@@ -2008,6 +2141,7 @@ async fn claim_populate(
             record,
             requeue: 15,
             event: None,
+            after_patch: None,
         });
     }
     // `false` while the prime's PV hasn't been provisioned yet — come back soon.
@@ -2021,6 +2155,7 @@ async fn claim_populate(
         record,
         requeue: 5,
         event: None,
+        after_patch: None,
     })
 }
 
@@ -2075,6 +2210,7 @@ async fn resolve_claim_source(
                     ),
                     requeue: 300,
                     event: None,
+                    after_patch: None,
                 })));
             }
         };
@@ -2138,6 +2274,7 @@ fn no_snapshot_for_claim(
             ),
             requeue,
             event: None,
+            after_patch: None,
         }));
     }
     match effective_on_missing(
@@ -2161,6 +2298,7 @@ fn no_snapshot_for_claim(
             ),
             requeue: 300,
             event: None,
+            after_patch: None,
         })),
         // Deploy-or-restore. We are about to provision the empty volume, so NOW
         // the decision is real and must be pinned: a snapshot that appears LATER
@@ -2483,7 +2621,7 @@ fn restore_success_status(
         Some(kopiur_api::ResolutionOutcome::Snapshot) => restore_ready_status(
             restore,
             RestorePhase::Completed,
-            "RestoreSucceeded",
+            crate::consts::RESTORE_POPULATED_REASON,
             "the restore mover completed; the snapshot data was written into the target",
         ),
         // Outcome unknown (the mover's best-effort status PATCHes were both lost):
@@ -2680,28 +2818,6 @@ async fn drive_direct_restore(
             Ok(Action::requeue(std::time::Duration::from_secs(120)))
         }
     }
-}
-
-/// Whether a restore mover `Job`'s NAME is re-used across runs.
-///
-/// Closed (and not a `bool`) because the two answers change how a TERMINATING
-/// Job is read, and getting that backwards loses data either way: treat a
-/// re-used name as fresh and a reaped-then-re-populated claim reads the outgoing
-/// Job's `Succeeded` as its own, rebinding a still-empty prime; treat a fresh
-/// name as re-used and a direct restore's TTL-reaped Job has its outcome dropped
-/// and the whole restore re-runs over a target the workload may already be
-/// writing to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobNameReuse {
-    /// One run, one name — a direct restore (`{restore}`) or a per-claim
-    /// populate (`{restore}-populate-{fnv8(uid)}`, #443). A terminating Job
-    /// under this name IS this run's.
-    Fresh,
-    /// The pre-#443 shared populate name `{restore}-populate`, reached only when
-    /// driving a claim adopted from a legacy status. A terminating Job under it
-    /// may belong to a PREVIOUS claim, so wait for the delete to land and create
-    /// a fresh one.
-    LegacyShared,
 }
 
 /// What ONE restore mover dispatch is filling, and how it reports.

@@ -481,40 +481,34 @@ fn resolved_with(
 
 #[test]
 fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
-    use RestorePhase::Pending;
-
     // A pinned `NoSnapshot` is always the deploy-or-restore Empty decision — even
     // if a kopiaSnapshotID somehow co-exists, NoSnapshot wins (data-safety: a later
     // snapshot must never retarget a volume that already came up empty).
     assert_eq!(
-        pinned_decision(
-            Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
-            Some(&Pending),
-        ),
+        pinned_decision(Some(&resolved_with(
+            Some(ResolutionOutcome::NoSnapshot),
+            None
+        ))),
         Some(Resolution::Empty)
     );
 
     // A pinned snapshot id resolves to that id (with the explicit Snapshot outcome…).
     assert_eq!(
-        pinned_decision(
-            Some(&resolved_with(
-                Some(ResolutionOutcome::Snapshot),
-                Some("k7")
-            )),
-            Some(&Pending),
-        ),
+        pinned_decision(Some(&resolved_with(
+            Some(ResolutionOutcome::Snapshot),
+            Some("k7")
+        ))),
         Some(Resolution::Snapshot("k7".into()))
     );
     // …and a LEGACY pin (id present, `resolution` field absent) reads the same,
     // so an in-flight restore pinned before this field existed keeps its target.
     assert_eq!(
-        pinned_decision(Some(&resolved_with(None, Some("k7"))), Some(&Pending)),
+        pinned_decision(Some(&resolved_with(None, Some("k7")))),
         Some(Resolution::Snapshot("k7".into()))
     );
 
     // A fresh, un-pinned restore must resolve.
-    assert_eq!(pinned_decision(None, Some(&Pending)), None);
-    assert_eq!(pinned_decision(None, None), None);
+    assert_eq!(pinned_decision(None), None);
 }
 
 /// #443: everything `pinned_decision` used to do for a POPULATOR now happens per
@@ -565,6 +559,359 @@ fn the_populator_arms_of_pinned_decision_moved_intact_onto_the_claim() {
     );
     // A fresh claim resolves.
     assert_eq!(claim_pinned_decision(&record(None, None)), None);
+}
+
+/// A claim record in `phase`/`reason`, for the pure tables below.
+fn claim_record(
+    phase: Option<kopiur_api::RestoreClaimPhase>,
+    reason: Option<&str>,
+) -> kopiur_api::RestoreClaimStatus {
+    kopiur_api::RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase,
+        reason: reason.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// #443 review item 2 — the steady Settled sweep exists for ONE shape: a
+/// finished claim whose finalize crashed and left an orphan prime. It must NOT
+/// touch a `Failed` claim's mover Job or prime: the record tells the user to
+/// read that Job's pod logs, restore movers carry no TTL, and pre-#443 both
+/// survived until the user acted (a `Failed` populator was terminal at the
+/// guard). Sweeping them 120 s later deletes the evidence the message points at.
+#[test]
+fn a_settled_failed_claim_keeps_its_job_and_prime_for_the_user_to_read() {
+    use crate::consts::{
+        MOVER_JOB_FAILED_REASON, MOVER_POD_WEDGED_REASON, POPULATE_HIJACKED_REASON,
+        RESTORE_POPULATED_REASON, RESTORE_TARGET_ALREADY_BOUND_REASON,
+    };
+    use kopiur_api::RestoreClaimPhase as P;
+
+    // The crash-recovery shape the sweep is FOR.
+    assert!(settled_artifacts_reapable(&claim_record(
+        Some(P::Populated),
+        Some(RESTORE_POPULATED_REASON)
+    )));
+    assert!(settled_artifacts_reapable(&claim_record(
+        Some(P::AlreadyBound),
+        Some(RESTORE_TARGET_ALREADY_BOUND_REASON)
+    )));
+
+    // Every failure keeps its artifacts until the claim is re-armed or dropped.
+    for reason in [
+        MOVER_JOB_FAILED_REASON,
+        MOVER_POD_WEDGED_REASON,
+        POPULATE_HIJACKED_REASON,
+        crate::consts::SOURCE_PATH_AMBIGUOUS_REASON,
+        crate::consts::RESTORE_SNAPSHOT_NOT_FOUND_REASON,
+    ] {
+        assert!(
+            !settled_artifacts_reapable(&claim_record(Some(P::Failed), Some(reason))),
+            "a Failed/{reason} claim must keep its Job and prime"
+        );
+    }
+
+    // The hijack refusal still holds through the wider gate too — the two
+    // predicates protect different things and neither may be dropped.
+    assert!(!claim_artifacts_reapable(Some(POPULATE_HIJACKED_REASON)));
+
+    // Unsettled phases cannot reach this arm; encoded as "leave it alone"
+    // rather than a panic, so a hand-patched status cannot crash the loop.
+    for phase in [
+        None,
+        Some(P::Pending),
+        Some(P::Populating),
+        Some(P::Rebinding),
+    ] {
+        assert!(!settled_artifacts_reapable(&claim_record(phase, None)));
+    }
+    assert!(!settled_artifacts_reapable(&claim_record(
+        Some(P::Unknown("Staging".into())),
+        None
+    )));
+}
+
+/// #443 review item 1 — the zero-claimant pass must NULL the records of
+/// claimants that are gone in the SAME patch that parks. Writing the park alone
+/// left them standing, so the next pass 30 s later re-reaped them and
+/// re-published `OrphanedPrimePvcReaped`, forever, for every app torn down with
+/// its populator left in place.
+#[test]
+fn the_zero_claimant_park_nulls_the_records_of_gone_claimants() {
+    let restore = restore_with_anchor(None);
+    let (reason, message) = claims_summary(&ClaimsAggregate::NoClaims);
+
+    let status = awaiting_claim_status(&restore, reason, &message, &["postgres-data".to_string()]);
+    assert_eq!(
+        status["claims"]["postgres-data"],
+        serde_json::Value::Null,
+        "the null must be EXPLICIT — an omitted key leaves the record standing: {status}"
+    );
+    // The pre-#443 zero-claim surface is unchanged.
+    assert_eq!(status["phase"], "Pending");
+    assert_eq!(status["target"]["pvcPrime"], "awaiting-claim");
+    assert!(
+        status["conditions"]
+            .as_array()
+            .expect("conditions array")
+            .iter()
+            .any(|c| c["type"] == "AwaitingClaim"
+                && c["status"] == "True"
+                && c["reason"] == crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON),
+        "{status}"
+    );
+
+    // Nothing gone ⇒ no `claims` key at all, so the steady zero-claim heartbeat
+    // is a no-op under the deep merge predicate rather than a write every 30s.
+    let quiet = awaiting_claim_status(&restore, reason, &message, &[]);
+    assert!(quiet.get("claims").is_none(), "{quiet}");
+    assert!(
+        crate::io::status_merge_patch_is_noop(
+            Some(&serde_json::json!({
+                "phase": "Pending",
+                "observedGeneration": 1,
+                "conditions": quiet["conditions"].clone(),
+                "target": { "pvcPrime": "awaiting-claim" },
+            })),
+            &quiet
+        ),
+        "an unchanged zero-claim park must not re-write: {quiet}"
+    );
+}
+
+/// #443 review item 9 — the steady heartbeat skips the cluster-wide
+/// `PersistentVolume` LIST, and a prime that will NEVER be reaped must not
+/// defeat that. A hijacked populate's prime is kept ON PURPOSE and forever, so
+/// treating it as "still busy" buys one cluster-wide LIST every 600 s for a
+/// claim whose artifacts nothing will ever collect.
+#[test]
+fn a_deliberately_kept_prime_does_not_keep_the_pass_busy() {
+    use kopiur_api::RestoreClaimPhase as P;
+    let live = vec![("data".to_string(), "u1".to_string())];
+    let settled = vec![ClaimDrive::Settled];
+    let primes: std::collections::BTreeSet<String> = ["prime-u1".to_string()].into();
+    let none: std::collections::BTreeSet<String> = Default::default();
+
+    let with = |record: kopiur_api::RestoreClaimStatus| {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("data".to_string(), record);
+        m
+    };
+
+    // A hijacked populate's prime stands forever: quiet.
+    let hijacked = with(claim_record(
+        Some(P::Failed),
+        Some(crate::consts::POPULATE_HIJACKED_REASON),
+    ));
+    assert!(pass_is_all_quiet(&[], &settled, &live, &hijacked, &primes));
+
+    // A prime that IS reapable means there is real work left (the crashed
+    // finalize the Settled sweep exists for), so the LIST is paid.
+    let populated = with(claim_record(
+        Some(P::Populated),
+        Some(crate::consts::RESTORE_POPULATED_REASON),
+    ));
+    assert!(!pass_is_all_quiet(
+        &[],
+        &settled,
+        &live,
+        &populated,
+        &primes
+    ));
+    // No prime at all: quiet.
+    assert!(pass_is_all_quiet(&[], &settled, &live, &populated, &none));
+
+    // Anything unsettled, or any record to drop, is never quiet.
+    assert!(!pass_is_all_quiet(
+        &[],
+        &[ClaimDrive::Drive],
+        &live,
+        &populated,
+        &none
+    ));
+    assert!(!pass_is_all_quiet(
+        &["old".to_string()],
+        &settled,
+        &live,
+        &populated,
+        &none
+    ));
+}
+
+/// A claiming PVC, for [`legacy_claimant`]'s table.
+fn adoption_claimant(
+    name: &str,
+    uid: &str,
+    bound: bool,
+) -> k8s_openapi::api::core::v1::PersistentVolumeClaim {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": name, "namespace": "ns", "uid": uid },
+        "spec": { "volumeName": if bound { "pv-1" } else { "" } },
+        "status": { "phase": if bound { "Bound" } else { "Pending" } }
+    }))
+    .expect("valid PVC")
+}
+
+/// #443 review item 4 — the upgrade path's claimant selection, which is the only
+/// new logic in it.
+///
+/// The failing shape is the REPORTER'S OWN cluster after upgrade: N claimants,
+/// exactly one populated (the pre-fan-out driver could only ever fill the first
+/// LIST hit). Adopting nothing there re-drives the populated claim, which reads
+/// `NothingToPopulate` and relabels it `TargetAlreadyBound` — "no restore ran;
+/// delete the PVC" — over the volume holding the restored data.
+#[test]
+fn legacy_adoption_picks_the_one_claim_the_pre_fanout_driver_was_about() {
+    let primes = |names: &[&str]| -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    };
+
+    // 1. A surviving uid-keyed prime names the claim mid-handshake exactly —
+    //    bound or not, and regardless of how many claimants there are.
+    let mid = vec![
+        adoption_claimant("data-a", "uid-a", false),
+        adoption_claimant("data-b", "uid-b", true),
+    ];
+    assert_eq!(
+        legacy_claimant(&mid, &primes(&["prime-uid-a"]))
+            .map(kube::ResourceExt::name_any)
+            .as_deref(),
+        Some("data-a")
+    );
+
+    // 2. N claimants, no prime, exactly ONE bound: the reporter's state.
+    let reporter = vec![
+        adoption_claimant("data-a", "uid-a", true),
+        adoption_claimant("data-b", "uid-b", false),
+        adoption_claimant("data-c", "uid-c", false),
+    ];
+    assert_eq!(
+        legacy_claimant(&reporter, &primes(&[]))
+            .map(kube::ResourceExt::name_any)
+            .as_deref(),
+        Some("data-a"),
+        "the populated PVC must be adopted, not relabelled TargetAlreadyBound"
+    );
+
+    // 3. A lone BOUND claimant — the ordinary single-PVC upgrade.
+    let lone_bound = vec![adoption_claimant("data", "uid", true)];
+    assert!(legacy_claimant(&lone_bound, &primes(&[])).is_some());
+
+    // 4. A lone UNBOUND claimant is NOT adopted. That is a `Completed` populator
+    //    whose claim was deleted and re-applied; pre-#443 it was re-populated on
+    //    the next pass, and adopting `Populated` onto it would settle a claim
+    //    that never got its volume.
+    let lone_unbound = vec![adoption_claimant("data", "uid", false)];
+    assert!(legacy_claimant(&lone_unbound, &primes(&[])).is_none());
+
+    // 5. Several bound, no prime: the old driver could not have populated more
+    //    than one, so the extras were bound by something else and we cannot tell
+    //    which is ours. Adopt nothing; every claimant drives fresh.
+    let ambiguous = vec![
+        adoption_claimant("data-a", "uid-a", true),
+        adoption_claimant("data-b", "uid-b", true),
+    ];
+    assert!(legacy_claimant(&ambiguous, &primes(&[])).is_none());
+    // 6. None bound at all: nothing was ever populated.
+    let none_bound = vec![
+        adoption_claimant("data-a", "uid-a", false),
+        adoption_claimant("data-b", "uid-b", false),
+    ];
+    assert!(legacy_claimant(&none_bound, &primes(&[])).is_none());
+}
+
+/// #443 review item 8 — adoption must not fire on a brand-new `Restore`. A new
+/// populator parks `Pending`/`AwaitingPvcDataSourceRef` with the sentinel
+/// `target.pvcPrime: awaiting-claim`; its first claim would otherwise "adopt"
+/// that park, spend a Job GET and log that a pre-fan-out status was adopted.
+#[test]
+fn only_a_pre_fanout_status_is_adopted() {
+    let status = |v: serde_json::Value| -> kopiur_api::RestoreStatus {
+        serde_json::from_value(v).expect("valid RestoreStatus")
+    };
+
+    // The zero-claim park a BRAND-NEW populator writes: not legacy.
+    assert!(!is_legacy_populator_status(&status(serde_json::json!({
+        "phase": "Pending",
+        "target": { "pvcPrime": "awaiting-claim" }
+    }))));
+    assert!(!is_legacy_populator_status(&status(
+        serde_json::json!({ "phase": "Resolving" })
+    )));
+
+    // A pinned top-level `resolved` is written only by the pre-fan-out path.
+    assert!(is_legacy_populator_status(&status(serde_json::json!({
+        "phase": "Pending",
+        "resolved": { "kopiaSnapshotID": "k1" }
+    }))));
+    // …as is any phase past resolution.
+    for phase in ["Restoring", "Completed", "Failed"] {
+        assert!(
+            is_legacy_populator_status(&status(serde_json::json!({ "phase": phase }))),
+            "{phase}"
+        );
+    }
+    // A phase this build cannot read is evidence of a NEWER operator, which
+    // would have written `claims` — not of a legacy one.
+    assert!(!is_legacy_populator_status(&status(
+        serde_json::json!({ "phase": "Staging" })
+    )));
+    // Anything that already has claims is emphatically not legacy.
+    assert!(!is_legacy_populator_status(&status(serde_json::json!({
+        "phase": "Completed",
+        "claims": { "data": { "phase": "Populated" } }
+    }))));
+}
+
+/// #443 review item 5 — an adopted `{restore}-populate` Job carries no
+/// `claimKey`, so when its DEFERRED source resolves the mover pins the
+/// TOP-LEVEL `status.resolved`. Adoption snapshots that field exactly once (when
+/// it is typically still unpinned), so without a fallback the finalize reads
+/// `None` and records "provisioned an empty volume" over a real restore.
+///
+/// A `Fresh` claim must NEVER take that fallback: its mover writes only
+/// `status.claims.<pvc>.resolved`, and reading the top level would let it
+/// inherit a sibling's — or a legacy — pin and report the wrong snapshot.
+#[test]
+fn only_an_adopted_legacy_job_reads_the_top_level_pin() {
+    let snapshot = resolved_with(Some(ResolutionOutcome::Snapshot), Some("k9"));
+    let empty = resolved_with(Some(ResolutionOutcome::NoSnapshot), None);
+
+    // LegacyShared with nothing of its own: the top-level pin its own mover wrote.
+    assert_eq!(
+        claim_finalize_pin(
+            JobNameReuse::LegacyShared,
+            None,
+            None,
+            Some(snapshot.clone())
+        ),
+        Some(snapshot.clone())
+    );
+    // Fresh with nothing of its own: NO fallback — an absent pin stays absent.
+    assert_eq!(
+        claim_finalize_pin(JobNameReuse::Fresh, None, None, Some(snapshot.clone())),
+        None
+    );
+    // The claim's own pin always wins over both.
+    for reuse in [JobNameReuse::Fresh, JobNameReuse::LegacyShared] {
+        assert_eq!(
+            claim_finalize_pin(
+                reuse,
+                Some(empty.clone()),
+                Some(snapshot.clone()),
+                Some(snapshot.clone())
+            ),
+            Some(empty.clone())
+        );
+        // …then the record carried into the pass.
+        assert_eq!(
+            claim_finalize_pin(reuse, None, Some(empty.clone()), Some(snapshot.clone())),
+            Some(empty.clone())
+        );
+    }
 }
 
 // --- kstatus Ready conditions (ADR-0005 §2) -----------------------------

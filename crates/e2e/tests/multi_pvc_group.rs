@@ -66,55 +66,6 @@ async fn assert_selector_landed(api: &Api<kopiur_api::SnapshotPolicy>, name: &st
     );
 }
 
-/// The `Snapshot` CRs a policy produced, by its config label.
-async fn children_of(client: &kube::Client, policy: &str) -> Vec<kopiur_api::Snapshot> {
-    let api: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    api.list(&ListParams::default().labels(&format!("kopiur.home-operations.com/config={policy}")))
-        .await
-        .expect("list Snapshots")
-        .items
-}
-
-/// Purge one scenario's leftovers from a previous try, so the e2e profile's
-/// nextest retries actually RE-RUN the scenario instead of dying in setup.
-///
-/// A panicked try skips the end-of-test cleanup and leaves three tripwires: the
-/// policy (the fresh `create` dies `AlreadyExists` — how a real CSI group-member
-/// flake turned into 3/3 shard failures on PR #417's merge queue), the schedule
-/// (its `runOnCreate` token is consumed, so even an idempotent create fires no
-/// new capture), and stale children (a terminal `Failed` member makes the
-/// all-Succeeded wait unwinnable). Deletion order mirrors the tests' own
-/// success-path cleanup — schedule first so nothing re-produces children — and
-/// then waits for the children to fully go (their finalizers release the
-/// kopia-side state through the batched delete path). A fresh cluster is a
-/// fast no-op.
-async fn clear_scenario_leftovers(client: &kube::Client, schedule: &str, policy: &str) {
-    let schedules: Api<kopiur_api::SnapshotSchedule> =
-        Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let backups: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
-    let _ = policies.delete(policy, &DeleteParams::default()).await;
-    for child in children_of(client, policy).await {
-        if let Some(n) = child.metadata.name {
-            let _ = backups.delete(&n, &DeleteParams::default()).await;
-        }
-    }
-    wait_until(
-        &format!("leftovers of scenario `{policy}` are gone"),
-        default_timeout(),
-        poll_interval(),
-        || async {
-            let gone = schedules.get_opt(schedule).await?.is_none()
-                && policies.get_opt(policy).await?.is_none()
-                && children_of(client, policy).await.is_empty();
-            Ok(gone.then_some(()))
-        },
-    )
-    .await
-    .unwrap_or_else(|e| panic!("previous try's `{policy}` leftovers must clear: {e}"));
-}
-
 /// A `pvcSelector` policy fires one Snapshot per matched PVC, each backing up
 /// its OWN volume at its OWN kopia source path.
 ///
