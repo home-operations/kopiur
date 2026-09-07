@@ -11162,6 +11162,29 @@ spec:
                         description: 'Which snapshot to pick: 0 = latest, 1 = previous, and so on.'
                         format: int64
                         type: integer
+                      sourcePath:
+                        description: |-
+                          The kopia source path to restore FROM, overriding the path kopiur derives
+                          from the policy.
+
+                          Normally the path is derived: a policy with one plain `pvc:`/`nfs` source
+                          contributes its own path, and a `pvcSelector` policy contributes the path
+                          its `sourcePathStrategy` would have produced for the PVC being restored
+                          (`/pvc/<name>` or `/pvc/<namespace>/<name>`) — the same rule the backup
+                          side used when it wrote the snapshot, so a fan-out restore fills each PVC
+                          from ITS OWN snapshot instead of the newest snapshot of any member.
+
+                          Set this when the derivation is ambiguous or wrong: selector sources that
+                          disagree on `sourcePathStrategy`/`sourcePathOverride` (kopiur fails closed
+                          rather than guess), a policy whose selector sources share one
+                          `sourcePathOverride`, or a cross-namespace `target.pvcRef` whose derived
+                          `/pvc/<namespace>/<name>` names a namespace the repository never saw.
+
+                          Mirrors `IdentitySource::source_path`: it selects which kopia source to
+                          READ, it does not change where the data is written.
+                        maxLength: 4096
+                        nullable: true
+                        type: string
                     required:
                     - name
                     type: object
@@ -11280,6 +11303,214 @@ spec:
             description: Observed state of a Restore, written by the controller/mover.
             nullable: true
             properties:
+              claims:
+                additionalProperties:
+                  description: |-
+                    The state of ONE claiming PVC of a `target.populator` restore (#443).
+
+                    Written by the controller (every field except `resolved`/`observedAt`/
+                    `logTail`/`failure`) and by that claim's mover `Job`, which nests its status
+                    patch under `status.claims.<pvc>` and deliberately omits `phase` — the
+                    controller owns claim phase exactly as it owns the top-level one.
+                  properties:
+                    failure:
+                      description: Structured terminal-failure detail for this claim. Mover-owned.
+                      nullable: true
+                      properties:
+                        exitCode:
+                          description: The process exit code, if one was reported.
+                          format: int32
+                          nullable: true
+                          type: integer
+                        kopiaErrorClass:
+                          description: kopia error class (e.g. `RepositoryUnavailable`, `AuthFailure`).
+                          type: string
+                        message:
+                          description: 'A short human-readable message: what failed, why, and how to fix it.'
+                          type: string
+                        op:
+                          description: |-
+                            The mover operation that failed, as a stable label (e.g.
+                            `repository connect`, `snapshot create`) — the values of the mover's
+                            `KopiaOp::as_str()`. Distinguishes a repository-level connect failure
+                            from a source-level failure (a broken PVC), which share
+                            `kopiaErrorClass` values (e.g. `NotFound`). Absent on failures that
+                            occurred outside a kopia invocation.
+                          nullable: true
+                          type: string
+                        retryRecommended:
+                          description: Whether retrying the same operation unchanged could succeed.
+                          type: boolean
+                        stderrTail:
+                          description: |-
+                            The last lines of kopia's stderr, if any were captured (bounded by
+                            [`MAX_LOG_TAIL_BYTES`]).
+                          nullable: true
+                          type: string
+                      required:
+                      - kopiaErrorClass
+                      - message
+                      - retryRecommended
+                      type: object
+                    job:
+                      description: The mover `Job` populating this claim's prime PVC.
+                      nullable: true
+                      type: string
+                    logTail:
+                      description: |-
+                        The last lines of this claim's mover output, written once at its terminal
+                        transition. Mover-owned.
+                      nullable: true
+                      type: string
+                    message:
+                      description: Human-readable what / why / fix for the current phase.
+                      nullable: true
+                      type: string
+                    observedAt:
+                      description: |-
+                        When this claim's mover last patched (RFC3339). Mover-owned: every
+                        `StatusUpdate` carries it, and the field must exist here or the schema's
+                        `additionalProperties` pruning would silently drop the mover's whole patch.
+                      nullable: true
+                      type: string
+                    phase:
+                      description: Lifecycle phase of one claiming PVC of a populator restore.
+                      enum:
+                      - Pending
+                      - Populating
+                      - Rebinding
+                      - Populated
+                      - AlreadyBound
+                      - Failed
+                      nullable: true
+                      type: string
+                    pvcPrime:
+                      description: The prime PVC provisioned for this claim's populate handshake.
+                      nullable: true
+                      type: string
+                    reason:
+                      description: |-
+                        Machine-readable reason for the current phase (`PopulatingPrimePvc`,
+                        `MoverJobFailed`, `SourcePathAmbiguous`, …).
+                      nullable: true
+                      type: string
+                    resolved:
+                      description: The source this claim resolved and pinned; never re-resolved.
+                      nullable: true
+                      properties:
+                        identity:
+                          description: The resolved kopia identity (`username@hostname:path`) of the snapshot.
+                          nullable: true
+                          properties:
+                            hostname:
+                              description: The final `hostname` kopia records, fixed at admission.
+                              type: string
+                            sourcePath:
+                              description: The resolved snapshot source path, when applicable (`username@hostname:path`).
+                              nullable: true
+                              type: string
+                            username:
+                              description: The final `username` kopia records, fixed at admission.
+                              type: string
+                          required:
+                          - hostname
+                          - username
+                          type: object
+                        kopiaSnapshotID:
+                          description: The exact kopia snapshot manifest id the source resolved to; pinned once.
+                          nullable: true
+                          type: string
+                        pinnedAt:
+                          description: Timestamp at which the source was pinned (RFC3339).
+                          nullable: true
+                          type: string
+                        repository:
+                          description: The repository the snapshot lives in, resolved from the source.
+                          nullable: true
+                          properties:
+                            kind:
+                              default: Repository
+                              description: Which repository CRD this points at; defaults to [`RepositoryKind::Repository`].
+                              enum:
+                              - Repository
+                              - ClusterRepository
+                              type: string
+                            name:
+                              description: Name of the referenced `Repository`/`ClusterRepository`.
+                              type: string
+                            namespace:
+                              description: Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`.
+                              nullable: true
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        resolution:
+                          description: Which outcome the source resolution pinned, once and never re-resolved.
+                          enum:
+                          - Snapshot
+                          - NoSnapshot
+                          nullable: true
+                          type: string
+                        snapshotRef:
+                          description: The concrete `Snapshot` CR the source resolved to, when applicable.
+                          nullable: true
+                          properties:
+                            name:
+                              description: Name of the referenced object.
+                              type: string
+                            namespace:
+                              description: Namespace of the referenced object; absent = same namespace as the referrer.
+                              nullable: true
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      type: object
+                    sourcePath:
+                      description: |-
+                        The kopia source path this claim restores FROM, derived from the policy's
+                        `sourcePathStrategy` (or pinned from `source.fromPolicy.sourcePath`).
+                        Recorded so a fan-out restore is auditable: each claim shows which member's
+                        data it read.
+                      nullable: true
+                      type: string
+                    uid:
+                      description: |-
+                        `metadata.uid` of the claiming PVC this record describes. A record whose
+                        uid no longer matches the live claimant is STALE — the PVC was deleted and
+                        re-created — so the claim re-arms and the old claim's prime PVC / Job / PV
+                        are reaped under the recorded uid.
+                      nullable: true
+                      type: string
+                    waitStartedAt:
+                      description: |-
+                        When THIS claim's `policy.waitTimeout` window opened (RFC3339) — the first
+                        pass on which this claim could actually proceed. Per-claim because
+                        claimants appear at different times: a sibling created an hour later gets
+                        its own full window.
+                      nullable: true
+                      type: string
+                  type: object
+                description: |-
+                  Per-claimant state for a `target.populator` restore, keyed by the claiming
+                  PVC's name (#443).
+
+                  A populator `Restore` is claimed by EVERY PVC whose `spec.dataSourceRef`
+                  names it, not just the first, and each claimant gets its own prime PVC, its
+                  own mover `Job` and its own kopia source path — so each needs its own state.
+                  A **map**, not a list, because an RFC-7386 merge patch merges map keys but
+                  REPLACES arrays: N concurrent populate movers each patch only their own key
+                  and can never clobber a sibling (the same reason as
+                  `SnapshotPolicyStatus.verificationStamps`).
+
+                  Absent for a direct `target.pvc`/`target.pvcRef` restore, which keeps using
+                  the top-level `resolved`/`target`/`waitStartedAt`/`logTail`/`failure`.
+
+                  The schema renders as an object with `additionalProperties`, which PRUNES
+                  unknown keys — so every field any writer (controller or mover) puts under
+                  `claims.<pvc>` must exist on `RestoreClaimStatus`.
+                type: object
               conditions:
                 description: Standard Kubernetes conditions carrying the human-readable status/reason.
                 items:

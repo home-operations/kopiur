@@ -3003,6 +3003,7 @@ Externally tagged — set **exactly one** of: `fromPolicy` · `identity` · `sna
 | `asOf` | string | — | Restore the newest snapshot at or before this RFC3339 timestamp (point-in-time). |
 | `namespace` | string | — | Namespace of the `SnapshotPolicy`; absent = the `Restore`'s own namespace. |
 | `offset` | integer | `0` | Which snapshot to pick: 0 = latest, 1 = previous, and so on. |
+| `sourcePath` | string | —<br><sub>maxLength 4096</sub> | The kopia source path to restore FROM, overriding the path kopiur derives from the policy.<br>Normally the path is derived: a policy with one plain `pvc:`/`nfs` source contributes its own path, and a `pvcSelector` policy contributes the path its `sourcePathStrategy` would have produced for the PVC being restored (`/pvc/&lt;name&gt;` or `/pvc/&lt;namespace&gt;/&lt;name&gt;`) — the same rule the backup side used when it wrote the snapshot, so a fan-out restore fills each PVC from ITS OWN snapshot instead of the newest snapshot of any member.<br>Set this when the derivation is ambiguous or wrong: selector sources that disagree on `sourcePathStrategy`/`sourcePathOverride` (kopiur fails closed rather than guess), a policy whose selector sources share one `sourcePathOverride`, or a cross-namespace `target.pvcRef` whose derived `/pvc/&lt;namespace&gt;/&lt;name&gt;` names a namespace the repository never saw.<br>Mirrors `IdentitySource::source_path`: it selects which kopia source to READ, it does not change where the data is written. |
 
 ##### `spec.source.identity` { #restore-spec-source-identity }
 
@@ -3144,6 +3145,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `claims` | map[string]object | — | Per-claimant state for a `target.populator` restore, keyed by the claiming PVC's name (#443).<br>A populator `Restore` is claimed by EVERY PVC whose `spec.dataSourceRef` names it, not just the first, and each claimant gets its own prime PVC, its own mover `Job` and its own kopia source path — so each needs its own state. A **map**, not a list, because an RFC-7386 merge patch merges map keys but REPLACES arrays: N concurrent populate movers each patch only their own key and can never clobber a sibling (the same reason as `SnapshotPolicyStatus.verificationStamps`).<br>Absent for a direct `target.pvc`/`target.pvcRef` restore, which keeps using the top-level `resolved`/`target`/`waitStartedAt`/`logTail`/`failure`.<br>The schema renders as an object with `additionalProperties`, which PRUNES unknown keys — so every field any writer (controller or mover) puts under `claims.&lt;pvc&gt;` must exist on `RestoreClaimStatus`. |
 | `conditions` | [][object](#restore-status-conditions) | — | Standard Kubernetes conditions carrying the human-readable status/reason. |
 | `failure` | [object](#restore-status-failure) | — | Structured terminal-failure detail (kopia error class, stderr tail, retry hint). |
 | `logTail` | string | — | The last lines of the run's output, written by the mover at the terminal transition. |
