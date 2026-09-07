@@ -387,6 +387,23 @@ pub enum KopiaError {
         source: serde_json::Error,
     },
 
+    /// The process feeding kopia's stdin did not finish successfully, so the
+    /// snapshot was deliberately aborted before kopia wrote any manifest.
+    ///
+    /// Distinct from [`KopiaError::NonZeroExit`]: kopia itself was fine — it was
+    /// killed on purpose. Surfacing that difference is what tells an operator
+    /// "your dump command failed" rather than "the backup tool failed".
+    #[error(
+        "the snapshot was aborted because its stdin producer failed: {detail}{}",
+        if stderr_tail.is_empty() { String::new() } else { format!(" (kopia stderr: {stderr_tail})") }
+    )]
+    StdinProducerFailed {
+        /// What went wrong with the producer, already free of any streamed data.
+        detail: String,
+        /// Bounded tail of kopia's own stderr, for context.
+        stderr_tail: String,
+    },
+
     /// We expected a JSON object/array on stdout but found none (kopia printed
     /// only progress / nothing) even though it exited **0**.
     ///
@@ -426,6 +443,10 @@ impl KopiaError {
             KopiaError::Json { .. } | KopiaError::EmptyOutput { .. } => KopiaErrorClass::Unknown,
             // Timeouts are usually a slow backend → worth a retry.
             KopiaError::Timeout { .. } => KopiaErrorClass::RepositoryUnavailable,
+            // The repository was never at fault — the user's dump command was.
+            // Retrying the same Job re-runs the same failing command, so this is
+            // NOT retryable; the fix is in the workload or the policy.
+            KopiaError::StdinProducerFailed { .. } => KopiaErrorClass::Unknown,
         }
     }
 
@@ -436,6 +457,11 @@ impl KopiaError {
             // An exit-0-with-no-JSON keeps its stderr too, so `status.failure`
             // shows kopia's own words instead of a bare "class Unknown".
             KopiaError::EmptyOutput { stderr_tail, .. } if !stderr_tail.is_empty() => {
+                Some(stderr_tail.as_str())
+            }
+            // Bounded kopia stderr only. The producer's own diagnostics ride in
+            // `detail`, and its STDOUT — the backup data — is never captured at all.
+            KopiaError::StdinProducerFailed { stderr_tail, .. } if !stderr_tail.is_empty() => {
                 Some(stderr_tail.as_str())
             }
             _ => None,

@@ -308,7 +308,8 @@ pub fn effective_on_policy_delete(
     deletion.map(|d| d.on_policy_delete).unwrap_or_default()
 }
 
-/// A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs` (webhook-enforced).
+/// A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs`, `stream`
+/// (webhook-enforced).
 // The exactly-one-of rule is written as an integer sum of `has()` ternaries rather
 // than `[...].filter(x,x).size()==1`: the apiserver estimates per-item CEL cost ×
 // `maxItems`, and a list-construction + lambda `filter` blows the budget on the
@@ -316,11 +317,18 @@ pub fn effective_on_policy_delete(
 // `Default` is derived purely for construction ergonomics: `Source` is built as an
 // exhaustive struct literal in ~20 places, and every added field would otherwise have
 // to be spelled out at each one. An all-`None` `Source` is not a valid spec (the CEL
-// rule above demands exactly one of pvc/pvcSelector/nfs) and admission rejects it.
+// rule above demands exactly one of pvc/pvcSelector/nfs/stream) and admission rejects it.
+//
+// The forms stay sibling `Option`s rather than an externally-tagged enum because they
+// SHARE the `sourcePath*`/`readOnly` keys (see `crate::validate::validate_source`), which
+// an enum could only express with a `#[serde(flatten)]` kube's structural-schema rewriter
+// cannot represent. The type-safety thesis is upheld one layer up instead: [`source_shape`]
+// resolves this struct into the [`SourceShape`] enum, and every reconcile path matches on
+// THAT exhaustively — so a fifth form cannot compile until each handler accounts for it.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[schemars(extend("x-kubernetes-validations" = [{
-    "rule": "(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) == 1",
-    "message": "exactly one of pvc, pvcSelector, nfs"
+    "rule": "(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) + (has(self.stream) ? 1 : 0) == 1",
+    "message": "exactly one of pvc, pvcSelector, nfs, stream"
 }]))]
 #[serde(rename_all = "camelCase")]
 pub struct Source {
@@ -330,9 +338,15 @@ pub struct Source {
     /// Label/namespace selector matching many PVCs. Mutually exclusive with `pvc`/`nfs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pvc_selector: Option<PvcSelector>,
-    /// An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`.
+    /// An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`/`stream`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfs: Option<NfsVolume>,
+    /// Capture a command's standard output as one virtual file — a logical backup
+    /// (`pg_dumpall`, `mysqldump`, …) rather than a volume copy. Mutually exclusive
+    /// with `pvc`/`pvcSelector`/`nfs`. No volume is mounted; the mover execs the
+    /// command in a running workload Pod and streams its stdout straight into kopia.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamSource>,
     /// Mount the source read-only (default `true`; kopia only ever reads it).
     ///
     /// Set `false` **only** to make `fsGroup` work on the source. The kubelet applies
@@ -366,6 +380,165 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default = "default_source_path_strategy")]
     pub source_path_strategy: Option<SourcePathStrategy>,
+}
+
+/// The virtual directory a stream source's single file lives under, so a streamed
+/// artifact can never collide with a PVC source's `/pvc/<name>` namespace.
+pub const STREAM_SOURCE_ROOT: &str = "/stream";
+
+/// Capture a command's standard output as ONE virtual file inside a normal kopia
+/// snapshot — the logical-backup source (`pg_dumpall`, `mysqldump`, …).
+///
+/// Nothing is mounted: the mover execs `workloadExec.command` in a running workload
+/// Pod and pipes its stdout directly into `kopia snapshot create --stdin-file`. The
+/// snapshot root is a virtual directory at `/stream/<fileName>` (override with
+/// `sourcePathOverride`) containing exactly that one file.
+///
+/// The command runs in the WORKLOAD's container, so it uses the database credentials
+/// already present there; the mover never hands it repository credentials.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSource {
+    /// Name of the single virtual file stored in the snapshot (e.g. `postgres.sql`).
+    ///
+    /// Must be ONE file name: no `/`, and not `.` or `..`. kopia stores this string
+    /// verbatim as the entry name and does not sanitize it, so a path-shaped value
+    /// would make a later `kopia restore` write OUTSIDE its destination directory.
+    #[schemars(length(min = 1, max = 255))]
+    pub file_name: String,
+    /// The producer: what to run, and where. Its stdout IS the backup data.
+    pub workload_exec: StreamExec,
+}
+
+/// Exec a command in exactly one running workload Pod, streaming one of its
+/// standard streams. Used as the producer of a `stream` backup source and as the
+/// consumer of a `streamExec` restore target.
+///
+/// Exactly one RUNNING Pod must match `podSelector`: zero, several, or only
+/// not-running matches are named failures, never an arbitrary pick — a backup that
+/// silently dumped a different replica than intended is worse than one that stops.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamExec {
+    /// Standard label selector identifying the workload Pod, resolved in the
+    /// `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an
+    /// empty selector matches every Pod in the namespace.
+    pub pod_selector: LabelSelector,
+    /// Container to exec in; absent uses the Pod's default container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// The argv to execute. NOT a shell line: element 0 is the program, so use
+    /// `["sh", "-ec", "..."]` explicitly if you want shell semantics.
+    ///
+    /// Reference credentials through the container's existing environment or mounted
+    /// Secrets — never inline them here. This argv is copied into the mover Pod's
+    /// spec, so anyone with `pods:get` in the namespace can read it.
+    #[schemars(length(min = 1))]
+    pub command: Vec<String>,
+    /// Go duration bounding the command (e.g. `2h`); absent uses
+    /// [`DEFAULT_STREAM_TIMEOUT`]. On expiry the command is abandoned and the run
+    /// fails, leaving no snapshot behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+/// Default bound on a stream producer/consumer command when `timeout` is unset.
+/// Generous enough for a large logical dump, finite so a wedged command cannot pin
+/// a mover Job forever.
+pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 3600;
+
+/// The four mutually-exclusive forms a [`Source`] can take, resolved from its
+/// sibling `Option`s.
+///
+/// THE point of this type: `Source` must stay a struct of `Option`s on the wire (the
+/// forms share `sourcePath*`/`readOnly` keys), but every reconcile path matches on
+/// this enum EXHAUSTIVELY — so a fifth source form cannot compile until backup Job
+/// construction, validation, and identity resolution each account for it. Borrowed,
+/// so callers match without cloning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SourceShape<'a> {
+    /// One PVC named directly.
+    Pvc(&'a PvcSource),
+    /// A label/namespace selector matching many PVCs (fans out into child Snapshots).
+    PvcSelector(&'a PvcSelector),
+    /// An inline NFS export read directly.
+    Nfs(&'a NfsVolume),
+    /// A command whose stdout is captured as one virtual file.
+    Stream(&'a StreamSource),
+}
+
+impl SourceShape<'_> {
+    /// Stable discriminant string for status, metrics, and messages.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            SourceShape::Pvc(_) => "pvc",
+            SourceShape::PvcSelector(_) => "pvcSelector",
+            SourceShape::Nfs(_) => "nfs",
+            SourceShape::Stream(_) => "stream",
+        }
+    }
+}
+
+/// THE exactly-one-of resolver for a [`Source`]'s form.
+///
+/// Never panics: a stored CR can carry an invalid shape (none set, or several — e.g. a
+/// write that raced an old CRD schema), so those come back as a
+/// [`ValidationError`](crate::error::ValidationError) for the caller's error path rather
+/// than as an `unwrap` in a reconciler. Mirrors
+/// [`policy_repositories`](crate::snapshot_policy::policy_repositories).
+///
+/// ```
+/// use kopiur_api::snapshot_policy::{Source, SourceShape, PvcSource, source_shape};
+///
+/// let s = Source { pvc: Some(PvcSource { name: "data".into() }), ..Default::default() };
+/// assert!(matches!(source_shape(&s), Ok(SourceShape::Pvc(p)) if p.name == "data"));
+///
+/// // Nothing set is a named error, never a silent default.
+/// assert!(source_shape(&Source::default()).is_err());
+/// ```
+pub fn source_shape(source: &Source) -> Result<SourceShape<'_>, crate::error::ValidationError> {
+    let set: Vec<&'static str> = [
+        ("pvc", source.pvc.is_some()),
+        ("pvcSelector", source.pvc_selector.is_some()),
+        ("nfs", source.nfs.is_some()),
+        ("stream", source.stream.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+
+    match set.as_slice() {
+        [] => Err(crate::error::ValidationError::MissingRequiredField {
+            field: "source.pvc, source.pvcSelector, source.nfs, or source.stream".to_string(),
+        }),
+        [first, second, ..] => Err(crate::error::ValidationError::MutuallyExclusive {
+            a: (*first).to_string(),
+            b: (*second).to_string(),
+            context: "snapshot source".to_string(),
+        }),
+        // Exactly one is set; return the one that is. The `expect`s cannot fire —
+        // each arm is reached only when its own `is_some()` put the name in `set`.
+        ["pvc"] => Ok(SourceShape::Pvc(source.pvc.as_ref().expect("pvc is set"))),
+        ["pvcSelector"] => Ok(SourceShape::PvcSelector(
+            source.pvc_selector.as_ref().expect("pvcSelector is set"),
+        )),
+        ["nfs"] => Ok(SourceShape::Nfs(source.nfs.as_ref().expect("nfs is set"))),
+        ["stream"] => Ok(SourceShape::Stream(
+            source.stream.as_ref().expect("stream is set"),
+        )),
+        // Unreachable: `set` is built from exactly the four names above.
+        [other] => Err(crate::error::ValidationError::InvalidFieldValue {
+            field: "spec.sources[]".to_string(),
+            reason: format!("unknown source form `{other}`"),
+        }),
+    }
+}
+
+/// The kopia source path a stream source records by default: `/stream/<fileName>`.
+/// Deliberately distinct from a PVC source's `/pvc/<name>` so a streamed artifact and
+/// a volume backup can never share a kopia identity.
+pub fn stream_source_path(stream: &StreamSource) -> String {
+    format!("{STREAM_SOURCE_ROOT}/{}", stream.file_name)
 }
 
 /// A single backup source addressed by PVC name.

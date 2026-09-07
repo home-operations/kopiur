@@ -12,8 +12,8 @@ pub mod session;
 pub use client::{
     CacheTuning, ConnectOptions, ConnectSpec, CreateOptions, KopiaClient, KopiaClientBuilder,
     MaintenanceMode, MigratePolicies, MigrateSources, PolicyArgs, RestoreOptions, ServerAuthMode,
-    ServerStartSpec, SnapshotCreateOptions, SnapshotMigrateOptions, SyncToOptions, ThrottleArgs,
-    VerifyOptions, split_policy_scopes,
+    ServerStartSpec, SnapshotCreateOptions, SnapshotMigrateOptions, StdinOutcome, SyncToOptions,
+    ThrottleArgs, VerifyOptions, split_policy_scopes,
 };
 pub use error::{
     KopiaError, KopiaErrorClass, notfound_is_uninitialized, snapshot_skipped_unchanged,

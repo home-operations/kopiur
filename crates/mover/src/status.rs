@@ -146,6 +146,10 @@ impl From<&crate::error::MoverError> for FailureBlock {
                     KopiaError::Spawn { .. }
                     | KopiaError::Json { .. }
                     | KopiaError::EmptyOutput { .. }
+                    // kopia was killed on purpose, so its exit code says nothing
+                    // about the failure — the producer's does, and it is in the
+                    // message.
+                    | KopiaError::StdinProducerFailed { .. }
                     | KopiaError::Timeout { .. } => None,
                 },
                 Some(op.as_str().to_string()),

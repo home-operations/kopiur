@@ -682,6 +682,8 @@ spec:
                   - pvcRef
                 - required:
                   - populator
+                - required:
+                  - streamExec
                 properties:
                   populator:
                     description: 'Passive populator mode: the restore is claimed by a PVC''s `spec.dataSourceRef`.'
@@ -731,6 +733,86 @@ spec:
                         type: string
                     required:
                     - name
+                    type: object
+                  streamExec:
+                    description: |-
+                      Stream one virtual file out of the snapshot into a command's stdin in a
+                      running Pod — the companion of a `stream` backup source (e.g. feeding a
+                      `pg_dumpall` artifact back through `psql`). Writes no PVC.
+                    properties:
+                      fileName:
+                        description: |-
+                          Which virtual file inside the snapshot to read back — the `fileName` the
+                          backup's stream source used (e.g. `postgres.sql`).
+                        maxLength: 255
+                        minLength: 1
+                        type: string
+                      workloadExec:
+                        description: 'Where to send it: the command receives the file''s bytes on stdin.'
+                        properties:
+                          command:
+                            description: |-
+                              The argv to execute. NOT a shell line: element 0 is the program, so use
+                              `["sh", "-ec", "..."]` explicitly if you want shell semantics.
+
+                              Reference credentials through the container's existing environment or mounted
+                              Secrets — never inline them here. This argv is copied into the mover Pod's
+                              spec, so anyone with `pods:get` in the namespace can read it.
+                            items:
+                              type: string
+                            minItems: 1
+                            type: array
+                          container:
+                            description: Container to exec in; absent uses the Pod's default container.
+                            nullable: true
+                            type: string
+                          podSelector:
+                            description: |-
+                              Standard label selector identifying the workload Pod, resolved in the
+                              `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an
+                              empty selector matches every Pod in the namespace.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                items:
+                                  description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector applies to.
+                                      type: string
+                                    operator:
+                                      description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                          timeout:
+                            description: |-
+                              Go duration bounding the command (e.g. `2h`); absent uses
+                              [`DEFAULT_STREAM_TIMEOUT`]. On expiry the command is abandoned and the run
+                              fails, leaving no snapshot behind.
+                            nullable: true
+                            type: string
+                        required:
+                        - command
+                        - podSelector
+                        type: object
+                    required:
+                    - fileName
+                    - workloadExec
                     type: object
                 type: object
             required:

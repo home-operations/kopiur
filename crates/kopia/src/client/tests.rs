@@ -620,12 +620,19 @@ fn snapshot_create_args_default_is_todays_argv() {
     let mut tags = BTreeMap::new();
     tags.insert("app".to_string(), "db".to_string());
     assert_eq!(
-        snapshot_create_args("/data", &tags, None, &SnapshotCreateOptions::default()),
+        snapshot_create_args(
+            "/data",
+            None,
+            &tags,
+            None,
+            &SnapshotCreateOptions::default()
+        ),
         vec!["snapshot", "create", "/data", "--json", "--tags", "app:db"]
     );
     assert_eq!(
         snapshot_create_args(
             "/data",
+            None,
             &BTreeMap::new(),
             Some("u@h:/data"),
             &SnapshotCreateOptions::default()
@@ -651,7 +658,7 @@ fn snapshot_create_args_fail_fast_upload_limit_and_description() {
         description: Some("smoke test".to_string()),
     };
     assert_eq!(
-        snapshot_create_args("/data", &BTreeMap::new(), None, &opts),
+        snapshot_create_args("/data", None, &BTreeMap::new(), None, &opts),
         vec![
             "snapshot",
             "create",
@@ -672,7 +679,7 @@ fn snapshot_create_args_fail_fast_upload_limit_and_description() {
         ..Default::default()
     };
     assert_eq!(
-        snapshot_create_args("/data", &BTreeMap::new(), None, &opts_false),
+        snapshot_create_args("/data", None, &BTreeMap::new(), None, &opts_false),
         vec!["snapshot", "create", "/data", "--json", "--no-fail-fast"]
     );
 }

@@ -2404,17 +2404,18 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 #### `spec.sources[]` { #snapshotpolicy-spec-sources }
 
-Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
+Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector` · `stream`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `acknowledgeLiveMutation` | boolean | — | Acknowledges that `copyMethod: Direct` + `readOnly: false` lets the kubelet recursively `chgrp` the **live** volume to the mover's `fsGroup` and make it group-writable — permanently, while the workload is running. Required for that combination alone.<br>Ignored (not rejected) otherwise: it is an acknowledgement, never harmful to carry, and rejecting a stale one would make switching `copyMethod` between `Direct` and `Snapshot`/`Clone` a two-step edit in both directions. |
-| `nfs` | [object](#snapshotpolicy-spec-sources-nfs) | — | An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`. |
+| `nfs` | [object](#snapshotpolicy-spec-sources-nfs) | — | An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`/`stream`. |
 | `pvc` | [object](#snapshotpolicy-spec-sources-pvc) | — | Single PVC by name. Mutually exclusive with `pvcSelector`/`nfs`. |
 | `pvcSelector` | [object](#snapshotpolicy-spec-sources-pvcselector) | — | Label/namespace selector matching many PVCs. Mutually exclusive with `pvc`/`nfs`. |
 | `readOnly` | boolean | `true` | Mount the source read-only (default `true`; kopia only ever reads it).<br>Set `false` **only** to make `fsGroup` work on the source. The kubelet applies `fsGroup` by recursively `chgrp`-ing the volume and adding group-write — and it skips that walk entirely on a read-only mount, which is why a mover `fsGroup`/`fsGroupChangePolicy` otherwise has no effect here. Under `copyMethod: Snapshot`/`Clone` the walk rewrites the throwaway staged PVC and never touches your data. Under `copyMethod: Direct` it rewrites the LIVE volume, which requires `acknowledgeLiveMutation`.<br>Not supported on an `nfs` source: the kubelet does not apply `fsGroup` to in-tree NFS volumes at all, so a read-write mount would grant nothing. |
 | `sourcePathOverride` | string | —<br><sub>maxLength 4096</sub> | What kopia records as the source path (default `/pvc/&lt;name&gt;`, or the NFS export `path`). |
 | `sourcePathStrategy` | enum: PvcName \| PvcNamespacedName | `PvcName` | How a selector-matched PVC's source path is derived. Only relevant for `pvcSelector` sources, where one recipe expands to many PVCs and each needs a distinct kopia source path. Defaults to `PvcName`. |
+| `stream` | [object](#snapshotpolicy-spec-sources-stream) | — | Capture a command's standard output as one virtual file — a logical backup (`pg_dumpall`, `mysqldump`, …) rather than a volume copy. Mutually exclusive with `pvc`/`pvcSelector`/`nfs`. No volume is mounted; the mover execs the command in a running workload Pod and streams its stdout straight into kopia. |
 
 ##### `spec.sources[].nfs` { #snapshotpolicy-spec-sources-nfs }
 
@@ -2441,6 +2442,22 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `matchNames` | []string | — | Exact namespace names to search; empty means the policy's own namespace. |
+
+##### `spec.sources[].stream` { #snapshotpolicy-spec-sources-stream }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `fileName` | string | **required**<br><sub>minLength 1; maxLength 255</sub> | Name of the single virtual file stored in the snapshot (e.g. `postgres.sql`).<br>Must be ONE file name: no `/`, and not `.` or `..`. kopia stores this string verbatim as the entry name and does not sanitize it, so a path-shaped value would make a later `kopia restore` write OUTSIDE its destination directory. |
+| `workloadExec` | [object](#snapshotpolicy-spec-sources-stream-workloadexec) | **required** | The producer: what to run, and where. Its stdout IS the backup data. |
+
+###### `spec.sources[].stream.workloadExec` { #snapshotpolicy-spec-sources-stream-workloadexec }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `command` | []string | **required**<br><sub>minItems 1</sub> | The argv to execute. NOT a shell line: element 0 is the program, so use `["sh", "-ec", "..."]` explicitly if you want shell semantics.<br>Reference credentials through the container's existing environment or mounted Secrets — never inline them here. This argv is copied into the mover Pod's spec, so anyone with `pods:get` in the namespace can read it. |
+| `podSelector` | core/v1 LabelSelector | **required** | Standard label selector identifying the workload Pod, resolved in the `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an empty selector matches every Pod in the namespace. |
+| `container` | string | — | Container to exec in; absent uses the Pod's default container. |
+| `timeout` | string | — | Go duration bounding the command (e.g. `2h`); absent uses `DEFAULT_STREAM_TIMEOUT`. On expiry the command is abandoned and the run fails, leaving no snapshot behind. |
 
 #### `spec.staging` { #snapshotpolicy-spec-staging }
 
@@ -3025,13 +3042,14 @@ Externally tagged — set **exactly one** of: `fromPolicy` · `identity` · `sna
 
 #### `spec.target` { #restore-spec-target }
 
-Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef`.
+Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef` · `streamExec`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `populator` | object | — | Passive populator mode: the restore is claimed by a PVC's `spec.dataSourceRef`. |
 | `pvc` | [object](#restore-spec-target-pvc) | — | Operator creates the PVC. |
 | `pvcRef` | [object](#restore-spec-target-pvcref) | — | Write into an existing PVC. |
+| `streamExec` | [object](#restore-spec-target-streamexec) | — | Stream one virtual file out of the snapshot into a command's stdin in a running Pod — the companion of a `stream` backup source (e.g. feeding a `pg_dumpall` artifact back through `psql`). Writes no PVC. |
 
 ##### `spec.target.pvc` { #restore-spec-target-pvc }
 
@@ -3048,6 +3066,22 @@ Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef`.
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the referenced object. |
 | `namespace` | string | — | Namespace of the referenced object; absent = same namespace as the referrer. |
+
+##### `spec.target.streamExec` { #restore-spec-target-streamexec }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `fileName` | string | **required**<br><sub>minLength 1; maxLength 255</sub> | Which virtual file inside the snapshot to read back — the `fileName` the backup's stream source used (e.g. `postgres.sql`). |
+| `workloadExec` | [object](#restore-spec-target-streamexec-workloadexec) | **required** | Where to send it: the command receives the file's bytes on stdin. |
+
+###### `spec.target.streamExec.workloadExec` { #restore-spec-target-streamexec-workloadexec }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `command` | []string | **required**<br><sub>minItems 1</sub> | The argv to execute. NOT a shell line: element 0 is the program, so use `["sh", "-ec", "..."]` explicitly if you want shell semantics.<br>Reference credentials through the container's existing environment or mounted Secrets — never inline them here. This argv is copied into the mover Pod's spec, so anyone with `pods:get` in the namespace can read it. |
+| `podSelector` | core/v1 LabelSelector | **required** | Standard label selector identifying the workload Pod, resolved in the `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an empty selector matches every Pod in the namespace. |
+| `container` | string | — | Container to exec in; absent uses the Pod's default container. |
+| `timeout` | string | — | Go duration bounding the command (e.g. `2h`); absent uses `DEFAULT_STREAM_TIMEOUT`. On expiry the command is abandoned and the run fails, leaving no snapshot behind. |
 
 #### `spec.credentialProjection` { #restore-spec-credentialprojection }
 

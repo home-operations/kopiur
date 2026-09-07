@@ -18,7 +18,7 @@ use crate::backend::NfsVolume;
 use crate::common::{FailurePolicy, MoverSpec, PvcAccessMode, RepositoryMode};
 use crate::error::{ValidationError, ValidationResult};
 use crate::server::{ServerAuth, ServerSpec};
-use crate::snapshot_policy::Source;
+use crate::snapshot_policy::{Source, SourceShape, StreamExec, StreamSource};
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use kube_quantity::ParsedQuantity;
 
@@ -113,56 +113,157 @@ fn validate_pvc_selector(selector: &crate::snapshot_policy::PvcSelector) -> Vali
 }
 
 /// A single backup `Source` is well-formed: **exactly one** of `pvc`,
-/// `pvcSelector`, or `nfs` is set (ADR §3.3 — modeled as sibling Options because
-/// the forms share `sourcePath*` keys, so it's a webhook check, not an enum). When
-/// the source is `nfs`, its server/path are also validated.
+/// `pvcSelector`, `nfs`, or `stream` is set (ADR §3.3 — modeled as sibling Options
+/// because the forms share `sourcePath*` keys, so it's a webhook check, not an
+/// enum), and that form's own content is valid.
+///
+/// The dispatch is an EXHAUSTIVE match over [`SourceShape`] rather than a chain of
+/// `if let`s: a fifth source form then cannot compile until it is given content
+/// validation here, instead of silently falling through with none.
 pub fn validate_source(source: &Source) -> ValidationResult {
-    let set: Vec<&str> = [
-        ("pvc", source.pvc.is_some()),
-        ("pvcSelector", source.pvc_selector.is_some()),
-        ("nfs", source.nfs.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(name, present)| present.then_some(name))
-    .collect();
-
-    match set.as_slice() {
-        [] => Err(ValidationError::MissingRequiredField {
-            field: "source.pvc, source.pvcSelector, or source.nfs".to_string(),
-        }),
-        [first, second, ..] => Err(ValidationError::MutuallyExclusive {
-            a: (*first).to_string(),
-            b: (*second).to_string(),
-            context: "snapshot source".to_string(),
-        }),
-        [_only] => match &source.nfs {
-            Some(nfs) => {
-                // `readOnly: false` exists for exactly one purpose — letting the kubelet
-                // apply `fsGroup` to the source — and the kubelet does not apply `fsGroup`
-                // to in-tree NFS volumes at all. So on NFS it buys nothing and only makes
-                // the export writable to the mover. Reject it rather than ship a knob that
-                // silently does the opposite of what its user wants.
-                if !crate::snapshot_policy::source_read_only(source) {
-                    return Err(ValidationError::InvalidFieldValue {
-                        field: "spec.sources[].readOnly".to_string(),
-                        reason: "readOnly: false is not supported on an nfs source: the kubelet \
-                                 does not apply fsGroup to in-tree NFS volumes, so a read-write \
-                                 mount grants the mover no additional readability and only \
-                                 exposes the export to writes. Remove readOnly (NFS is read \
-                                 directly), and grant access with mover.podSecurityContext \
-                                 supplementalGroups / mover.securityContext runAsUser matching \
-                                 the export's ownership, or with a server-side ID remap"
-                            .to_string(),
-                    });
-                }
-                validate_nfs_volume(nfs, "snapshot source")
+    match crate::snapshot_policy::source_shape(source)? {
+        SourceShape::Pvc(_) => Ok(()),
+        SourceShape::PvcSelector(selector) => validate_pvc_selector(selector),
+        SourceShape::Nfs(nfs) => {
+            // `readOnly: false` exists for exactly one purpose — letting the kubelet
+            // apply `fsGroup` to the source — and the kubelet does not apply `fsGroup`
+            // to in-tree NFS volumes at all. So on NFS it buys nothing and only makes
+            // the export writable to the mover. Reject it rather than ship a knob that
+            // silently does the opposite of what its user wants.
+            if !crate::snapshot_policy::source_read_only(source) {
+                return Err(ValidationError::InvalidFieldValue {
+                    field: "spec.sources[].readOnly".to_string(),
+                    reason: "readOnly: false is not supported on an nfs source: the kubelet \
+                             does not apply fsGroup to in-tree NFS volumes, so a read-write \
+                             mount grants the mover no additional readability and only \
+                             exposes the export to writes. Remove readOnly (NFS is read \
+                             directly), and grant access with mover.podSecurityContext \
+                             supplementalGroups / mover.securityContext runAsUser matching \
+                             the export's ownership, or with a server-side ID remap"
+                        .to_string(),
+                });
             }
-            None => match source.pvc_selector.as_ref() {
-                Some(selector) => validate_pvc_selector(selector),
-                None => Ok(()),
-            },
-        },
+            validate_nfs_volume(nfs, "snapshot source")
+        }
+        SourceShape::Stream(stream) => validate_stream_source(source, stream),
     }
+}
+
+/// A `stream` source is well-formed: a safe single-segment `fileName`, a runnable
+/// `command`, a non-empty `podSelector`, a parseable `timeout`, and none of the
+/// PVC-only knobs that cannot mean anything without a mounted volume.
+fn validate_stream_source(source: &Source, stream: &StreamSource) -> ValidationResult {
+    validate_stream_file_name("spec.sources[].stream.fileName", &stream.file_name)?;
+    validate_stream_exec("spec.sources[].stream.workloadExec", &stream.workload_exec)?;
+
+    // PVC-only knobs. A stream source mounts nothing, so `readOnly` has no volume to
+    // apply to, `acknowledgeLiveMutation` acknowledges a mutation that cannot happen,
+    // and `sourcePathStrategy` derives a path from a PVC that does not exist. Reject
+    // rather than ignore: silently accepting a field that does nothing is how a user
+    // comes to believe a protection is in place when it is not.
+    if source.read_only.is_some() {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "spec.sources[].readOnly".to_string(),
+            reason: "readOnly does not apply to a stream source: nothing is mounted — the \
+                     mover execs a command and pipes its stdout into kopia. Remove readOnly"
+                .to_string(),
+        });
+    }
+    if source.acknowledge_live_mutation.is_some() {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "spec.sources[].acknowledgeLiveMutation".to_string(),
+            reason: "acknowledgeLiveMutation does not apply to a stream source: it \
+                     acknowledges the kubelet rewriting a mounted volume's ownership, and a \
+                     stream source mounts no volume. Remove acknowledgeLiveMutation"
+                .to_string(),
+        });
+    }
+    if source.source_path_strategy.is_some() {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "spec.sources[].sourcePathStrategy".to_string(),
+            reason: "sourcePathStrategy derives a kopia path from a matched PVC's name and \
+                     applies only to a pvcSelector source. A stream source records \
+                     /stream/<fileName>; set sourcePathOverride to change it"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// `fileName` is ONE safe path segment.
+///
+/// Security-relevant, not cosmetic: kopia stores the `--stdin-file` value verbatim as
+/// the snapshot entry's name and does not sanitize it, so an entry named `../x` makes
+/// a later `kopia restore <id> <dir>` write OUTSIDE `<dir>` (verified against kopia
+/// 0.23.1). An empty value is worse still — kopia then ignores stdin entirely and
+/// tries to snapshot the source path from the mover's own filesystem.
+pub fn validate_stream_file_name(field: &str, name: &str) -> ValidationResult {
+    let bad = name.is_empty()
+        || name.contains('/')
+        || name == "."
+        || name == ".."
+        || name.contains('\0')
+        || name.chars().any(|c| c.is_control());
+    if bad {
+        return Err(ValidationError::InvalidFieldValue {
+            field: field.to_string(),
+            reason: format!(
+                "`{name}` is not a usable file name. Give ONE file name (e.g. `postgres.sql`): \
+                 no `/`, not `.` or `..`, no control characters, not empty. kopia stores this \
+                 value verbatim as the entry name inside the snapshot, so a path-shaped value \
+                 would make a later restore write outside its destination directory"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// A [`StreamExec`] is runnable: a non-empty argv, a selector that identifies
+/// something, and a parseable timeout. Shared by the backup source and the restore
+/// target so both reject the same mistakes with the same words.
+pub fn validate_stream_exec(field: &str, exec: &StreamExec) -> ValidationResult {
+    if exec.command.is_empty() {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{field}.command"),
+            reason: "give the argv to run, e.g. [\"sh\", \"-ec\", \"pg_dumpall -U postgres\"]. \
+                     This is exec'd directly, not through a shell, so element 0 is the program"
+                .to_string(),
+        });
+    }
+    if exec.command.iter().all(|a| a.trim().is_empty()) {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{field}.command"),
+            reason: "the command is entirely blank; element 0 must name the program to run"
+                .to_string(),
+        });
+    }
+    let selector_empty = exec
+        .pod_selector
+        .match_labels
+        .as_ref()
+        .is_none_or(|m| m.is_empty())
+        && exec
+            .pod_selector
+            .match_expressions
+            .as_ref()
+            .is_none_or(|e| e.is_empty());
+    if selector_empty {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{field}.podSelector"),
+            reason: "the podSelector is empty, which matches EVERY pod in the namespace. Set \
+                     matchLabels/matchExpressions identifying the one workload pod to exec into"
+                .to_string(),
+        });
+    }
+    if let Some(t) = &exec.timeout
+        && crate::duration::parse_go_duration(t).is_none()
+    {
+        return Err(ValidationError::InvalidFieldValue {
+            field: format!("{field}.timeout"),
+            reason: format!("`{t}` is not a Go duration. Use forms like `30m`, `2h`, `90s`"),
+        });
+    }
+    Ok(())
 }
 
 /// An inline [`NfsVolume`] is well-formed: a non-empty server and an absolute

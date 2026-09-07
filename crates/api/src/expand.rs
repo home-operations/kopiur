@@ -67,7 +67,9 @@ const FANOUT_MARKER: &str = "-pvc-";
 
 /// The single source one `Snapshot` actually backs up, after resolving
 /// `spec.source` (a fanned-out child) against the policy's `sources[]`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq` only, never `Eq`: `stream` carries a `StreamExec`, which embeds
+// k8s-openapi's `LabelSelector` — a `PartialEq`-only type (api-conventions §3).
+#[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveSource {
     /// Index into `policy.spec.sources` these knobs came from.
     pub index: usize,
@@ -75,6 +77,10 @@ pub struct EffectiveSource {
     pub pvc: Option<PvcTargetRef>,
     /// The NFS export path, when this is an NFS source.
     pub nfs_path: Option<String>,
+    /// The stream producer, when this is a `stream` source. Mounts nothing: the mover
+    /// execs a command and pipes its stdout into kopia, so no `pvc`/`nfs_path` is set
+    /// and `read_only` is meaningless (see [`EffectiveSource::read_only`]).
+    pub stream: Option<crate::snapshot_policy::StreamSource>,
     /// `sourcePathOverride` from the governing source.
     pub source_path_override: Option<String>,
     /// Whether the mount is read-only.
@@ -98,6 +104,12 @@ impl EffectiveSource {
                     format!("/pvc/{}/{}", p.namespace, p.name)
                 }
             });
+        }
+        // A stream source records `/stream/<fileName>` — deliberately a different
+        // root from `/pvc/...` so a streamed artifact can never share a kopia
+        // identity with a volume backup.
+        if let Some(stream) = &self.stream {
+            return Some(crate::snapshot_policy::stream_source_path(stream));
         }
         self.nfs_path.clone()
     }
@@ -137,6 +149,7 @@ pub fn effective_source(
         index,
         pvc,
         nfs_path: source.nfs.as_ref().map(|n| n.path.clone()),
+        stream: source.stream.clone(),
         source_path_override: source.source_path_override.clone(),
         read_only,
     };
@@ -384,6 +397,8 @@ pub fn restore_source_path(
             index,
             pvc: Some(target.clone()),
             nfs_path: None,
+            // Matched by its own plain `pvc:` source, so PVC-shaped by construction.
+            stream: None,
             source_path_override: source.source_path_override.clone(),
             read_only: snapshot_policy::source_read_only(source),
         };
@@ -434,6 +449,9 @@ pub fn restore_source_path(
                 index: 0,
                 pvc: Some(target.clone()),
                 nfs_path: None,
+                // A selector-derived path is PVC-shaped; a stream source never
+                // participates in a selector derivation.
+                stream: None,
                 source_path_override: None,
                 read_only: true,
             };
@@ -1024,6 +1042,10 @@ pub fn expand_sources(
                 index,
                 pvc: Some(target.clone()),
                 nfs_path: None,
+                // A selector source is always PVC-shaped; a stream source never
+                // expands (it is one artifact per Snapshot, and admission requires
+                // it to be its policy's only source).
+                stream: None,
                 source_path_override: source.source_path_override.clone(),
                 read_only: snapshot_policy::source_read_only(source),
             };

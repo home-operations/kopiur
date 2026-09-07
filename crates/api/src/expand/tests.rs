@@ -37,6 +37,7 @@ fn selector_source(strategy: Option<SourcePathStrategy>, namespaces: Vec<&str>) 
             label_selector: None,
         }),
         nfs: None,
+        stream: None,
         read_only: None,
         acknowledge_live_mutation: None,
         source_path_override: None,
@@ -51,6 +52,7 @@ fn pvc_source(name: &str) -> Source {
         }),
         pvc_selector: None,
         nfs: None,
+        stream: None,
         read_only: None,
         acknowledge_live_mutation: None,
         source_path_override: None,
@@ -930,10 +932,7 @@ fn nfs_source(path: &str) -> Source {
             server: "nas.lan".into(),
             path: path.to_string(),
         }),
-        read_only: None,
-        acknowledge_live_mutation: None,
-        source_path_override: None,
-        source_path_strategy: None,
+        ..Default::default()
     }
 }
 

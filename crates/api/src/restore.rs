@@ -5,6 +5,7 @@ use crate::common::{
     CredentialProjection, FailurePolicy, MoverSpec, ObjectRef, PvcAccessMode, RepositoryRef,
     ResolvedIdentity,
 };
+use crate::snapshot_policy::StreamExec;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -178,6 +179,10 @@ pub enum RestoreTarget {
     PvcRef(ObjectRef),
     /// Passive populator mode: the restore is claimed by a PVC's `spec.dataSourceRef`.
     Populator(PopulatorTarget),
+    /// Stream one virtual file out of the snapshot into a command's stdin in a
+    /// running Pod — the companion of a `stream` backup source (e.g. feeding a
+    /// `pg_dumpall` artifact back through `psql`). Writes no PVC.
+    StreamExec(StreamExecTarget),
 }
 
 impl RestoreTarget {
@@ -200,8 +205,27 @@ impl RestoreTarget {
             RestoreTarget::Pvc(_) => "Pvc",
             RestoreTarget::PvcRef(_) => "PvcRef",
             RestoreTarget::Populator(_) => "Populator",
+            RestoreTarget::StreamExec(_) => "StreamExec",
         }
     }
+}
+
+/// Feed one virtual file from the snapshot into a command's stdin, in exactly one
+/// running Pod.
+///
+/// The reverse of a `stream` backup source. Deliberately opt-in and deliberately
+/// blunt: it runs whatever you name against whatever the selector matches, so point
+/// it at a scratch or otherwise prepared database, never at a live production Pod
+/// you are not willing to overwrite.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamExecTarget {
+    /// Which virtual file inside the snapshot to read back — the `fileName` the
+    /// backup's stream source used (e.g. `postgres.sql`).
+    #[schemars(length(min = 1, max = 255))]
+    pub file_name: String,
+    /// Where to send it: the command receives the file's bytes on stdin.
+    pub workload_exec: StreamExec,
 }
 
 /// Passive-populator target marker; its presence selects populator mode.

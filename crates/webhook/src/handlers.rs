@@ -701,7 +701,10 @@ async fn handle_restore(
     let target_pvc = match &spec.target {
         api::restore::RestoreTarget::PvcRef(r) => Some(r.name.as_str()),
         api::restore::RestoreTarget::Pvc(t) => Some(t.name.as_str()),
-        api::restore::RestoreTarget::Populator(_) => None,
+        // Neither writes a PVC, so there is no destination ownership to warn about.
+        api::restore::RestoreTarget::Populator(_) | api::restore::RestoreTarget::StreamExec(_) => {
+            None
+        }
     };
     let warnings = crate::secctx::restore_warnings(
         client,

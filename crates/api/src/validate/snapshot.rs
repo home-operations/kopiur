@@ -156,6 +156,36 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 .to_string(),
         });
     }
+    // Same reasoning as the NFS arm above: a stream source has no PVC to snapshot.
+    if spec.volume_snapshot_class_name.is_some() && spec.sources.iter().any(|s| s.stream.is_some())
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.volumeSnapshotClassName".to_string(),
+            reason: "a stream source captures a command's stdout and mounts no volume, so \
+                     volumeSnapshotClassName is meaningless with it; remove \
+                     volumeSnapshotClassName, or use a PVC source for copyMethod: Snapshot/Clone"
+                .to_string(),
+        });
+    }
+    // A stream source must be its policy's ONLY source. Expansion fans out selector
+    // sources only (`expand_sources` returns None when no `pvcSelector` is present), so
+    // a non-selector policy runs `sources[0]` and nothing else — pairing a stream with
+    // another source would silently back up just one of them. Refuse instead of
+    // dropping a backup the user believes is configured.
+    if spec.sources.len() > 1
+        && let Some(i) = spec.sources.iter().position(|s| s.stream.is_some())
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: format!("spec.sources[{i}].stream"),
+            reason: format!(
+                "a stream source must be the only source in its SnapshotPolicy, but this one \
+                 has {}. A stream source produces exactly one artifact per Snapshot and is \
+                 never expanded, so the other sources would not be backed up. Move the stream \
+                 source into its own SnapshotPolicy",
+                spec.sources.len()
+            ),
+        });
+    }
     if let Some(m) = &spec.mover {
         // `inheritSecurityContextFrom.snapshot` replays a backup's RECORDED identity;
         // a backup has no recorded identity to replay — it is the run that records one.
@@ -423,6 +453,15 @@ fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
             field: overrides.clone(),
             reason: "an NFS source is read directly and never staged, so a staged-PVC \
                      override is meaningless with it; remove the override(s) or use a PVC \
+                     source for copyMethod: Snapshot/Clone"
+                .to_string(),
+        });
+    }
+    if spec.sources.iter().any(|s| s.stream.is_some()) {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: overrides.clone(),
+            reason: "a stream source captures a command's stdout and mounts no volume, so \
+                     there is no staged PVC to override; remove the override(s) or use a PVC \
                      source for copyMethod: Snapshot/Clone"
                 .to_string(),
         });
