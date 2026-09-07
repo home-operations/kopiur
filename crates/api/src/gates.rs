@@ -265,6 +265,19 @@ pub const PRIVILEGED_MOVER_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Fail,
 };
 
+/// A `stream` source in a namespace that has not opted in to
+/// [`STREAM_EXEC_ANNOTATION`](consts::STREAM_EXEC_ANNOTATION). Shares
+/// `MoverPermitted` with [`PRIVILEGED_MOVER_GATE`] — both answer "may this mover
+/// run here at all?" — but carries its own reason, because the fix is a different
+/// annotation and conflating them would send an admin to the wrong one.
+pub const STREAM_EXEC_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotOrRestore,
+    condition: consts::MOVER_PERMITTED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+    severity: GateSeverity::Fail,
+};
+
 /// The mover's credential `Secret` is not in the workload namespace. Parks at
 /// `phase: Pending` until the user creates it (or enables projection).
 pub const MISSING_CREDENTIALS_GATE: StructuralGate = StructuralGate {
@@ -576,6 +589,7 @@ pub const RESTORE_REFERENT_MISSING_GATE: StructuralGate = StructuralGate {
 /// controller's `every_registered_gate_has_a_writer` drift test.
 pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     PRIVILEGED_MOVER_GATE,
+    STREAM_EXEC_GATE,
     MISSING_CREDENTIALS_GATE,
     MISSING_SERVICE_ACCOUNT_GATE,
     MISSING_CA_BUNDLE_GATE,
@@ -848,6 +862,13 @@ mod tests {
                 consts::MOVER_PERMITTED_CONDITION,
                 CONDITION_FALSE,
                 consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+                GateScope::SnapshotOrRestore,
+                GateSeverity::Fail,
+            ),
+            (
+                consts::MOVER_PERMITTED_CONDITION,
+                CONDITION_FALSE,
+                consts::STREAM_EXEC_NOT_PERMITTED_REASON,
                 GateScope::SnapshotOrRestore,
                 GateSeverity::Fail,
             ),

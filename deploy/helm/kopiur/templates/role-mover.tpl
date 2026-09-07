@@ -65,4 +65,51 @@ rules:
     resources:
       - configmaps
     verbs: [get, patch]
+---
+# Dedicated stream-source mover Role. RBAC rules SYNCED from
+# `cargo xtask gen-rbac` (deploy/rbac/mover-role.yaml, third document) —
+# that xtask is the SOURCE OF TRUTH; edit it and re-run, then re-sync these rules.
+#
+# A `stream` source execs a command in a running workload pod, which needs
+# `pods/exec`. That verb must NEVER reach the generic mover role above: every
+# ordinary mover Job in the namespace runs as that ServiceAccount, so granting it
+# there would let any backup Job run arbitrary commands in any pod in the
+# namespace. The controller mints the same-named ServiceAccount + a RoleBinding to
+# THIS role per namespace, only for stream-source mover Jobs.
+#
+# `resourceNames` cannot narrow `pods/exec` further — the pod name is not known
+# until the selector resolves at run time, and RBAC has no label-selector form. The
+# effective bound is the namespace, which is why stream sources additionally
+# require a cluster-admin namespace opt-in annotation.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kopiur.streamMoverName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kopiur.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - kopiur.home-operations.com
+    resources:
+      - snapshots/status
+      - restores/status
+      - repositories/status
+      - maintenances/status
+      - snapshotpolicies/status
+      - repositoryreplications/status
+      - snapshotreplications/status
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources:
+      - pods
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources:
+      - pods/exec
+    verbs: [create, get]
 {{- end }}

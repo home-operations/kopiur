@@ -3929,6 +3929,15 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         crate::consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
         "snapshot::reconcile_inner + restore::run_restore_mover (upsert_gate)",
     ),
+    // Same condition, different capability: a `stream` source needs `pods/exec` in
+    // the workload namespace, which requires its own namespace opt-in annotation.
+    // Its own reason so an admin is pointed at the right annotation.
+    (
+        crate::consts::MOVER_PERMITTED_CONDITION,
+        false,
+        crate::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+        "snapshot::reconcile_inner stream-exec gate (upsert_gate)",
+    ),
     // The `Error::MissingDependency` credential arm in `snapshot::reconcile_inner`
     // and `restore::run_restore_mover`, via
     // io::upsert_gate(&MISSING_CREDENTIALS_GATE, …).

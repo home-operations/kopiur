@@ -32,7 +32,8 @@ pub use kopiur_api::consts::{
     SCHEDULE_FANOUT_CAPPED_CONDITION, SCHEDULE_LABEL, SCHEDULE_RUNNABLE_CONDITION,
     SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SLOT_ACQUIRED_REASON, SNAPSHOT_CLEANUP_FINALIZER,
     SNAPSHOT_ID_LABEL, SOURCE_PVC_AVAILABLE_CONDITION, SOURCE_PVC_MISSING_REASON,
-    STALLED_CONDITION, WAITING_FOR_SLOT_REASON,
+    STALLED_CONDITION, STREAM_EXEC_ANNOTATION, STREAM_EXEC_NOT_PERMITTED_REASON,
+    WAITING_FOR_SLOT_REASON,
 };
 
 /// `reason` when a backup is held in `Pending` (then `Failed` after the timeout)
@@ -446,6 +447,9 @@ pub const KOPIA_UI_FLAG: &str = "features.kopiaUi.enabled";
 
 /// Event `action` (remediation hint) for a refused privileged mover.
 pub const ALLOW_PRIVILEGED_MOVER_ACTION: &str = "AnnotateNamespaceForPrivilegedMovers";
+
+/// Event `action` (remediation hint) for a refused stream-source mover.
+pub const ALLOW_STREAM_EXEC_ACTION: &str = "AnnotateNamespaceForStreamExec";
 /// `Snapshot` condition for CSI source staging (`copyMethod: Snapshot`/`Clone`,
 /// ADR §3.3): `True` once the staged VolumeSnapshot/PVC is ready for the mover;
 /// `False` while waiting (reason [`STAGING_WAITING_REASON`]) or on a preflight

@@ -215,6 +215,21 @@ pub(super) fn build_backup_run(
     Ok((work_spec, source_volume, repo_volume, creds_secrets))
 }
 
+/// Whether this run's work spec execs into a workload pod (a `stream` source).
+///
+/// Read off the WORK SPEC rather than re-derived from the policy: the work spec is
+/// what the mover will actually execute, so the RBAC minted and the gate applied
+/// cannot drift from what the Job does.
+pub(super) fn work_spec_uses_stream(spec: &kopiur_mover::workspec::MoverWorkSpec) -> bool {
+    match &spec.operation {
+        kopiur_mover::workspec::Operation::Snapshot(op) => matches!(
+            kopiur_mover::workspec::snapshot_input(op),
+            kopiur_mover::workspec::SnapshotInput::Stream(_)
+        ),
+        _ => false,
+    }
+}
+
 /// Stable identity anchors for a Snapshot's kopia manifest, read from its
 /// recorded status. kopia rewrites a snapshot's manifest id on pin, so the pin
 /// and delete movers re-resolve the live id by these anchors (source path +

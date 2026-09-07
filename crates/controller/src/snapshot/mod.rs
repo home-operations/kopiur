@@ -1171,16 +1171,86 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the credential Secret(s) the mover loads via envFrom are present. Either
     // problem surfaces as a clear `CredentialsAvailable=False` condition + Warning
     // Event and a requeue, instead of launching a Job that hangs (ADR §4.12).
-    let mover_identity = match io::ensure_mover_identity(
-        &ctx.client,
-        &namespace,
-        &[&repo.backend],
-        ctx.mover_service_account.as_deref(),
-        ctx.mover_role_kind.as_str(),
-        &ctx.mover_clusterrole,
-    )
-    .await
-    {
+    // Does this run exec into a workload pod? A stream source needs `pods/exec`,
+    // which lives on a DEDICATED role + ServiceAccount so the verb never reaches the
+    // SA every ordinary mover Job in the namespace runs as.
+    let uses_stream = work_spec_uses_stream(&work_spec);
+
+    // Stream-exec gate: the namespace must opt in. Anyone able to write a
+    // SnapshotPolicy here could otherwise run arbitrary commands in any pod in the
+    // namespace without holding `pods/exec` themselves — a verb Kubernetes separates
+    // from ordinary write access deliberately.
+    if uses_stream && !io::namespace_allows_stream_exec(&ctx.client, &namespace).await? {
+        let sa = io::stream_mover_name(&ctx.mover_clusterrole);
+        let msg = io::stream_exec_not_allowed_message(
+            "SnapshotPolicy",
+            &config.name_any(),
+            &namespace,
+            &sa,
+        );
+        let existing = backup
+            .status
+            .as_ref()
+            .map(|s| s.conditions.clone())
+            .unwrap_or_default();
+        let conditions = io::upsert_gate(
+            &existing,
+            &kopiur_api::gates::STREAM_EXEC_GATE,
+            &msg,
+            backup.meta().generation,
+        );
+        // Guarded like the privileged-mover refusal: the message is stable, so
+        // only a real transition should emit the Event/metric.
+        let current = serde_json::to_value(&backup.status).ok();
+        let wrote = io::patch_status_if_changed(
+            &api,
+            &name,
+            current.as_ref(),
+            serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+        )
+        .await?;
+        if wrote {
+            ctx.metrics.inc_backup_refused(
+                &namespace,
+                &name,
+                kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+            );
+            io::publish_warning_event(
+                ctx,
+                backup,
+                kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+                crate::consts::ALLOW_STREAM_EXEC_ACTION,
+                &msg,
+            )
+            .await;
+        }
+        // Same as the privileged gate: the blocker is an annotation an admin adds
+        // out-of-band, and the Namespace watch re-enqueues this Snapshot the moment
+        // it lands, so the requeue is only a backstop.
+        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+    }
+
+    let identity_result = if uses_stream {
+        io::ensure_stream_mover_identity(
+            &ctx.client,
+            &namespace,
+            &[&repo.backend],
+            &ctx.mover_clusterrole,
+            ctx.mover_role_kind.as_str(),
+        )
+        .await
+    } else {
+        io::ensure_mover_identity(
+            &ctx.client,
+            &namespace,
+            &[&repo.backend],
+            ctx.mover_service_account.as_deref(),
+            ctx.mover_role_kind.as_str(),
+            &ctx.mover_clusterrole,
+        )
+        .await
+    };
+    let mover_identity = match identity_result {
         Ok(identity) => identity,
         Err(Error::MissingDependency(msg)) => {
             let existing = backup

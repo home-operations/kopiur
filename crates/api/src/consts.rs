@@ -380,11 +380,25 @@ pub const MASS_DELETION_THRESHOLD_EXCEEDED_REASON: &str = "ThresholdExceeded";
 /// minted mover ServiceAccount at that privilege. Mirrors VolSync's
 /// `volsync.backube/privileged-movers`.
 pub const PRIVILEGED_MOVERS_ANNOTATION: &str = "kopiur.home-operations.com/privileged-movers";
+/// Namespace annotation a cluster admin sets to allow `stream` backup sources in
+/// that namespace.
+///
+/// Separate from [`PRIVILEGED_MOVERS_ANNOTATION`] because it gates a different
+/// capability: not an elevated container, but `pods/exec` — the ability to run
+/// commands inside OTHER pods in the namespace. Kubernetes separates that verb from
+/// ordinary write access deliberately, and without this gate anyone who can create a
+/// `SnapshotPolicy` in a namespace would effectively acquire it.
+pub const STREAM_EXEC_ANNOTATION: &str = "kopiur.home-operations.com/stream-exec-movers";
 /// `Snapshot`/`Restore` condition surfaced when a privileged mover is requested in a
 /// namespace that has not opted in — `False` carries the actionable message.
 pub const MOVER_PERMITTED_CONDITION: &str = "MoverPermitted";
 /// `reason`/Event reason for [`MOVER_PERMITTED_CONDITION`] = `False`.
 pub const PRIVILEGED_MOVER_NOT_PERMITTED_REASON: &str = "PrivilegedMoverNotPermitted";
+
+/// `reason`/Event reason for [`MOVER_PERMITTED_CONDITION`] = `False` when a
+/// `stream` source is used in a namespace that has not opted in to
+/// [`STREAM_EXEC_ANNOTATION`].
+pub const STREAM_EXEC_NOT_PERMITTED_REASON: &str = "StreamExecNotPermitted";
 
 /// `SnapshotSchedule` condition recording whether the schedule is able to fire
 /// its next slot. Set `False` (with [`BLOCKED_ON_UNREADABLE_RUN_REASON`]) when

@@ -17,7 +17,7 @@ use kube::{Api, ResourceExt};
 use kopiur_api::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
 use kopiur_api::secctx_compat::{is_managed_by_kopiur, pod_mounts_claim};
 
-use crate::consts::PRIVILEGED_MOVERS_ANNOTATION;
+use crate::consts::{PRIVILEGED_MOVERS_ANNOTATION, STREAM_EXEC_ANNOTATION};
 use crate::error::{Error, Result};
 
 /// Apply a mover run's objects (server-side): the `Job` (which carries the
@@ -383,6 +383,124 @@ pub async fn ensure_snapshot_replication_mover_identity(
         service_account: Some(sa_name),
         azure_workload_identity: azure,
     })
+}
+
+/// The dedicated stream-source mover identity's name, derived from the generic
+/// mover role name the same way [`snapshot_replication_mover_name`] is.
+///
+/// Keep in lockstep with the chart's `kopiur.streamMoverName` helper: the
+/// controller derives the roleRef from `KOPIUR_MOVER_CLUSTERROLE`, so renaming
+/// either side alone leaves the RoleBinding pointing at a role that does not exist.
+pub fn stream_mover_name(base: &str) -> String {
+    match base.strip_suffix("-mover") {
+        Some(stem) => format!("{stem}-stream-mover"),
+        None => format!("{base}-stream"),
+    }
+}
+
+/// Resolve the identity a STREAM-SOURCE mover Job runs as and ensure its RBAC —
+/// the dedicated-SA sibling of [`ensure_mover_identity`].
+///
+/// This mover holds `pods/exec` in the workload namespace, which the generic
+/// `kopiur-mover` role must never hold: every ordinary mover Job in the namespace
+/// runs as that SA, so granting it there would let any backup Job run arbitrary
+/// commands in any pod in the namespace. So a stream Job runs as its own
+/// `…-stream-mover` ServiceAccount bound to the equally dedicated role, minted here
+/// per namespace exactly like the generic and snapshot-replication pairs.
+///
+/// Workload-identity backends still win the SA choice (the cloud federation names
+/// the SA the pod must run as); the dedicated role is then bound to the user's SA
+/// under a distinct `kopiur-stream-mover-wi-<sa>` binding name — RoleBinding
+/// `roleRef` is immutable, so reusing the generic `kopiur-mover-wi-<sa>` binding
+/// would 422 whenever both movers share one WI ServiceAccount.
+pub async fn ensure_stream_mover_identity(
+    client: &kube::Client,
+    ns: &str,
+    backends: &[&kopiur_api::backend::Backend],
+    mover_role_base: &str,
+    role_kind: &str,
+) -> Result<MoverRunIdentity> {
+    use kopiur_api::creds::{WorkloadIdentityCloud, backend_workload_identity};
+    let dedicated = stream_mover_name(mover_role_base);
+    let wi: Vec<_> = backends
+        .iter()
+        .filter_map(|b| backend_workload_identity(b))
+        .collect();
+    let Some((first, first_cloud)) = wi.first() else {
+        ensure_mover_rbac(client, ns, &dedicated, role_kind, &dedicated).await?;
+        return Ok(MoverRunIdentity {
+            service_account: Some(dedicated),
+            azure_workload_identity: false,
+        });
+    };
+    let sa_name = first.service_account_name.clone();
+    let azure = wi
+        .iter()
+        .any(|(_, cloud)| *cloud == WorkloadIdentityCloud::Azure);
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), ns);
+    if sa_api
+        .get_opt(&sa_name)
+        .await
+        .map_err(Error::Kube)?
+        .is_none()
+    {
+        return Err(Error::MissingDependency(
+            missing_workload_identity_sa_message(&sa_name, ns, *first_cloud, WI_CONSUMER_MOVER),
+        ));
+    }
+    let mut rb = build_mover_rolebinding(ns, &sa_name, role_kind, &dedicated);
+    rb.metadata.name = Some(wi_rolebinding_named("kopiur-stream-mover-wi-", &sa_name));
+    let rb_name = rb.metadata.name.clone().unwrap_or_default();
+    let rb_api: Api<RoleBinding> = Api::namespaced(client.clone(), ns);
+    apply(&rb_api, &rb_name, &rb).await?;
+    Ok(MoverRunIdentity {
+        service_account: Some(sa_name),
+        azure_workload_identity: azure,
+    })
+}
+
+/// Whether `ns` has opted in to stream-source movers.
+///
+/// Mirrors [`namespace_allows_privileged_movers`], including its 403 fallback: a
+/// namespaced install cannot read Namespaces, and there the operator is already
+/// scoped to admin-selected namespaces, so refusing would break the feature for a
+/// deployment shape that does not need the guard.
+///
+/// The guard exists because a stream source is an RBAC escalation: anyone who can
+/// write a `SnapshotPolicy` in `ns` could otherwise cause arbitrary commands to run
+/// in any pod in `ns`, without themselves holding `pods/exec`. Kubernetes separates
+/// that verb deliberately; this keeps that separation meaningful.
+pub async fn namespace_allows_stream_exec(client: &kube::Client, ns: &str) -> Result<bool> {
+    use k8s_openapi::api::core::v1::Namespace;
+    let api: Api<Namespace> = Api::all(client.clone());
+    match api.get(ns).await {
+        Ok(namespace) => Ok(namespace
+            .annotations()
+            .get(STREAM_EXEC_ANNOTATION)
+            .is_some_and(|v| v == "true")),
+        Err(kube::Error::Api(e)) if e.code == 403 => {
+            tracing::warn!(
+                namespace = ns,
+                "cannot read namespace to check the stream-exec opt-in (operator lacks \
+                 namespaces:get); allowing the stream mover"
+            );
+            Ok(true)
+        }
+        Err(e) => Err(Error::Kube(e)),
+    }
+}
+
+/// The actionable message for a stream source refused in a namespace that has not
+/// opted in (what / why / how-to-fix). Pure so the exact text is unit-asserted.
+pub fn stream_exec_not_allowed_message(kind: &str, name: &str, ns: &str, mover_sa: &str) -> String {
+    format!(
+        "{kind} `{name}` uses a `stream` source, which execs a command inside a running pod in \
+         namespace `{ns}`, but that namespace has not opted in. Anyone able to write a {kind} in \
+         `{ns}` could otherwise run arbitrary commands in any pod there without holding \
+         `pods/exec` themselves, and the minted `{mover_sa}` ServiceAccount would carry that \
+         permission for the whole namespace. Fix: a cluster admin runs `kubectl annotate \
+         namespace {ns} {STREAM_EXEC_ANNOTATION}=true`, or use a PVC source instead."
+    )
 }
 
 /// 8-hex-char content hash for name truncation (same idiom as the
