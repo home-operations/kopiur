@@ -2557,6 +2557,7 @@ async fn run_restore_mover(
             kind: "Restore".to_string(),
             name: name.to_string(),
             namespace: namespace.to_string(),
+            claim_key: None,
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),

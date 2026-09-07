@@ -1738,6 +1738,8 @@ fn cluster_bootstrap_work_spec(
             kind: "ClusterRepository".to_string(),
             name: name.to_string(),
             namespace: job_ns.to_string(),
+            // Bootstrap writes the top-level status, never a claim entry (#443).
+            claim_key: None,
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),

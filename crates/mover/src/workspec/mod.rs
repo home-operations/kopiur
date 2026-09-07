@@ -2186,6 +2186,23 @@ pub struct TargetRef {
     pub name: String,
     /// The CR namespace.
     pub namespace: String,
+    /// For one claim of a fanned-out populator `Restore` (#443): the claiming
+    /// PVC's NAME, which is the key this run's status belongs under
+    /// (`status.claims.<claimKey>`).
+    ///
+    /// A populator `Restore` runs N concurrent movers, one per claiming PVC. If
+    /// each wrote the top-level `status.phase`/`resolved`/`logTail`/`failure`
+    /// they would clobber one another, and the controller's pinned-resolution
+    /// read would hand claim B the snapshot claim A resolved. So a claim-scoped
+    /// run nests its whole status body under its own map key — which a JSON
+    /// merge patch merges rather than replaces — and OMITS `phase`, because the
+    /// controller owns claim phase exactly as it owns the top-level one.
+    ///
+    /// Absent for every other run (backups, direct restores, maintenance, …),
+    /// which keep writing the top-level status verbatim. `#[serde(default)]`, so
+    /// a work spec written by an older controller still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_key: Option<String>,
 }
 
 /// A summary of the hook plan the workload pod will execute. The mover does

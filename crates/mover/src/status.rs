@@ -551,7 +551,32 @@ impl StatusUpdate {
     /// Wrap this update as the `{ "status": ... }` merge-patch body kube
     /// expects for a status subresource PATCH.
     pub fn as_patch_body(&self) -> serde_json::Value {
-        serde_json::json!({ "status": self })
+        self.as_patch_body_for(None)
+    }
+
+    /// The merge-patch body, scoped to one claim of a fanned-out populator
+    /// `Restore` when `claim_key` is set (#443).
+    ///
+    /// `None` — the classic flow: `{ "status": { …everything… } }`, byte-identical
+    /// to every prior operator.
+    ///
+    /// `Some(key)` — this run populates ONE claiming PVC of a `Restore` that has
+    /// several. The body nests under `status.claims.<key>`, which a JSON merge
+    /// patch merges (arrays are replaced, maps are merged), so N concurrent
+    /// populate movers each touch only their own key. `phase` is **dropped**: the
+    /// controller derives every claim's phase from the observed handshake and
+    /// aggregates them into the Restore's own phase, so a mover-asserted claim
+    /// phase could only fight it (the same reasoning that keeps `phase` off the
+    /// progress heartbeat).
+    pub fn as_patch_body_for(&self, claim_key: Option<&str>) -> serde_json::Value {
+        let Some(key) = claim_key else {
+            return serde_json::json!({ "status": self });
+        };
+        let mut body = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("phase");
+        }
+        serde_json::json!({ "status": { "claims": { key: body } } })
     }
 }
 
@@ -942,6 +967,9 @@ pub struct KubeStatusReporter {
     kind: String,
     namespace: String,
     name: String,
+    /// `TargetRef::claim_key` — when set, every read and write this reporter
+    /// makes is scoped to `status.claims.<key>` instead of the top level (#443).
+    claim_key: Option<String>,
 }
 
 impl KubeStatusReporter {
@@ -983,13 +1011,16 @@ impl KubeStatusReporter {
             kind: target.kind.clone(),
             namespace: target.namespace.clone(),
             name: target.name.clone(),
+            claim_key: target.claim_key.clone(),
         }
     }
 
-    /// PATCH the update's `.status` merge body onto the target object.
+    /// PATCH the update's `.status` merge body onto the target object — nested
+    /// under `status.claims.<claimKey>` for one claim of a fanned-out populator
+    /// restore (#443).
     pub async fn patch(&mut self, update: &StatusUpdate) -> Result<()> {
         use kube::api::{Patch, PatchParams};
-        let body = update.as_patch_body();
+        let body = update.as_patch_body_for(self.claim_key.as_deref());
         self.api
             .patch_status(&self.name, &PatchParams::default(), &Patch::Merge(&body))
             .await
@@ -1029,19 +1060,16 @@ impl KubeStatusReporter {
             }
         };
         Ok(obj
-            .and_then(|o| {
-                o.data
-                    .get("status")
-                    .and_then(|s| s.get("resolved"))
-                    .cloned()
-            })
+            .and_then(|o| resolved_at(o.data.get("status"), self.claim_key.as_deref()))
             .and_then(|v| serde_json::from_value(v).ok()))
     }
 
-    /// Resolved-only `.status` merge PATCH (no `phase`), pinning `status.resolved`.
+    /// Resolved-only `.status` merge PATCH (no `phase`), pinning `status.resolved`
+    /// — or `status.claims.<claimKey>.resolved` for a claim-scoped run (#443),
+    /// so one claim's pin can never be read as another's.
     async fn pin_resolved(&mut self, resolved: &ResolvedRestore) -> Result<()> {
         use kube::api::{Patch, PatchParams};
-        let body = serde_json::json!({ "status": { "resolved": resolved } });
+        let body = pin_resolved_body(resolved, self.claim_key.as_deref());
         self.api
             .patch_status(&self.name, &PatchParams::default(), &Patch::Merge(&body))
             .await
@@ -1052,6 +1080,39 @@ impl KubeStatusReporter {
                 source: Box::new(source),
             })?;
         Ok(())
+    }
+}
+
+/// The `resolved` value inside a fetched `.status`, from the top level or from
+/// this run's own claim entry (#443). Pure, so the nesting is unit-asserted
+/// without a cluster.
+///
+/// A claim-scoped run must NOT fall back to the top-level `resolved`: on a
+/// fanned-out populator that value belongs to no claim in particular (it is the
+/// legacy single-claim pin, or a sibling's), and reading it would hand this
+/// claim another PVC's snapshot — the exact #443 hazard, one layer up.
+fn resolved_at(
+    status: Option<&serde_json::Value>,
+    claim_key: Option<&str>,
+) -> Option<serde_json::Value> {
+    let status = status?;
+    match claim_key {
+        None => status.get("resolved").cloned(),
+        Some(key) => status
+            .get("claims")
+            .and_then(|c| c.get(key))
+            .and_then(|c| c.get("resolved"))
+            .cloned(),
+    }
+}
+
+/// The resolved-only merge-patch body, top-level or claim-scoped (#443). Pure.
+fn pin_resolved_body(resolved: &ResolvedRestore, claim_key: Option<&str>) -> serde_json::Value {
+    match claim_key {
+        None => serde_json::json!({ "status": { "resolved": resolved } }),
+        Some(key) => {
+            serde_json::json!({ "status": { "claims": { key: { "resolved": resolved } } } })
+        }
     }
 }
 
@@ -1612,6 +1673,7 @@ mod tests {
             kind: "SnapshotDeleteBatch".into(),
             name: "prune-job".into(),
             namespace: "backups".into(),
+            claim_key: None,
         };
         let reporter = StatusReporter::log_only(target.clone());
         assert!(reporter.inner.is_none());
@@ -1850,6 +1912,7 @@ mod tests {
                 kind: kind.to_string(),
                 name: "plex".to_string(),
                 namespace: "test-ns".to_string(),
+                claim_key: None,
             }
         }
 
@@ -1987,6 +2050,166 @@ mod tests {
                 ["/apis/kopiur.home-operations.com/v1alpha1/clusterrepositories/plex/status"],
                 "cluster-scoped kinds must not use a namespaced path"
             );
+        }
+
+        /// #443: a claim-scoped run reads ITS OWN pin, from
+        /// `status.claims.<key>.resolved`.
+        #[tokio::test]
+        async fn claim_scoped_read_resolved_reads_only_its_own_claim() {
+            let body = serde_json::json!({
+                "apiVersion": kopiur_api::consts::API_VERSION,
+                "kind": "Restore",
+                "metadata": { "name": "plex", "namespace": "test-ns", "uid": "uid-r" },
+                "spec": {},
+                "status": {
+                    // A legacy top-level pin AND a sibling's — neither may leak
+                    // into this claim's answer, or the claim restores another
+                    // PVC's snapshot (the #443 hazard, one layer up).
+                    "resolved": { "resolution": "Snapshot", "kopiaSnapshotID": "legacy" },
+                    "claims": {
+                        "data-0": { "resolved": {
+                            "resolution": "Snapshot", "kopiaSnapshotID": "mine",
+                        } },
+                        "data-1": { "resolved": {
+                            "resolution": "Snapshot", "kopiaSnapshotID": "sibling",
+                        } },
+                    },
+                },
+            });
+            let mut t = target("Restore");
+            t.claim_key = Some("data-0".to_string());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let reporter = KubeStatusReporter::from_client(
+                logging_client(log, StatusCode::OK, body.clone()),
+                &t,
+            );
+            assert_eq!(
+                reporter
+                    .read_resolved()
+                    .await
+                    .expect("read succeeds")
+                    .expect("claim pin present")
+                    .kopia_snapshot_id
+                    .as_deref(),
+                Some("mine")
+            );
+
+            // A claim with no entry yet is "no pin" — it must NOT fall back to
+            // the top-level `resolved`.
+            let mut t = target("Restore");
+            t.claim_key = Some("data-2".to_string());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let reporter =
+                KubeStatusReporter::from_client(logging_client(log, StatusCode::OK, body), &t);
+            assert!(
+                reporter
+                    .read_resolved()
+                    .await
+                    .expect("read succeeds")
+                    .is_none(),
+                "an unpinned claim must not inherit the top-level pin"
+            );
+        }
+    }
+
+    // --- #443: claim-scoped status bodies ---------------------------------
+
+    mod claim_scoped_bodies {
+        use super::*;
+
+        fn resolved() -> ResolvedRestore {
+            ResolvedRestore {
+                resolution: Some(kopiur_api::restore::ResolutionOutcome::Snapshot),
+                kopia_snapshot_id: Some("abc123".into()),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn an_unscoped_body_is_byte_identical_to_the_classic_shape() {
+            // Every non-populator run must keep writing the top level verbatim.
+            let u = StatusUpdate::completed("abc123", ts());
+            assert_eq!(u.as_patch_body(), u.as_patch_body_for(None));
+            assert_eq!(u.as_patch_body()["status"]["phase"], "Completed");
+            assert!(u.as_patch_body()["status"].get("claims").is_none());
+            assert_eq!(
+                pin_resolved_body(&resolved(), None),
+                serde_json::json!({ "status": { "resolved": resolved() } })
+            );
+        }
+
+        #[test]
+        fn a_claim_scoped_body_nests_under_its_key_and_drops_the_phase() {
+            // N concurrent populate movers must touch only their own map key —
+            // a merge patch merges map keys, so nothing clobbers a sibling — and
+            // must not assert a phase, which the controller derives from the
+            // observed handshake and aggregates into the Restore's own.
+            let u = StatusUpdate::completed_resolved(
+                "abc123",
+                ResolvedIdentity {
+                    username: "app".into(),
+                    hostname: "billing".into(),
+                    source_path: Some("/pvc/data-0".into()),
+                },
+                ts(),
+            );
+            assert_eq!(u.phase.as_deref(), Some("Completed"), "fixture assumption");
+            let body = u.as_patch_body_for(Some("data-0"));
+            let claim = &body["status"]["claims"]["data-0"];
+            assert!(
+                claim.get("phase").is_none(),
+                "the controller owns claim phase: {body}"
+            );
+            // `observedAt` must be present under the claim: the CRD's
+            // `additionalProperties` PRUNES unknown keys, so a field the mover
+            // always writes and `RestoreClaimStatus` did not declare would take
+            // the whole patch down with it.
+            assert!(claim["observedAt"].is_string(), "{body}");
+            assert_eq!(claim["resolved"]["kopiaSnapshotID"], "abc123");
+            // Nothing at the top level: a sibling's write must not be replaced.
+            assert!(body["status"].get("phase").is_none(), "{body}");
+            assert!(body["status"].get("resolved").is_none(), "{body}");
+            assert!(body["status"]["claims"].get("data-1").is_none(), "{body}");
+
+            // A terminal failure keeps its logTail/failure under the claim.
+            let err = KopiaError::NonZeroExit {
+                args: "restore".into(),
+                code: Some(1),
+                class: KopiaErrorClass::AuthFailure,
+                stderr_tail: "invalid repository password".into(),
+            };
+            let body = StatusUpdate::failed(&err, ts()).as_patch_body_for(Some("data-0"));
+            let claim = &body["status"]["claims"]["data-0"];
+            assert!(claim.get("phase").is_none(), "{body}");
+            assert!(claim.get("failure").is_some(), "{body}");
+            assert!(claim.get("logTail").is_some(), "{body}");
+
+            // …and the pin body nests the same way.
+            assert_eq!(
+                pin_resolved_body(&resolved(), Some("data-0")),
+                serde_json::json!({
+                    "status": { "claims": { "data-0": { "resolved": resolved() } } }
+                })
+            );
+        }
+
+        #[test]
+        fn resolved_at_reads_the_right_layer() {
+            let status = serde_json::json!({
+                "resolved": { "kopiaSnapshotID": "legacy" },
+                "claims": { "data-0": { "resolved": { "kopiaSnapshotID": "mine" } } },
+            });
+            assert_eq!(
+                resolved_at(Some(&status), None).unwrap()["kopiaSnapshotID"],
+                "legacy"
+            );
+            assert_eq!(
+                resolved_at(Some(&status), Some("data-0")).unwrap()["kopiaSnapshotID"],
+                "mine"
+            );
+            assert!(resolved_at(Some(&status), Some("data-9")).is_none());
+            assert!(resolved_at(None, None).is_none());
+            assert!(resolved_at(None, Some("data-0")).is_none());
         }
     }
 }

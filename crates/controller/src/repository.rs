@@ -1772,6 +1772,8 @@ fn bootstrap_work_spec(
             kind: "Repository".to_string(),
             name: name.to_string(),
             namespace: namespace.to_string(),
+            // Bootstrap writes the top-level status, never a claim entry (#443).
+            claim_key: None,
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),

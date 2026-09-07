@@ -22,6 +22,7 @@ fn sample_target() -> TargetRef {
         kind: "Snapshot".into(),
         name: "mydb-20260601".into(),
         namespace: "prod".into(),
+        claim_key: None,
     }
 }
 
@@ -1734,6 +1735,7 @@ fn snapshot_replicate_roundtrip_and_wire_shape() {
             kind: "SnapshotReplication".into(),
             name: "offsite-mirror".into(),
             namespace: "backups".into(),
+            claim_key: None,
         },
         hook_plan: HookPlanSummary::default(),
         options: MoverOptions::default(),
@@ -2763,4 +2765,40 @@ fn a_just_seeded_repository_restamps_its_maintenance_owner_unconditionally() {
         ),
         None
     );
+}
+
+// --- TargetRef.claimKey (#443) ----------------------------------------------
+
+#[test]
+fn target_ref_without_a_claim_key_still_decodes_and_stays_off_the_wire() {
+    // Upgrade safety: a work-spec ConfigMap written by an older controller (and
+    // still mounted by an in-flight Job) carries no `claimKey`. It must decode,
+    // not error the mover out at startup.
+    let old = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Snapshot",
+        "name": "mydb-20260601",
+        "namespace": "prod",
+    });
+    let decoded: TargetRef = serde_json::from_value(old).expect("old wire decodes");
+    assert_eq!(decoded, sample_target());
+    assert_eq!(decoded.claim_key, None);
+
+    // …and an unset key is omitted, so every non-populator run's work spec is
+    // byte-identical to what it was before #443.
+    let v = serde_json::to_value(&decoded).unwrap();
+    assert!(v.get("claimKey").is_none(), "{v}");
+}
+
+#[test]
+fn target_ref_claim_key_round_trips_camel_cased() {
+    let scoped = TargetRef {
+        kind: "Restore".into(),
+        claim_key: Some("data-0".into()),
+        ..sample_target()
+    };
+    let v = serde_json::to_value(&scoped).unwrap();
+    assert_eq!(v["claimKey"], "data-0");
+    let back: TargetRef = serde_json::from_value(v).expect("round-trips");
+    assert_eq!(back, scoped);
 }
