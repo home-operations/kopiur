@@ -239,7 +239,36 @@ moved. The matching condition is `Seeded`.
 - `resolvedCredentialVersion` — `resourceVersion` of the password Secret observed at
   the last connect attempt; editing the Secret's content re-triggers a connect
   rather than parking the repository `Failed` forever.
-- `uniqueId` — the kopia repository's unique ID.
+- `uniqueId` — the kopia repository's unique ID, pinned on the **first**
+  successful bootstrap and never rewritten by a health probe. Its presence is what
+  makes auto-create one-way in time: `spec.create.enabled` governs the first
+  bootstrap only, and once this is set kopiur will never create a fresh empty
+  repository at this backend, however empty the backend becomes. A wiped backend
+  therefore parks at `Failed` with reason `RepositoryReinitializeBlocked` instead
+  of being silently re-created — see
+  [`allow-reinitialize`](#annotations) below.
 - `backend` — mirror of `spec.backend`'s discriminant for the print column.
 - `conditions` — standard Kubernetes conditions (e.g. `Connected`,
   `MaintenanceOwned`).
+
+## Annotations
+
+- `kopiur.home-operations.com/allow-reinitialize` — acknowledges a deliberate
+  **re-initialization** of a repository whose backend was wiped. Its value is the
+  repository's current `status.uniqueId`, verbatim, and it is honored only while
+  the two match. That is what makes it self-expiring: a successful re-initialize
+  mints a new ID, the annotation stops matching, and a copy left behind in a
+  GitOps manifest can never authorize a second wipe. It is also inert on a
+  healthy repository — an ack only becomes a create permission once the
+  repository has left `Ready`, so it can never turn a routine health probe into a
+  re-create.
+
+  A value that does not match the pin is ignored (fail-safe) and, while the
+  repository is not `Ready`, raises a Warning event `InvalidReinitializeAck`
+  naming the value kopiur expects. kopiur never writes, rewrites or removes this
+  annotation. Full procedure:
+  [Deliberately re-initialize a wiped repository](../../repository-health.md#deliberately-re-initialize-a-wiped-repository).
+
+- `kopiur.home-operations.com/allow-mass-deletion` — acknowledges a pending
+  mass-deletion wave; see
+  [the mass-deletion circuit breaker](../../repositories.md#deletionprotection--the-mass-deletion-circuit-breaker).

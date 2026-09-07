@@ -22,7 +22,7 @@ will eventually use.
 ## The two flags
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:316:332"
+--8<-- "deploy/helm/kopiur/values.yaml:316:333"
 ```
 
 | CRD field you set… | …needs this Helm flag | Grants the operator `secrets` |

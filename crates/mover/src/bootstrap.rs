@@ -209,6 +209,81 @@ pub const REPOSITORY_NOT_INITIALIZED_MESSAGE: &str = "no kopia repository exists
      spec.create.enabled: true to create a new repository here, or point the backend \
      at an existing repository";
 
+/// Sentinel [`FailureBlock::kopia_error_class`] the mover writes when connect found
+/// **no** repository at the backend but the object has been `Ready` before (a pinned
+/// `status.uniqueId`), so kopiur refuses to create a fresh empty repository over the
+/// wiped one (issue #435).
+///
+/// The sibling of [`REPOSITORY_NOT_INITIALIZED_CLASS`], and split out from it
+/// precisely because the two need OPPOSITE remediation copy: that one says "enable
+/// create", which is actively wrong here — `spec.create.enabled` is usually already
+/// `true`, and the real block is the never-recreate data-safety invariant. Also
+/// deliberately not a [`kopiur_kopia::KopiaErrorClass`], for the same reason as its
+/// sibling: this is a kopiur create-*policy* outcome, not kopia stderr.
+pub const REPOSITORY_REINITIALIZE_BLOCKED_CLASS: &str = "RepositoryReinitializeBlocked";
+
+/// The ` -n <namespace>` fragment for a `kubectl` command kopiur puts in front of
+/// a user, or the empty string for a cluster-scoped object.
+///
+/// One producer, shared across the crate boundary (the controller's
+/// `InvalidReinitializeAck` copy calls it too), because getting this wrong is not
+/// cosmetic: `kubectl annotate clusterrepository shared -n kopiur-system ...`
+/// simply fails, and the whole point of these messages is that the user can paste
+/// them.
+pub fn kubectl_namespace_flag(namespace: Option<&str>) -> String {
+    namespace
+        .filter(|ns| !ns.is_empty())
+        .map(|ns| format!(" -n {ns}"))
+        .unwrap_or_default()
+}
+
+/// The stable, volatile-free actionable message for
+/// [`REPOSITORY_REINITIALIZE_BLOCKED_CLASS`] — the ONE producer of this text, shared
+/// by the mover Job path and the controller's in-process bare-path connect arm.
+///
+/// Sharing is load-bearing, not tidiness: the controller writes it verbatim as a
+/// condition message under [`patch_status_if_changed`]-style guards, so a single
+/// byte of difference between the two paths would make every alternating reconcile a
+/// real status write — a hot loop plus duplicate Events.
+///
+/// Shape rules, both deliberate:
+/// * the `kubectl annotate` command comes FIRST, because Event notes are truncated
+///   at 1024 bytes (`EVENT_NOTE_MAX_BYTES`) and the command is the one part that must
+///   survive truncation;
+/// * `namespace` is derived from the KIND by the caller (a `ClusterRepository` is
+///   cluster-scoped ⇒ `None` ⇒ no `-n`), never from the work spec's `target_ref`,
+///   whose namespace for a cluster repository is the OPERATOR's namespace and would
+///   produce a command that does not work.
+///
+/// [`patch_status_if_changed`]: https://docs.rs/kopiur-controller
+///
+/// The ` -n <ns>` fragment comes from [`kubectl_namespace_flag`], shared with the
+/// controller's `InvalidReinitializeAck` copy — every `kubectl` command kopiur
+/// hands a user must scope the same way, and a cluster-scoped object must never
+/// grow a `-n`.
+pub fn reinitialize_blocked_message(
+    kind: &str,
+    name: &str,
+    namespace: Option<&str>,
+    unique_id: &str,
+    also_spec_disabled: bool,
+) -> String {
+    let ns = kubectl_namespace_flag(namespace);
+    let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
+    let also = if also_spec_disabled {
+        "; spec.create.enabled is also false and must be true"
+    } else {
+        ""
+    };
+    format!(
+        "To re-initialize, run: kubectl annotate {kind} {name}{ns} {annotation}={unique_id} \
+         (this discards the history the old repository held). Reason: no kopia repository \
+         exists at this backend (connect returned NotFound) but this {kind} was once Ready \
+         (status.uniqueId={unique_id}), so kopiur will not silently create an empty one over \
+         it{also}. If the wipe was not deliberate, restore the backend instead."
+    )
+}
+
 /// Sentinel [`FailureBlock::kopia_error_class`] the mover writes when a seed's
 /// SOURCE backend answered but holds no kopia repository at all (issue #380) —
 /// a connect that classified `NotFound` with kopia's "not initialized" on
@@ -825,6 +900,18 @@ impl BootstrapResult {
             REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string(),
             false,
         )
+    }
+
+    /// A terminal-failure outcome for "connect found no repository and this
+    /// object was once `Ready`" ([`REPOSITORY_REINITIALIZE_BLOCKED_CLASS`], issue
+    /// #435). Never retryable: nothing at the backend will change on its own, and
+    /// the only ways out are a human ack or a restored backend — both of which
+    /// re-trigger the reconciler.
+    ///
+    /// `message` must come from [`reinitialize_blocked_message`] so the Job path
+    /// and the controller's in-process path stay byte-identical.
+    pub fn reinitialize_blocked(message: String) -> Self {
+        BootstrapResult::sentinel(REPOSITORY_REINITIALIZE_BLOCKED_CLASS, message, false)
     }
 
     /// A terminal-failure outcome for a KOPIUR-decided (non-kopia) bootstrap

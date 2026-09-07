@@ -107,7 +107,7 @@ spec:
             severity: critical
           annotations:
             summary: "Repository {{`{{ $labels.namespace }}/{{ $labels.name }}`}} is {{`{{ $labels.phase }}`}}"
-            description: "A kopiur repository has been Degraded/Failed for 15m; backups to it will not run."
+            description: "A kopiur repository has been Degraded/Failed for 15m; backups to it will not run. Check the Ready condition message: a Failed repository whose message names `allow-reinitialize` was wiped and needs a human acknowledgement before kopiur will re-create it."
         - alert: KopiurSnapshotFailed
           # Per-CR, gated on recovery (#280): failed Snapshot CRs are retained
           # by design, so an ungated phase match would page forever for CRs

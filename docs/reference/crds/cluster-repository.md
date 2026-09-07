@@ -124,3 +124,21 @@ Mirrors [Repository](repository.md) status (`phase`, `observedGeneration`,
 
 - `allowedNamespaceCount` — number of namespaces currently resolved by
   `spec.allowedNamespaces`; also the `Namespaces` print column.
+
+`uniqueId` carries the same pin semantics as on a namespaced `Repository`: it is
+set on the first successful bootstrap and, once set, kopiur will never create a
+fresh empty repository at this backend — a wiped backend parks at `Failed` with
+reason `RepositoryReinitializeBlocked`.
+
+## Annotations
+
+Same set as [Repository](repository.md#annotations), with one difference in how
+you apply them: a `ClusterRepository` is cluster-scoped, so the commands kopiur
+puts in its condition messages and events carry **no `-n`**:
+
+```console
+$ kubectl annotate clusterrepository shared \
+    kopiur.home-operations.com/allow-reinitialize=$(kubectl get clusterrepository shared -o jsonpath='{.status.uniqueId}')
+```
+
+See [Deliberately re-initialize a wiped repository](../../repository-health.md#deliberately-re-initialize-a-wiped-repository).

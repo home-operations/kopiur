@@ -16,10 +16,11 @@
 //! controller-side: they are remediation copy, not wire contract.
 
 pub use kopiur_api::consts::{
-    ALLOW_MASS_DELETION_ANNOTATION, API_VERSION, BLOCKED_ON_UNREADABLE_RUN_REASON, CONFIG_LABEL,
-    CREDENTIALS_AVAILABLE_CONDITION, DELETION_HELD_CONDITION, FANOUT_TOO_LARGE_REASON,
-    INDEX_BLOB_HEALTH_CONDITION, MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL,
-    MANAGED_BY_VALUE, MASS_DELETION_BREAKER_REASON, MASS_DELETION_HELD_CONDITION,
+    ALLOW_MASS_DELETION_ANNOTATION, ALLOW_REINITIALIZE_ANNOTATION, API_VERSION,
+    BLOCKED_ON_UNREADABLE_RUN_REASON, CONFIG_LABEL, CREDENTIALS_AVAILABLE_CONDITION,
+    DELETION_HELD_CONDITION, FANOUT_TOO_LARGE_REASON, INDEX_BLOB_HEALTH_CONDITION,
+    MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    MASS_DELETION_BREAKER_REASON, MASS_DELETION_HELD_CONDITION,
     MASS_DELETION_THRESHOLD_EXCEEDED_REASON, MISSING_CA_BUNDLE_REASON, MISSING_CREDENTIALS_REASON,
     MISSING_SERVICE_ACCOUNT_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_RESTORE,
     OP_RESTORE_TARGET, ORIGIN_LABEL, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
@@ -630,6 +631,38 @@ pub const REPOSITORY_NOT_INITIALIZED_REASON: &str = "RepositoryNotInitialized";
 /// `action` (remediation hint) for [`REPOSITORY_NOT_INITIALIZED_REASON`]: enable
 /// repository creation (or point at an existing repository).
 pub const ENABLE_CREATE_ACTION: &str = "EnableRepositoryCreate";
+
+/// Machine-readable `reason` (condition + Warning Event) when a bootstrap connect
+/// found **no** repository at the backend but this repository has been `Ready`
+/// before (a pinned `status.uniqueId`), so kopiur refuses to create a fresh empty
+/// one over it (issue #435). The sibling of [`REPOSITORY_NOT_INITIALIZED_REASON`]
+/// and deliberately distinct from it: the fix is NOT `spec.create.enabled: true`
+/// (which may well already be true) — it is either restoring the backend or
+/// acknowledging the wipe via
+/// [`ALLOW_REINITIALIZE_ANNOTATION`].
+pub const REPOSITORY_REINITIALIZE_BLOCKED_REASON: &str = "RepositoryReinitializeBlocked";
+/// `action` for [`REPOSITORY_REINITIALIZE_BLOCKED_REASON`]: acknowledge the wipe
+/// with the uniqueId-valued `allow-reinitialize` annotation (the condition
+/// message carries the exact `kubectl annotate` command).
+pub const ACKNOWLEDGE_REINITIALIZE_ACTION: &str = "AcknowledgeReinitialize";
+/// Machine-readable Event `reason` when [`ALLOW_REINITIALIZE_ANNOTATION`] is
+/// present but does not equal the pinned `status.uniqueId`: the ack is ignored
+/// (fail-safe) and the event names the value kopiur expects.
+pub const INVALID_REINITIALIZE_ACK_REASON: &str = "InvalidReinitializeAck";
+/// Normal Event `reason` when a VALID [`ALLOW_REINITIALIZE_ANNOTATION`] is
+/// present but the repository connected fine — the backend is not empty, so
+/// there is nothing to re-initialize and kopiur wiped nothing. Emitted so the
+/// user knows the ack was seen rather than silently ignored.
+pub const REINITIALIZE_ACK_IGNORED_REPOSITORY_PRESENT_REASON: &str =
+    "ReinitializeAckIgnoredRepositoryPresent";
+
+/// The bootstrap Job annotation recording the `allow-reinitialize` ack value the
+/// launch was made with — the ack-side twin of
+/// [`BOOTSTRAP_GENERATION_ANNOTATION`]. An annotation edit does not bump
+/// `metadata.generation`, so without this stamp a terminal bootstrap Job would
+/// keep being re-read (and its stale "reinitialize blocked" verdict re-published)
+/// until the kube TTL reaped it, ignoring a freshly-applied ack for minutes.
+pub const BOOTSTRAP_REINIT_ACK_ANNOTATION: &str = "kopiur.home-operations.com/bootstrap-reinit-ack";
 
 /// `action` for the source-side `spec.seed` failures (issue #380): the seed
 /// source is not usable — a mis-pointed bucket/prefix, or a mirror that was

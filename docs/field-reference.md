@@ -968,7 +968,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `seed` | [object](#repository-status-seed) | — | What the last seed attempt did (`spec.seed`); absent on a repository that was never seeded. |
 | `server` | [object](#repository-status-server) | — | Resolved kopia server endpoint/auth, pinned by the reconciler. |
 | `storageStats` | [object](#repository-status-storagestats) | — | Repository size and snapshot counts from the last catalog scan. |
-| `uniqueId` | string | — | Kopia repository unique ID. |
+| `uniqueId` | string | — | Kopia repository unique ID, pinned on the first successful bootstrap.<br>Its presence is the "this repository has been Ready" flag that makes auto-create one-way in time: `spec.create.enabled` governs the FIRST bootstrap only, and once this is set kopiur will never create a fresh empty repository over the backend, however empty the backend goes. A wiped backend therefore parks at `Failed` with reason `RepositoryReinitializeBlocked` instead of being silently re-created.<br>To deliberately re-initialize a wiped repository, annotate it with `kopiur.home-operations.com/allow-reinitialize` set to THIS value; the ack is honored only while it matches, so the new ID minted by a successful re-initialize makes it inert. This discards the history the old repository held. |
 
 #### `status.catalog` { #repository-status-catalog }
 
@@ -2038,7 +2038,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `seed` | [object](#clusterrepository-status-seed) | — | What the last seed attempt did (`spec.seed`); absent on a repository that was never seeded. |
 | `server` | [object](#clusterrepository-status-server) | — | Resolved kopia server endpoint/auth, pinned by the reconciler. |
 | `storageStats` | [object](#clusterrepository-status-storagestats) | — | Repository size and snapshot counts from the last catalog scan. |
-| `uniqueId` | string | — | Kopia repository unique ID. |
+| `uniqueId` | string | — | Kopia repository unique ID, pinned on the first successful bootstrap.<br>Its presence is the "this repository has been Ready" flag that makes auto-create one-way in time: `spec.create.enabled` governs the FIRST bootstrap only, and once this is set kopiur will never create a fresh empty repository over the backend, however empty the backend goes. A wiped backend therefore parks at `Failed` with reason `RepositoryReinitializeBlocked` instead of being silently re-created.<br>To deliberately re-initialize a wiped repository, annotate it with `kopiur.home-operations.com/allow-reinitialize` set to THIS value; the ack is honored only while it matches, so the new ID minted by a successful re-initialize makes it inert. This discards the history the old repository held. |
 
 #### `status.catalog` { #clusterrepository-status-catalog }
 

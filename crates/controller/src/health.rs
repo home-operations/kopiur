@@ -190,26 +190,289 @@ pub fn reconcile_index_blob_health(
 // under either policy.
 // ---------------------------------------------------------------------------
 
-/// **Part A — the data-safety invariant.** kopiur auto-creates a kopia
-/// repository ONLY on the very first bootstrap. Once a repository has reached
-/// `Ready` it carries a pinned `status.uniqueId` forever, so a later connect
-/// failure (a wiped or unreachable backend) must NEVER be "fixed" by silently
-/// creating a fresh empty repository over it — that destroys restorability.
-/// Re-creation of a once-good repository is a deliberate human action.
+/// **Part A — the data-safety invariant.** WHY a bootstrap may (or may not)
+/// create a kopia repository at the backend.
 ///
-/// Returns whether `create` may be attempted: the spec opted in (`create.enabled`)
-/// AND this repository was never successfully bootstrapped (`uniqueId` unset). Used
-/// at every create site (the in-process bare-path connect, the mover work-spec
-/// builder, and the no-Job re-create path) in both reconcilers.
+/// kopiur auto-creates a kopia repository ONLY on the very first bootstrap. Once
+/// a repository has reached `Ready` it carries a pinned `status.uniqueId`
+/// forever, so a later connect failure (a wiped or unreachable backend) must
+/// NEVER be "fixed" by silently creating a fresh empty repository over it — that
+/// destroys restorability. Re-creation of a once-good repository is a deliberate
+/// human action, spelled
+/// [`kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION`].
+///
+/// The typed replacement for the old fused `spec_enabled && unique_id.is_none()`
+/// bool (issue #435). The bool answered "may I create?" but threw away the
+/// reason, so the mover could only ever say "set `spec.create.enabled: true`" —
+/// wrong, and actively misleading, for the user whose bucket was deleted after
+/// the repository had been `Ready` with `create.enabled: true` all along.
+///
+/// **This enum is not, on its own, a create permission.** It knows nothing about
+/// the phase, and `Allowed { via_reinit_ack: true }` on a `Ready` repository must
+/// NOT create (review C1 — a standing ack would otherwise let an ordinary health
+/// probe re-create a wiped backend and freeze the old id). Every create decision
+/// goes through [`effective_create`], which folds in `reinit_requested`. There is
+/// deliberately no `pub` helper that answers "may create?" without the phase.
+///
+/// Exhaustive on purpose: every create site matches it, so a new blocking reason
+/// cannot be added without every message deciding what to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateGate {
+    /// Create is permitted: the spec opted in AND either this repository was
+    /// never bootstrapped, or a valid re-initialize ack is present.
+    Allowed {
+        /// `true` when the ONLY reason this is allowed is a valid
+        /// [`kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION`] matching the
+        /// pinned `status.uniqueId` — i.e. the human asked for a deliberate
+        /// re-initialize of a wiped backend. Drives the "treat this one pass as
+        /// a first bootstrap" behavior (strict, non-probe launch; fresh seed).
+        via_reinit_ack: bool,
+    },
+    /// `spec.create.enabled` is false. `also_pinned` records that the once-Ready
+    /// pin ALSO blocks, so the message can name both fixes at once instead of
+    /// handing the user a two-step diagnosis (enable create, hit the pin, ack).
+    DisabledBySpec {
+        /// A `status.uniqueId` is pinned too, with no valid ack.
+        also_pinned: bool,
+    },
+    /// The spec opted in, but this repository has been `Ready` before (a pinned
+    /// `status.uniqueId`) and no valid ack is present. The load-bearing
+    /// data-safety invariant: never silently create an empty repository over a
+    /// wiped one.
+    PinnedOnceReady,
+}
+
+/// The create decision a launch actually applies: whether `create` may be
+/// attempted on THIS pass, and — when it may not — the reason to hand the mover.
+///
+/// The two travel together on purpose. Deriving them separately is what produced
+/// the review's C1: `create_enabled` was read straight off [`CreateGate`], which
+/// says nothing about the phase, so a `Ready` repository carrying a standing
+/// valid ack shipped `auto_create: true` on its ordinary health probe. A probe is
+/// still a real bootstrap in the mover (`probe_only` gates only the catalog
+/// listing), so a wipe under that ack would have been silently re-created — and
+/// because a probe never rebinds identity, `status.uniqueId` would keep naming
+/// the destroyed repository, leaving the ack valid and the repository armed to do
+/// it again forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveCreate {
+    /// May this launch create a repository at the backend?
+    pub allowed: bool,
+    /// Why not, when `allowed` is false — carried to the mover as
+    /// [`kopiur_mover::workspec::CreateBlock`] so its decline message is
+    /// accurate. `None` exactly when `allowed` is true.
+    pub block: Option<kopiur_mover::workspec::CreateBlock>,
+}
+
+/// Resolve [`EffectiveCreate`] from the gate and the phase-gated
+/// `reinit_requested` (`phase != Ready && Allowed { via_reinit_ack: true }`).
+///
+/// The ONE place the controller→mover mapping lives, so the work-spec builders
+/// and the in-process bare-path connect arm can never disagree about either half
+/// of the decision. Exhaustive over [`CreateGate`].
+///
+/// The load-bearing arm is `Allowed { via_reinit_ack: true }` with
+/// `reinit_requested == false` — a healthy repository whose owner left the ack in
+/// their GitOps manifest. That must behave exactly like `PinnedOnceReady`: no
+/// create, and if the backend has just vanished, the re-initialize hint. The ack
+/// only becomes a create permission once the repository has actually left
+/// `Ready`, which under the default `onFailure: Degrade` is one probe failure
+/// away and under `Alert` never happens at all — the Alert contract ("never
+/// auto-recreates, whatever else is true") therefore survives a standing ack.
 ///
 /// ```
-/// use kopiur_controller::health::auto_create_allowed;
-/// assert!(auto_create_allowed(true, None));            // first bootstrap, opted in
-/// assert!(!auto_create_allowed(true, Some("abc123"))); // once-Ready: never recreate
-/// assert!(!auto_create_allowed(false, None));          // not opted in
+/// use kopiur_controller::health::{create_gate, effective_create};
+///
+/// // First bootstrap, opted in: create.
+/// let first = create_gate(true, None, None);
+/// assert!(effective_create(first, false).allowed);
+///
+/// // Once-Ready (pinned uniqueId), no ack: NEVER create. The data-safety
+/// // invariant, and it does not care what the phase says.
+/// let pinned = create_gate(true, Some("abc123"), None);
+/// assert!(!effective_create(pinned, false).allowed);
+/// assert!(!effective_create(pinned, true).allowed);
+///
+/// // Not opted in: never create.
+/// assert!(!effective_create(create_gate(false, None, None), false).allowed);
+///
+/// // Acked THIS pinned id — and the phase is what decides. Dormant while the
+/// // repository is healthy; a permission only once it has left `Ready`.
+/// let acked = create_gate(true, Some("abc123"), Some("abc123"));
+/// assert!(!effective_create(acked, false).allowed); // Ready: a no-op
+/// assert!(effective_create(acked, true).allowed);   // Failed/Degraded: re-initialize
 /// ```
-pub fn auto_create_allowed(spec_create_enabled: bool, unique_id: Option<&str>) -> bool {
-    spec_create_enabled && unique_id.is_none()
+pub fn effective_create(gate: CreateGate, reinit_requested: bool) -> EffectiveCreate {
+    use kopiur_mover::workspec::CreateBlock;
+    let allow = |allowed: bool, block: Option<CreateBlock>| EffectiveCreate { allowed, block };
+    match gate {
+        CreateGate::Allowed {
+            via_reinit_ack: false,
+        } => allow(true, None),
+        CreateGate::Allowed {
+            via_reinit_ack: true,
+        } => {
+            if reinit_requested {
+                allow(true, None)
+            } else {
+                // Ready + a standing valid ack: dormant, not armed.
+                allow(
+                    false,
+                    Some(CreateBlock::OnceReadyPinned {
+                        also_spec_disabled: false,
+                    }),
+                )
+            }
+        }
+        CreateGate::DisabledBySpec { also_pinned: false } => {
+            allow(false, Some(CreateBlock::SpecDisabled))
+        }
+        // Both block: the mover names both fixes in one message rather than
+        // sending the user round the loop twice.
+        CreateGate::DisabledBySpec { also_pinned: true } => allow(
+            false,
+            Some(CreateBlock::OnceReadyPinned {
+                also_spec_disabled: true,
+            }),
+        ),
+        CreateGate::PinnedOnceReady => allow(
+            false,
+            Some(CreateBlock::OnceReadyPinned {
+                also_spec_disabled: false,
+            }),
+        ),
+    }
+}
+
+/// Decide [`CreateGate`] from the spec flag, the pinned `status.uniqueId`, and
+/// the raw [`kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION`] value.
+///
+/// An ack is VALID only when it equals the pinned id and both are non-empty; an
+/// ack with no pin is inert (there is nothing to re-initialize), and an ack that
+/// no longer matches the pin — the state the annotation lands in the instant a
+/// successful re-init mints a new id — is inert too. That is what makes the ack
+/// self-expiring and safe to leave in a GitOps manifest.
+///
+/// The pin is checked BEFORE the spec flag reports on its own: when both block,
+/// the answer is `DisabledBySpec { also_pinned: true }`, never a bare
+/// `DisabledBySpec`.
+pub fn create_gate(
+    spec_create_enabled: bool,
+    unique_id: Option<&str>,
+    reinit_ack: Option<&str>,
+) -> CreateGate {
+    let pinned = unique_id.filter(|id| !id.is_empty());
+    let ack_valid = match (pinned, reinit_ack.filter(|a| !a.is_empty())) {
+        (Some(id), Some(ack)) => id == ack,
+        _ => false,
+    };
+    match (spec_create_enabled, pinned, ack_valid) {
+        (false, pinned, _) => CreateGate::DisabledBySpec {
+            also_pinned: pinned.is_some(),
+        },
+        (true, None, _) => CreateGate::Allowed {
+            via_reinit_ack: false,
+        },
+        (true, Some(_), true) => CreateGate::Allowed {
+            via_reinit_ack: true,
+        },
+        (true, Some(_), false) => CreateGate::PinnedOnceReady,
+    }
+}
+
+/// The in-process bare-path twin of the mover's `bootstrap_declined` #435 arm:
+/// turn a failed in-process connect into a
+/// [`crate::io::BootstrapFailure::RepositoryReinitializeBlocked`], or `None` when
+/// this failure is not that case and the caller should keep its ordinary
+/// kopia-class handling.
+///
+/// The in-process connect path (a bare `backend.filesystem` repository, which
+/// needs no mover Job) never reaches `bootstrap_declined`, so without this it
+/// would report a bare `NotFound` — the #435 bug, one layer down.
+///
+/// `block` is [`EffectiveCreate::block`] — the phase-gated decision, not the raw
+/// gate — so a `Ready` repository carrying a standing valid ack reports the
+/// re-initialize hint here exactly as it does on the Job path.
+///
+/// Both guards matter:
+/// * only [`kopiur_mover::workspec::CreateBlock::OnceReadyPinned`] qualifies —
+///   a spec opt-out on a never-bootstrapped repository is the *other* sentinel,
+///   and create being ALLOWED means there is no decline to explain;
+/// * a `NotFound` counts only when kopia's stderr says the storage holds no
+///   repository ([`kopiur_kopia::notfound_is_uninitialized`]) — the same test
+///   the mover applies. A missing mount or a wrong `path` is also `NotFound`,
+///   and reporting *that* as a vanished repository would hand the user an
+///   annotate command that destroys nothing and fixes nothing.
+///
+/// The message comes from [`kopiur_mover::bootstrap::reinitialize_blocked_message`],
+/// the single producer shared with the Job path — a byte of drift between the two
+/// would turn every alternating reconcile into a real status write.
+pub fn inprocess_reinitialize_block(
+    block: Option<kopiur_mover::workspec::CreateBlock>,
+    err: &kopiur_kopia::KopiaError,
+    kind: &str,
+    name: &str,
+    namespace: Option<&str>,
+    pinned_unique_id: Option<&str>,
+) -> Option<crate::io::BootstrapFailure> {
+    let also_spec_disabled = match block? {
+        kopiur_mover::workspec::CreateBlock::OnceReadyPinned { also_spec_disabled } => {
+            also_spec_disabled
+        }
+        kopiur_mover::workspec::CreateBlock::SpecDisabled => return None,
+    };
+    if err.class() != kopiur_kopia::KopiaErrorClass::NotFound
+        || !err
+            .stderr_tail()
+            .is_some_and(kopiur_kopia::notfound_is_uninitialized)
+    {
+        return None;
+    }
+    Some(crate::io::BootstrapFailure::RepositoryReinitializeBlocked {
+        message: kopiur_mover::bootstrap::reinitialize_blocked_message(
+            kind,
+            name,
+            namespace,
+            pinned_unique_id?,
+            also_spec_disabled,
+        ),
+    })
+}
+
+/// Whether this pass should REPORT a mismatched `allow-reinitialize` ack
+/// (the `InvalidReinitializeAck` Warning).
+///
+/// `reinit_ack_mismatched` alone is not the answer, and the difference is the
+/// review's I2. The instant a successful re-initialize mints a new `uniqueId`,
+/// the ack the user applied — and quite reasonably left in their GitOps
+/// manifest — stops matching the pin. Reporting that on the now-`Ready`
+/// repository turns the reward for doing exactly the right thing into a
+/// permanent Warning, which contradicts the annotation's whole self-expiring,
+/// safe-to-leave-in-Git contract.
+///
+/// So a stale ack on a `Ready` repository is inert AND silent. It becomes worth
+/// reporting again only once the repository has left `Ready` — the only state in
+/// which an ack could do anything, and the state in which a user is actually
+/// looking.
+pub fn report_reinit_ack_mismatch(
+    phase_is_ready: bool,
+    unique_id: Option<&str>,
+    reinit_ack: Option<&str>,
+) -> bool {
+    !phase_is_ready && reinit_ack_mismatched(unique_id, reinit_ack)
+}
+
+/// Whether a `reinitialize` ack is PRESENT on the object but does not match the
+/// pinned `status.uniqueId` — the fail-safe "ignored, and the user should be
+/// told" case. `false` when there is no ack, no pin, or the ack is valid.
+pub fn reinit_ack_mismatched(unique_id: Option<&str>, reinit_ack: Option<&str>) -> bool {
+    match (
+        unique_id.filter(|id| !id.is_empty()),
+        reinit_ack.filter(|a| !a.is_empty()),
+    ) {
+        (Some(id), Some(ack)) => id != ack,
+        _ => false,
+    }
 }
 
 /// Whether a backend health probe is due now: the probe is enabled, the
@@ -395,8 +658,10 @@ impl ProbeFailureKind {
 
 /// Classify a [`crate::io::BootstrapFailure`] as the unified backend sensor's
 /// failure kind — the ONE place the mapping lives (it was four hand-copied
-/// two-way collapses across the twins before #414). Exhaustive: only the
-/// mover's genuine `RepositoryNotInitialized` sentinel may read as *vanished*
+/// two-way collapses across the twins before #414). Exhaustive: only the two
+/// genuine "the backend answered and holds no repository" sentinels
+/// (`RepositoryNotInitialized` and its #435 sibling
+/// `RepositoryReinitializeBlocked`) may read as *vanished*
 /// (a wrong "absent" here could, in a future auto-recreate, be catastrophic),
 /// only a Job-deadline kill reads as *timed out*, and everything else is the
 /// conservative *unreachable*.
@@ -404,6 +669,10 @@ pub fn probe_failure_kind(failure: &crate::io::BootstrapFailure) -> ProbeFailure
     use crate::io::BootstrapFailure;
     match failure {
         BootstrapFailure::RepositoryNotInitialized => ProbeFailureKind::Vanished,
+        // #435: the same observation (an answering backend with no repository),
+        // only with a different reason for declining to create one. The probe's
+        // `RepositoryVanished` copy is exactly right for it.
+        BootstrapFailure::RepositoryReinitializeBlocked { .. } => ProbeFailureKind::Vanished,
         BootstrapFailure::JobDeadlineExceeded { .. } => ProbeFailureKind::TimedOut,
         BootstrapFailure::Backend { .. }
         | BootstrapFailure::JobFailedWithoutResult { .. }
@@ -795,7 +1064,7 @@ pub enum BreakerVerdict {
 /// pausing is equally right — and the breaker's own strict re-check escalates a
 /// *real* wipe to terminal `Failed` anyway: while `Degraded`, the strict retry
 /// bootstrap runs with auto-create forbidden (pinned `uniqueId`, see
-/// [`auto_create_allowed`]), so a truly absent repository comes back as the
+/// [`effective_create`]), so a truly absent repository comes back as the
 /// `RepositoryNotInitialized` verdict, which
 /// [`BootstrapFailure::retryable_outage_for_bootstrapped`](crate::io::BootstrapFailure::retryable_outage_for_bootstrapped)
 /// refuses to recycle — parking the repository visibly at `Failed` instead of
@@ -1231,18 +1500,278 @@ mod tests {
         assert!(upd.event.is_none());
     }
 
-    // ---- Part A: auto_create_allowed ---------------------------------------
+    // ---- Part A: the create decision ---------------------------------------
 
+    /// The Part A truth table, end to end: spec flag + pin + ack + PHASE ⇒ may
+    /// this launch create?
+    ///
+    /// It reads through `create_gate` → `effective_create` because that is the
+    /// only path production has. The `auto_create_allowed` bool adapter this test
+    /// used to call was deleted after review round 1: it answered "may create?"
+    /// without the phase, which is precisely the question that has no safe answer
+    /// — its own doctest asserted `(true, Some(id), Some(id)) == true`, the
+    /// "Ready + standing ack ⇒ create" verdict C1 forbids. Keeping a `pub` helper
+    /// that can be asked the phase-blind question is how the next call site gets
+    /// it wrong.
     #[test]
     fn auto_create_only_on_first_bootstrap() {
-        // Opted in, never bootstrapped → may create (first bootstrap).
-        assert!(auto_create_allowed(true, None));
-        // Once-Ready (pinned uniqueId) → NEVER create, even though create.enabled.
-        // This is the load-bearing data-safety invariant.
-        assert!(!auto_create_allowed(true, Some("kopia-unique-id")));
+        let may_create = |spec: bool, pin: Option<&str>, ack: Option<&str>, reinit: bool| {
+            effective_create(create_gate(spec, pin, ack), reinit).allowed
+        };
+        let id = Some("kopia-unique-id");
+
+        // Opted in, never bootstrapped → may create (first bootstrap). No phase
+        // can change that: a repository with no pin has nothing to protect.
+        assert!(may_create(true, None, None, false));
+        assert!(may_create(true, None, None, true));
+
+        // Once-Ready (pinned uniqueId) → NEVER create, even though
+        // create.enabled. The load-bearing data-safety invariant.
+        assert!(!may_create(true, id, None, false));
+        assert!(!may_create(true, id, None, true));
+
         // Not opted in → never create regardless.
-        assert!(!auto_create_allowed(false, None));
-        assert!(!auto_create_allowed(false, Some("kopia-unique-id")));
+        assert!(!may_create(false, None, None, false));
+        assert!(!may_create(false, id, None, false));
+        assert!(!may_create(false, id, id, false));
+
+        // The ONE way through the pin: the human acked THIS id (#435) AND the
+        // repository has left `Ready`. The ack alone is not enough — see
+        // `an_ack_grants_create_only_once_the_repository_has_left_ready`.
+        assert!(!may_create(true, id, id, false));
+        assert!(may_create(true, id, id, true));
+    }
+
+    #[test]
+    fn create_gate_truth_table() {
+        use CreateGate::*;
+        // spec off: always DisabledBySpec, but it REPORTS the pin so one message
+        // can name both fixes (#435 — otherwise the user enables create, then
+        // discovers the pin and has to diagnose twice).
+        assert_eq!(
+            create_gate(false, None, None),
+            DisabledBySpec { also_pinned: false }
+        );
+        assert_eq!(
+            create_gate(false, Some("U1"), None),
+            DisabledBySpec { also_pinned: true }
+        );
+        // A valid-looking ack does NOT unblock a spec that never opted in.
+        assert_eq!(
+            create_gate(false, Some("U1"), Some("U1")),
+            DisabledBySpec { also_pinned: true }
+        );
+
+        // spec on, never bootstrapped: the first-bootstrap create.
+        assert_eq!(
+            create_gate(true, None, None),
+            Allowed {
+                via_reinit_ack: false
+            }
+        );
+        // An ack with NO pin is inert: there is nothing to re-initialize, and it
+        // must not masquerade as a re-init pass (which forces a fresh seed).
+        assert_eq!(
+            create_gate(true, None, Some("U1")),
+            Allowed {
+                via_reinit_ack: false
+            }
+        );
+        assert_eq!(
+            create_gate(true, Some(""), Some("U1")),
+            Allowed {
+                via_reinit_ack: false
+            }
+        );
+
+        // spec on, pinned: the data-safety block, and the one way through it.
+        assert_eq!(create_gate(true, Some("U1"), None), PinnedOnceReady);
+        assert_eq!(create_gate(true, Some("U1"), Some("")), PinnedOnceReady);
+        assert_eq!(create_gate(true, Some("U1"), Some("U2")), PinnedOnceReady);
+        assert_eq!(
+            create_gate(true, Some("U1"), Some("U1")),
+            Allowed {
+                via_reinit_ack: true
+            }
+        );
+
+        // Self-terminating: once the ack'd re-init mints U2, the SAME annotation
+        // value (U1, still sitting in the GitOps manifest) is inert — a second
+        // wipe parks again and needs a fresh ack naming U2.
+        assert_eq!(create_gate(true, Some("U2"), Some("U1")), PinnedOnceReady);
+    }
+
+    /// Review C1, the data-safety regression guard: an ack is a create
+    /// permission ONLY while the repository has left `Ready`.
+    ///
+    /// The bug it pins: `create_enabled` was read straight off `CreateGate`, so a
+    /// `Ready` repository carrying a standing valid ack shipped
+    /// `auto_create: true` on its ordinary health probe. `probe_only` gates only
+    /// the mover's catalog listing — `bootstrap_init_action` still returns
+    /// `Create` for `NotFound` + `auto_create` — so a wipe under that ack was
+    /// silently re-created into an empty repository, with no phase transition and
+    /// no vanish alert. Worse, a probe never rebinds identity, so
+    /// `status.uniqueId` kept naming the destroyed repository and the ack stayed
+    /// valid: the repository was armed to do it again on every future wipe.
+    #[test]
+    fn an_ack_grants_create_only_once_the_repository_has_left_ready() {
+        use kopiur_mover::workspec::CreateBlock;
+
+        let acked = CreateGate::Allowed {
+            via_reinit_ack: true,
+        };
+        // Ready (reinit_requested = false): DORMANT. No create, and the block
+        // reason is the same one an unacked pinned repository gets, so a wipe
+        // observed in this window still reports the re-initialize hint.
+        let ready = effective_create(acked, false);
+        assert!(
+            !ready.allowed,
+            "a standing ack on a Ready repository must NEVER arm create"
+        );
+        assert_eq!(
+            ready.block,
+            Some(CreateBlock::OnceReadyPinned {
+                also_spec_disabled: false
+            })
+        );
+        // Not Ready (Failed/Degraded): armed — this is the whole feature.
+        let armed = effective_create(acked, true);
+        assert!(armed.allowed);
+        assert_eq!(armed.block, None);
+
+        // An ordinary first bootstrap is unaffected by the phase gate.
+        let first = CreateGate::Allowed {
+            via_reinit_ack: false,
+        };
+        for reinit in [false, true] {
+            let e = effective_create(first, reinit);
+            assert!(e.allowed, "first bootstrap, reinit_requested={reinit}");
+            assert_eq!(e.block, None);
+        }
+
+        // Every blocking gate keeps its reason whatever the phase says — a
+        // `reinit_requested` can only ever be true for the acked gate anyway, but
+        // the mapping must not depend on that to stay correct.
+        for reinit in [false, true] {
+            assert_eq!(
+                effective_create(CreateGate::PinnedOnceReady, reinit),
+                EffectiveCreate {
+                    allowed: false,
+                    block: Some(CreateBlock::OnceReadyPinned {
+                        also_spec_disabled: false
+                    })
+                }
+            );
+            assert_eq!(
+                effective_create(CreateGate::DisabledBySpec { also_pinned: false }, reinit),
+                EffectiveCreate {
+                    allowed: false,
+                    block: Some(CreateBlock::SpecDisabled)
+                }
+            );
+            assert_eq!(
+                effective_create(CreateGate::DisabledBySpec { also_pinned: true }, reinit),
+                EffectiveCreate {
+                    allowed: false,
+                    block: Some(CreateBlock::OnceReadyPinned {
+                        also_spec_disabled: true
+                    })
+                }
+            );
+        }
+
+        // `allowed` and `block` are two halves of one answer and must never
+        // disagree: a block reason with create allowed would be a message about
+        // a decline that did not happen.
+        for gate in [
+            CreateGate::Allowed {
+                via_reinit_ack: false,
+            },
+            CreateGate::Allowed {
+                via_reinit_ack: true,
+            },
+            CreateGate::DisabledBySpec { also_pinned: false },
+            CreateGate::DisabledBySpec { also_pinned: true },
+            CreateGate::PinnedOnceReady,
+        ] {
+            for reinit in [false, true] {
+                let e = effective_create(gate, reinit);
+                assert_eq!(
+                    e.allowed,
+                    e.block.is_none(),
+                    "{gate:?} / reinit={reinit}: allowed and block disagree"
+                );
+            }
+        }
+    }
+
+    /// The Alert-mode contract survives a standing ack. Under
+    /// `onFailure: Alert` a wiped repository stays `Ready` forever, so
+    /// `reinit_requested` is never true and create is never armed — which is what
+    /// `health_probe.rs::alert_mode_probe_alerts_on_wipe_but_stays_ready_and_
+    /// never_recreates` asserts end to end.
+    #[test]
+    fn alert_mode_never_arms_create_however_valid_the_ack() {
+        let gate = create_gate(true, Some("U1"), Some("U1"));
+        assert_eq!(
+            gate,
+            CreateGate::Allowed {
+                via_reinit_ack: true
+            }
+        );
+        // Alert keeps the phase `Ready` through every failure ⇒ reinit_requested
+        // is always false ⇒ create stays shut.
+        assert!(!effective_create(gate, false).allowed);
+    }
+
+    #[test]
+    fn reinit_ack_mismatch_is_only_for_a_present_non_matching_ack() {
+        assert!(reinit_ack_mismatched(Some("U1"), Some("U2")));
+        assert!(!reinit_ack_mismatched(Some("U1"), Some("U1")));
+        assert!(!reinit_ack_mismatched(Some("U1"), None));
+        assert!(!reinit_ack_mismatched(None, Some("U1")));
+        assert!(!reinit_ack_mismatched(Some("U1"), Some("")));
+    }
+
+    /// Review I2: the mismatch Warning is `Ready`-gated, so a successful
+    /// re-initialize does not leave a permanent Warning on the healthy
+    /// repository it just fixed.
+    #[test]
+    fn a_stale_ack_is_reported_only_while_the_repository_is_not_ready() {
+        // The exact post-re-initialize state: pin rotated to U2, the user's
+        // annotation still says U1, repository healthy. Silent.
+        assert!(!report_reinit_ack_mismatch(true, Some("U2"), Some("U1")));
+        // The same annotation on a repository that has since gone Failed IS
+        // worth reporting: an ack could act here, and this one cannot.
+        assert!(report_reinit_ack_mismatch(false, Some("U2"), Some("U1")));
+        // A typo'd ack while the repository is parked — the case the Warning
+        // exists for — still fires.
+        assert!(report_reinit_ack_mismatch(false, Some("U1"), Some("typo")));
+        // A matching ack is never a mismatch, in either phase.
+        assert!(!report_reinit_ack_mismatch(false, Some("U1"), Some("U1")));
+        assert!(!report_reinit_ack_mismatch(true, Some("U1"), Some("U1")));
+        // No ack, or no pin: nothing to say.
+        assert!(!report_reinit_ack_mismatch(false, Some("U1"), None));
+        assert!(!report_reinit_ack_mismatch(false, None, Some("U1")));
+    }
+
+    #[test]
+    fn reinit_success_heals_the_breaker_through_the_existing_fold() {
+        // 1.1b: an ack'd re-init is a strict (non-probe) bootstrap, and its
+        // success must reset the #345 breaker. There is deliberately NO second
+        // reset path — `success_fold(probe_run = false, ..)` already returns
+        // `Heal`, which nulls the failure counters, stamps `lastHealthyAt` and
+        // re-asserts `BackendReachable=True`.
+        let degraded = RepositoryHealthStatus {
+            last_probe_at: Some("2026-01-01T00:05:00Z".into()),
+            consecutive_probe_failures: Some(7),
+            first_failure_at: Some("2026-01-01T00:00:00Z".into()),
+            probe_attempt_at: Some("2026-01-01T00:05:00Z".into()),
+            ..Default::default()
+        };
+        let fold = success_fold(false, Some(&degraded), false, "2026-01-01T01:00:00Z")
+            .expect("a strict success on a degraded repository must heal");
+        assert_eq!(fold.reason, SuccessFoldReason::Heal);
     }
 
     // ---- Part B: health_probe_due ------------------------------------------

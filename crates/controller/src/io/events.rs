@@ -142,6 +142,111 @@ pub async fn publish_normal_event<K>(
     }
 }
 
+/// The `InvalidReinitializeAck` Warning's message (issue #435). Pure so its exact
+/// text is asserted; volatile-free apart from the two annotation values, which are
+/// the whole point of the message.
+///
+/// The `--overwrite` matters: the user already set the annotation once, and
+/// `kubectl annotate` without it fails on an existing key.
+pub fn invalid_reinitialize_ack_message(
+    kind: &str,
+    name: &str,
+    namespace: Option<&str>,
+    expected: &str,
+    found: &str,
+) -> String {
+    // Same producer as the block message's command, so a cluster-scoped object
+    // can never grow a `-n` in one place and not the other.
+    let ns = kopiur_mover::bootstrap::kubectl_namespace_flag(namespace);
+    let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
+    format!(
+        "The `{annotation}` annotation on this {kind} is `{found}`, which is not this \
+         repository's pinned status.uniqueId (`{expected}`), so it is IGNORED and kopiur will \
+         NOT re-initialize. If you do mean to discard the history the old repository held, run: \
+         kubectl annotate {kind} {name}{ns} {annotation}={expected} --overwrite"
+    )
+}
+
+/// The `ReinitializeAckIgnoredRepositoryPresent` Normal message (issue #435):
+/// the ack is valid, but there is nothing to re-initialize. Pure; volatile-free.
+pub fn reinitialize_ack_ignored_message(kind: &str, unique_id: &str) -> String {
+    let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
+    format!(
+        "The `{annotation}` annotation matches this {kind}'s pinned status.uniqueId \
+         (`{unique_id}`), but the kopia repository at this backend is present and healthy — \
+         there is nothing to re-initialize, and kopiur has wiped nothing. The annotation is \
+         inert while the repository stays healthy; remove it when convenient."
+    )
+}
+
+/// Publish the two informational outcomes of an `allow-reinitialize` annotation
+/// that does NOT lead to a re-initialize (issue #435), or nothing at all — the
+/// common case. One call site per reconciler, ahead of the backend match, so both
+/// the mover path and the in-process bare path are covered by one writer.
+///
+/// * a MISMATCHED ack (present, a `uniqueId` is pinned, values differ) on a
+///   repository that is **not** `Ready` is fail-safe-ignored, and would otherwise
+///   be invisible: the condition message names the value kopiur expects, not the
+///   one the user typed, so nothing on the object tells them why their annotation
+///   did nothing.
+/// * a VALID ack on a healthy repository is a no-op by design (a re-initialize is
+///   only ever a response to an EMPTY backend), and saying so is what stops the
+///   user from concluding the ack was silently dropped.
+///
+/// The `phase_is_ready` guard on the MISMATCH branch is the review's I2, and it
+/// is the annotation's self-expiring contract made real: the instant a successful
+/// re-initialize mints a new id, the ack the user applied (and quite reasonably
+/// left in their GitOps manifest) stops matching the pin. Without the guard the
+/// reward for doing exactly the right thing was a permanent Warning on a healthy
+/// repository — visible in `kubectl describe`, `get events` and any
+/// Warning-based alerting — for as long as the manifest carried the annotation.
+/// A stale ack on a `Ready` repository is inert, so it is also silent; it becomes
+/// worth reporting again only once the repository is in a state where an ack
+/// could do something.
+///
+/// Both references omit `resourceVersion` ([`event_ref`]), so the Recorder
+/// aggregates the repeats a requeue produces into one series.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_reinitialize_ack_diagnostics<K>(
+    ctx: &Context,
+    obj: &K,
+    kind: &str,
+    name: &str,
+    namespace: Option<&str>,
+    phase_is_ready: bool,
+    pinned_unique_id: Option<&str>,
+    raw_ack: Option<&str>,
+) where
+    K: Resource<DynamicType = ()>,
+{
+    let Some(ack) = raw_ack.filter(|a| !a.is_empty()) else {
+        return;
+    };
+    if crate::health::report_reinit_ack_mismatch(phase_is_ready, pinned_unique_id, Some(ack)) {
+        let expected = pinned_unique_id.unwrap_or_default();
+        publish_warning_event(
+            ctx,
+            obj,
+            crate::consts::INVALID_REINITIALIZE_ACK_REASON,
+            crate::consts::ACKNOWLEDGE_REINITIALIZE_ACTION,
+            &invalid_reinitialize_ack_message(kind, name, namespace, expected, ack),
+        )
+        .await;
+        return;
+    }
+    // Valid, and the repository is healthy: seen, and deliberately doing nothing.
+    if phase_is_ready && pinned_unique_id == Some(ack) {
+        publish_normal_event(
+            ctx,
+            obj,
+            crate::consts::REINITIALIZE_ACK_IGNORED_REPOSITORY_PRESENT_REASON,
+            crate::consts::ACKNOWLEDGE_REINITIALIZE_ACTION,
+            &reinitialize_ack_ignored_message(kind, ack),
+        )
+        .await;
+    }
+}
+
 /// Emit a `Warning` Event on an explicit [`ObjectReference`], for a referent the
 /// reconciler does not hold as a typed object — e.g. the deletion finalizer
 /// warning about a malformed `allow-mass-deletion` ack on the repository CR it
@@ -799,6 +904,24 @@ pub enum BootstrapFailure {
     /// confusing `NotFound`. Signalled by the mover via
     /// [`kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_CLASS`].
     RepositoryNotInitialized,
+    /// The connect found **no** repository at the backend, `spec.create.enabled`
+    /// was (usually) on, but this object has been `Ready` before — a pinned
+    /// `status.uniqueId` — so kopiur refused to create a fresh empty repository
+    /// over the wiped one (issue #435). Signalled by the mover via
+    /// [`kopiur_mover::bootstrap::REPOSITORY_REINITIALIZE_BLOCKED_CLASS`], and
+    /// produced identically by the in-process bare-path connect arm.
+    ///
+    /// Split from [`RepositoryNotInitialized`](Self::RepositoryNotInitialized)
+    /// because the remediation is the opposite: not "enable create" (it already
+    /// is), but "restore the backend, or acknowledge the wipe with
+    /// `allow-reinitialize`". Conflating them is exactly the bug #435 reported.
+    RepositoryReinitializeBlocked {
+        /// The full, volatile-free hint —
+        /// [`kopiur_mover::bootstrap::reinitialize_blocked_message`], which is
+        /// the single producer of this text on both paths, leading with the
+        /// `kubectl annotate` command so a 1024-byte Event note cannot eat it.
+        message: String,
+    },
     /// A `spec.seed` failed (issue #380). Its own variant rather than a
     /// [`Backend`](Self::Backend) one because the seed sentinels are kopiur
     /// seeding-policy outcomes, not kopia stderr classes — routed through
@@ -927,6 +1050,9 @@ impl BootstrapFailure {
                 crate::consts::BOOTSTRAP_DEADLINE_EXCEEDED_REASON
             }
             BootstrapFailure::RepositoryNotInitialized => REPOSITORY_NOT_INITIALIZED_REASON,
+            BootstrapFailure::RepositoryReinitializeBlocked { .. } => {
+                crate::consts::REPOSITORY_REINITIALIZE_BLOCKED_REASON
+            }
             BootstrapFailure::Seed { failure, .. } => failure.reason(),
             BootstrapFailure::SeedMoverTooOld => kopiur_api::consts::SEED_MOVER_TOO_OLD_REASON,
             BootstrapFailure::InternalInconsistency { .. } => {
@@ -949,6 +1075,7 @@ impl BootstrapFailure {
             | BootstrapFailure::JobFailedWithoutResult { .. }
             | BootstrapFailure::JobDeadlineExceeded { .. }
             | BootstrapFailure::RepositoryNotInitialized
+            | BootstrapFailure::RepositoryReinitializeBlocked { .. }
             | BootstrapFailure::InternalInconsistency { .. } => None,
         }
     }
@@ -956,15 +1083,22 @@ impl BootstrapFailure {
     /// Whether this failure means "the backend answered but the kopia repository
     /// is absent" (an empty/uninitialized backend) rather than "the backend is
     /// unreachable / the connect otherwise failed". Only the
-    /// [`RepositoryNotInitialized`](Self::RepositoryNotInitialized) sentinel — which
-    /// the mover emits *only* for a genuine `repository not initialized`, never a
-    /// missing path/mount — qualifies. The health probe uses this to choose between
-    /// `RepositoryVanished` and `BackendUnreachable`; it must stay exhaustive so a
-    /// new failure variant can't silently default to "repository absent" (which
-    /// could, in a future auto-recreate, be catastrophic).
+    /// [`RepositoryNotInitialized`](Self::RepositoryNotInitialized) and
+    /// [`RepositoryReinitializeBlocked`](Self::RepositoryReinitializeBlocked)
+    /// sentinels — which are emitted *only* for a genuine `repository not
+    /// initialized`, never a missing path/mount — qualify. The health probe uses
+    /// this to choose between `RepositoryVanished` and `BackendUnreachable`; it
+    /// must stay exhaustive so a new failure variant can't silently default to
+    /// "repository absent" (which could, in a future auto-recreate, be
+    /// catastrophic).
     pub fn is_repository_absent(&self) -> bool {
         match self {
             BootstrapFailure::RepositoryNotInitialized => true,
+            // #435: the SAME observation as its sibling — the backend answered and
+            // holds no repository — differing only in why kopiur declined to make
+            // one. It IS a vanished backend, and it is the one that matters most:
+            // a once-Ready repository whose storage is gone.
+            BootstrapFailure::RepositoryReinitializeBlocked { .. } => true,
             // A seed failure says something about the SOURCE or the copy, never
             // "this repository's backend is empty" — and the skew guard says the
             // opposite (an empty repository was just created here). Routing any
@@ -1017,6 +1151,10 @@ impl BootstrapFailure {
             | BootstrapFailure::Seed { .. } => true,
             BootstrapFailure::Backend { .. }
             | BootstrapFailure::RepositoryNotInitialized
+            // #435 is terminal for a human in exactly the way its sibling is:
+            // retrying re-observes the same empty backend. The way out is an ack
+            // or a restored backend, and both re-trigger the reconciler.
+            | BootstrapFailure::RepositoryReinitializeBlocked { .. }
             | BootstrapFailure::SeedMoverTooOld
             | BootstrapFailure::InternalInconsistency { .. } => false,
         }
@@ -1068,6 +1206,12 @@ impl BootstrapFailure {
             BootstrapFailure::JobDeadlineExceeded { .. } => bootstrapped,
             BootstrapFailure::JobFailedWithoutResult { .. }
             | BootstrapFailure::RepositoryNotInitialized
+            // #435: the escalation OUT of the retry loop, exactly like its
+            // sibling. While `Degraded` the strict retry runs with create
+            // forbidden, so this verdict is how a real wipe of a once-Ready
+            // repository stops looping and parks visibly at terminal `Failed`
+            // with the annotate command in its condition.
+            | BootstrapFailure::RepositoryReinitializeBlocked { .. }
             // A seed failure only ever fires on a repository that has NEVER
             // bootstrapped (the seed is armed only while `status.uniqueId` is
             // unset), so this arm is unreachable for it — and it already has
@@ -1114,6 +1258,7 @@ impl BootstrapFailure {
             BootstrapFailure::RepositoryNotInitialized => {
                 kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_MESSAGE.to_string()
             }
+            BootstrapFailure::RepositoryReinitializeBlocked { message } => message.clone(),
             BootstrapFailure::Seed { message, .. }
             | BootstrapFailure::InternalInconsistency { message } => message.clone(),
             BootstrapFailure::SeedMoverTooOld => seed_mover_too_old_message(),
@@ -1173,6 +1318,20 @@ impl BootstrapFailure {
                     name,
                     REPOSITORY_NOT_INITIALIZED_REASON,
                     ENABLE_CREATE_ACTION,
+                    note,
+                )
+                .await;
+            }
+            BootstrapFailure::RepositoryReinitializeBlocked { message } => {
+                // The message leads with the `kubectl annotate` command precisely
+                // so this truncation cannot remove it.
+                let note = truncate_for_note(message, EVENT_NOTE_MAX_BYTES);
+                publish_warning(
+                    ctx,
+                    regarding,
+                    name,
+                    crate::consts::REPOSITORY_REINITIALIZE_BLOCKED_REASON,
+                    crate::consts::ACKNOWLEDGE_REINITIALIZE_ACTION,
                     note,
                 )
                 .await;
@@ -1305,6 +1464,27 @@ pub fn bootstrap_outcome(
                     == Some(kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_CLASS) =>
         {
             BootstrapOutcome::Failed(BootstrapFailure::RepositoryNotInitialized)
+        }
+        // #435's sibling sentinel: the backend is empty but this repository was
+        // once `Ready`, so the decline needs the re-initialize hint, not "enable
+        // create". Checked before the generic `Backend` mapping for the same
+        // reason as the arm above — `from_label` would flatten it to `Unknown`.
+        // Binding `f` in the guard (rather than re-reaching for `r.failure` in the
+        // body) keeps `reinitialize_blocked_message` the SINGLE producer of this
+        // text: an `unwrap_or_else` fallback here would be a second, unreachable
+        // copy of copy the whole change goes out of its way to single-source.
+        Some(r)
+            if !r.success
+                && r.failure.as_ref().is_some_and(|f| {
+                    f.kopia_error_class
+                        == kopiur_mover::bootstrap::REPOSITORY_REINITIALIZE_BLOCKED_CLASS
+                }) =>
+        {
+            let message = r
+                .failure
+                .map(|f| f.message)
+                .expect("the guard proved `failure` is present");
+            BootstrapOutcome::Failed(BootstrapFailure::RepositoryReinitializeBlocked { message })
         }
         // The seed sentinels + the mover's internal-inconsistency class (#380),
         // checked before the generic Backend mapping for the same reason: they

@@ -136,7 +136,7 @@ namespaces it manages, so each is gated behind a Helm flag — the chart does
 names match the CRD field that triggers them.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:303:332"
+--8<-- "deploy/helm/kopiur/values.yaml:303:333"
 ```
 
 | CRD field you set… | …needs this Helm flag | Grants `secrets` |
@@ -303,7 +303,7 @@ it), `webhook.replicaCount`, scheduling (`webhook.nodeSelector` /
 security](#pod-security)). A root-level workload key never touches it.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:454:509"
+--8<-- "deploy/helm/kopiur/values.yaml:455:510"
 ```
 
 - **`enabled`** — when `false`, validation falls back to the controller's
@@ -321,7 +321,7 @@ security](#pod-security)). A root-level workload key never touches it.
 ### Webhook TLS
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:562:592"
+--8<-- "deploy/helm/kopiur/values.yaml:563:593"
 ```
 
 The webhook **always** serves TLS (Kubernetes requires HTTPS for admission);
@@ -340,7 +340,7 @@ TLS](install.md#webhook-tls).
 ## Monitoring (Prometheus & Grafana)
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:391:452"
+--8<-- "deploy/helm/kopiur/values.yaml:392:453"
 ```
 
 All metrics are under the `kopiur_` namespace and served via a Prometheus **pull**
@@ -389,7 +389,7 @@ The webhook's own HTTPS scrape lives separately under
 ## OpenTelemetry (OTLP)
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:367:389"
+--8<-- "deploy/helm/kopiur/values.yaml:368:390"
 ```
 
 Off by default. Metrics are **always** available via the `/metrics` pull endpoint;
@@ -406,7 +406,7 @@ and a sample collector config.
 ## Logging
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:348:365"
+--8<-- "deploy/helm/kopiur/values.yaml:349:366"
 ```
 
 Controls the stdout (`kubectl logs`) logging every component writes. The
@@ -474,7 +474,7 @@ filesystem, and all capabilities dropped (the images are `distroless:nonroot`).
 The webhook's own block:
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:510:526"
+--8<-- "deploy/helm/kopiur/values.yaml:511:527"
 ```
 
 /// note | This is the operator's security context, not the mover's

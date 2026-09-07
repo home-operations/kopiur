@@ -145,6 +145,13 @@ Repository create/connect is **idempotent**: every bootstrap *connects first* an
 
 Set **`create.enabled: false`** for a strictly read-only or externally-managed repository the operator must never create. With creation disabled, a typo in `bucket`/`endpoint` surfaces as a connect failure (`Bootstrapped=False`, `reason: RepositoryNotInitialized`) instead of spinning up a new empty repository — at the cost of opting in for every genuinely-new repo. (A wrong-password connect fails `AuthFailure` and **never** recreates over existing data — see [Safe by construction](#safe-by-construction) below.)
 
+Note that `create.enabled` governs the **first** bootstrap only. A repository that has been `Ready` is never re-created, whatever this field says — so an absent repository has **two** distinct reasons, and they need opposite fixes:
+
+| Reason | Means | Fix |
+|---|---|---|
+| `RepositoryNotInitialized` | the backend holds no repository and `create.enabled` is `false` | set `create.enabled: true`, or point the backend at an existing repository |
+| `RepositoryReinitializeBlocked` | the backend holds no repository but this one was once `Ready` (a pinned `status.uniqueId`) — it was **wiped** | restore the backend, or [deliberately re-initialize](repository-health.md#deliberately-re-initialize-a-wiped-repository) |
+
 ///
 
 ### Safe by construction
@@ -156,6 +163,8 @@ Set **`create.enabled: false`** for a strictly read-only or externally-managed r
 - **No repository exists** → kopiur creates one (only because `create.enabled` is on). As a final backstop, kopia's own `repository create` refuses to overwrite an existing repository, so even a misclassified connect cannot clobber your data.
 
 So enabling `create.enabled` for a repository that turns out to already exist is safe: kopiur will adopt it, not re-initialize it.
+
+And the gate is one-way in time: **once a repository has been `Ready`** it carries a pinned `status.uniqueId`, and from then on kopiur refuses to create over it even when `create.enabled` is `true` and the backend comes back empty. That case parks at terminal `Failed` with `RepositoryReinitializeBlocked` and a condition message carrying the exact acknowledgement command — see [Deliberately re-initialize a wiped repository](repository-health.md#deliberately-re-initialize-a-wiped-repository).
 
 ## `seed` — initialize a new repository from a replica
 

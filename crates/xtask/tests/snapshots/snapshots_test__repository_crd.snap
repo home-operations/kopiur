@@ -3881,7 +3881,21 @@ spec:
                     type: integer
                 type: object
               uniqueId:
-                description: Kopia repository unique ID.
+                description: |-
+                  Kopia repository unique ID, pinned on the first successful bootstrap.
+
+                  Its presence is the "this repository has been Ready" flag that makes
+                  auto-create one-way in time: `spec.create.enabled` governs the FIRST
+                  bootstrap only, and once this is set kopiur will never create a fresh
+                  empty repository over the backend, however empty the backend goes. A
+                  wiped backend therefore parks at `Failed` with reason
+                  `RepositoryReinitializeBlocked` instead of being silently re-created.
+
+                  To deliberately re-initialize a wiped repository, annotate it with
+                  `kopiur.home-operations.com/allow-reinitialize` set to THIS value; the
+                  ack is honored only while it matches, so the new ID minted by a
+                  successful re-initialize makes it inert. This discards the history the
+                  old repository held.
                 nullable: true
                 type: string
             type: object
