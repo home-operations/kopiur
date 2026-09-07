@@ -203,6 +203,14 @@ jobs:
           - shard: hooks-retention
             bins: "hooks retention policy_knobs adoption"
             backends: true
+          # Streamed command sources: the mover execs into a workload pod and pipes
+          # stdout into kopia. Its own shard because the scenarios mutate the
+          # NAMESPACE annotation that gates stream-exec (on, then off, then on
+          # again) — a binary sharing the cluster could see a Snapshot parked or
+          # released by someone else's edit rather than its own.
+          - shard: stream-sources
+            bins: "stream_sources"
+            backends: false
           - shard: reshape-async
             bins: "verification replication"
             backends: false
