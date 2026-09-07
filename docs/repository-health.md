@@ -195,6 +195,60 @@ still remain** and be recoverable, so verify the backend is genuinely empty
 
 ///
 
+### Deliberately re-initialize a wiped repository
+
+When a once-`Ready` repository's backend is genuinely gone — the bucket was
+deleted, a lifecycle rule emptied it, someone ran `rm -rf` on the export — the
+repository parks at terminal `Failed` with reason
+`RepositoryReinitializeBlocked`, and its `Ready` condition message carries the
+exact command to run. `kubectl kopiur status` prints that message verbatim, and
+so does `kubectl describe`.
+
+The acknowledgement is an annotation whose **value is the repository's current
+`status.uniqueId`**:
+
+```console
+$ kubectl get repository nas -n billing -o jsonpath='{.status.uniqueId}'
+c9b1f0e4a7d24e11
+
+$ kubectl annotate repository nas -n billing \
+    kopiur.home-operations.com/allow-reinitialize=c9b1f0e4a7d24e11
+```
+
+For a cluster-scoped `ClusterRepository`, drop the `-n`.
+
+On the next reconcile kopiur treats that one pass as a first bootstrap: it
+creates a fresh kopia repository at the backend, pins a **new** `uniqueId`, heals
+the circuit breaker, and backups resume. If `spec.seed` is set, the seed re-arms
+and re-seeds from the source — the stale `status.seed` from the old repository is
+cleared first, so nothing "resumes" a copy into storage that no longer holds it.
+
+/// warning | This discards the old repository's history
+
+Re-initializing does not recover anything. Every snapshot the old repository held
+is unrecoverable from that backend afterwards. **Verify the backend is genuinely
+empty first** — a `RepositoryVanished` alert means the *format blob* is gone, and
+data blobs may still be there. If the wipe was not deliberate, restore the
+backend (or point `spec.backend` at a replica) instead of acknowledging.
+
+///
+
+Three properties make the annotation safe to leave in a GitOps manifest:
+
+- **It is self-expiring.** It is honored only while its value equals the pinned
+  `status.uniqueId`. A successful re-initialize mints a new id, so the annotation
+  immediately stops matching and a *future* wipe parks again, needing a fresh
+  acknowledgement naming the new id.
+- **A mismatched value is ignored**, not guessed at. kopiur raises an
+  `InvalidReinitializeAck` Warning event naming the value it expects.
+- **It does nothing to a healthy repository.** If the backend is reachable and
+  the repository is present, there is nothing to re-initialize; kopiur emits one
+  `ReinitializeAckIgnoredRepositoryPresent` Normal event so you know the
+  annotation was seen, and wipes nothing.
+
+kopiur never adds, rewrites, or removes this annotation — there is no "honored"
+stamp to keep in sync. Remove it whenever you like.
+
 /// tip | Tuning & opting out
 
 - `interval` — how often to re-connect (Go-style duration; min `30s`, default
