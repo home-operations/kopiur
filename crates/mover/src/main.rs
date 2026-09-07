@@ -3862,6 +3862,7 @@ mod tests {
             kind: kind.to_string(),
             name: name.to_string(),
             namespace: namespace.to_string(),
+            claim_key: None,
         }
     }
 
