@@ -526,7 +526,13 @@ async fn an_ambiguous_policy_fails_the_claim_closed_and_names_the_fix() {
                     { "pvcSelector": { "labelSelector": {
                         "matchLabels": { BACKUP_LABEL_KEY: RESTORE_LABEL_VALUE } } },
                       "sourcePathStrategy": "PvcNamespacedName" }
-                ]
+                ],
+                // A distinct kopia identity: the admission webhook refuses two
+                // policies that resolve to the same identity in one repository,
+                // and the shared fan-out policy already owns `popfanout@e2e`.
+                // The identity is irrelevant to what this test proves — the
+                // claim must fail closed BEFORE any snapshot is looked up.
+                "identity": { "username": "popfanout-ambiguous", "hostname": "e2e" }
             }),
         )),
         "create the ambiguous selector SnapshotPolicy",
