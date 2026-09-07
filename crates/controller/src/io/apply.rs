@@ -55,6 +55,60 @@ pub fn status_patch_is_noop(
         .all(|(k, v)| current_obj.get(k) == Some(v))
 }
 
+/// Apply an RFC-7386 JSON merge patch of `patch` onto `target`, returning the
+/// result. Pure.
+///
+/// The three rules, verbatim from the RFC and from what the API server does with
+/// a `Patch::Merge` body: a `null` REMOVES the key, two objects MERGE key by key
+/// (recursively), and anything else — arrays included — REPLACES.
+fn apply_merge_patch(target: &serde_json::Value, patch: &serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(patch_obj) = patch else {
+        return patch.clone();
+    };
+    let mut out = match target {
+        serde_json::Value::Object(t) => t.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (key, value) in patch_obj {
+        if value.is_null() {
+            out.remove(key);
+            continue;
+        }
+        let existing = out.get(key).cloned().unwrap_or(serde_json::Value::Null);
+        out.insert(key.clone(), apply_merge_patch(&existing, value));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Whether merge-patching `desired` over `current` would leave the status
+/// BYTE-IDENTICAL, evaluated with full RFC-7386 semantics — the deep counterpart
+/// to [`status_patch_is_noop`].
+///
+/// [`status_patch_is_noop`] compares each top-level key by whole-value equality,
+/// which is exact for a reconciler that writes whole values but wrong for one
+/// that writes a PARTIAL sub-object. The fanned-out populator (#443) patches
+/// `claims: { "<one pvc>": {…} }` while `status.claims` holds every claimant, so
+/// the shallow check can never see a no-op: every pass would PATCH, bump
+/// `resourceVersion`, wake the watch and re-trigger itself — the exact hot-loop
+/// [`patch_status_if_changed`] exists to break, on the 120s cadence times N
+/// claims.
+///
+/// It also reads an explicit `null` correctly (a merge DELETES that key), where
+/// the shallow check compares it against the current value and effectively never
+/// matches.
+///
+/// Pure and cluster-free, so the semantics are unit-asserted rather than
+/// discovered from a busy cluster.
+pub fn status_merge_patch_is_noop(
+    current: Option<&serde_json::Value>,
+    desired: &serde_json::Value,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    apply_merge_patch(current, desired) == *current
+}
+
 /// Idempotent status patch: skip the PATCH entirely when `desired` matches the
 /// object's existing status (`current`), returning `false`; otherwise merge-patch
 /// and return `true`.

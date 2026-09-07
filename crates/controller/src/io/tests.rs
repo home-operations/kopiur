@@ -3996,3 +3996,126 @@ fn upsert_gate_writes_exactly_what_the_row_declares() {
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].message, "b");
 }
+
+// --- claims-aware (deep) no-op comparison, #443 --------------------------
+
+#[test]
+fn merge_noop_sees_through_a_partial_claims_map() {
+    // The fan-out patches ONE claim's entry while `status.claims` holds every
+    // claimant. The shallow comparison compares `claims` by whole value, so a
+    // partial map can never match and every 120s pass would PATCH — bumping
+    // resourceVersion, waking the watch, and re-triggering the reconcile. Times N
+    // claims. The deep predicate applies the merge and compares the result.
+    let current = serde_json::json!({
+        "phase": "Restoring",
+        "claims": {
+            "data-0": { "uid": "u0", "phase": "Populated", "reason": "RestoreSucceeded" },
+            "data-1": { "uid": "u1", "phase": "Populating", "reason": "PopulatingPrimePvc" },
+        },
+    });
+    // An unchanged single-claim merge: deep says no-op, shallow (correctly, for
+    // its own contract) does not.
+    let steady = serde_json::json!({
+        "phase": "Restoring",
+        "claims": { "data-1": { "uid": "u1", "phase": "Populating", "reason": "PopulatingPrimePvc" } },
+    });
+    assert!(status_merge_patch_is_noop(Some(&current), &steady));
+    assert!(!status_patch_is_noop(Some(&current), &steady));
+
+    // A real per-claim transition must still write.
+    let moved = serde_json::json!({
+        "claims": { "data-1": { "uid": "u1", "phase": "Populated", "reason": "RestoreSucceeded" } },
+    });
+    assert!(!status_merge_patch_is_noop(Some(&current), &moved));
+
+    // A brand-new claim must write.
+    let added = serde_json::json!({ "claims": { "data-2": { "uid": "u2" } } });
+    assert!(!status_merge_patch_is_noop(Some(&current), &added));
+}
+
+#[test]
+fn merge_noop_reads_an_explicit_null_as_a_deletion() {
+    // The fan-out nulls controller-owned keys that disappeared (a reaped
+    // `pvcPrime`, a spent `waitStartedAt`) and nulls whole entries for claimants
+    // that are gone. A null over an ABSENT key changes nothing and must read as a
+    // no-op; a null over a PRESENT key is a real deletion and must write.
+    let current = serde_json::json!({
+        "claims": { "data-0": { "uid": "u0", "pvcPrime": "prime-u0" } },
+    });
+    assert!(status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "claims": { "data-0": { "job": null } } })
+    ));
+    assert!(!status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "claims": { "data-0": { "pvcPrime": null } } })
+    ));
+    assert!(!status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "claims": { "data-0": null } })
+    ));
+    assert!(status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "claims": { "gone-already": null } })
+    ));
+}
+
+#[test]
+fn merge_noop_keeps_array_replace_semantics_and_the_no_status_case() {
+    // A merge patch REPLACES arrays, so the conditions array is compared whole —
+    // exactly as the shallow predicate does. A deep comparison must not start
+    // "merging" conditions element-wise, which would silently call a changed
+    // condition set a no-op.
+    let current = serde_json::json!({
+        "conditions": [{ "type": "Ready", "status": "True", "reason": "RestoreSucceeded" }],
+    });
+    assert!(status_merge_patch_is_noop(Some(&current), &current));
+    assert!(!status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "conditions": [] })
+    ));
+    assert!(!status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({
+            "conditions": [{ "type": "Ready", "status": "False", "reason": "ClaimFailed" }],
+        })
+    ));
+    // No status at all (first reconcile) is never a no-op — same as the shallow
+    // predicate.
+    assert!(!status_merge_patch_is_noop(
+        None,
+        &serde_json::json!({ "phase": "Pending" })
+    ));
+    assert!(!status_merge_patch_is_noop(
+        Some(&serde_json::Value::Null),
+        &serde_json::json!({ "phase": "Pending" })
+    ));
+}
+
+#[test]
+fn merge_noop_agrees_with_the_shallow_predicate_on_flat_statuses() {
+    // Everything that is not a partial sub-object must keep the answer it had:
+    // this is the guard against the deep predicate quietly changing behavior for
+    // every OTHER reconciler when it is eventually wired in.
+    let current = serde_json::json!({
+        "phase": "Failed",
+        "observedGeneration": 3,
+        "uniqueId": "abc",
+        "conditions": [{ "type": "Bootstrapped", "status": "False", "reason": "PermissionDenied" }],
+    });
+    for desired in [
+        serde_json::json!({ "phase": "Failed", "observedGeneration": 3 }),
+        serde_json::json!({ "phase": "Completed", "observedGeneration": 3 }),
+        serde_json::json!({ "observedGeneration": 4 }),
+        serde_json::json!({
+            "conditions": [{ "type": "Bootstrapped", "status": "False", "reason": "AuthFailure" }],
+        }),
+        serde_json::json!({ "uniqueId": "abc" }),
+    ] {
+        assert_eq!(
+            status_merge_patch_is_noop(Some(&current), &desired),
+            status_patch_is_noop(Some(&current), &desired),
+            "the two predicates must agree on a flat status: {desired}"
+        );
+    }
+}

@@ -4391,6 +4391,7 @@ fn sample_backup_work_spec() -> kopiur_mover::workspec::MoverWorkSpec {
             kind: "Snapshot".into(),
             name: "db-1".into(),
             namespace: "prod".into(),
+            claim_key: None,
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),

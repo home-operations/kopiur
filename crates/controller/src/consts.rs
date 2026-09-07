@@ -316,6 +316,61 @@ pub const ORPHANED_PRIME_REAPED_REASON: &str = "OrphanedPrimePvcReaped";
 /// `action` for the already-bound no-op / orphan-reap Events: to actually restore into the
 /// claim, delete it and let it be recreated (keeping its `dataSourceRef`).
 pub const RECREATE_CLAIM_TO_RESTORE_ACTION: &str = "RecreateClaimToRestore";
+
+// --- #443: the fanned-out populator's per-claim vocabulary ------------------
+//
+// A populator `Restore` is claimed by EVERY PVC whose `dataSourceRef` names it,
+// and each claim carries its own `status.claims.<pvc>.reason`. These were inline
+// string literals while there was only ever one claim to report on; a per-claim
+// record re-reads them (`plan::ClaimReason`), and a reason that is compared as
+// well as written has to have exactly one spelling.
+
+/// `Restore` claim reason while no PVC claims a populator at all (also the
+/// Restore-level `AwaitingClaim=True` reason). The wait window has not opened.
+pub const AWAITING_PVC_DATA_SOURCE_REF_REASON: &str = "AwaitingPvcDataSourceRef";
+/// `Restore` claim reason while a `WaitForFirstConsumer` claimant has no
+/// `volume.kubernetes.io/selected-node` yet: the scheduler has not placed a pod
+/// on it, so the prime PVC has no topology to be provisioned into. Per-claim
+/// since #443 — one unscheduled claimant no longer parks its siblings.
+pub const AWAITING_POD_SCHEDULE_REASON: &str = "AwaitingPodSchedule";
+/// `Restore` reason while the source snapshot has not appeared yet and the
+/// `policy.waitTimeout` window is still open.
+pub const WAITING_FOR_SNAPSHOT_REASON: &str = "WaitingForSnapshot";
+/// `Restore` reason while its repository is not `Ready` (backend unreachable).
+pub const RESTORE_REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
+/// `Restore` reason once the source resolved to a concrete snapshot.
+pub const RESTORE_SOURCE_RESOLVED_REASON: &str = "SourceResolved";
+/// `Restore` reason while a claim's mover `Job` is writing its prime PVC.
+pub const POPULATING_PRIME_PVC_REASON: &str = "PopulatingPrimePvc";
+/// `Restore` reason for a deliberate deploy-or-restore: no snapshot matched and
+/// `onMissingSnapshot: Continue` chose an empty volume.
+pub const NO_SNAPSHOT_CONTINUE_REASON: &str = "NoSnapshotContinue";
+/// `Restore` failure reason when the mover `Job` failed.
+pub const MOVER_JOB_FAILED_REASON: &str = "MoverJobFailed";
+/// `Restore` failure reason when the mover `Job`'s pod could not be scheduled or
+/// started within its deadline.
+pub const MOVER_POD_WEDGED_REASON: &str = "MoverPodWedged";
+/// `Restore` failure reason when `onMissingSnapshot: Fail` fired.
+pub const RESTORE_SNAPSHOT_NOT_FOUND_REASON: &str = "SnapshotNotFound";
+/// `Restore` claim failure reason when the per-PVC kopia source path cannot be
+/// derived from the policy (selector sources that disagree on
+/// `sourcePathStrategy`/`sourcePathOverride`, or share one override). Fails
+/// closed: restoring with no path matches the newest snapshot of ANY member and
+/// could fill the volume with another volume's data (#443).
+pub const SOURCE_PATH_AMBIGUOUS_REASON: &str = "SourcePathAmbiguous";
+/// `Restore` `AwaitingClaim=False` reason once at least one PVC claims a
+/// populator: the per-claim records in `status.claims` are now the story.
+pub const CLAIMS_OBSERVED_REASON: &str = "ClaimsObserved";
+/// `Restore` claim reason when our rebind was issued but a DIFFERENT volume won
+/// the claim, so the handover is lost and can never complete. The restored data
+/// is on a PV kept under a forced `Retain` — see `plan::lost_rebind_message`.
+pub const LOST_REBIND_REASON: &str = "LostRebind";
+/// `Restore` `Stalled` reason when at least one claim of a fanned-out populator
+/// terminally failed. Deliberately ONE stable string rather than the failing
+/// claim's own reason: the aggregate condition would otherwise churn as
+/// different claims failed, and the per-claim reasons are in the message (and in
+/// `status.claims`) where they belong.
+pub const RESTORE_CLAIM_FAILED_REASON: &str = "ClaimFailed";
 /// Event `action` (remediation hint) for
 /// [`RESTORE_REFERENT_MISSING_REASON`]: create the referenced object, or repoint
 /// the `Restore` at one that exists. Published on the park TRANSITION only (the

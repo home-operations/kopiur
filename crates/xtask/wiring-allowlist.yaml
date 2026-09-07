@@ -174,10 +174,6 @@ allow:
     reason: Never written; the mover reports no per-run byte count..
   - path: RepositoryReplication.status.lastReplicatedBlobs
     reason: Never written; the mover reports no per-run blob count..
-  - path: Restore.status.target.pvcPrime
-    reason: >-
-      Never written by the Restore reconciler, despite the in-place-mirror flow
-      that would populate it..
   - path: Snapshot.status.stats.bytesNew
     reason: >-
       Never written. Siblings filesNew/filesModified/filesUnchanged are read by

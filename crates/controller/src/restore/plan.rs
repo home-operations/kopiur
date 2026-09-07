@@ -8,7 +8,10 @@
 use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 
-use kopiur_api::{OnMissingSnapshot, Restore, RestorePhase, RestoreSource, RestoreTarget};
+use kopiur_api::{
+    OnMissingSnapshot, Restore, RestoreClaimPhase, RestoreClaimStatus, RestorePhase, RestoreSource,
+    RestoreTarget,
+};
 
 use crate::io;
 
@@ -120,15 +123,33 @@ pub(super) fn repository_not_ready_restore_message(repo_name: &str) -> String {
     )
 }
 
-/// Whether `phase` lets the reconcile-entry guard short-circuit. `Failed` always does.
-/// `Completed` does for a DIRECT restore (the mover wrote the target PVC itself), but
-/// NOT for a populator: there the mover stamps `Completed` on finishing the PRIME PVC
-/// while the prime→consumer rebind is still pending, so it must fall through to
-/// [`drive_populator_restore`]. Pure.
+/// Whether `phase` lets the reconcile-entry guard short-circuit.
+///
+/// For a DIRECT restore both terminal phases do: the mover wrote the target PVC
+/// itself, a Restore is one-shot, and a retry is a NEW Restore.
+///
+/// For a populator, NEITHER does (#443).
+/// - `Completed` never did: the mover stamps it on finishing the PRIME PVC while
+///   the prime→consumer rebind is still pending, so it must fall through to the
+///   populator driver.
+/// - `Failed` no longer does, and that is a deliberate behavior change. A
+///   populator now fans out over EVERY claiming PVC, and its Restore-level
+///   `Failed` means "at least one claim failed" — short-circuiting there would
+///   freeze the healthy siblings mid-populate, and would make the standing advice
+///   ("re-create the claiming PVC") a lie, since nothing would ever look at the
+///   re-created claim. Per-CLAIM, `Failed` IS terminal
+///   ([`RestoreClaimPhase::is_terminal`]), which is what stops a failed claim
+///   from being re-driven forever.
+///
+/// One protection moved rather than disappeared: `fail_populate_hijacked` leaves
+/// its prime PVC standing because it holds half-written data, and what kept the
+/// reaper away from it used to be this very short-circuit. That is now
+/// [`ClaimReason::artifacts_reapable`], gated on the claim's own reason.
+///
+/// Pure.
 pub(super) fn phase_is_terminal_at_guard(phase: &RestorePhase, state: PopulatorState) -> bool {
     match phase {
-        RestorePhase::Failed => true,
-        RestorePhase::Completed => state == PopulatorState::DirectTarget,
+        RestorePhase::Failed | RestorePhase::Completed => state == PopulatorState::DirectTarget,
         RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring => false,
         // Not terminal: an uninterpretable phase must not short-circuit the
         // reconcile into "nothing left to do".
@@ -675,7 +696,7 @@ pub(super) fn effective_wait_anchor(restore: &Restore, created_epoch: i64) -> i6
 /// "not open yet" state can never be silently reported as an ordinary snapshot wait: the
 /// two park with different messages AND different cadences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WaitWindow {
+pub enum WaitWindow {
     /// Open, anchored at this epoch — `status.waitStartedAt` once stamped, else the
     /// Restore's creation (which is also what an unconfigured window reads, where nothing
     /// measures the anchor at all).
@@ -687,7 +708,7 @@ pub(super) enum WaitWindow {
 
 impl WaitWindow {
     /// The epoch this pass measures `waitTimeout` from.
-    pub(super) fn anchor(self) -> i64 {
+    pub fn anchor(self) -> i64 {
         match self {
             Self::Open(at) | Self::AwaitingClaim(at) => at,
         }
@@ -788,4 +809,680 @@ pub fn wait_remaining_secs(
     let timeout = crate::snapshot_schedule::parse_go_duration(wait_timeout?)?;
     let deadline = anchor_epoch.saturating_add(timeout.as_secs().try_into().ok()?);
     (now_epoch < deadline).then(|| (deadline - now_epoch) as u64)
+}
+
+// --- #443: the fanned-out populator's per-claim decisions -------------------
+//
+// A populator `Restore` is claimed by EVERY PVC whose `spec.dataSourceRef` names
+// it. Each claim gets its own prime PVC, mover `Job`, source path and record in
+// `status.claims`; the Restore's own phase is the AGGREGATE over those records.
+// Everything below is pure over the records alone, so the whole fan-out state
+// machine is unit-tested without a cluster.
+
+/// How one claim's phase counts toward the aggregate. Pure + exhaustive over
+/// [`RestoreClaimPhase`], so a new claim phase has to declare which side of
+/// "still working / settled / failed" it lands on before it compiles — the
+/// classification the Restore's own phase, its kstatus trio and the reaper all
+/// rest on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimClass {
+    /// Not settled: still waiting, populating, or rebinding.
+    InFlight,
+    /// The claim is bound to the volume this restore populated.
+    Populated,
+    /// The claim was already bound, so there was nothing to populate (#233).
+    AlreadyBound,
+    /// The claim terminally failed.
+    Failed,
+}
+
+/// Classify one claim record's phase. An absent phase is a record the controller
+/// has observed but not yet driven — in flight, never settled.
+pub fn claim_class(phase: Option<&RestoreClaimPhase>) -> ClaimClass {
+    match phase {
+        None
+        | Some(
+            RestoreClaimPhase::Pending
+            | RestoreClaimPhase::Populating
+            | RestoreClaimPhase::Rebinding,
+        ) => ClaimClass::InFlight,
+        Some(RestoreClaimPhase::Populated) => ClaimClass::Populated,
+        Some(RestoreClaimPhase::AlreadyBound) => ClaimClass::AlreadyBound,
+        Some(RestoreClaimPhase::Failed) => ClaimClass::Failed,
+        // A phase this build cannot read is never reported as settled: a newer
+        // operator may still be driving it, and calling the Restore `Completed`
+        // over it would tell `kubectl wait`/Flux a restore landed that did not.
+        Some(RestoreClaimPhase::Unknown(_)) => ClaimClass::InFlight,
+    }
+}
+
+/// The counted shape of a claims map — what [`claims_summary`] renders and what
+/// [`aggregate_phase`] decides from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClaimTally {
+    /// How many claims there are in total.
+    pub total: usize,
+    /// How many are `Populated`.
+    pub populated: usize,
+    /// How many were already bound (a truthful no-op, #233).
+    pub already_bound: usize,
+    /// Names of the claims not settled yet, in map (name) order.
+    pub in_flight: Vec<String>,
+    /// Of those, how many have a mover actually running (`Populating`) or a
+    /// rebind outstanding (`Rebinding`) — the difference between the Restore
+    /// reporting `Restoring` and reporting `Pending`.
+    pub active: usize,
+    /// `(claim, reason)` for each failed claim, in map order.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Where a fanned-out populator stands, over all of its claims.
+///
+/// Closed and matched exhaustively because the four states drive different
+/// phases, different cadences and different work: [`Self::NoClaims`] is the
+/// standing GitOps populator nothing has claimed yet (its wait window has not
+/// even opened); [`Self::Failed`] stalls the Restore while siblings keep going;
+/// [`Self::AllSettled`] is the only state that may skip the PV LIST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimsAggregate {
+    /// No PVC claims this populator yet.
+    NoClaims,
+    /// At least one claim terminally failed.
+    Failed(ClaimTally),
+    /// Nothing failed and at least one claim is still working.
+    InFlight(ClaimTally),
+    /// Every claim reached a terminal state and none failed.
+    AllSettled(ClaimTally),
+}
+
+impl ClaimsAggregate {
+    /// The tally behind this aggregate; `None` only for [`Self::NoClaims`].
+    /// Exhaustive.
+    pub fn tally(&self) -> Option<&ClaimTally> {
+        match self {
+            Self::NoClaims => None,
+            Self::Failed(t) | Self::InFlight(t) | Self::AllSettled(t) => Some(t),
+        }
+    }
+}
+
+/// Fold the per-claim records into the whole restore's state. Pure.
+pub fn aggregate_claims(
+    claims: &std::collections::BTreeMap<String, RestoreClaimStatus>,
+) -> ClaimsAggregate {
+    if claims.is_empty() {
+        return ClaimsAggregate::NoClaims;
+    }
+    let mut tally = ClaimTally {
+        total: claims.len(),
+        ..Default::default()
+    };
+    for (name, record) in claims {
+        match claim_class(record.phase.as_ref()) {
+            ClaimClass::InFlight => {
+                tally.in_flight.push(name.clone());
+                if claim_is_active(record.phase.as_ref()) {
+                    tally.active += 1;
+                }
+            }
+            ClaimClass::Populated => tally.populated += 1,
+            ClaimClass::AlreadyBound => tally.already_bound += 1,
+            ClaimClass::Failed => tally.failed.push((
+                name.clone(),
+                record
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "Failed".to_string()),
+            )),
+        }
+    }
+    if !tally.failed.is_empty() {
+        return ClaimsAggregate::Failed(tally);
+    }
+    if !tally.in_flight.is_empty() {
+        return ClaimsAggregate::InFlight(tally);
+    }
+    ClaimsAggregate::AllSettled(tally)
+}
+
+/// Whether this claim has work actually in flight (a mover running or a rebind
+/// outstanding), as opposed to merely waiting. Pure + exhaustive.
+fn claim_is_active(phase: Option<&RestoreClaimPhase>) -> bool {
+    match phase {
+        Some(RestoreClaimPhase::Populating | RestoreClaimPhase::Rebinding) => true,
+        None
+        | Some(
+            RestoreClaimPhase::Pending
+            | RestoreClaimPhase::Populated
+            | RestoreClaimPhase::AlreadyBound
+            | RestoreClaimPhase::Failed,
+        ) => false,
+        // Never claimed as active: an unreadable phase must not make the Restore
+        // report `Restoring` when nothing of ours is running.
+        Some(RestoreClaimPhase::Unknown(_)) => false,
+    }
+}
+
+/// The `Restore`'s own phase, given where its claims stand. Pure + exhaustive
+/// over [`ClaimsAggregate`], so kstatus (via the unchanged
+/// [`restore_ready_outcome`]) follows automatically.
+///
+/// `InFlight` splits: `Restoring` once a mover is actually running or a rebind is
+/// outstanding, `Pending` while every unsettled claim is merely waiting (for a
+/// scheduling hint, the repository, or the source snapshot) — the same
+/// distinction the single-claim path drew before #443.
+pub fn aggregate_phase(aggregate: &ClaimsAggregate) -> RestorePhase {
+    // Every payload is BOUND, never `(_)`: an arm-initial wildcard in a match
+    // that yields a phase is exactly the shape `cargo xtask check-phases` rule B
+    // exists to catch (#351's `_ => continue` over `SnapshotPhase::Unchanged`).
+    match aggregate {
+        ClaimsAggregate::NoClaims => RestorePhase::Pending,
+        ClaimsAggregate::Failed(failed) => {
+            debug_assert!(!failed.failed.is_empty());
+            RestorePhase::Failed
+        }
+        ClaimsAggregate::InFlight(tally) if tally.active > 0 => RestorePhase::Restoring,
+        ClaimsAggregate::InFlight(waiting) => {
+            debug_assert_eq!(waiting.active, 0);
+            RestorePhase::Pending
+        }
+        ClaimsAggregate::AllSettled(settled) => {
+            debug_assert!(settled.in_flight.is_empty() && settled.failed.is_empty());
+            RestorePhase::Completed
+        }
+    }
+}
+
+/// The `(reason, message)` for the Restore's Ready/Stalled condition, given the
+/// aggregate. Pure so the text a human acts on is unit-asserted.
+///
+/// The reason is a STABLE string per aggregate state, never the failing claim's
+/// own reason: the condition would otherwise churn (and re-bump
+/// `resourceVersion`) every time a different claim failed. Per-claim detail goes
+/// in the message, and in `status.claims`.
+pub fn claims_summary(aggregate: &ClaimsAggregate) -> (&'static str, String) {
+    use crate::consts::{
+        AWAITING_PVC_DATA_SOURCE_REF_REASON, POPULATING_PRIME_PVC_REASON,
+        RESTORE_CLAIM_FAILED_REASON, RESTORE_POPULATED_REASON,
+    };
+    let Some(tally) = aggregate.tally() else {
+        return (
+            AWAITING_PVC_DATA_SOURCE_REF_REASON,
+            "passive populator: no PersistentVolumeClaim claims this Restore yet \
+             (spec.dataSourceRef), so there is nothing to populate and the waitTimeout window \
+             has NOT started — it opens when a claim appears. Create the claiming PVC to \
+             proceed."
+                .to_string(),
+        );
+    };
+    let mut message = format!("{}/{} claims populated", tally.populated, tally.total);
+    if tally.already_bound > 0 {
+        message.push_str(&format!("; already bound: {}", tally.already_bound));
+    }
+    if !tally.in_flight.is_empty() {
+        message.push_str(&format!("; populating: {}", tally.in_flight.join(", ")));
+    }
+    if !tally.failed.is_empty() {
+        let failed: Vec<String> = tally
+            .failed
+            .iter()
+            .map(|(name, reason)| format!("{name} ({reason})"))
+            .collect();
+        message.push_str(&format!("; failed: {}", failed.join(", ")));
+        message.push_str(
+            ". A failed claim stalls the Restore while its siblings continue; fix the cause and \
+             re-create that claiming PVC to re-arm it.",
+        );
+    }
+    let reason = match aggregate {
+        ClaimsAggregate::NoClaims => AWAITING_PVC_DATA_SOURCE_REF_REASON,
+        ClaimsAggregate::Failed(failed) => {
+            debug_assert!(!failed.failed.is_empty());
+            RESTORE_CLAIM_FAILED_REASON
+        }
+        ClaimsAggregate::InFlight(in_flight) => {
+            debug_assert!(!in_flight.in_flight.is_empty());
+            POPULATING_PRIME_PVC_REASON
+        }
+        ClaimsAggregate::AllSettled(settled) => {
+            debug_assert!(settled.in_flight.is_empty());
+            RESTORE_POPULATED_REASON
+        }
+    };
+    (reason, message)
+}
+
+/// What this pass must do with one claim record. Pure model, matched
+/// exhaustively by the driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimDrive {
+    /// Run the handshake for this claim.
+    Drive,
+    /// The claim reached a terminal state under the LIVE claimant's uid — leave
+    /// it alone.
+    ///
+    /// Keyed on the record's terminal phase, deliberately NOT on "bound and no
+    /// prime": a `Failed` claim is unbound with its prime still standing, so the
+    /// latter would re-drive it forever on the 120s cadence. Artifact reaping is
+    /// a separate, reason-gated step (see [`claim_artifacts_reapable`]) — the
+    /// prime of a hijacked populate holds half-written data and must survive.
+    Settled,
+    /// The record belongs to a DELETED claimant (its uid no longer matches the
+    /// live PVC): reap the old claim's artifacts under `stale_uid`, then start
+    /// over. Re-creating a claiming PVC is how a failed claim is re-armed.
+    ReArm {
+        /// The recorded (now dead) claimant uid, which names its prime PVC, Job
+        /// and PV.
+        stale_uid: String,
+    },
+}
+
+/// Decide what to do with one claim record against the live claimant's uid.
+/// Pure.
+///
+/// A record with no uid at all (a hand-patched or half-written entry) is DRIVEN
+/// rather than re-armed: there is nothing to reap under an unknown uid, and
+/// driving re-derives the record from the observed handshake.
+pub fn claim_drive(record: Option<&RestoreClaimStatus>, live_uid: &str) -> ClaimDrive {
+    let Some(record) = record else {
+        return ClaimDrive::Drive;
+    };
+    match record.uid.as_deref() {
+        Some(uid) if uid != live_uid => ClaimDrive::ReArm {
+            stale_uid: uid.to_string(),
+        },
+        Some(_) | None => match record.phase.as_ref() {
+            Some(phase) if phase.is_terminal() => ClaimDrive::Settled,
+            Some(_) | None => ClaimDrive::Drive,
+        },
+    }
+}
+
+/// The reason vocabulary a populator claim record carries.
+///
+/// An enum rather than string compares because one of these decisions is
+/// destructive: [`Self::PopulateHijacked`] leaves its prime PVC standing ON
+/// PURPOSE (it holds half-written data a human may want), and the reaper must
+/// refuse it. A `reason == "PopulateHijacked"` test would silently stop matching
+/// the day the literal moved; an exhaustive match over this enum cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimReason {
+    /// No PVC claims the populator yet.
+    AwaitingPvcDataSourceRef,
+    /// A `WaitForFirstConsumer` claimant has no scheduling hint yet.
+    AwaitingPodSchedule,
+    /// The source snapshot has not appeared and the wait window is open.
+    WaitingForSnapshot,
+    /// The repository is not `Ready`.
+    RepositoryNotReady,
+    /// The referent the repository is derived from does not exist.
+    RestoreReferentMissing,
+    /// The source resolved to a concrete snapshot.
+    SourceResolved,
+    /// A mover is writing this claim's prime PVC.
+    PopulatingPrimePvc,
+    /// Deploy-or-restore: no snapshot matched and `Continue` chose empty.
+    NoSnapshotContinue,
+    /// This claim's populate landed and the claim is bound to it.
+    RestoreSucceeded,
+    /// The claim was already bound — a truthful no-op (#233).
+    TargetAlreadyBound,
+    /// A previously no-op'd populator's claim was re-created, so it re-resolves.
+    ClaimRecreated,
+    /// The mover `Job` failed.
+    MoverJobFailed,
+    /// The mover pod could not start within its deadline.
+    MoverPodWedged,
+    /// The claim was bound out from under a RUNNING populate.
+    PopulateHijacked,
+    /// `onMissingSnapshot: Fail` fired.
+    SnapshotNotFound,
+    /// The per-PVC kopia source path could not be derived (#443).
+    SourcePathAmbiguous,
+    /// Our rebind was issued but a different volume won the claim.
+    LostRebind,
+}
+
+impl ClaimReason {
+    /// Every reason, so the parse/label round-trip is a tripwire rather than a
+    /// hand-maintained list.
+    pub const ALL: &'static [Self] = &[
+        Self::AwaitingPvcDataSourceRef,
+        Self::AwaitingPodSchedule,
+        Self::WaitingForSnapshot,
+        Self::RepositoryNotReady,
+        Self::RestoreReferentMissing,
+        Self::SourceResolved,
+        Self::PopulatingPrimePvc,
+        Self::NoSnapshotContinue,
+        Self::RestoreSucceeded,
+        Self::TargetAlreadyBound,
+        Self::ClaimRecreated,
+        Self::MoverJobFailed,
+        Self::MoverPodWedged,
+        Self::PopulateHijacked,
+        Self::SnapshotNotFound,
+        Self::SourcePathAmbiguous,
+        Self::LostRebind,
+    ];
+
+    /// The stored string for this reason. Exhaustive; every value comes from
+    /// [`crate::consts`] so a reason written in one place and compared in another
+    /// can never drift.
+    pub fn as_str(self) -> &'static str {
+        use crate::consts as c;
+        match self {
+            Self::AwaitingPvcDataSourceRef => c::AWAITING_PVC_DATA_SOURCE_REF_REASON,
+            Self::AwaitingPodSchedule => c::AWAITING_POD_SCHEDULE_REASON,
+            Self::WaitingForSnapshot => c::WAITING_FOR_SNAPSHOT_REASON,
+            Self::RepositoryNotReady => c::RESTORE_REPOSITORY_NOT_READY_REASON,
+            Self::RestoreReferentMissing => c::RESTORE_REFERENT_MISSING_REASON,
+            Self::SourceResolved => c::RESTORE_SOURCE_RESOLVED_REASON,
+            Self::PopulatingPrimePvc => c::POPULATING_PRIME_PVC_REASON,
+            Self::NoSnapshotContinue => c::NO_SNAPSHOT_CONTINUE_REASON,
+            Self::RestoreSucceeded => c::RESTORE_POPULATED_REASON,
+            Self::TargetAlreadyBound => c::RESTORE_TARGET_ALREADY_BOUND_REASON,
+            Self::ClaimRecreated => c::RESTORE_CLAIM_RECREATED_REASON,
+            Self::MoverJobFailed => c::MOVER_JOB_FAILED_REASON,
+            Self::MoverPodWedged => c::MOVER_POD_WEDGED_REASON,
+            Self::PopulateHijacked => c::POPULATE_HIJACKED_REASON,
+            Self::SnapshotNotFound => c::RESTORE_SNAPSHOT_NOT_FOUND_REASON,
+            Self::SourcePathAmbiguous => c::SOURCE_PATH_AMBIGUOUS_REASON,
+            Self::LostRebind => c::LOST_REBIND_REASON,
+        }
+    }
+
+    /// Parse a stored reason string; `None` for anything outside the vocabulary
+    /// (a hand-edited status, or a newer operator's reason).
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|r| r.as_str() == s)
+    }
+
+    /// Whether this claim's leftover populate artifacts (prime PVC, mover `Job`,
+    /// work-spec `ConfigMap`, earmarked PV) may be reaped. Exhaustive.
+    ///
+    /// `PopulateHijacked` is the one `false`. `fail_populate_hijacked` leaves the
+    /// prime PVC standing because it holds HALF-WRITTEN data the admin may want
+    /// to inspect, and before #443 what protected it was the whole populator
+    /// short-circuiting on `Failed` at the reconcile-entry guard. Fan-out relaxes
+    /// that guard (a failed claim must not stop its siblings), so the protection
+    /// has to move here.
+    pub fn artifacts_reapable(self) -> bool {
+        match self {
+            Self::PopulateHijacked => false,
+            Self::AwaitingPvcDataSourceRef
+            | Self::AwaitingPodSchedule
+            | Self::WaitingForSnapshot
+            | Self::RepositoryNotReady
+            | Self::RestoreReferentMissing
+            | Self::SourceResolved
+            | Self::PopulatingPrimePvc
+            | Self::NoSnapshotContinue
+            | Self::RestoreSucceeded
+            | Self::TargetAlreadyBound
+            | Self::ClaimRecreated
+            | Self::MoverJobFailed
+            | Self::MoverPodWedged
+            | Self::SnapshotNotFound
+            | Self::SourcePathAmbiguous
+            | Self::LostRebind => true,
+        }
+    }
+}
+
+/// Whether a claim recorded with `reason` may have its populate artifacts
+/// reaped. An unrecognized reason is reapable — that matches the pre-#443
+/// behavior, where `PopulateHijacked` was the only special case. Pure.
+pub fn claim_artifacts_reapable(reason: Option<&str>) -> bool {
+    match reason.and_then(ClaimReason::parse) {
+        Some(r) => r.artifacts_reapable(),
+        None => true,
+    }
+}
+
+/// Seed a claim record from a LEGACY single-claim `Restore` status — the upgrade
+/// path (#443).
+///
+/// Fires only when `status.claims` is empty and the object already carries a
+/// phase, i.e. a `Restore` written by a pre-fan-out operator. Existing
+/// single-PVC populators then keep working with zero spec change and no status
+/// regression: an in-flight populate is adopted and driven (under its legacy Job
+/// name, via `legacy_job`, so a second mover is never launched into the same
+/// prime), and a finished one is recorded as finished rather than re-run.
+///
+/// The phase is keyed on the legacy TOP-LEVEL phase first and the Ready reason
+/// only to disambiguate `Completed`, which is three different situations:
+/// a genuine success, the #233 already-bound no-op, and the legacy stuck orphan
+/// (`Completed` + `PopulatingPrimePvc`) that still needs driving. A
+/// `RestoreSucceeded` legacy is emphatically NOT relabeled `AlreadyBound` — that
+/// would tell the user no restore ever ran.
+pub fn adopt_legacy_claim(
+    status: &kopiur_api::RestoreStatus,
+    consumer: &PersistentVolumeClaim,
+    legacy_job: Option<&str>,
+) -> Option<RestoreClaimStatus> {
+    if !status.claims.is_empty() {
+        return None;
+    }
+    let phase = status.phase.as_ref()?;
+    let ready = status
+        .conditions
+        .iter()
+        .find(|c| c.type_ == crate::consts::READY_CONDITION);
+    let reason = ready.map(|c| c.reason.as_str());
+    Some(RestoreClaimStatus {
+        uid: consumer.metadata.uid.clone(),
+        phase: Some(legacy_claim_phase(phase, reason)),
+        reason: reason.map(str::to_string),
+        message: ready.map(|c| c.message.clone()),
+        source_path: status
+            .resolved
+            .as_ref()
+            .and_then(|r| r.identity.as_ref())
+            .and_then(|i| i.source_path.clone()),
+        resolved: status.resolved.clone(),
+        pvc_prime: status.target.as_ref().and_then(|t| t.pvc_prime.clone()),
+        job: legacy_job.map(str::to_string),
+        wait_started_at: status.wait_started_at.clone(),
+        // Mover-owned; a controller-side adoption never claims to have written
+        // them, so `claim_merge_body` has nothing of the mover's to clobber.
+        observed_at: None,
+        log_tail: None,
+        failure: None,
+    })
+}
+
+/// The claim phase a legacy `(top-level phase, Ready reason)` pair maps to.
+/// Pure + exhaustive over [`RestorePhase`].
+fn legacy_claim_phase(phase: &RestorePhase, reason: Option<&str>) -> RestoreClaimPhase {
+    match phase {
+        // `Completed` is three situations, told apart by the Ready reason.
+        // Exhaustive over `Option<ClaimReason>` — no `_ =>` — so a reason added
+        // later must decide what a legacy `Completed` carrying it adopted as.
+        RestorePhase::Completed => match reason.and_then(ClaimReason::parse) {
+            Some(ClaimReason::TargetAlreadyBound) => RestoreClaimPhase::AlreadyBound,
+            Some(ClaimReason::RestoreSucceeded | ClaimReason::NoSnapshotContinue) => {
+                RestoreClaimPhase::Populated
+            }
+            // The legacy stuck orphan (`Completed` + `PopulatingPrimePvc`) and
+            // every other reason, including one this build cannot place (`None`):
+            // drive it and let the observed handshake settle it. Re-driving a
+            // populator is idempotent (its source is pinned), so this is the safe
+            // default — claiming `Populated` over a rebind that never happened is
+            // not.
+            None
+            | Some(
+                ClaimReason::AwaitingPvcDataSourceRef
+                | ClaimReason::AwaitingPodSchedule
+                | ClaimReason::WaitingForSnapshot
+                | ClaimReason::RepositoryNotReady
+                | ClaimReason::RestoreReferentMissing
+                | ClaimReason::SourceResolved
+                | ClaimReason::PopulatingPrimePvc
+                | ClaimReason::ClaimRecreated
+                | ClaimReason::MoverJobFailed
+                | ClaimReason::MoverPodWedged
+                | ClaimReason::PopulateHijacked
+                | ClaimReason::SnapshotNotFound
+                | ClaimReason::SourcePathAmbiguous
+                | ClaimReason::LostRebind,
+            ) => RestoreClaimPhase::Populating,
+        },
+        RestorePhase::Failed => RestoreClaimPhase::Failed,
+        RestorePhase::Restoring => RestoreClaimPhase::Populating,
+        RestorePhase::Pending | RestorePhase::Resolving => RestoreClaimPhase::Pending,
+        // An unreadable phase is driven, not settled.
+        RestorePhase::Unknown(_) => RestoreClaimPhase::Pending,
+    }
+}
+
+/// [`super::pinned_decision`] for ONE claim record (#443) — all four of its arms,
+/// keyed on the claim's own pin and phase rather than the Restore's.
+///
+/// - `resolution: NoSnapshot` pinned → [`super::Resolution::Empty`].
+/// - `kopiaSnapshotID` pinned (with or without the newer `resolution`, so a pin
+///   written before that field existed still reads) → `Snapshot`.
+/// - Unpinned but the claim already reads `Populated`: the pre-fix `Continue`
+///   arm stamped completion without pinning anything, and a snapshot-resolved
+///   claim always pins before it can be `Populated` — so the decision WAS
+///   "empty". Back-fill it rather than re-resolve, or a snapshot that appeared
+///   after the original decision would silently restore over the volume.
+/// - Unpinned and `AlreadyBound` is the #233 carve-out: that claim never ran a
+///   mover, and the mover is what pins a deferred source. Back-filling
+///   `NoSnapshot` there would durably record "this restore decided to come up
+///   empty", so a later, legitimate re-creation of the claiming PVC would
+///   provision an EMPTY volume instead of restoring.
+///
+/// Anything else → `None` (resolve now). Pure + exhaustive.
+pub fn claim_pinned_decision(record: &RestoreClaimStatus) -> Option<super::Resolution> {
+    use kopiur_api::ResolutionOutcome;
+    match &record.resolved {
+        Some(r) if r.resolution == Some(ResolutionOutcome::NoSnapshot) => {
+            Some(super::Resolution::Empty)
+        }
+        Some(r) => r.kopia_snapshot_id.clone().map(super::Resolution::Snapshot),
+        None => match record.phase.as_ref() {
+            Some(RestoreClaimPhase::Populated) => Some(super::Resolution::Empty),
+            None
+            | Some(
+                RestoreClaimPhase::Pending
+                | RestoreClaimPhase::Populating
+                | RestoreClaimPhase::Rebinding
+                | RestoreClaimPhase::AlreadyBound
+                | RestoreClaimPhase::Failed
+                | RestoreClaimPhase::Unknown(_),
+            ) => None,
+        },
+    }
+}
+
+/// The controller-owned keys of a claim record, in wire spelling. Anything not
+/// listed here is the mover's and the controller never writes (or nulls) it.
+const CLAIM_CONTROLLER_KEYS: &[&str] = &[
+    "uid",
+    "phase",
+    "reason",
+    "message",
+    "sourcePath",
+    "pvcPrime",
+    "job",
+    "waitStartedAt",
+];
+
+/// The mover-owned keys of a claim record. The controller strips these from
+/// every merge body it builds, so a controller pass can never blank a value the
+/// claim's own mover wrote.
+const CLAIM_MOVER_KEYS: &[&str] = &["observedAt", "logTail", "failure"];
+
+/// The merge-patch value for one claim's entry: `next`, minus the mover-owned
+/// keys, plus an explicit JSON `null` for every controller-owned key that `prev`
+/// had and `next` does not.
+///
+/// The nulls are the whole point and cannot be expressed by the typed status: an
+/// RFC-7386 merge patch removes only the keys it names, and every field is
+/// `skip_serializing_if = "Option::is_none"`, so a `None` serializes to nothing
+/// and would leave (say) a spent `waitStartedAt` or a reaped `pvcPrime` standing
+/// forever.
+///
+/// `resolved` is written when `next` has one (the controller pinned it) and
+/// never nulled — a claim's pin is durable, and the mover writes it too.
+pub fn claim_merge_body(
+    prev: Option<&RestoreClaimStatus>,
+    next: &RestoreClaimStatus,
+) -> serde_json::Value {
+    let mut body = serde_json::to_value(next).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(obj) = body.as_object_mut() else {
+        return serde_json::json!({});
+    };
+    for key in CLAIM_MOVER_KEYS {
+        obj.remove(*key);
+    }
+    if let Some(prev) = prev
+        && let Some(prev_obj) = serde_json::to_value(prev).ok().and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+    {
+        for key in CLAIM_CONTROLLER_KEYS {
+            if prev_obj.contains_key(*key) && !obj.contains_key(*key) {
+                obj.insert((*key).to_string(), serde_json::Value::Null);
+            }
+        }
+    }
+    body
+}
+
+/// Whether a claim record CHANGED in a way worth an Event — the `(phase, reason)`
+/// pair moved, or the record is new. Pure.
+///
+/// This is what stops Event `count` inflation on the 120s heartbeat: the recorder
+/// aggregates identical Events into one object, so a per-pass emit would spin a
+/// single Event's count rather than record anything new. Phases are compared by
+/// their labels, which is a total comparison over the enum (a new variant cannot
+/// silently land on the "unchanged" side).
+pub fn claim_transition(prev: Option<&RestoreClaimStatus>, next: &RestoreClaimStatus) -> bool {
+    use kopiur_api::common::PhaseLabel;
+    let label = |r: &RestoreClaimStatus| r.phase.as_ref().map(|p| p.label().to_string());
+    match prev {
+        None => true,
+        Some(prev) => label(prev) != label(next) || prev.reason != next.reason,
+    }
+}
+
+/// The `waitTimeout` window for ONE claim (#443).
+///
+/// Per-claim because claimants appear at different times: a sibling created an
+/// hour after the first must get its own full window, not the remains of the
+/// first one's. Anchored at the claim record's `waitStartedAt` once stamped;
+/// failing that, at the Restore's legacy top-level `waitStartedAt` (so an upgrade
+/// mid-wait does not silently restart the window); failing that, at `now` —
+/// this pass is the first on which the claim could proceed, and the caller stamps
+/// it into the record.
+///
+/// Always [`WaitWindow::Open`]: a claim record exists only because a PVC claims
+/// the populator, which is exactly the condition
+/// [`WaitWindow::AwaitingClaim`] describes the absence of. That state stays the
+/// Restore-level one, for zero claims. Pure.
+pub fn claim_wait_window(
+    record: Option<&RestoreClaimStatus>,
+    restore: &Restore,
+    now_epoch: i64,
+) -> WaitWindow {
+    let parse = |at: &str| {
+        chrono::DateTime::parse_from_rfc3339(at)
+            .ok()
+            .map(|t| t.timestamp())
+    };
+    let anchor = record
+        .and_then(|r| r.wait_started_at.as_deref())
+        .and_then(parse)
+        .or_else(|| {
+            restore
+                .status
+                .as_ref()
+                .and_then(|s| s.wait_started_at.as_deref())
+                .and_then(parse)
+        })
+        .unwrap_or(now_epoch);
+    WaitWindow::Open(anchor)
 }
