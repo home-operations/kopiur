@@ -572,9 +572,18 @@ impl StatusUpdate {
         let Some(key) = claim_key else {
             return serde_json::json!({ "status": self });
         };
-        let mut body = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("phase");
+        // `expect`, not a silent empty-object fallback: degrading here would post a
+        // patch that says nothing about a finished claim, leaving the controller to
+        // re-drive it forever with no error anywhere. `StatusUpdate` is `Option`s
+        // over strings, a `DateTime<Utc>` and derived structs — no custom
+        // `Serialize` — so `to_value` is infallible and always yields an object.
+        let mut body = serde_json::to_value(self)
+            .expect("StatusUpdate serializes: plain Options, no custom Serialize");
+        match body.as_object_mut() {
+            Some(obj) => {
+                obj.remove("phase");
+            }
+            None => unreachable!("a struct serializes to a JSON object, got {body}"),
         }
         serde_json::json!({ "status": { "claims": { key: body } } })
     }

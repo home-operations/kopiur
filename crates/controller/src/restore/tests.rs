@@ -425,17 +425,15 @@ fn populator_completed_is_not_terminal_at_guard() {
     assert!(!phase_is_terminal_at_guard(&Completed, AwaitingClaim));
     // A direct restore writes the target itself, so `Completed` IS terminal.
     assert!(phase_is_terminal_at_guard(&Completed, DirectTarget));
-    // #443: a populator `Failed` is NO LONGER terminal at the guard. It now means
-    // "at least one claim failed" over a fan-out, and short-circuiting there would
-    // freeze the healthy siblings mid-populate and make the standing advice
-    // ("re-create the claiming PVC") a lie — nothing would ever look at the
-    // re-created claim. Terminality moved down a level, to
-    // `RestoreClaimPhase::is_terminal`, which is what stops a failed CLAIM from
-    // being re-driven forever. The hijacked-prime protection this guard used to
-    // provide moved to `ClaimReason::artifacts_reapable`.
-    assert!(!phase_is_terminal_at_guard(&Failed, AwaitingClaim));
-    // A direct restore is still one-shot: `Failed` is terminal, and a retry is a
-    // NEW Restore.
+    // `Failed` is terminal regardless of dispatch model — and for a populator that
+    // is load-bearing, not incidental: `fail_populate_hijacked` deliberately leaves
+    // its prime PVC standing (half-written restore data), and this short-circuit is
+    // what keeps the next pass from reading the bound claimant as
+    // `NothingToPopulate` and reaping it. C2 (#443) relaxes this to
+    // DirectTarget-only in the same commit that wires `claim_drive` (Settled for a
+    // terminal claim) + `claim_artifacts_reapable` (refuses PopulateHijacked); the
+    // relaxation must not land before its caller, so C1 pins today's behavior here.
+    assert!(phase_is_terminal_at_guard(&Failed, AwaitingClaim));
     assert!(phase_is_terminal_at_guard(&Failed, DirectTarget));
     // In-flight phases are never terminal.
     for p in [

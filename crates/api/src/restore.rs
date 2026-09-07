@@ -606,10 +606,11 @@ impl RestoreClaimPhase {
     /// Whether this claim reached an end state and the operator will do no
     /// further work on it of its own accord.
     ///
-    /// `Failed` IS terminal here even though a populator `Restore` as a whole no
-    /// longer short-circuits on `Failed`: the failure is scoped to this claim, and
-    /// what re-arms it is deleting and re-creating the claiming PVC (which mints a
-    /// new uid, hence a new record) — never a re-drive of the old one.
+    /// `Failed` IS terminal here, and that is what lets the fan-out stop
+    /// short-circuiting the WHOLE `Restore` on `Failed`: the failure is scoped to
+    /// this claim, its siblings keep going, and what re-arms it is deleting and
+    /// re-creating the claiming PVC (which mints a new uid, hence a new record) —
+    /// never a re-drive of the old one.
     ///
     /// Pure + exhaustive, so the single definition lives in one tested place.
     ///

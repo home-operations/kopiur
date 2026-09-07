@@ -123,33 +123,24 @@ pub(super) fn repository_not_ready_restore_message(repo_name: &str) -> String {
     )
 }
 
-/// Whether `phase` lets the reconcile-entry guard short-circuit.
+/// Whether `phase` lets the reconcile-entry guard short-circuit. `Failed` always does.
+/// `Completed` does for a DIRECT restore (the mover wrote the target PVC itself), but
+/// NOT for a populator: there the mover stamps `Completed` on finishing the PRIME PVC
+/// while the prime→consumer rebind is still pending, so it must fall through to
+/// [`drive_populator_restore`]. Pure.
 ///
-/// For a DIRECT restore both terminal phases do: the mover wrote the target PVC
-/// itself, a Restore is one-shot, and a retry is a NEW Restore.
-///
-/// For a populator, NEITHER does (#443).
-/// - `Completed` never did: the mover stamps it on finishing the PRIME PVC while
-///   the prime→consumer rebind is still pending, so it must fall through to the
-///   populator driver.
-/// - `Failed` no longer does, and that is a deliberate behavior change. A
-///   populator now fans out over EVERY claiming PVC, and its Restore-level
-///   `Failed` means "at least one claim failed" — short-circuiting there would
-///   freeze the healthy siblings mid-populate, and would make the standing advice
-///   ("re-create the claiming PVC") a lie, since nothing would ever look at the
-///   re-created claim. Per-CLAIM, `Failed` IS terminal
-///   ([`RestoreClaimPhase::is_terminal`]), which is what stops a failed claim
-///   from being re-driven forever.
-///
-/// One protection moved rather than disappeared: `fail_populate_hijacked` leaves
-/// its prime PVC standing because it holds half-written data, and what kept the
-/// reaper away from it used to be this very short-circuit. That is now
-/// [`ClaimReason::artifacts_reapable`], gated on the claim's own reason.
-///
-/// Pure.
+/// `Failed => true` is load-bearing for a populator, not incidental:
+/// `fail_populate_hijacked` deliberately LEAVES its prime PVC standing (it holds
+/// half-written restore data), and this short-circuit is the only thing that keeps
+/// the next pass from reading the bound claimant as `NothingToPopulate` and reaping
+/// it. C2 (#443) relaxes this to DirectTarget-only together with `claim_drive`
+/// (which returns [`ClaimDrive::Settled`] for a terminal claim) and
+/// [`claim_artifacts_reapable`] (which refuses `PopulateHijacked`) — the pure halves
+/// of that protection ship here, but the relaxation must not land before its caller.
 pub(super) fn phase_is_terminal_at_guard(phase: &RestorePhase, state: PopulatorState) -> bool {
     match phase {
-        RestorePhase::Failed | RestorePhase::Completed => state == PopulatorState::DirectTarget,
+        RestorePhase::Failed => true,
+        RestorePhase::Completed => state == PopulatorState::DirectTarget,
         RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring => false,
         // Not terminal: an uninterpretable phase must not short-circuit the
         // reconcile into "nothing left to do".
@@ -1203,10 +1194,12 @@ impl ClaimReason {
     ///
     /// `PopulateHijacked` is the one `false`. `fail_populate_hijacked` leaves the
     /// prime PVC standing because it holds HALF-WRITTEN data the admin may want
-    /// to inspect, and before #443 what protected it was the whole populator
-    /// short-circuiting on `Failed` at the reconcile-entry guard. Fan-out relaxes
-    /// that guard (a failed claim must not stop its siblings), so the protection
-    /// has to move here.
+    /// to inspect, and what protects it today is the whole populator
+    /// short-circuiting on `Failed` at [`phase_is_terminal_at_guard`]. The fan-out
+    /// has to relax that guard (a failed claim must not stop its siblings), so
+    /// this predicate is where the protection lands instead — and the two must
+    /// change together: C2 (#443) relaxes the guard in the same commit that gates
+    /// `reap_claim_artifacts` on this.
     pub fn artifacts_reapable(self) -> bool {
         match self {
             Self::PopulateHijacked => false,
@@ -1410,26 +1403,31 @@ pub fn claim_merge_body(
     prev: Option<&RestoreClaimStatus>,
     next: &RestoreClaimStatus,
 ) -> serde_json::Value {
-    let mut body = serde_json::to_value(next).unwrap_or_else(|_| serde_json::json!({}));
-    let Some(obj) = body.as_object_mut() else {
-        return serde_json::json!({});
+    // `expect`, not a silent `unwrap_or_else(json!({}))`: degrading to an empty
+    // patch here would drop a claim's whole state update with nothing in the log.
+    // `RestoreClaimStatus` is plain `Option`s over strings, unit enums and derived
+    // structs — no custom `Serialize`, no non-string map key — so `to_value` is
+    // infallible and always yields an object.
+    let claim_object = |record: &RestoreClaimStatus| match serde_json::to_value(record)
+        .expect("RestoreClaimStatus serializes: plain Options, no custom Serialize")
+    {
+        serde_json::Value::Object(map) => map,
+        other => unreachable!("a struct serializes to a JSON object, got {other}"),
     };
+
+    let mut obj = claim_object(next);
     for key in CLAIM_MOVER_KEYS {
         obj.remove(*key);
     }
-    if let Some(prev) = prev
-        && let Some(prev_obj) = serde_json::to_value(prev).ok().and_then(|v| match v {
-            serde_json::Value::Object(m) => Some(m),
-            _ => None,
-        })
-    {
+    if let Some(prev) = prev {
+        let prev_obj = claim_object(prev);
         for key in CLAIM_CONTROLLER_KEYS {
             if prev_obj.contains_key(*key) && !obj.contains_key(*key) {
                 obj.insert((*key).to_string(), serde_json::Value::Null);
             }
         }
     }
-    body
+    serde_json::Value::Object(obj)
 }
 
 /// Whether a claim record CHANGED in a way worth an Event — the `(phase, reason)`
