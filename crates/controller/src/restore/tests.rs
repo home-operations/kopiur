@@ -413,7 +413,7 @@ fn populator_state_depends_on_target_variant() {
 }
 
 #[test]
-fn populator_completed_is_not_terminal_at_guard() {
+fn a_populator_is_terminal_at_the_guard_on_neither_completed_nor_failed() {
     use PopulatorState::{AwaitingClaim, DirectTarget};
     use RestorePhase::{Completed, Failed, Pending, Resolving, Restoring};
 
@@ -425,16 +425,35 @@ fn populator_completed_is_not_terminal_at_guard() {
     assert!(!phase_is_terminal_at_guard(&Completed, AwaitingClaim));
     // A direct restore writes the target itself, so `Completed` IS terminal.
     assert!(phase_is_terminal_at_guard(&Completed, DirectTarget));
-    // `Failed` is terminal regardless of dispatch model — and for a populator that
-    // is load-bearing, not incidental: `fail_populate_hijacked` deliberately leaves
-    // its prime PVC standing (half-written restore data), and this short-circuit is
-    // what keeps the next pass from reading the bound claimant as
-    // `NothingToPopulate` and reaping it. C2 (#443) relaxes this to
-    // DirectTarget-only in the same commit that wires `claim_drive` (Settled for a
-    // terminal claim) + `claim_artifacts_reapable` (refuses PopulateHijacked); the
-    // relaxation must not land before its caller, so C1 pins today's behavior here.
-    assert!(phase_is_terminal_at_guard(&Failed, AwaitingClaim));
+
+    // #443: a populator `Failed` is the AGGREGATE over its claims, so it must not
+    // short-circuit either — one failed claim would otherwise freeze every sibling.
+    // Terminality moved to the CLAIM (`claim_drive` ⇒ Settled), and the prime of a
+    // hijacked populate is protected by `claim_artifacts_reapable` instead of by
+    // this guard. The two assertions below and that predicate are ONE change.
+    assert!(!phase_is_terminal_at_guard(&Failed, AwaitingClaim));
+    assert!(
+        !ClaimReason::PopulateHijacked.artifacts_reapable(),
+        "the guard relaxation above is only safe while the reaper refuses a hijacked \
+         populate's artifacts — these must never be changed apart"
+    );
+    assert!(
+        claim_drive(
+            Some(&kopiur_api::RestoreClaimStatus {
+                uid: Some("u1".into()),
+                phase: Some(kopiur_api::RestoreClaimPhase::Failed),
+                reason: Some(crate::consts::POPULATE_HIJACKED_REASON.into()),
+                ..Default::default()
+            }),
+            "u1",
+        ) == ClaimDrive::Settled,
+        "a hijacked populate's claim must rest, not be re-driven every 120s"
+    );
+
+    // A DIRECT restore is one-shot: `Failed` stays terminal, and a retry is a NEW
+    // Restore.
     assert!(phase_is_terminal_at_guard(&Failed, DirectTarget));
+
     // In-flight phases are never terminal.
     for p in [
         Pending,
@@ -462,8 +481,7 @@ fn resolved_with(
 
 #[test]
 fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
-    use PopulatorState::{AwaitingClaim, DirectTarget};
-    use RestorePhase::{Completed, Pending};
+    use RestorePhase::Pending;
 
     // A pinned `NoSnapshot` is always the deploy-or-restore Empty decision — even
     // if a kopiaSnapshotID somehow co-exists, NoSnapshot wins (data-safety: a later
@@ -471,9 +489,7 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
     assert_eq!(
         pinned_decision(
             Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
-            Some(&Completed),
-            AwaitingClaim,
-            false,
+            Some(&Pending),
         ),
         Some(Resolution::Empty)
     );
@@ -486,95 +502,69 @@ fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
                 Some("k7")
             )),
             Some(&Pending),
-            DirectTarget,
-            false,
         ),
         Some(Resolution::Snapshot("k7".into()))
     );
     // …and a LEGACY pin (id present, `resolution` field absent) reads the same,
     // so an in-flight restore pinned before this field existed keeps its target.
     assert_eq!(
-        pinned_decision(
-            Some(&resolved_with(None, Some("k7"))),
-            Some(&Pending),
-            DirectTarget,
-            false,
-        ),
+        pinned_decision(Some(&resolved_with(None, Some("k7"))), Some(&Pending)),
         Some(Resolution::Snapshot("k7".into()))
     );
 
-    // The pre-fix stuck populator: `Completed` with NOTHING pinned. A snapshot-
-    // resolved populator ALWAYS pins before Completed, so this unambiguously means
-    // the decision was "empty" — back-fill Empty, do NOT re-resolve.
-    assert_eq!(
-        pinned_decision(None, Some(&Completed), AwaitingClaim, false),
-        Some(Resolution::Empty)
-    );
-    // The same shape on a DIRECT target is not a stuck populator (its `Completed`
-    // is terminal at the guard, so it never reaches here): require fresh resolution.
-    assert_eq!(
-        pinned_decision(None, Some(&Completed), DirectTarget, false),
-        None
-    );
-
     // A fresh, un-pinned restore must resolve.
-    assert_eq!(
-        pinned_decision(None, Some(&Pending), AwaitingClaim, false),
-        None
-    );
-    assert_eq!(pinned_decision(None, None, DirectTarget, false), None);
+    assert_eq!(pinned_decision(None, Some(&Pending)), None);
+    assert_eq!(pinned_decision(None, None), None);
 }
 
-/// #233: the OTHER way a populator reaches `Completed` unpinned is an already-bound
-/// no-op on a DEFERRED source — the mover (which pins a deferred source) never ran.
-/// Back-filling `Empty` there would durably pin `NoSnapshot`, so a later, legitimate
-/// re-creation of the claiming PVC would provision an EMPTY volume instead of restoring
-/// the snapshot. The `noop_already_bound` flag must suppress exactly that back-fill —
-/// and nothing else.
+/// #443: everything `pinned_decision` used to do for a POPULATOR now happens per
+/// claim, keyed on that claim's own pin and phase. The two arms that only ever
+/// existed for a populator — the pre-fix `Completed`-but-unpinned back-fill and
+/// the #233 already-bound carve-out from it — must still be exactly as careful,
+/// or a re-created claim comes up EMPTY instead of restoring.
 #[test]
-fn pinned_decision_skips_empty_backfill_after_already_bound_noop() {
-    use PopulatorState::AwaitingClaim;
-    use RestorePhase::Completed;
+fn the_populator_arms_of_pinned_decision_moved_intact_onto_the_claim() {
+    use kopiur_api::{RestoreClaimPhase as P, RestoreClaimStatus};
 
-    // The no-op'd populator: do NOT infer "empty", leave it unresolved so a recreated
-    // claim re-resolves and restores for real.
+    let record = |phase: Option<P>, resolved: Option<ResolvedRestore>| RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase,
+        resolved,
+        ..Default::default()
+    };
+
+    // The pre-fix stuck populator: the claim reads `Populated` with NOTHING pinned.
+    // A snapshot-resolved claim ALWAYS pins before it can be Populated, so this
+    // unambiguously means the decision was "empty" — back-fill, do NOT re-resolve.
     assert_eq!(
-        pinned_decision(None, Some(&Completed), AwaitingClaim, true),
-        None
-    );
-    // The legacy stuck populator (same shape, but NOT an already-bound no-op) still
-    // back-fills — that heal must survive this fix.
-    assert_eq!(
-        pinned_decision(None, Some(&Completed), AwaitingClaim, false),
+        claim_pinned_decision(&record(Some(P::Populated), None)),
         Some(Resolution::Empty)
     );
-    // A genuine deploy-or-restore PINNED `NoSnapshot`, so it reads its pin either way:
-    // the flag never overrides a real pin.
-    for noop in [true, false] {
-        assert_eq!(
-            pinned_decision(
-                Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
-                Some(&Completed),
-                AwaitingClaim,
-                noop,
-            ),
-            Some(Resolution::Empty)
-        );
-        // …and a pinned snapshot id is likewise honored, so a recreated claim restores
-        // the SAME snapshot (ADR §4.6: pinned once, never re-resolved).
-        assert_eq!(
-            pinned_decision(
-                Some(&resolved_with(
-                    Some(ResolutionOutcome::Snapshot),
-                    Some("k9")
-                )),
-                Some(&Completed),
-                AwaitingClaim,
-                noop,
-            ),
-            Some(Resolution::Snapshot("k9".into()))
-        );
-    }
+    // The #233 carve-out: an already-bound no-op on a DEFERRED source never ran the
+    // mover, and the mover is what pins a deferred source. Back-filling `NoSnapshot`
+    // here would durably record "this restore decided to come up empty".
+    assert_eq!(
+        claim_pinned_decision(&record(Some(P::AlreadyBound), None)),
+        None
+    );
+    // A real pin is honored either way, so a re-created claim restores the SAME
+    // snapshot (ADR §4.6: pinned once, never re-resolved).
+    assert_eq!(
+        claim_pinned_decision(&record(
+            Some(P::AlreadyBound),
+            Some(resolved_with(Some(ResolutionOutcome::NoSnapshot), None))
+        )),
+        Some(Resolution::Empty)
+    );
+    assert_eq!(
+        claim_pinned_decision(&record(
+            Some(P::AlreadyBound),
+            Some(resolved_with(Some(ResolutionOutcome::Snapshot), Some("k9")))
+        )),
+        Some(Resolution::Snapshot("k9".into()))
+    );
+    // A fresh claim resolves.
+    assert_eq!(claim_pinned_decision(&record(None, None)), None);
 }
 
 // --- kstatus Ready conditions (ADR-0005 §2) -----------------------------
@@ -859,27 +849,6 @@ fn completed_populator_with_ready_reason(reason: &str) -> Restore {
     .expect("valid Restore")
 }
 
-/// The `Ready` reason is what tells the three `Completed` populator states apart, so it
-/// gates both the re-resolution skip and the `pinned_decision` back-fill.
-#[test]
-fn completed_as_target_already_bound_reads_ready_reason() {
-    assert!(completed_as_target_already_bound(
-        &completed_populator_with_ready_reason(crate::consts::RESTORE_TARGET_ALREADY_BOUND_REASON)
-    ));
-    // A real restore, and the legacy stuck-populator state, must NOT be mistaken for it —
-    // the first would have its success message clobbered, the second would never heal.
-    assert!(!completed_as_target_already_bound(
-        &completed_populator_with_ready_reason(crate::consts::RESTORE_POPULATED_REASON)
-    ));
-    assert!(!completed_as_target_already_bound(
-        &completed_populator_with_ready_reason("PopulatingPrimePvc")
-    ));
-    // No status at all (a fresh CR) is not a no-op completion either.
-    assert!(!completed_as_target_already_bound(&restore_with_condition(
-        "Resolved", "True"
-    )));
-}
-
 /// The no-op and reap messages are what a human reads when 49 prime PVCs vanish, so the
 /// what/why/fix text is asserted like any other behavior.
 #[test]
@@ -1080,55 +1049,61 @@ fn wait_park_report_names_the_blocker_and_picks_the_cadence() {
     assert_eq!(WaitWindow::AwaitingClaim(7).anchor(), 7);
 }
 
-/// A populator that no-op'd long ago and is then asked to populate a FRESHLY re-created
-/// claim must measure its `waitTimeout` from the re-open, not from an anchor spent on the
-/// previous claim — otherwise the window is already gone, and a `fromPolicy` source (which
-/// defaults to `Continue`) skips the wait and provisions an EMPTY volume the instant the
-/// snapshot happens not to be there yet.
+/// A populator claim that is deleted and re-created must measure its
+/// `waitTimeout` from the NEW claim, not from an anchor spent on the previous
+/// one — otherwise the window is already gone, and a `fromPolicy` source (which
+/// defaults to `Continue`) skips the wait and provisions an EMPTY volume the
+/// instant the snapshot happens not to be there yet.
 ///
-/// The re-open therefore CLEARS the anchor, and it must do so with an explicit JSON
-/// `null`: a merge patch deletes only the keys it names, so an elided `None` would leave
-/// the stale anchor in place. Re-anchoring then happens on the next pass, which is also
-/// the pass that finds the re-created claim.
+/// Before #443 that took an explicit JSON `null` on the Restore's top-level
+/// `waitStartedAt` (a merge patch deletes only the keys it names). The fan-out
+/// makes it structural instead: a re-created claimant has a NEW uid, so
+/// `claim_drive` re-arms it and the driver writes a fresh record — the spent
+/// anchor goes with the record it belonged to, and `claim_merge_body` emits the
+/// null for it.
 #[test]
-fn reopening_a_recreated_claim_clears_the_wait_anchor_with_an_explicit_null() {
-    let restore = restore_with_anchor(Some("2026-01-01T00:00:00Z"));
-    let status = reopen_resolution_status(&restore, "claim re-created");
+fn a_re_armed_claim_drops_the_previous_claims_spent_wait_anchor() {
+    use kopiur_api::{RestoreClaimPhase as P, RestoreClaimStatus};
 
+    let spent = RestoreClaimStatus {
+        uid: Some("old-uid".into()),
+        phase: Some(P::Populated),
+        wait_started_at: Some("2026-01-01T00:00:00Z".into()),
+        ..Default::default()
+    };
+    // A new claimant uid re-arms rather than settling, even though the record is
+    // terminal — that is what makes re-creating the PVC the documented retry.
     assert_eq!(
-        status.get("waitStartedAt"),
+        claim_drive(Some(&spent), "new-uid"),
+        ClaimDrive::ReArm {
+            stale_uid: "old-uid".into()
+        }
+    );
+    // The fresh record carries no anchor, and the merge body NULLS the old one:
+    // an elided `None` would leave a window that closed months ago in place.
+    let fresh = RestoreClaimStatus {
+        uid: Some("new-uid".into()),
+        phase: Some(P::Pending),
+        reason: Some(ClaimReason::ClaimRecreated.as_str().into()),
+        ..Default::default()
+    };
+    let body = claim_merge_body(Some(&spent), &fresh);
+    assert_eq!(
+        body.get("waitStartedAt"),
         Some(&serde_json::Value::Null),
-        "the clear must be an EXPLICIT null, not an omitted key: {status}"
+        "the clear must be an EXPLICIT null, not an omitted key: {body}"
     );
     assert_eq!(
-        status.get("phase").and_then(|p| p.as_str()),
-        Some("Resolving")
-    );
-    assert!(
-        status["conditions"]
-            .as_array()
-            .expect("conditions array")
-            .iter()
-            .any(|c| c["type"] == "Ready" && c["reason"] == "ClaimRecreated"),
-        "{status}"
+        body.get("uid").and_then(|u| u.as_str()),
+        Some("new-uid"),
+        "{body}"
     );
 
-    // Serializing the typed status can NEVER produce that null (the field is
-    // skip_serializing_if = "Option::is_none") — which is exactly why the writer builds
-    // the key by hand.
-    let cleared = restore_with_anchor(None);
-    let typed = serde_json::to_value(cleared.status.as_ref().expect("status")).unwrap();
-    assert!(
-        typed.get("waitStartedAt").is_none(),
-        "an unset anchor elides the key entirely: {typed}"
-    );
-
-    // Once cleared, the anchor falls back and the next pass re-stamps it (`now`), so the
-    // re-created claim gets the user's window back in full.
-    let created = 1_000_000_000;
+    // A claim window with no record and no legacy top-level anchor opens at `now`,
+    // so a claimant that appears an hour after its sibling gets its OWN full window.
     assert_eq!(
-        effective_wait_anchor(&restore_with_anchor(None), created),
-        created
+        claim_wait_window(None, &restore_with_anchor(None), 1_700_000_000),
+        WaitWindow::Open(1_700_000_000)
     );
 }
 
@@ -1150,8 +1125,6 @@ fn restore_with_anchor(wait_started_at: Option<&str>) -> Restore {
     }))
     .expect("valid Restore")
 }
-
-// --- restore_flags (M2 flag sweep controller-glue guard) ---
 
 #[test]
 fn restore_flags_absent_options_map_to_all_none() {

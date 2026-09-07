@@ -123,24 +123,33 @@ pub(super) fn repository_not_ready_restore_message(repo_name: &str) -> String {
     )
 }
 
-/// Whether `phase` lets the reconcile-entry guard short-circuit. `Failed` always does.
-/// `Completed` does for a DIRECT restore (the mover wrote the target PVC itself), but
-/// NOT for a populator: there the mover stamps `Completed` on finishing the PRIME PVC
-/// while the prime→consumer rebind is still pending, so it must fall through to
-/// [`drive_populator_restore`]. Pure.
+/// Whether `phase` lets the reconcile-entry guard short-circuit — i.e. whether
+/// the whole `Restore` is settled. Pure.
 ///
-/// `Failed => true` is load-bearing for a populator, not incidental:
-/// `fail_populate_hijacked` deliberately LEAVES its prime PVC standing (it holds
-/// half-written restore data), and this short-circuit is the only thing that keeps
-/// the next pass from reading the bound claimant as `NothingToPopulate` and reaping
-/// it. C2 (#443) relaxes this to DirectTarget-only together with `claim_drive`
-/// (which returns [`ClaimDrive::Settled`] for a terminal claim) and
-/// [`claim_artifacts_reapable`] (which refuses `PopulateHijacked`) — the pure halves
-/// of that protection ship here, but the relaxation must not land before its caller.
+/// A DIRECT restore is one-shot: both `Completed` (the mover wrote the target
+/// PVC itself) and `Failed` are terminal, and a retry is a NEW `Restore`.
+///
+/// A POPULATOR short-circuits on NEITHER, and both exceptions are load-bearing:
+/// - `Completed` — the mover stamps it on finishing the PRIME PVC while the
+///   prime→consumer rebind is still pending, so the pass must fall through to
+///   [`super::drive_populator_fanout`] to finish the handover.
+/// - `Failed` (#443) — the Restore-level phase is now the AGGREGATE over its
+///   claims, and one failed claim must not stop its siblings. Terminality moved
+///   to the CLAIM ([`kopiur_api::RestoreClaimPhase::is_terminal`] via
+///   [`claim_drive`], which returns [`ClaimDrive::Settled`] for a failed claim
+///   under a live claimant), so a failed claim rests exactly as it used to while
+///   the rest of the fan-out proceeds.
+///
+/// **The `Failed` relaxation and [`ClaimReason::artifacts_reapable`] are ONE
+/// change and must stay one change.** `super::fail_populate_hijacked` leaves its
+/// prime PVC standing because it holds half-written data; what used to protect
+/// that prime was precisely this guard refusing to fall through. With the
+/// relaxation, the protection is `artifacts_reapable` refusing
+/// `PopulateHijacked` in `super::reap_claim_artifacts`. Relax one without the
+/// other and a hijacked populate loses its prime — and reports success over it.
 pub(super) fn phase_is_terminal_at_guard(phase: &RestorePhase, state: PopulatorState) -> bool {
     match phase {
-        RestorePhase::Failed => true,
-        RestorePhase::Completed => state == PopulatorState::DirectTarget,
+        RestorePhase::Failed | RestorePhase::Completed => state == PopulatorState::DirectTarget,
         RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring => false,
         // Not terminal: an uninterpretable phase must not short-circuit the
         // reconcile into "nothing left to do".
@@ -213,27 +222,6 @@ pub(super) fn populator_handshake(
         (None, _) if pvc_is_bound(consumer) => PopulatorHandshake::NothingToPopulate,
         (None, _) => PopulatorHandshake::Populate,
     }
-}
-
-/// True when this `Restore` already completed as an already-bound **no-op**
-/// ([`crate::consts::RESTORE_TARGET_ALREADY_BOUND_REASON`] on its `Ready` condition).
-///
-/// Load-bearing twice over, both times to keep a no-op'd populator quiet and safe:
-/// - it suppresses source re-resolution on the 600s heartbeat (a populator's `Completed`
-///   is deliberately non-terminal, so the CR keeps reconciling — re-resolving would GET
-///   the `SnapshotPolicy`/`Repository` forever, and error-loop the moment a user deletes
-///   either); and
-/// - it suppresses the `Completed`+unpinned ⟹ "empty" back-fill in
-///   [`super::pinned_decision`], which would otherwise durably pin `NoSnapshot` on a
-///   deferred-source no-op and make a later, legitimate claim recreation come up EMPTY
-///   instead of restoring.
-pub(super) fn completed_as_target_already_bound(restore: &Restore) -> bool {
-    use crate::consts::{READY_CONDITION, RESTORE_TARGET_ALREADY_BOUND_REASON};
-    restore.status.as_ref().is_some_and(|s| {
-        s.conditions
-            .iter()
-            .any(|c| c.type_ == READY_CONDITION && c.reason == RESTORE_TARGET_ALREADY_BOUND_REASON)
-    })
 }
 
 /// What / why / fix for the already-bound no-op completion (#233). Pure, so the text a
@@ -754,26 +742,6 @@ pub(super) fn wait_window_opens(state: PopulatorState, has_claiming_pvc: bool) -
         PopulatorState::DirectTarget => true,
         PopulatorState::AwaitingClaim => has_claiming_pvc,
     }
-}
-
-/// The status patch that re-opens a populator's source resolution for a re-created claim:
-/// `Resolving` + `Ready`/[`crate::consts::RESTORE_CLAIM_RECREATED_REASON`], **plus an
-/// explicit JSON `null` on `waitStartedAt`**.
-///
-/// The null is the whole point and cannot be expressed by the typed status: a merge patch
-/// deletes only the keys it names, and `wait_started_at` is `skip_serializing_if =
-/// "Option::is_none"`, so a `None` would serialize to nothing and silently leave the
-/// original claim's long-spent anchor in place — the re-created claim would then find a
-/// window that closed months ago. Pure, so the null is asserted without a cluster.
-pub(super) fn reopen_resolution_status(restore: &Restore, message: &str) -> serde_json::Value {
-    let mut status = restore_ready_status(
-        restore,
-        RestorePhase::Resolving,
-        crate::consts::RESTORE_CLAIM_RECREATED_REASON,
-        message,
-    );
-    status["waitStartedAt"] = serde_json::Value::Null;
-    status
 }
 
 /// The absolute instant (RFC3339) the `waitTimeout` window closes, given the anchor
