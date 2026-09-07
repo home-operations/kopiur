@@ -239,10 +239,15 @@ Three properties make the annotation safe to leave in a GitOps manifest:
   `status.uniqueId`. A successful re-initialize mints a new id, so the annotation
   immediately stops matching and a *future* wipe parks again, needing a fresh
   acknowledgement naming the new id.
-- **A mismatched value is ignored**, not guessed at. kopiur raises an
-  `InvalidReinitializeAck` Warning event naming the value it expects.
-- **It does nothing to a healthy repository.** If the backend is reachable and
-  the repository is present, there is nothing to re-initialize; kopiur emits one
+- **A mismatched value is ignored**, not guessed at. While the repository is not
+  `Ready`, kopiur raises an `InvalidReinitializeAck` Warning event naming the
+  value it expects. Once the repository is healthy again a stale value is inert
+  *and* silent — so the annotation you left behind after a successful
+  re-initialize does not become a standing Warning.
+- **It does nothing to a healthy repository.** The ack only becomes a permission
+  to create once the repository has left `Ready`, so it can never turn a routine
+  health probe into a re-create. If the backend is reachable and the repository
+  is present there is nothing to re-initialize; kopiur emits a
   `ReinitializeAckIgnoredRepositoryPresent` Normal event so you know the
   annotation was seen, and wipes nothing.
 

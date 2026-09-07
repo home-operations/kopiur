@@ -449,6 +449,17 @@ fn reinitialize_ack_diagnostic_messages_name_both_values_and_fit_the_note_budget
     );
     assert!(truncate_for_note(&invalid, EVENT_NOTE_MAX_BYTES).len() <= EVENT_NOTE_MAX_BYTES);
 
+    // A ClusterRepository is cluster-scoped, so the fix command carries no `-n`
+    // — shared with the block message through `kubectl_namespace_flag`.
+    let cluster = crate::io::invalid_reinitialize_ack_message(
+        "ClusterRepository",
+        "shared",
+        None,
+        "U2",
+        "U1",
+    );
+    assert!(!cluster.contains(" -n "), "{cluster}");
+
     let ignored = crate::io::reinitialize_ack_ignored_message("ClusterRepository", "U1");
     assert!(ignored.contains("U1"));
     assert!(

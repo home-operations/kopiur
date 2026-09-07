@@ -222,6 +222,21 @@ pub const REPOSITORY_NOT_INITIALIZED_MESSAGE: &str = "no kopia repository exists
 /// sibling: this is a kopiur create-*policy* outcome, not kopia stderr.
 pub const REPOSITORY_REINITIALIZE_BLOCKED_CLASS: &str = "RepositoryReinitializeBlocked";
 
+/// The ` -n <namespace>` fragment for a `kubectl` command kopiur puts in front of
+/// a user, or the empty string for a cluster-scoped object.
+///
+/// One producer, shared across the crate boundary (the controller's
+/// `InvalidReinitializeAck` copy calls it too), because getting this wrong is not
+/// cosmetic: `kubectl annotate clusterrepository shared -n kopiur-system ...`
+/// simply fails, and the whole point of these messages is that the user can paste
+/// them.
+pub fn kubectl_namespace_flag(namespace: Option<&str>) -> String {
+    namespace
+        .filter(|ns| !ns.is_empty())
+        .map(|ns| format!(" -n {ns}"))
+        .unwrap_or_default()
+}
+
 /// The stable, volatile-free actionable message for
 /// [`REPOSITORY_REINITIALIZE_BLOCKED_CLASS`] — the ONE producer of this text, shared
 /// by the mover Job path and the controller's in-process bare-path connect arm.
@@ -241,6 +256,11 @@ pub const REPOSITORY_REINITIALIZE_BLOCKED_CLASS: &str = "RepositoryReinitializeB
 ///   produce a command that does not work.
 ///
 /// [`patch_status_if_changed`]: https://docs.rs/kopiur-controller
+///
+/// The ` -n <ns>` fragment comes from [`kubectl_namespace_flag`], shared with the
+/// controller's `InvalidReinitializeAck` copy — every `kubectl` command kopiur
+/// hands a user must scope the same way, and a cluster-scoped object must never
+/// grow a `-n`.
 pub fn reinitialize_blocked_message(
     kind: &str,
     name: &str,
@@ -248,10 +268,7 @@ pub fn reinitialize_blocked_message(
     unique_id: &str,
     also_spec_disabled: bool,
 ) -> String {
-    let ns = match namespace {
-        Some(ns) => format!(" -n {ns}"),
-        None => String::new(),
-    };
+    let ns = kubectl_namespace_flag(namespace);
     let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
     let also = if also_spec_disabled {
         "; spec.create.enabled is also false and must be true"

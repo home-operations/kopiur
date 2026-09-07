@@ -309,6 +309,60 @@ pub(crate) fn seed_job_limits(armed: bool, seed: Option<&SeedSpec>, base: JobLim
     }
 }
 
+/// What a pass should do about `spec.seed`, once an acknowledged re-initialize
+/// is in play (issue #435).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReinitSeedPlan {
+    /// Arm the seed on this launch ([`kopiur_api::seed::seed_armed`]).
+    pub armed: bool,
+    /// RESUME an interrupted copy rather than starting a fresh one
+    /// ([`kopiur_api::seed::seed_resume`]).
+    pub resume: bool,
+    /// Wipe `status.seed` with an explicit RFC 7386 null before stamping a new
+    /// marker. Also the "pass `existing = None` to [`seed_marker_patch`]" flag —
+    /// the two are the same question, and answering them separately is how a
+    /// stale `seededAt` would survive into the new repository's marker.
+    pub clear_status: bool,
+}
+
+/// **Pure.** Decide [`ReinitSeedPlan`] for one bootstrap pass.
+///
+/// For every ordinary pass (`reinit_requested == false`) this is exactly the
+/// pre-#435 behavior: `seed_armed(spec.seed, unique_id)` and
+/// `seed_resume(armed, status.seed)`, with nothing cleared.
+///
+/// On an acknowledged re-initialize all three answers change, and they change
+/// for one reason: the backend this pass is about to write to is EMPTY, and the
+/// `status.seed` sitting on the object describes a copy into a repository that
+/// no longer exists.
+///
+/// * **armed** is computed as if `unique_id` were unset, because the pass IS a
+///   first bootstrap by decree — otherwise a configured `spec.seed` would stay
+///   the standing no-op it correctly is on a live repository, and the
+///   re-initialized repository would come back empty instead of re-seeded.
+/// * **resume** is forced `false`. `status.seed` is never cleared by the normal
+///   flow, so a `startedAt` with no `seededAt` — an attempt that died against
+///   the OLD repository — would otherwise make this "resume" a copy into storage
+///   holding nothing it ever touched. A resuming migrate has no kopia-side
+///   backstop (blob mode gets one from `sync-to`'s format-blob check), so this
+///   guard is the only thing standing between that marker and a resumed copy.
+/// * **clear_status** removes the stale marker outright, so the fresh one
+///   `seed_marker_patch` writes cannot inherit `seededAt`/`snapshotCount` from
+///   the copy into the destroyed repository.
+pub(crate) fn reinit_seed_plan(
+    seed: Option<&SeedSpec>,
+    unique_id: Option<&str>,
+    status_seed: Option<&SeedStatus>,
+    reinit_requested: bool,
+) -> ReinitSeedPlan {
+    let armed = kopiur_api::seed::seed_armed(seed, if reinit_requested { None } else { unique_id });
+    ReinitSeedPlan {
+        armed,
+        resume: !reinit_requested && kopiur_api::seed::seed_resume(armed, status_seed),
+        clear_status: reinit_requested && status_seed.is_some(),
+    }
+}
+
 /// **Pure.** The `status.seed` marker patch stamped BEFORE a seeding bootstrap
 /// Job is created, or `None` when nothing would change.
 ///
@@ -1097,6 +1151,98 @@ mod tests {
     /// and `from.backend` is one.
     fn seed_spec(v: serde_json::Value) -> SeedSpec {
         serde_json::from_value(v).expect("typed")
+    }
+
+    /// A minimal migrate seed — the mode with no kopia-side no-clobber backstop,
+    /// so the mode the resume guard actually protects.
+    fn a_seed() -> SeedSpec {
+        seed_spec(serde_json::json!({
+            "from": { "repository": { "kind": "Repository", "name": "offsite" } }
+        }))
+    }
+
+    /// The marker a bootstrap that STARTED seeding and died leaves behind.
+    fn interrupted_attempt() -> SeedStatus {
+        SeedStatus {
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            ..Default::default()
+        }
+    }
+
+    /// The brief's case, and review I3: on an acknowledged re-initialize a
+    /// `startedAt` with no `seededAt` must produce a FRESH seed, never a resume.
+    ///
+    /// The marker describes an attempt against the repository that has since been
+    /// wiped. `seed_resume` is deliberately the sole guard on a resuming migrate
+    /// (there is no kopia-side check — `sync-to`'s format-blob comparison only
+    /// covers blob mode), so resuming here would re-run `kopia snapshot migrate`
+    /// into a backend holding nothing the interrupted attempt ever wrote.
+    #[test]
+    fn an_acked_reinitialize_seeds_fresh_and_never_resumes_the_old_attempt() {
+        let seed = a_seed();
+        let marker = interrupted_attempt();
+
+        // WITHOUT the ack this is the ordinary #380 resume: the pin is unset (the
+        // repository never finished bootstrapping), so the seed is armed and the
+        // marker says continue.
+        let ordinary = reinit_seed_plan(Some(&seed), None, Some(&marker), false);
+        assert!(ordinary.armed);
+        assert!(ordinary.resume, "#380's resume must be untouched");
+        assert!(!ordinary.clear_status);
+
+        // WITH the ack — the repository IS pinned (that is what the ack names) —
+        // the pass is a first bootstrap by decree: armed despite the pin, and
+        // never a resume.
+        let acked = reinit_seed_plan(Some(&seed), Some("U1"), Some(&marker), true);
+        assert!(
+            acked.armed,
+            "a configured spec.seed must re-seed the emptied backend, not stay the \
+             standing no-op it is on a live repository"
+        );
+        assert!(
+            !acked.resume,
+            "the marker describes an attempt against the WIPED repository"
+        );
+        assert!(
+            acked.clear_status,
+            "the stale marker must be removed outright, or the fresh one inherits \
+             its seededAt/snapshotCount"
+        );
+    }
+
+    #[test]
+    fn reinit_seed_plan_leaves_every_ordinary_pass_exactly_as_it_was() {
+        let seed = a_seed();
+        let done = SeedStatus {
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            seeded_at: Some("2026-01-01T01:00:00Z".into()),
+            ..Default::default()
+        };
+
+        // A live repository with a standing spec.seed: the documented no-op.
+        let live = reinit_seed_plan(Some(&seed), Some("U1"), Some(&done), false);
+        assert!(!live.armed);
+        assert!(!live.resume);
+        assert!(!live.clear_status);
+
+        // No spec.seed at all: nothing is ever armed, ack or not.
+        for reinit in [false, true] {
+            let none = reinit_seed_plan(None, Some("U1"), Some(&done), reinit);
+            assert!(!none.armed);
+            assert!(!none.resume);
+        }
+
+        // An ack'd pass on a repository that never recorded a seed attempt has
+        // nothing to clear (so no pointless status write on the launch path).
+        assert!(!reinit_seed_plan(Some(&seed), Some("U1"), None, true).clear_status);
+
+        // A COMPLETED seed is not resumed on an ack'd pass either — the plan
+        // forces `resume: false` before `seed_resume` is even consulted, and the
+        // marker is cleared, so the relaunch is a genuine fresh seed.
+        let acked_over_done = reinit_seed_plan(Some(&seed), Some("U1"), Some(&done), true);
+        assert!(acked_over_done.armed);
+        assert!(!acked_over_done.resume);
+        assert!(acked_over_done.clear_status);
     }
 
     fn resolved_source(backend: Backend, namespace: Option<&str>) -> ResolvedRepository {

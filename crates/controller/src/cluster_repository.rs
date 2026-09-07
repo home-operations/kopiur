@@ -425,7 +425,6 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 pinned_unique_id,
                 reinit_ack_raw(repo),
             );
-            let create_enabled = matches!(create_gate, health::CreateGate::Allowed { .. });
             let phase_is_ready = repo.status.as_ref().and_then(|s| s.phase.as_ref())
                 == Some(&RepositoryPhase::Ready);
             let reinit_requested = !phase_is_ready
@@ -435,6 +434,10 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                         via_reinit_ack: true
                     }
                 );
+            // Create permission is the PHASE-GATED decision, never the raw gate
+            // (review C1) — see the namespaced twin.
+            let effective_create = health::effective_create(create_gate, reinit_requested);
+            let create_enabled = effective_create.allowed;
             if io::terminal_gate_holds(
                 repo.status.as_ref().and_then(|s| s.phase.as_ref()),
                 repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -495,7 +498,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                     // None` — a `ClusterRepository` is cluster-scoped, so the
                     // `kubectl annotate` command must carry no `-n`.
                     let reinit_block = health::inprocess_reinitialize_block(
-                        create_gate,
+                        effective_create.block,
                         &e,
                         "ClusterRepository",
                         &name,
@@ -1097,25 +1100,22 @@ async fn bootstrap_cluster_via_mover(
         pinned_unique_id,
         reinit_ack_raw(repo),
     );
-    let create_enabled = matches!(create_gate, health::CreateGate::Allowed { .. });
     let launch_reinit_ack = crate::repository::valid_reinit_ack(create_gate, pinned_unique_id);
     let reinit_requested = !already_ready && launch_reinit_ack.is_some();
-    let seed_armed = kopiur_api::seed::seed_armed(
+    // Create permission is the PHASE-GATED decision, never the raw gate (review
+    // C1) — see the namespaced twin for the failure it prevents.
+    let effective_create = health::effective_create(create_gate, reinit_requested);
+    let create_enabled = effective_create.allowed;
+    // #380 + #435: arm / resume / clear, decided together by one pure fn — see
+    // the namespaced twin.
+    let seed_plan = crate::repo_seed::reinit_seed_plan(
         repo.spec.seed.as_ref(),
-        // An ack'd re-initialize IS a first bootstrap by decree — see the twin.
-        if reinit_requested {
-            None
-        } else {
-            pinned_unique_id
-        },
+        pinned_unique_id,
+        repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+        reinit_requested,
     );
-    // Never RESUME on an ack'd pass: a stale marker describes an attempt against
-    // the OLD repository. The launch clears `status.seed` for the same reason.
-    let seed_resume = !reinit_requested
-        && kopiur_api::seed::seed_resume(
-            seed_armed,
-            repo.status.as_ref().and_then(|s| s.seed.as_ref()),
-        );
+    let seed_armed = seed_plan.armed;
+    let seed_resume = seed_plan.resume;
     let probe_enabled =
         kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
     let probe_attempt_at = repo
@@ -1204,7 +1204,15 @@ async fn bootstrap_cluster_via_mover(
         {
             tracing::info!(
                 repo = %name,
-                "recycling a terminal bootstrap Job launched for an older generation"
+                stamped_ack = ?job
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION)),
+                live_ack = ?launch_reinit_ack,
+                "recycling a terminal bootstrap Job whose evidence is stale: it was \
+                 launched for an older generation, or before the allow-reinitialize \
+                 ack now on the object"
             );
             io::delete_mover_run(&ctx.client, &job_ns, &job_name).await?;
             return Ok(Action::requeue(Duration::from_secs(5)));
@@ -1496,7 +1504,7 @@ async fn bootstrap_cluster_via_mover(
         name,
         &job_ns,
         create_enabled,
-        create_gate.create_block(),
+        effective_create.block,
         pinned_unique_id.map(str::to_string),
         // Probe-only (#414): see the namespaced twin.
         probe_style_launch && !catalog_create_due,
@@ -1677,13 +1685,7 @@ async fn bootstrap_cluster_via_mover(
     // ORDER is the whole point; see the namespaced twin.
     // #435: clear the OLD repository's `status.seed` with an explicit RFC 7386
     // null before stamping a fresh marker — see the namespaced twin.
-    if reinit_requested
-        && repo
-            .status
-            .as_ref()
-            .and_then(|st| st.seed.as_ref())
-            .is_some()
-    {
+    if seed_plan.clear_status {
         io::patch_status(
             api,
             name,
@@ -1693,7 +1695,8 @@ async fn bootstrap_cluster_via_mover(
     }
     if let Some(s) = seed.as_ref()
         && let Some(patch) = crate::repo_seed::seed_marker_patch(
-            if reinit_requested {
+            // The same flag — see the namespaced twin.
+            if seed_plan.clear_status {
                 None
             } else {
                 repo.status.as_ref().and_then(|st| st.seed.as_ref())

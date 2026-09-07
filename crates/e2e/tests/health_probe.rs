@@ -887,6 +887,34 @@ async fn degrade_mode_wipe_escalates_to_reinitialize_blocked_and_ack_recreates()
         .await
         .expect("a backup succeeds into the re-initialized repository");
 
+    // 7. The ack is still applied (value U1) and the pin is now U2 — the exact
+    //    state a GitOps manifest lands in after a successful re-initialize. It
+    //    must be INERT AND SILENT: no `InvalidReinitializeAck` naming U1, or the
+    //    reward for following the documented procedure is a permanent Warning on
+    //    a healthy repository. The step-4 Warning (value "definitely-not-the-pin",
+    //    published while Failed) legitimately remains, so match on the note.
+    let stale_ack_warning = events
+        .list(&ListParams::default())
+        .await
+        .expect("list events")
+        .items
+        .into_iter()
+        .find(|e| {
+            e.reason.as_deref() == Some("InvalidReinitializeAck")
+                && e.regarding.as_ref().is_some_and(|r| {
+                    r.kind.as_deref() == Some("ClusterRepository")
+                        && r.name.as_deref() == Some(name)
+                })
+                && e.note
+                    .as_deref()
+                    .is_some_and(|n| n.contains(&format!("is `{u1}`")))
+        });
+    assert!(
+        stale_ack_warning.is_none(),
+        "a once-valid ack left behind after a successful re-initialize must be \
+         inert AND silent on a Ready repository; got: {stale_ack_warning:?}"
+    );
+
     let _ = snaps
         .delete("e2e-reinit-ack-snap-1", &DeleteParams::default())
         .await;

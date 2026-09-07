@@ -155,10 +155,9 @@ pub fn invalid_reinitialize_ack_message(
     expected: &str,
     found: &str,
 ) -> String {
-    let ns = match namespace {
-        Some(ns) => format!(" -n {ns}"),
-        None => String::new(),
-    };
+    // Same producer as the block message's command, so a cluster-scoped object
+    // can never grow a `-n` in one place and not the other.
+    let ns = kopiur_mover::bootstrap::kubectl_namespace_flag(namespace);
     let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
     format!(
         "The `{annotation}` annotation on this {kind} is `{found}`, which is not this \
@@ -185,13 +184,25 @@ pub fn reinitialize_ack_ignored_message(kind: &str, unique_id: &str) -> String {
 /// common case. One call site per reconciler, ahead of the backend match, so both
 /// the mover path and the in-process bare path are covered by one writer.
 ///
-/// * a MISMATCHED ack (present, a `uniqueId` is pinned, values differ) is
-///   fail-safe-ignored, and would otherwise be invisible: the condition message
-///   names the value kopiur expects, not the one the user typed, so nothing on the
-///   object tells them why their annotation did nothing.
+/// * a MISMATCHED ack (present, a `uniqueId` is pinned, values differ) on a
+///   repository that is **not** `Ready` is fail-safe-ignored, and would otherwise
+///   be invisible: the condition message names the value kopiur expects, not the
+///   one the user typed, so nothing on the object tells them why their annotation
+///   did nothing.
 /// * a VALID ack on a healthy repository is a no-op by design (a re-initialize is
 ///   only ever a response to an EMPTY backend), and saying so is what stops the
 ///   user from concluding the ack was silently dropped.
+///
+/// The `phase_is_ready` guard on the MISMATCH branch is the review's I2, and it
+/// is the annotation's self-expiring contract made real: the instant a successful
+/// re-initialize mints a new id, the ack the user applied (and quite reasonably
+/// left in their GitOps manifest) stops matching the pin. Without the guard the
+/// reward for doing exactly the right thing was a permanent Warning on a healthy
+/// repository — visible in `kubectl describe`, `get events` and any
+/// Warning-based alerting — for as long as the manifest carried the annotation.
+/// A stale ack on a `Ready` repository is inert, so it is also silent; it becomes
+/// worth reporting again only once the repository is in a state where an ack
+/// could do something.
 ///
 /// Both references omit `resourceVersion` ([`event_ref`]), so the Recorder
 /// aggregates the repeats a requeue produces into one series.
@@ -211,7 +222,7 @@ pub async fn publish_reinitialize_ack_diagnostics<K>(
     let Some(ack) = raw_ack.filter(|a| !a.is_empty()) else {
         return;
     };
-    if crate::health::reinit_ack_mismatched(pinned_unique_id, Some(ack)) {
+    if crate::health::report_reinit_ack_mismatch(phase_is_ready, pinned_unique_id, Some(ack)) {
         let expected = pinned_unique_id.unwrap_or_default();
         publish_warning_event(
             ctx,
@@ -1458,22 +1469,22 @@ pub fn bootstrap_outcome(
         // once `Ready`, so the decline needs the re-initialize hint, not "enable
         // create". Checked before the generic `Backend` mapping for the same
         // reason as the arm above — `from_label` would flatten it to `Unknown`.
+        // Binding `f` in the guard (rather than re-reaching for `r.failure` in the
+        // body) keeps `reinitialize_blocked_message` the SINGLE producer of this
+        // text: an `unwrap_or_else` fallback here would be a second, unreachable
+        // copy of copy the whole change goes out of its way to single-source.
         Some(r)
             if !r.success
-                && r.failure.as_ref().map(|f| f.kopia_error_class.as_str())
-                    == Some(kopiur_mover::bootstrap::REPOSITORY_REINITIALIZE_BLOCKED_CLASS) =>
+                && r.failure.as_ref().is_some_and(|f| {
+                    f.kopia_error_class
+                        == kopiur_mover::bootstrap::REPOSITORY_REINITIALIZE_BLOCKED_CLASS
+                }) =>
         {
-            BootstrapOutcome::Failed(BootstrapFailure::RepositoryReinitializeBlocked {
-                message: r
-                    .failure
-                    .as_ref()
-                    .map(|f| f.message.clone())
-                    .unwrap_or_else(|| {
-                        "this repository was once Ready but its backend holds no kopia \
-                         repository; kopiur will not create an empty one over it"
-                            .to_string()
-                    }),
-            })
+            let message = r
+                .failure
+                .map(|f| f.message)
+                .expect("the guard proved `failure` is present");
+            BootstrapOutcome::Failed(BootstrapFailure::RepositoryReinitializeBlocked { message })
         }
         // The seed sentinels + the mover's internal-inconsistency class (#380),
         // checked before the generic Backend mapping for the same reason: they

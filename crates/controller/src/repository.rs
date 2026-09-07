@@ -257,10 +257,9 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 pinned_unique_id,
                 reinit_ack_raw(repo),
             );
-            let create_enabled = matches!(create_gate, health::CreateGate::Allowed { .. });
             // The `phase != Ready` half is load-bearing: on a healthy repository a
             // standing ack must be a complete no-op, never a nudge that re-opens the
-            // backend on every reconcile.
+            // backend on every reconcile — and (review C1) never a create permission.
             let phase_is_ready = repo.status.as_ref().and_then(|s| s.phase.as_ref())
                 == Some(&RepositoryPhase::Ready);
             let reinit_requested = !phase_is_ready
@@ -270,6 +269,9 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                         via_reinit_ack: true
                     }
                 );
+            // Create permission is the PHASE-GATED decision, never the raw gate.
+            let effective_create = health::effective_create(create_gate, reinit_requested);
+            let create_enabled = effective_create.allowed;
             if io::terminal_gate_holds(
                 repo.status.as_ref().and_then(|s| s.phase.as_ref()),
                 repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -344,7 +346,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                     // SAME `BootstrapFailure` the mover path uses, so the
                     // reason/message/event trio has exactly one producer.
                     let reinit_block = health::inprocess_reinitialize_block(
-                        create_gate,
+                        effective_create.block,
                         &e,
                         "Repository",
                         &name,
@@ -1021,7 +1023,6 @@ async fn bootstrap_via_mover(
         pinned_unique_id,
         reinit_ack_raw(repo),
     );
-    let create_enabled = matches!(create_gate, health::CreateGate::Allowed { .. });
     // The VALID ack: stamped on any Job this pass launches, and compared against
     // the stamp on a Job it finds (`stale_bootstrap_job`).
     let launch_reinit_ack = valid_reinit_ack(create_gate, pinned_unique_id);
@@ -1036,28 +1037,24 @@ async fn bootstrap_via_mover(
     // (`probe_only = false`), which is what makes `finalize_bootstrap` pin the
     // NEW `result.unique_id` instead of keeping the old one.
     let reinit_requested = !already_ready && launch_reinit_ack.is_some();
-    let seed_armed = kopiur_api::seed::seed_armed(
+    // Create permission is the PHASE-GATED decision, never the raw gate. Reading
+    // it off `create_gate` was review C1: a `Ready` repository with a standing
+    // valid ack shipped `auto_create: true` on its ordinary probe, and a probe is
+    // a full bootstrap in the mover (`probe_only` gates only the catalog listing),
+    // so a wipe under that ack was silently re-created — and re-pinned the OLD id,
+    // leaving the ack armed forever.
+    let effective_create = health::effective_create(create_gate, reinit_requested);
+    let create_enabled = effective_create.allowed;
+    // #380 + #435: arm / resume / clear, decided together by one pure fn so the
+    // ack'd-pass behavior is testable and cannot drift between the two kinds.
+    let seed_plan = repo_seed::reinit_seed_plan(
         repo.spec.seed.as_ref(),
-        // On an ack'd re-initialize this pass IS a first bootstrap by decree, so
-        // the pin is treated as absent and a configured `spec.seed` re-seeds the
-        // now-empty backend rather than being the standing no-op it is on a live
-        // repository.
-        if reinit_requested {
-            None
-        } else {
-            pinned_unique_id
-        },
+        pinned_unique_id,
+        repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+        reinit_requested,
     );
-    // ...but never RESUME on an ack'd pass. `status.seed` is never cleared, so a
-    // stale `startedAt` with no `seededAt` (an attempt that died against the OLD
-    // repository) would make this "resume" a copy into a backend that holds
-    // nothing it ever touched. The launch clears `status.seed` outright for the
-    // same reason.
-    let seed_resume = !reinit_requested
-        && kopiur_api::seed::seed_resume(
-            seed_armed,
-            repo.status.as_ref().and_then(|s| s.seed.as_ref()),
-        );
+    let seed_armed = seed_plan.armed;
+    let seed_resume = seed_plan.resume;
     let probe_enabled =
         kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
     let probe_attempt_at = repo
@@ -1157,7 +1154,15 @@ async fn bootstrap_via_mover(
         {
             tracing::info!(
                 repo = %name,
-                "recycling a terminal bootstrap Job launched for an older generation"
+                stamped_ack = ?job
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION)),
+                live_ack = ?launch_reinit_ack,
+                "recycling a terminal bootstrap Job whose evidence is stale: it was \
+                 launched for an older generation, or before the allow-reinitialize \
+                 ack now on the object"
             );
             io::delete_mover_run(&ctx.client, namespace, &job_name).await?;
             return Ok(Action::requeue(Duration::from_secs(5)));
@@ -1459,7 +1464,7 @@ async fn bootstrap_via_mover(
         name,
         namespace,
         create_enabled,
-        create_gate.create_block(),
+        effective_create.block,
         pinned_unique_id.map(str::to_string),
         true,
         // Probe-only (#414): a probe-style launch with no catalog work due
@@ -1680,13 +1685,7 @@ async fn bootstrap_via_mover(
     // fresh marker, so the marker merges into an absent object instead of
     // inheriting a stale `seededAt`/`snapshotCount` from a copy into storage that
     // no longer exists.
-    if reinit_requested
-        && repo
-            .status
-            .as_ref()
-            .and_then(|st| st.seed.as_ref())
-            .is_some()
-    {
+    if seed_plan.clear_status {
         io::patch_status(
             api,
             name,
@@ -1696,7 +1695,9 @@ async fn bootstrap_via_mover(
     }
     if let Some(s) = seed.as_ref()
         && let Some(patch) = repo_seed::seed_marker_patch(
-            if reinit_requested {
+            // The same flag: a marker stamped over a cleared `status.seed` must
+            // not inherit the old repository's `seededAt`.
+            if seed_plan.clear_status {
                 None
             } else {
                 repo.status.as_ref().and_then(|st| st.seed.as_ref())
