@@ -3222,16 +3222,61 @@ async fn run_restore_mover(
     // it loads via envFrom — verifying the user-managed ones are present, or (with
     // `spec.credentialProjection`) projecting the repository's Secret(s) here owned
     // by this Restore. A problem surfaces as a clear condition + Event (ADR §4.12).
-    let mover_identity = match io::ensure_mover_identity(
-        &ctx.client,
-        namespace,
-        &[&repo.backend],
-        ctx.mover_service_account.as_deref(),
-        ctx.mover_role_kind.as_str(),
-        &ctx.mover_clusterrole,
-    )
-    .await
-    {
+    // A stream destination execs into a workload pod, so it needs the dedicated
+    // exec-capable identity AND the namespace opt-in — same reasoning, same
+    // annotation, as the backup side.
+    let uses_stream = matches!(destination, RestoreDestination::Stream(_));
+    if uses_stream && !io::namespace_allows_stream_exec(&ctx.client, namespace).await? {
+        let sa = io::stream_mover_name(&ctx.mover_clusterrole);
+        let msg = io::stream_exec_not_allowed_message("Restore", name, namespace, &sa);
+        let existing = restore
+            .status
+            .as_ref()
+            .map(|s| s.conditions.clone())
+            .unwrap_or_default();
+        let conditions = io::upsert_gate(
+            &existing,
+            &kopiur_api::gates::STREAM_EXEC_GATE,
+            &msg,
+            restore.metadata.generation,
+        );
+        io::patch_status(
+            api,
+            name,
+            serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+        )
+        .await?;
+        io::publish_warning_event(
+            ctx,
+            restore,
+            kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+            crate::consts::ALLOW_STREAM_EXEC_ACTION,
+            &msg,
+        )
+        .await;
+        return Ok(MoverOutcome::Running { created: false });
+    }
+    let identity_result = if uses_stream {
+        io::ensure_stream_mover_identity(
+            &ctx.client,
+            namespace,
+            &[&repo.backend],
+            &ctx.mover_clusterrole,
+            ctx.mover_role_kind.as_str(),
+        )
+        .await
+    } else {
+        io::ensure_mover_identity(
+            &ctx.client,
+            namespace,
+            &[&repo.backend],
+            ctx.mover_service_account.as_deref(),
+            ctx.mover_role_kind.as_str(),
+            &ctx.mover_clusterrole,
+        )
+        .await
+    };
+    let mover_identity = match identity_result {
         Ok(identity) => identity,
         Err(Error::MissingDependency(msg)) => {
             let existing = restore
@@ -3567,7 +3612,26 @@ async fn run_restore_mover(
     let work_spec = MoverWorkSpec {
         version: 2,
         operation: Operation::Restore(RestoreOp {
-            stdout: None,
+            // A stream destination replaces the filesystem write entirely: the
+            // mover reads ONE virtual file out of the snapshot and pipes it into a
+            // command's stdin, so `target_path` below is inert for it.
+            stdout: match destination {
+                RestoreDestination::Pvc(_) => None,
+                RestoreDestination::Stream(t) => Some(kopiur_mover::workspec::StreamConsumerSpec {
+                    namespace: namespace.to_string(),
+                    pod_selector: io::label_selector_to_string(&t.workload_exec.pod_selector),
+                    container: t.workload_exec.container.clone(),
+                    command: t.workload_exec.command.clone(),
+                    file_name: t.file_name.clone(),
+                    timeout_seconds: t
+                        .workload_exec
+                        .timeout
+                        .as_deref()
+                        .and_then(kopiur_api::duration::parse_go_duration)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(kopiur_api::snapshot_policy::DEFAULT_STREAM_TIMEOUT_SECS),
+                }),
+            },
             source: selection.clone(),
             target_path: target_path.clone(),
             anchor,
