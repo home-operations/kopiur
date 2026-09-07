@@ -45,7 +45,7 @@
           "properties": {
             "enabled": {
               "default": false,
-              "description": "Grant the operator `secrets` create+patch+delete so\n`spec.credentialProjection` works: the operator copies a repository's\ncredential Secret(s) into each mover Job's namespace (the chief win is a shared\nClusterRepository whose Secret is pinned to one namespace) and cleans its\ncopies up again (legacy-copy sweep, reap-on-shrink, reap-on-disable).\nSECURITY TRADE-OFF: `create` cannot be scoped to a Secret name, so the\noperator can write a Secret in any namespace it manages.",
+              "description": "Enable `spec.credentialProjection` (copy a repository's credential\nSecret(s) into each mover Job's namespace) by granting the operator `secrets`\ncreate+patch+delete. The chief win is a shared ClusterRepository whose Secret\nis pinned to one namespace; the operator also cleans its copies up again\n(legacy-copy sweep, reap-on-shrink, reap-on-disable).\nSECURITY TRADE-OFF: `create` cannot be scoped to a Secret name, so the\noperator can write a Secret in any namespace it manages.",
               "title": "enabled",
               "type": "boolean"
             }
@@ -58,7 +58,7 @@
           "properties": {
             "enabled": {
               "default": false,
-              "description": "Grant the operator `secrets` create+patch+delete so `spec.server` (the\nkopia web-UI) works: it creates a generated-auth Secret, mirrors each of a\nClusterRepository's credential Secrets into the server namespace, and deletes\nall of them on teardown. SECURITY TRADE-OFF: grants unscoped create/delete on\nSecrets in any namespace the operator manages.",
+              "description": "Enable `spec.server` (the kopia web-UI) by granting the operator `secrets`\ncreate+patch+delete. The server needs a generated-auth Secret, a mirror of\neach of a ClusterRepository's credential Secrets in the server namespace, and\ndeletion of all of them on teardown.\nSECURITY TRADE-OFF: grants unscoped create/delete on Secrets in any namespace\nthe operator manages.",
               "title": "enabled",
               "type": "boolean"
             }
