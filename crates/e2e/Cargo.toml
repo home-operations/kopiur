@@ -11,7 +11,9 @@ publish = false
 
 [dependencies]
 kopiur-api = { workspace = true }
-kube = { workspace = true, features = ["client", "runtime", "derive", "rustls-tls"] }
+# `ws` for `Api::exec`: the stream-source scenarios read back what a streamExec
+# restore wrote INSIDE the target pod, which is the only way to prove byte-identity.
+kube = { workspace = true, features = ["client", "runtime", "derive", "rustls-tls", "ws"] }
 rustls = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_33"] }
 serde = { workspace = true }
