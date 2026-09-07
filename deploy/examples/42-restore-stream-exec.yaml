@@ -1,0 +1,41 @@
+# Example 42 — restore a logical dump back into a database with `streamExec`.
+#
+# The mirror of example 41: kopia streams the stored virtual file straight into a
+# command's stdin in a running pod. No PVC is written and nothing is staged on disk.
+#
+# POINT THIS AT A SCRATCH DATABASE. It runs whatever you name against whatever the
+# selector matches, and `psql` restoring a `pg_dumpall` will happily overwrite roles
+# and databases in a live system. The usual use is a restore DRILL: prove the dump is
+# restorable, on a throwaway target, on a schedule.
+#
+# The namespace needs the same opt-in annotation as the backup side:
+#
+#   kubectl annotate namespace bundlecop \
+#     kopiur.home-operations.com/stream-exec-movers=true
+---
+# --8<-- [start:restore]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: postgres-logical-drill
+  namespace: bundlecop
+spec:
+  source:
+    # Any Snapshot the policy produced. `fromPolicy` restores the latest instead.
+    snapshotRef:
+      name: postgres-logical-20260907-020000
+  target:
+    streamExec:
+      # The same fileName the backup stored.
+      fileName: postgres.sql
+      workloadExec:
+        podSelector:
+          matchLabels:
+            app: postgres-scratch # NOT the production database
+        container: postgres
+        command:
+          - sh
+          - -ec
+          - exec psql -U postgres -d postgres
+        timeout: 2h
+# --8<-- [end:restore]

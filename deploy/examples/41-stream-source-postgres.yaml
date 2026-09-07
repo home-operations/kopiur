@@ -1,0 +1,82 @@
+# Example 41 — logical PostgreSQL backup with a `stream` source.
+#
+# A stream source captures a command's STDOUT as one virtual file inside a normal
+# kopia snapshot. Nothing is mounted: the mover execs the command in the running
+# database pod and pipes its stdout straight into kopia. That makes it the right
+# tool for an application-consistent logical dump, and the only tool available when
+# the storage backend has no CSI snapshots to give you a crash-consistent PVC copy.
+#
+# Prerequisite (one-off, cluster admin):
+#
+#   kubectl annotate namespace bundlecop \
+#     kopiur.home-operations.com/stream-exec-movers=true
+#
+# Without it the Snapshot stays Pending with MoverPermitted=False. The annotation
+# exists because a stream source runs commands inside OTHER pods in the namespace:
+# without the gate, anyone who can write a SnapshotPolicy there would effectively
+# gain `pods/exec` without holding it.
+#
+# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
+# (docs/stream-sources.md pulls the policy and schedule individually). They are
+# plain YAML comments — the file stays `kubectl apply -f`-able as-is.
+---
+# --8<-- [start:policy]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-logical
+  namespace: bundlecop
+spec:
+  repository:
+    kind: ClusterRepository
+    name: k7-primary
+  identity:
+    username: bundlecop-postgres
+    hostname: k7
+  sources:
+    - stream:
+        # ONE file name — no "/", not "." or "..". kopia stores this verbatim as the
+        # entry name, so a path-shaped value would make a later restore write outside
+        # its destination directory.
+        #
+        # Store raw SQL rather than piping through gzip: kopia's own compression
+        # (below) deduplicates the unchanged parts of successive dumps, which a
+        # pre-compressed stream defeats entirely.
+        fileName: postgres.sql
+        workloadExec:
+          podSelector:
+            matchLabels:
+              app: postgres
+          container: postgres
+          # Exec'd directly, NOT through a shell — element 0 is the program. Use an
+          # explicit `sh -ec` when you want pipes or variable expansion.
+          #
+          # Credentials come from the container's own environment. Never inline a
+          # password here: this argv is copied into the mover pod's spec, where
+          # anyone with `pods:get` in the namespace can read it.
+          command:
+            - sh
+            - -ec
+            - exec pg_dumpall -U "$POSTGRES_USER"
+          timeout: 2h
+  compression:
+    compressor: zstd
+  retention:
+    keepDaily: 14
+    keepWeekly: 8
+    keepMonthly: 12
+# --8<-- [end:policy]
+---
+# --8<-- [start:schedule]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: postgres-logical-nightly
+  namespace: bundlecop
+spec:
+  policyRef:
+    name: postgres-logical
+  schedule:
+    cron: "H 2 * * *"
+    jitter: 30m
+# --8<-- [end:schedule]

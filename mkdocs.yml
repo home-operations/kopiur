@@ -188,6 +188,7 @@ nav:
           - Google Drive (native): backends/gdrive.md
       - Backups & schedules: backups.md
       - Copy methods (Snapshot/Clone/Direct): copy-methods.md
+      - Streamed command sources (DB dumps): stream-sources.md
       - PVC access modes & RWOP: access-modes.md
       - Restores: restores.md
       - Repository replication: replication.md
