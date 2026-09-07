@@ -129,16 +129,30 @@ pub fn is_terminal_for_generation(
 /// the one (`recorded_version`) observed at the last failed connect — `current_version`
 /// is the Secret's live `resourceVersion`, read cheaply before this check.
 ///
-/// Holds (skip the backend) only when BOTH are unchanged: terminal for this
-/// generation AND the credential is byte-for-byte the same Secret revision. Any
-/// difference (including a first failure that recorded no version) reopens it.
+/// A third opener, for the same reason (issue #435): a live, VALID
+/// `allow-reinitialize` ack is a new input too, and applying an annotation bumps
+/// neither `metadata.generation` nor the Secret's `resourceVersion`. Without
+/// `reinit_requested` here, the user's deliberate re-initialize of a wiped
+/// backend would sit behind the 30-minute heartbeat on exactly the bare-path
+/// repositories this gate protects. `reinit_requested` is computed by the caller
+/// as `phase != Ready && matches!(create_gate(..), Allowed { via_reinit_ack: true })`
+/// — the `phase != Ready` half is load-bearing: on a healthy repository a
+/// standing ack must be a complete no-op, never a nudge that re-opens the
+/// backend.
+///
+/// Holds (skip the backend) only when ALL THREE are unchanged: terminal for this
+/// generation, the credential is byte-for-byte the same Secret revision, and no
+/// re-initialize was requested. Any difference (including a first failure that
+/// recorded no version) reopens it.
 pub fn terminal_gate_holds(
     phase: Option<&kopiur_api::RepositoryPhase>,
     observed_generation: Option<i64>,
     generation: Option<i64>,
     recorded_version: Option<&str>,
     current_version: &str,
+    reinit_requested: bool,
 ) -> bool {
-    is_terminal_for_generation(phase, observed_generation, generation)
+    !reinit_requested
+        && is_terminal_for_generation(phase, observed_generation, generation)
         && recorded_version == Some(current_version)
 }

@@ -186,6 +186,22 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
         return Ok(Action::requeue(Duration::from_secs(300)));
     }
 
+    // #435: say something about an `allow-reinitialize` annotation that will NOT
+    // lead to a re-initialize — a mismatched value (ignored, fail-safe) or a valid
+    // one on a healthy repository (a deliberate no-op). One call, ahead of the
+    // backend match, so the mover path and the in-process bare path share it.
+    io::publish_reinitialize_ack_diagnostics(
+        ctx,
+        repo,
+        "Repository",
+        &name,
+        Some(&namespace),
+        repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
+        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
+        reinit_ack_raw(repo),
+    )
+    .await;
+
     // The optional kopia web-UI server runs regardless of backend (the server pod
     // connects to the repository itself), so reconcile it before the backend match
     // below — whose object-store/volume branches return early — to ensure it is
@@ -230,6 +246,30 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             // (bumps `generation`) or the password Secret (bumps its `resourceVersion`,
             // re-triggered by the Secret watch in `lib.rs`). The 30 min heartbeat keeps
             // us resilient to a watch desync without spamming the backend or the logs.
+            //
+            // #435 adds a third opener: a live, VALID `allow-reinitialize` ack on a
+            // repository that is not currently `Ready`. Applying an annotation bumps
+            // neither input above, so without this the user's deliberate re-initialize
+            // would sit behind the 30-minute heartbeat.
+            let pinned_unique_id = repo.status.as_ref().and_then(|s| s.unique_id.as_deref());
+            let create_gate = health::create_gate(
+                kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
+                pinned_unique_id,
+                reinit_ack_raw(repo),
+            );
+            let create_enabled = matches!(create_gate, health::CreateGate::Allowed { .. });
+            // The `phase != Ready` half is load-bearing: on a healthy repository a
+            // standing ack must be a complete no-op, never a nudge that re-opens the
+            // backend on every reconcile.
+            let phase_is_ready = repo.status.as_ref().and_then(|s| s.phase.as_ref())
+                == Some(&RepositoryPhase::Ready);
+            let reinit_requested = !phase_is_ready
+                && matches!(
+                    create_gate,
+                    health::CreateGate::Allowed {
+                        via_reinit_ack: true
+                    }
+                );
             if io::terminal_gate_holds(
                 repo.status.as_ref().and_then(|s| s.phase.as_ref()),
                 repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -238,6 +278,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                     .as_ref()
                     .and_then(|s| s.resolved_credential_version.as_deref()),
                 &cred_version,
+                reinit_requested,
             ) {
                 return Ok(Action::requeue(TERMINAL_HEARTBEAT));
             }
@@ -262,10 +303,6 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 // Part A: never auto-create over a once-`Ready` repository (pinned
                 // `uniqueId`). A wiped/unreachable backend must surface as a failure,
                 // never a silent fresh empty repo — re-create is a deliberate action.
-                let create_enabled = health::auto_create_allowed(
-                    kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
-                    repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
-                );
                 // Try create-then-connect when enabled and the failure isn't
                 // "repo already there" (auth/locked); otherwise the connect error
                 // is terminal. A terminal failure (connect OR a failed create)
@@ -302,21 +339,37 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 if let Err(e) = outcome {
                     let class = e.class();
                     let retryable = class.is_retryable();
+                    // #435: a wiped backend under a pinned `uniqueId` gets the
+                    // re-initialize hint, not a bare `NotFound`. Routed through the
+                    // SAME `BootstrapFailure` the mover path uses, so the
+                    // reason/message/event trio has exactly one producer.
+                    let reinit_block = health::inprocess_reinitialize_block(
+                        create_gate,
+                        &e,
+                        "Repository",
+                        &name,
+                        Some(&namespace),
+                        pinned_unique_id,
+                    );
                     // Reserve `Failed` (terminal, gated) for non-retryable classes;
                     // a retryable backend blip is `Degraded` and keeps retrying on
-                    // the 30 s transient cadence.
+                    // the 30 s transient cadence. (`NotFound` is never retryable, so
+                    // a reinitialize block always lands terminal.)
                     let phase = if retryable { "Degraded" } else { "Failed" };
                     let phase_enum = if retryable {
                         RepositoryPhase::Degraded
                     } else {
                         RepositoryPhase::Failed
                     };
+                    let (reason, message) = match reinit_block.as_ref() {
+                        Some(failure) => (failure.reason(), failure.condition_message()),
+                        None => (class.as_str(), class.summary().to_string()),
+                    };
                     // Stable, volatile-free condition message — the full stderr (with
                     // its per-attempt temp filename) goes to the Event only, so the
                     // persisted status is byte-identical across repeated failures and
                     // the guarded write below becomes a true no-op.
-                    let conditions =
-                        bootstrap_condition(repo, false, class.as_str(), class.summary());
+                    let conditions = bootstrap_condition(repo, false, reason, &message);
                     // kstatus conditions so Flux sees a retryable connect as
                     // Reconciling and a terminal one as Stalled, never a frozen
                     // Ready/Suspended (issue #245).
@@ -324,8 +377,8 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                         &conditions,
                         repo.metadata.generation,
                         io::ready_outcome_for_phase(&phase_enum),
-                        class.as_str(),
-                        class.summary(),
+                        reason,
+                        &message,
                     );
                     let current = serde_json::to_value(&repo.status).ok();
                     let wrote = io::patch_status_if_changed(
@@ -346,14 +399,21 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                     // Fire the Warning Event only on a real transition (not on every
                     // requeue) — it carries the full stderr for `kubectl describe`.
                     if wrote {
-                        io::publish_backend_failure(
-                            ctx,
-                            &io::event_ref(repo),
-                            &name,
-                            class,
-                            &e.to_string(),
-                        )
-                        .await;
+                        match reinit_block.as_ref() {
+                            Some(failure) => {
+                                failure.publish(ctx, &io::event_ref(repo), &name).await
+                            }
+                            None => {
+                                io::publish_backend_failure(
+                                    ctx,
+                                    &io::event_ref(repo),
+                                    &name,
+                                    class,
+                                    &e.to_string(),
+                                )
+                                .await
+                            }
+                        }
                     }
                     return if retryable {
                         // Transient: surface as an Err so error_policy requeues at
@@ -813,6 +873,17 @@ fn mass_deletion_ack_raw(repo: &Repository) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// The raw `allow-reinitialize` annotation value on this `Repository`, if any
+/// (issue #435). Validity — it must equal the pinned `status.uniqueId` — is
+/// decided by [`health::create_gate`], never here.
+pub(crate) fn reinit_ack_raw(repo: &Repository) -> Option<&str> {
+    repo.metadata
+        .annotations
+        .as_ref()?
+        .get(crate::consts::ALLOW_REINITIALIZE_ANNOTATION)
+        .map(String::as_str)
+}
+
 /// Fold the non-blocking `MassDeletionHeld` condition into `conditions` from the
 /// live Snapshot store (ADR-0005 §6; delegates to the shared
 /// [`crate::snapshot::repo_mass_deletion_conditions`]). Returns `conditions`
@@ -938,18 +1009,57 @@ async fn bootstrap_via_mover(
     // seed-attempt marker and nothing else: a repository with no marker is an
     // ordinary ADOPTION of a backend somebody else initialized, and must keep
     // the no-clobber `AlreadyInitialized` no-op.
-    let seed_armed = kopiur_api::seed::seed_armed(
-        repo.spec.seed.as_ref(),
-        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
-    );
-    let seed_resume = kopiur_api::seed::seed_resume(
-        seed_armed,
-        repo.status.as_ref().and_then(|s| s.seed.as_ref()),
-    );
-    let probe_enabled =
-        kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
     let prior_phase = repo.status.as_ref().and_then(|s| s.phase.as_ref());
     let already_ready = prior_phase == Some(&RepositoryPhase::Ready);
+    // #435, computed once per pass because a re-initialize ack is the THIRD kind
+    // of new input (spec edit, credential edit, ack) and, unlike the other two,
+    // changes no field the reconciler already watches for staleness: annotating
+    // bumps neither `metadata.generation` nor the Secret's `resourceVersion`.
+    let pinned_unique_id = repo.status.as_ref().and_then(|s| s.unique_id.as_deref());
+    let create_gate = health::create_gate(
+        kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
+        pinned_unique_id,
+        reinit_ack_raw(repo),
+    );
+    let create_enabled = matches!(create_gate, health::CreateGate::Allowed { .. });
+    // The VALID ack: stamped on any Job this pass launches, and compared against
+    // the stamp on a Job it finds (`stale_bootstrap_job`).
+    let launch_reinit_ack = valid_reinit_ack(create_gate, pinned_unique_id);
+    // "The human asked for a deliberate re-initialize, and this repository is not
+    // currently healthy." The `phase != Ready` half is load-bearing: on a Ready
+    // repository a standing ack must be a complete no-op, never a nudge that
+    // converts the gentle health probe into a strict bootstrap — which would flip
+    // the phase and bypass the "a probe NEVER rebinds identity" guard.
+    //
+    // Deliberately NOT ANDed into `probe_run`/`probe_style_launch` below: both are
+    // already false off-`Ready`, so the ack'd launch is naturally strict
+    // (`probe_only = false`), which is what makes `finalize_bootstrap` pin the
+    // NEW `result.unique_id` instead of keeping the old one.
+    let reinit_requested = !already_ready && launch_reinit_ack.is_some();
+    let seed_armed = kopiur_api::seed::seed_armed(
+        repo.spec.seed.as_ref(),
+        // On an ack'd re-initialize this pass IS a first bootstrap by decree, so
+        // the pin is treated as absent and a configured `spec.seed` re-seeds the
+        // now-empty backend rather than being the standing no-op it is on a live
+        // repository.
+        if reinit_requested {
+            None
+        } else {
+            pinned_unique_id
+        },
+    );
+    // ...but never RESUME on an ack'd pass. `status.seed` is never cleared, so a
+    // stale `startedAt` with no `seededAt` (an attempt that died against the OLD
+    // repository) would make this "resume" a copy into a backend that holds
+    // nothing it ever touched. The launch clears `status.seed` outright for the
+    // same reason.
+    let seed_resume = !reinit_requested
+        && kopiur_api::seed::seed_resume(
+            seed_armed,
+            repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+        );
+    let probe_enabled =
+        kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
     let probe_attempt_at = repo
         .status
         .as_ref()
@@ -1037,6 +1147,12 @@ async fn bootstrap_via_mover(
                     .and_then(|a| a.get(crate::consts::BOOTSTRAP_GENERATION_ANNOTATION))
                     .map(String::as_str),
                 repo.metadata.generation,
+                job.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION))
+                    .map(String::as_str),
+                launch_reinit_ack,
             )
         {
             tracing::info!(
@@ -1272,11 +1388,8 @@ async fn bootstrap_via_mover(
     // written back into the same ConfigMap under `result.json`).
     // Part A: the mover work spec only carries `auto_create` for a never-bootstrapped
     // repo. A once-`Ready` repo (pinned `uniqueId`) re-runs its bootstrap as a pure
-    // connect probe — it can never silently recreate over a vanished backend.
-    let create_enabled = health::auto_create_allowed(
-        kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
-        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
-    );
+    // connect probe — it can never silently recreate over a vanished backend, unless
+    // the human acknowledged THIS pinned id (#435).
     let cluster = repo
         .spec
         .identity_defaults
@@ -1346,6 +1459,8 @@ async fn bootstrap_via_mover(
         name,
         namespace,
         create_enabled,
+        create_gate.create_block(),
+        pinned_unique_id.map(str::to_string),
         true,
         // Probe-only (#414): a probe-style launch with no catalog work due
         // skips the O(snapshots) listing. A scan-token/refresh/spec-driven
@@ -1520,7 +1635,15 @@ async fn bootstrap_via_mover(
         pod_labels: resolved_mover.pod_labels.clone(),
         pod_annotations: resolved_mover.pod_annotations.clone(),
         labels,
-        annotations: bootstrap_generation_annotation(repo.metadata.generation),
+        // Generation + the `allow-reinitialize` ack this launch was made with
+        // (#435): an annotation edit bumps no generation, so the ack stamp is what
+        // lets `stale_bootstrap_job` recycle a terminal "reinitialize blocked" Job
+        // the moment the user acknowledges, instead of at the kube TTL.
+        annotations: {
+            let mut a = bootstrap_generation_annotation(repo.metadata.generation);
+            a.extend(bootstrap_reinit_ack_annotation(launch_reinit_ack));
+            a
+        },
         // The bootstrap's own `repo_volume` slot is taken, so a filesystem seed
         // SOURCE rides the spare one; the Job builder just turns it into a pod
         // volume/mount at that backend's path, which admission guarantees
@@ -1551,9 +1674,33 @@ async fn bootstrap_via_mover(
     // Conditions-free, deliberately: the launch path never writes conditions,
     // and doing so from the possibly-stale cached object would replace the
     // whole array.
+    // #435: an ack'd re-initialize is a first bootstrap by decree, so the OLD
+    // repository's `status.seed` must not leak into it. Cleared with an explicit
+    // RFC 7386 null (the technique `probe_failure_health_patch` uses) BEFORE the
+    // fresh marker, so the marker merges into an absent object instead of
+    // inheriting a stale `seededAt`/`snapshotCount` from a copy into storage that
+    // no longer exists.
+    if reinit_requested
+        && repo
+            .status
+            .as_ref()
+            .and_then(|st| st.seed.as_ref())
+            .is_some()
+    {
+        io::patch_status(
+            api,
+            name,
+            serde_json::json!({ "seed": serde_json::Value::Null }),
+        )
+        .await?;
+    }
     if let Some(s) = seed.as_ref()
         && let Some(patch) = repo_seed::seed_marker_patch(
-            repo.status.as_ref().and_then(|st| st.seed.as_ref()),
+            if reinit_requested {
+                None
+            } else {
+                repo.status.as_ref().and_then(|st| st.seed.as_ref())
+            },
             s.mode,
             &s.source_description,
             &chrono::Utc::now().to_rfc3339(),
@@ -1689,6 +1836,12 @@ fn bootstrap_work_spec(
     name: &str,
     namespace: &str,
     auto_create: bool,
+    // #435: WHY `auto_create` is false, when it is, plus the pinned
+    // `status.uniqueId` the re-initialize hint has to name. Resolved from
+    // `health::CreateGate` so the Job path and the in-process path can never
+    // disagree about which decline message a given gate produces.
+    create_block: Option<kopiur_mover::workspec::CreateBlock>,
+    pinned_unique_id: Option<String>,
     scan_catalog: bool,
     // #414: this launch is a pure health probe (probe-style, no catalog work
     // due) — the mover skips the `kopia snapshot list` catalog step and
@@ -1730,6 +1883,8 @@ fn bootstrap_work_spec(
         version: 1,
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
             auto_create,
+            create_block,
+            pinned_unique_id,
             scan_catalog,
             probe_only,
             // Create-time format knobs (encryption/splitter/hash/ECC) honored only
@@ -1799,19 +1954,75 @@ pub(crate) fn bootstrap_generation_annotation(generation: Option<i64>) -> BTreeM
 }
 
 /// Is this terminal bootstrap Job stale evidence — launched for a generation
-/// other than the live one? Pure decision for the recycle gate above.
+/// other than the live one, or before a re-initialize ack that is live now?
+/// Pure decision for the recycle gate above.
 ///
+/// Generation half:
 /// * `None` stamp (a Job from a pre-annotation operator, mid-upgrade) ⇒ NOT
 ///   stale: fall through to the existing consume path rather than recycling a
 ///   result whose provenance we can't read.
 /// * Unparseable stamp ⇒ stale (the annotation is controller-written; garbage
 ///   means something rewrote it, and a fresh bootstrap is the safe read).
 /// * Stamp != live generation ⇒ stale.
-pub(crate) fn stale_bootstrap_job(stamped: Option<&str>, live_generation: Option<i64>) -> bool {
+///
+/// Ack half (issue #435): applying an annotation does NOT bump
+/// `metadata.generation`, so the generation comparison alone leaves a terminal
+/// "reinitialize blocked" Job in place until the kube TTL reaps it — minutes of
+/// the user staring at a `Failed` repository after doing exactly what the
+/// condition told them to. `live_ack` is the VALID ack (`None` when absent or
+/// non-matching); `stamped_ack` is what the Job was launched with.
+///
+/// The predicate is `live_ack.is_some() && live_ack != stamped_ack`, and the
+/// `is_some()` guard is the load-bearing half: right after a SUCCESSFUL ack'd
+/// re-initialize the new `uniqueId` makes the live valid ack `None` while the
+/// good Job is still stamped with the old one — a bare `!=` would recycle that
+/// Job and throw away the catalog listing nothing has consumed yet.
+pub(crate) fn stale_bootstrap_job(
+    stamped: Option<&str>,
+    live_generation: Option<i64>,
+    stamped_ack: Option<&str>,
+    live_ack: Option<&str>,
+) -> bool {
+    if live_ack.is_some() && live_ack != stamped_ack {
+        return true;
+    }
     match (stamped, live_generation) {
         (None, _) | (_, None) => false,
         (Some(s), Some(live)) => s.parse::<i64>().map(|g| g != live).unwrap_or(true),
     }
+}
+
+/// The VALID `allow-reinitialize` ack on this object, or `None` — the value
+/// [`stale_bootstrap_job`] and [`bootstrap_reinit_ack_annotation`] compare, and
+/// the one stamped on a launched Job. "Valid" is [`health::create_gate`]'s
+/// definition: it equals the pinned `status.uniqueId`.
+pub(crate) fn valid_reinit_ack(
+    gate: health::CreateGate,
+    pinned_unique_id: Option<&str>,
+) -> Option<&str> {
+    match gate {
+        health::CreateGate::Allowed {
+            via_reinit_ack: true,
+        } => pinned_unique_id,
+        health::CreateGate::Allowed {
+            via_reinit_ack: false,
+        }
+        | health::CreateGate::DisabledBySpec { .. }
+        | health::CreateGate::PinnedOnceReady => None,
+    }
+}
+
+/// The `allow-reinitialize` ack annotation stamped on a bootstrap Job, mirroring
+/// [`bootstrap_generation_annotation`]. Empty map when the launch carried no
+/// valid ack, so an ordinary bootstrap Job is byte-identical to pre-#435.
+pub(crate) fn bootstrap_reinit_ack_annotation(ack: Option<&str>) -> BTreeMap<String, String> {
+    ack.map(|a| {
+        BTreeMap::from([(
+            crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION.to_string(),
+            a.to_string(),
+        )])
+    })
+    .unwrap_or_default()
 }
 
 /// Read the [`BootstrapResult`] the mover wrote into the work-spec ConfigMap.
@@ -2837,18 +3048,96 @@ mod tests {
     #[test]
     fn stale_bootstrap_job_recycles_only_older_generations() {
         // Old-generation terminal Job + edited spec ⇒ stale, recycle.
-        assert!(stale_bootstrap_job(Some("2"), Some(3)));
+        assert!(stale_bootstrap_job(Some("2"), Some(3), None, None));
         // The replacement Job (stamped with the live generation) is never
         // stale — its failure result must reach finalize and park `Failed`.
-        assert!(!stale_bootstrap_job(Some("3"), Some(3)));
+        assert!(!stale_bootstrap_job(Some("3"), Some(3), None, None));
         // Pre-annotation Job (operator upgrade window): provenance unreadable,
         // fall through to the existing consume path.
-        assert!(!stale_bootstrap_job(None, Some(3)));
+        assert!(!stale_bootstrap_job(None, Some(3), None, None));
         // No live generation (never set by the apiserver in practice): inert.
-        assert!(!stale_bootstrap_job(Some("2"), None));
+        assert!(!stale_bootstrap_job(Some("2"), None, None, None));
         // Garbage stamp: controller-written annotation was rewritten; a fresh
         // bootstrap is the safe read.
-        assert!(stale_bootstrap_job(Some("not-a-number"), Some(3)));
+        assert!(stale_bootstrap_job(
+            Some("not-a-number"),
+            Some(3),
+            None,
+            None
+        ));
+    }
+
+    /// #435: an `allow-reinitialize` ack bumps no generation, so the ack stamp
+    /// is the only thing that can recycle a terminal "reinitialize blocked" Job
+    /// promptly instead of at the kube TTL.
+    #[test]
+    fn stale_bootstrap_job_recycles_on_a_newly_applied_reinitialize_ack() {
+        // The Job that reported the block was launched with no ack; the user has
+        // now applied one ⇒ stale, recycle and relaunch as a real create.
+        assert!(stale_bootstrap_job(Some("3"), Some(3), None, Some("U1")));
+        // The Job launched WITH that ack is the ack'd run itself — never stale,
+        // or the run would be recycled before its result could be consumed.
+        assert!(!stale_bootstrap_job(
+            Some("3"),
+            Some(3),
+            Some("U1"),
+            Some("U1")
+        ));
+        // A second, different ack (the pin rotated and the user acked again)
+        // recycles the Job launched for the previous one.
+        assert!(stale_bootstrap_job(
+            Some("3"),
+            Some(3),
+            Some("U1"),
+            Some("U2")
+        ));
+
+        // THE `is_some()` GUARD. Right after a successful ack'd re-initialize the
+        // pin is U2, so the still-applied `U1` annotation is no longer valid and
+        // `live_ack` is `None` — while the GOOD Job is still stamped `U1`. A bare
+        // `live != stamped` would recycle that Job and throw away the catalog
+        // listing nothing has consumed yet.
+        assert!(!stale_bootstrap_job(Some("3"), Some(3), Some("U1"), None));
+        // ...and the generation half still decides when there is no live ack.
+        assert!(stale_bootstrap_job(Some("2"), Some(3), Some("U1"), None));
+    }
+
+    /// #435: only an `Allowed { via_reinit_ack: true }` gate yields a stampable
+    /// ack — everything else, including an ordinary first bootstrap, must stamp
+    /// nothing so ordinary Jobs stay byte-identical to pre-#435.
+    #[test]
+    fn valid_reinit_ack_is_only_the_acked_gate() {
+        use health::CreateGate::*;
+        assert_eq!(
+            valid_reinit_ack(
+                Allowed {
+                    via_reinit_ack: true
+                },
+                Some("U1")
+            ),
+            Some("U1")
+        );
+        assert_eq!(
+            valid_reinit_ack(
+                Allowed {
+                    via_reinit_ack: false
+                },
+                Some("U1")
+            ),
+            None
+        );
+        assert_eq!(valid_reinit_ack(PinnedOnceReady, Some("U1")), None);
+        assert_eq!(
+            valid_reinit_ack(DisabledBySpec { also_pinned: true }, Some("U1")),
+            None
+        );
+
+        let stamped = bootstrap_reinit_ack_annotation(Some("U1"));
+        assert_eq!(
+            stamped.get(crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION),
+            Some(&"U1".to_string())
+        );
+        assert!(bootstrap_reinit_ack_annotation(None).is_empty());
     }
 
     /// #414: `probe_only` rides the bootstrap op verbatim, so a probe-style
@@ -2867,6 +3156,8 @@ mod tests {
                 "nas",
                 "billing",
                 true,
+                None,
+                None,
                 true,
                 probe_only,
                 None,
@@ -2904,6 +3195,8 @@ mod tests {
                 "nas",
                 "billing",
                 true,
+                None,
+                None,
                 true,
                 false,
                 None,
@@ -2971,11 +3264,11 @@ mod tests {
     #[test]
     fn editing_spec_seed_mid_flight_discards_the_in_flight_result_as_stale() {
         // The Job was stamped with the pre-edit generation; the edit bumped it.
-        assert!(stale_bootstrap_job(Some("4"), Some(5)));
+        assert!(stale_bootstrap_job(Some("4"), Some(5), None, None));
         // Its replacement (stamped with the live generation) is consumed
         // normally — success or failure — so a persistently-broken seed spec
         // still surfaces instead of livelocking.
-        assert!(!stale_bootstrap_job(Some("5"), Some(5)));
+        assert!(!stale_bootstrap_job(Some("5"), Some(5), None, None));
         // And the marker is what makes the relaunch a RESUME.
         let marker = kopiur_api::seed::SeedStatus {
             started_at: Some("2026-08-17T00:00:00Z".into()),
@@ -3058,6 +3351,8 @@ mod tests {
                 "nas",
                 "billing",
                 true,
+                None,
+                None,
                 true,
                 false,
                 None,
@@ -3107,6 +3402,8 @@ mod tests {
                 "nas",
                 "billing",
                 true,
+                None,
+                None,
                 true,
                 false,
                 None,

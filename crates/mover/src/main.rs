@@ -1933,20 +1933,29 @@ async fn stamp_owner_on_new_repository(client: &KopiaClient, owner: Option<&Stri
 /// The [`BootstrapInitAction::Fail`] arm: turn a failed first connect into the
 /// most accurate message available.
 ///
-/// Two distinct decline reasons → two distinct messages:
+/// Three distinct decline reasons → three distinct messages:
 /// * create opt-out (`auto_create` off, no seed) + a genuinely-absent
 ///   repository ⇒ the actionable "set `spec.create.enabled: true`": the
 ///   repository just needs initializing. Scoped to exactly that case — an
 ///   unreachable backend (`RepositoryUnavailable`) or a denied bucket
 ///   (`AccessDenied`) is NOT "uninitialized", and telling the user to enable
 ///   create there would be wrong advice.
+/// * the SAME observable state, but the controller told us the block is the
+///   once-`Ready` pin ([`CreateBlock::OnceReadyPinned`], issue #435) ⇒ the
+///   re-initialize hint instead. "Enable create" is not just unhelpful here, it
+///   is false: `spec.create.enabled` is usually already `true`, and what kopiur
+///   is refusing to do is silently make an empty repository over a wiped one.
 /// * everything else (a repository exists that we cannot open — auth/locked; an
 ///   access or permission problem; or create/seed blocked by the class) ⇒
 ///   surface the real kopia class. Recreating would mask it or risk a second
 ///   repository, and seeding would write another cluster's data over a state we
 ///   could not even read.
+///
+/// `target` supplies the kind/name/namespace the re-initialize command names —
+/// they live on `MoverWorkSpec.target_ref`, not on the op.
 fn bootstrap_declined(
     op: &BootstrapRepositoryOp,
+    target: &kopiur_mover::workspec::TargetRef,
     err: &KopiaError,
     uninitialized: bool,
 ) -> BootstrapResult {
@@ -1955,7 +1964,28 @@ fn bootstrap_declined(
         && err.class() == KopiaErrorClass::NotFound
         && uninitialized
     {
-        return BootstrapResult::not_initialized();
+        // Exhaustive over the block reason. `None` is a work spec written by a
+        // controller older than #435, which only ever declined for the spec
+        // opt-out — so it keeps the historical message.
+        return match op.create_block {
+            Some(kopiur_mover::workspec::CreateBlock::OnceReadyPinned { also_spec_disabled }) => {
+                BootstrapResult::reinitialize_blocked(
+                    kopiur_mover::bootstrap::reinitialize_blocked_message(
+                        &target.kind,
+                        &target.name,
+                        // Cluster-scoped: `kubectl annotate clusterrepository -n ..`
+                        // would not work, and `target_ref.namespace` here is the
+                        // OPERATOR's namespace, not the object's.
+                        (target.kind != "ClusterRepository").then_some(target.namespace.as_str()),
+                        op.pinned_unique_id.as_deref().unwrap_or_default(),
+                        also_spec_disabled,
+                    ),
+                )
+            }
+            Some(kopiur_mover::workspec::CreateBlock::SpecDisabled) | None => {
+                BootstrapResult::not_initialized()
+            }
+        };
     }
     BootstrapResult::failed(err)
 }
@@ -2178,7 +2208,7 @@ async fn run_bootstrap(
             // rearrangement degrades to carrying on with a repository that IS
             // connected, instead of panicking mid-disaster-recovery.
             if let Some(e) = connect_err.as_ref() {
-                return bootstrap_declined(op, e, uninitialized);
+                return bootstrap_declined(op, &spec.target_ref, e, uninitialized);
             }
         }
         BootstrapInitAction::Create => {
@@ -3799,6 +3829,179 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #435: `bootstrap_declined` is three-way, not two-way ----------------
+
+    /// A `BootstrapRepositoryOp` with everything at its default and `auto_create`
+    /// off — the shape every #435 case starts from.
+    fn declined_op(
+        create_block: Option<kopiur_mover::workspec::CreateBlock>,
+        pinned_unique_id: Option<&str>,
+    ) -> BootstrapRepositoryOp {
+        BootstrapRepositoryOp {
+            auto_create: false,
+            create_block,
+            pinned_unique_id: pinned_unique_id.map(str::to_string),
+            scan_catalog: true,
+            probe_only: false,
+            create_options: Default::default(),
+            epoch_parameters: Default::default(),
+            blob_retention: None,
+            maintenance_owner: None,
+            catalog_foreign_prefilter_cluster: None,
+            restamp_policy: Default::default(),
+            maintenance_owner_aliases: Vec::new(),
+            read_only: false,
+            seed: None,
+        }
+    }
+
+    fn target(kind: &str, name: &str, namespace: &str) -> kopiur_mover::workspec::TargetRef {
+        kopiur_mover::workspec::TargetRef {
+            api_version: kopiur_api::consts::API_VERSION.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+        }
+    }
+
+    /// A `NotFound` whose stderr says the storage holds no repository — the only
+    /// shape that reaches the decline arms at all.
+    fn uninitialized_error() -> KopiaError {
+        KopiaError::NonZeroExit {
+            args: "repository connect s3".to_string(),
+            code: Some(1),
+            class: KopiaErrorClass::NotFound,
+            stderr_tail: "ERROR repository not initialized in the provided storage".to_string(),
+        }
+    }
+
+    fn failure_class(r: &BootstrapResult) -> String {
+        r.failure
+            .as_ref()
+            .map(|f| f.kopia_error_class.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn bootstrap_declined_picks_the_block_reason_the_controller_sent() {
+        let err = uninitialized_error();
+        let t = target("Repository", "nas", "billing");
+
+        // (1) The spec really is opted out on a never-bootstrapped repository:
+        // "enable create" is the right advice, and stays.
+        let spec_disabled = bootstrap_declined(
+            &declined_op(
+                Some(kopiur_mover::workspec::CreateBlock::SpecDisabled),
+                None,
+            ),
+            &t,
+            &err,
+            true,
+        );
+        assert_eq!(
+            failure_class(&spec_disabled),
+            kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_CLASS
+        );
+
+        // (2) A work spec from a controller older than #435 carries no block
+        // reason at all — it only ever declined for the opt-out, so it keeps the
+        // historical message byte-for-byte.
+        let old_controller = bootstrap_declined(&declined_op(None, None), &t, &err, true);
+        assert_eq!(
+            failure_class(&old_controller),
+            kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_CLASS
+        );
+        assert_eq!(
+            old_controller.failure.as_ref().unwrap().message,
+            kopiur_mover::bootstrap::REPOSITORY_NOT_INITIALIZED_MESSAGE
+        );
+
+        // (3) THE #435 CASE: `spec.create.enabled` is true, the repository was
+        // once Ready, and its bucket was deleted. "Set spec.create.enabled: true"
+        // would be false advice; the user needs the annotate command.
+        let pinned = bootstrap_declined(
+            &declined_op(
+                Some(kopiur_mover::workspec::CreateBlock::OnceReadyPinned {
+                    also_spec_disabled: false,
+                }),
+                Some("U1"),
+            ),
+            &t,
+            &err,
+            true,
+        );
+        assert_eq!(
+            failure_class(&pinned),
+            kopiur_mover::bootstrap::REPOSITORY_REINITIALIZE_BLOCKED_CLASS
+        );
+        let msg = &pinned.failure.as_ref().unwrap().message;
+        assert!(!msg.contains("spec.create.enabled is false"), "{msg}");
+        assert!(
+            msg.contains(
+                "kubectl annotate Repository nas -n billing \
+                 kopiur.home-operations.com/allow-reinitialize=U1"
+            ),
+            "{msg}"
+        );
+        // Byte-identical to what the controller's in-process path produces.
+        assert_eq!(
+            msg,
+            &kopiur_mover::bootstrap::reinitialize_blocked_message(
+                "Repository",
+                "nas",
+                Some("billing"),
+                "U1",
+                false,
+            )
+        );
+    }
+
+    #[test]
+    fn bootstrap_declined_derives_the_namespace_flag_from_the_kind_not_the_target_ref() {
+        // A ClusterRepository's work spec sets `target_ref.namespace` to the
+        // OPERATOR's namespace. Using it would emit `kubectl annotate
+        // clusterrepository shared -n kopiur-system ...`, which does not work on a
+        // cluster-scoped object.
+        let r = bootstrap_declined(
+            &declined_op(
+                Some(kopiur_mover::workspec::CreateBlock::OnceReadyPinned {
+                    also_spec_disabled: false,
+                }),
+                Some("U1"),
+            ),
+            &target("ClusterRepository", "shared", "kopiur-system"),
+            &uninitialized_error(),
+            true,
+        );
+        let msg = &r.failure.as_ref().unwrap().message;
+        assert!(!msg.contains("kopiur-system"), "{msg}");
+        assert!(!msg.contains(" -n "), "{msg}");
+    }
+
+    #[test]
+    fn bootstrap_declined_still_relays_a_real_kopia_class() {
+        // Not "uninitialized": a denied bucket is a backend verdict, and neither
+        // "enable create" nor "acknowledge the wipe" is the right advice.
+        let denied = KopiaError::NonZeroExit {
+            args: "repository connect s3".to_string(),
+            code: Some(1),
+            class: KopiaErrorClass::AccessDenied,
+            stderr_tail: "Access Denied".to_string(),
+        };
+        let r = bootstrap_declined(
+            &declined_op(
+                Some(kopiur_mover::workspec::CreateBlock::OnceReadyPinned {
+                    also_spec_disabled: false,
+                }),
+                Some("U1"),
+            ),
+            &target("Repository", "nas", "billing"),
+            &denied,
+            false,
+        );
+        assert_eq!(failure_class(&r), KopiaErrorClass::AccessDenied.as_str());
+    }
 
     // --- M0b: identity-scope retention pin (KOPIA_KEEP_MAX) is mandatory ---
 

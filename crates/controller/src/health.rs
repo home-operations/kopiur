@@ -197,19 +197,198 @@ pub fn reconcile_index_blob_health(
 /// creating a fresh empty repository over it — that destroys restorability.
 /// Re-creation of a once-good repository is a deliberate human action.
 ///
-/// Returns whether `create` may be attempted: the spec opted in (`create.enabled`)
-/// AND this repository was never successfully bootstrapped (`uniqueId` unset). Used
-/// at every create site (the in-process bare-path connect, the mover work-spec
-/// builder, and the no-Job re-create path) in both reconcilers.
+/// Returns whether `create` may be attempted: the bool adapter over
+/// [`create_gate`], kept because most call sites only need the yes/no. `create`
+/// is permitted when the spec opted in (`create.enabled`) AND either this
+/// repository was never successfully bootstrapped (`uniqueId` unset) or the human
+/// acknowledged a deliberate re-initialize of THIS pinned id (issue #435 — see
+/// [`kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION`]). Used at every create
+/// site (the in-process bare-path connect, the mover work-spec builder, and the
+/// no-Job re-create path) in both reconcilers.
 ///
 /// ```
 /// use kopiur_controller::health::auto_create_allowed;
-/// assert!(auto_create_allowed(true, None));            // first bootstrap, opted in
-/// assert!(!auto_create_allowed(true, Some("abc123"))); // once-Ready: never recreate
-/// assert!(!auto_create_allowed(false, None));          // not opted in
+/// assert!(auto_create_allowed(true, None, None));            // first bootstrap, opted in
+/// assert!(!auto_create_allowed(true, Some("abc123"), None)); // once-Ready: never recreate
+/// assert!(!auto_create_allowed(false, None, None));          // not opted in
+/// // ...unless the human acked THIS pinned id (issue #435).
+/// assert!(auto_create_allowed(true, Some("abc123"), Some("abc123")));
 /// ```
-pub fn auto_create_allowed(spec_create_enabled: bool, unique_id: Option<&str>) -> bool {
-    spec_create_enabled && unique_id.is_none()
+pub fn auto_create_allowed(
+    spec_create_enabled: bool,
+    unique_id: Option<&str>,
+    reinit_ack: Option<&str>,
+) -> bool {
+    matches!(
+        create_gate(spec_create_enabled, unique_id, reinit_ack),
+        CreateGate::Allowed { .. }
+    )
+}
+
+/// WHY a bootstrap may (or may not) create a kopia repository at the backend.
+///
+/// The typed replacement for the old fused `spec_enabled && unique_id.is_none()`
+/// bool (issue #435). The bool answered "may I create?" but threw away the
+/// reason, so the mover could only ever say "set `spec.create.enabled: true`" —
+/// wrong, and actively misleading, for the user whose bucket was deleted after
+/// the repository had been `Ready` with `create.enabled: true` all along.
+///
+/// Exhaustive on purpose: every create site matches it, so a new blocking reason
+/// cannot be added without every message deciding what to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateGate {
+    /// Create is permitted: the spec opted in AND either this repository was
+    /// never bootstrapped, or a valid re-initialize ack is present.
+    Allowed {
+        /// `true` when the ONLY reason this is allowed is a valid
+        /// [`kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION`] matching the
+        /// pinned `status.uniqueId` — i.e. the human asked for a deliberate
+        /// re-initialize of a wiped backend. Drives the "treat this one pass as
+        /// a first bootstrap" behavior (strict, non-probe launch; fresh seed).
+        via_reinit_ack: bool,
+    },
+    /// `spec.create.enabled` is false. `also_pinned` records that the once-Ready
+    /// pin ALSO blocks, so the message can name both fixes at once instead of
+    /// handing the user a two-step diagnosis (enable create, hit the pin, ack).
+    DisabledBySpec {
+        /// A `status.uniqueId` is pinned too, with no valid ack.
+        also_pinned: bool,
+    },
+    /// The spec opted in, but this repository has been `Ready` before (a pinned
+    /// `status.uniqueId`) and no valid ack is present. The load-bearing
+    /// data-safety invariant: never silently create an empty repository over a
+    /// wiped one.
+    PinnedOnceReady,
+}
+
+impl CreateGate {
+    /// The mover-side [`kopiur_mover::workspec::CreateBlock`] this gate implies,
+    /// or `None` when create is allowed (there is no block to explain).
+    ///
+    /// The ONE place the controller→mover mapping lives, so the work-spec
+    /// builders and the in-process bare-path connect arm can never disagree
+    /// about which message a given gate produces. Exhaustive.
+    pub fn create_block(self) -> Option<kopiur_mover::workspec::CreateBlock> {
+        use kopiur_mover::workspec::CreateBlock;
+        match self {
+            CreateGate::Allowed { .. } => None,
+            CreateGate::DisabledBySpec { also_pinned: false } => Some(CreateBlock::SpecDisabled),
+            // Both block: the mover names both fixes in one message rather than
+            // sending the user round the loop twice.
+            CreateGate::DisabledBySpec { also_pinned: true } => {
+                Some(CreateBlock::OnceReadyPinned {
+                    also_spec_disabled: true,
+                })
+            }
+            CreateGate::PinnedOnceReady => Some(CreateBlock::OnceReadyPinned {
+                also_spec_disabled: false,
+            }),
+        }
+    }
+}
+
+/// Decide [`CreateGate`] from the spec flag, the pinned `status.uniqueId`, and
+/// the raw [`kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION`] value.
+///
+/// An ack is VALID only when it equals the pinned id and both are non-empty; an
+/// ack with no pin is inert (there is nothing to re-initialize), and an ack that
+/// no longer matches the pin — the state the annotation lands in the instant a
+/// successful re-init mints a new id — is inert too. That is what makes the ack
+/// self-expiring and safe to leave in a GitOps manifest.
+///
+/// The pin is checked BEFORE the spec flag reports on its own: when both block,
+/// the answer is `DisabledBySpec { also_pinned: true }`, never a bare
+/// `DisabledBySpec`.
+pub fn create_gate(
+    spec_create_enabled: bool,
+    unique_id: Option<&str>,
+    reinit_ack: Option<&str>,
+) -> CreateGate {
+    let pinned = unique_id.filter(|id| !id.is_empty());
+    let ack_valid = match (pinned, reinit_ack.filter(|a| !a.is_empty())) {
+        (Some(id), Some(ack)) => id == ack,
+        _ => false,
+    };
+    match (spec_create_enabled, pinned, ack_valid) {
+        (false, pinned, _) => CreateGate::DisabledBySpec {
+            also_pinned: pinned.is_some(),
+        },
+        (true, None, _) => CreateGate::Allowed {
+            via_reinit_ack: false,
+        },
+        (true, Some(_), true) => CreateGate::Allowed {
+            via_reinit_ack: true,
+        },
+        (true, Some(_), false) => CreateGate::PinnedOnceReady,
+    }
+}
+
+/// The in-process bare-path twin of the mover's `bootstrap_declined` #435 arm:
+/// turn a failed in-process connect into a
+/// [`crate::io::BootstrapFailure::RepositoryReinitializeBlocked`], or `None` when
+/// this failure is not that case and the caller should keep its ordinary
+/// kopia-class handling.
+///
+/// The in-process connect path (a bare `backend.filesystem` repository, which
+/// needs no mover Job) never reaches `bootstrap_declined`, so without this it
+/// would report a bare `NotFound` — the #435 bug, one layer down.
+///
+/// Both guards matter:
+/// * only [`kopiur_mover::workspec::CreateBlock::OnceReadyPinned`] qualifies —
+///   a spec opt-out on a never-bootstrapped repository is the *other* sentinel,
+///   and create being ALLOWED means there is no decline to explain;
+/// * a `NotFound` counts only when kopia's stderr says the storage holds no
+///   repository ([`kopiur_kopia::notfound_is_uninitialized`]) — the same test
+///   the mover applies. A missing mount or a wrong `path` is also `NotFound`,
+///   and reporting *that* as a vanished repository would hand the user an
+///   annotate command that destroys nothing and fixes nothing.
+///
+/// The message comes from [`kopiur_mover::bootstrap::reinitialize_blocked_message`],
+/// the single producer shared with the Job path — a byte of drift between the two
+/// would turn every alternating reconcile into a real status write.
+pub fn inprocess_reinitialize_block(
+    gate: CreateGate,
+    err: &kopiur_kopia::KopiaError,
+    kind: &str,
+    name: &str,
+    namespace: Option<&str>,
+    pinned_unique_id: Option<&str>,
+) -> Option<crate::io::BootstrapFailure> {
+    let also_spec_disabled = match gate.create_block()? {
+        kopiur_mover::workspec::CreateBlock::OnceReadyPinned { also_spec_disabled } => {
+            also_spec_disabled
+        }
+        kopiur_mover::workspec::CreateBlock::SpecDisabled => return None,
+    };
+    if err.class() != kopiur_kopia::KopiaErrorClass::NotFound
+        || !err
+            .stderr_tail()
+            .is_some_and(kopiur_kopia::notfound_is_uninitialized)
+    {
+        return None;
+    }
+    Some(crate::io::BootstrapFailure::RepositoryReinitializeBlocked {
+        message: kopiur_mover::bootstrap::reinitialize_blocked_message(
+            kind,
+            name,
+            namespace,
+            pinned_unique_id?,
+            also_spec_disabled,
+        ),
+    })
+}
+
+/// Whether a `reinitialize` ack is PRESENT on the object but does not match the
+/// pinned `status.uniqueId` — the fail-safe "ignored, and the user should be
+/// told" case. `false` when there is no ack, no pin, or the ack is valid.
+pub fn reinit_ack_mismatched(unique_id: Option<&str>, reinit_ack: Option<&str>) -> bool {
+    match (
+        unique_id.filter(|id| !id.is_empty()),
+        reinit_ack.filter(|a| !a.is_empty()),
+    ) {
+        (Some(id), Some(ack)) => id != ack,
+        _ => false,
+    }
 }
 
 /// Whether a backend health probe is due now: the probe is enabled, the
@@ -395,8 +574,10 @@ impl ProbeFailureKind {
 
 /// Classify a [`crate::io::BootstrapFailure`] as the unified backend sensor's
 /// failure kind — the ONE place the mapping lives (it was four hand-copied
-/// two-way collapses across the twins before #414). Exhaustive: only the
-/// mover's genuine `RepositoryNotInitialized` sentinel may read as *vanished*
+/// two-way collapses across the twins before #414). Exhaustive: only the two
+/// genuine "the backend answered and holds no repository" sentinels
+/// (`RepositoryNotInitialized` and its #435 sibling
+/// `RepositoryReinitializeBlocked`) may read as *vanished*
 /// (a wrong "absent" here could, in a future auto-recreate, be catastrophic),
 /// only a Job-deadline kill reads as *timed out*, and everything else is the
 /// conservative *unreachable*.
@@ -404,6 +585,10 @@ pub fn probe_failure_kind(failure: &crate::io::BootstrapFailure) -> ProbeFailure
     use crate::io::BootstrapFailure;
     match failure {
         BootstrapFailure::RepositoryNotInitialized => ProbeFailureKind::Vanished,
+        // #435: the same observation (an answering backend with no repository),
+        // only with a different reason for declining to create one. The probe's
+        // `RepositoryVanished` copy is exactly right for it.
+        BootstrapFailure::RepositoryReinitializeBlocked { .. } => ProbeFailureKind::Vanished,
         BootstrapFailure::JobDeadlineExceeded { .. } => ProbeFailureKind::TimedOut,
         BootstrapFailure::Backend { .. }
         | BootstrapFailure::JobFailedWithoutResult { .. }
@@ -1236,13 +1421,106 @@ mod tests {
     #[test]
     fn auto_create_only_on_first_bootstrap() {
         // Opted in, never bootstrapped → may create (first bootstrap).
-        assert!(auto_create_allowed(true, None));
+        assert!(auto_create_allowed(true, None, None));
         // Once-Ready (pinned uniqueId) → NEVER create, even though create.enabled.
         // This is the load-bearing data-safety invariant.
-        assert!(!auto_create_allowed(true, Some("kopia-unique-id")));
+        assert!(!auto_create_allowed(true, Some("kopia-unique-id"), None));
         // Not opted in → never create regardless.
-        assert!(!auto_create_allowed(false, None));
-        assert!(!auto_create_allowed(false, Some("kopia-unique-id")));
+        assert!(!auto_create_allowed(false, None, None));
+        assert!(!auto_create_allowed(false, Some("kopia-unique-id"), None));
+        // ...and the ONE way through the pin: the human acked THIS id (#435).
+        assert!(auto_create_allowed(
+            true,
+            Some("kopia-unique-id"),
+            Some("kopia-unique-id")
+        ));
+    }
+
+    #[test]
+    fn create_gate_truth_table() {
+        use CreateGate::*;
+        // spec off: always DisabledBySpec, but it REPORTS the pin so one message
+        // can name both fixes (#435 — otherwise the user enables create, then
+        // discovers the pin and has to diagnose twice).
+        assert_eq!(
+            create_gate(false, None, None),
+            DisabledBySpec { also_pinned: false }
+        );
+        assert_eq!(
+            create_gate(false, Some("U1"), None),
+            DisabledBySpec { also_pinned: true }
+        );
+        // A valid-looking ack does NOT unblock a spec that never opted in.
+        assert_eq!(
+            create_gate(false, Some("U1"), Some("U1")),
+            DisabledBySpec { also_pinned: true }
+        );
+
+        // spec on, never bootstrapped: the first-bootstrap create.
+        assert_eq!(
+            create_gate(true, None, None),
+            Allowed {
+                via_reinit_ack: false
+            }
+        );
+        // An ack with NO pin is inert: there is nothing to re-initialize, and it
+        // must not masquerade as a re-init pass (which forces a fresh seed).
+        assert_eq!(
+            create_gate(true, None, Some("U1")),
+            Allowed {
+                via_reinit_ack: false
+            }
+        );
+        assert_eq!(
+            create_gate(true, Some(""), Some("U1")),
+            Allowed {
+                via_reinit_ack: false
+            }
+        );
+
+        // spec on, pinned: the data-safety block, and the one way through it.
+        assert_eq!(create_gate(true, Some("U1"), None), PinnedOnceReady);
+        assert_eq!(create_gate(true, Some("U1"), Some("")), PinnedOnceReady);
+        assert_eq!(create_gate(true, Some("U1"), Some("U2")), PinnedOnceReady);
+        assert_eq!(
+            create_gate(true, Some("U1"), Some("U1")),
+            Allowed {
+                via_reinit_ack: true
+            }
+        );
+
+        // Self-terminating: once the ack'd re-init mints U2, the SAME annotation
+        // value (U1, still sitting in the GitOps manifest) is inert — a second
+        // wipe parks again and needs a fresh ack naming U2.
+        assert_eq!(create_gate(true, Some("U2"), Some("U1")), PinnedOnceReady);
+    }
+
+    #[test]
+    fn reinit_ack_mismatch_is_only_for_a_present_non_matching_ack() {
+        assert!(reinit_ack_mismatched(Some("U1"), Some("U2")));
+        assert!(!reinit_ack_mismatched(Some("U1"), Some("U1")));
+        assert!(!reinit_ack_mismatched(Some("U1"), None));
+        assert!(!reinit_ack_mismatched(None, Some("U1")));
+        assert!(!reinit_ack_mismatched(Some("U1"), Some("")));
+    }
+
+    #[test]
+    fn reinit_success_heals_the_breaker_through_the_existing_fold() {
+        // 1.1b: an ack'd re-init is a strict (non-probe) bootstrap, and its
+        // success must reset the #345 breaker. There is deliberately NO second
+        // reset path — `success_fold(probe_run = false, ..)` already returns
+        // `Heal`, which nulls the failure counters, stamps `lastHealthyAt` and
+        // re-asserts `BackendReachable=True`.
+        let degraded = RepositoryHealthStatus {
+            last_probe_at: Some("2026-01-01T00:05:00Z".into()),
+            consecutive_probe_failures: Some(7),
+            first_failure_at: Some("2026-01-01T00:00:00Z".into()),
+            probe_attempt_at: Some("2026-01-01T00:05:00Z".into()),
+            ..Default::default()
+        };
+        let fold = success_fold(false, Some(&degraded), false, "2026-01-01T01:00:00Z")
+            .expect("a strict success on a degraded repository must heal");
+        assert_eq!(fold.reason, SuccessFoldReason::Heal);
     }
 
     // ---- Part B: health_probe_due ------------------------------------------

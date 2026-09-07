@@ -414,6 +414,8 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
         version: 1,
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
             auto_create: true,
+            create_block: None,
+            pinned_unique_id: None,
             scan_catalog: true,
             probe_only: false,
             create_options: Default::default(),
@@ -502,6 +504,8 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     // them) still parses the JSON a NEW controller writes.
     let op = BootstrapRepositoryOp {
         auto_create: true,
+        create_block: None,
+        pinned_unique_id: None,
         scan_catalog: true,
         probe_only: false,
         create_options: Default::default(),
@@ -526,6 +530,83 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     // would simply never read (it decodes what it recognizes and ignores the
     // rest), so this is still forward/backward compatible in practice.
     assert_eq!(v["restampPolicy"], "anyStale");
+    // #435: same contract for the two block-reason fields.
+    assert!(v.get("createBlock").is_none());
+    assert!(v.get("pinnedUniqueId").is_none());
+}
+
+/// #435: the two new fields ride the wire in the externally-tagged shape, and
+/// their absence decodes to "the pre-#435 reading" (`None` ⇒ SpecDisabled), so a
+/// mover/controller version skew can never turn a spec opt-out into a wiped-backend
+/// story or vice versa.
+#[test]
+fn bootstrap_create_block_round_trips_and_defaults_off_for_old_work_specs() {
+    use super::CreateBlock;
+
+    let mut op = BootstrapRepositoryOp {
+        auto_create: false,
+        create_block: Some(CreateBlock::OnceReadyPinned {
+            also_spec_disabled: false,
+        }),
+        pinned_unique_id: Some("U1".into()),
+        scan_catalog: true,
+        probe_only: false,
+        create_options: Default::default(),
+        epoch_parameters: Default::default(),
+        blob_retention: None,
+        maintenance_owner: None,
+        catalog_foreign_prefilter_cluster: None,
+        restamp_policy: RestampPolicy::AnyStale,
+        maintenance_owner_aliases: Vec::new(),
+        read_only: false,
+        seed: None,
+    };
+    let v = serde_json::to_value(&op).unwrap();
+    // Externally tagged (CLAUDE.md rule 1): the variant is the key. The
+    // `also_spec_disabled: false` default is elided, so the common case is the
+    // smallest possible payload.
+    assert!(v["createBlock"]["onceReadyPinned"].is_object());
+    assert!(v["createBlock"]["onceReadyPinned"]["alsoSpecDisabled"].is_null());
+    assert_eq!(v["pinnedUniqueId"], "U1");
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        op
+    );
+
+    // Both blocked: the flag DOES ride the wire, because the mover's message
+    // needs it to name both fixes at once.
+    op.create_block = Some(CreateBlock::OnceReadyPinned {
+        also_spec_disabled: true,
+    });
+    let v = serde_json::to_value(&op).unwrap();
+    assert_eq!(
+        v["createBlock"]["onceReadyPinned"]["alsoSpecDisabled"],
+        true
+    );
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        op
+    );
+
+    // The unit variant is a bare string.
+    op.create_block = Some(CreateBlock::SpecDisabled);
+    op.pinned_unique_id = None;
+    let v = serde_json::to_value(&op).unwrap();
+    assert_eq!(v["createBlock"], "specDisabled");
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        op
+    );
+
+    // Old controller: no key at all ⇒ `None`, which `bootstrap_declined` reads
+    // as the historical spec-opt-out message.
+    let old: BootstrapRepositoryOp = serde_json::from_value(serde_json::json!({
+        "autoCreate": false,
+        "scanCatalog": true,
+    }))
+    .unwrap();
+    assert!(old.create_block.is_none());
+    assert!(old.pinned_unique_id.is_none());
 }
 
 #[test]
@@ -2662,6 +2743,8 @@ fn seed_migrate_policies_default_to_an_explicit_no_policies() {
 fn a_seeding_bootstrap_op_round_trips_and_elides_its_defaults() {
     let op = BootstrapRepositoryOp {
         auto_create: false,
+        create_block: None,
+        pinned_unique_id: None,
         scan_catalog: true,
         probe_only: false,
         create_options: Default::default(),
