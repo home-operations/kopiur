@@ -180,6 +180,11 @@ pub fn cluster_repository_json(
 /// not work", with nothing in any log pointing at the overlay. That is exactly
 /// how the #351 e2e first failed in CI.
 pub fn merge_spec(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    assert!(
+        base.get("spec").is_some(),
+        "merge_spec merges into a full CR's `spec`; the base has no `spec` key, so the \
+         overlay would be silently dropped — pass the CR, or extend the spec object directly"
+    );
     if let (Some(spec), serde_json::Value::Object(more)) = (base.get_mut("spec"), extra) {
         assert!(
             !more.contains_key("spec"),

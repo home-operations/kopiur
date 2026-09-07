@@ -57,30 +57,30 @@ const SOURCES: [(&str, &str); 2] = [
 /// A `pvcSelector` `SnapshotPolicy` over [`RESTORE_LABEL_VALUE`], with an
 /// optional overlay merged into its spec.
 fn selector_policy_json(name: &str, strategy: &str, extra: serde_json::Value) -> serde_json::Value {
-    snapshot_policy_json(
-        E2E_NAMESPACE,
-        name,
-        "Repository",
-        REPO,
-        merge_spec(
-            serde_json::json!({
-                "sources": [ {
-                    "pvcSelector": {
-                        "labelSelector": {
-                            "matchLabels": { BACKUP_LABEL_KEY: RESTORE_LABEL_VALUE }
-                        }
-                    },
-                    "sourcePathStrategy": strategy
-                } ],
-                // No VolumeGroupSnapshot / VolumeSnapshot machinery: this file is
-                // about the populator handshake, not about staging.
-                "groupBy": "None",
-                "copyMethod": "Direct",
-                "identity": { "username": "popfanout", "hostname": "e2e" }
-            }),
-            extra,
-        ),
-    )
+    // Build the spec CONTENTS, then lay `extra` over them key-by-key. NOT
+    // `merge_spec`: that helper merges into a full CR's `spec` and would
+    // silently drop an overlay handed a bare spec object — which is exactly
+    // how the fail-closed test once created a single-source policy under the
+    // shared identity and was refused by the identity-collision guard.
+    let mut spec = serde_json::json!({
+        "sources": [ {
+            "pvcSelector": {
+                "labelSelector": {
+                    "matchLabels": { BACKUP_LABEL_KEY: RESTORE_LABEL_VALUE }
+                }
+            },
+            "sourcePathStrategy": strategy
+        } ],
+        // No VolumeGroupSnapshot / VolumeSnapshot machinery: this file is
+        // about the populator handshake, not about staging.
+        "groupBy": "None",
+        "copyMethod": "Direct",
+        "identity": { "username": "popfanout", "hostname": "e2e" }
+    });
+    if let (serde_json::Value::Object(base), serde_json::Value::Object(more)) = (&mut spec, extra) {
+        base.extend(more);
+    }
+    snapshot_policy_json(E2E_NAMESPACE, name, "Repository", REPO, spec)
 }
 
 /// Back the two labelled source PVCs up under one selector policy, then DELETE
