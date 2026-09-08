@@ -113,7 +113,7 @@ The chart's `features.credentialProjection.enabled` grant gained the `secrets` *
 
 ## After 0.7.2: **backups** stop accumulating credential copies (no action needed)
 
-The 0.7.2 fix above did not cover the highest-frequency consumer, so you may have watched your Secret count keep climbing. The stable name is `<snapshot>-creds-0`. But a `Snapshot` **is** the per-run object, so "one copy per CR" was still one live copy of your repository password and backend keys per backup, per namespace, retained for the entire GFS window because the `Snapshot` CR owns the kopia snapshot through a finalizer. A stable name bounds copies per CR; it cannot bound them per run. The lifetime was the bug, not the name.
+The 0.7.1 fix above did not cover the highest-frequency consumer, so you may have watched your Secret count keep climbing. The stable name is `<snapshot>-creds-0`. But a `Snapshot` **is** the per-run object, so "one copy per CR" was still one live copy of your repository password and backend keys per backup, per namespace, retained for the entire GFS window because the `Snapshot` CR owns the kopia snapshot through a finalizer. A stable name bounds copies per CR; it cannot bound them per run. The lifetime was the bug, not the name.
 
 Versions after 0.7.2 reclaim a copy when the run that needed it finishes. Both halves are automatic and need no `kubectl`:
 

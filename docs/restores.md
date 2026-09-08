@@ -16,7 +16,7 @@ You must set both `source` and `target`. `options` and `policy` are optional and
 
 ///
 
-A restore is "pick a row, write it somewhere". In the common case there is no timestamp arithmetic to do. A `Restore` resolves its source **once at admission** and records the answer in its status, so it never quietly switches to a different snapshot later.
+A restore is "pick a row, write it somewhere". In the common case there is no timestamp arithmetic to do. A `Restore` resolves its source **once**, the first time the operator reconciles it, and records the answer in its status. It never quietly switches to a different snapshot later.
 
 ## Where to restore _from_ — `source`
 
