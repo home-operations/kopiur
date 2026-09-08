@@ -6,6 +6,7 @@
 //! what stays here is how this command renders it.
 
 use chrono::{DateTime, Utc};
+use kopiur_ops::OpsError;
 use kopiur_ops::snapshots::resolve_repo_filter_for;
 use kopiur_ops::status::{StatusReport, build_report, gather};
 
@@ -214,29 +215,34 @@ pub async fn run(
     match output {
         OutputFormat::Table | OutputFormat::Wide => Ok(render(&report, now)),
         OutputFormat::Yaml => {
-            let value = serde_json::to_value(&report).map_err(|e| CliError::Serialization {
-                what: "status report",
-                source: e.into(),
+            let value = serde_json::to_value(&report).map_err(|e| {
+                CliError::Ops(OpsError::Serialization {
+                    what: "status report",
+                    source: e.into(),
+                })
             })?;
-            serde_yaml::to_string(&value).map_err(|e| CliError::Serialization {
-                what: "status report",
-                source: e.into(),
+            serde_yaml::to_string(&value).map_err(|e| {
+                CliError::Ops(OpsError::Serialization {
+                    what: "status report",
+                    source: e.into(),
+                })
             })
         }
         OutputFormat::Json => {
-            let mut s =
-                serde_json::to_string_pretty(&report).map_err(|e| CliError::Serialization {
+            let mut s = serde_json::to_string_pretty(&report).map_err(|e| {
+                CliError::Ops(OpsError::Serialization {
                     what: "status report",
                     source: e.into(),
-                })?;
+                })
+            })?;
             s.push('\n');
             Ok(s)
         }
         // There is no single resource to name; the report is the output.
-        OutputFormat::Name => Err(CliError::Serialization {
+        OutputFormat::Name => Err(CliError::Ops(OpsError::Serialization {
             what: "status report as -o name (status is a report, not a resource; use -o json)",
             source: Box::new(std::io::Error::other("unsupported output format")),
-        }),
+        })),
     }
 }
 

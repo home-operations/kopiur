@@ -10,6 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use kopiur_api::Restore;
+use kopiur_ops::OpsError;
 use kopiur_ops::actions::restore::{
     RestoreRequest, build_restore, create_restore, failure_detail, success_summary, terminal,
 };
@@ -50,22 +51,25 @@ pub async fn run(
                 // Through a JSON Value first: serde_yaml would render the
                 // externally-tagged enums (source/target) as `!snapshotRef`
                 // YAML tags — not the cluster's encoding (convention #5).
-                let value =
-                    serde_json::to_value(&created).map_err(|e| CliError::Serialization {
+                let value = serde_json::to_value(&created).map_err(|e| {
+                    CliError::Ops(OpsError::Serialization {
                         what: "created Restore",
                         source: e.into(),
-                    })?;
-                serde_yaml::to_string(&value).map_err(|e| CliError::Serialization {
-                    what: "created Restore",
-                    source: e.into(),
+                    })
+                })?;
+                serde_yaml::to_string(&value).map_err(|e| {
+                    CliError::Ops(OpsError::Serialization {
+                        what: "created Restore",
+                        source: e.into(),
+                    })
                 })?
             }
             OutputFormat::Json => {
                 let mut s = serde_json::to_string_pretty(&created).map_err(|e| {
-                    CliError::Serialization {
+                    CliError::Ops(OpsError::Serialization {
                         what: "created Restore",
                         source: e.into(),
-                    }
+                    })
                 })?;
                 s.push('\n');
                 s

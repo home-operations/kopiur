@@ -4,6 +4,7 @@
 //! The kind routing and the patch live in [`kopiur_ops::suspend`]; this module
 //! renders the resulting report for the requested `-o` format.
 
+use kopiur_ops::OpsError;
 use kopiur_ops::suspend::SuspendReport;
 
 use crate::cli::SuspendArgs;
@@ -32,18 +33,18 @@ pub fn render(report: &SuspendReport, output: OutputFormat) -> Result<String, Cl
                 Ok(format!("{resource} {verb}\n"))
             }
         }
-        OutputFormat::Yaml => {
-            serde_yaml::to_string(&report.object).map_err(|e| CliError::Serialization {
+        OutputFormat::Yaml => serde_yaml::to_string(&report.object).map_err(|e| {
+            CliError::Ops(OpsError::Serialization {
                 what: "patched object",
                 source: e.into(),
             })
-        }
+        }),
         OutputFormat::Json => {
             let mut s = serde_json::to_string_pretty(&report.object).map_err(|e| {
-                CliError::Serialization {
+                CliError::Ops(OpsError::Serialization {
                     what: "patched object",
                     source: e.into(),
-                }
+                })
             })?;
             s.push('\n');
             Ok(s)

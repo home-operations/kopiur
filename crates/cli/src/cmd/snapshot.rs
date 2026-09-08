@@ -8,6 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use kopiur_api::{Snapshot, SnapshotPolicy};
+use kopiur_ops::OpsError;
 use kopiur_ops::actions::snapshot::{
     SnapshotNowRequest, create_snapshots, failure_detail, plan_snapshots, success_summary, terminal,
 };
@@ -93,22 +94,25 @@ pub async fn run(
                 // Via a JSON Value: keeps the cluster's encoding for any
                 // externally-tagged enum (see cmd/restore.rs; SnapshotSpec has
                 // none today, but the route must not depend on that).
-                let value =
-                    serde_json::to_value(&created).map_err(|e| CliError::Serialization {
+                let value = serde_json::to_value(&created).map_err(|e| {
+                    CliError::Ops(OpsError::Serialization {
                         what: "created Snapshot",
                         source: e.into(),
-                    })?;
-                serde_yaml::to_string(&value).map_err(|e| CliError::Serialization {
-                    what: "created Snapshot",
-                    source: e.into(),
+                    })
+                })?;
+                serde_yaml::to_string(&value).map_err(|e| {
+                    CliError::Ops(OpsError::Serialization {
+                        what: "created Snapshot",
+                        source: e.into(),
+                    })
                 })?
             }
             OutputFormat::Json => {
                 let mut s = serde_json::to_string_pretty(&created).map_err(|e| {
-                    CliError::Serialization {
+                    CliError::Ops(OpsError::Serialization {
                         what: "created Snapshot",
                         source: e.into(),
-                    }
+                    })
                 })?;
                 s.push('\n');
                 s

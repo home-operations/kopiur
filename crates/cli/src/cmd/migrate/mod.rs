@@ -25,6 +25,7 @@ use kube::discovery::ApiResource;
 // `kopia::`/`translate::`/`volsync_types::` paths used throughout this file
 // resolve through these aliases, so the call sites stay byte-identical.
 use kopiur_migrate::{kopia, translate, volsync_types};
+use kopiur_ops::OpsError;
 
 use crate::CmdOutput;
 use crate::cli::{GlobalArgs, MigrateVolsyncArgs};
@@ -441,12 +442,12 @@ fn render_yaml(objects: &[serde_json::Value], banner: &str) -> Result<String, Cl
     out.push('\n');
     for obj in objects {
         out.push_str("---\n");
-        out.push_str(
-            &serde_yaml::to_string(obj).map_err(|e| CliError::Serialization {
+        out.push_str(&serde_yaml::to_string(obj).map_err(|e| {
+            CliError::Ops(OpsError::Serialization {
                 what: "translated manifest",
                 source: e.into(),
-            })?,
-        );
+            })
+        })?);
     }
     Ok(out)
 }
@@ -592,7 +593,7 @@ pub async fn run(global: &GlobalArgs, args: &MigrateVolsyncArgs) -> Result<CmdOu
     if let Some(name) = &args.name {
         sources.retain(|o| o.name == *name);
         if sources.is_empty() {
-            return Err(CliError::NotFound {
+            return Err(CliError::Ops(OpsError::NotFound {
                 kind: "ReplicationSource",
                 plural: "replicationsources",
                 name: name.clone(),
@@ -602,7 +603,7 @@ pub async fn run(global: &GlobalArgs, args: &MigrateVolsyncArgs) -> Result<CmdOu
                 } else {
                     format!(" -n {fallback_ns}")
                 },
-            });
+            }));
         }
     }
     if sources.is_empty() {

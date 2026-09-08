@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use kopiur_api::common::PhaseLabel;
 use kopiur_api::consts::CONFIG_LABEL;
 use kopiur_api::{Origin, Snapshot, SnapshotPhase};
+use kopiur_ops::OpsError;
 use kopiur_ops::snapshots::{
     RepoFilter, SnapshotListFilter, label_selector, list_snapshots, matches_repository, meta_time,
     resolve_repo_filter_for,
@@ -278,18 +279,18 @@ pub fn render_list(
                 "items": snaps,
             });
             match output {
-                OutputFormat::Yaml => {
-                    serde_yaml::to_string(&list).map_err(|e| CliError::Serialization {
+                OutputFormat::Yaml => serde_yaml::to_string(&list).map_err(|e| {
+                    CliError::Ops(OpsError::Serialization {
                         what: "snapshot list",
                         source: e.into(),
                     })
-                }
+                }),
                 _ => {
                     let mut s = serde_json::to_string_pretty(&list).map_err(|e| {
-                        CliError::Serialization {
+                        CliError::Ops(OpsError::Serialization {
                             what: "snapshot list",
                             source: e.into(),
-                        }
+                        })
                     })?;
                     s.push('\n');
                     Ok(s)
