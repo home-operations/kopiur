@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         cfg: Arc::clone(&cfg),
         metrics,
         readiness,
-        auth: Arc::new(auth::AuthState::default()),
+        auth: Arc::new(auth::AuthState::unconfigured()),
         source: Arc::new(cache::Source::Impersonated),
         sessions: Arc::new(browse::session_pool::SessionPool::default()),
     };
