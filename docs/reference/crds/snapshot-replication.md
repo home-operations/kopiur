@@ -28,7 +28,7 @@ Which snapshots to copy. Leaving it out copies every identity's full history, wh
 
 | Field | Meaning |
 | --- | --- |
-| `identities.include` / `identities.exclude` | Lists of matchers over the kopia identity triple. Each matcher sets any of `username` / `hostname` / `sourcePath` (at least one required — webhook-enforced); every **set** component must match. Components match with anchored globs: `*` = any run of characters, `?` = exactly one. A snapshot is selected when it matches any `include` (empty = everything) and no `exclude` — exclude wins. |
+| `identities.include` / `identities.exclude` | Lists of matchers over the kopia identity triple. Each matcher sets any of `username` / `hostname` / `sourcePath` (at least one required, webhook-enforced); every **set** component must match. Components match with anchored globs: `*` = any run of characters, `?` = exactly one. A snapshot is selected when it matches any `include` (empty = everything) and no `exclude`; exclude wins. |
 | `latestOnly` | `true` = copy only each selected identity's most recent snapshot (a cheap seed); default `false` = full history. |
 
 Matching zero identities is a successful no-op, not an error. Source snapshots that are incomplete, meaning interrupted, are never copied.
@@ -39,8 +39,8 @@ Tuning for the underlying `kopia snapshot migrate`:
 
 | Field | Meaning |
 | --- | --- |
-| `parallel` | Snapshots migrated concurrently (kopia default `1` — sequential; must be `>= 1` when set, webhook-enforced). The main knob for large first runs. |
-| `policies` | Whether kopia **policy** objects ride along: `none` (default — Kopiur pins retention CR-side, so imported kopia policies are usually unwanted), `copy` (copy where absent), `copyOverwrite` (copy and overwrite). |
+| `parallel` | Snapshots migrated concurrently (kopia default `1`, sequential; must be `>= 1` when set, webhook-enforced). The main knob for large first runs. |
+| `policies` | Whether kopia **policy** objects ride along: `none` (default; Kopiur pins retention CR-side, so imported kopia policies are usually unwanted), `copy` (copy where absent), `copyOverwrite` (copy and overwrite). |
 | `throttle.source` / `throttle.destination` | Bandwidth and ops caps for this replication's runs, one block **per side**. Each is a [`throttle`](shared-types.md#moverdefaults) block holding `uploadBytesPerSecond`, `downloadBytesPerSecond`, `readOpsPerSecond` and `writeOpsPerSecond`; every value you set must be `>= 1`, which the webhook enforces. Each side **overrides that side's repository `moverDefaults.throttle` one field at a time**: a value set here wins, and a value left unset keeps the repository's own. Leave both out and each side uses its repository's defaults. See [Throttling a replication](../../snapshot-replication.md#throttling-a-replication). |
 
 `kopia snapshot migrate` has **no speed flags of its own**, so `throttle` is not passed to the migrate command. Kopiur applies each side with `kopia repository throttle set` on that side's connection *before* the migrate runs, and kopia stores the limits in that connection's config for the migrate to pick up.

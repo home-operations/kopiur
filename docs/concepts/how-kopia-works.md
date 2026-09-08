@@ -64,7 +64,7 @@ $ kubectl -n billing get snapshot postgres-data-20260607 \
 billing-postgres-data@billing:/pvc/postgres-data
 ```
 
-See [`identityDefaults` — per-tenant identity](../repositories.md#identitydefaults--per-tenant-identity-cel) for the templating surface.
+See [`identityDefaults`: per-tenant identity](../repositories.md#identitydefaults--per-tenant-identity-cel) for the templating surface.
 
 ## Encryption
 
@@ -99,7 +99,7 @@ Pooling them is safe, because of identity. Different `SnapshotPolicy` objects wr
 - A **single namespace** that owns its backups uses one [`Repository`](../repositories.md).
 - A **platform team** serving many tenant namespaces uses one [`ClusterRepository`](../repositories.md#clusterrepository-a-shared-repository), gated with `allowedNamespaces` and templated with `identityDefaults`. Use `prefix: ""`, the bucket root, so dedup spans every tenant.
 
-A complete, apply-ready example is [Example 02 — Shared platform repository](../examples.md#example-02--shared-platform-repository), which shows two apps in two namespaces sharing one repository under distinct identities.
+A complete, apply-ready example is [Example 02: Shared platform repository](../examples.md#example-02--shared-platform-repository), which shows two apps in two namespaces sharing one repository under distinct identities.
 
 ///
 

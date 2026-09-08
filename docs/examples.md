@@ -30,18 +30,18 @@ A `SnapshotPolicy` runs nothing on its own. A `SnapshotSchedule` on a cron, or a
 | --- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | 01  | [Single PVC, scheduled](#example-01--single-pvc-scheduled)              | The canonical first backup: Repository → SnapshotPolicy → SnapshotSchedule. |
 | 02  | [Shared platform repository](#example-02--shared-platform-repository)   | A cluster-scoped `ClusterRepository` tenants reference without secrets. |
-| 03  | [Restore by picking a Snapshot](#example-03--restore-by-picking-a-snapshot) | Restore is "pick a row" from the catalog — no timestamp math.           |
+| 03  | [Restore by picking a Snapshot](#example-03--restore-by-picking-a-snapshot) | Restore is "pick a row" from the catalog, with no timestamp math.           |
 | 04  | [Multi-PVC selector](#example-04--multi-pvc-selector)                   | Back up every PVC matching a label as one consistent group.             |
 | 05  | [Deploy-or-restore (GitOps)](#example-05--deploy-or-restore-gitops)     | One bundle that restores on a fresh cluster, backs up otherwise.        |
 | 06  | [Manual one-shot backup](#example-06--manual-one-shot-backup)           | A `Snapshot` CR as the universal trigger.                                 |
 | 07  | [Restore a discovered backup](#example-07--restore-a-discovered-backup) | Restore foreign / pre-install snapshots.                                |
 | 08  | [Maintenance](#example-08--maintenance)                                 | A standalone `Maintenance` for fine-grained control.                    |
 | 09  | [Mover UID/GID & permissions](#example-09--mover-uidgid--permissions)   | Match the mover's UID/GID to the data owner so it can read it.          |
-| 10  | [NFS source (no PVC)](#example-10--nfs-source-no-pvc)                   | Back up a NAS export directly — no PersistentVolumeClaim.               |
+| 10  | [NFS source (no PVC)](#example-10--nfs-source-no-pvc)                   | Back up a NAS export directly, with no PersistentVolumeClaim.               |
 | 11  | [Credential projection](#example-11--credential-projection)             | Let the operator copy the repo Secret into each mover namespace.        |
 | 12  | [Restore mover, cache & failure policy](#example-12--restore-mover-cache--failure-policy) | Give a `Restore` the same UID/GID, cache, and retry knobs a backup has. |
 | 13  | [Restore by raw kopia identity](#example-13--restore-by-raw-kopia-identity) | Restore a foreign / aged-out snapshot by `username@hostname:path`. |
-| 14  | [Point-in-time / offset restore](#example-14--point-in-time--offset-restore) | "Roll back to Tuesday 2am" — restore via `asOf` / `offset`. |
+| 14  | [Point-in-time / offset restore](#example-14--point-in-time--offset-restore) | "Roll back to Tuesday 2am": restore via `asOf` / `offset`. |
 | 15  | [In-place mirror restore](#example-15--in-place-mirror-restore) | Restore into an existing PVC and make it an exact mirror. |
 | 16  | [Cross-namespace clone restore](#example-16--cross-namespace-clone-restore) | Clone one namespace's snapshot into another (prod → staging). |
 | 17  | [Restore from a shared repo (projection)](#example-17--restore-from-a-shared-repo-projection) | Restore from a `ClusterRepository` into a fresh namespace, creds projected. |

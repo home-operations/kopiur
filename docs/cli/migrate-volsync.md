@@ -6,8 +6,8 @@ Two VolSync movers are supported, and their **data semantics are very different*
 
 | Mover | Where it comes from | What migration means |
 | --- | --- | --- |
-| **restic** | upstream VolSync | Config translation ONLY — the repository formats are incompatible, so the kopiur repository starts empty. |
-| **kopia** | the [perfectra1n/volsync fork](https://github.com/perfectra1n/volsync) | The repository **is** a kopia repository: kopiur **adopts it in place** — all existing snapshots are preserved and history continues. |
+| **restic** | upstream VolSync | Config translation ONLY: the repository formats are incompatible, so the kopiur repository starts empty. |
+| **kopia** | the [perfectra1n/volsync fork](https://github.com/perfectra1n/volsync) | The repository **is** a kopia repository: kopiur **adopts it in place**, so all existing snapshots are preserved and history continues. |
 
 ```console
 $ kubectl kopiur migrate volsync -n media --resolve-secrets --apply
@@ -17,11 +17,11 @@ $ kubectl kopiur migrate volsync -n media --resolve-secrets --apply
 |---|---|
 | `--name NAME` | Translate one ReplicationSource (default: every one in the namespace). |
 | `--repository NAME [--repository-kind …]` | Point the translated policies at an EXISTING kopiur repository. |
-| `--resolve-secrets` | Instead, parse each repository Secret and EMIT a kopiur `Repository` derived from it. restic: + credential Secrets, with a `REPLACE_ME` kopia password **you must set** (a kopia repo needs its own new password); `--apply` refuses while any placeholder remains. kopia (fork): the existing repository is **adopted** — the Secret is referenced in place, no placeholder, so `--apply` works in one shot. |
+| `--resolve-secrets` | Instead, parse each repository Secret and EMIT a kopiur `Repository` derived from it. restic: + credential Secrets, with a `REPLACE_ME` kopia password **you must set** (a kopia repo needs its own new password); `--apply` refuses while any placeholder remains. kopia (fork): the existing repository is **adopted**: the Secret is referenced in place, no placeholder, so `--apply` works in one shot. |
 | `--include-destinations` | Also translate ReplicationDestinations into `Restore`s. restic (and kopia without an identity): deploy-or-restore `fromPolicy` + `onMissingSnapshot: Continue`. kopia with `sourceIdentity` or `username`/`hostname`: a raw-identity restore (`source.identity`), no policy pairing needed. |
 | `--strict` | Exit 1 (emitting nothing) when any field has no kopiur equivalent. A minimal fork-kopia source is fully mappable and passes. |
 | `--apply` | Server-side-apply the translated objects. |
-| `-f, --filename PATH` | Read VolSync objects from a YAML file, a directory, or `-` (stdin) instead of the cluster — **no kubeconfig required**. Repeatable. See [Offline / GitOps mode](#offline--gitops-mode). |
+| `-f, --filename PATH` | Read VolSync objects from a YAML file, a directory, or `-` (stdin) instead of the cluster. **No kubeconfig required.** Repeatable. See [Offline / GitOps mode](#offline--gitops-mode). |
 | `--secrets PATH` | In offline mode, resolve repository Secrets from plaintext Secret YAML on disk (file/dir/`-`). Repeatable; needs `--resolve-secrets`. |
 | `--from-cluster-secrets` | In offline mode, fetch the referenced Secrets from the live cluster instead of `--secrets`. |
 | `--out-dir DIR` | Write one YAML file per ReplicationSource (plus `_shared.yaml` for derived Repositories/Secrets) into `DIR` instead of stdout. |
@@ -54,7 +54,7 @@ Credentials offline have three options, because your SOPS-encrypted Secrets cann
 
 | You want | Use |
 | --- | --- |
-| Point policies at a kopiur `Repository` you author/migrate separately — no Secret reads | `--repository NAME` |
+| Point policies at a kopiur `Repository` you author/migrate separately, with no Secret reads | `--repository NAME` |
 | Derive the `Repository` from **plaintext** Secret YAML on disk | `--resolve-secrets --secrets ./secrets.yaml` |
 | Read VolSync from files but fetch Secrets from the **live** cluster (e.g. Flux already decrypted them) | `--resolve-secrets --from-cluster-secrets` |
 

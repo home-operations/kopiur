@@ -238,4 +238,4 @@ So a *bulk* disappearance at the source, whether ransomware emptying it or a fat
 - [Multi-repository fan-out](backups.md#repositories--one-recipe-several-repositories-fan-out): backing up into several repositories *directly* from one `SnapshotPolicy`, and why combining hooks with fan-out points you back here.
 - [Repositories & backends](repositories.md): the catalog, `deletionProtection`, and `identityDefaults`.
 - [Disaster recovery scenario](scenarios/disaster-recovery.md)
-- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md): the one-shot counterpart. `Repository.spec.seed` copies a whole repository in at first bootstrap, using the same `kopia snapshot migrate` under `seed.from.repository`, instead of copying selected snapshots on a schedule.
+- [Scenario 10, DR from a replicated repository](scenarios/dr-with-replicated-repository.md): the one-shot counterpart. `Repository.spec.seed` copies a whole repository in at first bootstrap, using the same `kopia snapshot migrate` under `seed.from.repository`, instead of copying selected snapshots on a schedule.

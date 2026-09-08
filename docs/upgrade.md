@@ -126,7 +126,7 @@ Watch it land on `/metrics`. **`kopiur_projected_secrets_live`** is the live cou
 
 ## Upgrading 0.5.x → 0.6.0 (one-time CRD migration)
 
-/// danger | 0.5.x → 0.6.0 is a breaking upgrade — read this first
+/// danger | 0.5.x → 0.6.0 is a breaking upgrade, read this first
 
 Two things change at once on this crossing, and both can bite:
 
@@ -265,7 +265,7 @@ CRs that only ever existed in the cluster, and were never captured in a manifest
 
 ## See also
 
-- [Installing Kopiur → CRD lifecycle](install.md#crd-lifecycle) — the steady-state
+- [Installing Kopiur → CRD lifecycle](install.md#crd-lifecycle): the steady-state
   `crds/`-directory behavior, and how to apply schema changes on later upgrades.
-- [GitOps with Kopiur](gitops.md) — CRD sync waves, `CreateReplace`, and the Flux/Argo
+- [GitOps with Kopiur](gitops.md): CRD sync waves, `CreateReplace`, and the Flux/Argo
   reconcile model.

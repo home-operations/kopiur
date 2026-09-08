@@ -12,7 +12,7 @@ Everything on this page is automatic. There is nothing to install or enable. The
 | --- | --- | --- | --- |
 | `ReadWriteMany` / `ReadOnlyMany` | ✅ mover schedules freely | ✅ | ✅ |
 | `ReadWriteOnce` (RWO) | ✅ mover **co-locates** onto the attach node automatically | ✅ | ✅ co-locates automatically |
-| `ReadWriteOncePod` (RWOP) | ⚠️ only while **no pod holds** the volume; a held volume fails fast with guidance | ✅ **works with no downtime** — recommended | ⚠️ only while no pod holds the volume |
+| `ReadWriteOncePod` (RWOP) | ⚠️ only while **no pod holds** the volume; a held volume fails fast with guidance | ✅ **works with no downtime**, recommended | ⚠️ only while no pod holds the volume |
 
 ## Try it end-to-end
 

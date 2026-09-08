@@ -16,7 +16,7 @@ snapshot nightly-manual-20260611030012 succeeded: kopia id a1b2c3d4e5f6, 5.0 GiB
 
 | Flag | Effect |
 |---|---|
-| `--policy NAME` | The SnapshotPolicy (recipe) to run. Checked up front — a typo fails fast with a fix hint. |
+| `--policy NAME` | The SnapshotPolicy (recipe) to run. Checked up front, so a typo fails fast with a fix hint. |
 | `--name NAME` | Name the Snapshot (default `<policy>-manual-<timestamp>`). |
 | `--tag KEY=VALUE` | kopia snapshot tag; repeatable. |
 | `--deletion-policy delete\|retain\|orphan` | What happens to the kopia snapshot when the CR is deleted. |
@@ -40,13 +40,13 @@ The `Restore` CRD's three sources and three targets as one command line. Exactly
 | Source | Meaning |
 |---|---|
 | `--from-snapshot NAME [--snapshot-namespace NS]` | An explicit Snapshot CR (scheduled, manual, or discovered). |
-| `--from-policy NAME [--policy-namespace NS] [--as-of RFC3339] [--offset N]` | Resolve via the SnapshotPolicy's identity — works with no Snapshot CR present (the GitOps deploy-or-restore pattern). |
+| `--from-policy NAME [--policy-namespace NS] [--as-of RFC3339] [--offset N]` | Resolve via the SnapshotPolicy's identity. Works with no Snapshot CR present (the GitOps deploy-or-restore pattern). |
 | `--identity USER@HOST[:PATH] [--snapshot-id ID] [--as-of] [--offset]` | A raw kopia identity, for foreign writers or snapshots aged out of the catalog. Requires `--repository`. |
 
 | Target | Meaning |
 |---|---|
 | `--to-pvc NAME` | Write into an existing PVC. |
-| `--create-pvc NAME --size 10Gi [--storage-class X] [--access-mode RWO]…` | The operator creates the PVC. `--size` is required — kopiur never guesses a capacity. |
+| `--create-pvc NAME --size 10Gi [--storage-class X] [--access-mode RWO]…` | The operator creates the PVC. `--size` is required, because kopiur never guesses a capacity. |
 | `--populator` | Passive mode: the restore is claimed later by a PVC's `dataSourceRef`. |
 
 ```console

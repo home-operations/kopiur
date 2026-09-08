@@ -42,8 +42,8 @@ Tuning for the underlying `kopia repository sync-to` call, from issue #216. Ever
 
 | Field | kopia flag | Meaning |
 | --- | --- | --- |
-| `parallel` | `--parallel` | Concurrent blob-copy workers (kopia default `1` — sequential; the main knob for a slow initial seed). |
-| `deleteExtra` | `--delete` | Prune destination-only blobs for a true mirror (kopia default `false` — additive sync). **Deletes destination content** — see the safety note in the guide. |
+| `parallel` | `--parallel` | Concurrent blob-copy workers (kopia default `1`, sequential; the main knob for a slow initial seed). |
+| `deleteExtra` | `--delete` | Prune destination-only blobs for a true mirror (kopia default `false`, additive sync). **Deletes destination content**; see the safety note in the guide. |
 | `mustExist` | `--[no-]must-exist` | Fail instead of initializing the destination's repository-format blob (kopia default `false`). |
 | `times` | `--[no-]times` | Synchronize blob modification times to the destination, when supported (kopia default `true`). |
 | `update` | `--[no-]update` | Update blobs already present at the destination when the source copy is newer (kopia default `true`). |

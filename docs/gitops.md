@@ -14,7 +14,7 @@ That makes the resources first-class for `kubectl wait`, for Flux `healthChecks`
 | -------------- | --- |
 | `Ready`        | The resource is reconciled and healthy (repository connected, schedule armed, restore complete, …). The one condition to gate on. |
 | `Reconciling`  | The controller is actively working toward the desired state (transient). |
-| `Stalled`      | Progress is blocked on something that won't resolve by retrying (e.g. a missing dependency, a terminal kopia error) — look at the message. |
+| `Stalled`      | Progress is blocked on something that won't resolve by retrying (e.g. a missing dependency, a terminal kopia error). Look at the message. |
 
 `observedGeneration` is the `metadata.generation` the status reflects. When it lags `metadata.generation`, the controller has not caught up to your latest edit yet.
 
@@ -130,7 +130,7 @@ Cross-field invariants are CEL rules written **into the CRD schema**, so the api
 | `SnapshotPolicy` | each `source` is exactly one of `pvc`/`pvcSelector`/`nfs`. |
 | `SnapshotSchedule` | exactly one of `policyRef` / `policySelector`. |
 | `Restore` | exactly one of `target.pvc` / `target.pvcRef` / `target.populator`. |
-| `Repository` / `ClusterRepository` | `create.{splitter,hash,encryption,ecc}` are immutable (transition rules). The `encryption.passwordSecretRef` reference is mutable — rename/repoint freely as long as it resolves to the same password value. |
+| `Repository` / `ClusterRepository` | `create.{splitter,hash,encryption,ecc}` are immutable (transition rules). The `encryption.passwordSecretRef` reference is mutable, so rename/repoint freely as long as it resolves to the same password value. |
 
 /// tip | Validate before you push
 
@@ -167,6 +167,6 @@ Under GitOps that crossing removes and re-installs the CRDs, which cascade-delet
 
 - [Upgrading](upgrade.md) covers the one-time 0.5.x to 0.6.0 CRD migration and recovery.
 - [Restores → deploy-or-restore](restores.md#deploy-or-restore-gitops) is the one-bundle GitOps pattern.
-- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md) covers `spec.seed`, the standing field that rebuilds a repository from its mirror.
+- [Scenario 10: DR from a replicated repository](scenarios/dr-with-replicated-repository.md) covers `spec.seed`, the standing field that rebuilds a repository from its mirror.
 - [Field reference](field-reference.md) lists the conditions and status fields per kind.
 - [Observability](dev/observability.md) covers metrics and the `resource_phase` gauge.

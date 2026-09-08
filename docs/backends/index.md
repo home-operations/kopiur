@@ -62,7 +62,7 @@ The mover reads these **exact** key names from the Secret you reference and feed
 | [Azure](azure.md)              | `AZURE_STORAGE_KEY` **or** `AZURE_STORAGE_SAS_TOKEN`                      | `backend.azure`      |
 | [Google Cloud Storage](gcs.md) | `KOPIA_GCS_CREDENTIALS` (the SA-key JSON)                                 | `backend.gcs`        |
 | [Backblaze B2](b2.md)          | `B2_KEY_ID`, `B2_KEY`                                                     | `backend.b2`         |
-| [Filesystem](filesystem.md)    | _(none — only `KOPIA_PASSWORD`)_                                          | `backend.filesystem` |
+| [Filesystem](filesystem.md)    | _(none: only `KOPIA_PASSWORD`)_                                          | `backend.filesystem` |
 | [SFTP](sftp.md)                | `KOPIA_SFTP_KEY_DATA`, `KOPIA_SFTP_KNOWN_HOSTS`                           | `backend.sftp`       |
 | [WebDAV](webdav.md)            | `KOPIA_WEBDAV_USERNAME`, `KOPIA_WEBDAV_PASSWORD`                          | `backend.webDav`     |
 | [rclone](rclone.md)            | `KOPIA_RCLONE_CONFIG` _(via `configSecretRef`)_                           | `backend.rclone`     |
