@@ -242,16 +242,17 @@ A [`pvcSelector`](backups.md#sources--what-to-back-up) source expands to **one `
 | `VolumeGroupSnapshot` (default) | One CSI `VolumeGroupSnapshot` captures every matched PVC at the **same instant**, and each member stages from its own snapshot within that group. This is what you want for an application whose volumes must agree, such as a database and its write-ahead log. |
 | `None` | Each PVC is captured independently. Simpler, works on any snapshot-capable driver, but the volumes are captured at slightly different moments. |
 
-!!! warning "Group snapshots need more than a snapshot-capable driver"
+/// warning | Group snapshots need more than a snapshot-capable driver
 
-    `groupBy: VolumeGroupSnapshot` requires three things: the `groupsnapshot.storage.k8s.io` API group (external-snapshotter **8.2+**, Beta as of Kubernetes 1.32), a `VolumeGroupSnapshotClass` for your CSI driver, and a driver that advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`. Many drivers support per-volume snapshots but not group snapshots. Kopiur tells you which piece is missing and names `groupBy: None` as the way forward. It never silently downgrades, because "we captured these at slightly different times" is exactly the fact a consistency group exists to rule out.
+`groupBy: VolumeGroupSnapshot` requires three things: the `groupsnapshot.storage.k8s.io` API group (external-snapshotter **8.2+**, Beta as of Kubernetes 1.32), a `VolumeGroupSnapshotClass` for your CSI driver, and a driver that advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`. Many drivers support per-volume snapshots but not group snapshots. Kopiur tells you which piece is missing and names `groupBy: None` as the way forward. It never silently downgrades, because "we captured these at slightly different times" is exactly the fact a consistency group exists to rule out.
 
-    It also needs `installScope: cluster`. Resolving a group class and mapping group members back to their PVCs are cluster-scoped reads that a namespaced install's Role cannot make.
+It also needs `installScope: cluster`. Resolving a group class and mapping group members back to their PVCs are cluster-scoped reads that a namespaced install's Role cannot make.
 
-    Beta here still means **off by default**: external-snapshotter ships `CSIVolumeGroupSnapshot` as `{Default: false, PreRelease: Beta}`, so both the `snapshot-controller` and the `csi-snapshotter` sidecar need `--feature-gates=CSIVolumeGroupSnapshot=true`. Without it the CRDs install and nothing ever reconciles them, so a `VolumeGroupSnapshot` sits at `readyToUse: false` forever and kopiur fails the members on the staging deadline.
+Beta here still means **off by default**: external-snapshotter ships `CSIVolumeGroupSnapshot` as `{Default: false, PreRelease: Beta}`, so both the `snapshot-controller` and the `csi-snapshotter` sidecar need `--feature-gates=CSIVolumeGroupSnapshot=true`. Without it the CRDs install and nothing ever reconciles them, so a `VolumeGroupSnapshot` sits at `readyToUse: false` forever and kopiur fails the members on the staging deadline.
 
-    Kopiur picks the class exactly as it does for per-volume snapshots: match the source PVC's CSI driver, otherwise use the unique class annotated `groupsnapshot.storage.kubernetes.io/is-default-class: "true"`. Note that the annotation's domain is `kubernetes.io` while the API group is `k8s.io`. They differ for group classes where they match for per-volume ones.
+Kopiur picks the class exactly as it does for per-volume snapshots: match the source PVC's CSI driver, otherwise use the unique class annotated `groupsnapshot.storage.kubernetes.io/is-default-class: "true"`. Note that the annotation's domain is `kubernetes.io` while the API group is `k8s.io`. They differ for group classes where they match for per-volume ones.
 
+///
 Consistency is **per namespace**. A `VolumeGroupSnapshot` is a namespaced object whose selector is namespace-local, so a selector spanning namespaces produces one group per namespace. A group with a single member falls back to the ordinary per-PVC path, since a one-volume "group" buys nothing.
 
 ### The flagship use: CephFS shallow snapshots
