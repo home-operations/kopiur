@@ -1,13 +1,24 @@
 #![warn(missing_docs)]
 //! `kubectl kopiur` — the kopiur kubectl plugin.
 //!
+//! The operations themselves live in [`kopiur_ops`], the shared client-side
+//! layer this plugin and the web UI both drive: the reports, the matchers, the
+//! browse data-plane, the action builders, and the actionable
+//! [`kopiur_ops::OpsError`] every front end renders. What lives HERE is the
+//! plugin's own surface — argument parsing, terminal rendering, `--wait` loops,
+//! and the `--local` browse transport, which reads credentials with the
+//! caller's own RBAC and so has no place in a server.
+//!
 //! Library layout (the binary is a thin wrapper around [`run`]):
 //! - [`cli`]: the clap command tree (parsing only).
-//! - [`cmd`]: one module per command family; pure "args → report" cores with
-//!   thin kube-IO wrappers.
-//! - [`context`]: client construction honoring kubectl's config sources.
-//! - [`output`]: `-o` formats, table writer, humanizers.
-//! - [`error`]: the exhaustive [`error::CliError`] with what/why/fix messages.
+//! - [`cmd`]: one module per command family; thin wrappers that turn
+//!   [`kopiur_ops`] reports into text.
+//! - [`context`]: client construction honoring kubectl's config sources,
+//!   yielding the shared [`kopiur_ops::OpsCtx`].
+//! - [`output`]: `-o` formats, table writer, humanizers (bytes and the empty
+//!   cell are re-exported from [`kopiur_ops::format`]).
+//! - [`error`]: the exhaustive [`error::CliError`] — CLI-only failures, plus
+//!   [`error::CliError::Ops`] carrying a shared failure verbatim.
 
 pub mod cli;
 pub mod cmd;
