@@ -535,6 +535,77 @@ pub fn label_selector_string(
     terms.join(",")
 }
 
+/// Whether an object with these `labels` matches `selector` — the client-side
+/// counterpart to [`label_selector_string`].
+///
+/// Implements `matchLabels` (every key present with the required value) plus the
+/// `matchExpressions` operators `In`/`NotIn`/`Exists`/`DoesNotExist`. An empty
+/// selector matches everything, as Kubernetes defines it.
+///
+/// Lives here rather than in a consumer because three of them need the same
+/// answer and a partial re-implementation is worse than none: the schedule
+/// reconciler decides which policies to fire, its watch mapper decides which
+/// schedules a policy edit wakes, and the web UI shows a policy which schedules
+/// fire it. A copy that handled only `matchLabels` would silently claim a
+/// `matchExpressions` selector matched every policy in the namespace.
+///
+/// An unknown operator is treated as *no constraint* rather than as no match:
+/// the CRD schema constrains the set, so an unrecognized one can only come from
+/// a newer API than this build, and refusing to match would silently drop a
+/// policy the operator itself is scheduling.
+///
+/// ```
+/// use std::collections::BTreeMap;
+/// use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+/// use kopiur_api::expand::labels_match_selector;
+///
+/// let labels = BTreeMap::from([("tier".to_string(), "gold".to_string())]);
+/// // An empty selector selects everything.
+/// assert!(labels_match_selector(&labels, &LabelSelector::default()));
+///
+/// let gold: LabelSelector = serde_json::from_value(serde_json::json!({
+///     "matchLabels": { "tier": "gold" }
+/// }))
+/// .unwrap();
+/// assert!(labels_match_selector(&labels, &gold));
+/// ```
+pub fn labels_match_selector(
+    labels: &std::collections::BTreeMap<String, String>,
+    selector: &k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector,
+) -> bool {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement;
+    if let Some(ml) = &selector.match_labels {
+        for (k, v) in ml {
+            if labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+    }
+    if let Some(exprs) = &selector.match_expressions {
+        for LabelSelectorRequirement {
+            key,
+            operator,
+            values,
+        } in exprs
+        {
+            let vals = values.clone().unwrap_or_default();
+            let present = labels.get(key);
+            let ok = match operator.as_str() {
+                "In" => present.is_some_and(|v| vals.iter().any(|x| x == v)),
+                "NotIn" => present.is_none_or(|v| !vals.iter().any(|x| x == v)),
+                "Exists" => present.is_some(),
+                "DoesNotExist" => present.is_none(),
+                // Unknown operator: the schema constrains the set; treat as no constraint.
+                _ => true,
+            };
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 // --- naming -----------------------------------------------------------------
 
 /// The deterministic name of the fanned-out `Snapshot` for one PVC.

@@ -7,7 +7,6 @@
 
 use chrono::{DateTime, Utc};
 use kopiur_api::common::PhaseLabel;
-use kopiur_api::consts::CONFIG_LABEL;
 use kopiur_api::{Origin, Snapshot, SnapshotPhase};
 use kopiur_ops::OpsError;
 use kopiur_ops::snapshots::{
@@ -115,18 +114,10 @@ fn phase_cell(phase: Option<&SnapshotPhase>) -> String {
 /// One table row for a Snapshot. Pure; `now` is injected for a deterministic AGE.
 pub fn row(snap: &Snapshot, now: DateTime<Utc>, all_namespaces: bool, wide: bool) -> Vec<String> {
     let status = snap.status.as_ref();
-    let policy = snap
-        .spec
-        .policy_ref
-        .as_ref()
-        .map(|p| p.name.clone())
-        .or_else(|| {
-            snap.metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get(CONFIG_LABEL).cloned())
-        })
-        .unwrap_or_else(|| EMPTY_CELL.into());
+    // Shared with the web UI so one row cannot name two different policies
+    // depending on which front end drew it.
+    let policy = kopiur_ops::snapshots::policy_of(snap)
+        .map_or_else(|| EMPTY_CELL.to_string(), str::to_string);
     let stats = status.and_then(|s| s.stats.as_ref());
     let size = stats
         .and_then(|s| s.size_bytes)

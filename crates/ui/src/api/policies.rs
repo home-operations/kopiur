@@ -22,9 +22,10 @@ use kopiur_ui_model::views::{
 use crate::AppState;
 use crate::api::problem::{ApiError, problem};
 use crate::api::schedules::{fires_policy, schedule_row};
-use crate::api::snapshots::{policy_of, view_row};
+use crate::api::snapshots::view_row;
 use crate::api::{NamespaceQuery, client_for, conditions_view, gate_hits, repo_ref_display};
 use crate::auth::CurrentIdentity;
+use kopiur_ops::snapshots::policy_of;
 
 /// How many recent runs the detail screen shows.
 const RECENT_SNAPSHOTS: usize = 10;
@@ -164,7 +165,7 @@ pub fn view_detail(
 
     let mut recent: Vec<Arc<Snapshot>> = snapshots
         .iter()
-        .filter(|s| policy_of(s).as_deref() == Some(name.as_str()))
+        .filter(|s| policy_of(s) == Some(name.as_str()))
         .cloned()
         .collect();
     recent.sort_by(|a, b| {

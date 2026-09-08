@@ -3,14 +3,14 @@
 //!
 //! A schedule fires a policy either by naming it (`policyRef`) or by selecting
 //! it (`policySelector`). Both are shown, and [`fires_policy`] is the one place
-//! the two are reconciled — for *display* only: which policies a selector
-//! actually fires is the controller's decision, made against live labels, and
-//! the UI never re-derives an authorization or a schedule from it.
+//! the two are reconciled. A selector is evaluated with the operator's own
+//! matcher, so the answer is exact — but it stays *display only*: the UI never
+//! re-derives an authorization, a fire time, or which run to create from it.
 
 use axum::extract::{Query, State};
 use axum::{Json, Router, routing::get};
 
-use kopiur_api::expand::label_selector_string;
+use kopiur_api::expand::{label_selector_string, labels_match_selector};
 use kopiur_api::{SnapshotPolicy, SnapshotSchedule};
 use kopiur_ui_model::views::ScheduleRow;
 
@@ -52,17 +52,18 @@ pub fn schedule_row(s: &SnapshotSchedule) -> ScheduleRow {
     }
 }
 
-/// **Pure.** Whether this schedule would fire `policy`, for display.
+/// **Pure.** Whether this schedule would fire `policy`.
 ///
 /// A `policyRef` matches by name in the schedule's own namespace — the CRD gives
-/// a schedule no way to fire a policy elsewhere. A `policySelector` matches the
-/// policy's labels, evaluated here the same way
-/// [`label_selector_string`] renders it: `matchLabels` only, because the
-/// expression forms need an evaluator the API crate does not export and a
-/// half-evaluated selector would silently *under*-report which schedules touch a
-/// recipe. A schedule with `matchExpressions` therefore shows up on every policy
-/// in its namespace whose `matchLabels` half agrees, which errs toward showing
-/// the user a schedule that might fire rather than hiding one that does.
+/// a schedule no way to fire a policy elsewhere. A `policySelector` is evaluated
+/// with [`labels_match_selector`], the same matcher the schedule reconciler and
+/// its watch mapper use, so this answer is **exact** rather than an
+/// approximation: `matchExpressions` included.
+///
+/// It was not, once. A local `matchLabels`-only version reported that a
+/// `matchExpressions`-only selector fired *every* policy in its namespace, which
+/// is the opposite of what that selector means. Sharing the operator's own
+/// matcher is what makes the wire type able to promise exactness.
 pub fn fires_policy(schedule: &SnapshotSchedule, policy: &SnapshotPolicy) -> bool {
     if schedule.metadata.namespace != policy.metadata.namespace {
         return false;
@@ -73,11 +74,10 @@ pub fn fires_policy(schedule: &SnapshotSchedule, policy: &SnapshotPolicy) -> boo
     let Some(selector) = &schedule.spec.policy_selector else {
         return false;
     };
-    let labels = policy.metadata.labels.clone().unwrap_or_default();
-    selector
-        .match_labels
-        .as_ref()
-        .is_none_or(|want| want.iter().all(|(k, v)| labels.get(k) == Some(v)))
+    labels_match_selector(
+        &policy.metadata.labels.clone().unwrap_or_default(),
+        selector,
+    )
 }
 
 /// `GET /api/v1/schedules?namespace=`
@@ -243,6 +243,62 @@ spec:
 "#,
         );
         assert!(fires_policy(&everything, &unlabelled));
+    }
+
+    #[test]
+    fn a_match_expressions_selector_is_evaluated_not_approximated() {
+        // The regression guard for the `matchLabels`-only version: with no
+        // `matchLabels` at all, it saw an empty constraint and reported that
+        // this schedule fires EVERY policy in the namespace.
+        let expressions_only: SnapshotSchedule = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata: { name: gold-only-cron, namespace: media }
+spec:
+  policySelector:
+    matchExpressions:
+      - { key: tier, operator: In, values: [gold] }
+  schedule: { cron: "0 3 * * *" }
+"#,
+        );
+        let gold: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media, labels: { tier: gold } }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+"#,
+        );
+        let silver: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: weekly, namespace: media, labels: { tier: silver } }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+"#,
+        );
+        let unlabelled: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: plain, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+"#,
+        );
+
+        assert!(fires_policy(&expressions_only, &gold));
+        assert!(!fires_policy(&expressions_only, &silver));
+        assert!(
+            !fires_policy(&expressions_only, &unlabelled),
+            "an expression-only selector constrains; it does not select everything"
+        );
     }
 
     #[test]

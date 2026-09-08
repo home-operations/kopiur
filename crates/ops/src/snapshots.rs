@@ -59,6 +59,60 @@ pub fn label_selector(filter: &SnapshotListFilter) -> Option<String> {
     }
 }
 
+/// The `SnapshotPolicy` a Snapshot was taken under, as the front ends display
+/// it. **Pure.**
+///
+/// `spec.policyRef.name` first, the [`CONFIG_LABEL`] second. The precedence is
+/// the CLI's, and it is here so it is only decided once: `kubectl kopiur
+/// snapshots` and the web UI showing different policies for the same row is
+/// exactly the kind of disagreement the shared ops layer exists to prevent. The
+/// two sources differ only on a row whose label was rewritten without its spec
+/// — an adopted snapshot mid-adoption — and the spec is what the user wrote.
+///
+/// `None` for a discovered snapshot that no policy claims.
+pub fn policy_of(snap: &Snapshot) -> Option<&str> {
+    if let Some(policy_ref) = snap.spec.policy_ref.as_ref() {
+        return Some(policy_ref.name.as_str());
+    }
+    snap.metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(CONFIG_LABEL))
+        .map(String::as_str)
+}
+
+/// Does this Snapshot satisfy the label-backed half of a list query? **Pure.**
+///
+/// The client-side twin of [`label_selector`]: it answers the same question
+/// about one already-fetched object that the selector answers server-side about
+/// a collection. Both read the same two labels — [`CONFIG_LABEL`] for the policy
+/// and [`ORIGIN_LABEL`] for the origin — so a caller that cannot push a selector
+/// to the apiserver still selects exactly the rows one would have.
+///
+/// Deliberately NOT `status.origin`, even though it carries the same value: the
+/// label is what the selector filters on, and the point of this function is that
+/// the two paths agree. `label_selector_and_matches_filter_agree` pins it.
+pub fn matches_filter(snap: &Snapshot, filter: &SnapshotListFilter) -> bool {
+    let label = |key: &str| {
+        snap.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(key))
+            .map(String::as_str)
+    };
+    if let Some(policy) = &filter.policy
+        && label(CONFIG_LABEL) != Some(policy.as_str())
+    {
+        return false;
+    }
+    if let Some(origin) = filter.origin
+        && label(ORIGIN_LABEL) != Some(origin.label_value())
+    {
+        return false;
+    }
+    true
+}
+
 /// Does this Snapshot belong to the filtered repository? Two paths, matching
 /// how the operator records the relationship:
 /// - discovered Snapshots carry the repository UID as a dedup label;
@@ -324,6 +378,128 @@ spec: {}
         assert_eq!(
             sort_key(&pending),
             Utc.with_ymd_and_hms(2026, 6, 10, 0, 0, 0).unwrap()
+        );
+    }
+
+    /// The two halves of one query must select the same rows. `label_selector`
+    /// goes to the apiserver; `matches_filter` runs over an object a cache
+    /// already holds. A caller that cannot push the selector server-side (the
+    /// web UI in cache mode) has to get the same answer, so the agreement is
+    /// asserted rather than assumed.
+    #[test]
+    fn label_selector_and_matches_filter_agree() {
+        let labelled: Snapshot = from_yaml(
+            r#"
+metadata:
+  name: nightly-1
+  labels:
+    kopiur.home-operations.com/config: nightly
+    kopiur.home-operations.com/origin: scheduled
+spec: {}
+"#,
+        );
+        let other_policy: Snapshot = from_yaml(
+            r#"
+metadata:
+  name: weekly-1
+  labels:
+    kopiur.home-operations.com/config: weekly
+    kopiur.home-operations.com/origin: scheduled
+spec: {}
+"#,
+        );
+        let unlabelled: Snapshot = from_yaml(
+            r#"
+metadata: { name: found-1 }
+spec: {}
+"#,
+        );
+
+        // Every filter shape the CLI's flags can build, against every fixture.
+        let filters = [
+            SnapshotListFilter::default(),
+            SnapshotListFilter {
+                policy: Some("nightly".into()),
+                origin: None,
+            },
+            SnapshotListFilter {
+                policy: None,
+                origin: Some(Origin::Scheduled),
+            },
+            SnapshotListFilter {
+                policy: Some("nightly".into()),
+                origin: Some(Origin::Scheduled),
+            },
+            SnapshotListFilter {
+                policy: Some("nightly".into()),
+                origin: Some(Origin::Manual),
+            },
+        ];
+
+        for filter in &filters {
+            for snap in [&labelled, &other_policy, &unlabelled] {
+                let selector = label_selector(filter);
+                // What the apiserver would do with that selector, spelled out:
+                // every `k=v` term must be present on the object.
+                let server_side = selector.as_deref().is_none_or(|s| {
+                    s.split(',').all(|term| {
+                        let (k, v) = term.split_once('=').expect("terms are k=v");
+                        snap.metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|l| l.get(k))
+                            .map(String::as_str)
+                            == Some(v)
+                    })
+                });
+                assert_eq!(
+                    matches_filter(snap, filter),
+                    server_side,
+                    "client-side and server-side disagree for {:?} on {:?}",
+                    filter,
+                    snap.metadata.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn policy_of_prefers_the_spec_reference_over_the_label() {
+        // The two disagree only mid-adoption, when the controller has rewritten
+        // the label but the user's spec still says what they asked for.
+        let both: Snapshot = from_yaml(
+            r#"
+metadata:
+  name: adopted-1
+  labels:
+    kopiur.home-operations.com/config: relabelled
+spec:
+  policyRef: { name: as-written }
+"#,
+        );
+        assert_eq!(policy_of(&both), Some("as-written"));
+
+        let label_only: Snapshot = from_yaml(
+            r#"
+metadata:
+  name: adopted-2
+  labels:
+    kopiur.home-operations.com/config: nightly
+spec: {}
+"#,
+        );
+        assert_eq!(policy_of(&label_only), Some("nightly"));
+
+        let neither: Snapshot = from_yaml(
+            r#"
+metadata: { name: found-1 }
+spec: {}
+"#,
+        );
+        assert_eq!(
+            policy_of(&neither),
+            None,
+            "a discovered snapshot no policy claims has no policy to show"
         );
     }
 }

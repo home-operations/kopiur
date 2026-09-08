@@ -30,7 +30,10 @@ use kopiur_api::gates::GateScope;
 use kopiur_api::retention::{SnapshotLike, select_kept};
 use kopiur_api::snapshot::repository_ref_for;
 use kopiur_api::{Origin, Snapshot, SnapshotPhase, SnapshotPolicy};
-use kopiur_ops::snapshots::{RepoFilter, matches_repository, resolve_repo_filter_for, sort_key};
+use kopiur_ops::snapshots::{
+    RepoFilter, SnapshotListFilter, matches_filter, matches_repository, policy_of,
+    resolve_repo_filter_for, sort_key,
+};
 use kopiur_ui_model::views::{
     FailureView, Lineage, Page, RetentionPreview, SnapshotDetail, SnapshotRefView, SnapshotRow,
     SnapshotStatsView,
@@ -95,19 +98,32 @@ pub struct SnapshotQuery {
     pub limit: Option<usize>,
 }
 
-/// The label-and-field filters [`filter_rows`] applies, already parsed.
+/// The filters [`filter_rows`] applies, already parsed.
 ///
 /// Separate from [`SnapshotQuery`] because parsing can fail with a 400 and
 /// filtering cannot — once this exists, every remaining decision is total.
+///
+/// # Why the label filters are applied client-side
+///
+/// `labels` is exactly the `kopiur_ops::SnapshotListFilter` the CLI builds from
+/// `--policy`/`--origin`, and the CLI hands it to the apiserver as a label
+/// selector. This API cannot: reads go through [`crate::cache::Source`], whose
+/// cache arm answers from reflector stores that hold whole kinds and have no
+/// selector to push anywhere. So the same filter is evaluated here instead, by
+/// [`matches_filter`] — the client-side twin of `label_selector`, which reads
+/// the same two labels, with a test in `kopiur_ops` pinning the two against each
+/// other. The alternative, re-deriving "is this the right policy?" locally, is
+/// what let this endpoint filter origin on `status.origin` while the CLI
+/// filtered it on the label.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedFilter {
-    /// The resolved repository, when one was named.
+    /// The resolved repository, when one was named. Not a label filter: a
+    /// produced snapshot records its repository in status, not in a label.
     pub repository: Option<RepoFilter>,
-    /// The policy name to match.
-    pub policy: Option<String>,
-    /// The origin to match.
-    pub origin: Option<Origin>,
-    /// The phase to match.
+    /// The policy and origin, in the shared ops type.
+    pub labels: SnapshotListFilter,
+    /// The phase to match. Not a label filter either — the phase lives in
+    /// status, so the CLI cannot select on it server-side and neither can this.
     pub phase: Option<PhaseFilter>,
 }
 
@@ -168,20 +184,6 @@ fn phase_matches(snap: &Snapshot, filter: &PhaseFilter) -> bool {
     }
 }
 
-/// **Pure.** The `SnapshotPolicy` a snapshot belongs to.
-///
-/// The config label is authoritative — it is what the operator's own retention
-/// and adoption passes join on — and `spec.policyRef` is the fallback for a CR
-/// the controller has not labelled yet.
-pub fn policy_of(snap: &Snapshot) -> Option<String> {
-    snap.metadata
-        .labels
-        .as_ref()
-        .and_then(|l| l.get(CONFIG_LABEL))
-        .cloned()
-        .or_else(|| snap.spec.policy_ref.as_ref().map(|p| p.name.clone()))
-}
-
 /// **Pure.** Apply every parsed filter, newest run first.
 pub fn filter_rows(snapshots: &[Arc<Snapshot>], filter: &ParsedFilter) -> Vec<Arc<Snapshot>> {
     let mut kept: Vec<Arc<Snapshot>> = snapshots
@@ -192,17 +194,7 @@ pub fn filter_rows(snapshots: &[Arc<Snapshot>], filter: &ParsedFilter) -> Vec<Ar
                 .as_ref()
                 .is_none_or(|r| matches_repository(s, r))
         })
-        .filter(|s| {
-            filter
-                .policy
-                .as_ref()
-                .is_none_or(|p| policy_of(s).as_ref() == Some(p))
-        })
-        .filter(|s| {
-            filter
-                .origin
-                .is_none_or(|o| s.status.as_ref().and_then(|st| st.origin) == Some(o))
-        })
+        .filter(|s| matches_filter(s, &filter.labels))
         .filter(|s| filter.phase.as_ref().is_none_or(|p| phase_matches(s, p)))
         .cloned()
         .collect();
@@ -229,7 +221,7 @@ pub fn view_row(snap: &Snapshot) -> SnapshotRow {
             .and_then(|s| s.phase.as_ref())
             .map(snapshot_phase_view),
         origin: status.and_then(|s| s.origin).map(origin_view),
-        policy: policy_of(snap),
+        policy: policy_of(snap).map(str::to_string),
         repository: repository_ref_for(snap).map(|r| repo_ref_display(&r, Some(&namespace))),
         kopia_snapshot_id: info.map(|i| i.kopia_snapshot_id.clone()),
         identity: info.map(|i| kopiur_api::identity::identity_string(&i.identity)),
@@ -654,8 +646,12 @@ async fn parse_query(
 
     Ok(ParsedFilter {
         repository,
-        policy: q.policy.clone(),
-        origin,
+        // The same value `--policy`/`--origin` build, so `matches_filter` and
+        // the CLI's `label_selector` select the same rows.
+        labels: SnapshotListFilter {
+            policy: q.policy.clone(),
+            origin,
+        },
         phase,
     })
 }
@@ -719,7 +715,7 @@ async fn detail(
     let policy_name = policy.metadata.name.clone().unwrap_or_default();
     let peers: Vec<Arc<Snapshot>> = siblings
         .iter()
-        .filter(|s| policy_of(s).as_deref() == Some(policy_name.as_str()))
+        .filter(|s| policy_of(s) == Some(policy_name.as_str()))
         .cloned()
         .collect();
 
@@ -823,6 +819,11 @@ mod tests {
         Arc::new(from_yaml(yaml))
     }
 
+    /// A snapshot as the operator actually produces one: BOTH the config and
+    /// origin labels (the operator mirrors `status.origin` onto the label) plus
+    /// the status. The label pair is what the CLI's server-side selector filters
+    /// on, so a fixture carrying only the status would not exercise the filter
+    /// the two front ends now share.
     fn nightly_run(name: &str, start: &str, phase: &str) -> Arc<Snapshot> {
         snapshot(&format!(
             r#"
@@ -831,7 +832,9 @@ kind: Snapshot
 metadata:
   name: {name}
   namespace: media
-  labels: {{ "kopiur.home-operations.com/config": nightly }}
+  labels:
+    "kopiur.home-operations.com/config": nightly
+    "kopiur.home-operations.com/origin": scheduled
 spec:
   policyRef: {{ name: nightly }}
 status:
@@ -890,37 +893,54 @@ status:
     }
 
     #[test]
-    fn the_policy_label_wins_over_the_spec_reference() {
-        // The controller relabels an adopted snapshot; the label is what its own
-        // retention pass joins on, so it is what the row must show.
-        let adopted = snapshot(
+    fn the_row_names_the_same_policy_the_cli_prints() {
+        // `policy_of` is `kopiur_ops`', shared with `kubectl kopiur snapshots`:
+        // the spec reference first, the config label second. This endpoint used
+        // to have the precedence the other way round, so one row could name two
+        // different policies depending on which front end drew it.
+        let both = snapshot(
             r#"
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
 metadata:
   name: adopted-1
   namespace: media
-  labels: { "kopiur.home-operations.com/config": nightly }
+  labels: { "kopiur.home-operations.com/config": relabelled }
 spec:
-  policyRef: { name: stale-name }
+  policyRef: { name: as-written }
 status: { phase: Discovered, origin: adopted }
 "#,
         );
-        assert_eq!(policy_of(&adopted).as_deref(), Some("nightly"));
+        assert_eq!(view_row(&both).policy.as_deref(), Some("as-written"));
 
-        let unlabelled = snapshot(
+        let label_only = snapshot(
             r#"
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
-metadata: { name: fresh, namespace: media }
-spec: { policyRef: { name: nightly } }
+metadata:
+  name: adopted-2
+  namespace: media
+  labels: { "kopiur.home-operations.com/config": nightly }
+spec: {}
+status: { phase: Discovered, origin: adopted }
 "#,
         );
         assert_eq!(
-            policy_of(&unlabelled).as_deref(),
+            view_row(&label_only).policy.as_deref(),
             Some("nightly"),
-            "before the controller labels it, the spec is all there is"
+            "an adopted row with no spec reference is named by its label"
         );
+
+        let neither = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata: { name: found-1, namespace: media }
+spec: {}
+status: { phase: Discovered, origin: discovered }
+"#,
+        );
+        assert_eq!(view_row(&neither).policy, None);
     }
 
     #[test]
@@ -1036,9 +1056,11 @@ status:
         let scoped = filter_rows(
             &all,
             &ParsedFilter {
-                policy: Some("nightly".into()),
+                labels: SnapshotListFilter {
+                    policy: Some("nightly".into()),
+                    origin: Some(Origin::Scheduled),
+                },
                 phase: Some(PhaseFilter::Exactly(SnapshotPhase::Succeeded)),
-                origin: Some(Origin::Scheduled),
                 ..Default::default()
             },
         );
