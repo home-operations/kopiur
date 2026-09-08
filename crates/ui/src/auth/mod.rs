@@ -374,6 +374,7 @@ mod tests {
                 ttl: Duration::from_secs(600),
             },
             sar_ttl: Duration::from_secs(60),
+            sar_cache_size: crate::config::DEFAULT_SAR_CACHE_SIZE,
             tls: None,
             cors_origins: Vec::new(),
         }

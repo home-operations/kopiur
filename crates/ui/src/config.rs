@@ -220,6 +220,15 @@ pub const SAR_TTL_ENV: &str = "KOPIUR_UI_SAR_TTL";
 /// Default for [`SAR_TTL_ENV`].
 pub const DEFAULT_SAR_TTL: &str = "60s";
 
+/// How many `SubjectAccessReview` answers to retain. The decision cache is keyed
+/// by the whole identity, so without a bound a long-lived UI grows by one entry
+/// per (user, groups, extras, verb, resource, namespace, name) ever seen — a
+/// slow leak driven by how many people log in, not by how much they do.
+pub const SAR_CACHE_SIZE_ENV: &str = "KOPIUR_UI_SAR_CACHE_SIZE";
+/// Default for [`SAR_CACHE_SIZE_ENV`]. Generous: an entry is a few hundred bytes
+/// and the point of the bound is to be finite, not tight.
+pub const DEFAULT_SAR_CACHE_SIZE: usize = 4096;
+
 // --- TLS / CORS -------------------------------------------------------------
 
 /// PEM certificate chain for serving the app port over HTTPS. Optional: the
@@ -391,6 +400,10 @@ pub struct UiArgs {
     #[arg(long, env = SAR_TTL_ENV, default_value = DEFAULT_SAR_TTL)]
     pub sar_ttl: String,
 
+    /// How many SubjectAccessReview answers to retain.
+    #[arg(long, env = SAR_CACHE_SIZE_ENV, default_value_t = DEFAULT_SAR_CACHE_SIZE)]
+    pub sar_cache_size: usize,
+
     /// PEM certificate chain for serving the app port over HTTPS.
     #[arg(long, env = TLS_CERT_ENV)]
     pub tls_cert: Option<String>,
@@ -435,6 +448,8 @@ pub struct UiConfig {
     pub client_cache: CacheLimits,
     /// How long a `SubjectAccessReview` answer is reused.
     pub sar_ttl: Duration,
+    /// Maximum `SubjectAccessReview` answers retained across all identities.
+    pub sar_cache_size: usize,
     /// Serving certificate, when the UI terminates TLS itself.
     pub tls: Option<TlsPaths>,
     /// Cross-origin allowlist for `/api`. Empty in every production deployment.
@@ -889,6 +904,7 @@ impl UiArgs {
             snapshot_list_cap: self.snapshot_list_cap,
             client_cache,
             sar_ttl,
+            sar_cache_size: self.sar_cache_size,
             tls,
             cors_origins: csv(self.cors_origins.as_deref()),
         })
