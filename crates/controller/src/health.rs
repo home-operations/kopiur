@@ -262,6 +262,24 @@ pub struct EffectiveCreate {
     /// [`kopiur_mover::workspec::CreateBlock`] so its decline message is
     /// accurate. `None` exactly when `allowed` is true.
     pub block: Option<kopiur_mover::workspec::CreateBlock>,
+    /// `allowed` holds ONLY because of a valid, armed `allow-reinitialize` ack
+    /// (never on a first bootstrap). Carried to the mover as
+    /// [`kopiur_mover::workspec::BootstrapRepositoryOp::create_via_reinit_ack`]
+    /// and into [`kopiur_mover::bootstrap::CreateGrant::ReinitAck`], which
+    /// narrows the create arm to a `NotFound` whose stderr proves the storage
+    /// holds no repository — a plain `NotFound` (unbound mount, wrong prefix)
+    /// under an ack declines instead of creating (review wave 2, finding 1b).
+    /// `false` whenever `allowed` is false.
+    pub via_reinit_ack: bool,
+}
+
+impl EffectiveCreate {
+    /// The typed create permission the mover-side gate consumes. Total over the
+    /// two booleans this struct carries, so a caller cannot hand the gate a
+    /// `via_reinit_ack` create that was never allowed.
+    pub fn grant(self) -> kopiur_mover::bootstrap::CreateGrant {
+        kopiur_mover::bootstrap::CreateGrant::from_flags(self.allowed, self.via_reinit_ack)
+    }
 }
 
 /// Resolve [`EffectiveCreate`] from the gate and the phase-gated
@@ -304,7 +322,11 @@ pub struct EffectiveCreate {
 /// ```
 pub fn effective_create(gate: CreateGate, reinit_requested: bool) -> EffectiveCreate {
     use kopiur_mover::workspec::CreateBlock;
-    let allow = |allowed: bool, block: Option<CreateBlock>| EffectiveCreate { allowed, block };
+    let allow = |allowed: bool, block: Option<CreateBlock>| EffectiveCreate {
+        allowed,
+        block,
+        via_reinit_ack: false,
+    };
     match gate {
         CreateGate::Allowed {
             via_reinit_ack: false,
@@ -313,7 +335,11 @@ pub fn effective_create(gate: CreateGate, reinit_requested: bool) -> EffectiveCr
             via_reinit_ack: true,
         } => {
             if reinit_requested {
-                allow(true, None)
+                EffectiveCreate {
+                    allowed: true,
+                    block: None,
+                    via_reinit_ack: true,
+                }
             } else {
                 // Ready + a standing valid ack: dormant, not armed.
                 allow(
@@ -472,6 +498,110 @@ pub fn reinit_ack_mismatched(unique_id: Option<&str>, reinit_ack: Option<&str>) 
     ) {
         (Some(id), Some(ack)) => id != ack,
         _ => false,
+    }
+}
+
+/// Whether a VALID `allow-reinitialize` ack may act on THIS pass, judged from the
+/// repository's current parked verdict (review wave 2, finding 1a).
+///
+/// A valid ack plus `phase != Ready` used to be the whole test, and that is one
+/// lock too few. The annotation is documented as safe to leave in a GitOps
+/// manifest, so it routinely outlives the wipe it acknowledged — and "not
+/// `Ready`" is true of EVERY excursion: a credential rotation gone wrong, a
+/// transient outage, an unbound NFS mount, a recreated-but-empty bucket. With
+/// the mover's `auto_create` taking the `Create` arm on any `NotFound`, an ack
+/// left in Git would silently re-initialize and re-pin over any of those. So the
+/// ack is a permission ONLY while kopiur has already OBSERVED "backend reachable,
+/// repository absent" for the pinned id, which is exactly one of two verdicts:
+///
+/// * the terminal park — `Ready`/`Bootstrapped` reason
+///   [`crate::consts::REPOSITORY_REINITIALIZE_BLOCKED_REASON`];
+/// * the breaker's — `BackendReachable` reason [`REPOSITORY_VANISHED_REASON`],
+///   the `Degraded` step under `onFailure: Degrade` before the park.
+///
+/// Anything else (an unreachable backend, a wrong password, a deadline, or no
+/// verdict at all) leaves the ack DORMANT and names the verdict that keeps it so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReinitAckArming {
+    /// kopiur has observed the wiped-repository verdict for this pin: a valid
+    /// ack re-initializes on the next pass off `Ready`.
+    Armed,
+    /// The current verdict is not that one. `reason` is what the `Ready`
+    /// condition says (or `"none"` when it says nothing yet), for the Warning
+    /// that tells the user why their annotation did nothing.
+    Dormant {
+        /// The `Ready` condition's reason, or `"none"`.
+        reason: String,
+    },
+}
+
+/// Classify the repository's current conditions for the re-initialize ack. Pure.
+pub fn reinit_ack_arming(conditions: &[Condition]) -> ReinitAckArming {
+    let reason_of = |type_: &str| {
+        conditions
+            .iter()
+            .find(|c| c.type_ == type_)
+            .map(|c| c.reason.as_str())
+    };
+    let blocked = |type_: &str| {
+        reason_of(type_) == Some(crate::consts::REPOSITORY_REINITIALIZE_BLOCKED_REASON)
+    };
+    if blocked(crate::consts::READY_CONDITION)
+        || blocked(REPOSITORY_BOOTSTRAPPED_CONDITION)
+        || reason_of(BACKEND_REACHABLE_CONDITION) == Some(REPOSITORY_VANISHED_REASON)
+    {
+        return ReinitAckArming::Armed;
+    }
+    ReinitAckArming::Dormant {
+        reason: reason_of(crate::consts::READY_CONDITION)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("none")
+            .to_string(),
+    }
+}
+
+/// "The human asked for a deliberate re-initialize, this repository is not
+/// currently healthy, AND kopiur has already seen the backend empty for this
+/// pin." The single predicate every gate site computes `reinit_requested` from,
+/// so the two locks — phase and verdict — can never be applied at one site and
+/// forgotten at another. Pure.
+///
+/// `ack_valid` is `valid_reinit_ack(..).is_some()` — the ack equals the pinned
+/// `status.uniqueId`. The `!phase_is_ready` half is the review's C1 (a standing
+/// ack on a healthy repository must never arm a probe); the arming half is wave
+/// 2's finding 1a.
+pub fn reinit_requested(phase_is_ready: bool, ack_valid: bool, arming: &ReinitAckArming) -> bool {
+    !phase_is_ready
+        && ack_valid
+        && match arming {
+            ReinitAckArming::Armed => true,
+            ReinitAckArming::Dormant { .. } => false,
+        }
+}
+
+/// Whether this pass should REPORT a valid-but-dormant ack (the
+/// `ReinitializeAckDormant` Warning): the ack matches the pin, the repository is
+/// off `Ready`, and the verdict is not the wiped-repository one. Returns the
+/// verdict reason to name. Pure.
+pub fn report_reinit_ack_dormant(
+    phase_is_ready: bool,
+    unique_id: Option<&str>,
+    reinit_ack: Option<&str>,
+    arming: &ReinitAckArming,
+) -> Option<String> {
+    let ack_valid = match (
+        unique_id.filter(|id| !id.is_empty()),
+        reinit_ack.filter(|a| !a.is_empty()),
+    ) {
+        (Some(id), Some(ack)) => id == ack,
+        _ => false,
+    };
+    if phase_is_ready || !ack_valid {
+        return None;
+    }
+    match arming {
+        ReinitAckArming::Armed => None,
+        ReinitAckArming::Dormant { reason } => Some(reason.clone()),
     }
 }
 
@@ -1659,14 +1789,16 @@ mod tests {
                     allowed: false,
                     block: Some(CreateBlock::OnceReadyPinned {
                         also_spec_disabled: false
-                    })
+                    }),
+                    via_reinit_ack: false,
                 }
             );
             assert_eq!(
                 effective_create(CreateGate::DisabledBySpec { also_pinned: false }, reinit),
                 EffectiveCreate {
                     allowed: false,
-                    block: Some(CreateBlock::SpecDisabled)
+                    block: Some(CreateBlock::SpecDisabled),
+                    via_reinit_ack: false,
                 }
             );
             assert_eq!(
@@ -1675,7 +1807,8 @@ mod tests {
                     allowed: false,
                     block: Some(CreateBlock::OnceReadyPinned {
                         also_spec_disabled: true
-                    })
+                    }),
+                    via_reinit_ack: false,
                 }
             );
         }
@@ -1722,6 +1855,151 @@ mod tests {
         // Alert keeps the phase `Ready` through every failure ⇒ reinit_requested
         // is always false ⇒ create stays shut.
         assert!(!effective_create(gate, false).allowed);
+    }
+
+    /// Review wave 2, finding 1a: the ack is armed ONLY by the wiped-repository
+    /// verdict — `Ready`/`Bootstrapped` = `RepositoryReinitializeBlocked` or the
+    /// breaker's `BackendReachable` = `RepositoryVanished`. Every other parked
+    /// reason (an unreachable backend, a wrong password, a deadline, an unbound
+    /// mount reported as a plain `NotFound`) leaves a standing GitOps ack
+    /// dormant, naming the reason that keeps it so.
+    #[test]
+    fn a_standing_ack_is_armed_only_by_the_wiped_repository_verdict() {
+        let cond = |type_: &str, reason: &str| Condition {
+            type_: type_.to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message: "x".to_string(),
+            last_transition_time: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ),
+            observed_generation: None,
+        };
+        let ready = crate::consts::READY_CONDITION;
+        let blocked = crate::consts::REPOSITORY_REINITIALIZE_BLOCKED_REASON;
+
+        // Armed: the terminal park, on either condition that carries it.
+        assert_eq!(
+            reinit_ack_arming(&[cond(ready, blocked)]),
+            ReinitAckArming::Armed
+        );
+        assert_eq!(
+            reinit_ack_arming(&[cond(REPOSITORY_BOOTSTRAPPED_CONDITION, blocked)]),
+            ReinitAckArming::Armed
+        );
+        // Armed: the breaker's vanish verdict (Degraded, before the park).
+        assert_eq!(
+            reinit_ack_arming(&[
+                cond(ready, BACKEND_UNREACHABLE_REASON),
+                cond(BACKEND_REACHABLE_CONDITION, REPOSITORY_VANISHED_REASON),
+            ]),
+            ReinitAckArming::Armed
+        );
+        // Dormant: every other verdict names itself.
+        for other in [
+            BACKEND_UNREACHABLE_REASON,
+            BOOTSTRAP_DEADLINE_EXCEEDED_REASON,
+            "AuthFailure",
+            "RepositoryUnavailable",
+        ] {
+            assert_eq!(
+                reinit_ack_arming(&[
+                    cond(ready, other),
+                    cond(BACKEND_REACHABLE_CONDITION, BACKEND_UNREACHABLE_REASON),
+                ]),
+                ReinitAckArming::Dormant {
+                    reason: other.to_string()
+                },
+                "{other}"
+            );
+        }
+        // Dormant: no verdict at all (a brand-new or hand-cleared status).
+        assert_eq!(
+            reinit_ack_arming(&[]),
+            ReinitAckArming::Dormant {
+                reason: "none".into()
+            }
+        );
+
+        // The single `reinit_requested` predicate: phase × ack × verdict.
+        let armed = ReinitAckArming::Armed;
+        let dormant = ReinitAckArming::Dormant {
+            reason: BACKEND_UNREACHABLE_REASON.into(),
+        };
+        for (ready, valid, arming, expect) in [
+            (false, true, &armed, true),
+            (false, true, &dormant, false), // finding 1a: the second lock
+            (true, true, &armed, false),    // review C1: the phase lock
+            (true, true, &dormant, false),
+            (false, false, &armed, false), // no/mismatched ack
+            (false, false, &dormant, false),
+            (true, false, &armed, false),
+            (true, false, &dormant, false),
+        ] {
+            assert_eq!(
+                reinit_requested(ready, valid, arming),
+                expect,
+                "ready={ready} valid={valid} arming={arming:?}"
+            );
+        }
+
+        // The Warning fires for exactly the dormant-with-valid-ack cell, and
+        // names the verdict.
+        assert_eq!(
+            report_reinit_ack_dormant(false, Some("U1"), Some("U1"), &dormant),
+            Some(BACKEND_UNREACHABLE_REASON.to_string())
+        );
+        assert_eq!(
+            report_reinit_ack_dormant(false, Some("U1"), Some("U1"), &armed),
+            None
+        );
+        assert_eq!(
+            report_reinit_ack_dormant(true, Some("U1"), Some("U1"), &dormant),
+            None,
+            "Ready: the ack is inert and silent, whatever the verdict"
+        );
+        assert_eq!(
+            report_reinit_ack_dormant(false, Some("U1"), Some("U2"), &dormant),
+            None,
+            "a MISMATCHED ack is the InvalidReinitializeAck Warning, not this one"
+        );
+        assert_eq!(
+            report_reinit_ack_dormant(false, None, Some("U1"), &dormant),
+            None
+        );
+    }
+
+    /// Finding 1b's controller half: `via_reinit_ack` rides with `allowed` only
+    /// on the acked-and-armed arm, and the typed grant the mover-side gate
+    /// consumes is derived from the pair — never from the raw gate.
+    #[test]
+    fn effective_create_marks_an_acked_create_and_grants_it_typed() {
+        use kopiur_mover::bootstrap::CreateGrant;
+        let acked = CreateGate::Allowed {
+            via_reinit_ack: true,
+        };
+        let armed = effective_create(acked, true);
+        assert!(armed.allowed && armed.via_reinit_ack);
+        assert_eq!(armed.grant(), CreateGrant::ReinitAck);
+
+        let first = effective_create(
+            CreateGate::Allowed {
+                via_reinit_ack: false,
+            },
+            false,
+        );
+        assert!(first.allowed && !first.via_reinit_ack);
+        assert_eq!(first.grant(), CreateGrant::Enabled);
+
+        for shut in [
+            effective_create(acked, false),
+            effective_create(CreateGate::PinnedOnceReady, true),
+            effective_create(CreateGate::DisabledBySpec { also_pinned: false }, true),
+            effective_create(CreateGate::DisabledBySpec { also_pinned: true }, false),
+        ] {
+            assert!(!shut.allowed && !shut.via_reinit_ack, "{shut:?}");
+            assert_eq!(shut.grant(), CreateGrant::Denied);
+        }
     }
 
     #[test]

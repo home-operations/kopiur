@@ -250,6 +250,19 @@ Three properties make the annotation safe to leave in a GitOps manifest:
   is present there is nothing to re-initialize; kopiur emits a
   `ReinitializeAckIgnoredRepositoryPresent` Normal event so you know the
   annotation was seen, and wipes nothing.
+- **It acts only on the verdict it was written for.** Leaving `Ready` is not
+  enough on its own: the ack is honored only while kopiur has *itself* observed
+  "backend reachable, repository absent" for the pinned id — a `Ready` reason of
+  `RepositoryReinitializeBlocked`, or the breaker's `BackendReachable` reason
+  `RepositoryVanished`. Any other excursion (an unreachable backend, a wrong
+  password, an unbound NFS mount or a wrong bucket prefix — both of which kopia
+  also reports as `NotFound` — a bootstrap deadline) leaves the annotation
+  **dormant** and raises a `ReinitializeAckDormant` Warning event naming the
+  current reason. Two independent locks back this: the controller only arms the
+  create for that verdict, and the mover, even when armed, creates only where
+  kopia's own stderr proves the storage holds no repository — a plain `NotFound`
+  declines with its real class. So an annotation left in Git after a successful
+  re-initialize cannot quietly re-create over a later, unrelated outage.
 
 kopiur never adds, rewrites, or removes this annotation — there is no "honored"
 stamp to keep in sync. Remove it whenever you like.

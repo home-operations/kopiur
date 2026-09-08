@@ -655,6 +655,14 @@ pub const INVALID_REINITIALIZE_ACK_REASON: &str = "InvalidReinitializeAck";
 /// user knows the ack was seen rather than silently ignored.
 pub const REINITIALIZE_ACK_IGNORED_REPOSITORY_PRESENT_REASON: &str =
     "ReinitializeAckIgnoredRepositoryPresent";
+/// Warning Event `reason` when a VALID [`ALLOW_REINITIALIZE_ANNOTATION`] is
+/// present on a repository that is NOT `Ready`, but whose parked verdict is not
+/// the wiped-repository one (`RepositoryReinitializeBlocked` / the breaker's
+/// `RepositoryVanished`) — an unreachable backend, a wrong password, a deadline,
+/// an unbound mount. The ack is DORMANT there by design (review wave 2, finding
+/// 1a: an ack left in a GitOps manifest must never re-initialize over a later,
+/// unrelated excursion), and this event names the verdict that keeps it so.
+pub const REINITIALIZE_ACK_DORMANT_REASON: &str = "ReinitializeAckDormant";
 
 /// The bootstrap Job annotation recording the `allow-reinitialize` ack value the
 /// launch was made with — the ack-side twin of

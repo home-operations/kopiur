@@ -517,6 +517,51 @@ pub enum BootstrapInitAction {
     Seed,
 }
 
+/// The create permission a bootstrap carries — WHY `create` is allowed, not
+/// just whether. Closed, so the create arm of [`bootstrap_init_action`] cannot
+/// treat the two grants alike (review wave 2, finding 1b).
+///
+/// The controller grants create for two very different reasons. On a FIRST
+/// bootstrap (`spec.create.enabled`, no pinned `uniqueId`) any miss the connect
+/// cannot explain is fair game: kopia's own `create` refuses to overwrite an
+/// existing repository, and there is no history to lose. Under a valid
+/// `allow-reinitialize` ack the situation is the opposite: the repository WAS
+/// once `Ready`, the ack says "the backend is empty, make a new one", and the
+/// one thing that must never happen is creating somewhere the ack did not mean —
+/// an unbound NFS mount, a wrong bucket prefix, a path that is simply not there.
+/// Those all classify `NotFound` too. So [`ReinitAck`](Self::ReinitAck) creates
+/// ONLY on a `NotFound` whose stderr carries kopia's "repository not initialized"
+/// (the backend answered, and holds no repository), and declines everything else
+/// with the connect's real class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateGrant {
+    /// Create is not permitted on this launch (spec opt-out, or a once-`Ready`
+    /// pin with no valid ack).
+    Denied,
+    /// The ordinary first-bootstrap permission (`spec.create.enabled` on a
+    /// never-bootstrapped repository).
+    Enabled,
+    /// Create is permitted ONLY because a valid, armed `allow-reinitialize` ack
+    /// is present. Narrower than [`Enabled`](Self::Enabled): see the type docs.
+    ReinitAck,
+}
+
+impl CreateGrant {
+    /// From the wire pair on
+    /// [`BootstrapRepositoryOp`](crate::workspec::BootstrapRepositoryOp)
+    /// (`auto_create`, `create_via_reinit_ack`). Total: a `via_reinit_ack` flag
+    /// with `auto_create: false` is meaningless and reads as `Denied`, so a
+    /// hand-edited work spec cannot conjure a permission the controller did not
+    /// grant.
+    pub fn from_flags(auto_create: bool, via_reinit_ack: bool) -> Self {
+        match (auto_create, via_reinit_ack) {
+            (false, _) => Self::Denied,
+            (true, false) => Self::Enabled,
+            (true, true) => Self::ReinitAck,
+        }
+    }
+}
+
 /// Decide how the first bootstrap connect is answered (issue #380). Pure, so
 /// the whole matrix is unit-tested without kopia.
 ///
@@ -551,61 +596,91 @@ pub enum BootstrapInitAction {
 ///    unclassified error — is [`Fail`](BootstrapInitAction::Fail): a seed is a
 ///    whole-repository copy, and the create fallback is deliberately NOT taken
 ///    behind it (falling back would produce the empty repository #380 is about).
-/// 4. Otherwise the pre-#380 create gate: `auto_create` ⇒
-///    [`Create`](BootstrapInitAction::Create), else
-///    [`Fail`](BootstrapInitAction::Fail). kopia's own `create` refuses to
-///    overwrite an existing repository, so this can never smash data.
+/// 4. Otherwise the create gate, exhaustive over [`CreateGrant`]:
+///    [`Enabled`](CreateGrant::Enabled) ⇒ [`Create`](BootstrapInitAction::Create)
+///    (the pre-#380 fallback; kopia's own `create` refuses to overwrite an
+///    existing repository, so this can never smash data);
+///    [`ReinitAck`](CreateGrant::ReinitAck) ⇒ `Create` ONLY on a `NotFound`
+///    with the "not initialized" proof, else [`Fail`](BootstrapInitAction::Fail)
+///    — the ack means "the backend is empty", and a plain `NotFound` (unbound
+///    mount, wrong prefix) is not that; [`Denied`](CreateGrant::Denied) ⇒ `Fail`.
 ///
 /// [`should_attempt_create`] is exactly this function's `Create` arm, kept as
 /// the narrow published predicate.
 ///
 /// ```
 /// use kopiur_kopia::KopiaErrorClass;
-/// use kopiur_mover::bootstrap::{BootstrapInitAction, bootstrap_init_action};
+/// use kopiur_mover::bootstrap::{BootstrapInitAction, CreateGrant, bootstrap_init_action};
 ///
+/// // An acked re-initialize creates only where the backend PROVED empty…
+/// assert_eq!(
+///     bootstrap_init_action(false, false, CreateGrant::ReinitAck, Some(KopiaErrorClass::NotFound), true),
+///     BootstrapInitAction::Create
+/// );
+/// // …and declines a plain NotFound (a missing mount is not a wiped repository).
+/// assert_eq!(
+///     bootstrap_init_action(false, false, CreateGrant::ReinitAck, Some(KopiaErrorClass::NotFound), false),
+///     BootstrapInitAction::Fail
+/// );
 /// // Connect succeeded, nothing to do.
 /// assert_eq!(
-///     bootstrap_init_action(false, false, true, None, false),
+///     bootstrap_init_action(false, false, CreateGrant::Enabled, None, false),
 ///     BootstrapInitAction::Proceed
 /// );
 /// // Connect succeeded, a seed is armed but not resuming: the documented no-op.
 /// assert_eq!(
-///     bootstrap_init_action(true, false, false, None, false),
+///     bootstrap_init_action(true, false, CreateGrant::Denied, None, false),
 ///     BootstrapInitAction::Proceed
 /// );
 /// // Connect succeeded and we are RESUMING an interrupted seed: run it anyway.
 /// assert_eq!(
-///     bootstrap_init_action(true, true, false, None, false),
+///     bootstrap_init_action(true, true, CreateGrant::Denied, None, false),
 ///     BootstrapInitAction::Seed
 /// );
 /// // No seed, create enabled, repo genuinely absent ⇒ create an empty one.
 /// assert_eq!(
-///     bootstrap_init_action(false, false, true, Some(KopiaErrorClass::NotFound), true),
+///     bootstrap_init_action(false, false, CreateGrant::Enabled, Some(KopiaErrorClass::NotFound), true),
 ///     BootstrapInitAction::Create
 /// );
 /// // Seed armed on the same miss ⇒ seed instead; create is never the fallback.
 /// assert_eq!(
-///     bootstrap_init_action(true, false, true, Some(KopiaErrorClass::NotFound), true),
+///     bootstrap_init_action(true, false, CreateGrant::Enabled, Some(KopiaErrorClass::NotFound), true),
 ///     BootstrapInitAction::Seed
 /// );
 /// // A NotFound that is a missing mount, not an empty backend ⇒ never touch it.
 /// assert_eq!(
-///     bootstrap_init_action(true, false, true, Some(KopiaErrorClass::NotFound), false),
+///     bootstrap_init_action(true, false, CreateGrant::Enabled, Some(KopiaErrorClass::NotFound), false),
 ///     BootstrapInitAction::Fail
 /// );
 /// // A repository we cannot open is never recreated and never seeded over.
 /// assert_eq!(
-///     bootstrap_init_action(true, true, true, Some(KopiaErrorClass::AuthFailure), true),
+///     bootstrap_init_action(true, true, CreateGrant::Enabled, Some(KopiaErrorClass::AuthFailure), true),
 ///     BootstrapInitAction::Fail
 /// );
 /// ```
 pub fn bootstrap_init_action(
     seed_armed: bool,
     resume: bool,
-    auto_create: bool,
+    grant: CreateGrant,
     connect_class: Option<KopiaErrorClass>,
     uninitialized: bool,
 ) -> BootstrapInitAction {
+    // The create arm, exhaustive over the grant. `ReinitAck` is the narrow one:
+    // the human said "the backend is empty" — creating anywhere that has not
+    // PROVED empty (kopia's own "not initialized" on stderr) would put a fresh
+    // repository on an unbound mount or under a wrong prefix, and then re-pin
+    // it as the real one. `proven_empty` is only ever true for a `NotFound`.
+    let create_or_fail = |proven_empty: bool| match grant {
+        CreateGrant::Enabled => BootstrapInitAction::Create,
+        CreateGrant::ReinitAck => {
+            if proven_empty {
+                BootstrapInitAction::Create
+            } else {
+                BootstrapInitAction::Fail
+            }
+        }
+        CreateGrant::Denied => BootstrapInitAction::Fail,
+    };
     let Some(class) = connect_class else {
         // The connect succeeded: the repository exists and opens. Only a
         // RESUMING seed has work to do against it.
@@ -633,10 +708,8 @@ pub fn bootstrap_init_action(
                 } else {
                     BootstrapInitAction::Fail
                 }
-            } else if auto_create {
-                BootstrapInitAction::Create
             } else {
-                BootstrapInitAction::Fail
+                create_or_fail(uninitialized)
             }
         }
         KopiaErrorClass::RepositoryUnavailable
@@ -645,13 +718,12 @@ pub fn bootstrap_init_action(
             // A seed never runs on an unclassified miss: the connect never got
             // far enough to prove anything about the backend, and a
             // whole-repository copy onto an unknown state is not a recoverable
-            // mistake.
+            // mistake. An acked re-initialize never creates here either — the
+            // backend has not answered "empty", so nothing is proven.
             if seed_armed {
                 BootstrapInitAction::Fail
-            } else if auto_create {
-                BootstrapInitAction::Create
             } else {
-                BootstrapInitAction::Fail
+                create_or_fail(false)
             }
         }
     }
@@ -1028,7 +1100,11 @@ impl BootstrapResult {
 /// Whether, after a failed connect, the mover should attempt `repository
 /// create`. Pure so it is unit-tested without kopia.
 ///
-/// Create is attempted only when `auto_create` is set AND the failure class does
+/// `uninitialized` is kopia's "repository not initialized" proof on the connect's
+/// stderr ([`kopiur_kopia::notfound_is_uninitialized`]); it gates ONLY the
+/// [`CreateGrant::ReinitAck`] arm and is ignored for [`CreateGrant::Enabled`].
+///
+/// Create is attempted only when the grant permits it AND the failure class does
 /// not indicate an *existing* repository or a problem that `create` cannot fix:
 /// - `AuthFailure` ⇒ a repo exists here that the password can't open — never
 ///   recreate (would risk a second repo / mask the real wrong-password error).
@@ -1045,24 +1121,29 @@ impl BootstrapResult {
 ///
 /// ```
 /// use kopiur_kopia::KopiaErrorClass;
-/// use kopiur_mover::bootstrap::should_attempt_create;
+/// use kopiur_mover::bootstrap::{CreateGrant, should_attempt_create};
 ///
 /// // Repo absent (or some other unclassified miss) + auto-create ⇒ create it.
-/// assert!(should_attempt_create(true, KopiaErrorClass::NotFound));
+/// assert!(should_attempt_create(CreateGrant::Enabled, KopiaErrorClass::NotFound, false));
 /// // An existing repo we can't open (wrong password) must never be recreated.
-/// assert!(!should_attempt_create(true, KopiaErrorClass::AuthFailure));
+/// assert!(!should_attempt_create(CreateGrant::Enabled, KopiaErrorClass::AuthFailure, false));
 /// // auto-create off ⇒ never create, whatever the class.
-/// assert!(!should_attempt_create(false, KopiaErrorClass::NotFound));
+/// assert!(!should_attempt_create(CreateGrant::Denied, KopiaErrorClass::NotFound, false));
+/// // An acked re-initialize needs the backend to have PROVED empty.
+/// assert!(should_attempt_create(CreateGrant::ReinitAck, KopiaErrorClass::NotFound, true));
+/// assert!(!should_attempt_create(CreateGrant::ReinitAck, KopiaErrorClass::NotFound, false));
 /// ```
-pub fn should_attempt_create(auto_create: bool, class: KopiaErrorClass) -> bool {
+pub fn should_attempt_create(
+    grant: CreateGrant,
+    class: KopiaErrorClass,
+    uninitialized: bool,
+) -> bool {
     // Delegates rather than restating the gate: [`bootstrap_init_action`] is the
     // single decision, and this is its `Create` arm. `seed_armed: false` (no
-    // seed is in play on this call, so `resume` is moot too), and
-    // `uninitialized` is then unread — it only ever selects between Seed and
-    // Fail. `Some(class)` because a create decision only arises from a FAILED
-    // connect.
+    // seed is in play on this call, so `resume` is moot too). `Some(class)`
+    // because a create decision only arises from a FAILED connect.
     matches!(
-        bootstrap_init_action(false, false, auto_create, Some(class), false),
+        bootstrap_init_action(false, false, grant, Some(class), uninitialized),
         BootstrapInitAction::Create
     )
 }
@@ -1121,7 +1202,13 @@ mod tests {
                     for uninit in [false, true] {
                         for resume in [false, true] {
                             assert_eq!(
-                                bootstrap_init_action(seed, resume, create, Some(class), uninit),
+                                bootstrap_init_action(
+                                    seed,
+                                    resume,
+                                    CreateGrant::from_flags(create, false),
+                                    Some(class),
+                                    uninit
+                                ),
                                 BootstrapInitAction::Fail,
                                 "{class:?} seed={seed} resume={resume} create={create} uninit={uninit}"
                             );
@@ -1139,24 +1226,48 @@ mod tests {
         // file or directory"), and only kopia's "repository not initialized"
         // proves the backend answered and is simply empty.
         assert_eq!(
-            bootstrap_init_action(true, false, false, Some(KopiaErrorClass::NotFound), true),
+            bootstrap_init_action(
+                true,
+                false,
+                CreateGrant::Denied,
+                Some(KopiaErrorClass::NotFound),
+                true
+            ),
             BootstrapInitAction::Seed
         );
         assert_eq!(
-            bootstrap_init_action(true, false, false, Some(KopiaErrorClass::NotFound), false),
+            bootstrap_init_action(
+                true,
+                false,
+                CreateGrant::Denied,
+                Some(KopiaErrorClass::NotFound),
+                false
+            ),
             BootstrapInitAction::Fail
         );
         // `auto_create` does not gate a seed either way — a seed is the
         // initialization the user explicitly asked for, not the create fallback.
         assert_eq!(
-            bootstrap_init_action(true, false, true, Some(KopiaErrorClass::NotFound), true),
+            bootstrap_init_action(
+                true,
+                false,
+                CreateGrant::Enabled,
+                Some(KopiaErrorClass::NotFound),
+                true
+            ),
             BootstrapInitAction::Seed
         );
         // A marker-bearing (resuming) seed over a backend that turns out to be
         // genuinely EMPTY still seeds from the start — the previous attempt died
         // before writing a format blob, or someone cleared it.
         assert_eq!(
-            bootstrap_init_action(true, true, false, Some(KopiaErrorClass::NotFound), true),
+            bootstrap_init_action(
+                true,
+                true,
+                CreateGrant::Denied,
+                Some(KopiaErrorClass::NotFound),
+                true
+            ),
             BootstrapInitAction::Seed
         );
     }
@@ -1172,7 +1283,7 @@ mod tests {
         for class in ALL_CLASSES {
             for resume in [false, true] {
                 assert_eq!(
-                    bootstrap_init_action(true, resume, true, Some(class), false),
+                    bootstrap_init_action(true, resume, CreateGrant::Enabled, Some(class), false),
                     BootstrapInitAction::Fail,
                     "no proof the backend is empty ⇒ neither create nor seed ({class:?}, resume={resume})"
                 );
@@ -1188,7 +1299,7 @@ mod tests {
                     BootstrapInitAction::Fail
                 };
                 assert_eq!(
-                    bootstrap_init_action(true, resume, true, Some(class), true),
+                    bootstrap_init_action(true, resume, CreateGrant::Enabled, Some(class), true),
                     expected,
                     "{class:?} resume={resume}"
                 );
@@ -1203,11 +1314,11 @@ mod tests {
         // attempt left a copy unfinished and the seed must actually run, or the
         // retry Readies partial history (issue #380).
         assert_eq!(
-            bootstrap_init_action(true, true, false, None, false),
+            bootstrap_init_action(true, true, CreateGrant::Denied, None, false),
             BootstrapInitAction::Seed
         );
         assert_eq!(
-            bootstrap_init_action(true, false, false, None, false),
+            bootstrap_init_action(true, false, CreateGrant::Denied, None, false),
             BootstrapInitAction::Proceed
         );
         // `resume` is meaningless without a seed armed, and must never invent
@@ -1215,7 +1326,13 @@ mod tests {
         for resume in [false, true] {
             for auto_create in [false, true] {
                 assert_eq!(
-                    bootstrap_init_action(false, resume, auto_create, None, false),
+                    bootstrap_init_action(
+                        false,
+                        resume,
+                        CreateGrant::from_flags(auto_create, false),
+                        None,
+                        false
+                    ),
                     BootstrapInitAction::Proceed,
                     "resume={resume} auto_create={auto_create}"
                 );
@@ -1231,7 +1348,7 @@ mod tests {
         for class in ALL_CLASSES {
             for uninit in [false, true] {
                 assert_ne!(
-                    bootstrap_init_action(true, true, true, Some(class), uninit),
+                    bootstrap_init_action(true, true, CreateGrant::Enabled, Some(class), uninit),
                     BootstrapInitAction::Create,
                     "{class:?} uninit={uninit}"
                 );
@@ -1244,7 +1361,7 @@ mod tests {
             KopiaErrorClass::PermissionDenied,
         ] {
             assert_eq!(
-                bootstrap_init_action(true, true, true, Some(class), true),
+                bootstrap_init_action(true, true, CreateGrant::Enabled, Some(class), true),
                 BootstrapInitAction::Fail,
                 "{class:?}"
             );
@@ -1280,11 +1397,16 @@ mod tests {
         for class in ALL_CLASSES {
             for create in [false, true] {
                 for uninit in [false, true] {
-                    let creates = bootstrap_init_action(false, false, create, Some(class), uninit)
-                        == BootstrapInitAction::Create;
+                    let creates = bootstrap_init_action(
+                        false,
+                        false,
+                        CreateGrant::from_flags(create, false),
+                        Some(class),
+                        uninit,
+                    ) == BootstrapInitAction::Create;
                     assert_eq!(
                         creates,
-                        should_attempt_create(create, class),
+                        should_attempt_create(CreateGrant::from_flags(create, false), class, false),
                         "{class:?} create={create} uninit={uninit}"
                     );
                 }
@@ -1524,19 +1646,104 @@ mod tests {
     #[test]
     fn create_blocked_on_auth_and_lock() {
         // An existing repo we can't open / is locked must never be recreated.
-        assert!(!should_attempt_create(true, KopiaErrorClass::AuthFailure));
-        assert!(!should_attempt_create(true, KopiaErrorClass::Locked));
+        assert!(!should_attempt_create(
+            CreateGrant::Enabled,
+            KopiaErrorClass::AuthFailure,
+            false
+        ));
+        assert!(!should_attempt_create(
+            CreateGrant::Enabled,
+            KopiaErrorClass::Locked,
+            false
+        ));
+    }
+
+    /// Review wave 2, finding 1b: under an acked re-initialize the create arm
+    /// needs the backend to have PROVED empty. A plain `NotFound` — an unbound
+    /// NFS mount, a wrong bucket prefix, a path that is not there — declines
+    /// with the connect's real class, exactly as it would with no ack at all;
+    /// only kopia's "repository not initialized" on stderr opens create. The
+    /// ordinary first-bootstrap grant is unchanged (kopia's own `create` is its
+    /// backstop), and `Denied` never creates.
+    #[test]
+    fn an_acked_create_needs_the_backend_to_prove_empty() {
+        for class in ALL_CLASSES {
+            for uninit in [false, true] {
+                let acked = bootstrap_init_action(
+                    false,
+                    false,
+                    CreateGrant::ReinitAck,
+                    Some(class),
+                    uninit,
+                );
+                let expect = if class == KopiaErrorClass::NotFound && uninit {
+                    BootstrapInitAction::Create
+                } else {
+                    BootstrapInitAction::Fail
+                };
+                assert_eq!(acked, expect, "ReinitAck {class:?} uninit={uninit}");
+                assert_eq!(
+                    should_attempt_create(CreateGrant::ReinitAck, class, uninit),
+                    expect == BootstrapInitAction::Create,
+                    "{class:?} uninit={uninit}"
+                );
+                // `Enabled` ignores the proof: it creates on every class the
+                // denylist does not name, proven-empty or not.
+                let enabled =
+                    bootstrap_init_action(false, false, CreateGrant::Enabled, Some(class), uninit);
+                assert_eq!(
+                    enabled,
+                    bootstrap_init_action(false, false, CreateGrant::Enabled, Some(class), !uninit),
+                    "Enabled must not read `uninitialized` ({class:?})"
+                );
+                // `Denied` never creates.
+                assert_ne!(
+                    bootstrap_init_action(false, false, CreateGrant::Denied, Some(class), uninit),
+                    BootstrapInitAction::Create
+                );
+            }
+        }
+        // A seed still wins over an acked create on a proven-empty backend.
+        assert_eq!(
+            bootstrap_init_action(
+                true,
+                false,
+                CreateGrant::ReinitAck,
+                Some(KopiaErrorClass::NotFound),
+                true
+            ),
+            BootstrapInitAction::Seed
+        );
+        // The wire pair maps totally; `via_reinit_ack` without `auto_create` is
+        // meaningless and reads as Denied.
+        assert_eq!(CreateGrant::from_flags(false, false), CreateGrant::Denied);
+        assert_eq!(CreateGrant::from_flags(false, true), CreateGrant::Denied);
+        assert_eq!(CreateGrant::from_flags(true, false), CreateGrant::Enabled);
+        assert_eq!(CreateGrant::from_flags(true, true), CreateGrant::ReinitAck);
     }
 
     #[test]
     fn create_attempted_for_absent_or_unknown_when_enabled() {
-        assert!(should_attempt_create(true, KopiaErrorClass::NotFound));
         assert!(should_attempt_create(
-            true,
-            KopiaErrorClass::RepositoryUnavailable
+            CreateGrant::Enabled,
+            KopiaErrorClass::NotFound,
+            false
         ));
-        assert!(should_attempt_create(true, KopiaErrorClass::Unknown));
-        assert!(should_attempt_create(true, KopiaErrorClass::SourceError));
+        assert!(should_attempt_create(
+            CreateGrant::Enabled,
+            KopiaErrorClass::RepositoryUnavailable,
+            false
+        ));
+        assert!(should_attempt_create(
+            CreateGrant::Enabled,
+            KopiaErrorClass::Unknown,
+            false
+        ));
+        assert!(should_attempt_create(
+            CreateGrant::Enabled,
+            KopiaErrorClass::SourceError,
+            false
+        ));
     }
 
     #[test]
@@ -1547,7 +1754,7 @@ mod tests {
             KopiaErrorClass::Unknown,
             KopiaErrorClass::RepositoryUnavailable,
         ] {
-            assert!(!should_attempt_create(false, class));
+            assert!(!should_attempt_create(CreateGrant::Denied, class, false));
         }
     }
 

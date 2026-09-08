@@ -29,8 +29,8 @@ use kopiur_kopia::{
 use tracing::{error, info, warn};
 
 use kopiur_mover::bootstrap::{
-    BootstrapInitAction, BootstrapResult, MAX_RETURNED_SNAPSHOTS, RESULT_CONFIGMAP_KEY,
-    SeedOutcome, bootstrap_init_action,
+    BootstrapInitAction, BootstrapResult, CreateGrant, MAX_RETURNED_SNAPSHOTS,
+    RESULT_CONFIGMAP_KEY, SeedOutcome, bootstrap_init_action,
 };
 use kopiur_mover::cli::{MoverCli, MoverCommand};
 use kopiur_mover::credentials;
@@ -2140,7 +2140,9 @@ async fn bootstrap_connect_probe(
     let action = bootstrap_init_action(
         op.seed.is_some(),
         op.seed.as_ref().is_some_and(|s| s.resume),
-        op.auto_create,
+        // The typed grant: an acked re-initialize creates ONLY on a proven-empty
+        // backend (wave 2, finding 1b); the wire pair is folded here, once.
+        CreateGrant::from_flags(op.auto_create, op.create_via_reinit_ack),
         err.as_ref().map(KopiaError::class),
         uninitialized,
     );
@@ -3842,6 +3844,7 @@ mod tests {
             auto_create: false,
             create_block,
             pinned_unique_id: pinned_unique_id.map(str::to_string),
+            create_via_reinit_ack: false,
             scan_catalog: true,
             probe_only: false,
             create_options: Default::default(),
@@ -3955,6 +3958,70 @@ mod tests {
                 "U1",
                 false,
             )
+        );
+    }
+
+    /// Review wave 2, finding 1b — the mover's half of the second lock. The
+    /// controller granted create via a valid ack, and the connect came back a
+    /// PLAIN `NotFound` (an unbound mount, a wrong prefix — no "repository not
+    /// initialized" on stderr). That is not the wiped backend the ack meant, so
+    /// the init decision is `Fail`, and the decline carries the connect's REAL
+    /// class rather than creating, and rather than the re-initialize hint (the
+    /// hint is for a proven-empty backend with NO ack).
+    #[test]
+    fn an_acked_create_declines_a_plain_not_found_with_its_real_class() {
+        let mut op = declined_op(None, Some("U1"));
+        op.auto_create = true;
+        op.create_via_reinit_ack = true;
+        let plain = KopiaError::NonZeroExit {
+            args: "repository connect filesystem".to_string(),
+            code: Some(1),
+            class: KopiaErrorClass::NotFound,
+            stderr_tail: "ERROR open /repo/kopia.repository: no such file or directory".to_string(),
+        };
+        let uninitialized = plain
+            .stderr_tail()
+            .is_some_and(kopiur_kopia::notfound_is_uninitialized);
+        assert!(
+            !uninitialized,
+            "a missing path must not read as an empty backend"
+        );
+
+        assert_eq!(
+            bootstrap_init_action(
+                op.seed.is_some(),
+                false,
+                CreateGrant::from_flags(op.auto_create, op.create_via_reinit_ack),
+                Some(plain.class()),
+                uninitialized,
+            ),
+            BootstrapInitAction::Fail
+        );
+        let declined = bootstrap_declined(
+            &op,
+            &target("Repository", "nas", "billing"),
+            &plain,
+            uninitialized,
+        );
+        assert_eq!(
+            failure_class(&declined),
+            KopiaErrorClass::NotFound.to_string()
+        );
+        assert_ne!(
+            failure_class(&declined),
+            kopiur_mover::bootstrap::REPOSITORY_REINITIALIZE_BLOCKED_CLASS
+        );
+
+        // The SAME op against a backend that PROVED empty is the create arm.
+        assert_eq!(
+            bootstrap_init_action(
+                false,
+                false,
+                CreateGrant::from_flags(op.auto_create, op.create_via_reinit_ack),
+                Some(KopiaErrorClass::NotFound),
+                true,
+            ),
+            BootstrapInitAction::Create
         );
     }
 

@@ -204,8 +204,32 @@ pub fn reinitialize_ack_ignored_message(kind: &str, unique_id: &str) -> String {
 /// worth reporting again only once the repository is in a state where an ack
 /// could do something.
 ///
+/// The `ReinitializeAckDormant` Warning message (review wave 2, finding 1a):
+/// the ack is valid and the repository is off `Ready`, but the parked verdict is
+/// not the wiped-repository one, so the ack does nothing — and says why. Pure;
+/// volatile-free.
+pub fn reinitialize_ack_dormant_message(kind: &str, unique_id: &str, verdict: &str) -> String {
+    let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
+    format!(
+        "The `{annotation}` annotation matches this {kind}'s pinned status.uniqueId \
+         (`{unique_id}`), but it is DORMANT: kopiur re-initializes only after it has itself \
+         observed \"backend reachable, repository absent\" for this id (Ready reason \
+         `RepositoryReinitializeBlocked`, or BackendReachable reason `RepositoryVanished`). \
+         The current Ready reason is `{verdict}`, which is not that — an unreachable backend, \
+         a credential or mount problem, or a deadline is not a wiped repository, and \
+         creating a fresh one there would re-pin the wrong storage. Fix that cause first; if \
+         the repository then turns out to be genuinely gone, kopiur parks at \
+         RepositoryReinitializeBlocked and this annotation takes effect on its own."
+    )
+}
+
 /// Both references omit `resourceVersion` ([`event_ref`]), so the Recorder
 /// aggregates the repeats a requeue produces into one series.
+///
+/// `arming` is the parked-verdict lock ([`crate::health::reinit_ack_arming`]):
+/// a VALID ack on a non-`Ready` repository whose verdict is not the
+/// wiped-repository one is dormant, and — being exactly the state in which a
+/// user is waiting for it to act — gets a Warning naming the verdict.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_reinitialize_ack_diagnostics<K>(
     ctx: &Context,
@@ -216,6 +240,7 @@ pub async fn publish_reinitialize_ack_diagnostics<K>(
     phase_is_ready: bool,
     pinned_unique_id: Option<&str>,
     raw_ack: Option<&str>,
+    arming: &crate::health::ReinitAckArming,
 ) where
     K: Resource<DynamicType = ()>,
 {
@@ -230,6 +255,22 @@ pub async fn publish_reinitialize_ack_diagnostics<K>(
             crate::consts::INVALID_REINITIALIZE_ACK_REASON,
             crate::consts::ACKNOWLEDGE_REINITIALIZE_ACTION,
             &invalid_reinitialize_ack_message(kind, name, namespace, expected, ack),
+        )
+        .await;
+        return;
+    }
+    if let Some(verdict) = crate::health::report_reinit_ack_dormant(
+        phase_is_ready,
+        pinned_unique_id,
+        Some(ack),
+        arming,
+    ) {
+        publish_warning_event(
+            ctx,
+            obj,
+            crate::consts::REINITIALIZE_ACK_DORMANT_REASON,
+            crate::consts::ACKNOWLEDGE_REINITIALIZE_ACTION,
+            &reinitialize_ack_dormant_message(kind, ack, &verdict),
         )
         .await;
         return;

@@ -199,6 +199,12 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
         repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
         repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
         reinit_ack_raw(repo),
+        &health::reinit_ack_arming(
+            repo.status
+                .as_ref()
+                .map(|s| s.conditions.as_slice())
+                .unwrap_or_default(),
+        ),
     )
     .await;
 
@@ -257,21 +263,28 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 pinned_unique_id,
                 reinit_ack_raw(repo),
             );
-            // The `phase != Ready` half is load-bearing: on a healthy repository a
-            // standing ack must be a complete no-op, never a nudge that re-opens the
-            // backend on every reconcile — and (review C1) never a create permission.
+            // Two locks on the ack (`health::reinit_requested`): the phase — on a
+            // healthy repository a standing ack must be a complete no-op, never a
+            // nudge that re-opens the backend on every reconcile and (review C1)
+            // never a create permission — and the parked VERDICT: the ack acts only
+            // once kopiur has itself observed "backend reachable, repository absent"
+            // for this pin (wave 2, finding 1a), so an ack left in Git cannot
+            // re-initialize over a later unbound mount or a recreated empty path.
             let phase_is_ready = repo.status.as_ref().and_then(|s| s.phase.as_ref())
                 == Some(&RepositoryPhase::Ready);
-            let reinit_requested = !phase_is_ready
-                && matches!(
-                    create_gate,
-                    health::CreateGate::Allowed {
-                        via_reinit_ack: true
-                    }
-                );
+            let arming = health::reinit_ack_arming(
+                repo.status
+                    .as_ref()
+                    .map(|s| s.conditions.as_slice())
+                    .unwrap_or_default(),
+            );
+            let reinit_requested = health::reinit_requested(
+                phase_is_ready,
+                valid_reinit_ack(create_gate, pinned_unique_id).is_some(),
+                &arming,
+            );
             // Create permission is the PHASE-GATED decision, never the raw gate.
             let effective_create = health::effective_create(create_gate, reinit_requested);
-            let create_enabled = effective_create.allowed;
             if io::terminal_gate_holds(
                 repo.status.as_ref().and_then(|s| s.phase.as_ref()),
                 repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -317,27 +330,37 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                     repo.spec.create.as_ref(),
                 )
                 .to_kopia();
-                let outcome =
-                    if kopiur_mover::bootstrap::should_attempt_create(create_enabled, e.class()) {
-                        match client
-                            .repository_create(
-                                &spec,
-                                kopiur_kopia::CacheTuning::default(),
-                                &create_opts,
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                created = true;
-                                client
-                                    .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
-                                    .await
-                            }
-                            Err(ce) => Err(ce),
+                // The same typed grant + proven-empty check the mover applies
+                // (wave 2, finding 1b): an acked create needs kopia's "repository
+                // not initialized" on stderr, or a missing mount reported as a
+                // plain `NotFound` would be created over and re-pinned.
+                let uninitialized = e
+                    .stderr_tail()
+                    .is_some_and(kopiur_kopia::notfound_is_uninitialized);
+                let outcome = if kopiur_mover::bootstrap::should_attempt_create(
+                    effective_create.grant(),
+                    e.class(),
+                    uninitialized,
+                ) {
+                    match client
+                        .repository_create(
+                            &spec,
+                            kopiur_kopia::CacheTuning::default(),
+                            &create_opts,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            created = true;
+                            client
+                                .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
+                                .await
                         }
-                    } else {
-                        Err(e)
-                    };
+                        Err(ce) => Err(ce),
+                    }
+                } else {
+                    Err(e)
+                };
                 if let Err(e) = outcome {
                     let class = e.class();
                     let retryable = class.is_retryable();
@@ -1036,7 +1059,21 @@ async fn bootstrap_via_mover(
     // already false off-`Ready`, so the ack'd launch is naturally strict
     // (`probe_only = false`), which is what makes `finalize_bootstrap` pin the
     // NEW `result.unique_id` instead of keeping the old one.
-    let reinit_requested = !already_ready && launch_reinit_ack.is_some();
+    //
+    // Wave 2, finding 1a — the second lock: the ack acts only while the parked
+    // verdict is the wiped-repository one (`RepositoryReinitializeBlocked`, or
+    // the breaker's `RepositoryVanished`). `launch_reinit_ack` itself stays
+    // verdict-blind on purpose: it is the Job STAMP `stale_bootstrap_job`
+    // compares, and must keep matching a running acked Job after its launch
+    // rewrote the conditions.
+    let arming = health::reinit_ack_arming(
+        repo.status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or_default(),
+    );
+    let reinit_requested =
+        health::reinit_requested(already_ready, launch_reinit_ack.is_some(), &arming);
     // Create permission is the PHASE-GATED decision, never the raw gate. Reading
     // it off `create_gate` was review C1: a `Ready` repository with a standing
     // valid ack shipped `auto_create: true` on its ordinary probe, and a probe is
@@ -1466,6 +1503,7 @@ async fn bootstrap_via_mover(
         create_enabled,
         effective_create.block,
         pinned_unique_id.map(str::to_string),
+        effective_create.via_reinit_ack,
         true,
         // Probe-only (#414): a probe-style launch with no catalog work due
         // skips the O(snapshots) listing. A scan-token/refresh/spec-driven
@@ -1843,6 +1881,9 @@ fn bootstrap_work_spec(
     // disagree about which decline message a given gate produces.
     create_block: Option<kopiur_mover::workspec::CreateBlock>,
     pinned_unique_id: Option<String>,
+    // Wave 2, finding 1b: `auto_create` holds only because of an armed ack, so
+    // the mover narrows its create arm to a proven-empty backend.
+    create_via_reinit_ack: bool,
     scan_catalog: bool,
     // #414: this launch is a pure health probe (probe-style, no catalog work
     // due) — the mover skips the `kopia snapshot list` catalog step and
@@ -1886,6 +1927,7 @@ fn bootstrap_work_spec(
             auto_create,
             create_block,
             pinned_unique_id,
+            create_via_reinit_ack,
             scan_catalog,
             probe_only,
             // Create-time format knobs (encryption/splitter/hash/ECC) honored only
@@ -3161,6 +3203,7 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
                 true,
                 probe_only,
                 None,
@@ -3200,6 +3243,7 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
                 true,
                 false,
                 None,
@@ -3356,6 +3400,7 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
                 true,
                 false,
                 None,
@@ -3407,6 +3452,7 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
                 true,
                 false,
                 None,

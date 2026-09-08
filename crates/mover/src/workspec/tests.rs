@@ -417,6 +417,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             auto_create: true,
             create_block: None,
             pinned_unique_id: None,
+            create_via_reinit_ack: false,
             scan_catalog: true,
             probe_only: false,
             create_options: Default::default(),
@@ -507,6 +508,7 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
         auto_create: true,
         create_block: None,
         pinned_unique_id: None,
+        create_via_reinit_ack: false,
         scan_catalog: true,
         probe_only: false,
         create_options: Default::default(),
@@ -550,6 +552,7 @@ fn bootstrap_create_block_round_trips_and_defaults_off_for_old_work_specs() {
             also_spec_disabled: false,
         }),
         pinned_unique_id: Some("U1".into()),
+        create_via_reinit_ack: false,
         scan_catalog: true,
         probe_only: false,
         create_options: Default::default(),
@@ -608,6 +611,25 @@ fn bootstrap_create_block_round_trips_and_defaults_off_for_old_work_specs() {
     .unwrap();
     assert!(old.create_block.is_none());
     assert!(old.pinned_unique_id.is_none());
+    // …and no `createViaReinitAck` ⇒ the plain first-bootstrap grant (wave 2,
+    // finding 1b): an old controller never granted create via an ack.
+    assert!(!old.create_via_reinit_ack);
+
+    // The acked grant rides the wire only when set, so an ordinary bootstrap's
+    // payload is byte-identical to pre-wave-2 — and an old mover that has never
+    // heard of the key still parses what a new controller writes.
+    op.auto_create = true;
+    op.create_block = None;
+    op.create_via_reinit_ack = true;
+    let v = serde_json::to_value(&op).unwrap();
+    assert_eq!(v["createViaReinitAck"], true);
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        op
+    );
+    op.create_via_reinit_ack = false;
+    let v = serde_json::to_value(&op).unwrap();
+    assert!(v.get("createViaReinitAck").is_none(), "{v}");
 }
 
 #[test]
@@ -2747,6 +2769,7 @@ fn a_seeding_bootstrap_op_round_trips_and_elides_its_defaults() {
         auto_create: false,
         create_block: None,
         pinned_unique_id: None,
+        create_via_reinit_ack: false,
         scan_catalog: true,
         probe_only: false,
         create_options: Default::default(),

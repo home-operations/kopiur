@@ -661,6 +661,16 @@ pub struct BootstrapRepositoryOp {
     /// otherwise and on pre-#435 work specs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_unique_id: Option<String>,
+    /// `auto_create` is `true` ONLY because a valid, armed `allow-reinitialize`
+    /// ack is present (review wave 2, finding 1b). The mover folds the pair into
+    /// [`crate::bootstrap::CreateGrant::ReinitAck`], whose create arm additionally
+    /// requires kopia's "repository not initialized" on the connect's stderr —
+    /// so an ack left in a GitOps manifest can never turn an unbound mount or a
+    /// wrong prefix (both a plain `NotFound`) into a freshly created, re-pinned
+    /// repository. `false` on every ordinary bootstrap and on work specs written
+    /// by an older controller, where it reads as the plain first-bootstrap grant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_via_reinit_ack: bool,
     /// The stable kopia maintenance owner (`user@hostname`, derived from the
     /// managed lease — `kopiur_api::maintenance::kopia_owner_for_lease`) to
     /// stamp on a repository this bootstrap CREATES. Adopted repositories are

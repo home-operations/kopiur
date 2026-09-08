@@ -379,6 +379,12 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
         repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
         repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
         reinit_ack_raw(repo),
+        &health::reinit_ack_arming(
+            repo.status
+                .as_ref()
+                .map(|s| s.conditions.as_slice())
+                .unwrap_or_default(),
+        ),
     )
     .await;
 
@@ -427,17 +433,21 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             );
             let phase_is_ready = repo.status.as_ref().and_then(|s| s.phase.as_ref())
                 == Some(&RepositoryPhase::Ready);
-            let reinit_requested = !phase_is_ready
-                && matches!(
-                    create_gate,
-                    health::CreateGate::Allowed {
-                        via_reinit_ack: true
-                    }
-                );
+            // Two locks — phase and parked verdict — see the namespaced twin.
+            let arming = health::reinit_ack_arming(
+                repo.status
+                    .as_ref()
+                    .map(|s| s.conditions.as_slice())
+                    .unwrap_or_default(),
+            );
+            let reinit_requested = health::reinit_requested(
+                phase_is_ready,
+                crate::repository::valid_reinit_ack(create_gate, pinned_unique_id).is_some(),
+                &arming,
+            );
             // Create permission is the PHASE-GATED decision, never the raw gate
             // (review C1) — see the namespaced twin.
             let effective_create = health::effective_create(create_gate, reinit_requested);
-            let create_enabled = effective_create.allowed;
             if io::terminal_gate_holds(
                 repo.status.as_ref().and_then(|s| s.phase.as_ref()),
                 repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -471,26 +481,31 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                     repo.spec.create.as_ref(),
                 )
                 .to_kopia();
-                let outcome =
-                    if kopiur_mover::bootstrap::should_attempt_create(create_enabled, e.class()) {
-                        match client
-                            .repository_create(
-                                &spec,
-                                kopiur_kopia::CacheTuning::default(),
-                                &create_opts,
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                client
-                                    .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
-                                    .await
-                            }
-                            Err(ce) => Err(ce),
+                let outcome = if kopiur_mover::bootstrap::should_attempt_create(
+                    effective_create.grant(),
+                    e.class(),
+                    // Wave 2, finding 1b — see the namespaced twin.
+                    e.stderr_tail()
+                        .is_some_and(kopiur_kopia::notfound_is_uninitialized),
+                ) {
+                    match client
+                        .repository_create(
+                            &spec,
+                            kopiur_kopia::CacheTuning::default(),
+                            &create_opts,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            client
+                                .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
+                                .await
                         }
-                    } else {
-                        Err(e)
-                    };
+                        Err(ce) => Err(ce),
+                    }
+                } else {
+                    Err(e)
+                };
                 if let Err(e) = outcome {
                     let class = e.class();
                     let retryable = class.is_retryable();
@@ -1101,7 +1116,16 @@ async fn bootstrap_cluster_via_mover(
         reinit_ack_raw(repo),
     );
     let launch_reinit_ack = crate::repository::valid_reinit_ack(create_gate, pinned_unique_id);
-    let reinit_requested = !already_ready && launch_reinit_ack.is_some();
+    // Two locks — phase and parked verdict (wave 2, finding 1a); the Job stamp
+    // `launch_reinit_ack` stays verdict-blind — see the namespaced twin.
+    let arming = health::reinit_ack_arming(
+        repo.status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or_default(),
+    );
+    let reinit_requested =
+        health::reinit_requested(already_ready, launch_reinit_ack.is_some(), &arming);
     // Create permission is the PHASE-GATED decision, never the raw gate (review
     // C1) — see the namespaced twin for the failure it prevents.
     let effective_create = health::effective_create(create_gate, reinit_requested);
@@ -1506,6 +1530,7 @@ async fn bootstrap_cluster_via_mover(
         create_enabled,
         effective_create.block,
         pinned_unique_id.map(str::to_string),
+        effective_create.via_reinit_ack,
         // Probe-only (#414): see the namespaced twin.
         probe_style_launch && !catalog_create_due,
         repo.spec.create.as_ref(),
@@ -1787,6 +1812,8 @@ fn cluster_bootstrap_work_spec(
     // twin.
     create_block: Option<kopiur_mover::workspec::CreateBlock>,
     pinned_unique_id: Option<String>,
+    // Wave 2, finding 1b — see the namespaced twin.
+    create_via_reinit_ack: bool,
     // #414: this launch is a pure health probe — see the namespaced twin.
     probe_only: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
@@ -1826,6 +1853,7 @@ fn cluster_bootstrap_work_spec(
             auto_create,
             create_block,
             pinned_unique_id,
+            create_via_reinit_ack,
             // The Job returns the snapshot listing so `finalize_cluster_bootstrap`
             // can materialize discovered Snapshots (placed per identity hostname —
             // see `crate::catalog`).
@@ -2831,6 +2859,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
                 None,
                 Default::default(),
                 None,
@@ -2903,6 +2932,7 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
                 false,
                 None,
                 Default::default(),
