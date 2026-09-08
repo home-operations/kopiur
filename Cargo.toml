@@ -7,6 +7,7 @@ members = [
     "crates/kopia",
     "crates/migrate",
     "crates/telemetry",
+    "crates/ui-model",
     "crates/webhook",
     "crates/controller",
     "crates/mover",
@@ -30,6 +31,7 @@ kopiur-migrate = { path = "crates/migrate" }
 kopiur-mover = { path = "crates/mover" }
 kopiur-ops = { path = "crates/ops" }
 kopiur-telemetry = { path = "crates/telemetry" }
+kopiur-ui-model = { path = "crates/ui-model" }
 
 # Kubernetes / controller-runtime
 kube = { version = "4.0", default-features = false }
@@ -40,6 +42,12 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# TypeScript bindings for the web UI wire types (`crates/ui-model`). `serde-compat`
+# makes ts-rs honor the serde attributes that already shape the JSON — `rename_all`,
+# externally-tagged enums, `skip_serializing_if` — so the generated `.ts` cannot drift
+# from what serde actually emits. NOT a JSON-schema pipeline: the SPA consumes these
+# `.ts` files directly.
+ts-rs = { version = "12", features = ["serde-compat"] }
 # kopia's `--root-ca-pem-base64` S3 flag takes the PEM base64-encoded on argv.
 base64 = "0.23"
 
