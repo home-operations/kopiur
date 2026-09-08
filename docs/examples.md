@@ -1,22 +1,28 @@
 # Examples
 
-A walkthrough of the manifests in [`deploy/examples/`](https://github.com/home-operations/kopiur/tree/main/deploy/examples). Each is a complete, apply-ready manifest; copy one, replace the `REPLACE_ME` secrets and PVC/bucket names, and `kubectl apply -f`.
+A walkthrough of the manifests in [`deploy/examples/`](https://github.com/home-operations/kopiur/tree/main/deploy/examples). Each one is a complete, apply-ready manifest. Copy one, replace the `REPLACE_ME` secrets and the PVC and bucket names, then `kubectl apply -f` it.
 
 /// tip | Looking for a whole workflow, not one capability?
 
-This page is a ladder of **per-capability** manifests. For end-to-end, problem-driven walkthroughs — protect a database, recover deleted data, disaster recovery, cross-cluster migration, adopting an existing repo, verification drills — see [**Scenarios**](scenarios/index.md). For the full install-to-restore journey with the reasoning behind every choice (S3 and NAS tracks, CLI included), see the [**Complete walkthrough**](walkthrough.md).
+This page is a ladder of **per-capability** manifests.
+
+For end-to-end, problem-driven walkthroughs, such as protecting a database, recovering deleted data, disaster recovery, cross-cluster migration, adopting an existing repository, or verification drills, see [**Scenarios**](scenarios/index.md).
+
+For the full install-to-restore journey with the reasoning behind every choice, covering S3 and NAS tracks with the CLI included, see the [**Complete walkthrough**](walkthrough.md).
 
 ///
 
 /// info | Single source
 
-The YAML below is pulled directly from the manifests in `deploy/examples/` at build time (MkDocs snippets), so the docs never drift from the files you actually apply. Each manifest carries its own inline comments.
+The YAML below is pulled straight from the manifests in `deploy/examples/` when the site is built, using MkDocs snippets, so the docs never drift from the files you actually apply. Each manifest carries its own inline comments.
 
 ///
 
 /// tip | The mental model
 
-Kopiur separates the backup **recipe** (`SnapshotPolicy`) from its **invocation** (`Snapshot`) from its **schedule** (`SnapshotSchedule`). A `SnapshotPolicy` runs nothing on its own — a `SnapshotSchedule` (cron) or a `Snapshot` (manual / external trigger) is what produces a snapshot. The [`Repository`](repositories.md) holds the storage, and [`Maintenance`](maintenance.md) reclaims it. You can apply a whole bundle at once; the operator resolves the ordering.
+Kopiur separates the backup **recipe** (`SnapshotPolicy`) from its **invocation** (`Snapshot`) from its **schedule** (`SnapshotSchedule`).
+
+A `SnapshotPolicy` runs nothing on its own. A `SnapshotSchedule` on a cron, or a `Snapshot` from a manual or external trigger, is what produces a snapshot. The [`Repository`](repositories.md) holds the storage, and [`Maintenance`](maintenance.md) reclaims it. You can apply a whole bundle at once, because the operator resolves the ordering.
 
 ///
 
@@ -45,13 +51,15 @@ Kopiur separates the backup **recipe** (`SnapshotPolicy`) from its **invocation*
 
 /// tip | Looking for a specific storage backend?
 
-Each backend (S3, Azure, GCS, B2, filesystem, SFTP, WebDAV, rclone) has its own dedicated page — provider prerequisites, the exact Secret shape, a field-by-field reference, and a complete apply-ready manifest — starting from the [Backend configuration](backends/index.md) index. The apply-ready manifests themselves live under [`deploy/examples/backends/`](https://github.com/home-operations/kopiur/tree/main/deploy/examples/backends). The numbered ladder below is the task/workflow tutorial.
+Each backend, so S3, Azure, GCS, B2, filesystem, SFTP, WebDAV and rclone, has its own page with provider prerequisites, the exact Secret shape, a field-by-field reference, and a complete apply-ready manifest. Start from the [Backend configuration](backends/index.md) index.
+
+The apply-ready manifests themselves live under [`deploy/examples/backends/`](https://github.com/home-operations/kopiur/tree/main/deploy/examples/backends). The numbered ladder below is the task and workflow tutorial.
 
 ///
 
 /// warning | Alpha
 
-These use API group `kopiur.home-operations.com`, version `v1alpha1`. Backends are **externally tagged** (the bucket lives under `backend.s3`, not `backend: { kind: S3 }`).
+These use API group `kopiur.home-operations.com`, version `v1alpha1`. Backends are **externally tagged**, so the bucket lives under `backend.s3`, not under `backend: { kind: S3 }`.
 
 ///
 
@@ -59,7 +67,7 @@ These use API group `kopiur.home-operations.com`, version `v1alpha1`. Backends a
 
 ## Example 01 — Single PVC, scheduled
 
-The canonical first backup: one `Repository` (S3), one `SnapshotPolicy` (the idempotent recipe), one `SnapshotSchedule` (the cron that creates `Snapshot` CRs). Maintenance is implicit — a default `Maintenance` is created for the repository unless you override or disable it.
+The canonical first backup: one `Repository` on S3, one `SnapshotPolicy` as the idempotent recipe, and one `SnapshotSchedule` as the cron that creates `Snapshot` objects. Maintenance is implicit: a default `Maintenance` is created for the repository unless you override or disable it.
 
 ```yaml
 --8<-- "deploy/examples/01-single-pvc-scheduled.yaml"
@@ -69,11 +77,11 @@ The canonical first backup: one `Repository` (S3), one `SnapshotPolicy` (the ide
 
 ## Example 02 — Shared platform repository
 
-A platform team owns a cluster-scoped `ClusterRepository`; tenant namespaces reference it without knowing the secret name or backend details. Per-consumer identity is templated at admission.
+A platform team owns a cluster-scoped `ClusterRepository`, and tenant namespaces reference it without knowing the secret name or the backend details. Per-consumer identity is templated at admission.
 
 /// note
 
-Requires the operator installed with `installScope=cluster`. Because `ClusterRepository` is cluster-scoped, its Secret references **must** carry an explicit `namespace` (webhook-enforced).
+This requires the operator installed with `installScope=cluster`. Because `ClusterRepository` is cluster-scoped, its Secret references **must** carry an explicit `namespace`, which the webhook enforces.
 
 ///
 
@@ -85,7 +93,7 @@ Requires the operator installed with `installScope=cluster`. Because `ClusterRep
 
 ## Example 03 — Restore by picking a Snapshot
 
-Browse the catalog, then reference a specific `Snapshot` CR. No timestamp math — restore is "pick a row". `source` and `target` are externally-tagged (`target.pvc` creates a PVC; `target.pvcRef` writes into an existing one).
+Browse the catalog, then reference a specific `Snapshot` object. There is no timestamp math: restore is "pick a row". `source` and `target` are single-key objects, where `target.pvc` creates a PVC and `target.pvcRef` writes into an existing one.
 
 ```console
 # list candidate snapshots for a policy, newest last:
@@ -102,7 +110,9 @@ $ kubectl get snapshots -n billing \
 
 ## Example 04 — Multi-PVC selector
 
-Back up every PVC matching a label as one consistent group (one `VolumeGroupSnapshot` across all matched PVCs). The selector expands to **one `Snapshot` per matched PVC**, each with its own kopia snapshot and its own retention bucket; `groupBy: None` captures them independently instead. A `Source` has mutually-exclusive `pvc` and `pvcSelector` (webhook-enforced).
+Back up every PVC matching a label as one consistent group, using one `VolumeGroupSnapshot` across all the matched PVCs.
+
+The selector expands to **one `Snapshot` per matched PVC**, each with its own kopia snapshot and its own retention bucket. `groupBy: None` captures them independently instead. A `Source` has mutually exclusive `pvc` and `pvcSelector` fields, which the webhook enforces.
 
 ```yaml
 --8<-- "deploy/examples/04-multi-pvc-selector.yaml"
@@ -112,11 +122,13 @@ Back up every PVC matching a label as one consistent group (one `VolumeGroupSnap
 
 ## Example 05 — Deploy-or-restore (GitOps)
 
-The headline GitOps pattern. Apply everything together: on a **fresh cluster against an existing repo**, the PVC restores the latest snapshot before the app starts; on a **fresh repo**, the PVC comes up empty and is backed up going forward. The trick is a **passive `Restore`** (`target.populator: {}`, `source.fromPolicy`, `onMissingSnapshot: Continue`) consumed by a PVC's `dataSourceRef` as a volume populator.
+The headline GitOps pattern. Apply everything together, and it behaves differently depending on what already exists. On a **fresh cluster against an existing repository**, the PVC restores the latest snapshot before the app starts. On a **fresh repository**, the PVC comes up empty and is backed up going forward.
+
+The trick is a **passive `Restore`**, with `target.populator: {}`, `source.fromPolicy` and `onMissingSnapshot: Continue`, consumed by a PVC's `dataSourceRef` as a volume populator.
 
 /// note
 
-The volume-populator handshake needs Kubernetes ≥ 1.24 (`AnyVolumeDataSource`).
+The volume-populator handshake needs Kubernetes 1.24 or later, for `AnyVolumeDataSource`.
 
 ///
 
@@ -128,7 +140,7 @@ The volume-populator handshake needs Kubernetes ≥ 1.24 (`AnyVolumeDataSource`)
 
 ## Example 06 — Manual one-shot backup
 
-A `Snapshot` CR is the universal trigger — created by a `SnapshotSchedule`, by `kubectl create`, or by any external system (Argo Events, Tekton, CI). The trigger is separable from the recipe. `deletionPolicy` is `Delete` (default for produced) | `Retain` | `Orphan`.
+A `Snapshot` object is the universal trigger. It can be created by a `SnapshotSchedule`, by `kubectl create`, or by any external system such as Argo Events, Tekton or CI. The trigger is separable from the recipe. `deletionPolicy` is `Delete`, the default for produced snapshots, `Retain`, or `Orphan`.
 
 ```yaml
 --8<-- "deploy/examples/06-manual-backup.yaml"
@@ -138,7 +150,9 @@ A `Snapshot` CR is the universal trigger — created by a `SnapshotSchedule`, by
 
 ## Example 07 — Restore a discovered backup
 
-Snapshots the operator did **not** produce (a foreign kopia writer, or snapshots predating the install) are materialized as `Snapshot` CRs with `origin=discovered` in the repository's namespace, forced to `deletionPolicy: Retain`. Restore one **(A)** by referencing the discovered `Snapshot` CR, or **(B)** by a raw kopia identity (which requires an explicit `spec.repository`).
+Snapshots the operator did **not** produce, whether written by a foreign kopia writer or predating the install, are materialized as `Snapshot` objects with `origin=discovered` in the repository's namespace, and forced to `deletionPolicy: Retain`.
+
+Restore one either **(A)** by referencing the discovered `Snapshot` object, or **(B)** by a raw kopia identity, which requires an explicit `spec.repository`.
 
 ```console
 # list discovered snapshots in the repo namespace:
@@ -153,7 +167,7 @@ $ kubectl get snapshots -n backups -l kopiur.home-operations.com/origin=discover
 
 ## Example 08 — Maintenance
 
-Maintenance is default-managed (see the [Maintenance guide](maintenance.md)), but you can author a standalone `Maintenance` for fine-grained control — a custom ownership identity or takeover policy. When a user-authored `Maintenance` references a repository, the operator defers to it and never creates a duplicate.
+Maintenance is managed by default; see the [Maintenance guide](maintenance.md). You can also write a standalone `Maintenance` for fine-grained control, such as a custom ownership identity or takeover policy. When a `Maintenance` you wrote references a repository, the operator defers to it and never creates a duplicate.
 
 ```yaml
 --8<-- "deploy/examples/08-maintenance.yaml"
@@ -163,7 +177,9 @@ Maintenance is default-managed (see the [Maintenance guide](maintenance.md)), bu
 
 ## Example 09 — Mover UID/GID & permissions
 
-The mover Job is a separate pod that mounts and reads your PVC, so it must run as a UID/GID that can read the data (and, on restore, write the target). This `SnapshotPolicy` sets `spec.mover.securityContext.runAsUser/runAsGroup` to match the owning user, and comments the root-mover variant for data you can't match. See the [Permissions guide](permissions.md) for how to find the right numbers.
+The mover Job is a separate pod that mounts and reads your PVC, so it must run as a UID and GID that can read the data, and on restore, write the target.
+
+This `SnapshotPolicy` sets `spec.mover.securityContext.runAsUser` and `runAsGroup` to match the owning user, and comments out the root-mover variant for data you cannot match. See the [Permissions guide](permissions.md) for how to find the right numbers.
 
 ```yaml
 --8<-- "deploy/examples/09-mover-permissions.yaml"
@@ -173,7 +189,9 @@ The mover Job is a separate pod that mounts and reads your PVC, so it must run a
 
 ## Example 10 — NFS source (no PVC)
 
-Back up a NAS export directly: `source.nfs` names an NFS `server` + `path` instead of a `pvc`, and the operator mounts the export read-only into the backup mover for kopia to snapshot — no `PersistentVolumeClaim`, no StorageClass. kopia records the export `path` as the snapshot source path by default (override with `sourcePathOverride`). An NFS source is mutually exclusive with `pvc`/`pvcSelector` (webhook-enforced) and works with **any** repository backend. The repository here is itself an [inline-NFS filesystem repo](backends/filesystem.md#inline-nfs-no-pvc), but that's independent of the source.
+Back up a NAS export directly. `source.nfs` names an NFS `server` and `path` instead of a `pvc`, and the operator mounts the export read-only into the backup mover for kopia to snapshot. There is no `PersistentVolumeClaim` and no StorageClass.
+
+Kopia records the export `path` as the snapshot source path by default; override it with `sourcePathOverride`. An NFS source is mutually exclusive with `pvc` and `pvcSelector`, which the webhook enforces, and it works with **any** repository backend. The repository here happens to be an [inline-NFS filesystem repository](backends/filesystem.md#inline-nfs-no-pvc), but that is independent of the source.
 
 ```yaml
 --8<-- "deploy/examples/10-nfs-source.yaml"
@@ -181,7 +199,11 @@ Back up a NAS export directly: `source.nfs` names an NFS `server` + `path` inste
 
 ## Example 11 — Credential projection
 
-A shared `ClusterRepository` keeps its credential Secret in the operator namespace, but movers run in workload namespaces and load creds via namespace-local `envFrom` — so normally you copy that Secret into every namespace yourself. Setting `credentialProjection.enabled: true` on the **`SnapshotPolicy`** (also available on `Restore`/`Maintenance`) opts out of that chore: before each run the operator projects the repository's Secret into the mover's namespace, owned by the consuming `Snapshot`/`Restore`/`Maintenance` (garbage-collected with it) and refreshed from source each run. It's **off by default** (cross-namespace copying is opt-in) but is the **recommended** path for a shared repository spanning several namespaces. It needs the operator's cluster-wide `secrets` create/patch RBAC (Helm `features.credentialProjection.enabled`, **off by default** — set it when you opt a consumer into projection); see [Movers, RBAC & credentials](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) for the security trade-off.
+A shared `ClusterRepository` keeps its credential Secret in the operator namespace, but movers run in workload namespaces and load credentials through `envFrom`, which only reads the local namespace. Normally you copy that Secret into every namespace yourself.
+
+Setting `credentialProjection.enabled: true` on the **`SnapshotPolicy`**, and it is also available on `Restore` and `Maintenance`, opts out of that chore. Before each run the operator projects the repository's Secret into the mover's namespace, owned by the consuming `Snapshot`, `Restore` or `Maintenance` so it is garbage-collected with it, and refreshed from source each run.
+
+It is **off by default**, because cross-namespace copying is opt-in, but it is the **recommended** path for a shared repository spanning several namespaces. It needs the operator's cluster-wide `secrets` create and patch RBAC, through the Helm flag `features.credentialProjection.enabled`, which is also **off by default**; set it when you opt a consumer into projection. See [Movers, RBAC & credentials](movers.md#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) for the security trade-off.
 
 ```yaml
 --8<-- "deploy/examples/11-credential-projection.yaml"
@@ -189,7 +211,11 @@ A shared `ClusterRepository` keeps its credential Secret in the operator namespa
 
 ## Example 12 — Restore mover, cache & failure policy
 
-A `Restore` writes data **into** a PVC, so it has the same mover concerns a backup does. `spec.mover` matches the UID/GID that should own the restored files (or `inheritSecurityContextFrom` copies it from a live workload pod — the two are mutually exclusive), `spec.mover.cache` sizes the kopia cache (`mode: Persistent` keeps a warm cache PVC across runs), and `spec.failurePolicy` sets the restore Job's `backoffLimit`/`activeDeadlineSeconds`. An elevated restore mover (root / `privilegedMode`) is gated by the same per-namespace `privileged-movers` opt-in a backup uses. See [Restores → Mover, cache & failure policy](restores.md#mover-cache--failure-policy) and [Permissions](permissions.md).
+A `Restore` writes data **into** a PVC, so it has the same mover concerns a backup does.
+
+`spec.mover` matches the UID and GID that should own the restored files, or `inheritSecurityContextFrom` copies that from a live workload pod; the two are mutually exclusive. `spec.mover.cache` sizes the kopia cache, and `mode: Persistent` keeps a warm cache PVC across runs. `spec.failurePolicy` sets the restore Job's `backoffLimit` and `activeDeadlineSeconds`.
+
+An elevated restore mover, whether root or `privilegedMode`, is gated by the same per-namespace `privileged-movers` opt-in a backup uses. See [Restores → Mover, cache & failure policy](restores.md#mover-cache--failure-policy) and [Permissions](permissions.md).
 
 ```yaml
 --8<-- "deploy/examples/12-restore-mover-cache.yaml"
@@ -197,7 +223,9 @@ A `Restore` writes data **into** a PVC, so it has the same mover concerns a back
 
 ## Example 13 — Restore by raw kopia identity
 
-No `Snapshot` CR to point at — a snapshot written by a foreign kopia client, or one that aged out of the catalog? Restore by the raw kopia identity (`username@hostname:path`). This mode **requires** an explicit `spec.repository` (there's nothing to infer it from). Pin an exact `snapshotID`, or select with `asOf` / `offset`.
+No `Snapshot` object to point at, because the snapshot was written by a foreign kopia client or aged out of the catalog? Restore by the raw kopia identity, `username@hostname:path`.
+
+This mode **requires** an explicit `spec.repository`, because there is nothing to infer it from. Pin an exact `snapshotID`, or select with `asOf` or `offset`.
 
 ```yaml
 --8<-- "deploy/examples/13-restore-by-identity.yaml"
@@ -205,7 +233,9 @@ No `Snapshot` CR to point at — a snapshot written by a foreign kopia client, o
 
 ## Example 14 — Point-in-time / offset restore
 
-"Roll back to Tuesday 2am" without hunting for the exact `Snapshot` CR. `source.fromPolicy` resolves through the `SnapshotPolicy`'s identity and takes `asOf` (newest snapshot at/before an instant) or `offset` (0 = latest, 1 = previous, …) — so it works even when the matching `Snapshot` CR has aged out. Restore into a side-by-side PVC and compare; see [scenario 07](scenarios/point-in-time-rollback.md).
+Roll back to Tuesday 2am without hunting for the exact `Snapshot` object.
+
+`source.fromPolicy` resolves through the `SnapshotPolicy`'s identity and takes `asOf`, the newest snapshot at or before an instant, or `offset`, where 0 is the latest and 1 the previous. It therefore works even when the matching `Snapshot` object has aged out. Restore into a side-by-side PVC and compare; see [scenario 07](scenarios/point-in-time-rollback.md).
 
 ```yaml
 --8<-- "deploy/examples/14-restore-point-in-time.yaml"
@@ -213,11 +243,13 @@ No `Snapshot` CR to point at — a snapshot written by a foreign kopia client, o
 
 ## Example 15 — In-place mirror restore
 
-Restore straight into an **existing** PVC (`target.pvcRef`) and make it an **exact mirror** of the snapshot with `options.enableFileDeletion: true` (files not in the snapshot are deleted). The faithful "put it back exactly how it was" restore — use it deliberately, and scale the app down first.
+Restore straight into an **existing** PVC, with `target.pvcRef`, and make it an **exact mirror** of the snapshot with `options.enableFileDeletion: true`, which deletes files that are not in the snapshot.
+
+This is the faithful "put it back exactly how it was" restore. Use it deliberately, and scale the app down first.
 
 /// warning | `enableFileDeletion` is destructive
 
-By default a restore is additive. `enableFileDeletion: true` deletes target files that aren't in the snapshot — point it at the wrong PVC and it wipes the extras. Scale the workload to zero so nothing writes the target mid-restore.
+By default a restore is additive. `enableFileDeletion: true` deletes target files that are not in the snapshot, so pointing it at the wrong PVC wipes the extras. Scale the workload to zero so nothing writes the target during the restore.
 
 ///
 
@@ -227,7 +259,9 @@ By default a restore is additive. `enableFileDeletion: true` deletes target file
 
 ## Example 16 — Cross-namespace clone restore
 
-Restore a snapshot taken in one namespace **into another** — e.g. clone production data into `staging` to reproduce a bug against real data. The `snapshotRef` carries the **source** namespace; the `Restore` and its target PVC live in the **destination**. The mover runs in the destination, so the repo credentials must be readable there (a shared `ClusterRepository` + `credentialProjection` handles that — example 17). See [scenario 08](scenarios/clone-app-to-namespace.md).
+Restore a snapshot taken in one namespace **into another**, for example to clone production data into `staging` and reproduce a bug against real data.
+
+The `snapshotRef` carries the **source** namespace, while the `Restore` and its target PVC live in the **destination**. The mover runs in the destination, so the repository credentials must be readable there. A shared `ClusterRepository` plus `credentialProjection` handles that, as example 17 shows. See [scenario 08](scenarios/clone-app-to-namespace.md).
 
 ```yaml
 --8<-- "deploy/examples/16-restore-cross-namespace.yaml"
@@ -235,7 +269,9 @@ Restore a snapshot taken in one namespace **into another** — e.g. clone produc
 
 ## Example 17 — Restore from a shared repo (projection)
 
-Restoring from a shared `ClusterRepository` into a namespace that has never run a backup hits a chicken-and-egg: the mover loads the repo creds from a Secret in **its** namespace, which isn't there yet. `credentialProjection.enabled: true` has the operator copy the repository's Secret into the mover's namespace for the run (owned by the `Restore`, GC'd with it). Needs the operator's Secret-projection RBAC (Helm `features.credentialProjection.enabled`).
+Restoring from a shared `ClusterRepository` into a namespace that has never run a backup hits a chicken-and-egg problem: the mover loads the repository credentials from a Secret in **its** namespace, which is not there yet.
+
+`credentialProjection.enabled: true` has the operator copy the repository's Secret into the mover's namespace for the run, owned by the `Restore` and garbage-collected with it. It needs the operator's Secret-projection RBAC, through the Helm flag `features.credentialProjection.enabled`.
 
 ```yaml
 --8<-- "deploy/examples/17-restore-shared-repo-projection.yaml"
@@ -243,7 +279,11 @@ Restoring from a shared `ClusterRepository` into a namespace that has never run 
 
 ## Example 18 — Inherit the mover security context from a workload
 
-Instead of hard-coding the mover's UID/GID (example 09), `spec.mover.inheritSecurityContextFrom` copies the `securityContext` from a live workload pod onto the mover, so it runs as "whatever the app runs as." On a **backup** the simplest form is `pvcConsumer: {}` — Kopiur auto-derives the pod mounting the source PVC; or name the workload by **label** with `workloadSelector` (required on a `Restore`, whose target consumer may not exist yet). Mutually exclusive with `securityContext`; an inherited *root* context is still gated by the `privileged-movers` opt-in. See [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload).
+Instead of hard-coding the mover's UID and GID, as example 09 does, `spec.mover.inheritSecurityContextFrom` copies the `securityContext` from a live workload pod onto the mover, so it runs as whatever the app runs as.
+
+On a **backup** the simplest form is `pvcConsumer: {}`, where Kopiur derives the pod mounting the source PVC. You can also name the workload by **label** with `workloadSelector`, which is required on a `Restore`, whose target consumer may not exist yet.
+
+It is mutually exclusive with `securityContext`, and an inherited *root* context is still gated by the `privileged-movers` opt-in. See [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload).
 
 ```yaml
 --8<-- "deploy/examples/18-inherit-security-context.yaml"
@@ -251,7 +291,9 @@ Instead of hard-coding the mover's UID/GID (example 09), `spec.mover.inheritSecu
 
 ## Example 19 — Repository replication
 
-Mirror a repository's blobs to a **second** backend on a schedule (`kopia repository sync-to`) — the off-site copy that makes a 3-2-1 strategy. A `RepositoryReplication` is namespaced, references its source via `sourceRef`, and writes to a `destination` backend that must differ from the source. The destination's own access credentials ride its `auth.secretRef` (co-resident in the CR's namespace); `sync-to` is a blob copy, so the mirror reuses the source repo's password. See [Repository replication](replication.md).
+Mirror a repository's blobs to a **second** backend on a schedule, with `kopia repository sync-to`. This is the off-site copy that makes a 3-2-1 strategy.
+
+A `RepositoryReplication` is namespaced, references its source through `sourceRef`, and writes to a `destination` backend that must differ from the source. The destination's own access credentials ride on its `auth.secretRef`, which lives in the same namespace as the object. `sync-to` is a blob copy, so the mirror reuses the source repository's password. See [Repository replication](replication.md).
 
 ```yaml
 --8<-- "deploy/examples/19-repository-replication.yaml"
@@ -259,7 +301,11 @@ Mirror a repository's blobs to a **second** backend on a schedule (`kopia reposi
 
 ## Example 20 — Quiesce with hooks
 
-App-consistent backups: `spec.hooks` runs commands **in the workload** (the controller execs into your pod — the mover never runs hooks) before and after the snapshot. Here PostgreSQL is put into backup mode (`beforeSnapshot` workloadExec), resumed afterwards, and a notifier is called (`httpRequest` with `continueOnFailure: true` so a flaky notifier can't fail the backup). The `runJob` form (a full one-shot Job, the k8up `PreBackupPod` analog) is shown in a comment. A failing hook **aborts** the backup unless that hook opts out; `afterSnapshot` hooks run whether the backup succeeded or failed, so a resume can't be skipped. See [Backups → hooks](backups.md#hooks--quiesce-the-app-around-the-snapshot).
+App-consistent backups. `spec.hooks` runs commands **in the workload**: the controller execs into your pod, and the mover never runs hooks. They run before and after the snapshot.
+
+Here PostgreSQL is put into backup mode with a `beforeSnapshot` workloadExec, resumed afterwards, and a notifier is called with an `httpRequest` carrying `continueOnFailure: true`, so a flaky notifier cannot fail the backup. The `runJob` form, a full one-shot Job and the k8up `PreBackupPod` equivalent, is shown in a comment.
+
+A failing hook **aborts** the backup unless that hook opts out. `afterSnapshot` hooks run whether the backup succeeded or failed, so a resume can never be skipped. See [Backups → hooks](backups.md#hooks--quiesce-the-app-around-the-snapshot).
 
 ```yaml
 --8<-- "deploy/examples/20-backup-with-hooks.yaml"

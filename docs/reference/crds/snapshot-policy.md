@@ -1,128 +1,77 @@
 # SnapshotPolicy
 
-The backup recipe — what to back up, identity, retention, policy, hooks. A
-`SnapshotPolicy` is idempotent and runs nothing on its own; a `Snapshot`
-invocation or a `SnapshotSchedule` drives it. For the terse type/default table see
-the [field reference](../../field-reference.md); for how-to guidance see
-[Backups & schedules](../../backups.md).
+A `SnapshotPolicy` is the backup recipe: what to back up, under which identity, how long to keep it, which kopia policy to use, and which hooks to run.
+
+A `SnapshotPolicy` is idempotent and runs nothing on its own. A `Snapshot` invocation or a `SnapshotSchedule` is what drives it.
+
+For the short type-and-default table see the [field reference](../../field-reference.md). For task guidance see [Backups & schedules](../../backups.md).
 
 ## `spec`
 
 ### `repository` / `repositories`
 
-Where the backups go — **exactly one of** the two fields is set (webhook- and
-CEL-enforced):
+Where the backups go. Set **exactly one** of the two fields. Both the webhook and an apiserver CEL rule enforce that.
 
-- `repository` — discriminated reference to one repository: a namespaced
-  `Repository` or a cluster-scoped `ClusterRepository`. The wire shape carries
-  a `kind` so the referent kind is explicit.
-- `repositories` — a list of **1–8 distinct** such refs for
-  [multi-repository fan-out](../../backups.md#repositories--one-recipe-several-repositories-fan-out):
-  every run backs each source up into **each** listed repository (one
-  `Snapshot` CR + one mover Job per (source, repository) pair — independent
-  captures, per-repo identity/retention/verification/cache). Duplicate entries
-  are refused, and `repositories` is mutually exclusive with `hooks` (the
-  quiesce contract cannot span N concurrent children — use a single-repo
-  policy plus a [`SnapshotReplication`](snapshot-replication.md) instead).
+- `repository` points at one repository. It carries a `kind`, so you always say whether you mean a namespaced `Repository` or a cluster-scoped `ClusterRepository`.
+- `repositories` is a list of **1 to 8 distinct** such references, used for [multi-repository fan-out](../../backups.md#repositories--one-recipe-several-repositories-fan-out). Every run backs each source up into **each** listed repository. You get one `Snapshot` object and one mover Job per source-and-repository pair, and each capture is independent, with its own identity, retention, verification and cache.
+
+Duplicate entries in `repositories` are refused. `repositories` is also mutually exclusive with `hooks`, because a quiesce window cannot span several concurrent children. Use a single-repository policy plus a [`SnapshotReplication`](snapshot-replication.md) instead.
 
 ### `identity`
 
-Identity overrides — what kopia records as `username@hostname:path`. Resolved at
-admission and pinned to `status.resolved.identity`, never re-rendered afterward.
-Leave it unset to take the operator's defaults.
+Overrides for what kopia records as `username@hostname:path`. Kopiur resolves the identity at admission and pins it to `status.resolved.identity`, and never re-renders it afterwards. Leave the field unset to take the operator's defaults.
 
 ### `sources`
 
-What to back up. At least one source is required (the webhook enforces it). Each
-entry is a single PVC by name, a label/namespace `pvcSelector` matching many PVCs,
-or an inline `nfs` export — exactly one of the three per source (also
-webhook-enforced). Both the `sourcePathOverride` and `sourcePathStrategy` siblings
-apply per source.
+What to back up. At least one source is required, and the webhook enforces that.
+
+Each entry is exactly one of three things: a single PVC by name, a `pvcSelector` matching many PVCs by label and namespace, or an inline `nfs` export. The webhook enforces that too. The `sourcePathOverride` and `sourcePathStrategy` siblings apply per source.
 
 Per-source fields:
 
-- `pvc` — a single `PersistentVolumeClaim` by name, in the policy's namespace.
-- `pvcSelector` — a Kubernetes `labelSelector` plus an optional `namespaceSelector`
-  (its `matchNames` restricts the search; absent means the policy's own namespace).
-- `nfs` — an inline NFS export backed up directly, with no PVC; mounted read-only.
-- `sourcePathOverride` — what kopia records as the source path. Defaults to
-  `/pvc/<name>` for a PVC, or the NFS export's `path` for an NFS source.
-- `sourcePathStrategy` — for `pvcSelector` sources only, how each matched PVC's
-  source path is derived: `PvcName` (default) uses the name alone;
-  `PvcNamespacedName` uses `<namespace>/<name>` to disambiguate same-named PVCs
-  across namespaces.
-- `readOnly` — mount the source read-only (default `true`; kopia only reads it).
-  Set `false` **only** to make `fsGroup` apply: the kubelet implements `fsGroup`
-  by recursively rewriting the volume's group ownership, and skips that rewrite
-  entirely on a read-only mount, so a mover's `fsGroup`/`fsGroupChangePolicy` is
-  otherwise inert here. Rejected at admission on an `nfs` source (the kubelet
-  never applies `fsGroup` to in-tree NFS volumes, so it cannot help) and when
-  `staging.accessModes` is `[ReadOnlyMany]` (a read-only stage cannot be mounted
-  read-write).
-- `acknowledgeLiveMutation` — required with `copyMethod: Direct` + `readOnly:
-  false`, the one combination that reaches the **live** volume: the kubelet will
-  recursively chgrp your running application's files to the mover's `fsGroup`
-  (`65532` by default) and make them group-writable, permanently. Under
-  `Snapshot`/`Clone` the rewrite lands on a throwaway staged PVC and no
-  acknowledgement is needed. Ignored where it is not needed, so switching
-  `copyMethod` is never a two-step edit. See
-  [Copy methods](../../copy-methods.md#making-fsgroup-apply-to-the-source).
+- `pvc` names a single `PersistentVolumeClaim` in the policy's namespace.
+- `pvcSelector` is a Kubernetes `labelSelector` plus an optional `namespaceSelector`. Its `matchNames` restricts the search; leaving it out searches the policy's own namespace.
+- `nfs` backs up an NFS export directly, with no PVC. Kopiur mounts it read-only.
+- `sourcePathOverride` sets what kopia records as the source path. It defaults to `/pvc/<name>` for a PVC, or to the NFS export's `path` for an NFS source.
+- `sourcePathStrategy` applies to `pvcSelector` sources only, and decides how each matched PVC's source path is derived. `PvcName`, the default, uses the name alone. `PvcNamespacedName` uses `<namespace>/<name>`, which disambiguates same-named PVCs across namespaces.
+- `readOnly` mounts the source read-only. It defaults to `true`, because kopia only reads the source. Set it `false` **only** to make `fsGroup` apply. The kubelet implements `fsGroup` by recursively rewriting the volume's group ownership, and it skips that rewrite entirely on a read-only mount, so a mover's `fsGroup` and `fsGroupChangePolicy` otherwise do nothing here. It is rejected at admission on an `nfs` source, because the kubelet never applies `fsGroup` to in-tree NFS volumes, and rejected when `staging.accessModes` is `[ReadOnlyMany]`, because a read-only stage cannot be mounted read-write.
+- `acknowledgeLiveMutation` is required with `copyMethod: Direct` plus `readOnly: false`, the one combination that reaches the **live** volume. In that combination the kubelet recursively changes the group of your running application's files to the mover's `fsGroup`, `65532` by default, and makes them group-writable, permanently. Under `Snapshot` or `Clone` the rewrite lands on a throwaway staged PVC and no acknowledgement is needed. The field is ignored where it is not needed, so switching `copyMethod` is never a two-step edit. See [Copy methods](../../copy-methods.md#making-fsgroup-apply-to-the-source).
 
 ### `copyMethod`
 
-How the source volume is captured before kopia reads it. `Snapshot` (the
-default) takes a point-in-time CSI volume snapshot, giving a crash-consistent
-capture decoupled from the app's node; it needs the CSI snapshot stack and a
-`VolumeSnapshotClass` for the source's driver. `Clone` takes a CSI volume
-clone, for drivers that support cloning but not snapshotting. Both stages are
-mounted per `sources[].readOnly` — read-only by default. `Direct` reads the live
-PVC with no intermediate snapshot or
-clone — it works on **any** storage with no CSI snapshot stack required, but
-gives no point-in-time guarantee (the mover co-locates on the volume's node
-for RWO); set it explicitly for non-CSI/static sources or clusters without the
-snapshot stack. See [Copy methods](../../copy-methods.md).
+How the source volume is captured before kopia reads it.
+
+`Snapshot` is the default. It takes a point-in-time CSI volume snapshot, which gives a crash-consistent capture that does not depend on the application's node. It needs the CSI snapshot stack and a `VolumeSnapshotClass` for the source's driver.
+
+`Clone` takes a CSI volume clone instead. Use it for drivers that support cloning but not snapshotting.
+
+Both stages are mounted according to `sources[].readOnly`, so read-only by default.
+
+`Direct` reads the live PVC with no intermediate snapshot or clone. It works on **any** storage and needs no CSI snapshot stack, but it gives no point-in-time guarantee. For a `ReadWriteOnce` volume the mover runs on the volume's node. Set `Direct` explicitly for non-CSI or static sources, or for clusters without the snapshot stack. See [Copy methods](../../copy-methods.md).
 
 ### `volumeSnapshotClassName`
 
 The `VolumeSnapshotClass` used when `copyMethod` is `Snapshot` or `Clone`.
 
-Absent **and empty** both mean the same thing: auto-select the default class for the
-source PVC's CSI driver. That matters when the field is templated — a Flux/Kustomize
-post-build substitution like `volumeSnapshotClassName: ${KOPIUR_SNAPSHOTCLASS}` renders
-empty whenever the variable is undefined, and is treated as unset rather than as a class
-whose name happens to be blank.
+Absent and empty mean the same thing: auto-select the default class for the source PVC's CSI driver. That matters when the field is templated. A Flux or Kustomize post-build substitution such as `volumeSnapshotClassName: ${KOPIUR_SNAPSHOTCLASS}` renders empty whenever the variable is undefined, and Kopiur treats that as unset rather than as a class whose name happens to be blank.
 
 ### `staging`
 
-Knobs for the CSI capture (`copyMethod: Snapshot`/`Clone`) that runs before the
-mover:
+Settings for the CSI capture that runs before the mover, so for `copyMethod: Snapshot` and `Clone`.
 
-- `timeout` — the staging deadline budget (Go-style duration, default `10m`,
-  `"0"` = wait indefinitely). Bounds the `VolumeSnapshot` becoming `readyToUse`
-  **and** — as a fresh budget — the staged PVC binding (the CSI restore/clone
-  window), both pre-Job on `Immediate` classes and while the mover Job runs on
-  `WaitForFirstConsumer` classes.
-- `storageClassName` — StorageClass for the **staged PVC** only (absent ⇒ copy
-  the source PVC's class). Must belong to the **same CSI driver** as the source;
-  a mismatch fails fast with `StagedClassMismatch`. Flagship use: a rook-ceph
-  CephFS class with `backingSnapshot: "true"` for a near-instant shallow
-  read-only mount instead of a minutes-long full subvolume clone.
-- `accessModes` — access modes for the staged PVC (absent ⇒ copy the source's);
-  a closed enum of the four Kubernetes modes. `[ReadOnlyMany]` pairs with
-  snapshot-backed read-only classes. The mover mounts the stage read-only
-  unless a source sets `readOnly: false`, which `[ReadOnlyMany]` is rejected
-  with (a read-only stage cannot be mounted read-write).
+- `timeout` is the staging deadline. Write it as a Go-style duration; the default is `10m`, and `"0"` waits indefinitely. It bounds the `VolumeSnapshot` becoming `readyToUse`, and then, as a fresh budget, the staged PVC binding, which is the CSI restore or clone window. On `Immediate` classes both happen before the Job; on `WaitForFirstConsumer` classes the binding happens while the mover Job runs.
+- `storageClassName` sets the StorageClass for the **staged PVC** only. Leave it out to copy the source PVC's class. It must belong to the **same CSI driver** as the source; a mismatch fails fast with `StagedClassMismatch`. The main use is a rook-ceph CephFS class with `backingSnapshot: "true"`, which gives a near-instant shallow read-only mount instead of a full subvolume clone that takes minutes.
+- `accessModes` sets the access modes for the staged PVC. Leave it out to copy the source's. It is a closed enum of the four Kubernetes modes. `[ReadOnlyMany]` pairs with snapshot-backed read-only classes. The mover mounts the stage read-only unless a source sets `readOnly: false`, and that combination is rejected with `[ReadOnlyMany]`, because a read-only stage cannot be mounted read-write.
 
-The two overrides need a staged PVC to act on, so they are **rejected at
-admission** for `copyMethod: Direct`, NFS sources, and `pvcSelector` sources. See
-[Copy methods → staging overrides](../../copy-methods.md#staging-overrides).
+Both overrides need a staged PVC to act on, so they are **rejected at admission** for `copyMethod: Direct`, for NFS sources, and for `pvcSelector` sources. See [Copy methods → staging overrides](../../copy-methods.md#staging-overrides).
 
 ### `groupBy`
 
-Multi-PVC consistency grouping. `VolumeGroupSnapshot` (the default for multi-PVC
-sources) takes one consistent group snapshot across all PVCs; `None` opts into
-independent per-PVC snapshots. `None` must be set **explicitly** — there is no
-silent per-PVC fallback, because that would produce inconsistent backups.
+Consistency grouping across several PVCs.
+
+`VolumeGroupSnapshot` is the default for multi-PVC sources. It takes one consistent group snapshot across all the PVCs. `None` opts into independent per-PVC snapshots.
+
+You must set `None` **explicitly**. There is no silent per-PVC fallback, because that would produce inconsistent backups.
 
 /// note | Single-PVC today
 
@@ -134,45 +83,29 @@ observable effect.
 
 ### `retention`
 
-GFS (grandfather-father-son) retention, enforced by the operator pruning the
-`Snapshot` CRs produced from this recipe. See [Backups & schedules](../../backups.md).
+Grandfather-father-son (GFS) retention. The operator enforces it by pruning the `Snapshot` objects this recipe produced. See [Backups & schedules](../../backups.md).
 
 ### `groupBy`
 
-Whether a [`pvcSelector`](#sources) expansion's PVCs are captured **together**.
+Whether the PVCs a [`pvcSelector`](#sources) expands to are captured **together**.
 
-`VolumeGroupSnapshot` (the default) takes one CSI `VolumeGroupSnapshot` across
-every matched PVC, so they share an instant — what you want for an application
-whose volumes must agree. `None` captures each independently.
+`VolumeGroupSnapshot`, the default, takes one CSI `VolumeGroupSnapshot` across every matched PVC, so they all share one instant. That is what you want for an application whose volumes must agree with each other. `None` captures each PVC independently.
 
-Group capture needs the `groupsnapshot.storage.k8s.io` API group
-(external-snapshotter 8.2+), a `VolumeGroupSnapshotClass` for your driver, a
-driver that advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`, and
-`installScope: cluster`. Kopiur fails with the missing piece named rather than
-downgrading to independent capture. See
-[copy methods](../../copy-methods.md#multi-pvc-and-consistency-groups).
+Group capture needs four things: the `groupsnapshot.storage.k8s.io` API group, from external-snapshotter 8.2 or later; a `VolumeGroupSnapshotClass` for your driver; a driver that advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`; and `installScope: cluster`. If a piece is missing, Kopiur fails and names it rather than quietly downgrading to independent capture. See [copy methods](../../copy-methods.md#multi-pvc-and-consistency-groups).
 
 ### `defaultDeletionPolicy`
 
-The default `deletionPolicy` stamped onto `Snapshot` CRs created against this
-recipe (`Delete`, `Retain`, or `Orphan`), controlling whether deleting the CR also
-deletes its kopia snapshot.
+The `deletionPolicy` stamped onto `Snapshot` objects created against this recipe: `Delete`, `Retain` or `Orphan`. It controls whether deleting the object also deletes its kopia snapshot.
 
 ### `compression`
 
-Compression policy. `compressor` names a kopia compressor (e.g. `zstd`); absent
-leaves kopia's default. `neverCompress` is a list of filename globs to leave
-uncompressed (e.g. already-compressed media).
+Compression policy. `compressor` names a kopia compressor such as `zstd`; leaving it out keeps kopia's default. `neverCompress` is a list of filename globs to leave uncompressed, which is useful for media that is already compressed.
 
 ### `files`
 
-File-ignore policy. `ignoreRules` are filename/path globs to exclude from the
-snapshot (e.g. `*.tmp`, `*/cache/*`); `ignoreCacheDirs` honors `CACHEDIR.TAG`;
-`ignoreIdenticalSnapshots` (default `false`) tells kopia not to write a new
-manifest when the source is byte-identical to the previous snapshot. The run
-still reads and hashes the whole source — the saving is a manifest, not the
-work — and the `Snapshot` CR ends in the [`Unchanged`](snapshot.md#status)
-phase instead of `Succeeded`.
+File-ignore policy.
+
+`ignoreRules` is a list of filename and path globs to exclude from the snapshot, such as `*.tmp` or `*/cache/*`. `ignoreCacheDirs` honors `CACHEDIR.TAG`. `ignoreIdenticalSnapshots`, default `false`, tells kopia not to write a new manifest when the source is identical to the previous snapshot. The run still reads and hashes the whole source, so what you save is a manifest and not the work, and the `Snapshot` object ends in the [`Unchanged`](snapshot.md#status) phase instead of `Succeeded`.
 
 !!! warning "It changes what a backup run produces"
 
@@ -187,181 +120,102 @@ phase instead of `Succeeded`.
     scope on every run, so a repository-global kopia policy cannot turn this on
     behind your back. Only this field enables it.
 
-`ignoreRules` defaults to a 5-entry OS-artifact exclude set — `/lost+found`,
-`System Volume Information`, `$RECYCLE.BIN`, `@eaDir`, `.snapshot` — applied even
-when `files` is omitted from the spec entirely (the apiserver only
-server-side-defaults *nested* fields when the parent object is present, so this
-default is additionally applied by the controller when resolving the mover work
-spec). An explicit `ignoreRules` list **replaces** the default wholesale rather
-than merging with it; `ignoreRules: []` opts fully out of ignoring anything. See
-[Backups → `files.ignoreRules` default](../../backups.md#filesignorerules-default-os-artifact-excludes)
-for the per-entry rationale and a copy-paste "recommended extras" block.
+`ignoreRules` defaults to a set of five OS-artifact excludes: `/lost+found`, `System Volume Information`, `$RECYCLE.BIN`, `@eaDir` and `.snapshot`. They apply even when you leave `files` out of the spec entirely. The apiserver only server-side-defaults a nested field when the parent object is present, so the controller applies this default again when it resolves the mover work spec.
+
+An explicit `ignoreRules` list **replaces** the default outright rather than adding to it, and `ignoreRules: []` turns off ignoring anything at all. See [Backups → `files.ignoreRules` default](../../backups.md#filesignorerules-default-os-artifact-excludes) for why each entry is there, plus a copy-paste block of recommended extras.
 
 ### `extraArgs`
 
-An escape hatch for kopia flags not yet modeled as first-class fields.
+An escape hatch for kopia flags that do not yet have a field of their own.
 
 ### `errorHandling`
 
-Backup-side error handling — lets a snapshot complete-with-errors instead of
-failing outright. Each flag defaults `false` (kopia's fail-on-error default):
-`ignoreFileErrors` (`--ignore-file-errors`) continues past unreadable files,
-`ignoreDirErrors` (`--ignore-dir-errors`) past unreadable directories, and
-`ignoreUnknownTypes` (`--ignore-unknown-types`) past entries of unknown type.
+Backup-side error handling. It lets a snapshot complete with errors instead of failing outright. Each flag defaults to `false`, which is kopia's fail-on-error default.
 
-`failFast` (`--fail-fast`, default `false`) is the opposite kind of knob: it
-aborts the snapshot at the *first* error instead of collecting and continuing.
-It rides `kopia snapshot create`'s own argv (not `policy set`), which is why it
-lives here beside its semantic opposites rather than under `upload`.
+- `ignoreFileErrors` maps to `--ignore-file-errors` and continues past unreadable files.
+- `ignoreDirErrors` maps to `--ignore-dir-errors` and continues past unreadable directories.
+- `ignoreUnknownTypes` maps to `--ignore-unknown-types` and continues past entries of unknown type.
+
+`failFast` maps to `--fail-fast` and defaults to `false`. It is the opposite kind of knob: it aborts the snapshot at the *first* error instead of collecting errors and continuing. It rides on `kopia snapshot create`'s own arguments rather than on `policy set`, which is why it lives here beside its opposites rather than under `upload`.
 
 ### `upload`
 
-Upload parallelism (kopia's upload policy). `maxParallelSnapshots`
-(`--max-parallel-snapshots`) is how many sources snapshot concurrently;
-`maxParallelFileReads` (`--max-parallel-file-reads`) is file-read concurrency
-within a snapshot. `limitMb` (`--upload-limit-mb`, kopia default: unlimited)
-aborts the snapshot once this many MB have been uploaded — named `limitMb`
-rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter. Like
-`failFast`, it is a `snapshot create` argv flag, not a `policy set` knob, but
-lives here beside its parallelism siblings. Absent knobs leave kopia's
-default.
+Upload parallelism, which is kopia's upload policy.
+
+`maxParallelSnapshots` maps to `--max-parallel-snapshots` and is how many sources snapshot at the same time. `maxParallelFileReads` maps to `--max-parallel-file-reads` and is the file-read concurrency within one snapshot. `limitMb` maps to `--upload-limit-mb`, which kopia leaves unlimited by default, and aborts the snapshot once that many MB have been uploaded. It is named `limitMb` rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter.
+
+Like `failFast`, `limitMb` is a `snapshot create` argument rather than a `policy set` value, but it lives here beside its parallelism siblings. Any knob you leave out keeps kopia's default.
 
 ### `verification`
 
-First-class backup verification that proves snapshots are **restorable**, not just
-that maintenance ran. Opt-in: when absent, no verification runs. Two tiers, both
-shaped `{ schedule: CronSpec, ... }`:
+Verification that proves snapshots are **restorable**, not just that maintenance ran. It is opt-in: leave the block out and no verification runs.
 
-- `quick` — a `QuickVerification { schedule?: CronSpec, parallel?, fileParallelism?,
-  fileQueueLength?, maxErrors? }`: the frequent blob-level `kopia snapshot verify`.
-  `quick.schedule` absent means no quick verification. `verifyFilesPercent`
-  (`--verify-files-percent`, a sibling of `quick`/`deep` on `verification` itself)
-  tunes how many files it verifies fully (absent leaves kopia's default). The four
-  tuning knobs map directly onto `kopia snapshot verify`'s own flags — `parallel`
-  (`--parallel`, kopia default 8), `fileParallelism` (`--file-parallelism`),
-  `fileQueueLength` (`--file-queue-length`, kopia default 20000), and `maxErrors`
-  (`--max-errors`, kopia default 0 — stop at the first error); all optional, and
-  `maxErrors` is the only one left unconstrained at admission (0 is a meaningful
-  value, not a footgun) — the other three must be `>= 1` when set.
-- `deep` — a `DeepVerification { schedule: CronSpec, storageClassName?, capacity?,
-  parallel? }`: the rarer scratch-restore restorability test, which restores the
-  latest snapshot into an ephemeral volume, sanity-checks it, then discards it.
-  `deep.schedule` is its cron+jitter (e.g. weekly); `deep.capacity` sizes the
-  ephemeral scratch PVC (e.g. `10Gi`) — absent falls back to a node-ephemeral
-  `emptyDir`; `deep.storageClassName` picks the scratch PVC's StorageClass (absent
-  uses the cluster default, and only applies when `capacity` is set); `deep.parallel`
-  maps onto `restore --parallel` — deep verify IS a restore under the hood, so this
-  is the restore's own parallelism knob, not a separate concept.
-- `successExpr` — a CEL pass/fail predicate over the verify result, applied to both
-  tiers. The environment exposes `stats{files,bytes,errors}`, `snapshot`, and (deep
-  only) `restored{files,checksumMatches}`; returning `false` fails the run, killing
-  the silent "0 files" success. Example: `"stats.files > 0 && stats.errors == 0"`.
+There are two tiers, both shaped `{ schedule: CronSpec, ... }`.
 
-Scheduling is gated: a policy with `verification` set does not spawn a verify Job
-until it has either a first successful backup or (an adopted repository) discovered
-snapshots already present — see
-[Backups → verification scheduling](../../backups.md#verification-scheduling--gated-until-there-is-something-to-verify).
+`quick` is a `QuickVerification { schedule?: CronSpec, parallel?, fileParallelism?, fileQueueLength?, maxErrors? }`. It is the frequent blob-level `kopia snapshot verify`. Leave `quick.schedule` out and no quick verification runs. `verifyFilesPercent` maps to `--verify-files-percent` and tunes how many files are verified fully; it sits on `verification` itself, beside `quick` and `deep`, and leaving it out keeps kopia's default. The four tuning knobs map straight onto `kopia snapshot verify`'s own flags: `parallel` is `--parallel` (kopia default 8), `fileParallelism` is `--file-parallelism`, `fileQueueLength` is `--file-queue-length` (kopia default 20000), and `maxErrors` is `--max-errors` (kopia default 0, which stops at the first error). All four are optional. `maxErrors` is the only one left unconstrained at admission, because 0 is a meaningful value there; the other three must be `1` or greater when set.
+
+`deep` is a `DeepVerification { schedule: CronSpec, storageClassName?, capacity?, parallel? }`. It is the rarer scratch-restore test: it restores the latest snapshot into a throwaway volume, sanity-checks it, then discards it. `deep.schedule` is its cron and jitter, weekly for example. `deep.capacity` sizes the throwaway scratch PVC, `10Gi` for example; leave it out and the scratch volume is a node-local `emptyDir`. `deep.storageClassName` picks the scratch PVC's StorageClass; leave it out to use the cluster default. It only applies when `capacity` is set. `deep.parallel` maps onto `restore --parallel`, because a deep verify is a restore underneath, so this is the restore's own parallelism knob rather than a separate concept.
+
+`successExpr` is a CEL pass/fail predicate over the verify result, and applies to both tiers. The environment exposes `stats{files,bytes,errors}`, `snapshot`, and, for deep verification only, `restored{files,checksumMatches}`. Returning `false` fails the run, which is how you catch the silent "0 files" success. Example: `"stats.files > 0 && stats.errors == 0"`.
+
+Scheduling is gated. A policy with `verification` set does not start a verify Job until it has either one successful backup, or, on an adopted repository, discovered snapshots already present. See [Backups → verification scheduling](../../backups.md#verification-scheduling--gated-until-there-is-something-to-verify).
 
 /// note | Old flat `quick: { cron, jitter }` shape
-`quick`'s `schedule` field is `Option` specifically so an already-persisted old-shape
-object (`quick: { cron, jitter }`, pre-#174) keeps decoding — with the quick tier
-treated as disabled until migrated. A **new** write in that old shape is rejected at
-admission with a message pointing at the `quick.schedule` move.
+`quick`'s `schedule` field is optional for one reason: an object already stored in the old shape (`quick: { cron, jitter }`, from before #174) keeps decoding, with the quick tier treated as disabled until you migrate it. A **new** write in that old shape is rejected at admission, with a message pointing at the move to `quick.schedule`.
 ///
 
 ### `preflight`
 
-User-declared **CEL preconditions** a backup must satisfy before its mover Job
-launches — generalizing the built-in repository-readiness gate. Opt-in: when absent,
-no preflight runs.
+CEL preconditions you declare, which a backup must satisfy before its mover Job launches. It generalizes the built-in repository-readiness gate, and it is opt-in: leave the block out and no preflight runs.
 
-- `checks` — a list of `{ name, expr, message? }`. Each `expr` is a CEL **bool**
-  predicate; **all** must pass (AND) for the backup to launch. `name` is unique and
-  identifies the check in the `Snapshot`'s status; `message` is an optional human hint.
-- `timeout` — how long to hold the `Snapshot` in `Pending` while a check is unsatisfied
-  before failing it (Go-style duration; default `10m`; `0` holds indefinitely). The
-  clock starts when a check first fails with the repository `Ready`, so a slow-to-connect
-  repository doesn't consume the budget. The resulting `Failed` Snapshots are bounded by
-  the schedule's `failedJobsHistoryLimit`.
+- `checks` is a list of `{ name, expr, message? }`. Each `expr` is a CEL predicate returning a bool, and **all** of them must pass before the backup launches. `name` is unique and identifies the check in the `Snapshot`'s status. `message` is an optional hint for humans.
+- `timeout` is how long the `Snapshot` is held in `Pending` while a check is unsatisfied, before the run fails. Write it as a Go-style duration; the default is `10m`, and `0` holds indefinitely. The clock starts when a check first fails while the repository is `Ready`, so a repository that is slow to connect does not eat the budget. The `Failed` Snapshots this produces are bounded by the schedule's `failedJobsHistoryLimit`.
 
-The CEL environment exposes
-`repository.{phase,ready,backendReachable,snapshotCountKnown,snapshotCount,
-indexBlobCountKnown,indexBlobCount,sizeBytesKnown,sizeBytes,lastHealthyKnown,
-lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}` and
-`maintenance.{hasRun,lastSuccessAgeSeconds}`, validated at admission. Unobserved values are
-`i64::MAX`: a freshness (`< N`) check fails closed, but a count/size (`> N`) check fails
-*open*, so always pair it with the `*Known`/`hasRun` companion. Example:
-`"maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800"`. See
-[Repository health → Backup preflight](../../repository-health.md#backup-preflight-opt-in).
+The CEL environment exposes `repository.{phase,ready,backendReachable,snapshotCountKnown,snapshotCount,indexBlobCountKnown,indexBlobCount,sizeBytesKnown,sizeBytes,lastHealthyKnown,lastHealthyAgeSeconds,lastReverifyKnown,lastReverifyAgeSeconds}` and `maintenance.{hasRun,lastSuccessAgeSeconds}`. Kopiur validates your expressions at admission.
+
+A value that has not been observed is `i64::MAX`. A freshness check written as `< N` therefore fails closed, but a count or size check written as `> N` fails **open**, so always pair one with its `*Known` or `hasRun` companion. Example: `"maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800"`. See [Repository health → Backup preflight](../../repository-health.md#backup-preflight-opt-in).
 
 ### `suspend`
 
-Pause this recipe declaratively. A suspended `SnapshotPolicy` is skipped by
-schedules and by its own reconcile — no retention prune, no backup creation —
-and is surfaced via the `SUSPENDED` condition/column.
+Pause this recipe from the manifest. Schedules skip a suspended `SnapshotPolicy`, and so does its own reconcile, so there is no retention prune and no backup creation. The state shows up in the `SUSPENDED` condition and column.
 
 ### `hooks`
 
-Pre/post snapshot hooks that run in the workload, not the mover. `beforeSnapshot`
-hooks run in order before the snapshot is taken (e.g. quiescing a database);
-`afterSnapshot` hooks run in order after it completes (e.g. resuming the workload).
+Pre- and post-snapshot hooks that run in the workload, not in the mover. `beforeSnapshot` hooks run in order before the snapshot is taken, for example to quiesce a database. `afterSnapshot` hooks run in order after it completes, for example to resume the workload.
+
 Each hook is exactly one of three forms:
 
-- `workloadExec` — a `kubectl exec`-style command into a matched workload
-  pod/container (the default form). Carries the pod/container selector, `command`,
-  and `timeout`.
-- `runJob` — a full Kubernetes `JobSpec` run as a one-shot Job (the k8up
-  `PreBackupPod` analog).
-- `httpRequest` — a typed HTTP request for cross-system orchestration, with `url`,
-  `method` (default `POST`), optional `body`, optional `headers`, and `timeout`.
-  `headers` is a list of `{name, value}` objects, validated at admission: names are
-  case-insensitive RFC 7230 tokens, values must be single-line, and duplicate names
-  are rejected. Kopiur sends no default `Content-Type` with a `body`, so set one via
-  `headers` if the endpoint needs it. An explicit `Authorization` header replaces
-  `user:pass@…` credentials in the `url` (setting both is rejected).
+- `workloadExec` runs a `kubectl exec`-style command in a matched workload pod or container. It is the default form, and carries the pod and container selector, the `command`, and a `timeout`.
+- `runJob` runs a full Kubernetes `JobSpec` as a one-shot Job. It is the k8up `PreBackupPod` equivalent.
+- `httpRequest` sends a typed HTTP request, for orchestrating another system. It takes `url`, `method` (default `POST`), an optional `body`, optional `headers`, and a `timeout`. `headers` is a list of `{name, value}` objects, validated at admission: names are case-insensitive RFC 7230 tokens, values must be a single line, and duplicate names are rejected. Kopiur sends no default `Content-Type` with a `body`, so set one through `headers` if the endpoint needs it. An explicit `Authorization` header replaces `user:pass@…` credentials in the `url`, and setting both is rejected.
 
-A hook failure aborts the backup by default; set `continueOnFailure: true` on any
-hook form to let the backup proceed past a failed hook. Timeouts are Go duration
-strings (e.g. `2m`).
+A failed hook aborts the backup by default. Set `continueOnFailure: true` on any hook form to let the backup carry on past that hook. Timeouts are Go duration strings, such as `2m`.
 
 ### `mover`
 
-Per-recipe mover overrides — resources, cache, security context — layered over the
-repository's `moverDefaults`. See [Movers](../../movers.md) and
-[Security context](../../security-context.md).
+Per-recipe mover overrides for resources, cache and security context, layered over the repository's `moverDefaults`. See [Movers](../../movers.md) and [Security context](../../security-context.md).
 
 ### `credentialProjection`
 
-Opt-in credential-Secret projection for this recipe's backup movers (default off).
-When `enabled: true`, the operator copies the referenced repository's credential
-Secret(s) into the namespace where each backup mover runs (a no-op when they
-already live there) — so a workload backing up to a shared `ClusterRepository`
-need not pre-create the Secret in its own namespace. Inherited by `Snapshot`s
-produced from this recipe.
+Opt-in projection of the credential Secret for this recipe's backup movers. It is off by default.
+
+With `enabled: true`, the operator copies the referenced repository's credential Secrets into the namespace where each backup mover runs. It is a no-op when the Secrets already live there. That way a workload backing up to a shared `ClusterRepository` does not need the Secret created in its own namespace first. `Snapshot`s produced from this recipe inherit the setting.
 
 ## `status`
 
 ### `resolved`
 
-The recipe as kopia would see it, pinned at admission and never re-rendered:
-`resolved.identity` is the resolved `username@hostname` identity, and
-`resolved.sources` is the concrete list of PVCs and source paths after selector
-expansion (each entry pairs a `namespace/name` `pvc` with the `sourcePath` kopia
-records for it).
+The recipe as kopia would see it, pinned at admission and never re-rendered.
+
+`resolved.identity` is the resolved `username@hostname` identity. `resolved.sources` is the concrete list of PVCs and source paths after selector expansion; each entry pairs a `namespace/name` `pvc` with the `sourcePath` kopia records for it.
 
 ### `retention`
 
-Summary of the most recent GFS retention prune: `activeSnapshotCount` (CRs
-currently inside the GFS window), `lastPruneAt` (RFC3339 timestamp of the last
-prune pass), and `lastPruneDeleted` (number of `Snapshot` CRs deleted by it).
+A summary of the most recent GFS retention prune. `activeSnapshotCount` is how many objects are currently inside the GFS window. `lastPruneAt` is the RFC 3339 timestamp of the last prune pass. `lastPruneDeleted` is how many `Snapshot` objects that pass deleted.
 
 ### Other status fields
 
-- `observedGeneration` — `metadata.generation` last reconciled, for staleness
-  detection.
-- `lastSuccessfulSnapshot` — RFC3339 timestamp of the most recent successful child
-  `Snapshot` from this recipe (backs the `LAST-SNAPSHOT` column).
-- `lastVerified` — RFC3339 timestamp of the most recent successful verification of
-  any tier (backs the `LAST-VERIFIED` column).
-- `conditions` — standard Kubernetes conditions (e.g. `RepositoryReachable`,
-  `GroupSnapshotSupported`).
+- `observedGeneration` is the `metadata.generation` last reconciled, for staleness detection.
+- `lastSuccessfulSnapshot` is the RFC 3339 timestamp of the most recent successful child `Snapshot` from this recipe. It backs the `LAST-SNAPSHOT` column.
+- `lastVerified` is the RFC 3339 timestamp of the most recent successful verification of either tier. It backs the `LAST-VERIFIED` column.
+- `conditions` holds the standard Kubernetes conditions, such as `RepositoryReachable` and `GroupSnapshotSupported`.

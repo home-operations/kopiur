@@ -1,8 +1,10 @@
 # Kopiur
 
-**Kopiur** (Kopia + Rust) is a Kopia-native Kubernetes backup operator written in Rust on [`kube-rs`](https://github.com/kube-rs/kube). It makes a kopia repository a first-class Kubernetes resource and separates the backup **recipe** from its **invocation** from its **schedule**, so backups can be triggered by cron, `kubectl create`, Argo Events, or a Helm hook — and a kopia snapshot's lifecycle is tied to its `Snapshot` CR by a finalizer + `deletionPolicy`.
+**Kopiur**, from Kopia plus Rust, is a Kopia-native Kubernetes backup operator written in Rust on [`kube-rs`](https://github.com/kube-rs/kube).
 
-The whole CRD surface is modeled as Rust enums so invalid states are unrepresentable and reconcilers handle every variant at compile time. For the high-level mental model start with [Concepts](concepts/how-kopia-works.md).
+It makes a kopia repository a first-class Kubernetes resource, and it splits a backup into three resources: the **recipe**, its **invocation**, and its **schedule**. That is what lets a backup be triggered by cron, by `kubectl create`, by Argo Events, or by a Helm hook. A kopia snapshot's lifecycle is tied to its `Snapshot` object through a finalizer and a `deletionPolicy`.
+
+The whole CRD surface is modeled as Rust enums, so invalid states cannot be expressed and reconcilers handle every variant at compile time. For the high-level mental model start with [Concepts](concepts/how-kopia-works.md).
 
 /// warning | Alpha
 
@@ -26,15 +28,15 @@ API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may 
 
 ## Where to next
 
-- **[How Kopia works](concepts/how-kopia-works.md)** — content-addressable dedup, snapshots, the `username@hostname:path` identity model, encryption, maintenance — and why one shared repository is the recommended layout.
-- **[Why Kopiur is designed this way](concepts/why-kopiur.md)** — the recipe/invocation/schedule split, repository-as-resource, the type-safety thesis, and snapshot-lifecycle-tied-to-CR.
-- **[Getting started](getting-started.md)** — the end-to-end walkthrough: install, first backup, and a verified restore in ~15 minutes.
-- **[Scenarios](scenarios/index.md)** — problem-driven, end-to-end walkthroughs: protect a database, recover deleted data, disaster recovery, migration, adopting an existing repo, verification drills.
-- **[Installation](install.md)** — prerequisites, install modes, and the CRD-lifecycle caveat.
-- **[Repositories & backends](repositories.md)** — point Kopiur at S3, Azure, GCS, B2, a NAS, or rclone.
-- **[Backups & schedules](backups.md)** and **[Restores](restores.md)** — the recipe/invocation/schedule model and reading data back.
-- **[Troubleshooting](troubleshooting.md)** — when something doesn't go green.
-- **[GitOps (Flux / Argo)](gitops.md)** — kstatus health, `kubectl wait`, managed-by/ownerRefs, drift-free applies.
-- **[Field reference](field-reference.md)** — every field of all 9 CRDs: type, default, immutability.
-- **[API reference (rustdoc)](api-reference.md)** — the generated Rust API docs for every crate in the workspace.
-- **[API conventions](dev/api-conventions.md)** and **[Observability](dev/observability.md)** — developer notes.
+- **[How Kopia works](concepts/how-kopia-works.md)** covers content-addressable dedup, snapshots, the `username@hostname:path` identity model, encryption and maintenance, plus why one shared repository is the recommended layout.
+- **[Why Kopiur is designed this way](concepts/why-kopiur.md)** covers the recipe, invocation and schedule split, repository-as-resource, the type-safety argument, and tying a snapshot's lifecycle to its object.
+- **[Getting started](getting-started.md)** is the end-to-end walkthrough: install, first backup, and a verified restore in about 15 minutes.
+- **[Scenarios](scenarios/index.md)** are problem-driven, end-to-end walkthroughs: protect a database, recover deleted data, disaster recovery, migration, adopting an existing repository, verification drills.
+- **[Installation](install.md)** covers prerequisites, install modes, and the CRD-lifecycle caveat.
+- **[Repositories & backends](repositories.md)** points Kopiur at S3, Azure, GCS, B2, a NAS, or rclone.
+- **[Backups & schedules](backups.md)** and **[Restores](restores.md)** cover the recipe, invocation and schedule model, and reading data back.
+- **[Troubleshooting](troubleshooting.md)** is for when something does not go green.
+- **[GitOps (Flux / Argo)](gitops.md)** covers kstatus health, `kubectl wait`, managed-by and ownerRefs, and drift-free applies.
+- **[Field reference](field-reference.md)** lists every field of all 9 CRDs, with type, default and immutability.
+- **[API reference (rustdoc)](api-reference.md)** is the generated Rust API docs for every crate in the workspace.
+- **[API conventions](dev/api-conventions.md)** and **[Observability](dev/observability.md)** are developer notes.
