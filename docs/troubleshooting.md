@@ -348,7 +348,21 @@ $ kubectl logs -n <ns> --selector=job-name="$JOB"
 `status.failure.retryRecommended: false` means retrying unchanged won't help —
 fix the cause (`kopiaErrorClass` names it: `AuthFailure` = wrong password,
 `PermissionDenied` = filesystem/bucket ACLs, …) and re-create the Snapshot. The
-same `logTail`/`failure` fields appear on a failed `Restore`.
+same `logTail`/`failure` fields appear on a failed **direct** `Restore`
+(`target.pvc`/`pvcRef`). A **populator** `Restore` records them **per claim**,
+under `status.claims.<pvc>.failure` / `status.claims.<pvc>.logTail` — one
+mover per claiming PVC — and the top-level pair stays empty:
+
+```console
+$ kubectl get restore <name> -n <ns> -o jsonpath='{range .status.claims}{@}{end}' | jq
+# or per claim:
+$ kubectl get restore <name> -n <ns> -o jsonpath='{.status.claims.<pvc>.failure}'
+```
+
+`kubectl kopiur restore --wait` prints the failed claim's own failure and tail
+(a per-claim list when several PVCs claim the restore), and
+`kubectl kopiur logs restore <name>` falls back to each claim's recorded
+`logTail` once the mover Jobs are gone.
 
 Common causes: the source PVC's `VolumeSnapshotClass` is wrong/missing (for `copyMethod: Snapshot`), a `beforeSnapshot` hook failed (it aborts the backup unless `continueOnFailure: true`), or the repository became unreachable mid-run.
 
