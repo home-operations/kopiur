@@ -15,7 +15,7 @@ Kopiur splits one job into separate resources so each can change independently:
 - a **`Restore`** reads a snapshot back into a PVC;
 - a **`Maintenance`** reclaims space in the repository.
 
-**Identity** is the detail that makes or breaks the recovery and migration scenarios. kopia stores each snapshot under `username@hostname:path`, defaulting to `<backup-config-name>@<namespace>:/pvc/<pvcName>`. To find an _existing_ snapshot, you have to match that identity. See [How Kopia works](../concepts/how-kopia-works.md).
+**Identity** is the detail that makes or breaks the recovery and migration scenarios. kopia stores each snapshot under `username@hostname:path`, defaulting to `<policy-name>@<namespace>:/pvc/<pvcName>`. To find an _existing_ snapshot, you have to match that identity. See [How Kopia works](../concepts/how-kopia-works.md).
 
 ///
 
