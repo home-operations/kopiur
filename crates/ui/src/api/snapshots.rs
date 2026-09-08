@@ -25,10 +25,12 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use kopiur_api::common::RepositoryKind;
-use kopiur_api::consts::CONFIG_LABEL;
 use kopiur_api::gates::GateScope;
-use kopiur_api::retention::{SnapshotLike, select_kept};
+use kopiur_api::retention::{
+    SnapshotRetentionView, retention_buckets, retention_group_key, retention_view, select_kept,
+};
 use kopiur_api::snapshot::repository_ref_for;
+use kopiur_api::snapshot_policy::is_multi_repo;
 use kopiur_api::{Origin, Snapshot, SnapshotPhase, SnapshotPolicy};
 use kopiur_ops::snapshots::{
     RepoFilter, SnapshotListFilter, matches_filter, matches_repository, policy_of,
@@ -314,59 +316,34 @@ pub fn view_lineage(snap: &Snapshot, siblings: &[Arc<Snapshot>]) -> Lineage {
     }
 }
 
-/// A `Snapshot` seen through the retention selector's eyes.
-///
-/// The adapter exists so the preview answers with *exactly* the rule the
-/// operator's own prune would apply — same `select_kept`, same inputs — rather
-/// than with a second implementation of GFS that could disagree with it.
-struct RetentionCandidate {
-    id: String,
-    end: DateTime<Utc>,
-    pinned: bool,
-}
-
-impl SnapshotLike for RetentionCandidate {
-    fn end_time(&self) -> DateTime<Utc> {
-        self.end
-    }
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn pinned(&self) -> bool {
-        self.pinned
-    }
-}
-
-/// **Pure.** The retention candidate a snapshot makes, or `None` when it holds no
-/// kopia manifest to keep (a `Pending` run, or an `Unchanged` one, which takes no
-/// GFS slot at all).
-fn retention_candidate(snap: &Snapshot) -> Option<RetentionCandidate> {
-    let status = snap.status.as_ref()?;
-    let id = status.snapshot.as_ref()?.kopia_snapshot_id.clone();
-    let end = status
-        .timing
-        .as_ref()
-        .and_then(|t| t.end_time.as_deref())
-        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&Utc))?;
-    Some(RetentionCandidate {
-        id,
-        end,
-        pinned: status.pinned.unwrap_or(snap.spec.pin),
-    })
-}
-
 /// **Pure.** Whether today's retention would keep this snapshot, and which rules
 /// say so.
 ///
-/// The reasons are derived by re-running [`select_kept`] with one rule enabled
-/// at a time. GFS buckets are independent — the kept set is their union — so a
-/// single-rule run answers "would *this* rule alone have kept it" exactly, with
-/// no second implementation of the bucketing to drift.
+/// # The population and the bucketing are the prune's, not a second opinion
 ///
-/// `None` when the snapshot holds no manifest, or the policy configures no
-/// retention: there is no answer to preview, and inventing "kept: true" would
-/// read as a guarantee.
+/// `kopiur_api::retention::retention_buckets` is what
+/// `kopiur_controller::snapshot_policy::backups_to_delete` runs over: it admits
+/// only `Succeeded` rows carrying controller-written provenance, excludes
+/// terminating ones, falls back to `creationTimestamp` for a missing `endTime`,
+/// reads `spec.pin` (never `status.pinned` — during an unpin the two disagree,
+/// and the prune honours the spec), and splits the population **per source**,
+/// and per `(source, repository)` while the policy is multi-repo.
+///
+/// That last part is the whole reason this shares code rather than approximating.
+/// A flat run over a 7-PVC `pvcSelector` fan-out under `keepDaily: 7` finds seven
+/// keepers — one day across all seven volumes — and reports the other 42 real,
+/// protected restore points as `kept: false`. That is the #346 shape the
+/// controller's own comment calls "silent data loss introduced by the fan-out",
+/// and telling a user their backup is about to be deleted when it is not is the
+/// same lie in the other direction.
+///
+/// Only the *target's own bucket* is evaluated: buckets are independent, so the
+/// other buckets cannot change this row's verdict.
+///
+/// `None` when the policy configures no retention, or this snapshot is not in
+/// the GFS population at all (a `Pending`, `Failed`, `Unchanged` or `Deleting`
+/// row) — there is no answer to preview, and inventing one would read as a
+/// guarantee.
 pub fn view_retention_preview(
     snap: &Snapshot,
     policy: &SnapshotPolicy,
@@ -374,34 +351,46 @@ pub fn view_retention_preview(
     now: DateTime<Utc>,
 ) -> Option<RetentionPreview> {
     let retention = policy.spec.retention.as_ref()?;
-    let this = retention_candidate(snap)?;
-    let target = this.id.clone();
+    let policy_is_multi = is_multi_repo(&policy.spec);
 
-    let mut candidates: Vec<RetentionCandidate> = peers
+    // The id the prune works in is the CR name, not the kopia manifest id.
+    let target = snap.metadata.name.clone()?;
+    // Not in the population → not previewable. Asked before bucketing so a row
+    // the prune ignores never gets an answer about a set it is not in.
+    retention_view(snap)?;
+    let bucket_key = retention_group_key(snap, policy_is_multi);
+
+    // The peer set may or may not already contain this snapshot, depending on
+    // how the caller assembled it; a duplicate would let one row compete with
+    // itself for its own keep slot.
+    let mut population: Vec<&Snapshot> = peers
         .iter()
-        .filter_map(|p| retention_candidate(p))
+        .map(Arc::as_ref)
+        .filter(|p| p.metadata.name.as_deref() != Some(target.as_str()))
         .collect();
-    if !candidates.iter().any(|c| c.id == target) {
-        candidates.push(this);
-    }
+    population.push(snap);
 
-    let kept = select_kept(&candidates, retention).keep.contains(&target);
+    let buckets = retention_buckets(&population, policy_is_multi);
+    let bucket = buckets.get(&bucket_key)?;
+
+    let kept = select_kept(bucket, retention).keep.contains(&target);
 
     let mut reasons = Vec::new();
-    if candidates
-        .iter()
-        .any(|c| c.id == target && SnapshotLike::pinned(c))
-    {
+    if snap.spec.pin {
         reasons.push("pinned".to_string());
     }
-    // Rule attribution runs over the same population with every pin dropped: a
-    // pinned snapshot lands in `keep` whatever the rule says, so leaving the
-    // pins in would credit each configured rule with a keep it did not make.
-    let unpinned: Vec<RetentionCandidate> = candidates
+    // Rule attribution re-runs the selection over the same bucket with one rule
+    // enabled at a time. GFS buckets are a union, so a single-rule run answers
+    // "would THIS rule alone have kept it" exactly, with no second
+    // implementation of the bucketing to drift. Pins are dropped for the
+    // attribution runs only: a pinned row lands in `keep` whatever the rule
+    // says, so leaving them in would credit every configured rule with a keep it
+    // did not make.
+    let unpinned: Vec<SnapshotRetentionView> = bucket
         .iter()
-        .map(|c| RetentionCandidate {
-            id: c.id.clone(),
-            end: c.end,
+        .map(|v| SnapshotRetentionView {
+            name: v.name.clone(),
+            end_time: v.end_time,
             pinned: false,
         })
         .collect();
@@ -1178,7 +1167,7 @@ status:
     }
 
     #[test]
-    fn the_retention_preview_matches_the_prune_that_would_run() {
+    fn a_single_source_policy_previews_one_flat_gfs_bucket() {
         let policy: SnapshotPolicy = from_yaml(
             r#"
 apiVersion: kopiur.home-operations.com/v1alpha1
@@ -1209,6 +1198,250 @@ spec:
             "the third-newest day falls outside keepDaily: 2"
         );
         assert!(pruned.reasons.is_empty());
+    }
+
+    /// A fan-out child, as a `pvcSelector` policy actually mints one: the
+    /// `spec.source` pin is what puts it in its OWN GFS bucket.
+    fn fanout_run(pvc: &str, day: u32) -> Arc<Snapshot> {
+        snapshot(&format!(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: nightly-{pvc}-{day:02}
+  namespace: media
+  labels:
+    "kopiur.home-operations.com/config": nightly
+    "kopiur.home-operations.com/origin": scheduled
+spec:
+  policyRef: {{ name: nightly }}
+  source:
+    sourceIndex: 0
+    target:
+      pvc: {{ namespace: media, name: {pvc} }}
+status:
+  phase: Succeeded
+  origin: scheduled
+  timing:
+    startTime: "2026-05-{day:02}T02:00:00Z"
+    endTime: "2026-05-{day:02}T02:05:00Z"
+  snapshot:
+    kopiaSnapshotID: k-{pvc}-{day:02}
+    identity: {{ username: kopiur, hostname: media, sourcePath: /data }}
+"#
+        ))
+    }
+
+    /// The A-C2 regression guard, and the #346 shape one level up.
+    ///
+    /// Seven PVCs backed up for seven days under `keepDaily: 7` is 49 protected
+    /// restore points: the controller buckets GFS PER SOURCE, so each volume
+    /// keeps its own seven days. A preview that ran one flat `select_kept` over
+    /// the whole policy's children found seven keepers and reported the other
+    /// **42 live, protected snapshots as `kept: false`** — telling the user
+    /// their backups were about to be deleted when nothing of the kind was
+    /// happening.
+    #[test]
+    fn a_fanout_policy_keeps_every_source_its_own_days() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources:
+    - pvcSelector: { labelSelector: { matchLabels: { backup: "yes" } } }
+  retention: { keepDaily: 7 }
+"#,
+        );
+        let pvcs = [
+            "data-0", "data-1", "data-2", "data-3", "data-4", "data-5", "data-6",
+        ];
+        let days = [18, 19, 20, 21, 22, 23, 24];
+        let population: Vec<Arc<Snapshot>> = pvcs
+            .iter()
+            .flat_map(|pvc| days.iter().map(move |d| fanout_run(pvc, *d)))
+            .collect();
+        assert_eq!(population.len(), 49);
+
+        let now = DateTime::parse_from_rfc3339("2026-05-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let doomed: Vec<&str> = population
+            .iter()
+            .filter(|s| {
+                !view_retention_preview(s, &policy, &population, now)
+                    .expect("every succeeded child is previewable")
+                    .kept
+            })
+            .map(|s| s.metadata.name.as_deref().unwrap_or_default())
+            .collect();
+        assert!(
+            doomed.is_empty(),
+            "all 49 are inside keepDaily: 7 per source; these were reported as doomed: {doomed:?}"
+        );
+
+        // …and the eighth day of ONE volume still falls out of that volume's
+        // window, so the bucketing is per-source rather than simply disabled.
+        let mut with_older = population.clone();
+        let older = fanout_run("data-0", 17);
+        with_older.push(older.clone());
+        let preview = view_retention_preview(&older, &policy, &with_older, now).unwrap();
+        assert!(
+            !preview.kept,
+            "the eighth day of data-0 is outside its own keepDaily: 7"
+        );
+        // The other volumes are untouched by data-0 having an extra day.
+        let sibling = &population[7]; // data-1's oldest
+        assert!(
+            view_retention_preview(sibling, &policy, &with_older, now)
+                .unwrap()
+                .kept,
+            "one source's extra day must not evict another source's"
+        );
+    }
+
+    /// The prune reads `spec.pin`; `status.pinned` is what kopia currently
+    /// holds. During an unpin the two disagree, and a preview reading status
+    /// would promise a keep the very next prune will not honour.
+    #[test]
+    fn an_unpinned_snapshot_is_previewed_against_the_spec_not_the_stale_status() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 1 }
+"#,
+        );
+        let newest = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        // spec.pin cleared, kopia not yet caught up.
+        let unpinning = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: unpinning
+  namespace: media
+  labels: { "kopiur.home-operations.com/config": nightly }
+spec:
+  policyRef: { name: nightly }
+  pin: false
+status:
+  phase: Succeeded
+  origin: manual
+  pinned: true
+  timing: { startTime: "2026-01-01T02:00:00Z", endTime: "2026-01-01T02:00:00Z" }
+  snapshot:
+    kopiaSnapshotID: k-unpinning
+    identity: { username: kopiur, hostname: media, sourcePath: /data }
+"#,
+        );
+        let peers = vec![newest, unpinning.clone()];
+        let preview = view_retention_preview(&unpinning, &policy, &peers, Utc::now()).unwrap();
+        assert!(
+            !preview.kept,
+            "the prune reads spec.pin, so the preview must not report a keep status.pinned alone implies"
+        );
+        assert!(preview.reasons.is_empty());
+    }
+
+    /// A `Deleting` row keeps its `status.snapshot`, its `endTime` and its
+    /// config label, so a preview with no phase gate lets it claim a keep slot
+    /// and shift the buckets under every live row.
+    #[test]
+    fn a_row_the_prune_ignores_has_no_preview_and_claims_no_slot() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 1 }
+"#,
+        );
+        let deleting = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: going-away
+  namespace: media
+  labels: { "kopiur.home-operations.com/config": nightly }
+spec: { policyRef: { name: nightly } }
+status:
+  phase: Deleting
+  origin: scheduled
+  timing: { startTime: "2026-05-25T02:00:00Z", endTime: "2026-05-25T02:00:00Z" }
+  snapshot:
+    kopiaSnapshotID: k-going-away
+    identity: { username: kopiur, hostname: media, sourcePath: /data }
+"#,
+        );
+        let live = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        let peers = vec![deleting.clone(), live.clone()];
+        let now = DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert!(
+            view_retention_preview(&deleting, &policy, &peers, now).is_none(),
+            "a row outside the GFS population has no verdict to give"
+        );
+        assert!(
+            view_retention_preview(&live, &policy, &peers, now)
+                .unwrap()
+                .kept,
+            "and it must not displace the live row it is newer than"
+        );
+    }
+
+    /// The controller falls back to `creationTimestamp` when `endTime` is
+    /// missing; a preview that dropped the candidate would answer `None` for a
+    /// snapshot the prune will happily evaluate.
+    #[test]
+    fn a_snapshot_with_no_end_time_falls_back_to_its_creation_timestamp() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepLatest: 1 }
+"#,
+        );
+        let no_end = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: no-end
+  namespace: media
+  creationTimestamp: "2026-05-24T02:00:00Z"
+  labels: { "kopiur.home-operations.com/config": nightly }
+spec: { policyRef: { name: nightly } }
+status:
+  phase: Succeeded
+  origin: scheduled
+  snapshot:
+    kopiaSnapshotID: k-no-end
+    identity: { username: kopiur, hostname: media, sourcePath: /data }
+"#,
+        );
+        let preview =
+            view_retention_preview(&no_end, &policy, std::slice::from_ref(&no_end), Utc::now())
+                .expect("the prune evaluates this row, so the preview must too");
+        assert!(preview.kept);
+        assert_eq!(preview.reasons, vec!["keepLatest"]);
     }
 
     #[test]

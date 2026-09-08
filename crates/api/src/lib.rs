@@ -111,7 +111,10 @@ pub use recorded::{
     KOPIUR_META_SCHEMA_V1, KOPIUR_META_TAG, MetaTagDecode, RecordedSnapshotMeta, RecordedSrc,
     decode_meta_tag, encode_meta_tag,
 };
-pub use retention::{KeptSet, SnapshotLike, select_kept};
+pub use retention::{
+    KeptSet, SnapshotLike, SnapshotRetentionView, retention_buckets, retention_group_key,
+    retention_view, select_kept,
+};
 pub use success_expr::{
     RestoredStats, SuccessExprInputs, VerifyStats, eval_success_expr, validate_success_expr,
 };
