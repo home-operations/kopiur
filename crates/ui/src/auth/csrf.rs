@@ -91,10 +91,18 @@ pub enum CsrfError {
 
 /// Gate a mutating request.
 ///
-/// `has_body` says whether the request carries a payload; the caller decides that
-/// (see [`super::mutation_guard`]), because it is a property of the request
-/// framing rather than of the headers alone.
-pub fn require_mutation_headers(headers: &HeaderMap, has_body: bool) -> Result<(), CsrfError> {
+/// `has_body` says whether the request carries a payload, and `authority` is the
+/// request target's own authority — both are properties of the request framing
+/// rather than of the headers, so [`super::mutation_guard`] supplies them.
+///
+/// `authority` matters because HTTP/2 has no `Host` header: the client sends
+/// `:authority`, which hyper puts in the request URI. Without it, every h2 request
+/// carrying an `Origin` would be refused as a mismatch against an absent host.
+pub fn require_mutation_headers(
+    headers: &HeaderMap,
+    has_body: bool,
+    authority: Option<&str>,
+) -> Result<(), CsrfError> {
     if headers.get(REQUEST_HEADER).map(HeaderValue::as_bytes)
         != Some(REQUEST_HEADER_VALUE.as_bytes())
     {
@@ -104,7 +112,7 @@ pub fn require_mutation_headers(headers: &HeaderMap, has_body: bool) -> Result<(
         require_json_body(headers)?;
     }
     require_same_site(headers)?;
-    require_matching_origin(headers)
+    require_matching_origin(headers, authority)
 }
 
 /// Gate a same-site navigation — the `GET …/file` download, which the browser
@@ -137,28 +145,30 @@ fn require_same_site(headers: &HeaderMap) -> Result<(), CsrfError> {
 
 /// `Origin`, when present, must name the host the request was addressed to.
 ///
-/// Compared as scheme-stripped authority against `Host`, which is what the two
-/// headers actually contain: `Origin: https://kopiur.example` versus `Host:
-/// kopiur.example`. A request with an `Origin` but no `Host` is refused rather
-/// than waved through — HTTP/1.1 requires `Host` and HTTP/2 synthesises it, so its
-/// absence is not a shape the UI needs to serve.
-fn require_matching_origin(headers: &HeaderMap) -> Result<(), CsrfError> {
+/// Compared as scheme-stripped authority against the request's own host:
+/// `Origin: https://kopiur.example` versus `kopiur.example`. The host comes from
+/// the `Host` header when there is one, and otherwise from `authority` — HTTP/2
+/// carries no `Host` at all, only the `:authority` pseudo-header, which hyper
+/// surfaces on the request URI. If neither exists there is nothing to compare an
+/// `Origin` against, and the request is refused rather than waved through.
+fn require_matching_origin(headers: &HeaderMap, authority: Option<&str>) -> Result<(), CsrfError> {
     let Some(origin) = headers.get(ORIGIN) else {
         return Ok(());
     };
     let origin = origin.to_str().unwrap_or("<non-ascii>");
     // `Origin: null` is what a sandboxed frame or a redirected cross-origin
-    // request sends. It is not this host.
-    let authority = origin
+    // request sends. It matches no host, which is the point.
+    let origin_host = origin
         .strip_prefix("https://")
         .or_else(|| origin.strip_prefix("http://"))
         .unwrap_or(origin);
     let host = headers
         .get(HOST)
         .and_then(|h| h.to_str().ok())
+        .or(authority)
         .unwrap_or_default();
 
-    if !host.is_empty() && authority == host {
+    if !host.is_empty() && origin_host == host {
         Ok(())
     } else {
         Err(CsrfError::OriginMismatch {
@@ -231,21 +241,24 @@ mod tests {
 
     #[test]
     fn the_spas_own_request_passes() {
-        assert_eq!(require_mutation_headers(&headers(&good()), true), Ok(()));
+        assert_eq!(
+            require_mutation_headers(&headers(&good()), true, None),
+            Ok(())
+        );
     }
 
     #[test]
     fn the_marker_header_is_required_and_must_carry_its_value() {
         assert_eq!(
-            require_mutation_headers(&without(REQUEST_HEADER), true),
+            require_mutation_headers(&without(REQUEST_HEADER), true, None),
             Err(CsrfError::MissingRequestHeader)
         );
         assert_eq!(
-            require_mutation_headers(&with(REQUEST_HEADER, "0"), true),
+            require_mutation_headers(&with(REQUEST_HEADER, "0"), true, None),
             Err(CsrfError::MissingRequestHeader)
         );
         assert_eq!(
-            require_mutation_headers(&with(REQUEST_HEADER, "true"), true),
+            require_mutation_headers(&with(REQUEST_HEADER, "true"), true, None),
             Err(CsrfError::MissingRequestHeader)
         );
     }
@@ -258,7 +271,7 @@ mod tests {
             "text/plain",
         ] {
             assert_eq!(
-                require_mutation_headers(&with("content-type", got), true),
+                require_mutation_headers(&with("content-type", got), true, None),
                 Err(CsrfError::WrongContentType {
                     got: got.to_string()
                 }),
@@ -266,7 +279,7 @@ mod tests {
             );
         }
         assert_eq!(
-            require_mutation_headers(&without("content-type"), true),
+            require_mutation_headers(&without("content-type"), true, None),
             Err(CsrfError::WrongContentType { got: String::new() })
         );
     }
@@ -279,7 +292,7 @@ mod tests {
             "application/json ",
         ] {
             assert_eq!(
-                require_mutation_headers(&with("content-type", got), true),
+                require_mutation_headers(&with("content-type", got), true, None),
                 Ok(()),
                 "{got} is JSON"
             );
@@ -290,7 +303,7 @@ mod tests {
     fn a_bodyless_request_needs_no_content_type() {
         // DELETE /snapshots/{ns}/{name} sends no body.
         assert_eq!(
-            require_mutation_headers(&without("content-type"), false),
+            require_mutation_headers(&without("content-type"), false, None),
             Ok(())
         );
     }
@@ -299,18 +312,18 @@ mod tests {
     fn a_cross_site_fetch_is_refused_and_absent_metadata_is_allowed() {
         for site in ["cross-site", "same-site"] {
             assert_eq!(
-                require_mutation_headers(&with(SEC_FETCH_SITE, site), true),
+                require_mutation_headers(&with(SEC_FETCH_SITE, site), true, None),
                 Err(CsrfError::CrossSite {
                     sec_fetch_site: site.to_string()
                 })
             );
         }
         assert_eq!(
-            require_mutation_headers(&with(SEC_FETCH_SITE, "none"), true),
+            require_mutation_headers(&with(SEC_FETCH_SITE, "none"), true, None),
             Ok(())
         );
         assert_eq!(
-            require_mutation_headers(&without(SEC_FETCH_SITE), true),
+            require_mutation_headers(&without(SEC_FETCH_SITE), true, None),
             Ok(()),
             "a browser that sends no Fetch Metadata still has to pass the marker header"
         );
@@ -319,14 +332,14 @@ mod tests {
     #[test]
     fn a_foreign_origin_is_refused() {
         assert_eq!(
-            require_mutation_headers(&with("origin", "https://evil.example"), true),
+            require_mutation_headers(&with("origin", "https://evil.example"), true, None),
             Err(CsrfError::OriginMismatch {
                 origin: "https://evil.example".to_string(),
                 host: "kopiur.example".to_string(),
             })
         );
         assert_eq!(
-            require_mutation_headers(&with("origin", "null"), true),
+            require_mutation_headers(&with("origin", "null"), true, None),
             Err(CsrfError::OriginMismatch {
                 origin: "null".to_string(),
                 host: "kopiur.example".to_string(),
@@ -337,27 +350,61 @@ mod tests {
     #[test]
     fn an_origin_matching_the_host_passes_over_either_scheme_and_port() {
         assert_eq!(
-            require_mutation_headers(&with("origin", "http://kopiur.example"), true),
+            require_mutation_headers(&with("origin", "http://kopiur.example"), true, None),
             Ok(())
         );
         let mut map = with("origin", "https://kopiur.example:8443");
         map.insert(HOST, HeaderValue::from_static("kopiur.example:8443"));
-        assert_eq!(require_mutation_headers(&map, true), Ok(()));
+        assert_eq!(require_mutation_headers(&map, true, None), Ok(()));
     }
 
     #[test]
-    fn an_origin_with_no_host_is_refused() {
+    fn an_origin_with_neither_a_host_header_nor_an_authority_is_refused() {
         let mut map = without("host");
         map.insert(ORIGIN, HeaderValue::from_static("https://kopiur.example"));
         assert!(matches!(
-            require_mutation_headers(&map, true),
+            require_mutation_headers(&map, true, None),
             Err(CsrfError::OriginMismatch { .. })
         ));
     }
 
     #[test]
+    fn an_http2_request_matches_its_origin_against_the_uri_authority() {
+        // HTTP/2 sends no Host header at all — the client sends :authority, which
+        // hyper puts on the request URI. Without the fallback, every h2 request
+        // carrying an Origin would be a false 403.
+        let mut map = without("host");
+        map.insert(ORIGIN, HeaderValue::from_static("https://kopiur.example"));
+
+        assert_eq!(
+            require_mutation_headers(&map, true, Some("kopiur.example")),
+            Ok(())
+        );
+        assert_eq!(
+            require_mutation_headers(&map, true, Some("evil.example")),
+            Err(CsrfError::OriginMismatch {
+                origin: "https://kopiur.example".to_string(),
+                host: "evil.example".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_host_header_wins_over_the_uri_authority() {
+        // Both present: `Host` is what the browser addressed, so it is what the
+        // Origin has to match.
+        assert_eq!(
+            require_mutation_headers(&headers(&good()), true, Some("elsewhere.example")),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn no_origin_header_at_all_passes() {
-        assert_eq!(require_mutation_headers(&without("origin"), true), Ok(()));
+        assert_eq!(
+            require_mutation_headers(&without("origin"), true, None),
+            Ok(())
+        );
     }
 
     #[test]
