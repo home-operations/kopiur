@@ -712,6 +712,73 @@ pub fn direct_source_path_ambiguous_message(ambiguity: &str) -> String {
     )
 }
 
+/// The sentence appended to a "no snapshot matched" outcome when the kopia
+/// source path was DERIVED rather than set (review wave 2, finding 3c). Pure +
+/// exhaustive over [`RestoreSource`].
+///
+/// `Some` only for a `fromPolicy` source with no `sourcePath` override — the
+/// derivation (`kopiur_api::expand::restore_source_path`) is then what chose the
+/// path, from the TARGET PVC's name for a selector policy. A restore of a
+/// selector-policy member into a differently-named PVC therefore derives a path
+/// the repository has never seen, and the honest `SnapshotNotFound` (or the
+/// empty volume under `Continue`) it gets says nothing about WHY unless this
+/// names the derived path and the override that fixes it. `recorded_path` is
+/// the path this claim (or the top-level `resolved.identity`) recorded; absent
+/// when resolution never got that far.
+///
+/// `None` for every other source: `snapshotRef` names a snapshot outright, and
+/// `identity` spells its own path, so a miss there is not a derivation problem.
+pub fn derived_source_path_hint(
+    source: &RestoreSource,
+    recorded_path: Option<&str>,
+) -> Option<String> {
+    let from_policy = match source {
+        RestoreSource::FromPolicy(p) => p,
+        RestoreSource::SnapshotRef(_) | RestoreSource::Identity(_) => return None,
+    };
+    if from_policy.source_path.is_some() {
+        return None;
+    }
+    let path = match recorded_path.filter(|p| !p.is_empty()) {
+        Some(p) => format!("the kopia source path `{p}` was derived from the policy"),
+        None => "the kopia source path was derived from the policy".to_string(),
+    };
+    Some(format!(
+        "Note: {path} (spec.source.fromPolicy.sourcePath is unset) — for a pvcSelector policy \
+         it is derived from the TARGET PVC's name, so restoring a member into a \
+         differently-named PVC (or cross-namespace) derives a path the repository has never \
+         seen. If the data you want was backed up under another member's path, set \
+         spec.source.fromPolicy.sourcePath explicitly (e.g. /pvc/<member>) on a new Restore, \
+         or `kubectl kopiur restore --from-policy <policy> --source-path /pvc/<member> ...`."
+    ))
+}
+
+/// Append [`derived_source_path_hint`] to `message` when it applies. Pure.
+pub fn with_derived_source_path_hint(
+    message: String,
+    source: &RestoreSource,
+    recorded_path: Option<&str>,
+) -> String {
+    match derived_source_path_hint(source, recorded_path) {
+        Some(hint) => format!("{message} {hint}"),
+        None => message,
+    }
+}
+
+/// How the mover's in-Job `onMissingSnapshot: Fail` outcome
+/// (`kopiur_mover::error::MoverError::RestoreNoSnapshot`) begins on the wire —
+/// its failure block classifies as the environmental `Unknown`, so the message
+/// is the only signal. Pinned here and tripwired against the mover's `Display`
+/// in the unit tests, so the two cannot drift silently.
+pub const RESTORE_NO_SNAPSHOT_MESSAGE_PREFIX: &str = "no snapshot matched the restore source";
+
+/// Whether a mover failure block says "no snapshot matched" — the deferred
+/// (in-Job) `SnapshotNotFound`, which the controller only ever sees as a
+/// `MoverJobFailed` claim with the mover's failure text. Pure.
+pub fn mover_reported_no_snapshot(failure: Option<&kopiur_api::common::FailureBlock>) -> bool {
+    failure.is_some_and(|f| f.message.starts_with(RESTORE_NO_SNAPSHOT_MESSAGE_PREFIX))
+}
+
 /// How to park a restore that is still inside (or has not yet started) its wait: the
 /// condition `reason`, the actionable message, and the requeue cadence in seconds.
 ///

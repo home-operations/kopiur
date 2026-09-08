@@ -1769,10 +1769,17 @@ async fn claim_finalize_rebound(
     } else {
         (
             ClaimReason::NoSnapshotContinue,
-            format!(
-                "populator: no snapshot found; provisioned an empty volume for claiming PVC \
-                 `{}` (deploy-or-restore)",
-                cc.consumer_name
+            // Wave 2, finding 3c: a derived path that matched nothing names
+            // itself and the `sourcePath` override, or an empty volume from a
+            // differently-named target looks like a restore with no data.
+            with_derived_source_path_hint(
+                format!(
+                    "populator: no snapshot found; provisioned an empty volume for claiming PVC \
+                     `{}` (deploy-or-restore)",
+                    cc.consumer_name
+                ),
+                &restore.spec.source,
+                cc.prev.and_then(|p| p.source_path.as_deref()),
             ),
         )
     };
@@ -2069,15 +2076,29 @@ async fn claim_populate(
                 )
             }
             MoverOutcome::Failed => {
+                let message = format!(
+                    "the populator restore mover Job `{}` failed; see the Job/pod logs, fix \
+                     the cause and re-create the claiming PVC `{}` to re-arm this claim \
+                     (other claims continue)",
+                    cc.job_name, cc.consumer_name
+                );
+                // Wave 2, finding 3c: the in-Job `onMissingSnapshot: Fail` is
+                // the deferred SnapshotNotFound, visible here only through the
+                // mover's failure block — when the path was derived, say so.
+                let message =
+                    if mover_reported_no_snapshot(cc.prev.and_then(|p| p.failure.as_ref())) {
+                        with_derived_source_path_hint(
+                            message,
+                            &restore.spec.source,
+                            source_path.as_deref(),
+                        )
+                    } else {
+                        message
+                    };
                 let mut record = cc.record(
                     RestoreClaimPhase::Failed,
                     ClaimReason::MoverJobFailed,
-                    format!(
-                        "the populator restore mover Job `{}` failed; see the Job/pod logs, fix \
-                         the cause and re-create the claiming PVC `{}` to re-arm this claim \
-                         (other claims continue)",
-                        cc.job_name, cc.consumer_name
-                    ),
+                    message,
                 );
                 record.pvc_prime = Some(cc.prime_name.clone());
                 record.job = Some(cc.job_name.clone());
@@ -2128,10 +2149,14 @@ async fn claim_populate(
         cc.record(
             RestoreClaimPhase::Populating,
             ClaimReason::NoSnapshotContinue,
-            format!(
-                "populator: no snapshot found; provisioning an empty volume for claiming PVC \
-                 `{}` (deploy-or-restore)",
-                cc.consumer_name
+            with_derived_source_path_hint(
+                format!(
+                    "populator: no snapshot found; provisioning an empty volume for claiming PVC \
+                     `{}` (deploy-or-restore)",
+                    cc.consumer_name
+                ),
+                &restore.spec.source,
+                cc.prev.and_then(|p| p.source_path.as_deref()),
             ),
         )
     };
@@ -2607,14 +2632,22 @@ fn restore_success_status(
 ) -> serde_json::Value {
     match resolved.and_then(|r| r.resolution) {
         Some(kopiur_api::ResolutionOutcome::NoSnapshot) => {
-            let msg = "no snapshot matched the source; provisioned an empty target volume \
-                       (deploy-or-restore)";
+            // Wave 2, finding 3c: name the derived path and the override.
+            let msg = with_derived_source_path_hint(
+                "no snapshot matched the source; provisioned an empty target volume \
+                 (deploy-or-restore)"
+                    .to_string(),
+                &restore.spec.source,
+                resolved
+                    .and_then(|r| r.identity.as_ref())
+                    .and_then(|i| i.source_path.as_deref()),
+            );
             let conditions = io::upsert_condition(
                 &existing_conditions(restore),
                 "Resolved",
                 true,
                 NO_SNAPSHOT_CONTINUE_REASON,
-                msg,
+                &msg,
                 restore.metadata.generation,
             );
             restore_ready_status_on(
@@ -2622,7 +2655,7 @@ fn restore_success_status(
                 &conditions,
                 RestorePhase::Completed,
                 NO_SNAPSHOT_CONTINUE_REASON,
-                msg,
+                &msg,
             )
         }
         Some(kopiur_api::ResolutionOutcome::Snapshot) => restore_ready_status(

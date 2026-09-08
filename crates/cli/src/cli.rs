@@ -484,6 +484,20 @@ pub struct RestoreArgs {
     #[arg(long, value_name = "N", conflicts_with = "from_snapshot")]
     pub offset: Option<i64>,
 
+    /// The kopia source path to read (--from-policy only), e.g. /pvc/<member>.
+    /// Overrides the per-PVC derivation: needed to restore a pvcSelector
+    /// policy's member into a differently-named PVC, or cross-namespace.
+    // `requires` alone is satisfied by ANY member of the `source` group in clap
+    // (`--from-snapshot … --source-path` parsed), so the other sources are
+    // named as explicit conflicts too.
+    #[arg(
+        long,
+        value_name = "KOPIA_PATH",
+        requires = "from_policy",
+        conflicts_with_all = ["from_snapshot", "identity"]
+    )]
+    pub source_path: Option<String>,
+
     /// Pin an exact kopia snapshot ID (--identity only; excludes --as-of/--offset).
     #[arg(
         long,

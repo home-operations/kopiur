@@ -1951,6 +1951,100 @@ fn wait_deadline_runs_from_the_anchor_not_from_creation() {
 /// `status.waitStartedAt` — deliberately absent until a claim appears — points them at the
 /// wrong thing. It also never resolves on its own, so it takes the 30s awaiting-claim
 /// cadence rather than a permanent 15s poll.
+/// Review wave 2, finding 3c: when a `fromPolicy` restore with no `sourcePath`
+/// comes up empty, the message must name the DERIVED path and the override that
+/// fixes it — restoring a selector-policy member into a differently-named PVC
+/// derives a path the repository has never seen, and a bare "no snapshot" (or a
+/// silently empty volume under `Continue`) says nothing about why.
+#[test]
+fn a_no_snapshot_outcome_names_the_derived_path_and_the_source_path_override() {
+    use kopiur_api::common::ObjectRef;
+    use kopiur_api::restore::{FromPolicy, IdentitySource};
+
+    let derived = RestoreSource::FromPolicy(FromPolicy {
+        name: "cfg".into(),
+        namespace: None,
+        as_of: None,
+        offset: 0,
+        source_path: None,
+    });
+    let hint = derived_source_path_hint(&derived, Some("/pvc/scratch")).expect("a hint");
+    assert!(hint.contains("`/pvc/scratch`"), "{hint}");
+    assert!(hint.contains("derived from the policy"), "{hint}");
+    assert!(hint.contains("spec.source.fromPolicy.sourcePath"), "{hint}");
+    assert!(hint.contains("/pvc/<member>"), "{hint}");
+    assert!(hint.contains("--source-path"), "{hint}");
+    // No recorded path (resolution never got that far): still a hint, without
+    // inventing a path.
+    let bare = derived_source_path_hint(&derived, None).expect("a hint");
+    assert!(!bare.contains("source path `"), "{bare}");
+    assert!(bare.contains("source path was derived"), "{bare}");
+    assert!(bare.contains("spec.source.fromPolicy.sourcePath"), "{bare}");
+    assert_eq!(
+        derived_source_path_hint(&derived, Some("")),
+        Some(bare.clone())
+    );
+
+    // An explicit override was the user's own choice: no derivation to explain.
+    let overridden = RestoreSource::FromPolicy(FromPolicy {
+        source_path: Some("/pvc/other".into()),
+        name: "cfg".into(),
+        namespace: None,
+        as_of: None,
+        offset: 0,
+    });
+    assert_eq!(
+        derived_source_path_hint(&overridden, Some("/pvc/other")),
+        None
+    );
+    // Nor for the sources that name their snapshot or path outright.
+    let by_ref = RestoreSource::SnapshotRef(ObjectRef {
+        name: "s".into(),
+        namespace: None,
+    });
+    assert_eq!(derived_source_path_hint(&by_ref, Some("/pvc/x")), None);
+    let by_identity = RestoreSource::Identity(IdentitySource {
+        username: "u".into(),
+        hostname: "h".into(),
+        source_path: Some("/data".into()),
+        snapshot_id: None,
+        as_of: None,
+        offset: None,
+    });
+    assert_eq!(derived_source_path_hint(&by_identity, Some("/data")), None);
+
+    // The appender leaves a non-derived message byte-identical.
+    assert_eq!(
+        with_derived_source_path_hint("m".into(), &by_ref, None),
+        "m"
+    );
+    assert!(with_derived_source_path_hint("m".into(), &derived, None).starts_with("m Note: "));
+
+    // The mover's in-Job `Fail` outcome reaches the controller only as a failure
+    // block; the prefix the controller keys on must be the mover's actual text.
+    let mover_text = kopiur_mover::error::MoverError::RestoreNoSnapshot {
+        identity: "u@h:/pvc/scratch".into(),
+    }
+    .to_string();
+    assert!(
+        mover_text.starts_with(RESTORE_NO_SNAPSHOT_MESSAGE_PREFIX),
+        "mover text drifted from the controller's prefix: {mover_text}"
+    );
+    let block = |message: &str| kopiur_api::common::FailureBlock {
+        kopia_error_class: "Unknown".into(),
+        message: message.into(),
+        retry_recommended: false,
+        stderr_tail: None,
+        exit_code: None,
+        op: None,
+    };
+    assert!(mover_reported_no_snapshot(Some(&block(&mover_text))));
+    assert!(!mover_reported_no_snapshot(Some(&block(
+        "kopia: permission denied"
+    ))));
+    assert!(!mover_reported_no_snapshot(None));
+}
+
 /// Review wave 2, finding 9: a direct-target ambiguity is one-shot terminal, so
 /// its message must name the recovery that exists (a NEW Restore) and never
 /// promise the spec edit the reconcile guard will not re-read.

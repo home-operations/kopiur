@@ -81,10 +81,9 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
             namespace: args.policy_namespace.clone(),
             as_of: args.as_of.clone(),
             offset: args.offset.unwrap_or(0),
-            // The per-PVC path override (#443) has no CLI flag yet: the derivation
-            // covers every shape `kubectl kopiur restore` can build today, and an
-            // ambiguous policy fails closed naming the field to set in YAML.
-            source_path: None,
+            // The per-PVC path override (#443): `--source-path`, fromPolicy only
+            // (clap `requires = "from_policy"` rejects it with any other source).
+            source_path: args.source_path.clone(),
         }),
         (None, None, Some(identity)) => RestoreSource::Identity(IdentitySource {
             username: identity.username.clone(),
@@ -418,6 +417,47 @@ mod tests {
         // time with flag-level wording instead.
         let err = parse_err(&["--from-policy", "p", "--create-pvc", "x"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// `--source-path` (#443 review wave 2, finding 3b): the per-PVC path
+    /// override, fromPolicy only. It is what restores a selector-policy member
+    /// into a differently-named PVC.
+    #[test]
+    fn source_path_lands_on_from_policy_and_is_refused_with_other_sources() {
+        let args = parse(&[
+            "--from-policy",
+            "nightly",
+            "--source-path",
+            "/pvc/postgres-data",
+            "--to-pvc",
+            "scratch",
+        ]);
+        let restore = build_restore(&args, "media", at());
+        match &restore.spec.source {
+            RestoreSource::FromPolicy(p) => {
+                assert_eq!(p.source_path.as_deref(), Some("/pvc/postgres-data"));
+            }
+            other => panic!("expected fromPolicy, got {other:?}"),
+        }
+        // Absent ⇒ absent on the wire (the derivation applies).
+        let bare = parse(&["--from-policy", "nightly", "--to-pvc", "scratch"]);
+        match &build_restore(&bare, "media", at()).spec.source {
+            RestoreSource::FromPolicy(p) => assert!(p.source_path.is_none()),
+            other => panic!("expected fromPolicy, got {other:?}"),
+        }
+        // Any other source: a parse-time error, not a silently dropped flag.
+        for source in [
+            &["--from-snapshot", "snap1"][..],
+            &["--identity", "u@h:/data", "--repository", "r"][..],
+        ] {
+            let mut argv = source.to_vec();
+            argv.extend(["--source-path", "/pvc/x", "--to-pvc", "d"]);
+            let err = parse_err(&argv);
+            assert!(
+                err.to_string().contains("--source-path"),
+                "{source:?}: {err}"
+            );
+        }
     }
 
     #[test]
