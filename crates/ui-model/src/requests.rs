@@ -70,7 +70,20 @@ pub struct RestoreBody {
     /// Overwrite files that already exist on the target.
     #[serde(default)]
     pub overwrite: Option<bool>,
-    /// Restore only this subtree of the snapshot instead of the whole thing.
+    /// Which kopia source path to read FROM, overriding the one kopiur would
+    /// derive.
+    ///
+    /// A source *selector*, not a subtree filter: it picks which of a
+    /// repository's kopia sources the snapshot is pulled from, and does not
+    /// change what is written or restore only part of a snapshot. Mirrors the
+    /// CRD's own `fromPolicy.sourcePath` and `identity.sourcePath`, which is
+    /// where it lands.
+    ///
+    /// Needed when the derivation is ambiguous or wrong — most often a
+    /// multi-PVC `pvcSelector` policy, where each member wrote its own
+    /// `/pvc/<name>` source and the restore has to say which one it wants.
+    /// Meaningless with a `snapshotRef` source, which already pins the path its
+    /// `Snapshot` was written from.
     #[serde(default)]
     pub source_path: Option<String>,
 }
@@ -212,6 +225,14 @@ pub struct ReplicationRunBody {
     pub namespace: String,
     /// Name of the replication resource.
     pub name: String,
+    /// `RepositoryReplication` or `SnapshotReplication`, or the kebab tokens;
+    /// omit to detect by name.
+    ///
+    /// Detection reads both kinds and fails when one name exists in both — this
+    /// is how the caller says which one they meant, so the remediation on that
+    /// ambiguity is something the API can actually satisfy.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// Trigger a catalog scan of a repository.

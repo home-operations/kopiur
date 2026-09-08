@@ -286,7 +286,12 @@ fn ui_fix(error: &OpsError) -> Option<&'static str> {
         OpsError::UnknownPolicyRepository { .. } => {
             Some("choose one of the policy's repositories in the request")
         }
-        OpsError::AmbiguousTarget { .. } => Some("specify the replication kind in the request"),
+        // Names the field that actually resolves it. The CLI text says
+        // `--kind`, and the earlier UI wording ("specify the replication kind")
+        // was unsatisfiable until `ReplicationRunBody` grew a `kind`.
+        OpsError::AmbiguousTarget { .. } => Some(
+            "set `kind` in the request body to `RepositoryReplication` or `SnapshotReplication`",
+        ),
 
         OpsError::SelectorMatchedNothing { .. }
         | OpsError::Forbidden { .. }
@@ -727,8 +732,15 @@ mod tests {
             what: "two replications named nightly".to_string(),
             candidates: "SnapshotReplication/nightly, RepositoryReplication/nightly".to_string(),
         });
-        assert_eq!(api.0.fix, "specify the replication kind in the request");
+        assert_eq!(
+            api.0.fix,
+            "set `kind` in the request body to `RepositoryReplication` or `SnapshotReplication`"
+        );
         assert!(!api.0.fix.contains("positional"));
+        assert!(
+            !api.0.fix.contains("--kind"),
+            "a browser cannot pass a CLI flag"
+        );
     }
 
     #[test]

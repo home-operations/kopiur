@@ -18,6 +18,18 @@
 //! shared verbatim. The translation below is therefore mechanical, and its tests
 //! assert the mechanics rather than the semantics.
 //!
+//! # A write-consequential read is never served from the reflector
+//!
+//! Nothing in this module touches [`crate::cache::Source`]. The read side may
+//! answer from the watch-fed reflector — a page rendering a policy one watch-lag
+//! stale is a cosmetic problem — but a mutation's *input* is not a view. The
+//! `SnapshotPolicy` that `snapshot-now` reads is what decides how many `Snapshot`
+//! CRs get created and against which repositories, so it is fetched live through
+//! the caller's own impersonated client. Staleness there would not misrender a
+//! page; it would create the wrong backups. The rule is absolute rather than
+//! per-read so it stays greppable: `actions/` contains zero references to
+//! `app.source`.
+//!
 //! # Why the string fields are parsed here and not in the wire types
 //!
 //! `SuspendBody::kind`, `MaintenanceRunBody::mode` and `ScanCatalogBody::kind`
@@ -37,16 +49,14 @@
 //! it stamped) and lets the SPA watch the object's status for the rest.
 
 // Every function here returns `Result<_, ApiError>`, and an `ApiError` is a whole
-// RFC 9457 `Problem` — eight owned strings, ~280 bytes — so clippy objects that
-// the success path carries the error's size on the stack. That is the right
-// complaint about the wrong place: the size belongs to `api::problem::ApiError`,
-// which is the shared error shape for this entire crate, and the fix is to box
-// the `Problem` inside it once rather than to box it at every call site here.
-// Until that lands, the cost is one ~280-byte `Result` per HTTP request, which is
-// noise next to the request itself.
+// RFC 9457 `Problem` — six `String`s, two `Option<String>`s and a `u16`, ~200
+// bytes — so clippy objects that the success path carries the error's size on the
+// stack. That is the right complaint about the wrong place: the size belongs to
+// `api::problem::ApiError`, which is the shared error shape for this entire
+// crate, and the fix is to box the `Problem` inside it once rather than to box it
+// at every call site here. Until that lands, the cost is one ~200-byte `Result`
+// per HTTP request, which is noise next to the request itself.
 #![allow(clippy::result_large_err)]
-
-use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -116,11 +126,15 @@ pub fn router() -> Router<AppState> {
 /// is told which field. serde's own message names it, so it is carried into
 /// `what` verbatim rather than paraphrased.
 ///
-/// Every rejection maps to 400, including the ones axum would status differently
-/// (a missing `Content-Type` is a 415 there). That costs no fidelity here:
+/// Two rejections, not one. A body that exceeded axum's length limit is a 413
+/// `body-too-large`, because "your request is malformed" is a false diagnosis
+/// that sends the caller looking for a typo they do not have. Everything else is
+/// the 400 above.
+///
+/// The remaining variants axum would status differently — `MissingJsonContentType`
+/// is a 415 there — collapse into the 400 without losing anything, because
 /// [`crate::auth::csrf`] already refuses a mutating request whose body is not
-/// `application/json`, so those variants are unreachable behind the guard, and
-/// the SPA switches on the `type` URN rather than on the status.
+/// `application/json`, so they are unreachable behind the guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiJson<T>(pub T);
 
@@ -135,8 +149,24 @@ where
         let path = req.uri().path().to_string();
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(invalid_body(rejection.body_text()).with_instance(path)),
+            Err(rejection) => Err(rejected_body(&rejection).with_instance(path)),
         }
+    }
+}
+
+/// Which problem one [`JsonRejection`] becomes.
+///
+/// `JsonRejection` is `#[non_exhaustive]`, so this cannot be an exhaustive match
+/// — the `_` arm is the compiler's requirement, not a shortcut. Everything the
+/// wildcard catches is a body kopiur-ui could not read, which is what
+/// `invalid-body` says.
+fn rejected_body(rejection: &JsonRejection) -> ApiError {
+    match rejection {
+        // axum's own body-length limit tripped. The body was never parsed, so
+        // serde has nothing to say about it and `body_text()` is about the
+        // length rather than the content.
+        JsonRejection::BytesRejection(_) => body_too_large(rejection.body_text()),
+        _ => invalid_body(rejection.body_text()),
     }
 }
 
@@ -151,6 +181,27 @@ fn invalid_body(detail: impl Into<String>) -> ApiError {
          or changed.",
         "correct the request and try again; if you did not hand-write it, reload the page so \
          the SPA bundle matches this backend",
+    )
+}
+
+/// The 413 for a body that exceeded the server's length limit.
+///
+/// Distinct from [`invalid_body`] because the remediation is the opposite one:
+/// nothing about the request's *shape* is wrong, so telling the caller to fix
+/// their JSON would send them hunting for a defect that is not there.
+fn body_too_large(detail: impl Into<String>) -> ApiError {
+    problem(
+        413,
+        "body-too-large",
+        format!(
+            "kopiur-ui refused the request because its body is too large: {}",
+            detail.into()
+        ),
+        "The body exceeded the server's request-size limit and was never read, so nothing \
+         was created or changed. Every action body here is a handful of fields; a large one \
+         usually means a field was filled with a file or a whole manifest.",
+        "send only the fields the action needs; if a list in the request is genuinely that \
+         long, split it across several requests",
     )
 }
 
@@ -193,21 +244,45 @@ fn not_found(kind: &'static str, plural: &'static str, namespace: &str, name: &s
     }
 }
 
-/// A created `Snapshot` as the wire reference the SPA links to.
+/// A just-created object as the wire reference the SPA links to.
 ///
-/// `fallback_namespace` is the namespace the action ran in: the apiserver always
-/// echoes `metadata.namespace` on a created object, but a reference with an empty
-/// namespace would be an unusable link, so the request's own namespace stands in
-/// rather than `""`.
-fn snapshot_ref(snapshot: &Snapshot, fallback_namespace: &str) -> SnapshotRefView {
-    SnapshotRefView {
-        namespace: snapshot
-            .metadata
+/// Generic over the kind because `Snapshot` and `Restore` need the identical
+/// treatment and a second hand-written copy is how the two would drift.
+///
+/// The two absent-metadata cases are deliberately not symmetric. A missing
+/// namespace is *recoverable*: the action ran in exactly one namespace, so
+/// `fallback_namespace` is not a guess, it is the answer. A missing name is not
+/// — there is nothing to substitute, and `{"name": ""}` would hand the SPA a
+/// link that resolves to nothing. The apiserver always echoes a name on a
+/// created object, so this is unreachable in practice; making it an `internal`
+/// problem keeps the one impossible state from degrading into a wrong answer.
+fn created_ref<K: kube::Resource<DynamicType = ()>>(
+    object: &K,
+    fallback_namespace: &str,
+) -> Result<SnapshotRefView, ApiError> {
+    let meta = object.meta();
+    let name = meta.name.clone().ok_or_else(|| {
+        problem(
+            500,
+            "internal",
+            format!(
+                "kopiur-ui created a {} but the API server returned it without a name.",
+                K::kind(&())
+            ),
+            "A created object always echoes metadata.name, so this should be impossible; \
+             kopiur-ui has nothing to link the new object by.",
+            "the object was most likely created — check the namespace for it before retrying, \
+             and report this at https://github.com/home-operations/kopiur/issues",
+        )
+    })?;
+
+    Ok(SnapshotRefView {
+        namespace: meta
             .namespace
             .clone()
             .unwrap_or_else(|| fallback_namespace.to_string()),
-        name: snapshot.metadata.name.clone().unwrap_or_default(),
-    }
+        name,
+    })
 }
 
 /// A receipt for an action that stamped a request rather than creating anything.
@@ -295,26 +370,39 @@ fn manual_run_mode(raw: &str) -> Result<ManualRunMode, ApiError> {
     })
 }
 
-/// The namespace a namespaced action runs in.
+/// The namespace a namespaced action runs in, refusing an empty one.
 ///
-/// A cluster-scoped kind needs none, and every namespaced kind needs a real one:
-/// `Api::namespaced("")` builds a URL naming a *different* collection, so a
-/// missing namespace must be a 400 rather than a request against whatever that
-/// URL happens to resolve to.
+/// Every namespace input in this module goes through here, including the four
+/// that are a required `String` on the wire. Required is not the same as
+/// non-empty: a Helm chart renders a nulled value as `""`, and a hand-written
+/// request can send it outright. `Api::namespaced(client, "")` does not fail —
+/// it builds `.../namespaces//<plural>`, a URL naming a *different* collection —
+/// so an empty namespace has to be a 400 rather than a request against whatever
+/// that resolves to.
+fn require_namespace<'a>(kind_label: &str, namespace: &'a str) -> Result<&'a str, ApiError> {
+    if namespace.is_empty() {
+        return Err(invalid_body(format!(
+            "namespace is required for {kind_label}, which is a namespaced kind"
+        )));
+    }
+    Ok(namespace)
+}
+
+/// [`require_namespace`] for the two bodies whose namespace is optional because
+/// the kind may be cluster-scoped.
+///
+/// A cluster-scoped kind needs none, and one sent anyway is meaningless rather
+/// than malformed — the CRD has no namespace for it to disagree with — so it is
+/// dropped instead of refused.
 fn action_namespace(
     namespaced: bool,
     kind_label: &str,
     namespace: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
-    match (namespaced, namespace.filter(|ns| !ns.is_empty())) {
-        (true, Some(ns)) => Ok(Some(ns.to_string())),
-        (true, None) => Err(invalid_body(format!(
-            "namespace is required for {kind_label}, which is a namespaced kind"
-        ))),
-        // Cluster-scoped: a namespace is meaningless, not malformed — the CRD has
-        // none to disagree with, so one sent anyway is simply unused.
-        (false, _) => Ok(None),
+    if !namespaced {
+        return Ok(None);
     }
+    require_namespace(kind_label, namespace.unwrap_or_default()).map(|ns| Some(ns.to_string()))
 }
 
 /// Which [`MaintenanceTarget`] a run request names.
@@ -359,19 +447,27 @@ fn repository_ref(body: &RepositoryRefBody) -> Result<RepositoryRef, ApiError> {
 
 /// Map [`RestoreSourceBody`] onto the CRD's `RestoreSource`.
 ///
-/// `source_path` is `RestoreBody::source_path` — "restore only this subtree". The
-/// CRD has no such field on the spec: it hangs off the *source*, and only two of
-/// the three sources have somewhere to put it. So:
+/// `source_path` is `RestoreBody::source_path`: a **source selector**, not a
+/// subtree filter. It says which of a repository's kopia source paths to READ
+/// from — the case that needs it is a multi-PVC `pvcSelector` policy, where each
+/// member wrote its own `/pvc/<name>` source and the restore has to name the one
+/// it wants. It does not change what gets written, and it cannot restore part of
+/// a snapshot; `FromPolicy::source_path` says so in the CRD itself.
 ///
-/// * `fromPolicy` — the body-level path fills [`FromPolicy::source_path`], which
-///   overrides the path kopiur would otherwise derive from the policy.
-/// * `identity` — the variant carries its own `sourcePath` (it is part of the
-///   kopia identity being addressed); the body-level one fills it in only when
-///   the variant left it unset, so the more specific value always wins.
-/// * `snapshotRef` — a `Snapshot` already pins the source path it was written
-///   from. There is nowhere for a second one to go, so it is refused rather than
-///   dropped: silently ignoring it would restore the whole snapshot while telling
-///   the caller a subtree was restored.
+/// It is a property of the *source*, so where it lands depends on which source
+/// this is — and one of the three has no selector at all:
+///
+/// * `fromPolicy` — fills [`FromPolicy::source_path`], overriding the path
+///   kopiur would otherwise derive from the policy's `sourcePathStrategy`.
+/// * `identity` — the variant carries its own `sourcePath` (it is a component of
+///   the kopia identity being addressed); the body-level one fills it in only
+///   when the variant left it unset, so the more specific value always wins.
+/// * `snapshotRef` — refused. A `Snapshot` *is* one already-selected source, so
+///   there is no selector to set; the CRD gives `RestoreSource::SnapshotRef` only
+///   a name and a namespace. Accepting the field and dropping it would let a
+///   caller believe they had picked a source when the snapshot they named had
+///   already picked it for them — the CLI refuses the same combination
+///   (`--source-path` is `fromPolicy`-only).
 fn restore_source(
     body: &RestoreSourceBody,
     source_path: Option<&str>,
@@ -380,9 +476,10 @@ fn restore_source(
         RestoreSourceBody::SnapshotRef { name, namespace } => {
             if source_path.is_some() {
                 return Err(invalid_body(
-                    "sourcePath cannot be combined with a snapshotRef source, because a \
-                     Snapshot already pins the kopia source path it was written from; use a \
-                     fromPolicy or identity source to name a different path",
+                    "sourcePath selects which kopia source to read from, and a snapshotRef \
+                     source has no such selector — the Snapshot you named is already one \
+                     source. Drop sourcePath to restore that snapshot, or use a fromPolicy \
+                     or identity source to choose a different source path",
                 ));
             }
             Ok(RestoreSource::SnapshotRef(ObjectRef {
@@ -486,26 +583,41 @@ fn restore_request(body: &RestoreBody) -> Result<RestoreRequest, ApiError> {
 
 /// `POST /actions/snapshot-now` — run a `SnapshotPolicy` right now.
 ///
-/// The policy is read through [`crate::cache::Source`] (so a cache deployment
-/// answers from the reflector, still `SubjectAccessReview`-gated) and then handed
-/// to the shared planner, which mints the same fan-out cells a `SnapshotSchedule`
-/// slot would. `201` with every `Snapshot` created — plural, because a
-/// `pvcSelector` or multi-repository policy fans out.
+/// The policy is read LIVE through the caller's impersonated client — never the
+/// reflector cache, see the module header — and handed to the shared planner,
+/// which mints the same fan-out cells a `SnapshotSchedule` slot would. `201` with
+/// every `Snapshot` created; plural, because a `pvcSelector` or multi-repository
+/// policy fans out.
 async fn snapshot_now(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
     ApiJson(body): ApiJson<SnapshotNowBody>,
 ) -> Result<(StatusCode, axum::Json<ActionReceipt>), ApiError> {
-    let ctx = ops_ctx(&app, &id, &body.namespace)?;
-    let policy: Arc<SnapshotPolicy> = app
-        .source
-        .get(&id, &ctx.client, Some(&body.namespace), &body.policy)
-        .await?
+    let namespace = require_namespace("SnapshotPolicy", &body.namespace)?;
+    let ctx = ops_ctx(&app, &id, namespace)?;
+
+    // Live, through the caller's own client — never `app.source`. See the
+    // module header: this object decides how many Snapshots get created and
+    // against which repositories, so a reflector's watch lag here would create
+    // the wrong backups rather than misrender a page.
+    let policy: SnapshotPolicy = Api::<SnapshotPolicy>::namespaced(ctx.client.clone(), namespace)
+        .get_opt(&body.policy)
+        .await
+        .map_err(|e| {
+            classify_kube(
+                "get",
+                "SnapshotPolicy",
+                "snapshotpolicies",
+                Some(namespace),
+                Some(&body.policy),
+                e,
+            )
+        })?
         .ok_or_else(|| {
             not_found(
                 "SnapshotPolicy",
                 "snapshotpolicies",
-                &body.namespace,
+                namespace,
                 &body.policy,
             )
         })?;
@@ -524,8 +636,8 @@ async fn snapshot_now(
     };
 
     let now = Utc::now();
-    let planned = plan_snapshots(&ctx, &request, &policy, &body.namespace, now).await?;
-    let created = create_snapshots(&ctx, &body.namespace, &planned).await?;
+    let planned = plan_snapshots(&ctx, &request, &policy, namespace, now).await?;
+    let created = create_snapshots(&ctx, namespace, &planned).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -533,8 +645,8 @@ async fn snapshot_now(
             kind: "Snapshot".to_string(),
             created: created
                 .iter()
-                .map(|s| snapshot_ref(s, &body.namespace))
-                .collect(),
+                .map(|s| created_ref(s, namespace))
+                .collect::<Result<Vec<_>, _>>()?,
             requested_at: None,
             note: None,
         }),
@@ -551,23 +663,17 @@ async fn restore(
     CurrentIdentity(id): CurrentIdentity,
     ApiJson(body): ApiJson<RestoreBody>,
 ) -> Result<(StatusCode, axum::Json<ActionReceipt>), ApiError> {
-    let ctx = ops_ctx(&app, &id, &body.namespace)?;
+    let namespace = require_namespace("Restore", &body.namespace)?;
+    let ctx = ops_ctx(&app, &id, namespace)?;
     let request = restore_request(&body)?;
-    let built = build_restore(&request, &body.namespace, Utc::now());
-    let created = create_restore(&ctx, &body.namespace, built).await?;
+    let built = build_restore(&request, namespace, Utc::now());
+    let created = create_restore(&ctx, namespace, built).await?;
 
     Ok((
         StatusCode::CREATED,
         axum::Json(ActionReceipt {
             kind: "Restore".to_string(),
-            created: vec![SnapshotRefView {
-                namespace: created
-                    .metadata
-                    .namespace
-                    .clone()
-                    .unwrap_or_else(|| body.namespace.clone()),
-                name: created.metadata.name.clone().unwrap_or_default(),
-            }],
+            created: vec![created_ref(&created, namespace)?],
             requested_at: None,
             note: None,
         }),
@@ -585,13 +691,30 @@ async fn restore(
 /// mass-deletion breaker keeps its [`DELETION_HELD_CONDITION`], and a UI that
 /// reported a bare success there would tell the caller a backup was deleted while
 /// the breaker was still holding it.
+///
+/// # `note` is a courtesy, not an answer — the SPA must watch the object
+///
+/// The re-read races the controller and usually loses. `DeletionHeld` is stamped
+/// by a *later* reconcile, once the batched deleter has seen the
+/// `deletionTimestamp`, so on a first DELETE the condition cannot be there yet
+/// and this note will be absent. It fires mainly on a repeat DELETE of an
+/// already-deleting object.
+///
+/// So: an ABSENT note means nothing at all. It does not mean the snapshot is
+/// unheld, and a `202` here is not a statement that the kopia snapshot will be
+/// deleted. Whoever renders this must follow the `Snapshot`'s own conditions for
+/// the real answer and must not treat the receipt as authoritative for
+/// `DeletionHeld`. A present note is trustworthy; its absence is not evidence.
 async fn delete_snapshot(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
     Path((namespace, name)): Path<(String, String)>,
 ) -> Result<(StatusCode, axum::Json<ActionReceipt>), ApiError> {
-    let ctx = ops_ctx(&app, &id, &namespace)?;
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
+    // The path parameter gets the same guard as every body namespace: a route
+    // match is not a promise that the segment is non-empty.
+    let namespace = require_namespace("Snapshot", &namespace)?;
+    let ctx = ops_ctx(&app, &id, namespace)?;
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
 
     api.delete(&name, &DeleteParams::background())
         .await
@@ -600,7 +723,7 @@ async fn delete_snapshot(
                 "delete",
                 "Snapshot",
                 "snapshots",
-                Some(&namespace),
+                Some(namespace),
                 Some(&name),
                 e,
             )
@@ -721,7 +844,8 @@ async fn maintenance_run(
 ) -> Result<(StatusCode, axum::Json<ActionReceipt>), ApiError> {
     let target = maintenance_target(&body)?;
     let mode = manual_run_mode(&body.mode)?;
-    let ctx = ops_ctx(&app, &id, &body.namespace)?;
+    let namespace = require_namespace("Maintenance", &body.namespace)?;
+    let ctx = ops_ctx(&app, &id, namespace)?;
 
     let maint = maintenance::resolve(&ctx, &target).await?;
     let requested_at = maintenance::request_run(&ctx, &maint, mode, Utc::now()).await?;
@@ -734,17 +858,24 @@ async fn maintenance_run(
 
 /// `POST /actions/replication-run` — ask for a replication run now.
 ///
-/// The kind is detected rather than taken from the caller: exactly one of a
-/// `RepositoryReplication` and a `SnapshotReplication` may hold the name in that
-/// namespace, and both existing is an ambiguity `kopiur_ops` refuses instead of
-/// guessing which one to fire.
+/// `kind` is optional and detection is the default, because a caller who knows a
+/// name usually does not care which of the two CRDs holds it. Detection reads
+/// both kinds and refuses when one name exists in both rather than guessing which
+/// replication to fire — and `kind` is how the caller answers that refusal, which
+/// is why the remediation on `OpsError::AmbiguousTarget` names this field.
 async fn replication_run(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
     ApiJson(body): ApiJson<ReplicationRunBody>,
 ) -> Result<(StatusCode, axum::Json<ActionReceipt>), ApiError> {
-    let ctx = ops_ctx(&app, &id, &body.namespace)?;
-    let kind = replication::detect_kind(&ctx, &body.name).await?;
+    let stated = body.kind.as_deref().map(replication_kind).transpose()?;
+    let namespace = require_namespace("replication resources", &body.namespace)?;
+    let ctx = ops_ctx(&app, &id, namespace)?;
+
+    let kind = match stated {
+        Some(kind) => kind,
+        None => replication::detect_kind(&ctx, &body.name).await?,
+    };
     let requested_at = replication::request_run_by_kind(&ctx, kind, &body.name, Utc::now()).await?;
 
     Ok((
@@ -753,9 +884,50 @@ async fn replication_run(
     ))
 }
 
-/// The CRD kind name for a detected replication kind. Exhaustive over
-/// [`ReplicationKind`], so a third replication kind cannot compile until the
-/// receipt names it.
+/// Accepted spellings for one replication kind: the kebab-case token and the
+/// lowercased CRD kind, exactly as [`SUSPENDABLE_KINDS`] does it.
+const REPLICATION_KINDS: &[(&str, &str, ReplicationKind)] = &[
+    (
+        "replication",
+        "repositoryreplication",
+        ReplicationKind::RepositoryReplication,
+    ),
+    (
+        "snapshot-replication",
+        "snapshotreplication",
+        ReplicationKind::SnapshotReplication,
+    ),
+];
+
+/// Parse `ReplicationRunBody::kind`.
+///
+/// Same two-spelling, case-insensitive rule as [`suspendable_kind`] — a caller
+/// who writes `RepositoryReplication` for one endpoint and `replication` for the
+/// other should not have to remember which endpoint wanted which. Unknown input
+/// is a 400 listing the accepted tokens rather than a silent fall back to
+/// detection, because detection can pick the kind the caller was trying to rule
+/// out.
+fn replication_kind(raw: &str) -> Result<ReplicationKind, ApiError> {
+    let want = raw.trim().to_ascii_lowercase();
+    REPLICATION_KINDS
+        .iter()
+        .find(|(token, crd, _)| *token == want || *crd == want)
+        .map(|(_, _, kind)| *kind)
+        .ok_or_else(|| {
+            invalid_body(format!(
+                "{raw:?} is not a replication kind; expected one of {}, or omit kind to \
+                 detect it from the name",
+                REPLICATION_KINDS
+                    .iter()
+                    .flat_map(|(token, _, kind)| [*token, replication_kind_label(*kind)])
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
+/// The CRD kind name for a replication kind. Exhaustive over [`ReplicationKind`],
+/// so a third replication kind cannot compile until the receipt names it.
 fn replication_kind_label(kind: ReplicationKind) -> &'static str {
     match kind {
         ReplicationKind::RepositoryReplication => "RepositoryReplication",
@@ -796,6 +968,8 @@ async fn scan_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
 
     use axum::body::Body;
     use axum::http::{Request as HttpRequest, StatusCode as Status};
@@ -906,6 +1080,7 @@ mod tests {
                     ttl: std::time::Duration::from_secs(600),
                 },
                 sar_ttl: std::time::Duration::from_secs(60),
+                sar_cache_size: DEFAULT_SAR_CACHE_SIZE,
                 tls: None,
                 cors_origins: Vec::new(),
             }),
@@ -913,7 +1088,30 @@ mod tests {
             readiness: Arc::new(crate::ops_listener::Readiness::new(
                 crate::static_files::is_placeholder(),
             )),
-            auth: Arc::new(crate::auth::AuthState::default()),
+            // `AuthState::new`, not `unconfigured()`: the latter refuses every
+            // request with `NotWired` (a deliberate fail-closed), which would
+            // stop each of these tests at a 500 before the body is ever read.
+            // The base config still points at 127.0.0.1:1, so a handler that
+            // reaches the apiserver fails to connect rather than touching a
+            // cluster.
+            auth: Arc::new(crate::auth::AuthState::new(
+                AuthConfig {
+                    mode: AuthMode::AnonymousOnly(AnonymousIdentity {
+                        user: "viewer".to_string(),
+                        groups: Vec::new(),
+                    }),
+                    groups_separator: DEFAULT_GROUPS_SEPARATOR.to_string(),
+                    email_header: None,
+                    extra_keys: Vec::new(),
+                    allowed_groups: None,
+                    proxy_secret: None,
+                },
+                kube::Config::new("http://127.0.0.1:1/".parse().expect("test url")),
+                CacheLimits {
+                    size: 8,
+                    ttl: std::time::Duration::from_secs(600),
+                },
+            )),
             source: Arc::new(crate::cache::Source::Impersonated),
             sessions: Arc::new(crate::browse::session_pool::SessionPool::default()),
         }
@@ -1190,6 +1388,68 @@ mod tests {
             action_namespace(false, "ClusterRepository", Some("prod")).expect("ok"),
             None,
             "a ClusterRepository has no namespace for one to mean anything in"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_required_namespace_sent_empty_is_a_400_not_a_request_to_an_empty_collection() {
+        // `SnapshotNowBody::namespace` is a required `String`, which stops the
+        // key being absent but not its value being `""` — and `Api::namespaced(
+        // client, "")` would happily build `.../namespaces//snapshotpolicies`.
+        // Every namespace input goes through `require_namespace` for this.
+        let response = app()
+            .oneshot(spa_request(
+                "POST",
+                "/actions/snapshot-now",
+                r#"{"namespace":"","policy":"nightly","tags":[],"pin":false}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), Status::BAD_REQUEST);
+        let problem = problem_of(response).await;
+        assert_eq!(problem.r#type, "urn:kopiur:problem:invalid-body");
+        assert!(
+            problem.what.contains("namespace is required"),
+            "{}",
+            problem.what
+        );
+    }
+
+    #[test]
+    fn every_namespace_input_shares_one_guard() {
+        for kind in ["SnapshotPolicy", "Restore", "Maintenance", "Snapshot"] {
+            let error = require_namespace(kind, "").expect_err("empty must be refused");
+            assert_eq!(error.status(), Status::BAD_REQUEST, "{kind}");
+            assert!(error.0.what.contains(kind), "{}", error.0.what);
+        }
+        assert_eq!(require_namespace("Restore", "prod").expect("ok"), "prod");
+    }
+
+    // --- mutations never read from the cache --------------------------------
+
+    #[test]
+    fn no_mutation_reads_through_the_reflector_cache() {
+        // The rule from the module header, asserted against the source itself:
+        // a write-consequential read must not be served from a watch-fed store
+        // that is one lag behind and SAR-gated with a TTL. `snapshot_now`'s
+        // policy read is the one that matters — it decides how many Snapshots
+        // get created — but the rule is module-wide so it stays greppable.
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the non-test half of this file");
+        // Comment lines are skipped, so the module header may state the rule in
+        // the same words the check looks for.
+        let offending: Vec<&str> = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("app.source") || line.contains("cache::Source"))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "actions/ must never read through crate::cache::Source: {offending:?}"
         );
     }
 
@@ -1590,9 +1850,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_snapshot_reference_falls_back_to_the_namespace_the_action_ran_in() {
-        let mut snapshot = Snapshot::new(
+    fn bare_snapshot() -> Snapshot {
+        Snapshot::new(
             "nightly-1",
             kopiur_api::SnapshotSpec {
                 policy_ref: None,
@@ -1605,10 +1864,65 @@ mod tests {
                 pin: false,
                 description: None,
             },
+        )
+    }
+
+    #[test]
+    fn a_created_reference_falls_back_to_the_namespace_the_action_ran_in() {
+        let mut snapshot = bare_snapshot();
+        assert_eq!(
+            created_ref(&snapshot, "prod").expect("named").namespace,
+            "prod"
         );
-        assert_eq!(snapshot_ref(&snapshot, "prod").namespace, "prod");
         snapshot.metadata.namespace = Some("backups".to_string());
-        assert_eq!(snapshot_ref(&snapshot, "prod").namespace, "backups");
+        assert_eq!(
+            created_ref(&snapshot, "prod").expect("named").namespace,
+            "backups"
+        );
+    }
+
+    #[test]
+    fn the_same_helper_serves_every_created_kind() {
+        // One generic, so `Snapshot` and `Restore` cannot drift apart.
+        let restore = kopiur_api::Restore::new(
+            "restore-1",
+            kopiur_api::RestoreSpec {
+                repository: None,
+                source: RestoreSource::SnapshotRef(ObjectRef {
+                    name: "nightly-1".to_string(),
+                    namespace: None,
+                }),
+                target: RestoreTarget::PvcRef(ObjectRef {
+                    name: "data".to_string(),
+                    namespace: None,
+                }),
+                options: None,
+                policy: None,
+                credential_projection: None,
+                mover: None,
+                failure_policy: None,
+            },
+        );
+        let view = created_ref(&restore, "prod").expect("named");
+        assert_eq!(
+            (view.namespace.as_str(), view.name.as_str()),
+            ("prod", "restore-1")
+        );
+    }
+
+    #[test]
+    fn a_created_object_with_no_name_is_an_internal_problem_not_an_empty_link() {
+        // Unreachable against a real apiserver, which always echoes a name. The
+        // point is that the one impossible state fails loudly instead of handing
+        // the SPA `{"name": ""}`, a link that resolves to nothing.
+        let mut snapshot = bare_snapshot();
+        snapshot.metadata.name = None;
+
+        let error = created_ref(&snapshot, "prod").expect_err("must not degrade");
+        assert_eq!(error.status(), Status::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.0.r#type, "urn:kopiur:problem:internal");
+        assert!(error.0.what.contains("Snapshot"), "{}", error.0.what);
+        assert!(!error.0.fix.is_empty());
     }
 
     #[test]
@@ -1649,6 +1963,108 @@ mod tests {
             replication_kind_label(ReplicationKind::SnapshotReplication),
             "SnapshotReplication"
         );
+    }
+
+    #[test]
+    fn a_stated_replication_kind_parses_from_both_spellings() {
+        let cases = [
+            ("replication", ReplicationKind::RepositoryReplication),
+            (
+                "RepositoryReplication",
+                ReplicationKind::RepositoryReplication,
+            ),
+            ("snapshot-replication", ReplicationKind::SnapshotReplication),
+            ("SnapshotReplication", ReplicationKind::SnapshotReplication),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(replication_kind(raw).expect("parses"), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_replication_table_covers_every_variant_and_refuses_anything_else() {
+        for kind in [
+            ReplicationKind::RepositoryReplication,
+            ReplicationKind::SnapshotReplication,
+        ] {
+            assert!(
+                REPLICATION_KINDS.iter().any(|(_, _, k)| *k == kind),
+                "{kind:?} has no accepted spelling"
+            );
+        }
+        assert_eq!(REPLICATION_KINDS.len(), 2);
+
+        for raw in ["", "repository", "snapshot", "repl"] {
+            let error = replication_kind(raw).expect_err("must be refused");
+            assert_eq!(error.status(), Status::BAD_REQUEST, "{raw:?}");
+            assert!(
+                error.0.what.contains("omit kind"),
+                "the refusal must say detection is the alternative: {}",
+                error.0.what
+            );
+        }
+    }
+
+    #[test]
+    fn a_replication_run_body_accepts_an_optional_kind() {
+        // The field exists so the remediation on an ambiguous name is something
+        // the API can actually satisfy; omitting it must stay valid.
+        let detected: ReplicationRunBody =
+            serde_json::from_value(serde_json::json!({ "namespace": "prod", "name": "nightly" }))
+                .expect("kind is optional");
+        assert_eq!(detected.kind, None);
+
+        let stated: ReplicationRunBody = serde_json::from_value(serde_json::json!({
+            "namespace": "prod",
+            "name": "nightly",
+            "kind": "SnapshotReplication",
+        }))
+        .expect("kind is accepted");
+        assert_eq!(
+            replication_kind(stated.kind.as_deref().expect("set")).expect("parses"),
+            ReplicationKind::SnapshotReplication
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_stated_replication_kind_is_refused_before_any_cluster_call() {
+        let response = app()
+            .oneshot(spa_request(
+                "POST",
+                "/actions/replication-run",
+                r#"{"namespace":"prod","name":"nightly","kind":"Mirror"}"#,
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), Status::BAD_REQUEST);
+        assert_eq!(
+            problem_of(response).await.r#type,
+            "urn:kopiur:problem:invalid-body"
+        );
+    }
+
+    // --- oversized bodies ---------------------------------------------------
+
+    #[tokio::test]
+    async fn a_body_over_the_length_limit_is_a_413_not_a_malformed_request() {
+        // axum's default request-body limit is 2 MiB. Answering "malformed"
+        // here would send the caller hunting for a typo that is not there.
+        let oversized = format!(
+            r#"{{"kind":"policy","name":"nightly","namespace":"prod","suspend":true,"pad":"{}"}}"#,
+            "x".repeat(3 * 1024 * 1024)
+        );
+        let response = app()
+            .oneshot(spa_request("POST", "/actions/suspend", &oversized))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), Status::PAYLOAD_TOO_LARGE);
+        let problem = problem_of(response).await;
+        assert_eq!(problem.r#type, "urn:kopiur:problem:body-too-large");
+        assert_eq!(problem.status, 413);
+        assert!(!problem.fix.is_empty(), "413s carry a remediation too");
+        assert_eq!(problem.instance.as_deref(), Some("/actions/suspend"));
     }
 
     #[test]
