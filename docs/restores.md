@@ -213,13 +213,13 @@ There is one exception. If a provisioner bound the claim to some other volume wh
 
 ///
 
-/// warning | `target` is required — the empty-`target` form is gone
+/// warning | `target` is required, and the empty-`target` form is gone
 
 The webhook rejects a `Restore` with **no** `target`. Populator intent must be the **explicit** `target.populator: {}`, not an omitted `target`. The live-pod `inheritSecurityContextFrom` modes, `workloadSelector` and `pvcConsumer`, are invalid in populator mode: there is no workload pod at provision time. The webhook rejects them and points you at `moverDefaults`, an explicit `securityContext`, or `inheritSecurityContextFrom: { snapshot: {} }`. That last one **is** allowed, because it replays the identity recorded on the backup and needs no live pod. See [the re-bootstrap section](#declarative-re-bootstrap--restore-as-the-recorded-identity).
 
 ///
 
-/// note | A populator `Restore` is reusable — recreate the PVC and it restores again
+/// note | A populator `Restore` is reusable: recreate the PVC and it restores again
 
 A populator `Restore` is a **living source, not a one-shot**. `Completed` reports the *last* populate. It does **not** mark the `Restore` used up. Every PVC that claims it through `dataSourceRef` is populated as that PVC is provisioned. So if you delete the claiming PVC and apply a new one with the same `dataSourceRef`, Kopiur restores into the new PVC again. You do not touch the `Restore` at all. The PVC event re-enqueues it, and a populator's `Completed` phase is deliberately **not** terminal until a *bound* consumer exists, so a fresh, unbound claim drives a new populate.
 
@@ -411,7 +411,7 @@ The catalog scan filters out identities that belong to **other clusters**, recog
 
 ///
 
-/// note | `asOf` selects twice — CR-side identity vs repository-side data
+/// note | `asOf` selects twice: CR-side identity vs repository-side data
 
 With `fromPolicy` or `identity` plus `snapshot: {}`, **data and identity both come from the same catalog row**. The controller selects one matching Snapshot CR, honoring `asOf` and `offset`, records its kopia snapshot id as the data to restore, and replays that same snapshot's recorded identity. The two can never diverge, so snapshot B's data is never restored under snapshot A's uid, gid and fsGroup. The trade-off is deliberate. Selection runs against the **CR catalog**, not the live repository listing, so under catalog lag the restore picks the newest *catalogued* snapshot. The scan converges the catalog, and a not-yet-catalogued snapshot is simply not eligible yet. The condition message names the exact Snapshot both came from.
 
@@ -485,8 +485,8 @@ The full `Restore` surface, with the examples that exercise each field. `source`
 
 ## See also
 
-- [Backups & schedules](backups.md) — producing the snapshots you restore.
-- [Repositories & backends](repositories.md) — where the snapshots live.
-- [Permissions](permissions.md) — choosing the mover's UID/GID and the privileged-movers opt-in (applies to restores too).
-- [Scenarios](scenarios/index.md) — [02 recover lost data](scenarios/recover-lost-data.md), [07 point-in-time rollback](scenarios/point-in-time-rollback.md), [08 clone to another namespace](scenarios/clone-app-to-namespace.md), [10 DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
-- [Examples](examples.md) — [03 by Snapshot](examples.md#example-03--restore-by-picking-a-snapshot), [05 deploy-or-restore](examples.md#example-05--deploy-or-restore-gitops), [07 discovered](examples.md#example-07--restore-a-discovered-backup), [12 mover/cache/failure policy](examples.md#example-12--restore-mover-cache--failure-policy), [13 by identity](examples.md#example-13--restore-by-raw-kopia-identity), [14 point-in-time](examples.md#example-14--point-in-time--offset-restore), [15 in-place mirror](examples.md#example-15--in-place-mirror-restore), [16 cross-namespace](examples.md#example-16--cross-namespace-clone-restore), [17 shared-repo projection](examples.md#example-17--restore-from-a-shared-repo-projection).
+- [Backups & schedules](backups.md): producing the snapshots you restore.
+- [Repositories & backends](repositories.md): where the snapshots live.
+- [Permissions](permissions.md): choosing the mover's UID/GID and the privileged-movers opt-in (applies to restores too).
+- [Scenarios](scenarios/index.md): [02 recover lost data](scenarios/recover-lost-data.md), [07 point-in-time rollback](scenarios/point-in-time-rollback.md), [08 clone to another namespace](scenarios/clone-app-to-namespace.md), [10 DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
+- [Examples](examples.md): [03 by Snapshot](examples.md#example-03--restore-by-picking-a-snapshot), [05 deploy-or-restore](examples.md#example-05--deploy-or-restore-gitops), [07 discovered](examples.md#example-07--restore-a-discovered-backup), [12 mover/cache/failure policy](examples.md#example-12--restore-mover-cache--failure-policy), [13 by identity](examples.md#example-13--restore-by-raw-kopia-identity), [14 point-in-time](examples.md#example-14--point-in-time--offset-restore), [15 in-place mirror](examples.md#example-15--in-place-mirror-restore), [16 cross-namespace](examples.md#example-16--cross-namespace-clone-restore), [17 shared-repo projection](examples.md#example-17--restore-from-a-shared-repo-projection).

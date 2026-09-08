@@ -16,9 +16,9 @@ The mental model: Kopiur separates the **repository** from the **work**. The rep
 | **Backend health probe** (default-ON, `spec.health.probe`) | Repository reconcile (post-`Ready`) | `BackendReachable` condition (`RepositoryVanished` / `BackendUnreachable` / `ProbeDeadlineExceeded`) + Warning Event + `kopiur_repository_health_probe_failures` | **The circuit breaker's sensor**: past `failureThreshold`, `onFailure: Degrade` (default) moves the repo to `Degraded` and pauses backups and replication until a re-connect succeeds. Maintenance also pauses for unreachable or vanished, but keeps running for a deadline kill. `onFailure: Alert` keeps it advisory and the repo stays `Ready` |
 | **Credentials available** | Mover preflight | `CredentialsAvailable=False` + Warning Event | The mover starting (the credential Secret must exist in the workload namespace) |
 | **Mover permitted** | Admission / reconcile | `MoverPermitted=False` | A privileged mover that wasn't opted in |
-| **Security-context compatibility** | Admission (advisory) + post-run | admission Warning + `SecurityContextCompatible=False` | Advisory — warns the mover UID likely can't read the source |
-| **Index-blob health** | Repository reconcile (post-`Ready`) | `IndexBlobHealth` condition + Warning Event | Advisory — flags maintenance falling behind; non-blocking |
-| **Scratch writability** (`/scratch`) | Mover, **deep verify only** | `ScratchNotWritable` error | The restore-test, before kopia runs — turns a cryptic `mkdir` failure into an actionable one |
+| **Security-context compatibility** | Admission (advisory) + post-run | admission Warning + `SecurityContextCompatible=False` | Advisory: warns the mover UID likely can't read the source |
+| **Index-blob health** | Repository reconcile (post-`Ready`) | `IndexBlobHealth` condition + Warning Event | Advisory: flags maintenance falling behind; non-blocking |
+| **Scratch writability** (`/scratch`) | Mover, **deep verify only** | `ScratchNotWritable` error | The restore-test, before kopia runs; it turns a cryptic `mkdir` failure into an actionable one |
 | **Terminal gate** | Repository reconcile | stays `Failed`, long heartbeat | Stops hammering the backend after a non-retryable failure until an input (spec/Secret) changes |
 
 ### The fail-fast gate (the headline behavior)
@@ -76,11 +76,11 @@ While the breaker is open, gated work **parks**. It is deferred, never refused o
 
 In metrics this is visible as:
 
-- `kopiur_repository_breaker_trips_total{kind,namespace,name,probe_kind}` — one increment per breaker opening, counting the transition only, never re-confirmations,
-- `kopiur_repository_consecutive_backend_failures{kind,namespace,name}` — the live failure streak, where a `0` after recovery means "healed",
-- `kopiur_repository_breaker_open_since_timestamp_seconds{kind,namespace,name}` — exists **only while open**; `time() - metric` is the open duration,
-- `kopiur_repository_breaker_open{kind,namespace,name,reason}` — 1 for the same open window, with the **cause** (`unreachable`/`vanished`/`timed_out`) so alerting can tell a hard outage from the self-healing slow-connect spiral,
-- `kopiur_snapshot_gated{namespace,policy}` — the parked-`Pending` population, draining to absence on recovery,
+- `kopiur_repository_breaker_trips_total{kind,namespace,name,probe_kind}`: one increment per breaker opening, counting the transition only, never re-confirmations,
+- `kopiur_repository_consecutive_backend_failures{kind,namespace,name}`: the live failure streak, where a `0` after recovery means "healed",
+- `kopiur_repository_breaker_open_since_timestamp_seconds{kind,namespace,name}`: exists **only while open**; `time() - metric` is the open duration,
+- `kopiur_repository_breaker_open{kind,namespace,name,reason}`: 1 for the same open window, with the **cause** (`unreachable`/`vanished`/`timed_out`) so alerting can tell a hard outage from the self-healing slow-connect spiral,
+- `kopiur_snapshot_gated{namespace,policy}`: the parked-`Pending` population, draining to absence on recovery,
 - Helm alert rules `KopiurRepositoryBreakerOpen` (warning, 15m, hard causes), `KopiurRepositoryConnectSlow` (info, 30m, the `timed_out` cause), and `KopiurSnapshotsGated` (info, 30m). See [observability](dev/observability.md).
 
 Three failures are reported distinctly, because they demand different responses:
@@ -89,7 +89,7 @@ Three failures are reported distinctly, because they demand different responses:
 |---|---|---|
 | `RepositoryVanished` | backend **reachable**, kopia repository **absent** (format blob gone) | Verify the backend is *truly* empty before any re-create (see warning below) |
 | `BackendUnreachable` | backend unreachable, mount/path missing, or auth/lock failed | Fix the backend / credentials / volume; **not** a wipe |
-| `ProbeDeadlineExceeded` | the connect was **killed by the bootstrap Job deadline** — the backend may be reachable but slow (a cold cache over many index blobs) | Usually nothing: maintenance keeps running and kopiur raises the deadline itself. To accelerate, raise `spec.bootstrap.failurePolicy.activeDeadlineSeconds` |
+| `ProbeDeadlineExceeded` | the connect was **killed by the bootstrap Job deadline**, so the backend may be reachable but slow (a cold cache over many index blobs) | Usually nothing: maintenance keeps running and kopiur raises the deadline itself. To accelerate, raise `spec.bootstrap.failurePolicy.activeDeadlineSeconds` |
 
 /// warning | kopiur never auto-recreates a repository it once trusted
 
@@ -176,7 +176,7 @@ Each check is a CEL **bool** expression over two variables:
 |---|---|---|
 | `repository.phase` | string | repository `status.phase` (`Ready`, …) |
 | `repository.ready` | bool | `phase == Ready` |
-| `repository.backendReachable` | bool | the [health probe](#backend-health-probe-default-on)'s `BackendReachable` condition is `True` — **`true` when the probe is disabled**, since there is no evidence of a fault. On an `onFailure: Alert` repository this check can hold backups `Pending` through an outage and `Fail` them once `preflight.timeout` elapses, which is the bound you configured |
+| `repository.backendReachable` | bool | the [health probe](#backend-health-probe-default-on)'s `BackendReachable` condition is `True`. It is **`true` when the probe is disabled**, since there is no evidence of a fault. On an `onFailure: Alert` repository this check can hold backups `Pending` through an outage and `Fail` them once `preflight.timeout` elapses, which is the bound you configured |
 | `repository.snapshotCountKnown` | bool | the snapshot count has been observed (guard `snapshotCount` checks with this) |
 | `repository.snapshotCount` | int | snapshots in the repository |
 | `repository.indexBlobCountKnown` | bool | the index-blob count has been observed |
