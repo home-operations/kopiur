@@ -144,22 +144,17 @@ impl RepositoryKindPath {
 
 /// Build the impersonating client for `id`.
 ///
-/// A failure here is never the caller's fault — the client is constructed from
-/// the UI's own resolved `kube::Config` — so it is classified through
-/// [`kopiur_ops::classify_kube`] rather than guessed at, which keeps the one
-/// case that *can* happen in practice (a malformed impersonation header value
-/// the config allows) readable in the browser.
+/// The two ways this fails are already classified by
+/// [`ClientBuildError`](crate::auth::impersonate::ClientBuildError) — an identity
+/// that cannot be expressed as impersonation headers, and a `kube::Config` the
+/// UI itself cannot turn into a client — and `problem.rs` maps both, so this is
+/// a `?`-shaped wrapper rather than a second opinion about what went wrong.
 ///
 /// # Errors
 ///
 /// [`ApiError`] when the client cannot be built.
 pub fn client_for(app: &AppState, id: &Identity) -> Result<kube::Client, ApiError> {
-    match app.auth.clients.client_for(id) {
-        Ok(client) => Ok(client),
-        Err(e) => Err(ApiError::from(kopiur_ops::classify_kube(
-            "build", "Client", "clients", None, None, e,
-        ))),
-    }
+    Ok(app.auth.clients.client_for(id)?)
 }
 
 /// The per-request [`OpsCtx`] the `kopiur_ops` helpers are threaded through.
