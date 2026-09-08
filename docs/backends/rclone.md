@@ -30,7 +30,7 @@ $ rclone config
 $ rclone mkdir mydrive:backups/kopia
 $ rclone ls mydrive:backups/kopia
 
-# 3. Print the config — THIS goes under KOPIA_RCLONE_CONFIG, verbatim:
+# 3. Print the config. THIS goes under KOPIA_RCLONE_CONFIG, exactly as printed:
 $ rclone config show mydrive
 [mydrive]
 type = drive
