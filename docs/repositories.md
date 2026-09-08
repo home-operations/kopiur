@@ -74,8 +74,8 @@ The mover reads these **well-known keys** from the Secret you reference and feed
 | **SFTP**       | `KOPIA_SFTP_KEY_DATA`, `KOPIA_SFTP_KNOWN_HOSTS`                           | Key-based auth; the mover writes both to files (`--keyfile`/`--known-hosts`). See [SFTP](backends/sftp.md). |
 | **WebDAV**     | `KOPIA_WEBDAV_USERNAME`, `KOPIA_WEBDAV_PASSWORD`                          | HTTP basic auth, via `auth.secretRef`.                                                                      |
 | **rclone**     | `KOPIA_RCLONE_CONFIG` (the `rclone.conf`)                                 | Referenced by `backend.rclone.configSecretRef`, not `auth`.                                                 |
-| **gdrive**     | `KOPIA_GDRIVE_CREDENTIALS` (service-account JSON)                         | Native Google Drive; referenced by `backend.gdrive.credentialsSecretRef`. Experimental — see [Google Drive](backends/gdrive.md). |
-| **filesystem** | _(none — local path)_                                                     | Only `KOPIA_PASSWORD` is needed.                                                                            |
+| **gdrive**     | `KOPIA_GDRIVE_CREDENTIALS` (service-account JSON)                         | Native Google Drive; referenced by `backend.gdrive.credentialsSecretRef`. Experimental; see [Google Drive](backends/gdrive.md). |
+| **filesystem** | _(none: local path)_                                                     | Only `KOPIA_PASSWORD` is needed.                                                                            |
 
 /// note | ClusterRepository Secret references need a namespace
 
@@ -150,7 +150,7 @@ Note that `create.enabled` governs the **first** bootstrap only. A repository th
 | Reason | Means | Fix |
 |---|---|---|
 | `RepositoryNotInitialized` | the backend holds no repository and `create.enabled` is `false` | set `create.enabled: true`, or point the backend at an existing repository |
-| `RepositoryReinitializeBlocked` | the backend holds no repository but this one was once `Ready` (a pinned `status.uniqueId`) — it was **wiped** | restore the backend, or [deliberately re-initialize](repository-health.md#deliberately-re-initialize-a-wiped-repository) |
+| `RepositoryReinitializeBlocked` | the backend holds no repository but this one was once `Ready` (a pinned `status.uniqueId`), so it was **wiped** | restore the backend, or [deliberately re-initialize](repository-health.md#deliberately-re-initialize-a-wiped-repository) |
 
 ///
 
@@ -263,9 +263,9 @@ Byte-rate caps apply to **cold** backend traffic only. Content already in the mo
 | --- | --- |
 | `seed` only | The seed initializes the repository. `create.enabled` keeps its ordinary meaning for later connects, but the **create fallback is never taken** while a seed is armed. A failed seed fails the bootstrap instead of quietly creating an empty repository. |
 | `seed.from.backend` + `create.{splitter,hash,encryption,ecc}` | **Rejected at admission.** A blob copy takes the mirror's repository format exactly as it is, so those algorithms would never be applied. Remove them, or use migrate mode. |
-| `seed.from.repository` + `create.{…}` | Honored — migrate mode really does create a local repository with the format you declare. |
+| `seed.from.repository` + `create.{…}` | Honored: migrate mode really does create a local repository with the format you declare. |
 | `seed` + `mode: ReadOnly` | **Rejected at admission.** Seeding is the largest write a repository ever takes. |
-| `seed` on a bare-path `filesystem` backend (no `volume`) | **Rejected at admission** — for the repository *and* for a filesystem seed source. Seeding runs in a mover Job; a bare path exists only on the controller's own filesystem, so the Job would mount nothing. |
+| `seed` on a bare-path `filesystem` backend (no `volume`) | **Rejected at admission**, for the repository *and* for a filesystem seed source. Seeding runs in a mover Job; a bare path exists only on the controller's own filesystem, so the Job would mount nothing. |
 
 ### The fields
 
@@ -273,7 +273,7 @@ Byte-rate caps apply to **cold** backend traffic only. Content already in the mo
 | --- | --- | --- |
 | `seed.from.backend` | — | Blob mode: a mirror's storage backend (the same externally-tagged `Backend` shape `spec.backend` uses). |
 | `seed.from.repository` | — | Migrate mode: a `RepositoryRef` (`kind` defaults to `Repository`; an absent `namespace` resolves in this CR's namespace, and for a `ClusterRepository` in the operator's namespace). |
-| `seed.sync.parallel` | kopia's `1` | Blob mode only: concurrent blob-copy workers. Raise it — a first seed over a WAN is what sequential copying is worst at. |
+| `seed.sync.parallel` | kopia's `1` | Blob mode only: concurrent blob-copy workers. Raise it: a first seed over a WAN is what sequential copying is worst at. |
 | `seed.sync.maxDownloadSpeedBytesPerSecond` / `maxUploadSpeedBytesPerSecond` | unlimited | Blob mode only: throttle the copy. |
 | `seed.migrate.parallel` | kopia's `1` | Migrate mode only: snapshots migrated concurrently. |
 | `seed.migrate.latestOnly` | `false` | Copy only each identity's newest snapshot instead of its full history. |
@@ -282,7 +282,7 @@ Byte-rate caps apply to **cold** backend traffic only. Content already in the mo
 | `seed.allowEmptySource` | `false` | Accept a source holding zero snapshots. Left at `false`, an empty source **fails the bootstrap** and retries. |
 | `seed.failurePolicy.activeDeadlineSeconds` | `86400` (24 h) | Wall-clock cap for the seeding Job. |
 | `seed.failurePolicy.backoffLimit` | as `bootstrap` | Pod retries within one seeding Job. |
-| `seed.credentialProjection.enabled` | `false` | Migrate mode: copy the **source** repository's credential Secrets into the seeding Job's namespace for the run. Requires the operator's `features.credentialProjection.enabled` flag — see [Feature permissions](feature-permissions.md). |
+| `seed.credentialProjection.enabled` | `false` | Migrate mode: copy the **source** repository's credential Secrets into the seeding Job's namespace for the run. Requires the operator's `features.credentialProjection.enabled` flag; see [Feature permissions](feature-permissions.md). |
 
 The mode-specific blocks are **not** silently ignored when paired with the other mode's source. Using `sync` with a repository source, or `migrate` (or an enabled `credentialProjection`) with a backend source, is rejected at admission. Kopiur does not accept fields that would do nothing.
 
@@ -315,7 +315,7 @@ Using `spec.suspend` mid-seed leaves the Job running. Its result is consumed whe
 
 ### Status and conditions
 
-`status.seed` carries `startedAt`, `seededAt`, `mode`, `source`, `snapshotCount` and, for migrate mode only, `snapshotsCopied`. The `Seeded` condition carries the state, `kopiur_repository_seed_total{mode,outcome}` counts the outcomes, and `kubectl kopiur doctor` explains every `Seeded=False` reason. The full reason table, the DR walkthrough, and the identity and retention hazards to review **before** re-applying policies over seeded history are in [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
+`status.seed` carries `startedAt`, `seededAt`, `mode`, `source`, `snapshotCount` and, for migrate mode only, `snapshotsCopied`. The `Seeded` condition carries the state, `kopiur_repository_seed_total{mode,outcome}` counts the outcomes, and `kubectl kopiur doctor` explains every `Seeded=False` reason. The full reason table, the DR walkthrough, and the identity and retention hazards to review **before** re-applying policies over seeded history are in [Scenario 10: DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
 
 /// danger | Review retention before re-applying policies over seeded history
 
@@ -547,16 +547,16 @@ Concurrency, `scheduleDefaults` and `moverDefaults.podLabels` are the three sett
 
 | Value | On namespace deletion |
 | --- | --- |
-| `Orphan` _(default)_ | Release ownership (drop the `Snapshot` finalizers) **without** deleting the kopia snapshots — off-site history survives. |
+| `Orphan` _(default)_ | Release ownership (drop the `Snapshot` finalizers) **without** deleting the kopia snapshots, so off-site history survives. |
 | `Delete` | Cascade: each `Snapshot`'s own `deletionPolicy` applies (produced snapshots are `kopia snapshot delete`d). Opt-in. |
 
 A namespace delete is only one of **three independent ways** a `Snapshot`'s kopia data can go away. The others are deleting the `Snapshot` itself and deleting its `SnapshotSchedule`. Each has its own opt-in field, and every one of them defaults to keeping the data:
 
 | Axis | Trigger | `Snapshot` CRs | kopia data, by DEFAULT | Opt into cascading kopia data |
 | --- | --- | --- | --- | --- |
-| Single `Snapshot` | `kubectl delete snapshot <name>` | Removed once its finalizer clears | Honors *this* Snapshot's own `deletionPolicy` — `Delete` by default for `scheduled`/`manual` (see [Backups → deletionPolicy](backups.md#deletionpolicy--what-happens-to-the-snapshot)) | Set `deletionPolicy: Retain`/`Orphan` on the Snapshot, or `SnapshotPolicy.spec.defaultDeletionPolicy` |
-| Namespace | `kubectl delete namespace <ns>` | Finalizers released, CRs removed | **Retained** — this field, `onNamespaceDelete: Orphan` (default, above) | This field, `onNamespaceDelete: Delete` |
-| `SnapshotSchedule` | `kubectl delete snapshotschedule <name>` | GC'd via `ownerReference` once finalizers clear | **Retained**, rediscovered as `origin: discovered` — schedule `spec.deletion.onScheduleDelete: Retain` (default), which overrides even a produced Snapshot whose own `deletionPolicy` was `Delete` | Schedule `spec.deletion.onScheduleDelete: Delete` — see [Backups → what happens when the schedule is deleted](backups.md#what-happens-when-the-schedule-is-deleted) |
+| Single `Snapshot` | `kubectl delete snapshot <name>` | Removed once its finalizer clears | Honors *this* Snapshot's own `deletionPolicy`, which is `Delete` by default for `scheduled`/`manual` (see [Backups → deletionPolicy](backups.md#deletionpolicy--what-happens-to-the-snapshot)) | Set `deletionPolicy: Retain`/`Orphan` on the Snapshot, or `SnapshotPolicy.spec.defaultDeletionPolicy` |
+| Namespace | `kubectl delete namespace <ns>` | Finalizers released, CRs removed | **Retained** by this field, `onNamespaceDelete: Orphan` (default, above) | This field, `onNamespaceDelete: Delete` |
+| `SnapshotSchedule` | `kubectl delete snapshotschedule <name>` | GC'd via `ownerReference` once finalizers clear | **Retained**, rediscovered as `origin: discovered`; schedule `spec.deletion.onScheduleDelete: Retain` (default), which overrides even a produced Snapshot whose own `deletionPolicy` was `Delete` | Schedule `spec.deletion.onScheduleDelete: Delete`; see [Backups → what happens when the schedule is deleted](backups.md#what-happens-when-the-schedule-is-deleted) |
 
 Whichever of these triggers an actual `kopia snapshot delete`, meaning an EXTERNAL deletion with effective `deletionPolicy: Delete` as opposed to one of Kopiur's own retention or `failedJobsHistoryLimit` prunes, is additionally subject to the per-repository mass-deletion circuit breaker, described next.
 
@@ -808,15 +808,15 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `create.enabled`                                       | Whether to initialize a new repository.           |
 | `seed.from.{backend,repository}`                        | Initialize a brand-new repository from a surviving replica on its first bootstrap (disaster recovery). |
 | `backend.s3.tls.disableTls`                            | Plain-HTTP endpoints (in-cluster MinIO/RustFS).   |
-| `backend.s3.tls.caBundleRef`                           | Trust a private-CA HTTPS endpoint: a ConfigMap key with the CA PEM (`key` defaults to `ca.crt`), resolved in the `Repository`'s namespace — operator's namespace for a `ClusterRepository` — and inlined into every mover. See [Private-CA HTTPS](backends/s3.md#private-ca-https-trusting-your-own-ca). |
+| `backend.s3.tls.caBundleRef`                           | Trust a private-CA HTTPS endpoint: a ConfigMap key with the CA PEM (`key` defaults to `ca.crt`), resolved in the `Repository`'s namespace (the operator's namespace for a `ClusterRepository`) and inlined into every mover. See [Private-CA HTTPS](backends/s3.md#private-ca-https-trusting-your-own-ca). |
 | `allowedNamespaces` _(ClusterRepository)_              | Which namespaces may use the repo.                |
 | `identityDefaults` _(ClusterRepository)_               | Per-tenant snapshot identity (CEL `*Expr`) and, for a repository shared across clusters, `cluster`. |
 | `moverDefaults`                                        | Base security context / resources / cache for every mover. |
 | `parameters.epoch.minDuration`                          | Lower it (e.g. `6h`) when index blobs stay in the thousands despite maintenance running. |
 | `scheduleDefaults.timezone`                             | Cron timezone inherited by verification/replication/maintenance and `SnapshotSchedule` crons. |
-| `scheduleDefaults.jitter`                               | Deterministic firing spread (e.g. `10m`, max 24h) inherited by the same crons — de-synchronizes a whole repository's schedules in one line. |
+| `scheduleDefaults.jitter`                               | Deterministic firing spread (e.g. `10m`, max 24h) inherited by the same crons; it de-synchronizes a whole repository's schedules in one line. |
 | `concurrency.maxConcurrentJobs`                         | Ceiling on this repository's in-flight mover Jobs (backups + restores + replication source side). Absent/`0` = unlimited. |
-| `moverDefaults.podLabels` / `podAnnotations`            | Extra labels/annotations on every mover pod — a Kueue queue name, a `NetworkPolicy` selector, a sidecar-injection opt-out. |
+| `moverDefaults.podLabels` / `podAnnotations`            | Extra labels/annotations on every mover pod: a Kueue queue name, a `NetworkPolicy` selector, a sidecar-injection opt-out. |
 | `onNamespaceDelete`                                    | `Orphan` (default) / `Delete` on namespace delete.|
 | `deletionProtection.threshold`                          | Mass-deletion breaker: HOLD external destructive Snapshot deletions at/above this count (default 10; `0` disables). |
 | `mode`                                                 | `ReadWrite` (default) / `ReadOnly`.               |
@@ -824,10 +824,10 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 
 ## See also
 
-- [How Kopia works](concepts/how-kopia-works.md) — dedup, the identity model, and why one shared repository maximizes it.
-- [Backend configuration](backends/index.md) — per-backend setup cookbook (prereqs, Secret keys, apply-ready manifests).
-- [Movers, RBAC & credentials](movers.md) — where the credential Secret must live.
-- [Maintenance](maintenance.md) — the default-managed space reclamation per repo.
-- [`deploy/examples/01-single-pvc-scheduled.yaml`](examples.md#example-01--single-pvc-scheduled) — S3 `Repository`, end to end.
-- [`deploy/examples/02-cluster-repository.yaml`](examples.md#example-02--shared-platform-repository) — `ClusterRepository`.
-- [Scenario 10 — DR from a replicated repository](scenarios/dr-with-replicated-repository.md) — `spec.seed` end to end.
+- [How Kopia works](concepts/how-kopia-works.md): dedup, the identity model, and why one shared repository maximizes it.
+- [Backend configuration](backends/index.md): per-backend setup cookbook (prereqs, Secret keys, apply-ready manifests).
+- [Movers, RBAC & credentials](movers.md): where the credential Secret must live.
+- [Maintenance](maintenance.md): the default-managed space reclamation per repo.
+- [`deploy/examples/01-single-pvc-scheduled.yaml`](examples.md#example-01--single-pvc-scheduled): S3 `Repository`, end to end.
+- [`deploy/examples/02-cluster-repository.yaml`](examples.md#example-02--shared-platform-repository): `ClusterRepository`.
+- [Scenario 10, DR from a replicated repository](scenarios/dr-with-replicated-repository.md): `spec.seed` end to end.
