@@ -680,6 +680,297 @@ fn the_zero_claimant_park_nulls_the_records_of_gone_claimants() {
     );
 }
 
+// --- the single-claim TOP-LEVEL mirror (#443 CI regression) -------------
+//
+// The overwhelmingly common populator is a one-PVC app, and for it the `Restore`
+// simply IS that claim. `docs/restores.md` promises the deploy-or-restore
+// decision is pinned to `status.resolved`, and `kubectl kopiur restore`/`status`
+// read exactly that field — moving the pin under `status.claims.<pvc>.resolved`
+// broke both, plus four e2e regressions.
+
+/// A claims map holding exactly `records`, keyed in insertion order.
+fn claims_of(
+    records: &[(&str, kopiur_api::RestoreClaimStatus)],
+) -> std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus> {
+    records
+        .iter()
+        .map(|(name, record)| ((*name).to_string(), record.clone()))
+        .collect()
+}
+
+/// One claim record, for the mirror tables.
+fn mirror_record(
+    phase: kopiur_api::RestoreClaimPhase,
+    reason: &str,
+    message: &str,
+    resolved: Option<ResolutionOutcome>,
+) -> kopiur_api::RestoreClaimStatus {
+    kopiur_api::RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase: Some(phase),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        resolved: resolved.map(|o| resolved_with(Some(o), None)),
+        ..Default::default()
+    }
+}
+
+/// One condition off a status body.
+fn condition_of(status: &serde_json::Value, type_: &str) -> Option<serde_json::Value> {
+    status["conditions"]
+        .as_array()?
+        .iter()
+        .find(|c| c["type"] == type_)
+        .cloned()
+}
+
+/// The status body a fan-out pass writes for exactly these claims.
+fn mirrored_status(
+    claims: &std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus>,
+) -> serde_json::Value {
+    fanout_status(
+        &restore_with_anchor(None),
+        &std::collections::BTreeMap::new(),
+        claims,
+        &[],
+    )
+}
+
+/// Deploy-or-restore, one claim: the pinned "no snapshot" decision must be
+/// visible at `status.resolved` — a later snapshot must never be able to
+/// retarget the volume — and the outcome must be SELF-DESCRIBING
+/// (`Resolved=True/NoSnapshotContinue`) rather than looking like a restore that
+/// wrote data.
+#[test]
+fn a_lone_deploy_or_restore_claim_pins_its_decision_to_the_top_level_status() {
+    use crate::consts::NO_SNAPSHOT_CONTINUE_REASON;
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let claims = claims_of(&[(
+        "data",
+        mirror_record(
+            P::Populated,
+            NO_SNAPSHOT_CONTINUE_REASON,
+            "provisioned an empty volume",
+            Some(ResolutionOutcome::NoSnapshot),
+        ),
+    )]);
+    let status = mirrored_status(&claims);
+
+    assert_eq!(
+        status["resolved"]["resolution"],
+        serde_json::json!("NoSnapshot"),
+        "{status}"
+    );
+    assert_eq!(status["target"]["pvcRef"]["name"], "data", "{status}");
+    let resolved = condition_of(&status, "Resolved").expect("a Resolved condition");
+    assert_eq!(resolved["status"], "True", "{resolved}");
+    assert_eq!(
+        resolved["reason"], NO_SNAPSHOT_CONTINUE_REASON,
+        "{resolved}"
+    );
+    let ready = condition_of(&status, "Ready").expect("a Ready condition");
+    assert_eq!(ready["reason"], NO_SNAPSHOT_CONTINUE_REASON, "{ready}");
+    assert_eq!(ready["message"], "provisioned an empty volume", "{ready}");
+}
+
+/// The #233 no-op, one claim: the completion must say WHY nothing happened, in
+/// the claim's own words. The aggregate wording ("1/1 claims settled") does not
+/// tell the user their live volume was left untouched, or how to actually
+/// restore into it.
+#[test]
+fn a_lone_already_bound_claim_reports_its_own_reason_and_clears_the_mirror() {
+    use crate::consts::RESTORE_TARGET_ALREADY_BOUND_REASON;
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let claims = claims_of(&[(
+        "data",
+        mirror_record(
+            P::AlreadyBound,
+            RESTORE_TARGET_ALREADY_BOUND_REASON,
+            &target_already_bound_message("data", Some("pv-1")),
+            None,
+        ),
+    )]);
+    let status = mirrored_status(&claims);
+
+    assert_eq!(status["phase"], "Completed", "{status}");
+    let ready = condition_of(&status, "Ready").expect("a Ready condition");
+    assert_eq!(ready["status"], "True", "{ready}");
+    assert_eq!(
+        ready["reason"], RESTORE_TARGET_ALREADY_BOUND_REASON,
+        "{ready}"
+    );
+    assert!(
+        ready["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already bound"),
+        "the mirrored message is the CLAIM's, verbatim: {ready}"
+    );
+    // Nothing pinned and the handshake is over: the mirror CLEARS rather than
+    // leaving a stale pin or a reaped prime advertised.
+    assert_eq!(status["resolved"], serde_json::Value::Null, "{status}");
+    assert_eq!(
+        status["target"]["pvcPrime"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+    // A `Resolved` condition would be news about the SOURCE; an already-bound
+    // no-op is news about the handshake, so none is written.
+    assert!(condition_of(&status, "Resolved").is_none(), "{status}");
+}
+
+/// A real restore mirrors its snapshot pin; an in-flight one mirrors the prime
+/// it is writing, so `status.target.pvcPrime` still names the volume to look at.
+#[test]
+fn a_lone_claim_mirrors_its_pin_and_its_prime_through_the_handshake() {
+    use crate::consts::{POPULATING_PRIME_PVC_REASON, RESTORE_POPULATED_REASON};
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let done = claims_of(&[(
+        "data",
+        mirror_record(
+            P::Populated,
+            RESTORE_POPULATED_REASON,
+            "restored and rebound",
+            Some(ResolutionOutcome::Snapshot),
+        ),
+    )]);
+    let status = mirrored_status(&done);
+    assert_eq!(
+        status["resolved"]["resolution"],
+        serde_json::json!("Snapshot")
+    );
+    assert_eq!(
+        condition_of(&status, "Ready").expect("Ready")["reason"],
+        RESTORE_POPULATED_REASON
+    );
+
+    let mut populating = mirror_record(
+        P::Populating,
+        POPULATING_PRIME_PVC_REASON,
+        "restoring into the prime PVC",
+        None,
+    );
+    populating.pvc_prime = Some("prime-u1".into());
+    let status = mirrored_status(&claims_of(&[("data", populating)]));
+    assert_eq!(status["target"]["pvcPrime"], "prime-u1", "{status}");
+    assert_eq!(status["phase"], "Restoring", "{status}");
+}
+
+/// ZERO claims: the park owns that surface, and it must clear a departed single
+/// claim's mirrored `pvcRef` — a merge patch merges objects key by key, so
+/// writing only the sentinel would leave the gone claim advertised beside it.
+#[test]
+fn the_zero_claim_park_clears_a_departed_claims_mirror() {
+    let empty = std::collections::BTreeMap::new();
+    assert_eq!(claims_mirror(&empty), ClaimsMirror::NoClaims);
+
+    let park = awaiting_claim_status(
+        &restore_with_anchor(None),
+        crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON,
+        "m",
+        &[],
+    );
+    assert_eq!(park["target"]["pvcPrime"], "awaiting-claim", "{park}");
+    assert_eq!(park["target"]["pvcRef"], serde_json::Value::Null, "{park}");
+}
+
+/// SEVERAL claims: there is no single top-level answer, so `resolved`/`target`
+/// are CLEARED and the conditions carry the aggregate. A `Restore` that ran with
+/// one claim and later gained a second must not keep advertising the first
+/// claim's pin as the whole restore's.
+#[test]
+fn several_claims_clear_the_mirror_and_report_the_aggregate() {
+    use crate::consts::RESTORE_POPULATED_REASON;
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let mut second = mirror_record(
+        P::Populated,
+        RESTORE_POPULATED_REASON,
+        "restored",
+        Some(ResolutionOutcome::NoSnapshot),
+    );
+    second.uid = Some("u2".into());
+    let two = claims_of(&[
+        (
+            "data",
+            mirror_record(
+                P::Populated,
+                RESTORE_POPULATED_REASON,
+                "restored",
+                Some(ResolutionOutcome::Snapshot),
+            ),
+        ),
+        ("logs", second),
+    ]);
+    assert_eq!(claims_mirror(&two), ClaimsMirror::Many);
+
+    let status = mirrored_status(&two);
+    assert_eq!(
+        status["resolved"],
+        serde_json::Value::Null,
+        "a two-claim Restore must not advertise one claim's pin as its own: {status}"
+    );
+    assert_eq!(status["target"], serde_json::Value::Null, "{status}");
+    assert!(
+        condition_of(&status, "Ready").expect("Ready")["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("2/2 claims settled"),
+        "several claims report the AGGREGATE: {status}"
+    );
+
+    // Clearing an already-absent key is a server-side no-op, so the many-claim
+    // heartbeat does not re-write just to null what was never there.
+    let current = serde_json::json!({
+        "phase": status["phase"].clone(),
+        "observedGeneration": status["observedGeneration"].clone(),
+        "conditions": status["conditions"].clone(),
+        "claims": { "data": {}, "logs": {} },
+    });
+    let mut idempotent = status.clone();
+    idempotent["claims"] = serde_json::json!({ "data": {}, "logs": {} });
+    assert!(
+        crate::io::status_merge_patch_is_noop(Some(&current), &idempotent),
+        "nulling absent top-level keys must not force a write: {idempotent}"
+    );
+}
+
+/// The mirror is CONTROLLER-owned top-level state, so a mirrored
+/// `status.resolved` must never make a fanned-out `Restore` look pre-fan-out.
+/// `is_legacy_populator_status` keys on `claims` being empty FIRST, and
+/// `claim_merge_body` still never names a mover-owned key.
+#[test]
+fn a_mirrored_pin_is_not_mistaken_for_a_legacy_status() {
+    let status: kopiur_api::RestoreStatus = serde_json::from_value(serde_json::json!({
+        "phase": "Completed",
+        // Exactly what the single-claim mirror writes…
+        "resolved": { "resolution": "NoSnapshot", "pinnedAt": "2026-01-01T00:00:00Z" },
+        "target": { "pvcRef": { "name": "data" } },
+        // …beside the claim it was copied from.
+        "claims": { "data": { "phase": "Populated", "reason": "NoSnapshotContinue" } }
+    }))
+    .expect("valid RestoreStatus");
+    assert!(
+        !is_legacy_populator_status(&status),
+        "a mirrored pin on a Restore that HAS claims is not a legacy status"
+    );
+
+    // And the merge body for that claim still names no mover-owned key.
+    let record = kopiur_api::RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase: Some(kopiur_api::RestoreClaimPhase::Populated),
+        resolved: Some(resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
+        ..Default::default()
+    };
+    let body = claim_merge_body(None, &record);
+    for mover_key in ["observedAt", "logTail", "failure"] {
+        assert!(body.get(mover_key).is_none(), "{mover_key} in {body}");
+    }
+}
+
 /// #443 review item 9 — the steady heartbeat skips the cluster-wide
 /// `PersistentVolume` LIST, and a prime that will NEVER be reaped must not
 /// defeat that. A hijacked populate's prime is kept ON PURPOSE and forever, so

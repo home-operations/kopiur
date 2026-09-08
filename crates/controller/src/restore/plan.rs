@@ -1299,7 +1299,13 @@ pub fn awaiting_claim_status(
     );
     let mut status =
         restore_ready_status_on(restore, &conditions, RestorePhase::Pending, reason, message);
-    status["target"] = serde_json::json!({ "pvcPrime": AWAITING_CLAIM_SENTINEL });
+    // `pvcRef: null` clears a single-claim mirror's: a merge patch merges objects
+    // key by key, so writing only `pvcPrime` would leave the departed claim
+    // advertised as this Restore's target beside the sentinel.
+    status["target"] = serde_json::json!({
+        "pvcPrime": AWAITING_CLAIM_SENTINEL,
+        "pvcRef": serde_json::Value::Null,
+    });
     if !gone.is_empty() {
         let mut nulls = serde_json::Map::new();
         for claim in gone {
@@ -1352,9 +1358,9 @@ pub fn fanout_status(
     next: &std::collections::BTreeMap<String, RestoreClaimStatus>,
     gone: &[String],
 ) -> serde_json::Value {
-    let aggregate = aggregate_claims(next);
-    let (reason, message) = claims_summary(&aggregate);
-    let conditions = io::upsert_condition(
+    let mirror = claims_mirror(next);
+    let (reason, message) = mirrored_report(&mirror, next);
+    let mut conditions = io::upsert_condition(
         &existing_conditions(restore),
         "AwaitingClaim",
         false,
@@ -1363,13 +1369,24 @@ pub fn fanout_status(
          per-claim state",
         restore.metadata.generation,
     );
+    if let Some((met, resolved_reason)) = mirrored_resolved_condition(&mirror) {
+        conditions = io::upsert_condition(
+            &conditions,
+            "Resolved",
+            met,
+            resolved_reason,
+            &message,
+            restore.metadata.generation,
+        );
+    }
     let mut status = restore_ready_status_on(
         restore,
         &conditions,
-        aggregate_phase(&aggregate),
-        reason,
+        aggregate_phase(&aggregate_claims(next)),
+        &reason,
         &message,
     );
+    apply_claims_mirror(&mut status, &mirror);
     let mut merges = serde_json::Map::new();
     for (claim, record) in next {
         merges.insert(claim.clone(), claim_merge_body(prev.get(claim), record));
@@ -1379,6 +1396,165 @@ pub fn fanout_status(
     }
     status["claims"] = serde_json::Value::Object(merges);
     status
+}
+
+/// How a fanned-out populator's per-claim state reaches the TOP-LEVEL `Restore`
+/// status. Pure model, matched exhaustively wherever it is consumed.
+///
+/// The overwhelmingly common populator is a ONE-PVC app, and for it the
+/// `Restore` simply IS that claim: `status.resolved`, `status.target` and the
+/// `Ready`/`Resolved` conditions are the claim's, verbatim. That is not a
+/// convenience — it is the published contract. `docs/restores.md` promises the
+/// deploy-or-restore decision is pinned to `status.resolved`, and
+/// `kubectl kopiur restore` / `kubectl kopiur status` read exactly that field.
+/// #443 moved the pin under `status.claims.<pvc>.resolved` and broke both.
+///
+/// With SEVERAL claims there is no single answer, so the top-level `resolved`
+/// and `target` are CLEARED (an explicit `null`, in case an earlier single-claim
+/// pass mirrored them) and the conditions carry the aggregate
+/// [`claims_summary`]. `status.claims` is authoritative there, and only there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimsMirror<'a> {
+    /// Nothing claims this populator. The zero-claim park
+    /// ([`awaiting_claim_status`]) owns that surface; this variant exists so the
+    /// mirror is TOTAL over a claims map rather than assuming at least one.
+    NoClaims,
+    /// Exactly one claim — the Restore is that claim.
+    Single {
+        /// The claiming PVC's name.
+        claim: &'a str,
+        /// Its record, mirrored onto the top-level status.
+        record: &'a RestoreClaimStatus,
+    },
+    /// Several claims: no single top-level answer exists.
+    Many,
+}
+
+/// Classify a claims map for [`ClaimsMirror`]. Pure.
+pub fn claims_mirror(
+    claims: &std::collections::BTreeMap<String, RestoreClaimStatus>,
+) -> ClaimsMirror<'_> {
+    let mut iter = claims.iter();
+    match (iter.next(), iter.next()) {
+        (None, _) => ClaimsMirror::NoClaims,
+        (Some((claim, record)), None) => ClaimsMirror::Single { claim, record },
+        (Some(_), Some(_)) => ClaimsMirror::Many,
+    }
+}
+
+/// The `(reason, message)` the top-level `Ready`/`Stalled` condition carries.
+/// Pure + exhaustive over [`ClaimsMirror`].
+///
+/// A single claim reports its OWN reason and message — `TargetAlreadyBound` with
+/// its "nothing to populate, here is the fix" text, `NoSnapshotContinue`,
+/// `RestoreSucceeded` — because for a one-PVC populator that IS the Restore's
+/// outcome, and both the docs and four e2e regressions key on it. A record that
+/// carries neither falls back to the aggregate rather than reporting nothing.
+pub fn mirrored_report(
+    mirror: &ClaimsMirror<'_>,
+    claims: &std::collections::BTreeMap<String, RestoreClaimStatus>,
+) -> (String, String) {
+    let aggregate = || {
+        let (reason, message) = claims_summary(&aggregate_claims(claims));
+        (reason.to_string(), message)
+    };
+    match mirror {
+        ClaimsMirror::NoClaims | ClaimsMirror::Many => aggregate(),
+        ClaimsMirror::Single { record, .. } => match (&record.reason, &record.message) {
+            (Some(reason), Some(message)) => (reason.clone(), message.clone()),
+            // Half a record (hand-patched, or observed before the controller
+            // wrote it): the aggregate is always well-formed.
+            (Some(_) | None, _) => aggregate(),
+        },
+    }
+}
+
+/// The top-level `Resolved` domain condition a MIRRORED single claim also
+/// carries — `Some((met, reason))` — or `None` when the claim's state says
+/// nothing about source resolution. Pure + exhaustive over [`ClaimReason`].
+///
+/// This restores the pre-#443 populator surface exactly: a deploy-or-restore
+/// that came up empty is self-describing (`Resolved=True/NoSnapshotContinue`)
+/// rather than silently claiming data was written, and everything that BLOCKS
+/// resolution reports `Resolved=False` under the blocker's own reason.
+pub fn mirrored_resolved_condition(mirror: &ClaimsMirror<'_>) -> Option<(bool, &'static str)> {
+    let record = match mirror {
+        ClaimsMirror::NoClaims | ClaimsMirror::Many => return None,
+        ClaimsMirror::Single { record, .. } => record,
+    };
+    match ClaimReason::parse(record.reason.as_deref()?)? {
+        // Resolution ran and deliberately chose "no snapshot": say so, or an
+        // empty volume looks like a restore that wrote data.
+        ClaimReason::NoSnapshotContinue => Some((true, ClaimReason::NoSnapshotContinue.as_str())),
+        // Resolution is blocked, or refused. Each keeps its own reason so
+        // `kubectl describe` names the real blocker.
+        ClaimReason::WaitingForSnapshot => Some((false, ClaimReason::WaitingForSnapshot.as_str())),
+        ClaimReason::SnapshotNotFound => Some((false, ClaimReason::SnapshotNotFound.as_str())),
+        ClaimReason::SourcePathAmbiguous => {
+            Some((false, ClaimReason::SourcePathAmbiguous.as_str()))
+        }
+        ClaimReason::RepositoryNotReady => Some((false, ClaimReason::RepositoryNotReady.as_str())),
+        ClaimReason::RestoreReferentMissing => {
+            Some((false, ClaimReason::RestoreReferentMissing.as_str()))
+        }
+        ClaimReason::AwaitingPvcDataSourceRef => {
+            Some((false, ClaimReason::AwaitingPvcDataSourceRef.as_str()))
+        }
+        // Everything else is news about the HANDSHAKE, not the source: a
+        // resolved restore that is populating, rebinding, done, already bound,
+        // re-armed, hijacked, or whose mover failed says nothing new about
+        // resolution, and writing `Resolved` there would churn a condition with
+        // no news in it.
+        ClaimReason::AwaitingPodSchedule
+        | ClaimReason::SourceResolved
+        | ClaimReason::PopulatingPrimePvc
+        | ClaimReason::RestoreSucceeded
+        | ClaimReason::TargetAlreadyBound
+        | ClaimReason::ClaimRecreated
+        | ClaimReason::MoverJobFailed
+        | ClaimReason::MoverPodWedged
+        | ClaimReason::PopulateHijacked
+        | ClaimReason::LostRebind => None,
+    }
+}
+
+/// Write (or CLEAR) the top-level `resolved`/`target` mirror onto a status body.
+/// Pure + exhaustive over [`ClaimsMirror`].
+///
+/// The clears are explicit JSON `null`s, and they matter: a `Restore` that ran
+/// with one claim and later gains a second must not keep advertising the first
+/// claim's pin as the whole restore's. An RFC-7386 merge removes only the keys
+/// it names, and nulling an ALREADY-absent key is a server-side no-op, so this
+/// stays idempotent on the many-claim heartbeat.
+///
+/// The mirrored `resolved` is CONTROLLER-owned top-level state — a copy — and is
+/// distinct from the claim's own `claims.<pvc>.resolved`, which that claim's
+/// mover writes and which [`claim_merge_body`] never touches.
+pub fn apply_claims_mirror(status: &mut serde_json::Value, mirror: &ClaimsMirror<'_>) {
+    match mirror {
+        // The zero-claim park writes its own `target`; a spent pin is left alone
+        // (the claim it belonged to is gone, and its record went with it).
+        ClaimsMirror::NoClaims => {}
+        ClaimsMirror::Single { claim, record } => {
+            status["resolved"] = match &record.resolved {
+                Some(resolved) => serde_json::to_value(resolved)
+                    .expect("ResolvedRestore serializes: plain Options, no custom Serialize"),
+                // Nothing pinned yet — clear a stale mirror rather than leave it.
+                None => serde_json::Value::Null,
+            };
+            status["target"] = serde_json::json!({
+                "pvcRef": { "name": claim },
+                // Named while the handshake is in flight, nulled once it is over:
+                // a merge would otherwise leave a reaped prime advertised, and the
+                // zero-claim park's `awaiting-claim` sentinel standing.
+                "pvcPrime": record.pvc_prime,
+            });
+        }
+        ClaimsMirror::Many => {
+            status["resolved"] = serde_json::Value::Null;
+            status["target"] = serde_json::Value::Null;
+        }
+    }
 }
 
 /// What this pass must do with one claim record. Pure model, matched

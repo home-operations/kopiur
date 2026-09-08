@@ -189,6 +189,8 @@ $ kubectl get restore billing-app-restore -n billing -o jsonpath='{.status.claim
 
 The `Restore`'s own `PHASE` is the **aggregate**: `Completed` once every claim settled, `Failed` if any claim failed, `Restoring`/`Pending` while work is outstanding. A per-claim phase is one of `Pending`, `Populating`, `Rebinding`, `Populated`, `AlreadyBound`, `Failed`.
 
+With exactly **one** claim — the ordinary single-PVC app — the `Restore` *is* that claim, so the claim's state is mirrored onto the top-level status: `status.resolved` (the pinned decision), `status.target`, and the `Ready`/`Resolved` conditions all carry that claim's values verbatim, exactly as they did before the fan-out. With **several** claims there is no single answer, so the top-level `resolved`/`target` are cleared, the conditions carry the aggregate summary, and `status.claims.<pvc>` is the authoritative record for each volume.
+
 /// note | A failed claim stalls the Restore — and its siblings keep going
 
 One claim failing (a wedged mover pod, an ambiguous source path, `onMissingSnapshot: Fail` with nothing to restore) makes the whole `Restore` report `Failed`/`Stalled=True`, so `kubectl wait` and Flux/Argo see the failure. It does **not** stop the other claims: they carry on being populated, and `status.claims` says exactly which one is stuck and why.
