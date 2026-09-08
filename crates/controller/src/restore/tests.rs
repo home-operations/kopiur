@@ -1951,6 +1951,20 @@ fn wait_deadline_runs_from_the_anchor_not_from_creation() {
 /// `status.waitStartedAt` — deliberately absent until a claim appears — points them at the
 /// wrong thing. It also never resolves on its own, so it takes the 30s awaiting-claim
 /// cadence rather than a permanent 15s poll.
+/// Review wave 2, finding 9: a direct-target ambiguity is one-shot terminal, so
+/// its message must name the recovery that exists (a NEW Restore) and never
+/// promise the spec edit the reconcile guard will not re-read.
+#[test]
+fn a_direct_source_path_ambiguity_says_to_create_a_new_restore() {
+    let ambiguity = "SnapshotPolicy `cfg`'s selector sources do not yield a per-PVC path.";
+    let msg = direct_source_path_ambiguous_message(ambiguity);
+    assert!(msg.starts_with(ambiguity), "{msg}");
+    assert!(msg.contains("create a NEW Restore"), "{msg}");
+    assert!(msg.contains("source.fromPolicy.sourcePath"), "{msg}");
+    assert!(msg.contains("terminal"), "{msg}");
+    assert!(msg.contains("spec edit is not re-read"), "{msg}");
+}
+
 #[test]
 fn wait_park_report_names_the_blocker_and_picks_the_cadence() {
     let (reason, msg, requeue) = wait_park_report(WaitWindow::Open(1000), Some("5m"), 240);

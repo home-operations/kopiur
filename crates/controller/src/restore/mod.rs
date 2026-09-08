@@ -512,26 +512,31 @@ async fn drive_direct_target(
     .await
 }
 
-/// Park a restore whose per-PVC kopia source path could not be derived (#443).
+/// Fail a DIRECT-target restore whose per-PVC kopia source path could not be
+/// derived (#443) — a one-shot terminal `Failed`, consistent with the
+/// reconciler's contract for every other direct-restore failure.
 ///
 /// A SPEC problem, not a missing object: the `Restore` and the `SnapshotPolicy`
 /// are each valid, but together they name no single volume for this target, and
 /// restoring under a pathless identity would take the newest snapshot of any
-/// member — i.e. quite possibly another volume's data. So it fails closed,
-/// terminally (`Failed`/`Stalled`), and the message names the field that fixes
-/// it.
+/// member — i.e. quite possibly another volume's data. So it fails closed. The
+/// message ([`direct_source_path_ambiguous_message`]) tells the user to create
+/// a NEW `Restore` with `source.fromPolicy.sourcePath` set: `Failed` is terminal
+/// at the reconcile guard for a direct target, so a spec edit is never re-read
+/// (review wave 2, finding 9 — the previous text promised exactly that).
 async fn stall_source_path_ambiguous(
     restore: &Restore,
     api: &Api<Restore>,
     name: &str,
-    msg: &str,
+    ambiguity: &str,
 ) -> Result<Action> {
+    let msg = direct_source_path_ambiguous_message(ambiguity);
     let conditions = io::upsert_condition(
         &existing_conditions(restore),
         "Resolved",
         false,
         SOURCE_PATH_AMBIGUOUS_REASON,
-        msg,
+        &msg,
         restore.metadata.generation,
     );
     io::patch_status(
@@ -542,15 +547,14 @@ async fn stall_source_path_ambiguous(
             &conditions,
             RestorePhase::Failed,
             SOURCE_PATH_AMBIGUOUS_REASON,
-            msg,
+            &msg,
         ),
     )
     .await?;
     tracing::warn!(restore = %name, "{msg}");
-    // Terminal for THIS restore: only a spec edit clears it, so heartbeat on the
-    // slow structural cadence rather than returning an error the policy would
-    // retry (and count) every 30 s.
-    Ok(Action::requeue(std::time::Duration::from_secs(300)))
+    // Terminal: the same slow heartbeat every other terminal direct restore
+    // takes (`steady_terminal_restore`).
+    Ok(Action::requeue(std::time::Duration::from_secs(600)))
 }
 
 /// Durably pin the deploy-or-restore "no snapshot" decision, so a snapshot that appears

@@ -694,6 +694,24 @@ impl WaitWindow {
     }
 }
 
+/// The `Ready`/`Resolved` message for a DIRECT-target restore whose per-PVC
+/// kopia source path could not be derived (review wave 2, finding 9). Pure.
+///
+/// `ambiguity` is the api-level what/why/fix from
+/// [`kopiur_api::expand::restore_source_path`], whose "fix" says to set
+/// `source.fromPolicy.sourcePath`. That advice is right for a CLAIM (re-create
+/// the PVC to re-arm it), but a direct-target `Restore` is one-shot: `Failed` is
+/// terminal at the reconcile guard and a spec edit is never re-read, so this
+/// wrapper states the only recovery that actually exists — a NEW `Restore` —
+/// rather than promising one the reconciler will not honor.
+pub fn direct_source_path_ambiguous_message(ambiguity: &str) -> String {
+    format!(
+        "{ambiguity} This Restore is terminal (a direct-target Restore never retries, and a \
+         spec edit is not re-read): create a NEW Restore with source.fromPolicy.sourcePath \
+         set to the member to restore."
+    )
+}
+
 /// How to park a restore that is still inside (or has not yet started) its wait: the
 /// condition `reason`, the actionable message, and the requeue cadence in seconds.
 ///
