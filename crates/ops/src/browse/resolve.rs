@@ -117,14 +117,45 @@ pub fn session_creds_secrets(
     Ok(names)
 }
 
-/// Resolve `snapshot_name` in `namespace` into a [`BrowseTarget`]: fetch the
-/// Snapshot, derive its repository via the shared
-/// [`kopiur_api::snapshot::repository_ref_for`] rule, then fetch the
-/// Repository/ClusterRepository for backend + credentials.
+/// Resolve `snapshot_name` in `namespace` into a [`BrowseTarget`], discovering
+/// the operator's namespace from the cluster if a `ClusterRepository`'s CA
+/// bundle turns out to need it.
+///
+/// The `kubectl kopiur` entry point: a CLI has no pod of its own to read
+/// `KOPIUR_NAMESPACE` from, so it always pays for the fail-closed
+/// controller-Deployment lookup. A server that already knows the operator's
+/// namespace calls [`resolve_with`] instead.
 pub async fn resolve(
     ctx: &OpsCtx,
     namespace: &str,
     snapshot_name: &str,
+) -> Result<BrowseTarget, OpsError> {
+    resolve_with(
+        ctx,
+        namespace,
+        snapshot_name,
+        &OperatorNamespace::DiscoverFromControllerDeployment,
+    )
+    .await
+}
+
+/// Resolve `snapshot_name` in `namespace` into a [`BrowseTarget`]: fetch the
+/// Snapshot, derive its repository via the shared
+/// [`kopiur_api::snapshot::repository_ref_for`] rule, then fetch the
+/// Repository/ClusterRepository for backend + credentials.
+///
+/// `operator_namespace` is threaded straight through to [`resolve_ca_bundle`],
+/// the only step that consults it (and only for a `ClusterRepository` whose
+/// backend declares a `tls.caBundleRef`). It is a parameter rather than a
+/// constant because the two front ends know different things: `kopiur-ui` runs
+/// inside the operator's install and is told its own namespace by the chart, so
+/// it passes [`OperatorNamespace::Known`] and skips a cluster-wide Deployment
+/// LIST that the human it impersonates may well not be allowed to perform.
+pub async fn resolve_with(
+    ctx: &OpsCtx,
+    namespace: &str,
+    snapshot_name: &str,
+    operator_namespace: &OperatorNamespace,
 ) -> Result<BrowseTarget, OpsError> {
     let ns = namespace.to_string();
     let snaps: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &ns);
@@ -207,12 +238,7 @@ pub async fn resolve(
         }
     };
 
-    let ca_bundle_pem = resolve_ca_bundle(
-        ctx,
-        &repo,
-        &OperatorNamespace::DiscoverFromControllerDeployment,
-    )
-    .await?;
+    let ca_bundle_pem = resolve_ca_bundle(ctx, &repo, operator_namespace).await?;
     Ok(BrowseTarget {
         snapshot: snapshot_name.to_string(),
         namespace: ns,
