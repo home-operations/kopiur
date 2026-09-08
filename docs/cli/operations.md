@@ -27,7 +27,7 @@ That column is plain inventory rather than a warning. A repository shared by sev
 
 ## `doctor`
 
-Diagnoses an installation and exits 1 if anything failed. There are nine checks: the 8 CRDs are installed and serve `v1alpha1`; the controller Deployment is ready, and the webhook Deployment too when it is installed; a **live dry-run admission probe** succeeds, using an intentionally invalid SnapshotPolicy that must be denied, and changing nothing in the cluster; every repository is `Ready` and unblocked; every repository's credential Secrets resolve; no work is **blocked or stuck**; no Snapshot or Restore failed within `--failure-lookback`, which defaults to `24h`; and recent Warning events are summarized.
+Diagnoses an installation and exits 1 if anything failed. There are nine checks: the 9 CRDs are installed and serve `v1alpha1`; the controller Deployment is ready, and the webhook Deployment too when it is installed; a **live dry-run admission probe** succeeds, using an intentionally invalid SnapshotPolicy that must be denied, and changing nothing in the cluster; every repository is `Ready` and unblocked; every repository's credential Secrets resolve; no work is **blocked or stuck**; no Snapshot or Restore failed within `--failure-lookback`, which defaults to `24h`; and recent Warning events are summarized.
 
 ```console
 $ kubectl kopiur doctor -n media

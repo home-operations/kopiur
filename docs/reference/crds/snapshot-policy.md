@@ -65,22 +65,6 @@ Settings for the CSI capture that runs before the mover, so for `copyMethod: Sna
 
 Both overrides need a staged PVC to act on, so they are **rejected at admission** for `copyMethod: Direct`, for NFS sources, and for `pvcSelector` sources. See [Copy methods → staging overrides](../../copy-methods.md#staging-overrides).
 
-### `groupBy`
-
-Consistency grouping across several PVCs.
-
-`VolumeGroupSnapshot` is the default for multi-PVC sources. It takes one consistent group snapshot across all the PVCs. `None` opts into independent per-PVC snapshots.
-
-You must set `None` **explicitly**. There is no silent per-PVC fallback, because that would produce inconsistent backups.
-
-/// note | Single-PVC today
-
-Group snapshotting is not yet fully wired; multi-PVC group consistency is a
-work in progress. For the current single-PVC behavior this field has no
-observable effect.
-
-///
-
 ### `retention`
 
 Grandfather-father-son (GFS) retention. The operator enforces it by pruning the `Snapshot` objects this recipe produced. See [Backups & schedules](../../backups.md).
@@ -107,19 +91,12 @@ File-ignore policy.
 
 `ignoreRules` is a list of filename and path globs to exclude from the snapshot, such as `*.tmp` or `*/cache/*`. `ignoreCacheDirs` honors `CACHEDIR.TAG`. `ignoreIdenticalSnapshots`, default `false`, tells kopia not to write a new manifest when the source is identical to the previous snapshot. The run still reads and hashes the whole source, so what you save is a manifest and not the work, and the `Snapshot` object ends in the [`Unchanged`](snapshot.md#status) phase instead of `Succeeded`.
 
-!!! warning "It changes what a backup run produces"
+/// warning | It changes what a backup run produces
 
-    An `Unchanged` run owns **no kopia snapshot**, so you cannot restore from
-    that CR — the previous snapshot is still the restore point, and it belongs
-    to the previous CR. It is a success for every liveness purpose (last-backup
-    timestamp, policy health, `Ready` condition, `snapshot now --wait` exit
-    code) and it takes no retention slot, so it can never displace a real
-    restore point. Leave it off unless you specifically want fewer manifests.
+An `Unchanged` run owns **no kopia snapshot**, so you cannot restore from that CR. The previous snapshot is still the restore point, and it belongs to the previous CR. It is a success for every liveness purpose (last-backup timestamp, policy health, `Ready` condition, `snapshot now --wait` exit code) and it takes no retention slot, so it can never displace a real restore point. Leave it off unless you specifically want fewer manifests.
+Kopiur pins `--ignore-identical-snapshots=false` at the kopia identity scope on every run, so a repository-global kopia policy cannot turn this on behind your back. Only this field enables it.
 
-    Kopiur pins `--ignore-identical-snapshots=false` at the kopia identity
-    scope on every run, so a repository-global kopia policy cannot turn this on
-    behind your back. Only this field enables it.
-
+///
 `ignoreRules` defaults to a set of five OS-artifact excludes: `/lost+found`, `System Volume Information`, `$RECYCLE.BIN`, `@eaDir` and `.snapshot`. They apply even when you leave `files` out of the spec entirely. The apiserver only server-side-defaults a nested field when the parent object is present, so the controller applies this default again when it resolves the mover work spec.
 
 An explicit `ignoreRules` list **replaces** the default outright rather than adding to it, and `ignoreRules: []` turns off ignoring anything at all. See [Backups → `files.ignoreRules` default](../../backups.md#filesignorerules-default-os-artifact-excludes) for why each entry is there, plus a copy-paste block of recommended extras.

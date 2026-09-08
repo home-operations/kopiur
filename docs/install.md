@@ -252,7 +252,7 @@ kubectl apply -f deploy/examples/01-single-pvc-scheduled.yaml
 kubectl get repositories,snapshotpolicies,snapshotschedules -n billing
 ```
 
-Eight runnable walkthroughs live in `deploy/examples/`:
+The first eight examples in `deploy/examples/` cover the common patterns. The full numbered ladder is on the [Examples](examples.md) page.
 
 | File                               | Pattern                                             |
 | ---------------------------------- | --------------------------------------------------- |
