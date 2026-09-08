@@ -190,7 +190,7 @@ Each check is a CEL **bool** expression over two variables:
 | `maintenance.hasRun` | bool | the repo's `Maintenance` has a recorded successful run (scheduled **or** manual run-now) |
 | `maintenance.lastSuccessAgeSeconds` | int | seconds since the most recent successful maintenance of any mode |
 
-/// warning | Unknown values — always pair with the `*Known`/`hasRun` companion bool
+/// warning | Unknown values: always pair with the `*Known`/`hasRun` companion bool
 
 An unobserved age, count or size is `i64::MAX`. For a **freshness** check such as `maintenance.lastSuccessAgeSeconds < 604800`, that fails *closed*: the unknown value is "infinitely old", so the check blocks, which is what you want. But for a **count or size** check the same sentinel fails *open*. `repository.snapshotCount > 0` is `true` against `i64::MAX`, so an unscanned repository would wrongly pass. Always guard with the boolean companion so the unknown case fails closed:
 

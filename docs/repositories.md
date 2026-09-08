@@ -55,7 +55,7 @@ spec:
             key: KOPIA_PASSWORD
 ```
 
-/// warning | Externally tagged — no `kind:` field
+/// warning | Externally tagged: there is no `kind:` field
 
 A backend is selected by **which key you set** (`backend.s3`, `backend.azure`, and so on), not by a `kind:` discriminator. `backend: { kind: S3 }` will **not** admit. This is the type-safety design: exactly one backend can be expressed. See the [API conventions](dev/api-conventions.md).
 
@@ -139,7 +139,7 @@ The `encryption.passwordSecretRef` is **not** in this set. You may rename or rep
 
 ///
 
-/// note | `create.enabled` defaults to **on** — and that's safe
+/// note | `create.enabled` defaults to **on**, and that's safe
 
 Repository create and connect are **idempotent**. Every bootstrap *connects first* and only creates when the backend holds no repository yet; see [Safe by construction](#safe-by-construction). So creating on first use is the least-surprise default: a genuinely absent repository is initialized instead of erroring, and pointing `create` at one that already exists just adopts it. Omitting `create` entirely, or writing `create: {}`, is the same as `create.enabled: true`.
 
