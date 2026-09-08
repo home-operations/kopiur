@@ -1,13 +1,13 @@
 # Permissions, UID & GID
 
-The single most common reason a backup runs but reads **nothing** — or a restore writes files the app then can't open — is a **UID/GID mismatch**. This page shows how to find the right numbers, how to set them, and how to verify it worked, without guesswork.
+The most common reason a backup runs but reads **nothing**, or a restore writes files the app then cannot open, is a **UID or GID mismatch**. This page shows how to find the right numbers, how to set them, and how to check it worked, with no guesswork.
 
 /// tip | The mental model: the mover is a separate pod
 
-A backup does not run inside your app's pod. Kopiur launches a short-lived **mover** Job that mounts your PVC and runs kopia. Linux file permissions don't care that it's "your" data — they only see the **UID/GID the mover process runs as**. So the rule is simply:
+A backup does not run inside your app's pod. Kopiur launches a short-lived **mover** Job that mounts your PVC and runs kopia. Linux file permissions do not care that it is "your" data. They only see the **UID and GID the mover process runs as**. So the rule is simply:
 
-- **Backup** — the mover's UID/GID must be able to **read** every file in the source PVC.
-- **Restore** — the mover's UID/GID must be able to **write** into the target PVC.
+- **Backup**: the mover's UID and GID must be able to **read** every file in the source PVC.
+- **Restore**: the mover's UID and GID must be able to **write** into the target PVC.
 
 Get the numbers to line up and permissions stop being a problem.
 
@@ -15,27 +15,31 @@ Get the numbers to line up and permissions stop being a problem.
 
 /// info | Looking for the field reference?
 
-This page is the **task** guide — how to find the owning UID and make a stuck backup/restore work. For the full `securityContext` reference (every field, the hardened default, inheriting from a workload, root/privileged movers, and the awkward cases like RWX volumes and preserving ownership on restore), see [**The mover security context**](security-context.md).
+This page is the **task** guide: how to find the owning UID and make a stuck backup or restore work.
+
+For the full `securityContext` reference, meaning every field, the hardened default, inheriting from a workload, root and privileged movers, and the awkward cases such as RWX volumes and preserving ownership on restore, see [**The mover security context**](security-context.md).
 
 ///
 
 ## What the mover runs as by default
 
-Out of the box the mover runs **unprivileged** as the mover image's user — **UID `65532`** (distroless `nonroot`) — with a hardened security context: `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, all Linux capabilities dropped, seccomp `RuntimeDefault`.
+Out of the box the mover runs **unprivileged**, as the mover image's user, which is **UID `65532`**, the distroless `nonroot` user. It runs with a hardened security context: `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, all Linux capabilities dropped, and seccomp `RuntimeDefault`.
 
-That default reads data that is **world-readable** or **owned by `65532`**. If your app writes files `0600`/`0640` owned by some other UID (very common — most images run as `1000`, `1001`, `999`, …), an unprivileged mover at `65532` gets **permission denied** on those files. You then have three options, in order of preference:
+That default reads data that is **world-readable** or **owned by `65532`**. If your app writes files `0600` or `0640` owned by some other UID, which is very common because most images run as `1000`, `1001` or `999`, an unprivileged mover at `65532` gets **permission denied** on those files.
 
-1. Run the mover as the **same UID/GID** that owns the data (best).
+You then have three options, best first:
+
+1. Run the mover as the **same UID and GID** that owns the data.
 2. Run the mover with a **GID** that matches a group the files are readable by.
-3. Run the mover as **root** — reads anything, but is _elevated_ and needs an admin opt-in (last resort).
+3. Run the mover as **root**, which reads anything but is elevated and needs an admin opt-in. This is the last resort.
 
-The rest of this page is how to do (1)/(2) reliably, and when to reach for (3).
+The rest of this page is how to do options 1 and 2 reliably, and when to reach for option 3.
 
 ## Step 1 — Find the UID/GID that owns your data
 
-You want the **numeric** owner of the files in the PVC. Numeric, not names — the mover image has no `/etc/passwd` entry for your app's user, so `ls -l` showing a name is misleading. Use `-n` for numeric.
+You want the **numeric** owner of the files in the PVC. Numeric, not names: the mover image has no `/etc/passwd` entry for your app's user, so `ls -l` showing a name is misleading. Use `-n` for numeric.
 
-**If the workload is running** — read it straight from the app pod:
+**If the workload is running**, read it straight from the app pod:
 
 ```console
 $ kubectl exec -n app deploy/myapp -- id
@@ -46,9 +50,9 @@ drwxr-xr-x 2 1000 1000 4096 Jun  6 12:00 .
 -rw------- 1 1000 1000  512 Jun  6 12:00 secret.key   # 0600, owner-only
 ```
 
-Here the data is owned by `1000:1000` and some files are owner-only (`0600`) — so the mover **must** run as UID `1000` (matching the group is not enough for `0600` files).
+Here the data is owned by `1000:1000` and some files are owner-only at `0600`, so the mover **must** run as UID `1000`. Matching the group is not enough for `0600` files.
 
-**If nothing is mounting the PVC** (e.g. a fresh restore target, or a scaled-down app) — spin up a throwaway pod that mounts it read-only and inspect:
+**If nothing is mounting the PVC**, for example a fresh restore target or a scaled-down app, spin up a throwaway pod that mounts it read-only and inspect it:
 
 ```console
 $ kubectl run pvc-inspect -n app --rm -it --restart=Never \
@@ -68,11 +72,11 @@ $ kubectl run pvc-inspect -n app --rm -it --restart=Never \
 1000 1000 600 /data/secret.key
 ```
 
-Note the **lowest common denominator**: if any file you need is `0600` owned by `1000`, the mover has to be UID `1000`. If everything is at least group-readable (`0640`/`0750`) and shares a GID, matching the **GID** is enough.
+Look for the strictest file. If any file you need is `0600` owned by `1000`, the mover has to be UID `1000`. If everything is at least group-readable, so `0640` or `0750`, and shares a GID, matching the **GID** is enough.
 
 ## Step 2 — Set the mover's UID/GID in the `SnapshotPolicy`
 
-Set it per-recipe under `spec.mover.securityContext` (a standard Kubernetes container `SecurityContext`). Match what you found in Step 1:
+Set it per recipe under `spec.mover.securityContext`, which is a standard Kubernetes container `SecurityContext`. Match what you found in Step 1:
 
 ```yaml
 spec:
@@ -88,23 +92,27 @@ spec:
                 type: RuntimeDefault
 ```
 
-A complete, apply-ready example (Repository + SnapshotPolicy with this block, plus the root-mover variant commented out) is [Example 09](examples.md#example-09--mover-uidgid--permissions):
+A complete, apply-ready example, with a Repository and a SnapshotPolicy carrying this block plus the root-mover variant commented out, is [Example 09](examples.md#example-09--mover-uidgid--permissions):
 
 /// tip | `fsGroup` lives on `mover.podSecurityContext`
 
-`runAsUser`/`runAsGroup` above are **container**-level (`spec.mover.securityContext`). `fsGroup` is **pod**-level, so it has its own sibling field — `spec.mover.podSecurityContext.fsGroup`. It's the right tool when an unprivileged mover must **write a freshly-provisioned restore volume** (the kubelet makes the mount group-writable by that GID). For *reading* source data, prefer matching the owning `runAsUser`/`runAsGroup`. See [The mover security context → fsGroup](security-context.md).
+`runAsUser` and `runAsGroup` above are **container**-level, under `spec.mover.securityContext`. `fsGroup` is **pod**-level, so it has its own sibling field, `spec.mover.podSecurityContext.fsGroup`.
+
+`fsGroup` is the right tool when an unprivileged mover must **write a freshly provisioned restore volume**, because the kubelet makes the mount group-writable by that GID. For *reading* source data, prefer matching the owning `runAsUser` and `runAsGroup`. See [The mover security context → fsGroup](security-context.md).
 
 ///
 
 /// warning | `fsGroup` does nothing on NFS
 
-`fsGroup` relies on the kubelet chowning the volume, which it **does not do for in-tree NFS mounts**. So `fsGroup` can't grant write to an NFS source or an NFS-backed filesystem repo. Use `podSecurityContext.supplementalGroups` against a group-writable export (supplemental GIDs *are* honored over NFS), `securityContext.runAsUser` matching the export owner, or a server-side remap (TrueNAS Mapall / `all_squash`). See [Security context → NFS filesystem repositories](security-context.md#nfs-filesystem-repositories).
+`fsGroup` relies on the kubelet chowning the volume, and the kubelet **does not do that for in-tree NFS mounts**. So `fsGroup` cannot grant write access to an NFS source or an NFS-backed filesystem repository.
+
+Use one of these instead: `podSecurityContext.supplementalGroups` against a group-writable export, since supplemental GIDs *are* honored over NFS; `securityContext.runAsUser` matching the export owner; or a server-side remap such as TrueNAS Mapall or `all_squash`. See [Security context → NFS filesystem repositories](security-context.md#nfs-filesystem-repositories).
 
 ///
 
 ## Step 3 — Verify it worked
 
-Re-run the backup and confirm it actually read files, rather than silently snapshotting an empty/partial tree:
+Re-run the backup and confirm it actually read files, rather than quietly snapshotting an empty or partial tree:
 
 ```console
 # the mover Job's exact name lives on the Snapshot (it's named after the Snapshot CR):
@@ -122,11 +130,11 @@ $ kubectl logs <mover-pod> -n app | grep -i "permission denied"
 $ kubectl get snapshot <snapshot-name> -n app -o jsonpath='{.status.conditions}'
 ```
 
-A healthy backup ends `Succeeded` with non-zero files/bytes in `status`. A backup that "succeeded" but shows **zero files** is the classic sign the mover couldn't read the data — recheck the UID.
+A healthy backup ends `Succeeded` with non-zero files and bytes in `status`. A backup that "succeeded" but shows **zero files** is the classic sign the mover could not read the data. Recheck the UID.
 
 ## When you can't match the UID: the root mover
 
-If the data is owned by **assorted UIDs you can't match** (a `lost+found`, a multi-user volume, or an app that writes as root), a **root mover** reads everything. Set:
+If the data is owned by **assorted UIDs you cannot match**, such as a `lost+found`, a multi-user volume, or an app that writes as root, a **root mover** reads everything. Set:
 
 ```yaml
 spec:
@@ -137,7 +145,9 @@ spec:
         privilegedMode: true # also preserves UID/GID ownership on RESTORE
 ```
 
-A root (or otherwise elevated) mover is a **privileged mover**, and granting it is a per-namespace admin decision. If the namespace hasn't opted in, the `Snapshot` is refused with a clear `MoverPermitted=False` condition. Opt the namespace in by applying a `Namespace` carrying the opt-in annotation:
+A root, or otherwise elevated, mover is a **privileged mover**, and granting it is a per-namespace admin decision. If the namespace has not opted in, the `Snapshot` is refused with a clear `MoverPermitted=False` condition.
+
+Opt the namespace in by applying a `Namespace` carrying the opt-in annotation:
 
 ```yaml
 --8<-- "deploy/examples/privileged-mover-namespace.yaml"
@@ -147,21 +157,21 @@ A root (or otherwise elevated) mover is a **privileged mover**, and granting it 
 $ kubectl apply -f privileged-mover-namespace.yaml
 ```
 
-…or imperatively: `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`.
+Or do it imperatively with `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`.
 
-Anything that trips the "privileged" detector needs that opt-in: `runAsUser: 0`, `privileged: true`, `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot: false`, or `privilegedMode: true`. Full detail and the revoke path are in [Movers → Privileged movers](movers.md#privileged-movers).
+Anything that trips the privileged detector needs that opt-in: `runAsUser: 0`, `privileged: true`, `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot: false`, or `privilegedMode: true`. The full detail and the revoke path are in [Movers → Privileged movers](movers.md#privileged-movers).
 
 /// tip | Prefer matching the UID over going root
 
-A root mover widens the blast radius of the minted mover ServiceAccount. Reach for it only when you genuinely can't match the owning UID/GID. Most single-app PVCs back up fine as their app's UID.
+A root mover widens the blast radius of the mover ServiceAccount Kopiur mints. Reach for it only when you genuinely cannot match the owning UID or GID. Most single-app PVCs back up fine as their app's UID.
 
 ///
 
 ## Filesystem repositories: the _other_ permission
 
-The UID/GID story above is about reading **source data**. A [filesystem repository](backends/filesystem.md) (PVC- or NFS-backed) adds a second surface: the **repository path itself must be writable** by the operator/mover UID.
+The UID and GID story above is about reading **source data**. A [filesystem repository](backends/filesystem.md), backed by a PVC or NFS, adds a second surface: the **repository path itself must be writable** by the operator and mover UID.
 
-When create/connect can't write the repo path, Kopiur does not hang — it emits a Warning Event (and a `Bootstrapped=False` condition) naming the **actual** UID it runs as and the fix:
+When create or connect cannot write the repository path, Kopiur does not hang. It emits a Warning Event, and a `Bootstrapped=False` condition, naming the **actual** UID it runs as and the fix:
 
 ```console
 $ kubectl describe repository nas-primary -n backups
@@ -170,26 +180,28 @@ Warning  PermissionDenied  the repository path is not writable by the operator's
   fix its ownership/mode (e.g. `chown -R 65532 /repo`) and reconcile again.
 ```
 
-The UID in that message is the operator's real effective UID (it varies with the chart's `podSecurityContext.runAsUser`), so the `chown` it prints is always correct for your install. Run it on the NAS/host backing the PVC, then reconcile.
+The UID in that message is the operator's real effective UID, which varies with the chart's `podSecurityContext.runAsUser`, so the `chown` it prints is always correct for your install. Run it on the NAS or host backing the PVC, then reconcile.
 
-For an **NFS-backed** repo whose export is owned by a dedicated UID/GID while your apps run as other UIDs, don't reach for `fsGroup` (a no-op on NFS) — make the export group-writable and give every backend-writer (movers via `moverDefaults.podSecurityContext.supplementalGroups`, and the kopia-ui server via `server.podSecurityContext.supplementalGroups`) the shared group. This keeps per-policy source reads as the app's UID while the group grants repo writes. Full recipe and an apply-ready example: [Security context → NFS filesystem repositories](security-context.md#nfs-filesystem-repositories).
+For an **NFS-backed** repository whose export is owned by a dedicated UID and GID while your apps run as other UIDs, do not reach for `fsGroup`, which does nothing on NFS. Make the export group-writable instead, and give every backend writer the shared group: movers through `moverDefaults.podSecurityContext.supplementalGroups`, and the kopia UI server through `server.podSecurityContext.supplementalGroups`. That keeps per-policy source reads running as the app's UID while the group grants repository writes. The full recipe and an apply-ready example are in [Security context → NFS filesystem repositories](security-context.md#nfs-filesystem-repositories).
 
 ## Restore-side permissions
 
-A restore writes files into the **target** PVC, so the same rules apply in reverse — and a `Restore` has the **same `spec.mover`** surface a `SnapshotPolicy` does:
+A restore writes files into the **target** PVC, so the same rules apply in reverse. A `Restore` has the **same `spec.mover`** surface a `SnapshotPolicy` does:
 
-- **`Restore.spec.mover.securityContext`** — set the UID/GID the restore mover writes as, so the restored files land owned correctly and the mover can write the target. (Before this existed the restore mover always ran as UID `65532`.) For a freshly created target PVC (`target.pvc`) the default is usually fine; for an existing PVC (`target.pvcRef`) match the UID that owns it.
-- **`Restore.spec.mover.inheritSecurityContextFrom`** — copy the `securityContext` from a live workload pod by label selector instead of hard-coding it (combines with `securityContext`, which overrides it field-wise; needs the workload to pin `runAsUser`). Handy for "restore as whatever the app runs as" — full treatment in [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload).
-- **Preserving original ownership** — kopia restores files with the UID/GID they had when snapshotted. Reproducing that ownership requires a privileged (root) mover with `privilegedMode: true`; an unprivileged mover writes files owned by its own UID instead. An elevated restore mover (root / `privilegedMode`, or one inherited from a root pod) is gated by the same `privileged-movers` namespace opt-in a backup uses.
-- **`spec.options.ignorePermissionErrors`** (default `true`) lets a restore complete and _report_ permission problems via a condition rather than failing hard. Set it `false` to fail-closed when exact permissions matter.
+- **`Restore.spec.mover.securityContext`** sets the UID and GID the restore mover writes as, so the restored files land owned correctly and the mover can write the target. Before this field existed the restore mover always ran as UID `65532`. For a freshly created target PVC, meaning `target.pvc`, the default is usually fine. For an existing PVC, meaning `target.pvcRef`, match the UID that owns it.
+- **`Restore.spec.mover.inheritSecurityContextFrom`** copies the `securityContext` from a live workload pod by label selector, instead of hard-coding it. It combines with `securityContext`, which overrides it field by field, and it needs the workload to pin `runAsUser`. It is handy for "restore as whatever the app runs as", and is covered fully in [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload).
+- **Preserving original ownership.** Kopia restores files with the UID and GID they had when snapshotted. Reproducing that ownership requires a privileged root mover with `privilegedMode: true`; an unprivileged mover writes files owned by its own UID instead. An elevated restore mover, whether root, `privilegedMode`, or inherited from a root pod, is gated by the same `privileged-movers` namespace opt-in a backup uses.
+- **`spec.options.ignorePermissionErrors`**, default `true`, lets a restore complete and *report* permission problems through a condition rather than failing hard. Set it `false` to fail closed when exact permissions matter.
 
 See [Restores → Mover, cache & failure policy](restores.md#mover-cache--failure-policy) for the full restore mover surface, and [example 12](examples.md#example-12--restore-mover-cache--failure-policy).
 
 ## Try it end-to-end
 
-See the UID-match fix work — and watch the classic anti-pattern fail — from a clean slate: a PVC seeded with files owned `1000:1000`, mode `0600` (readable **only** by UID 1000), backed up by a mover that runs as `runAsUser: 1000`. The backup reads the files (`status.stats.filesNew` is non-zero); the *default* mover (UID 65532) would "succeed" reading **zero**.
+See the UID-match fix work, and watch the classic anti-pattern fail, from a clean slate.
 
-One apply-ready bundle, [`deploy/examples/tryit/permissions-uid.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/permissions-uid.yaml): the `app` `Namespace`, a PVC, a seed Job, an S3 `Repository`, a UID-matched `SnapshotPolicy`, and a manual `Snapshot`.
+The setup is a PVC seeded with files owned `1000:1000`, mode `0600`, so readable **only** by UID 1000, backed up by a mover that runs as `runAsUser: 1000`. The backup reads the files, so `status.stats.filesNew` is non-zero. The *default* mover, at UID 65532, would "succeed" while reading **zero**.
+
+It is one apply-ready bundle, [`deploy/examples/tryit/permissions-uid.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/permissions-uid.yaml): the `app` `Namespace`, a PVC, a seed Job, an S3 `Repository`, a UID-matched `SnapshotPolicy`, and a manual `Snapshot`.
 
 The seed writes owner-only files that only UID 1000 can read:
 
@@ -203,7 +215,7 @@ The policy matches the mover to that owner:
 --8<-- "deploy/examples/tryit/permissions-uid.yaml:policy"
 ```
 
-**1. Fill in the credentials** (`AWS_*` + `KOPIA_PASSWORD`) in the `secret` section, then apply the bundle:
+**1. Fill in the credentials**, meaning `AWS_*` and `KOPIA_PASSWORD`, in the `secret` section, then apply the bundle:
 
 ```console
 $ kubectl apply -f deploy/examples/tryit/permissions-uid.yaml
@@ -211,7 +223,7 @@ $ kubectl -n app wait --for=condition=Ready repository/app-primary --timeout=2m
 $ kubectl -n app wait --for=condition=complete job/seed-app-data --timeout=2m
 ```
 
-**2. Take the backup** (the `Snapshot` uses `generateName`, so `create` it):
+**2. Take the backup.** The `Snapshot` uses `generateName`, so `create` it:
 
 ```console
 $ kubectl create -f deploy/examples/tryit/permissions-uid.yaml
@@ -241,13 +253,15 @@ $ kubectl -n app get pod <mover-pod> \
 
 /// warning | The anti-pattern: the default UID reads nothing
 
-Drop the `mover` block (or set `runAsUser: 65532`) and re-run: the backup still ends **`Succeeded`**, but `status.stats.filesNew` reads **0** — the unprivileged mover got *permission denied* on every `0600` file and silently snapshotted an empty tree. A `Succeeded` snapshot with **zero files** is the canonical sign of a UID mismatch. Match the owning UID (above) or, if the data is owned by UIDs you can't match, reach for a [root mover](#when-you-cant-match-the-uid-the-root-mover).
+Drop the `mover` block, or set `runAsUser: 65532`, and re-run. The backup still ends **`Succeeded`**, but `status.stats.filesNew` reads **0**: the unprivileged mover got permission denied on every `0600` file and snapshotted an empty tree without saying so.
+
+A `Succeeded` snapshot with **zero files** is the canonical sign of a UID mismatch. Match the owning UID as described above, or, if the data is owned by UIDs you cannot match, reach for a [root mover](#when-you-cant-match-the-uid-the-root-mover).
 
 ///
 
 /// note | Illustrative output
 
-The `status.stats` numbers and the `app-data-manual-abc12` / `<mover-pod>` names stand in for what your run produces. The shape and the **non-zero `filesNew`** are the point.
+The `status.stats` numbers and the `app-data-manual-abc12` and `<mover-pod>` names stand in for what your run produces. The shape, and the **non-zero `filesNew`**, are the point.
 
 ///
 
@@ -278,6 +292,6 @@ The `status.stats` numbers and the `app-data-manual-abc12` / `<mover-pod>` names
 
 ## See also
 
-- [Movers, RBAC & credentials](movers.md) — privileged movers, the minted ServiceAccount, credential placement.
-- [Backend configuration](backends/index.md) — filesystem & SFTP backends, where ownership matters most.
-- [Restores](restores.md) — restore targets and options.
+- [Movers, RBAC & credentials](movers.md) covers privileged movers, the minted ServiceAccount, and credential placement.
+- [Backend configuration](backends/index.md) covers the filesystem and SFTP backends, where ownership matters most.
+- [Restores](restores.md) covers restore targets and options.
