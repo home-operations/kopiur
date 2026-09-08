@@ -433,7 +433,11 @@ pub enum OpsError {
     },
 
     /// An I/O error while copying bytes between the session pod and the caller.
-    #[error("I/O error while {what}: {source}")]
+    #[error(
+        "I/O error while {what}: {source}. \
+         Fix: retry the command; if it recurs, check the session pod with \
+         `kubectl kopiur doctor` and the network path between you and the cluster"
+    )]
     StreamIo {
         /// What was being copied.
         what: String,

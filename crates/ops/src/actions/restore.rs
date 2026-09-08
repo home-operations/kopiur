@@ -12,9 +12,9 @@ use kopiur_api::restore::{RestoreOptions, RestorePolicy, RestoreSpec};
 use kopiur_api::{Restore, RestorePhase, RestoreSource, RestoreTarget};
 use kube::api::{Api, PostParams};
 
-use crate::actions::snapshot::human_bytes;
 use crate::ctx::OpsCtx;
 use crate::error::{OpsError, classify_kube};
+use crate::format::human_bytes;
 
 /// One restore invocation: the exactly-one-of source/target pair plus the
 /// optional policy sub-objects, all already in CRD shape.
@@ -94,7 +94,7 @@ pub async fn create_restore(
     restore: Restore,
 ) -> Result<Restore, OpsError> {
     let api: Api<Restore> = Api::namespaced(ctx.client.clone(), namespace);
-    let name = restore.metadata.name.clone().expect("name set by builder");
+    let name = restore.metadata.name.as_deref().unwrap_or("<unnamed>");
     api.create(&PostParams::default(), &restore)
         .await
         .map_err(|e| {
@@ -103,7 +103,7 @@ pub async fn create_restore(
                 "Restore",
                 "restores",
                 Some(namespace),
-                Some(&name),
+                Some(name),
                 e,
             )
         })

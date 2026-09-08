@@ -13,14 +13,10 @@ use kopiur_api::common::RepositoryKind;
 use kopiur_api::consts::{RUN_MODE_ANNOTATION, RUN_REQUESTED_ANNOTATION};
 use kopiur_api::{Maintenance, ManualRunMode, ManualRunPhase};
 use kube::ResourceExt;
-use kube::api::{Api, ListParams, Patch, PatchParams};
+use kube::api::{Api, ListParams, Patch};
 
-use crate::ctx::OpsCtx;
+use crate::ctx::{OpsCtx, merge_patch_params};
 use crate::error::{OpsError, classify_kube, scope_suffix};
-
-/// The `managedFields` owner recorded on the run-request PATCH, so the change
-/// is attributed to kopiur's own tooling rather than an anonymous client.
-const FIELD_MANAGER: &str = "kubectl-kopiur";
 
 /// Does this Maintenance cover the wanted repository? An absent ref namespace
 /// means "same as the Maintenance" for a namespaced Repository. Pure.
@@ -203,7 +199,8 @@ pub async fn resolve(ctx: &OpsCtx, target: &MaintenanceTarget) -> Result<Mainten
 ///
 /// The patch is issued where the Maintenance LIVES (a ClusterRepository's
 /// managed Maintenance is typically in the operator namespace), not where the
-/// caller happens to be scoped.
+/// caller happens to be scoped, and is attributed to `ctx.field_manager`
+/// ([`merge_patch_params`]) so the write names the front end that made it.
 pub async fn request_run(
     ctx: &OpsCtx,
     maint: &Maintenance,
@@ -218,10 +215,7 @@ pub async fn request_run(
         .unwrap_or_else(|| ctx.namespace.clone());
     let api: Api<Maintenance> = Api::namespaced(ctx.client.clone(), &ns);
     let requested_at = now.to_rfc3339_opts(SecondsFormat::Secs, true);
-    let params = PatchParams {
-        field_manager: Some(FIELD_MANAGER.to_string()),
-        ..Default::default()
-    };
+    let params = merge_patch_params(&ctx.field_manager);
     api.patch(
         &name,
         &params,
@@ -358,5 +352,17 @@ mod tests {
             detail.contains("kopiur.home-operations.com/maintenance=m"),
             "{detail}"
         );
+    }
+
+    #[test]
+    fn the_run_request_patch_is_attributed_to_the_contexts_field_manager() {
+        // `request_run` builds its PatchParams with `merge_patch_params(&ctx.
+        // field_manager)`; this module holds no manager string of its own any
+        // more, so the CLI and a server are told apart in `managedFields`.
+        let cli = merge_patch_params("kubectl-kopiur");
+        assert_eq!(cli.field_manager.as_deref(), Some("kubectl-kopiur"));
+        let ui = merge_patch_params("kopiur-web-ui");
+        assert_eq!(ui.field_manager.as_deref(), Some("kopiur-web-ui"));
+        assert!(!cli.force, "a run request must not force-take ownership");
     }
 }

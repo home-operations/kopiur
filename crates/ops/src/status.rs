@@ -19,11 +19,8 @@ use serde::Serialize;
 
 use crate::ctx::{OpsCtx, Scope};
 use crate::error::{OpsError, classify_kube};
+use crate::format::EMPTY_CELL;
 use crate::snapshots::{RepoFilter, matches_repository};
-
-/// The placeholder a missing value renders as. Mirrors the CLI table's empty
-/// cell so `-o json` and the human table agree on "nothing reported".
-const EMPTY_CELL: &str = "-";
 
 /// The typed report `-o yaml|json` emits (and the table renders).
 #[derive(Debug, Serialize, Default)]

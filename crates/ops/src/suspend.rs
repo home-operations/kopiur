@@ -9,15 +9,11 @@ use kopiur_api::{
     ClusterRepository, Repository, RepositoryReplication, SnapshotPolicy, SnapshotReplication,
     SnapshotSchedule,
 };
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, Patch};
 use serde::de::DeserializeOwned;
 
-use crate::ctx::OpsCtx;
+use crate::ctx::{OpsCtx, merge_patch_params};
 use crate::error::{OpsError, classify_kube};
-
-/// The `managedFields` owner recorded on the suspend PATCH, so the change is
-/// attributed to kopiur's own tooling rather than an anonymous client.
-const FIELD_MANAGER: &str = "kubectl-kopiur";
 
 /// Every kind that exposes a declarative suspend field (ADR-0005 §14(e)).
 /// Closed enum: the patch path and API routing `match` it exhaustively, so a
@@ -126,19 +122,21 @@ pub struct SuspendReport {
 
 /// Toggle one object's suspend field: get (for the previous value and a real
 /// not-found message), merge-patch only when it would change, return the
-/// resulting object. Idempotent by construction.
+/// resulting object. Idempotent by construction. The patch — when there is one
+/// — is attributed to `field_manager` (the caller's [`OpsCtx::field_manager`]).
 async fn toggle<K>(
     api: Api<K>,
-    meta: KindMeta,
     namespace: Option<&str>,
     name: &str,
     kind: SuspendableKind,
     desired: bool,
+    field_manager: &str,
     current: impl Fn(&K) -> bool,
 ) -> Result<SuspendReport, OpsError>
 where
     K: kube::Resource + Clone + std::fmt::Debug + DeserializeOwned + serde::Serialize,
 {
+    let meta = kind_meta(kind);
     let obj = api
         .get(name)
         .await
@@ -147,10 +145,7 @@ where
     let patched = if previous == desired {
         obj
     } else {
-        let params = PatchParams {
-            field_manager: Some(FIELD_MANAGER.to_string()),
-            ..Default::default()
-        };
+        let params = merge_patch_params(field_manager);
         api.patch(name, &params, &Patch::Merge(patch_for(kind, desired)))
             .await
             .map_err(|e| classify_kube("patch", meta.kind, meta.plural, namespace, Some(name), e))?
@@ -185,36 +180,36 @@ pub async fn set_suspended(
     name: &str,
     desired: bool,
 ) -> Result<SuspendReport, OpsError> {
-    let meta = kind_meta(kind);
     let ns = namespace.unwrap_or(ctx.namespace.as_str());
     let client = ctx.client.clone();
+    let fm = ctx.field_manager.as_str();
     match kind {
         SuspendableKind::Policy => {
             let api: Api<SnapshotPolicy> = Api::namespaced(client, ns);
-            toggle(api, meta, Some(ns), name, kind, desired, |o| o.spec.suspend).await
+            toggle(api, Some(ns), name, kind, desired, fm, |o| o.spec.suspend).await
         }
         SuspendableKind::Schedule => {
             let api: Api<SnapshotSchedule> = Api::namespaced(client, ns);
-            toggle(api, meta, Some(ns), name, kind, desired, |o| {
+            toggle(api, Some(ns), name, kind, desired, fm, |o| {
                 o.spec.schedule.suspend
             })
             .await
         }
         SuspendableKind::Repository => {
             let api: Api<Repository> = Api::namespaced(client, ns);
-            toggle(api, meta, Some(ns), name, kind, desired, |o| o.spec.suspend).await
+            toggle(api, Some(ns), name, kind, desired, fm, |o| o.spec.suspend).await
         }
         SuspendableKind::ClusterRepository => {
             let api: Api<ClusterRepository> = Api::all(client);
-            toggle(api, meta, None, name, kind, desired, |o| o.spec.suspend).await
+            toggle(api, None, name, kind, desired, fm, |o| o.spec.suspend).await
         }
         SuspendableKind::Replication => {
             let api: Api<RepositoryReplication> = Api::namespaced(client, ns);
-            toggle(api, meta, Some(ns), name, kind, desired, |o| o.spec.suspend).await
+            toggle(api, Some(ns), name, kind, desired, fm, |o| o.spec.suspend).await
         }
         SuspendableKind::SnapshotReplication => {
             let api: Api<SnapshotReplication> = Api::namespaced(client, ns);
-            toggle(api, meta, Some(ns), name, kind, desired, |o| o.spec.suspend).await
+            toggle(api, Some(ns), name, kind, desired, fm, |o| o.spec.suspend).await
         }
     }
 }

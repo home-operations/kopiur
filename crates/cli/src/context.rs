@@ -57,5 +57,9 @@ pub async fn connect(global: &GlobalArgs) -> Result<KubeCtx, CliError> {
         client,
         namespace,
         scope,
+        // Every write this process makes is attributed to the CLI, so
+        // `--show-managed-fields` distinguishes it from the operator and from
+        // a future web UI.
+        field_manager: crate::consts::FIELD_MANAGER.to_string(),
     })
 }

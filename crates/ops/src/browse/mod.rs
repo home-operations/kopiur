@@ -41,11 +41,12 @@ pub trait SnapshotAccess {
     type Error: std::error::Error + Send + Sync + 'static + From<OpsError>;
 
     /// The root directory object id of `kopia_snapshot_id`, from the
-    /// repository's own catalog.
+    /// repository's own catalog. Already validated: an [`ObjectId`], not a
+    /// string a caller has to re-parse (and could forget to).
     fn snapshot_root(
         &mut self,
         kopia_snapshot_id: &str,
-    ) -> impl Future<Output = Result<String, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<ObjectId, Self::Error>> + Send;
 
     /// A directory object's manifest.
     fn list_dir(
@@ -115,9 +116,9 @@ pub fn parse_oid(oid: &str) -> Result<ObjectId, OpsError> {
 impl SnapshotAccess for session::ExecSession {
     type Error = OpsError;
 
-    async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<String, OpsError> {
+    async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<ObjectId, OpsError> {
         let out = self.exec_capture(SessionCmd::SnapshotListJson).await?;
-        root_oid_from_list(&out, kopia_snapshot_id).map(|oid| oid.as_str().to_string())
+        root_oid_from_list(&out, kopia_snapshot_id)
     }
 
     async fn list_dir(&mut self, oid: &ObjectId) -> Result<DirManifest, OpsError> {
@@ -305,8 +306,8 @@ mod tests {
     impl SnapshotAccess for FakeAccess {
         type Error = OpsError;
 
-        async fn snapshot_root(&mut self, _id: &str) -> Result<String, OpsError> {
-            Ok(self.root.clone())
+        async fn snapshot_root(&mut self, _id: &str) -> Result<ObjectId, OpsError> {
+            parse_oid(&self.root)
         }
 
         async fn list_dir(&mut self, oid: &ObjectId) -> Result<DirManifest, OpsError> {

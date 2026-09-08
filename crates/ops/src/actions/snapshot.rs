@@ -16,6 +16,7 @@ use kube::api::{Api, PostParams};
 
 use crate::ctx::OpsCtx;
 use crate::error::{OpsError, classify_kube};
+use crate::format::human_bytes;
 
 /// One "run this recipe now" invocation: the recipe plus the per-run overrides.
 ///
@@ -190,28 +191,6 @@ pub fn failure_detail(snapshot: &Snapshot) -> String {
     out
 }
 
-/// Humanize a byte count: `512 B`, `1.5 KiB`, `2.0 GiB`. Binary units, one
-/// decimal, matching kopia's own reporting style.
-///
-/// `pub(crate)` and defined here because both action summaries render sizes;
-/// the CLI keeps its own copy for the table renderers it did not move.
-pub(crate) fn human_bytes(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = "";
-    for u in UNITS {
-        value /= 1024.0;
-        unit = u;
-        if value < 1024.0 {
-            break;
-        }
-    }
-    format!("{value:.1} {unit}")
-}
-
 /// The `Snapshot` CRs this invocation should create.
 ///
 /// One, for an ordinary single-source recipe. N — one per matched PVC — when
@@ -373,7 +352,7 @@ pub async fn create_snapshots(
     let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
     let mut created = Vec::with_capacity(planned.len());
     for snapshot in planned {
-        let name = snapshot.metadata.name.clone().expect("name set by builder");
+        let name = snapshot.metadata.name.as_deref().unwrap_or("<unnamed>");
         created.push(
             api.create(&PostParams::default(), snapshot)
                 .await
@@ -383,7 +362,7 @@ pub async fn create_snapshots(
                         "Snapshot",
                         "snapshots",
                         Some(namespace),
-                        Some(&name),
+                        Some(name),
                         e,
                     )
                 })?,
@@ -532,14 +511,6 @@ mod tests {
         assert!(detail.contains("snapshot s failed (AuthFailure): credentials rejected"));
         assert!(detail.contains("--- kopia stderr tail ---\naccess denied"));
         assert!(detail.contains("--- log tail ---\nlast lines"));
-    }
-
-    #[test]
-    fn human_bytes_uses_binary_units() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(1023), "1023 B");
-        assert_eq!(human_bytes(1536), "1.5 KiB");
-        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
     }
 
     // --- multi-repo fan-out (#368): planned cells + the pin on the wire -----

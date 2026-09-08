@@ -7,6 +7,7 @@ pub mod browse;
 pub mod ctx;
 pub mod doctor;
 pub mod error;
+pub mod format;
 pub mod maintenance;
 pub mod replication;
 pub mod snapshots;
@@ -14,5 +15,5 @@ pub mod status;
 pub mod suspend;
 pub mod wait;
 
-pub use ctx::{OpsCtx, Scope};
+pub use ctx::{OpsCtx, Scope, merge_patch_params};
 pub use error::{OpsError, OpsErrorKind, classify_kube, scope_suffix};

@@ -36,11 +36,9 @@ use crate::output::{EMPTY_CELL, OutputFormat, Table, human_bytes};
 impl SnapshotAccess for local::LocalSession {
     type Error = CliError;
 
-    async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<String, CliError> {
+    async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<ObjectId, CliError> {
         let out = self.run_capture(SessionCmd::SnapshotListJson).await?;
-        Ok(root_oid_from_list(&out, kopia_snapshot_id)?
-            .as_str()
-            .to_string())
+        Ok(root_oid_from_list(&out, kopia_snapshot_id)?)
     }
 
     async fn list_dir(&mut self, oid: &ObjectId) -> Result<DirManifest, CliError> {
@@ -72,7 +70,7 @@ pub enum Transport {
 impl SnapshotAccess for Transport {
     type Error = CliError;
 
-    async fn snapshot_root(&mut self, id: &str) -> Result<String, CliError> {
+    async fn snapshot_root(&mut self, id: &str) -> Result<ObjectId, CliError> {
         match self {
             Transport::Session(s) => Ok(s.snapshot_root(id).await?),
             Transport::Local(l) => l.snapshot_root(id).await,
@@ -122,15 +120,6 @@ async fn open_transport(
             .await?,
         ))
     }
-}
-
-/// The snapshot root, as the validated object id the walk needs.
-async fn snapshot_root_oid<A: SnapshotAccess + ?Sized>(
-    access: &mut A,
-    kopia_snapshot_id: &str,
-) -> Result<ObjectId, A::Error> {
-    let root = access.snapshot_root(kopia_snapshot_id).await?;
-    Ok(parse_oid(&root)?)
 }
 
 /// A directory entry's size for the table: a file's own size, or a directory
@@ -245,7 +234,7 @@ pub async fn ls(ctx: &KubeCtx, args: &LsArgs, output: OutputFormat) -> Result<Cm
     let components = validate_rel_path(args.path.as_deref().unwrap_or(""))?;
     let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
-    let root = snapshot_root_oid(&mut access, &target.kopia_snapshot_id).await?;
+    let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let (_oid, manifest) = walk_to_dir(&mut access, &root, &components).await?;
     Ok(CmdOutput::ok(render_manifest(&manifest, output)?))
 }
@@ -256,7 +245,7 @@ pub async fn cat(ctx: &KubeCtx, args: &CatArgs) -> Result<CmdOutput, CliError> {
     let components = validate_rel_path(&args.path)?;
     let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
-    let root = snapshot_root_oid(&mut access, &target.kopia_snapshot_id).await?;
+    let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let (oid, _entry) = walk_to_file(&mut access, &root, &components, &args.path).await?;
     let mut stdout = tokio::io::stdout();
     access.read_file(&oid, &mut stdout).await?;
@@ -277,7 +266,7 @@ pub async fn download(ctx: &KubeCtx, args: &DownloadArgs) -> Result<CmdOutput, C
     let components = validate_rel_path(&args.path)?;
     let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
-    let root = snapshot_root_oid(&mut access, &target.kopia_snapshot_id).await?;
+    let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let (oid, entry) = walk_to_file(&mut access, &root, &components, &args.path).await?;
 
     let dest: PathBuf = match &args.dest {
@@ -540,7 +529,7 @@ pub async fn browse(ctx: &KubeCtx, args: &BrowseArgs) -> Result<CmdOutput, CliEr
     reject_all_namespaces(ctx, "browse")?;
     let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
-    let root = snapshot_root_oid(&mut access, &target.kopia_snapshot_id).await?;
+    let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let mut state = ReplState::new(root);
 
     eprintln!(
@@ -658,8 +647,8 @@ mod tests {
     impl SnapshotAccess for FakeAccess {
         type Error = CliError;
 
-        async fn snapshot_root(&mut self, _id: &str) -> Result<String, CliError> {
-            Ok(self.root.clone())
+        async fn snapshot_root(&mut self, _id: &str) -> Result<ObjectId, CliError> {
+            Ok(parse_oid(&self.root)?)
         }
 
         async fn list_dir(&mut self, oid: &ObjectId) -> Result<DirManifest, CliError> {

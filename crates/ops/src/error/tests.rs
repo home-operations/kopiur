@@ -369,7 +369,7 @@ fn unexpected_kopia_output_is_reported_as_a_compat_bug() {
 }
 
 #[test]
-fn stream_io_names_what_was_being_copied() {
+fn stream_io_names_what_was_being_copied_and_how_to_recover() {
     let msg = OpsError::StreamIo {
         what: "streaming sub/b.txt from the session pod".into(),
         source: std::io::Error::other("broken pipe"),
@@ -380,6 +380,9 @@ fn stream_io_names_what_was_being_copied() {
         "{msg}"
     );
     assert!(msg.contains("broken pipe"), "{msg}");
+    // Repo convention: every message ends in an actionable Fix clause.
+    assert!(msg.contains("Fix: retry the command"), "{msg}");
+    assert!(msg.contains("`kubectl kopiur doctor`"), "{msg}");
 }
 
 #[test]

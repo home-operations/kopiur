@@ -233,6 +233,17 @@ pub enum OperatorNamespace {
     DiscoverFromControllerDeployment,
 }
 
+/// **Pure.** The operator namespace when the caller already knows it, or `None`
+/// when the cluster must be asked. Split out of [`resolve_ca_bundle`] so the
+/// "does this bypass the cluster lookup?" decision is exhaustive over
+/// [`OperatorNamespace`] and directly testable.
+pub fn known_operator_namespace(source: &OperatorNamespace) -> Option<&str> {
+    match source {
+        OperatorNamespace::Known(ns) => Some(ns.as_str()),
+        OperatorNamespace::DiscoverFromControllerDeployment => None,
+    }
+}
+
 /// Resolve the PEM content of the repository backend's `tls.caBundleRef`
 /// ConfigMap, or `Ok(None)` when the backend declares none — the client-side
 /// twin of the controller's `resolve_backend_ca`, with the same namespace rule:
@@ -265,11 +276,9 @@ pub async fn resolve_ca_bundle(
     };
     let ns = match &repo.namespace {
         Some(ns) => ns.clone(),
-        None => match operator_ns {
-            OperatorNamespace::Known(ns) => ns.clone(),
-            OperatorNamespace::DiscoverFromControllerDeployment => {
-                operator_namespace_for_ca(ctx, &repo.name, cm_name).await?
-            }
+        None => match known_operator_namespace(operator_ns) {
+            Some(ns) => ns.to_string(),
+            None => operator_namespace_for_ca(ctx, &repo.name, cm_name).await?,
         },
     };
     let key = key_ref.key.as_deref().unwrap_or(DEFAULT_CA_BUNDLE_KEY);
@@ -569,5 +578,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("secretRef.namespace"), "{msg}");
+    }
+
+    #[test]
+    fn a_known_operator_namespace_bypasses_the_cluster_lookup() {
+        assert_eq!(
+            known_operator_namespace(&OperatorNamespace::Known("kopiur-system".into())),
+            Some("kopiur-system")
+        );
+        // Discovery must NOT resolve to a default here: returning None is what
+        // sends `resolve_ca_bundle` to the fail-closed cluster lookup.
+        assert_eq!(
+            known_operator_namespace(&OperatorNamespace::DiscoverFromControllerDeployment),
+            None
+        );
     }
 }

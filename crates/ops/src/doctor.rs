@@ -43,12 +43,6 @@ use serde::Serialize;
 
 use crate::ctx::{OpsCtx, Scope};
 
-/// The field manager recorded on the admission probe's dry-run create, so the
-/// request is attributable. Mirrors the CLI's `consts::FIELD_MANAGER` — the
-/// probe never persists anything (server-side `dryRun`), so this only ever
-/// shows up in an apiserver audit entry.
-const PROBE_FIELD_MANAGER: &str = "kubectl-kopiur";
-
 /// Every check doctor performs. Closed enum: adding a check forces the runner
 /// and the renderer to handle it. Ten checks, run in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -291,6 +285,23 @@ async fn check_crds(ctx: &OpsCtx) -> Outcome {
     }
 }
 
+/// **Pure.** The "nothing matched" text for a Deployment lookup, naming WHERE
+/// we looked. A caller that pinned the operator namespace searched only there,
+/// and the unqualified wording would send the reader hunting cluster-wide for
+/// something we never asked about.
+fn deployment_not_found(
+    component: &str,
+    operator_namespace: Option<&str>,
+    selector: &str,
+) -> String {
+    match operator_namespace {
+        Some(ns) => {
+            format!("no {component} Deployment found in namespace {ns} (label {selector})")
+        }
+        None => format!("no {component} Deployment found (label {selector})"),
+    }
+}
+
 /// Find kopiur Deployments by the chart's labels — across namespaces, or in
 /// `operator_namespace` when the caller already knows where the operator runs.
 /// Returns the outcome plus whether the Deployment EXISTS at all (the admission
@@ -311,18 +322,17 @@ async fn check_deployment(
         Ok(l) => l,
         Err(e) => return (warn_for("list", "deployments", &e), true),
     };
+    let missing = deployment_not_found(component, operator_namespace, &selector);
     let Some(deploy) = listed.items.first() else {
         if !required {
             return (
-                Outcome::Warn(format!(
-                    "no {component} Deployment found (label {selector}); skipped if not installed"
-                )),
+                Outcome::Warn(format!("{missing}; skipped if not installed")),
                 false,
             );
         }
         return (
             Outcome::Fail {
-                what: format!("no {component} Deployment found (label {selector})"),
+                what: missing,
                 why: "without the controller nothing reconciles — backups will not run".into(),
                 fix: "install kopiur (helm install …) or check the release's namespace".into(),
             },
@@ -380,9 +390,12 @@ async fn check_webhook_admission(ctx: &OpsCtx, webhook_installed: bool) -> Outco
         }
     }))
     .expect("probe fixture");
+    // The probe never persists anything (server-side `dryRun`), so the context's
+    // field manager only ever shows up in an apiserver audit entry — but it
+    // still names which front end ran the probe.
     let params = PostParams {
         dry_run: true,
-        field_manager: Some(PROBE_FIELD_MANAGER.to_string()),
+        field_manager: Some(ctx.field_manager.clone()),
     };
     match api.create(&params, &invalid).await {
         // Denied BY KOPIUR's webhook: reachable and validating. Healthy. (The
@@ -516,7 +529,10 @@ fn summarize_cluster_repository(r: &ClusterRepository) -> RepoSummary {
     }
 }
 
-async fn list_repos(ctx: &OpsCtx) -> Result<Vec<RepoSummary>, Outcome> {
+/// Every `Repository` in scope plus every `ClusterRepository`, summarized. The
+/// listing failing is an [`Outcome`] (a warning), not a hard error: a
+/// kubeconfig that cannot list repositories still deserves the rest of doctor.
+pub async fn list_repos(ctx: &OpsCtx) -> Result<Vec<RepoSummary>, Outcome> {
     let api: Api<Repository> = match &ctx.scope {
         Scope::All => Api::all(ctx.client.clone()),
         Scope::Namespace(ns) => Api::namespaced(ctx.client.clone(), ns),
@@ -1191,7 +1207,10 @@ pub struct Work {
     pub degraded: Vec<Outcome>,
 }
 
-async fn list_work(ctx: &OpsCtx) -> Work {
+/// Every work object in scope (Snapshots, Restores, schedules, policies), with
+/// the kinds that could not be listed recorded in [`Work::degraded`] rather
+/// than discarding the ones that succeeded.
+pub async fn list_work(ctx: &OpsCtx) -> Work {
     async fn listed<K>(ctx: &OpsCtx, resource: &str, degraded: &mut Vec<Outcome>) -> Vec<K>
     where
         K: kube::Resource<Scope = kube::core::NamespaceResourceScope>
@@ -2889,5 +2908,21 @@ mod tests {
         ];
         let titles: std::collections::BTreeSet<&str> = checks.iter().map(|c| c.title()).collect();
         assert_eq!(titles.len(), checks.len(), "doctor runs 9 distinct checks");
+    }
+
+    #[test]
+    fn a_namespace_scoped_deployment_lookup_says_where_it_looked() {
+        let selector = "app.kubernetes.io/name=kopiur,app.kubernetes.io/component=controller";
+        // Scoped: the reader is told the search was namespace-local, so a
+        // controller running elsewhere is an obvious next thing to check.
+        assert_eq!(
+            deployment_not_found("controller", Some("kopiur-system"), selector),
+            format!("no controller Deployment found in namespace kopiur-system (label {selector})")
+        );
+        // Cluster-wide (what the CLI passes): wording unchanged.
+        assert_eq!(
+            deployment_not_found("webhook", None, selector),
+            format!("no webhook Deployment found (label {selector})")
+        );
     }
 }

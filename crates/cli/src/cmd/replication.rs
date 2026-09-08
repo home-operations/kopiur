@@ -15,7 +15,7 @@
 use chrono::{DateTime, Utc};
 use kopiur_api::{RepositoryReplication, SnapshotReplication};
 use kopiur_ops::replication::{
-    ReplicationKind, ReplicationTarget, answered, detect_kind, failure_detail,
+    ReplicationKind, ReplicationTarget, answered, detect_kind, failure_detail, request_run_by_kind,
 };
 use kube::api::Api;
 
@@ -43,27 +43,31 @@ pub async fn run(
         Some(arg) => ReplicationKind::from(arg),
         None => detect_kind(ctx, &args.name).await?,
     };
+    // The request itself is kind-routed by the shared layer, so the CLI has no
+    // second copy of that dispatch to drift from it.
+    let requested_at = request_run_by_kind(ctx, kind, &args.name, now).await?;
     // Exhaustive over the kind: a third replication CRD cannot compile until
-    // this dispatch names it too.
+    // this dispatch names it too. What remains kind-generic here is the
+    // reporting and the `--wait` loop, which are CLI-only.
     match kind {
         ReplicationKind::RepositoryReplication => {
-            run_kind::<RepositoryReplication>(ctx, args, now).await
+            report::<RepositoryReplication>(ctx, args, &requested_at).await
         }
         ReplicationKind::SnapshotReplication => {
-            run_kind::<SnapshotReplication>(ctx, args, now).await
+            report::<SnapshotReplication>(ctx, args, &requested_at).await
         }
     }
 }
 
-/// The kind-generic body: patch the annotation, then optionally wait.
-async fn run_kind<K: ReplicationTarget>(
+/// The kind-generic body after the request landed: print the request line, then
+/// optionally wait for `status.manualRun` to answer it.
+async fn report<K: ReplicationTarget>(
     ctx: &KubeCtx,
     args: &ReplicationRunArgs,
-    now: DateTime<Utc>,
+    requested_at: &str,
 ) -> Result<CmdOutput, CliError> {
     let ns = ctx.namespace.as_str();
     let name = args.name.as_str();
-    let requested_at = kopiur_ops::replication::request_run::<K>(ctx, name, now).await?;
 
     let requested_line = format!(
         "{}.{}/{name} run requested ({requested_at})\n",
@@ -77,7 +81,7 @@ async fn run_kind<K: ReplicationTarget>(
     eprint!("{requested_line}");
     let api: Api<K> = Api::namespaced(ctx.client.clone(), ns);
     let timeout = args.timeout.unwrap_or(DEFAULT_WAIT_TIMEOUT);
-    let requested_for_check = requested_at.clone();
+    let requested_for_check = requested_at.to_string();
     let verdict = wait_for(
         &api,
         name,
@@ -106,7 +110,7 @@ async fn run_kind<K: ReplicationTarget>(
             )))
         }
         Err(failed) => {
-            eprint!("{}", failure_detail(failed.as_ref(), name, &requested_at));
+            eprint!("{}", failure_detail(failed.as_ref(), name, requested_at));
             Ok(CmdOutput {
                 text: String::new(),
                 exit: 1,

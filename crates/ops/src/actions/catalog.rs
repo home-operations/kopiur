@@ -10,16 +10,10 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use kopiur_api::common::RepositoryKind;
 use kopiur_api::{ClusterRepository, Repository};
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, Patch};
 
-use crate::ctx::OpsCtx;
+use crate::ctx::{OpsCtx, merge_patch_params};
 use crate::error::{OpsError, classify_kube};
-
-/// The field manager every kopiur client-side write identifies itself with, so
-/// `kubectl get -o yaml --show-managed-fields` names the tool that made the
-/// change. Mirrors `kubectl kopiur maintenance run`'s merge patch; module-local
-/// only until the shared layer grows one home for it.
-const FIELD_MANAGER: &str = "kubectl-kopiur";
 
 /// **Pure.** The merge patch that requests a catalog scan as of `now`.
 ///
@@ -47,8 +41,8 @@ pub fn scan_patch(now: DateTime<Utc>) -> serde_json::Value {
 /// A merge patch (not a server-side apply) — the annotation is a request the
 /// operator consumes, not a field this tool owns; an apply would fight the
 /// controller for ownership of the whole annotations map. It still carries the
-/// [`FIELD_MANAGER`], exactly as `kubectl kopiur maintenance run` does, so the
-/// write is attributable.
+/// context's [`OpsCtx::field_manager`], exactly as `kubectl kopiur maintenance
+/// run` does, so the write is attributable.
 pub async fn request_scan(
     ctx: &OpsCtx,
     kind: RepositoryKind,
@@ -57,10 +51,7 @@ pub async fn request_scan(
     now: DateTime<Utc>,
 ) -> Result<String, OpsError> {
     let patch = Patch::Merge(scan_patch(now));
-    let pp = PatchParams {
-        field_manager: Some(FIELD_MANAGER.to_string()),
-        ..Default::default()
-    };
+    let pp = merge_patch_params(&ctx.field_manager);
     match kind {
         RepositoryKind::Repository => {
             let ns = namespace.unwrap_or(ctx.namespace.as_str());

@@ -48,7 +48,7 @@ const MOVER_IMAGE_ENV: &str = "KOPIUR_MOVER_IMAGE";
 /// mover-image lookup ([`resolve_mover_image`]) and the operator-namespace
 /// discovery ([`super::resolve::resolve_ca_bundle`]); both demand exactly one
 /// match cluster-wide and fail closed otherwise.
-pub(crate) const CONTROLLER_DEPLOYMENT_SELECTOR: &str =
+pub const CONTROLLER_DEPLOYMENT_SELECTOR: &str =
     "app.kubernetes.io/name=kopiur,app.kubernetes.io/component=controller";
 
 /// Which mover image a session pod runs. Exhaustive: a caller that already
@@ -60,6 +60,18 @@ pub enum MoverImageSource {
     Fixed(String),
     /// Read it from the single controller Deployment's `KOPIUR_MOVER_IMAGE`.
     DiscoverFromControllerDeployment,
+}
+
+/// **Pure.** The image when the caller already knows it, or `None` when the
+/// cluster must be asked. Split out of the async resolver so the "does this
+/// bypass the cluster lookup?" decision is exhaustive over
+/// [`MoverImageSource`] and directly testable — a new variant that silently
+/// fell through to discovery would be a fail-open change to a fail-closed path.
+pub fn pinned_mover_image(source: &MoverImageSource) -> Option<&str> {
+    match source {
+        MoverImageSource::Fixed(pinned) => Some(pinned.as_str()),
+        MoverImageSource::DiscoverFromControllerDeployment => None,
+    }
 }
 
 /// Progress notifications while a session is being established. A session is
@@ -578,11 +590,10 @@ fn owner_ref_for_repo(repo: &RepoHandle) -> OwnerReference {
 /// Deliberately resolve-only for the CLI: there is no `--image` flag, so a
 /// session always runs what the operator runs.
 async fn resolve_mover_image(ctx: &OpsCtx, image: &MoverImageSource) -> Result<String, OpsError> {
-    // Exhaustive: a new image source must decide how it resolves to compile.
-    let selector = match image {
-        MoverImageSource::Fixed(pinned) => return Ok(pinned.clone()),
-        MoverImageSource::DiscoverFromControllerDeployment => CONTROLLER_DEPLOYMENT_SELECTOR,
-    };
+    if let Some(pinned) = pinned_mover_image(image) {
+        return Ok(pinned.to_string());
+    }
+    let selector = CONTROLLER_DEPLOYMENT_SELECTOR;
     let api: Api<Deployment> = Api::all(ctx.client.clone());
     let list = api
         .list(&ListParams::default().labels(selector))
@@ -929,5 +940,19 @@ mod tests {
         // The repository connect mirrors the backend.
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["repository"]["filesystem"]["path"], "/repo");
+    }
+
+    #[test]
+    fn a_pinned_mover_image_bypasses_the_cluster_lookup() {
+        assert_eq!(
+            pinned_mover_image(&MoverImageSource::Fixed("ghcr.io/x/mover:1.2.3".into())),
+            Some("ghcr.io/x/mover:1.2.3")
+        );
+        // Discovery must NOT resolve to a default here: returning None is what
+        // sends `resolve_mover_image` to the fail-closed cluster lookup.
+        assert_eq!(
+            pinned_mover_image(&MoverImageSource::DiscoverFromControllerDeployment),
+            None
+        );
     }
 }

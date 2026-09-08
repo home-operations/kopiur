@@ -13,15 +13,11 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kopiur_api::common::{ReplicationManualRunPhase, ReplicationManualRunStatus};
 use kopiur_api::consts::RUN_REQUESTED_ANNOTATION;
 use kopiur_api::{RepositoryReplication, SnapshotReplication};
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, Patch};
 use serde::de::DeserializeOwned;
 
-use crate::ctx::OpsCtx;
+use crate::ctx::{OpsCtx, merge_patch_params};
 use crate::error::{OpsError, classify_kube, scope_suffix};
-
-/// The `managedFields` owner recorded on the run-request PATCH, so the change
-/// is attributed to kopiur's own tooling rather than an anonymous client.
-const FIELD_MANAGER: &str = "kubectl-kopiur";
 
 /// The two kinds a replication run can target, behind one interface: naming for
 /// messages plus the `status.manualRun`/`status.conditions` reads the command
@@ -206,7 +202,7 @@ pub async fn detect_kind(ctx: &OpsCtx, name: &str) -> Result<ReplicationKind, Op
 /// Stamp the run-request annotation on one replication object and return the
 /// `requestedAt` timestamp, which is the token `status.manualRun` echoes back —
 /// [`answered`] matches on it so a PREVIOUS run's outcome can never be mistaken
-/// for this one's.
+/// for this one's. The patch is attributed to `ctx.field_manager`.
 pub async fn request_run<K: ReplicationTarget>(
     ctx: &OpsCtx,
     name: &str,
@@ -215,14 +211,34 @@ pub async fn request_run<K: ReplicationTarget>(
     let ns = ctx.namespace.as_str();
     let api: Api<K> = Api::namespaced(ctx.client.clone(), ns);
     let requested_at = now.to_rfc3339_opts(SecondsFormat::Secs, true);
-    let params = PatchParams {
-        field_manager: Some(FIELD_MANAGER.to_string()),
-        ..Default::default()
-    };
+    let params = merge_patch_params(&ctx.field_manager);
     api.patch(name, &params, &Patch::Merge(run_patch(&requested_at)))
         .await
         .map_err(|e| classify_kube("patch", K::KIND, K::PLURAL, Some(ns), Some(name), e))?;
     Ok(requested_at)
+}
+
+/// [`request_run`] for a kind decided at runtime — what a front end holding a
+/// [`ReplicationKind`] (from `--kind`, or from [`detect_kind`]) actually needs.
+///
+/// Exhaustive over [`ReplicationKind`]: a third replication kind cannot compile
+/// until its route is stated here, so no front end can silently fail to fire
+/// one. The generic [`request_run`] stays public for callers that know the kind
+/// statically.
+pub async fn request_run_by_kind(
+    ctx: &OpsCtx,
+    kind: ReplicationKind,
+    name: &str,
+    now: DateTime<Utc>,
+) -> Result<String, OpsError> {
+    match kind {
+        ReplicationKind::RepositoryReplication => {
+            request_run::<RepositoryReplication>(ctx, name, now).await
+        }
+        ReplicationKind::SnapshotReplication => {
+            request_run::<SnapshotReplication>(ctx, name, now).await
+        }
+    }
 }
 
 #[cfg(test)]
