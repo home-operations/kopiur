@@ -70,6 +70,7 @@ pub struct UiMetrics {
     exec_inflight: Gauge<u64>,
     cache_objects: Gauge<u64>,
     sar: Counter<u64>,
+    sar_cache_size: Gauge<u64>,
 }
 
 impl UiMetrics {
@@ -143,6 +144,15 @@ impl UiMetrics {
             )
             .build();
 
+        let sar_cache_size = m
+            .u64_gauge("kopiur_ui_sar_cache_size")
+            .with_description(
+                "SubjectAccessReview decisions currently cached, across all identities. \
+                 This tracking KOPIUR_UI_SAR_CACHE_SIZE means the cache is saturated and \
+                 decisions are being evicted before their TTL, so the SAR rate rises.",
+            )
+            .build();
+
         Self {
             provider,
             requests,
@@ -152,6 +162,7 @@ impl UiMetrics {
             exec_inflight,
             cache_objects,
             sar,
+            sar_cache_size,
         }
     }
 
@@ -205,6 +216,11 @@ impl UiMetrics {
     pub fn inc_sar(&self, allowed: bool) {
         self.sar.add(1, &[KeyValue::new("allowed", allowed)]);
     }
+
+    /// Publish how many authorization decisions the SAR cache holds.
+    pub fn set_sar_cache_size(&self, entries: usize) {
+        self.sar_cache_size.record(entries as u64, &[]);
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +239,7 @@ mod tests {
         metrics.set_identity_cache_size(3);
         metrics.set_exec_inflight(1);
         metrics.set_cache_objects("Snapshot", 12);
+        metrics.set_sar_cache_size(7);
 
         let text = String::from_utf8(metrics.gather()).expect("exposition must be UTF-8");
 
@@ -236,6 +253,7 @@ mod tests {
             "kopiur_ui_exec_inflight",
             "kopiur_ui_cache_objects",
             "kopiur_ui_sar_total",
+            "kopiur_ui_sar_cache_size",
         ] {
             assert!(text.contains(needle), "missing {needle} in:\n{text}");
         }

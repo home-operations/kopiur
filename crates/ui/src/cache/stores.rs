@@ -23,14 +23,19 @@
 //! them for the process lifetime. Dropping one silently stops refreshing that
 //! kind, which would serve an ever-staler cache with no signal, so they are
 //! returned rather than detached here.
+//!
+//! Readiness itself is published on a `tokio::sync::watch` channel rather than
+//! exposed as an awaitable function, because kube's per-store readiness holds a
+//! single waker and two concurrent waiters on one cold store can deadlock. See
+//! [`start`].
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use futures::StreamExt as _;
 use kube::Api;
 use kube::runtime::reflector::{Store, store};
 use kube::runtime::{WatchStreamExt as _, reflector, watcher};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use kopiur_api::{
@@ -41,55 +46,60 @@ use kopiur_api::{
 use crate::cache::KopiurKind;
 use crate::metrics::UiMetrics;
 
-pub use kube::runtime::reflector::store::WriterDropped;
-
 /// A watch-fed read cache for every Kopiur kind.
 ///
 /// Cheap to clone (each [`Store`] is an `Arc` handle onto shared state), so this
 /// is passed by value into [`crate::cache::Source::Cache`] rather than behind
 /// another layer of indirection.
 ///
-/// The fields are `pub` because [`KopiurKind::store`] projects one out
-/// generically; they are still not a read API. Reach a store through
-/// [`crate::cache::Source`], never directly — see the module docs for why.
-#[derive(Debug, Clone)]
+/// Every field is `pub(super)`, not `pub`: the stores hold objects the apiserver
+/// did NOT filter for any caller, so reaching one from outside this module would
+/// be a way to skip [`crate::cache::authz::filter_visible`] entirely. Handlers
+/// get their data from [`crate::cache::Source::list`]/`get` and nothing else.
+/// [`KopiurKind::store`] can project a field out, but only for code holding a
+/// [`StoreAccess`] witness, which cannot be constructed outside `cache`.
+#[derive(Clone)]
 pub struct Stores {
     /// Namespaced `Repository` objects.
-    pub repositories: Store<Repository>,
+    pub(super) repositories: Store<Repository>,
     /// Cluster-scoped `ClusterRepository` objects.
-    pub cluster_repositories: Store<ClusterRepository>,
+    pub(super) cluster_repositories: Store<ClusterRepository>,
     /// `SnapshotPolicy` recipes.
-    pub policies: Store<SnapshotPolicy>,
+    pub(super) policies: Store<SnapshotPolicy>,
     /// `Snapshot` invocations. The largest store by object count in any real
     /// fleet — this is the one the cache exists for.
-    pub snapshots: Store<Snapshot>,
+    pub(super) snapshots: Store<Snapshot>,
     /// `SnapshotSchedule` schedules.
-    pub schedules: Store<SnapshotSchedule>,
+    pub(super) schedules: Store<SnapshotSchedule>,
     /// `Restore` invocations.
-    pub restores: Store<Restore>,
+    pub(super) restores: Store<Restore>,
     /// `Maintenance` objects, both operator-projected and externally authored.
-    pub maintenances: Store<Maintenance>,
+    pub(super) maintenances: Store<Maintenance>,
     /// `RepositoryReplication` objects.
-    pub repository_replications: Store<RepositoryReplication>,
+    pub(super) repository_replications: Store<RepositoryReplication>,
     /// `SnapshotReplication` objects.
-    pub snapshot_replications: Store<SnapshotReplication>,
+    pub(super) snapshot_replications: Store<SnapshotReplication>,
 }
 
-impl Stores {
-    /// Every namespace that currently holds at least one object of kind `K`.
-    ///
-    /// This is the candidate set a cache-backed cross-namespace list hands to
-    /// [`crate::cache::authz::SarCache::visible_namespaces`]: there is no point
-    /// asking the apiserver whether the caller may list in a namespace that
-    /// holds nothing to show them. Cluster-scoped kinds yield an empty set,
-    /// which is correct — for them only a cluster-wide allow returns anything.
-    #[must_use]
-    pub fn namespaces_present<K: KopiurKind>(&self) -> BTreeSet<String> {
-        K::store(self)
-            .state()
-            .iter()
-            .filter_map(|obj| kube::Resource::meta(obj.as_ref()).namespace.clone())
-            .collect()
+impl std::fmt::Debug for Stores {
+    /// Sizes only. The derived `Debug` would render every cached object, so a
+    /// single `tracing` call at debug level could dump the whole fleet — object
+    /// bodies the caller may not even be authorized to see — into the log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stores")
+            .field("repositories", &self.repositories.len())
+            .field("cluster_repositories", &self.cluster_repositories.len())
+            .field("policies", &self.policies.len())
+            .field("snapshots", &self.snapshots.len())
+            .field("schedules", &self.schedules.len())
+            .field("restores", &self.restores.len())
+            .field("maintenances", &self.maintenances.len())
+            .field(
+                "repository_replications",
+                &self.repository_replications.len(),
+            )
+            .field("snapshot_replications", &self.snapshot_replications.len())
+            .finish()
     }
 }
 
@@ -105,11 +115,30 @@ impl Stores {
 ///
 /// The returned handles must be kept alive for as long as the cache is served
 /// from. This function never fails: a watch that cannot start backs off and
-/// retries forever, and [`wait_ready`] is what decides whether the UI may
-/// declare itself ready.
+/// retries forever.
+///
+/// # Readiness
+///
+/// The third return value reports whether every store has completed its initial
+/// list. Until it reads `true` the cache is *cold*, and a cold store is worse
+/// than no cache: a `Snapshot` list would answer `[]`, which is exactly what a
+/// healthy cluster that has taken no backups looks like. The UI must not report
+/// ready before it flips.
+///
+/// It is a `watch::Receiver` rather than a `wait_ready(&Stores).await` for a
+/// specific reason. kube delivers per-store readiness through `DelayedInit`,
+/// whose pending path is a `oneshot::Receiver` — which holds exactly **one**
+/// waker. Two futures awaiting the *same* still-cold store clobber each other's
+/// waker and one may never be woken; this repository has been bitten by that
+/// before. So `start` performs the one and only `wait_until_ready` join itself,
+/// in a task it owns, and publishes the result on a channel that any number of
+/// callers may clone, poll, and await safely.
 #[must_use]
-pub fn start(client: kube::Client, metrics: Arc<UiMetrics>) -> (Stores, Vec<JoinHandle<()>>) {
-    let mut tasks = Vec::with_capacity(9);
+pub fn start(
+    client: kube::Client,
+    metrics: Arc<UiMetrics>,
+) -> (Stores, Vec<JoinHandle<()>>, watch::Receiver<bool>) {
+    let mut tasks = Vec::with_capacity(10);
 
     let repositories = spawn::<Repository>(&client, &metrics, &mut tasks);
     let cluster_repositories = spawn::<ClusterRepository>(&client, &metrics, &mut tasks);
@@ -132,7 +161,48 @@ pub fn start(client: kube::Client, metrics: Arc<UiMetrics>) -> (Stores, Vec<Join
         repository_replications,
         snapshot_replications,
     };
-    (stores, tasks)
+
+    let (ready_tx, ready_rx) = watch::channel(false);
+    tasks.push(tokio::spawn(publish_readiness(stores.clone(), ready_tx)));
+
+    (stores, tasks, ready_rx)
+}
+
+/// The single owner of every `wait_until_ready` future.
+///
+/// Joins the nine concurrently — safe, because each store has its own
+/// `DelayedInit` and so its own waker slot; the hazard is only ever two waiters
+/// on one store — and publishes `true` once all nine have listed.
+///
+/// On a dropped writer it publishes nothing and logs: the cache can never become
+/// correct, and leaving the flag `false` is what keeps the UI from reporting
+/// ready over a cache that will stay empty forever.
+async fn publish_readiness(stores: Stores, ready_tx: watch::Sender<bool>) {
+    let synced = tokio::try_join!(
+        stores.repositories.wait_until_ready(),
+        stores.cluster_repositories.wait_until_ready(),
+        stores.policies.wait_until_ready(),
+        stores.snapshots.wait_until_ready(),
+        stores.schedules.wait_until_ready(),
+        stores.restores.wait_until_ready(),
+        stores.maintenances.wait_until_ready(),
+        stores.repository_replications.wait_until_ready(),
+        stores.snapshot_replications.wait_until_ready(),
+    );
+
+    match synced {
+        Ok(_) => {
+            tracing::info!("kopiur-ui cache synced; all nine stores have completed initial list");
+            // A send error means every receiver was dropped, i.e. the process is
+            // shutting down. Nothing to report to.
+            let _ = ready_tx.send(true);
+        }
+        Err(e) => tracing::error!(
+            error = %e,
+            "a kopiur-ui cache writer was dropped before its first sync; the cache will \
+             never become ready and the UI must not serve from it",
+        ),
+    }
 }
 
 /// Create one kind's store and spawn the task that keeps it filled.
@@ -191,50 +261,88 @@ fn spawn<K: KopiurKind>(
     reader
 }
 
-/// Wait until every kind's store has completed its initial list.
-///
-/// Until this resolves the stores are *cold*, and a cold store is worse than no
-/// cache: `Snapshot` list would answer `[]`, which reads exactly like a healthy
-/// cluster that has taken no backups. The UI must not report ready before this
-/// returns `Ok`.
-///
-/// # Errors
-///
-/// [`WriterDropped`] if some kind's reflector task was dropped before its first
-/// sync — the cache can never become correct, so the caller should fail startup
-/// rather than serve from it.
-///
-/// # Concurrency
-///
-/// Call this from **one** task at a time. Readiness is delivered through kube's
-/// `DelayedInit`, whose pending path is a `oneshot::Receiver` and therefore
-/// stores a single waker: two futures awaiting the *same* store while it is
-/// still cold clobber each other's waker and one may never be woken. Once a
-/// store is ready the value is memoized and any number of callers get it
-/// immediately, so a readiness probe that polls after startup is fine — what is
-/// not fine is two concurrent `wait_ready` calls racing a cold cache.
-pub async fn wait_ready(stores: &Stores) -> Result<(), WriterDropped> {
-    // Concurrent, not sequential: nine independent initial lists, and each store
-    // has its own `DelayedInit`, so there is no single-waker contention between
-    // these nine distinct futures.
-    tokio::try_join!(
-        stores.repositories.wait_until_ready(),
-        stores.cluster_repositories.wait_until_ready(),
-        stores.policies.wait_until_ready(),
-        stores.snapshots.wait_until_ready(),
-        stores.schedules.wait_until_ready(),
-        stores.restores.wait_until_ready(),
-        stores.maintenances.wait_until_ready(),
-        stores.repository_replications.wait_until_ready(),
-        stores.snapshot_replications.wait_until_ready(),
-    )?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use kube::Resource;
+    use kube::runtime::reflector::store::Writer;
+
+    use crate::cache::StoreAccess;
+
+    /// The nine writers, held so the stores stay cold until a test says
+    /// otherwise.
+    ///
+    /// `store::<K>()` returns a reader and a writer; dropping a writer makes its
+    /// store permanently un-syncable, so a test that wants to control readiness
+    /// has to keep them. `Event::InitDone` is what kube uses to mark a store's
+    /// initial list complete, which is exactly the transition under test.
+    struct Writers {
+        repositories: Writer<Repository>,
+        cluster_repositories: Writer<ClusterRepository>,
+        policies: Writer<SnapshotPolicy>,
+        snapshots: Writer<Snapshot>,
+        schedules: Writer<SnapshotSchedule>,
+        restores: Writer<Restore>,
+        maintenances: Writer<Maintenance>,
+        repository_replications: Writer<RepositoryReplication>,
+        snapshot_replications: Writer<SnapshotReplication>,
+    }
+
+    impl Writers {
+        fn new() -> Self {
+            Self {
+                repositories: Writer::default(),
+                cluster_repositories: Writer::default(),
+                policies: Writer::default(),
+                snapshots: Writer::default(),
+                schedules: Writer::default(),
+                restores: Writer::default(),
+                maintenances: Writer::default(),
+                repository_replications: Writer::default(),
+                snapshot_replications: Writer::default(),
+            }
+        }
+
+        fn stores(&self) -> Stores {
+            Stores {
+                repositories: self.repositories.as_reader(),
+                cluster_repositories: self.cluster_repositories.as_reader(),
+                policies: self.policies.as_reader(),
+                snapshots: self.snapshots.as_reader(),
+                schedules: self.schedules.as_reader(),
+                restores: self.restores.as_reader(),
+                maintenances: self.maintenances.as_reader(),
+                repository_replications: self.repository_replications.as_reader(),
+                snapshot_replications: self.snapshot_replications.as_reader(),
+            }
+        }
+
+        /// Complete the initial list of every store but `snapshots`, so a test
+        /// can prove one laggard holds the whole cache un-ready.
+        fn mark_all_ready_except_snapshots(&mut self) {
+            self.repositories
+                .apply_watcher_event(&watcher::Event::InitDone);
+            self.cluster_repositories
+                .apply_watcher_event(&watcher::Event::InitDone);
+            self.policies.apply_watcher_event(&watcher::Event::InitDone);
+            self.schedules
+                .apply_watcher_event(&watcher::Event::InitDone);
+            self.restores.apply_watcher_event(&watcher::Event::InitDone);
+            self.maintenances
+                .apply_watcher_event(&watcher::Event::InitDone);
+            self.repository_replications
+                .apply_watcher_event(&watcher::Event::InitDone);
+            self.snapshot_replications
+                .apply_watcher_event(&watcher::Event::InitDone);
+        }
+
+        fn mark_snapshots_ready(&mut self) {
+            self.snapshots
+                .apply_watcher_event(&watcher::Event::InitDone);
+        }
+    }
 
     /// Build a `Stores` whose every store is empty and permanently cold. No
     /// client, no cluster: `store::<K>()` hands back a reader and a writer, and
@@ -289,16 +397,17 @@ mod tests {
 
         // Compare by the address of the projected field: nine different fields
         // must yield nine different addresses.
+        let a = StoreAccess::new();
         let addresses = [
-            std::ptr::from_ref(Repository::store(&stores)).addr(),
-            std::ptr::from_ref(ClusterRepository::store(&stores)).addr(),
-            std::ptr::from_ref(SnapshotPolicy::store(&stores)).addr(),
-            std::ptr::from_ref(Snapshot::store(&stores)).addr(),
-            std::ptr::from_ref(SnapshotSchedule::store(&stores)).addr(),
-            std::ptr::from_ref(Restore::store(&stores)).addr(),
-            std::ptr::from_ref(Maintenance::store(&stores)).addr(),
-            std::ptr::from_ref(RepositoryReplication::store(&stores)).addr(),
-            std::ptr::from_ref(SnapshotReplication::store(&stores)).addr(),
+            std::ptr::from_ref(Repository::store(&stores, a)).addr(),
+            std::ptr::from_ref(ClusterRepository::store(&stores, a)).addr(),
+            std::ptr::from_ref(SnapshotPolicy::store(&stores, a)).addr(),
+            std::ptr::from_ref(Snapshot::store(&stores, a)).addr(),
+            std::ptr::from_ref(SnapshotSchedule::store(&stores, a)).addr(),
+            std::ptr::from_ref(Restore::store(&stores, a)).addr(),
+            std::ptr::from_ref(Maintenance::store(&stores, a)).addr(),
+            std::ptr::from_ref(RepositoryReplication::store(&stores, a)).addr(),
+            std::ptr::from_ref(SnapshotReplication::store(&stores, a)).addr(),
         ];
         let unique: BTreeSet<usize> = addresses.iter().copied().collect();
         assert_eq!(
@@ -308,22 +417,60 @@ mod tests {
         );
     }
 
+    /// `Debug` must never render cached objects. A `tracing` call at debug level
+    /// would otherwise dump the whole fleet — bodies the caller may not even be
+    /// authorized to see — into the log.
     #[test]
-    fn an_empty_store_offers_no_candidate_namespaces() {
-        let stores = empty_stores();
-        assert!(stores.namespaces_present::<Snapshot>().is_empty());
-        // Cluster-scoped: never any namespaces, however full the store is.
-        assert!(stores.namespaces_present::<ClusterRepository>().is_empty());
+    fn debug_renders_sizes_not_objects() {
+        let rendered = format!("{:?}", empty_stores());
+        assert!(rendered.contains("snapshots: 0"), "{rendered}");
+        assert!(
+            !rendered.contains("ObjectMeta") && !rendered.contains("spec"),
+            "Stores must never render object bodies: {rendered}",
+        );
     }
 
-    /// A dropped writer must surface as `WriterDropped`, not hang: startup has
-    /// to be able to tell "still listing" from "this cache will never work".
+    /// Readiness must not flip until every store has listed, and must flip once
+    /// they have. This is the contract `/readyz` hangs off: a `true` here means
+    /// an empty `Snapshot` list is a genuinely empty fleet rather than a cold
+    /// cache.
     #[tokio::test]
-    async fn wait_ready_reports_a_dropped_writer_rather_than_hanging() {
-        let stores = empty_stores(); // every writer already dropped
+    async fn readiness_flips_only_once_every_store_has_synced() {
+        let mut writers = Writers::new();
+        let stores = writers.stores();
+        let (tx, mut rx) = watch::channel(false);
+        let task = tokio::spawn(publish_readiness(stores, tx));
+
+        assert!(!*rx.borrow(), "a cold cache must not report ready");
+
+        // Mark eight of nine synced; readiness must still be false.
+        writers.mark_all_ready_except_snapshots();
+        tokio::task::yield_now().await;
         assert!(
-            wait_ready(&stores).await.is_err(),
-            "a cache that can never sync must fail readiness, not block forever",
+            !*rx.borrow(),
+            "one un-synced store must hold the whole cache un-ready",
+        );
+
+        writers.mark_snapshots_ready();
+        rx.changed().await.expect("the publisher must send");
+        assert!(*rx.borrow(), "all nine synced means ready");
+
+        task.await.expect("publisher task must not panic");
+    }
+
+    /// A dropped writer must leave readiness `false` forever rather than hang or
+    /// falsely report ready: startup has to be able to tell "still listing" from
+    /// "this cache will never work".
+    #[tokio::test]
+    async fn a_dropped_writer_never_reports_ready() {
+        let stores = empty_stores(); // every writer already dropped
+        let (tx, rx) = watch::channel(false);
+
+        // The publisher must RETURN (not hang) and must not have sent `true`.
+        publish_readiness(stores, tx).await;
+        assert!(
+            !*rx.borrow(),
+            "a cache that can never sync must never report ready",
         );
     }
 }
