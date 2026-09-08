@@ -268,24 +268,15 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
             // prime PVCs this Restore owns (which is what lets a settled claim's
             // "is my prime really gone?" check cost no extra GET).
             let claimants = claiming_pvcs(ctx, &namespace, &name, restore.uid().as_deref()).await?;
-            // #380: the Restore-level `waitTimeout` anchor still opens on the
-            // first pass that gets past the readiness gate AND finds a claim, so
-            // a standing GitOps populator does not burn its window sitting idle.
-            // Each claim then measures its OWN window from that anchor (or from
-            // its own later stamp) via `claim_wait_window`.
-            ensure_wait_anchor(
-                restore,
-                &api,
-                &namespace,
-                &name,
-                state,
-                !claimants.consumers.is_empty(),
-            )
-            .await?;
+            // The `waitTimeout` window is PER CLAIM ONLY (wave 2, finding 4):
+            // each claim's record opens its own window on its first pass
+            // (`claim_wait_window`) and the Restore-level `waitStartedAt` is the
+            // DirectTarget's — stamping it here made later siblings measure
+            // their window from the first claimant's anchor.
             drive_populator_fanout(ctx, restore, &api, &namespace, &name, claimants).await
         }
         PopulatorState::DirectTarget => {
-            drive_direct_target(ctx, restore, &api, &namespace, &name, state).await
+            drive_direct_target(ctx, restore, &api, &namespace, &name).await
         }
     }
 }
@@ -306,7 +297,6 @@ async fn drive_direct_target(
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-    state: PopulatorState,
 ) -> Result<Action> {
     // The PVC this restore fills — and, since #443, the PVC its per-PVC kopia
     // source path is derived from. A direct restore against a `pvcSelector`
@@ -337,7 +327,7 @@ async fn drive_direct_target(
     // anchor in effect for THIS pass, and is what the wait below is measured from: the
     // freshly stamped value rather than a re-read of `restore`, because the pass that
     // OPENS the window is exactly the pass that must not measure it from creation.
-    let wait_window = ensure_wait_anchor(restore, api, namespace, name, state, true).await?;
+    let wait_window = ensure_wait_anchor(restore, api, namespace, name).await?;
 
     let on_missing = effective_on_missing(
         restore
@@ -2207,7 +2197,7 @@ async fn resolve_claim_source(
         namespace: namespace.to_string(),
         name: cc.consumer_name.clone(),
     };
-    let window = claim_wait_window(cc.prev, restore, chrono::Utc::now().timestamp());
+    let window = claim_wait_window(cc.prev, chrono::Utc::now().timestamp());
     let outcome =
         match resolve_snapshot(ctx, restore, namespace, window.anchor(), &target, cache).await? {
             SourceResolution::Resolved(outcome) => outcome,
@@ -4841,15 +4831,16 @@ async fn park_on_missing_referent(
 ///   than `waitTimeout` means the first pass that reaches resolution already finds the
 ///   window closed and applies `onMissingSnapshot` — for `fromPolicy` that defaults to
 ///   `Continue`, i.e. an EMPTY volume.
-/// - **A claiming PVC.** Resolution runs while a populator is `AwaitingClaim`, so a
-///   standing populator `Restore` created months before anything claims it would burn its
-///   whole window sitting idle and pin `Empty` the moment a claim finally appears.
+/// - **A claiming PVC** — for a `target.populator`, which is why this function is
+///   DirectTarget-only (wave 2, finding 4): a populator's window is per claim and lives
+///   in each claim's own record (`claim_wait_window`), opened on that claim's first pass.
+///   Stamping the Restore-level anchor for the populator too made every LATER sibling's
+///   first pass measure from the first claimant's anchor, on the very pass that pins the
+///   missing-snapshot decision.
 ///
 /// Returns the *effective* window rather than relying on the caller re-reading the CR: on
 /// the pass that opens it the stamp is not on the `restore` we were handed, and that is
 /// precisely the pass that must not fall back to the creation timestamp.
-/// [`WaitWindow::AwaitingClaim`] anchors at `now`, so the full window always remains — and
-/// tells the parking caller to report the claim, not a phantom snapshot wait.
 ///
 /// Writes NOTHING but `waitStartedAt`: the conditions array is replaced wholesale by a
 /// merge patch, so a second conditions writer in one reconcile would erase the first.
@@ -4861,8 +4852,6 @@ async fn ensure_wait_anchor(
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
-    state: PopulatorState,
-    has_claim: bool,
 ) -> Result<WaitWindow> {
     let now = chrono::Utc::now();
     let created = restore
@@ -4879,10 +4868,6 @@ async fn ensure_wait_anchor(
         .is_some_and(|s| s.wait_started_at.is_some())
     {
         return Ok(WaitWindow::Open(effective_wait_anchor(restore, created)));
-    }
-    // A populator with nothing claiming it cannot proceed, so its window has not opened.
-    if !wait_window_opens(state, has_claim) {
-        return Ok(WaitWindow::AwaitingClaim(now.timestamp()));
     }
     // No `waitTimeout` ⇒ nothing measures a window; don't stamp one.
     // `wait_remaining_secs`/`wait_deadline_rfc3339` both return `None` here.

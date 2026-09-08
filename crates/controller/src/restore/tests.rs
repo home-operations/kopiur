@@ -1946,19 +1946,6 @@ fn wait_deadline_runs_from_the_anchor_not_from_creation() {
     assert_eq!(wait_deadline_rfc3339(anchor, Some("later")), None);
 }
 
-/// Which target modes may OPEN the window: a direct target the moment the repository is
-/// Ready, a populator only once a PVC claims it. Resolution runs while a populator is
-/// `AwaitingClaim`, so a standing GitOps populator created long before its claim would
-/// otherwise spend the whole window idle and pin `Empty` the instant a claim appeared.
-#[test]
-fn wait_window_opens_for_a_populator_only_once_a_claim_exists() {
-    use PopulatorState::{AwaitingClaim, DirectTarget};
-    assert!(wait_window_opens(DirectTarget, false));
-    assert!(wait_window_opens(DirectTarget, true));
-    assert!(!wait_window_opens(AwaitingClaim, false));
-    assert!(wait_window_opens(AwaitingClaim, true));
-}
-
 /// Parking inside the wait window reports the REAL blocker. An unclaimed populator reaches
 /// the wait branch (resolution runs while `AwaitingClaim`), and telling that user to read
 /// `status.waitStartedAt` — deliberately absent until a claim appears — points them at the
@@ -2096,7 +2083,7 @@ fn a_re_armed_claim_drops_the_previous_claims_spent_wait_anchor() {
     // A claim window with no record and no legacy top-level anchor opens at `now`,
     // so a claimant that appears an hour after its sibling gets its OWN full window.
     assert_eq!(
-        claim_wait_window(None, &restore_with_anchor(None), 1_700_000_000),
+        claim_wait_window(None, 1_700_000_000),
         WaitWindow::Open(1_700_000_000)
     );
 }
@@ -3517,32 +3504,32 @@ fn claim_transition_fires_only_on_a_real_phase_or_reason_move() {
     assert!(!claim_transition(Some(&populating), &chatty));
 }
 
+/// Review wave 2, finding 4 — the claim window is PER CLAIM ONLY. The old
+/// fallback to the Restore-level `status.waitStartedAt` made every later
+/// sibling's first pass measure `waitTimeout` from the first claimant's anchor,
+/// and the missing-snapshot decision is pinned on that same pass — so a claim
+/// that appeared after the window had spent was provisioned EMPTY on sight.
+/// The top-level anchor is now DirectTarget-only and the populator path never
+/// stamps or reads it: `claim_wait_window` takes no `Restore` at all.
 #[test]
-fn claim_wait_window_prefers_the_claim_anchor_then_the_legacy_one_then_now() {
+fn claim_wait_window_is_per_claim_only_and_opens_now_on_the_first_pass() {
     let anchored = RestoreClaimStatus {
         wait_started_at: Some("2026-01-01T00:00:00Z".into()),
         ..Default::default()
     };
-    let legacy = restore_with_anchor(Some("2025-06-01T00:00:00Z"));
-    let bare = restore_with_anchor(None);
     let now = 1_800_000_000_i64;
 
-    // The claim's own anchor wins: a sibling created an hour later gets its own
-    // full window rather than the remains of the first claim's.
+    // First pass, no record ⇒ Open(now): the caller stamps `now` into the
+    // record in this same pass, so the two agree.
+    assert_eq!(claim_wait_window(None, now), WaitWindow::Open(now));
+    // A record with an anchor ⇒ that anchor, verbatim.
     assert_eq!(
-        claim_wait_window(Some(&anchored), &legacy, now),
+        claim_wait_window(Some(&anchored), now),
         WaitWindow::Open(1_767_225_600)
     );
-    // No claim anchor yet → the legacy top-level one, so an upgrade mid-wait does
-    // not silently restart the window.
+    // A record with no anchor yet ⇒ now.
     assert_eq!(
-        claim_wait_window(None, &legacy, now),
-        WaitWindow::Open(1_748_736_000)
-    );
-    // Neither → this pass is the first on which the claim could proceed.
-    assert_eq!(claim_wait_window(None, &bare, now), WaitWindow::Open(now));
-    assert_eq!(
-        claim_wait_window(Some(&RestoreClaimStatus::default()), &bare, now),
+        claim_wait_window(Some(&RestoreClaimStatus::default()), now),
         WaitWindow::Open(now)
     );
     // An unparseable anchor falls through rather than panicking.
@@ -3550,8 +3537,13 @@ fn claim_wait_window_prefers_the_claim_anchor_then_the_legacy_one_then_now() {
         wait_started_at: Some("yesterday".into()),
         ..Default::default()
     };
+    assert_eq!(claim_wait_window(Some(&bad), now), WaitWindow::Open(now));
+    // The top-level anchor cannot be consulted: there is no parameter to pass
+    // it through. `effective_wait_anchor` (the DirectTarget reader) still
+    // honors it, which is the only place it should be read.
+    let created = 1_700_000_000_i64;
     assert_eq!(
-        claim_wait_window(Some(&bad), &bare, now),
-        WaitWindow::Open(now)
+        effective_wait_anchor(&restore_with_anchor(Some("2025-06-01T00:00:00Z")), created),
+        1_748_736_000
     );
 }

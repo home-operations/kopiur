@@ -731,19 +731,6 @@ pub(super) fn wait_park_report(
     }
 }
 
-/// Whether the `waitTimeout` window may OPEN on this pass — i.e. whether the restore can
-/// actually proceed now that its repository is `Ready`. A direct target always can; a
-/// `target.populator` only once a PVC claims it, because resolution runs while the
-/// populator is `AwaitingClaim` and a standing GitOps populator would otherwise burn its
-/// whole window sitting idle (#380). Exhaustive over [`PopulatorState`], so a new target
-/// mode must decide this before it compiles. Pure.
-pub(super) fn wait_window_opens(state: PopulatorState, has_claiming_pvc: bool) -> bool {
-    match state {
-        PopulatorState::DirectTarget => true,
-        PopulatorState::AwaitingClaim => has_claiming_pvc,
-    }
-}
-
 /// The absolute instant (RFC3339) the `waitTimeout` window closes, given the anchor
 /// [`effective_wait_anchor`] resolved — `None` when no (parseable) window is
 /// configured. This is what the mover polls against, so an in-Job wait is stable
@@ -2067,37 +2054,32 @@ pub fn claim_transition(prev: Option<&RestoreClaimStatus>, next: &RestoreClaimSt
 
 /// The `waitTimeout` window for ONE claim (#443).
 ///
-/// Per-claim because claimants appear at different times: a sibling created an
-/// hour after the first must get its own full window, not the remains of the
-/// first one's. Anchored at the claim record's `waitStartedAt` once stamped;
-/// failing that, at the Restore's legacy top-level `waitStartedAt` (so an upgrade
-/// mid-wait does not silently restart the window); failing that, at `now` —
-/// this pass is the first on which the claim could proceed, and the caller stamps
-/// it into the record.
+/// Per-claim, and PER CLAIM ONLY (review wave 2, finding 4): claimants appear at
+/// different times, so a sibling created an hour after the first must get its
+/// own full window, not the remains of the first one's. Anchored at the claim
+/// record's `waitStartedAt` once stamped; otherwise at `now` — this pass is the
+/// first on which the claim could proceed, and the caller stamps that instant
+/// into the record in the same pass.
+///
+/// The Restore-level `status.waitStartedAt` is deliberately NOT consulted. It
+/// was a fallback for "an upgrade mid-wait must not restart the window", but it
+/// also made every LATER sibling's first pass measure `waitTimeout` from the
+/// first claimant's anchor — and the missing-snapshot decision is pinned on
+/// that very pass, so a claim that appeared after the window had spent was
+/// provisioned EMPTY on sight. The top-level anchor is the DirectTarget's, and
+/// the populator path no longer stamps it.
 ///
 /// Always [`WaitWindow::Open`]: a claim record exists only because a PVC claims
 /// the populator, which is exactly the condition
 /// [`WaitWindow::AwaitingClaim`] describes the absence of. That state stays the
 /// Restore-level one, for zero claims. Pure.
-pub fn claim_wait_window(
-    record: Option<&RestoreClaimStatus>,
-    restore: &Restore,
-    now_epoch: i64,
-) -> WaitWindow {
-    let parse = |at: &str| {
-        chrono::DateTime::parse_from_rfc3339(at)
-            .ok()
-            .map(|t| t.timestamp())
-    };
+pub fn claim_wait_window(record: Option<&RestoreClaimStatus>, now_epoch: i64) -> WaitWindow {
     let anchor = record
         .and_then(|r| r.wait_started_at.as_deref())
-        .and_then(parse)
-        .or_else(|| {
-            restore
-                .status
-                .as_ref()
-                .and_then(|s| s.wait_started_at.as_deref())
-                .and_then(parse)
+        .and_then(|at| {
+            chrono::DateTime::parse_from_rfc3339(at)
+                .ok()
+                .map(|t| t.timestamp())
         })
         .unwrap_or(now_epoch);
     WaitWindow::Open(anchor)
