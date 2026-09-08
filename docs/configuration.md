@@ -14,20 +14,20 @@ at build time, using MkDocs snippets. So the documented defaults can never drift
 
 Kopiur ships **three images** wired into **two Deployments**, plus a per-Job image:
 
-- **controller** — the operator, meaning the reconcilers. It serves `/metrics`, `/healthz`, and `/readyz`.
-- **webhook** — a _separate_ axum admission Deployment, both validating and mutating.
-- **mover** — not a Deployment. The controller stamps this image into every
+- **controller**: the operator, meaning the reconcilers. It serves `/metrics`, `/healthz`, and `/readyz`.
+- **webhook**: a _separate_ axum admission Deployment, both validating and mutating.
+- **mover**: not a Deployment. The controller stamps this image into every
   `Snapshot`, `Restore` and `Maintenance` **Job** it creates.
 
 The **controller is the chart's primary component**, so its knobs live at the **root**, with no prefix. `replicaCount`, `resources`, `nodeSelector`, `podSecurityContext`, `image` and so on all configure the controller. The two auxiliary components get their own named blocks: `webhook:` gets a full Deployment surface, and `mover:` gets the per-Job image only. So a root-level workload key applies to the controller alone. You configure the controller and webhook independently because they have different resource profiles and lifecycles.
 
 /// tip | The five values most people actually set
 
-1. `installScope` — `cluster` (default) or `namespaced` (least-privilege opt-down; disables `ClusterRepository`).
-2. `image.tag` (controller) / `mover.image.digest` — pin what runs (digest-pin the mover in prod).
-3. `webhook.tls.mode` — `self` (default), `cert-manager`, or `manual`.
-4. `monitoring.serviceMonitor.enabled` / `monitoring.dashboards.enabled` — wire up Prometheus + Grafana.
-5. `observability.otlp.enabled` — add OTLP traces/logs/metrics-push on top of the pull endpoint.
+1. `installScope`: `cluster` (default) or `namespaced` (least-privilege opt-down; disables `ClusterRepository`).
+2. `image.tag` (controller) / `mover.image.digest`: pin what runs (digest-pin the mover in prod).
+3. `webhook.tls.mode`: `self` (default), `cert-manager`, or `manual`.
+4. `monitoring.serviceMonitor.enabled` / `monitoring.dashboards.enabled`: wire up Prometheus + Grafana.
+5. `observability.otlp.enabled`: add OTLP traces/logs/metrics-push on top of the pull endpoint.
 
 Everything else has a sensible default. The sections below cover them all.
 
@@ -45,10 +45,10 @@ These are the standard Helm escape hatches. `nameOverride` changes the chart-nam
 
 Each of the three images is configured next to the component it belongs to, and each `repository` is a **full registry plus path** string:
 
-- **controller** — the root `image` block: `image.repository`, `image.tag`,
+- **controller**: the root `image` block is `image.repository`, `image.tag`,
   `image.digest`, `image.pullPolicy`.
-- **webhook** — `webhook.image.*`, with its own `webhook.image.pullPolicy`.
-- **mover** — `mover.image.*`, with its own `mover.image.pullPolicy`.
+- **webhook**: `webhook.image.*`, with its own `webhook.image.pullPolicy`.
+- **mover**: `mover.image.*`, with its own `mover.image.pullPolicy`.
 
 ```yaml
 --8<-- "deploy/helm/kopiur/values.yaml:62:86"
@@ -126,7 +126,7 @@ The controller's knobs live at the **root** of the values file, with no `control
 
 This is the operator itself. The settings worth knowing:
 
-- **`replicaCount` + `leaderElection`** — run more than one replica for high availability.
+- **`replicaCount` + `leaderElection`**: run more than one replica for high availability.
   With `leaderElection.enabled`, the default, the replicas elect a leader through a
   `coordination.k8s.io/v1` Lease in the release namespace, named after the
   release. Only the Lease holder runs reconcilers. Standby replicas stay
@@ -146,7 +146,7 @@ This is the operator itself. The settings worth knowing:
 `leaderElection.enabled: false` removes the Lease RBAC and the election entirely. Every replica then reconciles concurrently, duplicating mover Jobs and racing status writes. Only disable it at `replicaCount: 1`.
 
 ///
-- **`streamingLists`** — use the Kubernetes WatchList streaming-list API for the
+- **`streamingLists`**: use the Kubernetes WatchList streaming-list API for the
   controller's cluster-wide watches. It lowers peak memory during the initial
   resync by streaming pages instead of buffering them, which is the startup burst the
   memory note below warns about. **Default `true`**: WatchList is beta in
@@ -155,15 +155,15 @@ This is the operator itself. The settings worth knowing:
   falls back to paged lists below 1.32 either way. So set `false` only if your
   apiserver has the WatchList feature gate disabled; turning it off just skips
   the feature probe.
-- **`workerThreads`** — Tokio worker threads for the controller runtime,
+- **`workerThreads`**: Tokio worker threads for the controller runtime,
   default `2`. The controller is I/O-bound, so a small pool is ample. Raise it
   only for a reconcile-heavy deployment.
-- **`reconcileConcurrency`** — per-controller cap on concurrently running
+- **`reconcileConcurrency`**: per-controller cap on concurrently running
   reconciles, default `8`. The operator runs 8 controllers, so that is at most 64 process-wide.
   This is the one cap on this page that is **bounded by default**, because
   unbounded reconcile concurrency is what let an apiserver flap exhaust the
   controller's file descriptors within seconds. `0` means unbounded, which is not recommended.
-- **`maxConcurrentJobs`** — cluster-wide cap on **pooled mover Jobs**, counted across
+- **`maxConcurrentJobs`**: cluster-wide cap on **pooled mover Jobs**, counted across
   all repositories, default `0` which means uncapped. Pooled Jobs are backup
   snapshots, restores, and the source side of either replication. This is the cluster-operator's
   *backstop*; the primary knob is each repository's own
@@ -176,19 +176,19 @@ This is the operator itself. The settings worth knowing:
   Maintenance, verification, pin and snapshot-delete Jobs are outside the pool
   entirely. Leaving it at `0` costs nothing: with no cap set anywhere the
   operator performs no extra API calls at all.
-- **`maxConcurrentDeleteJobs`** — cluster-wide cap on concurrent `snapdel-*`
+- **`maxConcurrentDeleteJobs`**: cluster-wide cap on concurrent `snapdel-*`
   batch-delete Jobs, default `0` which means uncapped. This is a *separate* pool from
   `maxConcurrentJobs`, because a deletion reduces repository load and is already batched
   one Job per repository. Queuing it behind backups would grow the backlog it
   exists to drain. It does not gate whether a deletion is *allowed*; that is
   `deletionProtection.threshold` on the repository.
-- **`extraVolumes` / `extraVolumeMounts`** — the way to make a **filesystem
+- **`extraVolumes` / `extraVolumeMounts`**: the way to make a **filesystem
   backend** reachable in-process, through hostPath, NFS or a PVC, so the controller can
   run its short idempotent kopia ops. The e2e harness uses a hostPath here.
-- **`resources`** — only **requests** are set by default. There are intentionally
+- **`resources`**: only **requests** are set by default. There are intentionally
   **no limits**; the `limits` block ships commented out. Uncomment and tune it to
   your own measured ceiling if you want them.
-- **`podDisruptionBudget` / `topologySpreadConstraints`** — pair these with
+- **`podDisruptionBudget` / `topologySpreadConstraints`**: pair these with
   `replicaCount > 1` to make high availability genuine. The PodDisruptionBudget keeps a voluntary
   disruption, such as a node drain or cluster upgrade, from taking the controller to zero, and the
   spread constraints keep both replicas off the same node or zone. Both fall back
@@ -226,14 +226,14 @@ The webhook is a **full component** with its own `webhook:` block. That covers i
 --8<-- "deploy/helm/kopiur/values.yaml:455:510"
 ```
 
-- **`enabled`** — when `false`, validation falls back to the controller's
+- **`enabled`**: when `false`, validation falls back to the controller's
   defensive checks only. Not recommended: the webhook is what makes invalid
   states unrepresentable at admission time.
-- **`failurePolicy: Fail`** — failing closed is the default and the right call for a
+- **`failurePolicy: Fail`**: failing closed is the default and the right call for a
   backup operator. If the webhook is down, reject the write rather than
   silently admit an unvalidated `Snapshot`. That makes `webhook.podDisruptionBudget`
   the most important PodDisruptionBudget to enable in a high-availability setup.
-- **`webhook.serviceMonitor`** — the webhook serves `/metrics` on its TLS port,
+- **`webhook.serviceMonitor`**: the webhook serves `/metrics` on its TLS port,
   and scraping it needs `insecureSkipVerify`, because it serves a self-signed cert by
   default. This stays under `webhook:` rather than `monitoring:` because it's an HTTPS
   scrape of the webhook's own port.
@@ -262,14 +262,14 @@ The default `self` mode needs **zero** configuration and no external dependency.
 
 All metrics are under the `kopiur_` namespace and served through a Prometheus **pull** endpoint on the controller's port, `metrics.port`. The controller's metrics `Service` is **always** created, because that listener co-hosts `/metrics` with `/healthz` and `/readyz`, so there's nothing to disable. The `monitoring:` block additionally connects the Prometheus Operator and Grafana:
 
-- **`monitoring.serviceMonitor.enabled`** — create a `ServiceMonitor` scraping
+- **`monitoring.serviceMonitor.enabled`**: create a `ServiceMonitor` scraping
   the controller's `/metrics` over plain HTTP. It needs the Prometheus-Operator CRDs.
   Set `.labels` to match your `serviceMonitorSelector`. The `ServiceMonitor` sets
   `honorLabels: true`, so each `kopiur_*` series keeps its own `namespace` label,
   which is the namespace of the CR the metric describes, instead of having it overwritten
   by the controller's namespace. Prometheus would otherwise move the CR's namespace aside
   to `exported_namespace`.
-- **`monitoring.prometheusRule.enabled`** — ship the kopiur alert rules.
+- **`monitoring.prometheusRule.enabled`**: ship the kopiur alert rules.
   `backupStaleAfterSeconds`, default 48h, is the age after which a
   `SnapshotPolicy`'s last success is considered stale. The backup-failure alerts
   are **recovery-aware**. `KopiurLastBackupFailed` fires while a `SnapshotPolicy`'s
@@ -280,7 +280,7 @@ All metrics are under the `kopiur_` namespace and served through a Prometheus **
   `KopiurBackupStale` still covers the policy that has never succeeded, or whose
   successful `Snapshot` CRs were all pruned. Both recovery-aware alerts wait
   `for: 10m` at `severity: warning`.
-- **`monitoring.dashboards.enabled`** — ship the dashboard. By default it's a
+- **`monitoring.dashboards.enabled`**: ship the dashboard. By default it's a
   sidecar-discoverable `ConfigMap`, sourced from `deploy/dashboards/kopiur.json`. Flip
   `monitoring.dashboards.grafanaOperator.enabled` to render a grafana-operator
   `GrafanaDashboard` CR from the very same JSON instead.
@@ -312,9 +312,9 @@ This is off by default. Metrics are **always** available through the `/metrics` 
 
 This controls the stdout logging, what `kubectl logs` shows, that every component writes. The controller passes `RUST_LOG` and `KOPIUR_LOG_FORMAT` through to mover Jobs, so a mover honors the same level and format.
 
-- **`level`** — `RUST_LOG`-style, default `info`. Per-target works too:
+- **`level`**: `RUST_LOG`-style, default `info`. Per-target works too:
   `"info,kopia=debug"` surfaces kopia's own progress in mover logs.
-- **`format`** — `text`, which is human-readable and the default, or `json`, one structured
+- **`format`**: `text`, which is human-readable and the default, or `json`, one structured
   object per line for Loki, ELK or Datadog.
 
 ## Flags & environment variables
@@ -391,7 +391,7 @@ The whole annotated file, exactly as the chart ships it:
 
 ## See also
 
-- [Installation](install.md) — quickstart, scope, webhook-TLS `--set` recipes, CRD lifecycle.
-- [Movers, RBAC & credentials](movers.md) — what the mover Jobs need and how projection works.
-- [Observability](dev/observability.md) — the full metric list, OTLP details, collector config.
-- The chart's own [`README.md`](https://github.com/home-operations/kopiur/blob/main/deploy/helm/kopiur/README.md) — generated from the same values.
+- [Installation](install.md): quickstart, scope, webhook-TLS `--set` recipes, CRD lifecycle.
+- [Movers, RBAC & credentials](movers.md): what the mover Jobs need and how projection works.
+- [Observability](dev/observability.md): the full metric list, OTLP details, collector config.
+- The chart's own [`README.md`](https://github.com/home-operations/kopiur/blob/main/deploy/helm/kopiur/README.md), generated from the same values.
