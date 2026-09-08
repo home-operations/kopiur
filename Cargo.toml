@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/api",
     "crates/cli",
+    "crates/ops",
     "crates/kopia",
     "crates/migrate",
     "crates/telemetry",
@@ -27,6 +28,7 @@ kopiur-api = { path = "crates/api" }
 kopiur-kopia = { path = "crates/kopia" }
 kopiur-migrate = { path = "crates/migrate" }
 kopiur-mover = { path = "crates/mover" }
+kopiur-ops = { path = "crates/ops" }
 kopiur-telemetry = { path = "crates/telemetry" }
 
 # Kubernetes / controller-runtime

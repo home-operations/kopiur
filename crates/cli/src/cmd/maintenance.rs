@@ -127,6 +127,7 @@ async fn resolve(ctx: &KubeCtx, args: &MaintenanceRunArgs) -> Result<Maintenance
                 Some(name),
                 e,
             )
+            .into()
         });
     }
     let repo = args.repository.as_deref().expect("clap group");

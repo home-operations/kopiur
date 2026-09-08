@@ -71,7 +71,7 @@ pub use crate::scan::{scrub, strip_cfg_test, strip_use_stmts};
 ///
 /// `migrate` only *writes* CRs, so a field only it mentions is still inert at
 /// runtime. `xtask`/`telemetry`/`e2e` are tooling.
-const CONSUMER_CRATES: &[&str] = &["controller", "mover", "kopia", "webhook", "cli"];
+const CONSUMER_CRATES: &[&str] = &["controller", "mover", "kopia", "webhook", "cli", "ops"];
 
 // `crates/api` is deliberately NOT a consumer, even though it owns real
 // resolver helpers (`api::identity`, `CatalogBounds`, `effective_*`). Including

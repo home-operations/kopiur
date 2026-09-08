@@ -576,7 +576,7 @@ exit 0
     let client = client_for(&s);
     let mut sink: Vec<u8> = Vec::new();
     let args = kopiur_kopia::SessionCmd::ShowObject {
-        oid: "kfile".into(),
+        oid: kopiur_kopia::ObjectId::parse("kfile").expect("valid oid"),
     }
     .argv("ignored-bin");
     let n = client

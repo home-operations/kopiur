@@ -479,14 +479,7 @@ async fn create_session_job(
             return Ok(name);
         }
         Err(e) => {
-            return Err(classify_kube(
-                "create",
-                "Job",
-                "jobs",
-                Some(ns),
-                Some(&name),
-                e,
-            ));
+            return Err(classify_kube("create", "Job", "jobs", Some(ns), Some(&name), e).into());
         }
     };
     Ok(created.name_any())
@@ -584,7 +577,7 @@ async fn wait_pod_ready(
         let list = pods
             .list(&ListParams::default().labels(&selector))
             .await
-            .map_err(|e| classify_kube("list", "Pod", "pods", Some(namespace), None, e));
+            .map_err(|e| classify_kube("list", "Pod", "pods", Some(namespace), None, e).into());
         let list = match list {
             Ok(l) => l.items,
             Err(e) => break Err(e),
@@ -656,7 +649,7 @@ async fn wait_job_gone(jobs_api: &Api<Job>, name: &str) -> Result<(), CliError> 
             }
             Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(500)).await,
             Err(e) => {
-                return Err(classify_kube("get", "Job", "jobs", None, Some(name), e));
+                return Err(classify_kube("get", "Job", "jobs", None, Some(name), e).into());
             }
         }
     }

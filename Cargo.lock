@@ -1731,6 +1731,7 @@ dependencies = [
  "kopiur-kopia",
  "kopiur-migrate",
  "kopiur-mover",
+ "kopiur-ops",
  "kube",
  "rustls",
  "serde",
@@ -1844,6 +1845,25 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tower",
+ "tracing",
+]
+
+[[package]]
+name = "kopiur-ops"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "k8s-openapi",
+ "kopiur-api",
+ "kopiur-kopia",
+ "kopiur-mover",
+ "kube",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.20",
+ "tokio",
  "tracing",
 ]
 

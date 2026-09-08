@@ -166,6 +166,18 @@ pub const ALLOW_MASS_DELETION_ANNOTATION: &str = "kopiur.home-operations.com/all
 /// raises one Warning event naming the expected value.
 pub const ALLOW_REINITIALIZE_ANNOTATION: &str = "kopiur.home-operations.com/allow-reinitialize";
 
+/// Annotation stamped on a `Repository`/`ClusterRepository` (writer: the policy
+/// reconciler, M6) to REQUEST an on-demand catalog scan — e.g. after adopting a
+/// delete-then-recreated repository, so its discovered snapshots materialize
+/// immediately instead of waiting for the next spec change or (opt-in) periodic
+/// refresh. The RFC3339 timestamp VALUE is an opaque token: honored once via
+/// `status.catalog.scanRequestHonored` (equality, never a `lastRefreshAt`
+/// comparison), and rate-limited via `status.catalog.scanRequestAttemptAt` so a
+/// pending token against an unreachable backend cannot recreate bootstrap Jobs on
+/// every reconcile.
+pub const CATALOG_SCAN_REQUESTED_ANNOTATION: &str =
+    "kopiur.home-operations.com/catalog-scan-requested-at";
+
 /// The API version string for kopiur CRDs (used in mover `TargetRef`s and
 /// `kubectl -o name`-style output).
 pub const API_VERSION: &str = "kopiur.home-operations.com/v1alpha1";
@@ -697,6 +709,7 @@ mod tests {
             ALLOW_MASS_DELETION_ANNOTATION,
             ALLOW_REINITIALIZE_ANNOTATION,
             PRIVILEGED_MOVERS_ANNOTATION,
+            CATALOG_SCAN_REQUESTED_ANNOTATION,
             REPO_POOL_LABEL,
         ] {
             assert!(s.starts_with(crate::GROUP), "{s} must be group-prefixed");

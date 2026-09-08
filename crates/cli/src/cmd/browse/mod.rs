@@ -89,6 +89,16 @@ pub fn parse_dir_manifest(bytes: &[u8], oid: &str) -> Result<DirManifest, CliErr
     Ok(manifest)
 }
 
+/// Validate an object id read out of a repository manifest before it reaches
+/// the session argv. A manifest entry is untrusted input: a value starting with
+/// `-` would otherwise be parsed by kopia as a flag.
+fn parse_oid(oid: &str) -> Result<kopiur_kopia::ObjectId, CliError> {
+    kopiur_kopia::ObjectId::parse(oid).map_err(|e| CliError::UnexpectedKopiaOutput {
+        what: "a directory manifest entry".into(),
+        detail: e.to_string(),
+    })
+}
+
 impl SnapshotAccess for session::ExecSession {
     async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<String, CliError> {
         let out = self.exec_capture(SessionCmd::SnapshotListJson).await?;
@@ -97,7 +107,7 @@ impl SnapshotAccess for session::ExecSession {
     async fn list_dir(&mut self, oid: &str) -> Result<DirManifest, CliError> {
         let out = self
             .exec_capture(SessionCmd::ShowObject {
-                oid: oid.to_string(),
+                oid: parse_oid(oid)?,
             })
             .await?;
         parse_dir_manifest(&out, oid)
@@ -109,7 +119,7 @@ impl SnapshotAccess for session::ExecSession {
     ) -> Result<u64, CliError> {
         self.exec_stream(
             SessionCmd::ShowObject {
-                oid: oid.to_string(),
+                oid: parse_oid(oid)?,
             },
             sink,
         )
@@ -125,7 +135,7 @@ impl SnapshotAccess for local::LocalSession {
     async fn list_dir(&mut self, oid: &str) -> Result<DirManifest, CliError> {
         let out = self
             .run_capture(SessionCmd::ShowObject {
-                oid: oid.to_string(),
+                oid: parse_oid(oid)?,
             })
             .await?;
         parse_dir_manifest(&out, oid)
@@ -137,7 +147,7 @@ impl SnapshotAccess for local::LocalSession {
     ) -> Result<u64, CliError> {
         self.run_stream(
             SessionCmd::ShowObject {
-                oid: oid.to_string(),
+                oid: parse_oid(oid)?,
             },
             sink,
         )

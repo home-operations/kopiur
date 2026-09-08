@@ -355,7 +355,7 @@ where
 {
     api.get(name)
         .await
-        .map_err(|e| classify_kube("get", kind, plural, namespace, Some(name), e))
+        .map_err(|e| classify_kube("get", kind, plural, namespace, Some(name), e).into())
 }
 
 /// Run `snapshots list` and render for the requested format.

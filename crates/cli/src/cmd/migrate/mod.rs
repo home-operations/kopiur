@@ -470,7 +470,7 @@ async fn list_raw(ctx: &KubeCtx, kind: VolsyncKind) -> Result<Vec<RawVolsync>, C
                             .into(),
                 }
             }
-            _ => classify_kube("list", kind_str, plural, Some(&ctx.namespace), None, e),
+            _ => classify_kube("list", kind_str, plural, Some(&ctx.namespace), None, e).into(),
         })?;
     Ok(listed
         .items

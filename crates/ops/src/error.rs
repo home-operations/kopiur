@@ -1,10 +1,12 @@
-//! The CLI's typed error surface. One exhaustive enum; every message states
-//! what failed, why, and how to fix it (the message text is unit-tested).
+//! The shared operations layer's typed error surface. One exhaustive enum;
+//! every message states what failed, why, and how to fix it (the message text
+//! is unit-tested). Both `kubectl kopiur` and the web UI render these — the CLI
+//! prints the message, a server maps [`OpsError::kind`] onto a status code.
 
-/// Everything `kubectl kopiur` can fail with. Exhaustive — a new failure mode
+/// Everything a kopiur operation can fail with. Exhaustive — a new failure mode
 /// is a new variant, never a stringly-typed catch-all.
 #[derive(Debug, thiserror::Error)]
-pub enum CliError {
+pub enum OpsError {
     /// A `pvcSelector` recipe matched no PersistentVolumeClaims, so there is
     /// nothing to snapshot.
     #[error(
@@ -34,20 +36,6 @@ pub enum CliError {
         policy: String,
         /// Comma-joined valid repository names.
         valid: String,
-    },
-
-    /// The kubeconfig could not be loaded or the requested context resolved.
-    #[error(
-        "could not load a Kubernetes client configuration: {source}. \
-         kubectl-kopiur reads the same configuration kubectl does \
-         ($KUBECONFIG, ~/.kube/config, or in-cluster). \
-         Fix: check --kubeconfig/--context, or verify your setup with \
-         `kubectl config current-context`"
-    )]
-    KubeConfig {
-        /// The underlying kube config/client construction error.
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// The API server refused the request with 403.
@@ -150,18 +138,6 @@ pub enum CliError {
         hint: String,
     },
 
-    /// A log stream broke mid-flight (network blip, apiserver restart).
-    #[error(
-        "the log stream was interrupted: {source}. \
-         The connection to the API server dropped mid-stream; the run itself is unaffected. \
-         Fix: re-run the same `kubectl kopiur logs` command to resume following"
-    )]
-    LogStreamInterrupted {
-        /// The underlying stream error.
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     /// The object being waited on was deleted mid-wait.
     #[error(
         "{what} was deleted while waiting for it to finish. \
@@ -183,15 +159,6 @@ pub enum CliError {
         what: String,
         /// The matching object names.
         candidates: String,
-    },
-
-    /// A migration input (VolSync object / restic Secret) can't be translated.
-    #[error("{what}. Fix: {fix}")]
-    MigrationInput {
-        /// What is wrong with the input.
-        what: String,
-        /// What to do about it.
-        fix: String,
     },
 
     /// A snapshot's repository lives in a different namespace than the
@@ -267,16 +234,6 @@ pub enum CliError {
         path: String,
         /// The kopia entry type encountered (`f`, `s`, …).
         entry_type: String,
-    },
-
-    /// `-A` was passed to a command that targets exactly one object.
-    #[error(
-        "{command} targets a single object in one namespace, so -A/--all-namespaces \
-         does not apply. Fix: drop -A and pass -n <namespace> instead"
-    )]
-    AllNamespacesNotApplicable {
-        /// The command that rejected `-A`.
-        command: &'static str,
     },
 
     /// (De)serializing an object for output failed — a kopiur bug, not a user error.
@@ -403,77 +360,6 @@ pub enum CliError {
         stderr: String,
     },
 
-    /// `--local` was passed but no kopia binary is available.
-    #[error(
-        "--local needs a kopia binary on this machine, but {bin:?} was not found. \
-         Fix: install kopia (https://kopia.io/docs/installation/) or pass \
-         --kopia-bin PATH — or drop --local to use the in-cluster session, \
-         which needs no local kopia"
-    )]
-    LocalKopiaMissing {
-        /// The binary that was looked for.
-        bin: String,
-    },
-
-    /// A `--local` kopia invocation failed.
-    #[error(
-        "--local kopia operation failed ({what}): {source}. \
-         --local talks to the backend FROM THIS MACHINE with the repository's \
-         credentials. Fix: verify the endpoint is reachable from here (in-cluster-only \
-         endpoints need a port-forward) and the credentials Secret is valid — or drop \
-         --local to read through the in-cluster session"
-    )]
-    LocalKopia {
-        /// Which operation failed.
-        what: String,
-        /// The kopia client error.
-        #[source]
-        source: Box<kopiur_kopia::KopiaError>,
-    },
-
-    /// `--local` cannot mount a cluster-volume filesystem repository.
-    #[error(
-        "--local cannot read repository {repository:?}: its filesystem backend lives \
-         on a cluster volume (PVC/inline NFS) this machine cannot mount. \
-         Fix: drop --local and use the in-cluster session, which mounts the \
-         repository volume read-only"
-    )]
-    LocalRepoVolume {
-        /// The repository name.
-        repository: String,
-    },
-
-    /// `--local` cannot authenticate a workload-identity repository.
-    #[error(
-        "--local cannot read repository {repository:?}: its backend authenticates via workload \
-         identity (ServiceAccount {service_account:?}), whose federated credentials exist only \
-         inside a pod running as that ServiceAccount — there is no Secret to copy here. Fix: \
-         drop --local and use the in-cluster session, which runs as the federated ServiceAccount"
-    )]
-    LocalWorkloadIdentity {
-        /// The repository name.
-        repository: String,
-        /// The federated ServiceAccount the backend names.
-        service_account: String,
-    },
-
-    /// Reading the credential Secret for `--local` was refused.
-    #[error(
-        "forbidden: cannot get Secret {secret:?} in namespace {namespace}: {source}. \
-         --local copies the repository credentials onto this machine, which needs \
-         `get` on `secrets` — RBAC the in-cluster session path deliberately does NOT \
-         need. Fix: ask a cluster admin for `get secrets` in {namespace}, or drop --local"
-    )]
-    SecretsForbidden {
-        /// The Secret name.
-        secret: String,
-        /// Its namespace.
-        namespace: String,
-        /// The API server's error.
-        #[source]
-        source: Box<kube::Error>,
-    },
-
     /// A user-supplied snapshot path is malformed or escapes the snapshot root.
     #[error(
         "invalid snapshot path {path:?}: {reason}. \
@@ -533,24 +419,6 @@ pub enum CliError {
         id: String,
     },
 
-    /// A download wrote fewer/more bytes than the snapshot manifest records.
-    #[error(
-        "download of {path:?} is incomplete: expected {expected} bytes, wrote {actual}. \
-         The partial file at {dest} was removed so a truncated restore can't be \
-         mistaken for the real one. Fix: retry; if it persists, verify the snapshot \
-         (kopiur's verification, or `kopia snapshot verify`)"
-    )]
-    DownloadIncomplete {
-        /// The snapshot path downloaded.
-        path: String,
-        /// Bytes the manifest records.
-        expected: i64,
-        /// Bytes actually written.
-        actual: u64,
-        /// Destination whose partial content was removed.
-        dest: String,
-    },
-
     /// kopia produced output the CLI could not interpret.
     #[error(
         "unexpected kopia output while reading {what}: {detail}. \
@@ -564,30 +432,162 @@ pub enum CliError {
         detail: String,
     },
 
-    /// A local filesystem operation (download dest, --local staging dir) failed.
-    #[error(
-        "local file operation failed ({what}): {source}. \
-         Fix: check the path exists, is writable, and has free space, then retry"
-    )]
-    LocalIo {
-        /// What was being done.
+    /// An I/O error while copying bytes between the session pod and the caller.
+    #[error("I/O error while {what}: {source}")]
+    StreamIo {
+        /// What was being copied.
         what: String,
         /// The underlying IO error.
         #[source]
         source: std::io::Error,
     },
-
-    /// A failure raised by the shared operations layer; its text is already
-    /// what/why/fix.
-    #[error(transparent)]
-    Ops(#[from] kopiur_ops::OpsError),
 }
 
-// The kube-error classifier and its scope-suffix helper moved to
-// `kopiur_ops::error` when the operations layer was extracted; re-exported so
-// every CLI call site keeps resolving them through `crate::error`. They build
-// `OpsError`s, which `?` converts via [`CliError::Ops`].
-pub use kopiur_ops::error::{classify_kube, scope_suffix};
+/// Coarse class of a failure, for HTTP status mapping and retry decisions.
+/// The CLI never needs this (it prints the message); a server does — the
+/// message text is for humans, this is for the protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpsErrorKind {
+    /// RBAC refused the caller (403).
+    Forbidden,
+    /// The named object, path, or catalog entry does not exist (404).
+    NotFound,
+    /// The kopiur CRDs are missing from the cluster — an install problem, not
+    /// a request problem.
+    KindNotInstalled,
+    /// An admission webhook rejected the object.
+    Admission,
+    /// The request cannot be satisfied as stated because the cluster's shape
+    /// conflicts with it (cross-namespace reference, ambiguous target).
+    Conflict,
+    /// The caller's input is malformed or names something invalid (400).
+    Invalid,
+    /// A dependency (the API server, the session pod, kopia) failed or was
+    /// unreachable — usually retryable.
+    Upstream,
+    /// A bounded wait expired; the work itself may still be running.
+    Timeout,
+    /// A kopiur bug: serialization failures and output we cannot interpret.
+    Internal,
+}
+
+impl OpsError {
+    /// This failure's coarse class. Exhaustive — a new variant must pick a
+    /// kind here before it compiles, so no failure can reach a server without
+    /// a deliberate status-code decision.
+    pub fn kind(&self) -> OpsErrorKind {
+        match self {
+            OpsError::Forbidden { .. } => OpsErrorKind::Forbidden,
+            OpsError::NotFound { .. }
+            | OpsError::SnapshotMissingInRepo { .. }
+            | OpsError::PathNotFound { .. } => OpsErrorKind::NotFound,
+            OpsError::KindNotInstalled { .. } => OpsErrorKind::KindNotInstalled,
+            OpsError::AdmissionDenied { .. } => OpsErrorKind::Admission,
+            OpsError::RepoOutsideSessionNamespace { .. }
+            | OpsError::CredsOutsideSessionNamespace { .. }
+            | OpsError::ClusterRepoSecretNamespaceMissing { .. }
+            | OpsError::AmbiguousTarget { .. } => OpsErrorKind::Conflict,
+            OpsError::SelectorMatchedNothing { .. }
+            | OpsError::UnknownPolicyRepository { .. }
+            | OpsError::InvalidPath { .. }
+            | OpsError::IsADirectory { .. }
+            | OpsError::NotADirectory { .. }
+            | OpsError::NotAFile { .. }
+            | OpsError::SnapshotNotBrowsable { .. }
+            | OpsError::RepositoryUnderivable { .. } => OpsErrorKind::Invalid,
+            OpsError::WaitTimeout { .. } | OpsError::SessionNotReady { .. } => {
+                OpsErrorKind::Timeout
+            }
+            OpsError::Api { .. }
+            | OpsError::SessionExec { .. }
+            | OpsError::SessionPodFailed { .. }
+            | OpsError::MoverImageUnresolvable { .. }
+            | OpsError::OperatorNamespaceUnresolvable { .. }
+            | OpsError::CaBundleUnresolvable { .. }
+            | OpsError::GoneWhileWaiting { .. } => OpsErrorKind::Upstream,
+            OpsError::Serialization { .. }
+            | OpsError::UnexpectedKopiaOutput { .. }
+            | OpsError::StreamIo { .. } => OpsErrorKind::Internal,
+        }
+    }
+}
+
+/// Human-readable scope suffix for error messages: `" in namespace x"` for a
+/// namespaced call, `""` for a cluster-scoped one.
+pub fn scope_suffix(namespace: Option<&str>) -> String {
+    match namespace {
+        Some(ns) => format!(" in namespace {ns}"),
+        None => String::new(),
+    }
+}
+
+/// The API server's NotFoundHandler message when the URL's resource *type* is
+/// unknown (the CRD is absent). An object-level 404 instead names the object
+/// (`snapshots.kopiur… "x" not found`). kube's `Status` carries no structured
+/// discriminator between the two, so this message match is the only signal —
+/// single definition here, exercised by the tests below.
+const KIND_NOT_FOUND_NEEDLE: &str = "could not find the requested resource";
+
+/// Classify a `kube::Error` from a `{verb} {resource}` call into the matching
+/// [`OpsError`] variant, so every command surfaces the same actionable
+/// messages without forking the mapping logic. Pass `name` for object-level
+/// calls (get/patch/delete) so their 404 maps to [`OpsError::NotFound`]; a 404
+/// whose message says the *resource type* is unknown maps to
+/// [`OpsError::KindNotInstalled`] either way.
+pub fn classify_kube(
+    verb: &'static str,
+    kind: &'static str,
+    resource: &'static str,
+    namespace: Option<&str>,
+    name: Option<&str>,
+    source: kube::Error,
+) -> OpsError {
+    let scope = scope_suffix(namespace);
+    match &source {
+        // An admission-webhook denial (apiserver relays it as 400/403 with the
+        // webhook's message). Checked before the RBAC arm — a denial can be 403.
+        kube::Error::Api(ae) if ae.message.contains("denied the request") => {
+            OpsError::AdmissionDenied {
+                message: ae.message.clone(),
+            }
+        }
+        kube::Error::Api(ae) if ae.code == 403 => OpsError::Forbidden {
+            verb,
+            resource,
+            scope,
+            source: Box::new(source),
+        },
+        kube::Error::Api(ae) if ae.code == 404 && ae.message.contains(KIND_NOT_FOUND_NEEDLE) => {
+            OpsError::KindNotInstalled {
+                kind,
+                source: Box::new(source),
+            }
+        }
+        kube::Error::Api(ae) if ae.code == 404 => match name {
+            Some(n) => OpsError::NotFound {
+                kind,
+                plural: resource,
+                name: n.to_string(),
+                scope,
+                scope_flag: namespace.map(|ns| format!(" -n {ns}")).unwrap_or_default(),
+            },
+            // A collection-level 404 that doesn't carry the unknown-type
+            // message: don't guess, surface it as a plain API failure.
+            None => OpsError::Api {
+                verb,
+                resource,
+                scope,
+                source: Box::new(source),
+            },
+        },
+        _ => OpsError::Api {
+            verb,
+            resource,
+            scope,
+            source: Box::new(source),
+        },
+    }
+}
 
 #[cfg(test)]
 mod tests;

@@ -143,7 +143,7 @@ impl LocalSession {
                     namespace: ns.clone(),
                     source: Box::new(e),
                 },
-                _ => classify_kube("get", "Secret", "secrets", Some(&ns), Some(&r.name), e),
+                _ => classify_kube("get", "Secret", "secrets", Some(&ns), Some(&r.name), e).into(),
             })?;
             env.extend(secret_env(&secret));
         }

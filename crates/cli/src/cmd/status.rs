@@ -635,7 +635,8 @@ async fn gather(
                     ns,
                     None,
                     e,
-                ));
+                )
+                .into());
             }
         };
         for r in replications {
