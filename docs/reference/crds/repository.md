@@ -1,245 +1,163 @@
 # Repository
 
-A namespaced kopia repository — credentials, backend, encryption, and optional
-catalog-materialization bounds — owned by one namespace and referenced by many
-`SnapshotPolicy` and `Restore` resources. For the terse type/default table see the
-[field reference](../../field-reference.md); for how-to guidance see
-[Repositories](../../repositories.md).
+A `Repository` is one kopia repository owned by a single namespace. It holds the storage backend, the credentials, the encryption password, and optional limits on how many discovered snapshots become `Snapshot` objects. Many `SnapshotPolicy` and `Restore` resources can point at the same one.
+
+For the short type-and-default table see the [field reference](../../field-reference.md). For task guidance see [Repositories](../../repositories.md).
 
 ## `spec`
 
 ### `backend`
 
-Exactly one storage backend. The wire shape is a single-key object
-(`backend: { s3: {...} }`), so an invalid "two backends at once" state is
-unrepresentable. See [Backends](../../backends/index.md) for the per-backend fields.
+Exactly one storage backend. You write it as a single-key object, such as `backend: { s3: {...} }`. That shape is what makes "two backends at once" impossible to express. See [Backends](../../backends/index.md) for the fields each backend takes.
 
 ### `encryption`
 
-The repository password, always given as a Secret reference. It is a sub-object
-(`encryption.passwordSecretRef`) rather than a bare field.
+The repository password, always given as a reference to a Secret. It is a sub-object, `encryption.passwordSecretRef`, rather than a bare field.
 
 ### `create`
 
-What to do when the repository does not yet exist in the backing storage. When
-absent (or disabled) the repository must already exist and the operator only
-connects. When enabled, the operator creates it with the given
-encryption/splitter/hash/ECC algorithms. Those `create.*` algorithm choices are
-**immutable after creation** — the apiserver and webhook reject changing them on an
-existing repository, because kopia fixes them into the repository format. (The
-`encryption` password Secret reference itself is *not* locked: renaming the Secret
-with identical content is allowed.)
+What to do when the repository does not exist yet in the backing storage.
+
+Leave `create` out, or disable it, and the repository must already exist. The operator then only connects to it. Enable it and the operator creates the repository using the encryption, splitter, hash and ECC algorithms you give.
+
+Those `create.*` algorithm choices are **immutable after creation**. The apiserver and the webhook reject a change to them on an existing repository, because kopia writes them into the repository format. The `encryption` password Secret reference is not locked, so you can rename the Secret as long as the password value stays the same.
 
 ### `seed`
 
-Initialize this repository from an existing replica on its **first** bootstrap —
-the disaster-recovery counterpart of `RepositoryReplication`. `seed.from` is a
-single-key one-of: `backend` (blob mode, `kopia repository sync-to` from a bare
-mirror backend, inheriting the mirror's format and password) or `repository`
-(migrate mode, `kopia snapshot migrate` from another `Repository`/`ClusterRepository`,
-which creates a local repository with its own format and password). Both preserve
-snapshot identities and times.
+Initialize this repository from an existing replica the **first** time it bootstraps. This is the disaster-recovery counterpart of `RepositoryReplication`.
 
-Armed only while `status.uniqueId` is unset **and** the mover's first connect finds
-the backend uninitialized; on an already-initialized repository it is a no-op
-(`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave standing in a
-GitOps manifest. Mode-specific tuning (`sync` for blob, `migrate` and
-`credentialProjection` for migrate) is rejected when paired with the other mode's
-source. `allowEmptySource` (default `false`) is the only way to accept a source
-holding zero snapshots. `failurePolicy.activeDeadlineSeconds` defaults to **86400**
-(24 h) while seeding, versus the 120 s a routine connect gets. See
-[Repositories → `seed`](../../repositories.md#seed--initialize-a-new-repository-from-a-replica).
+`seed.from` takes exactly one of two sources:
 
-Capping the copy differs by mode. Blob mode uses `sync.maxDownloadSpeedBytesPerSecond`
-/ `maxUploadSpeedBytesPerSecond` — `kopia repository sync-to` takes real speed
-flags. Migrate mode's `kopia snapshot migrate` takes **none**, so
-`migrate.throttle` is applied as `kopia repository throttle set` on each
-connection before the copy runs, **per side**: `throttle.source` caps the
-replica's read connection and `throttle.destination` this repository's write
-connection, each a [`throttle`](shared-types.md#moverdefaults) block
-(`uploadBytesPerSecond`, `downloadBytesPerSecond`, `readOpsPerSecond`,
-`writeOpsPerSecond`; every set knob must be `>= 1`, webhook-enforced). Each side
-**overrides that side's repository's `moverDefaults.throttle` field by field** —
-a knob set here wins, a knob left unset keeps the repository's value — and only
-while the seed is armed; later connects are capped by `moverDefaults.throttle`
-alone. Two repositories, two connections, two independent blocks: the replica cap
-says nothing about this repository's and vice versa. Applying a cap to the
-read-only replica connection is supported (kopia accepts `throttle set` there).
-See [Throttling a seed](../../repositories.md#throttling-a-seed).
+- `backend` is blob mode. Kopiur runs `kopia repository sync-to` from a bare mirror backend, and the new repository inherits the mirror's format and password.
+- `repository` is migrate mode. Kopiur runs `kopia snapshot migrate` from another `Repository` or `ClusterRepository`, and the new repository gets its own format and password.
+
+Both modes preserve snapshot identities and times.
+
+A seed only runs while `status.uniqueId` is unset **and** the mover's first connect finds the backend uninitialized. On an already-initialized repository it does nothing and reports `Seeded=True` with reason `AlreadyInitialized`, so it is safe to leave in a GitOps manifest forever.
+
+Tuning that belongs to one mode is rejected when you pair it with the other mode's source: `sync` belongs to blob mode, `migrate` and `credentialProjection` belong to migrate mode. `allowEmptySource` (default `false`) is the only way to accept a source that holds zero snapshots. While a seed runs, `failurePolicy.activeDeadlineSeconds` defaults to **86400** seconds, or 24 hours, instead of the 120 seconds a routine connect gets. See [Repositories → `seed`](../../repositories.md#seed--initialize-a-new-repository-from-a-replica).
+
+How you cap the copy depends on the mode.
+
+Blob mode uses `sync.maxDownloadSpeedBytesPerSecond` and `sync.maxUploadSpeedBytesPerSecond`, because `kopia repository sync-to` has real speed flags.
+
+Migrate mode has no such flags. `kopia snapshot migrate` accepts none, so Kopiur applies `migrate.throttle` with `kopia repository throttle set` on each connection before the copy starts, one side at a time. `throttle.source` caps the replica's read connection. `throttle.destination` caps this repository's write connection. Each is a [`throttle`](shared-types.md#moverdefaults) block holding `uploadBytesPerSecond`, `downloadBytesPerSecond`, `readOpsPerSecond` and `writeOpsPerSecond`. Every value you set must be `1` or greater, which the webhook enforces.
+
+Each side overrides **that side's** repository `moverDefaults.throttle` one field at a time: a value set here wins, and a value left unset keeps the repository's own. The override applies only while the seed is armed. Later connects are capped by `moverDefaults.throttle` alone. Two repositories means two connections and two independent blocks, so the cap on the replica says nothing about the cap on this repository, and the reverse. Capping the read-only replica connection works, because kopia accepts `throttle set` there. See [Throttling a seed](../../repositories.md#throttling-a-seed).
 
 ### `moverDefaults`
 
-Base mover configuration — security context, pod security context, resources,
-cache, `nodeSelector`/`tolerations`/`affinity`, `podLabels`/`podAnnotations`,
-Job TTL — inherited by **every** mover this repository spawns (bootstrap, backup,
-restore, maintenance). Each recipe can override fields per-mover; the merge is
-field-wise. See [Movers](../../movers.md) and
-[MoverDefaults](shared-types.md#moverdefaults).
+Base mover configuration inherited by **every** mover this repository starts: bootstrap, backup, restore and maintenance. It covers security context, pod security context, resources, cache, `nodeSelector`, `tolerations`, `affinity`, `podLabels`, `podAnnotations` and the Job TTL. Each recipe can override any field, and the two are merged one field at a time. See [Movers](../../movers.md) and [MoverDefaults](shared-types.md#moverdefaults).
 
 ### `scheduleDefaults`
 
-Repo-level scheduling defaults inherited at reconcile time by consumers that don't
-set their own equivalent field: `SnapshotPolicy.spec.verification`,
-`RepositoryReplication.spec.schedule`, `SnapshotReplication.spec.schedule`,
-`Maintenance.spec.schedule`, and `SnapshotSchedule.spec.schedule` all fall back to
-`scheduleDefaults.timezone` and `scheduleDefaults.jitter` when their own value is
-absent (the consuming cron's own value always wins). The fallback beneath
-`timezone` is UTC; beneath `jitter` there is none — absent at both levels means no
-spread. A `SnapshotSchedule` resolves its target policy's repository defaults,
-records both in `status.nextSchedule.{timezone,jitter}`, and is re-triggered by a
-repository referent watch when either default changes (recomputing the pinned
-slot). `jitter` is capped at 24h at admission.
-See [Repositories → `scheduleDefaults`](../../repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once)
-and [ScheduleDefaults](shared-types.md#scheduledefaults).
+Repository-wide scheduling defaults. Consumers that do not set their own equivalent field inherit them at reconcile time. That covers `SnapshotPolicy.spec.verification`, `RepositoryReplication.spec.schedule`, `SnapshotReplication.spec.schedule`, `Maintenance.spec.schedule` and `SnapshotSchedule.spec.schedule`, each of which falls back to `scheduleDefaults.timezone` and `scheduleDefaults.jitter` when its own value is missing. The cron's own value always wins.
+
+Below `timezone` the fallback is UTC. Below `jitter` there is no fallback, so a value missing at both levels means no spread at all.
+
+A `SnapshotSchedule` resolves the repository defaults of the policy it targets and records both in `status.nextSchedule.timezone` and `status.nextSchedule.jitter`. A watch on the repository re-triggers the schedule when either default changes, and the pinned slot is recomputed. `jitter` is capped at 24 hours at admission. See [Repositories → `scheduleDefaults`](../../repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once) and [ScheduleDefaults](shared-types.md#scheduledefaults).
 
 ### `concurrency`
 
-Concurrency limits for the mover Jobs this repository runs. `maxConcurrentJobs` is
-the ceiling; absent or `0` means unlimited (the default, and the behavior of every
-release before it existed). Backups, restores and the source side of both
-replication kinds share ONE pool; maintenance, verification, pin, batched snapshot
-deletions, bootstrap/catalog scans and browse sessions are excluded. Restores are
-always admitted but still occupy a slot.
-See [ConcurrencySpec](shared-types.md#concurrencyspec) and
-[Backups → limiting concurrent jobs per repository](../../backups.md#limiting-concurrent-jobs-per-repository).
+Limits on how many mover Jobs this repository runs at once. `maxConcurrentJobs` is the ceiling. Leave it out, or set `0`, for unlimited, which is the default and matches every release before the field existed.
+
+Backups, restores and the source side of both replication kinds share ONE pool. Maintenance, verification, pin, batched snapshot deletions, bootstrap and catalog scans, and browse sessions are all outside it. A restore is always admitted, but it still occupies a slot while it runs. See [ConcurrencySpec](shared-types.md#concurrencyspec) and [Backups → limiting concurrent jobs per repository](../../backups.md#limiting-concurrent-jobs-per-repository).
 
 ### `catalog`
 
-Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia
-catalog, keeping the etcd footprint sane for large repositories.
+Limits how many `Snapshot` objects with `origin: discovered` Kopiur creates from the kopia catalog. Use it to keep the etcd footprint sane on a large repository.
 
 ### `server`
 
-Optional kopia web-UI server, exposed via a `Service` in this Repository's own
-namespace. Presence of the block enables it. See [Server](../../server.md).
+An optional kopia web UI server, published through a `Service` in this repository's own namespace. Adding the block turns it on. See [Server](../../server.md).
 
 ### `maintenance`
 
-Maintenance control. Default-managed: when absent or `enabled: true`, the reconciler
-creates and owns a `Maintenance` CR for this repository in this namespace. An
-externally-authored `Maintenance` is always honored and never duplicated. See
-[Maintenance](../../maintenance.md).
+Maintenance control, managed by default. When this block is absent, or sets `enabled: true`, the reconciler creates and owns a `Maintenance` object for this repository in this namespace. A `Maintenance` you write yourself is always honored and never duplicated. See [Maintenance](../../maintenance.md).
 
 ### `onNamespaceDelete`
 
-What happens to this repository's snapshots when a consuming namespace is deleted.
-`Orphan` (default) keeps the snapshot history and releases ownership; `Delete`
-cascades per-`Snapshot` `deletionPolicy`. The default means `kubectl delete ns` does
-not destroy snapshots.
+What happens to this repository's snapshots when a namespace that uses it is deleted. `Orphan`, the default, keeps the snapshot history and gives up ownership. `Delete` cascades to each `Snapshot`'s own `deletionPolicy`. Because `Orphan` is the default, `kubectl delete ns` does not destroy snapshots.
 
 ### `mode`
 
-Access mode: `ReadWrite` (default) or `ReadOnly`. A `ReadOnly` repository serves
-restores only — the reconciler refuses backup Jobs and skips maintenance projection
-— useful for decommissioning or migration without write risk. See
-[Access modes](../../access-modes.md).
+Access mode: `ReadWrite`, the default, or `ReadOnly`. A `ReadOnly` repository serves restores only. The reconciler refuses backup Jobs and skips maintenance projection. Use it when decommissioning or migrating and you want no risk of a write. See [Access modes](../../access-modes.md).
 
 ### `suspend`
 
-Pause this repository declaratively (default `false`). A suspended repository skips
-connect/bootstrap and maintenance projection, and surfaces the state via a condition.
+Pause this repository from the manifest, default `false`. A suspended repository skips connect, bootstrap and maintenance projection, and reports the state in a condition.
 
 ### `health`
 
-Repository health thresholds — tuning for the warnings the reconciler raises about a
-degrading-but-still-usable repository.
+Thresholds for the warnings the reconciler raises about a repository that is degrading but still usable.
 
-- `health.indexBlobWarnThreshold` — the index-blob count above which the reconciler
-  raises the `IndexBlobHealth` condition plus a Warning event (maintenance isn't
-  compacting fast enough). Absent uses the built-in default (1000). `0` disables the
-  warning entirely; a negative value is rejected by the admission webhook.
+- `health.indexBlobWarnThreshold` is the index-blob count above which the reconciler raises the `IndexBlobHealth` condition and a Warning event, meaning maintenance is not compacting fast enough. Leave it out to use the built-in default of 1000. Set `0` to turn the warning off. A negative value is rejected by the admission webhook.
 
 ### `parameters`
 
-Mutable kopia repository parameters, re-applied whenever they drift from what the
-repository reports. Distinct from [`create`](#create), whose knobs are fixed at
-creation and immutable afterwards — these describe a live repository and are the
-point of `kopia repository set-parameters`.
+Kopia repository parameters that can change. Kopiur re-applies them whenever they drift from what the repository reports. These are different from [`create`](#create), whose settings are fixed when the repository is made and immutable afterwards. `parameters` describes a live repository and is what `kopia repository set-parameters` exists for.
 
-`parameters.epoch` tunes the epoch manager. kopia cannot compact an index blob until
-its epoch closes, and an epoch cannot close before `minDuration` regardless of how
-many blobs it holds — so on a busy repository this gate, not the maintenance
-schedule, is what pins the index-blob count high.
+`parameters.epoch` tunes the epoch manager. Kopia cannot compact an index blob until its epoch closes, and an epoch cannot close before `minDuration` no matter how many blobs it holds. On a busy repository that gate, not the maintenance schedule, is what keeps the index-blob count high.
 
-- `epoch.minDuration` — minimum epoch age before it may advance (kopia default `24h`).
-  A Go-style duration. **The gate**; lower it (e.g. `6h`) when blobs stay high despite
-  maintenance running.
-- `epoch.refreshFrequency` — how often clients re-read epoch state (kopia default `20m`).
-- `epoch.advanceOnCount` — index blobs that trigger an advance once past `minDuration`
-  (kopia default `20`).
-- `epoch.advanceOnSizeMiB` — index size that triggers an advance (kopia default `10`).
-  **Mebibytes**: `10` is 10485760 bytes, even though kopia's own log renders it as "MB".
-- `epoch.checkpointFrequency` — epochs between full index checkpoints (kopia default `7`).
-- `epoch.deleteParallelism` — parallelism for epoch cleanup deletions (kopia default `4`).
+- `epoch.minDuration` is the minimum age an epoch reaches before it may advance. Kopia's default is `24h`. Write it as a Go-style duration. This is the gate to lower, to `6h` for example, when blob counts stay high even though maintenance is running.
+- `epoch.refreshFrequency` is how often clients re-read epoch state. Kopia's default is `20m`.
+- `epoch.advanceOnCount` is the number of index blobs that triggers an advance once `minDuration` has passed. Kopia's default is `20`.
+- `epoch.advanceOnSizeMiB` is the index size that triggers an advance. Kopia's default is `10`. The unit is **mebibytes**, so `10` means 10485760 bytes, even though kopia's own log prints "MB".
+- `epoch.checkpointFrequency` is how many epochs pass between full index checkpoints. Kopia's default is `7`.
+- `epoch.deleteParallelism` is the parallelism used for epoch cleanup deletions. Kopia's default is `4`.
 
-Every field is optional and kopiur supplies no defaults of its own: **absent leaves
-kopia's current value untouched**, and removing a value you previously set does not
-restore kopia's default. Rejected at admission on a `mode: ReadOnly` repository —
-`set-parameters` is a repository-wide write kopia refuses on a read-only connection.
-See [Maintenance → index-blob health](../../maintenance.md#index-blob-health).
+Every field is optional and Kopiur adds no defaults of its own. Leaving a field out leaves kopia's current value alone, and removing a value you set earlier does not restore kopia's default. The whole block is rejected at admission on a `mode: ReadOnly` repository, because `set-parameters` is a repository-wide write that kopia refuses on a read-only connection. See [Maintenance → index-blob health](../../maintenance.md#index-blob-health).
 
 ## `status`
 
 ### `storageStats`
 
-Aggregate repository storage figures from the last catalog scan:
+Repository-wide storage figures from the last catalog scan.
 
-- `snapshotCount` — total snapshots present in the repository (across all identities).
-- `totalSize` — human-readable total on-disk size (e.g. `412Gi`).
-- `lastObservedAt` — RFC 3339 timestamp these stats were last observed.
-- `indexBlobCount` — number of content-index blobs observed at the last bootstrap.
-  kopia compacts these during maintenance; an unbounded climb means maintenance
-  isn't keeping up, and crossing `spec.health.indexBlobWarnThreshold` raises the
-  `IndexBlobHealth` warning. Also surfaced as the `IndexBlobs` print column.
+- `snapshotCount` is the total number of snapshots in the repository, across all identities.
+- `totalSize` is the total on-disk size in human-readable form, such as `412Gi`.
+- `lastObservedAt` is the RFC 3339 timestamp when these figures were last seen.
+- `indexBlobCount` is the number of content-index blobs seen at the last bootstrap. Kopia compacts these during maintenance. A count that climbs without limit means maintenance is not keeping up, and crossing `spec.health.indexBlobWarnThreshold` raises the `IndexBlobHealth` warning. It is also the `IndexBlobs` print column.
 
 ### `parameters`
 
-The kopia repository parameters actually **observed** at the last bootstrap — what the
-repository reports, not what `spec.parameters` asked for, so a declared value that
-failed to apply shows up here as a mismatch rather than as silence.
+The kopia repository parameters actually **seen** at the last bootstrap. This is what the repository reports, not what `spec.parameters` asked for, so a value you declared that failed to apply shows up here as a mismatch instead of silence.
 
-`parameters.epoch` mirrors the full epoch set (`enabled`, `minDuration`,
-`refreshFrequency`, `cleanupSafetyMargin`, `advanceOnCount`, `advanceOnSizeMiB`,
-`checkpointFrequency`, `deleteParallelism`), with durations rendered in the same
-Go-style grammar `spec` uses so the two are directly comparable.
+`parameters.epoch` mirrors the full epoch set: `enabled`, `minDuration`, `refreshFrequency`, `cleanupSafetyMargin`, `advanceOnCount`, `advanceOnSizeMiB`, `checkpointFrequency` and `deleteParallelism`. Durations use the same Go-style grammar `spec` uses, so you can compare the two directly.
 
-`cleanupSafetyMargin` appears here but is deliberately **not** settable: it is the grace
-window that stops kopia deleting index blobs a concurrent writer still needs.
+`cleanupSafetyMargin` appears here but you deliberately cannot set it. It is the grace window that stops kopia deleting index blobs a concurrent writer still needs.
 
 ### `catalog`
 
-Catalog-materialization status: `discoveredBackupCount` (how many `Snapshot` CRs
-were materialized from the scan) and `lastRefreshAt` (RFC 3339 timestamp of the last
-catalog refresh).
+Catalog status. `discoveredBackupCount` is how many `Snapshot` objects the scan created, and `lastRefreshAt` is the RFC 3339 timestamp of the last catalog refresh.
 
 ### `server`
 
-Resolved kopia server endpoint/auth, pinned by the reconciler. See
-[Server](../../server.md).
+The resolved kopia server endpoint and auth, pinned by the reconciler. See [Server](../../server.md).
 
 ### `seed`
 
-What the last seed attempt did. `startedAt` is the durable seed-attempt marker
-(stamped before the seeding Job is created, never cleared — it is what lets an
-interrupted seed resume instead of being mistaken for an ordinary adoption);
-`seededAt` is set once, when the seed completes. `mode` is `blob`/`migrate`,
-`source` is the rendered source (a backend discriminant, or `Kind/name`) and never
-a credential or a bucket path. `snapshotCount` is what the seed observed at the
-source; `snapshotsCopied` is migrate-only and **cumulative** — what is present
-after the run, including anything an interrupted earlier attempt had already
-moved. The matching condition is `Seeded`.
+What the last seed attempt did.
+
+`startedAt` is stamped before the seeding Job is created and never cleared. It is the durable marker that lets an interrupted seed resume instead of being mistaken for an ordinary adoption. `seededAt` is set once, when the seed completes. `mode` is `blob` or `migrate`. `source` is the rendered source, either a backend discriminant or `Kind/name`, and never a credential or a bucket path. `snapshotCount` is what the seed saw at the source. `snapshotsCopied` applies to migrate mode only and is **cumulative**: it counts what is present after the run, including anything an interrupted earlier attempt had already moved. The matching condition is `Seeded`.
 
 ### Other status fields
 
-- `phase` — lifecycle phase: `Pending`, `Initializing`, `Ready`, `Degraded`
-  (reachable but a sub-operation is failing — see conditions), or `Failed`
-  (connect/create failed — see conditions for the actionable reason).
-- `observedGeneration` — `metadata.generation` of the `spec` last reconciled; drives
-  staleness detection.
-- `resolvedCredentialVersion` — `resourceVersion` of the password Secret observed at
-  the last connect attempt; editing the Secret's content re-triggers a connect
-  rather than parking the repository `Failed` forever.
-- `uniqueId` — the kopia repository's unique ID.
-- `backend` — mirror of `spec.backend`'s discriminant for the print column.
-- `conditions` — standard Kubernetes conditions (e.g. `Connected`,
-  `MaintenanceOwned`).
+- `phase` is the lifecycle phase: `Pending`, `Initializing`, `Ready`, `Degraded` (the repository is reachable but a sub-operation is failing, so read the conditions), or `Failed` (connect or create failed, and the conditions name the reason).
+- `observedGeneration` is the `metadata.generation` of the `spec` last reconciled. It drives staleness detection.
+- `resolvedCredentialVersion` is the `resourceVersion` of the password Secret seen at the last connect attempt. Editing the Secret's content therefore re-triggers a connect instead of leaving the repository parked at `Failed`.
+- `uniqueId` is the kopia repository's unique ID. It is pinned on the **first** successful bootstrap and never rewritten by a health probe. Its presence is what makes auto-create a one-time event: `spec.create.enabled` governs the first bootstrap only, and once this field is set Kopiur will never create a fresh empty repository at this backend, however empty the backend becomes. A wiped backend therefore parks at `Failed` with reason `RepositoryReinitializeBlocked` instead of being re-created silently. See [`allow-reinitialize`](#annotations) below.
+- `backend` mirrors the `spec.backend` discriminant for the print column.
+- `conditions` holds the standard Kubernetes conditions, such as `Connected` and `MaintenanceOwned`.
+
+## Annotations
+
+- `kopiur.home-operations.com/allow-reinitialize` tells Kopiur that you meant to **re-initialize** a repository whose backend was wiped.
+
+  Set the value to the repository's current `status.uniqueId`, copied exactly. Kopiur honors the annotation only while the two match, and that is what makes it expire on its own: a successful re-initialize mints a new ID, the old value stops matching, and a copy left behind in a GitOps manifest can never authorize a second wipe.
+
+  It also does nothing on a healthy repository. The acknowledgement becomes permission to create only after the repository has left `Ready`, so it can never turn a routine health probe into a re-create.
+
+  A value that does not match the pin is ignored. While the repository is not `Ready`, a mismatch also raises a Warning event, `InvalidReinitializeAck`, naming the value Kopiur expects. Kopiur never writes, rewrites or removes this annotation. Full procedure: [Deliberately re-initialize a wiped repository](../../repository-health.md#deliberately-re-initialize-a-wiped-repository).
+
+- `kopiur.home-operations.com/allow-mass-deletion` acknowledges a pending mass-deletion wave. See [the mass-deletion circuit breaker](../../repositories.md#deletionprotection--the-mass-deletion-circuit-breaker).

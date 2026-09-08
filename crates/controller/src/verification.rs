@@ -665,6 +665,7 @@ pub fn build_verify_work_spec(
             kind: "SnapshotPolicy".to_string(),
             name: policy_name.to_string(),
             namespace: namespace.to_string(),
+            claim_key: None,
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),

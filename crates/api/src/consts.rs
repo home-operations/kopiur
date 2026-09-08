@@ -146,6 +146,26 @@ pub const PRUNED_BY_ANNOTATION: &str = "kopiur.home-operations.com/pruned-by";
 /// an unparseable value is ignored (Warning event on the repository).
 pub const ALLOW_MASS_DELETION_ANNOTATION: &str = "kopiur.home-operations.com/allow-mass-deletion";
 
+/// Acknowledges a deliberate RE-INITIALIZATION of a `Repository`/`ClusterRepository`
+/// whose backend was wiped: kopiur refuses to auto-create a fresh kopia repository
+/// over a once-`Ready` one (the pinned `status.uniqueId`), and this annotation is
+/// the human "yes, I know the history is gone — make a new one".
+///
+/// Value: the repository's CURRENT `status.uniqueId`, verbatim. Honored only while
+/// it equals that pin, which is what makes it **self-expiring**: the moment the
+/// re-initialize succeeds a NEW unique id is minted, the annotation no longer
+/// matches, and the ack is inert — so a copy left behind in a GitOps manifest can
+/// never authorize a second wipe. Contrast with
+/// [`ALLOW_MASS_DELETION_ANNOTATION`] (an RFC3339 timestamp, compared against each
+/// pending deletion) and with [`ALLOW_IDENTITY_CHANGE_ANNOTATION`] (presence-only,
+/// consumed at a single admission instant): this one is read continuously by the
+/// controller, so it needs a value that goes stale on its own. kopiur never writes
+/// or removes it — there is no "honored" stamp to keep in sync.
+///
+/// A value that is present but does NOT match the pin is ignored (fail-safe) and
+/// raises one Warning event naming the expected value.
+pub const ALLOW_REINITIALIZE_ANNOTATION: &str = "kopiur.home-operations.com/allow-reinitialize";
+
 /// The API version string for kopiur CRDs (used in mover `TargetRef`s and
 /// `kubectl -o name`-style output).
 pub const API_VERSION: &str = "kopiur.home-operations.com/v1alpha1";
@@ -675,6 +695,7 @@ mod tests {
             ALLOW_IDENTITY_CHANGE_ANNOTATION,
             PRUNED_BY_ANNOTATION,
             ALLOW_MASS_DELETION_ANNOTATION,
+            ALLOW_REINITIALIZE_ANNOTATION,
             PRIVILEGED_MOVERS_ANNOTATION,
             REPO_POOL_LABEL,
         ] {

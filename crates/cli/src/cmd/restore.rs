@@ -81,6 +81,9 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
             namespace: args.policy_namespace.clone(),
             as_of: args.as_of.clone(),
             offset: args.offset.unwrap_or(0),
+            // The per-PVC path override (#443): `--source-path`, fromPolicy only
+            // (clap rejects it beside any other source at parse time).
+            source_path: args.source_path.clone(),
         }),
         (None, None, Some(identity)) => RestoreSource::Identity(IdentitySource {
             username: identity.username.clone(),
@@ -176,14 +179,43 @@ pub fn terminal(restore: &Restore) -> Option<Result<Box<Restore>, Box<Restore>>>
     }
 }
 
+/// What one claim's pin says it restored, for the success summary: the kopia
+/// snapshot id, or "empty volume" for a pinned deploy-or-restore `NoSnapshot`
+/// decision, or `?` when nothing was recorded. Pure.
+fn pinned_outcome(resolved: Option<&kopiur_api::restore::ResolvedRestore>) -> String {
+    match resolved.and_then(|r| r.resolution) {
+        Some(kopiur_api::ResolutionOutcome::NoSnapshot) => "empty volume (no snapshot)".into(),
+        Some(kopiur_api::ResolutionOutcome::Snapshot) | None => resolved
+            .and_then(|r| r.kopia_snapshot_id.as_deref())
+            .map(|id| format!("kopia id {id}"))
+            .unwrap_or_else(|| "kopia id ?".into()),
+    }
+}
+
 /// One-line success summary from the terminal object's status.
+///
+/// A populator's state lives PER CLAIM under `status.claims.<pvc>` (#443), so
+/// a fanned-out restore lists each claim's own kopia id and target rather than
+/// the top-level mirror — which is absent with several claims and would read
+/// `kopia id ?` (review wave 2, finding 8). A direct restore (no claims) keeps
+/// the classic top-level shape.
 pub fn success_summary(restore: &Restore) -> String {
     let status = restore.status.as_ref();
     let name = restore.metadata.name.as_deref().unwrap_or("?");
-    let id = status
-        .and_then(|s| s.resolved.as_ref())
-        .and_then(|r| r.kopia_snapshot_id.as_deref())
-        .unwrap_or("?");
+    let claims = status.map(|s| &s.claims).filter(|c| !c.is_empty());
+    if let Some(claims) = claims {
+        let per_claim: Vec<String> = claims
+            .iter()
+            .map(|(pvc, claim)| format!("pvc/{pvc}: {}", pinned_outcome(claim.resolved.as_ref())))
+            .collect();
+        let n = claims.len();
+        return format!(
+            "restore {name} completed: {n} claim{} — {}\n",
+            if n == 1 { "" } else { "s" },
+            per_claim.join("; ")
+        );
+    }
+    let id = pinned_outcome(status.and_then(|s| s.resolved.as_ref()));
     let bytes = status
         .and_then(|s| s.progress.as_ref())
         .and_then(|p| p.bytes_restored)
@@ -199,21 +231,74 @@ pub fn success_summary(restore: &Restore) -> String {
         .and_then(|t| t.pvc_ref.as_ref())
         .map(|p| format!("pvc/{}", p.name))
         .unwrap_or_else(|| "target".into());
-    format!("restore {name} completed: kopia id {id}, {bytes} / {files} files into {target}\n")
+    format!("restore {name} completed: {id}, {bytes} / {files} files into {target}\n")
 }
 
-/// Failure detail from the terminal object's status, for stderr.
-pub fn failure_detail(restore: &Restore) -> String {
-    let name = restore.metadata.name.as_deref().unwrap_or("?");
-    let mut out = format!("restore {name} failed");
-    if let Some(f) = restore.status.as_ref().and_then(|s| s.failure.as_ref()) {
+/// Render one failure block + log tail pair (the mover's last words), shared by
+/// the direct and per-claim shapes. Pure.
+fn push_failure_and_tail(
+    out: &mut String,
+    failure: Option<&kopiur_api::common::FailureBlock>,
+    log_tail: Option<&str>,
+) {
+    if let Some(f) = failure {
         out.push_str(&format!(" ({}): {}", f.kopia_error_class, f.message));
         if let Some(stderr) = &f.stderr_tail {
             out.push_str(&format!("\n--- kopia stderr tail ---\n{stderr}"));
         }
     }
-    if let Some(tail) = restore.status.as_ref().and_then(|s| s.log_tail.as_ref()) {
+    if let Some(tail) = log_tail {
         out.push_str(&format!("\n--- log tail ---\n{tail}"));
+    }
+}
+
+/// Failure detail from the terminal object's status, for stderr.
+///
+/// Per claim for a populator (#443, review wave 2 finding 8): with ONE claim
+/// the detail is that claim's own `failure`/`logTail`; with several, a
+/// per-claim list ("claim <pvc>: <reason> — <message>") with each failed
+/// claim's failure block and tail beneath it, so the user sees WHICH claim
+/// stalled the restore. A direct restore reads the top-level fields.
+pub fn failure_detail(restore: &Restore) -> String {
+    let name = restore.metadata.name.as_deref().unwrap_or("?");
+    let status = restore.status.as_ref();
+    let mut out = format!("restore {name} failed");
+    let claims = status.map(|s| &s.claims).filter(|c| !c.is_empty());
+    match claims {
+        None => push_failure_and_tail(
+            &mut out,
+            status.and_then(|s| s.failure.as_ref()),
+            status.and_then(|s| s.log_tail.as_deref()),
+        ),
+        Some(claims) if claims.len() == 1 => {
+            let (pvc, claim) = claims.iter().next().expect("one claim");
+            out.push_str(&format!(" (claim {pvc})"));
+            push_failure_and_tail(&mut out, claim.failure.as_ref(), claim.log_tail.as_deref());
+        }
+        Some(claims) => {
+            for (pvc, claim) in claims {
+                let phase = claim
+                    .phase
+                    .as_ref()
+                    .map(|p| serde_json::to_value(p).ok())
+                    .and_then(|v| v.and_then(|v| v.as_str().map(str::to_string)))
+                    .unwrap_or_else(|| "?".into());
+                out.push_str(&format!(
+                    "\nclaim {pvc}: {phase}/{} — {}",
+                    claim.reason.as_deref().unwrap_or("?"),
+                    claim.message.as_deref().unwrap_or("")
+                ));
+                let mut detail = String::new();
+                push_failure_and_tail(
+                    &mut detail,
+                    claim.failure.as_ref(),
+                    claim.log_tail.as_deref(),
+                );
+                if !detail.is_empty() {
+                    out.push_str(&format!("\n  claim {pvc} detail{detail}"));
+                }
+            }
+        }
     }
     out.push('\n');
     out
@@ -414,6 +499,47 @@ mod tests {
         // time with flag-level wording instead.
         let err = parse_err(&["--from-policy", "p", "--create-pvc", "x"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// `--source-path` (#443 review wave 2, finding 3b): the per-PVC path
+    /// override, fromPolicy only. It is what restores a selector-policy member
+    /// into a differently-named PVC.
+    #[test]
+    fn source_path_lands_on_from_policy_and_is_refused_with_other_sources() {
+        let args = parse(&[
+            "--from-policy",
+            "nightly",
+            "--source-path",
+            "/pvc/postgres-data",
+            "--to-pvc",
+            "scratch",
+        ]);
+        let restore = build_restore(&args, "media", at());
+        match &restore.spec.source {
+            RestoreSource::FromPolicy(p) => {
+                assert_eq!(p.source_path.as_deref(), Some("/pvc/postgres-data"));
+            }
+            other => panic!("expected fromPolicy, got {other:?}"),
+        }
+        // Absent ⇒ absent on the wire (the derivation applies).
+        let bare = parse(&["--from-policy", "nightly", "--to-pvc", "scratch"]);
+        match &build_restore(&bare, "media", at()).spec.source {
+            RestoreSource::FromPolicy(p) => assert!(p.source_path.is_none()),
+            other => panic!("expected fromPolicy, got {other:?}"),
+        }
+        // Any other source: a parse-time error, not a silently dropped flag.
+        for source in [
+            &["--from-snapshot", "snap1"][..],
+            &["--identity", "u@h:/data", "--repository", "r"][..],
+        ] {
+            let mut argv = source.to_vec();
+            argv.extend(["--source-path", "/pvc/x", "--to-pvc", "d"]);
+            let err = parse_err(&argv);
+            assert!(
+                err.to_string().contains("--source-path"),
+                "{source:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -686,6 +812,141 @@ mod tests {
         }
         assert!(matches!(terminal(&with_phase("Completed")), Some(Ok(_))));
         assert!(matches!(terminal(&with_phase("Failed")), Some(Err(_))));
+    }
+
+    /// A fanned-out populator (#443) with two claims: one restored, one
+    /// deploy-or-restore'd empty. Reused by the success and failure renderers.
+    fn two_claims(phase: &str, claims: serde_json::Value) -> Restore {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Restore",
+            "metadata": { "name": "app" },
+            "spec": {
+                "source": { "fromPolicy": { "name": "cfg" } },
+                "target": { "populator": {} }
+            },
+            "status": { "phase": phase, "claims": claims }
+        }))
+        .unwrap()
+    }
+
+    /// Review wave 2, finding 8: the CLI reads the PER-CLAIM records. With
+    /// several claims the top-level `resolved` is absent by design, so the old
+    /// renderer printed `kopia id ?`; now each claim's own id and target is listed.
+    #[test]
+    fn success_summary_lists_every_claims_own_id_and_target() {
+        let restore = two_claims(
+            "Completed",
+            serde_json::json!({
+                "data": {
+                    "phase": "Populated", "reason": "RestoreSucceeded",
+                    "resolved": { "resolution": "Snapshot", "kopiaSnapshotID": "abc123" }
+                },
+                "logs": {
+                    "phase": "Populated", "reason": "NoSnapshotContinue",
+                    "resolved": { "resolution": "NoSnapshot" }
+                }
+            }),
+        );
+        assert_eq!(
+            success_summary(&restore),
+            "restore app completed: 2 claims — pvc/data: kopia id abc123; \
+             pvc/logs: empty volume (no snapshot)\n"
+        );
+        // One claim: still its OWN record, never `kopia id ?`.
+        let one = two_claims(
+            "Completed",
+            serde_json::json!({
+                "data": {
+                    "phase": "Populated", "reason": "RestoreSucceeded",
+                    "resolved": { "resolution": "Snapshot", "kopiaSnapshotID": "abc123" }
+                }
+            }),
+        );
+        assert_eq!(
+            success_summary(&one),
+            "restore app completed: 1 claim — pvc/data: kopia id abc123\n"
+        );
+    }
+
+    /// Review wave 2, finding 8: a failed fan-out names WHICH claim failed, with
+    /// that claim's failure block and log tail; the healthy sibling is listed
+    /// without detail. One claim reads its own record directly.
+    #[test]
+    fn failure_detail_is_per_claim() {
+        let restore = two_claims(
+            "Failed",
+            serde_json::json!({
+                "data": {
+                    "phase": "Populated", "reason": "RestoreSucceeded",
+                    "message": "restored"
+                },
+                "logs": {
+                    "phase": "Failed", "reason": "MoverJobFailed",
+                    "message": "the populator restore mover Job `app-populate-deadbeef` failed",
+                    "failure": {
+                        "kopiaErrorClass": "PermissionDenied",
+                        "message": "kopia: cannot write /data",
+                        "retryRecommended": false,
+                        "stderrTail": "ERROR permission denied"
+                    },
+                    "logTail": "mover: restore failed"
+                }
+            }),
+        );
+        let text = failure_detail(&restore);
+        assert_eq!(
+            text,
+            "restore app failed\n\
+             claim data: Populated/RestoreSucceeded — restored\n\
+             claim logs: Failed/MoverJobFailed — the populator restore mover Job \
+             `app-populate-deadbeef` failed\n  \
+             claim logs detail (PermissionDenied): kopia: cannot write /data\n\
+             --- kopia stderr tail ---\nERROR permission denied\n\
+             --- log tail ---\nmover: restore failed\n"
+        );
+
+        let one = two_claims(
+            "Failed",
+            serde_json::json!({
+                "logs": {
+                    "phase": "Failed", "reason": "MoverJobFailed",
+                    "failure": {
+                        "kopiaErrorClass": "PermissionDenied",
+                        "message": "kopia: cannot write /data",
+                        "retryRecommended": false
+                    },
+                    "logTail": "mover: restore failed"
+                }
+            }),
+        );
+        assert_eq!(
+            failure_detail(&one),
+            "restore app failed (claim logs) (PermissionDenied): kopia: cannot write /data\n\
+             --- log tail ---\nmover: restore failed\n"
+        );
+
+        // A direct restore keeps reading the top-level fields.
+        let direct: Restore = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Restore",
+            "metadata": { "name": "r" },
+            "spec": {
+                "source": { "snapshotRef": { "name": "s" } },
+                "target": { "pvcRef": { "name": "d" } }
+            },
+            "status": {
+                "phase": "Failed",
+                "failure": { "kopiaErrorClass": "AuthFailure", "message": "bad password",
+                             "retryRecommended": false },
+                "logTail": "tail"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            failure_detail(&direct),
+            "restore r failed (AuthFailure): bad password\n--- log tail ---\ntail\n"
+        );
     }
 
     #[test]

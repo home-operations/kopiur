@@ -16,10 +16,11 @@
 //! controller-side: they are remediation copy, not wire contract.
 
 pub use kopiur_api::consts::{
-    ALLOW_MASS_DELETION_ANNOTATION, API_VERSION, BLOCKED_ON_UNREADABLE_RUN_REASON, CONFIG_LABEL,
-    CREDENTIALS_AVAILABLE_CONDITION, DELETION_HELD_CONDITION, FANOUT_TOO_LARGE_REASON,
-    INDEX_BLOB_HEALTH_CONDITION, MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL,
-    MANAGED_BY_VALUE, MASS_DELETION_BREAKER_REASON, MASS_DELETION_HELD_CONDITION,
+    ALLOW_MASS_DELETION_ANNOTATION, ALLOW_REINITIALIZE_ANNOTATION, API_VERSION,
+    BLOCKED_ON_UNREADABLE_RUN_REASON, CONFIG_LABEL, CREDENTIALS_AVAILABLE_CONDITION,
+    DELETION_HELD_CONDITION, FANOUT_TOO_LARGE_REASON, INDEX_BLOB_HEALTH_CONDITION,
+    MAINTENANCE_CONFIGURED_CONDITION, MANAGED_BY_LABEL, MANAGED_BY_VALUE,
+    MASS_DELETION_BREAKER_REASON, MASS_DELETION_HELD_CONDITION,
     MASS_DELETION_THRESHOLD_EXCEEDED_REASON, MISSING_CA_BUNDLE_REASON, MISSING_CREDENTIALS_REASON,
     MISSING_SERVICE_ACCOUNT_REASON, MOVER_PERMITTED_CONDITION, OP_LABEL, OP_RESTORE,
     OP_RESTORE_TARGET, ORIGIN_LABEL, PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
@@ -316,6 +317,61 @@ pub const ORPHANED_PRIME_REAPED_REASON: &str = "OrphanedPrimePvcReaped";
 /// `action` for the already-bound no-op / orphan-reap Events: to actually restore into the
 /// claim, delete it and let it be recreated (keeping its `dataSourceRef`).
 pub const RECREATE_CLAIM_TO_RESTORE_ACTION: &str = "RecreateClaimToRestore";
+
+// --- #443: the fanned-out populator's per-claim vocabulary ------------------
+//
+// A populator `Restore` is claimed by EVERY PVC whose `dataSourceRef` names it,
+// and each claim carries its own `status.claims.<pvc>.reason`. These were inline
+// string literals while there was only ever one claim to report on; a per-claim
+// record re-reads them (`plan::ClaimReason`), and a reason that is compared as
+// well as written has to have exactly one spelling.
+
+/// `Restore` claim reason while no PVC claims a populator at all (also the
+/// Restore-level `AwaitingClaim=True` reason). The wait window has not opened.
+pub const AWAITING_PVC_DATA_SOURCE_REF_REASON: &str = "AwaitingPvcDataSourceRef";
+/// `Restore` claim reason while a `WaitForFirstConsumer` claimant has no
+/// `volume.kubernetes.io/selected-node` yet: the scheduler has not placed a pod
+/// on it, so the prime PVC has no topology to be provisioned into. Per-claim
+/// since #443 — one unscheduled claimant no longer parks its siblings.
+pub const AWAITING_POD_SCHEDULE_REASON: &str = "AwaitingPodSchedule";
+/// `Restore` reason while the source snapshot has not appeared yet and the
+/// `policy.waitTimeout` window is still open.
+pub const WAITING_FOR_SNAPSHOT_REASON: &str = "WaitingForSnapshot";
+/// `Restore` reason while its repository is not `Ready` (backend unreachable).
+pub const RESTORE_REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
+/// `Restore` reason once the source resolved to a concrete snapshot.
+pub const RESTORE_SOURCE_RESOLVED_REASON: &str = "SourceResolved";
+/// `Restore` reason while a claim's mover `Job` is writing its prime PVC.
+pub const POPULATING_PRIME_PVC_REASON: &str = "PopulatingPrimePvc";
+/// `Restore` reason for a deliberate deploy-or-restore: no snapshot matched and
+/// `onMissingSnapshot: Continue` chose an empty volume.
+pub const NO_SNAPSHOT_CONTINUE_REASON: &str = "NoSnapshotContinue";
+/// `Restore` failure reason when the mover `Job` failed.
+pub const MOVER_JOB_FAILED_REASON: &str = "MoverJobFailed";
+/// `Restore` failure reason when the mover `Job`'s pod could not be scheduled or
+/// started within its deadline.
+pub const MOVER_POD_WEDGED_REASON: &str = "MoverPodWedged";
+/// `Restore` failure reason when `onMissingSnapshot: Fail` fired.
+pub const RESTORE_SNAPSHOT_NOT_FOUND_REASON: &str = "SnapshotNotFound";
+/// `Restore` claim failure reason when the per-PVC kopia source path cannot be
+/// derived from the policy (selector sources that disagree on
+/// `sourcePathStrategy`/`sourcePathOverride`, or share one override). Fails
+/// closed: restoring with no path matches the newest snapshot of ANY member and
+/// could fill the volume with another volume's data (#443).
+pub const SOURCE_PATH_AMBIGUOUS_REASON: &str = "SourcePathAmbiguous";
+/// `Restore` `AwaitingClaim=False` reason once at least one PVC claims a
+/// populator: the per-claim records in `status.claims` are now the story.
+pub const CLAIMS_OBSERVED_REASON: &str = "ClaimsObserved";
+/// `Restore` claim reason when our rebind was issued but a DIFFERENT volume won
+/// the claim, so the handover is lost and can never complete. The restored data
+/// is on a PV kept under a forced `Retain` — see `plan::lost_rebind_message`.
+pub const LOST_REBIND_REASON: &str = "LostRebind";
+/// `Restore` `Stalled` reason when at least one claim of a fanned-out populator
+/// terminally failed. Deliberately ONE stable string rather than the failing
+/// claim's own reason: the aggregate condition would otherwise churn as
+/// different claims failed, and the per-claim reasons are in the message (and in
+/// `status.claims`) where they belong.
+pub const RESTORE_CLAIM_FAILED_REASON: &str = "ClaimFailed";
 /// Event `action` (remediation hint) for
 /// [`RESTORE_REFERENT_MISSING_REASON`]: create the referenced object, or repoint
 /// the `Restore` at one that exists. Published on the park TRANSITION only (the
@@ -575,6 +631,46 @@ pub const REPOSITORY_NOT_INITIALIZED_REASON: &str = "RepositoryNotInitialized";
 /// `action` (remediation hint) for [`REPOSITORY_NOT_INITIALIZED_REASON`]: enable
 /// repository creation (or point at an existing repository).
 pub const ENABLE_CREATE_ACTION: &str = "EnableRepositoryCreate";
+
+/// Machine-readable `reason` (condition + Warning Event) when a bootstrap connect
+/// found **no** repository at the backend but this repository has been `Ready`
+/// before (a pinned `status.uniqueId`), so kopiur refuses to create a fresh empty
+/// one over it (issue #435). The sibling of [`REPOSITORY_NOT_INITIALIZED_REASON`]
+/// and deliberately distinct from it: the fix is NOT `spec.create.enabled: true`
+/// (which may well already be true) — it is either restoring the backend or
+/// acknowledging the wipe via
+/// [`ALLOW_REINITIALIZE_ANNOTATION`].
+pub const REPOSITORY_REINITIALIZE_BLOCKED_REASON: &str = "RepositoryReinitializeBlocked";
+/// `action` for [`REPOSITORY_REINITIALIZE_BLOCKED_REASON`]: acknowledge the wipe
+/// with the uniqueId-valued `allow-reinitialize` annotation (the condition
+/// message carries the exact `kubectl annotate` command).
+pub const ACKNOWLEDGE_REINITIALIZE_ACTION: &str = "AcknowledgeReinitialize";
+/// Machine-readable Event `reason` when [`ALLOW_REINITIALIZE_ANNOTATION`] is
+/// present but does not equal the pinned `status.uniqueId`: the ack is ignored
+/// (fail-safe) and the event names the value kopiur expects.
+pub const INVALID_REINITIALIZE_ACK_REASON: &str = "InvalidReinitializeAck";
+/// Normal Event `reason` when a VALID [`ALLOW_REINITIALIZE_ANNOTATION`] is
+/// present but the repository connected fine — the backend is not empty, so
+/// there is nothing to re-initialize and kopiur wiped nothing. Emitted so the
+/// user knows the ack was seen rather than silently ignored.
+pub const REINITIALIZE_ACK_IGNORED_REPOSITORY_PRESENT_REASON: &str =
+    "ReinitializeAckIgnoredRepositoryPresent";
+/// Warning Event `reason` when a VALID [`ALLOW_REINITIALIZE_ANNOTATION`] is
+/// present on a repository that is NOT `Ready`, but whose parked verdict is not
+/// the wiped-repository one (`RepositoryReinitializeBlocked` / the breaker's
+/// `RepositoryVanished`) — an unreachable backend, a wrong password, a deadline,
+/// an unbound mount. The ack is DORMANT there by design (review wave 2, finding
+/// 1a: an ack left in a GitOps manifest must never re-initialize over a later,
+/// unrelated excursion), and this event names the verdict that keeps it so.
+pub const REINITIALIZE_ACK_DORMANT_REASON: &str = "ReinitializeAckDormant";
+
+/// The bootstrap Job annotation recording the `allow-reinitialize` ack value the
+/// launch was made with — the ack-side twin of
+/// [`BOOTSTRAP_GENERATION_ANNOTATION`]. An annotation edit does not bump
+/// `metadata.generation`, so without this stamp a terminal bootstrap Job would
+/// keep being re-read (and its stale "reinitialize blocked" verdict re-published)
+/// until the kube TTL reaped it, ignoring a freshly-applied ack for minutes.
+pub const BOOTSTRAP_REINIT_ACK_ANNOTATION: &str = "kopiur.home-operations.com/bootstrap-reinit-ack";
 
 /// `action` for the source-side `spec.seed` failures (issue #380): the seed
 /// source is not usable — a mis-pointed bucket/prefix, or a mirror that was

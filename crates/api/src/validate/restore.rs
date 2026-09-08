@@ -26,6 +26,13 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
         RestoreSource::SnapshotRef(_) => {}
         RestoreSource::FromPolicy(c) => {
             validate_as_of("restore.source.fromPolicy.asOf", c.as_of.as_deref())?;
+            // The per-PVC source-path override (#443). Same shape check as
+            // `IdentitySource::sourcePath` and as the resolved path the identity
+            // kernel emits, so a value the webhook admits can never be rejected
+            // later by `resolve_identity`'s own `validate_source_path`.
+            if let Some(p) = c.source_path.as_deref() {
+                crate::validate::validate_source_path("restore.source.fromPolicy.sourcePath", p)?;
+            }
         }
         RestoreSource::Identity(i) => {
             validate_as_of("restore.source.identity.asOf", i.as_of.as_deref())?;

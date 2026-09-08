@@ -315,20 +315,21 @@ serviceAccount:
 # See docs/feature-permissions.md for the full mapping and security trade-offs.
 features:
   credentialProjection:
-    # -- Grant the operator `secrets` create+patch+delete so
-    # `spec.credentialProjection` works: the operator copies a repository's
-    # credential Secret(s) into each mover Job's namespace (the chief win is a shared
-    # ClusterRepository whose Secret is pinned to one namespace) and cleans its
-    # copies up again (legacy-copy sweep, reap-on-shrink, reap-on-disable).
+    # -- Enable `spec.credentialProjection` (copy a repository's credential
+    # Secret(s) into each mover Job's namespace) by granting the operator `secrets`
+    # create+patch+delete. The chief win is a shared ClusterRepository whose Secret
+    # is pinned to one namespace; the operator also cleans its copies up again
+    # (legacy-copy sweep, reap-on-shrink, reap-on-disable).
     # SECURITY TRADE-OFF: `create` cannot be scoped to a Secret name, so the
     # operator can write a Secret in any namespace it manages.
     enabled: false
   kopiaUi:
-    # -- Grant the operator `secrets` create+patch+delete so `spec.server` (the
-    # kopia web-UI) works: it creates a generated-auth Secret, mirrors each of a
-    # ClusterRepository's credential Secrets into the server namespace, and deletes
-    # all of them on teardown. SECURITY TRADE-OFF: grants unscoped create/delete on
-    # Secrets in any namespace the operator manages.
+    # -- Enable `spec.server` (the kopia web-UI) by granting the operator `secrets`
+    # create+patch+delete. The server needs a generated-auth Secret, a mirror of
+    # each of a ClusterRepository's credential Secrets in the server namespace, and
+    # deletion of all of them on teardown.
+    # SECURITY TRADE-OFF: grants unscoped create/delete on Secrets in any namespace
+    # the operator manages.
     enabled: false
 
 # =============================================================================

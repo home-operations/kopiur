@@ -152,6 +152,7 @@ pub(super) fn build_backup_run(
             kind: "Snapshot".to_string(),
             name: _name.to_string(),
             namespace: namespace.to_string(),
+            claim_key: None,
         },
         // Observability only: the CONTROLLER executes hooks around this Job
         // (ADR §4.8); the summary lets the mover/work-spec show what ran.

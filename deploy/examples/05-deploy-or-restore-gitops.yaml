@@ -15,6 +15,10 @@
 #   * PVC            — references the passive Restore via spec.dataSourceRef.
 #
 # `onMissingSnapshot: Continue` is the DEFAULT for fromPolicy; shown explicitly.
+#
+# Several PVCs? See 44-multi-pvc-deploy-or-restore.yaml. You still write ONE
+# Restore: a populator Restore is claimed by EVERY PVC whose dataSourceRef names
+# it, and each claim is populated from its own per-PVC kopia source path.
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy

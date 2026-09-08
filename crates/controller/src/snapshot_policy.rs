@@ -2173,6 +2173,81 @@ pub fn config_identity(
     kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))
 }
 
+/// [`config_identity`] with the kopia source path chosen by the CALLER (#443).
+///
+/// This is the restore side of a selector policy. `config_identity` derives the
+/// path from `sources.first()`, which for a `pvcSelector` policy has no `pvc` at
+/// all — so it resolves a PATHLESS identity, whose kopia filter (`user@host:`)
+/// matches every member path and takes the newest of them. Restoring one PVC of
+/// a multi-PVC policy could therefore fill it with another PVC's data. The
+/// restore reconciler derives the right member path with
+/// `kopiur_api::expand::restore_source_path` and passes it here.
+///
+/// The input shape mirrors the BACKUP side (`snapshot::build::resolve_identity_for`)
+/// rather than `config_identity`'s: the derived path goes in as
+/// `source_path_override` so the identity kernel uses it VERBATIM instead of
+/// re-deriving `/pvc/<name>` from a PVC name, which is exactly what the backup
+/// did when it wrote the snapshot. `pvc_name`/`default_source_path` still come
+/// from the governing source and are inert whenever a path is supplied.
+///
+/// CEL cannot be affected: the identity context exposes only
+/// `namespace`/`policyName`/`labels`/`annotations`/`cluster`, and the path
+/// override is applied after both name renders.
+///
+/// `source_path: None` reproduces [`config_identity`] exactly — including its
+/// tolerance of a zero-source legacy policy — except that a policy which HAS
+/// sources but derives no path falls back to `/data`, the same fallback the
+/// mover identity takes on the backup side, so the two agree on what such a
+/// policy was recorded under.
+///
+/// **Callers MUST pass the derived path for any policy carrying a `pvcSelector`
+/// source.** A selector source has no `pvc`, no `nfs` and no override, so
+/// `None` there does NOT reproduce `config_identity`'s pathless identity: it
+/// takes the `/data` fallback, a path a selector policy was never recorded
+/// under (the backup side always passes a per-member fan-out pin), so every
+/// lookup misses. Fail closed on
+/// [`kopiur_api::expand::restore_source_path`]'s error instead of calling this
+/// with `None` — that is the #443 cross-volume guard, and the fan-out driver
+/// does exactly that.
+pub fn config_identity_for_path(
+    config: &SnapshotPolicy,
+    namespace: &str,
+    defaults: Option<&kopiur_api::IdentityDefaults>,
+    source_path: Option<&str>,
+) -> Result<kopiur_api::common::ResolvedIdentity> {
+    let first = config.spec.sources.first();
+    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
+    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
+    // The caller's derived path wins; without one, the governing source's own
+    // `sourcePathOverride` still applies exactly as `config_identity` applies it.
+    let source_path_override = match source_path {
+        Some(p) => Some(p.to_string()),
+        None => first.and_then(|s| s.source_path_override.clone()),
+    };
+    let inputs = kopiur_api::IdentityInputs {
+        object_name: &config.name_any(),
+        namespace,
+        overrides: config.spec.identity.as_ref(),
+        defaults,
+        labels: config.metadata.labels.as_ref(),
+        annotations: config.metadata.annotations.as_ref(),
+        pvc_name: pvc_name.as_deref(),
+        default_source_path: nfs_source_path.as_deref(),
+        source_path_override: source_path_override.as_deref(),
+    };
+    let mut resolved =
+        kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))?;
+    if resolved.source_path.is_none() && !config.spec.sources.is_empty() {
+        // Mirrors `resolve_identity_for`'s `/data` fallback: a policy that HAS a
+        // source but yields no path was backed up under `/data`, so a restore has
+        // to look there. A zero-source legacy policy keeps the pathless
+        // identity-only form `config_identity` gives it — turning that into
+        // `/data` would break a working restore on upgrade.
+        resolved.source_path = Some("/data".to_string());
+    }
+    Ok(resolved)
+}
+
 /// **Pure.** The `status.resolved` mirror body for this pass (#368): the
 /// single-repo shape pins its one resolution verbatim (byte-identical wire);
 /// the multi shape pins one `repositories` entry per member — the repository

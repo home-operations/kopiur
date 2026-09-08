@@ -1,15 +1,11 @@
 # Google Cloud Storage
 
-The GCS backend stores the kopia repository in a **Google Cloud Storage** bucket,
-authenticating with a service-account key. GCS credentials are delivered as a
-**file**, not an environment variable (see below).
+The GCS backend stores the kopia repository in a **Google Cloud Storage** bucket, authenticating with a service-account key. GCS credentials are delivered as a **file**, not as an environment variable. The next section explains why.
 
 ## Provider prerequisites
 
-- A **GCS bucket** (Kopiur does not create it).
-- A **service account** with object admin on that bucket
-  (`roles/storage.objectAdmin`, scoped to the bucket where possible), and a **JSON
-  key** for it.
+- A **GCS bucket**. Kopiur does not create it.
+- A **service account** with object admin on that bucket, meaning `roles/storage.objectAdmin`, scoped to the bucket where possible. You also need a **JSON key** for it.
 
 /// example | The full provider-side setup with gcloud
 
@@ -32,22 +28,19 @@ $ gcloud iam service-accounts keys create key.json \
     --iam-account kopia@PROJECT.iam.gserviceaccount.com
 ```
 
-`roles/storage.objectAdmin` is the right role: kopia needs to create, read,
-list, **and delete** objects (retention and [maintenance](../maintenance.md)
-delete expired blobs). The read-only and creator roles both break maintenance.
+`roles/storage.objectAdmin` is the right role. kopia needs to create, read, list, **and delete** objects, because retention and [maintenance](../maintenance.md) delete expired blobs. The read-only and creator roles both break maintenance.
 
 ///
 
 ## The Secret shape
 
-GCS is one of the three **file-delivered** backends. kopia's GCS path wants a
-credentials _file_, and the SDK env var `GOOGLE_APPLICATION_CREDENTIALS` holds a
-_path_, not the JSON — so Kopiur reads the JSON body from a well-known env key and
-the mover writes it to a private (`0600`) file, then passes `--credentials-file`.
+GCS is one of the three **file-delivered** backends. kopia's GCS path wants a credentials _file_, and the SDK environment variable `GOOGLE_APPLICATION_CREDENTIALS` holds a _path_, not the JSON.
+
+So Kopiur reads the JSON body from a well-known environment key. The mover writes it to a private file with mode `0600`, then passes `--credentials-file`.
 
 | Secret key              | Required | What it is                                                                                            |
 | ----------------------- | -------- | ----------------------------------------------------------------------------------------------------- |
-| `KOPIA_GCS_CREDENTIALS` | yes      | The **full service-account key JSON, verbatim**. Materialized to a file → kopia `--credentials-file`. |
+| `KOPIA_GCS_CREDENTIALS` | yes      | The **full service-account key JSON**, exactly as issued. Written to a file, then passed to kopia as `--credentials-file`. |
 | `KOPIA_PASSWORD`        | **yes**  | The repository encryption password.                                                                   |
 
 ```yaml
@@ -59,10 +52,9 @@ stringData:
 
 /// info | Why KOPIA_GCS_CREDENTIALS and not GOOGLE_APPLICATION_CREDENTIALS
 
-`GOOGLE_APPLICATION_CREDENTIALS` is, by Google's own convention, a **path** to a
-key file — putting JSON under that name would be misread. Kopiur takes the JSON
-**body** under `KOPIA_GCS_CREDENTIALS`, writes it to a `0600` file in the mover,
-and points kopia at the path. The secret never lands on kopia's argv.
+By Google's own convention, `GOOGLE_APPLICATION_CREDENTIALS` is a **path** to a key file. Putting JSON under that name would be misread.
+
+So Kopiur takes the JSON **body** under `KOPIA_GCS_CREDENTIALS`, writes it to a file with mode `0600` in the mover, and points kopia at the path. The secret never lands on kopia's command line.
 
 ///
 
@@ -76,41 +68,32 @@ and points kopia at the path. The secret never lands on kopia's argv.
 
 | Field            | Required | Default     | Example                    | What it controls                                                                                                 |
 | ---------------- | -------- | ----------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `bucket`         | yes      | —           | `my-kopia-backups`         | The GCS bucket holding the repository. The bare name — no `gs://`.                                                |
+| `bucket`         | yes      | —           | `my-kopia-backups`         | The GCS bucket holding the repository. The bare name, with no `gs://`.                                            |
 | `prefix`         | no       | bucket root | `clusters/prod/`           | Object-name prefix so several repos can share one bucket. End it with `/`.                                        |
 | `auth.secretRef` | no¹      | —           | `{ name: gcs-repo-creds }` | Names the credential Secret above. Same namespace as the `Repository`; a `ClusterRepository` adds `namespace:`. Mutually exclusive with `workloadIdentity`. |
-| `auth.workloadIdentity.serviceAccountName` | no¹ | — | `backup-mover`      | Run the mover Jobs as this (user-created, GSA-bound) ServiceAccount instead of a key file — see [Workload identity](#workload-identity-gke). |
+| `auth.workloadIdentity.serviceAccountName` | no¹ | — | `backup-mover`      | Run the mover Jobs as this ServiceAccount instead of a key file. You create it and bind it to a Google service account. See [Workload identity](#workload-identity-gke). |
 
-¹ Set **exactly one** of `auth.secretRef` or `auth.workloadIdentity`
-(webhook-enforced). `auth` itself may be omitted when `KOPIA_GCS_CREDENTIALS`
-rides the encryption-password Secret.
+¹ Set **exactly one** of `auth.secretRef` or `auth.workloadIdentity`. The webhook enforces this. You may omit `auth` entirely when `KOPIA_GCS_CREDENTIALS` lives in the encryption-password Secret.
 
 ## Customization — the values you actually change
 
-- **`bucket` / `prefix`** — where snapshots land.
-- **`create.enabled`** — initialize the repository if missing. Creation-time
-  algorithms are fixed forever — see [creation](../repositories.md#encryption-and-repository-creation).
-- **`moverDefaults.cache`** — mover cache sizing ([movers](../movers.md)).
+- **`bucket` and `prefix`** set where snapshots land.
+- **`create.enabled`** initializes the repository if it's missing. The creation-time algorithms are fixed forever. See [creation](../repositories.md#encryption-and-repository-creation).
+- **`moverDefaults.cache`** sizes the mover cache. See [movers](../movers.md).
 
 ## Workload identity (GKE) { #workload-identity-gke }
 
-On GKE with Workload Identity Federation, you can drop the service-account key
-JSON entirely: set `auth.workloadIdentity.serviceAccountName` and every mover
-Job runs **as that ServiceAccount**. With no credentials file supplied, kopia
-falls back to Application Default Credentials — which the GKE metadata server
-answers with the bound Google service account's identity. No key to mint,
-rotate, or leak; the only secret left in the cluster is `KOPIA_PASSWORD`.
+On GKE with Workload Identity Federation, you can drop the service-account key JSON entirely.
+
+Set `auth.workloadIdentity.serviceAccountName` and every mover Job runs **as that ServiceAccount**. With no credentials file supplied, kopia falls back to Application Default Credentials, which the GKE metadata server answers with the bound Google service account's identity.
+
+There is no key to mint, rotate, or leak. The only secret left in the cluster is `KOPIA_PASSWORD`.
 
 What you provide:
 
-1. A **Google service account** with `roles/storage.objectAdmin` on the bucket
-   (the [setup above](#provider-prerequisites), minus step 4 — no key).
-2. The **Workload Identity binding**: `roles/iam.workloadIdentityUser` from
-   `PROJECT.svc.id.goog[<namespace>/<sa-name>]` to that GSA, and a Kubernetes
-   ServiceAccount annotated `iam.gke.io/gcp-service-account`, present in every
-   namespace mover Jobs run in.
-3. `auth.workloadIdentity.serviceAccountName` on the backend, instead of
-   `auth.secretRef`.
+1. A **Google service account** with `roles/storage.objectAdmin` on the bucket. That is the [setup above](#provider-prerequisites), minus step 4, because there is no key.
+2. The **Workload Identity binding**. Grant `roles/iam.workloadIdentityUser` from `PROJECT.svc.id.goog[<namespace>/<sa-name>]` to that Google service account. Then create a Kubernetes ServiceAccount annotated `iam.gke.io/gcp-service-account`, present in every namespace mover Jobs run in.
+3. `auth.workloadIdentity.serviceAccountName` on the backend, instead of `auth.secretRef`.
 
 ```yaml
 --8<-- "deploy/examples/backends/gcs-workload-identity.yaml"
@@ -118,44 +101,32 @@ What you provide:
 
 ## As a `ClusterRepository`
 
-The same `backend.gcs` stanza works on a cluster-scoped
-[`ClusterRepository`](../repositories.md#clusterrepository-a-shared-repository); every
-Secret reference must carry an explicit `namespace:` and the credential Secret
-must exist where the movers run — see [Movers](../movers.md).
+The same `backend.gcs` stanza works on a cluster-scoped [`ClusterRepository`](../repositories.md#clusterrepository-a-shared-repository), with two requirements. Every Secret reference must carry an explicit `namespace:`, and the Secret must exist in the namespaces the movers run in. See [Movers](../movers.md).
 
 ## Try it end-to-end
 
-Prove this backend really takes a backup. The same example file carries a tiny
-smoke-test (a throwaway PVC + a `SnapshotPolicy` + a `Snapshot`) that targets the
-`gcs-primary` repository above, so you can go from "applied" to "a snapshot in my
-bucket" in one arc.
+Prove this backend really takes a backup. The same example file carries a tiny smoke-test: a throwaway PVC, a `SnapshotPolicy`, and a `Snapshot`, all pointed at the `gcs-primary` repository above. It takes you from "applied" to "a snapshot in my bucket" in one go.
 
 /// warning | Fill in the credentials first
 
-The smoke backup only goes green once `KOPIA_GCS_CREDENTIALS` holds a **real**
-service-account key JSON. With the `REPLACE_ME` placeholders the `Repository`
-stalls at `Failed` (kopia can't reach the bucket) and the `Snapshot` stays
-`Pending`.
+The smoke backup only goes green once `KOPIA_GCS_CREDENTIALS` holds a **real** service-account key JSON. With the `REPLACE_ME` placeholders the `Repository` stalls at `Failed`, because kopia can't reach the bucket, and the `Snapshot` stays `Pending`.
 
 ///
 
-**1. Apply the bundle** (namespace `backups`, Secret, Repository, and the
-smoke-test objects):
+**1. Apply the bundle.** That is the `backups` namespace, the Secret, the Repository, and the smoke-test objects:
 
 ```console
 $ kubectl apply -f deploy/examples/backends/gcs.yaml
 ```
 
-**2. Wait for the repository to be `Ready`** — the gate everything else waits on:
+**2. Wait for the repository to be `Ready`.** Everything else waits on this:
 
 ```console
 $ kubectl -n backups wait --for=condition=Ready repository/gcs-primary --timeout=2m
 repository.kopiur.home-operations.com/gcs-primary condition met
 ```
 
-**3. Take the smoke backup.** The `Snapshot` uses `generateName`, so `create` it
-(the namespace, Secret, Repository, PVC, and policy already exist and report
-unchanged — the `Snapshot` is the one new object):
+**3. Take the smoke backup.** The `Snapshot` uses `generateName`, so `create` it rather than apply it. The namespace, Secret, Repository, PVC, and policy already exist and report unchanged. The `Snapshot` is the one new object:
 
 ```console
 $ kubectl create -f deploy/examples/backends/gcs.yaml
@@ -172,17 +143,14 @@ smoke-now-abc12   Running     manual                7s
 smoke-now-abc12   Succeeded   manual   k1f1ec0a8    38s
 ```
 
-(Output illustrative.) The `Snapshot` has no fixed `Succeeded` *condition*; to
-wait on it in a script, key on the phase:
+The output above is illustrative. The `Snapshot` has no fixed `Succeeded` *condition*, so to wait on it in a script, key on the phase:
 
 ```console
 $ kubectl -n backups wait --for=jsonpath='{.status.phase}'=Succeeded \
     snapshot/smoke-now-abc12 --timeout=5m
 ```
 
-**5. Deep proof — the data really moved.** `status.stats` shows non-zero
-`bytesNew`/`filesNew`, and `status.snapshot.kopiaSnapshotID` is the kopia
-snapshot ID in your bucket:
+**5. Prove the data really moved.** `status.stats` shows non-zero `bytesNew` and `filesNew`, and `status.snapshot.kopiaSnapshotID` is the kopia snapshot ID in your bucket:
 
 ```console
 $ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.stats}'
@@ -192,8 +160,7 @@ $ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.snapshot
 k1f1ec0a8
 ```
 
-(Both outputs illustrative — sizes and the ID vary.) Non-zero `bytesNew` is the
-proof the backup uploaded real content to GCS.
+Both outputs are illustrative; sizes and the ID vary. Non-zero `bytesNew` proves the backup uploaded real content to GCS.
 
 **6. Clean up** the smoke-test when you're done:
 
@@ -205,43 +172,27 @@ $ kubectl -n backups delete pvc smoke-data
 
 /// warning | Deleting a Snapshot deletes its snapshot
 
-A produced `Snapshot` defaults to `deletionPolicy: Delete`, so removing the CR
-runs `kopia snapshot delete` via a finalizer. Use `Retain` (or `Orphan`) to keep
-the data — see [Backups → deletionPolicy](../backups.md#deletionpolicy--what-happens-to-the-snapshot).
+A produced `Snapshot` defaults to `deletionPolicy: Delete`, so removing the CR runs `kopia snapshot delete` through a finalizer. Use `Retain` or `Orphan` to keep the data. See [Backups → deletionPolicy](../backups.md#deletionpolicy--what-happens-to-the-snapshot).
 
 ///
 
-From here the full lifecycle is backend-independent — only the `Repository`
-differs. Put it on a cron with a `SnapshotSchedule`
-([Backups & schedules](../backups.md),
-[Example 01](../examples.md#example-01--single-pvc-scheduled)) and restore by
-picking a `Snapshot` ([Restores](../restores.md),
-[Example 03](../examples.md#example-03--restore-by-picking-a-snapshot)).
+From here the rest of the lifecycle is the same on every backend. Only the `Repository` differs. Put it on a cron with a `SnapshotSchedule`, described in [Backups & schedules](../backups.md) and [Example 01](../examples.md#example-01--single-pvc-scheduled). Restore by picking a `Snapshot`, described in [Restores](../restores.md) and [Example 03](../examples.md#example-03--restore-by-picking-a-snapshot).
 
 ## Troubleshooting
 
 /// warning | Paste the JSON body, not a path
 
-A common mistake is putting a filename or path under `KOPIA_GCS_CREDENTIALS`. It
-must be the **entire key JSON**, verbatim (including the `BEGIN PRIVATE KEY`
-block). The mover writes that body to the credentials file for you.
+A common mistake is putting a filename or a path under `KOPIA_GCS_CREDENTIALS`. It must be the **entire key JSON**, exactly as issued, including the `BEGIN PRIVATE KEY` block. The mover writes that body to the credentials file for you.
 
 ///
 
-- **`403` / permission denied** — the service account lacks object admin on the
-  bucket. Grant `roles/storage.objectAdmin` scoped to the bucket. If the bucket
-  predates uniform bucket-level access, a legacy object ACL can also deny the SA —
-  prefer turning uniform access on.
-- **Malformed JSON** — a clipped or re-indented key fails to parse; copy the file
-  contents unchanged. The `private_key` field must keep its embedded `\n` escapes.
-- **Key rejected after rotation** — a disabled or deleted service-account key
-  fails like a wrong key. Mint a new one (`gcloud iam service-accounts keys
-  create`) and update the Secret in place; the operator re-verifies on the
-  Secret change.
+- **`403` or permission denied.** The service account lacks object admin on the bucket. Grant `roles/storage.objectAdmin` scoped to the bucket. If the bucket predates uniform bucket-level access, a legacy object ACL can also deny the service account; prefer turning uniform access on.
+- **Malformed JSON.** A clipped or re-indented key fails to parse. Copy the file contents unchanged. The `private_key` field must keep its embedded `\n` escapes.
+- **Key rejected after rotation.** A disabled or deleted service-account key fails like a wrong key. Mint a new one with `gcloud iam service-accounts keys create` and update the Secret in place. The operator re-verifies when the Secret changes.
 
 ## See also
 
-- [Object lock (ransomware protection)](s3.md#object-lock-ransomware-protection) — `spec.parameters.blobRetention` works on GCS too; the S3 page documents it in full.
-- [Repositories & backends](../repositories.md) — concepts: scope, encryption, creation.
-- [Movers, RBAC & credentials](../movers.md) — where the credential Secret must live.
-- Sibling backends: [S3](s3.md) · [Azure](azure.md) · [rclone](rclone.md) (for Google Drive).
+- [Object lock (ransomware protection)](s3.md#object-lock-ransomware-protection): `spec.parameters.blobRetention` works on GCS too. The S3 page documents it in full.
+- [Repositories & backends](../repositories.md): the concepts, meaning scope, encryption, and creation.
+- [Movers, RBAC & credentials](../movers.md): where the credential Secret must live.
+- Sibling backends: [S3](s3.md) · [Azure](azure.md) · [rclone](rclone.md), which is one way to reach Google Drive.

@@ -180,6 +180,11 @@ pub fn cluster_repository_json(
 /// not work", with nothing in any log pointing at the overlay. That is exactly
 /// how the #351 e2e first failed in CI.
 pub fn merge_spec(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    assert!(
+        base.get("spec").is_some(),
+        "merge_spec merges into a full CR's `spec`; the base has no `spec` key, so the \
+         overlay would be silently dropped — pass the CR, or extend the spec object directly"
+    );
     if let (Some(spec), serde_json::Value::Object(more)) = (base.get_mut("spec"), extra) {
         assert!(
             !more.contains_key("spec"),
@@ -654,5 +659,367 @@ pub async fn ensure_empty_policy(client: &Client, repo: &str, policy: &str, subp
                 )),
             )
             .await;
+    }
+}
+
+// --- CSI populator helpers (shared by repository_lifecycle, multi_pvc_group,
+//     populator_fanout, copy_methods, staging_*) ------------------------------
+//
+// Hoisted here by #443: the fan-out scenario needs the same claim/reader
+// machinery the single-claim populator tests use, and a second private copy in
+// a second test binary is exactly how two copies drift.
+
+/// CSI hostpath StorageClass installed by the `snapshot-stack` harness step — a
+/// populator-aware provisioner (its external-provisioner defers to `dataSourceRef`).
+/// `Immediate` binding (provisions the prime PVC as soon as it's created).
+pub const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
+/// The `WaitForFirstConsumer` variant over the same hostpath provisioner (also installed
+/// by `snapshot-stack`). Exercises the populator handshake's late-binding path: the claim
+/// only gets a `selected-node` once a pod schedules it, which the controller pins the
+/// prime PVC to.
+pub const CSI_STORAGE_CLASS_WFFC: &str = "csi-hostpath-sc-wffc";
+
+/// The label KEY a `pvcSelector` matches on, mirroring `deploy/examples/04-multi-pvc-selector.yaml`.
+pub const BACKUP_LABEL_KEY: &str = "backup";
+
+/// Whether `storage_class` is present (proceed with the test). If it's absent we either
+/// HARD-FAIL or skip: a `csi: true` CI shard installs the snapshot stack and sets
+/// `KOPIUR_E2E_REQUIRE_CSI=1`, so there an absent class is a real setup failure and must
+/// NOT silently pass — a silent skip once let a populator regression ship green (#121).
+/// Without that env (local dev with no snapshot stack) we skip gracefully.
+pub async fn csi_class_present_or_skip(client: &Client, storage_class: &str) -> bool {
+    use k8s_openapi::api::storage::v1::StorageClass;
+    let scs: Api<StorageClass> = Api::all(client.clone());
+    if scs
+        .get_opt(storage_class)
+        .await
+        .expect("list storageclasses")
+        .is_some()
+    {
+        return true;
+    }
+    let require = std::env::var("KOPIUR_E2E_REQUIRE_CSI").is_ok_and(|v| v == "1");
+    assert!(
+        !require,
+        "storageclass {storage_class} absent but KOPIUR_E2E_REQUIRE_CSI=1 — this shard must \
+         install the CSI snapshot stack (mise run //crates/e2e:snapshot-stack) before the \
+         populator/copyMethod tests; refusing to silently skip (cf. #121)"
+    );
+    eprintln!(
+        "skipping populator test: storageclass {storage_class} absent \
+         (run `mise run //crates/e2e:snapshot-stack`)"
+    );
+    false
+}
+
+/// Create a CSI PVC on [`CSI_STORAGE_CLASS`] carrying `BACKUP_LABEL_KEY: label_value`,
+/// and seed `/data/marker.txt` with `marker` so it binds and carries data unique to it.
+///
+/// `label_value` is a PARAMETER, not a constant: several scenarios share one cluster and
+/// one namespace and none of them deletes its PVCs, so a shared label value would make
+/// one scenario's `pvcSelector` match another's volumes — failing on a count assertion
+/// that has nothing to do with what it tests, and only in whichever order nextest picked.
+/// The distinct MARKER is what proves cross-volume isolation: each restored PVC must come
+/// back holding ITS OWN marker, never a sibling's.
+pub async fn csi_pvc_with_data(client: &Client, name: &str, label_value: &str, marker: &str) {
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    // A seed Pod left `Succeeded` by a previous call makes the next
+    // `pods.create` fail `AlreadyExists` behind the `let _ =` below — so a fresh
+    // PVC would bind EMPTY and every marker assertion downstream would fail for
+    // a reason that has nothing to do with what the test covers. Clear it, and
+    // wait: `create` on a still-terminating name is rejected too.
+    let seed = format!("{name}-seed");
+    let _ = pods.delete(&seed, &DeleteParams::default()).await;
+    wait_until(
+        &format!("seed pod {seed} is gone"),
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(pods.get_opt(&seed).await?.is_none().then_some(())) },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("a previous seed pod for {name} must clear: {e}"));
+    let _ = pvcs
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": name, "namespace": E2E_NAMESPACE,
+                    "labels": { BACKUP_LABEL_KEY: label_value },
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": CSI_STORAGE_CLASS,
+                    "resources": { "requests": { "storage": "64Mi" } },
+                },
+            })),
+        )
+        .await;
+    let _ = pods
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": { "name": seed, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{
+                        "name": "seed", "image": kopiur_e2e::consts::BUSYBOX_IMAGE,
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["sh", "-c", format!("echo {marker} > /data/marker.txt")],
+                        "volumeMounts": [{ "name": "d", "mountPath": "/data" }],
+                    }],
+                    "volumes": [{ "name": "d", "persistentVolumeClaim": { "claimName": name } }],
+                },
+            })),
+        )
+        .await;
+    wait_until(
+        &format!("PVC {name} Bound"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let bound = pvcs
+                .get_opt(name)
+                .await?
+                .and_then(|p| p.status.and_then(|s| s.phase))
+                .as_deref()
+                == Some("Bound");
+            Ok(bound.then_some(()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("PVC {name} should bind: {e}"));
+    // Bound is NOT the same as seeded: an `Immediate` class binds the PVC before
+    // the seed pod has written anything. Wait for the WRITE, or a backup taken
+    // straight after this call can capture an empty volume.
+    kopiur_e2e::wait::pod_succeeded(client, E2E_NAMESPACE, &seed)
+        .await
+        .unwrap_or_else(|e| panic!("the seed pod for {name} must write {marker:?}: {e}"));
+}
+
+/// The `Snapshot` CRs a policy produced, by its config label.
+pub async fn children_of(client: &Client, policy: &str) -> Vec<Snapshot> {
+    let api: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    api.list(
+        &kube::api::ListParams::default()
+            .labels(&format!("kopiur.home-operations.com/config={policy}")),
+    )
+    .await
+    .expect("list Snapshots")
+    .items
+}
+
+/// Purge one scenario's schedule, policy and produced `Snapshot` CRs, so a
+/// re-run — a nextest retry, or a second call from a sibling test in the same
+/// shard — actually RE-RUNS the scenario instead of dying in setup.
+///
+/// A panicked (or simply a preceding) try leaves three tripwires: the policy
+/// (the fresh `create` dies `AlreadyExists`), the schedule (its `runOnCreate`
+/// token is consumed, so even an idempotent create fires no new capture), and
+/// stale children (which make an "exactly N children" wait unwinnable, and a
+/// terminal `Failed` member makes an all-Succeeded wait unwinnable). Deletion
+/// order matters — schedule first, so nothing re-produces children — and then it
+/// waits for the children to fully go (their finalizers release the kopia-side
+/// state through the batched delete path). A fresh cluster is a fast no-op.
+pub async fn clear_scenario_leftovers(client: &Client, schedule: &str, policy: &str) {
+    let schedules: Api<kopiur_api::SnapshotSchedule> =
+        Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    for child in children_of(client, policy).await {
+        if let Some(n) = child.metadata.name {
+            let _ = backups.delete(&n, &DeleteParams::default()).await;
+        }
+    }
+    wait_until(
+        &format!("leftovers of scenario `{policy}` are gone"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let gone = schedules.get_opt(schedule).await?.is_none()
+                && policies.get_opt(policy).await?.is_none()
+                && children_of(client, policy).await.is_empty();
+            Ok(gone.then_some(()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("previous try's `{policy}` leftovers must clear: {e}"));
+}
+
+/// Delete a PVC and its seed Pod and WAIT for both to go, so the next
+/// [`csi_pvc_with_data`] starts from nothing rather than adopting a volume whose
+/// labels or contents belong to a previous scenario.
+pub async fn drop_csi_pvc(client: &Client, name: &str) {
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let seed = format!("{name}-seed");
+    let _ = pods.delete(&seed, &DeleteParams::default()).await;
+    let _ = pvcs.delete(name, &DeleteParams::default()).await;
+    wait_until(
+        &format!("PVC {name} and its seed pod are gone"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let gone = pvcs.get_opt(name).await?.is_none() && pods.get_opt(&seed).await?.is_none();
+            Ok(gone.then_some(()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("PVC {name} must be deleted before it is re-seeded: {e}"));
+}
+
+/// A populator `Restore` reading `seed` out of `repo` (`target.populator: {}`).
+pub fn populator_restore_json(name: &str, repo: &str, seed: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": repo },
+            "source": { "snapshotRef": { "name": seed } },
+            "target": { "populator": {} }
+        }
+    })
+}
+
+/// A PVC whose `dataSourceRef` claims the populator `Restore` `restore`, so a
+/// populator-aware provisioner defers to the handshake instead of binding it to an
+/// empty volume.
+pub fn claiming_pvc_json(name: &str, storage_class: &str, restore: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": storage_class,
+            "resources": { "requests": { "storage": "1Gi" } },
+            "dataSourceRef": {
+                "apiGroup": "kopiur.home-operations.com",
+                "kind": "Restore",
+                "name": restore,
+            }
+        }
+    })
+}
+
+/// One claiming PVC to drive, and what its reader pod must find inside it.
+pub struct ClaimSpec<'a> {
+    /// PVC name.
+    pub name: &'a str,
+    /// Path inside the restored volume the reader reads (relative to the mount).
+    pub path: &'a str,
+    /// The exact content that path must hold. For a fan-out this is the claim's
+    /// OWN marker — reading a sibling's marker is the cross-volume bug.
+    pub expect: &'a str,
+}
+
+/// The objects a [`populate_claims`] run left behind, so a caller can keep inspecting
+/// them (and clean up when done) instead of tearing them down immediately.
+pub struct PopulatedClaims {
+    pub restore: String,
+    pub claims: Vec<String>,
+    pub readers: Vec<String>,
+}
+
+impl PopulatedClaims {
+    pub async fn cleanup(&self, client: &Client) {
+        use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+        use kopiur_api::Restore;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        for reader in &self.readers {
+            let _ = pods.delete(reader, &DeleteParams::default()).await;
+        }
+        for claim in &self.claims {
+            let _ = pvcs.delete(claim, &DeleteParams::default()).await;
+        }
+        let _ = restores
+            .delete(&self.restore, &DeleteParams::default())
+            .await;
+    }
+}
+
+/// Drive ONE populator `Restore` over N claiming PVCs to completion and LEAVE the
+/// objects in place (the caller owns cleanup).
+///
+/// Each claim gets a reader pod doing double duty: scheduling it produces the
+/// `selected-node` a `WaitForFirstConsumer` claim needs (the controller pins that
+/// claim's prime PVC to it), and it asserts the restored bytes. A reader can only run
+/// once ITS claim binds, so N successes prove N prime→consumer rebinds AND that each
+/// volume carries its own data.
+///
+/// Generalized from the single-claim helper by #443: before the fan-out a populator
+/// filled exactly one claimant, so one claim was all the harness could express — which
+/// is precisely why the bug shipped.
+pub async fn populate_claims(
+    client: &Client,
+    storage_class: &str,
+    restore_name: &str,
+    restore: serde_json::Value,
+    claims: &[ClaimSpec<'_>],
+) -> PopulatedClaims {
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+    use kopiur_api::Restore;
+    use kopiur_e2e::{builders, wait};
+
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    restores
+        .create(&PostParams::default(), &cr(restore))
+        .await
+        .expect("create populator Restore");
+
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let mut readers = Vec::new();
+    for claim in claims {
+        pvcs.create(
+            &PostParams::default(),
+            &cr(claiming_pvc_json(claim.name, storage_class, restore_name)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create claiming PVC {}: {e}", claim.name));
+
+        let reader = format!("{}-reader", claim.name);
+        let script = format!("test \"$(cat /mnt/{})\" = '{}'", claim.path, claim.expect);
+        pods.create(
+            &PostParams::default(),
+            &builders::one_shot_pod(
+                E2E_NAMESPACE,
+                &reader,
+                &["sh", "-c", &script],
+                &[(claim.name, "/mnt")],
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create reader pod for {}: {e}", claim.name));
+        readers.push(reader);
+    }
+
+    for (claim, reader) in claims.iter().zip(&readers) {
+        wait::pod_succeeded(client, E2E_NAMESPACE, reader)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "claiming PVC {} must bind carrying its OWN data ({} = {}): {e}",
+                    claim.name, claim.path, claim.expect
+                )
+            });
+    }
+    wait_phase(&restores, restore_name, "Completed")
+        .await
+        .expect("the populator Restore reaches Completed once every claim is bound");
+
+    PopulatedClaims {
+        restore: restore_name.to_string(),
+        claims: claims.iter().map(|c| c.name.to_string()).collect(),
+        readers,
     }
 }

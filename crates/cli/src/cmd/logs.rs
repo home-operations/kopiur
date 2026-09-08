@@ -55,33 +55,84 @@ pub fn newest_pod(pods: Vec<Pod>) -> Option<Pod> {
     })
 }
 
+/// One status-recorded mover tail: the top-level `logTail`/`failure` of a
+/// Snapshot or a direct Restore (`scope: None`), or ONE claim's own record of a
+/// fanned-out populator Restore (`scope: Some(<pvc>)`, #443).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedTail {
+    /// The claiming PVC this tail belongs to; `None` for the top-level fields.
+    pub scope: Option<String>,
+    /// `logTail` as recorded.
+    pub log_tail: Option<String>,
+    /// `failure` as recorded.
+    pub failure: Option<kopiur_api::common::FailureBlock>,
+}
+
+/// A Snapshot's recorded tail: always the single top-level pair. Pure.
+pub fn snapshot_recorded_tails(status: Option<&kopiur_api::SnapshotStatus>) -> Vec<RecordedTail> {
+    vec![RecordedTail {
+        scope: None,
+        log_tail: status.and_then(|s| s.log_tail.clone()),
+        failure: status.and_then(|s| s.failure.clone()),
+    }]
+}
+
+/// A Restore's recorded tails (review wave 2, finding 8): PER CLAIM when the
+/// populator fanned out (`status.claims` non-empty — each claim's mover writes
+/// its own `logTail`/`failure` there, and the top-level pair is a direct
+/// restore's), else the top-level pair. Pure.
+pub fn restore_recorded_tails(status: Option<&kopiur_api::RestoreStatus>) -> Vec<RecordedTail> {
+    match status.map(|s| &s.claims).filter(|c| !c.is_empty()) {
+        Some(claims) => claims
+            .iter()
+            .map(|(pvc, claim)| RecordedTail {
+                scope: Some(pvc.clone()),
+                log_tail: claim.log_tail.clone(),
+                failure: claim.failure.clone(),
+            })
+            .collect(),
+        None => vec![RecordedTail {
+            scope: None,
+            log_tail: status.and_then(|s| s.log_tail.clone()),
+            failure: status.and_then(|s| s.failure.clone()),
+        }],
+    }
+}
+
 /// The fallback text when the Job/pods have been garbage-collected: the
-/// status-recorded tail plus an honest note that full logs have rotated. Pure.
-pub fn gone_fallback(
-    kind: &str,
-    name: &str,
-    log_tail: Option<&str>,
-    failure: Option<&kopiur_api::common::FailureBlock>,
-) -> String {
+/// status-recorded tail(s) plus an honest note that full logs have rotated.
+/// One section per [`RecordedTail`], headed by its claim when scoped. Pure.
+pub fn gone_fallback(kind: &str, name: &str, tails: &[RecordedTail]) -> String {
     let mut out = format!(
         "the mover Job (and its pods) for {kind} {name} no longer exist — \
          completed Jobs are garbage-collected. Showing the tail recorded in status:\n"
     );
-    match (log_tail, failure) {
-        (None, None) => out.push_str("(no logTail recorded — the run may never have started)\n"),
-        (tail, failure) => {
-            if let Some(f) = failure {
-                out.push_str(&format!(
-                    "failure ({}): {}\n",
-                    f.kopia_error_class, f.message
-                ));
-                if let Some(stderr) = &f.stderr_tail {
-                    out.push_str(&format!("--- kopia stderr tail ---\n{stderr}\n"));
-                }
+    let any_recorded = tails
+        .iter()
+        .any(|t| t.log_tail.is_some() || t.failure.is_some());
+    if !any_recorded {
+        out.push_str("(no logTail recorded — the run may never have started)\n");
+        return out;
+    }
+    for t in tails {
+        if let Some(pvc) = &t.scope {
+            out.push_str(&format!("=== claim {pvc} ===\n"));
+            if t.log_tail.is_none() && t.failure.is_none() {
+                out.push_str("(no logTail recorded for this claim)\n");
+                continue;
             }
-            if let Some(t) = tail {
-                out.push_str(&format!("--- log tail ---\n{t}\n"));
+        }
+        if let Some(f) = &t.failure {
+            out.push_str(&format!(
+                "failure ({}): {}\n",
+                f.kopia_error_class, f.message
+            ));
+            if let Some(stderr) = &f.stderr_tail {
+                out.push_str(&format!("--- kopia stderr tail ---\n{stderr}\n"));
             }
+        }
+        if let Some(tail) = &t.log_tail {
+            out.push_str(&format!("--- log tail ---\n{tail}\n"));
         }
     }
     out
@@ -121,8 +172,7 @@ async fn resolve_job(
                 None => Ok(Err(gone_fallback(
                     "snapshot",
                     name,
-                    snap.status.as_ref().and_then(|s| s.log_tail.as_deref()),
-                    snap.status.as_ref().and_then(|s| s.failure.as_ref()),
+                    &snapshot_recorded_tails(snap.status.as_ref()),
                 ))),
             }
         }
@@ -139,11 +189,11 @@ async fn resolve_job(
                 .map_err(|e| classify_kube("list", "Job", "jobs", Some(ns), None, e))?;
             match newest_job_owned_by(listed.items, &uid) {
                 Some(job) => Ok(Ok(job.name_any())),
+                // Per claim for a fanned-out populator (#443, wave 2 finding 8).
                 None => Ok(Err(gone_fallback(
                     "restore",
                     name,
-                    restore.status.as_ref().and_then(|s| s.log_tail.as_deref()),
-                    restore.status.as_ref().and_then(|s| s.failure.as_ref()),
+                    &restore_recorded_tails(restore.status.as_ref()),
                 ))),
             }
         }
@@ -200,9 +250,9 @@ pub async fn run(
         .map_err(|e| classify_kube("list", "Pod", "pods", Some(ns), None, e))?;
     let Some(pod) = newest_pod(listed.items) else {
         // The Job object survived but its pods rotated; same honest fallback.
-        let (kind, tail, failure) = fetch_tail(ctx, target, &args.name).await?;
+        let (kind, tails) = fetch_tail(ctx, target, &args.name).await?;
         return Ok(CmdOutput {
-            text: gone_fallback(kind, &args.name, tail.as_deref(), failure.as_ref()),
+            text: gone_fallback(kind, &args.name, &tails),
             exit: 0,
         });
     };
@@ -224,14 +274,7 @@ async fn fetch_tail(
     ctx: &KubeCtx,
     target: LogsTarget,
     name: &str,
-) -> Result<
-    (
-        &'static str,
-        Option<String>,
-        Option<kopiur_api::common::FailureBlock>,
-    ),
-    CliError,
-> {
+) -> Result<(&'static str, Vec<RecordedTail>), CliError> {
     let ns = ctx.namespace.as_str();
     match target {
         LogsTarget::Snapshot => {
@@ -239,16 +282,14 @@ async fn fetch_tail(
             let snap = api.get(name).await.map_err(|e| {
                 classify_kube("get", "Snapshot", "snapshots", Some(ns), Some(name), e)
             })?;
-            let status = snap.status.unwrap_or_default();
-            Ok(("snapshot", status.log_tail, status.failure))
+            Ok(("snapshot", snapshot_recorded_tails(snap.status.as_ref())))
         }
         LogsTarget::Restore => {
             let api: Api<Restore> = Api::namespaced(ctx.client.clone(), ns);
             let restore = api.get(name).await.map_err(|e| {
                 classify_kube("get", "Restore", "restores", Some(ns), Some(name), e)
             })?;
-            let status = restore.status.unwrap_or_default();
-            Ok(("restore", status.log_tail, status.failure))
+            Ok(("restore", restore_recorded_tails(restore.status.as_ref())))
         }
     }
 }
@@ -491,13 +532,76 @@ mod tests {
             retry_recommended: false,
             op: None,
         };
-        let text = gone_fallback("snapshot", "s", Some("tail lines"), Some(&failure));
+        let top = |tail: Option<&str>, failure: Option<&kopiur_api::common::FailureBlock>| {
+            vec![RecordedTail {
+                scope: None,
+                log_tail: tail.map(str::to_string),
+                failure: failure.cloned(),
+            }]
+        };
+        let text = gone_fallback("snapshot", "s", &top(Some("tail lines"), Some(&failure)));
         assert!(text.contains("no longer exist"));
         assert!(text.contains("garbage-collected"));
         assert!(text.contains("failure (AuthFailure): creds rejected"));
         assert!(text.contains("--- log tail ---\ntail lines"));
+        assert!(!text.contains("=== claim"), "top-level: no claim headers");
 
-        let empty = gone_fallback("restore", "r", None, None);
+        let empty = gone_fallback("restore", "r", &top(None, None));
         assert!(empty.contains("no logTail recorded"));
+    }
+
+    /// Review wave 2, finding 8: `kubectl kopiur logs restore X` falls back to
+    /// the CLAIMS' recorded tails for a fanned-out populator, one section per
+    /// claim; a direct restore (no claims) keeps the top-level pair.
+    #[test]
+    fn restore_gone_fallback_shows_each_claims_own_tail() {
+        let status: kopiur_api::RestoreStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Failed",
+            "claims": {
+                "data": { "phase": "Populated", "reason": "RestoreSucceeded",
+                          "logTail": "data: restored 12 files" },
+                "logs": {
+                    "phase": "Failed", "reason": "MoverJobFailed",
+                    "failure": { "kopiaErrorClass": "PermissionDenied",
+                                 "message": "cannot write /data",
+                                 "retryRecommended": false,
+                                 "stderrTail": "ERROR permission denied" },
+                    "logTail": "logs: restore failed"
+                },
+                "cache": { "phase": "Pending", "reason": "AwaitingPodSchedule" }
+            }
+        }))
+        .unwrap();
+        let tails = restore_recorded_tails(Some(&status));
+        assert_eq!(
+            tails.iter().map(|t| t.scope.as_deref()).collect::<Vec<_>>(),
+            [Some("cache"), Some("data"), Some("logs")]
+        );
+        let text = gone_fallback("restore", "app", &tails);
+        assert_eq!(
+            text,
+            "the mover Job (and its pods) for restore app no longer exist — completed Jobs \
+             are garbage-collected. Showing the tail recorded in status:\n\
+             === claim cache ===\n(no logTail recorded for this claim)\n\
+             === claim data ===\n--- log tail ---\ndata: restored 12 files\n\
+             === claim logs ===\nfailure (PermissionDenied): cannot write /data\n\
+             --- kopia stderr tail ---\nERROR permission denied\n\
+             --- log tail ---\nlogs: restore failed\n"
+        );
+
+        // A direct restore: the top-level pair, unscoped.
+        let direct: kopiur_api::RestoreStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Failed", "logTail": "direct tail"
+        }))
+        .unwrap();
+        let tails = restore_recorded_tails(Some(&direct));
+        assert_eq!(tails.len(), 1);
+        assert_eq!(tails[0].scope, None);
+        assert_eq!(tails[0].log_tail.as_deref(), Some("direct tail"));
+        // No status at all: one empty top-level entry ⇒ the honest note.
+        assert!(
+            gone_fallback("restore", "r", &restore_recorded_tails(None))
+                .contains("no logTail recorded")
+        );
     }
 }

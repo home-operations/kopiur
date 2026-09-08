@@ -857,6 +857,7 @@ pub fn build_replication_work_spec(
             kind: "RepositoryReplication".to_string(),
             name: cr_name.to_string(),
             namespace: namespace.to_string(),
+            claim_key: None,
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),

@@ -1,15 +1,13 @@
 # Azure Blob Storage
 
-The Azure backend stores the kopia repository in an **Azure Blob Storage**
-container. Reach for it when your storage is Azure; for an S3-compatible store use
-[S3](s3.md) instead.
+The Azure backend stores the kopia repository in an **Azure Blob Storage** container. Reach for it when your storage is Azure. For an S3-compatible store, use [S3](s3.md) instead.
 
 ## Provider prerequisites
 
-- A **storage account** and a **blob container** within it (Kopiur does not create them).
+- A **storage account** and a **blob container** within it. Kopiur does not create them.
 - A credential for that container, **exactly one** of:
-    - the storage-account **access key** (`AZURE_STORAGE_KEY`), or
-    - a **SAS token** (`AZURE_STORAGE_SAS_TOKEN`) scoped to the container — least privilege.
+    - the storage-account **access key**, under `AZURE_STORAGE_KEY`; or
+    - a **SAS token**, under `AZURE_STORAGE_SAS_TOKEN`, scoped to the container. This is the least-privilege option.
 
 /// example | Creating the container and credential with the Azure CLI
 
@@ -27,16 +25,15 @@ $ az storage container generate-sas \
     --permissions racwdl --expiry 2027-06-12 -o tsv
 ```
 
-The SAS `--permissions` must include **r**ead, **a**dd, **c**reate, **w**rite,
-**d**elete, and **l**ist (`racwdl`) — kopia lists and deletes blobs during
-retention and [maintenance](../maintenance.md), not just at backup time. Paste
-the CLI output as-is: it has no leading `?`.
+The SAS `--permissions` must include **r**ead, **a**dd, **c**reate, **w**rite, **d**elete, and **l**ist, which is `racwdl`. kopia lists and deletes blobs during retention and [maintenance](../maintenance.md), not just at backup time.
+
+Paste the CLI output exactly as it comes out. It has no leading `?`.
 
 ///
 
 ## The Secret shape
 
-Loaded with `envFrom`; the keys reach kopia as environment variables.
+The mover loads this Secret with `envFrom`, so the keys reach kopia as environment variables.
 
 | Secret key                | Required | What it is                                            |
 | ------------------------- | -------- | ----------------------------------------------------- |
@@ -44,7 +41,7 @@ Loaded with `envFrom`; the keys reach kopia as environment variables.
 | `AZURE_STORAGE_SAS_TOKEN` | one of¹  | A SAS token scoped to the container (no leading `?`). |
 | `KOPIA_PASSWORD`          | **yes**  | The repository encryption password.                   |
 
-¹ Provide **exactly one** of the key or the SAS token. kopia uses whichever is set.
+¹ Provide **exactly one** of the key or the SAS token. kopia uses whichever one is set.
 
 ```yaml
 stringData:
@@ -54,8 +51,7 @@ stringData:
 
 /// warning | Lose the password, lose the backups
 
-`KOPIA_PASSWORD` encrypts the repository and cannot be recovered if lost. Store it
-outside the cluster and back up the Secret. See [Encryption](../repositories.md#encryption-and-repository-creation).
+`KOPIA_PASSWORD` encrypts the repository, and it cannot be recovered if you lose it. Store it outside the cluster and back up the Secret. See [Encryption](../repositories.md#encryption-and-repository-creation).
 
 ///
 
@@ -69,28 +65,24 @@ outside the cluster and back up the Secret. See [Encryption](../repositories.md#
 
 | Field            | Required | Default        | Example                      | What it controls                                                                                                |
 | ---------------- | -------- | -------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `container`      | yes      | —              | `kopia-backups`              | The blob container holding the repository. The container name only — not a URL, not `account/container`.        |
+| `container`      | yes      | —              | `kopia-backups`              | The blob container holding the repository. The container name only: not a URL, not `account/container`.         |
 | `prefix`         | no       | container root | `prod/`                      | Blob-name prefix so several repos can share one container. End it with `/`.                                     |
-| `storageAccount` | no       | inferred       | `mystorageacct`              | Account name. In practice set it always: SAS tokens don't carry it, and being explicit costs nothing with a key. |
+| `storageAccount` | no       | inferred       | `mystorageacct`              | Account name. Set it always in practice. SAS tokens don't carry it, and being explicit costs nothing with a key. |
 | `auth.secretRef` | no¹      | —              | `{ name: azure-repo-creds }` | Names the credential Secret above. Same namespace as the `Repository`; a `ClusterRepository` adds `namespace:`. Mutually exclusive with `workloadIdentity`. |
-| `auth.workloadIdentity.serviceAccountName` | no¹ | — | `backup-mover`        | Run the mover Jobs as this (user-created, Entra-federated) ServiceAccount instead of a key/SAS — see [Workload identity](#workload-identity-aks). Requires `storageAccount`. |
+| `auth.workloadIdentity.serviceAccountName` | no¹ | — | `backup-mover`        | Run the mover Jobs as this ServiceAccount instead of a key or SAS token. You create it and federate it with Entra. See [Workload identity](#workload-identity-aks). Requires `storageAccount`. |
 
-¹ Set **exactly one** of `auth.secretRef` or `auth.workloadIdentity`
-(webhook-enforced). `auth` itself may be omitted when the `AZURE_*` key rides
-the encryption-password Secret.
+¹ Set **exactly one** of `auth.secretRef` or `auth.workloadIdentity`. The webhook enforces this. You may omit `auth` entirely when the `AZURE_*` key lives in the encryption-password Secret.
 
 ## Customization — the values you actually change
 
-- **`container` / `prefix`** — where snapshots land.
-- **`storageAccount`** — usually required; SAS tokens don't encode the account.
-- **Key vs. SAS** — switch by which Secret key you set (see the SAS variant below).
-- **`create.enabled`** — initialize the repository if missing. Creation-time
-  `encryption`/`splitter`/`hash` are fixed forever — see [creation](../repositories.md#encryption-and-repository-creation).
+- **`container` and `prefix`** set where snapshots land.
+- **`storageAccount`** is usually required, because SAS tokens don't encode the account.
+- **Key vs. SAS.** You switch between them by which Secret key you set. See the SAS variant below.
+- **`create.enabled`** initializes the repository if it's missing. The creation-time `encryption`, `splitter`, and `hash` values are fixed forever. See [creation](../repositories.md#encryption-and-repository-creation).
 
 ### SAS-token auth (least privilege)
 
-A SAS token scoped to the container, time-limited, avoids handing the mover the
-full account key:
+A SAS token scoped to the container is time-limited, and it avoids handing the mover the full account key:
 
 ```yaml
 --8<-- "deploy/examples/backends/azure-sas.yaml"
@@ -98,25 +90,15 @@ full account key:
 
 ## Workload identity (AKS) { #workload-identity-aks }
 
-On AKS with the workload-identity add-on (or any cluster running the
-azure-workload-identity webhook), you can drop the storage key and SAS token
-entirely: set `auth.workloadIdentity.serviceAccountName` and every mover Job
-runs **as that ServiceAccount**. Kopiur stamps the mover pods with the
-`azure.workload.identity/use: "true"` label, the Azure webhook injects
-`AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_FEDERATED_TOKEN_FILE`, and kopia
-authenticates with the federated token. The only secret left in the cluster is
-`KOPIA_PASSWORD`.
+On AKS with the workload-identity add-on, or any cluster running the azure-workload-identity webhook, you can drop the storage key and SAS token entirely.
+
+Set `auth.workloadIdentity.serviceAccountName` and every mover Job runs **as that ServiceAccount**. Kopiur stamps the mover pods with the `azure.workload.identity/use: "true"` label. The Azure webhook then injects `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`, and kopia authenticates with the federated token. The only secret left in the cluster is `KOPIA_PASSWORD`.
 
 What you provide:
 
-1. A **managed identity** (or app registration) with
-   `Storage Blob Data Contributor` on the container, plus a **federated
-   credential** for `system:serviceaccount:<namespace>:<sa-name>`.
-2. A **ServiceAccount** annotated `azure.workload.identity/client-id: <id>`,
-   present in every namespace mover Jobs run in.
-3. `auth.workloadIdentity.serviceAccountName` on the backend — and
-   **`storageAccount` becomes required** (webhook-enforced): the identity
-   webhook injects the tenant, client id, and token, but not the account name.
+1. A **managed identity**, or an app registration, with `Storage Blob Data Contributor` on the container, plus a **federated credential** for `system:serviceaccount:<namespace>:<sa-name>`.
+2. A **ServiceAccount** annotated `azure.workload.identity/client-id: <id>`, present in every namespace mover Jobs run in.
+3. `auth.workloadIdentity.serviceAccountName` on the backend. Setting it makes **`storageAccount` required**, and the webhook enforces that. The identity webhook injects the tenant, client id, and token, but not the account name.
 
 ```yaml
 --8<-- "deploy/examples/backends/azure-workload-identity.yaml"
@@ -124,11 +106,9 @@ What you provide:
 
 /// warning | Replication: don't mix static and workload-identity Azure pairs
 
-A `RepositoryReplication` between two Azure backends must use the same auth
-style on both sides (or both `workloadIdentity` with the same ServiceAccount) —
-a mixed pair is rejected at admission, because the replication pod's env would
-carry the static side's `AZURE_*` credentials where the federated side's
-env-driven flags would pick them up.
+A `RepositoryReplication` between two Azure backends must use the same auth style on both sides. If both use `workloadIdentity`, they must name the same ServiceAccount.
+
+A mixed pair is rejected at admission. The replication pod's environment would carry the static side's `AZURE_*` credentials, and the federated side's environment-driven flags would pick them up.
 
 ///
 
@@ -137,40 +117,32 @@ env-driven flags would pick them up.
 The same `backend.azure` stanza works on a cluster-scoped
 [`ClusterRepository`](../repositories.md#clusterrepository-a-shared-repository); every
 Secret reference must carry an explicit `namespace:` and the Secret must be
-present where the movers run — see [Movers](../movers.md).
+present where the movers run. See [Movers](../movers.md).
 
 ## Try it end-to-end
 
-Prove this backend really takes a backup. The same example file carries a tiny
-smoke-test (a throwaway PVC + a `SnapshotPolicy` + a `Snapshot`) that targets the
-`azure-primary` repository above, so you can go from "applied" to "a snapshot in
-my container" in one arc.
+Prove this backend really takes a backup. The same example file carries a tiny smoke-test: a throwaway PVC, a `SnapshotPolicy`, and a `Snapshot`, all pointed at the `azure-primary` repository above. It takes you from "applied" to "a snapshot in my container" in one go.
 
 /// warning | Fill in the credentials first
 
-The smoke backup only goes green once the `REPLACE_ME` value in the Secret is a
-**real** storage key or SAS token. With placeholders the `Repository` stalls at
-`Failed` (kopia can't reach the container) and the `Snapshot` stays `Pending`.
+The smoke backup only goes green once the `REPLACE_ME` value in the Secret is a **real** storage key or SAS token. With placeholders the `Repository` stalls at `Failed`, because kopia can't reach the container, and the `Snapshot` stays `Pending`.
 
 ///
 
-**1. Apply the bundle** (namespace `backups`, Secret, Repository, and the
-smoke-test objects):
+**1. Apply the bundle.** That is the `backups` namespace, the Secret, the Repository, and the smoke-test objects:
 
 ```console
 $ kubectl apply -f deploy/examples/backends/azure.yaml
 ```
 
-**2. Wait for the repository to be `Ready`** — the gate everything else waits on:
+**2. Wait for the repository to be `Ready`.** Everything else waits on this:
 
 ```console
 $ kubectl -n backups wait --for=condition=Ready repository/azure-primary --timeout=2m
 repository.kopiur.home-operations.com/azure-primary condition met
 ```
 
-**3. Take the smoke backup.** The `Snapshot` uses `generateName`, so `create` it
-(the namespace, Secret, Repository, PVC, and policy already exist and report
-unchanged — the `Snapshot` is the one new object):
+**3. Take the smoke backup.** The `Snapshot` uses `generateName`, so `create` it rather than apply it. The namespace, Secret, Repository, PVC, and policy already exist and report unchanged. The `Snapshot` is the one new object:
 
 ```console
 $ kubectl create -f deploy/examples/backends/azure.yaml
@@ -187,17 +159,14 @@ smoke-now-abc12   Running     manual                7s
 smoke-now-abc12   Succeeded   manual   k1f1ec0a8    38s
 ```
 
-(Output illustrative.) The `Snapshot` has no fixed `Succeeded` *condition*; to
-wait on it in a script, key on the phase:
+The output above is illustrative. The `Snapshot` has no fixed `Succeeded` *condition*, so to wait on it in a script, key on the phase:
 
 ```console
 $ kubectl -n backups wait --for=jsonpath='{.status.phase}'=Succeeded \
     snapshot/smoke-now-abc12 --timeout=5m
 ```
 
-**5. Deep proof — the data really moved.** `status.stats` shows non-zero
-`bytesNew`/`filesNew`, and `status.snapshot.kopiaSnapshotID` is the kopia
-snapshot ID in your container:
+**5. Prove the data really moved.** `status.stats` shows non-zero `bytesNew` and `filesNew`, and `status.snapshot.kopiaSnapshotID` is the kopia snapshot ID in your container:
 
 ```console
 $ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.stats}'
@@ -207,8 +176,7 @@ $ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.snapshot
 k1f1ec0a8
 ```
 
-(Both outputs illustrative — sizes and the ID vary.) Non-zero `bytesNew` is the
-proof the backup uploaded real content to Azure Blob.
+Both outputs are illustrative; sizes and the ID vary. Non-zero `bytesNew` proves the backup uploaded real content to Azure Blob.
 
 **6. Clean up** the smoke-test when you're done:
 
@@ -220,51 +188,37 @@ $ kubectl -n backups delete pvc smoke-data
 
 /// warning | Deleting a Snapshot deletes its snapshot
 
-A produced `Snapshot` defaults to `deletionPolicy: Delete`, so removing the CR
-runs `kopia snapshot delete` via a finalizer. Use `Retain` (or `Orphan`) to keep
-the data — see [Backups → deletionPolicy](../backups.md#deletionpolicy--what-happens-to-the-snapshot).
+A produced `Snapshot` defaults to `deletionPolicy: Delete`, so removing the CR runs `kopia snapshot delete` through a finalizer. Use `Retain` or `Orphan` to keep the data. See [Backups → deletionPolicy](../backups.md#deletionpolicy--what-happens-to-the-snapshot).
 
 ///
 
-From here the full lifecycle is backend-independent — only the `Repository`
-differs. Put it on a cron with a `SnapshotSchedule`
-([Backups & schedules](../backups.md),
-[Example 01](../examples.md#example-01--single-pvc-scheduled)) and restore by
-picking a `Snapshot` ([Restores](../restores.md),
-[Example 03](../examples.md#example-03--restore-by-picking-a-snapshot)).
+From here the rest of the lifecycle is the same on every backend. Only the `Repository` differs. Put it on a cron with a `SnapshotSchedule`, described in [Backups & schedules](../backups.md) and [Example 01](../examples.md#example-01--single-pvc-scheduled). Restore by picking a `Snapshot`, described in [Restores](../restores.md) and [Example 03](../examples.md#example-03--restore-by-picking-a-snapshot).
 
 ## Troubleshooting
 
 /// warning | Provide exactly one credential
 
-Setting **both** `AZURE_STORAGE_KEY` and `AZURE_STORAGE_SAS_TOKEN` is ambiguous.
-Provide one. A SAS token must be pasted **without** a leading `?` and must grant
-read/write/list/delete on the container.
+Setting **both** `AZURE_STORAGE_KEY` and `AZURE_STORAGE_SAS_TOKEN` is ambiguous. Provide one.
+
+A SAS token must be pasted **without** a leading `?`, and it must grant read, write, list, and delete on the container.
 
 ///
 
-/// note | SAS tokens expire — and take your backups offline with them
+/// note | SAS tokens expire, and take your backups offline with them
 
-A SAS token carries an expiry (`se=` in the token). When it lapses, every mover
-run starts failing with `AuthenticationFailed` even though nothing in the cluster
-changed. Pick an expiry you'll actually rotate before, put the rotation in your
-calendar, and update the Secret in place — the operator
-[watches the Secret](../repositories.md) and re-verifies the repository without
-you touching the `Repository` object.
+A SAS token carries an expiry, shown as `se=` in the token. When it lapses, every mover run starts failing with `AuthenticationFailed`, even though nothing in the cluster changed.
+
+Pick an expiry you'll actually rotate before, put the rotation in your calendar, and update the Secret in place. The operator [watches the Secret](../repositories.md) and re-verifies the repository without you touching the `Repository` object.
 
 ///
 
-- **`AuthenticationFailed`** — wrong key, expired SAS token (check the `se=`
-  timestamp inside the token), or a SAS scoped to the wrong container.
-  Regenerate scoped to _this_ container.
-- **`ContainerNotFound`** — create the container first; Kopiur won't.
-- **Works with the key, fails with SAS** — the SAS is missing a permission
-  (needs `racwdl`) or `storageAccount` is unset; a SAS token doesn't encode the
-  account name.
+- **`AuthenticationFailed`.** The key is wrong, the SAS token has expired, or the SAS is scoped to the wrong container. Check the `se=` timestamp inside the token. Regenerate the SAS scoped to _this_ container.
+- **`ContainerNotFound`.** Create the container first. Kopiur won't.
+- **Works with the key, fails with SAS.** Either the SAS is missing a permission, and it needs `racwdl`, or `storageAccount` is unset. A SAS token doesn't encode the account name.
 
 ## See also
 
-- [Object lock (ransomware protection)](s3.md#object-lock-ransomware-protection) — `spec.parameters.blobRetention` works on Azure Blob too; the S3 page documents it in full.
-- [Repositories & backends](../repositories.md) — concepts: scope, encryption, creation.
-- [Movers, RBAC & credentials](../movers.md) — where the credential Secret must live.
+- [Object lock (ransomware protection)](s3.md#object-lock-ransomware-protection): `spec.parameters.blobRetention` works on Azure Blob too. The S3 page documents it in full.
+- [Repositories & backends](../repositories.md): the concepts, meaning scope, encryption, and creation.
+- [Movers, RBAC & credentials](../movers.md): where the credential Secret must live.
 - Sibling backends: [S3](s3.md) · [GCS](gcs.md) · [B2](b2.md).

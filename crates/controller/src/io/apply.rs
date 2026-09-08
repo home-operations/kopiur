@@ -55,6 +55,63 @@ pub fn status_patch_is_noop(
         .all(|(k, v)| current_obj.get(k) == Some(v))
 }
 
+/// Apply an RFC-7386 JSON merge patch of `patch` onto `target`, returning the
+/// result. Pure.
+///
+/// The three rules, verbatim from the RFC and from what the API server does with
+/// a `Patch::Merge` body: a `null` REMOVES the key, two objects MERGE key by key
+/// (recursively), and anything else — arrays included — REPLACES.
+pub(crate) fn apply_merge_patch(
+    target: &serde_json::Value,
+    patch: &serde_json::Value,
+) -> serde_json::Value {
+    let serde_json::Value::Object(patch_obj) = patch else {
+        return patch.clone();
+    };
+    let mut out = match target {
+        serde_json::Value::Object(t) => t.clone(),
+        _ => serde_json::Map::new(),
+    };
+    for (key, value) in patch_obj {
+        if value.is_null() {
+            out.remove(key);
+            continue;
+        }
+        let existing = out.get(key).cloned().unwrap_or(serde_json::Value::Null);
+        out.insert(key.clone(), apply_merge_patch(&existing, value));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Whether merge-patching `desired` over `current` would leave the status
+/// BYTE-IDENTICAL, evaluated with full RFC-7386 semantics — the deep counterpart
+/// to [`status_patch_is_noop`].
+///
+/// [`status_patch_is_noop`] compares each top-level key by whole-value equality,
+/// which is exact for a reconciler that writes whole values but wrong for one
+/// that writes a PARTIAL sub-object. The fanned-out populator (#443) patches
+/// `claims: { "<one pvc>": {…} }` while `status.claims` holds every claimant, so
+/// the shallow check can never see a no-op: every pass would PATCH, bump
+/// `resourceVersion`, wake the watch and re-trigger itself — the exact hot-loop
+/// [`patch_status_if_changed`] exists to break, on the 120s cadence times N
+/// claims.
+///
+/// It also reads an explicit `null` correctly (a merge DELETES that key), where
+/// the shallow check compares it against the current value and effectively never
+/// matches.
+///
+/// Pure and cluster-free, so the semantics are unit-asserted rather than
+/// discovered from a busy cluster.
+pub fn status_merge_patch_is_noop(
+    current: Option<&serde_json::Value>,
+    desired: &serde_json::Value,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    apply_merge_patch(current, desired) == *current
+}
+
 /// Idempotent status patch: skip the PATCH entirely when `desired` matches the
 /// object's existing status (`current`), returning `false`; otherwise merge-patch
 /// and return `true`.
@@ -68,6 +125,16 @@ pub fn status_patch_is_noop(
 /// [`crate::io::upsert_condition`] preserves `lastTransitionTime` while the status is
 /// unchanged. The returned bool lets the caller fire its Warning Event only on a
 /// real transition.
+///
+/// The no-op test is [`status_merge_patch_is_noop`] — full RFC-7386 semantics,
+/// i.e. exactly what the API server would do with this body. The shallow
+/// [`status_patch_is_noop`] agrees with it on every FLAT status (asserted in
+/// `io::tests`), and the two differ only where the deep one is right: a PARTIAL
+/// sub-object patch (the fanned-out populator's `claims: { "<one pvc>": {…} }`,
+/// #443) and an explicit `null` (a merge DELETES that key). Using the shallow
+/// predicate there would make every pass a write, bumping `resourceVersion`,
+/// waking the watch and re-triggering the reconcile — the very hot-loop this
+/// function exists to break.
 pub async fn patch_status_if_changed<K>(
     api: &Api<K>,
     name: &str,
@@ -77,7 +144,7 @@ pub async fn patch_status_if_changed<K>(
 where
     K: Resource + DeserializeOwned + Clone + std::fmt::Debug,
 {
-    if status_patch_is_noop(current, &desired) {
+    if status_merge_patch_is_noop(current, &desired) {
         return Ok(false);
     }
     patch_status(api, name, desired).await?;
@@ -129,16 +196,30 @@ pub fn is_terminal_for_generation(
 /// the one (`recorded_version`) observed at the last failed connect — `current_version`
 /// is the Secret's live `resourceVersion`, read cheaply before this check.
 ///
-/// Holds (skip the backend) only when BOTH are unchanged: terminal for this
-/// generation AND the credential is byte-for-byte the same Secret revision. Any
-/// difference (including a first failure that recorded no version) reopens it.
+/// A third opener, for the same reason (issue #435): a live, VALID
+/// `allow-reinitialize` ack is a new input too, and applying an annotation bumps
+/// neither `metadata.generation` nor the Secret's `resourceVersion`. Without
+/// `reinit_requested` here, the user's deliberate re-initialize of a wiped
+/// backend would sit behind the 30-minute heartbeat on exactly the bare-path
+/// repositories this gate protects. `reinit_requested` is computed by the caller
+/// as `phase != Ready && matches!(create_gate(..), Allowed { via_reinit_ack: true })`
+/// — the `phase != Ready` half is load-bearing: on a healthy repository a
+/// standing ack must be a complete no-op, never a nudge that re-opens the
+/// backend.
+///
+/// Holds (skip the backend) only when ALL THREE are unchanged: terminal for this
+/// generation, the credential is byte-for-byte the same Secret revision, and no
+/// re-initialize was requested. Any difference (including a first failure that
+/// recorded no version) reopens it.
 pub fn terminal_gate_holds(
     phase: Option<&kopiur_api::RepositoryPhase>,
     observed_generation: Option<i64>,
     generation: Option<i64>,
     recorded_version: Option<&str>,
     current_version: &str,
+    reinit_requested: bool,
 ) -> bool {
-    is_terminal_for_generation(phase, observed_generation, generation)
+    !reinit_requested
+        && is_terminal_for_generation(phase, observed_generation, generation)
         && recorded_version == Some(current_version)
 }

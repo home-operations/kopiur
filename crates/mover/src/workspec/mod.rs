@@ -608,6 +608,36 @@ pub struct SnapshotDeleteItem {
     pub anchor: SnapshotAnchor,
 }
 
+/// WHY [`BootstrapRepositoryOp::auto_create`] is `false`, when it is (issue
+/// #435). The controller resolves it from `kopiur_controller::health::CreateGate`;
+/// the mover uses it to pick between two very different decline messages for the
+/// same observable state ("connect says NotFound and the backend is empty").
+///
+/// Closed enum — a new blocking reason cannot compile until the mover's decline
+/// arm decides what to say about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CreateBlock {
+    /// `spec.create.enabled` is `false`: this backend just needs initializing and
+    /// the user only has to opt in. The pre-#435 message.
+    SpecDisabled,
+    /// The spec DID opt in, but this repository has been `Ready` before (a pinned
+    /// `status.uniqueId`) and no `allow-reinitialize` ack matches it. Telling
+    /// this user to "set spec.create.enabled: true" is wrong — it already is —
+    /// and hides the real question: the backend was wiped, and re-creating
+    /// discards the history the old repository held.
+    // `rename_all` on the enum renames the VARIANTS; a struct variant's fields
+    // need their own attribute, or this rides the wire as `also_spec_disabled`
+    // while every other field in the work spec is camelCase.
+    #[serde(rename_all = "camelCase")]
+    OnceReadyPinned {
+        /// `spec.create.enabled` is ALSO false, so the message must name both
+        /// fixes at once rather than handing out a two-step diagnosis.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        also_spec_disabled: bool,
+    },
+}
+
 /// Payload for a repository-bootstrap run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -619,6 +649,28 @@ pub struct BootstrapRepositoryOp {
     /// instead of silently spawning a second repository.
     #[serde(default)]
     pub auto_create: bool,
+    /// WHY `auto_create` is `false`, when it is (issue #435). `None` on an
+    /// `auto_create: true` op — and on work specs written by a controller older
+    /// than #435, where the mover falls back to the historical
+    /// [`CreateBlock::SpecDisabled`] reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_block: Option<CreateBlock>,
+    /// The controller's pinned `status.uniqueId`, carried so the mover's
+    /// re-initialize hint can name the exact annotation value the user must
+    /// apply. Set only alongside [`CreateBlock::OnceReadyPinned`]; absent
+    /// otherwise and on pre-#435 work specs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_unique_id: Option<String>,
+    /// `auto_create` is `true` ONLY because a valid, armed `allow-reinitialize`
+    /// ack is present (review wave 2, finding 1b). The mover folds the pair into
+    /// [`crate::bootstrap::CreateGrant::ReinitAck`], whose create arm additionally
+    /// requires kopia's "repository not initialized" on the connect's stderr —
+    /// so an ack left in a GitOps manifest can never turn an unbound mount or a
+    /// wrong prefix (both a plain `NotFound`) into a freshly created, re-pinned
+    /// repository. `false` on every ordinary bootstrap and on work specs written
+    /// by an older controller, where it reads as the plain first-bootstrap grant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_via_reinit_ack: bool,
     /// The stable kopia maintenance owner (`user@hostname`, derived from the
     /// managed lease — `kopiur_api::maintenance::kopia_owner_for_lease`) to
     /// stamp on a repository this bootstrap CREATES. Adopted repositories are
@@ -2186,6 +2238,23 @@ pub struct TargetRef {
     pub name: String,
     /// The CR namespace.
     pub namespace: String,
+    /// For one claim of a fanned-out populator `Restore` (#443): the claiming
+    /// PVC's NAME, which is the key this run's status belongs under
+    /// (`status.claims.<claimKey>`).
+    ///
+    /// A populator `Restore` runs N concurrent movers, one per claiming PVC. If
+    /// each wrote the top-level `status.phase`/`resolved`/`logTail`/`failure`
+    /// they would clobber one another, and the controller's pinned-resolution
+    /// read would hand claim B the snapshot claim A resolved. So a claim-scoped
+    /// run nests its whole status body under its own map key — which a JSON
+    /// merge patch merges rather than replaces — and OMITS `phase`, because the
+    /// controller owns claim phase exactly as it owns the top-level one.
+    ///
+    /// Absent for every other run (backups, direct restores, maintenance, …),
+    /// which keep writing the top-level status verbatim. `#[serde(default)]`, so
+    /// a work spec written by an older controller still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_key: Option<String>,
 }
 
 /// A summary of the hook plan the workload pod will execute. The mover does
@@ -2260,6 +2329,7 @@ impl Default for MoverOptions {
 ///         kind: "Snapshot".into(),
 ///         name: "mydb-20260601".into(),
 ///         namespace: "prod".into(),
+///         claim_key: None,
 ///     },
 ///     hook_plan: HookPlanSummary::default(),
 ///     options: MoverOptions::default(),

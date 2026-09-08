@@ -141,6 +141,27 @@ a once-`Ready` repository — `create.enabled` governs the first bootstrap only,
 and a wipe always ends in a loud terminal state for a human, not a silent
 fresh-empty-repo.
 
+**Amended by #435.** The invariant above stands unchanged; what it lacked was a
+door. Two things were wrong in practice:
+
+1. The terminal state reused `RepositoryNotInitialized`, whose message says "set
+   `spec.create.enabled: true`" — false advice for the reporter, whose
+   `create.enabled` was already `true` and whose bucket had been deleted. That
+   case now has its own reason, `RepositoryReinitializeBlocked`, produced from a
+   typed `health::CreateGate` (`Allowed { via_reinit_ack }` /
+   `DisabledBySpec { also_pinned }` / `PinnedOnceReady`) that is carried to the
+   mover as `BootstrapRepositoryOp.create_block`.
+2. Nothing ever cleared `status.uniqueId`, so "a deliberate human action" had no
+   documented form and the reporter deleted the whole namespace. The action is
+   now the annotation
+   `kopiur.home-operations.com/allow-reinitialize: <status.uniqueId>`, honored
+   only while it equals the pin — self-expiring, because a successful re-init
+   mints a new id.
+
+The ack'd pass is a strict (non-probe) bootstrap, so the existing
+`success_fold(probe_run = false, ..)` → `Heal` path resets the breaker; no second
+reset path was added.
+
 ### 6. kstatus: `Degraded` is `Reconciling`, not `Stalled`
 
 `crates/controller/src/io/finalizer.rs::ready_outcome_for_phase` maps

@@ -22,6 +22,7 @@ fn sample_target() -> TargetRef {
         kind: "Snapshot".into(),
         name: "mydb-20260601".into(),
         namespace: "prod".into(),
+        claim_key: None,
     }
 }
 
@@ -414,6 +415,9 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
         version: 1,
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
             auto_create: true,
+            create_block: None,
+            pinned_unique_id: None,
+            create_via_reinit_ack: false,
             scan_catalog: true,
             probe_only: false,
             create_options: Default::default(),
@@ -502,6 +506,9 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     // them) still parses the JSON a NEW controller writes.
     let op = BootstrapRepositoryOp {
         auto_create: true,
+        create_block: None,
+        pinned_unique_id: None,
+        create_via_reinit_ack: false,
         scan_catalog: true,
         probe_only: false,
         create_options: Default::default(),
@@ -526,6 +533,103 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
     // would simply never read (it decodes what it recognizes and ignores the
     // rest), so this is still forward/backward compatible in practice.
     assert_eq!(v["restampPolicy"], "anyStale");
+    // #435: same contract for the two block-reason fields.
+    assert!(v.get("createBlock").is_none());
+    assert!(v.get("pinnedUniqueId").is_none());
+}
+
+/// #435: the two new fields ride the wire in the externally-tagged shape, and
+/// their absence decodes to "the pre-#435 reading" (`None` ⇒ SpecDisabled), so a
+/// mover/controller version skew can never turn a spec opt-out into a wiped-backend
+/// story or vice versa.
+#[test]
+fn bootstrap_create_block_round_trips_and_defaults_off_for_old_work_specs() {
+    use super::CreateBlock;
+
+    let mut op = BootstrapRepositoryOp {
+        auto_create: false,
+        create_block: Some(CreateBlock::OnceReadyPinned {
+            also_spec_disabled: false,
+        }),
+        pinned_unique_id: Some("U1".into()),
+        create_via_reinit_ack: false,
+        scan_catalog: true,
+        probe_only: false,
+        create_options: Default::default(),
+        epoch_parameters: Default::default(),
+        blob_retention: None,
+        maintenance_owner: None,
+        catalog_foreign_prefilter_cluster: None,
+        restamp_policy: RestampPolicy::AnyStale,
+        maintenance_owner_aliases: Vec::new(),
+        read_only: false,
+        seed: None,
+    };
+    let v = serde_json::to_value(&op).unwrap();
+    // Externally tagged (CLAUDE.md rule 1): the variant is the key. The
+    // `also_spec_disabled: false` default is elided, so the common case is the
+    // smallest possible payload.
+    assert!(v["createBlock"]["onceReadyPinned"].is_object());
+    assert!(v["createBlock"]["onceReadyPinned"]["alsoSpecDisabled"].is_null());
+    assert_eq!(v["pinnedUniqueId"], "U1");
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        op
+    );
+
+    // Both blocked: the flag DOES ride the wire, because the mover's message
+    // needs it to name both fixes at once.
+    op.create_block = Some(CreateBlock::OnceReadyPinned {
+        also_spec_disabled: true,
+    });
+    let v = serde_json::to_value(&op).unwrap();
+    assert_eq!(
+        v["createBlock"]["onceReadyPinned"]["alsoSpecDisabled"],
+        true
+    );
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        op
+    );
+
+    // The unit variant is a bare string.
+    op.create_block = Some(CreateBlock::SpecDisabled);
+    op.pinned_unique_id = None;
+    let v = serde_json::to_value(&op).unwrap();
+    assert_eq!(v["createBlock"], "specDisabled");
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        op
+    );
+
+    // Old controller: no key at all ⇒ `None`, which `bootstrap_declined` reads
+    // as the historical spec-opt-out message.
+    let old: BootstrapRepositoryOp = serde_json::from_value(serde_json::json!({
+        "autoCreate": false,
+        "scanCatalog": true,
+    }))
+    .unwrap();
+    assert!(old.create_block.is_none());
+    assert!(old.pinned_unique_id.is_none());
+    // …and no `createViaReinitAck` ⇒ the plain first-bootstrap grant (wave 2,
+    // finding 1b): an old controller never granted create via an ack.
+    assert!(!old.create_via_reinit_ack);
+
+    // The acked grant rides the wire only when set, so an ordinary bootstrap's
+    // payload is byte-identical to pre-wave-2 — and an old mover that has never
+    // heard of the key still parses what a new controller writes.
+    op.auto_create = true;
+    op.create_block = None;
+    op.create_via_reinit_ack = true;
+    let v = serde_json::to_value(&op).unwrap();
+    assert_eq!(v["createViaReinitAck"], true);
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        op
+    );
+    op.create_via_reinit_ack = false;
+    let v = serde_json::to_value(&op).unwrap();
+    assert!(v.get("createViaReinitAck").is_none(), "{v}");
 }
 
 #[test]
@@ -1734,6 +1838,7 @@ fn snapshot_replicate_roundtrip_and_wire_shape() {
             kind: "SnapshotReplication".into(),
             name: "offsite-mirror".into(),
             namespace: "backups".into(),
+            claim_key: None,
         },
         hook_plan: HookPlanSummary::default(),
         options: MoverOptions::default(),
@@ -2662,6 +2767,9 @@ fn seed_migrate_policies_default_to_an_explicit_no_policies() {
 fn a_seeding_bootstrap_op_round_trips_and_elides_its_defaults() {
     let op = BootstrapRepositoryOp {
         auto_create: false,
+        create_block: None,
+        pinned_unique_id: None,
+        create_via_reinit_ack: false,
         scan_catalog: true,
         probe_only: false,
         create_options: Default::default(),
@@ -2763,4 +2871,40 @@ fn a_just_seeded_repository_restamps_its_maintenance_owner_unconditionally() {
         ),
         None
     );
+}
+
+// --- TargetRef.claimKey (#443) ----------------------------------------------
+
+#[test]
+fn target_ref_without_a_claim_key_still_decodes_and_stays_off_the_wire() {
+    // Upgrade safety: a work-spec ConfigMap written by an older controller (and
+    // still mounted by an in-flight Job) carries no `claimKey`. It must decode,
+    // not error the mover out at startup.
+    let old = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Snapshot",
+        "name": "mydb-20260601",
+        "namespace": "prod",
+    });
+    let decoded: TargetRef = serde_json::from_value(old).expect("old wire decodes");
+    assert_eq!(decoded, sample_target());
+    assert_eq!(decoded.claim_key, None);
+
+    // …and an unset key is omitted, so every non-populator run's work spec is
+    // byte-identical to what it was before #443.
+    let v = serde_json::to_value(&decoded).unwrap();
+    assert!(v.get("claimKey").is_none(), "{v}");
+}
+
+#[test]
+fn target_ref_claim_key_round_trips_camel_cased() {
+    let scoped = TargetRef {
+        kind: "Restore".into(),
+        claim_key: Some("data-0".into()),
+        ..sample_target()
+    };
+    let v = serde_json::to_value(&scoped).unwrap();
+    assert_eq!(v["claimKey"], "data-0");
+    let back: TargetRef = serde_json::from_value(v).expect("round-trips");
+    assert_eq!(back, scoped);
 }

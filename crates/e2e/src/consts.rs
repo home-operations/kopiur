@@ -105,6 +105,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // #346 multi-PVC fan-out + VolumeGroupSnapshot group staging.
     "multipvc-fanout",
     "multipvc-group",
+    // #443: the populator fan-out scenario needs its own repo so no other
+    // scenario's snapshots land under the same identity and confuse a
+    // per-member path assertion.
+    "populator-fanout",
     // #351 kopia-deduped (Unchanged) runs.
     "unchanged-dedup",
     "unchanged-default",
@@ -469,6 +473,11 @@ pub const BUCKETS: &[&str] = &[
     // sharing a kopia repository with each other or any other scenario.
     BUCKET_BREAKER_REPO,
     BUCKET_BREAKER_ALERT,
+    // Deliberate re-initialize after a wipe (#435, crates/e2e/tests/health_probe.rs,
+    // `degrade_mode_wipe_escalates_to_reinitialize_blocked_and_ack_recreates`): the
+    // scenario EMPTIES this bucket mid-test and then lets the ack re-create a
+    // repository in it, so it must be isolated from every other scenario.
+    BUCKET_REINIT_ACK,
 ];
 
 /// The anonymous-policy bucket for the workload-identity scenario (see
@@ -513,6 +522,9 @@ pub const BUCKET_BREAKER_REPO: &str = "kopiur-breaker-repo";
 /// Bucket for the Alert-mode opt-out repository riding the same outage window
 /// in crates/e2e/tests/repo_breaker.rs.
 pub const BUCKET_BREAKER_ALERT: &str = "kopiur-breaker-alert";
+/// Bucket for the #435 deliberate-re-initialize scenario: wiped mid-test, then
+/// re-created by an acknowledged re-initialize.
+pub const BUCKET_REINIT_ACK: &str = "kopiur-reinit-ack";
 
 // --- SFTP backend (in-cluster atmoz/sftp server, key-based auth) ---------------
 // kopia's SFTP backend has no env-var credential form, so the mover materializes

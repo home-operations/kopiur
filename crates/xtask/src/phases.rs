@@ -136,6 +136,7 @@ pub const API_PHASE_ENUMS: &[&str] = &[
     "ReplicationManualRunPhase",
     "RepositoryPhase",
     "RepositoryReplicationPhase",
+    "RestoreClaimPhase",
     "RestorePhase",
     "SnapshotPhase",
     "SnapshotReplicationPhase",

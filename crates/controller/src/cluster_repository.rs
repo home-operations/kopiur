@@ -141,6 +141,18 @@ fn mass_deletion_ack_raw(repo: &ClusterRepository) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// The raw `allow-reinitialize` annotation value on this `ClusterRepository`,
+/// if any (issue #435) — the cluster-scoped twin of
+/// [`crate::repository::reinit_ack_raw`]. Validity is decided by
+/// [`health::create_gate`].
+pub(crate) fn reinit_ack_raw(repo: &ClusterRepository) -> Option<&str> {
+    repo.metadata
+        .annotations
+        .as_ref()?
+        .get(crate::consts::ALLOW_REINITIALIZE_ANNOTATION)
+        .map(String::as_str)
+}
+
 /// Fold the non-blocking `MassDeletionHeld` condition into `conditions` from the
 /// live Snapshot store (ADR-0005 §6; shared
 /// [`crate::snapshot::repo_mass_deletion_conditions`]). Unchanged when the store
@@ -355,6 +367,27 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
         io::remove_finalizer(&api, repo, SERVER_CLEANUP_FINALIZER).await?;
     }
 
+    // #435: report an `allow-reinitialize` annotation that will NOT lead to a
+    // re-initialize — see the namespaced twin. `namespace: None`: a
+    // `ClusterRepository` is cluster-scoped, so the command carries no `-n`.
+    io::publish_reinitialize_ack_diagnostics(
+        ctx,
+        repo,
+        "ClusterRepository",
+        &name,
+        None,
+        repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RepositoryPhase::Ready),
+        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
+        reinit_ack_raw(repo),
+        &health::reinit_ack_arming(
+            repo.status
+                .as_ref()
+                .map(|s| s.conditions.as_slice())
+                .unwrap_or_default(),
+        ),
+    )
+    .await;
+
     // Same connect/create/status lifecycle as Repository. A cluster-scoped secret ref has
     // no referrer namespace to inherit, so an absent one resolves to the operator's
     // namespace (`cluster_secret_namespace`).
@@ -389,7 +422,32 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             // Hard-stop: terminally Failed for this spec generation AND the password
             // Secret unchanged since → quiet heartbeat. Reopens on a spec change
             // (generation) or a Secret content edit (resourceVersion; re-triggered by
-            // the Secret watch in `lib.rs`).
+            // the Secret watch in `lib.rs`) — or, since #435, a live valid
+            // `allow-reinitialize` ack on a non-`Ready` repository (an annotation edit
+            // bumps neither of the other two).
+            let pinned_unique_id = repo.status.as_ref().and_then(|s| s.unique_id.as_deref());
+            let create_gate = health::create_gate(
+                kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
+                pinned_unique_id,
+                reinit_ack_raw(repo),
+            );
+            let phase_is_ready = repo.status.as_ref().and_then(|s| s.phase.as_ref())
+                == Some(&RepositoryPhase::Ready);
+            // Two locks — phase and parked verdict — see the namespaced twin.
+            let arming = health::reinit_ack_arming(
+                repo.status
+                    .as_ref()
+                    .map(|s| s.conditions.as_slice())
+                    .unwrap_or_default(),
+            );
+            let reinit_requested = health::reinit_requested(
+                phase_is_ready,
+                crate::repository::valid_reinit_ack(create_gate, pinned_unique_id).is_some(),
+                &arming,
+            );
+            // Create permission is the PHASE-GATED decision, never the raw gate
+            // (review C1) — see the namespaced twin.
+            let effective_create = health::effective_create(create_gate, reinit_requested);
             if io::terminal_gate_holds(
                 repo.status.as_ref().and_then(|s| s.phase.as_ref()),
                 repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -398,6 +456,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                     .as_ref()
                     .and_then(|s| s.resolved_credential_version.as_deref()),
                 &cred_version,
+                reinit_requested,
             ) {
                 return Ok(Action::requeue(TERMINAL_HEARTBEAT));
             }
@@ -413,10 +472,6 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 // Part A: never auto-create over a once-`Ready` repository (pinned
                 // `uniqueId`) — a wiped/unreachable backend surfaces as a failure,
                 // never a silent fresh empty repo.
-                let create_enabled = health::auto_create_allowed(
-                    kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
-                    repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
-                );
                 // Try create-then-connect when enabled and the failure isn't
                 // "repo already there" (auth/locked); otherwise the connect error
                 // is terminal. A terminal failure (connect OR a failed create)
@@ -426,38 +481,57 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                     repo.spec.create.as_ref(),
                 )
                 .to_kopia();
-                let outcome =
-                    if kopiur_mover::bootstrap::should_attempt_create(create_enabled, e.class()) {
-                        match client
-                            .repository_create(
-                                &spec,
-                                kopiur_kopia::CacheTuning::default(),
-                                &create_opts,
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                client
-                                    .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
-                                    .await
-                            }
-                            Err(ce) => Err(ce),
+                let outcome = if kopiur_mover::bootstrap::should_attempt_create(
+                    effective_create.grant(),
+                    e.class(),
+                    // Wave 2, finding 1b — see the namespaced twin.
+                    e.stderr_tail()
+                        .is_some_and(kopiur_kopia::notfound_is_uninitialized),
+                ) {
+                    match client
+                        .repository_create(
+                            &spec,
+                            kopiur_kopia::CacheTuning::default(),
+                            &create_opts,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            client
+                                .repository_connect(&spec, kopiur_kopia::CacheTuning::default())
+                                .await
                         }
-                    } else {
-                        Err(e)
-                    };
+                        Err(ce) => Err(ce),
+                    }
+                } else {
+                    Err(e)
+                };
                 if let Err(e) = outcome {
                     let class = e.class();
                     let retryable = class.is_retryable();
+                    // #435: the namespaced twin's re-initialize hint. `namespace:
+                    // None` — a `ClusterRepository` is cluster-scoped, so the
+                    // `kubectl annotate` command must carry no `-n`.
+                    let reinit_block = health::inprocess_reinitialize_block(
+                        effective_create.block,
+                        &e,
+                        "ClusterRepository",
+                        &name,
+                        None,
+                        pinned_unique_id,
+                    );
                     let phase_enum = if retryable {
                         RepositoryPhase::Degraded
                     } else {
                         RepositoryPhase::Failed
                     };
                     let phase = if retryable { "Degraded" } else { "Failed" };
+                    let (reason, message) = match reinit_block.as_ref() {
+                        Some(failure) => (failure.reason(), failure.condition_message()),
+                        None => (class.as_str(), class.summary().to_string()),
+                    };
                     // Stable, volatile-free condition message; full stderr → Event.
-                    let conditions =
-                        cluster_bootstrap_condition(repo, false, class.as_str(), class.summary());
+                    let conditions = cluster_bootstrap_condition(repo, false, reason, &message);
                     // kstatus conditions so Flux sees a retryable connect as
                     // Reconciling and a terminal one as Stalled, never a frozen
                     // Ready/Suspended (issue #245).
@@ -465,8 +539,8 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                         &conditions,
                         repo.metadata.generation,
                         io::ready_outcome_for_phase(&phase_enum),
-                        class.as_str(),
-                        class.summary(),
+                        reason,
+                        &message,
                     );
                     let current = serde_json::to_value(&repo.status).ok();
                     let wrote = io::patch_status_if_changed(
@@ -485,14 +559,21 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                     )
                     .await?;
                     if wrote {
-                        io::publish_backend_failure(
-                            ctx,
-                            &io::event_ref(repo),
-                            &name,
-                            class,
-                            &e.to_string(),
-                        )
-                        .await;
+                        match reinit_block.as_ref() {
+                            Some(failure) => {
+                                failure.publish(ctx, &io::event_ref(repo), &name).await
+                            }
+                            None => {
+                                io::publish_backend_failure(
+                                    ctx,
+                                    &io::event_ref(repo),
+                                    &name,
+                                    class,
+                                    &e.to_string(),
+                                )
+                                .await
+                            }
+                        }
                     }
                     return if retryable {
                         Err(Error::Kopia(e))
@@ -1024,18 +1105,43 @@ async fn bootstrap_cluster_via_mover(
     // carries no seed and keeps its short deadline. `resume` comes from the
     // durable seed-attempt marker and nothing else — see
     // `kopiur_api::seed::seed_resume`.
-    let seed_armed = kopiur_api::seed::seed_armed(
-        repo.spec.seed.as_ref(),
-        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
-    );
-    let seed_resume = kopiur_api::seed::seed_resume(
-        seed_armed,
-        repo.status.as_ref().and_then(|s| s.seed.as_ref()),
-    );
-    let probe_enabled =
-        kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
     let prior_phase = repo.status.as_ref().and_then(|s| s.phase.as_ref());
     let already_ready = prior_phase == Some(&RepositoryPhase::Ready);
+    // #435 — computed once per pass; see the namespaced twin for why an ack is a
+    // third kind of new input, and why the `phase != Ready` guard is load-bearing.
+    let pinned_unique_id = repo.status.as_ref().and_then(|s| s.unique_id.as_deref());
+    let create_gate = health::create_gate(
+        kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
+        pinned_unique_id,
+        reinit_ack_raw(repo),
+    );
+    let launch_reinit_ack = crate::repository::valid_reinit_ack(create_gate, pinned_unique_id);
+    // Two locks — phase and parked verdict (wave 2, finding 1a); the Job stamp
+    // `launch_reinit_ack` stays verdict-blind — see the namespaced twin.
+    let arming = health::reinit_ack_arming(
+        repo.status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or_default(),
+    );
+    let reinit_requested =
+        health::reinit_requested(already_ready, launch_reinit_ack.is_some(), &arming);
+    // Create permission is the PHASE-GATED decision, never the raw gate (review
+    // C1) — see the namespaced twin for the failure it prevents.
+    let effective_create = health::effective_create(create_gate, reinit_requested);
+    let create_enabled = effective_create.allowed;
+    // #380 + #435: arm / resume / clear, decided together by one pure fn — see
+    // the namespaced twin.
+    let seed_plan = crate::repo_seed::reinit_seed_plan(
+        repo.spec.seed.as_ref(),
+        pinned_unique_id,
+        repo.status.as_ref().and_then(|s| s.seed.as_ref()),
+        reinit_requested,
+    );
+    let seed_armed = seed_plan.armed;
+    let seed_resume = seed_plan.resume;
+    let probe_enabled =
+        kopiur_api::repository::RepositoryHealthProbeSpec::enabled(repo.spec.health.as_ref());
     let probe_attempt_at = repo
         .status
         .as_ref()
@@ -1112,11 +1218,25 @@ async fn bootstrap_cluster_via_mover(
                     .and_then(|a| a.get(crate::consts::BOOTSTRAP_GENERATION_ANNOTATION))
                     .map(String::as_str),
                 repo.metadata.generation,
+                job.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION))
+                    .map(String::as_str),
+                launch_reinit_ack,
             )
         {
             tracing::info!(
                 repo = %name,
-                "recycling a terminal bootstrap Job launched for an older generation"
+                stamped_ack = ?job
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION)),
+                live_ack = ?launch_reinit_ack,
+                "recycling a terminal bootstrap Job whose evidence is stale: it was \
+                 launched for an older generation, or before the allow-reinitialize \
+                 ack now on the object"
             );
             io::delete_mover_run(&ctx.client, &job_ns, &job_name).await?;
             return Ok(Action::requeue(Duration::from_secs(5)));
@@ -1335,11 +1455,8 @@ async fn bootstrap_cluster_via_mover(
     );
 
     // Part A: only a never-bootstrapped ClusterRepository (no pinned `uniqueId`)
-    // may carry `auto_create`; a once-`Ready` one re-runs as a pure connect probe.
-    let create_enabled = health::auto_create_allowed(
-        kopiur_api::common::create_enabled(repo.spec.create.as_ref()),
-        repo.status.as_ref().and_then(|s| s.unique_id.as_deref()),
-    );
+    // may carry `auto_create`; a once-`Ready` one re-runs as a pure connect probe
+    // — unless the human acknowledged THIS pinned id (#435).
     let cluster = repo
         .spec
         .identity_defaults
@@ -1411,6 +1528,9 @@ async fn bootstrap_cluster_via_mover(
         name,
         &job_ns,
         create_enabled,
+        effective_create.block,
+        pinned_unique_id.map(str::to_string),
+        effective_create.via_reinit_ack,
         // Probe-only (#414): see the namespaced twin.
         probe_style_launch && !catalog_create_due,
         repo.spec.create.as_ref(),
@@ -1569,7 +1689,16 @@ async fn bootstrap_cluster_via_mover(
             .as_ref()
             .map(|s| s.extra_env.clone())
             .unwrap_or_default(),
-        annotations: crate::repository::bootstrap_generation_annotation(repo.metadata.generation),
+        // Generation + the `allow-reinitialize` ack this launch was made with
+        // (#435) — see the namespaced twin.
+        annotations: {
+            let mut a =
+                crate::repository::bootstrap_generation_annotation(repo.metadata.generation);
+            a.extend(crate::repository::bootstrap_reinit_ack_annotation(
+                launch_reinit_ack,
+            ));
+            a
+        },
         // Bootstrap is a short connect/create probe: an emptyDir cache suffices.
         cache_volume: Default::default(),
         scratch_volume: None,
@@ -1579,9 +1708,24 @@ async fn bootstrap_cluster_via_mover(
     let job = jobs::build_job(&inputs)?;
     // #380: stamp the durable seed-attempt marker BEFORE the Job exists — the
     // ORDER is the whole point; see the namespaced twin.
+    // #435: clear the OLD repository's `status.seed` with an explicit RFC 7386
+    // null before stamping a fresh marker — see the namespaced twin.
+    if seed_plan.clear_status {
+        io::patch_status(
+            api,
+            name,
+            serde_json::json!({ "seed": serde_json::Value::Null }),
+        )
+        .await?;
+    }
     if let Some(s) = seed.as_ref()
         && let Some(patch) = crate::repo_seed::seed_marker_patch(
-            repo.status.as_ref().and_then(|st| st.seed.as_ref()),
+            // The same flag — see the namespaced twin.
+            if seed_plan.clear_status {
+                None
+            } else {
+                repo.status.as_ref().and_then(|st| st.seed.as_ref())
+            },
             s.mode,
             &s.source_description,
             &chrono::Utc::now().to_rfc3339(),
@@ -1663,6 +1807,13 @@ fn cluster_bootstrap_work_spec(
     name: &str,
     job_ns: &str,
     auto_create: bool,
+    // #435: WHY `auto_create` is false, when it is, plus the pinned
+    // `status.uniqueId` the re-initialize hint has to name — see the namespaced
+    // twin.
+    create_block: Option<kopiur_mover::workspec::CreateBlock>,
+    pinned_unique_id: Option<String>,
+    // Wave 2, finding 1b — see the namespaced twin.
+    create_via_reinit_ack: bool,
     // #414: this launch is a pure health probe — see the namespaced twin.
     probe_only: bool,
     create: Option<&kopiur_api::common::CreateBehavior>,
@@ -1700,6 +1851,9 @@ fn cluster_bootstrap_work_spec(
         version: 1,
         operation: Operation::BootstrapRepository(BootstrapRepositoryOp {
             auto_create,
+            create_block,
+            pinned_unique_id,
+            create_via_reinit_ack,
             // The Job returns the snapshot listing so `finalize_cluster_bootstrap`
             // can materialize discovered Snapshots (placed per identity hostname —
             // see `crate::catalog`).
@@ -1738,6 +1892,8 @@ fn cluster_bootstrap_work_spec(
             kind: "ClusterRepository".to_string(),
             name: name.to_string(),
             namespace: job_ns.to_string(),
+            // Bootstrap writes the top-level status, never a claim entry (#443).
+            claim_key: None,
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),
@@ -2700,6 +2856,9 @@ mod tests {
                 "shared",
                 "kopia-system",
                 true,
+                None,
+                None,
+                false,
                 false,
                 None,
                 Default::default(),
@@ -2771,6 +2930,9 @@ mod tests {
                 "shared",
                 "kopia-system",
                 true,
+                None,
+                None,
+                false,
                 false,
                 None,
                 Default::default(),

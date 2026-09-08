@@ -20,16 +20,10 @@
 mod common;
 
 use common::*;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::PersistentVolumeClaim;
 use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
-
-/// The storage class the `snapshot-stack` mise task installs.
-const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
-
-/// The label KEY a `pvcSelector` matches on, mirroring example 04.
-const BACKUP_LABEL_KEY: &str = "backup";
 
 /// The two scenarios below use DIFFERENT label values on purpose.
 ///
@@ -38,7 +32,9 @@ const BACKUP_LABEL_KEY: &str = "backup";
 /// the fan-out scenario's selector match four PVCs instead of two, so it would
 /// fail on a count assertion that has nothing to do with what it tests, and only
 /// in whichever order nextest happened to pick. Distinct values also mean a
-/// crashed run cannot poison its sibling.
+/// crashed run cannot poison its sibling. `populator_fanout.rs` uses a THIRD
+/// value for the same reason. (`BACKUP_LABEL_KEY` and `csi_pvc_with_data` are
+/// shared, in `common`.)
 const FANOUT_LABEL_VALUE: &str = "fanout";
 /// See [`FANOUT_LABEL_VALUE`].
 const GROUP_LABEL_VALUE: &str = "group";
@@ -55,64 +51,6 @@ fn volume_group_snapshots(client: &kube::Client) -> Api<DynamicObject> {
     Api::namespaced_with(client.clone(), E2E_NAMESPACE, &ar)
 }
 
-/// Create a CSI PVC carrying the selector label, and seed it so it binds.
-async fn csi_pvc_with_data(client: &kube::Client, name: &str, marker: &str) {
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let _ = pvcs
-        .create(
-            &PostParams::default(),
-            &cr(serde_json::json!({
-                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-                "metadata": {
-                    "name": name, "namespace": E2E_NAMESPACE,
-                    "labels": { BACKUP_LABEL_KEY: GROUP_LABEL_VALUE },
-                },
-                "spec": {
-                    "accessModes": ["ReadWriteOnce"],
-                    "storageClassName": CSI_STORAGE_CLASS,
-                    "resources": { "requests": { "storage": "64Mi" } },
-                },
-            })),
-        )
-        .await;
-    let _ = pods
-        .create(
-            &PostParams::default(),
-            &cr(serde_json::json!({
-                "apiVersion": "v1", "kind": "Pod",
-                "metadata": { "name": format!("{name}-seed"), "namespace": E2E_NAMESPACE },
-                "spec": {
-                    "restartPolicy": "Never",
-                    "containers": [{
-                        "name": "seed", "image": kopiur_e2e::consts::BUSYBOX_IMAGE,
-                        "imagePullPolicy": "IfNotPresent",
-                        "command": ["sh", "-c", format!("echo {marker} > /data/marker.txt")],
-                        "volumeMounts": [{ "name": "d", "mountPath": "/data" }],
-                    }],
-                    "volumes": [{ "name": "d", "persistentVolumeClaim": { "claimName": name } }],
-                },
-            })),
-        )
-        .await;
-    wait_until(
-        &format!("PVC {name} Bound"),
-        default_timeout(),
-        poll_interval(),
-        || async {
-            let bound = pvcs
-                .get_opt(name)
-                .await?
-                .and_then(|p| p.status.and_then(|s| s.phase))
-                .as_deref()
-                == Some("Bound");
-            Ok(bound.then_some(()))
-        },
-    )
-    .await
-    .unwrap_or_else(|e| panic!("PVC {name} should bind: {e}"));
-}
-
 /// Fail fast if the created policy is not actually a selector policy.
 ///
 /// The whole test is about fan-out, so a policy that quietly kept the harness's
@@ -126,55 +64,6 @@ async fn assert_selector_landed(api: &Api<kopiur_api::SnapshotPolicy>, name: &st
         "the created policy must carry a pvcSelector source, got {:?}",
         p.spec.sources
     );
-}
-
-/// The `Snapshot` CRs a policy produced, by its config label.
-async fn children_of(client: &kube::Client, policy: &str) -> Vec<kopiur_api::Snapshot> {
-    let api: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    api.list(&ListParams::default().labels(&format!("kopiur.home-operations.com/config={policy}")))
-        .await
-        .expect("list Snapshots")
-        .items
-}
-
-/// Purge one scenario's leftovers from a previous try, so the e2e profile's
-/// nextest retries actually RE-RUN the scenario instead of dying in setup.
-///
-/// A panicked try skips the end-of-test cleanup and leaves three tripwires: the
-/// policy (the fresh `create` dies `AlreadyExists` — how a real CSI group-member
-/// flake turned into 3/3 shard failures on PR #417's merge queue), the schedule
-/// (its `runOnCreate` token is consumed, so even an idempotent create fires no
-/// new capture), and stale children (a terminal `Failed` member makes the
-/// all-Succeeded wait unwinnable). Deletion order mirrors the tests' own
-/// success-path cleanup — schedule first so nothing re-produces children — and
-/// then waits for the children to fully go (their finalizers release the
-/// kopia-side state through the batched delete path). A fresh cluster is a
-/// fast no-op.
-async fn clear_scenario_leftovers(client: &kube::Client, schedule: &str, policy: &str) {
-    let schedules: Api<kopiur_api::SnapshotSchedule> =
-        Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let backups: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
-    let _ = policies.delete(policy, &DeleteParams::default()).await;
-    for child in children_of(client, policy).await {
-        if let Some(n) = child.metadata.name {
-            let _ = backups.delete(&n, &DeleteParams::default()).await;
-        }
-    }
-    wait_until(
-        &format!("leftovers of scenario `{policy}` are gone"),
-        default_timeout(),
-        poll_interval(),
-        || async {
-            let gone = schedules.get_opt(schedule).await?.is_none()
-                && policies.get_opt(policy).await?.is_none()
-                && children_of(client, policy).await.is_empty();
-            Ok(gone.then_some(()))
-        },
-    )
-    .await
-    .unwrap_or_else(|e| panic!("previous try's `{policy}` leftovers must clear: {e}"));
 }
 
 /// A `pvcSelector` policy fires one Snapshot per matched PVC, each backing up
@@ -368,7 +257,7 @@ async fn a_group_capture_is_shared_by_every_member_and_reaped_after() {
 
     ensure_repo(&client, "multipvc-group").await;
     for (name, marker) in [("e2e-grp-a", "alpha"), ("e2e-grp-b", "bravo")] {
-        csi_pvc_with_data(&client, name, marker).await;
+        csi_pvc_with_data(&client, name, GROUP_LABEL_VALUE, marker).await;
     }
 
     let repos: Api<kopiur_api::Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);

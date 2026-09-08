@@ -182,7 +182,20 @@ pub struct ClusterRepositoryStatus {
     /// `resourceVersion` of the password Secret observed at the last connect attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_credential_version: Option<String>,
-    /// Kopia repository unique ID.
+    /// Kopia repository unique ID, pinned on the first successful bootstrap.
+    ///
+    /// Its presence is the "this repository has been Ready" flag that makes
+    /// auto-create one-way in time: `spec.create.enabled` governs the FIRST
+    /// bootstrap only, and once this is set kopiur will never create a fresh
+    /// empty repository over the backend, however empty the backend goes. A
+    /// wiped backend therefore parks at `Failed` with reason
+    /// `RepositoryReinitializeBlocked` instead of being silently re-created.
+    ///
+    /// To deliberately re-initialize a wiped repository, annotate it with
+    /// `kopiur.home-operations.com/allow-reinitialize` set to THIS value; the
+    /// ack is honored only while it matches, so the new ID minted by a
+    /// successful re-initialize makes it inert. This discards the history the
+    /// old repository held.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_id: Option<String>,
     /// What the last seed attempt did (`spec.seed`); absent on a repository that

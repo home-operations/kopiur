@@ -931,6 +931,7 @@ mod tests {
                 kind: "Snapshot".into(),
                 name: "db-1".into(),
                 namespace: "prod".into(),
+                claim_key: None,
             },
             hook_plan: Default::default(),
             options: MoverOptions::default(),

@@ -906,6 +906,7 @@ fn restore_as_of_must_be_rfc3339_and_message_says_how_to_fix() {
             namespace: None,
             as_of: Some("yesterday".into()),
             offset: 0,
+            source_path: None,
         }),
         None,
     );
@@ -925,10 +926,47 @@ fn restore_as_of_must_be_rfc3339_and_message_says_how_to_fix() {
             namespace: None,
             as_of: Some("2026-05-01T00:00:00+02:00".into()),
             offset: 1,
+            source_path: None,
         }),
         None,
     );
     assert!(validate_restore(&ok).is_ok());
+}
+
+#[test]
+fn restore_from_policy_source_path_is_shape_checked_like_the_identity_one() {
+    // #443: the per-PVC override goes straight into the kopia identity, which
+    // `resolve_identity` re-checks with `validate_source_path`. Admitting a value
+    // the reconciler would then reject would park the restore with a confusing
+    // "resolved sourcePath" error instead of a webhook rejection on the field the
+    // user actually typed.
+    use crate::restore::FromPolicy;
+    let with = |p: Option<&str>| {
+        restore_with(
+            RestoreSource::FromPolicy(FromPolicy {
+                name: "pg".into(),
+                namespace: None,
+                as_of: None,
+                offset: 0,
+                source_path: p.map(String::from),
+            }),
+            None,
+        )
+    };
+    // Absent and ordinary values are fine.
+    assert!(validate_restore(&with(None)).is_ok());
+    assert!(validate_restore(&with(Some("/pvc/pgdata"))).is_ok());
+    assert!(validate_restore(&with(Some("/pvc/billing/pgdata"))).is_ok());
+
+    // Empty and control characters are not.
+    for bad in ["", "/pvc/pg\ndata"] {
+        let err = validate_restore(&with(Some(bad))).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("restore.source.fromPolicy.sourcePath"),
+            "names the field: {msg}"
+        );
+    }
 }
 
 #[test]

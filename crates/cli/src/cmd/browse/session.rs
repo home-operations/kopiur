@@ -199,6 +199,7 @@ pub fn session_work_spec(target: &BrowseTarget, ttl: Duration) -> MoverWorkSpec 
             },
             name: target.repo.name.clone(),
             namespace: target.namespace.clone(),
+            claim_key: None,
         },
         hook_plan: Default::default(),
         options: Default::default(),

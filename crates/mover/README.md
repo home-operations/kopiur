@@ -85,6 +85,7 @@ let spec = MoverWorkSpec {
         kind: "Snapshot".into(),
         name: "mydb-20260601".into(),
         namespace: "prod".into(),
+        claim_key: None,
     },
     hook_plan: HookPlanSummary::default(),
     options: MoverOptions::default(),

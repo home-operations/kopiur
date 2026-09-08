@@ -10,6 +10,14 @@
 //! (`Degraded`, then terminal `Failed` once the strict re-check confirms the
 //! repository is gone); that arc is `crates/e2e/tests/repo_breaker.rs`.
 //!
+//! The last scenario in this file is the other half of that invariant (#435):
+//! never-recreate is right, but a wiped repository still needs a documented way
+//! back. A `Degrade`-mode `ClusterRepository` is wiped, parks terminal `Failed`
+//! with `RepositoryReinitializeBlocked` (naming the exact `kubectl annotate`
+//! command, and NOT the pre-#435 "set spec.create.enabled: true" — which was
+//! already true), rejects a mismatched ack loudly, and re-initializes on the
+//! right one.
+//!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
 //! `mise run //crates/e2e:test`. Skips gracefully without a cluster.
 
@@ -20,14 +28,17 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
+use k8s_openapi::api::events::v1::Event as CoreEvent;
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::{Api, ResourceExt};
 
-use kopiur_api::{ClusterRepository, Repository};
+use kopiur_api::{ClusterRepository, Repository, Snapshot, SnapshotPolicy};
 use kopiur_e2e::builders::{self, SeedStep};
 use kopiur_e2e::{
     E2E_NAMESPACE, Need, World, consts, default_timeout, poll_interval, wait, wait_until,
 };
+
+mod common;
 
 /// A `Repository` on a dedicated MinIO bucket with the health probe at a fast
 /// cadence (`interval: 30s`, `failureThreshold: 1`) so the alert fires within
@@ -545,4 +556,371 @@ fn cluster_status_value(repo: &ClusterRepository) -> serde_json::Value {
         .ok()
         .and_then(|v| v.get("status").cloned())
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// #435: deliberate re-initialize after a wipe.
+//
+// The reported failure: a user's bucket was deleted, and the once-`Ready`
+// repository parked telling them to "set spec.create.enabled: true" — which was
+// already true. There was no documented way back, so they deleted the whole
+// namespace. This scenario is the arc end to end: wipe → an accurate terminal
+// reason carrying the exact `kubectl annotate` command → a WRONG ack ignored
+// loudly → the RIGHT ack re-initializes and backups resume.
+//
+// The "ack goes inert once the pin rotates" property is unit-tested
+// (`health::create_gate_truth_table`), not e2e'd: a second Degrade→Failed cycle
+// would need another ~120s strict-retry holdoff and blow the per-wait budget.
+// ---------------------------------------------------------------------------
+
+/// The re-initialize scenario's `ClusterRepository`: the DEFAULT
+/// `onFailure: Degrade` (so a wipe escalates through the breaker to terminal
+/// `Failed`, unlike the Alert-mode opt-out above), `create.enabled: true` — the
+/// whole point, since #435 is about a user whose create WAS enabled — and a fast
+/// probe so the wipe is noticed inside the budget.
+fn reinit_repository_json(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "ClusterRepository",
+        "metadata": { "name": name },
+        "spec": {
+            "backend": { "s3": {
+                "bucket": consts::BUCKET_REINIT_ACK,
+                "endpoint": consts::MINIO_ENDPOINT,
+                "region": "us-east-1",
+                "tls": { "disableTls": true },
+                "auth": { "secretRef": { "name": consts::SECRET_S3_CREDS, "namespace": E2E_NAMESPACE } }
+            }},
+            "encryption": {
+                "passwordSecretRef": {
+                    "name": consts::SECRET_S3_CREDS,
+                    "namespace": E2E_NAMESPACE,
+                    "key": "KOPIA_PASSWORD"
+                }
+            },
+            "create": { "enabled": true },
+            "allowedNamespaces": { "all": true },
+            "maintenance": { "enabled": false },
+            "health": {
+                "probe": { "enabled": true, "interval": "30s", "failureThreshold": 1 }
+            }
+        }
+    })
+}
+
+/// An Event with `reason` regarding `kind`/`name`, or `None`. Listed
+/// cluster-wide: a `ClusterRepository` has no namespace of its own, so where the
+/// Recorder files its Events is an implementation detail this assertion must not
+/// depend on.
+async fn find_event(
+    events: &Api<CoreEvent>,
+    kind: &str,
+    name: &str,
+    reason: &str,
+) -> Option<CoreEvent> {
+    events
+        .list(&ListParams::default())
+        .await
+        .ok()?
+        .items
+        .into_iter()
+        .find(|e| {
+            e.reason.as_deref() == Some(reason)
+                && e.regarding.as_ref().is_some_and(|r| {
+                    r.kind.as_deref() == Some(kind) && r.name.as_deref() == Some(name)
+                })
+        })
+}
+
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn degrade_mode_wipe_escalates_to_reinitialize_blocked_and_ack_recreates() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem, Need::Minio])
+        .await
+        .expect("provision the source PVC + MinIO");
+    let client = world.client().clone();
+
+    let name = "e2e-reinit-ack";
+    let policy = "e2e-reinit-ack-policy";
+    let repos: Api<ClusterRepository> = Api::all(client.clone());
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let snaps: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let events: Api<CoreEvent> = Api::all(client.clone());
+
+    clear_leftover(&repos, name).await;
+    repos
+        .create(
+            &PostParams::default(),
+            &serde_json::from_value(reinit_repository_json(name))
+                .expect("ClusterRepository JSON deserializes"),
+        )
+        .await
+        .expect("create ClusterRepository");
+
+    // 1. First bootstrap creates the repository and pins U1, and one backup
+    //    lands real history in it — the history the re-initialize will discard,
+    //    which is exactly why kopiur refuses to do it silently.
+    wait_until(
+        &format!("{name} Ready"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = cluster_status_value(&repos.get(name).await?);
+            Ok((s.get("phase").and_then(|p| p.as_str()) == Some("Ready")).then_some(()))
+        },
+    )
+    .await
+    .expect("cluster repository becomes Ready");
+    let u1 = cluster_status_value(&repos.get(name).await.unwrap())
+        .get("uniqueId")
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+        .expect("a Ready repository pins a uniqueId");
+
+    let _ = policies
+        .create(
+            &PostParams::default(),
+            &common::cr(common::snapshot_policy_json(
+                E2E_NAMESPACE,
+                policy,
+                "ClusterRepository",
+                name,
+                serde_json::json!({}),
+            )),
+        )
+        .await;
+    snaps
+        .create(
+            &PostParams::default(),
+            &common::cr(common::snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-reinit-ack-snap-1",
+                policy,
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create the pre-wipe Snapshot");
+    common::wait_phase(&snaps, "e2e-reinit-ack-snap-1", "Succeeded")
+        .await
+        .expect("a backup succeeds before the wipe");
+
+    // 2. Wipe the bucket out-of-band. The bucket SURVIVES (it is the kopia
+    //    repository that vanished, not the storage), so the acknowledged
+    //    re-create later has somewhere to land — which is the real-world shape
+    //    too: an object-lifecycle rule, or an errant `mc rm --recursive`.
+    let wipe = builders::foreign_kopia_pod(
+        E2E_NAMESPACE,
+        "e2e-reinit-ack-wipe",
+        &[SeedStep::WipeBucket {
+            bucket: consts::BUCKET_REINIT_ACK,
+        }],
+    );
+    pods.create(&PostParams::default(), &wipe)
+        .await
+        .expect("create wipe pod");
+    wait::pod_succeeded(&client, E2E_NAMESPACE, "e2e-reinit-ack-wipe")
+        .await
+        .expect("wipe pod empties the bucket");
+
+    // 3. Degrade → (one strict-retry holdoff, ~120s) → terminal `Failed` with
+    //    the ACCURATE reason. Pre-#435 this said "spec.create.enabled is false,
+    //    set it to true" on a repository whose create was already enabled.
+    wait_until(
+        &format!("{name} Failed/RepositoryReinitializeBlocked"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = cluster_status_value(&repos.get(name).await?);
+            let blocked = s.get("phase").and_then(|p| p.as_str()) == Some("Failed")
+                && condition(&s, "Ready", "reason").as_deref()
+                    == Some("RepositoryReinitializeBlocked");
+            Ok(blocked.then_some(()))
+        },
+    )
+    .await
+    .expect("a wiped once-Ready repository parks at RepositoryReinitializeBlocked");
+
+    let blocked_msg = condition(
+        &cluster_status_value(&repos.get(name).await.unwrap()),
+        "Ready",
+        "message",
+    )
+    .expect("the Ready condition carries a message");
+    assert!(
+        blocked_msg.contains(&format!("allow-reinitialize={u1}")),
+        "the condition must name the exact annotation value (this is what \
+         `kubectl kopiur status` prints verbatim), got: {blocked_msg}"
+    );
+    assert!(
+        !blocked_msg.contains("spec.create.enabled is false"),
+        "THE #435 BUG: create.enabled is true here, so this advice is false. \
+         Got: {blocked_msg}"
+    );
+    assert!(
+        !blocked_msg.contains(" -n "),
+        "a ClusterRepository is cluster-scoped: the command must carry no -n. \
+         Got: {blocked_msg}"
+    );
+
+    // ...and the same reason reaches `kubectl get events`, with the annotate
+    // command intact after the apiserver's 1024-byte note clamp (the command
+    // leads the message precisely so truncation cannot eat it).
+    let ev = wait_until(
+        "a RepositoryReinitializeBlocked Warning Event is published",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(find_event(
+                &events,
+                "ClusterRepository",
+                name,
+                "RepositoryReinitializeBlocked",
+            )
+            .await)
+        },
+    )
+    .await
+    .expect("the block must be visible as a Warning Event, not only in the condition");
+    let note = ev.note.unwrap_or_default();
+    assert!(note.len() <= 1024, "Event note is {} bytes", note.len());
+    assert!(
+        note.contains(&format!("allow-reinitialize={u1}")),
+        "the annotate command must survive the note clamp, got: {note}"
+    );
+
+    // 4. A WRONG ack is ignored (fail-safe) and says so. Without this the user
+    //    sees nothing at all and concludes kopiur dropped their annotation.
+    repos
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": {
+                    "kopiur.home-operations.com/allow-reinitialize": "definitely-not-the-pin"
+                }}
+            })),
+        )
+        .await
+        .expect("annotate with a wrong ack value");
+    wait_until(
+        "an InvalidReinitializeAck Warning Event is published",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(find_event(&events, "ClusterRepository", name, "InvalidReinitializeAck").await)
+        },
+    )
+    .await
+    .expect("a mismatched ack must be reported, not silently ignored");
+    assert_eq!(
+        cluster_status_value(&repos.get(name).await.unwrap())
+            .get("phase")
+            .and_then(|p| p.as_str()),
+        Some("Failed"),
+        "a mismatched ack must NOT re-initialize anything"
+    );
+
+    // 5. The RIGHT ack: re-initialize. The phase may pass through `Degraded`
+    //    rather than `Initializing` (the breaker was open — `health::launch_phase`
+    //    deliberately does not flap a Degraded repository), so wait on `Ready`.
+    repos
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": {
+                    "kopiur.home-operations.com/allow-reinitialize": u1
+                }}
+            })),
+        )
+        .await
+        .expect("annotate with the pinned uniqueId");
+    wait_until(
+        &format!("{name} Ready again after the acknowledged re-initialize"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = cluster_status_value(&repos.get(name).await?);
+            Ok((s.get("phase").and_then(|p| p.as_str()) == Some("Ready")).then_some(()))
+        },
+    )
+    .await
+    .expect("an acknowledged re-initialize must bring the repository back to Ready");
+
+    let healed = cluster_status_value(&repos.get(name).await.unwrap());
+    let u2 = healed
+        .get("uniqueId")
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+        .expect("the re-initialized repository pins a uniqueId");
+    assert_ne!(
+        u2, u1,
+        "a re-initialize MINTS a new repository, so the pin must rotate — and that \
+         rotation is what makes the still-applied ack inert against a future wipe"
+    );
+    assert_eq!(
+        condition(&healed, "BackendReachable", "status").as_deref(),
+        Some("True"),
+        "the strict success must heal the #345 breaker (no second reset path exists)"
+    );
+
+    // 6. Backups work again — the point of the whole exercise.
+    snaps
+        .create(
+            &PostParams::default(),
+            &common::cr(common::snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-reinit-ack-snap-2",
+                policy,
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create the post-re-initialize Snapshot");
+    common::wait_phase(&snaps, "e2e-reinit-ack-snap-2", "Succeeded")
+        .await
+        .expect("a backup succeeds into the re-initialized repository");
+
+    // 7. The ack is still applied (value U1) and the pin is now U2 — the exact
+    //    state a GitOps manifest lands in after a successful re-initialize. It
+    //    must be INERT AND SILENT: no `InvalidReinitializeAck` naming U1, or the
+    //    reward for following the documented procedure is a permanent Warning on
+    //    a healthy repository. The step-4 Warning (value "definitely-not-the-pin",
+    //    published while Failed) legitimately remains, so match on the note.
+    let stale_ack_warning = events
+        .list(&ListParams::default())
+        .await
+        .expect("list events")
+        .items
+        .into_iter()
+        .find(|e| {
+            e.reason.as_deref() == Some("InvalidReinitializeAck")
+                && e.regarding.as_ref().is_some_and(|r| {
+                    r.kind.as_deref() == Some("ClusterRepository")
+                        && r.name.as_deref() == Some(name)
+                })
+                && e.note
+                    .as_deref()
+                    .is_some_and(|n| n.contains(&format!("is `{u1}`")))
+        });
+    assert!(
+        stale_ack_warning.is_none(),
+        "a once-valid ack left behind after a successful re-initialize must be \
+         inert AND silent on a Ready repository; got: {stale_ack_warning:?}"
+    );
+
+    let _ = snaps
+        .delete("e2e-reinit-ack-snap-1", &DeleteParams::default())
+        .await;
+    let _ = snaps
+        .delete("e2e-reinit-ack-snap-2", &DeleteParams::default())
+        .await;
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = repos.delete(name, &DeleteParams::default()).await;
 }

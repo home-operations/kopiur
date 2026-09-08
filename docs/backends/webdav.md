@@ -1,21 +1,17 @@
 # WebDAV
 
-The WebDAV backend stores the kopia repository at a **WebDAV collection URL** with
-HTTP basic auth — Nextcloud, Apache `mod_dav`, or any WebDAV server.
+The WebDAV backend stores the kopia repository at a **WebDAV collection URL**, using HTTP basic authentication. That covers Nextcloud, Apache `mod_dav`, and any other WebDAV server.
 
-Reach for WebDAV when your target speaks WebDAV but not S3. For Nextcloud you can
-also reach it as an [rclone](rclone.md) remote, but native WebDAV is simpler.
+Reach for WebDAV when your target speaks WebDAV but not S3. For Nextcloud you can also reach it as an [rclone](rclone.md) remote, but native WebDAV is simpler.
 
 ## Provider prerequisites
 
-- A WebDAV **collection URL** for the repository (e.g.
-  `https://dav.example.com/kopia` or a Nextcloud `/remote.php/dav/files/<user>/...` path).
+- A WebDAV **collection URL** for the repository, such as `https://dav.example.com/kopia`, or a Nextcloud `/remote.php/dav/files/<user>/...` path.
 - **Basic-auth** credentials with write access to that collection.
 
 ### Finding your collection URL
 
-The URL must point at a **folder (collection) that already exists** and is
-writable; the path shape is server-specific:
+The URL must point at a **collection**, meaning a folder, that already exists and is writable. The shape of the path depends on the server:
 
 | Server               | Collection URL shape                                              | Notes                                                                |
 | -------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------- |
@@ -26,20 +22,14 @@ writable; the path shape is server-specific:
 /// example | Nextcloud: app password + the exact URL
 
 1. Create the target folder (`kopia` here) in the Files app.
-2. _Personal settings → Security → Devices & sessions_ → **Create new app
-   password**. Use it as `KOPIA_WEBDAV_PASSWORD` — with two-factor enabled the
-   account password will not work for WebDAV at all, and an app password is
-   revocable on its own either way.
-3. The URL is the user-specific DAV path, **not** the share link and **not** the
-   bare hostname: `https://cloud.example.com/remote.php/dav/files/alice/kopia`
-   (for login `alice`). The deprecated `/remote.php/webdav/…` form still works
-   but the `dav/files/<user>` form is canonical.
+2. Go to _Personal settings → Security → Devices & sessions_ and **create a new app password**. Use it as `KOPIA_WEBDAV_PASSWORD`. With two-factor enabled, the account password will not work for WebDAV at all, and an app password can be revoked on its own either way.
+3. The URL is the user-specific DAV path. It is **not** the share link and **not** the bare hostname. For login `alice` it is `https://cloud.example.com/remote.php/dav/files/alice/kopia`. The deprecated `/remote.php/webdav/…` form still works, but the `dav/files/<user>` form is the current one.
 
 ///
 
 ## The Secret shape
 
-Loaded with `envFrom`; the keys reach kopia as environment variables.
+The mover loads this Secret with `envFrom`, so the keys reach kopia as environment variables.
 
 | Secret key              | Required | What it is                                                          |
 | ----------------------- | -------- | ------------------------------------------------------------------- |
@@ -56,9 +46,7 @@ stringData:
 
 /// warning | Lose the password, lose the backups
 
-`KOPIA_PASSWORD` encrypts the repository and cannot be recovered if lost. It is
-**separate** from the WebDAV login password. Store it outside the cluster and back
-up the Secret. See [Encryption](../repositories.md#encryption-and-repository-creation).
+`KOPIA_PASSWORD` encrypts the repository, and it cannot be recovered if you lose it. It is **separate** from the WebDAV login password. Store it outside the cluster and back up the Secret. See [Encryption](../repositories.md#encryption-and-repository-creation).
 
 ///
 
@@ -74,59 +62,45 @@ Note the spec key is `webDav` (camelCase, capital D).
 
 | Field            | Required | Default | Example                                                      | What it controls                                                                                                 |
 | ---------------- | -------- | ------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `url`            | yes      | —       | `https://cloud.example.com/remote.php/dav/files/alice/kopia` | The WebDAV collection URL holding the repository — full scheme + path to an **existing, writable** folder.       |
+| `url`            | yes      | —       | `https://cloud.example.com/remote.php/dav/files/alice/kopia` | The WebDAV collection URL holding the repository: the full scheme plus the path to an **existing, writable** folder. |
 | `auth.secretRef` | no       | —       | `{ name: webdav-repo-creds }`                                | Names the basic-auth Secret above. Same namespace as the `Repository`; a `ClusterRepository` adds `namespace:`.   |
 
-WebDAV has no cloud-IAM federation, so its `auth` is **Secret-only** — there is
-no `workloadIdentity` here. A stray `auth.workloadIdentity` is silently
-**pruned** by the API server (it's not in the schema), not rejected.
+WebDAV has no cloud IAM to federate with, so its `auth` is **Secret-only**. There is no `workloadIdentity` here. A stray `auth.workloadIdentity` is not rejected; the API server silently **prunes** it, because it isn't in the schema.
 
 ## Customization — the values you actually change
 
-- **`url`** — the collection URL. Include the full path to the repository folder.
-- **`create.enabled`** — initialize the repository if missing.
-- **`moverDefaults.cache`** — mover cache sizing ([movers](../movers.md)).
+- **`url`** is the collection URL. Include the full path to the repository folder.
+- **`create.enabled`** initializes the repository if it's missing.
+- **`moverDefaults.cache`** sizes the mover cache. See [movers](../movers.md).
 
 ## As a `ClusterRepository`
 
-The same `backend.webDav` stanza works on a cluster-scoped
-[`ClusterRepository`](../repositories.md#clusterrepository-a-shared-repository); every
-Secret reference must carry an explicit `namespace:` and the Secret must exist
-where the movers run — see [Movers](../movers.md).
+The same `backend.webDav` stanza works on a cluster-scoped [`ClusterRepository`](../repositories.md#clusterrepository-a-shared-repository), with two requirements. Every Secret reference must carry an explicit `namespace:`, and the Secret must exist in the namespaces the movers run in. See [Movers](../movers.md).
 
 ## Try it end-to-end
 
-Prove this backend really takes a backup. The same example file carries a tiny
-smoke-test (a throwaway PVC + a `SnapshotPolicy` + a `Snapshot`) that targets the
-`webdav-primary` repository above, so you can go from "applied" to "a snapshot in
-my collection" in one arc.
+Prove this backend really takes a backup. The same example file carries a tiny smoke-test: a throwaway PVC, a `SnapshotPolicy`, and a `Snapshot`, all pointed at the `webdav-primary` repository above. It takes you from "applied" to "a snapshot in my collection" in one go.
 
 /// warning | Fill in the credentials first
 
-The smoke backup only goes green once `KOPIA_WEBDAV_USERNAME` /
-`KOPIA_WEBDAV_PASSWORD` are **real** basic-auth credentials (and `url` points at
-an existing, writable collection). With the `REPLACE_ME` placeholders the
-`Repository` stalls at `Failed` and the `Snapshot` stays `Pending`.
+The smoke backup only goes green once `KOPIA_WEBDAV_USERNAME` and `KOPIA_WEBDAV_PASSWORD` hold **real** basic-auth credentials, and `url` points at an existing, writable collection. With the `REPLACE_ME` placeholders the `Repository` stalls at `Failed` and the `Snapshot` stays `Pending`.
 
 ///
 
-**1. Apply the bundle** (namespace `backups`, Secret, Repository, and the
-smoke-test objects):
+**1. Apply the bundle.** That is the `backups` namespace, the Secret, the Repository, and the smoke-test objects:
 
 ```console
 $ kubectl apply -f deploy/examples/backends/webdav.yaml
 ```
 
-**2. Wait for the repository to be `Ready`** — the gate everything else waits on:
+**2. Wait for the repository to be `Ready`.** Everything else waits on this:
 
 ```console
 $ kubectl -n backups wait --for=condition=Ready repository/webdav-primary --timeout=2m
 repository.kopiur.home-operations.com/webdav-primary condition met
 ```
 
-**3. Take the smoke backup.** The `Snapshot` uses `generateName`, so `create` it
-(the namespace, Secret, Repository, PVC, and policy already exist and report
-unchanged — the `Snapshot` is the one new object):
+**3. Take the smoke backup.** The `Snapshot` uses `generateName`, so `create` it rather than apply it. The namespace, Secret, Repository, PVC, and policy already exist and report unchanged. The `Snapshot` is the one new object:
 
 ```console
 $ kubectl create -f deploy/examples/backends/webdav.yaml
@@ -143,17 +117,14 @@ smoke-now-abc12   Running     manual                7s
 smoke-now-abc12   Succeeded   manual   k1f1ec0a8    38s
 ```
 
-(Output illustrative.) The `Snapshot` has no fixed `Succeeded` *condition*; to
-wait on it in a script, key on the phase:
+The output above is illustrative. The `Snapshot` has no fixed `Succeeded` *condition*, so to wait on it in a script, key on the phase:
 
 ```console
 $ kubectl -n backups wait --for=jsonpath='{.status.phase}'=Succeeded \
     snapshot/smoke-now-abc12 --timeout=5m
 ```
 
-**5. Deep proof — the data really moved.** `status.stats` shows non-zero
-`bytesNew`/`filesNew`, and `status.snapshot.kopiaSnapshotID` is the kopia
-snapshot ID in your collection:
+**5. Prove the data really moved.** `status.stats` shows non-zero `bytesNew` and `filesNew`, and `status.snapshot.kopiaSnapshotID` is the kopia snapshot ID in your collection:
 
 ```console
 $ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.stats}'
@@ -163,8 +134,7 @@ $ kubectl -n backups get snapshot smoke-now-abc12 -o jsonpath='{.status.snapshot
 k1f1ec0a8
 ```
 
-(Both outputs illustrative — sizes and the ID vary.) Non-zero `bytesNew` is the
-proof the backup uploaded real content over WebDAV.
+Both outputs are illustrative; sizes and the ID vary. Non-zero `bytesNew` proves the backup uploaded real content over WebDAV.
 
 **6. Clean up** the smoke-test when you're done:
 
@@ -176,37 +146,21 @@ $ kubectl -n backups delete pvc smoke-data
 
 /// warning | Deleting a Snapshot deletes its snapshot
 
-A produced `Snapshot` defaults to `deletionPolicy: Delete`, so removing the CR
-runs `kopia snapshot delete` via a finalizer. Use `Retain` (or `Orphan`) to keep
-the data — see [Backups → deletionPolicy](../backups.md#deletionpolicy--what-happens-to-the-snapshot).
+A produced `Snapshot` defaults to `deletionPolicy: Delete`, so removing the CR runs `kopia snapshot delete` through a finalizer. Use `Retain` or `Orphan` to keep the data. See [Backups → deletionPolicy](../backups.md#deletionpolicy--what-happens-to-the-snapshot).
 
 ///
 
-From here the full lifecycle is backend-independent — only the `Repository`
-differs. Put it on a cron with a `SnapshotSchedule`
-([Backups & schedules](../backups.md),
-[Example 01](../examples.md#example-01--single-pvc-scheduled)) and restore by
-picking a `Snapshot` ([Restores](../restores.md),
-[Example 03](../examples.md#example-03--restore-by-picking-a-snapshot)).
+From here the rest of the lifecycle is the same on every backend. Only the `Repository` differs. Put it on a cron with a `SnapshotSchedule`, described in [Backups & schedules](../backups.md) and [Example 01](../examples.md#example-01--single-pvc-scheduled). Restore by picking a `Snapshot`, described in [Restores](../restores.md) and [Example 03](../examples.md#example-03--restore-by-picking-a-snapshot).
 
 ## Troubleshooting
 
-- **`401 Unauthorized`** — wrong basic-auth username/password, or the server
-  requires an **app password** (Nextcloud with two-factor) rather than the
-  account password.
-- **`404` / `409`** — the collection URL doesn't exist or isn't a writable
-  collection. Create the folder and point `url` at it. On Nextcloud, also check
-  the username **in the path** matches the login the credentials belong to.
-- **TLS errors** — the WebDAV backend speaks HTTPS; use a valid certificate (the
-  `tls` overrides available on S3 are not part of `backend.webDav`). For an
-  internal server with a private CA, terminate with a publicly-trusted cert or
-  use a different backend.
-- **Slow backups** — WebDAV is the chattiest backend (one HTTP request per
-  blob operation, no multipart). Fine for modest datasets; for large or
-  high-churn sources prefer an object store.
+- **`401 Unauthorized`.** Either the basic-auth username and password are wrong, or the server requires an **app password** rather than the account password. Nextcloud with two-factor does.
+- **`404` or `409`.** The collection URL doesn't exist, or it isn't a writable collection. Create the folder and point `url` at it. On Nextcloud, also check that the username **in the path** matches the login the credentials belong to.
+- **TLS errors.** The WebDAV backend speaks HTTPS, so use a valid certificate. The `tls` overrides available on S3 are not part of `backend.webDav`. For an internal server with a private CA, terminate with a publicly-trusted certificate or use a different backend.
+- **Slow backups.** WebDAV is the chattiest backend: one HTTP request per blob operation, and no multipart uploads. That is fine for modest datasets. For large or high-churn sources, prefer an object store.
 
 ## See also
 
-- [Repositories & backends](../repositories.md) — concepts: scope, encryption, creation.
-- [Movers, RBAC & credentials](../movers.md) — where the credential Secret must live.
-- Sibling backends: [S3](s3.md) · [rclone](rclone.md) (for Nextcloud and many others).
+- [Repositories & backends](../repositories.md): the concepts, meaning scope, encryption, and creation.
+- [Movers, RBAC & credentials](../movers.md): where the credential Secret must live.
+- Sibling backends: [S3](s3.md) · [rclone](rclone.md), which also reaches Nextcloud and many others.

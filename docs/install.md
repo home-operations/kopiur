@@ -1,26 +1,22 @@
 # Installing Kopiur
 
-Kopiur is a Kopia-native Kubernetes backup operator (Rust / kube-rs). This guide covers installing the operator with the Helm chart and verifying it.
+Kopiur is a Kopia-native Kubernetes backup operator, written in Rust on kube-rs. This guide covers installing the operator with the Helm chart and verifying it.
 
-The chart is published as an OCI artifact at
-`oci://ghcr.io/home-operations/charts/kopiur` — **that is the preferred way to
-install**. Every published version is cosign-signed and ships with all three
-component images (controller, webhook, mover) pinned by digest to the exact
-release build. The in-repo chart (`deploy/helm/kopiur`) is the development
-copy: its image digests are empty and its tags float, so use it only when
-working from a checkout.
+The chart is published as an OCI artifact at `oci://ghcr.io/home-operations/charts/kopiur`, and **that is the preferred way to install**. Every published version is cosign-signed and ships all three component images, controller, webhook and mover, pinned by digest to the exact release build.
 
-> Status: **alpha** — API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may still change between releases.
+The in-repo chart at `deploy/helm/kopiur` is the development copy. Its image digests are empty and its tags float, so use it only when you are working from a checkout.
+
+> Status: **alpha**. API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may still change between releases.
 
 ## Prerequisites
 
-- **Kubernetes >= 1.24.** The deploy-or-restore volume-populator path (`Restore` + `PVC.spec.dataSourceRef`) relies on the `AnyVolumeDataSource` feature, available from 1.24.
+- **Kubernetes 1.24 or later.** The deploy-or-restore volume-populator path, meaning a `Restore` plus a PVC `spec.dataSourceRef`, relies on the `AnyVolumeDataSource` feature, available from 1.24.
 - **Helm 3 or 4.**
-- A **kopia repository backend** you can reach: S3/MinIO, Azure Blob, GCS, B2, filesystem (PVC), SFTP, WebDAV, or rclone.
-- A **CSI snapshot stack** (a `snapshot-controller` plus a `VolumeSnapshotClass` for your driver) for the **default** `copyMethod: Snapshot`. Many distributions bundle it (EKS, GKE, AKS, Talos, k3s add-ons); where yours does not, install the home-operations [`snapshot-controller`](https://github.com/home-operations/helm-charts) chart (`oci://ghcr.io/home-operations/charts/snapshot-controller`). Not needed if every `SnapshotPolicy` sets `copyMethod: Direct`. See [Copy methods → What it requires](copy-methods.md#what-it-requires).
-- _(Optional)_ **cert-manager** — only if you prefer it to manage the admission webhook's certificate. **It is not required**: by default the operator manages the webhook cert itself (see [Webhook TLS](#webhook-tls)).
-- _(Optional)_ **volume-data-source-validator** — recommended alongside CSI populators so a malformed `dataSourceRef` is surfaced as an event rather than a silently-stuck PVC.
-- _(Optional)_ **Prometheus Operator** — if you want the chart's `ServiceMonitor`.
+- A **kopia repository backend** you can reach: S3 or MinIO, Azure Blob, GCS, B2, filesystem on a PVC, SFTP, WebDAV, or rclone.
+- A **CSI snapshot stack**, meaning a `snapshot-controller` plus a `VolumeSnapshotClass` for your driver, for the **default** `copyMethod: Snapshot`. Many distributions bundle it, including EKS, GKE, AKS, Talos and k3s add-ons. Where yours does not, install the home-operations [`snapshot-controller`](https://github.com/home-operations/helm-charts) chart from `oci://ghcr.io/home-operations/charts/snapshot-controller`. You do not need it if every `SnapshotPolicy` sets `copyMethod: Direct`. See [Copy methods → What it requires](copy-methods.md#what-it-requires).
+- _(Optional)_ **cert-manager**, only if you prefer it to manage the admission webhook's certificate. **It is not required**: by default the operator manages the webhook cert itself. See [Webhook TLS](#webhook-tls).
+- _(Optional)_ **volume-data-source-validator**, recommended alongside CSI populators so a malformed `dataSourceRef` surfaces as an event rather than a PVC that is quietly stuck.
+- _(Optional)_ **Prometheus Operator**, if you want the chart's `ServiceMonitor`.
 
 ## Quickstart
 
@@ -43,11 +39,7 @@ kubectl get crd | grep kopiur.home-operations.com
 
 ## GitOps install (Flux / Argo)
 
-Point your GitOps tool at the same OCI chart — **never at the in-repo
-`deploy/helm/kopiur` path**, whose image digests are empty and whose tags float
-(a git-sourced install renders image tags from the chart's `appVersion`, so a
-checkout can pull a tag that was never published). The published chart pins all
-three images by digest.
+Point your GitOps tool at the same OCI chart. **Never point it at the in-repo `deploy/helm/kopiur` path**, whose image digests are empty and whose tags float: a git-sourced install renders image tags from the chart's `appVersion`, so a checkout can pull a tag that was never published. The published chart pins all three images by digest.
 
 /// tab | Flux
 
@@ -81,12 +73,7 @@ spec:
   # values: {}   # override chart values here
 ```
 
-The `OCIRepository` and `HelmRelease` are namespaced, so `kopiur-system` must
-exist before they apply; that is why the `Namespace` is included above (Flux's
-`install.createNamespace` only creates the release's *target* namespace, not
-the one the `HelmRelease` object itself lives in). In a real Flux repo the
-namespace usually comes from the parent Kustomization; keep it here so the
-snippet applies stand-alone.
+The `OCIRepository` and `HelmRelease` are namespaced, so `kopiur-system` must exist before they apply. That is why the `Namespace` is included above: Flux's `install.createNamespace` only creates the release's *target* namespace, not the one the `HelmRelease` object itself lives in. In a real Flux repository the namespace usually comes from the parent Kustomization; it is kept here so the snippet applies on its own.
 
 ///
 
@@ -118,10 +105,9 @@ spec:
 
 /// warning | `helm upgrade` and GitOps reconciles never update the CRDs
 
-The 9 CRDs ship in the chart's special `crds/` directory, which Helm installs
-once and never touches on upgrade (see [CRD lifecycle](#crd-lifecycle) below).
-A GitOps tool with a `CreateReplace` / server-side-apply CRD policy handles
-schema changes automatically; otherwise apply `deploy/crds/` yourself.
+The 9 CRDs ship in the chart's special `crds/` directory, which Helm installs once and never touches on upgrade. See [CRD lifecycle](#crd-lifecycle) below.
+
+A GitOps tool with a `CreateReplace` or server-side-apply CRD policy handles schema changes automatically. Otherwise, apply `deploy/crds/` yourself.
 
 ///
 
@@ -137,7 +123,7 @@ The admission webhook always serves TLS, and the API server must trust it. `webh
 
 ### `self` (default)
 
-Nothing to configure — this is the `helm install` above. The operator grants itself the minimal extra RBAC to write its one serving Secret and `patch` the `caBundle` of its two webhook configurations (resourceName-scoped).
+There is nothing to configure; this is the `helm install` above. The operator grants itself the minimal extra RBAC it needs: writing its one serving Secret, and patching the `caBundle` of its two webhook configurations, scoped to those resource names.
 
 ### `cert-manager`
 
@@ -160,7 +146,7 @@ helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
   --set webhook.caBundle="$(base64 -w0 ca.crt)"
 ```
 
-Or disable the webhook entirely (validation then relies on the controller's defensive checks only — not recommended):
+Or turn the webhook off entirely. Validation then relies on the controller's defensive checks alone, which is not recommended:
 
 ```bash
 helm install kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system --set webhook.enabled=false
@@ -173,43 +159,30 @@ helm install kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system
 | Cluster (default)  | `cluster`             | ClusterRole | cluster-wide           | reconciled          |
 | Namespaced         | `namespaced`          | Role        | release namespace only | not reconciled      |
 
-**Cluster** is the default so a shared platform repository (`ClusterRepository`) referenced by many tenant namespaces works out of the box — a namespace-scoped `Role` silently disables the cluster-scoped `ClusterRepository` kind. See `deploy/examples/02-cluster-repository.yaml`. Choose **namespaced** as the explicit least-privilege opt-down for a single-team install.
+**Cluster** is the default so that a shared platform repository, a `ClusterRepository` referenced by many tenant namespaces, works out of the box. A namespace-scoped `Role` silently disables the cluster-scoped `ClusterRepository` kind. See `deploy/examples/02-cluster-repository.yaml`.
 
-In namespaced scope the controller's watches are narrowed to the release
-namespace to match the Role-only RBAC (the chart passes
-`--namespace={{ .Release.Namespace }}`), and cluster-scoped kinds are skipped
-entirely: `ClusterRepository` is not reconciled, and the
-[privileged-movers namespace opt-in](permissions.md) check fails **open**
-(the operator is already confined to admin-chosen namespaces there).
+Choose **namespaced** as the explicit least-privilege opt-down for a single-team install.
+
+In namespaced scope the controller's watches are narrowed to the release namespace, to match the Role-only RBAC; the chart passes `--namespace={{ .Release.Namespace }}`. Cluster-scoped kinds are skipped entirely: `ClusterRepository` is not reconciled, and the [privileged-movers namespace opt-in](permissions.md) check fails **open**, because the operator is already confined to admin-chosen namespaces there.
 
 /// warning | Features that need cluster RBAC are refused in namespaced scope
 
-Two features read or write cluster-scoped objects (PersistentVolumes,
-StorageClasses, VolumeSnapshotClasses) that a Role can never grant, so a
-namespaced install refuses them **up front with an actionable message**
-instead of retrying forever:
+Two features read or write cluster-scoped objects that a Role can never grant: PersistentVolumes, StorageClasses and VolumeSnapshotClasses. A namespaced install refuses them **up front with an actionable message** rather than retrying forever.
 
-- **`target.populator` restores** — use `target.pvc`/`target.pvcRef`, or
-  install with `installScope: cluster`.
-- **`copyMethod: Snapshot`/`Clone` backups** (CSI staging) — set
-  `copyMethod: Direct` on the `SnapshotPolicy`. Note `copyMethod`
-  **defaults to `Snapshot`**, so an untouched policy hits this refusal; the
-  message spells out the fix.
+- **`target.populator` restores.** Use `target.pvc` or `target.pvcRef`, or install with `installScope: cluster`.
+- **`copyMethod: Snapshot` and `Clone` backups**, which need CSI staging. Set `copyMethod: Direct` on the `SnapshotPolicy`. Note that `copyMethod` **defaults to `Snapshot`**, so an untouched policy hits this refusal, and the message spells out the fix.
 
 ///
 
 /// note | RBAC for the optional web UI
 
-If you use the [web UI](server.md) (`spec.server` on a `Repository`/`ClusterRepository`), the controller manages `Deployments`, `Services`, `ConfigMaps`, and `Secrets` for the kopia server pod. That RBAC ships with the chart in both scopes — nothing extra to grant. The feature is off until you add a `spec.server` block.
+If you use the [web UI](server.md), meaning `spec.server` on a `Repository` or `ClusterRepository`, the controller manages `Deployments`, `Services`, `ConfigMaps` and `Secrets` for the kopia server pod. That RBAC ships with the chart in both scopes, so there is nothing extra to grant. The feature stays off until you add a `spec.server` block.
 
 ///
 
 ## Runtime tuning
 
-The chart's defaults are sized for a typical homelab-to-mid-size cluster; a handful of
-top-level values tune the controller's runtime footprint and API-server load
-(full rationale in the
-[developer docs](dev/watch-and-reconcile.md#memory-footprint)):
+The chart's defaults are sized for a typical homelab to mid-size cluster. A handful of top-level values tune the controller's runtime footprint and its load on the API server. The full rationale is in the [developer docs](dev/watch-and-reconcile.md#memory-footprint).
 
 | Value | Env var | Default | What it does |
 |---|---|---|---|
@@ -217,44 +190,36 @@ top-level values tune the controller's runtime footprint and API-server load
 | `streamingLists` | `KOPIUR_STREAMING_LISTS` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists when the apiserver *answers* with a pre-1.32 version; a startup probe that fails to answer keeps the configured value, since a transport failure is not evidence about the server's version. |
 | `reconcileConcurrency` | `KOPIUR_RECONCILE_CONCURRENCY` | `8` | Per-controller cap on concurrent reconciles. Bounds API-server load and file descriptors during re-list storms and API-server outages. `0` = unbounded (not recommended). |
 | `maxConcurrentDeleteJobs` | `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` | `0` (uncapped) | Opt-in backstop on concurrent snapshot-delete batch Jobs; batching per repository is the primary protection. |
-| `maxConcurrentJobs` | `KOPIUR_MAX_CONCURRENT_JOBS` | `0` (uncapped) | Opt-in cluster-wide backstop on concurrent **pooled** mover Jobs — backups, restores, and the source side of either replication — across all repositories. The per-repository [`spec.concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) is the primary knob; a run must satisfy both. |
+| `maxConcurrentJobs` | `KOPIUR_MAX_CONCURRENT_JOBS` | `0` (uncapped) | Opt-in cluster-wide backstop on concurrent **pooled** mover Jobs (backups, restores, and the source side of either replication) across all repositories. The per-repository [`spec.concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) is the primary knob; a run must satisfy both. |
 | `leaderElection.flowSchema.enabled` | — | `true` | Give the controller's leader-election Lease its own API Priority and Fairness lane. See below. |
 
 /// note | Which of the two job caps to reach for
 
-`maxConcurrentJobs` here is the **cluster-operator's** backstop: set it when the node pool cannot host N movers no matter which repositories they belong to. Set the per-repository `spec.concurrency.maxConcurrentJobs` when one **backend** is the thing that must not be saturated — that is the knob most people want, and it is the one whose numbers appear in a queued run's status message. Leaving this one at `0` costs nothing: with no cap set anywhere the operator makes no extra API calls at all.
+`maxConcurrentJobs` here is the **cluster operator's** backstop. Set it when the node pool cannot host N movers no matter which repositories they belong to.
 
-Restores are always admitted and never queued (though a running restore still occupies a slot); maintenance, verification, pin and snapshot-delete Jobs are outside the pool entirely. See [Backups → limiting concurrent jobs per repository](backups.md#limiting-concurrent-jobs-per-repository).
+Set the per-repository `spec.concurrency.maxConcurrentJobs` when one **backend** is the thing that must not be saturated. That is the knob most people want, and it is the one whose numbers appear in a queued run's status message.
+
+Leaving this one at `0` costs nothing: with no cap set anywhere, the operator makes no extra API calls at all.
+
+Restores are always admitted and never queued, though a running restore still occupies a slot. Maintenance, verification, pin and snapshot-delete Jobs are outside the pool entirely. See [Backups → limiting concurrent jobs per repository](backups.md#limiting-concurrent-jobs-per-repository).
 
 ///
 
 /// note | Why the chart ships a FlowSchema
 
-Kubernetes' built-in `system-leader-election` FlowSchema routes lease renewals
-into a guaranteed priority level whose concurrency is never lent away — but it
-matches only `kube-controller-manager`, `kube-scheduler`, and ServiceAccounts in
-`kube-system`. An operator in its own namespace falls through to
-`service-accounts` → `workload-low`, where its lease renewals queue behind every
-other ServiceAccount's bulk traffic in the cluster. On one production cluster the
-p99 queue wait differed by ~360× between the two lanes, and the controller was
-restarting roughly fifteen times a day as a result.
+Kubernetes' built-in `system-leader-election` FlowSchema routes lease renewals into a guaranteed priority level whose concurrency is never lent away. It matches only `kube-controller-manager`, `kube-scheduler`, and ServiceAccounts in `kube-system`.
 
-The chart therefore ships a `FlowSchema` scoping **only** the operator's
-`leases` get/create/update calls into the built-in `leader-election` level.
-Set `leaderElection.flowSchema.enabled: false` if APF is disabled on your
-cluster, or if you cannot create cluster-scoped
-`flowcontrol.apiserver.k8s.io` objects. Kopiur runs correctly without it — the
-renew loop tolerates a congested lane, it just has less headroom.
+An operator in its own namespace therefore falls through to `service-accounts` and then to `workload-low`, where its lease renewals queue behind every other ServiceAccount's bulk traffic in the cluster. On one production cluster the p99 queue wait differed by about 360 times between the two lanes, and the controller was restarting roughly fifteen times a day as a result.
+
+The chart therefore ships a `FlowSchema` that routes **only** the operator's `leases` get, create and update calls into the built-in `leader-election` level. Set `leaderElection.flowSchema.enabled: false` if APF is disabled on your cluster, or if you cannot create cluster-scoped `flowcontrol.apiserver.k8s.io` objects. Kopiur runs correctly without it; the renew loop tolerates a congested lane, it just has less headroom.
 
 ///
 
 /// note | Why reconcileConcurrency is bounded by default
 
-Unbounded reconcile concurrency let an API-server outage exhaust the
-controller's file descriptors within seconds (every re-listed object
-reconciling — and failing — at once). The default of 8 per controller clears a
-few-hundred-object re-list in seconds while keeping the controller a good
-citizen toward a struggling control plane.
+Unbounded reconcile concurrency let an API-server outage exhaust the controller's file descriptors within seconds, because every re-listed object reconciled, and failed, at once.
+
+The default of 8 per controller clears a re-list of a few hundred objects in seconds while keeping the controller a good citizen toward a struggling control plane.
 
 ///
 
@@ -262,7 +227,7 @@ citizen toward a struggling control plane.
 
 The 9 CRDs ship in the chart's special `crds/` directory. Helm treats that directory specially: **`helm install` installs the CRDs, but `helm upgrade` never touches them.** There is no toggle for this.
 
-> Caution: because `helm upgrade` skips the `crds/` directory, a **helm-CLI upgrade that carries a schema change does not apply it** — you must apply the new CRDs yourself:
+> Caution: because `helm upgrade` skips the `crds/` directory, a **helm-CLI upgrade that carries a schema change does not apply it**. You must apply the new CRDs yourself:
 >
 > ```bash
 > # Server-side apply is required: the SnapshotPolicy CRD embeds a full JobSpec
@@ -270,13 +235,13 @@ The 9 CRDs ship in the chart's special `crds/` directory. Helm treats that direc
 > kubectl apply --server-side -f deploy/crds/
 > ```
 >
-> A GitOps flow (Flux/Argo with a `CreateReplace` sync policy) applies CRD changes automatically. Anyone managing CRDs entirely out of band just applies `deploy/crds/` themselves — `helm install` skips the ones that already exist.
+> A GitOps flow (Flux or Argo with a `CreateReplace` sync policy) applies CRD changes automatically. If you manage CRDs entirely out of band, just apply `deploy/crds/` yourself, since `helm install` skips the ones that already exist.
 >
-> Skipping this is usually **silent**, not loud: when a release adds a new spec field, an apiserver still running the old schema **prunes** that field out of every object you apply. The object admits cleanly, `kubectl get -o yaml` shows no trace of the field, and the feature you configured simply never happens. If a newly-documented field seems to be ignored, check the live CRD before anything else (`kubectl get crd <plural>.kopiur.home-operations.com -o yaml | grep <field>`); `kubectl kopiur doctor` flags known-stale schemas too.
+> Skipping this is usually **silent**, not loud. When a release adds a new spec field, an apiserver still running the old schema **prunes** that field out of every object you apply. The object admits cleanly, `kubectl get -o yaml` shows no trace of the field, and the feature you configured simply never happens. If a newly documented field seems to be ignored, check the live CRD before anything else with `kubectl get crd <plural>.kopiur.home-operations.com -o yaml | grep <field>`. `kubectl kopiur doctor` flags known-stale schemas too.
 
-The CRDs and RBAC shipped by the chart are **generated** by `cargo xtask gen-crds` / `cargo xtask gen-rbac` and checked in under `deploy/crds/` and `deploy/rbac/`. Those xtasks are the source of truth.
+The CRDs and RBAC shipped by the chart are **generated** by `cargo xtask gen-crds` and `cargo xtask gen-rbac`, and checked in under `deploy/crds/` and `deploy/rbac/`. Those xtasks are the source of truth.
 
-Upgrading **from 0.5.x to 0.6.0** is a special case: the CRDs used to be release-owned templates and moved into this `crds/` directory, so the crossing removes and re-installs them (cascade-deleting your CRs) unless you pin them first. See [Upgrading → 0.5.x → 0.6.0](upgrade.md#upgrading-05x--060-one-time-crd-migration) before you upgrade.
+Upgrading **from 0.5.x to 0.6.0** is a special case. The CRDs used to be release-owned templates and moved into this `crds/` directory, so the crossing removes and re-installs them, which cascade-deletes your custom resources, unless you pin them first. Read [Upgrading → 0.5.x → 0.6.0](upgrade.md#upgrading-05x--060-one-time-crd-migration) before you upgrade.
 
 ## First backup
 
@@ -287,7 +252,7 @@ kubectl apply -f deploy/examples/01-single-pvc-scheduled.yaml
 kubectl get repositories,snapshotpolicies,snapshotschedules -n billing
 ```
 
-Eight runnable walkthroughs live in `deploy/examples/`:
+The first eight examples in `deploy/examples/` cover the common patterns. The full numbered ladder is on the [Examples](examples.md) page.
 
 | File                               | Pattern                                             |
 | ---------------------------------- | --------------------------------------------------- |
@@ -302,12 +267,12 @@ Eight runnable walkthroughs live in `deploy/examples/`:
 
 ## Observability
 
-- The controller serves `/metrics`, `/healthz`, and `/readyz` on its single port (`metrics.port`, default `:8081`); the webhook serves `/metrics` on its TLS port (`webhook.port`, default `:8443`). All metrics are under the `kopiur_` namespace.
-- The controller and webhook default to the **dual-stack wildcard bind** (`[::]:8081` / `[::]:8443`), which serves both IPv4 and IPv6 kubelets/API servers, so probes work out of the box on either. The chart renders `[::]:<port>` into `KOPIUR_HTTP_ADDR` (controller) and `KOPIUR_WEBHOOK_ADDR` (webhook). On a host where **IPv6 is disabled in the pod network namespace** a `[::]` bind fails outright — force an IPv4-only bind by adding `KOPIUR_HTTP_ADDR=0.0.0.0:8081` through the controller's `extraEnv`. See [Helm chart values → Controller Deployment](configuration.md#controller-deployment) for the full detail.
-- The controller's metrics `Service` is **always** created (the `:8081` listener co-hosts `/metrics` with the probes, so there's nothing to disable).
-- `monitoring.serviceMonitor.enabled=true` creates a Prometheus-Operator `ServiceMonitor` (requires the Prometheus-Operator CRDs); `monitoring.prometheusRule.enabled=true` ships the kopiur alert rules.
-- `monitoring.dashboards.enabled=true` ships the Grafana dashboard as a sidecar-discoverable `ConfigMap` (source: `deploy/dashboards/kopiur.json`). Set `monitoring.dashboards.grafanaOperator.enabled=true` to instead render a [grafana-operator](https://grafana.github.io/grafana-operator/) `GrafanaDashboard` CR from the same JSON (use `monitoring.dashboards.grafanaOperator.matchLabels` to select the Grafana instance).
-- `observability.otlp.enabled=true` (with `observability.otlp.endpoint`) additionally exports OTLP **traces, logs, and a metrics push** from the controller, webhook, and mover Jobs. Off by default.
+- The controller serves `/metrics`, `/healthz` and `/readyz` on its single port, set by `metrics.port` and defaulting to `:8081`. The webhook serves `/metrics` on its TLS port, set by `webhook.port` and defaulting to `:8443`. All metrics are under the `kopiur_` namespace.
+- The controller and webhook default to the **dual-stack wildcard bind**, `[::]:8081` and `[::]:8443`, which serves both IPv4 and IPv6 kubelets and API servers, so probes work out of the box on either. The chart renders `[::]:<port>` into `KOPIUR_HTTP_ADDR` for the controller and `KOPIUR_WEBHOOK_ADDR` for the webhook. On a host where **IPv6 is disabled in the pod network namespace** a `[::]` bind fails outright; force an IPv4-only bind by adding `KOPIUR_HTTP_ADDR=0.0.0.0:8081` through the controller's `extraEnv`. See [Helm chart values → Controller Deployment](configuration.md#controller-deployment) for the full detail.
+- The controller's metrics `Service` is **always** created. The `:8081` listener hosts `/metrics` alongside the probes, so there is nothing to disable.
+- `monitoring.serviceMonitor.enabled=true` creates a Prometheus-Operator `ServiceMonitor`, which requires the Prometheus-Operator CRDs. `monitoring.prometheusRule.enabled=true` ships the kopiur alert rules.
+- `monitoring.dashboards.enabled=true` ships the Grafana dashboard as a sidecar-discoverable `ConfigMap`, sourced from `deploy/dashboards/kopiur.json`. Set `monitoring.dashboards.grafanaOperator.enabled=true` to render a [grafana-operator](https://grafana.github.io/grafana-operator/) `GrafanaDashboard` object from the same JSON instead, and use `monitoring.dashboards.grafanaOperator.matchLabels` to select the Grafana instance.
+- `observability.otlp.enabled=true`, with `observability.otlp.endpoint` set, also exports OTLP traces, logs and a metrics push from the controller, the webhook and mover Jobs. It is off by default.
 
 Turn it all on with the ready-made overlay:
 
@@ -325,7 +290,7 @@ helm upgrade kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system
 helm uninstall kopiur -n kopiur-system                                             # leaves the crds/ CRDs (and your CRs) in place
 ```
 
-Upgrading **from 0.5.x** needs a one-time pre-step so the CRD move doesn't delete your resources — see [Upgrading](upgrade.md).
+Upgrading **from 0.5.x** needs a one-time pre-step, so the CRD move does not delete your resources. See [Upgrading](upgrade.md).
 
 ## See also
 

@@ -44,6 +44,7 @@ fn from_config() -> RestoreSource {
         namespace: None,
         as_of: None,
         offset: 0,
+        source_path: None,
     })
 }
 fn identity() -> RestoreSource {
@@ -412,7 +413,7 @@ fn populator_state_depends_on_target_variant() {
 }
 
 #[test]
-fn populator_completed_is_not_terminal_at_guard() {
+fn a_populator_is_terminal_at_the_guard_on_neither_completed_nor_failed() {
     use PopulatorState::{AwaitingClaim, DirectTarget};
     use RestorePhase::{Completed, Failed, Pending, Resolving, Restoring};
 
@@ -424,9 +425,35 @@ fn populator_completed_is_not_terminal_at_guard() {
     assert!(!phase_is_terminal_at_guard(&Completed, AwaitingClaim));
     // A direct restore writes the target itself, so `Completed` IS terminal.
     assert!(phase_is_terminal_at_guard(&Completed, DirectTarget));
-    // `Failed` is terminal regardless of dispatch model.
-    assert!(phase_is_terminal_at_guard(&Failed, AwaitingClaim));
+
+    // #443: a populator `Failed` is the AGGREGATE over its claims, so it must not
+    // short-circuit either — one failed claim would otherwise freeze every sibling.
+    // Terminality moved to the CLAIM (`claim_drive` ⇒ Settled), and the prime of a
+    // hijacked populate is protected by `claim_artifacts_reapable` instead of by
+    // this guard. The two assertions below and that predicate are ONE change.
+    assert!(!phase_is_terminal_at_guard(&Failed, AwaitingClaim));
+    assert!(
+        !ClaimReason::PopulateHijacked.artifacts_reapable(),
+        "the guard relaxation above is only safe while the reaper refuses a hijacked \
+         populate's artifacts — these must never be changed apart"
+    );
+    assert!(
+        claim_drive(
+            Some(&kopiur_api::RestoreClaimStatus {
+                uid: Some("u1".into()),
+                phase: Some(kopiur_api::RestoreClaimPhase::Failed),
+                reason: Some(crate::consts::POPULATE_HIJACKED_REASON.into()),
+                ..Default::default()
+            }),
+            "u1",
+        ) == ClaimDrive::Settled,
+        "a hijacked populate's claim must rest, not be re-driven every 120s"
+    );
+
+    // A DIRECT restore is one-shot: `Failed` stays terminal, and a retry is a NEW
+    // Restore.
     assert!(phase_is_terminal_at_guard(&Failed, DirectTarget));
+
     // In-flight phases are never terminal.
     for p in [
         Pending,
@@ -454,117 +481,1061 @@ fn resolved_with(
 
 #[test]
 fn pinned_decision_reads_the_pinned_outcome_and_never_re_resolves() {
-    use PopulatorState::{AwaitingClaim, DirectTarget};
-    use RestorePhase::{Completed, Pending};
-
     // A pinned `NoSnapshot` is always the deploy-or-restore Empty decision — even
     // if a kopiaSnapshotID somehow co-exists, NoSnapshot wins (data-safety: a later
     // snapshot must never retarget a volume that already came up empty).
     assert_eq!(
-        pinned_decision(
-            Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
-            Some(&Completed),
-            AwaitingClaim,
-            false,
-        ),
+        pinned_decision(Some(&resolved_with(
+            Some(ResolutionOutcome::NoSnapshot),
+            None
+        ))),
         Some(Resolution::Empty)
     );
 
     // A pinned snapshot id resolves to that id (with the explicit Snapshot outcome…).
     assert_eq!(
-        pinned_decision(
-            Some(&resolved_with(
-                Some(ResolutionOutcome::Snapshot),
-                Some("k7")
-            )),
-            Some(&Pending),
-            DirectTarget,
-            false,
-        ),
+        pinned_decision(Some(&resolved_with(
+            Some(ResolutionOutcome::Snapshot),
+            Some("k7")
+        ))),
         Some(Resolution::Snapshot("k7".into()))
     );
     // …and a LEGACY pin (id present, `resolution` field absent) reads the same,
     // so an in-flight restore pinned before this field existed keeps its target.
     assert_eq!(
-        pinned_decision(
-            Some(&resolved_with(None, Some("k7"))),
-            Some(&Pending),
-            DirectTarget,
-            false,
-        ),
+        pinned_decision(Some(&resolved_with(None, Some("k7")))),
         Some(Resolution::Snapshot("k7".into()))
     );
 
-    // The pre-fix stuck populator: `Completed` with NOTHING pinned. A snapshot-
-    // resolved populator ALWAYS pins before Completed, so this unambiguously means
-    // the decision was "empty" — back-fill Empty, do NOT re-resolve.
-    assert_eq!(
-        pinned_decision(None, Some(&Completed), AwaitingClaim, false),
-        Some(Resolution::Empty)
-    );
-    // The same shape on a DIRECT target is not a stuck populator (its `Completed`
-    // is terminal at the guard, so it never reaches here): require fresh resolution.
-    assert_eq!(
-        pinned_decision(None, Some(&Completed), DirectTarget, false),
-        None
-    );
-
     // A fresh, un-pinned restore must resolve.
-    assert_eq!(
-        pinned_decision(None, Some(&Pending), AwaitingClaim, false),
-        None
-    );
-    assert_eq!(pinned_decision(None, None, DirectTarget, false), None);
+    assert_eq!(pinned_decision(None), None);
 }
 
-/// #233: the OTHER way a populator reaches `Completed` unpinned is an already-bound
-/// no-op on a DEFERRED source — the mover (which pins a deferred source) never ran.
-/// Back-filling `Empty` there would durably pin `NoSnapshot`, so a later, legitimate
-/// re-creation of the claiming PVC would provision an EMPTY volume instead of restoring
-/// the snapshot. The `noop_already_bound` flag must suppress exactly that back-fill —
-/// and nothing else.
+/// #443: everything `pinned_decision` used to do for a POPULATOR now happens per
+/// claim, keyed on that claim's own pin and phase. The two arms that only ever
+/// existed for a populator — the pre-fix `Completed`-but-unpinned back-fill and
+/// the #233 already-bound carve-out from it — must still be exactly as careful,
+/// or a re-created claim comes up EMPTY instead of restoring.
 #[test]
-fn pinned_decision_skips_empty_backfill_after_already_bound_noop() {
-    use PopulatorState::AwaitingClaim;
-    use RestorePhase::Completed;
+fn the_populator_arms_of_pinned_decision_moved_intact_onto_the_claim() {
+    use kopiur_api::{RestoreClaimPhase as P, RestoreClaimStatus};
 
-    // The no-op'd populator: do NOT infer "empty", leave it unresolved so a recreated
-    // claim re-resolves and restores for real.
+    let record = |phase: Option<P>, resolved: Option<ResolvedRestore>| RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase,
+        resolved,
+        ..Default::default()
+    };
+
+    // The pre-fix stuck populator: the claim reads `Populated` with NOTHING pinned.
+    // A snapshot-resolved claim ALWAYS pins before it can be Populated, so this
+    // unambiguously means the decision was "empty" — back-fill, do NOT re-resolve.
     assert_eq!(
-        pinned_decision(None, Some(&Completed), AwaitingClaim, true),
-        None
-    );
-    // The legacy stuck populator (same shape, but NOT an already-bound no-op) still
-    // back-fills — that heal must survive this fix.
-    assert_eq!(
-        pinned_decision(None, Some(&Completed), AwaitingClaim, false),
+        claim_pinned_decision(&record(Some(P::Populated), None)),
         Some(Resolution::Empty)
     );
-    // A genuine deploy-or-restore PINNED `NoSnapshot`, so it reads its pin either way:
-    // the flag never overrides a real pin.
-    for noop in [true, false] {
-        assert_eq!(
-            pinned_decision(
-                Some(&resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
-                Some(&Completed),
-                AwaitingClaim,
-                noop,
-            ),
-            Some(Resolution::Empty)
+    // The #233 carve-out: an already-bound no-op on a DEFERRED source never ran the
+    // mover, and the mover is what pins a deferred source. Back-filling `NoSnapshot`
+    // here would durably record "this restore decided to come up empty".
+    assert_eq!(
+        claim_pinned_decision(&record(Some(P::AlreadyBound), None)),
+        None
+    );
+    // A real pin is honored either way, so a re-created claim restores the SAME
+    // snapshot (ADR §4.6: pinned once, never re-resolved).
+    assert_eq!(
+        claim_pinned_decision(&record(
+            Some(P::AlreadyBound),
+            Some(resolved_with(Some(ResolutionOutcome::NoSnapshot), None))
+        )),
+        Some(Resolution::Empty)
+    );
+    assert_eq!(
+        claim_pinned_decision(&record(
+            Some(P::AlreadyBound),
+            Some(resolved_with(Some(ResolutionOutcome::Snapshot), Some("k9")))
+        )),
+        Some(Resolution::Snapshot("k9".into()))
+    );
+    // A fresh claim resolves.
+    assert_eq!(claim_pinned_decision(&record(None, None)), None);
+}
+
+/// A claim record in `phase`/`reason`, for the pure tables below.
+fn claim_record(
+    phase: Option<kopiur_api::RestoreClaimPhase>,
+    reason: Option<&str>,
+) -> kopiur_api::RestoreClaimStatus {
+    kopiur_api::RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase,
+        reason: reason.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+/// #443 review item 2 — the steady Settled sweep exists for ONE shape: a
+/// finished claim whose finalize crashed and left an orphan prime. It must NOT
+/// touch a `Failed` claim's mover Job or prime: the record tells the user to
+/// read that Job's pod logs, restore movers carry no TTL, and pre-#443 both
+/// survived until the user acted (a `Failed` populator was terminal at the
+/// guard). Sweeping them 120 s later deletes the evidence the message points at.
+#[test]
+fn a_settled_failed_claim_keeps_its_job_and_prime_for_the_user_to_read() {
+    use crate::consts::{
+        MOVER_JOB_FAILED_REASON, MOVER_POD_WEDGED_REASON, POPULATE_HIJACKED_REASON,
+        RESTORE_POPULATED_REASON, RESTORE_TARGET_ALREADY_BOUND_REASON,
+    };
+    use kopiur_api::RestoreClaimPhase as P;
+
+    // The crash-recovery shape the sweep is FOR.
+    assert!(settled_artifacts_reapable(&claim_record(
+        Some(P::Populated),
+        Some(RESTORE_POPULATED_REASON)
+    )));
+    assert!(settled_artifacts_reapable(&claim_record(
+        Some(P::AlreadyBound),
+        Some(RESTORE_TARGET_ALREADY_BOUND_REASON)
+    )));
+
+    // Every failure keeps its artifacts until the claim is re-armed or dropped.
+    for reason in [
+        MOVER_JOB_FAILED_REASON,
+        MOVER_POD_WEDGED_REASON,
+        POPULATE_HIJACKED_REASON,
+        crate::consts::SOURCE_PATH_AMBIGUOUS_REASON,
+        crate::consts::RESTORE_SNAPSHOT_NOT_FOUND_REASON,
+    ] {
+        assert!(
+            !settled_artifacts_reapable(&claim_record(Some(P::Failed), Some(reason))),
+            "a Failed/{reason} claim must keep its Job and prime"
         );
-        // …and a pinned snapshot id is likewise honored, so a recreated claim restores
-        // the SAME snapshot (ADR §4.6: pinned once, never re-resolved).
+    }
+
+    // The hijack refusal still holds through the wider gate too — the two
+    // predicates protect different things and neither may be dropped.
+    assert!(!claim_artifacts_reapable(Some(POPULATE_HIJACKED_REASON)));
+
+    // Unsettled phases cannot reach this arm; encoded as "leave it alone"
+    // rather than a panic, so a hand-patched status cannot crash the loop.
+    for phase in [
+        None,
+        Some(P::Pending),
+        Some(P::Populating),
+        Some(P::Rebinding),
+    ] {
+        assert!(!settled_artifacts_reapable(&claim_record(phase, None)));
+    }
+    assert!(!settled_artifacts_reapable(&claim_record(
+        Some(P::Unknown("Staging".into())),
+        None
+    )));
+}
+
+/// #443 review item 1 — the zero-claimant pass must NULL the records of
+/// claimants that are gone in the SAME patch that parks. Writing the park alone
+/// left them standing, so the next pass 30 s later re-reaped them and
+/// re-published `OrphanedPrimePvcReaped`, forever, for every app torn down with
+/// its populator left in place.
+#[test]
+fn the_zero_claimant_park_nulls_the_records_of_gone_claimants() {
+    let restore = restore_with_anchor(None);
+    let (reason, message) = claims_summary(&ClaimsAggregate::NoClaims);
+
+    let status = awaiting_claim_status(&restore, reason, &message, &["postgres-data".to_string()]);
+    assert_eq!(
+        status["claims"]["postgres-data"],
+        serde_json::Value::Null,
+        "the null must be EXPLICIT — an omitted key leaves the record standing: {status}"
+    );
+    // The pre-#443 zero-claim surface is unchanged.
+    assert_eq!(status["phase"], "Pending");
+    assert_eq!(status["target"]["pvcPrime"], "awaiting-claim");
+    assert!(
+        status["conditions"]
+            .as_array()
+            .expect("conditions array")
+            .iter()
+            .any(|c| c["type"] == "AwaitingClaim"
+                && c["status"] == "True"
+                && c["reason"] == crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON),
+        "{status}"
+    );
+
+    // Nothing gone ⇒ no `claims` key at all, so the steady zero-claim heartbeat
+    // is a no-op under the deep merge predicate rather than a write every 30s.
+    let quiet = awaiting_claim_status(&restore, reason, &message, &[]);
+    assert!(quiet.get("claims").is_none(), "{quiet}");
+    assert!(
+        crate::io::status_merge_patch_is_noop(
+            Some(&serde_json::json!({
+                "phase": "Pending",
+                "observedGeneration": 1,
+                "conditions": quiet["conditions"].clone(),
+                "target": { "pvcPrime": "awaiting-claim" },
+            })),
+            &quiet
+        ),
+        "an unchanged zero-claim park must not re-write: {quiet}"
+    );
+}
+
+// --- the single-claim TOP-LEVEL mirror (#443 CI regression) -------------
+//
+// The overwhelmingly common populator is a one-PVC app, and for it the `Restore`
+// simply IS that claim. `docs/restores.md` promises the deploy-or-restore
+// decision is pinned to `status.resolved`, and `kubectl kopiur restore`/`status`
+// read exactly that field — moving the pin under `status.claims.<pvc>.resolved`
+// broke both, plus four e2e regressions.
+
+/// A claims map holding exactly `records`, keyed in insertion order.
+fn claims_of(
+    records: &[(&str, kopiur_api::RestoreClaimStatus)],
+) -> std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus> {
+    records
+        .iter()
+        .map(|(name, record)| ((*name).to_string(), record.clone()))
+        .collect()
+}
+
+/// One claim record, for the mirror tables.
+fn mirror_record(
+    phase: kopiur_api::RestoreClaimPhase,
+    reason: &str,
+    message: &str,
+    resolved: Option<ResolutionOutcome>,
+) -> kopiur_api::RestoreClaimStatus {
+    kopiur_api::RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase: Some(phase),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+        resolved: resolved.map(|o| resolved_with(Some(o), None)),
+        ..Default::default()
+    }
+}
+
+/// One condition off a status body.
+fn condition_of(status: &serde_json::Value, type_: &str) -> Option<serde_json::Value> {
+    status["conditions"]
+        .as_array()?
+        .iter()
+        .find(|c| c["type"] == type_)
+        .cloned()
+}
+
+/// The status body a fan-out pass writes for exactly these claims.
+fn mirrored_status(
+    claims: &std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus>,
+) -> serde_json::Value {
+    fanout_status(
+        &restore_with_anchor(None),
+        &std::collections::BTreeMap::new(),
+        claims,
+        &[],
+    )
+}
+
+/// Deploy-or-restore, one claim: the pinned "no snapshot" decision must be
+/// visible at `status.resolved` — a later snapshot must never be able to
+/// retarget the volume — and the outcome must be SELF-DESCRIBING
+/// (`Resolved=True/NoSnapshotContinue`) rather than looking like a restore that
+/// wrote data.
+#[test]
+fn a_lone_deploy_or_restore_claim_pins_its_decision_to_the_top_level_status() {
+    use crate::consts::NO_SNAPSHOT_CONTINUE_REASON;
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let claims = claims_of(&[(
+        "data",
+        mirror_record(
+            P::Populated,
+            NO_SNAPSHOT_CONTINUE_REASON,
+            "provisioned an empty volume",
+            Some(ResolutionOutcome::NoSnapshot),
+        ),
+    )]);
+    let status = mirrored_status(&claims);
+
+    assert_eq!(
+        status["resolved"]["resolution"],
+        serde_json::json!("NoSnapshot"),
+        "{status}"
+    );
+    assert_eq!(status["target"]["pvcRef"]["name"], "data", "{status}");
+    let resolved = condition_of(&status, "Resolved").expect("a Resolved condition");
+    assert_eq!(resolved["status"], "True", "{resolved}");
+    assert_eq!(
+        resolved["reason"], NO_SNAPSHOT_CONTINUE_REASON,
+        "{resolved}"
+    );
+    let ready = condition_of(&status, "Ready").expect("a Ready condition");
+    assert_eq!(ready["reason"], NO_SNAPSHOT_CONTINUE_REASON, "{ready}");
+    assert_eq!(ready["message"], "provisioned an empty volume", "{ready}");
+}
+
+/// The #233 no-op, one claim: the completion must say WHY nothing happened, in
+/// the claim's own words. The aggregate wording ("1/1 claims settled") does not
+/// tell the user their live volume was left untouched, or how to actually
+/// restore into it.
+#[test]
+fn a_lone_already_bound_claim_reports_its_own_reason_and_clears_the_mirror() {
+    use crate::consts::RESTORE_TARGET_ALREADY_BOUND_REASON;
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let claims = claims_of(&[(
+        "data",
+        mirror_record(
+            P::AlreadyBound,
+            RESTORE_TARGET_ALREADY_BOUND_REASON,
+            &target_already_bound_message("data", Some("pv-1")),
+            None,
+        ),
+    )]);
+    let status = mirrored_status(&claims);
+
+    assert_eq!(status["phase"], "Completed", "{status}");
+    let ready = condition_of(&status, "Ready").expect("a Ready condition");
+    assert_eq!(ready["status"], "True", "{ready}");
+    assert_eq!(
+        ready["reason"], RESTORE_TARGET_ALREADY_BOUND_REASON,
+        "{ready}"
+    );
+    assert!(
+        ready["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already bound"),
+        "the mirrored message is the CLAIM's, verbatim: {ready}"
+    );
+    // Nothing pinned: the mirror leaves the top-level `resolved` UNTOUCHED
+    // (wave 2, finding 5 — a `null` here erased an adopted legacy mover's pin
+    // before `claim_finalize_pin` could fall back to it). The handshake is over,
+    // so the reaped prime is no longer advertised.
+    assert!(
+        status.get("resolved").is_none(),
+        "an unpinned single claim must not name `resolved` at all: {status}"
+    );
+    assert_eq!(
+        status["target"]["pvcPrime"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+    // A `Resolved` condition would be news about the SOURCE; an already-bound
+    // no-op is news about the handshake, so none is written.
+    assert!(condition_of(&status, "Resolved").is_none(), "{status}");
+}
+
+/// A real restore mirrors its snapshot pin; an in-flight one mirrors the prime
+/// it is writing, so `status.target.pvcPrime` still names the volume to look at.
+#[test]
+fn a_lone_claim_mirrors_its_pin_and_its_prime_through_the_handshake() {
+    use crate::consts::{POPULATING_PRIME_PVC_REASON, RESTORE_POPULATED_REASON};
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let done = claims_of(&[(
+        "data",
+        mirror_record(
+            P::Populated,
+            RESTORE_POPULATED_REASON,
+            "restored and rebound",
+            Some(ResolutionOutcome::Snapshot),
+        ),
+    )]);
+    let status = mirrored_status(&done);
+    assert_eq!(
+        status["resolved"]["resolution"],
+        serde_json::json!("Snapshot")
+    );
+    assert_eq!(
+        condition_of(&status, "Ready").expect("Ready")["reason"],
+        RESTORE_POPULATED_REASON
+    );
+
+    let mut populating = mirror_record(
+        P::Populating,
+        POPULATING_PRIME_PVC_REASON,
+        "restoring into the prime PVC",
+        None,
+    );
+    populating.pvc_prime = Some("prime-u1".into());
+    let status = mirrored_status(&claims_of(&[("data", populating)]));
+    assert_eq!(status["target"]["pvcPrime"], "prime-u1", "{status}");
+    assert_eq!(status["phase"], "Restoring", "{status}");
+}
+
+/// ZERO claims: the park owns that surface, and it must clear a departed single
+/// claim's mirrored `pvcRef` — a merge patch merges objects key by key, so
+/// writing only the sentinel would leave the gone claim advertised beside it.
+#[test]
+fn the_zero_claim_park_clears_a_departed_claims_mirror() {
+    let empty = std::collections::BTreeMap::new();
+    assert_eq!(claims_mirror(&empty), ClaimsMirror::NoClaims);
+
+    let park = awaiting_claim_status(
+        &restore_with_anchor(None),
+        crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON,
+        "m",
+        &[],
+    );
+    assert_eq!(park["target"]["pvcPrime"], "awaiting-claim", "{park}");
+    assert_eq!(park["target"]["pvcRef"], serde_json::Value::Null, "{park}");
+    // Nothing was dropped, so nothing is cleared: a park over a GENUINE
+    // pre-fan-out status (no records, a legacy top-level pin) must leave that
+    // pin standing for adoption to read.
+    assert!(park.get("resolved").is_none(), "{park}");
+
+    // Wave 2, finding 6: dropping the LAST record nulls the top-level mirror in
+    // the same patch, so an empty `claims` beside a present `resolved` can only
+    // ever mean a genuine pre-fan-out status.
+    let last_gone = awaiting_claim_status(
+        &restore_with_anchor(None),
+        crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON,
+        "m",
+        &["data".to_string()],
+    );
+    assert_eq!(
+        last_gone["resolved"],
+        serde_json::Value::Null,
+        "{last_gone}"
+    );
+    assert_eq!(last_gone["claims"]["data"], serde_json::Value::Null);
+    assert_eq!(last_gone["target"]["pvcRef"], serde_json::Value::Null);
+    assert_eq!(last_gone["target"]["pvcPrime"], "awaiting-claim");
+}
+
+/// Wave 2, finding 5 — the single-claim mirror over (claim pinned?, previous
+/// top-level pin present?, claim count). `resolved` is the deploy-or-restore
+/// DECISION surface and the legacy-adoption signal, so the mirror writes it only
+/// when the claim is pinned, nulls it only when the controller is RESETTING
+/// (Single→Many, a re-arm, a dropped sibling), and otherwise leaves it alone —
+/// an unpinned claim's `null` erased an adopted LEGACY mover's top-level pin
+/// before `claim_finalize_pin`'s `own.or(top_level)` could read it.
+#[test]
+fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
+    use crate::consts::{POPULATING_PRIME_PVC_REASON, RESTORE_POPULATED_REASON};
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let pinned = || {
+        mirror_record(
+            P::Populated,
+            RESTORE_POPULATED_REASON,
+            "restored",
+            Some(ResolutionOutcome::Snapshot),
+        )
+    };
+    let unpinned = || {
+        let mut r = mirror_record(P::Populating, POPULATING_PRIME_PVC_REASON, "writing", None);
+        r.pvc_prime = Some("prime-u1".into());
+        r
+    };
+    let legacy_pinned = restore_with_legacy_pin();
+    let bare = restore_with_anchor(None);
+    let none = std::collections::BTreeMap::new();
+
+    for (restore, top_level_present) in [(&legacy_pinned, true), (&bare, false)] {
+        // Pinned, one claim ⇒ written (whatever stood there before).
+        let one = claims_of(&[("data", pinned())]);
+        let s = fanout_status(restore, &none, &one, &[]);
         assert_eq!(
-            pinned_decision(
-                Some(&resolved_with(
-                    Some(ResolutionOutcome::Snapshot),
-                    Some("k9")
-                )),
-                Some(&Completed),
-                AwaitingClaim,
-                noop,
+            s["resolved"]["resolution"],
+            serde_json::json!("Snapshot"),
+            "top_level_present={top_level_present}: {s}"
+        );
+        assert_eq!(s["target"]["pvcRef"]["name"], "data");
+
+        // Unpinned, one claim ⇒ `resolved` OMITTED — the adopted legacy pin (or
+        // nothing) stays. `target` still names the prime being written.
+        let one = claims_of(&[("data", unpinned())]);
+        let s = fanout_status(restore, &none, &one, &[]);
+        assert!(
+            s.get("resolved").is_none(),
+            "top_level_present={top_level_present}: {s}"
+        );
+        assert_eq!(s["target"]["pvcPrime"], "prime-u1");
+        // …and the same on the heartbeat, where `prev` is that same record.
+        let s = fanout_status(restore, &one, &one, &[]);
+        assert!(s.get("resolved").is_none(), "{s}");
+
+        // Unpinned, one claim, but the CLAIMANT CHANGED (a re-arm): the pin that
+        // stands is the dead claimant's — reset it (finding 2's top-level twin).
+        let mut fresh = unpinned();
+        fresh.uid = Some("u-new".into());
+        let rearmed = claims_of(&[("data", fresh)]);
+        let s = fanout_status(restore, &claims_of(&[("data", pinned())]), &rearmed, &[]);
+        assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
+
+        // Unpinned survivor while a SIBLING's record is dropped: the dropped
+        // claim's mirrored pin is stale — reset it.
+        let s = fanout_status(
+            restore,
+            &claims_of(&[("data", unpinned()), ("logs", pinned())]),
+            &claims_of(&[("data", unpinned())]),
+            &["logs".to_string()],
+        );
+        assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
+
+        // Two claims from a Single ⇒ nulls; two claims from two ⇒ omitted.
+        let mut second = pinned();
+        second.uid = Some("u2".into());
+        let two = claims_of(&[("data", pinned()), ("logs", second)]);
+        let s = fanout_status(restore, &claims_of(&[("data", pinned())]), &two, &[]);
+        assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
+        assert_eq!(s["target"], serde_json::Value::Null, "{s}");
+        let s = fanout_status(restore, &two, &two, &[]);
+        assert!(s.get("resolved").is_none(), "{s}");
+    }
+}
+
+/// A `Restore` carrying a LEGACY top-level pin (pre-fan-out status shape).
+fn restore_with_legacy_pin() -> Restore {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+        "spec": {
+            "source": { "fromPolicy": { "name": "cfg" } },
+            "target": { "populator": {} }
+        },
+        "status": {
+            "phase": "Restoring",
+            "resolved": { "resolution": "Snapshot", "kopiaSnapshotID": "legacy1" },
+            "target": { "pvcRef": { "name": "data" }, "pvcPrime": "prime-u1" }
+        }
+    }))
+    .expect("valid Restore")
+}
+
+/// SEVERAL claims: there is no single top-level answer, so `resolved`/`target`
+/// are CLEARED and the conditions carry the aggregate. A `Restore` that ran with
+/// one claim and later gained a second must not keep advertising the first
+/// claim's pin as the whole restore's.
+#[test]
+fn several_claims_clear_the_mirror_and_report_the_aggregate() {
+    use crate::consts::RESTORE_POPULATED_REASON;
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let mut second = mirror_record(
+        P::Populated,
+        RESTORE_POPULATED_REASON,
+        "restored",
+        Some(ResolutionOutcome::NoSnapshot),
+    );
+    second.uid = Some("u2".into());
+    let two = claims_of(&[
+        (
+            "data",
+            mirror_record(
+                P::Populated,
+                RESTORE_POPULATED_REASON,
+                "restored",
+                Some(ResolutionOutcome::Snapshot),
             ),
-            Some(Resolution::Snapshot("k9".into()))
+        ),
+        ("logs", second),
+    ]);
+    assert_eq!(claims_mirror(&two), ClaimsMirror::Many);
+
+    // The Single→Many TRANSITION: the previous pass mirrored `data`'s pin, so
+    // this pass must explicitly null it (wave 2, finding 5).
+    let was_single = claims_of(&[(
+        "data",
+        mirror_record(
+            P::Populated,
+            RESTORE_POPULATED_REASON,
+            "restored",
+            Some(ResolutionOutcome::Snapshot),
+        ),
+    )]);
+    let status = fanout_status(&restore_with_anchor(None), &was_single, &two, &[]);
+    assert_eq!(
+        status["resolved"],
+        serde_json::Value::Null,
+        "a two-claim Restore must not advertise one claim's pin as its own: {status}"
+    );
+    assert_eq!(status["target"], serde_json::Value::Null, "{status}");
+    // Many→Many heartbeat: nothing to clear, so `resolved` is not named — a
+    // `null` there is what erased an adopted legacy pin (finding 5).
+    let steady = fanout_status(&restore_with_anchor(None), &two, &two, &[]);
+    assert!(
+        steady.get("resolved").is_none(),
+        "the many-claim heartbeat must leave `resolved` alone: {steady}"
+    );
+    let status = mirrored_status(&two);
+    assert!(
+        condition_of(&status, "Ready").expect("Ready")["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("2/2 claims settled"),
+        "several claims report the AGGREGATE: {status}"
+    );
+
+    // Clearing an already-absent key is a server-side no-op, so the many-claim
+    // heartbeat does not re-write just to null what was never there.
+    let current = serde_json::json!({
+        "phase": status["phase"].clone(),
+        "observedGeneration": status["observedGeneration"].clone(),
+        "conditions": status["conditions"].clone(),
+        "claims": { "data": {}, "logs": {} },
+    });
+    let mut idempotent = status.clone();
+    idempotent["claims"] = serde_json::json!({ "data": {}, "logs": {} });
+    assert!(
+        crate::io::status_merge_patch_is_noop(Some(&current), &idempotent),
+        "nulling absent top-level keys must not force a write: {idempotent}"
+    );
+}
+
+/// The mirror is CONTROLLER-owned top-level state, so a mirrored
+/// `status.resolved` must never make a fanned-out `Restore` look pre-fan-out.
+/// `is_legacy_populator_status` keys on `claims` being empty FIRST, and
+/// `claim_merge_body` still never names a mover-owned key.
+#[test]
+fn a_mirrored_pin_is_not_mistaken_for_a_legacy_status() {
+    let status: kopiur_api::RestoreStatus = serde_json::from_value(serde_json::json!({
+        "phase": "Completed",
+        // Exactly what the single-claim mirror writes…
+        "resolved": { "resolution": "NoSnapshot", "pinnedAt": "2026-01-01T00:00:00Z" },
+        "target": { "pvcRef": { "name": "data" } },
+        // …beside the claim it was copied from.
+        "claims": { "data": { "phase": "Populated", "reason": "NoSnapshotContinue" } }
+    }))
+    .expect("valid RestoreStatus");
+    assert!(
+        !is_legacy_populator_status(&status),
+        "a mirrored pin on a Restore that HAS claims is not a legacy status"
+    );
+
+    // Wave 2, finding 6: once the LAST claimant is gone, the zero-claim park
+    // nulls the mirror together with the record, so the status that reaches the
+    // NEXT claimant (empty `claims`, no `resolved`) is not read as pre-fan-out —
+    // which would have "adopted" the departed claim's pin for a brand-new PVC.
+    let fanned_out: Restore = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+        "spec": {
+            "source": { "fromPolicy": { "name": "cfg" } },
+            "target": { "populator": {} }
+        },
+        "status": serde_json::to_value(&status).unwrap()
+    }))
+    .expect("valid Restore");
+    let park = awaiting_claim_status(
+        &fanned_out,
+        crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON,
+        "m",
+        &["data".to_string()],
+    );
+    let after = crate::io::apply_merge_patch(&serde_json::to_value(&status).unwrap(), &park);
+    let after: kopiur_api::RestoreStatus = serde_json::from_value(after).expect("merged status");
+    assert!(after.claims.is_empty(), "{after:?}");
+    assert!(after.resolved.is_none(), "{after:?}");
+    assert!(
+        !is_legacy_populator_status(&after),
+        "a fanned-out Restore whose last claimant left must not adopt as legacy: {after:?}"
+    );
+
+    // And the merge body for that claim still names no mover-owned key.
+    let record = kopiur_api::RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase: Some(kopiur_api::RestoreClaimPhase::Populated),
+        resolved: Some(resolved_with(Some(ResolutionOutcome::NoSnapshot), None)),
+        ..Default::default()
+    };
+    let body = claim_merge_body(None, &record);
+    for mover_key in ["observedAt", "logTail", "failure"] {
+        assert!(body.get(mover_key).is_none(), "{mover_key} in {body}");
+    }
+}
+
+/// #443 review item 9 — the steady heartbeat skips the cluster-wide
+/// `PersistentVolume` LIST, and a prime that will NEVER be reaped must not
+/// defeat that. A hijacked populate's prime is kept ON PURPOSE and forever, so
+/// treating it as "still busy" buys one cluster-wide LIST every 600 s for a
+/// claim whose artifacts nothing will ever collect.
+#[test]
+fn a_deliberately_kept_prime_does_not_keep_the_pass_busy() {
+    use kopiur_api::RestoreClaimPhase as P;
+    let live = vec![("data".to_string(), "u1".to_string())];
+    let settled = vec![ClaimDrive::Settled];
+    let primes: std::collections::BTreeSet<String> = ["prime-u1".to_string()].into();
+    let none: std::collections::BTreeSet<String> = Default::default();
+
+    let with = |record: kopiur_api::RestoreClaimStatus| {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("data".to_string(), record);
+        m
+    };
+
+    // A hijacked populate's prime stands forever: quiet.
+    let hijacked = with(claim_record(
+        Some(P::Failed),
+        Some(crate::consts::POPULATE_HIJACKED_REASON),
+    ));
+    assert!(pass_is_all_quiet(&[], &settled, &live, &hijacked, &primes));
+
+    // A prime that IS reapable means there is real work left (the crashed
+    // finalize the Settled sweep exists for), so the LIST is paid.
+    let populated = with(claim_record(
+        Some(P::Populated),
+        Some(crate::consts::RESTORE_POPULATED_REASON),
+    ));
+    assert!(!pass_is_all_quiet(
+        &[],
+        &settled,
+        &live,
+        &populated,
+        &primes
+    ));
+    // No prime at all: quiet.
+    assert!(pass_is_all_quiet(&[], &settled, &live, &populated, &none));
+
+    // Anything unsettled, or any record to drop, is never quiet.
+    assert!(!pass_is_all_quiet(
+        &[],
+        &[ClaimDrive::Drive],
+        &live,
+        &populated,
+        &none
+    ));
+    assert!(!pass_is_all_quiet(
+        &["old".to_string()],
+        &settled,
+        &live,
+        &populated,
+        &none
+    ));
+}
+
+/// A claiming PVC, for [`legacy_claimant`]'s table.
+fn adoption_claimant(
+    name: &str,
+    uid: &str,
+    bound: bool,
+) -> k8s_openapi::api::core::v1::PersistentVolumeClaim {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": { "name": name, "namespace": "ns", "uid": uid },
+        "spec": { "volumeName": if bound { "pv-1" } else { "" } },
+        "status": { "phase": if bound { "Bound" } else { "Pending" } }
+    }))
+    .expect("valid PVC")
+}
+
+/// #443 review item 4 — the upgrade path's claimant selection, which is the only
+/// new logic in it.
+///
+/// The failing shape is the REPORTER'S OWN cluster after upgrade: N claimants,
+/// exactly one populated (the pre-fan-out driver could only ever fill the first
+/// LIST hit). Adopting nothing there re-drives the populated claim, which reads
+/// `NothingToPopulate` and relabels it `TargetAlreadyBound` — "no restore ran;
+/// delete the PVC" — over the volume holding the restored data.
+#[test]
+fn legacy_adoption_picks_the_one_claim_the_pre_fanout_driver_was_about() {
+    let primes = |names: &[&str]| -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    };
+
+    // 1. A surviving uid-keyed prime names the claim mid-handshake exactly —
+    //    bound or not, and regardless of how many claimants there are.
+    let mid = vec![
+        adoption_claimant("data-a", "uid-a", false),
+        adoption_claimant("data-b", "uid-b", true),
+    ];
+    assert_eq!(
+        legacy_claimant(&mid, &primes(&["prime-uid-a"]))
+            .map(kube::ResourceExt::name_any)
+            .as_deref(),
+        Some("data-a")
+    );
+
+    // 2. N claimants, no prime, exactly ONE bound: the reporter's state.
+    let reporter = vec![
+        adoption_claimant("data-a", "uid-a", true),
+        adoption_claimant("data-b", "uid-b", false),
+        adoption_claimant("data-c", "uid-c", false),
+    ];
+    assert_eq!(
+        legacy_claimant(&reporter, &primes(&[]))
+            .map(kube::ResourceExt::name_any)
+            .as_deref(),
+        Some("data-a"),
+        "the populated PVC must be adopted, not relabelled TargetAlreadyBound"
+    );
+
+    // 3. A lone BOUND claimant — the ordinary single-PVC upgrade.
+    let lone_bound = vec![adoption_claimant("data", "uid", true)];
+    assert!(legacy_claimant(&lone_bound, &primes(&[])).is_some());
+
+    // 4. A lone UNBOUND claimant is NOT adopted. That is a `Completed` populator
+    //    whose claim was deleted and re-applied; pre-#443 it was re-populated on
+    //    the next pass, and adopting `Populated` onto it would settle a claim
+    //    that never got its volume.
+    let lone_unbound = vec![adoption_claimant("data", "uid", false)];
+    assert!(legacy_claimant(&lone_unbound, &primes(&[])).is_none());
+
+    // 5. Several bound, no prime: the old driver could not have populated more
+    //    than one, so the extras were bound by something else and we cannot tell
+    //    which is ours. Adopt nothing; every claimant drives fresh.
+    let ambiguous = vec![
+        adoption_claimant("data-a", "uid-a", true),
+        adoption_claimant("data-b", "uid-b", true),
+    ];
+    assert!(legacy_claimant(&ambiguous, &primes(&[])).is_none());
+    // 6. None bound at all: nothing was ever populated.
+    let none_bound = vec![
+        adoption_claimant("data-a", "uid-a", false),
+        adoption_claimant("data-b", "uid-b", false),
+    ];
+    assert!(legacy_claimant(&none_bound, &primes(&[])).is_none());
+}
+
+/// #443 review item 8 — adoption must not fire on a brand-new `Restore`. A new
+/// populator parks `Pending`/`AwaitingPvcDataSourceRef` with the sentinel
+/// `target.pvcPrime: awaiting-claim`; its first claim would otherwise "adopt"
+/// that park, spend a Job GET and log that a pre-fan-out status was adopted.
+#[test]
+fn only_a_pre_fanout_status_is_adopted() {
+    let status = |v: serde_json::Value| -> kopiur_api::RestoreStatus {
+        serde_json::from_value(v).expect("valid RestoreStatus")
+    };
+
+    // The zero-claim park a BRAND-NEW populator writes: not legacy.
+    assert!(!is_legacy_populator_status(&status(serde_json::json!({
+        "phase": "Pending",
+        "target": { "pvcPrime": "awaiting-claim" }
+    }))));
+    assert!(!is_legacy_populator_status(&status(
+        serde_json::json!({ "phase": "Resolving" })
+    )));
+
+    // A pinned top-level `resolved` is written only by the pre-fan-out path.
+    assert!(is_legacy_populator_status(&status(serde_json::json!({
+        "phase": "Pending",
+        "resolved": { "kopiaSnapshotID": "k1" }
+    }))));
+    // …as is any phase past resolution.
+    for phase in ["Restoring", "Completed", "Failed"] {
+        assert!(
+            is_legacy_populator_status(&status(serde_json::json!({ "phase": phase }))),
+            "{phase}"
+        );
+    }
+    // A phase this build cannot read is evidence of a NEWER operator, which
+    // would have written `claims` — not of a legacy one.
+    assert!(!is_legacy_populator_status(&status(
+        serde_json::json!({ "phase": "Staging" })
+    )));
+    // Anything that already has claims is emphatically not legacy.
+    assert!(!is_legacy_populator_status(&status(serde_json::json!({
+        "phase": "Completed",
+        "claims": { "data": { "phase": "Populated" } }
+    }))));
+}
+
+/// #443 final review, Important 2 — the status alone is not a sufficient
+/// adoption signal, so [`legacy_adoption`] adds a second one.
+///
+/// The pre-fan-out pass was `ensure_prime_pvc` → `run_restore_mover` (creates
+/// `{restore}-populate`) → `patch_status(Restoring)`. A `helm upgrade` rollout
+/// terminates the old operator at an ARBITRARY instant, so an in-flight populate
+/// is routinely left with the prime AND the Job created and the status still
+/// `Pending`. Gating on the status alone skipped adoption there and drove the
+/// claim `Fresh`, launching a SECOND mover into the prime `{restore}-populate`
+/// was still writing.
+///
+/// `status.target.pvcPrime` cannot be that signal: the legacy driver only ever
+/// wrote the `awaiting-claim` sentinel there, never a real prime name.
+#[test]
+fn an_in_flight_legacy_populate_is_adopted_from_its_live_prime() {
+    let status = |v: serde_json::Value| -> kopiur_api::RestoreStatus {
+        serde_json::from_value(v).expect("valid RestoreStatus")
+    };
+    let primes = |names: &[&str]| -> std::collections::BTreeSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    };
+    let claimants = vec![adoption_claimant("data", "uid-a", false)];
+
+    // 1. A terminal legacy status adopts on the status alone, prime or not.
+    for phase in ["Restoring", "Completed", "Failed"] {
+        assert_eq!(
+            legacy_adoption(
+                &status(serde_json::json!({ "phase": phase })),
+                &claimants,
+                &primes(&[])
+            ),
+            LegacyAdoption::PreFanoutStatus,
+            "{phase}"
+        );
+    }
+
+    // 2. THE UPGRADE WINDOW: the old operator created `prime-uid-a` and the
+    //    `{restore}-populate` Job, then died before writing `Restoring`. The
+    //    status is the ordinary zero-claim park — sentinel included, which is
+    //    why the sentinel is useless as a signal — and the live prime is the
+    //    only evidence there is.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({
+                "phase": "Pending",
+                "target": { "pvcPrime": "awaiting-claim" }
+            })),
+            &claimants,
+            &primes(&["prime-uid-a"])
+        ),
+        LegacyAdoption::InFlightPrime
+    );
+    // …and with no phase written at all, which is the same window one patch
+    // earlier.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({})),
+            &claimants,
+            &primes(&["prime-uid-a"])
+        ),
+        LegacyAdoption::InFlightPrime
+    );
+
+    // 3. A brand-new `Restore`: no prime, no legacy status. Adopting here would
+    //    "adopt" the park a zero-claim pass just wrote.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({
+                "phase": "Pending",
+                "target": { "pvcPrime": "awaiting-claim" }
+            })),
+            &claimants,
+            &primes(&[])
+        ),
+        LegacyAdoption::No
+    );
+
+    // 4. A prime whose claimant is GONE is an orphan for the reaper, not an
+    //    in-flight handshake — the prime name is uid-keyed, so it cannot belong
+    //    to any live claimant here.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({ "phase": "Pending" })),
+            &claimants,
+            &primes(&["prime-uid-departed"])
+        ),
+        LegacyAdoption::No
+    );
+
+    // 5. A status that already carries `claims` is a NEWER write, never legacy —
+    //    otherwise every ordinary in-flight fan-out pass, which always has a live
+    //    prime for a live claimant, would re-adopt itself.
+    assert_eq!(
+        legacy_adoption(
+            &status(serde_json::json!({
+                "phase": "Restoring",
+                "claims": { "data": { "phase": "Populating" } }
+            })),
+            &claimants,
+            &primes(&["prime-uid-a"])
+        ),
+        LegacyAdoption::No
+    );
+}
+
+/// The adopted record must carry the legacy Job even when the status has no
+/// phase — that `job` field is the whole point of adopting in the upgrade
+/// window, because it is what drives the claim `LegacyShared` instead of
+/// `Fresh`. And the `awaiting-claim` PARK SENTINEL must never be copied into the
+/// record as if it were a prime name.
+#[test]
+fn an_adopted_in_flight_claim_records_the_legacy_job_and_drops_the_sentinel() {
+    let status = |v: serde_json::Value| -> kopiur_api::RestoreStatus {
+        serde_json::from_value(v).expect("valid RestoreStatus")
+    };
+    let consumer = adoption_claimant("data", "uid-a", false);
+
+    let record = adopt_legacy_claim(
+        &status(serde_json::json!({
+            "phase": "Pending",
+            "target": { "pvcPrime": AWAITING_CLAIM_SENTINEL }
+        })),
+        &consumer,
+        Some("r-populate"),
+    )
+    .expect("an in-flight legacy claim adopts");
+    assert_eq!(record.job.as_deref(), Some("r-populate"));
+    assert_eq!(record.phase, Some(kopiur_api::RestoreClaimPhase::Pending));
+    assert_eq!(
+        record.pvc_prime, None,
+        "the park sentinel is not a prime name and must not outlive adoption"
+    );
+    assert_eq!(record.uid.as_deref(), Some("uid-a"));
+
+    // No phase at all still adopts, conservatively, as `Pending`.
+    let no_phase = adopt_legacy_claim(
+        &status(serde_json::json!({})),
+        &consumer,
+        Some("r-populate"),
+    )
+    .expect("a phase-less legacy status still adopts");
+    assert_eq!(no_phase.phase, Some(kopiur_api::RestoreClaimPhase::Pending));
+    assert_eq!(no_phase.job.as_deref(), Some("r-populate"));
+
+    // A REAL prime name is still carried through untouched.
+    let real = adopt_legacy_claim(
+        &status(serde_json::json!({
+            "phase": "Restoring",
+            "target": { "pvcPrime": "prime-uid-a" }
+        })),
+        &consumer,
+        None,
+    )
+    .expect("adopts");
+    assert_eq!(real.pvc_prime.as_deref(), Some("prime-uid-a"));
+}
+
+/// #443 review item 5 — an adopted `{restore}-populate` Job carries no
+/// `claimKey`, so when its DEFERRED source resolves the mover pins the
+/// TOP-LEVEL `status.resolved`. Adoption snapshots that field exactly once (when
+/// it is typically still unpinned), so without a fallback the finalize reads
+/// `None` and records "provisioned an empty volume" over a real restore.
+///
+/// A `Fresh` claim must NEVER take that fallback: its mover writes only
+/// `status.claims.<pvc>.resolved`, and reading the top level would let it
+/// inherit a sibling's — or a legacy — pin and report the wrong snapshot.
+#[test]
+fn only_an_adopted_legacy_job_reads_the_top_level_pin() {
+    let snapshot = resolved_with(Some(ResolutionOutcome::Snapshot), Some("k9"));
+    let empty = resolved_with(Some(ResolutionOutcome::NoSnapshot), None);
+
+    // LegacyShared with nothing of its own: the top-level pin its own mover wrote.
+    assert_eq!(
+        claim_finalize_pin(
+            JobNameReuse::LegacyShared,
+            None,
+            None,
+            Some(snapshot.clone())
+        ),
+        Some(snapshot.clone())
+    );
+    // Fresh with nothing of its own: NO fallback — an absent pin stays absent.
+    assert_eq!(
+        claim_finalize_pin(JobNameReuse::Fresh, None, None, Some(snapshot.clone())),
+        None
+    );
+    // The claim's own pin always wins over both.
+    for reuse in [JobNameReuse::Fresh, JobNameReuse::LegacyShared] {
+        assert_eq!(
+            claim_finalize_pin(
+                reuse,
+                Some(empty.clone()),
+                Some(snapshot.clone()),
+                Some(snapshot.clone())
+            ),
+            Some(empty.clone())
+        );
+        // …then the record carried into the pass.
+        assert_eq!(
+            claim_finalize_pin(reuse, None, Some(empty.clone()), Some(snapshot.clone())),
+            Some(empty.clone())
         );
     }
 }
@@ -829,49 +1800,6 @@ fn populator_handshake_covers_every_binding_ordering() {
     );
 }
 
-/// A populator Restore that is `Completed` with `Ready=True/<reason>`, parsed the
-/// cluster's way (JSON → typed).
-fn completed_populator_with_ready_reason(reason: &str) -> Restore {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "kopiur.home-operations.com/v1alpha1",
-        "kind": "Restore",
-        "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
-        "spec": {
-            "source": { "snapshotRef": { "name": "b" } },
-            "target": { "populator": {} }
-        },
-        "status": {
-            "phase": "Completed",
-            "conditions": [{
-                "type": "Ready", "status": "True", "reason": reason, "message": "m",
-                "lastTransitionTime": "2026-01-01T00:00:00Z"
-            }]
-        }
-    }))
-    .expect("valid Restore")
-}
-
-/// The `Ready` reason is what tells the three `Completed` populator states apart, so it
-/// gates both the re-resolution skip and the `pinned_decision` back-fill.
-#[test]
-fn completed_as_target_already_bound_reads_ready_reason() {
-    assert!(completed_as_target_already_bound(
-        &completed_populator_with_ready_reason(crate::consts::RESTORE_TARGET_ALREADY_BOUND_REASON)
-    ));
-    // A real restore, and the legacy stuck-populator state, must NOT be mistaken for it —
-    // the first would have its success message clobbered, the second would never heal.
-    assert!(!completed_as_target_already_bound(
-        &completed_populator_with_ready_reason(crate::consts::RESTORE_POPULATED_REASON)
-    ));
-    assert!(!completed_as_target_already_bound(
-        &completed_populator_with_ready_reason("PopulatingPrimePvc")
-    ));
-    // No status at all (a fresh CR) is not a no-op completion either.
-    assert!(!completed_as_target_already_bound(&restore_with_condition(
-        "Resolved", "True"
-    )));
-}
-
 /// The no-op and reap messages are what a human reads when 49 prime PVCs vanish, so the
 /// what/why/fix text is asserted like any other behavior.
 #[test]
@@ -1018,24 +1946,119 @@ fn wait_deadline_runs_from_the_anchor_not_from_creation() {
     assert_eq!(wait_deadline_rfc3339(anchor, Some("later")), None);
 }
 
-/// Which target modes may OPEN the window: a direct target the moment the repository is
-/// Ready, a populator only once a PVC claims it. Resolution runs while a populator is
-/// `AwaitingClaim`, so a standing GitOps populator created long before its claim would
-/// otherwise spend the whole window idle and pin `Empty` the instant a claim appeared.
-#[test]
-fn wait_window_opens_for_a_populator_only_once_a_claim_exists() {
-    use PopulatorState::{AwaitingClaim, DirectTarget};
-    assert!(wait_window_opens(DirectTarget, false));
-    assert!(wait_window_opens(DirectTarget, true));
-    assert!(!wait_window_opens(AwaitingClaim, false));
-    assert!(wait_window_opens(AwaitingClaim, true));
-}
-
 /// Parking inside the wait window reports the REAL blocker. An unclaimed populator reaches
 /// the wait branch (resolution runs while `AwaitingClaim`), and telling that user to read
 /// `status.waitStartedAt` — deliberately absent until a claim appears — points them at the
 /// wrong thing. It also never resolves on its own, so it takes the 30s awaiting-claim
 /// cadence rather than a permanent 15s poll.
+/// Review wave 2, finding 3c: when a `fromPolicy` restore with no `sourcePath`
+/// comes up empty, the message must name the DERIVED path and the override that
+/// fixes it — restoring a selector-policy member into a differently-named PVC
+/// derives a path the repository has never seen, and a bare "no snapshot" (or a
+/// silently empty volume under `Continue`) says nothing about why.
+#[test]
+fn a_no_snapshot_outcome_names_the_derived_path_and_the_source_path_override() {
+    use kopiur_api::common::ObjectRef;
+    use kopiur_api::restore::{FromPolicy, IdentitySource};
+
+    let derived = RestoreSource::FromPolicy(FromPolicy {
+        name: "cfg".into(),
+        namespace: None,
+        as_of: None,
+        offset: 0,
+        source_path: None,
+    });
+    let hint = derived_source_path_hint(&derived, Some("/pvc/scratch")).expect("a hint");
+    assert!(hint.contains("`/pvc/scratch`"), "{hint}");
+    assert!(hint.contains("derived from the policy"), "{hint}");
+    assert!(hint.contains("spec.source.fromPolicy.sourcePath"), "{hint}");
+    assert!(hint.contains("/pvc/<member>"), "{hint}");
+    assert!(hint.contains("--source-path"), "{hint}");
+    // No recorded path (resolution never got that far): still a hint, without
+    // inventing a path.
+    let bare = derived_source_path_hint(&derived, None).expect("a hint");
+    assert!(!bare.contains("source path `"), "{bare}");
+    assert!(bare.contains("source path was derived"), "{bare}");
+    assert!(bare.contains("spec.source.fromPolicy.sourcePath"), "{bare}");
+    assert_eq!(
+        derived_source_path_hint(&derived, Some("")),
+        Some(bare.clone())
+    );
+
+    // An explicit override was the user's own choice: no derivation to explain.
+    let overridden = RestoreSource::FromPolicy(FromPolicy {
+        source_path: Some("/pvc/other".into()),
+        name: "cfg".into(),
+        namespace: None,
+        as_of: None,
+        offset: 0,
+    });
+    assert_eq!(
+        derived_source_path_hint(&overridden, Some("/pvc/other")),
+        None
+    );
+    // Nor for the sources that name their snapshot or path outright.
+    let by_ref = RestoreSource::SnapshotRef(ObjectRef {
+        name: "s".into(),
+        namespace: None,
+    });
+    assert_eq!(derived_source_path_hint(&by_ref, Some("/pvc/x")), None);
+    let by_identity = RestoreSource::Identity(IdentitySource {
+        username: "u".into(),
+        hostname: "h".into(),
+        source_path: Some("/data".into()),
+        snapshot_id: None,
+        as_of: None,
+        offset: None,
+    });
+    assert_eq!(derived_source_path_hint(&by_identity, Some("/data")), None);
+
+    // The appender leaves a non-derived message byte-identical.
+    assert_eq!(
+        with_derived_source_path_hint("m".into(), &by_ref, None),
+        "m"
+    );
+    assert!(with_derived_source_path_hint("m".into(), &derived, None).starts_with("m Note: "));
+
+    // The mover's in-Job `Fail` outcome reaches the controller only as a failure
+    // block; the prefix the controller keys on must be the mover's actual text.
+    let mover_text = kopiur_mover::error::MoverError::RestoreNoSnapshot {
+        identity: "u@h:/pvc/scratch".into(),
+    }
+    .to_string();
+    assert!(
+        mover_text.starts_with(RESTORE_NO_SNAPSHOT_MESSAGE_PREFIX),
+        "mover text drifted from the controller's prefix: {mover_text}"
+    );
+    let block = |message: &str| kopiur_api::common::FailureBlock {
+        kopia_error_class: "Unknown".into(),
+        message: message.into(),
+        retry_recommended: false,
+        stderr_tail: None,
+        exit_code: None,
+        op: None,
+    };
+    assert!(mover_reported_no_snapshot(Some(&block(&mover_text))));
+    assert!(!mover_reported_no_snapshot(Some(&block(
+        "kopia: permission denied"
+    ))));
+    assert!(!mover_reported_no_snapshot(None));
+}
+
+/// Review wave 2, finding 9: a direct-target ambiguity is one-shot terminal, so
+/// its message must name the recovery that exists (a NEW Restore) and never
+/// promise the spec edit the reconcile guard will not re-read.
+#[test]
+fn a_direct_source_path_ambiguity_says_to_create_a_new_restore() {
+    let ambiguity = "SnapshotPolicy `cfg`'s selector sources do not yield a per-PVC path.";
+    let msg = direct_source_path_ambiguous_message(ambiguity);
+    assert!(msg.starts_with(ambiguity), "{msg}");
+    assert!(msg.contains("create a NEW Restore"), "{msg}");
+    assert!(msg.contains("source.fromPolicy.sourcePath"), "{msg}");
+    assert!(msg.contains("terminal"), "{msg}");
+    assert!(msg.contains("spec edit is not re-read"), "{msg}");
+}
+
 #[test]
 fn wait_park_report_names_the_blocker_and_picks_the_cadence() {
     let (reason, msg, requeue) = wait_park_report(WaitWindow::Open(1000), Some("5m"), 240);
@@ -1072,55 +2095,104 @@ fn wait_park_report_names_the_blocker_and_picks_the_cadence() {
     assert_eq!(WaitWindow::AwaitingClaim(7).anchor(), 7);
 }
 
-/// A populator that no-op'd long ago and is then asked to populate a FRESHLY re-created
-/// claim must measure its `waitTimeout` from the re-open, not from an anchor spent on the
-/// previous claim — otherwise the window is already gone, and a `fromPolicy` source (which
-/// defaults to `Continue`) skips the wait and provisions an EMPTY volume the instant the
-/// snapshot happens not to be there yet.
+/// A populator claim that is deleted and re-created must measure its
+/// `waitTimeout` from the NEW claim, not from an anchor spent on the previous
+/// one — otherwise the window is already gone, and a `fromPolicy` source (which
+/// defaults to `Continue`) skips the wait and provisions an EMPTY volume the
+/// instant the snapshot happens not to be there yet.
 ///
-/// The re-open therefore CLEARS the anchor, and it must do so with an explicit JSON
-/// `null`: a merge patch deletes only the keys it names, so an elided `None` would leave
-/// the stale anchor in place. Re-anchoring then happens on the next pass, which is also
-/// the pass that finds the re-created claim.
+/// Before #443 that took an explicit JSON `null` on the Restore's top-level
+/// `waitStartedAt` (a merge patch deletes only the keys it names). The fan-out
+/// makes it structural instead: a re-created claimant has a NEW uid, so
+/// `claim_drive` re-arms it and the driver writes a fresh record — the spent
+/// anchor goes with the record it belonged to, and `claim_merge_body` emits the
+/// null for it.
 #[test]
-fn reopening_a_recreated_claim_clears_the_wait_anchor_with_an_explicit_null() {
-    let restore = restore_with_anchor(Some("2026-01-01T00:00:00Z"));
-    let status = reopen_resolution_status(&restore, "claim re-created");
+fn a_re_armed_claim_drops_the_previous_claims_spent_wait_anchor() {
+    use kopiur_api::{RestoreClaimPhase as P, RestoreClaimStatus};
 
+    let spent = RestoreClaimStatus {
+        uid: Some("old-uid".into()),
+        phase: Some(P::Populated),
+        wait_started_at: Some("2026-01-01T00:00:00Z".into()),
+        ..Default::default()
+    };
+    // A new claimant uid re-arms rather than settling, even though the record is
+    // terminal — that is what makes re-creating the PVC the documented retry.
     assert_eq!(
-        status.get("waitStartedAt"),
+        claim_drive(Some(&spent), "new-uid"),
+        ClaimDrive::ReArm {
+            stale_uid: "old-uid".into()
+        }
+    );
+    // The fresh record carries no anchor, and the merge body NULLS the old one:
+    // an elided `None` would leave a window that closed months ago in place.
+    let fresh = RestoreClaimStatus {
+        uid: Some("new-uid".into()),
+        phase: Some(P::Pending),
+        reason: Some(ClaimReason::ClaimRecreated.as_str().into()),
+        ..Default::default()
+    };
+    let body = claim_merge_body(Some(&spent), &fresh);
+    assert_eq!(
+        body.get("waitStartedAt"),
         Some(&serde_json::Value::Null),
-        "the clear must be an EXPLICIT null, not an omitted key: {status}"
+        "the clear must be an EXPLICIT null, not an omitted key: {body}"
     );
     assert_eq!(
-        status.get("phase").and_then(|p| p.as_str()),
-        Some("Resolving")
-    );
-    assert!(
-        status["conditions"]
-            .as_array()
-            .expect("conditions array")
-            .iter()
-            .any(|c| c["type"] == "Ready" && c["reason"] == "ClaimRecreated"),
-        "{status}"
+        body.get("uid").and_then(|u| u.as_str()),
+        Some("new-uid"),
+        "{body}"
     );
 
-    // Serializing the typed status can NEVER produce that null (the field is
-    // skip_serializing_if = "Option::is_none") — which is exactly why the writer builds
-    // the key by hand.
-    let cleared = restore_with_anchor(None);
-    let typed = serde_json::to_value(cleared.status.as_ref().expect("status")).unwrap();
-    assert!(
-        typed.get("waitStartedAt").is_none(),
-        "an unset anchor elides the key entirely: {typed}"
-    );
+    // Review wave 2, finding 2: the re-arm is a RESET of the dead claimant's
+    // whole record, and the controller owns the reset even though the mover
+    // owns these values in steady state. Stripping (not nulling) them left the
+    // previous claim's pin standing, so `claim_pinned_decision` short-circuited
+    // and a re-created PVC under `Continue` was provisioned EMPTY again although
+    // a snapshot now matched — or restored a stale mover pin, or showed a stale
+    // failure block beside a fresh `Pending`.
+    let spent_with_mover_state: RestoreClaimStatus = serde_json::from_value(serde_json::json!({
+        "uid": "old-uid",
+        "phase": "Populated",
+        "reason": "NoSnapshotContinue",
+        "waitStartedAt": "2026-01-01T00:00:00Z",
+        "resolved": { "resolution": "NoSnapshot", "pinnedAt": "2026-01-01T00:00:00Z" },
+        "observedAt": "2026-01-01T00:05:00Z",
+        "logTail": "kopia: nothing to restore",
+        "failure": { "kopiaErrorClass": "Unknown", "message": "x", "retryRecommended": false }
+    }))
+    .expect("valid claim record");
+    let body = claim_merge_body(Some(&spent_with_mover_state), &fresh);
+    for reset in ["resolved", "failure", "logTail", "observedAt"] {
+        assert_eq!(
+            body.get(reset),
+            Some(&serde_json::Value::Null),
+            "a re-arm must EXPLICITLY null `{reset}`: {body}"
+        );
+    }
+    // The nulls are scoped to the re-arm: the SAME claimant's heartbeat still
+    // never names a mover-owned key (the mover writes them; a controller pass
+    // must not blank them), and keeps a pin it did not itself drop.
+    let same_uid_next = RestoreClaimStatus {
+        uid: Some("old-uid".into()),
+        phase: Some(P::Populating),
+        reason: Some(ClaimReason::PopulatingPrimePvc.as_str().into()),
+        ..Default::default()
+    };
+    let body = claim_merge_body(Some(&spent_with_mover_state), &same_uid_next);
+    for untouched in ["resolved", "failure", "logTail", "observedAt"] {
+        assert!(
+            body.get(untouched).is_none(),
+            "same claimant: `{untouched}` must be left to its owner, got {body}"
+        );
+    }
 
-    // Once cleared, the anchor falls back and the next pass re-stamps it (`now`), so the
-    // re-created claim gets the user's window back in full.
-    let created = 1_000_000_000;
+    // A claim window with no record and no legacy top-level anchor opens at `now`,
+    // so a claimant that appears an hour after its sibling gets its OWN full window.
     assert_eq!(
-        effective_wait_anchor(&restore_with_anchor(None), created),
-        created
+        claim_wait_window(None, 1_700_000_000),
+        WaitWindow::Open(1_700_000_000)
     );
 }
 
@@ -1142,8 +2214,6 @@ fn restore_with_anchor(wait_started_at: Option<&str>) -> Restore {
     }))
     .expect("valid Restore")
 }
-
-// --- restore_flags (M2 flag sweep controller-glue guard) ---
 
 #[test]
 fn restore_flags_absent_options_map_to_all_none() {
@@ -1911,4 +2981,677 @@ async fn an_uncapped_repository_leaves_the_restore_path_untouched() {
         .expect("restore gate");
     assert!(slot.is_none());
     assert!(ctx.pool_admissions.outstanding_for_test().is_empty());
+}
+
+// --- #443: the fanned-out populator's per-claim decisions -------------------
+
+use kopiur_api::{RestoreClaimPhase, RestoreClaimStatus};
+use std::collections::BTreeMap;
+
+/// A claim record with just a phase + reason — the shape the aggregate reads.
+fn claim(phase: Option<RestoreClaimPhase>, reason: Option<&str>) -> RestoreClaimStatus {
+    RestoreClaimStatus {
+        uid: Some("u".into()),
+        phase,
+        reason: reason.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+fn claims(entries: &[(&str, RestoreClaimStatus)]) -> BTreeMap<String, RestoreClaimStatus> {
+    entries
+        .iter()
+        .map(|(n, r)| ((*n).to_string(), r.clone()))
+        .collect()
+}
+
+#[test]
+fn claim_class_is_exhaustive_over_every_claim_phase() {
+    use RestoreClaimPhase as P;
+    use kopiur_api::common::PhaseLabel;
+    // Driven off ALL, so a new claim phase must be classified deliberately.
+    let classified: Vec<(&str, ClaimClass)> = P::ALL
+        .iter()
+        .map(|p| (p.label(), claim_class(Some(p))))
+        .collect();
+    assert_eq!(
+        classified,
+        [
+            ("Pending", ClaimClass::InFlight),
+            ("Populating", ClaimClass::InFlight),
+            ("Rebinding", ClaimClass::InFlight),
+            ("Populated", ClaimClass::Populated),
+            ("AlreadyBound", ClaimClass::AlreadyBound),
+            ("Failed", ClaimClass::Failed),
+        ]
+    );
+    // An unobserved record and an unreadable phase are both IN FLIGHT — never
+    // settled, so a newer operator's claim cannot make the Restore report
+    // `Completed` over work that may still be running.
+    assert_eq!(claim_class(None), ClaimClass::InFlight);
+    assert_eq!(
+        claim_class(Some(&P::Unknown("Quiescing".into()))),
+        ClaimClass::InFlight
+    );
+}
+
+#[test]
+fn aggregate_covers_the_four_states_of_a_fan_out() {
+    use RestoreClaimPhase as P;
+
+    // Nothing claims the populator yet.
+    assert_eq!(
+        aggregate_claims(&BTreeMap::new()),
+        ClaimsAggregate::NoClaims
+    );
+    assert_eq!(
+        aggregate_phase(&ClaimsAggregate::NoClaims),
+        RestorePhase::Pending
+    );
+
+    // Every claim settled, none failed → the Restore completed.
+    let all = claims(&[
+        ("a", claim(Some(P::Populated), Some("RestoreSucceeded"))),
+        (
+            "b",
+            claim(Some(P::AlreadyBound), Some("TargetAlreadyBound")),
+        ),
+    ]);
+    let agg = aggregate_claims(&all);
+    let ClaimsAggregate::AllSettled(t) = &agg else {
+        panic!("expected AllSettled, got {agg:?}");
+    };
+    assert_eq!((t.total, t.populated, t.already_bound), (2, 1, 1));
+    assert_eq!(aggregate_phase(&agg), RestorePhase::Completed);
+
+    // A mover running → `Restoring`.
+    let running = claims(&[
+        ("a", claim(Some(P::Populated), Some("RestoreSucceeded"))),
+        ("b", claim(Some(P::Populating), Some("PopulatingPrimePvc"))),
+    ]);
+    let agg = aggregate_claims(&running);
+    assert!(matches!(agg, ClaimsAggregate::InFlight(_)));
+    assert_eq!(aggregate_phase(&agg), RestorePhase::Restoring);
+
+    // …and a rebind outstanding counts as active too.
+    let rebinding = claims(&[("a", claim(Some(P::Rebinding), None))]);
+    assert_eq!(
+        aggregate_phase(&aggregate_claims(&rebinding)),
+        RestorePhase::Restoring
+    );
+
+    // Everything merely WAITING → `Pending`, not `Restoring`: nothing of ours is
+    // running, and reporting `Restoring` over an unscheduled claimant would make
+    // a stuck fan-out look busy.
+    let waiting = claims(&[
+        ("a", claim(Some(P::Pending), Some("AwaitingPodSchedule"))),
+        ("b", claim(None, None)),
+    ]);
+    let agg = aggregate_claims(&waiting);
+    assert!(matches!(agg, ClaimsAggregate::InFlight(_)));
+    assert_eq!(aggregate_phase(&agg), RestorePhase::Pending);
+
+    // One failure stalls the Restore even while siblings still run.
+    let mixed = claims(&[
+        ("a", claim(Some(P::Populated), Some("RestoreSucceeded"))),
+        ("b", claim(Some(P::Populating), Some("PopulatingPrimePvc"))),
+        ("c", claim(Some(P::Failed), Some("MoverJobFailed"))),
+    ]);
+    let agg = aggregate_claims(&mixed);
+    let ClaimsAggregate::Failed(t) = &agg else {
+        panic!("expected Failed, got {agg:?}");
+    };
+    assert_eq!(t.failed, [("c".to_string(), "MoverJobFailed".to_string())]);
+    assert_eq!(t.in_flight, ["b".to_string()]);
+    assert_eq!(aggregate_phase(&agg), RestorePhase::Failed);
+    // kstatus follows from the phase, through the unchanged mapping.
+    assert_eq!(
+        restore_ready_outcome(&aggregate_phase(&agg)),
+        crate::io::ReadyOutcome::Stalled
+    );
+    assert_eq!(
+        restore_ready_outcome(&aggregate_phase(&aggregate_claims(&all))),
+        crate::io::ReadyOutcome::Ready
+    );
+
+    // An unreadable claim phase never settles the Restore.
+    let unknown = claims(&[
+        ("a", claim(Some(P::Populated), None)),
+        ("b", claim(Some(P::Unknown("Quiescing".into())), None)),
+    ]);
+    assert_eq!(
+        aggregate_phase(&aggregate_claims(&unknown)),
+        RestorePhase::Pending
+    );
+}
+
+#[test]
+fn claims_summary_names_the_counts_the_stragglers_and_the_failures() {
+    use RestoreClaimPhase as P;
+    let mixed = claims(&[
+        ("a", claim(Some(P::Populated), Some("RestoreSucceeded"))),
+        ("b", claim(Some(P::Populated), Some("RestoreSucceeded"))),
+        ("c", claim(Some(P::Populating), Some("PopulatingPrimePvc"))),
+        ("d", claim(Some(P::Failed), Some("MoverJobFailed"))),
+    ]);
+    let (reason, message) = claims_summary(&aggregate_claims(&mixed));
+    assert_eq!(reason, crate::consts::RESTORE_CLAIM_FAILED_REASON);
+    assert!(message.starts_with("2/4 claims settled"), "{message}");
+    assert!(message.contains("populated: 2"), "{message}");
+    // "in flight", not "populating": the list carries Pending claims too.
+    assert!(message.contains("in flight: c"), "{message}");
+    assert!(message.contains("failed: d (MoverJobFailed)"), "{message}");
+    // The fix a human acts on: siblings keep going, re-create the failed claim.
+    assert!(message.contains("re-create that claiming PVC"), "{message}");
+
+    // The healthy states carry the reasons the pre-#443 single-claim path used,
+    // so `kubectl describe` reads the same for a one-PVC populator.
+    let (reason, message) = claims_summary(&aggregate_claims(&claims(&[(
+        "a",
+        claim(Some(P::Populated), None),
+    )])));
+    assert_eq!(reason, crate::consts::RESTORE_POPULATED_REASON);
+    assert_eq!(message, "1/1 claims settled; populated: 1");
+
+    let (reason, _) = claims_summary(&aggregate_claims(&claims(&[(
+        "a",
+        claim(Some(P::Populating), None),
+    )])));
+    assert_eq!(reason, crate::consts::POPULATING_PRIME_PVC_REASON);
+
+    // An already-bound no-op is counted separately from a real populate — saying
+    // "1/1 populated" over a claim nothing was written to would be a lie.
+    let (_, message) = claims_summary(&aggregate_claims(&claims(&[(
+        "a",
+        claim(Some(P::AlreadyBound), None),
+    )])));
+    // Counted as SETTLED (it is a success) but never as populated — saying
+    // "1/1 populated" over a claim nothing was written to would be a lie, and
+    // "0/1 settled" beside Ready=True reads as a contradiction.
+    assert_eq!(message, "1/1 claims settled; already bound: 1");
+
+    // Zero claims points at the missing dataSourceRef, and says the window has
+    // not started.
+    let (reason, message) = claims_summary(&ClaimsAggregate::NoClaims);
+    assert_eq!(reason, crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON);
+    assert!(message.contains("dataSourceRef"), "{message}");
+    assert!(message.contains("has NOT started"), "{message}");
+}
+
+#[test]
+fn claim_drive_has_exactly_three_outcomes() {
+    use RestoreClaimPhase as P;
+    // No record yet → drive it.
+    assert_eq!(claim_drive(None, "live"), ClaimDrive::Drive);
+
+    // Record for a DELETED claimant → re-arm, naming the dead uid so its prime
+    // PVC / Job / PV can be reaped under it.
+    let stale = RestoreClaimStatus {
+        uid: Some("dead".into()),
+        phase: Some(P::Populated),
+        ..Default::default()
+    };
+    assert_eq!(
+        claim_drive(Some(&stale), "live"),
+        ClaimDrive::ReArm {
+            stale_uid: "dead".into()
+        }
+    );
+
+    // Terminal under the LIVE uid → settled, for all three terminal phases. A
+    // `Failed` claim is UNBOUND with its prime still present, so a "bound and no
+    // prime" test would re-drive it forever on the 120s cadence.
+    for phase in [P::Populated, P::AlreadyBound, P::Failed] {
+        let settled = RestoreClaimStatus {
+            uid: Some("live".into()),
+            phase: Some(phase.clone()),
+            ..Default::default()
+        };
+        assert_eq!(claim_drive(Some(&settled), "live"), ClaimDrive::Settled);
+    }
+
+    // Non-terminal under the live uid → drive.
+    for phase in [
+        None,
+        Some(P::Pending),
+        Some(P::Populating),
+        Some(P::Rebinding),
+    ] {
+        let live = RestoreClaimStatus {
+            uid: Some("live".into()),
+            phase,
+            ..Default::default()
+        };
+        assert_eq!(claim_drive(Some(&live), "live"), ClaimDrive::Drive);
+    }
+    // An unreadable phase is driven, never settled.
+    let unknown = RestoreClaimStatus {
+        uid: Some("live".into()),
+        phase: Some(P::Unknown("Quiescing".into())),
+        ..Default::default()
+    };
+    assert_eq!(claim_drive(Some(&unknown), "live"), ClaimDrive::Drive);
+
+    // A record with no uid has nothing to reap: drive rather than re-arm.
+    let uidless = RestoreClaimStatus {
+        uid: None,
+        phase: Some(P::Pending),
+        ..Default::default()
+    };
+    assert_eq!(claim_drive(Some(&uidless), "live"), ClaimDrive::Drive);
+}
+
+#[test]
+fn claim_reason_vocabulary_round_trips_and_a_hijack_or_an_unreadable_reason_blocks_the_reaper() {
+    // Every reason parses back to itself, so a write and a later compare cannot
+    // drift.
+    for r in ClaimReason::ALL {
+        assert_eq!(ClaimReason::parse(r.as_str()), Some(*r), "{}", r.as_str());
+    }
+    // Labels are unique — two reasons sharing a string would make `parse`
+    // silently answer the wrong one.
+    let mut labels: Vec<&str> = ClaimReason::ALL.iter().map(|r| r.as_str()).collect();
+    let count = labels.len();
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels.len(), count, "claim reasons must be unique");
+
+    // The one destructive decision: a hijacked populate's prime PVC holds
+    // HALF-WRITTEN data and must survive the reaper. Before #443 what protected
+    // it was the whole populator short-circuiting on `Failed` at the guard.
+    assert!(!ClaimReason::PopulateHijacked.artifacts_reapable());
+    assert!(!claim_artifacts_reapable(Some(
+        crate::consts::POPULATE_HIJACKED_REASON
+    )));
+    for r in ClaimReason::ALL
+        .iter()
+        .filter(|r| **r != ClaimReason::PopulateHijacked)
+    {
+        assert!(r.artifacts_reapable(), "{} must be reapable", r.as_str());
+        assert!(claim_artifacts_reapable(Some(r.as_str())));
+    }
+    // Wave 2, finding 7 — FAIL CLOSED on a reason this build cannot read. An
+    // absent reason is a half-written or hand-patched record; an unknown string
+    // is a NEWER operator's vocabulary, which may well be its own "keep the
+    // prime" case. Deleting a prime PVC on a guess is irreversible, so neither
+    // is reaped automatically: a human deletes `prime-<uid>` by hand.
+    assert!(!claim_artifacts_reapable(None));
+    assert!(!claim_artifacts_reapable(Some("")));
+    assert!(!claim_artifacts_reapable(Some("SomethingNewerWrote")));
+    // …and the settled-sweep gate inherits the same answer.
+    for reason in [None, Some("SomethingNewerWrote")] {
+        let record = RestoreClaimStatus {
+            uid: Some("u1".into()),
+            phase: Some(kopiur_api::RestoreClaimPhase::Populated),
+            reason: reason.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(
+            !settled_artifacts_reapable(&record),
+            "reason={reason:?} must never be swept automatically"
+        );
+    }
+}
+
+/// A legacy (pre-fan-out) `Restore` status: top-level phase + a `Ready`
+/// condition, with an optional pinned resolution and wait anchor.
+fn legacy_status(phase: &str, reason: &str) -> kopiur_api::RestoreStatus {
+    serde_json::from_value(serde_json::json!({
+        "phase": phase,
+        "waitStartedAt": "2026-01-01T00:00:00Z",
+        "target": { "pvcPrime": "prime-old" },
+        "resolved": {
+            "resolution": "Snapshot",
+            "kopiaSnapshotID": "k1",
+            "identity": { "username": "app", "hostname": "ns", "sourcePath": "/pvc/data" },
+        },
+        "conditions": [{
+            "type": "Ready", "status": "True", "reason": reason, "message": "legacy message",
+            "lastTransitionTime": "2026-01-01T00:00:00Z",
+        }],
+    }))
+    .expect("legacy status parses")
+}
+
+fn claimant(uid: &str) -> k8s_openapi::api::core::v1::PersistentVolumeClaim {
+    serde_json::from_value(serde_json::json!({
+        "metadata": { "name": "data", "namespace": "ns", "uid": uid },
+        "spec": {},
+    }))
+    .expect("pvc parses")
+}
+
+#[test]
+fn adopt_legacy_claim_maps_the_whole_legacy_reason_vocabulary() {
+    use RestoreClaimPhase as P;
+    // The upgrade path: an existing single-PVC populator keeps working with zero
+    // spec change. The phase is keyed on the top-level PHASE first, with the
+    // Ready reason used only to tell `Completed`'s three situations apart.
+    let cases: &[(&str, &str, P)] = &[
+        // Completed: a genuine success and a deploy-or-restore are Populated…
+        ("Completed", "RestoreSucceeded", P::Populated),
+        ("Completed", "NoSnapshotContinue", P::Populated),
+        // …the #233 no-op is AlreadyBound…
+        ("Completed", "TargetAlreadyBound", P::AlreadyBound),
+        // …and the legacy STUCK orphan still needs driving.
+        ("Completed", "PopulatingPrimePvc", P::Populating),
+        // Failures keep their reason and stay Failed.
+        ("Failed", "MoverJobFailed", P::Failed),
+        ("Failed", "MoverPodWedged", P::Failed),
+        ("Failed", "PopulateHijacked", P::Failed),
+        ("Failed", "SnapshotNotFound", P::Failed),
+        // In-flight and waiting shapes.
+        ("Restoring", "PopulatingPrimePvc", P::Populating),
+        ("Restoring", "NoSnapshotContinue", P::Populating),
+        ("Pending", "AwaitingPvcDataSourceRef", P::Pending),
+        ("Pending", "AwaitingPodSchedule", P::Pending),
+        ("Pending", "WaitingForSnapshot", P::Pending),
+        ("Pending", "RepositoryNotReady", P::Pending),
+        ("Pending", "RestoreReferentMissing", P::Pending),
+        ("Resolving", "SourceResolved", P::Pending),
+        ("Resolving", "ClaimRecreated", P::Pending),
+        // A phase this build cannot read is driven, not settled.
+        ("Quiescing", "SourceResolved", P::Pending),
+    ];
+    for (phase, reason, expected) in cases {
+        let adopted = adopt_legacy_claim(&legacy_status(phase, reason), &claimant("u1"), None)
+            .unwrap_or_else(|| panic!("{phase}/{reason} must adopt"));
+        assert_eq!(
+            adopted.phase.as_ref(),
+            Some(expected),
+            "{phase} + {reason} adopted as {:?}",
+            adopted.phase
+        );
+        // The legacy reason is KEPT verbatim, so a `RestoreSucceeded` legacy is
+        // never relabeled `TargetAlreadyBound` (which would tell the user no
+        // restore ever ran).
+        assert_eq!(adopted.reason.as_deref(), Some(*reason));
+        assert_eq!(adopted.message.as_deref(), Some("legacy message"));
+        // The pin, the wait anchor, the prime and the path all carry over, so the
+        // adopted claim never re-resolves or restarts its window.
+        assert_eq!(adopted.uid.as_deref(), Some("u1"));
+        assert_eq!(
+            adopted.wait_started_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(adopted.pvc_prime.as_deref(), Some("prime-old"));
+        assert_eq!(adopted.source_path.as_deref(), Some("/pvc/data"));
+        assert_eq!(
+            adopted
+                .resolved
+                .and_then(|r| r.kopia_snapshot_id)
+                .as_deref(),
+            Some("k1")
+        );
+        // Mover-owned fields are never seeded by a controller-side adoption.
+        assert_eq!(adopted.observed_at, None);
+        assert_eq!(adopted.log_tail, None);
+        assert_eq!(adopted.failure, None);
+    }
+}
+
+#[test]
+fn adopt_legacy_claim_only_fires_on_a_legacy_shaped_status() {
+    use RestoreClaimPhase as P;
+    // Already fanned out → nothing to adopt (adopting would overwrite live
+    // records with the legacy top-level state).
+    let mut fanned = legacy_status("Completed", "RestoreSucceeded");
+    fanned
+        .claims
+        .insert("data".into(), claim(Some(P::Populated), None));
+    assert_eq!(adopt_legacy_claim(&fanned, &claimant("u1"), None), None);
+
+    // No phase at all now ADOPTS (#443 final review, Important 2). It used to
+    // return `None` on the theory that a phase-less status is a brand-new
+    // `Restore` — but a brand-new `Restore` no longer reaches this function at
+    // all: [`legacy_adoption`] answers `No` for it. The only caller that gets
+    // here with no phase is the upgrade window, where the old operator created
+    // the prime and the `{restore}-populate` Job and died before its first
+    // status patch. Refusing there drives the claim `Fresh` and puts a SECOND
+    // mover into that prime.
+    let fresh = kopiur_api::RestoreStatus::default();
+    let adopted_fresh = adopt_legacy_claim(&fresh, &claimant("u1"), Some("r-populate"))
+        .expect("the upgrade window adopts on the prime signal");
+    assert_eq!(
+        adopted_fresh.phase,
+        Some(P::Pending),
+        "drive it, do not settle it"
+    );
+    assert_eq!(adopted_fresh.job.as_deref(), Some("r-populate"));
+
+    // An in-flight legacy populate is driven under ITS OWN Job name, so a second
+    // mover is never launched into the same prime PVC.
+    let adopted = adopt_legacy_claim(
+        &legacy_status("Restoring", "PopulatingPrimePvc"),
+        &claimant("u1"),
+        Some("r-populate"),
+    )
+    .expect("adopts");
+    assert_eq!(adopted.job.as_deref(), Some("r-populate"));
+    // …and when no legacy Job exists, the claim gets a fresh one.
+    let adopted = adopt_legacy_claim(
+        &legacy_status("Restoring", "PopulatingPrimePvc"),
+        &claimant("u1"),
+        None,
+    )
+    .expect("adopts");
+    assert_eq!(adopted.job, None);
+}
+
+#[test]
+fn claim_pinned_decision_keeps_all_four_arms_of_the_restore_level_one() {
+    use RestoreClaimPhase as P;
+    let with_resolved = |v: serde_json::Value| RestoreClaimStatus {
+        resolved: Some(serde_json::from_value(v).expect("resolved parses")),
+        ..Default::default()
+    };
+
+    // A pinned `NoSnapshot` reads as "deliberately empty" — a snapshot that
+    // appeared later must never retarget it.
+    assert_eq!(
+        claim_pinned_decision(&with_resolved(
+            serde_json::json!({ "resolution": "NoSnapshot" })
+        )),
+        Some(Resolution::Empty)
+    );
+    // A pinned id wins, with or without the newer `resolution` field (a legacy
+    // pin written before it existed still reads).
+    for v in [
+        serde_json::json!({ "resolution": "Snapshot", "kopiaSnapshotID": "k9" }),
+        serde_json::json!({ "kopiaSnapshotID": "k9" }),
+    ] {
+        assert_eq!(
+            claim_pinned_decision(&with_resolved(v)),
+            Some(Resolution::Snapshot("k9".into()))
+        );
+    }
+    // A `resolved` block with neither falls through to a fresh resolution.
+    assert_eq!(
+        claim_pinned_decision(&with_resolved(serde_json::json!({}))),
+        None
+    );
+
+    // Unpinned + `Populated`: the pre-fix `Continue` arm completed without
+    // pinning, so back-fill "empty" rather than re-resolve.
+    assert_eq!(
+        claim_pinned_decision(&claim(Some(P::Populated), None)),
+        Some(Resolution::Empty)
+    );
+    // Unpinned + `AlreadyBound` is the #233 carve-out: that claim never ran a
+    // mover, so back-filling `NoSnapshot` would make a later, legitimate
+    // re-creation of the claiming PVC come up EMPTY instead of restoring.
+    assert_eq!(
+        claim_pinned_decision(&claim(Some(P::AlreadyBound), None)),
+        None
+    );
+    // Every other unpinned state resolves now.
+    for p in [
+        None,
+        Some(P::Pending),
+        Some(P::Populating),
+        Some(P::Rebinding),
+        Some(P::Failed),
+        Some(P::Unknown("Quiescing".into())),
+    ] {
+        assert_eq!(claim_pinned_decision(&claim(p, None)), None);
+    }
+}
+
+#[test]
+fn claim_merge_body_nulls_vanished_controller_keys_and_never_names_mover_keys() {
+    use RestoreClaimPhase as P;
+    let prev = RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase: Some(P::Populating),
+        reason: Some("PopulatingPrimePvc".into()),
+        message: Some("m".into()),
+        source_path: Some("/pvc/data".into()),
+        pvc_prime: Some("prime-u1".into()),
+        job: Some("r-populate-abc".into()),
+        wait_started_at: Some("2026-01-01T00:00:00Z".into()),
+        // Mover-owned values already on the object.
+        observed_at: Some("2026-01-01T00:05:00Z".into()),
+        log_tail: Some("Restore completed".into()),
+        ..Default::default()
+    };
+    // The claim settles: the prime, Job and wait anchor are gone.
+    let next = RestoreClaimStatus {
+        uid: Some("u1".into()),
+        phase: Some(P::Populated),
+        reason: Some("RestoreSucceeded".into()),
+        message: Some("done".into()),
+        source_path: Some("/pvc/data".into()),
+        ..Default::default()
+    };
+    let body = claim_merge_body(Some(&prev), &next);
+    assert_eq!(body["phase"], "Populated");
+    assert_eq!(body["reason"], "RestoreSucceeded");
+    // Explicit nulls: a merge patch removes only the keys it NAMES, and every
+    // field is `skip_serializing_if`, so a `None` would leave a reaped prime and
+    // a spent anchor standing forever.
+    for key in ["pvcPrime", "job", "waitStartedAt"] {
+        assert_eq!(body[key], serde_json::Value::Null, "{key} in {body}");
+    }
+    // Mover-owned keys are NEVER named — not written, not nulled — so a
+    // controller pass can never blank what this claim's own mover wrote.
+    for key in ["observedAt", "logTail", "failure"] {
+        assert!(body.get(key).is_none(), "{key} must be absent: {body}");
+    }
+
+    // A brand-new record nulls nothing.
+    let body = claim_merge_body(None, &next);
+    assert!(
+        !body.as_object().unwrap().values().any(|v| v.is_null()),
+        "{body}"
+    );
+
+    // A controller-pinned `resolved` IS written…
+    let pinned = RestoreClaimStatus {
+        resolved: Some(
+            serde_json::from_value(serde_json::json!({ "kopiaSnapshotID": "k9" }))
+                .expect("resolved parses"),
+        ),
+        ..next.clone()
+    };
+    assert_eq!(
+        claim_merge_body(Some(&prev), &pinned)["resolved"]["kopiaSnapshotID"],
+        "k9"
+    );
+    // …but a pin the controller does not carry this pass is never NULLED: the
+    // mover writes `resolved` too, and a claim's pin is durable.
+    let prev_pinned = RestoreClaimStatus {
+        resolved: Some(
+            serde_json::from_value(serde_json::json!({ "kopiaSnapshotID": "k9" }))
+                .expect("resolved parses"),
+        ),
+        ..prev.clone()
+    };
+    assert!(
+        claim_merge_body(Some(&prev_pinned), &next)
+            .get("resolved")
+            .is_none(),
+        "a mover-written pin must survive a controller pass"
+    );
+}
+
+#[test]
+fn claim_transition_fires_only_on_a_real_phase_or_reason_move() {
+    use RestoreClaimPhase as P;
+    let populating = claim(Some(P::Populating), Some("PopulatingPrimePvc"));
+    // A new record is always a transition.
+    assert!(claim_transition(None, &populating));
+    // The steady-state heartbeat is not — the Event recorder aggregates
+    // identical Events into one object, so a per-pass emit would just spin one
+    // Event's `count`.
+    assert!(!claim_transition(Some(&populating), &populating));
+    // A phase move fires.
+    assert!(claim_transition(
+        Some(&populating),
+        &claim(Some(P::Populated), Some("PopulatingPrimePvc"))
+    ));
+    // …and so does a reason move under the same phase (Pending/AwaitingPodSchedule
+    // → Pending/WaitingForSnapshot is real news).
+    assert!(claim_transition(
+        Some(&claim(Some(P::Pending), Some("AwaitingPodSchedule"))),
+        &claim(Some(P::Pending), Some("WaitingForSnapshot"))
+    ));
+    // An unreadable phase compares by its stored label, so it neither fires
+    // spuriously nor hides a move away from it.
+    let unknown = claim(Some(P::Unknown("Quiescing".into())), None);
+    assert!(!claim_transition(Some(&unknown), &unknown));
+    assert!(claim_transition(
+        Some(&unknown),
+        &claim(Some(P::Pending), None)
+    ));
+    // A message-only change does NOT fire: messages carry volatile detail and
+    // would inflate Events with no news.
+    let chatty = RestoreClaimStatus {
+        message: Some("different".into()),
+        ..populating.clone()
+    };
+    assert!(!claim_transition(Some(&populating), &chatty));
+}
+
+/// Review wave 2, finding 4 — the claim window is PER CLAIM ONLY. The old
+/// fallback to the Restore-level `status.waitStartedAt` made every later
+/// sibling's first pass measure `waitTimeout` from the first claimant's anchor,
+/// and the missing-snapshot decision is pinned on that same pass — so a claim
+/// that appeared after the window had spent was provisioned EMPTY on sight.
+/// The top-level anchor is now DirectTarget-only and the populator path never
+/// stamps or reads it: `claim_wait_window` takes no `Restore` at all.
+#[test]
+fn claim_wait_window_is_per_claim_only_and_opens_now_on_the_first_pass() {
+    let anchored = RestoreClaimStatus {
+        wait_started_at: Some("2026-01-01T00:00:00Z".into()),
+        ..Default::default()
+    };
+    let now = 1_800_000_000_i64;
+
+    // First pass, no record ⇒ Open(now): the caller stamps `now` into the
+    // record in this same pass, so the two agree.
+    assert_eq!(claim_wait_window(None, now), WaitWindow::Open(now));
+    // A record with an anchor ⇒ that anchor, verbatim.
+    assert_eq!(
+        claim_wait_window(Some(&anchored), now),
+        WaitWindow::Open(1_767_225_600)
+    );
+    // A record with no anchor yet ⇒ now.
+    assert_eq!(
+        claim_wait_window(Some(&RestoreClaimStatus::default()), now),
+        WaitWindow::Open(now)
+    );
+    // An unparseable anchor falls through rather than panicking.
+    let bad = RestoreClaimStatus {
+        wait_started_at: Some("yesterday".into()),
+        ..Default::default()
+    };
+    assert_eq!(claim_wait_window(Some(&bad), now), WaitWindow::Open(now));
+    // The top-level anchor cannot be consulted: there is no parameter to pass
+    // it through. `effective_wait_anchor` (the DirectTarget reader) still
+    // honors it, which is the only place it should be read.
+    let created = 1_700_000_000_i64;
+    assert_eq!(
+        effective_wait_anchor(&restore_with_anchor(Some("2025-06-01T00:00:00Z")), created),
+        1_748_736_000
+    );
 }

@@ -1,12 +1,12 @@
 # Maintenance
 
-Kopia repositories need periodic **maintenance** to stay healthy: compacting indexes, advancing epochs, and — most importantly — **reclaiming storage** by garbage-collecting content that deleted snapshots no longer reference. Without it, a repository keeps growing even as you expire old backups.
+Kopia repositories need periodic **maintenance** to stay healthy. Maintenance compacts indexes, advances epochs, and, most importantly, **reclaims storage** by garbage-collecting content that deleted snapshots no longer reference. Without it, a repository keeps growing even as you expire old backups.
 
-Kopiur makes maintenance a first-class, **default-managed** concern. You don't have to remember to schedule it: every `Repository` and `ClusterRepository` gets a `Maintenance` resource automatically, and the operator runs `kopia maintenance` on a schedule for **every backend** — filesystem and object stores (S3, Azure, GCS, B2, …) alike.
+Kopiur makes maintenance a first-class, **default-managed** concern. You don't have to remember to schedule it. Every `Repository` and `ClusterRepository` gets a `Maintenance` resource automatically, and the operator runs `kopia maintenance` on a schedule for **every backend**, filesystem and object stores such as S3, Azure, GCS and B2 alike.
 
 /// info | How it runs
 
-Each scheduled run executes in a short-lived **mover Job** (the same mechanism used for backups and restores), so maintenance works identically whether your repository lives on a PVC or in an object store the operator can't reach directly.
+Each scheduled run executes in a short-lived **mover Job**, the same mechanism used for backups and restores. That means maintenance works identically whether your repository lives on a PVC or in an object store the operator can't reach directly.
 
 ///
 
@@ -17,13 +17,13 @@ kopia has two maintenance passes, and Kopiur schedules them independently:
 | Pass      | kopia command                     | What it does                                                                       | Default schedule                        |
 | --------- | --------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------- |
 | **Quick** | `kopia maintenance run --no-full` | Cheap, frequent: index compaction, epoch advance.                                  | every 6h (`0 */6 * * *`), 30m jitter    |
-| **Full**  | `kopia maintenance run --full`    | Heavier: content garbage-collection + rewrite — this is what **reclaims storage**. | daily at 03:00 (`0 3 * * *`), 1h jitter |
+| **Full**  | `kopia maintenance run --full`    | Heavier: content garbage-collection + rewrite. This is what **reclaims storage**. | daily at 03:00 (`0 3 * * *`), 1h jitter |
 
-A **full** run subsumes a **quick** run, so when both are due at once the operator runs full and advances both clocks.
+A **full** run does everything a **quick** run does, so when both are due at once the operator runs full and advances both clocks.
 
 ## The default-managed model
 
-Maintenance is **on by default**. For every `Repository`/`ClusterRepository`, the operator projects a `Maintenance` resource (named after the repository) with the default schedule above. You can see it with:
+Maintenance is **on by default**. For every `Repository` and `ClusterRepository`, the operator creates a `Maintenance` resource named after the repository, with the default schedule above. You can see it with:
 
 ```console
 $ kubectl get maintenance -A
@@ -35,9 +35,9 @@ There are three ways to control it, in increasing order of explicitness.
 
 ## Try it end-to-end
 
-Prove the default-managed model — *a `Maintenance` appears with nothing but a `Repository`* — and then force a run on demand. The bundle [`deploy/examples/tryit/maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/maintenance.yaml) is deliberately minimal: namespace, a repo PVC, a `KOPIA_PASSWORD` Secret, and a filesystem `Repository` — and **no** `Maintenance` resource. The operator projects one for you.
+Watch the default-managed model work: *a `Maintenance` appears with nothing but a `Repository`*, and then force a run on demand. The bundle [`deploy/examples/tryit/maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/tryit/maintenance.yaml) is deliberately minimal. It has a namespace, a repo PVC, a `KOPIA_PASSWORD` Secret, and a filesystem `Repository`, and **no** `Maintenance` resource. The operator creates one for you.
 
-The `Repository` below is the only CR in the bundle — note it carries no `spec.maintenance` block and there is no standalone `Maintenance`; the managed one is auto-projected the moment this repository is `Ready`:
+The `Repository` below is the only CR in the bundle. It carries no `spec.maintenance` block and there is no standalone `Maintenance`; the managed one appears the moment this repository is `Ready`:
 
 ```yaml
 --8<-- "deploy/examples/tryit/maintenance.yaml:repository"
@@ -50,7 +50,7 @@ $ kubectl apply -f deploy/examples/tryit/maintenance.yaml
 $ kubectl -n kopiur-tryit wait --for=condition=Ready repository/primary --timeout=2m
 ```
 
-**1. The managed `Maintenance` auto-appears.** You authored none — the operator created `primary` (named after the repository) with the default quick-6h / full-daily schedule:
+**1. The managed `Maintenance` appears on its own.** You wrote none. The operator created `primary`, named after the repository, with the default quick-6h and full-daily schedule:
 
 ```console
 $ kubectl -n kopiur-tryit get maintenance
@@ -58,7 +58,7 @@ NAME      REPOSITORY   OWNER                      AGE
 primary   primary      kopiur/kopiur-tryit/primary   20s
 ```
 
-**2. Request a `full` run NOW.** Stamp the two on-demand annotations (`--overwrite` because the timestamp changes each time):
+**2. Request a `full` run NOW.** Stamp the two on-demand annotations. Use `--overwrite` because the timestamp changes each time:
 
 ```console
 $ kubectl annotate maintenance primary -n kopiur-tryit --overwrite \
@@ -89,7 +89,7 @@ $ kubectl -n kopiur-tryit get maintenance primary \
 
 /// note | `lastContentReclaimedBytes` reads `0` even on a successful run
 
-`kopia maintenance run` does not emit a machine-readable reclaimed-bytes figure, so `status.full.lastContentReclaimedBytes` is reported as `0` today even though the run does reclaim space. The field exists and round-trips; populating it precisely is a planned enhancement.
+`kopia maintenance run` does not emit a machine-readable reclaimed-bytes figure, so `status.full.lastContentReclaimedBytes` reads `0` today even though the run does reclaim space. The field exists and round-trips. Populating it precisely is a planned enhancement.
 
 ///
 
@@ -97,7 +97,7 @@ To tear down: `kubectl delete namespace kopiur-tryit`.
 
 ### 1. Tune it inline on the repository
 
-Set `spec.maintenance` on the `Repository`/`ClusterRepository` to override the schedule (or other knobs) while keeping it operator-managed:
+Set `spec.maintenance` on the `Repository` or `ClusterRepository` to override the schedule, or other settings, while keeping it operator-managed:
 
 ```yaml
 --8<-- "deploy/examples/maintenance-inline-on-repository.yaml"
@@ -112,25 +112,25 @@ Set `spec.maintenance` on the `Repository`/`ClusterRepository` to override the s
 | `mover`          | Pod overrides for the maintenance Job (resources, scheduling, security context).                                          |
 | `failurePolicy`  | `backoffLimit` / `activeDeadlineSeconds` for the Job.                                                                     |
 | `takeoverPolicy` | Ownership-lease policy (see [Ownership](#ownership-and-shared-repositories)).                                             |
-| `namespace`      | **`ClusterRepository` only** — which namespace the managed `Maintenance` lives in (defaults to the operator's namespace). |
+| `namespace`      | **`ClusterRepository` only**: which namespace the managed `Maintenance` lives in (defaults to the operator's namespace). |
 
-/// tip | Timezone and jitter both cascade to the repository
+/// tip | Timezone and jitter both cascade from the repository
 
-`quick.timezone`/`full.timezone` (per-cron) wins; else the shared `schedule.timezone`; else the target repository's `scheduleDefaults.timezone` ([Repositories → `scheduleDefaults`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once)); else UTC. Set it once on the repository instead of repeating it on every `Maintenance`.
+The timezone is resolved in this order: the per-cron `quick.timezone` or `full.timezone` wins; then the shared `schedule.timezone`; then the target repository's `scheduleDefaults.timezone` ([Repositories → `scheduleDefaults`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once)); then UTC. Set it once on the repository instead of repeating it on every `Maintenance`.
 
-`jitter` inherits the same way, per cron: `quick.jitter`/`full.jitter` wins, else the repository's `scheduleDefaults.jitter`, else no spread (there is no built-in default window). A window over 24h — at either level — is rejected at admission. Note that a `Maintenance`'s jitter has never been validated at all before this: a garbage window used to be accepted and silently degrade to no jitter at reconcile, so both the parse and the 24h bound are new rejections, and both are [admission-only](upgrade.md#admission-only-jitter-and-deadline-rules-re-apply-only) — a stored `Maintenance` carrying one keeps maintaining itself (unspread) until someone edits it.
+`jitter` resolves the same way, per cron: `quick.jitter` or `full.jitter` wins, then the repository's `scheduleDefaults.jitter`, then no spread at all. There is no built-in default window. A window over 24h is rejected at admission, at either level. Note that a `Maintenance`'s jitter was never validated before this release: a garbage window used to be accepted and then silently fall back to no jitter at reconcile. So both the parse and the 24h bound are new rejections, and both are [admission-only](upgrade.md#admission-only-jitter-and-deadline-rules-re-apply-only). A stored `Maintenance` carrying a bad window keeps maintaining itself, unspread, until someone edits it.
 
 ///
 
 /// note | Maintenance never queues behind a repository's concurrency cap
 
-A `Repository`'s [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) bounds backups, restores and replication. Maintenance is **excluded from that pool entirely**, and deliberately so: maintenance is the *cure* for an overloaded repository — it compacts indexes and drops unreferenced blobs — so queuing it behind a saturated backup pool would make a struggling repository permanently unmaintainable. It is also already single-flight per repository via its own ownership lease, which is the limit that actually matters here. Verification, pin and batched snapshot deletions are outside the pool for the same family of reasons.
+A `Repository`'s [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) bounds backups, restores and replication. Maintenance is **excluded from that pool entirely**, and deliberately so. Maintenance is the *cure* for an overloaded repository: it compacts indexes and drops unreferenced blobs. Queuing it behind a saturated backup pool would make a struggling repository permanently unmaintainable. Maintenance is also already limited to one run at a time per repository by its own ownership lease, which is the limit that actually matters here. Verification, pin and batched snapshot deletions are outside the pool for similar reasons.
 
 ///
 
 ### 2. Author a standalone `Maintenance`
 
-For fine-grained control — a custom ownership identity or takeover policy — author a `Maintenance` directly ([example 08](examples.md#example-08--maintenance)). When one references a repository, the operator **defers to it and never creates a duplicate**, even if `spec.maintenance` is otherwise default-on.
+For fine-grained control, such as a custom ownership identity or takeover policy, write a `Maintenance` directly ([example 08](examples.md#example-08--maintenance)). When one references a repository, the operator **defers to it and never creates a duplicate**, even if `spec.maintenance` is otherwise default-on.
 
 ```yaml
 --8<-- "deploy/examples/08-maintenance.yaml:standalone"
@@ -142,17 +142,17 @@ Set `spec.maintenance.enabled: false` on the repository. The operator stops mana
 
 /// warning | Disabling stops space reclamation
 
-With no maintenance, the repository never garbage-collects, so storage grows without bound even as you expire backups. Only disable it if something else runs `kopia maintenance` against the repository. Note that `enabled: false` only tells the operator not to create _its own_ `Maintenance` — an externally-authored one referencing the repository is always honored.
+With no maintenance, the repository never garbage-collects, so storage grows without bound even as you expire backups. Only disable it if something else runs `kopia maintenance` against the repository. Note that `enabled: false` only tells the operator not to create _its own_ `Maintenance`. An externally-authored one referencing the repository is always honored.
 
 ///
 
 ## Ownership and shared repositories
 
-kopia tracks a single **maintenance owner** per repository. When several clusters (or operators) share one repository, only one should run maintenance at a time. `spec.ownership` encodes who that is and what to do on conflict:
+kopia tracks a single **maintenance owner** per repository. When several clusters, or several operators, share one repository, only one should run maintenance at a time. `spec.ownership` encodes who that is and what to do on conflict:
 
-- `owner` — a stable identity string for this `Maintenance` (the operator derives it for a managed `Maintenance`; see the lease format below).
-- `ownerAliases` — previous lease strings still recognized as **self** (the lease-format migration path, below).
-- `takeoverPolicy` — a closed enum:
+- `owner` is a stable identity string for this `Maintenance`. The operator derives it for a managed `Maintenance`; see the lease format below.
+- `ownerAliases` lists previous lease strings still recognized as **self**. It is the migration path when the lease format changes, described below.
+- `takeoverPolicy` is a closed set of three values:
 
 | Policy                      | Behavior when another owner holds the lease                    |
 | --------------------------- | -------------------------------------------------------------- |
@@ -160,11 +160,11 @@ kopia tracks a single **maintenance owner** per repository. When several cluster
 | `PromptCondition`           | Set a condition asking an operator to decide; don't seize it.  |
 | `Force`                     | Forcibly claim the lease and run.                              |
 
-The lease is read inside the maintenance Job (which is the only place with repository access for object stores). If the policy declines to take over, the run is a successful no-op that records why on the resource's conditions.
+The lease is read inside the maintenance Job, which is the only place with repository access for object stores. If the policy declines to take over, the run finishes successfully having done nothing, and records why on the resource's conditions.
 
 ### The lease string and kopia's recorded owner
 
-Every default-managed `Maintenance` derives its lease string (`spec.ownership.owner`) from the repository it covers. The format depends on whether the repository has [`identityDefaults.cluster`](repositories.md#identitydefaultscluster--sharing-one-repository-across-clusters) set — a repository shared across clusters needs a **distinct lease per cluster**, or every cluster would derive the identical lease and fight over it:
+Every default-managed `Maintenance` derives its lease string (`spec.ownership.owner`) from the repository it covers. The format depends on whether the repository has [`identityDefaults.cluster`](repositories.md#identitydefaultscluster--sharing-one-repository-across-clusters) set. A repository shared across clusters needs a **distinct lease per cluster**, or every cluster would derive the identical lease and fight over it:
 
 | Repository kind     | Cluster identity | Lease string (`spec.ownership.owner`)  | kopia's recorded owner (`user@hostname`)      |
 | -------------------- | ----------------- | --------------------------------------- | ----------------------------------------------- |
@@ -175,41 +175,41 @@ Every default-managed `Maintenance` derives its lease string (`spec.ownership.ow
 
 /// note | Why the cluster-qualified owner is dot-joined, not dash-joined
 
-A single-cluster lease sanitizes to one dash-joined DNS label (`kopiur-media-nas`), unchanged from before multi-cluster support. A cluster-qualified lease is instead dot-joined **per segment** (`kopiur.east.media.nas`). This dot-join only ever applies to a lease the operator itself generated — its first path segment is the literal, reserved `kopiur` — so a hand-authored `spec.ownership.owner` you write yourself always falls back to the single dash-joined form; its derivation can never change across an upgrade merely because it happens to also split into four segments.
+A single-cluster lease becomes one dash-joined DNS label, such as `kopiur-media-nas`. That is unchanged from before multi-cluster support. A cluster-qualified lease is instead dot-joined **per segment**, such as `kopiur.east.media.nas`. This dot-join only ever applies to a lease the operator itself generated, because its first path segment is the literal, reserved word `kopiur`. A `spec.ownership.owner` you write by hand always falls back to the single dash-joined form, so its derivation can never change across an upgrade merely because it happens to also split into four segments.
 
 ///
 
 ### `ownerAliases` — carrying ownership across a lease-format change
 
-`spec.ownership.ownerAliases` lists previous lease strings kopiur should still recognize as **itself**. This is the migration path for turning `identityDefaults.cluster` on for the first time on a repository that already has a managed `Maintenance`: the operator automatically records the pre-cluster lease as an alias on every managed `Maintenance` for a cluster-identified repository, so a run recognizes kopia's already-recorded owner as its own and **claims and re-stamps** it to the new cluster-qualified format, instead of yielding to what would otherwise look like a foreign owner. You don't set this by hand for a managed `Maintenance` — only a standalone one needs it authored explicitly if you hand-roll the same migration.
+`spec.ownership.ownerAliases` lists previous lease strings kopiur should still recognize as **itself**. This is the migration path for turning on `identityDefaults.cluster` for the first time on a repository that already has a managed `Maintenance`. The operator automatically records the pre-cluster lease as an alias on every managed `Maintenance` for a cluster-identified repository. A run then recognizes kopia's already-recorded owner as its own and **claims and re-stamps** it to the new cluster-qualified format, instead of yielding to what would otherwise look like a foreign owner. You don't set this by hand for a managed `Maintenance`. Only a standalone one needs it written out explicitly, if you hand-roll the same migration.
 
 ## Sharing one repository's maintenance across clusters: pick ONE owner
 
-kopia has no cross-host lock beyond this lease, so when several clusters' `Repository`/`ClusterRepository` objects all point at the **same physical repository**, each cluster's independently-managed `Maintenance` tries to claim the same lease. The default (`takeoverPolicy: Never`) makes that safe — every cluster but the current holder yields — but it isn't the recommended steady state once you know which cluster should own it:
+kopia has no cross-host lock beyond this lease. So when several clusters' `Repository` or `ClusterRepository` objects all point at the **same physical repository**, each cluster's independently-managed `Maintenance` tries to claim the same lease. The default, `takeoverPolicy: Never`, makes that safe, because every cluster but the current holder yields. It still isn't the recommended steady state once you know which cluster should own it:
 
-- **Pick the one cluster** that runs maintenance for the shared repository (kopia doesn't care which).
-- On every **other** cluster, set `spec.maintenance.enabled: false` on that repository — the operator stops creating/reconciling a `Maintenance` there at all, instead of one that exists only to yield forever.
-- **Remove `takeoverPolicy: Force` from every cluster except the owner.** `Force` unconditionally seizes the lease on its next run; leave it set on more than one cluster and they fight over it every reconcile, each re-seizing it from the other. Set `Force` only on the one cluster you intend to own it, and only long enough to claim the lease once — then revert it to `Never`.
+- **Pick the one cluster** that runs maintenance for the shared repository. kopia doesn't care which.
+- On every **other** cluster, set `spec.maintenance.enabled: false` on that repository. The operator then stops creating and reconciling a `Maintenance` there at all, instead of running one that exists only to yield forever.
+- **Remove `takeoverPolicy: Force` from every cluster except the owner.** `Force` unconditionally seizes the lease on its next run. Leave it set on more than one cluster and they fight over it every reconcile, each re-seizing it from the other. Set `Force` only on the one cluster you intend to own it, and only long enough to claim the lease once, then revert it to `Never`.
 
-Yielding is the **safety net**, not the recommended posture: a non-owner cluster left with maintenance enabled just yields loudly (`Ready=False`, reason `MaintenanceYielding`) rather than fighting for the lease or touching data — but the loud yielding (and a mover Job that runs for nothing every cron slot) is exactly why the explicit `enabled: false` posture above is preferred once you know the owner. See [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md) for the full walkthrough, with this step placed in the correct order relative to the identity flip.
+Yielding is the **safety net**, not the recommended posture. A non-owner cluster left with maintenance enabled just yields loudly, showing `Ready=False` with reason `MaintenanceYielding`, rather than fighting for the lease or touching data. But that loud yielding, plus a mover Job that runs for nothing every cron slot, is exactly why the explicit `enabled: false` posture above is preferred once you know the owner. See [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md) for the full walkthrough, with this step placed in the correct order relative to the identity flip.
 
 ### Self-healing a stale owner
 
-kopia stamps a maintenance owner when a repository is **created**. kopiur stamps its own stable, lease-derived owner (the table above) so that every maintenance Job — each from a fresh, throwaway pod — recognizes itself as the owner and runs. On every bootstrap (initial connect and each catalog refresh), if the recorded owner doesn't match, kopiur may re-stamp it (`kopia maintenance set --owner` is not owner-gated) — how readily depends on whether the repository has a cluster identity:
+kopia stamps a maintenance owner when a repository is **created**. kopiur stamps its own stable, lease-derived owner, per the table above, so that every maintenance Job, each running from a fresh throwaway pod, recognizes itself as the owner and runs. On every bootstrap, meaning the initial connect and each catalog refresh, if the recorded owner doesn't match, kopiur may re-stamp it. `kopia maintenance set --owner` is not owner-gated. How readily it re-stamps depends on whether the repository has a cluster identity:
 
-- **No `identityDefaults.cluster` (single-cluster repository).** Self-healing is unchanged from before multi-cluster support: any stale owner is re-stamped unconditionally. Safe, because at most one cluster's operator ever bootstraps this repository — a stale owner can only be kopia's own ephemeral create-time identity (e.g. `nonroot@nas-bootstrap-5trlr`) or an older-format stamp from this same operator, never another cluster's.
-- **`identityDefaults.cluster` set (shared repository).** Self-heal restamps **only** an owner that is empty, already the desired owner, or matches a recognized [`ownerAliases`](#owneraliases--carrying-ownership-across-a-lease-format-change) entry — i.e. only this cluster's own current or legacy formats. A **foreign cluster's owner is always honored** and left completely alone: with the unconditional rule, every cluster sharing the repository would see the OTHER's owner as "stale" and re-claim it on its own next bootstrap, ping-ponging the lease back and forth forever.
-- The tradeoff: an **ancient owner** this operator has never recognized before — a workstation `kopia` CLI, or any owner string that isn't this cluster's current lease or a registered alias — is left alone rather than auto-clobbered, even though it may genuinely be stale. Move it with a **one-time** `spec.ownership.takeoverPolicy: Force` (or `kopia maintenance set --owner` by hand); once claimed, this operator's own lease-derived owner is recognized on every subsequent run, so no further manual steps are needed. Revert `Force` to `Never` right after — see the "pick ONE owner" section above for why leaving it set is unsafe on a shared repository.
+- **No `identityDefaults.cluster`, a single-cluster repository.** Self-healing is unchanged from before multi-cluster support: any stale owner is re-stamped unconditionally. That is safe, because at most one cluster's operator ever bootstraps this repository. A stale owner can only be kopia's own short-lived create-time identity, such as `nonroot@nas-bootstrap-5trlr`, or an older-format stamp from this same operator. It is never another cluster's.
+- **`identityDefaults.cluster` set, a shared repository.** Self-heal re-stamps **only** an owner that is empty, already the desired owner, or matches a recognized [`ownerAliases`](#owneraliases--carrying-ownership-across-a-lease-format-change) entry. That is, only this cluster's own current or legacy formats. A **foreign cluster's owner is always honored** and left completely alone. Under the unconditional rule, every cluster sharing the repository would see the other's owner as "stale" and re-claim it on its own next bootstrap, bouncing the lease back and forth forever.
+- The tradeoff: an **ancient owner** this operator has never recognized before is left alone rather than clobbered automatically, even though it may genuinely be stale. That covers a workstation `kopia` CLI, or any owner string that isn't this cluster's current lease or a registered alias. Move it with a **one-time** `spec.ownership.takeoverPolicy: Force`, or with `kopia maintenance set --owner` by hand. Once claimed, this operator's own lease-derived owner is recognized on every subsequent run, so no further manual steps are needed. Revert `Force` to `Never` right after; see the "pick ONE owner" section above for why leaving it set is unsafe on a shared repository.
 
 ## Index-blob health
 
-kopia stores its content index as a set of **index blobs**. Each backup adds one; **maintenance compacts them back down**. So in a healthy repository the count rises during the day and falls after the next full-maintenance run. If maintenance stops keeping up — most often a stale owner (above), but also a disabled/failing `Maintenance` — the count climbs without bound, and once it gets high enough kopia warns "Found too many index blobs (N)" and backup/restore performance degrades.
+kopia stores its content index as a set of **index blobs**. Each backup adds one, and **maintenance compacts them back down**. So in a healthy repository the count rises during the day and falls after the next full-maintenance run. If maintenance stops keeping up, most often because of a stale owner as described above, but also because of a disabled or failing `Maintenance`, the count climbs without bound. Once it gets high enough, kopia warns "Found too many index blobs (N)" and backup and restore performance degrades.
 
-kopiur observes the count on every bootstrap and surfaces it three ways, **without blocking the repository** (it stays `Ready`; this is a degradation warning, not an outage):
+kopiur observes the count on every bootstrap and surfaces it three ways, **without blocking the repository**. The repository stays `Ready`; this is a degradation warning, not an outage:
 
-- a print column — `kubectl get repository` / `kubectl get clusterrepository` shows an `IndexBlobs` column (wide output);
+- a print column: `kubectl get repository` and `kubectl get clusterrepository` show an `IndexBlobs` column in wide output;
 - `status.storageStats.indexBlobCount`;
-- when the count crosses the threshold, an `IndexBlobHealth=False` condition (reason `TooManyIndexBlobs`) **and** a Kubernetes **Warning** event with the remediation in its message:
+- when the count crosses the threshold, an `IndexBlobHealth=False` condition with reason `TooManyIndexBlobs`, **and** a Kubernetes **Warning** event with the remediation in its message:
 
 ```console
 $ kubectl describe clusterrepository nas-shared | grep -A2 TooManyIndexBlobs
@@ -234,9 +234,9 @@ spec:
 
 ### When maintenance is running and the count still won't fall
 
-Raising the threshold hides the warning; it doesn't compact anything, and it has no effect on kopia's own hard-coded "Found too many index blobs" message or on how long your movers take to connect. If maintenance is demonstrably running and the count is still stuck in the thousands, the cause is usually kopia's **epoch-advance gate**, and no maintenance schedule can fix it.
+Raising the threshold hides the warning. It doesn't compact anything, it has no effect on kopia's own hard-coded "Found too many index blobs" message, and it doesn't change how long your movers take to connect. If maintenance is demonstrably running and the count is still stuck in the thousands, the cause is usually kopia's **epoch-advance gate**, and no maintenance schedule can fix it.
 
-kopia cannot compact an index blob until its **epoch** closes. An epoch may only close once it is older than `MinEpochDuration` — **24h by default** — no matter how many blobs accumulate inside it, and compaction then trails two epochs behind. So a fleet producing, say, ~60 index blobs an hour is forced to ~1700 blobs before an epoch may close, and permanently carries 1700–3400 uncompacted blobs. Compaction pace was never the bottleneck; the 24h floor is.
+kopia cannot compact an index blob until its **epoch** closes. An epoch may only close once it is older than `MinEpochDuration`, which is **24h by default**, no matter how many blobs accumulate inside it. Compaction then trails two epochs behind. So a fleet producing, say, around 60 index blobs an hour is forced to about 1700 blobs before an epoch may close, and permanently carries 1700 to 3400 uncompacted blobs. Compaction pace was never the bottleneck. The 24h floor is.
 
 `spec.parameters.epoch` exposes that gate on both `Repository` and `ClusterRepository`:
 
@@ -247,9 +247,9 @@ spec:
       minDuration: 6h   # kopia's default is 24h
 ```
 
-Every field is optional and kopiur has no defaults of its own — **absent means "leave kopia's current value alone"**, so a repository that declares nothing here is completely unaffected. Applying a change rewrites the repository's format blob, which invalidates other kopia clients' cached copy of it (they re-read within ~15 minutes), so kopiur calls `set-parameters` **only when the declared values actually differ** from what the repository reports.
+Every field is optional and kopiur has no defaults of its own. **Absent means "leave kopia's current value alone"**, so a repository that declares nothing here is completely unaffected. Applying a change rewrites the repository's format blob, which invalidates other kopia clients' cached copy of it. They re-read within about 15 minutes. Because of that, kopiur calls `set-parameters` **only when the declared values actually differ** from what the repository reports.
 
-Check what landed under `status.parameters.epoch` — it reports what the *repository* says, not what you asked for, so a value that failed to apply shows as a mismatch rather than as silence:
+Check what landed under `status.parameters.epoch`. It reports what the *repository* says, not what you asked for, so a value that failed to apply shows up as a mismatch rather than as silence:
 
 ```console
 $ kubectl get repository primary -o jsonpath='{.status.parameters.epoch}' | jq
@@ -274,27 +274,22 @@ The full field set, plus the sharp edges:
 Three things worth knowing:
 
 - **Removing a value does not restore kopia's default.** Under "absent means don't touch", deleting `minDuration` from your manifest leaves the repository at 6h forever. Set it back explicitly if you want 24h again.
-- **`mode: ReadOnly` repositories cannot declare parameters.** `set-parameters` is a repository-wide write and kopia refuses it on a read-only connection, so the combination is rejected at admission. In a multi-cluster layout, declare them on the cluster that owns the repository — they describe the repository, not each consumer. Two clusters declaring *different* values for one repository will fight over it.
+- **`mode: ReadOnly` repositories cannot declare parameters.** `set-parameters` is a repository-wide write and kopia refuses it on a read-only connection, so the combination is rejected at admission. In a multi-cluster layout, declare parameters on the cluster that owns the repository. They describe the repository, not each consumer. Two clusters declaring *different* values for one repository will fight over it.
 - **`cleanupSafetyMargin` is reported but not settable.** It is the grace window that stops kopia deleting index blobs a concurrent writer still needs, and there is no safe generic advice for lowering it.
 
-`spec.parameters` has a second key, `blobRetention`, which turns on S3/Azure/GCS **object lock** so a compromised credential cannot delete your backups. It rides the same `set-parameters` call as `epoch` — one invocation, applied only on drift — and it changes what maintenance can reclaim: deletes are still issued, but the storage layer refuses them until locks expire, so the repository grows for at least the retention period. See [Object lock](backends/s3.md#object-lock-ransomware-protection).
+`spec.parameters` has a second key, `blobRetention`, which turns on S3, Azure and GCS **object lock** so a compromised credential cannot delete your backups. It rides the same `set-parameters` call as `epoch`, one invocation applied only on drift, and it changes what maintenance can reclaim. Deletes are still issued, but the storage layer refuses them until locks expire, so the repository grows for at least the retention period. See [Object lock](backends/s3.md#object-lock-ransomware-protection).
 
 /// warning | A high index-blob count means maintenance isn't running
 
-The warning is a symptom; the fix is to get maintenance compacting again. Check that a `Maintenance` exists and is `Ready`, that it isn't yielding (`LeaseOwned=False`, reason `LeaseHeldByOther`), and that its owner is the stable lease owner — not an ephemeral `…-bootstrap-…` identity. The operator self-heals a stale owner on the next bootstrap; to recover **now**, set `spec.maintenance.takeoverPolicy: Force` once. Raising or zeroing `indexBlobWarnThreshold` only silences the warning — it does not compact the index.
+The warning is a symptom. The fix is to get maintenance compacting again. Check that a `Maintenance` exists and is `Ready`, that it isn't yielding (`LeaseOwned=False`, reason `LeaseHeldByOther`), and that its owner is the stable lease owner rather than a short-lived `…-bootstrap-…` identity. The operator self-heals a stale owner on the next bootstrap; to recover **now**, set `spec.maintenance.takeoverPolicy: Force` once. Raising or zeroing `indexBlobWarnThreshold` only silences the warning. It does not compact the index.
 
 ///
 
 ## Running maintenance on demand
 
-Maintenance normally fires on its quick/full crons, but you can request an
-out-of-band run at any time by stamping two annotations on the `Maintenance` —
-the operator routes it through the **same** mover, ownership-lease, and
-single-flight path as the scheduled slots, so a manual run can never violate the
-one-job-per-repository guarantee.
+Maintenance normally fires on its quick and full crons. You can request an out-of-band run at any time by stamping two annotations on the `Maintenance`. The operator routes it through the **same** mover, ownership-lease and one-at-a-time path as the scheduled slots, so a manual run can never break the one-job-per-repository rule.
 
-Declaratively (GitOps-friendly — set them in Git on the managed `Maintenance`,
-as in [example 08](examples.md#example-08--maintenance)):
+Declaratively, which is GitOps-friendly, set them in Git on the managed `Maintenance`, as in [example 08](examples.md#example-08--maintenance):
 
 ```yaml
 metadata:
@@ -304,14 +299,12 @@ metadata:
         kopiur.home-operations.com/run-mode: full # quick (default when absent) | full
 ```
 
-- `run-requested` is an RFC3339 timestamp. A **new** timestamp requests a new
-  run; re-applying the same value is a no-op once that request was handled.
-- `run-mode` is `quick` (the default when absent) or `full`.
+- `run-requested` is an RFC3339 timestamp. A **new** timestamp requests a new run; re-applying the same value does nothing once that request was handled.
+- `run-mode` is `quick`, the default when absent, or `full`.
 
 /// note | Imperative equivalent
 
-For a one-off run without editing Git, stamp the same two annotations with
-`kubectl` (`--overwrite` because the timestamp changes each time):
+For a one-off run without editing Git, stamp the same two annotations with `kubectl`. Use `--overwrite` because the timestamp changes each time:
 
 ```console
 $ kubectl annotate maintenance nas-primary -n billing --overwrite \
@@ -321,20 +314,10 @@ $ kubectl annotate maintenance nas-primary -n billing --overwrite \
 
 ///
 
-The outcome lands in `status.manualRun` (`requestedAt`, `mode`, `phase`:
-`Running`/`Succeeded`/`Failed`, `completedAt`). The
-[kubectl plugin](cli/index.md) wraps this as
-`kubectl kopiur maintenance run [NAME | --repository NAME] [--full] [--wait]`.
+The outcome lands in `status.manualRun`, which carries `requestedAt`, `mode`, `phase` (`Running`, `Succeeded` or `Failed`), and `completedAt`. The [kubectl plugin](cli/index.md) wraps this as `kubectl kopiur maintenance run [NAME | --repository NAME] [--full] [--wait]`.
 
 /// warning | Repositories bootstrapped by kopiur ≤ 0.3.x: claim the lease once
-kopia records the repository CREATOR as the maintenance owner. Older kopiur
-releases left that as the (ephemeral) bootstrap pod's identity, so every
-maintenance run saw a "foreign" owner and `takeoverPolicy: Never` yielded
-forever — maintenance silently never ran. New bootstraps stamp a stable,
-lease-derived owner (`kopiur@kopiur-<ns>-<repo>`); for repositories created
-before that, set `spec.ownership.takeoverPolicy: Force` once (or run
-`kopia maintenance set --owner kopiur@<lease>` by hand) — the next run claims
-the lease and subsequent runs proceed normally.
+kopia records the repository CREATOR as the maintenance owner. Older kopiur releases left that as the short-lived bootstrap pod's identity, so every maintenance run saw a "foreign" owner and `takeoverPolicy: Never` yielded forever, meaning maintenance silently never ran. New bootstraps stamp a stable, lease-derived owner, `kopiur@kopiur-<ns>-<repo>`. For repositories created before that, set `spec.ownership.takeoverPolicy: Force` once, or run `kopia maintenance set --owner kopiur@<lease>` by hand. The next run claims the lease and subsequent runs proceed normally.
 
 ///
 
@@ -350,8 +333,8 @@ Key `status` fields:
 | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ownership.owner` / `ownership.claimedAt`                            | Current lease holder and when it was claimed.                                                                                                 |
 | `quick.lastRunAt` / `full.lastRunAt`                                 | Timestamp of the most recent run of each pass.                                                                                                |
-| `quick.lastHandledAt` / `full.lastHandledAt`                     | The most recent cron slot whose Job finished — including a *yield* (which doesn't move `lastRunAt`), so a handled slot never re-fires.        |
-| `quick.lastContentReclaimedBytes` / `full.lastContentReclaimedBytes` | Storage reclaimed — **the only place this is surfaced.**                                                                                      |
+| `quick.lastHandledAt` / `full.lastHandledAt`                     | The most recent cron slot whose Job finished, including a *yield* (which doesn't move `lastRunAt`), so a handled slot never re-fires.        |
+| `quick.lastContentReclaimedBytes` / `full.lastContentReclaimedBytes` | Storage reclaimed. **The only place this is surfaced.**                                                                                      |
 | `conditions[type=LeaseOwned]`                                        | `True` when this resource holds the lease and is running; `False` (with a reason) when waiting on the repository, a held lease, or a failure. |
 
 The running mover Jobs are labeled, so you can watch them directly:
@@ -362,23 +345,23 @@ $ kubectl get jobs -n billing -l app.kubernetes.io/component=maintenance
 
 /// note | Reclaimed bytes currently reports 0
 
-`kopia maintenance run` does not emit a machine-readable reclaimed-bytes figure, so `lastContentReclaimedBytes` is reported as `0` today even though the run does reclaim space. The field exists and round-trips; populating it precisely is a planned enhancement.
+`kopia maintenance run` does not emit a machine-readable reclaimed-bytes figure, so `lastContentReclaimedBytes` reads `0` today even though the run does reclaim space. The field exists and round-trips. Populating it precisely is a planned enhancement.
 
 ///
 
 ## Behavior you can rely on
 
-- **Runs at the scheduled time.** Spawning is gated on the same cron + jitter logic as `SnapshotSchedule`, seeded deterministically per resource, so two replicas agree and the run lands in its window — it is not "every reconcile".
-- **Waits for the repository — but only when maintenance can't help.** Maintenance runs once the target repository has ever bootstrapped, and keeps running even while the repository is `Degraded` — unless the backend is confirmed unreachable or the repository vanished (`BackendReachable=False` with reason `BackendUnreachable`/`RepositoryVanished`), the repository has never bootstrapped, or it is in a terminal `Failed` state. A repository that is `Degraded` only because its connects keep exceeding the bootstrap deadline (`ProbeDeadlineExceeded`) **still gets maintenance**: index compaction is usually the cure for a slow connect, so withholding it would deadlock the repository ([#413](https://github.com/home-operations/kopiur/issues/413)). While deferred, the resource shows `LeaseOwned=False, reason=WaitingForRepository`.
+- **Runs at the scheduled time.** Spawning is gated on the same cron and jitter logic as `SnapshotSchedule`, seeded deterministically per resource, so two replicas agree and the run lands in its window. It is not "every reconcile".
+- **Waits for the repository, but only when maintenance can't help.** Maintenance runs once the target repository has ever bootstrapped, and keeps running even while the repository is `Degraded`. It only defers when the backend is confirmed unreachable or the repository vanished (`BackendReachable=False` with reason `BackendUnreachable` or `RepositoryVanished`), when the repository has never bootstrapped, or when it is in a terminal `Failed` state. A repository that is `Degraded` only because its connects keep exceeding the bootstrap deadline (`ProbeDeadlineExceeded`) **still gets maintenance**: index compaction is usually the cure for a slow connect, so withholding it would deadlock the repository ([#413](https://github.com/home-operations/kopiur/issues/413)). While deferred, the resource shows `LeaseOwned=False, reason=WaitingForRepository`.
 - **One run at a time.** The operator never starts a second maintenance Job for a repository while one is in flight.
-- **Catches up after downtime — once.** If the operator is down across several scheduled slots, it runs a single catch-up pass on recovery, not a storm of missed runs.
-- **Self-cleaning Jobs.** Finished maintenance Jobs are removed automatically (`ttlSecondsAfterFinished`); a failed run is retried with backoff.
-- **A handled slot never re-fires.** Each scheduled slot runs once — its outcome (a real run *or* a deliberate yield to a foreign lease holder) is recorded durably in `status.<quick|full>.lastHandledAt`, so the Job self-cleanup above cannot make the same slot run again. Only a *failed* slot is retried.
-- **Yielding is loud, not silent.** When every run yields (a foreign owner holds the lease and `takeoverPolicy: Never`), kopia GC/compaction is **not** happening — the resource reports `Ready=False`, reason `MaintenanceYielding`, with the `takeoverPolicy: Force` remediation in the message, instead of a misleading `Ready=True`.
+- **Catches up after downtime, once.** If the operator is down across several scheduled slots, it runs a single catch-up pass on recovery, not a storm of missed runs.
+- **Self-cleaning Jobs.** Finished maintenance Jobs are removed automatically via `ttlSecondsAfterFinished`, and a failed run is retried with backoff.
+- **A handled slot never re-fires.** Each scheduled slot runs once. Its outcome, either a real run or a deliberate yield to a foreign lease holder, is recorded durably in `status.<quick|full>.lastHandledAt`, so the Job self-cleanup above cannot make the same slot run again. Only a *failed* slot is retried.
+- **Yielding is loud, not silent.** When every run yields, meaning a foreign owner holds the lease and `takeoverPolicy` is `Never`, kopia garbage collection and compaction are **not** happening. The resource reports `Ready=False` with reason `MaintenanceYielding` and the `takeoverPolicy: Force` remediation in the message, instead of a misleading `Ready=True`.
 
 ## See also
 
-- [`deploy/examples/08-maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/08-maintenance.yaml) — a standalone `Maintenance`.
-- [`deploy/examples/01-single-pvc-scheduled.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/01-single-pvc-scheduled.yaml) — inline `spec.maintenance`.
-- [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md) — the full multi-cluster walkthrough, including the maintenance-ownership steps above in their correct order.
-- [Troubleshooting → Maintenance isn't running](troubleshooting.md#maintenance-isnt-running) — `LeaseHeldByOther` on a shared repository: expected vs. stale.
+- [`deploy/examples/08-maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/08-maintenance.yaml): a standalone `Maintenance`.
+- [`deploy/examples/01-single-pvc-scheduled.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/01-single-pvc-scheduled.yaml): inline `spec.maintenance`.
+- [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md): the full multi-cluster walkthrough, including the maintenance-ownership steps above in their correct order.
+- [Troubleshooting → Maintenance isn't running](troubleshooting.md#maintenance-isnt-running): `LeaseHeldByOther` on a shared repository, expected vs. stale.

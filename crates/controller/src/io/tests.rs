@@ -214,6 +214,14 @@ fn only_result_less_job_failures_recycle_for_retry() {
     );
     // Create-disabled on an absent repo needs a spec change, not a retry loop.
     assert!(!BootstrapFailure::RepositoryNotInitialized.recycles_for_retry());
+    // #435: a wiped once-Ready backend needs a HUMAN (an ack or a restored
+    // backend), not a retry loop either — both re-trigger the reconciler.
+    assert!(
+        !BootstrapFailure::RepositoryReinitializeBlocked {
+            message: "blocked".to_string(),
+        }
+        .recycles_for_retry()
+    );
 }
 
 // --- #345 M4: the strict-verdict reroute. A `RepositoryUnavailable` verdict on
@@ -264,6 +272,14 @@ fn only_a_bootstrapped_backend_outage_reroutes_to_degraded() {
     // visible terminal Failed.
     assert!(!BootstrapFailure::RepositoryNotInitialized.retryable_outage_for_bootstrapped(true));
     assert!(!BootstrapFailure::RepositoryNotInitialized.retryable_outage_for_bootstrapped(false));
+    // #435's sibling sentinel takes the same route, for the same reason: it IS
+    // the escalation out of the Degraded retry loop.
+    let reinit = BootstrapFailure::RepositoryReinitializeBlocked {
+        message: "blocked".to_string(),
+    };
+    assert!(!reinit.retryable_outage_for_bootstrapped(true));
+    assert!(!reinit.retryable_outage_for_bootstrapped(false));
+    assert_eq!(reinit.route(true), FailureRoute::Terminal);
 
     // A result-less Job failure is JobFailedWithoutResult's own route
     // (recycles_for_retry, flat 120s) — unaffected by M4.
@@ -321,6 +337,136 @@ fn bootstrap_failure_not_initialized_is_actionable_and_distinct() {
         "message must tell the operator how to fix it: {msg}"
     );
     assert!(!msg.is_empty());
+}
+
+/// #435: the sibling sentinel, and the whole point of splitting it out — the
+/// bug report was a user told to "set spec.create.enabled: true" when it was
+/// already true and their bucket had been deleted.
+#[test]
+fn bootstrap_failure_reinitialize_blocked_is_distinct_and_carries_the_annotate_command() {
+    let message = kopiur_mover::bootstrap::reinitialize_blocked_message(
+        "Repository",
+        "nas",
+        Some("billing"),
+        "U1",
+        false,
+    );
+    let f = BootstrapFailure::RepositoryReinitializeBlocked {
+        message: message.clone(),
+    };
+    assert_eq!(
+        f.reason(),
+        crate::consts::REPOSITORY_REINITIALIZE_BLOCKED_REASON
+    );
+    assert_ne!(f.reason(), REPOSITORY_NOT_INITIALIZED_REASON);
+    assert_eq!(
+        KopiaErrorClass::from_label(f.reason()),
+        KopiaErrorClass::Unknown,
+        "a kopiur policy outcome, not a kopia class"
+    );
+    let msg = f.condition_message();
+    assert_eq!(msg, message, "the message is relayed verbatim");
+    assert!(
+        !msg.contains("spec.create.enabled is false"),
+        "the #435 bug: this user's spec.create.enabled is TRUE. {msg}"
+    );
+    assert!(
+        msg.contains(
+            "kubectl annotate Repository nas -n billing \
+             kopiur.home-operations.com/allow-reinitialize=U1"
+        ),
+        "the exact command must be present: {msg}"
+    );
+    // It IS an absent repository (feeds the probe's `RepositoryVanished` copy)
+    // and it is terminal for a human.
+    assert!(f.is_repository_absent());
+    assert_eq!(
+        crate::health::probe_failure_kind(&f),
+        crate::health::ProbeFailureKind::Vanished
+    );
+
+    // Both blocked at once: ONE message names both fixes, so the user is not
+    // sent round the loop twice.
+    let both = kopiur_mover::bootstrap::reinitialize_blocked_message(
+        "Repository",
+        "nas",
+        Some("billing"),
+        "U1",
+        true,
+    );
+    assert!(both.contains("spec.create.enabled is also false and must be true"));
+
+    // A ClusterRepository is cluster-scoped: no `-n` in the command, whatever
+    // the work spec's `target_ref.namespace` says (it is the OPERATOR's).
+    let cluster = kopiur_mover::bootstrap::reinitialize_blocked_message(
+        "ClusterRepository",
+        "shared",
+        None,
+        "U1",
+        false,
+    );
+    assert!(!cluster.contains(" -n "), "cluster-scoped: {cluster}");
+    assert!(
+        cluster.contains(
+            "kubectl annotate ClusterRepository shared \
+             kopiur.home-operations.com/allow-reinitialize=U1"
+        ),
+        "{cluster}"
+    );
+
+    // Event-note budget: the command leads, so truncation can never eat it.
+    let note = truncate_for_note(&message, EVENT_NOTE_MAX_BYTES);
+    assert!(note.len() <= EVENT_NOTE_MAX_BYTES);
+    assert!(
+        note.contains("allow-reinitialize=U1"),
+        "the annotate command must survive the 1024-byte clamp: {note}"
+    );
+}
+
+/// #435: the two ack diagnostics' messages. Both are event notes, so both must
+/// fit the budget, and the invalid one must name BOTH values (the user's and the
+/// expected one) plus a runnable fix.
+#[test]
+fn reinitialize_ack_diagnostic_messages_name_both_values_and_fit_the_note_budget() {
+    let invalid = crate::io::invalid_reinitialize_ack_message(
+        "Repository",
+        "nas",
+        Some("billing"),
+        "U2",
+        "U1",
+    );
+    assert!(
+        invalid.contains("`U1`"),
+        "names what the user set: {invalid}"
+    );
+    assert!(
+        invalid.contains("`U2`"),
+        "names what kopiur expects: {invalid}"
+    );
+    assert!(
+        invalid.contains("--overwrite"),
+        "the key already exists, so plain `kubectl annotate` would fail: {invalid}"
+    );
+    assert!(truncate_for_note(&invalid, EVENT_NOTE_MAX_BYTES).len() <= EVENT_NOTE_MAX_BYTES);
+
+    // A ClusterRepository is cluster-scoped, so the fix command carries no `-n`
+    // — shared with the block message through `kubectl_namespace_flag`.
+    let cluster = crate::io::invalid_reinitialize_ack_message(
+        "ClusterRepository",
+        "shared",
+        None,
+        "U2",
+        "U1",
+    );
+    assert!(!cluster.contains(" -n "), "{cluster}");
+
+    let ignored = crate::io::reinitialize_ack_ignored_message("ClusterRepository", "U1");
+    assert!(ignored.contains("U1"));
+    assert!(
+        ignored.contains("nothing to re-initialize"),
+        "says why it did nothing: {ignored}"
+    );
+    assert!(truncate_for_note(&ignored, EVENT_NOTE_MAX_BYTES).len() <= EVENT_NOTE_MAX_BYTES);
 }
 
 #[test]
@@ -998,6 +1144,7 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
             Some(5),
             recorded,
             current,
+            false,
         )
     };
     // Same Secret revision → gate HOLDS (quiet heartbeat, don't re-hit the backend).
@@ -1014,7 +1161,8 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
         Some(5),
         Some(5),
         Some("100"),
-        "100"
+        "100",
+        false
     ));
     // A spec change (gen bumped) reopens regardless of the version match.
     assert!(!terminal_gate_holds(
@@ -1022,7 +1170,20 @@ fn terminal_gate_reopens_when_credential_secret_changes() {
         Some(5),
         Some(6),
         Some("100"),
-        "100"
+        "100",
+        false
+    ));
+    // #435: a live valid `allow-reinitialize` ack is the THIRD opener. Nothing
+    // else changed — same generation, same Secret revision, still terminally
+    // Failed — but the human asked for a deliberate re-initialize, and an
+    // annotation edit bumps neither of the other two inputs.
+    assert!(!terminal_gate_holds(
+        Some(&RepositoryPhase::Failed),
+        Some(5),
+        Some(5),
+        Some("100"),
+        "100",
+        true
     ));
 }
 
@@ -3995,4 +4156,127 @@ fn upsert_gate_writes_exactly_what_the_row_declares() {
     let again = upsert_gate(&first, &kopiur_api::gates::PRIVILEGED_MOVER_GATE, "b", None);
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].message, "b");
+}
+
+// --- claims-aware (deep) no-op comparison, #443 --------------------------
+
+#[test]
+fn merge_noop_sees_through_a_partial_claims_map() {
+    // The fan-out patches ONE claim's entry while `status.claims` holds every
+    // claimant. The shallow comparison compares `claims` by whole value, so a
+    // partial map can never match and every 120s pass would PATCH — bumping
+    // resourceVersion, waking the watch, and re-triggering the reconcile. Times N
+    // claims. The deep predicate applies the merge and compares the result.
+    let current = serde_json::json!({
+        "phase": "Restoring",
+        "claims": {
+            "data-0": { "uid": "u0", "phase": "Populated", "reason": "RestoreSucceeded" },
+            "data-1": { "uid": "u1", "phase": "Populating", "reason": "PopulatingPrimePvc" },
+        },
+    });
+    // An unchanged single-claim merge: deep says no-op, shallow (correctly, for
+    // its own contract) does not.
+    let steady = serde_json::json!({
+        "phase": "Restoring",
+        "claims": { "data-1": { "uid": "u1", "phase": "Populating", "reason": "PopulatingPrimePvc" } },
+    });
+    assert!(status_merge_patch_is_noop(Some(&current), &steady));
+    assert!(!status_patch_is_noop(Some(&current), &steady));
+
+    // A real per-claim transition must still write.
+    let moved = serde_json::json!({
+        "claims": { "data-1": { "uid": "u1", "phase": "Populated", "reason": "RestoreSucceeded" } },
+    });
+    assert!(!status_merge_patch_is_noop(Some(&current), &moved));
+
+    // A brand-new claim must write.
+    let added = serde_json::json!({ "claims": { "data-2": { "uid": "u2" } } });
+    assert!(!status_merge_patch_is_noop(Some(&current), &added));
+}
+
+#[test]
+fn merge_noop_reads_an_explicit_null_as_a_deletion() {
+    // The fan-out nulls controller-owned keys that disappeared (a reaped
+    // `pvcPrime`, a spent `waitStartedAt`) and nulls whole entries for claimants
+    // that are gone. A null over an ABSENT key changes nothing and must read as a
+    // no-op; a null over a PRESENT key is a real deletion and must write.
+    let current = serde_json::json!({
+        "claims": { "data-0": { "uid": "u0", "pvcPrime": "prime-u0" } },
+    });
+    assert!(status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "claims": { "data-0": { "job": null } } })
+    ));
+    assert!(!status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "claims": { "data-0": { "pvcPrime": null } } })
+    ));
+    assert!(!status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "claims": { "data-0": null } })
+    ));
+    assert!(status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "claims": { "gone-already": null } })
+    ));
+}
+
+#[test]
+fn merge_noop_keeps_array_replace_semantics_and_the_no_status_case() {
+    // A merge patch REPLACES arrays, so the conditions array is compared whole —
+    // exactly as the shallow predicate does. A deep comparison must not start
+    // "merging" conditions element-wise, which would silently call a changed
+    // condition set a no-op.
+    let current = serde_json::json!({
+        "conditions": [{ "type": "Ready", "status": "True", "reason": "RestoreSucceeded" }],
+    });
+    assert!(status_merge_patch_is_noop(Some(&current), &current));
+    assert!(!status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({ "conditions": [] })
+    ));
+    assert!(!status_merge_patch_is_noop(
+        Some(&current),
+        &serde_json::json!({
+            "conditions": [{ "type": "Ready", "status": "False", "reason": "ClaimFailed" }],
+        })
+    ));
+    // No status at all (first reconcile) is never a no-op — same as the shallow
+    // predicate.
+    assert!(!status_merge_patch_is_noop(
+        None,
+        &serde_json::json!({ "phase": "Pending" })
+    ));
+    assert!(!status_merge_patch_is_noop(
+        Some(&serde_json::Value::Null),
+        &serde_json::json!({ "phase": "Pending" })
+    ));
+}
+
+#[test]
+fn merge_noop_agrees_with_the_shallow_predicate_on_flat_statuses() {
+    // Everything that is not a partial sub-object must keep the answer it had:
+    // this is the guard against the deep predicate quietly changing behavior for
+    // every OTHER reconciler when it is eventually wired in.
+    let current = serde_json::json!({
+        "phase": "Failed",
+        "observedGeneration": 3,
+        "uniqueId": "abc",
+        "conditions": [{ "type": "Bootstrapped", "status": "False", "reason": "PermissionDenied" }],
+    });
+    for desired in [
+        serde_json::json!({ "phase": "Failed", "observedGeneration": 3 }),
+        serde_json::json!({ "phase": "Completed", "observedGeneration": 3 }),
+        serde_json::json!({ "observedGeneration": 4 }),
+        serde_json::json!({
+            "conditions": [{ "type": "Bootstrapped", "status": "False", "reason": "AuthFailure" }],
+        }),
+        serde_json::json!({ "uniqueId": "abc" }),
+    ] {
+        assert_eq!(
+            status_merge_patch_is_noop(Some(&current), &desired),
+            status_patch_is_noop(Some(&current), &desired),
+            "the two predicates must agree on a flat status: {desired}"
+        );
+    }
 }
