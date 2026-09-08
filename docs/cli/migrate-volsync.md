@@ -112,7 +112,7 @@ $ kubectl apply -f ./migrated
 
 ## restic sources (upstream VolSync)
 
-/// danger | Config translation ONLY — no data is migrated
+/// danger | Config translation ONLY, no data is migrated
 A VolSync **restic** repository is NOT a kopia repository. The kopiur repository the translated policies point at starts **empty**, and it fills as kopiur takes its own snapshots. Keep VolSync and its repository running until kopiur's retention coverage is enough for your recovery needs.
 
 ///
@@ -127,7 +127,7 @@ The kopia password is emitted as a `REPLACE_ME` placeholder you must replace. A 
 
 ## kopia sources (perfectra1n/volsync fork)
 
-/// tip | Repository ADOPTED in place — data and history are preserved
+/// tip | Repository ADOPTED in place, so data and history are preserved
 The fork's mover writes a real kopia repository. The emitted `Repository` connects to it **as-is**, with the same backend and the same password, and with **no `create` block**, so the repository must already exist and a mis-parsed backend can never initialize a fresh empty one. Every existing snapshot is preserved and shows up as an `origin: discovered` [Snapshot](../repositories.md).
 
 ///
@@ -223,7 +223,7 @@ NAME                          POLICY  ORIGIN      PHASE      SNAPSHOT-ID   SIZE 
 media-20260601-020000         -       discovered  Succeeded  9f8e7d6c5b4a  4.7 GiB  982    2026-06-01T02:00:00Z  10d
 ```
 
-/// note | Illustrative — discovered rows need a real fork repository
+/// note | Illustrative: discovered rows need a real fork repository
 
 The `--origin discovered` listing above is illustrative. Those rows appear only once the catalog scan finds real snapshots in the adopted repository. Against an empty placeholder backend the table stays empty until the fork's repository, with its history, is reachable. What appears exactly as shown is the adoption banner, the `mapped` and `applied <kind>/<name>` line formats, and the `ok    repositories ready` doctor line.
 

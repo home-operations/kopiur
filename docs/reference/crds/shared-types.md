@@ -186,7 +186,7 @@ Adding `spec.server` is what enables the server; there is no `enabled` bool. The
 
 - **`auth`** is the UI authentication mode, described below. Leaving it out defaults to `generate`, **never** to no auth.
 - **`readOnly`** connects the server's repository read-only, so the UI cannot create, delete or alter backups. It leaves browse and restore-download working. A repository with `spec.mode: ReadOnly` forces this on, and setting an explicit `readOnly: false` on a `ReadOnly` repository is rejected. Read-only blocks mutation, not reading: the server still holds the decryption key, so anyone who reaches the UI can read and restore every backup.
-- **`service`** is how the server is published as a `Service`. It takes `type` (`ClusterIP` by default, or `NodePort` or `LoadBalancer`), `port` (default `51515`), and `annotations`, which is where you wire up your own Ingress or LoadBalancer.
+- **`service`** is how the server is published as a `Service`. It takes `type` (`ClusterIP` by default, or `NodePort` or `LoadBalancer`), `port` (default `51515`), and `annotations`, which is where you connect your own Ingress or LoadBalancer.
 - **`resources`** sets resource requests and limits for the server pod.
 - **`securityContext`** overrides the hardened default container security context.
 - **`podSecurityContext`** is the pod-level security context. It notably carries `supplementalGroups`, which is how you grant the long-lived server write access to a group-owned filesystem export. `fsGroup` quietly does nothing on NFS, because the kubelet does not recursively chown in-tree NFS mounts.

@@ -6,7 +6,7 @@ The chart is published as an OCI artifact at `oci://ghcr.io/home-operations/char
 
 The in-repo chart at `deploy/helm/kopiur` is the development copy. Its image digests are empty and its tags float, so use it only when you are working from a checkout.
 
-> Status: **alpha** — API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may still change between releases.
+> Status: **alpha**. API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may still change between releases.
 
 ## Prerequisites
 
@@ -227,7 +227,7 @@ The default of 8 per controller clears a re-list of a few hundred objects in sec
 
 The 9 CRDs ship in the chart's special `crds/` directory. Helm treats that directory specially: **`helm install` installs the CRDs, but `helm upgrade` never touches them.** There is no toggle for this.
 
-> Caution: because `helm upgrade` skips the `crds/` directory, a **helm-CLI upgrade that carries a schema change does not apply it** — you must apply the new CRDs yourself:
+> Caution: because `helm upgrade` skips the `crds/` directory, a **helm-CLI upgrade that carries a schema change does not apply it**. You must apply the new CRDs yourself:
 >
 > ```bash
 > # Server-side apply is required: the SnapshotPolicy CRD embeds a full JobSpec
@@ -235,7 +235,7 @@ The 9 CRDs ship in the chart's special `crds/` directory. Helm treats that direc
 > kubectl apply --server-side -f deploy/crds/
 > ```
 >
-> A GitOps flow (Flux or Argo with a `CreateReplace` sync policy) applies CRD changes automatically. If you manage CRDs entirely out of band, just apply `deploy/crds/` yourself — `helm install` skips the ones that already exist.
+> A GitOps flow (Flux or Argo with a `CreateReplace` sync policy) applies CRD changes automatically. If you manage CRDs entirely out of band, just apply `deploy/crds/` yourself, since `helm install` skips the ones that already exist.
 >
 > Skipping this is usually **silent**, not loud. When a release adds a new spec field, an apiserver still running the old schema **prunes** that field out of every object you apply. The object admits cleanly, `kubectl get -o yaml` shows no trace of the field, and the feature you configured simply never happens. If a newly documented field seems to be ignored, check the live CRD before anything else with `kubectl get crd <plural>.kopiur.home-operations.com -o yaml | grep <field>`. `kubectl kopiur doctor` flags known-stale schemas too.
 

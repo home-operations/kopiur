@@ -6,7 +6,7 @@ If you only want the install reference, meaning every Helm value, the scopes, an
 
 Want the long version, with the reasoning behind every value, a NAS track, and the `kubectl kopiur` plugin woven in? That is the [Complete walkthrough](walkthrough.md).
 
-/// tip | The mental model — read this first
+/// tip | The mental model, read this first
 
 Kopiur splits one job into three resources so each can change independently:
 
