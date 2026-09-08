@@ -62,10 +62,10 @@ The mover reads the repository password, and any object-store keys, from a Secre
 
 | Repository kind                      | Self-managed (default)                                                                       | Projection (recommended for shared repos)                                                                       |
 | ------------------------------------ | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `Repository` (namespaced)            | Nothing extra — the repo and its Secret are already in the workload namespace.               | Not needed (no-op): the Secret is already where the mover runs.                                                 |
+| `Repository` (namespaced)            | Nothing extra; the repo and its Secret are already in the workload namespace.               | Not needed (no-op): the Secret is already where the mover runs.                                                 |
 | `ClusterRepository` (cluster-scoped) | Place a Secret of the same name in **each** workload namespace that backs up to it.          | Set `credentialProjection.enabled: true` on the `SnapshotPolicy`/`Restore`/`Maintenance` that uses it.            |
 
-/// tip | Don't hand-copy Secrets — turn on projection
+/// tip | Don't hand-copy Secrets, turn on projection
 
 If you run a shared `ClusterRepository` across more than a namespace or two, **use credential projection** instead of replicating the Secret by hand. It's one field on the consumer, meaning the `SnapshotPolicy`, `Restore` or `Maintenance`, and you never touch the credential Secret in a workload namespace again. It's **off by default**, because a namespace is a trust boundary and copying across one is opt-in. But for the multi-namespace shared-repo case it's the intended path. See [below](#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos).
 
@@ -81,7 +81,7 @@ Set `spec.credentialProjection.enabled: true` on the **consumer**, meaning the `
 
 Apply it with `kubectl apply -f`. For the full three-part bundle, meaning the
 `ClusterRepository` owner gate plus the consuming policy, see
-[Example 11 — Credential projection](examples.md#example-11--credential-projection).
+[Example 11: Credential projection](examples.md#example-11--credential-projection).
 
 `Snapshot`s produced from this config, whether manual, scheduled, or discovered, inherit the setting.
 
@@ -204,7 +204,7 @@ Reach for a privileged mover only when a workload genuinely needs it, for exampl
 
 To back up a PVC in `media` to a shared `ClusterRepository` whose Secret lives in `kopiur-system`, with a root mover:
 
-1. **Credentials** — place the repo Secret in `media`, or turn on [credential projection](#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) and skip this step:
+1. **Credentials**: place the repo Secret in `media`, or turn on [credential projection](#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos) and skip this step:
     ```console
     $ kubectl apply -f deploy/examples/workload-credential-secret.yaml
     ```
@@ -399,7 +399,7 @@ The mover preconditions surface on the `Snapshot` or `Restore` status as conditi
 | ------------------------------------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------- |
 | Backup stuck `Pending`, no Job                                                  | `CredentialsAvailable=False` / `MissingCredentialsSecret` | The credential Secret isn't in the workload namespace.          | Create the Secret there (replicate it for a `ClusterRepository`). |
 | Backup stuck `Pending`, no Job                                                  | `MoverPermitted=False` / `PrivilegedMoverNotPermitted`    | The mover requests privilege but the namespace hasn't opted in. | Annotate the namespace, or drop the elevated `securityContext`.   |
-| Job created but pod never appears, `FailedCreate: serviceaccount ... not found` | (pre-fix only)                                            | The mover ServiceAccount isn't in the namespace.                | Upgrade the operator — it now mints the ServiceAccount automatically. |
+| Job created but pod never appears, `FailedCreate: serviceaccount ... not found` | (pre-fix only)                                            | The mover ServiceAccount isn't in the namespace.                | Upgrade the operator; it now mints the ServiceAccount automatically. |
 
 /// info | Where to look
 

@@ -17,7 +17,7 @@ kopia has two maintenance passes, and Kopiur schedules them independently:
 | Pass      | kopia command                     | What it does                                                                       | Default schedule                        |
 | --------- | --------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------- |
 | **Quick** | `kopia maintenance run --no-full` | Cheap, frequent: index compaction, epoch advance.                                  | every 6h (`0 */6 * * *`), 30m jitter    |
-| **Full**  | `kopia maintenance run --full`    | Heavier: content garbage-collection + rewrite — this is what **reclaims storage**. | daily at 03:00 (`0 3 * * *`), 1h jitter |
+| **Full**  | `kopia maintenance run --full`    | Heavier: content garbage-collection + rewrite. This is what **reclaims storage**. | daily at 03:00 (`0 3 * * *`), 1h jitter |
 
 A **full** run does everything a **quick** run does, so when both are due at once the operator runs full and advances both clocks.
 
@@ -112,7 +112,7 @@ Set `spec.maintenance` on the `Repository` or `ClusterRepository` to override th
 | `mover`          | Pod overrides for the maintenance Job (resources, scheduling, security context).                                          |
 | `failurePolicy`  | `backoffLimit` / `activeDeadlineSeconds` for the Job.                                                                     |
 | `takeoverPolicy` | Ownership-lease policy (see [Ownership](#ownership-and-shared-repositories)).                                             |
-| `namespace`      | **`ClusterRepository` only** — which namespace the managed `Maintenance` lives in (defaults to the operator's namespace). |
+| `namespace`      | **`ClusterRepository` only**: which namespace the managed `Maintenance` lives in (defaults to the operator's namespace). |
 
 /// tip | Timezone and jitter both cascade from the repository
 
@@ -333,8 +333,8 @@ Key `status` fields:
 | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ownership.owner` / `ownership.claimedAt`                            | Current lease holder and when it was claimed.                                                                                                 |
 | `quick.lastRunAt` / `full.lastRunAt`                                 | Timestamp of the most recent run of each pass.                                                                                                |
-| `quick.lastHandledAt` / `full.lastHandledAt`                     | The most recent cron slot whose Job finished — including a *yield* (which doesn't move `lastRunAt`), so a handled slot never re-fires.        |
-| `quick.lastContentReclaimedBytes` / `full.lastContentReclaimedBytes` | Storage reclaimed — **the only place this is surfaced.**                                                                                      |
+| `quick.lastHandledAt` / `full.lastHandledAt`                     | The most recent cron slot whose Job finished, including a *yield* (which doesn't move `lastRunAt`), so a handled slot never re-fires.        |
+| `quick.lastContentReclaimedBytes` / `full.lastContentReclaimedBytes` | Storage reclaimed. **The only place this is surfaced.**                                                                                      |
 | `conditions[type=LeaseOwned]`                                        | `True` when this resource holds the lease and is running; `False` (with a reason) when waiting on the repository, a held lease, or a failure. |
 
 The running mover Jobs are labeled, so you can watch them directly:
@@ -361,7 +361,7 @@ $ kubectl get jobs -n billing -l app.kubernetes.io/component=maintenance
 
 ## See also
 
-- [`deploy/examples/08-maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/08-maintenance.yaml) — a standalone `Maintenance`.
-- [`deploy/examples/01-single-pvc-scheduled.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/01-single-pvc-scheduled.yaml) — inline `spec.maintenance`.
-- [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md) — the full multi-cluster walkthrough, including the maintenance-ownership steps above in their correct order.
-- [Troubleshooting → Maintenance isn't running](troubleshooting.md#maintenance-isnt-running) — `LeaseHeldByOther` on a shared repository: expected vs. stale.
+- [`deploy/examples/08-maintenance.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/08-maintenance.yaml): a standalone `Maintenance`.
+- [`deploy/examples/01-single-pvc-scheduled.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/01-single-pvc-scheduled.yaml): inline `spec.maintenance`.
+- [Share one repository across clusters](scenarios/shared-repository-multi-cluster.md): the full multi-cluster walkthrough, including the maintenance-ownership steps above in their correct order.
+- [Troubleshooting → Maintenance isn't running](troubleshooting.md#maintenance-isnt-running): `LeaseHeldByOther` on a shared repository, expected vs. stale.

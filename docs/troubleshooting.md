@@ -269,7 +269,7 @@ $ kubectl -n app get pod <consumer> \
 | No `runAsUser` at either level | Nothing to inherit; mover ran as `65532` | Set `runAsUser` on the workload, or set `mover.securityContext.runAsUser` to the image's UID (it merges with, and overrides, inherit) |
 | The first container is a sidecar (e.g. `istio-proxy`) | Inherit took the *first* container's context | Name the right one: `pvcConsumer: { container: app }` |
 | A `runAsUser` is pinned and matches the mover | The files are owned by a *third* UID (root-written data, `lost+found`, an old init container) | Use a [root mover](security-context.md#3-go-root-privileged-mover) |
-| A `runAsUser` is pinned and matches the mover | The `permission denied` is on the **repository**, not the source (e.g. an NFS filesystem repo owned by another UID) | See [NFS filesystem repositories](security-context.md#nfs-filesystem-repositories) — use `supplementalGroups` |
+| A `runAsUser` is pinned and matches the mover | The `permission denied` is on the **repository**, not the source (e.g. an NFS filesystem repo owned by another UID) | See [NFS filesystem repositories](security-context.md#nfs-filesystem-repositories) and use `supplementalGroups` |
 
 The first two cases now report themselves. Check the `SecurityContextInherited` condition before digging:
 
@@ -414,7 +414,7 @@ $ kubectl get snapshot <name> -n <ns> -o jsonpath='{.status.conditions[?(@.type=
 | Reason | Cause | Fix |
 | --- | --- | --- |
 | `SnapshotStackMissing` | The cluster has no `VolumeSnapshotClass` API, because the external-snapshotter (snapshot-controller plus CRDs) isn't installed. | Install the CSI snapshot stack and a `VolumeSnapshotClass` ([Copy methods → What it requires](copy-methods.md#what-it-requires) has the `snapshot-controller` chart command), or set `copyMethod: Direct`. |
-| `NoVolumeSnapshotClass` | No `VolumeSnapshotClass` matches the source PVC's driver, several match with no single default, or an explicit `volumeSnapshotClassName` doesn't exist. An **empty** `volumeSnapshotClassName` never causes this — it is treated as unset. | Create or annotate a class for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
+| `NoVolumeSnapshotClass` | No `VolumeSnapshotClass` matches the source PVC's driver, several match with no single default, or an explicit `volumeSnapshotClassName` doesn't exist. An **empty** `volumeSnapshotClassName` never causes this; it is treated as unset. | Create or annotate a class for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
 | `VolumeSnapshotFailed` | The VolumeSnapshot was still reporting an error when the staging deadline passed (`spec.staging.timeout`, default `10m`). Transient snapshot-controller errors during the wait, such as a benign 409 conflict, are retried and never fatal on their own. | Fix the class or driver issue named in the message, or raise `spec.staging.timeout` if the backend is just slow. The next scheduled run, or a new `Snapshot`, retries. |
 | `StagingTimedOut` | The VolumeSnapshot never became `readyToUse` within the staging deadline and reported no error. The driver or snapshot-controller is stuck or very slow. | Check the CSI driver and snapshot-controller. Raise `spec.staging.timeout` (`"0"` waits indefinitely) for slow backends. |
 | `SourceNotCSIProvisioned` | The source PVC has no `StorageClass` (static or hostPath), so there is nothing to snapshot. | Use a CSI-provisioned PVC, or `copyMethod: Direct`. |
@@ -556,8 +556,8 @@ $ kubectl describe snapshotpolicy <name> -n <ns> | grep -A3 SnapshotsAdopted
 
 **Both opt-outs**, if this isn't the behavior you want going forward:
 
-- `SnapshotPolicy.spec.adoption: Ignore` — this recipe never adopts, regardless of the repository's setting.
-- `Repository`/`ClusterRepository` `spec.catalog.adoption: Ignore` — no policy against this repository adopts.
+- `SnapshotPolicy.spec.adoption: Ignore`: this recipe never adopts, regardless of the repository's setting.
+- `Repository`/`ClusterRepository` `spec.catalog.adoption: Ignore`: no policy against this repository adopts.
 
 ## Adoption didn't happen
 
@@ -699,6 +699,6 @@ The controller and webhook also expose `kopiur_*` metrics on `/metrics`, plus `/
 
 ## See also
 
-- [Movers, RBAC & credentials](movers.md) — the credential + privilege preconditions in depth (with its own troubleshooting table).
-- [Maintenance](maintenance.md) — maintenance ownership and scheduling.
-- [Getting started](getting-started.md) — the happy-path walkthrough each step here mirrors.
+- [Movers, RBAC & credentials](movers.md): the credential + privilege preconditions in depth (with its own troubleshooting table).
+- [Maintenance](maintenance.md): maintenance ownership and scheduling.
+- [Getting started](getting-started.md): the happy-path walkthrough each step here mirrors.

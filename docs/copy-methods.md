@@ -310,7 +310,7 @@ spec:
 | `copyMethod` | The mover mounts | `readOnly: false` rewrites |
 | --- | --- | --- |
 | `Snapshot` / `Clone` | a temporary **staged PVC** | the throwaway stage, deleted when the run ends. Your volume is never touched. |
-| `Direct` | your **live PVC** | your production data — permanently, while the app runs. |
+| `Direct` | your **live PVC** | your production data, permanently, while the app runs. |
 
 So under `Snapshot` and `Clone` this costs you nothing, and it is the combination to reach for:
 
@@ -362,16 +362,16 @@ If a `SnapshotPolicy` never sets `copyMethod` and the cluster has no CSI snapsho
 
 | Condition / symptom | Cause | Fix |
 | --- | --- | --- |
-| `SourceStaged=False`, reason **`SnapshotStackMissing`** | No `VolumeSnapshotClass` API — the external-snapshotter isn't installed. | Install the snapshot-controller and a `VolumeSnapshotClass` ([What it requires](#what-it-requires) has the `snapshot-controller` chart command), or set `copyMethod: Direct`. |
-| `SourceStaged=False`, reason **`NoVolumeSnapshotClass`** | No class matches your source PVC's driver, or several do with no single default. (An **empty** `volumeSnapshotClassName` is not a cause — it counts as unset.) | Create or annotate a `VolumeSnapshotClass` for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
+| `SourceStaged=False`, reason **`SnapshotStackMissing`** | No `VolumeSnapshotClass` API, because the external-snapshotter isn't installed. | Install the snapshot-controller and a `VolumeSnapshotClass` ([What it requires](#what-it-requires) has the `snapshot-controller` chart command), or set `copyMethod: Direct`. |
+| `SourceStaged=False`, reason **`NoVolumeSnapshotClass`** | No class matches your source PVC's driver, or several do with no single default. (An **empty** `volumeSnapshotClassName` is not a cause; it counts as unset.) | Create or annotate a `VolumeSnapshotClass` for the driver, set `volumeSnapshotClassName` explicitly, or use `Direct`. |
 | `SourceStaged=False`, reason **`VolumeSnapshotFailed`** | The VolumeSnapshot was **still reporting an error when the staging deadline passed** (`spec.staging.timeout`, default `10m`). Transient errors during the wait are retried, never fatal on their own. | Read the message, which includes the driver's last error. Fix the class or driver, or raise `spec.staging.timeout` if the backend is just slow. The next scheduled run, or a new `Snapshot`, retries. |
 | `SourceStaged=False`, reason **`StagingTimedOut`** | The VolumeSnapshot never became `readyToUse` within the staging deadline and reported **no error**, so the CSI driver or snapshot-controller is stuck or very slow. | Check the driver and the snapshot-controller. Raise `spec.staging.timeout`, or set it to `"0"` to wait indefinitely, if the backend is just slow. |
 | `SourceStaged=False`, reason **`SourceNotCSIProvisioned`** | The source PVC has no `StorageClass`, so it is a static or hostPath volume and there is nothing to snapshot. | Use a CSI-provisioned PVC, or `copyMethod: Direct`. |
 | `SourceStaged=False`, reason **`StagedClassNotFound`** | `spec.staging.storageClassName` names a StorageClass that doesn't exist. | Create the class, point the override at an existing one, or remove the override to stage on the source's class. |
 | `SourceStaged=False`, reason **`StagedClassMismatch`** | `spec.staging.storageClassName` is on a **different CSI driver** than the source. Its provisioner can never restore or clone from your source, so the staged PVC would never bind. | Point the override at a class of the source's driver (the message names both), or remove it. |
-| `SourceStaged=False`, reason **`WaitingForStagedPvcBind`** (`Pending`, transient) | The staged PVC is still binding — the CSI restore or clone from the source is provisioning. Normal for slow restores; bounded by the [staging deadline](#how-long-staging-may-wait-specstagingtimeout). | Nothing, usually. It either binds or fails at the deadline with the row below. |
+| `SourceStaged=False`, reason **`WaitingForStagedPvcBind`** (`Pending`, transient) | The staged PVC is still binding: the CSI restore or clone from the source is provisioning. Normal for slow restores; bounded by the [staging deadline](#how-long-staging-may-wait-specstagingtimeout). | Nothing, usually. It either binds or fails at the deadline with the row below. |
 | `SourceStaged=False` / phase `Failed`, reason **`StagedPvcBindTimeout`** | The staged PVC never reached `Bound` within `spec.staging.timeout`. The restore or clone is still provisioning (e.g. a CephFS **full clone** of a small-file-heavy volume) or the class can't provision it. | Run `kubectl describe pvc <name>-src` and check the CSI provisioner logs. Raise `spec.staging.timeout` if the copy is just slow, or on CephFS stage on a [`backingSnapshot: "true"` shallow class](#the-flagship-use-cephfs-shallow-snapshots). |
-| Phase `Failed`, reason **`StagedPvcLost`** | The staged PVC reports `Lost` — its bound PV disappeared mid-stage. | Check the CSI driver and the PV lifecycle. The next scheduled run retries. |
-| Backup stuck `Pending`, staged PVC `Pending` | `WaitForFirstConsumer` (normal — binds when the mover starts) **or** the driver can't clone (for `Clone`). | If it never binds, the backup fails at the staging deadline with `StagedPvcBindTimeout`. Run `kubectl describe pvc <name>-src` for the driver event, and switch method if cloning is unsupported. |
+| Phase `Failed`, reason **`StagedPvcLost`** | The staged PVC reports `Lost`, because its bound PV disappeared mid-stage. | Check the CSI driver and the PV lifecycle. The next scheduled run retries. |
+| Backup stuck `Pending`, staged PVC `Pending` | `WaitForFirstConsumer` (normal; binds when the mover starts) **or** the driver can't clone (for `Clone`). | If it never binds, the backup fails at the staging deadline with `StagedPvcBindTimeout`. Run `kubectl describe pvc <name>-src` for the driver event, and switch method if cloning is unsupported. |
 
 See also [Troubleshooting → Multi-Attach](troubleshooting.md) for the `Direct`-mode co-location path.
