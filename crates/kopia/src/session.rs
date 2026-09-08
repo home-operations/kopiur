@@ -7,26 +7,61 @@
 //! through [`SessionCmd::argv`], so a mutating kopia verb is *structurally*
 //! impossible — the type system, not a denylist, is the guarantee (ADR §5.5).
 
-/// A kopia object id as it appears in manifests (`k…`/`x…` hex-ish). Validated so a
-/// repository entry can never smuggle a flag onto the session argv.
+/// A kopia object id as it appears in manifests. Validated so a repository
+/// entry can never smuggle a flag onto the session argv.
+///
+/// kopia's id space is wider than plain hex: content ids (`k…`/`x…`), indirect
+/// ids (`Ix…`), and *section* ids (`S<start>,<length>,<base>`) all appear in
+/// real manifests, and entry names carry through into ids that hold `-`, `_`
+/// or `.`. The gate is therefore a **deny-list**, not an allow-list: the only
+/// threat is argv flag injection (the session never goes through a shell —
+/// [`SessionCmd::argv`] is exec'd directly), so a legitimate-but-unforeseen id
+/// form must not be rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectId(String);
 
-/// A string that is not a well-formed kopia object id.
+/// A string that is not a well-formed kopia object id, naming the value and the
+/// rule it broke.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("invalid kopia object id {0:?}: expected only ASCII letters and digits")]
-pub struct InvalidObjectId(pub String);
+#[error("invalid kopia object id {value:?}: {reason}")]
+pub struct InvalidObjectId {
+    /// The rejected value, verbatim.
+    pub value: String,
+    /// Which rule it broke (e.g. `must not start with '-'`).
+    pub reason: &'static str,
+}
 
 impl ObjectId {
-    /// Parse an object id, rejecting anything that is not a non-empty run of
-    /// ASCII alphanumerics — so a leading `-`, a path separator, or a shell
-    /// metacharacter read out of a repository manifest can never reach argv.
+    /// Parse an object id read out of a repository manifest, rejecting only
+    /// what could subvert the session's argv or its logs: an empty string, a
+    /// leading `-` (kopia would read the id as a flag), a `/` (a path, never an
+    /// id), whitespace (argv word-splitting in anything that re-renders the
+    /// command), and control/non-ASCII bytes (terminal escapes in error text).
+    /// Everything else — commas, dashes, dots, underscores — is a shape kopia
+    /// itself emits and passes through.
     pub fn parse(s: &str) -> Result<Self, InvalidObjectId> {
-        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            Ok(Self(s.to_string()))
-        } else {
-            Err(InvalidObjectId(s.to_string()))
+        let reject = |reason: &'static str| {
+            Err(InvalidObjectId {
+                value: s.to_string(),
+                reason,
+            })
+        };
+        if s.is_empty() {
+            return reject("must not be empty");
         }
+        if s.starts_with('-') {
+            return reject("must not start with '-', which kopia would read as a flag");
+        }
+        if s.contains('/') {
+            return reject("must not contain '/'");
+        }
+        if s.bytes().any(|b| b.is_ascii_whitespace()) {
+            return reject("must not contain whitespace");
+        }
+        if s.bytes().any(|b| !b.is_ascii() || b.is_ascii_control()) {
+            return reject("must be printable ASCII");
+        }
+        Ok(Self(s.to_string()))
     }
 
     /// The validated id, for rendering onto argv.
@@ -118,27 +153,42 @@ mod tests {
     }
 
     #[test]
-    fn object_id_accepts_a_kopia_manifest_id() {
-        let oid = ObjectId::parse("k1a2b3").expect("alphanumeric oid parses");
-        assert_eq!(oid.as_str(), "k1a2b3");
-    }
-
-    #[test]
-    fn object_id_rejects_anything_that_could_smuggle_a_flag() {
-        for bad in ["--config-file=/x", "", "a b", "k/../x", "k;rm"] {
-            assert_eq!(
-                ObjectId::parse(bad),
-                Err(InvalidObjectId(bad.to_string())),
-                "{bad:?} must not parse as an object id"
-            );
+    fn object_id_accepts_every_shape_kopia_actually_emits() {
+        // Plain content id, a *section* id (commas), a manifest entry whose id
+        // carries a dash, and an indirect id — all real kopia forms. An
+        // allow-list of alphanumerics would false-reject the last three and
+        // break browsing on real repositories.
+        // `k;rm` is accepted deliberately: a shell metacharacter is not a
+        // threat here — argv is exec'd directly as a list (no shell anywhere on
+        // the session path), so the leading-flag prefix is the only injection
+        // vector, and an allow-list that rejected `;` would also have to guess
+        // which of kopia's id shapes are legal.
+        for good in ["k1a2b3", "S12,34,kabc", "kfile-a", "Ixdeadbeef", "k;rm"] {
+            let oid = ObjectId::parse(good).unwrap_or_else(|e| panic!("{good:?} must parse: {e}"));
+            assert_eq!(oid.as_str(), good);
         }
     }
 
     #[test]
-    fn invalid_object_id_says_what_is_allowed() {
-        let msg = InvalidObjectId("--config-file=/x".into()).to_string();
-        assert!(msg.contains("--config-file=/x"), "{msg}");
-        assert!(msg.contains("ASCII letters and digits"), "{msg}");
+    fn object_id_rejects_anything_that_could_smuggle_a_flag() {
+        // Every rejection names the value and the rule it broke.
+        for (bad, needle) in [
+            ("", "must not be empty"),
+            ("-h", "must not start with '-'"),
+            ("--config-file=/x", "must not start with '-'"),
+            ("a b", "must not contain whitespace"),
+            ("a\nb", "must not contain whitespace"),
+            ("a/b", "must not contain '/'"),
+            ("k/../x", "must not contain '/'"),
+            ("k\u{7f}rm", "must be printable ASCII"),
+        ] {
+            let err =
+                ObjectId::parse(bad).expect_err(&format!("{bad:?} must not parse as an object id"));
+            assert_eq!(err.value, bad);
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{bad:?}: {msg}");
+            assert!(msg.contains(&format!("{bad:?}")), "{bad:?}: {msg}");
+        }
     }
 
     #[test]
