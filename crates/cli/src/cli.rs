@@ -273,9 +273,9 @@ pub enum ReplicationCommand {
     Run(ReplicationRunArgs),
 }
 
-/// Which replication kind a name refers to. Closed enum: the dispatch `match`es
-/// it exhaustively, so a future replication kind cannot compile until the CLI
-/// is extended too.
+/// `--kind` values; mirrors [`kopiur_ops::replication::ReplicationKind`], which
+/// the dispatch `match`es exhaustively. Closed enum: a future replication kind
+/// cannot compile until the conversion below names it too.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplicationKindArg {
     /// RepositoryReplication — blob mirror (`kopia repository sync-to`).
@@ -284,6 +284,15 @@ pub enum ReplicationKindArg {
     /// SnapshotReplication — logical copy (`kopia snapshot migrate`).
     #[value(alias = "snap", alias = "snapshotreplication")]
     Snapshot,
+}
+
+impl From<ReplicationKindArg> for kopiur_ops::replication::ReplicationKind {
+    fn from(value: ReplicationKindArg) -> Self {
+        match value {
+            ReplicationKindArg::Repository => Self::RepositoryReplication,
+            ReplicationKindArg::Snapshot => Self::SnapshotReplication,
+        }
+    }
 }
 
 /// Flags for `replication run`.
@@ -865,16 +874,17 @@ pub struct LogsArgs {
 pub struct SuspendArgs {
     /// The kind of resource to (un)suspend.
     #[arg(value_enum)]
-    pub kind: SuspendableKind,
+    pub kind: SuspendableKindArg,
     /// Name of the resource.
     pub name: String,
 }
 
-/// Every kind that exposes a declarative suspend field (ADR-0005 §14(e)).
-/// Closed enum: the patch path and API routing `match` it exhaustively, so a
-/// future suspendable kind cannot compile until both are extended.
+/// `suspend`/`resume` KIND values; mirrors
+/// [`kopiur_ops::suspend::SuspendableKind`], which the patch path and API
+/// routing `match` exhaustively. Closed enum: a future suspendable kind cannot
+/// compile until the conversion below names it too.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SuspendableKind {
+pub enum SuspendableKindArg {
     /// SnapshotPolicy — `spec.suspend`.
     Policy,
     /// SnapshotSchedule — `spec.schedule.suspend`.
@@ -889,6 +899,19 @@ pub enum SuspendableKind {
     /// SnapshotReplication — `spec.suspend`.
     #[value(alias = "snapshotreplication")]
     SnapshotReplication,
+}
+
+impl From<SuspendableKindArg> for kopiur_ops::suspend::SuspendableKind {
+    fn from(value: SuspendableKindArg) -> Self {
+        match value {
+            SuspendableKindArg::Policy => Self::Policy,
+            SuspendableKindArg::Schedule => Self::Schedule,
+            SuspendableKindArg::Repository => Self::Repository,
+            SuspendableKindArg::ClusterRepository => Self::ClusterRepository,
+            SuspendableKindArg::Replication => Self::Replication,
+            SuspendableKindArg::SnapshotReplication => Self::SnapshotReplication,
+        }
+    }
 }
 
 /// `kubectl kopiur snapshots …`
@@ -1013,14 +1036,20 @@ mod tests {
     #[test]
     fn suspend_parses_every_kind_including_aliases() {
         for (token, kind) in [
-            ("policy", SuspendableKind::Policy),
-            ("schedule", SuspendableKind::Schedule),
-            ("repository", SuspendableKind::Repository),
-            ("cluster-repository", SuspendableKind::ClusterRepository),
-            ("clusterrepo", SuspendableKind::ClusterRepository),
-            ("replication", SuspendableKind::Replication),
-            ("snapshot-replication", SuspendableKind::SnapshotReplication),
-            ("snapshotreplication", SuspendableKind::SnapshotReplication),
+            ("policy", SuspendableKindArg::Policy),
+            ("schedule", SuspendableKindArg::Schedule),
+            ("repository", SuspendableKindArg::Repository),
+            ("cluster-repository", SuspendableKindArg::ClusterRepository),
+            ("clusterrepo", SuspendableKindArg::ClusterRepository),
+            ("replication", SuspendableKindArg::Replication),
+            (
+                "snapshot-replication",
+                SuspendableKindArg::SnapshotReplication,
+            ),
+            (
+                "snapshotreplication",
+                SuspendableKindArg::SnapshotReplication,
+            ),
         ] {
             let cli = parse(&["suspend", token, "x"]).unwrap();
             match cli.command {
@@ -1031,6 +1060,42 @@ mod tests {
                 other => panic!("expected suspend, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn clap_kinds_convert_to_the_ops_kinds_they_name() {
+        // A swapped arm here would suspend (or replicate) the wrong kind while
+        // still parsing and printing the one the user asked for, so pin every
+        // mapping rather than trusting the variant names to line up.
+        use kopiur_ops::replication::ReplicationKind;
+        use kopiur_ops::suspend::SuspendableKind;
+        for (arg, kind) in [
+            (SuspendableKindArg::Policy, SuspendableKind::Policy),
+            (SuspendableKindArg::Schedule, SuspendableKind::Schedule),
+            (SuspendableKindArg::Repository, SuspendableKind::Repository),
+            (
+                SuspendableKindArg::ClusterRepository,
+                SuspendableKind::ClusterRepository,
+            ),
+            (
+                SuspendableKindArg::Replication,
+                SuspendableKind::Replication,
+            ),
+            (
+                SuspendableKindArg::SnapshotReplication,
+                SuspendableKind::SnapshotReplication,
+            ),
+        ] {
+            assert_eq!(SuspendableKind::from(arg), kind, "{arg:?}");
+        }
+        assert_eq!(
+            ReplicationKind::from(ReplicationKindArg::Repository),
+            ReplicationKind::RepositoryReplication
+        );
+        assert_eq!(
+            ReplicationKind::from(ReplicationKindArg::Snapshot),
+            ReplicationKind::SnapshotReplication
+        );
     }
 
     #[test]
