@@ -6,8 +6,8 @@ Every backup and restore in Kopiur runs in a short-lived **mover** pod, and that
 
 A backup or restore does **not** run inside your app's pod. Kopiur launches a short-lived **mover** Job that mounts the PersistentVolumeClaim (PVC) and runs kopia. Linux file permissions don't care that it's "your" data. They only see the **UID and GID the mover process runs as**. The security context is how you control that identity.
 
-- **Backup** — the mover must be able to **read** every file in the source.
-- **Restore** — the mover must be able to **write** into the target, and ideally land files owned correctly for the app.
+- **Backup**: the mover must be able to **read** every file in the source.
+- **Restore**: the mover must be able to **write** into the target, and ideally land files owned correctly for the app.
 
 ///
 
@@ -95,9 +95,9 @@ The whole problem reduces to one number, sometimes two: the **numeric** UID and 
 
 1. **Find the owner.** Read it from the running app with `kubectl exec … -- id` or `ls -ln`. If nothing mounts the PVC, use a throwaway inspection pod. The step-by-step recipe lives in the [Permissions guide → Find the UID/GID](permissions.md#step-1--find-the-uidgid-that-owns-your-data). It includes the lowest-common-denominator rule: if any file you need is `0600` owned by `1000`, the mover must be UID `1000`; if everything is at least group-readable and shares a GID, matching the GID is enough.
 2. **Decide backup vs restore intent:**
-    - **Backup** — pick a UID/GID that can **read** the source.
-    - **Restore** — pick the UID/GID that should **own** the restored files, so the app can read them afterward. To reproduce the *original* ownership exactly, see [Preserving ownership on restore](#preserving-original-ownership-on-restore).
-3. **Choose how to express it** — one of the three approaches below.
+    - **Backup**: pick a UID/GID that can **read** the source.
+    - **Restore**: pick the UID/GID that should **own** the restored files, so the app can read them afterward. To reproduce the *original* ownership exactly, see [Preserving ownership on restore](#preserving-original-ownership-on-restore).
+3. **Choose how to express it**: one of the three approaches below.
 
 /// note | The resolved identity is recorded on every snapshot
 
@@ -333,9 +333,9 @@ A mover that can't read the data it's backing up is the classic footgun. By defa
 1. **At `kubectl apply` (admission warning).** When a SnapshotPolicy's `source.pvc` is mounted by a workload whose UID the mover's explicit `runAsUser` clearly can't match, meaning no shared UID or group, the webhook attaches a non-blocking **warning** to the apply. It is best-effort: it can't see file modes, and the workload may not be running yet.
 
 2. **On reconcile (status condition).** A Backup's `SecurityContextCompatible` condition is **positive-only and certain**. It is never a guess:
-   - `True` — provably fine, checked against the *resolved* mover identity and the live workloads mounting the source. Either the mover is root, or its UID exactly matches **every** container that writes the source, init containers included. Using `inheritSecurityContextFrom` is **not** itself a basis: inheriting only helps if the workload actually pins a `runAsUser`, and the condition says `True` only once it has confirmed the UIDs match.
-   - `False` — set **only** by the certain post-run signal, number 3 below: the completed backup actually excluded unreadable entries. It is never set from an up-front heuristic, so a successful backup of world-readable data is never falsely flagged.
-   - **Absent** — the common case. Not provable from the spec alone, because nobody pinned a UID, or several UIDs write the volume. Absence is not a warning. It means "no claim", and the run proceeds.
+   - `True`: provably fine, checked against the *resolved* mover identity and the live workloads mounting the source. Either the mover is root, or its UID exactly matches **every** container that writes the source, init containers included. Using `inheritSecurityContextFrom` is **not** itself a basis: inheriting only helps if the workload actually pins a `runAsUser`, and the condition says `True` only once it has confirmed the UIDs match.
+   - `False`: set **only** by the certain post-run signal, number 3 below: the completed backup actually excluded unreadable entries. It is never set from an up-front heuristic, so a successful backup of world-readable data is never falsely flagged.
+   - **Absent**: the common case. Not provable from the spec alone, because nobody pinned a UID, or several UIDs write the volume. Absence is not a warning. It means "no claim", and the run proceeds.
 
    ```console
    $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextCompatible")]}'
@@ -413,14 +413,14 @@ A filesystem repository backed by an inline NFS export (`backend.filesystem.volu
 
 The clean answer is to **decouple the two**: read the source as the app's UID, and write the repo through a **shared supplemental group**. Supplemental GIDs *are* sent to the NFS server over AUTH_SYS, within the 16-group limit, so a group-writable export grants write without changing the process's primary UID.
 
-1. **On the NAS** — own the export by the shared group and make it group-writable and setgid, so new repo blobs inherit the GID:
+1. **On the NAS**: own the export by the shared group and make it group-writable and setgid, so new repo blobs inherit the GID:
 
     ```console
     chown -R root:3001 /export/kopia    # or: chown -R 3001:3001
     chmod -R 2775 /export/kopia         # 2 = setgid
     ```
 
-2. **On the repository** — every pod that *writes the backend* must carry the shared group. That means the bootstrap connect/create Job, every snapshot and maintenance mover, **and** the kopia-ui server:
+2. **On the repository**: every pod that *writes the backend* must carry the shared group. That means the bootstrap connect/create Job, every snapshot and maintenance mover, **and** the kopia-ui server:
 
     ```yaml
     spec:
@@ -432,7 +432,7 @@ The clean answer is to **decouple the two**: read the source as the app's UID, a
           supplementalGroups: [3001] # the long-lived server joins it too
     ```
 
-3. **Per recipe** — source reads stay correct because each `SnapshotPolicy` or `Restore` reads as the *app's* identity, for example through `inheritSecurityContextFrom`. The supplemental group is additive and doesn't disturb the primary UID:
+3. **Per recipe**: source reads stay correct because each `SnapshotPolicy` or `Restore` reads as the *app's* identity, for example through `inheritSecurityContextFrom`. The supplemental group is additive and doesn't disturb the primary UID:
 
     ```yaml
     # SnapshotPolicy
@@ -540,7 +540,7 @@ That's the behavior when the recipe has **nothing else to go on**, as here. Add 
 | Set the UID/GID to… | an identity that can read the data | the identity that should **own** the restored files |
 | Default if unset | UID `65532` (reads world-readable / `65532`-owned only), pod `fsGroup: 65532` | UID `65532` (files land owned by `65532`), pod `fsGroup: 65532` |
 | Preserve original ownership | n/a (kopia records it) | needs root + `privilegedMode: true` |
-| Inherit from workload | `SnapshotPolicy.spec.mover.inheritSecurityContextFrom` (`pvcConsumer`/`workloadSelector`) | `Restore.spec.mover.inheritSecurityContextFrom` (`workloadSelector`, or `snapshot: {}` — the backup's recorded identity, no live pod) |
+| Inherit from workload | `SnapshotPolicy.spec.mover.inheritSecurityContextFrom` (`pvcConsumer`/`workloadSelector`) | `Restore.spec.mover.inheritSecurityContextFrom` (`workloadSelector`, or `snapshot: {}`, the backup's recorded identity, no live pod) |
 | Elevated context | namespace `privileged-movers` opt-in | same opt-in |
 | Tolerate permission errors | fails on unreadable files | `spec.options.ignorePermissionErrors` (default `true`) reports instead of failing |
 
@@ -570,18 +570,18 @@ A backup that reports **`Succeeded` but zero files and bytes** is the classic si
 | Thing | Value |
 | --- | --- |
 | Where to set it | `spec.mover.securityContext` (container) + `spec.mover.podSecurityContext` (pod) on `SnapshotPolicy` / `Restore` / `Maintenance` |
-| `fsGroup` | `spec.mover.podSecurityContext.fsGroup` — make a fresh restore volume writable by an unprivileged mover. **Defaults to `65532`** so the kopia cache is writable; override for a restore that must own files as the app's GID |
+| `fsGroup` | `spec.mover.podSecurityContext.fsGroup`: make a fresh restore volume writable by an unprivileged mover. **Defaults to `65532`** so the kopia cache is writable; override for a restore that must own files as the app's GID |
 | Default | container: UID `65532`, `runAsNonRoot: true`, drop ALL caps, seccomp `RuntimeDefault`, no escalation. pod: `fsGroup: 65532`, `fsGroupChangePolicy: OnRootMismatch` |
 | Set the UID/GID | `securityContext.runAsUser` / `runAsGroup` (match the data owner) |
-| Inherit from a workload | `inheritSecurityContextFrom.podSelector` (+ optional `container`) — copies container **and** pod context (UID + fsGroup). Needs the workload to pin `runAsUser`; combines with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback |
-| Inherit the backup's recorded identity (restore) | `inheritSecurityContextFrom: { snapshot: {} }` — replay the uid/gid/fsGroup recorded on the backup (`Snapshot.status.recorded`); works with every source, needs no live pod, holds on `MissingRecordedIdentity` until the catalog scan lands |
+| Inherit from a workload | `inheritSecurityContextFrom.podSelector` (+ optional `container`); copies container **and** pod context (UID + fsGroup). Needs the workload to pin `runAsUser`; combines with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback |
+| Inherit the backup's recorded identity (restore) | `inheritSecurityContextFrom: { snapshot: {} }`: replay the uid/gid/fsGroup recorded on the backup (`Snapshot.status.recorded`); works with every source, needs no live pod, holds on `MissingRecordedIdentity` until the catalog scan lands |
 | Root / preserve ownership | `runAsUser: 0` + `runAsNonRoot: false` (+ `privilegedMode: true` for restore ownership) |
 | Privileged-mover opt-in | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true` |
 | Find the owning UID | [Permissions → Find the UID/GID](permissions.md#step-1--find-the-uidgid-that-owns-your-data) |
 
 ## See also
 
-- [Permissions, UID & GID](permissions.md) — the task-oriented "my backup reads nothing / my restore is unreadable" workflow.
-- [Movers, RBAC & credentials](movers.md) — privileged movers, the minted ServiceAccount, credential placement.
-- [Restores](restores.md) — restore targets, options, and `ignorePermissionErrors`.
+- [Permissions, UID & GID](permissions.md): the task-oriented "my backup reads nothing / my restore is unreadable" workflow.
+- [Movers, RBAC & credentials](movers.md): privileged movers, the minted ServiceAccount, credential placement.
+- [Restores](restores.md): restore targets, options, and `ignorePermissionErrors`.
 - [Example 09](examples.md#example-09--mover-uidgid--permissions) · [Example 18](examples.md#example-18--inherit-the-mover-security-context-from-a-workload).
