@@ -1,16 +1,8 @@
 # Repository health & preflight checks
 
-This page enumerates **every health/preflight check Kopiur runs today** — what each
-one does, where it surfaces, and what it gates — including the default-on **backend
-health probe** (which doubles as the **repository circuit breaker**,
-[ADR-0007](adr/0007-repository-circuit-breaker.md)) and the opt-in **CEL backup
-preflight** (user-declared preconditions a backup must satisfy before it runs).
+This page lists **every health and preflight check Kopiur runs today**: what each one does, where it shows up, and what it blocks. That includes the default-on **backend health probe**, which doubles as the **repository circuit breaker** ([ADR-0007](adr/0007-repository-circuit-breaker.md)), and the opt-in **CEL backup preflight**, which is a set of conditions you declare that a backup must satisfy before it runs.
 
-The mental model: Kopiur separates the **repository** (a first-class resource whose
-reconcile owns connectivity) from the **work** (`Snapshot`/`Restore`/`Maintenance`/…
-that runs in a short-lived mover Job). Most "preflight" is therefore **the work
-refusing to start until the repository is known healthy**, rather than each Job
-re-testing the backend itself.
+The mental model: Kopiur separates the **repository** from the **work**. The repository is a first-class resource whose reconcile owns connectivity. The work is a `Snapshot`, `Restore`, `Maintenance` or similar that runs in a short-lived mover Job. Most "preflight" is therefore **the work refusing to start until the repository is known healthy**, rather than each Job re-testing the backend itself.
 
 ## What runs today
 
@@ -18,10 +10,10 @@ re-testing the backend itself.
 |---|---|---|---|
 | **Connectivity probe** (`kopia repository connect`) | Repository reconcile | `status.phase` (`Pending`→`Initializing`→`Ready`/`Degraded`/`Failed`) + `Ready`/`Stalled` conditions | Everything downstream keys off `phase == Ready` |
 | **Readiness gate** (`repository_ready`) | `Snapshot`, `SnapshotPolicy`, `RepositoryReplication`, `Restore` reconcilers | `RepositoryNotReady` / `WaitingForRepository` reason, held in `Pending`/`Reconciling` | Building & launching the mover Job |
-| **Maintenance gate** (`maintenance_may_proceed`) | `Maintenance` reconciler | `WaitingForRepository` reason on `LeaseOwned` | Deliberately WIDER than the readiness gate ([#413](https://github.com/home-operations/kopiur/issues/413)): maintenance runs for any once-bootstrapped repository — `Degraded` included — unless the backend is confirmed unreachable/vanished or the phase is terminal, because index compaction is often the cure for a `Degraded`-because-slow repository |
-| **Backup preflight** (opt-in, `spec.preflight`) | `Snapshot` reconcile (before launch) | `PreflightFailed` reason, held in `Pending` then `Failed` after `timeout` | User-declared CEL preconditions (e.g. maintenance freshness) before the backup Job runs |
+| **Maintenance gate** (`maintenance_may_proceed`) | `Maintenance` reconciler | `WaitingForRepository` reason on `LeaseOwned` | Deliberately WIDER than the readiness gate ([#413](https://github.com/home-operations/kopiur/issues/413)): maintenance runs for any once-bootstrapped repository, `Degraded` included, unless the backend is confirmed unreachable or vanished, or the phase is terminal. Index compaction is often the cure for a `Degraded`-because-slow repository |
+| **Backup preflight** (opt-in, `spec.preflight`) | `Snapshot` reconcile (before launch) | `PreflightFailed` reason, held in `Pending` then `Failed` after `timeout` | CEL conditions you declare, such as maintenance freshness, before the backup Job runs |
 | **Reactive re-probe on failure** | `Snapshot` reconciler → repository | `reverify-requested-at` annotation → `status.lastReverifyAt` | Forces a fresh connectivity probe within ~60s of a failed backup |
-| **Backend health probe** (default-ON, `spec.health.probe`) | Repository reconcile (post-`Ready`) | `BackendReachable` condition (`RepositoryVanished` / `BackendUnreachable` / `ProbeDeadlineExceeded`) + Warning Event + `kopiur_repository_health_probe_failures` | **The circuit breaker's sensor**: past `failureThreshold`, `onFailure: Degrade` (default) moves the repo to `Degraded` and pauses backups/replication until a re-connect succeeds (maintenance also pauses for unreachable/vanished, but keeps running for a deadline kill); `onFailure: Alert` keeps it advisory (repo stays `Ready`) |
+| **Backend health probe** (default-ON, `spec.health.probe`) | Repository reconcile (post-`Ready`) | `BackendReachable` condition (`RepositoryVanished` / `BackendUnreachable` / `ProbeDeadlineExceeded`) + Warning Event + `kopiur_repository_health_probe_failures` | **The circuit breaker's sensor**: past `failureThreshold`, `onFailure: Degrade` (default) moves the repo to `Degraded` and pauses backups and replication until a re-connect succeeds. Maintenance also pauses for unreachable or vanished, but keeps running for a deadline kill. `onFailure: Alert` keeps it advisory and the repo stays `Ready` |
 | **Credentials available** | Mover preflight | `CredentialsAvailable=False` + Warning Event | The mover starting (the credential Secret must exist in the workload namespace) |
 | **Mover permitted** | Admission / reconcile | `MoverPermitted=False` | A privileged mover that wasn't opted in |
 | **Security-context compatibility** | Admission (advisory) + post-run | admission Warning + `SecurityContextCompatible=False` | Advisory — warns the mover UID likely can't read the source |
@@ -31,11 +23,7 @@ re-testing the backend itself.
 
 ### The fail-fast gate (the headline behavior)
 
-A `Snapshot` will **not** spawn a mover Job while its repository is not `Ready`. Instead
-of a storm of pods that each only fail on `kopia repository connect` (the classic
-"volsync spins up jobs that can't do anything" after a NAS doesn't come back from a
-power loss), the backup holds in `Pending` with reason `RepositoryNotReady` and
-resumes automatically once the repository reconnects.
+A `Snapshot` will **not** spawn a mover Job while its repository is not `Ready`. You do not get a storm of pods that each only fail on `kopia repository connect`. That is the classic "volsync spins up jobs that can't do anything" problem after a NAS doesn't come back from a power loss. Instead, the backup holds in `Pending` with reason `RepositoryNotReady` and resumes automatically once the repository reconnects.
 
 ```console
 $ kubectl get snapshot <name> -n <ns> \
@@ -43,132 +31,57 @@ $ kubectl get snapshot <name> -n <ns> \
 # → "waiting for repository `nas` to become `Ready` before launching the backup…"
 ```
 
-This is the same gate `Maintenance`, `SnapshotPolicy`, and `RepositoryReplication`
-already applied; `Snapshot` and `Restore` were the write paths that skipped it, and
-both are gated now.
+This is the same gate `Maintenance`, `SnapshotPolicy`, and `RepositoryReplication` already applied. `Snapshot` and `Restore` were the write paths that skipped it, and both are gated now.
 
 ### How the repository's `phase` is kept current
 
-- **Bare-path filesystem** repos (reachable from the controller's own filesystem) connect
-  **in-process on every reconcile** — steady-state every 5 minutes, or immediately when a
-  re-probe is requested. Detection here is prompt.
-- **Object-store and volume-backed filesystem** repos connect in a **short bootstrap
-  Job** (the controller can't reach the backend or mount the volume in-process). The
-  default-on [backend health probe](#backend-health-probe-default-on) re-runs that
-  connect every `probe.interval` (default `30m`), so `phase` tracks the backend on a
-  timer — plus immediately on a spec change or the re-probe nudge below.
-  `catalog.periodicRefresh: true` additionally recycles the bootstrap Job every
-  `catalog.refreshInterval` (default `1h`) for catalog freshness.
-- **While the circuit breaker is open** (phase `Degraded`), the repository retries the
-  connect itself on an exponential backoff — 120s doubling to a 1800s cap per
-  consecutive failure (120→240→480→960→1800; every failed attempt re-arms the
-  hold-off, including a result-less Job kill, so a doomed loop decays to ~2
-  billed attempts/hour against a paid object store) — and **any** successful
-  connect (probe or retry) heals it back to `Ready` automatically. When the
-  failures are DEADLINE kills, the retry also escalates the bootstrap
-  deadline itself (doubling from the spec base up to 30m), so a
-  slow-but-alive backend self-heals without a spec edit. The phase holds
-  `Degraded` **stably** between retries (no `Initializing` flapping), so alerts
-  with a `for:` clause and the consumer gates see one coherent open state.
+- **Bare-path filesystem** repositories, which are reachable from the controller's own filesystem, connect **in-process on every reconcile**. That means every 5 minutes in steady state, or immediately when a re-probe is requested. Detection here is prompt.
+- **Object-store and volume-backed filesystem** repositories connect in a **short bootstrap Job**, because the controller can't reach the backend or mount the volume in-process. The default-on [backend health probe](#backend-health-probe-default-on) re-runs that connect every `probe.interval`, default `30m`, so `phase` tracks the backend on a timer. It also updates immediately on a spec change or the re-probe nudge below. Setting `catalog.periodicRefresh: true` additionally recycles the bootstrap Job every `catalog.refreshInterval`, default `1h`, for catalog freshness.
+- **While the circuit breaker is open** (phase `Degraded`), the repository retries the connect itself on an exponential backoff: 120s doubling to a 1800s cap per consecutive failure, so 120, 240, 480, 960, 1800. Every failed attempt re-arms the hold-off, including a Job killed before it returns a result, so a doomed loop decays to roughly 2 billed attempts an hour against a paid object store. **Any** successful connect, whether a probe or a retry, heals it back to `Ready` automatically. When the failures are DEADLINE kills, the retry also raises the bootstrap deadline itself, doubling from the spec base up to 30m, so a slow-but-alive backend self-heals without a spec edit. The phase holds `Degraded` **stably** between retries, with no `Initializing` flapping, so alerts with a `for:` clause and the consumer gates see one coherent open state.
 
 ### Reactive re-probe (closing most of the latency window)
 
-When a backup mover Job fails, the `Snapshot` stamps a rate-limited
-`reverify-requested-at` annotation on its repository, asking it to re-probe connectivity
-**now** rather than waiting for the next probe interval. The repository honors a fresh
-token once (loop-guarded on `status.lastReverifyAt`). What the re-probe's verdict does
-depends on its class: a **retryable outage** (connection refused/timeout, DNS — the
-`RepositoryUnavailable` class) on an already-bootstrapped repository lands `Degraded`
-(kstatus `Reconciling` — self-healing, `flux wait` keeps waiting) and enters the retry
-loop above; a **terminal** verdict (bad credentials, locked, vanished-and-confirmed)
-lands `Failed` (kstatus `Stalled` — a human is needed). Either way the gate then
-suppresses further Jobs.
+When a backup mover Job fails, the `Snapshot` stamps a rate-limited `reverify-requested-at` annotation on its repository, asking it to re-probe connectivity **now** rather than waiting for the next probe interval. The repository honors a fresh token once, loop-guarded on `status.lastReverifyAt`. What the re-probe's verdict does depends on its class. A **retryable outage**, meaning connection refused, a timeout, or DNS, which is the `RepositoryUnavailable` class, on an already-bootstrapped repository lands `Degraded`. In kstatus terms that is `Reconciling`, so it is self-healing and `flux wait` keeps waiting, and the repository enters the retry loop above. A **terminal** verdict, meaning bad credentials, locked, or vanished-and-confirmed, lands `Failed`. In kstatus terms that is `Stalled`, so a human is needed. Either way the gate then suppresses further Jobs.
 
 /// note | The detection window is one Job, and only the first
 
-An outage that begins between backups is detected either by the next scheduled probe
-(within `probe.interval`) or by the next backup's failure — whichever comes first. A
-backup already in flight (or launched inside that window) fails: **one** doomed Job
-per outage. It cannot become one per schedule tick any more — the failure nudges the
-re-probe, the probe failures cross `failureThreshold`, and the breaker opens. This
-replaces the old "known limitation": before the breaker, a *retryable* outage never
-flipped the phase at all, so the gate stayed open and every slot burned a Job
-(issue [#345](https://github.com/home-operations/kopiur/issues/345): 53 Failed CRs,
-23 dead Jobs). Bare-path filesystem repos don't even have the one-Job window (they
-re-probe every reconcile).
+An outage that begins between backups is detected either by the next scheduled probe, within `probe.interval`, or by the next backup's failure, whichever comes first. A backup already in flight, or launched inside that window, fails: **one** doomed Job per outage. It cannot become one per schedule tick any more. The failure nudges the re-probe, the probe failures cross `failureThreshold`, and the breaker opens. This replaces the old "known limitation": before the breaker, a *retryable* outage never flipped the phase at all, so the gate stayed open and every slot burned a Job. See issue [#345](https://github.com/home-operations/kopiur/issues/345), which reported 53 Failed CRs and 23 dead Jobs. Bare-path filesystem repositories don't even have the one-Job window, since they re-probe every reconcile.
 
 ///
 
 ## Backend health probe (default-ON)
 
-`spec.health.probe` gives every Repository (and ClusterRepository) a **periodic
-backend re-connect** so a wiped or unreachable repository is detected proactively —
-without waiting for the next backup to fail. Since
-[ADR-0007](adr/0007-repository-circuit-breaker.md) it is **on by default**; you only
-write the block to tune it or opt out.
+`spec.health.probe` gives every Repository and ClusterRepository a **periodic backend re-connect**, so a wiped or unreachable repository is detected proactively instead of waiting for the next backup to fail. Since [ADR-0007](adr/0007-repository-circuit-breaker.md) it is **on by default**. You only write the block to tune it or opt out.
 
 ```yaml
 --8<-- "deploy/examples/27-repository-health-probe.yaml:health"
 ```
 
-The full apply-ready example (Secret + Repository):
-[`deploy/examples/27-repository-health-probe.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/27-repository-health-probe.yaml).
+The full apply-ready example, Secret plus Repository, is [`deploy/examples/27-repository-health-probe.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/27-repository-health-probe.yaml).
 
-**What sustained failure does is `probe.onFailure`:**
+**What sustained failure does is set by `probe.onFailure`:**
 
-- **`Degrade` (default) — the circuit breaker.** Past `failureThreshold`
-  consecutive failed connects the repository moves to phase **`Degraded`**
-  (`BackendReachable=False`, `Ready=False`) and the consumer gates close:
-  backups, replication, and restores **pause** instead of burning mover Jobs
-  against a dead backend. Maintenance pauses only for a confirmed
-  unreachable/vanished backend — a repository that is `Degraded` because its
-  connects keep exceeding the bootstrap deadline (`ProbeDeadlineExceeded`)
-  **still gets maintenance**, because index compaction is usually the cure
-  for a slow connect ([#413](https://github.com/home-operations/kopiur/issues/413)).
-  Recovery is automatic — the repository keeps re-connecting on a 120s→1800s
-  backoff (with deadline escalation for timeout kills), and any success heals
-  it to `Ready`, cleared streak and all. Nothing needs restarting or
-  acknowledging.
-- **`Alert` — the opt-out.** The repository **stays `Ready`** even when the
-  probe raises an alert, so backups keep running (and failing) against the
-  unhealthy backend. This is the pre-breaker behavior for users who prefer
-  try-anyway.
+- **`Degrade` (default), the circuit breaker.** Past `failureThreshold` consecutive failed connects, the repository moves to phase **`Degraded`** with `BackendReachable=False` and `Ready=False`, and the consumer gates close. Backups, replication and restores **pause** instead of burning mover Jobs against a dead backend. Maintenance pauses only for a confirmed unreachable or vanished backend. A repository that is `Degraded` because its connects keep exceeding the bootstrap deadline (`ProbeDeadlineExceeded`) **still gets maintenance**, because index compaction is usually the cure for a slow connect ([#413](https://github.com/home-operations/kopiur/issues/413)). Recovery is automatic: the repository keeps re-connecting on a 120s to 1800s backoff, with deadline escalation for timeout kills, and any success heals it to `Ready` and clears the failure streak. Nothing needs restarting or acknowledging.
+- **`Alert`, the opt-out.** The repository **stays `Ready`** even when the probe raises an alert, so backups keep running, and failing, against the unhealthy backend. This is the pre-breaker behavior, for users who prefer try-anyway.
 
 Under either mode a failure surfaces as:
 
-- a `BackendReachable` **condition** (`True` healthy; `False` with reason
-  `RepositoryVanished`, `BackendUnreachable`, or `ProbeDeadlineExceeded`),
-- a **Warning Event** (`kubectl describe`), fired once per episode (after the
-  debounce, and again if the failure *reason* escalates),
+- a `BackendReachable` **condition**: `True` when healthy; `False` with reason `RepositoryVanished`, `BackendUnreachable`, or `ProbeDeadlineExceeded`,
+- a **Warning Event** visible in `kubectl describe`, fired once per episode after the debounce, and again if the failure *reason* escalates,
 - the `kopiur_repository_health_probe_failures{kind,namespace,name,outcome}` metric.
 
 ### What "paused" looks like (and how it recovers)
 
-While the breaker is open, gated work **parks** — it is deferred, never refused or
-lost. A scheduled `Snapshot` holds in `Pending` with `Ready` reason
-`RepositoryNotReady`; with the default `concurrencyPolicy: Forbid` that parked run
-counts as active, so later slots wait and parked work is **bounded at one** per
-schedule. On recovery the parked (pinned stale) slot fires **exactly once** as the
-catch-up backup, and the normal cadence resumes. (`concurrencyPolicy: Allow`
-schedules park one `Pending` per slot — that policy's declared overlap contract.)
+While the breaker is open, gated work **parks**. It is deferred, never refused or lost. A scheduled `Snapshot` holds in `Pending` with `Ready` reason `RepositoryNotReady`. With the default `concurrencyPolicy: Forbid` that parked run counts as active, so later slots wait and parked work is **bounded at one** per schedule. On recovery the parked slot, which is pinned stale, fires **exactly once** as the catch-up backup, and the normal cadence resumes. A `concurrencyPolicy: Allow` schedule parks one `Pending` per slot instead, which is that policy's declared overlap behavior.
 
-On the wire this is visible as:
+In metrics this is visible as:
 
-- `kopiur_repository_breaker_trips_total{kind,namespace,name,probe_kind}` — one
-  increment per breaker opening (the transition, never re-confirmations),
-- `kopiur_repository_consecutive_backend_failures{kind,namespace,name}` — the
-  live failure streak (a `0` after recovery means "healed"),
-- `kopiur_repository_breaker_open_since_timestamp_seconds{kind,namespace,name}` —
-  exists **only while open**; `time() - metric` is the open duration,
-- `kopiur_repository_breaker_open{kind,namespace,name,reason}` — 1 for the same
-  open window, with the **cause** (`unreachable`/`vanished`/`timed_out`) so
-  alerting can split a hard outage from the self-healing slow-connect spiral,
-- `kopiur_snapshot_gated{namespace,policy}` — the parked-`Pending` population,
-  draining to absence on recovery,
-- Helm alert rules `KopiurRepositoryBreakerOpen` (warning, 15m — hard causes),
-  `KopiurRepositoryConnectSlow` (info, 30m — the `timed_out` cause), and
-  `KopiurSnapshotsGated` (info, 30m) — see
-  [observability](dev/observability.md).
+- `kopiur_repository_breaker_trips_total{kind,namespace,name,probe_kind}` — one increment per breaker opening, counting the transition only, never re-confirmations,
+- `kopiur_repository_consecutive_backend_failures{kind,namespace,name}` — the live failure streak, where a `0` after recovery means "healed",
+- `kopiur_repository_breaker_open_since_timestamp_seconds{kind,namespace,name}` — exists **only while open**; `time() - metric` is the open duration,
+- `kopiur_repository_breaker_open{kind,namespace,name,reason}` — 1 for the same open window, with the **cause** (`unreachable`/`vanished`/`timed_out`) so alerting can tell a hard outage from the self-healing slow-connect spiral,
+- `kopiur_snapshot_gated{namespace,policy}` — the parked-`Pending` population, draining to absence on recovery,
+- Helm alert rules `KopiurRepositoryBreakerOpen` (warning, 15m, hard causes), `KopiurRepositoryConnectSlow` (info, 30m, the `timed_out` cause), and `KopiurSnapshotsGated` (info, 30m). See [observability](dev/observability.md).
 
 Three failures are reported distinctly, because they demand different responses:
 
@@ -176,36 +89,19 @@ Three failures are reported distinctly, because they demand different responses:
 |---|---|---|
 | `RepositoryVanished` | backend **reachable**, kopia repository **absent** (format blob gone) | Verify the backend is *truly* empty before any re-create (see warning below) |
 | `BackendUnreachable` | backend unreachable, mount/path missing, or auth/lock failed | Fix the backend / credentials / volume; **not** a wipe |
-| `ProbeDeadlineExceeded` | the connect was **killed by the bootstrap Job deadline** — the backend may be reachable but slow (a cold cache over many index blobs) | Usually nothing: maintenance keeps running and kopiur escalates the deadline itself. To accelerate, raise `spec.bootstrap.failurePolicy.activeDeadlineSeconds` |
+| `ProbeDeadlineExceeded` | the connect was **killed by the bootstrap Job deadline** — the backend may be reachable but slow (a cold cache over many index blobs) | Usually nothing: maintenance keeps running and kopiur raises the deadline itself. To accelerate, raise `spec.bootstrap.failurePolicy.activeDeadlineSeconds` |
 
 /// warning | kopiur never auto-recreates a repository it once trusted
 
-A wiped repository and a transient outage look alike, and silently creating a
-fresh empty repository over a real one destroys restorability. So
-`create.enabled` governs the **first** bootstrap only — once a repository has
-been `Ready` (it carries a pinned `status.uniqueId`), kopiur will **never**
-recreate it, even on a `RepositoryVanished` alert. Re-creating is always a
-deliberate human action. Under the default `onFailure: Degrade` a vanish first
-opens the breaker (`Degraded` — pausing is right either way) and the retry loop
-then confirms it: a repository that is genuinely gone escalates to **terminal
-`Failed`** for a human, still without recreating anything. And a
-`RepositoryVanished` alert means the *format blob* is gone — **data blobs may
-still remain** and be recoverable, so verify the backend is genuinely empty
-(and that no other Repository points at the same backend) before you act.
+A wiped repository and a transient outage look alike, and silently creating a fresh empty repository over a real one destroys restorability. So `create.enabled` governs the **first** bootstrap only. Once a repository has been `Ready`, meaning it carries a pinned `status.uniqueId`, kopiur will **never** recreate it, even on a `RepositoryVanished` alert. Re-creating is always a deliberate human action. Under the default `onFailure: Degrade` a vanish first opens the breaker, moving the repository to `Degraded`, since pausing is right either way. The retry loop then confirms it: a repository that is genuinely gone escalates to terminal **`Failed`** for a human, still without recreating anything. And a `RepositoryVanished` alert means the *format blob* is gone. **Data blobs may still remain** and be recoverable, so verify the backend is genuinely empty, and that no other Repository points at the same backend, before you act.
 
 ///
 
 ### Deliberately re-initialize a wiped repository
 
-When a once-`Ready` repository's backend is genuinely gone — the bucket was
-deleted, a lifecycle rule emptied it, someone ran `rm -rf` on the export — the
-repository parks at terminal `Failed` with reason
-`RepositoryReinitializeBlocked`, and its `Ready` condition message carries the
-exact command to run. `kubectl kopiur status` prints that message verbatim, and
-so does `kubectl describe`.
+When a once-`Ready` repository's backend is genuinely gone, because the bucket was deleted, a lifecycle rule emptied it, or someone ran `rm -rf` on the export, the repository parks at terminal `Failed` with reason `RepositoryReinitializeBlocked`. Its `Ready` condition message carries the exact command to run. `kubectl kopiur status` prints that message word for word, and so does `kubectl describe`.
 
-The acknowledgement is an annotation whose **value is the repository's current
-`status.uniqueId`**:
+The acknowledgement is an annotation whose **value is the repository's current `status.uniqueId`**:
 
 ```console
 $ kubectl get repository nas -n billing -o jsonpath='{.status.uniqueId}'
@@ -215,113 +111,46 @@ $ kubectl annotate repository nas -n billing \
     kopiur.home-operations.com/allow-reinitialize=c9b1f0e4a7d24e11 --overwrite
 ```
 
-For a cluster-scoped `ClusterRepository`, drop the `-n`. `--overwrite` is there
-because the annotation is routinely already present — a stale value left behind
-by the last re-initialize — and `kubectl annotate` refuses to replace one
-without it.
+For a cluster-scoped `ClusterRepository`, drop the `-n`. You need `--overwrite` because the annotation is routinely already present, left over from the last re-initialize, and `kubectl annotate` refuses to replace one without it.
 
-On the next reconcile kopiur treats that one pass as a first bootstrap: it
-creates a fresh kopia repository at the backend, pins a **new** `uniqueId`, heals
-the circuit breaker, and backups resume. If `spec.seed` is set, the seed re-arms
-and re-seeds from the source — the stale `status.seed` from the old repository is
-cleared first, so nothing "resumes" a copy into storage that no longer holds it.
+On the next reconcile kopiur treats that one pass as a first bootstrap. It creates a fresh kopia repository at the backend, pins a **new** `uniqueId`, heals the circuit breaker, and backups resume. If `spec.seed` is set, the seed re-arms and re-seeds from the source. The stale `status.seed` from the old repository is cleared first, so nothing "resumes" a copy into storage that no longer holds it.
 
 /// warning | This discards the old repository's history
 
-Re-initializing does not recover anything. Every snapshot the old repository held
-is unrecoverable from that backend afterwards. **Verify the backend is genuinely
-empty first** — a `RepositoryVanished` alert means the *format blob* is gone, and
-data blobs may still be there. If the wipe was not deliberate, restore the
-backend (or point `spec.backend` at a replica) instead of acknowledging.
+Re-initializing does not recover anything. Every snapshot the old repository held is unrecoverable from that backend afterwards. **Verify the backend is genuinely empty first.** A `RepositoryVanished` alert means the *format blob* is gone, and data blobs may still be there. If the wipe was not deliberate, restore the backend, or point `spec.backend` at a replica, instead of acknowledging.
 
 ///
 
 Three properties make the annotation safe to leave in a GitOps manifest:
 
-- **It is self-expiring.** It is honored only while its value equals the pinned
-  `status.uniqueId`. A successful re-initialize mints a new id, so the annotation
-  immediately stops matching and a *future* wipe parks again, needing a fresh
-  acknowledgement naming the new id.
-- **A mismatched value is ignored**, not guessed at. While the repository is not
-  `Ready`, kopiur raises an `InvalidReinitializeAck` Warning event naming the
-  value it expects. Once the repository is healthy again a stale value is inert
-  *and* silent — so the annotation you left behind after a successful
-  re-initialize does not become a standing Warning.
-- **It does nothing to a healthy repository.** The ack only becomes a permission
-  to create once the repository has left `Ready`, so it can never turn a routine
-  health probe into a re-create. If the backend is reachable and the repository
-  is present there is nothing to re-initialize; kopiur emits a
-  `ReinitializeAckIgnoredRepositoryPresent` Normal event so you know the
-  annotation was seen, and wipes nothing.
-- **It acts only on the verdict it was written for.** Leaving `Ready` is not
-  enough on its own: the ack is honored only while kopiur has *itself* observed
-  "backend reachable, repository absent" for the pinned id — a `Ready` reason of
-  `RepositoryReinitializeBlocked`, or the breaker's `BackendReachable` reason
-  `RepositoryVanished`. Any other excursion (an unreachable backend, a wrong
-  password, an unbound NFS mount or a wrong bucket prefix — both of which kopia
-  also reports as `NotFound` — a bootstrap deadline) leaves the annotation
-  **dormant** and raises a `ReinitializeAckDormant` Warning event naming the
-  current reason. Two independent locks back this: the controller only arms the
-  create for that verdict, and the mover, even when armed, creates only where
-  kopia's own stderr proves the storage holds no repository — a plain `NotFound`
-  declines with its real class. So an annotation left in Git after a successful
-  re-initialize cannot quietly re-create over a later, unrelated outage.
+- **It expires on its own.** It is honored only while its value equals the pinned `status.uniqueId`. A successful re-initialize mints a new id, so the annotation immediately stops matching, and a *future* wipe parks again and needs a fresh acknowledgement naming the new id.
+- **A mismatched value is ignored**, not guessed at. While the repository is not `Ready`, kopiur raises an `InvalidReinitializeAck` Warning event naming the value it expects. Once the repository is healthy again, a stale value is inert *and* silent, so the annotation you left behind after a successful re-initialize does not become a standing Warning.
+- **It does nothing to a healthy repository.** The acknowledgement only becomes permission to create once the repository has left `Ready`, so it can never turn a routine health probe into a re-create. If the backend is reachable and the repository is present there is nothing to re-initialize. kopiur emits a `ReinitializeAckIgnoredRepositoryPresent` Normal event so you know the annotation was seen, and wipes nothing.
+- **It acts only on the verdict it was written for.** Leaving `Ready` is not enough on its own. The acknowledgement is honored only while kopiur has *itself* observed "backend reachable, repository absent" for the pinned id, which shows up as a `Ready` reason of `RepositoryReinitializeBlocked`, or the breaker's `BackendReachable` reason `RepositoryVanished`. Any other excursion leaves the annotation **dormant** and raises a `ReinitializeAckDormant` Warning event naming the current reason. That covers an unreachable backend, a wrong password, an unbound NFS mount, or a wrong bucket prefix, the last two of which kopia also reports as `NotFound`, and a bootstrap deadline. Two independent locks back this up: the controller only arms the create for that verdict, and the mover, even when armed, creates only where kopia's own stderr proves the storage holds no repository. A plain `NotFound` declines with its real class. So an annotation left in Git after a successful re-initialize cannot quietly re-create over a later, unrelated outage.
 
-kopiur never adds, rewrites, or removes this annotation — there is no "honored"
-stamp to keep in sync. Remove it whenever you like.
+kopiur never adds, rewrites, or removes this annotation, and there is no "honored" stamp to keep in sync. Remove it whenever you like.
 
 /// tip | Tuning & opting out
 
-- `interval` — how often to re-connect (Go-style duration; min `30s`, default
-  `30m`). Each probe runs a short connect, so leave it long for metered stores.
-- `failureThreshold` — consecutive failing probes required before the failure
-  is acted on (default `3`). Debounces a single transient blip (an S3
-  list-after-delete race, a NAS reboot) from alarming or tripping the breaker.
-  Any success resets the counter and clears the condition.
-- `onFailure: Alert` — keep the repository `Ready` through failures
-  (alert-only; backups never pause).
-- `enabled: false` — no probe at all, which also disables the breaker (the
-  probe is its only sensor): detection falls back to the next backup's failure.
+- `interval` is how often to re-connect, a Go-style duration, minimum `30s`, default `30m`. Each probe runs a short connect, so leave it long for metered stores.
+- `failureThreshold` is how many consecutive failing probes are required before the failure is acted on, default `3`. It debounces a single transient blip, such as an S3 list-after-delete race or a NAS reboot, so it doesn't alarm or trip the breaker. Any success resets the counter and clears the condition.
+- `onFailure: Alert` keeps the repository `Ready` through failures. Alert-only; backups never pause.
+- `enabled: false` means no probe at all, which also disables the breaker, since the probe is its only sensor. Detection then falls back to the next backup's failure.
 
 ///
 
 /// note | How a probe run is tracked
 
-On an object-store, server, or volume-backed backend a probe re-connects by
-running the repository's `<name>-discovery` mover Job, so kopiur tracks each run
-across two reconciles:
+On an object-store, server, or volume-backed backend, a probe re-connects by running the repository's `<name>-discovery` mover Job, so kopiur tracks each run across two reconciles:
 
-- `status.health.probeAttemptAt` is stamped when the Job is **launched** and
-  cleared when its result is finalized. While it is set, the finished Job is
-  recognised as *that probe's* result rather than a stale one to recycle.
-- `status.health.lastProbeAt` is stamped when the run **finishes** (success or
-  failure) and drives the interval timer.
+- `status.health.probeAttemptAt` is stamped when the Job is **launched** and cleared when its result is finalized. While it is set, the finished Job is recognised as *that probe's* result rather than a stale one to recycle.
+- `status.health.lastProbeAt` is stamped when the run **finishes**, on success or failure, and drives the interval timer.
 
-A probe consumes its Job exactly once, so a healthy repository creates and
-destroys **one** mover Job per `interval` — if you see the bootstrap Job
-recreated every few seconds, that is [#273][issue-273], fixed in v0.7.6. A
-successful bootstrap (or breaker-recovery connect) also **seeds** `lastProbeAt`,
-so the first periodic probe lands one full `interval` after the connect that
-just proved the backend healthy — never immediately on top of it.
+A probe consumes its Job exactly once, so a healthy repository creates and destroys **one** mover Job per `interval`. If you see the bootstrap Job recreated every few seconds, that is [#273][issue-273], fixed in v0.7.6. A successful bootstrap, or a breaker-recovery connect, also **seeds** `lastProbeAt`, so the first periodic probe lands one full `interval` after the connect that just proved the backend healthy, never immediately on top of it.
 
-A probe also stands aside while a real (re-)bootstrap is in flight: a repository
-that is not `Ready` (a spec change is being applied, the bootstrap has failed,
-or the breaker is open) does not run the interval probe. While `Degraded` the
-**strict retry loop** is the sensor instead — same connect, same
-`consecutiveProbeFailures` streak, on the 120s→1800s backoff — so the streak
-keeps counting across the whole outage and any success heals. Since
-[#415](https://github.com/home-operations/kopiur/issues/415) a result-less Job
-failure (crash, eviction, deadline kill) feeds the same streak, so every retry
-route backs off instead of relaunching on a flat cadence. `phase: Failed` /
-`phase: Degraded` is the louder signal in that window.
+A probe also stands aside while a real bootstrap or re-bootstrap is in flight. A repository that is not `Ready`, because a spec change is being applied, the bootstrap has failed, or the breaker is open, does not run the interval probe. While `Degraded` the **strict retry loop** is the sensor instead: same connect, same `consecutiveProbeFailures` streak, on the 120s to 1800s backoff. So the streak keeps counting across the whole outage and any success heals it. Since [#415](https://github.com/home-operations/kopiur/issues/415) a Job that fails without producing a result, from a crash, eviction, or deadline kill, feeds the same streak, so every retry route backs off instead of relaunching on a flat cadence. `phase: Failed` and `phase: Degraded` are the louder signal in that window.
 
-A pure probe run is also **cheap** regardless of catalog size: it skips the
-`kopia snapshot list` catalog step (the part of a full bootstrap whose cost
-scales with the number of snapshots) while keeping the connect — the actual
-health signal — plus the stale-maintenance-owner self-heal, `set-parameters`
-drift correction, and the index-blob count that feeds `IndexBlobHealth`. A
-launch that also owes catalog work (a scan request, a periodic refresh, a spec
-change) always runs the full bootstrap.
+A pure probe run is also **cheap** regardless of catalog size. It skips the `kopia snapshot list` catalog step, the part of a full bootstrap whose cost scales with the number of snapshots, while keeping the connect, which is the actual health signal. It also keeps the stale-maintenance-owner self-heal, `set-parameters` drift correction, and the index-blob count that feeds `IndexBlobHealth`. A launch that also owes catalog work, such as a scan request, a periodic refresh, or a spec change, always runs the full bootstrap.
 
 [issue-273]: https://github.com/home-operations/kopiur/issues/273
 
@@ -329,28 +158,15 @@ change) always runs the full bootstrap.
 
 ## Backup preflight (opt-in)
 
-The readiness gate above is a single hard-coded precondition: *the repository is
-`Ready`*. `spec.preflight` on a **`SnapshotPolicy`** generalizes that into
-**user-declared preconditions** — named CEL expressions that must **all** hold before
-a backup's mover Job launches. It's the same CEL engine `successExpr` and the identity
-`*Expr` fields use, evaluated by the operator at reconcile against **live repository +
-maintenance state**.
+The readiness gate above is a single hard-coded precondition: *the repository is `Ready`*. `spec.preflight` on a **`SnapshotPolicy`** generalizes that into **conditions you declare yourself**: named CEL expressions that must **all** hold before a backup's mover Job launches. It is the same CEL engine that `successExpr` and the identity `*Expr` fields use, evaluated by the operator at reconcile against **live repository and maintenance state**.
 
 ```yaml
 --8<-- "deploy/examples/28-preflight-checks.yaml:preflight"
 ```
 
-The full apply-ready example (Secret + Repository + SnapshotPolicy + SnapshotSchedule):
-[`deploy/examples/28-preflight-checks.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/28-preflight-checks.yaml).
+The full apply-ready example, with Secret, Repository, SnapshotPolicy and SnapshotSchedule, is [`deploy/examples/28-preflight-checks.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/28-preflight-checks.yaml).
 
-**How a failing check behaves.** A `Snapshot` whose preflight isn't satisfied is held in
-`Pending` with reason `PreflightFailed` (no mover Job is created). Once
-`spec.preflight.timeout` elapses (default `10m`; `0` holds forever), it transitions to
-`Failed` — bounded so a schedule firing against a never-met precondition doesn't pile up
-`Pending` CRs. The timeout clock starts when the check **first fails** (after the
-repository is `Ready`), not at Snapshot creation, so a slow-to-connect repository doesn't
-eat the budget. `Failed` preflight Snapshots are pruned by the schedule's
-[`failedJobsHistoryLimit`](#bounding-failed-snapshots).
+**How a failing check behaves.** A `Snapshot` whose preflight isn't satisfied is held in `Pending` with reason `PreflightFailed`, and no mover Job is created. Once `spec.preflight.timeout` elapses, default `10m`, or `0` to hold forever, it transitions to `Failed`. That bound stops a schedule firing against a never-met precondition from piling up `Pending` CRs. The timeout clock starts when the check **first fails**, after the repository is `Ready`, not at Snapshot creation, so a slow-to-connect repository doesn't eat the budget. `Failed` preflight Snapshots are pruned by the schedule's [`failedJobsHistoryLimit`](#bounding-failed-snapshots).
 
 ### The CEL environment
 
@@ -360,7 +176,7 @@ Each check is a CEL **bool** expression over two variables:
 |---|---|---|
 | `repository.phase` | string | repository `status.phase` (`Ready`, …) |
 | `repository.ready` | bool | `phase == Ready` |
-| `repository.backendReachable` | bool | the [health probe](#backend-health-probe-default-on)'s `BackendReachable` condition is `True` — **`true` when the probe is disabled** (no evidence of a fault). On an `onFailure: Alert` repository this check can hold backups `Pending` through an outage and `Fail` them once `preflight.timeout` elapses — the user-configured bound |
+| `repository.backendReachable` | bool | the [health probe](#backend-health-probe-default-on)'s `BackendReachable` condition is `True` — **`true` when the probe is disabled**, since there is no evidence of a fault. On an `onFailure: Alert` repository this check can hold backups `Pending` through an outage and `Fail` them once `preflight.timeout` elapses, which is the bound you configured |
 | `repository.snapshotCountKnown` | bool | the snapshot count has been observed (guard `snapshotCount` checks with this) |
 | `repository.snapshotCount` | int | snapshots in the repository |
 | `repository.indexBlobCountKnown` | bool | the index-blob count has been observed |
@@ -376,12 +192,7 @@ Each check is a CEL **bool** expression over two variables:
 
 /// warning | Unknown values — always pair with the `*Known`/`hasRun` companion bool
 
-An unobserved age/count/size is `i64::MAX`. For a **freshness** check
-(`maintenance.lastSuccessAgeSeconds < 604800`) that fails *closed* — the unknown value
-is "infinitely old", so the check blocks, which is what you want. But for a
-**count/size** check the same sentinel fails *open*: `repository.snapshotCount > 0`
-is `true` against `i64::MAX`, so an unscanned repository would wrongly pass. Always
-guard with the boolean companion so the unknown case fails closed:
+An unobserved age, count or size is `i64::MAX`. For a **freshness** check such as `maintenance.lastSuccessAgeSeconds < 604800`, that fails *closed*: the unknown value is "infinitely old", so the check blocks, which is what you want. But for a **count or size** check the same sentinel fails *open*. `repository.snapshotCount > 0` is `true` against `i64::MAX`, so an unscanned repository would wrongly pass. Always guard with the boolean companion so the unknown case fails closed:
 
 - `maintenance.hasRun && maintenance.lastSuccessAgeSeconds < 604800`
 - `repository.snapshotCountKnown && repository.snapshotCount > 0`
@@ -391,20 +202,13 @@ guard with the boolean companion so the unknown case fails closed:
 
 /// tip | Validation & the AND rule
 
-Each `expr` is compiled and trial-evaluated **at admission** (`kubectl apply`), so a
-typo or non-bool expression is rejected up front, not at the first backup. Check
-`name`s must be unique. All checks must pass; the first failing one names itself in
-the Snapshot's `Ready` condition message (`kubectl describe snapshot`).
+Each `expr` is compiled and trial-evaluated **at admission**, on `kubectl apply`, so a typo or a non-bool expression is rejected up front rather than at the first backup. Check `name`s must be unique. All checks must pass, and the first failing one names itself in the Snapshot's `Ready` condition message, visible via `kubectl describe snapshot`.
 
 ///
 
 ### Bounding failed Snapshots
 
-GFS retention prunes only **successful** snapshots, so failures (including preflight
-`Failed`) are bounded separately by `SnapshotSchedule.spec.failedJobsHistoryLimit` — the
-maximum number of `Failed` Snapshots a schedule keeps (newest by completion time;
-default `10`, `0` keeps none). The oldest beyond the limit are deleted each reconcile.
-Manually-created (non-scheduled) Snapshots are one-offs and aren't affected.
+GFS retention prunes only **successful** snapshots, so failures, including preflight `Failed`, are bounded separately by `SnapshotSchedule.spec.failedJobsHistoryLimit`. That is the maximum number of `Failed` Snapshots a schedule keeps, newest by completion time, default `10`, with `0` keeping none. The oldest beyond the limit are deleted each reconcile. Manually-created Snapshots, meaning ones not from a schedule, are one-offs and aren't affected.
 
 ## See also
 
