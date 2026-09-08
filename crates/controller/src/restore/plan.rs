@@ -1935,8 +1935,21 @@ const CLAIM_MOVER_KEYS: &[&str] = &["observedAt", "logTail", "failure"];
 /// and would leave (say) a spent `waitStartedAt` or a reaped `pvcPrime` standing
 /// forever.
 ///
-/// `resolved` is written when `next` has one (the controller pinned it) and
-/// never nulled — a claim's pin is durable, and the mover writes it too.
+/// `resolved` is written when `next` has one (the controller pinned it) and is
+/// never nulled on the SAME claimant — a claim's pin is durable, and the mover
+/// writes it too.
+///
+/// The one exception is the RE-ARM (review wave 2, finding 2): when `prev` and
+/// `next` carry different claimant uids, the record is being reset for a
+/// re-created PVC, and the controller owns that reset even though the mover owns
+/// the values in steady state. `resolved`, `failure`, `logTail` and `observedAt`
+/// are then written as explicit `null`s. Merely stripping them left the dead
+/// claimant's pin in place, so [`claim_pinned_decision`] short-circuited on it
+/// and a re-created PVC under `Continue` was provisioned EMPTY again although a
+/// snapshot now matched — or restored a stale mover pin, or showed a stale
+/// failure block beside a fresh `Pending`. A uid change is exactly the
+/// [`ClaimDrive::ReArm`] outcome: `Drive` carries the recorded uid forward and
+/// adoption has no `prev`, so nothing else can produce it.
 pub fn claim_merge_body(
     prev: Option<&RestoreClaimStatus>,
     next: &RestoreClaimStatus,
@@ -1964,8 +1977,29 @@ pub fn claim_merge_body(
                 obj.insert((*key).to_string(), serde_json::Value::Null);
             }
         }
+        if claim_rearmed(prev, next) {
+            for key in CLAIM_REARM_RESET_KEYS {
+                if !obj.contains_key(*key) {
+                    obj.insert((*key).to_string(), serde_json::Value::Null);
+                }
+            }
+        }
     }
     serde_json::Value::Object(obj)
+}
+
+/// The keys a RE-ARM resets with explicit `null`s: the dead claimant's pin and
+/// its mover's last words. See [`claim_merge_body`].
+const CLAIM_REARM_RESET_KEYS: &[&str] = &["resolved", "failure", "logTail", "observedAt"];
+
+/// Whether `next` re-arms the claim `prev` recorded: both name a claimant uid
+/// and they differ. Pure. A record without a uid is never re-armed (there is
+/// nothing to reap under an unknown uid — the same rule as [`claim_drive`]).
+pub fn claim_rearmed(prev: &RestoreClaimStatus, next: &RestoreClaimStatus) -> bool {
+    match (prev.uid.as_deref(), next.uid.as_deref()) {
+        (Some(prev_uid), Some(next_uid)) => prev_uid != next_uid,
+        (None, _) | (_, None) => false,
+    }
 }
 
 /// Whether a claim record CHANGED in a way worth an Event — the `(phase, reason)`

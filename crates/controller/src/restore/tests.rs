@@ -1872,6 +1872,49 @@ fn a_re_armed_claim_drops_the_previous_claims_spent_wait_anchor() {
         "{body}"
     );
 
+    // Review wave 2, finding 2: the re-arm is a RESET of the dead claimant's
+    // whole record, and the controller owns the reset even though the mover
+    // owns these values in steady state. Stripping (not nulling) them left the
+    // previous claim's pin standing, so `claim_pinned_decision` short-circuited
+    // and a re-created PVC under `Continue` was provisioned EMPTY again although
+    // a snapshot now matched — or restored a stale mover pin, or showed a stale
+    // failure block beside a fresh `Pending`.
+    let spent_with_mover_state: RestoreClaimStatus = serde_json::from_value(serde_json::json!({
+        "uid": "old-uid",
+        "phase": "Populated",
+        "reason": "NoSnapshotContinue",
+        "waitStartedAt": "2026-01-01T00:00:00Z",
+        "resolved": { "resolution": "NoSnapshot", "pinnedAt": "2026-01-01T00:00:00Z" },
+        "observedAt": "2026-01-01T00:05:00Z",
+        "logTail": "kopia: nothing to restore",
+        "failure": { "kopiaErrorClass": "Unknown", "message": "x", "retryRecommended": false }
+    }))
+    .expect("valid claim record");
+    let body = claim_merge_body(Some(&spent_with_mover_state), &fresh);
+    for reset in ["resolved", "failure", "logTail", "observedAt"] {
+        assert_eq!(
+            body.get(reset),
+            Some(&serde_json::Value::Null),
+            "a re-arm must EXPLICITLY null `{reset}`: {body}"
+        );
+    }
+    // The nulls are scoped to the re-arm: the SAME claimant's heartbeat still
+    // never names a mover-owned key (the mover writes them; a controller pass
+    // must not blank them), and keeps a pin it did not itself drop.
+    let same_uid_next = RestoreClaimStatus {
+        uid: Some("old-uid".into()),
+        phase: Some(P::Populating),
+        reason: Some(ClaimReason::PopulatingPrimePvc.as_str().into()),
+        ..Default::default()
+    };
+    let body = claim_merge_body(Some(&spent_with_mover_state), &same_uid_next);
+    for untouched in ["resolved", "failure", "logTail", "observedAt"] {
+        assert!(
+            body.get(untouched).is_none(),
+            "same claimant: `{untouched}` must be left to its owner, got {body}"
+        );
+    }
+
     // A claim window with no record and no legacy top-level anchor opens at `now`,
     // so a claimant that appears an hour after its sibling gets its OWN full window.
     assert_eq!(
