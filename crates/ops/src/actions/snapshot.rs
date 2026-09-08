@@ -368,11 +368,11 @@ fn planned_cells(
 pub async fn create_snapshots(
     ctx: &OpsCtx,
     namespace: &str,
-    planned: Vec<Snapshot>,
+    planned: &[Snapshot],
 ) -> Result<Vec<Snapshot>, OpsError> {
     let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
     let mut created = Vec::with_capacity(planned.len());
-    for snapshot in &planned {
+    for snapshot in planned {
         let name = snapshot.metadata.name.clone().expect("name set by builder");
         created.push(
             api.create(&PostParams::default(), snapshot)

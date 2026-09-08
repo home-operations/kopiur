@@ -63,7 +63,7 @@ pub async fn run(
     // SnapshotSchedule does: a Snapshot must never guess which of N volumes it
     // covers.
     let planned = plan_snapshots(ctx, &req, &policy, ns, now).await?;
-    let created_all = create_snapshots(ctx, ns, planned).await?;
+    let created_all = create_snapshots(ctx, ns, &planned).await?;
     // The single-CR paths below (wait / --logs / the object echo) follow the
     // FIRST child. With a fan-out there is no single object to echo, so the
     // names are listed instead and the wait covers every child.

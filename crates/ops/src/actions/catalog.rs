@@ -30,8 +30,7 @@ pub fn scan_patch(now: DateTime<Utc>) -> serde_json::Value {
     serde_json::json!({
         "metadata": {
             "annotations": {
-                kopiur_api::consts::CATALOG_SCAN_REQUESTED_ANNOTATION:
-                    now.to_rfc3339_opts(SecondsFormat::Secs, true),
+                kopiur_api::consts::CATALOG_SCAN_REQUESTED_ANNOTATION: token(now),
             }
         }
     })

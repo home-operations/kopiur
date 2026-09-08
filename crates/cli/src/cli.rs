@@ -1430,7 +1430,16 @@ mod tests {
                 "FromPolicy",
             ),
             (
-                &["--identity", "pg@media:/pvc/data", "--repository", "repo1"],
+                &[
+                    "--identity",
+                    "pg@media:/pvc/data",
+                    "--repository",
+                    "repo1",
+                    "--as-of",
+                    "2026-06-01T00:00:00Z",
+                    "--offset",
+                    "3",
+                ],
                 "Identity",
             ),
         ];
@@ -1446,38 +1455,83 @@ mod tests {
                 let req = RestoreRequest::from(&args);
                 assert_eq!(req.source.kind_str(), source_kind, "{flags:?}");
                 assert_eq!(req.target.kind_str(), target_kind, "{flags:?}");
-                // The source's own flags survive the conversion.
-                match &req.source {
-                    RestoreSource::SnapshotRef(r) => {
-                        assert_eq!(r.name, "snap1");
-                        assert_eq!(r.namespace.as_deref(), Some("src"));
-                    }
-                    RestoreSource::FromPolicy(p) => {
-                        assert_eq!(p.name, "pol1");
-                        assert_eq!(p.namespace.as_deref(), Some("src"));
-                        assert_eq!(p.offset, 2);
-                        // Unpassed flags stay absent rather than defaulting to
-                        // a value the operator would then act on.
-                        assert!(p.source_path.is_none());
-                        assert!(p.as_of.is_none());
-                    }
-                    RestoreSource::Identity(i) => {
-                        assert_eq!(i.username, "pg");
-                        assert_eq!(i.hostname, "media");
-                        assert_eq!(i.source_path.as_deref(), Some("/pvc/data"));
-                    }
-                }
-                // As do the target's.
-                match &req.target {
-                    RestoreTarget::PvcRef(r) => assert_eq!(r.name, "existing"),
-                    RestoreTarget::Pvc(t) => {
-                        assert_eq!(t.name, "fresh");
-                        assert_eq!(t.capacity.as_deref(), Some("1Gi"));
-                    }
-                    RestoreTarget::Populator(_) => {}
-                }
+                // The source's and target's own flags survive the conversion.
+                assert_source_flags_landed(&req.source);
+                assert_target_flags_landed(&req.target);
             }
         }
+    }
+
+    /// Every source flag `restore_args_convert_for_every_source_target_combination`
+    /// passes must reach the request, and every flag it does NOT pass must stay
+    /// absent — a field silently replaced by `None` in the conversion has to
+    /// fail here. Lifted out of the 3×3 loop so its asserts sit at nesting
+    /// level 0 (the cognitive-complexity ratchet counts each one).
+    fn assert_source_flags_landed(source: &RestoreSource) {
+        match source {
+            RestoreSource::SnapshotRef(r) => {
+                assert_eq!(r.name, "snap1");
+                assert_eq!(r.namespace.as_deref(), Some("src"));
+            }
+            RestoreSource::FromPolicy(p) => {
+                assert_eq!(p.name, "pol1");
+                assert_eq!(p.namespace.as_deref(), Some("src"));
+                assert_eq!(p.offset, 2);
+                assert!(p.source_path.is_none());
+                assert!(p.as_of.is_none());
+            }
+            RestoreSource::Identity(i) => {
+                assert_eq!(i.username, "pg");
+                assert_eq!(i.hostname, "media");
+                assert_eq!(i.source_path.as_deref(), Some("/pvc/data"));
+                // The point-in-time selectors are identity's too, and are
+                // `Option<i64>`/`Option<String>` here rather than fromPolicy's
+                // defaulted `offset: i64`.
+                assert_eq!(i.as_of.as_deref(), Some("2026-06-01T00:00:00Z"));
+                assert_eq!(i.offset, Some(3));
+                // `--snapshot-id` conflicts with --as-of/--offset at parse
+                // time, so it gets its own case below; unset means absent.
+                assert!(i.snapshot_id.is_none());
+            }
+        }
+    }
+
+    /// The target half of [`assert_source_flags_landed`].
+    fn assert_target_flags_landed(target: &RestoreTarget) {
+        match target {
+            RestoreTarget::PvcRef(r) => assert_eq!(r.name, "existing"),
+            RestoreTarget::Pvc(t) => {
+                assert_eq!(t.name, "fresh");
+                assert_eq!(t.capacity.as_deref(), Some("1Gi"));
+            }
+            RestoreTarget::Populator(_) => {}
+        }
+    }
+
+    /// `--snapshot-id` pins an exact kopia snapshot on an identity source. It
+    /// cannot ride the 3×3 case above — clap makes it conflict with
+    /// `--as-of`/`--offset` — so it is guarded here, on the same seam: dropping
+    /// `snapshot_id` from the conversion must fail a test.
+    #[test]
+    fn identity_snapshot_id_reaches_the_request() {
+        let args = restore_args(&[
+            "--identity",
+            "pg@media:/pvc/data",
+            "--repository",
+            "nas",
+            "--snapshot-id",
+            "abc123",
+            "--to-pvc",
+            "data",
+        ]);
+        let req = RestoreRequest::from(&args);
+        let RestoreSource::Identity(identity) = &req.source else {
+            panic!("expected identity, got {:?}", req.source);
+        };
+        assert_eq!(identity.snapshot_id.as_deref(), Some("abc123"));
+        // The selectors it excludes stay absent.
+        assert!(identity.as_of.is_none());
+        assert!(identity.offset.is_none());
     }
 
     /// A `restore` invocation with EVERY flag set, for the two "no flag
