@@ -1,30 +1,21 @@
 # Scenarios
 
-The [Examples](../examples.md) page is a ladder of **component** manifests — one
-CRD capability per file. **Scenarios** are the layer above: end-to-end, problem-
-driven walkthroughs for a real situation ("the cluster is gone — get my data
-back"), tying several resources, the right `kubectl` commands, and the
-verification steps together.
+The [Examples](../examples.md) page is a ladder of **component** manifests, one CRD capability per file. **Scenarios** are the layer above. Each one walks a real situation end to end, like "the cluster is gone, get my data back", and ties together the resources you apply, the `kubectl` commands you run, and the checks that tell you it worked.
 
-Each scenario is backed by a single apply-ready bundle under
-[`deploy/examples/scenarios/`](https://github.com/home-operations/kopiur/tree/main/deploy/examples/scenarios)
-— copy it, replace the `REPLACE_ME` values, and `kubectl apply -f`.
+Each scenario is backed by one apply-ready bundle under [`deploy/examples/scenarios/`](https://github.com/home-operations/kopiur/tree/main/deploy/examples/scenarios). Copy it, replace the `REPLACE_ME` values, and `kubectl apply -f`.
 
 /// tip | The mental model (read this first if you're new)
 
 Kopiur splits one job into separate resources so each can change independently:
 
-- a **`Repository`** is _where_ snapshots live (an S3 bucket, a NAS, B2…);
-- a **`SnapshotPolicy`** is the **recipe** — _what_ to back up. It runs nothing on its own;
-- a **`Snapshot`** is one **invocation** — a single snapshot as a Kubernetes object;
-- a **`SnapshotSchedule`** is the **cron** — _when_ the recipe runs;
+- a **`Repository`** is _where_ snapshots live: an S3 bucket, a NAS, B2, and so on;
+- a **`SnapshotPolicy`** is the **recipe**, meaning _what_ to back up. It runs nothing on its own;
+- a **`Snapshot`** is one **invocation**: a single snapshot as a Kubernetes object;
+- a **`SnapshotSchedule`** is the **cron**, meaning _when_ the recipe runs;
 - a **`Restore`** reads a snapshot back into a PVC;
 - a **`Maintenance`** reclaims space in the repository.
 
-The load-bearing detail in the recovery/migration scenarios is **identity**:
-kopia stores each snapshot under `username@hostname:path`, defaulting to
-`<backup-config-name>@<namespace>:/pvc/<pvcName>`. Resolving an _existing_
-snapshot means matching that identity. See [How Kopia works](../concepts/how-kopia-works.md).
+**Identity** is the detail that makes or breaks the recovery and migration scenarios. kopia stores each snapshot under `username@hostname:path`, defaulting to `<backup-config-name>@<namespace>:/pvc/<pvcName>`. To find an _existing_ snapshot, you have to match that identity. See [How Kopia works](../concepts/how-kopia-works.md).
 
 ///
 
@@ -43,15 +34,13 @@ snapshot means matching that identity. See [How Kopia works](../concepts/how-kop
 
 /// warning | Alpha
 
-These use API group `kopiur.home-operations.com`, version `v1alpha1`. Backends
-are **externally tagged** (the bucket lives under `backend.s3`, not
-`backend: { kind: S3 }`).
+These use API group `kopiur.home-operations.com`, version `v1alpha1`. Backends are **externally tagged**: the bucket lives under `backend.s3`, not `backend: { kind: S3 }`.
 
 ///
 
 ## See also
 
-- [Getting started](../getting-started.md) — the install-to-first-restore walkthrough.
-- [Examples](../examples.md) — the per-capability manifest ladder.
-- [Backups & schedules](../backups.md) and [Restores](../restores.md) — the field-level reference for the resources these scenarios combine.
-- [Troubleshooting](../troubleshooting.md) — when a step doesn't go green.
+- [Getting started](../getting-started.md): the install-to-first-restore walkthrough.
+- [Examples](../examples.md): the per-capability manifest ladder.
+- [Backups & schedules](../backups.md) and [Restores](../restores.md): the field-level reference for the resources these scenarios combine.
+- [Troubleshooting](../troubleshooting.md): when a step doesn't go green.
