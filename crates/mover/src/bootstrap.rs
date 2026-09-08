@@ -275,9 +275,15 @@ pub fn reinitialize_blocked_message(
     } else {
         ""
     };
+    // `--overwrite`: the annotation is documented as safe to leave in a GitOps
+    // manifest, so it is routinely already present (a stale value from the last
+    // re-initialize); without the flag kubectl refuses with "already has a value"
+    // and the user is sent round the loop once more. The sibling
+    // `InvalidReinitializeAck` command carries it for the same reason.
     format!(
         "To re-initialize, run: kubectl annotate {kind} {name}{ns} {annotation}={unique_id} \
-         (this discards the history the old repository held). Reason: no kopia repository \
+         --overwrite (this discards the history the old repository held). Reason: no kopia \
+         repository \
          exists at this backend (connect returned NotFound) but this {kind} was once Ready \
          (status.uniqueId={unique_id}), so kopiur will not silently create an empty one over \
          it{also}. If the wipe was not deliberate, restore the backend instead."
@@ -1656,6 +1662,38 @@ mod tests {
             KopiaErrorClass::Locked,
             false
         ));
+    }
+
+    /// Wave 2, finding 10: the re-initialize hint carries `--overwrite` (the
+    /// annotation is routinely already present with a stale value) and stays
+    /// under the 1024-byte Event note clamp for realistic inputs, with the
+    /// command leading so truncation can never eat it. Both kinds, both
+    /// `also_spec_disabled` legs.
+    #[test]
+    fn reinitialize_hint_has_overwrite_and_fits_an_event_note() {
+        let long_name = "a".repeat(63);
+        let long_ns = "b".repeat(63);
+        let id = "c".repeat(32);
+        for (kind, ns) in [
+            ("Repository", Some(long_ns.as_str())),
+            ("ClusterRepository", None),
+        ] {
+            for also in [false, true] {
+                let msg = reinitialize_blocked_message(kind, &long_name, ns, &id, also);
+                assert!(msg.len() < 1024, "{kind} also={also}: {} bytes", msg.len());
+                let cmd = format!(
+                    "kubectl annotate {kind} {long_name}{} {}={id} --overwrite",
+                    kubectl_namespace_flag(ns),
+                    kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION
+                );
+                assert!(
+                    msg.starts_with(&format!("To re-initialize, run: {cmd}")),
+                    "{msg}"
+                );
+                assert_eq!(msg.contains(" -n "), ns.is_some(), "{msg}");
+                assert_eq!(msg.contains("spec.create.enabled is also false"), also);
+            }
+        }
     }
 
     /// Review wave 2, finding 1b: under an acked re-initialize the create arm

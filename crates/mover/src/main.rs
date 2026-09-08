@@ -3948,6 +3948,13 @@ mod tests {
             ),
             "{msg}"
         );
+        // Wave 2, finding 10: the annotation is routinely ALREADY present (a
+        // stale value left in Git after the last re-initialize), so the command
+        // must carry `--overwrite` or kubectl refuses it.
+        assert!(
+            msg.contains("allow-reinitialize=U1 --overwrite"),
+            "the annotate command must carry --overwrite: {msg}"
+        );
         // Byte-identical to what the controller's in-process path produces.
         assert_eq!(
             msg,

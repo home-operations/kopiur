@@ -212,10 +212,13 @@ $ kubectl get repository nas -n billing -o jsonpath='{.status.uniqueId}'
 c9b1f0e4a7d24e11
 
 $ kubectl annotate repository nas -n billing \
-    kopiur.home-operations.com/allow-reinitialize=c9b1f0e4a7d24e11
+    kopiur.home-operations.com/allow-reinitialize=c9b1f0e4a7d24e11 --overwrite
 ```
 
-For a cluster-scoped `ClusterRepository`, drop the `-n`.
+For a cluster-scoped `ClusterRepository`, drop the `-n`. `--overwrite` is there
+because the annotation is routinely already present — a stale value left behind
+by the last re-initialize — and `kubectl annotate` refuses to replace one
+without it.
 
 On the next reconcile kopiur treats that one pass as a first bootstrap: it
 creates a fresh kopia repository at the backend, pins a **new** `uniqueId`, heals
