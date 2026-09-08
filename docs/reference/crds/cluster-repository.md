@@ -1,140 +1,89 @@
 # ClusterRepository
 
-A cluster-scoped, shared kopia repository operated by a platform team and
-referenceable from allow-listed namespaces. It has the same storage surface as a
-[Repository](repository.md) (backend, encryption, create, moverDefaults,
-scheduleDefaults, catalog), plus a tenancy gate (`allowedNamespaces`) and
-per-namespace identity expressions (`identityDefaults`). For the terse
-type/default table see the [field reference](../../field-reference.md); for
-how-to guidance see [Repositories](../../repositories.md).
+A `ClusterRepository` is a shared kopia repository that lives outside any namespace. A platform team operates it, and namespaces you allow can reference it.
+
+It has the same storage surface as a [Repository](repository.md), including `backend`, `encryption`, `create`, `moverDefaults`, `scheduleDefaults` and `catalog`. On top of that it adds a tenancy gate, `allowedNamespaces`, and per-namespace identity expressions, `identityDefaults`.
+
+For the short type-and-default table see the [field reference](../../field-reference.md). For task guidance see [Repositories](../../repositories.md).
 
 /// warning | Every Secret reference needs an explicit namespace
 
-A `ClusterRepository` is cluster-scoped, so it has no namespace of its own to
-resolve references against. Every Secret/config reference — in `backend`,
-`encryption`, `server`, anywhere — **must carry an explicit `namespace`**. The
-type system cannot express this, so it is webhook-enforced: a reference without
-a namespace is rejected on apply.
+A `ClusterRepository` is cluster-scoped, so it has no namespace of its own to resolve references against. Every Secret or config reference **must carry an explicit `namespace`**, in `backend`, in `encryption`, in `server`, everywhere. The type system cannot express that rule, so the webhook enforces it: a reference without a namespace is rejected when you apply it.
 
 ///
 
 ## `spec`
 
-Fields shared with `Repository` — `backend`, `create`, `moverDefaults`,
-`scheduleDefaults`, `concurrency`, `catalog`, `maintenance`, `onNamespaceDelete`,
-`mode`, `suspend`, `health`, `parameters` — behave exactly as on the
-[Repository](repository.md) page. (`parameters.epoch` is worth calling out for a
-shared repository: it describes the repository itself, so declare it on the cluster
-that owns it — two clusters declaring different values will fight over them, and a
-`mode: ReadOnly` consumer is rejected for declaring any.)
-The differences and additions:
+These fields behave exactly as they do on the [Repository](repository.md) page: `backend`, `create`, `moverDefaults`, `scheduleDefaults`, `concurrency`, `catalog`, `maintenance`, `onNamespaceDelete`, `mode`, `suspend`, `health` and `parameters`.
+
+`parameters.epoch` is worth a note on a shared repository. It describes the repository itself, so declare it on the cluster that owns the repository. Two clusters declaring different values will fight over them, and a `mode: ReadOnly` consumer is rejected for declaring any.
+
+The rest of this page covers the differences and the additions.
 
 /// note | What `concurrency.maxConcurrentJobs` counts under a namespaced install
 
-The cap is enforced by listing this repository's in-flight pooled mover Jobs, and
-that list is scoped to the namespaces the operator watches. Under an
-`installScope: namespaced` install, a `ClusterRepository`'s cap therefore bounds
-the pooled Jobs **in the watched namespace**, not every namespace using the
-repository. It is the only answer available — a cluster-wide list under a
-namespaced install's `Role` RBAC is a permanent 403 that would wedge the reconcile
-— and it is the same scoping every other reconcile-time list already carries. A
-cluster-scoped install (the default) counts every namespace, as you would expect.
+Kopiur enforces the cap by listing this repository's in-flight pooled mover Jobs, and that list only covers the namespaces the operator watches.
+
+Under an `installScope: namespaced` install, a `ClusterRepository`'s cap therefore bounds the pooled Jobs **in the watched namespace**, not in every namespace that uses the repository. That is the only answer available: a cluster-wide list under a namespaced install's `Role` RBAC is a permanent 403 that would wedge the reconcile. It is also the same scoping every other reconcile-time list already uses. A cluster-scoped install, which is the default, counts every namespace.
 
 ///
 
 ### `encryption`
 
-The repository password as a Secret reference. Because the CR is cluster-scoped, the
-reference **must** carry an explicit `namespace`.
+The repository password as a Secret reference. Because the object is cluster-scoped, the reference **must** carry an explicit `namespace`.
 
 ### `allowedNamespaces`
 
-The tenancy gate: which namespaces are permitted to reference this repository,
-webhook-enforced on every consumer CR. Exactly one of:
+The tenancy gate: which namespaces may reference this repository. The webhook checks it on every consumer object. Set exactly one of:
 
-- `list: [...]` — explicit namespace names.
-- `selector: {...}` — match namespaces by label (a `LabelSelector`).
-- `all: true` — allow all namespaces. Must be `true`; `false` is meaningless and
-  rejected by the webhook.
+- `list: [...]` names namespaces explicitly.
+- `selector: {...}` matches namespaces by label, using a `LabelSelector`.
+- `all: true` allows every namespace. It must be `true`; `false` means nothing and the webhook rejects it.
 
-The number of namespaces this currently resolves to is surfaced as
-`status.allowedNamespaceCount` and the `Namespaces` print column.
+The number of namespaces this currently resolves to appears in `status.allowedNamespaceCount` and in the `Namespaces` print column.
 
 ### `identityDefaults`
 
-CEL expressions evaluated at admission to derive a consumer's kopia identity when a
-`SnapshotPolicy` doesn't override it. Each `*Expr` returns a string and is evaluated
-against `namespace`, `policyName`, `labels`, and `annotations` (the consuming
-`SnapshotPolicy`'s metadata). The expressions are sandboxed with no I/O and validated
-at admission, so a typo or out-of-scope variable is rejected on apply.
+CEL expressions that derive a consumer's kopia identity when a `SnapshotPolicy` does not override it. Kopiur evaluates them at admission.
 
-- `hostnameExpr` — CEL expression for the kopia identity hostname (e.g. `"namespace"`).
-- `usernameExpr` — CEL expression for the kopia identity username
-  (e.g. `"namespace + '-' + policyName"`).
+Each `*Expr` returns a string and is evaluated against `namespace`, `policyName`, `labels` and `annotations`, taken from the consuming `SnapshotPolicy`'s metadata. The expressions run sandboxed with no I/O and are validated at admission, so a typo or an out-of-scope variable is rejected when you apply.
+
+- `hostnameExpr` is the CEL expression for the kopia identity hostname, for example `"namespace"`.
+- `usernameExpr` is the CEL expression for the kopia identity username, for example `"namespace + '-' + policyName"`.
 
 ### `server`
 
-Optional kopia web-UI server. Because the CR is cluster-scoped, the target
-`namespace` is required. Presence enables it. See [Server](../../server.md).
+An optional kopia web UI server. Adding the block turns it on. Because the object is cluster-scoped, the target `namespace` is required. See [Server](../../server.md).
 
 ### `maintenance`
 
-Default-managed like the namespaced kind, but since `Maintenance` is itself
-namespaced, `maintenance.namespace` selects where the owned `Maintenance` CR lands
-(defaulting to the operator's namespace). See [Maintenance](../../maintenance.md).
+Managed by default, the same as on the namespaced kind. Because `Maintenance` is itself namespaced, `maintenance.namespace` picks where the owned `Maintenance` object lands. It defaults to the operator's namespace. See [Maintenance](../../maintenance.md).
 
 ### `seed`
 
-Same block as on the [Repository](repository.md#seed), with the cluster-scoped
-resolution rules:
+The same block as on the [Repository](repository.md#seed) page, plus these cluster-scoped resolution rules:
 
-- The seeding bootstrap Job runs in **the namespace the repository's own
-  credentials resolve in** — the operator's namespace, unless
-  `encryption.passwordSecretRef.namespace` pins another. A blob seed's
-  `from.backend` credential Secret is loaded with `envFrom` (namespace-local), so
-  it must live in **that** namespace; a seed `secretRef` that pins a namespace is
-  rejected at admission, because a cluster-scoped spec cannot name the right one.
-- A migrate seed's `from.repository` with no `namespace` resolves in the
-  operator's namespace — the same rule every other cluster-scoped reference
-  follows. Set it explicitly whenever the source lives anywhere else.
-- An armed seed makes the CR hold its cleanup finalizer, so that a deletion
-  reconcile runs at all. That reconcile then deletes the in-flight
-  `<name>-discovery` Job **best-effort** — it does not block or retry, and a
-  deletion is never wedged on the cleanup: a Job that already finished is an
-  ordinary miss, a failed delete is logged as a warning, and if the Job's
-  namespace cannot be resolved at all the operator warns and tells you to delete
-  the Job by hand. This exists because a namespaced Job cannot carry a
-  cluster-scoped ownerReference, so nothing else would ever reap a 24 h seeding
-  Job whose CR is gone.
+- The seeding bootstrap Job runs in **the namespace this repository's own credentials resolve in**. That is the operator's namespace, unless `encryption.passwordSecretRef.namespace` points somewhere else. A blob seed's `from.backend` credential Secret is loaded with `envFrom`, which only reads the local namespace, so the Secret must live in **that** namespace. A seed `secretRef` that names a namespace is rejected at admission, because a cluster-scoped spec cannot know the right one.
+- A migrate seed's `from.repository` with no `namespace` resolves in the operator's namespace, the same rule every other cluster-scoped reference follows. Set it explicitly whenever the source lives anywhere else.
+- An armed seed makes the object hold its cleanup finalizer, so that a deletion reconcile runs at all. That reconcile then tries to delete the in-flight `<name>-discovery` Job, but it does not block or retry, and a deletion is never stuck waiting on the cleanup. A Job that already finished is an ordinary miss. A failed delete is logged as a warning. If the Job's namespace cannot be resolved at all, the operator warns and tells you to delete the Job by hand. This exists because a namespaced Job cannot carry a cluster-scoped ownerReference, so nothing else would ever clean up a 24-hour seeding Job whose owning object is gone.
 
 ### `credentialProjection`
 
-The repository-owner gate for projecting this repository's credential Secret(s) into
-a foreign consumer namespace. **Default off** (`credentialProjection.allowed:
-false`): a consumer's own `credentialProjection.enabled` is necessary but not
-sufficient — the `ClusterRepository` owner must also allow it, and operator RBAC must
-permit it (fail-closed). A namespaced `Repository` has no such gate, because
-projection there is a same-namespace no-op.
+The repository owner's gate on projecting this repository's credential Secrets into another namespace.
+
+It is **off by default** (`credentialProjection.allowed: false`). A consumer's own `credentialProjection.enabled` is necessary but not enough: the `ClusterRepository` owner must also allow it, and operator RBAC must permit it. If any of the three is missing, projection does not happen. A namespaced `Repository` has no such gate, because projection there copies a Secret into the namespace it already lives in.
 
 ## `status`
 
-Mirrors [Repository](repository.md) status (`phase`, `observedGeneration`,
-`resolvedCredentialVersion`, `uniqueId`, `backend`, `storageStats`, `catalog`,
-`seed`, `server`, `conditions`) with one addition:
+Status mirrors [Repository](repository.md) status: `phase`, `observedGeneration`, `resolvedCredentialVersion`, `uniqueId`, `backend`, `storageStats`, `catalog`, `seed`, `server` and `conditions`. There is one addition:
 
-- `allowedNamespaceCount` — number of namespaces currently resolved by
-  `spec.allowedNamespaces`; also the `Namespaces` print column.
+- `allowedNamespaceCount` is the number of namespaces `spec.allowedNamespaces` currently resolves to. It is also the `Namespaces` print column.
 
-`uniqueId` carries the same pin semantics as on a namespaced `Repository`: it is
-set on the first successful bootstrap and, once set, kopiur will never create a
-fresh empty repository at this backend — a wiped backend parks at `Failed` with
-reason `RepositoryReinitializeBlocked`.
+`uniqueId` behaves exactly as it does on a namespaced `Repository`. It is set on the first successful bootstrap, and once set, Kopiur will never create a fresh empty repository at this backend. A wiped backend parks at `Failed` with reason `RepositoryReinitializeBlocked`.
 
 ## Annotations
 
-Same set as [Repository](repository.md#annotations), with one difference in how
-you apply them: a `ClusterRepository` is cluster-scoped, so the commands kopiur
-puts in its condition messages and events carry **no `-n`**:
+The same set as on [Repository](repository.md#annotations). Only the way you apply them differs: a `ClusterRepository` is cluster-scoped, so the commands Kopiur prints in its condition messages and events carry **no `-n`**:
 
 ```console
 $ kubectl annotate clusterrepository shared \
