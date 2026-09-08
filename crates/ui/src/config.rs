@@ -313,6 +313,26 @@ pub struct UiArgs {
           value_parser = parse_flag_bool)]
     pub acknowledge_no_proxy_secret: bool,
 
+    /// **Debug builds only.** Allow the configured anonymous identity to be a
+    /// `system:` principal (including `system:masters`).
+    ///
+    /// This exists for one purpose: a local smoke run against a throwaway kind
+    /// cluster, where the fastest way to see the UI work is to let it impersonate
+    /// `kubernetes-admin`/`system:masters` rather than to author RBAC first. It is
+    /// compiled out entirely by `#[cfg(debug_assertions)]`, so the released image
+    /// has no such flag, no such environment variable, and no code path that reads
+    /// one.
+    ///
+    /// It relaxes exactly one check — [`reject_system_identity`] over the
+    /// *operator-chosen* `KOPIUR_UI_ANONYMOUS_*` values. It cannot loosen what a
+    /// proxy may assert: header-mode principals go through
+    /// [`crate::auth::identity::is_forbidden_principal`], which has no escape
+    /// hatch at all.
+    #[cfg(debug_assertions)]
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_value_t = false,
+          default_missing_value = "true", value_parser = parse_flag_bool, hide = true)]
+    pub dev_allow_system_groups: bool,
+
     /// The operator's own namespace (the chart injects it via the downward API).
     #[arg(long = "operator-namespace", env = OPERATOR_NAMESPACE_ENV)]
     pub operator_namespace: Option<String>,
@@ -675,6 +695,22 @@ const ALLOWED_SYSTEM_IDENTITY: &str = "system:authenticated";
 const SYSTEM_MASTERS: &str = "system:masters";
 
 impl UiArgs {
+    /// Whether the debug-only `--dev-allow-system-groups` hatch is open.
+    ///
+    /// A release build has no such flag, so this is a compile-time `false` there
+    /// and the branch it guards folds away — the escape hatch cannot exist in a
+    /// shipped image even as dead code.
+    #[cfg(debug_assertions)]
+    fn system_anonymous_allowed(&self) -> bool {
+        self.dev_allow_system_groups
+    }
+
+    /// Release builds have no escape hatch. See the debug-build twin above.
+    #[cfg(not(debug_assertions))]
+    fn system_anonymous_allowed(&self) -> bool {
+        false
+    }
+
     /// Turn the raw flag/env surface into a validated [`UiConfig`], or explain
     /// why it cannot be one.
     ///
@@ -719,13 +755,22 @@ impl UiArgs {
         // even in header mode where it may never be used: a `system:` identity
         // sitting in the environment is a misconfiguration waiting for someone to
         // flip KOPIUR_UI_ANONYMOUS_FALLBACK on, and finding it then is too late.
+        let system_anonymous_allowed = self.system_anonymous_allowed();
         let anonymous_user = nonempty(self.anonymous_user);
         let anonymous_groups = csv(self.anonymous_groups.as_deref());
-        if let Some(user) = &anonymous_user {
-            reject_system_identity(user)?;
-        }
-        for group in &anonymous_groups {
-            reject_system_identity(group)?;
+        if system_anonymous_allowed {
+            tracing::warn!(
+                "--dev-allow-system-groups is set: the anonymous identity may be a system: \
+                 principal. This is a debug-build-only escape hatch for a local kind smoke \
+                 and must never be used against a cluster you care about."
+            );
+        } else {
+            if let Some(user) = &anonymous_user {
+                reject_system_identity(user)?;
+            }
+            for group in &anonymous_groups {
+                reject_system_identity(group)?;
+            }
         }
         let anonymous = anonymous_user.map(|user| AnonymousIdentity {
             user,
@@ -1002,6 +1047,57 @@ mod tests {
         ];
         v.extend(extra.iter().map(|s| (*s).to_string()));
         v
+    }
+
+    /// The debug-build-only escape hatch, and the fact that it is the *only*
+    /// thing that opens the anonymous `system:` door.
+    ///
+    /// A release build has no such flag; this test is compiled out with it, and
+    /// the `case(…)` table above keeps asserting the refusal in both profiles.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial]
+    fn the_dev_hatch_is_the_only_way_to_an_anonymous_system_identity() {
+        let smoke: Vec<String> = vec![
+            "--anonymous-user".into(),
+            "kubernetes-admin".into(),
+            "--anonymous-groups".into(),
+            SYSTEM_MASTERS.into(),
+        ];
+
+        let refused = resolve(&smoke).expect_err("without the hatch this must fail closed");
+        assert!(
+            matches!(refused, ConfigError::ForbiddenAnonymousGroup { .. }),
+            "{refused:?}"
+        );
+
+        let mut allowed = smoke;
+        allowed.push("--dev-allow-system-groups".into());
+        allowed.push("true".into());
+        let cfg = resolve(&allowed).expect("the hatch lets a local kind smoke through");
+        match &cfg.auth.mode {
+            AuthMode::AnonymousOnly(anonymous) => {
+                assert_eq!(anonymous.user, "kubernetes-admin");
+                assert_eq!(anonymous.groups, vec![SYSTEM_MASTERS.to_string()]);
+            }
+            AuthMode::Headers { .. } => panic!("no user header must select anonymous-only mode"),
+        }
+    }
+
+    /// The hatch is scoped to the anonymous identity: it must not make header
+    /// mode's deny-list negotiable.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial]
+    fn the_dev_hatch_does_not_touch_header_mode() {
+        let cfg = resolve(&header_mode(&["--dev-allow-system-groups", "true"]))
+            .expect("header mode still resolves");
+        assert!(matches!(cfg.auth.mode, AuthMode::Headers { .. }));
+        // Nothing in the resolved config can relax what a proxy may assert:
+        // `AuthConfig` carries no such flag, so `extract_identity` cannot read one.
+        assert!(crate::auth::identity::is_forbidden_principal(
+            SYSTEM_MASTERS
+        ));
     }
 
     fn resolve(args: &[String]) -> Result<UiConfig, ConfigError> {
