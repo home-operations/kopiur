@@ -51,5 +51,5 @@ Explicit restores **fail closed** with `onMissingSnapshot: Fail`. If the snapsho
 ## See also
 
 - [Restores](../restores.md): the full `source` / `target` / `options` / `policy` reference, including `pvcRef` for in-place restores and the `identity` source.
-- [Scenario 03 — disaster recovery](disaster-recovery.md): when it's not one volume but the whole cluster.
+- [Scenario 03, disaster recovery](disaster-recovery.md): when it's not one volume but the whole cluster.
 - [Troubleshooting](../troubleshooting.md): if a restore won't progress.

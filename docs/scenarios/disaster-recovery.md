@@ -15,7 +15,7 @@ This is the headline [deploy-or-restore](../restores.md#deploy-or-restore-gitops
 
 This scenario **connects** to the surviving repository, so the rebuilt cluster keeps writing into it.
 
-If what survived is an off-site *mirror* and you want the new cluster to have its own repository back, with the mirror left intact, seed a new one instead. See [Scenario 10 — DR from a replicated repository](dr-with-replicated-repository.md).
+If what survived is an off-site *mirror* and you want the new cluster to have its own repository back, with the mirror left intact, seed a new one instead. See [Scenario 10: DR from a replicated repository](dr-with-replicated-repository.md).
 
 ///
 
@@ -91,6 +91,6 @@ The volume-populator handshake needs the `AnyVolumeDataSource` feature, which is
 ## See also
 
 - [Restores → deploy-or-restore](../restores.md#deploy-or-restore-gitops) and [example 05](../examples.md#example-05--deploy-or-restore-gitops): the populator mechanism in detail.
-- [Scenario 04 — migrate across clusters](migrate-across-clusters.md): when the destination's name or namespace is _different_, and `fromPolicy` won't resolve the old snapshots.
+- [Scenario 04, migrate across clusters](migrate-across-clusters.md): when the destination's name or namespace is _different_, and `fromPolicy` won't resolve the old snapshots.
 - [Repositories & backends](../repositories.md): `create.enabled` and connection details.
-- [Scenario 10 — DR from a replicated repository](dr-with-replicated-repository.md): when the survivor is a mirror and you seed a *new* repository from it with `spec.seed`.
+- [Scenario 10, DR from a replicated repository](dr-with-replicated-repository.md): when the survivor is a mirror and you seed a *new* repository from it with `spec.seed`.

@@ -132,7 +132,7 @@ That is the on-demand [run-requested](../replication.md#run-it-now) path. It sta
 
 1. **Install the operator** on the rebuilt cluster, at a version that supports `spec.seed`. Enable `features.credentialProjection.enabled` if you are seeding in migrate mode from a source whose Secrets live elsewhere.
 2. **Restore the Secrets first.** The repository password must be the *original* one for a blob seed, because it is the mirror's format. The seed source's storage credentials must be in the bootstrap Job's namespace.
-3. **Apply the manifests** — repository, policies, schedules, populator restores, all in the same commit. Nothing needs a "recovery mode" branch.
+3. **Apply the manifests**: repository, policies, schedules, populator restores, all in the same commit. Nothing needs a "recovery mode" branch.
 4. **Watch the seed.** The repository stays out of `Ready` for the whole copy:
 
     ```console
@@ -217,8 +217,8 @@ If attempts keep being cut short, read the seeding Job's pod logs and raise `spe
 
 Two failures are **terminal**. The same inputs reproduce them forever, so retrying would only hide them:
 
-- **`MoverImageTooOldForSeed`** — the running mover image does not understand `spec.seed` and dropped it. Upgrade the mover image, *and* delete the finished bootstrap Job with `kubectl -n <ns> delete job <repository>-discovery`. Nothing recycles a terminal Job before its TTL, so an upgrade alone looks like it changed nothing for up to an hour.
-- **`BootstrapInternalInconsistency`** — a kopiur defect, not a repository problem. The message says so. Please file it.
+- **`MoverImageTooOldForSeed`**: the running mover image does not understand `spec.seed` and dropped it. Upgrade the mover image, *and* delete the finished bootstrap Job with `kubectl -n <ns> delete job <repository>-discovery`. Nothing recycles a terminal Job before its TTL, so an upgrade alone looks like it changed nothing for up to an hour.
+- **`BootstrapInternalInconsistency`**: a kopiur defect, not a repository problem. The message says so. Please file it.
 
 An `AuthFailure` against the seed source is terminal too, by the same rule that governs every bootstrap: kopiur never creates or seeds over a backend it could not authenticate to.
 
@@ -344,7 +344,7 @@ $ kubectl get pvc,restore -n billing
 ## See also
 
 - [Repositories → `seed`](../repositories.md#seed--initialize-a-new-repository-from-a-replica): the field-level reference.
-- [Scenario 03 — disaster recovery on a fresh cluster](disaster-recovery.md): the same rebuild, connecting to the surviving repository instead of seeding a new one.
+- [Scenario 03, disaster recovery on a fresh cluster](disaster-recovery.md): the same rebuild, connecting to the surviving repository instead of seeding a new one.
 - [Repository replication](../replication.md): the mirror this scenario seeds from, and `kubectl kopiur replication run`.
 - [Snapshot replication](../snapshot-replication.md): the ongoing counterpart of migrate mode, for history you want copied on a schedule rather than once.
 - [Troubleshooting → a seeding repository never reaches `Ready`](../troubleshooting.md#a-seeding-repository-never-reaches-ready).

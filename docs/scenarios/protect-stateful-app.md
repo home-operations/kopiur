@@ -70,5 +70,5 @@ A `SNAPSHOT` id on a `Succeeded` backup means the data is in the repository. Fro
 ## See also
 
 - [Backups & schedules](../backups.md): every field on these three resources, including the other hook forms (`runJob`, `httpRequest`) and `copyMethod`.
-- [Scenario 06 — verification drills](verification-drills.md): prove these backups actually restore.
+- [Scenario 06, verification drills](verification-drills.md): prove these backups actually restore.
 - [Movers, RBAC & credentials](../movers.md): where the mover runs and what it needs.

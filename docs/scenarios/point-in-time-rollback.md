@@ -51,5 +51,5 @@ Restoring over a mounted, running database can corrupt it. If you pick the wrong
 ## See also
 
 - [Restores → point-in-time](../restores.md#frompolicy--resolve-via-a-snapshotpolicys-identity): the `asOf` and `offset` reference.
-- [Example 14 — point-in-time / offset restore](../examples.md#example-14--point-in-time--offset-restore) and [example 15 — in-place mirror](../examples.md#example-15--in-place-mirror-restore).
-- [Scenario 02 — recover lost data](recover-lost-data.md): the same safe clone-and-verify habit for a known `Snapshot` CR.
+- [Example 14: point-in-time / offset restore](../examples.md#example-14--point-in-time--offset-restore) and [example 15: in-place mirror](../examples.md#example-15--in-place-mirror-restore).
+- [Scenario 02, recover lost data](recover-lost-data.md): the same safe clone-and-verify habit for a known `Snapshot` CR.

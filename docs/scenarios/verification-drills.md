@@ -98,4 +98,4 @@ For the strongest guarantee, go one level further. Have the drill, or a follow-o
 - [Backups → verification](../backups.md#verification--prove-the-snapshots-are-restorable): the built-in `quick` / `deep` / `successExpr` field reference.
 - [Observability](../dev/observability.md): the full `kopiur_*` metric surface and how to scrape it.
 - [Restores](../restores.md): `fromPolicy`, `onMissingSnapshot`, and restore phases.
-- [Scenario 02 — recover from data loss](recover-lost-data.md): the real restore your drills are rehearsing.
+- [Scenario 02, recover from data loss](recover-lost-data.md): the real restore your drills are rehearsing.

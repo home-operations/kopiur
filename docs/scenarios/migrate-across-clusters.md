@@ -84,5 +84,5 @@ If you're unsure what the source recorded, read it off a source `Snapshot`'s sta
 
 - [Restores → `identity` source](../restores.md#identity--a-raw-kopia-identity): the raw-identity restore mode.
 - [Backups → identity](../backups.md#identity--what-kopia-records-usernamehostnamepath): how identity is resolved, and the fork guards that protect existing history.
-- [Scenario 05 — adopt an existing repo](adopt-existing-repo.md): a close cousin, for when the "source" is foreign tooling rather than another Kopiur cluster.
+- [Scenario 05, adopt an existing repo](adopt-existing-repo.md): a close cousin, for when the "source" is foreign tooling rather than another Kopiur cluster.
 - [Share one repository across clusters](shared-repository-multi-cluster.md): the active-active or standby shape this page's danger box points at, instead of a one-time move.

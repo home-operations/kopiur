@@ -41,6 +41,6 @@ Point your staging `Deployment` or `StatefulSet` at `postgres-data-clone` and yo
 
 ## See also
 
-- [Example 16 — cross-namespace clone restore](../examples.md#example-16--cross-namespace-clone-restore) and [example 17 — restore from a shared repo with projection](../examples.md#example-17--restore-from-a-shared-repo-projection).
+- [Example 16: cross-namespace clone restore](../examples.md#example-16--cross-namespace-clone-restore) and [example 17: restore from a shared repo with projection](../examples.md#example-17--restore-from-a-shared-repo-projection).
 - [Movers, RBAC & credentials](../movers.md): credential projection and the minted mover ServiceAccount.
-- [Scenario 04 — migrate across clusters / namespaces](migrate-across-clusters.md): when it's a permanent move, not a clone.
+- [Scenario 04, migrate across clusters / namespaces](migrate-across-clusters.md): when it's a permanent move, not a clone.
