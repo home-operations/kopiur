@@ -137,9 +137,12 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 64,
+            exported, 65,
             "expected one .ts file per wire type; add the new type's root to \
-             `export_all` and bump this count deliberately"
+             `export_all` and bump this count deliberately. 64 -> 65 when \
+             `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
+             `String`, so one gate registry can no longer be described by two \
+             vocabularies"
         );
     }
 }

@@ -16,6 +16,7 @@ use kopiur_api::gates::{GateScope, STRUCTURAL_GATES, StructuralGate};
 use kopiur_ui_model::views::GateDescriptor;
 
 use crate::AppState;
+use crate::api::gate_severity_view;
 
 /// This module's routes, relative to `/api/v1`.
 pub fn router() -> Router<AppState> {
@@ -38,22 +39,18 @@ fn scope_label(scope: GateScope) -> &'static str {
 
 /// **Pure.** One registry row as its wire descriptor.
 ///
-/// `severity` is lower-cased to the `info`/`warning`/`error` vocabulary the wire
-/// type documents; the registry itself has only two levels, so `info` is
-/// unused — a gate is either wedged work or a plausible deliberate refusal, and
-/// neither is merely informational.
+/// `severity` goes through [`gate_severity_view`], the same projection a live
+/// [`GateHit`](kopiur_ui_model::graph::GateHit) uses, so this endpoint's
+/// documentation of a gate and the hit the SPA receives when it fires describe
+/// it identically. They once did not: `/gates` said `error` where a hit said
+/// `Fail`, for the same registry row.
 pub fn descriptor(gate: &StructuralGate) -> GateDescriptor {
-    use kopiur_api::gates::GateSeverity;
     GateDescriptor {
         scope: scope_label(gate.applies_to).to_string(),
         condition: gate.condition.to_string(),
         blocked_status: gate.blocked_status.to_string(),
         reason: gate.reason.to_string(),
-        severity: match gate.severity {
-            GateSeverity::Fail => "error",
-            GateSeverity::Warn => "warning",
-        }
-        .to_string(),
+        severity: gate_severity_view(gate.severity),
     }
 }
 
@@ -110,13 +107,26 @@ mod tests {
     }
 
     #[test]
-    fn severity_uses_the_wire_vocabulary() {
-        for gate in view_all() {
-            assert!(
-                gate.severity == "error" || gate.severity == "warning",
-                "{} has severity {}, which the SPA cannot render",
-                gate.condition,
-                gate.severity
+    fn both_severity_levels_actually_occur_in_the_registry() {
+        use kopiur_ui_model::graph::GateSeverityView;
+        // The enum makes "which vocabulary?" unrepresentable, so what is left to
+        // pin is that both levels are real — a registry that only ever said
+        // `Error` would leave the distinction untested and free to rot.
+        let all = view_all();
+        assert!(all.iter().any(|g| g.severity == GateSeverityView::Error));
+        assert!(all.iter().any(|g| g.severity == GateSeverityView::Warning));
+    }
+
+    #[test]
+    fn a_descriptors_severity_is_the_one_a_live_hit_of_that_gate_reports() {
+        // The A-C1 regression guard: `/gates` documenting a severity the
+        // `gates: [...]` arrays contradict is exactly what shipped before.
+        for gate in STRUCTURAL_GATES {
+            assert_eq!(
+                descriptor(gate).severity,
+                gate_severity_view(gate.severity),
+                "/gates must document {} with the severity a live hit reports",
+                gate.condition
             );
         }
     }

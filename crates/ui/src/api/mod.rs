@@ -57,14 +57,14 @@ use serde::Deserialize;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 use kopiur_api::common::{RepositoryKind, RepositoryRef, repo_key};
-use kopiur_api::gates::{GateScope, STRUCTURAL_GATES};
+use kopiur_api::gates::{GateScope, GateSeverity, STRUCTURAL_GATES};
 use kopiur_api::maintenance::ManualRunPhase;
 use kopiur_api::repository_replication::RepositoryReplicationPhase;
 use kopiur_api::restore::RestoreClaimPhase;
 use kopiur_api::snapshot_replication::SnapshotReplicationPhase;
 use kopiur_api::{Origin, RepositoryPhase, RestorePhase, SnapshotPhase};
 use kopiur_ops::{OpsCtx, Scope};
-use kopiur_ui_model::graph::GateHit;
+use kopiur_ui_model::graph::{GateHit, GateSeverityView};
 use kopiur_ui_model::views::{
     ConditionView, OriginView, Page, ReplicationPhaseView, RepositoryPhaseView, RestorePhaseView,
     SnapshotPhaseView,
@@ -330,6 +330,21 @@ pub fn repo_ref_display(r: &RepositoryRef, owner_ns: Option<&str>) -> String {
     repo_key(r, owner_ns.unwrap_or_default())
 }
 
+/// **Pure.** The wire severity for one registry row.
+///
+/// THE projection from `kopiur_api`'s two-level severity onto the wire's, and
+/// the only one: `gate_hits` and [`gates::descriptor`](crate::api::gates::descriptor)
+/// both call it, so the severity a gate is *documented* with and the severity a
+/// live hit *reports* cannot drift apart. They did — one shipped `Fail` and the
+/// other `error` for the same registry row — which is what makes this a function
+/// rather than two `match`es. Exhaustive.
+pub fn gate_severity_view(severity: GateSeverity) -> GateSeverityView {
+    match severity {
+        GateSeverity::Fail => GateSeverityView::Error,
+        GateSeverity::Warn => GateSeverityView::Warning,
+    }
+}
+
 /// **Pure.** Which structural gates a resource's live conditions have tripped.
 ///
 /// `covers` is the scope predicate for the kind being inspected — one of
@@ -365,7 +380,7 @@ pub fn gate_hits(conditions: &[Condition], covers: fn(GateScope) -> bool) -> Vec
             Some(GateHit {
                 condition: c.type_.clone(),
                 reason: c.reason.clone(),
-                severity: row.severity.label().to_string(),
+                severity: gate_severity_view(row.severity),
                 message: c.message.clone(),
             })
         })
@@ -600,11 +615,11 @@ mod tests {
         assert_eq!(hits[0].condition, "MassDeletionHeld");
         assert_eq!(hits[0].reason, "ThresholdExceeded");
         assert_eq!(hits[0].message, "42 deletions exceed the threshold of 10");
-        assert!(
-            hits[0].severity == "Fail" || hits[0].severity == "Warn",
-            "severity is a registry label, got {}",
-            hits[0].severity
-        );
+        // The mass-deletion breaker is a hard block, so the SPA must be told to
+        // style it as an error. The previous version of this assertion accepted
+        // either of the registry's OWN labels ("Fail"/"Warn"), which is how a hit
+        // shipping a vocabulary the wire type forbids passed review green.
+        assert_eq!(hits[0].severity, GateSeverityView::Error);
     }
 
     #[test]

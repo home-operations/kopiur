@@ -16,7 +16,7 @@ use axum::{Json, Router, routing::get};
 use k8s_openapi::api::batch::v1::Job;
 
 use kopiur_api::cluster_repository::AllowedNamespaces;
-use kopiur_api::common::{RepositoryKind, repo_key};
+use kopiur_api::common::{RepositoryKind, RepositoryMode, repo_key};
 use kopiur_api::gates::GateScope;
 use kopiur_api::snapshot_policy::repository_refs;
 use kopiur_api::{
@@ -54,6 +54,7 @@ struct RepoFacts<'a> {
     namespace: Option<String>,
     phase: Option<&'a RepositoryPhase>,
     backend: Option<String>,
+    mode: RepositoryMode,
     server_configured: bool,
     suspended: bool,
     snapshot_count: Option<i64>,
@@ -64,18 +65,26 @@ struct RepoFacts<'a> {
     allowed_namespace_count: Option<i64>,
 }
 
-/// **Pure.** How clients reach this repository.
+/// **Pure.** `spec.mode` as the string every other kopiur front end prints.
 ///
-/// `Direct` means every mover talks to the storage backend itself; `Server`
-/// means a kopia repository server fronts it. This is deliberately *not*
-/// `spec.mode` (`ReadWrite`/`ReadOnly`), which the CLI's table shows — the wire
-/// field's contract is the access path, and read-only-ness is already carried by
-/// [`ServerView::read_only`] and the repository's own conditions.
-fn mode_label(server_configured: bool) -> String {
-    if server_configured {
-        "Server"
-    } else {
-        "Direct"
+/// An exhaustive `match` rather than `format!("{mode:?}")`, producing the same
+/// two strings: `kopiur_ops::status` builds the CLI's `MODE` column with the
+/// `Debug` spelling (`crates/ops/src/status.rs`), `/api/v1/status` ships that
+/// report verbatim, and this row has to agree with both — but a `Debug` call
+/// would let a third variant ship a new string with no compile error, and the
+/// agreement is the whole point. `mode_is_the_string_status_and_the_cli_print`
+/// pins the two against each other.
+///
+/// A second spelling here would mean one API answering `mode` two ways, which is
+/// the collision this replaced.
+///
+/// How clients *reach* the repository is `server_backed`, a separate field:
+/// access path and access rights are independent, and a read-only repository
+/// can be either.
+fn mode_label(mode: RepositoryMode) -> String {
+    match mode {
+        RepositoryMode::ReadWrite => "ReadWrite",
+        RepositoryMode::ReadOnly => "ReadOnly",
     }
     .to_string()
 }
@@ -89,7 +98,8 @@ fn summary_from(facts: &RepoFacts<'_>, gates: &[GateHit]) -> RepositorySummary {
         phase: facts.phase.map(repo_phase_view),
         health: repository_health(facts.phase, facts.suspended, gates),
         backend: facts.backend.clone(),
-        mode: mode_label(facts.server_configured),
+        mode: mode_label(facts.mode),
+        server_backed: facts.server_configured,
         suspended: facts.suspended,
         snapshot_count: facts.snapshot_count,
         total_size_bytes: facts.total_size_bytes,
@@ -113,6 +123,7 @@ pub fn view_repository(repo: &Repository) -> RepositorySummary {
         backend: status
             .and_then(|s| s.backend.clone())
             .or_else(|| Some(repo.spec.backend.kind_str().to_string())),
+        mode: repo.spec.mode,
         server_configured: repo.spec.server.is_some(),
         suspended: repo.spec.suspend,
         snapshot_count: stats.and_then(|s| s.snapshot_count),
@@ -140,6 +151,7 @@ pub fn view_cluster_repository(repo: &ClusterRepository) -> RepositorySummary {
         backend: status
             .and_then(|s| s.backend.clone())
             .or_else(|| Some(repo.spec.backend.kind_str().to_string())),
+        mode: repo.spec.mode,
         server_configured: repo.spec.server.is_some(),
         suspended: repo.spec.suspend,
         snapshot_count: stats.and_then(|s| s.snapshot_count),
@@ -586,7 +598,8 @@ status:
         assert_eq!(row.phase, Some(RepositoryPhaseView::Ready));
         assert_eq!(row.health, Health::Healthy);
         assert_eq!(row.backend.as_deref(), Some("S3"));
-        assert_eq!(row.mode, "Direct", "no repository server is configured");
+        assert_eq!(row.mode, "ReadWrite", "spec.mode, defaulted");
+        assert!(!row.server_backed, "no repository server is configured");
         assert!(!row.suspended);
         assert_eq!(row.snapshot_count, Some(412));
         assert_eq!(row.total_size_bytes, Some(987_654_321));
@@ -643,7 +656,9 @@ spec:
     }
 
     #[test]
-    fn a_repository_server_changes_the_access_mode() {
+    fn the_access_path_and_the_access_rights_are_separate_fields() {
+        // A read-ONLY repository fronted by a server: the pairing that a single
+        // `mode` field could not express, and the reason `server_backed` exists.
         let served: Repository = from_yaml(
             r#"
 apiVersion: kopiur.home-operations.com/v1alpha1
@@ -652,6 +667,7 @@ metadata: { name: served, namespace: media }
 spec:
   backend: { filesystem: { path: /repo } }
   encryption: { passwordSecretRef: { name: pw, key: password } }
+  mode: ReadOnly
   server: { readOnly: true }
 status:
   phase: Ready
@@ -659,11 +675,27 @@ status:
 "#,
         );
         let row = view_repository(&served);
-        assert_eq!(row.mode, "Server");
+        assert_eq!(row.mode, "ReadOnly");
+        assert!(row.server_backed);
         assert_eq!(
             row.server_endpoint.as_deref(),
             Some("kopiur-served.media.svc:51515")
         );
+    }
+
+    #[test]
+    fn mode_is_the_string_status_and_the_cli_print() {
+        // `/api/v1/status` ships `kopiur_ops::status`'s report verbatim, and its
+        // `mode` is `format!("{:?}", spec.mode)`. One API must not answer `mode`
+        // two ways, so the two spellings are pinned against each other here
+        // rather than trusted to stay aligned.
+        for mode in [RepositoryMode::ReadWrite, RepositoryMode::ReadOnly] {
+            assert_eq!(
+                mode_label(mode),
+                format!("{mode:?}"),
+                "the row's MODE must read exactly as the CLI's column does"
+            );
+        }
     }
 
     #[test]

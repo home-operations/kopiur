@@ -63,6 +63,29 @@ pub enum Health {
     Unknown,
 }
 
+/// How loudly a gate should be reported.
+///
+/// A closed enum rather than a string because the severity is *load-bearing on
+/// both ends*: the SPA styles a banner from it, and the backend decides a
+/// node's [`Health`] from it. A stringly-typed severity let one half of the
+/// operator's own gate registry ship `Fail` while the other shipped `error`,
+/// with nothing to catch it — the two projections now cannot disagree because
+/// there is only one type to project onto.
+///
+/// Mirrors `kopiur_api::gates::GateSeverity`, which has exactly these two
+/// levels: a gate is either wedged work or a refusal that may well be the
+/// configuration you asked for. There is no `info` — an informational gate
+/// would not be a gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum GateSeverityView {
+    /// The block is refused work that may be a deliberate choice.
+    Warning,
+    /// Work is wedged and cannot progress without an out-of-band change.
+    Error,
+}
+
 /// One admission or reconcile gate that is currently holding a resource back.
 ///
 /// Mirrors the blocking `status.conditions` entry that produced it, flattened
@@ -75,8 +98,8 @@ pub struct GateHit {
     pub condition: String,
     /// The `status.conditions[].reason`, e.g. `DeletionProtectionEngaged`.
     pub reason: String,
-    /// How serious the gate is — `info`, `warning`, or `error`.
-    pub severity: String,
+    /// How serious the gate is.
+    pub severity: GateSeverityView,
     /// The `status.conditions[].message`, shown verbatim.
     pub message: String,
 }

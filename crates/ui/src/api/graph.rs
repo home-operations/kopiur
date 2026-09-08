@@ -37,7 +37,7 @@ use kopiur_api::{
     SnapshotPolicy, SnapshotReplication,
 };
 use kopiur_ui_model::graph::{
-    EdgeKind, GateHit, GraphEdge, GraphNode, Health, NodeKind, RepositoryGraph,
+    EdgeKind, GateHit, GateSeverityView, GraphEdge, GraphNode, Health, NodeKind, RepositoryGraph,
 };
 
 use crate::AppState;
@@ -160,7 +160,7 @@ pub fn repository_health(
     if suspended {
         return Health::Suspended;
     }
-    if gates.iter().any(|g| g.severity == "Fail") {
+    if gates.iter().any(|g| g.severity == GateSeverityView::Error) {
         return Health::Failed;
     }
     match phase {
@@ -338,7 +338,7 @@ fn policy_node(policy: &SnapshotPolicy) -> GraphNode {
     );
     let health = if policy.spec.suspend {
         Health::Suspended
-    } else if gates.iter().any(|g| g.severity == "Fail") {
+    } else if gates.iter().any(|g| g.severity == GateSeverityView::Error) {
         Health::Failed
     } else {
         Health::Healthy
@@ -1036,13 +1036,13 @@ status:
         let fail_gate = vec![GateHit {
             condition: "DeletionHeld".into(),
             reason: "DeletionProtectionEngaged".into(),
-            severity: "Fail".into(),
+            severity: GateSeverityView::Error,
             message: "held".into(),
         }];
         let warn_gate = vec![GateHit {
             condition: "MoverPermitted".into(),
             reason: "PrivilegedMoverNotPermitted".into(),
-            severity: "Warn".into(),
+            severity: GateSeverityView::Warning,
             message: "not opted in".into(),
         }];
 
