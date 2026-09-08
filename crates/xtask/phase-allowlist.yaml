@@ -311,7 +311,7 @@ allow:
     reason: >-
       The `Restore` half of the same `check_recent_failures` window, same
       reasoning.
-  - file: crates/cli/src/cmd/snapshot.rs
+  - file: crates/ops/src/actions/snapshot.rs
     snippet: "status.and_then(|s| s.phase.as_ref()) == Some(&SnapshotPhase::Unchanged)"
     reason: >-
       `success_summary` wording pick, reached only after the exhaustive

@@ -4,6 +4,12 @@
 
 use std::path::PathBuf;
 
+use kopiur_api::common::{FailurePolicy, ObjectRef, RepositoryRef};
+use kopiur_api::restore::{FromPolicy, IdentitySource, PvcTemplate, RestoreOptions, RestorePolicy};
+use kopiur_api::{PopulatorTarget, RestoreSource, RestoreTarget};
+use kopiur_ops::actions::restore::RestoreRequest;
+use kopiur_ops::actions::snapshot::SnapshotNowRequest;
+
 use crate::output::OutputFormat;
 
 /// `kubectl kopiur` — operate the kopiur backup operator from the command line.
@@ -663,6 +669,144 @@ pub struct RestoreArgs {
     pub timeout: Option<std::time::Duration>,
 }
 
+impl From<&RestoreArgs> for RestoreRequest {
+    /// Total, because PARSE TIME already enforced the exactly-one-of
+    /// invariant: clap's `source` and `target` `ArgGroup`s are `required(true)`
+    /// and mutually exclusive, so exactly one member of each is present here.
+    ///
+    /// A `TryFrom` would be the fallible-looking spelling, but its error type
+    /// could only be uninhabited — which `clippy::infallible_try_from` denies,
+    /// rightly: a conversion that cannot fail should say so. Callers written
+    /// against `TryFrom` still work — `std`'s blanket impl gives them one.
+    fn from(args: &RestoreArgs) -> Self {
+        let source = match (&args.from_snapshot, &args.from_policy, &args.identity) {
+            (Some(snapshot), None, None) => RestoreSource::SnapshotRef(ObjectRef {
+                name: snapshot.clone(),
+                namespace: args.snapshot_namespace.clone(),
+            }),
+            (None, Some(policy), None) => RestoreSource::FromPolicy(FromPolicy {
+                name: policy.clone(),
+                namespace: args.policy_namespace.clone(),
+                as_of: args.as_of.clone(),
+                offset: args.offset.unwrap_or(0),
+                // The per-PVC path override (#443): `--source-path`, fromPolicy
+                // only (clap rejects it beside any other source at parse time).
+                source_path: args.source_path.clone(),
+            }),
+            (None, None, Some(identity)) => RestoreSource::Identity(IdentitySource {
+                username: identity.username.clone(),
+                hostname: identity.hostname.clone(),
+                source_path: identity.source_path.clone(),
+                snapshot_id: args.snapshot_id.clone(),
+                as_of: args.as_of.clone(),
+                offset: args.offset,
+            }),
+            _ => unreachable!("clap group enforces exactly one source"),
+        };
+
+        let target = match (&args.to_pvc, &args.create_pvc, args.populator) {
+            (Some(existing), None, false) => RestoreTarget::PvcRef(ObjectRef {
+                name: existing.clone(),
+                namespace: None,
+            }),
+            (None, Some(create), false) => RestoreTarget::Pvc(PvcTemplate {
+                name: create.clone(),
+                storage_class_name: args.storage_class.clone(),
+                capacity: args.size.clone(),
+                access_modes: args.access_modes.clone(),
+            }),
+            (None, None, true) => RestoreTarget::Populator(PopulatorTarget {}),
+            _ => unreachable!("clap group enforces exactly one target"),
+        };
+
+        let repository = args.repository.as_ref().map(|name| RepositoryRef {
+            kind: args.repository_kind.into(),
+            name: name.clone(),
+            namespace: args.repository_namespace.clone(),
+        });
+
+        let policy = if args.on_missing_snapshot.is_some() || args.wait_timeout.is_some() {
+            Some(RestorePolicy {
+                on_missing_snapshot: args.on_missing_snapshot.map(Into::into),
+                wait_timeout: args.wait_timeout.clone(),
+            })
+        } else {
+            None
+        };
+
+        RestoreRequest {
+            source,
+            target,
+            repository,
+            options: restore_options_from_args(args),
+            policy,
+            credential_projection: args.credential_projection,
+            failure_policy: failure_policy_from(
+                args.backoff_limit,
+                args.active_deadline_seconds,
+                args.pod_startup_deadline_seconds,
+            ),
+            name: args.name.clone(),
+        }
+    }
+}
+
+/// Build `spec.options` from the parsed flags, or `None` when nothing was set
+/// (so a bare restore carries no optional noise on the wire). Split out of the
+/// conversion so its 13-flag "is anything set" check doesn't compound that
+/// function's cognitive complexity with the source/target dispatch.
+fn restore_options_from_args(args: &RestoreArgs) -> Option<RestoreOptions> {
+    let anything_set = args.enable_file_deletion
+        || args.ignore_permission_errors.is_some()
+        || args.write_files_atomically.is_some()
+        || args.parallel.is_some()
+        || args.write_sparse_files.is_some()
+        || args.skip_owners.is_some()
+        || args.skip_permissions.is_some()
+        || args.skip_times.is_some()
+        || args.overwrite_files.is_some()
+        || args.overwrite_directories.is_some()
+        || args.overwrite_symlinks.is_some()
+        || args.ignore_errors.is_some()
+        || args.skip_existing.is_some();
+    anything_set.then_some(RestoreOptions {
+        enable_file_deletion: args.enable_file_deletion,
+        ignore_permission_errors: args.ignore_permission_errors,
+        write_files_atomically: args.write_files_atomically,
+        parallel: args.parallel,
+        write_sparse_files: args.write_sparse_files,
+        skip_owners: args.skip_owners,
+        skip_permissions: args.skip_permissions,
+        skip_times: args.skip_times,
+        overwrite_files: args.overwrite_files,
+        overwrite_directories: args.overwrite_directories,
+        overwrite_symlinks: args.overwrite_symlinks,
+        ignore_errors: args.ignore_errors,
+        skip_existing: args.skip_existing,
+    })
+}
+
+/// The mover-Job failure controls, or `None` when no flag set one (leaving the
+/// operator's defaults). Shared by the `restore` and `snapshot now`
+/// conversions, which take the identical three flags.
+fn failure_policy_from(
+    backoff_limit: Option<i32>,
+    active_deadline_seconds: Option<i64>,
+    pod_startup_deadline_seconds: Option<i64>,
+) -> Option<FailurePolicy> {
+    if backoff_limit.is_none()
+        && active_deadline_seconds.is_none()
+        && pod_startup_deadline_seconds.is_none()
+    {
+        return None;
+    }
+    Some(FailurePolicy {
+        backoff_limit,
+        active_deadline_seconds,
+        pod_startup_deadline_seconds,
+    })
+}
+
 /// A parsed `--identity user@host[:path]` value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityArg {
@@ -794,6 +938,28 @@ pub struct SnapshotNowArgs {
     /// Give up waiting after this long (e.g. 90s, 30m, 1h; default 30m).
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub timeout: Option<std::time::Duration>,
+}
+
+impl From<&SnapshotNowArgs> for SnapshotNowRequest {
+    /// Total: `snapshot now` has no exactly-one-of group — every flag maps
+    /// straight onto a request field. `--wait`/`--logs`/`--timeout` are the
+    /// CLI's own and deliberately stay behind.
+    fn from(args: &SnapshotNowArgs) -> Self {
+        SnapshotNowRequest {
+            policy: args.policy.clone(),
+            name: args.name.clone(),
+            tags: args.tags.clone(),
+            deletion_policy: args.deletion_policy.map(Into::into),
+            pin: args.pin,
+            description: args.description.clone(),
+            failure_policy: failure_policy_from(
+                args.backoff_limit,
+                args.active_deadline_seconds,
+                args.pod_startup_deadline_seconds,
+            ),
+            repository: args.repository.clone(),
+        }
+    }
 }
 
 /// `--deletion-policy` values; mirrors `kopiur_api::DeletionPolicy`.
@@ -1224,5 +1390,325 @@ mod tests {
                 "no OriginFilter maps to {origin:?}"
             );
         }
+    }
+
+    // --- flags → shared-layer requests ------------------------------------
+    //
+    // The conversions are where a flag goes missing silently: the builders in
+    // `kopiur-ops` can only serialize what they were handed. These tests are
+    // the "no flag dropped" guard at that seam.
+
+    /// Parse a `restore` command line and take the args out of the tree.
+    fn restore_args(flags: &[&str]) -> RestoreArgs {
+        let cli = parse(&[&["restore"], flags].concat())
+            .unwrap_or_else(|e| panic!("flags {flags:?} should parse: {e}"));
+        match cli.command {
+            Command::Restore(a) => *a,
+            other => panic!("expected restore, got {other:?}"),
+        }
+    }
+
+    /// The conversion for every source × target combination clap accepts (3×3):
+    /// each pair must select the matching externally-tagged variant, and the
+    /// source's own flags must ride along.
+    #[test]
+    fn restore_args_convert_for_every_source_target_combination() {
+        let sources: [(&[&str], &str); 3] = [
+            (
+                &["--from-snapshot", "snap1", "--snapshot-namespace", "src"],
+                "SnapshotRef",
+            ),
+            (
+                &[
+                    "--from-policy",
+                    "pol1",
+                    "--policy-namespace",
+                    "src",
+                    "--offset",
+                    "2",
+                ],
+                "FromPolicy",
+            ),
+            (
+                &["--identity", "pg@media:/pvc/data", "--repository", "repo1"],
+                "Identity",
+            ),
+        ];
+        let targets: [(&[&str], &str); 3] = [
+            (&["--to-pvc", "existing"], "PvcRef"),
+            (&["--create-pvc", "fresh", "--size", "1Gi"], "Pvc"),
+            (&["--populator"], "Populator"),
+        ];
+        for (source_flags, source_kind) in sources {
+            for (target_flags, target_kind) in targets {
+                let flags: Vec<&str> = source_flags.iter().chain(target_flags).copied().collect();
+                let args = restore_args(&flags);
+                let req = RestoreRequest::from(&args);
+                assert_eq!(req.source.kind_str(), source_kind, "{flags:?}");
+                assert_eq!(req.target.kind_str(), target_kind, "{flags:?}");
+                // The source's own flags survive the conversion.
+                match &req.source {
+                    RestoreSource::SnapshotRef(r) => {
+                        assert_eq!(r.name, "snap1");
+                        assert_eq!(r.namespace.as_deref(), Some("src"));
+                    }
+                    RestoreSource::FromPolicy(p) => {
+                        assert_eq!(p.name, "pol1");
+                        assert_eq!(p.namespace.as_deref(), Some("src"));
+                        assert_eq!(p.offset, 2);
+                        // Unpassed flags stay absent rather than defaulting to
+                        // a value the operator would then act on.
+                        assert!(p.source_path.is_none());
+                        assert!(p.as_of.is_none());
+                    }
+                    RestoreSource::Identity(i) => {
+                        assert_eq!(i.username, "pg");
+                        assert_eq!(i.hostname, "media");
+                        assert_eq!(i.source_path.as_deref(), Some("/pvc/data"));
+                    }
+                }
+                // As do the target's.
+                match &req.target {
+                    RestoreTarget::PvcRef(r) => assert_eq!(r.name, "existing"),
+                    RestoreTarget::Pvc(t) => {
+                        assert_eq!(t.name, "fresh");
+                        assert_eq!(t.capacity.as_deref(), Some("1Gi"));
+                    }
+                    RestoreTarget::Populator(_) => {}
+                }
+            }
+        }
+    }
+
+    /// A `restore` invocation with EVERY flag set, for the two "no flag
+    /// dropped" sweeps below. They are split so the option sweep's 13 asserts
+    /// don't compound the other's cognitive complexity.
+    fn all_flags_restore_args() -> RestoreArgs {
+        restore_args(&[
+            "--from-policy",
+            "pol1",
+            "--policy-namespace",
+            "other",
+            "--as-of",
+            "2026-06-01T00:00:00Z",
+            "--offset",
+            "2",
+            "--source-path",
+            "/pvc/postgres-data",
+            "--create-pvc",
+            "fresh",
+            "--size",
+            "10Gi",
+            "--storage-class",
+            "fast",
+            "--access-mode",
+            "ReadWriteOnce",
+            "--access-mode",
+            "ReadOnlyMany",
+            "--enable-file-deletion",
+            "--ignore-permission-errors",
+            "false",
+            "--write-files-atomically",
+            "true",
+            "--parallel",
+            "4",
+            "--write-sparse-files",
+            "true",
+            "--skip-owners",
+            "true",
+            "--skip-permissions",
+            "false",
+            "--skip-times",
+            "true",
+            "--overwrite-files",
+            "false",
+            "--overwrite-directories",
+            "false",
+            "--overwrite-symlinks",
+            "true",
+            "--ignore-errors",
+            "false",
+            "--skip-existing",
+            "true",
+            "--credential-projection",
+            "--on-missing-snapshot",
+            "continue",
+            "--wait-timeout",
+            "5m",
+            "--backoff-limit",
+            "1",
+            "--active-deadline-seconds",
+            "600",
+            "--pod-startup-deadline-seconds",
+            "300",
+            "--repository",
+            "nas",
+            "--repository-kind",
+            "cluster-repository",
+            "--repository-namespace",
+            "infra",
+            "--name",
+            "my-restore",
+        ])
+    }
+
+    /// The restore-options-dropped bug class, at the conversion: EVERY flag
+    /// must land on the request.
+    #[test]
+    fn restore_args_conversion_drops_no_flag() {
+        let req = RestoreRequest::from(&all_flags_restore_args());
+
+        let RestoreSource::FromPolicy(source) = &req.source else {
+            panic!("expected fromPolicy, got {:?}", req.source);
+        };
+        assert_eq!(source.name, "pol1");
+        assert_eq!(source.namespace.as_deref(), Some("other"));
+        assert_eq!(source.as_of.as_deref(), Some("2026-06-01T00:00:00Z"));
+        assert_eq!(source.offset, 2);
+        assert_eq!(source.source_path.as_deref(), Some("/pvc/postgres-data"));
+
+        let RestoreTarget::Pvc(target) = &req.target else {
+            panic!("expected created pvc, got {:?}", req.target);
+        };
+        assert_eq!(target.name, "fresh");
+        assert_eq!(target.capacity.as_deref(), Some("10Gi"));
+        assert_eq!(target.storage_class_name.as_deref(), Some("fast"));
+        assert_eq!(
+            target.access_modes,
+            vec![
+                kopiur_api::common::PvcAccessMode::ReadWriteOnce,
+                kopiur_api::common::PvcAccessMode::ReadOnlyMany
+            ]
+        );
+
+        let repository = req.repository.as_ref().expect("--repository set");
+        assert_eq!(
+            repository.kind,
+            kopiur_api::common::RepositoryKind::ClusterRepository
+        );
+        assert_eq!(repository.name, "nas");
+        assert_eq!(repository.namespace.as_deref(), Some("infra"));
+
+        let policy = req.policy.as_ref().expect("policy set");
+        assert_eq!(
+            policy.on_missing_snapshot,
+            Some(kopiur_api::OnMissingSnapshot::Continue)
+        );
+        assert_eq!(policy.wait_timeout.as_deref(), Some("5m"));
+
+        let failure = req.failure_policy.as_ref().expect("failure policy set");
+        assert_eq!(failure.backoff_limit, Some(1));
+        assert_eq!(failure.active_deadline_seconds, Some(600));
+        assert_eq!(failure.pod_startup_deadline_seconds, Some(300));
+
+        assert!(req.credential_projection);
+        assert_eq!(req.name.as_deref(), Some("my-restore"));
+    }
+
+    /// The same sweep for the 13 kopia restore-option flags, split into its own
+    /// test so its assert count doesn't compound the one above's.
+    #[test]
+    fn restore_args_conversion_drops_no_option_flag() {
+        let req = RestoreRequest::from(&all_flags_restore_args());
+        let options = req.options.as_ref().expect("options set");
+        assert!(options.enable_file_deletion);
+        assert_eq!(options.ignore_permission_errors, Some(false));
+        assert_eq!(options.write_files_atomically, Some(true));
+        assert_eq!(options.parallel, Some(4));
+        assert_eq!(options.write_sparse_files, Some(true));
+        assert_eq!(options.skip_owners, Some(true));
+        assert_eq!(options.skip_permissions, Some(false));
+        assert_eq!(options.skip_times, Some(true));
+        assert_eq!(options.overwrite_files, Some(false));
+        assert_eq!(options.overwrite_directories, Some(false));
+        assert_eq!(options.overwrite_symlinks, Some(true));
+        assert_eq!(options.ignore_errors, Some(false));
+        assert_eq!(options.skip_existing, Some(true));
+    }
+
+    /// A bare restore carries no optional noise into the request — an
+    /// unset-flags default must stay `None`, not an empty sub-object.
+    #[test]
+    fn a_bare_restore_converts_to_an_empty_request() {
+        let args = restore_args(&["--from-snapshot", "snap1", "--to-pvc", "data"]);
+        let req = RestoreRequest::from(&args);
+        assert!(req.repository.is_none());
+        assert!(req.options.is_none());
+        assert!(req.policy.is_none());
+        assert!(req.failure_policy.is_none());
+        assert!(!req.credential_projection);
+        assert!(req.name.is_none());
+    }
+
+    /// The same guard for `snapshot now`: every flag must reach the request,
+    /// and the CLI-only ones (`--wait`/`--logs`/`--timeout`) must not.
+    #[test]
+    fn snapshot_now_args_conversion_drops_no_flag() {
+        let cli = parse(&[
+            "snapshot",
+            "now",
+            "--policy",
+            "nightly",
+            "--name",
+            "pre-upgrade",
+            "--tag",
+            "reason=pre-upgrade",
+            "--tag",
+            "ticket=123",
+            "--deletion-policy",
+            "retain",
+            "--pin",
+            "--description",
+            "before the upgrade",
+            "--backoff-limit",
+            "0",
+            "--active-deadline-seconds",
+            "120",
+            "--pod-startup-deadline-seconds",
+            "60",
+            "--repository",
+            "nas",
+            "--wait",
+            "--logs",
+        ])
+        .expect("should parse");
+        let Command::Snapshot(SnapshotCommand::Now(args)) = cli.command else {
+            panic!("expected snapshot now");
+        };
+        let req = SnapshotNowRequest::from(&args);
+        assert_eq!(req.policy, "nightly");
+        assert_eq!(req.name.as_deref(), Some("pre-upgrade"));
+        assert_eq!(
+            req.tags,
+            vec![
+                ("reason".to_string(), "pre-upgrade".to_string()),
+                ("ticket".to_string(), "123".to_string()),
+            ]
+        );
+        assert_eq!(
+            req.deletion_policy,
+            Some(kopiur_api::DeletionPolicy::Retain)
+        );
+        assert!(req.pin);
+        assert_eq!(req.description.as_deref(), Some("before the upgrade"));
+        let failure = req.failure_policy.as_ref().expect("failure policy set");
+        assert_eq!(failure.backoff_limit, Some(0));
+        assert_eq!(failure.active_deadline_seconds, Some(120));
+        assert_eq!(failure.pod_startup_deadline_seconds, Some(60));
+        assert_eq!(req.repository.as_deref(), Some("nas"));
+
+        // A bare invocation carries nothing optional.
+        let cli = parse(&["snapshot", "now", "--policy", "nightly"]).expect("should parse");
+        let Command::Snapshot(SnapshotCommand::Now(args)) = cli.command else {
+            panic!("expected snapshot now");
+        };
+        let bare = SnapshotNowRequest::from(&args);
+        assert!(bare.name.is_none());
+        assert!(bare.tags.is_empty());
+        assert!(bare.deletion_policy.is_none());
+        assert!(!bare.pin);
+        assert!(bare.description.is_none());
+        assert!(bare.failure_policy.is_none());
+        assert!(bare.repository.is_none());
     }
 }
