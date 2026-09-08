@@ -1782,12 +1782,19 @@ impl ClaimReason {
 }
 
 /// Whether a claim recorded with `reason` may have its populate artifacts
-/// reaped. An unrecognized reason is reapable — that matches the pre-#443
-/// behavior, where `PopulateHijacked` was the only special case. Pure.
+/// reaped. Pure, and FAIL-CLOSED (review wave 2, finding 7): a reason this
+/// build cannot parse — absent (a half-written or hand-patched record) or an
+/// unknown string (a NEWER operator's vocabulary, which may well be its own
+/// "keep the prime" case) — is never reaped automatically. Deleting a
+/// `prime-<uid>` PVC is irreversible, and there is no pre-#443 precedent to
+/// lean on: on main a `Failed` populator never reached any reaper at all (it
+/// was terminal at the reconcile guard), so "reap unless told otherwise" was
+/// never the historical behavior. Such a prime is a human's to delete by hand
+/// (documented in `docs/troubleshooting.md`).
 pub fn claim_artifacts_reapable(reason: Option<&str>) -> bool {
     match reason.and_then(ClaimReason::parse) {
         Some(r) => r.artifacts_reapable(),
-        None => true,
+        None => false,
     }
 }
 

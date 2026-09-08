@@ -3147,7 +3147,7 @@ fn claim_drive_has_exactly_three_outcomes() {
 }
 
 #[test]
-fn claim_reason_vocabulary_round_trips_and_only_a_hijack_blocks_the_reaper() {
+fn claim_reason_vocabulary_round_trips_and_a_hijack_or_an_unreadable_reason_blocks_the_reaper() {
     // Every reason parses back to itself, so a write and a later compare cannot
     // drift.
     for r in ClaimReason::ALL {
@@ -3175,10 +3175,27 @@ fn claim_reason_vocabulary_round_trips_and_only_a_hijack_blocks_the_reaper() {
         assert!(r.artifacts_reapable(), "{} must be reapable", r.as_str());
         assert!(claim_artifacts_reapable(Some(r.as_str())));
     }
-    // An unrecognized or absent reason keeps the pre-#443 behavior (reapable):
-    // `PopulateHijacked` was the only special case there too.
-    assert!(claim_artifacts_reapable(None));
-    assert!(claim_artifacts_reapable(Some("SomethingNewerWrote")));
+    // Wave 2, finding 7 — FAIL CLOSED on a reason this build cannot read. An
+    // absent reason is a half-written or hand-patched record; an unknown string
+    // is a NEWER operator's vocabulary, which may well be its own "keep the
+    // prime" case. Deleting a prime PVC on a guess is irreversible, so neither
+    // is reaped automatically: a human deletes `prime-<uid>` by hand.
+    assert!(!claim_artifacts_reapable(None));
+    assert!(!claim_artifacts_reapable(Some("")));
+    assert!(!claim_artifacts_reapable(Some("SomethingNewerWrote")));
+    // …and the settled-sweep gate inherits the same answer.
+    for reason in [None, Some("SomethingNewerWrote")] {
+        let record = RestoreClaimStatus {
+            uid: Some("u1".into()),
+            phase: Some(kopiur_api::RestoreClaimPhase::Populated),
+            reason: reason.map(str::to_string),
+            ..Default::default()
+        };
+        assert!(
+            !settled_artifacts_reapable(&record),
+            "reason={reason:?} must never be swept automatically"
+        );
+    }
 }
 
 /// A legacy (pre-fan-out) `Restore` status: top-level phase + a `Ready`

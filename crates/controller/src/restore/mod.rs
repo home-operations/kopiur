@@ -1161,10 +1161,15 @@ async fn reap_claim_artifacts(
     pv: Option<&str>,
 ) -> Result<()> {
     if !claim_artifacts_reapable(reason) {
+        // Either the hijacked case (the prime holds half-written data) or a
+        // reason this build cannot read (fail closed, wave 2 finding 7). Both
+        // leave `prime-<uid>` for a human.
         tracing::info!(
-            %namespace, claim = %claim_name, reason = reason.unwrap_or_default(),
-            "populator: keeping this claim's prime PVC — its populate was hijacked mid-flight \
-             and the prime holds half-written data"
+            %namespace, claim = %claim_name, reason = reason.unwrap_or("<none>"),
+            prime = %prime_pvc_name(uid),
+            "populator: keeping this claim's prime PVC — its recorded reason forbids automatic \
+             reaping (a hijacked populate's prime holds half-written data; an absent or \
+             unrecognized reason is never reaped on a guess); delete it by hand when done"
         );
         return Ok(());
     }
