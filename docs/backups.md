@@ -197,7 +197,7 @@ When a selector matches several PVCs, `groupBy` defaults to `VolumeGroupSnapshot
 | ---------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------- |
 | `Snapshot` _(default)_ | Point-in-time CSI `VolumeSnapshot` → temporary staged PVC → kopia reads the stage. | The CSI **snapshot stack** + a `VolumeSnapshotClass` for your driver. |
 | `Clone`                | CSI clone of the source PVC → kopia reads the clone.          | A CSI driver that supports volume **cloning**.                       |
-| `Direct`               | Read the **live** PVC directly (co-located on its node).     | Nothing — works on any storage.                                      |
+| `Direct`               | Read the **live** PVC directly (co-located on its node).     | Nothing; works on any storage.                                      |
 
 `volumeSnapshotClassName` selects the snapshot class when `Snapshot` or `Clone` is used. Leave it unset, or empty, which means the same thing, to auto-pick your driver's **default** class.
 
@@ -311,7 +311,7 @@ extraArgs: [] # escape hatch for kopia flags not modeled above
 | Field | What it does |
 | --- | --- |
 | `compression.compressor` | The kopia compressor (e.g. `zstd`, `gzip`, `s2`); omit to leave content uncompressed. |
-| `compression.neverCompress` | Globs to never attempt to compress — already-compressed media, archives. |
+| `compression.neverCompress` | Globs to never attempt to compress: already-compressed media, archives. |
 | `files.ignoreRules` | `.gitignore`-style globs of paths to exclude from the snapshot. |
 | `files.ignoreCacheDirs` | Honor `CACHEDIR.TAG` markers (skip directories tagged as caches). |
 | `files.ignoreIdenticalSnapshots` | When `true`, kopia won't create a new snapshot if the source is exactly identical to the last one. |
@@ -538,14 +538,14 @@ mover:
 
 | Value | What it does | When to change it |
 | --- | --- | --- |
-| `resources` | CPU/memory requests & limits on the mover container. | Large or many-file sources — give the mover memory headroom; or cap it so a backup doesn't starve the node. |
-| `securityContext.runAsUser` / `runAsGroup` | The UID/GID the mover runs as. Default UID `65532` reads only world-readable or `65532`-owned files. | **Set it to the UID/GID that owns your data** so the mover can read it — the single most common knob (see [example 09](examples.md#example-09--mover-uidgid--permissions) and [Permissions](permissions.md)). |
+| `resources` | CPU/memory requests & limits on the mover container. | Large or many-file sources: give the mover memory headroom; or cap it so a backup doesn't starve the node. |
+| `securityContext.runAsUser` / `runAsGroup` | The UID/GID the mover runs as. Default UID `65532` reads only world-readable or `65532`-owned files. | **Set it to the UID/GID that owns your data** so the mover can read it. This is the single most common knob (see [example 09](examples.md#example-09--mover-uidgid--permissions) and [Permissions](permissions.md)). |
 | `podSecurityContext.fsGroup` | A **pod**-level `fsGroup` (and `fsGroupChangePolicy`). On mount the kubelet makes the volume group-writable by that GID. | Let an **unprivileged** mover populate a **freshly-provisioned restore volume** (root-owned `0755`) without a root mover. A pod-level `runAsUser: 0` here is still gated as privileged. See [Security context → fsGroup](security-context.md). |
-| `inheritSecurityContextFrom` | Copy **both** the container `securityContext` **and** the pod-level `securityContext` (e.g. `fsGroup`) from a live workload pod, instead of hard-coding them. Requires the workload to pin `runAsUser`. | When you'd rather "run exactly as the app runs" — same UID *and* fsGroup — than track them. Combines with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no pod resolves. See [Security context](security-context.md#2-inherit-it-from-the-workload) and [example 18](examples.md#example-18--inherit-the-mover-security-context-from-a-workload). |
-| `cache.capacity` / `storageClassName` | Back the kopia cache with a sized volume instead of an `emptyDir`. | Large repositories — a sized cache avoids re-downloading metadata each run. |
+| `inheritSecurityContextFrom` | Copy **both** the container `securityContext` **and** the pod-level `securityContext` (e.g. `fsGroup`) from a live workload pod, instead of hard-coding them. Requires the workload to pin `runAsUser`. | When you'd rather "run exactly as the app runs" (same UID *and* fsGroup) than track them. Combines with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no pod resolves. See [Security context](security-context.md#2-inherit-it-from-the-workload) and [example 18](examples.md#example-18--inherit-the-mover-security-context-from-a-workload). |
+| `cache.capacity` / `storageClassName` | Back the kopia cache with a sized volume instead of an `emptyDir`. | Large repositories: a sized cache avoids re-downloading metadata each run. |
 | `cache.mode` | `Ephemeral` (fresh per run, GC'd with the Job) or `Persistent` (a controller-owned PVC reused across runs for a **warm** cache). | `Persistent` for big recurring backups where a warm cache speeds each run. It's `ReadWriteOnce`, so it assumes runs don't overlap. |
 | `cache.contentCacheSizeMb` / `metadataCacheSizeMb` | kopia's content/metadata cache budgets (MiB). | Tune kopia's memory/disk cache footprint independently of the volume size. |
-| `privilegedMode` | An opt-in elevation that also preserves original UID/GID ownership on **restore**. | Only when matching a single UID isn't enough (mixed ownership, `lost+found`). Namespace-gated — see below. |
+| `privilegedMode` | An opt-in elevation that also preserves original UID/GID ownership on **restore**. | Only when matching a single UID isn't enough (mixed ownership, `lost+found`). Namespace-gated; see below. |
 
 A repository can set `moverDefaults.cache` that every mover inherits, and `mover.cache` overlays it field by field, so you can, for example, bump only `capacity` per recipe. See [Repositories → moverDefaults.cache](repositories.md).
 
@@ -597,8 +597,8 @@ Kopiur reserves the `kopiur` key prefix for the tags it writes on every produced
 
 | Tag (as passed to kopia)  | Stored manifest key/value                        | What it records                                                                                                                                                                                                                          |
 | ------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kopiur:config:<policy>`  | key `tag:kopiur`, value `config:<policy>`        | Which `SnapshotPolicy` produced the snapshot (kopia's first-colon split puts `config:<policy>` in the value — a long-standing shape existing tooling depends on).                                                                          |
-| `kopiur-meta: {…}`        | key `tag:kopiur-meta`, value compact JSON        | The **resolved mover identity** the backup ran as — `uid`/`gid` (absent = image-determined), pod `fsGroup`, and `src` (whether the identity was `inherited` from the workload, pinned by the recipe's `explicit` context, or came from `defaults`). |
+| `kopiur:config:<policy>`  | key `tag:kopiur`, value `config:<policy>`        | Which `SnapshotPolicy` produced the snapshot (kopia's first-colon split puts `config:<policy>` in the value, a long-standing shape existing tooling depends on).                                                                          |
+| `kopiur-meta: {…}`        | key `tag:kopiur-meta`, value compact JSON        | The **resolved mover identity** the backup ran as: `uid`/`gid` (absent = image-determined), pod `fsGroup`, and `src` (whether the identity was `inherited` from the workload, pinned by the recipe's `explicit` context, or came from `defaults`). |
 
 The `kopiur-meta` value is mirrored to `status.recorded` at launch, and the catalog scan decodes it back onto **discovered** rows, and backfills pre-existing rows that lack it. So the identity your data expects survives cluster rebuilds with the repository itself. See [Security context](security-context.md) for how the identity is resolved.
 
@@ -609,8 +609,8 @@ A `Snapshot` CR **owns** its kopia snapshot via a finalizer. What happens to the
 | Policy   | On `Snapshot` deletion                                                                                 | Default for                                                                |
 | -------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | `Delete` | Finalizer runs `kopia snapshot delete`, then removes the CR.                                         | `scheduled` / `manual` backups.                                            |
-| `Retain` | CR is removed; the snapshot **stays** in the repository.                                             | `discovered` backups (forced — Kopiur won't delete what it didn't create). |
-| `Orphan` | CR is removed **without contacting the repository** — escape hatch for "the bucket is already gone". | —                                                                          |
+| `Retain` | CR is removed; the snapshot **stays** in the repository.                                             | `discovered` backups (forced, because Kopiur won't delete what it didn't create). |
+| `Orphan` | CR is removed **without contacting the repository**. Escape hatch for "the bucket is already gone". | —                                                                          |
 
 Set it per-`Snapshot` with `spec.deletionPolicy`, or set the recipe-wide default with `SnapshotPolicy.spec.defaultDeletionPolicy`. This is also how retention pruning reclaims space: pruned `Snapshot` CRs use `Delete`, so the snapshots go with them.
 
@@ -627,7 +627,7 @@ spec:
 | Value                | What happens to a produced Snapshot whose own `deletionPolicy` is `Delete`, once its schedule is gone/replaced                                     |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Retain` _(default)_  | Downgraded to retain: the finalizer releases, **no** `kopia snapshot delete` runs, a `SnapshotRetainedOnScheduleDelete` Warning Event fires on the Snapshot, and the catalog rediscovers the kopia snapshot as `origin: discovered` (forced `Retain`) on its next scan. |
-| `Delete`              | Opt-in cascade: the Snapshot's own `deletionPolicy` applies exactly as if the schedule still existed — its kopia snapshot really is deleted, subject to the repository's [mass-deletion breaker](repositories.md#deletionprotection--the-mass-deletion-circuit-breaker) below. |
+| `Delete`              | Opt-in cascade: the Snapshot's own `deletionPolicy` applies exactly as if the schedule still existed: its kopia snapshot really is deleted, subject to the repository's [mass-deletion breaker](repositories.md#deletionprotection--the-mass-deletion-circuit-breaker) below. |
 
 This guard exists because Kubernetes' own ownerReference garbage collection deletes a schedule's produced `Snapshot` CRs the moment the schedule is deleted, or a GitOps tool replaces it, with no way for the CRs themselves to tell "my schedule is gone" apart from "someone deleted me directly". And a schedule getting deleted, whether accidentally, by a flapping GitOps controller, or as part of a refactor, must never silently cascade into deleting a fleet's worth of backup history. `Retain` is the fail-safe default for exactly the same reason `onNamespaceDelete` defaults to `Orphan`.
 
@@ -647,8 +647,8 @@ spec:
 
 | Value                | What happens to the policy's `Snapshot` CRs once the `SnapshotPolicy` is deleted                                                                                                                                                        |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Retain` _(default)_  | Every CR is stamped `pruned-by: policy-cascade` and removed — but **every kopia snapshot stays in the repository**. A `SnapshotRetainedOnPolicyDelete` Warning Event fires on each one whose own `deletionPolicy` was `Delete` (the loud downgrade). Nothing is lost: the data is rediscovered as `origin: discovered` on the next catalog scan, and — since adoption defaults on — automatically re-attached the moment a `SnapshotPolicy` with a matching identity exists (including this same policy, re-created). When the matching policy's effective `defaultDeletionPolicy` is `Retain`/`Orphan`, only the history its retention window would keep is re-attached; the rest stays `discovered` (see [`catalog.adoption`](repositories.md#catalogadoption--automatically-re-attaching-discovered-snapshots)). |
-| `Delete`              | Opt-in cascade: each CR is deleted **unstamped**, so its own `deletionPolicy` applies exactly like any other external deletion — `Delete` really does call `kopia snapshot delete`, subject to the repository's [mass-deletion breaker](repositories.md#deletionprotection--the-mass-deletion-circuit-breaker) (the `allow-mass-deletion` ack) below. |
+| `Retain` _(default)_  | Every CR is stamped `pruned-by: policy-cascade` and removed, but **every kopia snapshot stays in the repository**. A `SnapshotRetainedOnPolicyDelete` Warning Event fires on each one whose own `deletionPolicy` was `Delete` (the loud downgrade). Nothing is lost: the data is rediscovered as `origin: discovered` on the next catalog scan, and (since adoption defaults on) automatically re-attached the moment a `SnapshotPolicy` with a matching identity exists (including this same policy, re-created). When the matching policy's effective `defaultDeletionPolicy` is `Retain`/`Orphan`, only the history its retention window would keep is re-attached; the rest stays `discovered` (see [`catalog.adoption`](repositories.md#catalogadoption--automatically-re-attaching-discovered-snapshots)). |
+| `Delete`              | Opt-in cascade: each CR is deleted **unstamped**, so its own `deletionPolicy` applies exactly like any other external deletion: `Delete` really does call `kopia snapshot delete`, subject to the repository's [mass-deletion breaker](repositories.md#deletionprotection--the-mass-deletion-circuit-breaker) (the `allow-mass-deletion` ack) below. |
 
 /// warning | Behavior change: previously-dangling CRs are now cleaned up
 
@@ -752,9 +752,9 @@ spec:
 
 | Value | What it does | When to change it |
 | --- | --- | --- |
-| `backoffLimit` | `Job.spec.backoffLimit` — retries before the run is marked failed. | Lower to fail fast on a flaky source; raise to ride out transient backend blips. |
-| `activeDeadlineSeconds` | `Job.spec.activeDeadlineSeconds` — a hard wall-clock cap on a mover that **is running**. | Set a ceiling so a long backup can't run forever; size it **above** your largest expected run. Defaults to a 48h backstop. |
-| `podStartupDeadlineSeconds` | How long the mover pod may sit **unable to start** — `CreateContainerConfigError`, `ImagePullBackOff`, or `Unschedulable` — before the run is failed with reason `MoverPodWedged`. | Raise on slow nodes/large images or when an RWO volume takes a while to detach from another node; lower to surface a misconfiguration faster. Default `300` (5 min). |
+| `backoffLimit` | `Job.spec.backoffLimit`: retries before the run is marked failed. | Lower to fail fast on a flaky source; raise to ride out transient backend blips. |
+| `activeDeadlineSeconds` | `Job.spec.activeDeadlineSeconds`: a hard wall-clock cap on a mover that **is running**. | Set a ceiling so a long backup can't run forever; size it **above** your largest expected run. Defaults to a 48h backstop. |
+| `podStartupDeadlineSeconds` | How long the mover pod may sit **unable to start** (`CreateContainerConfigError`, `ImagePullBackOff`, or `Unschedulable`) before the run is failed with reason `MoverPodWedged`. | Raise on slow nodes/large images or when an RWO volume takes a while to detach from another node; lower to surface a misconfiguration faster. Default `300` (5 min). |
 
 /// warning | The two deadlines solve different problems: don't conflate them
 
@@ -789,9 +789,9 @@ The schedule stage above is minimal. The full set of settings, `timezone`, `susp
 | `schedule.cron`                    | When to fire. Supports Jenkins-style **`H`** (see below).                                                                                    |
 | `schedule.jitter`                  | Spread firings over a window (e.g. `30m`), so many schedules don't all hit at once. Absent, it inherits the target policy's repository [`scheduleDefaults.jitter`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once) (see the tip below). Capped at 24h at admission. |
 | `schedule.timezone`                | IANA timezone the cron is evaluated in. Absent, it inherits the target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once), else UTC (see the tip below).                                                          |
-| `schedule.runOnCreate`             | `false` (default) means applying the schedule does **not** fire immediately — GitOps-friendly. Set `true` to backup the moment it's created. |
+| `schedule.runOnCreate`             | `false` (default) means applying the schedule does **not** fire immediately, which is GitOps-friendly. Set `true` to backup the moment it's created. |
 | `schedule.suspend`                 | `true` pauses future firings (in-flight and past runs are untouched).                                                                        |
-| `schedule.concurrencyPolicy`       | What to do if a run is still in flight: `Forbid` (default, skip), `Allow` (run anyway), `Replace` (cancel the old one — see below).           |
+| `schedule.concurrencyPolicy`       | What to do if a run is still in flight: `Forbid` (default, skip), `Allow` (run anyway), `Replace` (cancel the old one; see below).           |
 | `schedule.startingDeadlineSeconds` | If a slot is missed by more than this (operator was down), skip it rather than fire late.                                                    |
 | `failedJobsHistoryLimit`           | How many **failed** `Snapshot` CRs from this schedule to keep. Successful retention is GFS on the `SnapshotPolicy`.                              |
 
@@ -985,7 +985,7 @@ A `SnapshotPolicy` describes the work. A `SnapshotSchedule`, or you, turns it in
 
 ## See also
 
-- [Repositories & backends](repositories.md) — where snapshots are stored.
-- [Restores](restores.md) — reading a snapshot back.
-- [Movers, RBAC & credentials](movers.md) — where backups actually run and what they need.
-- [Examples](examples.md) — [01 scheduled](examples.md#example-01--single-pvc-scheduled), [04 multi-PVC](examples.md#example-04--multi-pvc-selector), [06 manual](examples.md#example-06--manual-one-shot-backup).
+- [Repositories & backends](repositories.md): where snapshots are stored.
+- [Restores](restores.md): reading a snapshot back.
+- [Movers, RBAC & credentials](movers.md): where backups actually run and what they need.
+- [Examples](examples.md): [01 scheduled](examples.md#example-01--single-pvc-scheduled), [04 multi-PVC](examples.md#example-04--multi-pvc-selector), [06 manual](examples.md#example-06--manual-one-shot-backup).
