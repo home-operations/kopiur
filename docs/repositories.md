@@ -273,7 +273,7 @@ Byte-rate caps apply to **cold** backend traffic only. Content already in the mo
 | --- | --- | --- |
 | `seed.from.backend` | — | Blob mode: a mirror's storage backend (the same externally-tagged `Backend` shape `spec.backend` uses). |
 | `seed.from.repository` | — | Migrate mode: a `RepositoryRef` (`kind` defaults to `Repository`; an absent `namespace` resolves in this CR's namespace, and for a `ClusterRepository` in the operator's namespace). |
-| `seed.sync.parallel` | kopia's `1` | Blob mode only: concurrent blob-copy workers. Raise it: a first seed over a WAN is what sequential copying is worst at. |
+| `seed.sync.parallel` | kopia's `1` | Blob mode only: concurrent blob-copy workers. Raise it, because a first seed over a WAN is what sequential copying is worst at. |
 | `seed.sync.maxDownloadSpeedBytesPerSecond` / `maxUploadSpeedBytesPerSecond` | unlimited | Blob mode only: throttle the copy. |
 | `seed.migrate.parallel` | kopia's `1` | Migrate mode only: snapshots migrated concurrently. |
 | `seed.migrate.latestOnly` | `false` | Copy only each identity's newest snapshot instead of its full history. |

@@ -126,7 +126,7 @@ Watch it land on `/metrics`. **`kopiur_projected_secrets_live`** is the live cou
 
 ## Upgrading 0.5.x → 0.6.0 (one-time CRD migration)
 
-/// danger | 0.5.x → 0.6.0 is a breaking upgrade, read this first
+/// danger | 0.5.x → 0.6.0 is a breaking upgrade: read this first
 
 Two things change at once on this crossing, and both can bite:
 

@@ -334,7 +334,7 @@ A mover that can't read the data it's backing up is the classic footgun. By defa
 
 2. **On reconcile (status condition).** A Backup's `SecurityContextCompatible` condition is **positive-only and certain**. It is never a guess:
    - `True`: provably fine, checked against the *resolved* mover identity and the live workloads mounting the source. Either the mover is root, or its UID exactly matches **every** container that writes the source, init containers included. Using `inheritSecurityContextFrom` is **not** itself a basis: inheriting only helps if the workload actually pins a `runAsUser`, and the condition says `True` only once it has confirmed the UIDs match.
-   - `False`: set **only** by the certain post-run signal, number 3 below: the completed backup actually excluded unreadable entries. It is never set from an up-front heuristic, so a successful backup of world-readable data is never falsely flagged.
+   - `False`: set **only** by the certain post-run signal, number 3 below, which is that the completed backup actually excluded unreadable entries. It is never set from an up-front heuristic, so a successful backup of world-readable data is never falsely flagged.
    - **Absent**: the common case. Not provable from the spec alone, because nobody pinned a UID, or several UIDs write the volume. Absence is not a warning. It means "no claim", and the run proceeds.
 
    ```console
@@ -413,14 +413,14 @@ A filesystem repository backed by an inline NFS export (`backend.filesystem.volu
 
 The clean answer is to **decouple the two**: read the source as the app's UID, and write the repo through a **shared supplemental group**. Supplemental GIDs *are* sent to the NFS server over AUTH_SYS, within the 16-group limit, so a group-writable export grants write without changing the process's primary UID.
 
-1. **On the NAS**: own the export by the shared group and make it group-writable and setgid, so new repo blobs inherit the GID:
+1. **On the NAS.** Own the export by the shared group and make it group-writable and setgid, so new repo blobs inherit the GID:
 
     ```console
     chown -R root:3001 /export/kopia    # or: chown -R 3001:3001
     chmod -R 2775 /export/kopia         # 2 = setgid
     ```
 
-2. **On the repository**: every pod that *writes the backend* must carry the shared group. That means the bootstrap connect/create Job, every snapshot and maintenance mover, **and** the kopia-ui server:
+2. **On the repository.** Every pod that *writes the backend* must carry the shared group. That means the bootstrap connect/create Job, every snapshot and maintenance mover, **and** the kopia-ui server:
 
     ```yaml
     spec:
@@ -432,7 +432,7 @@ The clean answer is to **decouple the two**: read the source as the app's UID, a
           supplementalGroups: [3001] # the long-lived server joins it too
     ```
 
-3. **Per recipe**: source reads stay correct because each `SnapshotPolicy` or `Restore` reads as the *app's* identity, for example through `inheritSecurityContextFrom`. The supplemental group is additive and doesn't disturb the primary UID:
+3. **Per recipe.** Source reads stay correct because each `SnapshotPolicy` or `Restore` reads as the *app's* identity, for example through `inheritSecurityContextFrom`. The supplemental group is additive and doesn't disturb the primary UID:
 
     ```yaml
     # SnapshotPolicy

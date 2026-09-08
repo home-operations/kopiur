@@ -65,7 +65,7 @@ The mover reads the repository password, and any object-store keys, from a Secre
 | `Repository` (namespaced)            | Nothing extra; the repo and its Secret are already in the workload namespace.               | Not needed (no-op): the Secret is already where the mover runs.                                                 |
 | `ClusterRepository` (cluster-scoped) | Place a Secret of the same name in **each** workload namespace that backs up to it.          | Set `credentialProjection.enabled: true` on the `SnapshotPolicy`/`Restore`/`Maintenance` that uses it.            |
 
-/// tip | Don't hand-copy Secrets, turn on projection
+/// tip | Don't hand-copy Secrets: turn on projection
 
 If you run a shared `ClusterRepository` across more than a namespace or two, **use credential projection** instead of replicating the Secret by hand. It's one field on the consumer, meaning the `SnapshotPolicy`, `Restore` or `Maintenance`, and you never touch the credential Secret in a workload namespace again. It's **off by default**, because a namespace is a trust boundary and copying across one is opt-in. But for the multi-namespace shared-repo case it's the intended path. See [below](#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos).
 
