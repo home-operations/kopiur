@@ -226,3 +226,11 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+# ---> kopiur web UI (crates/ui/web)
+# The SPA's build output and its pnpm store. `dist/` is what `mise run ui-build`
+# produces and `crates/ui/build.rs` embeds; both are named explicitly because the
+# generic `dist/` and `lib/` rules above come from the Python template and would
+# be easy to mistake for the ones that cover these.
+crates/ui/web/dist/
+crates/ui/web/node_modules/
+

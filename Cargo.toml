@@ -8,6 +8,7 @@ members = [
     "crates/migrate",
     "crates/telemetry",
     "crates/ui-model",
+    "crates/ui",
     "crates/webhook",
     "crates/controller",
     "crates/mover",
@@ -31,6 +32,7 @@ kopiur-migrate = { path = "crates/migrate" }
 kopiur-mover = { path = "crates/mover" }
 kopiur-ops = { path = "crates/ops" }
 kopiur-telemetry = { path = "crates/telemetry" }
+kopiur-ui = { path = "crates/ui" }
 kopiur-ui-model = { path = "crates/ui-model" }
 
 # Kubernetes / controller-runtime
@@ -60,7 +62,37 @@ axum = "0.8"
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tower = "0.5"
+# Middleware for the web UI's axum stack: request tracing, gzip of the SPA bundle
+# and JSON payloads, the static security headers (`set-header`), the `/api`
+# concurrency limit and per-request timeout, and the dev-only CORS layer. `fs` is
+# deliberately absent — the SPA is embedded with `rust-embed`, never read off disk.
+tower-http = { version = "0.6", features = [
+    "trace",
+    "compression-gzip",
+    "set-header",
+    "limit",
+    "timeout",
+    "cors",
+] }
 json-patch = "4"
+# Bare HTTP types (`HeaderName`, `StatusCode`, `Uri`) for code that must not drag
+# in a whole framework — e.g. `kopiur-ui`'s config, which parses and validates
+# identity header names long before a router exists.
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+# `ReaderStream`: the UI's browse download bridges a `tokio::io::duplex` pipe fed
+# by the kopia exec into an axum streaming body.
+tokio-util = { version = "0.7", features = ["io"] }
+# Content-Type for embedded SPA assets, derived from the file extension.
+mime_guess = "2"
+# The SPA is compiled into the `kopiur-ui` binary at build time (`build.rs` copies
+# `web/dist` into `$OUT_DIR/web`); `interpolate-folder-path` is what lets the
+# `#[folder]` attribute name `$OUT_DIR`.
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+# Constant-time comparison for the UI's proxy shared secret: a byte-by-byte `==`
+# leaks the matched prefix length through timing.
+constant_time_eq = "0.4"
 
 # Observability
 tracing = "0.1"

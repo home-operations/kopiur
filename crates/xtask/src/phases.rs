@@ -172,6 +172,8 @@ pub const SCAN_CRATES: &[&str] = &[
     "kopia",
     "mover",
     "ops",
+    "ui",
+    "ui-model",
     "webhook",
 ];
 

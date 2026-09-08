@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 /// How the backend established the caller's identity.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+///
+/// `Eq` + `Hash` because this is a field of the backend's `Identity`, which keys
+/// the impersonating-client and `SubjectAccessReview` caches: two callers that
+/// differ only in how they were authenticated must not share a cache entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum IdentitySource {

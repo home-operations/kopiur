@@ -1,0 +1,60 @@
+[package]
+name = "kopiur-ui"
+description = "Web UI backend for kopiur: identity-impersonating read/action API over the Kopiur CRDs, plus the embedded SPA"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kopiur-api = { workspace = true }
+kopiur-kopia = { workspace = true }
+kopiur-ops = { workspace = true }
+kopiur-telemetry = { workspace = true }
+kopiur-ui-model = { workspace = true }
+
+# `ws` is what browse sessions need (`pods/exec` attaches); `runtime` supplies the
+# reflector stores behind `KOPIUR_UI_CACHE`.
+kube = { workspace = true, features = ["client", "runtime", "ws", "rustls-tls"] }
+k8s-openapi = { workspace = true, features = ["v1_33"] }
+
+axum = { workspace = true }
+axum-server = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+rustls = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+mime_guess = { workspace = true }
+rust-embed = { workspace = true }
+constant_time_eq = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+opentelemetry = { workspace = true }
+
+clap = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+kopiur-api = { workspace = true, features = ["testutil"] }
+tower = { workspace = true, features = ["util"] }
+serde_yaml = { workspace = true }
+serial_test = { workspace = true }
+
+[[bin]]
+name = "kopiur-ui"
+path = "src/main.rs"
+
+[lib]
+name = "kopiur_ui"
+path = "src/lib.rs"
