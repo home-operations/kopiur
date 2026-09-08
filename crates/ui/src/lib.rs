@@ -144,7 +144,7 @@ mod tests {
             cfg: Arc::new(test_config()),
             metrics: Arc::new(UiMetrics::new(provider)),
             readiness: Arc::new(Readiness::new(static_files::is_placeholder())),
-            auth: Arc::new(auth::AuthState::default()),
+            auth: Arc::new(auth::AuthState::unconfigured()),
             source: Arc::new(cache::Source::Impersonated),
             sessions: Arc::new(browse::session_pool::SessionPool::default()),
         }
