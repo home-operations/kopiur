@@ -740,16 +740,9 @@ struct LiveSession {
 /// carries is the caller's impersonating client — a shared one would be a
 /// different person's.
 fn ops_ctx(app: &AppState, identity: &Identity, namespace: &str) -> Result<OpsCtx, ApiError> {
-    let client = app.auth.clients.client_for(identity).map_err(|e| {
-        problem(
-            500,
-            "internal",
-            "kopiur-ui could not build a Kubernetes client for this request.",
-            format!("Constructing the impersonating client failed: {e}"),
-            "check kopiur-ui's own ServiceAccount and in-cluster configuration, and report \
-             this at https://github.com/home-operations/kopiur/issues with the UI's logs",
-        )
-    })?;
+    // `From<ClientBuildError>` in `api::problem` owns the wording, so a browse
+    // request and an ordinary read report the same failure the same way.
+    let client = app.auth.clients.client_for(identity)?;
     Ok(OpsCtx {
         client,
         namespace: namespace.to_string(),
@@ -1634,18 +1627,31 @@ mod router_tests {
     /// The browse router with the identity middleware in front, running as a
     /// fixed anonymous user whose kube client points at a closed port — so any
     /// handler that DID reach the cluster fails loudly rather than passing.
+    ///
+    /// A real [`AuthState::new`], never `AuthState::unconfigured()`: the
+    /// unconfigured placeholder is fail-closed and 500s every request, which
+    /// would mask every refusal these tests exist to assert.
     fn app() -> Router {
+        let cfg = config();
         let state = AppState {
-            cfg: Arc::new(config()),
             metrics: Arc::new(crate::metrics::UiMetrics::new(Arc::new(
                 kopiur_telemetry::MetricsProvider::new("kopiur-ui-test"),
             ))),
             readiness: Arc::new(crate::ops_listener::Readiness::new(
                 crate::static_files::is_placeholder(),
             )),
-            auth: Arc::new(AuthState::default()),
+            auth: Arc::new(AuthState::new(
+                cfg.auth.clone(),
+                kube::Config::new(
+                    "http://127.0.0.1:1/"
+                        .parse()
+                        .expect("a literal URL parses as a Uri"),
+                ),
+                cfg.client_cache.clone(),
+            )),
             source: Arc::new(crate::cache::Source::Impersonated),
             sessions: Arc::new(session_pool::SessionPool::default()),
+            cfg: Arc::new(cfg),
         };
         router()
             .layer(axum::middleware::from_fn_with_state(
@@ -1688,6 +1694,7 @@ mod router_tests {
                 ttl: Duration::from_secs(600),
             },
             sar_ttl: Duration::from_secs(60),
+            sar_cache_size: DEFAULT_SAR_CACHE_SIZE,
             tls: None,
             cors_origins: Vec::new(),
         }
