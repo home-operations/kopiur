@@ -783,6 +783,8 @@ impl UiArgs {
         // that parses to no groups (`","`, `" , "`) is a typo, and both readings
         // of it are wrong: "allow nothing" locks every caller out, "unset" quietly
         // widens impersonation to every group the proxy asserts. Refuse instead.
+        // Read the debug-only dev hatch BEFORE any field is moved out of `self`.
+        let system_anonymous_allowed = self.system_anonymous_allowed();
         let allowed_groups = match nonempty(self.allowed_groups) {
             Some(raw) => {
                 let groups: BTreeSet<String> = csv(Some(&raw)).into_iter().collect();
@@ -798,7 +800,6 @@ impl UiArgs {
         // even in header mode where it may never be used: a `system:` identity
         // sitting in the environment is a misconfiguration waiting for someone to
         // flip KOPIUR_UI_ANONYMOUS_FALLBACK on, and finding it then is too late.
-        let system_anonymous_allowed = self.system_anonymous_allowed();
         let anonymous_user = nonempty(self.anonymous_user);
         let anonymous_groups = csv(self.anonymous_groups.as_deref());
         if system_anonymous_allowed {
