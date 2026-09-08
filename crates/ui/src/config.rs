@@ -640,6 +640,21 @@ pub enum ConfigError {
         source: std::net::AddrParseError,
     },
 
+    /// `KOPIUR_UI_ALLOWED_GROUPS` was set but names no group.
+    #[error(
+        "{ALLOWED_GROUPS_ENV}='{value}' is set but contains no group name — only separators \
+         and whitespace. Setting it means \"restrict impersonation to these groups\", and \
+         restricting it to nothing would either deny every caller or, if it were read as \
+         \"unset\", silently allow every group the proxy asserts; neither is what someone \
+         who typed this meant. List the groups you want, comma-separated (e.g. \
+         platform,sre), or unset {ALLOWED_GROUPS_ENV} entirely to accept whatever groups the \
+         proxy asserts."
+    )]
+    InvalidAllowedGroups {
+        /// The rejected value, as configured.
+        value: String,
+    },
+
     /// An anonymous user or group is inside Kubernetes' reserved `system:` space.
     #[error(
         "'{group}' cannot be used as an anonymous identity: it is inside Kubernetes' reserved \
@@ -678,14 +693,27 @@ impl UiArgs {
     /// Turn the raw flag/env surface into a validated [`UiConfig`], or explain
     /// why it cannot be one.
     ///
-    /// Ordering is deliberate. Cheap syntactic failures (addresses, durations,
-    /// header names) are reported before the security rules, so an operator with
-    /// two mistakes sees the typo first rather than a confusing security refusal
-    /// caused by it. Within the security rules, the more specific contradiction
-    /// wins: [`ConfigError::AnonymousWithoutUser`] (you asked for a fallback that
-    /// does not exist) is reported before [`ConfigError::NoIdentitySource`] (you
-    /// configured nothing at all), because it names the thing the operator
-    /// actually typed.
+    /// With several mistakes present, the first one reported is the one this
+    /// order picks, so the order is part of the diagnostics. It is, exactly as
+    /// the body runs it:
+    ///
+    /// 1. Bind addresses → [`ConfigError::InvalidAddr`].
+    /// 2. Durations and the allowed-group list → [`ConfigError::InvalidDuration`],
+    ///    [`ConfigError::InvalidAllowedGroups`].
+    /// 3. The anonymous identity's deny-list →
+    ///    [`ConfigError::ForbiddenAnonymousGroup`]. Ahead of the header names
+    ///    because it is checked for *any* configured anonymous identity, whether
+    ///    or not a header mode ends up using it — see the body.
+    /// 4. Header names → [`ConfigError::InvalidHeaderName`],
+    ///    [`ConfigError::ReservedHeaderName`].
+    /// 5. [`ConfigError::AnonymousWithoutUser`] — a fallback with nothing to fall
+    ///    back to. Ahead of `NoIdentitySource` because it names something the
+    ///    operator actually typed, rather than reporting the general absence it
+    ///    causes.
+    /// 6. Mode selection → [`ConfigError::NoIdentitySource`].
+    /// 7. The proxy secret → [`ConfigError::ProxySecretUnreadable`],
+    ///    [`ConfigError::ProxySecretRequired`]. Last because it only applies once
+    ///    header mode has been established in step 6.
     pub fn resolve(self) -> Result<UiConfig, ConfigError> {
         let addr = parse_addr(ADDR_ENV, &self.addr, DEFAULT_ADDR)?;
         let ops_addr = parse_addr(OPS_ADDR_ENV, &self.ops_addr, DEFAULT_OPS_ADDR)?;
@@ -714,6 +742,21 @@ impl UiArgs {
             )?,
         };
         let sar_ttl = parse_duration_or_default(SAR_TTL_ENV, &self.sar_ttl, DEFAULT_SAR_TTL)?;
+
+        // An empty value is "unset" as everywhere else, but a non-empty value
+        // that parses to no groups (`","`, `" , "`) is a typo, and both readings
+        // of it are wrong: "allow nothing" locks every caller out, "unset" quietly
+        // widens impersonation to every group the proxy asserts. Refuse instead.
+        let allowed_groups = match nonempty(self.allowed_groups) {
+            Some(raw) => {
+                let groups: BTreeSet<String> = csv(Some(&raw)).into_iter().collect();
+                if groups.is_empty() {
+                    return Err(ConfigError::InvalidAllowedGroups { value: raw });
+                }
+                Some(groups)
+            }
+            None => None,
+        };
 
         // The anonymous identity is validated whenever one is configured at all,
         // even in header mode where it may never be used: a `system:` identity
@@ -788,11 +831,7 @@ impl UiArgs {
                 groups_separator,
                 email_header,
                 extra_keys: csv(self.impersonate_extra_keys.as_deref()),
-                allowed_groups: self
-                    .allowed_groups
-                    .as_deref()
-                    .map(|v| csv(Some(v)).into_iter().collect::<BTreeSet<String>>())
-                    .filter(|s| !s.is_empty()),
+                allowed_groups,
                 proxy_secret,
             },
             operator_namespace: nonempty(self.operator_namespace),
@@ -957,13 +996,19 @@ fn parse_duration(name: &'static str, value: &str) -> Result<Duration, ConfigErr
     Ok(Duration::from_secs(secs))
 }
 
-/// clap value parser for the boolean flags. An EMPTY value means "unset" (the
-/// chart can render an env var as `""`, and clap consults the env before
-/// [`UiArgs::resolve`]'s empty-string filter can run) — but "unset" is the
-/// flag's DEFAULT, not `false`, so an empty value is rejected here and the
-/// caller's `default_value_t` is what applies... except clap has already
-/// consumed the env value by then. Empty therefore maps to `false` for the
-/// two opt-in flags and is special-cased for `--cache` in [`UiArgs::resolve`].
+/// clap value parser for the boolean flags.
+///
+/// An empty value maps to `false`, for every flag. That is right for the two
+/// opt-in flags (`--anonymous-fallback`, `--acknowledge-no-proxy-secret`), whose
+/// default is already `false`.
+///
+/// It is **wrong for `--cache`**, whose default is `true`: a chart that renders
+/// `KOPIUR_UI_CACHE=""` (a nulled Helm value) silently turns the read cache off
+/// rather than leaving it at the default. clap consults the environment and runs
+/// this parser before [`UiArgs::resolve`] ever sees the value, so `default_value_t`
+/// cannot rescue it and the fix has to be here or in the flag's declaration —
+/// Task 8 owns it. Until then, set `KOPIUR_UI_CACHE` to `true`/`false` explicitly
+/// or leave it out of the environment entirely; do not render it as `""`.
 fn parse_flag_bool(value: &str) -> Result<bool, String> {
     match value.to_ascii_lowercase().as_str() {
         "" => Ok(false),
@@ -1320,6 +1365,18 @@ mod tests {
                 |e| matches!(e, ConfigError::InvalidDuration { name, .. } if *name == SAR_TTL_ENV),
                 vec![SAR_TTL_ENV, "60ms"],
             ),
+            case(
+                "the allowed-group list is separators only",
+                header_mode(&["--allowed-groups", ","]),
+                |e| matches!(e, ConfigError::InvalidAllowedGroups { value } if value == ","),
+                vec![ALLOWED_GROUPS_ENV],
+            ),
+            case(
+                "the allowed-group list is whitespace and separators",
+                header_mode(&["--allowed-groups", " , , "]),
+                |e| matches!(e, ConfigError::InvalidAllowedGroups { value } if value == " , , "),
+                vec![ALLOWED_GROUPS_ENV],
+            ),
         ];
 
         for Case {
@@ -1339,6 +1396,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An EMPTY allowed-group list still means "unset" — the repo-wide
+    /// convention, because a chart renders a nulled value as `""`. Only a
+    /// non-empty value that names no group is the typo worth refusing.
+    #[test]
+    #[serial]
+    fn an_empty_allowed_groups_value_means_unset_not_a_typo() {
+        let cfg = resolve(&header_mode(&["--allowed-groups", ""]))
+            .expect("an empty allowed-groups value must resolve as unset");
+        assert_eq!(cfg.auth.allowed_groups, None);
     }
 
     #[test]

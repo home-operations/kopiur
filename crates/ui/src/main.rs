@@ -16,6 +16,12 @@
 //!    than a connection refused it can only report as CrashLoopBackOff.
 //! 6. **The app server**, with graceful shutdown on SIGTERM.
 //!
+//! The two servers are then raced with `tokio::select!`, so whichever fails
+//! first ends the process carrying its own error. The ops listener failing to
+//! bind is fatal for the same reason it starts first: probes are how the
+//! Deployment learns this pod is broken, and a process serving the app behind a
+//! dead ops port is both unprobeable and unmonitorable while looking healthy.
+//!
 //! Configuration is flag > env > default; every env name lives in
 //! [`kopiur_ui::config`].
 
@@ -74,7 +80,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Started first so the process is observable while the rest comes up.
+    // SPAWNED, not merely awaited later: the listener has to be binding and
+    // answering while the rest of startup (Task 8's kube client and reflector
+    // stores) is still running, which is the whole point of starting it first.
     let ops_addr = cfg.ops_addr;
     let ops = tokio::spawn({
         let metrics = Arc::clone(&metrics);
@@ -96,30 +104,74 @@ async fn main() -> anyhow::Result<()> {
     let router = app(state);
     let addr = cfg.addr;
 
-    let served = match &cfg.tls {
-        Some(tls) => {
-            let (cert, key) = (tls.cert.clone(), tls.key.clone());
-            tracing::info!(%addr, cert = %cert.display(), key = %key.display(),
-                "serving the kopiur-ui app over HTTPS");
-            serve_tls(addr, router, &cert, &key).await
-        }
-        None => {
-            tracing::info!(
-                %addr,
-                "serving the kopiur-ui app over plain HTTP; TLS is expected to terminate at \
-                 the authenticating proxy in front of it (set KOPIUR_UI_TLS_CERT/KEY to \
-                 terminate here instead)"
-            );
-            serve_http(addr, router).await
+    let serve_app = async {
+        match &cfg.tls {
+            Some(tls) => {
+                let (cert, key) = (tls.cert.clone(), tls.key.clone());
+                tracing::info!(%addr, cert = %cert.display(), key = %key.display(),
+                    "serving the kopiur-ui app over HTTPS");
+                serve_tls(addr, router, &cert, &key).await
+            }
+            None => {
+                tracing::info!(
+                    %addr,
+                    "serving the kopiur-ui app over plain HTTP; TLS is expected to terminate \
+                     at the authenticating proxy in front of it (set \
+                     KOPIUR_UI_TLS_CERT/KEY to terminate here instead)"
+                );
+                serve_http(addr, router).await
+            }
         }
     };
 
-    // The ops listener outlives the app server only long enough to report the
-    // shutdown; aborting it keeps a bind failure there from hanging the process.
-    ops.abort();
-    served
+    // Whichever server ends first ends the process, carrying its own error.
+    //
+    // The ops listener failing is FATAL, not a degraded mode. `/readyz` is how
+    // the Deployment learns this pod cannot serve, and `/metrics` is how anyone
+    // learns anything else: a process that kept serving the app with a dead ops
+    // port would look healthy to Kubernetes forever while being unmonitorable,
+    // and would never be rolled back. A non-zero exit turns that into a
+    // CrashLoopBackOff with the bind error in the pod's logs — which is the
+    // outcome an operator can actually act on.
+    //
+    // `select!` also drops the loser: the app server shutting down gracefully on
+    // SIGTERM tears the ops listener down with it, so nothing outlives the
+    // process's own shutdown.
+    tokio::select! {
+        served = serve_app => served,
+        joined = ops => Err(ops_ended_early(joined)),
+    }
 }
 
+/// Turn "the ops server finished before the app server did" into the error that
+/// ends the process.
+///
+/// Every outcome is a failure here, including `Ok(())`: [`serve_ops`] runs until
+/// the process does, so its returning at all means the ops port is gone.
+fn ops_ended_early(joined: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Error {
+    const CONSEQUENCE: &str = "without it Kubernetes cannot probe this pod and nothing can \
+                               scrape its metrics, so the process exits rather than keep \
+                               serving unmonitored";
+    match joined {
+        // The usual case: the bind failed, and this error carries the address
+        // and the KOPIUR_UI_OPS_ADDR remediation from `serve_ops`.
+        Ok(Err(e)) => e.context(format!(
+            "the kopiur-ui ops server (/metrics, /healthz, /readyz) failed; {CONSEQUENCE}"
+        )),
+        Ok(Ok(())) => anyhow::anyhow!(
+            "the kopiur-ui ops server (/metrics, /healthz, /readyz) stopped on its own while \
+             the app server was still running; {CONSEQUENCE}"
+        ),
+        Err(e) => anyhow::Error::new(e).context(format!(
+            "the kopiur-ui ops server (/metrics, /healthz, /readyz) task panicked; {CONSEQUENCE}"
+        )),
+    }
+}
+
+/// Serve `router` on `addr` over plain HTTP until SIGTERM or Ctrl-C.
+///
+/// The default: TLS normally terminates at the authenticating proxy in front of
+/// the UI, so the app port carries plain HTTP inside the cluster.
 async fn serve_http(addr: SocketAddr, router: axum::Router) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
@@ -136,6 +188,13 @@ async fn serve_http(addr: SocketAddr, router: axum::Router) -> anyhow::Result<()
     Ok(())
 }
 
+/// Serve `router` on `addr` over HTTPS until SIGTERM or Ctrl-C, terminating TLS
+/// with the cert/key at `cert_path`/`key_path`.
+///
+/// Used only when `KOPIUR_UI_TLS_CERT`/`_KEY` are both set — for a deployment
+/// that reaches the UI without a TLS-terminating proxy in front of it. The
+/// serving cert is re-read periodically ([`spawn_cert_reload`]) so a rotation
+/// does not need a pod restart.
 async fn serve_tls(
     addr: SocketAddr,
     router: axum::Router,

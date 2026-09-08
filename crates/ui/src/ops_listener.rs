@@ -35,9 +35,13 @@ pub struct Readiness {
     /// until the client is built and its first impersonated call succeeds:
     /// without it every request would fail, so the pod should not take traffic.
     pub impersonation_ok: AtomicBool,
-    /// Whether every reflector store has synced. Always true when
-    /// `KOPIUR_UI_CACHE` is off (there are no stores to sync). Serving from a
-    /// half-filled cache would show a healthy cluster as an empty one.
+    /// Whether every reflector store has synced. Serving from a half-filled
+    /// cache would show a healthy cluster as an empty one, so this gates traffic.
+    ///
+    /// [`Readiness::new`] starts it false unconditionally, and flipping it is the
+    /// caller's job — Task 8 owns that in `main`, both after the stores sync and,
+    /// immediately, when `KOPIUR_UI_CACHE` is off and there are no stores to wait
+    /// for. Until then a running process reports `cache-not-ready` forever.
     pub cache_ready: AtomicBool,
     /// Whether the embedded SPA is the `build.rs` placeholder rather than a real
     /// bundle. Fixed at compile time, hence not atomic.
@@ -86,6 +90,12 @@ impl Readiness {
 /// `/healthz` is liveness: it answers 200 as long as the process can serve HTTP
 /// at all, because restarting a UI that is merely waiting on the apiserver fixes
 /// nothing. `/readyz` is the one that gates traffic.
+///
+/// Returning at all means the ops port is gone, which `main` treats as fatal —
+/// see the `tokio::select!` there. A bind failure is by far the likeliest cause
+/// and its error names [`crate::config::OPS_ADDR_ENV`], because the two things
+/// that produce one are a port already in use and a `[::]` bind on a host with
+/// IPv6 disabled, and both are fixed by setting that variable.
 pub async fn serve_ops(
     addr: SocketAddr,
     metrics: Arc<UiMetrics>,
@@ -163,6 +173,37 @@ mod tests {
         assert_eq!(readiness.reasons(), vec!["cache-not-ready"]);
         readiness.cache_ready.store(true, Ordering::Relaxed);
         assert!(readiness.reasons().is_empty());
+    }
+
+    /// A bind failure must come back as an error naming the env var that fixes
+    /// it, because `main` turns that error into the process's exit — a silently
+    /// missing ops port would leave the pod unprobeable but apparently healthy.
+    #[tokio::test]
+    async fn a_bind_failure_names_the_env_var_that_fixes_it() {
+        // Hold the port so `serve_ops` cannot have it. Port 0 lets the OS pick a
+        // free one, so this never collides with a real service or another test.
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the test must be able to hold a port");
+        let taken = held.local_addr().expect("a bound listener has an address");
+
+        let metrics = Arc::new(UiMetrics::new(Arc::new(
+            kopiur_telemetry::MetricsProvider::new("kopiur-ui-test"),
+        )));
+        let err = serve_ops(taken, metrics, Arc::new(Readiness::new(false)))
+            .await
+            .expect_err("binding an address another socket holds must fail");
+
+        // `{:#}` renders the whole anyhow chain: the context plus the OS error.
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(crate::config::OPS_ADDR_ENV),
+            "the error must name the env var to change, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&taken.to_string()),
+            "the error must name the address it could not bind, got: {rendered}"
+        );
     }
 
     #[test]
