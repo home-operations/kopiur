@@ -61,7 +61,10 @@ pub fn status_patch_is_noop(
 /// The three rules, verbatim from the RFC and from what the API server does with
 /// a `Patch::Merge` body: a `null` REMOVES the key, two objects MERGE key by key
 /// (recursively), and anything else — arrays included — REPLACES.
-fn apply_merge_patch(target: &serde_json::Value, patch: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn apply_merge_patch(
+    target: &serde_json::Value,
+    patch: &serde_json::Value,
+) -> serde_json::Value {
     let serde_json::Value::Object(patch_obj) = patch else {
         return patch.clone();
     };

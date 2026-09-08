@@ -1312,6 +1312,15 @@ pub fn awaiting_claim_status(
             nulls.insert(claim.clone(), serde_json::Value::Null);
         }
         status["claims"] = serde_json::Value::Object(nulls);
+        // Wave 2, finding 6: the LAST record leaves with the mirror it fed.
+        // `is_legacy_populator_status` reads "empty `claims` + a top-level
+        // `resolved`" as a pre-fan-out status, so a departed single claim's
+        // mirrored pin would be ADOPTED by the next claimant — a brand-new PVC
+        // handed a dead claim's decision. Nulled in the same patch as the record
+        // (never on a park that drops nothing, which is the only shape a genuine
+        // legacy status can present here), so a present `resolved` beside an
+        // empty `claims` can only mean the pre-fan-out driver wrote it.
+        status["resolved"] = serde_json::Value::Null;
     }
     status
 }
@@ -1386,7 +1395,7 @@ pub fn fanout_status(
         &reason,
         &message,
     );
-    apply_claims_mirror(&mut status, &mirror);
+    apply_claims_mirror(&mut status, &mirror, prev, gone);
     let mut merges = serde_json::Map::new();
     for (claim, record) in next {
         merges.insert(claim.clone(), claim_merge_body(prev.get(claim), record));
@@ -1521,37 +1530,67 @@ pub fn mirrored_resolved_condition(mirror: &ClaimsMirror<'_>) -> Option<(bool, &
 /// Write (or CLEAR) the top-level `resolved`/`target` mirror onto a status body.
 /// Pure + exhaustive over [`ClaimsMirror`].
 ///
-/// The clears are explicit JSON `null`s, and they matter: a `Restore` that ran
-/// with one claim and later gains a second must not keep advertising the first
-/// claim's pin as the whole restore's. An RFC-7386 merge removes only the keys
-/// it names, and nulling an ALREADY-absent key is a server-side no-op, so this
-/// stays idempotent on the many-claim heartbeat.
+/// `resolved` is the deploy-or-restore DECISION surface and the legacy-adoption
+/// signal, so it is written only when the single claim is PINNED, and nulled
+/// only when the controller is RESETTING it (review wave 2, finding 5):
+///
+/// * Single, pinned ⇒ the claim's pin, verbatim.
+/// * Single, unpinned ⇒ `resolved` is OMITTED — left untouched. An adopted
+///   LEGACY mover (`JobNameReuse::LegacyShared`) pins the TOP-LEVEL `resolved`
+///   because its work spec carries no `claimKey`, and the claim record is
+///   unpinned until [`claim_finalize_pin`]'s `own.or(top_level)` reads that
+///   value; a `null` here erased it first, so the finalize recorded
+///   `NoSnapshotContinue` over a restore that genuinely ran.
+/// * Single, unpinned, but the record was RE-ARMED (a new claimant uid) or a
+///   sibling's record was dropped this pass ⇒ explicit `null`: the pin that
+///   stands is a dead claim's, and leaving it would hand the next reader a
+///   stale decision (finding 2's top-level twin).
+/// * Many ⇒ explicit `null` on the Single→Many TRANSITION only (the previous
+///   pass mirrored one claim's pin as the whole restore's); the many-claim
+///   heartbeat omits it.
+/// * No claims ⇒ nothing here; the zero-claim park owns that surface and
+///   nulls the mirror together with the last record it drops
+///   ([`awaiting_claim_status`], finding 6).
+///
+/// `target` is a display surface, never a decision input, so a single claim
+/// always writes it from its record — `pvcPrime` names the prime being written
+/// while the handshake is in flight and is nulled once it is over — and several
+/// claims null it (idempotent: nulling an absent key is a server-side no-op).
 ///
 /// The mirrored `resolved` is CONTROLLER-owned top-level state — a copy — and is
 /// distinct from the claim's own `claims.<pvc>.resolved`, which that claim's
-/// mover writes and which [`claim_merge_body`] never touches.
-pub fn apply_claims_mirror(status: &mut serde_json::Value, mirror: &ClaimsMirror<'_>) {
+/// mover writes and which [`claim_merge_body`] never touches on the same
+/// claimant.
+pub fn apply_claims_mirror(
+    status: &mut serde_json::Value,
+    mirror: &ClaimsMirror<'_>,
+    prev: &std::collections::BTreeMap<String, RestoreClaimStatus>,
+    gone: &[String],
+) {
     match mirror {
-        // The zero-claim park writes its own `target`; a spent pin is left alone
-        // (the claim it belonged to is gone, and its record went with it).
         ClaimsMirror::NoClaims => {}
         ClaimsMirror::Single { claim, record } => {
-            status["resolved"] = match &record.resolved {
-                Some(resolved) => serde_json::to_value(resolved)
-                    .expect("ResolvedRestore serializes: plain Options, no custom Serialize"),
-                // Nothing pinned yet — clear a stale mirror rather than leave it.
-                None => serde_json::Value::Null,
-            };
+            match &record.resolved {
+                Some(resolved) => {
+                    status["resolved"] = serde_json::to_value(resolved)
+                        .expect("ResolvedRestore serializes: plain Options, no custom Serialize");
+                }
+                None => {
+                    let rearmed = prev.get(*claim).is_some_and(|p| claim_rearmed(p, record));
+                    if rearmed || !gone.is_empty() {
+                        status["resolved"] = serde_json::Value::Null;
+                    }
+                }
+            }
             status["target"] = serde_json::json!({
                 "pvcRef": { "name": claim },
-                // Named while the handshake is in flight, nulled once it is over:
-                // a merge would otherwise leave a reaped prime advertised, and the
-                // zero-claim park's `awaiting-claim` sentinel standing.
                 "pvcPrime": record.pvc_prime,
             });
         }
         ClaimsMirror::Many => {
-            status["resolved"] = serde_json::Value::Null;
+            if matches!(claims_mirror(prev), ClaimsMirror::Single { .. }) {
+                status["resolved"] = serde_json::Value::Null;
+            }
             status["target"] = serde_json::Value::Null;
         }
     }

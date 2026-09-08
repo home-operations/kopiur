@@ -808,9 +808,14 @@ fn a_lone_already_bound_claim_reports_its_own_reason_and_clears_the_mirror() {
             .contains("already bound"),
         "the mirrored message is the CLAIM's, verbatim: {ready}"
     );
-    // Nothing pinned and the handshake is over: the mirror CLEARS rather than
-    // leaving a stale pin or a reaped prime advertised.
-    assert_eq!(status["resolved"], serde_json::Value::Null, "{status}");
+    // Nothing pinned: the mirror leaves the top-level `resolved` UNTOUCHED
+    // (wave 2, finding 5 — a `null` here erased an adopted legacy mover's pin
+    // before `claim_finalize_pin` could fall back to it). The handshake is over,
+    // so the reaped prime is no longer advertised.
+    assert!(
+        status.get("resolved").is_none(),
+        "an unpinned single claim must not name `resolved` at all: {status}"
+    );
     assert_eq!(
         status["target"]["pvcPrime"],
         serde_json::Value::Null,
@@ -875,6 +880,130 @@ fn the_zero_claim_park_clears_a_departed_claims_mirror() {
     );
     assert_eq!(park["target"]["pvcPrime"], "awaiting-claim", "{park}");
     assert_eq!(park["target"]["pvcRef"], serde_json::Value::Null, "{park}");
+    // Nothing was dropped, so nothing is cleared: a park over a GENUINE
+    // pre-fan-out status (no records, a legacy top-level pin) must leave that
+    // pin standing for adoption to read.
+    assert!(park.get("resolved").is_none(), "{park}");
+
+    // Wave 2, finding 6: dropping the LAST record nulls the top-level mirror in
+    // the same patch, so an empty `claims` beside a present `resolved` can only
+    // ever mean a genuine pre-fan-out status.
+    let last_gone = awaiting_claim_status(
+        &restore_with_anchor(None),
+        crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON,
+        "m",
+        &["data".to_string()],
+    );
+    assert_eq!(
+        last_gone["resolved"],
+        serde_json::Value::Null,
+        "{last_gone}"
+    );
+    assert_eq!(last_gone["claims"]["data"], serde_json::Value::Null);
+    assert_eq!(last_gone["target"]["pvcRef"], serde_json::Value::Null);
+    assert_eq!(last_gone["target"]["pvcPrime"], "awaiting-claim");
+}
+
+/// Wave 2, finding 5 — the single-claim mirror over (claim pinned?, previous
+/// top-level pin present?, claim count). `resolved` is the deploy-or-restore
+/// DECISION surface and the legacy-adoption signal, so the mirror writes it only
+/// when the claim is pinned, nulls it only when the controller is RESETTING
+/// (Single→Many, a re-arm, a dropped sibling), and otherwise leaves it alone —
+/// an unpinned claim's `null` erased an adopted LEGACY mover's top-level pin
+/// before `claim_finalize_pin`'s `own.or(top_level)` could read it.
+#[test]
+fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
+    use crate::consts::{POPULATING_PRIME_PVC_REASON, RESTORE_POPULATED_REASON};
+    use kopiur_api::RestoreClaimPhase as P;
+
+    let pinned = || {
+        mirror_record(
+            P::Populated,
+            RESTORE_POPULATED_REASON,
+            "restored",
+            Some(ResolutionOutcome::Snapshot),
+        )
+    };
+    let unpinned = || {
+        let mut r = mirror_record(P::Populating, POPULATING_PRIME_PVC_REASON, "writing", None);
+        r.pvc_prime = Some("prime-u1".into());
+        r
+    };
+    let legacy_pinned = restore_with_legacy_pin();
+    let bare = restore_with_anchor(None);
+    let none = std::collections::BTreeMap::new();
+
+    for (restore, top_level_present) in [(&legacy_pinned, true), (&bare, false)] {
+        // Pinned, one claim ⇒ written (whatever stood there before).
+        let one = claims_of(&[("data", pinned())]);
+        let s = fanout_status(restore, &none, &one, &[]);
+        assert_eq!(
+            s["resolved"]["resolution"],
+            serde_json::json!("Snapshot"),
+            "top_level_present={top_level_present}: {s}"
+        );
+        assert_eq!(s["target"]["pvcRef"]["name"], "data");
+
+        // Unpinned, one claim ⇒ `resolved` OMITTED — the adopted legacy pin (or
+        // nothing) stays. `target` still names the prime being written.
+        let one = claims_of(&[("data", unpinned())]);
+        let s = fanout_status(restore, &none, &one, &[]);
+        assert!(
+            s.get("resolved").is_none(),
+            "top_level_present={top_level_present}: {s}"
+        );
+        assert_eq!(s["target"]["pvcPrime"], "prime-u1");
+        // …and the same on the heartbeat, where `prev` is that same record.
+        let s = fanout_status(restore, &one, &one, &[]);
+        assert!(s.get("resolved").is_none(), "{s}");
+
+        // Unpinned, one claim, but the CLAIMANT CHANGED (a re-arm): the pin that
+        // stands is the dead claimant's — reset it (finding 2's top-level twin).
+        let mut fresh = unpinned();
+        fresh.uid = Some("u-new".into());
+        let rearmed = claims_of(&[("data", fresh)]);
+        let s = fanout_status(restore, &claims_of(&[("data", pinned())]), &rearmed, &[]);
+        assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
+
+        // Unpinned survivor while a SIBLING's record is dropped: the dropped
+        // claim's mirrored pin is stale — reset it.
+        let s = fanout_status(
+            restore,
+            &claims_of(&[("data", unpinned()), ("logs", pinned())]),
+            &claims_of(&[("data", unpinned())]),
+            &["logs".to_string()],
+        );
+        assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
+
+        // Two claims from a Single ⇒ nulls; two claims from two ⇒ omitted.
+        let mut second = pinned();
+        second.uid = Some("u2".into());
+        let two = claims_of(&[("data", pinned()), ("logs", second)]);
+        let s = fanout_status(restore, &claims_of(&[("data", pinned())]), &two, &[]);
+        assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
+        assert_eq!(s["target"], serde_json::Value::Null, "{s}");
+        let s = fanout_status(restore, &two, &two, &[]);
+        assert!(s.get("resolved").is_none(), "{s}");
+    }
+}
+
+/// A `Restore` carrying a LEGACY top-level pin (pre-fan-out status shape).
+fn restore_with_legacy_pin() -> Restore {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+        "spec": {
+            "source": { "fromPolicy": { "name": "cfg" } },
+            "target": { "populator": {} }
+        },
+        "status": {
+            "phase": "Restoring",
+            "resolved": { "resolution": "Snapshot", "kopiaSnapshotID": "legacy1" },
+            "target": { "pvcRef": { "name": "data" }, "pvcPrime": "prime-u1" }
+        }
+    }))
+    .expect("valid Restore")
 }
 
 /// SEVERAL claims: there is no single top-level answer, so `resolved`/`target`
@@ -907,13 +1036,32 @@ fn several_claims_clear_the_mirror_and_report_the_aggregate() {
     ]);
     assert_eq!(claims_mirror(&two), ClaimsMirror::Many);
 
-    let status = mirrored_status(&two);
+    // The Single→Many TRANSITION: the previous pass mirrored `data`'s pin, so
+    // this pass must explicitly null it (wave 2, finding 5).
+    let was_single = claims_of(&[(
+        "data",
+        mirror_record(
+            P::Populated,
+            RESTORE_POPULATED_REASON,
+            "restored",
+            Some(ResolutionOutcome::Snapshot),
+        ),
+    )]);
+    let status = fanout_status(&restore_with_anchor(None), &was_single, &two, &[]);
     assert_eq!(
         status["resolved"],
         serde_json::Value::Null,
         "a two-claim Restore must not advertise one claim's pin as its own: {status}"
     );
     assert_eq!(status["target"], serde_json::Value::Null, "{status}");
+    // Many→Many heartbeat: nothing to clear, so `resolved` is not named — a
+    // `null` there is what erased an adopted legacy pin (finding 5).
+    let steady = fanout_status(&restore_with_anchor(None), &two, &two, &[]);
+    assert!(
+        steady.get("resolved").is_none(),
+        "the many-claim heartbeat must leave `resolved` alone: {steady}"
+    );
+    let status = mirrored_status(&two);
     assert!(
         condition_of(&status, "Ready").expect("Ready")["message"]
             .as_str()
@@ -956,6 +1104,36 @@ fn a_mirrored_pin_is_not_mistaken_for_a_legacy_status() {
     assert!(
         !is_legacy_populator_status(&status),
         "a mirrored pin on a Restore that HAS claims is not a legacy status"
+    );
+
+    // Wave 2, finding 6: once the LAST claimant is gone, the zero-claim park
+    // nulls the mirror together with the record, so the status that reaches the
+    // NEXT claimant (empty `claims`, no `resolved`) is not read as pre-fan-out —
+    // which would have "adopted" the departed claim's pin for a brand-new PVC.
+    let fanned_out: Restore = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+        "spec": {
+            "source": { "fromPolicy": { "name": "cfg" } },
+            "target": { "populator": {} }
+        },
+        "status": serde_json::to_value(&status).unwrap()
+    }))
+    .expect("valid Restore");
+    let park = awaiting_claim_status(
+        &fanned_out,
+        crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON,
+        "m",
+        &["data".to_string()],
+    );
+    let after = crate::io::apply_merge_patch(&serde_json::to_value(&status).unwrap(), &park);
+    let after: kopiur_api::RestoreStatus = serde_json::from_value(after).expect("merged status");
+    assert!(after.claims.is_empty(), "{after:?}");
+    assert!(after.resolved.is_none(), "{after:?}");
+    assert!(
+        !is_legacy_populator_status(&after),
+        "a fanned-out Restore whose last claimant left must not adopt as legacy: {after:?}"
     );
 
     // And the merge body for that claim still names no mover-owned key.
