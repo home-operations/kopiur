@@ -144,7 +144,7 @@ mod tests {
             cfg: Arc::new(test_config()),
             metrics: Arc::new(UiMetrics::new(provider)),
             readiness: Arc::new(Readiness::new(static_files::is_placeholder())),
-            auth: Arc::new(auth::AuthState::default()),
+            auth: Arc::new(auth::AuthState::unconfigured()),
             source: Arc::new(cache::Source::Impersonated),
             sessions: Arc::new(browse::session_pool::SessionPool::default()),
         }
@@ -184,6 +184,7 @@ mod tests {
                 ttl: std::time::Duration::from_secs(600),
             },
             sar_ttl: std::time::Duration::from_secs(60),
+            sar_cache_size: crate::config::DEFAULT_SAR_CACHE_SIZE,
             tls: None,
             cors_origins: Vec::new(),
         }

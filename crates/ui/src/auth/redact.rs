@@ -19,6 +19,7 @@ use http::header::{HeaderMap, HeaderName};
 pub const STRIPPED_HEADERS: &[&str] = &[
     "cookie",
     "authorization",
+    "proxy-authorization",
     "x-forwarded-access-token",
     "x-forwarded-authorization",
 ];
@@ -28,8 +29,16 @@ pub const REDACTED: &str = "***";
 
 /// Substrings that make a token look like it names a credential. Matched
 /// case-insensitively, anywhere in the token, so `AWS_SECRET_ACCESS_KEY`,
-/// `--password` and `KOPIA_TOKEN:` all hit.
-const SECRET_MARKERS: &[&str] = &["aws_", "key", "token", "password", "secret"];
+/// `--password`, `KOPIA_TOKEN:` and `Bearer` all hit.
+const SECRET_MARKERS: &[&str] = &[
+    "aws_",
+    "key",
+    "token",
+    "password",
+    "secret",
+    "bearer",
+    "credential",
+];
 
 /// Remove every credential-bearing header from a request.
 ///
@@ -193,7 +202,8 @@ mod tests {
             ("KOPIA_PASSWORD: hunter2", "KOPIA_PASSWORD: ***"),
             ("token=abc123", "token=***"),
             ("api-key abc123", "api-key ***"),
-            ("Bearer eyJhbGciOi", "Bearer eyJhbGciOi"),
+            ("Bearer eyJhbGciOi", "Bearer ***"),
+            ("AWS_CREDENTIAL_FILE=/tmp/x", "AWS_CREDENTIAL_FILE=***"),
             ("nothing to see here", "nothing to see here"),
             ("", ""),
         ];

@@ -530,7 +530,7 @@ pub fn scope_suffix(namespace: Option<&str>) -> String {
 /// (`snapshots.kopiur… "x" not found`). kube's `Status` carries no structured
 /// discriminator between the two, so this message match is the only signal —
 /// single definition here, exercised by the tests below.
-const KIND_NOT_FOUND_NEEDLE: &str = "could not find the requested resource";
+pub const KIND_NOT_FOUND_NEEDLE: &str = "could not find the requested resource";
 
 /// Classify a `kube::Error` from a `{verb} {resource}` call into the matching
 /// [`OpsError`] variant, so every command surfaces the same actionable

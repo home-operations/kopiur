@@ -59,6 +59,10 @@ pub struct AuthState {
     pub cfg: AuthConfig,
     /// One `kube::Client` per distinct caller, bounded and idle-expiring.
     pub clients: ClientCache,
+    /// Whether `cfg` came from a resolved configuration or is the placeholder
+    /// [`AuthState::unconfigured`] left. Private, and the reason there is no
+    /// `Default`: a state nobody configured must refuse, not serve.
+    wired: bool,
 }
 
 impl AuthState {
@@ -69,45 +73,22 @@ impl AuthState {
         Self {
             clients: ClientCache::new(base, limits, extra_keys),
             cfg,
+            wired: true,
         }
     }
 
-    /// The identity this request runs as, or the reason it has none.
-    pub fn identify(&self, headers: &HeaderMap) -> Result<Identity, identity::AuthError> {
-        // Anonymous-only mode has no identity header to forge, so it has no trust
-        // boundary to protect and `resolve()` never gives it a secret. Matched
-        // exhaustively so a third mode cannot skip the check by accident.
-        match &self.cfg.mode {
-            AuthMode::Headers { .. } => {
-                proxy_secret::verify_proxy_secret(headers, self.cfg.proxy_secret.as_deref())?;
-            }
-            AuthMode::AnonymousOnly(_) => {}
-        }
-        identity::extract_identity(headers, &self.cfg)
-    }
-
-    /// How this deployment establishes identity, for the
-    /// `kopiur_ui_requests_total{identity_source}` label on a request that failed
-    /// before an [`Identity`] existed.
-    fn mode_source(&self) -> IdentitySource {
-        match &self.cfg.mode {
-            AuthMode::Headers { .. } => IdentitySource::TrustedHeaders,
-            AuthMode::AnonymousOnly(_) => IdentitySource::Anonymous,
-        }
-    }
-}
-
-impl Default for AuthState {
-    /// A state that identifies every caller as one inert anonymous user and can
-    /// reach no cluster.
+    /// A placeholder that **cannot serve**: every identity resolution returns
+    /// [`identity::AuthError::NotWired`].
     ///
-    /// It exists only so `AppState` can be constructed before `main` has resolved
-    /// the real configuration (and in tests that never touch auth). It is not a
-    /// usable deployment: the base config points at nothing, so every
-    /// `client_for` produces a client whose requests fail to connect. `main`
-    /// replaces it with [`AuthState::new`].
-    fn default() -> Self {
-        Self::new(
+    /// `AppState` has to be constructible before `main` has resolved a
+    /// configuration, and tests that never touch auth need *something* there.
+    /// This is deliberately not a `Default` and deliberately not an anonymous
+    /// identity: a placeholder that quietly resolved every caller to some
+    /// invented user would be a fail-open — requests would be served, as a
+    /// subject nobody chose, if a wiring change ever left it in place. Refusing
+    /// with a 500 makes that mistake loud on the first request instead.
+    pub fn unconfigured() -> Self {
+        let mut state = Self::new(
             AuthConfig {
                 mode: AuthMode::AnonymousOnly(crate::config::AnonymousIdentity {
                     user: "kopiur-ui-unconfigured".to_string(),
@@ -128,7 +109,36 @@ impl Default for AuthState {
                 size: crate::config::DEFAULT_CLIENT_CACHE_SIZE,
                 ttl: Duration::from_secs(600),
             },
-        )
+        );
+        state.wired = false;
+        state
+    }
+
+    /// The identity this request runs as, or the reason it has none.
+    pub fn identify(&self, headers: &HeaderMap) -> Result<Identity, identity::AuthError> {
+        if !self.wired {
+            return Err(identity::AuthError::NotWired);
+        }
+        // Anonymous-only mode has no identity header to forge, so it has no trust
+        // boundary to protect and `resolve()` never gives it a secret. Matched
+        // exhaustively so a third mode cannot skip the check by accident.
+        match &self.cfg.mode {
+            AuthMode::Headers { .. } => {
+                proxy_secret::verify_proxy_secret(headers, self.cfg.proxy_secret.as_deref())?;
+            }
+            AuthMode::AnonymousOnly(_) => {}
+        }
+        identity::extract_identity(headers, &self.cfg)
+    }
+
+    /// How this deployment establishes identity, for the
+    /// `kopiur_ui_requests_total{identity_source}` label on a request that failed
+    /// before an [`Identity`] existed.
+    fn mode_source(&self) -> IdentitySource {
+        match &self.cfg.mode {
+            AuthMode::Headers { .. } => IdentitySource::TrustedHeaders,
+            AuthMode::AnonymousOnly(_) => IdentitySource::Anonymous,
+        }
     }
 }
 
@@ -158,6 +168,12 @@ pub async fn identity_middleware(
             return response;
         }
     };
+
+    // The proxy's shared secret has done its one job. It is a long-lived
+    // credential for the trust boundary itself, so it must not survive into a
+    // handler, a `TraceLayer`, or an error path — the same argument as
+    // [`redact::STRIPPED_HEADERS`], applied after the check rather than before it.
+    req.headers_mut().remove(proxy_secret::PROXY_TOKEN_HEADER);
 
     let source = identity.source.clone();
     tracing::debug!(
@@ -226,7 +242,12 @@ pub async fn mutation_guard(req: Request, next: Next) -> Response {
     if req.method().is_safe() {
         return next.run(req).await;
     }
-    if let Err(error) = csrf::require_mutation_headers(req.headers(), has_body(req.headers())) {
+    // HTTP/2 sends no `Host` header; hyper puts its `:authority` on the URI, so
+    // the origin check needs both to have something to compare against.
+    let authority = req.uri().authority().map(|a| a.as_str().to_string());
+    if let Err(error) =
+        csrf::require_mutation_headers(req.headers(), has_body(req.headers()), authority.as_deref())
+    {
         return ApiError::from(error)
             .with_instance(req.uri().path().to_string())
             .into_response();
@@ -301,23 +322,29 @@ mod tests {
     }
 
     fn state(auth: AuthConfig) -> AppState {
+        state_with(auth.clone(), || {
+            AuthState::new(
+                auth.clone(),
+                kube::Config::new("http://127.0.0.1:1/".parse().expect("test url")),
+                CacheLimits {
+                    size: 8,
+                    ttl: Duration::from_secs(600),
+                },
+            )
+        })
+    }
+
+    fn state_with(auth: AuthConfig, build: impl Fn() -> AuthState) -> AppState {
         let provider = Arc::new(kopiur_telemetry::MetricsProvider::new("kopiur-ui-test"));
         let mut cfg = base_config();
-        cfg.auth = auth.clone();
+        cfg.auth = auth;
         AppState {
             cfg: Arc::new(cfg),
             metrics: Arc::new(crate::metrics::UiMetrics::new(provider)),
             readiness: Arc::new(crate::ops_listener::Readiness::new(
                 crate::static_files::is_placeholder(),
             )),
-            auth: Arc::new(AuthState::new(
-                auth,
-                kube::Config::new("http://127.0.0.1:1/".parse().expect("test url")),
-                CacheLimits {
-                    size: 8,
-                    ttl: Duration::from_secs(600),
-                },
-            )),
+            auth: Arc::new(build()),
             source: Arc::new(crate::cache::Source::Impersonated),
             sessions: Arc::new(crate::browse::session_pool::SessionPool::default()),
         }
@@ -347,6 +374,7 @@ mod tests {
                 ttl: Duration::from_secs(600),
             },
             sar_ttl: Duration::from_secs(60),
+            sar_cache_size: crate::config::DEFAULT_SAR_CACHE_SIZE,
             tls: None,
             cors_origins: Vec::new(),
         }
@@ -355,7 +383,15 @@ mod tests {
     /// A router that echoes back what the middleware resolved, so a test can
     /// assert on the identity a handler actually sees.
     fn app(auth: AuthConfig) -> Router {
-        let state = state(auth);
+        router(state(auth))
+    }
+
+    /// The same router over the placeholder auth state `main` starts with.
+    fn unwired_app() -> Router {
+        router(state_with(anonymous_auth(), AuthState::unconfigured))
+    }
+
+    fn router(state: AppState) -> Router {
         Router::new()
             .route("/api/v1/whoami", get(whoami))
             .route("/api/v1/write", post(write))
@@ -367,14 +403,14 @@ mod tests {
             .with_state(state)
     }
 
-    /// `user|groups|header count|whether a Cookie survived`.
+    /// `user|groups|whether a Cookie survived|whether the proxy token survived`.
     async fn whoami(CurrentIdentity(id): CurrentIdentity, headers: HeaderMap) -> String {
         format!(
             "{}|{}|{}|{}",
             id.user,
             id.groups.join(","),
-            headers.len(),
-            headers.contains_key("cookie")
+            headers.contains_key("cookie"),
+            headers.contains_key(proxy_secret::PROXY_TOKEN_HEADER)
         )
     }
 
@@ -463,26 +499,33 @@ mod tests {
 
     #[tokio::test]
     async fn the_handler_sees_the_resolved_identity_and_no_credentials() {
-        let response = app(header_auth(None))
+        let response = app(header_auth(Some(b"s3cr3t")))
             .oneshot(get_request(&[
                 (USER_HEADER, "alice"),
                 (GROUPS_HEADER, "ops,dev"),
+                ("x-kopiur-proxy-token", "s3cr3t"),
                 ("cookie", "session=abc"),
                 ("authorization", "Bearer nope"),
+                ("proxy-authorization", "Basic nope"),
                 ("x-forwarded-access-token", "nope"),
+                ("x-forwarded-authorization", "nope"),
             ]))
             .await
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_text(response).await;
-        let mut fields = body.split('|');
-        assert_eq!(fields.next(), Some("alice"));
-        assert_eq!(fields.next(), Some("dev,ops,system:authenticated"));
+        let fields: Vec<&str> = body.split('|').collect();
+        assert_eq!(fields[0], "alice");
+        assert_eq!(fields[1], "dev,ops,system:authenticated");
         assert_eq!(
-            fields.nth(1),
-            Some("false"),
+            fields[2], "false",
             "the handler must not be able to read a Cookie: {body}"
+        );
+        assert_eq!(
+            fields[3], "false",
+            "the proxy shared secret is a credential for the trust boundary and must not \
+             survive the check that consumed it: {body}"
         );
     }
 
@@ -594,6 +637,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_unconfigured_placeholder_refuses_every_request_instead_of_inventing_an_identity() {
+        let response = unwired_app()
+            .oneshot(get_request(&[(USER_HEADER, "alice")]))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let problem = body_problem(response).await;
+        assert_eq!(problem.r#type, "urn:kopiur:problem:not-wired");
+        assert!(problem.fix.contains("report it"), "{}", problem.fix);
+    }
+
+    #[tokio::test]
+    async fn the_unconfigured_placeholder_refuses_an_anonymous_request_too() {
+        // The old `Default` served this one as an invented anonymous user.
+        let response = unwired_app()
+            .oneshot(get_request(&[]))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body_problem(response).await.r#type,
+            "urn:kopiur:problem:not-wired"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wired_state_is_never_not_wired() {
+        assert!(
+            AuthState::new(
+                anonymous_auth(),
+                kube::Config::new("http://127.0.0.1:1/".parse().expect("test url")),
+                CacheLimits {
+                    size: 1,
+                    ttl: Duration::from_secs(1)
+                },
+            )
+            .identify(&HeaderMap::new())
+            .is_ok()
+        );
+    }
+
     #[test]
     fn the_metrics_label_reflects_how_the_deployment_identifies_callers() {
         assert_eq!(
@@ -609,7 +696,7 @@ mod tests {
             IdentitySource::TrustedHeaders
         );
         assert_eq!(
-            AuthState::default().mode_source(),
+            AuthState::unconfigured().mode_source(),
             IdentitySource::Anonymous
         );
     }
