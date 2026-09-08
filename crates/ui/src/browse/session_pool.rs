@@ -340,31 +340,79 @@ fn pool_closed(what: &str) -> ApiError {
 
 /// Describe a session Job on the wire.
 ///
-/// `expires_at` is the Job's creation time plus the TTL the session was started
-/// with, because that is what actually reaps it: the mover idles for its TTL and
-/// exits, and the Job's `activeDeadlineSeconds` backstops it. It is `None` when
-/// the Job carries no creation timestamp, which only a hand-made object does —
-/// a guessed expiry would be worse than an absent one, since the SPA renders it
-/// as a countdown.
-pub fn session_info(job: &Job, ttl: Duration, reused: bool) -> SessionInfo {
-    let expires_at = job
-        .metadata
-        .creation_timestamp
-        .as_ref()
-        .and_then(kopiur_ops::snapshots::meta_time)
-        .and_then(|created| {
-            chrono::Duration::from_std(ttl)
-                .ok()
-                .and_then(|d| created.checked_add_signed(d))
-        })
-        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+/// `expires_at` is read off **the Job itself** — `creationTimestamp +
+/// spec.activeDeadlineSeconds` — not off this process's configuration. The
+/// difference is not academic: a session started with `{"ttlSeconds": 120}`, or
+/// one started by `kubectl kopiur browse` with its own TTL, or one left over
+/// from a deployment whose `KOPIUR_UI_SESSION_TTL` has since changed, all have
+/// lifetimes the running config knows nothing about. The SPA renders this as a
+/// countdown, so a number taken from the wrong place counts down past the actual
+/// death of the pod.
+///
+/// `activeDeadlineSeconds` is the kubelet-enforced hard stop rather than the
+/// mover's own idle TTL (which is ~2 minutes shorter — see `JobLimits` in
+/// `kopiur_ops::browse::session`). That direction is the safe one for a
+/// countdown: it is the last moment the session could still be alive.
+///
+/// `None` when the Job carries no creation timestamp or no deadline — a guessed
+/// expiry is worse than an absent one.
+pub fn session_info(job: &Job, reused: bool) -> SessionInfo {
     SessionInfo {
         namespace: job.namespace().unwrap_or_default(),
         job: job.name_any(),
         pod: None,
         reused,
-        expires_at,
+        expires_at: session_expiry(job),
     }
+}
+
+/// **Pure.** `creationTimestamp + spec.activeDeadlineSeconds`, as RFC 3339.
+fn session_expiry(job: &Job) -> Option<String> {
+    let created = kopiur_ops::snapshots::meta_time(job.metadata.creation_timestamp.as_ref()?)?;
+    let deadline = job.spec.as_ref()?.active_deadline_seconds?;
+    created
+        .checked_add_signed(chrono::Duration::try_seconds(deadline)?)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+/// The read path's rule for an attach that may have created a session.
+///
+/// `GET …/tree` and `GET …/file` check for a live session Job and then attach to
+/// it, and those are two apiserver calls. In between, the Job can go away — a
+/// `kubectl kopiur session end`, or, far more ordinarily, the session simply
+/// reaching the end of its life, which is a normal event that needs no human at
+/// all. The attach is `ExecSession::ensure`, which is find-or-**create**, so
+/// losing that race silently starts a mover pod from a `GET`.
+///
+/// This is the undo. `reused` comes from comparing the attached Job's UID with
+/// the one the pre-check saw: when they differ, the attach created a Job, so
+/// `undo` deletes it and the caller gets exactly the 409 it would have got had
+/// the pre-check lost the race by a millisecond. The result is that a `GET`
+/// never leaves a pod running, under any interleaving.
+///
+/// Generic over the session payload so the branch is testable: `ExecSession` has
+/// no public constructor, so a test that had to build one could not reach here.
+pub async fn reuse_or_undo<S, U, Fut>(
+    attached: S,
+    reused: bool,
+    job: &str,
+    refusal: ApiError,
+    undo: U,
+) -> Result<S, ApiError>
+where
+    U: FnOnce(String) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    if reused {
+        return Ok(attached);
+    }
+    tracing::info!(
+        job,
+        "a read attached to a browse session that had just been replaced; deleting the \
+         session it started, because a GET must never leave a mover pod running"
+    );
+    undo(job.to_string()).await;
+    Err(refusal)
 }
 
 #[cfg(test)]
@@ -399,14 +447,23 @@ mod tests {
         }
     }
 
-    fn job(name: &str, namespace: &str, created: Option<&str>) -> Job {
+    fn job(
+        name: &str,
+        namespace: &str,
+        created: Option<&str>,
+        active_deadline_seconds: Option<i64>,
+    ) -> Job {
         let mut value = serde_json::json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
             "metadata": { "name": name, "namespace": namespace },
+            "spec": { "template": { "spec": { "containers": [], "restartPolicy": "Never" } } },
         });
         if let Some(created) = created {
             value["metadata"]["creationTimestamp"] = serde_json::json!(created);
+        }
+        if let Some(deadline) = active_deadline_seconds {
+            value["spec"]["activeDeadlineSeconds"] = serde_json::json!(deadline);
         }
         serde_json::from_value(value).expect("job fixture")
     }
@@ -621,26 +678,107 @@ mod tests {
     }
 
     #[test]
-    fn session_info_expiry_is_creation_plus_ttl() {
+    fn session_info_expiry_comes_from_the_jobs_own_deadline() {
+        // 1020s = a 900s TTL plus the 120s connect backstop `JobLimits` adds.
         let info = session_info(
             &job(
                 "kopiur-browse-nas-0badc0de",
                 "media",
                 Some("2026-06-11T01:02:03Z"),
+                Some(1020),
             ),
-            Duration::from_secs(900),
             true,
         );
         assert_eq!(info.namespace, "media");
         assert_eq!(info.job, "kopiur-browse-nas-0badc0de");
         assert!(info.reused);
         assert_eq!(info.pod, None);
-        assert_eq!(info.expires_at.as_deref(), Some("2026-06-11T01:17:03Z"));
+        assert_eq!(info.expires_at.as_deref(), Some("2026-06-11T01:19:03Z"));
 
-        // A Job with no creation timestamp reports no expiry rather than a
-        // guess the SPA would count down from.
-        let none = session_info(&job("j", "media", None), Duration::from_secs(900), false);
-        assert_eq!(none.expires_at, None);
-        assert!(!none.reused);
+        // A session started with a SHORT ttl reports its own short expiry, even
+        // though this process's configured TTL is 900s. Reading the expiry off
+        // the running config instead is exactly the bug this pins: the SPA would
+        // count down 15 minutes for a session that dies in two.
+        let short = session_info(
+            &job("j", "media", Some("2026-06-11T01:02:03Z"), Some(240)),
+            true,
+        );
+        assert_eq!(short.expires_at.as_deref(), Some("2026-06-11T01:06:03Z"));
+
+        // Missing either half is no expiry rather than a guess the SPA would
+        // count down from.
+        for (created, deadline) in [
+            (None, Some(1020)),
+            (Some("2026-06-11T01:02:03Z"), None),
+            (None, None),
+        ] {
+            let info = session_info(&job("j", "media", created, deadline), false);
+            assert_eq!(info.expires_at, None, "{created:?}/{deadline:?}");
+            assert!(!info.reused);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_that_accidentally_started_a_session_undoes_it_and_refuses() {
+        // The GET-never-creates guarantee, at the exact interleaving that used
+        // to break it: the pre-check saw a session, the attach landed on a
+        // DIFFERENT Job (the old one expired between the two calls), so the
+        // attach created one. Driven through the pool so the single-flight lock
+        // and the starts permit are on the path too.
+        let pool = SessionPool::new(limits(4, 4, 64));
+        let deleted: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+
+        let recorder = deleted.clone();
+        let result: Result<(&str, bool), ApiError> = pool
+            .ensure(
+                &key("media", "nas"),
+                || async {
+                    reuse_or_undo(
+                        "session",
+                        false, // the UIDs differed: this attach created the Job
+                        "kopiur-browse-nas-0badc0de",
+                        problem(409, "session-required", "no session", "", "start one"),
+                        |name| async move {
+                            recorder.lock().expect("test lock").push(name);
+                        },
+                    )
+                    .await
+                    .map(Some)
+                },
+                || async { unreachable!("the existing branch already refused") },
+            )
+            .await;
+
+        let error = result.expect_err("a read must not create a session");
+        assert_eq!(error.status(), 409);
+        assert_eq!(error.0.r#type, "urn:kopiur:problem:session-required");
+        assert_eq!(
+            deleted.lock().expect("test lock").as_slice(),
+            ["kopiur-browse-nas-0badc0de"],
+            "the Job the attach created must be deleted, not left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_attached_to_the_session_it_found_is_served() {
+        let undone: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorder = undone.clone();
+        let served = reuse_or_undo(
+            "session",
+            true, // the UIDs matched: this is the session the pre-check saw
+            "kopiur-browse-nas-0badc0de",
+            problem(409, "session-required", "no session", "", "start one"),
+            |name| async move {
+                recorder.lock().expect("test lock").push(name);
+            },
+        )
+        .await
+        .expect("a reused session is served");
+
+        assert_eq!(served, "session");
+        assert!(
+            undone.lock().expect("test lock").is_empty(),
+            "nothing was created, so nothing may be deleted"
+        );
     }
 }

@@ -44,7 +44,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, middleware};
@@ -93,19 +93,38 @@ pub const MAX_TREE_LIMIT: usize = 5000;
 /// useless — the SPA would start one, watch it die, and start another.
 const MIN_SESSION_TTL: Duration = Duration::from_secs(60);
 
-/// The browse routes, mounted by the API router under the paths spelled out
-/// here.
+/// The browse routes.
 ///
-/// The paths are absolute rather than relative to a nest point on purpose: this
-/// router carries the whole `/api/v1/...` prefix, so the routes read the same
-/// here as they do in the SPA and in the docs.
+/// # How this must be mounted
+///
+/// **The paths here are ABSOLUTE**, so the caller `merge`s this router at the
+/// **root** — `app.merge(browse::router())` — and never `nest("/api/v1", …)`s
+/// it, which would produce `/api/v1/api/v1/…`. (The other `/api/v1` modules
+/// register relative paths and *are* nested; the two sets are distinct literals
+/// in one `matchit` tree, so there is no collision.)
+///
+/// **A merged router inherits nothing applied to a nest point.** Every shared
+/// layer the API mounts on `/api/v1` — `identity_middleware` above all, plus the
+/// security headers, the concurrency limit, and the request timeout — must
+/// therefore be applied to the *merged whole*, or to this router explicitly.
+/// Missing headers would be a quiet regression; a missing `identity_middleware`
+/// is worse, because [`CurrentIdentity`] then fails at runtime with a 500 rather
+/// than at compile time.
+///
+/// `GET …/file` is the one route that must stay outside a request timeout: a
+/// legitimate multi-gigabyte restore outlives any fixed deadline. It bounds
+/// itself with a progress watchdog instead ([`download::under_watchdog`]).
+///
+/// # Why `route_layer` for the CSRF gate
 ///
 /// [`mutation_guard`] goes on with `route_layer` rather than `layer`: it then
 /// runs only for a request that actually matched a route here, so an unmatched
-/// path stays a 404 and a wrong method stays a 405 instead of both being
-/// answered with a CSRF refusal that says nothing true. The guard is a no-op for
-/// safe methods, so covering the whole router is exactly equivalent to naming
-/// `POST`/`DELETE` — and it cannot be forgotten when a route is added.
+/// path stays a 404 instead of being answered with a CSRF refusal that says
+/// nothing true. The guard is a no-op for safe methods, so covering the whole
+/// router is exactly equivalent to naming `POST`/`DELETE` — and it cannot be
+/// forgotten when a route is added. (It *does* still run for a matched path with
+/// an unserved method, so an un-marked `PUT …/session` is a 403 rather than a
+/// 405. Cosmetic, and both are refusals.)
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -117,8 +136,26 @@ pub fn router() -> Router<AppState> {
             delete(end_repository_session),
         )
         .route("/api/v1/snapshots/{namespace}/{name}/tree", get(tree))
-        .route("/api/v1/snapshots/{namespace}/{name}/file", get(download))
+        .route(
+            "/api/v1/snapshots/{namespace}/{name}/file",
+            // `get()` alone would also serve HEAD by running the handler and
+            // discarding the body — two pod execs and an exec permit spent to
+            // produce a `Content-Length` the caller already has from `…/tree`,
+            // plus a spawned copy whose body is dropped instantly and which
+            // therefore books a bogus incomplete-download count. The SPA never
+            // sends HEAD, so it is refused rather than served expensively.
+            get(download).head(head_not_allowed),
+        )
         .route_layer(middleware::from_fn(mutation_guard))
+}
+
+/// `HEAD …/file` — refused, with `Allow: GET`. See [`router`].
+async fn head_not_allowed() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, HeaderValue::from_static("GET"))],
+    )
+        .into_response()
 }
 
 // --- query shapes -----------------------------------------------------------
@@ -183,30 +220,35 @@ async fn create_session(
     let image = mover_image(&app.cfg);
     let ready_timeout = app.cfg.session.ready_timeout;
 
-    let (live, reused) = app
+    let (attached, _) = app
         .sessions
         .ensure(
             &key,
             || async {
                 match find_live_job(&ctx, &target).await? {
-                    // A live Job: attach to it. `ExecSession::ensure` takes its
-                    // reuse path and creates nothing.
-                    Some(_) => open_session(&ctx, &target, ttl, &image, ready_timeout)
+                    // A live Job: attach to it and confirm we landed on that
+                    // exact object. `ExecSession::ensure` takes its reuse path
+                    // and creates nothing — unless the Job expired in between,
+                    // which on this route is fine: a POST may create.
+                    Some(job) => attach(&ctx, &target, ttl, &image, ready_timeout, Some(&job))
                         .await
                         .map(Some),
                     None => Ok(None),
                 }
             },
-            || open_session(&ctx, &target, ttl, &image, ready_timeout),
+            || attach(&ctx, &target, ttl, &image, ready_timeout, None),
         )
         .await?;
 
-    if !reused {
+    // `reused` is the UID comparison, not "the pre-check saw something": a Job
+    // that went terminal between the check and the attach was replaced, and
+    // reporting that as a reuse would hide a pod start from the metric.
+    if !attached.reused {
         app.metrics.inc_session_started();
     }
 
-    let mut info = session_info(&live.job, ttl, reused);
-    info.pod = Some(live.session.pod.clone());
+    let mut info = session_info(&attached.job, attached.reused);
+    info.pod = Some(attached.session.pod.clone());
     Ok((StatusCode::CREATED, Json(info)).into_response())
 }
 
@@ -225,7 +267,7 @@ async fn get_session(
     let ctx = ops_ctx(&app, &identity, &namespace)?;
     let target = resolve_target(&app.cfg, &ctx, &namespace, &name).await?;
     match find_live_job(&ctx, &target).await? {
-        Some(job) => Ok(Json(session_info(&job, app.cfg.session.ttl, true))),
+        Some(job) => Ok(Json(session_info(&job, true))),
         None => Err(no_session(404, &namespace, &name)),
     }
 }
@@ -268,8 +310,9 @@ async fn end_repository_session(
     State(app): State<AppState>,
     CurrentIdentity(identity): CurrentIdentity,
     Path((kind, name)): Path<(String, String)>,
-    Query(query): Query<RepositorySessionQuery>,
+    uri: Uri,
 ) -> Result<StatusCode, ApiError> {
+    let query: RepositorySessionQuery = query_from(&uri)?;
     let kind = parse_repository_kind(&kind)?;
     let repo_namespace = match kind {
         RepositoryKind::Repository => Some(require_namespace(query.namespace.as_deref())?),
@@ -309,8 +352,9 @@ async fn tree(
     State(app): State<AppState>,
     CurrentIdentity(identity): CurrentIdentity,
     Path((namespace, name)): Path<(String, String)>,
-    Query(query): Query<TreeQuery>,
+    uri: Uri,
 ) -> Result<Json<DirListing>, ApiError> {
+    let query: TreeQuery = query_from(&uri)?;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_TREE_LIMIT)
@@ -319,19 +363,23 @@ async fn tree(
 
     let ctx = ops_ctx(&app, &identity, &namespace)?;
     let target = resolve_target(&app.cfg, &ctx, &namespace, &name).await?;
-    let live = require_live_session(&app, &ctx, &target, &namespace, &name).await?;
-    let _permit = app.sessions.exec_permit(&identity.user, &app.metrics)?;
 
-    let mut access = CappedAccess::new(live.session, app.cfg.manifest_max_bytes);
-    let listing = list_at(
-        &mut access,
-        &target.kopia_snapshot_id,
-        &parts,
-        query.offset,
-        limit,
-    )
-    .await
-    .map_err(|e| listing_error(e, &access, &query.path))?;
+    // BEFORE the readiness wait, not after: attaching can block for up to
+    // KOPIUR_UI_SESSION_READY_TIMEOUT, and a request that will be refused
+    // anyway should be refused now rather than after holding a client and a
+    // connection for five minutes.
+    let _permit = app.sessions.exec_permit(&identity.user, &app.metrics)?;
+    let live = require_live_session(&app, &ctx, &target, &namespace, &name).await?;
+
+    let cap = app.cfg.manifest_max_bytes;
+    let mut access = CappedAccess::new(live.session, cap);
+    let root = access
+        .snapshot_root(&target.kopia_snapshot_id)
+        .await
+        .map_err(|e| catalog_error(e, access.exceeded(), cap))?;
+    let listing = list_at(&mut access, &root, &parts, query.offset, limit)
+        .await
+        .map_err(|e| listing_error(e, access.exceeded(), cap, &query.path))?;
 
     Ok(Json(DirListing {
         path: query.path,
@@ -339,7 +387,7 @@ async fn tree(
         total: listing.total,
         offset: query.offset,
         limit,
-        session: session_info(&live.job, app.cfg.session.ttl, true),
+        session: session_info(&live.job, true),
     }))
 }
 
@@ -355,20 +403,36 @@ async fn download(
     State(app): State<AppState>,
     CurrentIdentity(identity): CurrentIdentity,
     Path((namespace, name)): Path<(String, String)>,
-    Query(query): Query<FileQuery>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Result<Response, ApiError> {
+    // The navigation check is the FIRST thing that runs, ahead of even parsing
+    // the query string — hence `Uri` rather than the `Query` extractor, whose
+    // rejection would otherwise answer a cross-site request with a 400 about
+    // its parameters instead of the 403 it earned.
     require_same_site_navigation(&headers)?;
+    let query: FileQuery = query_from(&uri)?;
     let parts = validate_rel_path(&query.path)?;
 
     let ctx = ops_ctx(&app, &identity, &namespace)?;
     let target = resolve_target(&app.cfg, &ctx, &namespace, &name).await?;
-    let live = require_live_session(&app, &ctx, &target, &namespace, &name).await?;
+    // Before the readiness wait — see `tree`.
     let permit = app.sessions.exec_permit(&identity.user, &app.metrics)?;
+    let live = require_live_session(&app, &ctx, &target, &namespace, &name).await?;
 
-    let mut access = CappedAccess::new(live.session, app.cfg.manifest_max_bytes);
-    let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
-    let (oid, entry) = walk_to_file(&mut access, &root, &parts, &query.path).await?;
+    let cap = app.cfg.manifest_max_bytes;
+    let mut access = CappedAccess::new(live.session, cap);
+    // Both walks buffer manifests through the same capped sink as `tree`, so
+    // they must produce the same 422 — not the generic 500 a raw `StreamIo`
+    // would map to. Downloading a file inside a directory too large to list
+    // should say so, not say "this is a bug, report it".
+    let root = access
+        .snapshot_root(&target.kopia_snapshot_id)
+        .await
+        .map_err(|e| catalog_error(e, access.exceeded(), cap))?;
+    let (oid, entry) = walk_to_file(&mut access, &root, &parts, &query.path)
+        .await
+        .map_err(|e| listing_error(e, access.exceeded(), cap, &query.path))?;
     let size = download_size(&entry, &query.path, app.cfg.download_max_bytes)?;
 
     let body = download::stream_file(
@@ -377,6 +441,7 @@ async fn download(
         size,
         permit,
         app.metrics.clone(),
+        app.cfg.download_chunk_timeout,
     );
     Ok(download_response(&entry.name, size, body))
 }
@@ -392,24 +457,29 @@ pub struct Page {
     pub total: usize,
 }
 
-/// Walk to `parts` and return one page of it.
+/// Walk to `parts` below `root` and return one page of it.
 ///
-/// Generic over [`SnapshotAccess`] so the whole listing path — root resolution,
-/// the walk, the entry mapping and the pagination arithmetic — is tested against
-/// a fake, with no cluster and no session pod.
+/// Generic over [`SnapshotAccess`] so the walk, the entry mapping and the
+/// pagination arithmetic are tested against a fake, with no cluster and no
+/// session pod.
+///
+/// The root oid is a parameter rather than resolved here so the caller can tell
+/// the two capped reads apart: resolving the root reads the repository's
+/// *snapshot catalog*, while everything below reads *directory manifests*, and
+/// when one of them is too big to buffer the remediation is completely
+/// different (see [`catalog_error`] and [`listing_error`]).
 ///
 /// An `offset` past the end is an empty page, not an error: a directory shrinks
 /// between snapshots and between clicks, and a browser that has paged to the end
 /// of yesterday's listing should see "nothing here", not a failure.
 pub async fn list_at<A: SnapshotAccess + ?Sized>(
     access: &mut A,
-    kopia_snapshot_id: &str,
+    root: &ObjectId,
     parts: &[String],
     offset: usize,
     limit: usize,
 ) -> Result<Page, A::Error> {
-    let root = access.snapshot_root(kopia_snapshot_id).await?;
-    let (_oid, manifest) = walk_to_dir(access, &root, parts).await?;
+    let (_oid, manifest) = walk_to_dir(access, root, parts).await?;
     let total = manifest.entries.len();
     let entries = manifest
         .entries
@@ -732,6 +802,11 @@ impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for CappedSink<W> {
 struct LiveSession {
     session: ExecSession,
     job: Job,
+    /// Whether the attach landed on the Job the caller expected — the Job UIDs
+    /// matched. `false` means `ExecSession::ensure` created one, which is legal
+    /// on `POST` and is undone on a read (see
+    /// [`session_pool::reuse_or_undo`]).
+    reused: bool,
 }
 
 /// The ops context for one request, speaking as the caller.
@@ -807,18 +882,29 @@ async fn find_live_job(ctx: &OpsCtx, target: &BrowseTarget) -> Result<Option<Job
     .filter(|job| !job_is_terminal(job)))
 }
 
-/// Attach to (or, on the create path, start) the session and wait for its pod.
+/// Attach to (or, when `expected` is `None`, start) the session and wait for its
+/// pod, reporting whether the session we ended up on is the one `expected`
+/// named.
 ///
-/// The wait is bounded by `KOPIUR_UI_SESSION_READY_TIMEOUT` rather than by ops'
-/// own internal budget, because a browser request cannot hang for five minutes:
-/// a `504` the SPA can retry is a better answer than a connection held open past
-/// every proxy's own timeout.
-async fn open_session(
+/// `ExecSession::ensure` is find-**or-create**, and it also replaces a Job that
+/// has gone terminal. So "I checked and there was one" is not the same as "I am
+/// now attached to the one I checked", and the difference is only knowable by
+/// comparing the Job's UID before and after. That comparison is what
+/// [`LiveSession::reused`] carries, and it is load-bearing twice over: on `POST`
+/// it keeps `kopiur_ui_sessions_started_total` honest, and on a read it is the
+/// signal that a `GET` just started a pod and must undo it.
+///
+/// The readiness wait is bounded by `KOPIUR_UI_SESSION_READY_TIMEOUT` rather
+/// than by ops' own internal budget, because a browser request cannot hang for
+/// five minutes: a `504` the SPA can retry is a better answer than a connection
+/// held open past every proxy's own timeout.
+async fn attach(
     ctx: &OpsCtx,
     target: &BrowseTarget,
     ttl: Duration,
     image: &MoverImageSource,
     ready_timeout: Duration,
+    expected: Option<&Job>,
 ) -> Result<LiveSession, ApiError> {
     let session = tokio::time::timeout(
         ready_timeout,
@@ -828,8 +914,8 @@ async fn open_session(
     .map_err(|_| session_ready_timeout(ready_timeout))?
     .map_err(session_error)?;
 
-    // Re-read the Job for its creation timestamp; `ExecSession` carries the
-    // names, not the object.
+    // Re-read the Job: `ExecSession` carries names, not the object, and the
+    // object is where both the UID and the expiry live.
     let job = find_session_job(
         ctx,
         &target.namespace,
@@ -848,16 +934,57 @@ async fn open_session(
              kopiur-browse-* Jobs",
         )
     })?;
-    Ok(LiveSession { session, job })
+
+    let reused = is_same_object(expected, &job);
+    Ok(LiveSession {
+        session,
+        job,
+        reused,
+    })
+}
+
+/// **Pure.** Whether two Job reads are the same object, by UID.
+///
+/// A missing expectation is not a reuse (there was nothing to reuse), and a Job
+/// with no UID is not a reuse either — an object the apiserver has assigned no
+/// UID is a hand-made one, and guessing "same" there would silently re-open the
+/// window this comparison exists to close.
+fn is_same_object(expected: Option<&Job>, actual: &Job) -> bool {
+    match (
+        expected.and_then(|j| j.metadata.uid.as_deref()),
+        actual.metadata.uid.as_deref(),
+    ) {
+        (Some(before), Some(now)) => before == now,
+        _ => false,
+    }
 }
 
 /// The session a read must use, or the 409 that tells the SPA to start one.
 ///
-/// The existence check and the attach are two calls, so a session deleted in
-/// between would be re-created by the attach. That window is one apiserver
-/// round-trip wide and needs a human to delete a session inside it; the check is
-/// what makes a *routine* `GET` — a crawler, a preload, a link in a chat — unable
-/// to create anything.
+/// # Why this is more than a pre-check
+///
+/// The check and the attach are two apiserver calls, and `ExecSession::ensure`
+/// creates a Job when it finds none — or when it finds a terminal one. Between
+/// the two calls the session can therefore stop being usable **with no human
+/// involved at all**: reaching the end of its TTL is the ordinary way a session
+/// dies. A naive pre-check would mean that a `GET …/tree` landing on that
+/// boundary quietly starts a mover pod (image pull, repository connect,
+/// credential mount) from a request nobody intended as a write.
+///
+/// Two things close it:
+///
+/// * The whole find-and-attach runs inside [`session_pool::SessionPool::ensure`],
+///   so it takes the per-key single-flight lock (concurrent reads of one
+///   snapshot cannot stampede) and — on the only branch that could create
+///   anything — a `MAX_SESSION_STARTS` permit. Every Job creation in this module
+///   is now bounded, not just the ones `POST` makes.
+/// * If the attach did not land on the Job the check saw
+///   ([`LiveSession::reused`]), it created one, so
+///   [`session_pool::reuse_or_undo`] deletes it and the caller gets the same 409
+///   it would have received had the check lost the race by a millisecond.
+///
+/// The result is unconditional: a `GET` never leaves a mover pod running, under
+/// any interleaving.
 async fn require_live_session(
     app: &AppState,
     ctx: &OpsCtx,
@@ -865,17 +992,52 @@ async fn require_live_session(
     namespace: &str,
     name: &str,
 ) -> Result<LiveSession, ApiError> {
-    if find_live_job(ctx, target).await?.is_none() {
-        return Err(no_session(409, namespace, name));
-    }
-    open_session(
-        ctx,
-        target,
-        app.cfg.session.ttl,
-        &mover_image(&app.cfg),
-        app.cfg.session.ready_timeout,
-    )
-    .await
+    let key = session_key(target);
+    let ttl = app.cfg.session.ttl;
+    let image = mover_image(&app.cfg);
+    let ready_timeout = app.cfg.session.ready_timeout;
+
+    let (live, _) = app
+        .sessions
+        .ensure(
+            &key,
+            || async {
+                let Some(job) = find_live_job(ctx, target).await? else {
+                    return Ok(None);
+                };
+                let live = attach(ctx, target, ttl, &image, ready_timeout, Some(&job)).await?;
+                let job_name = kube::ResourceExt::name_any(&live.job);
+                let reused = live.reused;
+                session_pool::reuse_or_undo(
+                    live,
+                    reused,
+                    &job_name,
+                    no_session(409, namespace, name),
+                    |name| async move {
+                        // Best-effort: the 409 stands either way, and a delete
+                        // that failed leaves a pod the TTL still reaps.
+                        if let Err(error) = delete_session(ctx, &target.namespace, &name).await {
+                            tracing::warn!(
+                                job = %name,
+                                %error,
+                                "could not delete the browse session a read accidentally \
+                                 started; it will be reaped by its own deadline"
+                            );
+                        }
+                    },
+                )
+                .await
+                .map(Some)
+            },
+            // Reached only when no live Job existed at all. It answers the 409
+            // from inside the pool deliberately: the caller still pays for the
+            // single-flight lock and a start permit, so a burst of reads against
+            // a snapshot with no session is bounded exactly like a burst that
+            // would have created one.
+            || async { Err(no_session(409, namespace, name)) },
+        )
+        .await?;
+    Ok(live)
 }
 
 /// The TTL a session is started with: what the caller asked for, clamped into
@@ -994,13 +1156,24 @@ fn session_ready_timeout(budget: Duration) -> ApiError {
     )
 }
 
-/// Turn an ops failure into an API error, redacting a pod log tail first.
+/// Turn an ops failure into an API error, redacting pod-authored text first.
 ///
-/// [`OpsError::SessionPodFailed`] carries the last lines of a failed session
-/// pod's log, which is exactly the diagnostic a user needs — and exactly where a
-/// mover that logged its environment would put credentials. It is the only
-/// `OpsError` whose payload is untrusted text rather than kopiur's own prose, so
-/// it is the only one rewritten here.
+/// Two `OpsError` variants carry text written by the session pod rather than by
+/// kopiur, and both reach the browser verbatim through the plain `From` impl:
+///
+/// * [`OpsError::SessionPodFailed`] — the last lines of a failed session pod's
+///   log. Exactly the diagnostic a user needs, and exactly where a mover that
+///   logged its environment would put credentials.
+/// * [`OpsError::SessionExec`] — kopia's stderr from a failed `kopia show`.
+///   Usually mundane ("unable to open object"), but it is the *pod's* stderr and
+///   nothing constrains what a future kopia, or a wrapper, prints there.
+///
+/// [`redact_text`] masks the values of `AWS_`/`KEY`-shaped tokens and leaves the
+/// rest, so the message stays useful; running it over both is free and removes
+/// the need to reason about which one is safe today.
+///
+/// The `match` is over exactly these two so a third pod-authored payload has to
+/// be added deliberately.
 fn session_error(error: OpsError) -> ApiError {
     match error {
         OpsError::SessionPodFailed {
@@ -1012,30 +1185,91 @@ fn session_error(error: OpsError) -> ApiError {
             namespace,
             detail: redact_text(&detail),
         }),
+        OpsError::SessionExec { what, stderr } => ApiError::from(OpsError::SessionExec {
+            what,
+            stderr: redact_text(&stderr),
+        }),
         other => ApiError::from(other),
     }
 }
 
-/// Turn a listing failure into an API error, naming the cap when that is what
-/// was hit.
-fn listing_error(error: OpsError, access: &CappedAccess, path: &str) -> ApiError {
-    if access.exceeded() {
-        return problem(
-            422,
-            "directory-too-large",
-            format!(
-                "The listing for {:?} is larger than this deployment will buffer ({} bytes).",
-                if path.is_empty() { "/" } else { path },
-                access.manifest_cap
-            ),
-            "kopiur-ui reads a directory by buffering kopia's whole JSON manifest for it, so \
-             a directory with millions of entries would be answered by the UI pod running out \
-             of memory. The limit turns that into this message.",
-            "list it with `kubectl kopiur ls`, which streams instead of buffering, or raise \
-             KOPIUR_UI_MAX_MANIFEST_BYTES",
-        );
+/// **Pure.** Turn a *directory* read's failure into an API error, naming the cap
+/// when that is what was hit.
+///
+/// `exceeded` rather than a `&CappedAccess` so this is a plain function over
+/// plain data: a `CappedAccess` owns an `ExecSession`, which has no public
+/// constructor, so a version taking one could never be unit-tested — and the
+/// status, the URN and the remediation are precisely what a test needs to pin.
+pub fn listing_error(error: OpsError, exceeded: bool, cap: u64, path: &str) -> ApiError {
+    if !exceeded {
+        return session_error(error);
     }
-    session_error(error)
+    problem(
+        422,
+        "directory-too-large",
+        format!(
+            "The listing for {:?} is larger than this deployment will buffer ({cap} bytes).",
+            if path.is_empty() { "/" } else { path },
+        ),
+        "kopiur-ui reads a directory by buffering kopia's whole JSON manifest for it, so a \
+         directory with millions of entries would be answered by the UI pod running out of \
+         memory. The limit turns that into this message.",
+        "list it with `kubectl kopiur ls`, which streams instead of buffering, or raise \
+         KOPIUR_UI_MAX_MANIFEST_BYTES",
+    )
+}
+
+/// **Pure.** Turn the *snapshot catalog* read's failure into an API error.
+///
+/// A separate problem from [`listing_error`] because it has a separate cause and
+/// a separate remedy. Resolving a snapshot's root runs `kopia snapshot list
+/// --all`, whose size is the number of snapshots in the **repository** — every
+/// identity, every schedule, all of history. When that is what overflowed, the
+/// user is not browsing a huge directory and `kubectl kopiur ls` will hit the
+/// same wall; the answer is repository retention (or a bigger buffer), so
+/// telling them to run `ls` would be sending them in a circle.
+pub fn catalog_error(error: OpsError, exceeded: bool, cap: u64) -> ApiError {
+    if !exceeded {
+        return session_error(error);
+    }
+    problem(
+        422,
+        "catalog-too-large",
+        format!(
+            "This repository's snapshot catalog is larger than this deployment will buffer \
+             ({cap} bytes)."
+        ),
+        "Opening any file in a snapshot starts by reading the repository's whole snapshot \
+         list — every kopia identity and all of its history, not just this Snapshot — and \
+         kopiur-ui buffers that JSON to find the root object. A repository with a very large \
+         number of snapshots exceeds the buffer before browsing can begin.",
+        "reduce the repository's snapshot count (check the retention on the policies writing \
+         to it, and run a maintenance pass), or raise KOPIUR_UI_MAX_MANIFEST_BYTES; \
+         `kubectl kopiur ls` reads the same catalog, so it will not work around this",
+    )
+}
+
+/// Deserialize a query string into `T`, as `application/problem+json` on failure.
+///
+/// Used instead of the `Query` extractor for two reasons. It keeps a malformed
+/// query answering in the same problem shape as everything else, rather than
+/// axum's default plain-text 400 that the SPA cannot parse. And it moves the
+/// parse *into* the handler body, so a check that must come first — the
+/// same-site navigation gate on `GET …/file` — actually does.
+fn query_from<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, ApiError> {
+    Query::<T>::try_from_uri(uri)
+        .map(|Query(q)| q)
+        .map_err(|e| {
+            problem(
+                400,
+                "invalid",
+                "The request's query parameters are not the shape this endpoint accepts.",
+                e.to_string(),
+                "check the parameter names and values against the API reference — an unknown \
+             parameter is refused rather than ignored, so that a typo cannot silently give \
+             you a default you did not ask for",
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1258,10 +1492,15 @@ mod tests {
         }
     }
 
+    /// [`fake`]'s root object id.
+    fn root() -> ObjectId {
+        parse_oid("kroot").expect("test oid")
+    }
+
     #[tokio::test]
     async fn the_root_lists_without_a_path() {
         let mut access = fake();
-        let page = list_at(&mut access, "ksnap", &[], 0, DEFAULT_TREE_LIMIT)
+        let page = list_at(&mut access, &root(), &[], 0, DEFAULT_TREE_LIMIT)
             .await
             .expect("root listing");
         assert_eq!(page.total, 2);
@@ -1275,7 +1514,7 @@ mod tests {
         let mut access = fake();
         let parts = validate_rel_path("sub").expect("valid path");
 
-        let page = list_at(&mut access, "ksnap", &parts, 0, 3)
+        let page = list_at(&mut access, &root(), &parts, 0, 3)
             .await
             .expect("first page");
         assert_eq!(page.total, 10, "total is the directory, not the page");
@@ -1287,7 +1526,7 @@ mod tests {
             ["e0", "e1", "e2"]
         );
 
-        let page = list_at(&mut access, "ksnap", &parts, 8, 3)
+        let page = list_at(&mut access, &root(), &parts, 8, 3)
             .await
             .expect("last, partial page");
         assert_eq!(page.total, 10);
@@ -1302,7 +1541,7 @@ mod tests {
 
         // Past the end is an empty page: a directory shrinks between snapshots
         // and a stale link must not 500.
-        let page = list_at(&mut access, "ksnap", &parts, 999, 3)
+        let page = list_at(&mut access, &root(), &parts, 999, 3)
             .await
             .expect("past the end");
         assert_eq!(page.total, 10);
@@ -1310,7 +1549,7 @@ mod tests {
 
         // A zero limit is a legal (empty) window whose `total` still tells the
         // SPA how many pages there are.
-        let page = list_at(&mut access, "ksnap", &parts, 0, 0)
+        let page = list_at(&mut access, &root(), &parts, 0, 0)
             .await
             .expect("zero limit");
         assert_eq!((page.total, page.entries.len()), (10, 0));
@@ -1321,13 +1560,13 @@ mod tests {
         let mut access = fake();
         let parts = validate_rel_path("nope").expect("valid path");
         assert!(matches!(
-            list_at(&mut access, "ksnap", &parts, 0, 10).await,
+            list_at(&mut access, &root(), &parts, 0, 10).await,
             Err(OpsError::PathNotFound { .. })
         ));
 
         let parts = validate_rel_path("a.txt").expect("valid path");
         assert!(matches!(
-            list_at(&mut access, "ksnap", &parts, 0, 10).await,
+            list_at(&mut access, &root(), &parts, 0, 10).await,
             Err(OpsError::NotADirectory { .. })
         ));
     }
@@ -1505,6 +1744,134 @@ mod tests {
         assert_eq!(missing_session_namespace().status(), 400);
     }
 
+    // --- the capped-read problem documents --------------------------------
+
+    /// The `StreamIo` a `CappedSink` refusal actually surfaces as.
+    fn capped_stream_io() -> OpsError {
+        OpsError::StreamIo {
+            what: "streaming `show kdir-sub` output".to_string(),
+            source: std::io::Error::other(
+                "the kopia output exceeded KOPIUR_UI_MAX_MANIFEST_BYTES (64 bytes)",
+            ),
+        }
+    }
+
+    #[test]
+    fn a_directory_too_large_to_buffer_is_a_422_naming_the_knob() {
+        // Without the cap flag this is `OpsErrorKind::Internal` → a 500 that
+        // says "this is a kopiur bug, report it". The whole point of the
+        // mapping is that a resource limit reads as a resource limit.
+        let error = listing_error(capped_stream_io(), true, 64 * 1024 * 1024, "var/log");
+        assert_eq!(error.status(), 422);
+        assert_eq!(error.0.r#type, "urn:kopiur:problem:directory-too-large");
+        assert!(error.0.what.contains("var/log"), "{:?}", error.0.what);
+        assert!(
+            error.0.what.contains("67108864"),
+            "the limit must be a number the operator can compare: {:?}",
+            error.0.what
+        );
+        assert!(
+            error.0.fix.contains("KOPIUR_UI_MAX_MANIFEST_BYTES"),
+            "{:?}",
+            error.0.fix
+        );
+        assert!(
+            error.0.fix.contains("kubectl kopiur ls"),
+            "{:?}",
+            error.0.fix
+        );
+
+        // The root directory is named as `/`, not as an empty string.
+        let root = listing_error(capped_stream_io(), true, 64, "");
+        assert!(root.0.what.contains("\"/\""), "{:?}", root.0.what);
+
+        // A failure that is NOT the cap keeps its own mapping — a missing path
+        // must stay a 404, not become "this directory is too large".
+        let missing = listing_error(
+            OpsError::PathNotFound {
+                path: "sub/nope".into(),
+            },
+            false,
+            64,
+            "sub/nope",
+        );
+        assert_eq!(missing.status(), 404);
+    }
+
+    #[test]
+    fn a_snapshot_catalog_too_large_to_buffer_is_its_own_problem() {
+        // Distinct from `directory-too-large` because the remedy is different:
+        // the user is not in a huge directory, the REPOSITORY has too many
+        // snapshots — and `kubectl kopiur ls` reads the same catalog, so sending
+        // them there would be a loop.
+        let error = catalog_error(capped_stream_io(), true, 64 * 1024 * 1024);
+        assert_eq!(error.status(), 422);
+        assert_eq!(error.0.r#type, "urn:kopiur:problem:catalog-too-large");
+        assert_ne!(error.0.r#type, "urn:kopiur:problem:directory-too-large");
+        assert!(error.0.what.contains("67108864"), "{:?}", error.0.what);
+        assert!(
+            error.0.why.contains("whole snapshot list"),
+            "the cause must name the catalog, not a directory: {:?}",
+            error.0.why
+        );
+        assert!(
+            error.0.fix.contains("retention") && error.0.fix.contains("maintenance"),
+            "{:?}",
+            error.0.fix
+        );
+        assert!(
+            error.0.fix.contains("KOPIUR_UI_MAX_MANIFEST_BYTES"),
+            "{:?}",
+            error.0.fix
+        );
+        assert!(
+            error.0.fix.contains("will not work around this"),
+            "sending the user to `kopiur ls` here would be a loop: {:?}",
+            error.0.fix
+        );
+
+        let other = catalog_error(
+            OpsError::SnapshotMissingInRepo {
+                id: "kgone".to_string(),
+            },
+            false,
+            64,
+        );
+        assert_eq!(other.status(), 404);
+    }
+
+    #[test]
+    fn an_attach_is_a_reuse_only_when_the_job_uid_matches() {
+        fn job(uid: Option<&str>) -> Job {
+            let mut value = serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": { "name": "kopiur-browse-nas-0badc0de", "namespace": "media" },
+            });
+            if let Some(uid) = uid {
+                value["metadata"]["uid"] = serde_json::json!(uid);
+            }
+            serde_json::from_value(value).expect("job fixture")
+        }
+
+        let a = job(Some("uid-a"));
+        let b = job(Some("uid-b"));
+        assert!(is_same_object(Some(&a), &a), "the same object");
+        assert!(
+            !is_same_object(Some(&a), &b),
+            "same NAME, different object: the session was replaced between the two reads, \
+             which is exactly the case the comparison exists for"
+        );
+        assert!(
+            !is_same_object(None, &a),
+            "nothing was expected, so nothing was reused"
+        );
+        // A UID-less object is a hand-made one; guessing 'same' there would
+        // re-open the window the comparison closes.
+        assert!(!is_same_object(Some(&job(None)), &a));
+        assert!(!is_same_object(Some(&a), &job(None)));
+        assert!(!is_same_object(Some(&job(None)), &job(None)));
+    }
+
     #[test]
     fn the_session_required_problem_says_the_same_thing_at_both_statuses() {
         let read = no_session(409, "media", "nightly-1");
@@ -1542,6 +1909,23 @@ mod tests {
             error.0.detail.contains("AWS_SECRET_ACCESS_KEY"),
             "{}",
             error.0.detail
+        );
+
+        // kopia's stderr is pod-authored too, and reaches the browser by the
+        // same route. Usually mundane; nothing constrains it to stay that way.
+        let exec = session_error(OpsError::SessionExec {
+            what: "show kdeadbeef".into(),
+            stderr: "connect failed: AWS_SECRET_ACCESS_KEY=hunter2hunter2".into(),
+        });
+        assert!(
+            !exec.0.detail.contains("hunter2hunter2"),
+            "kopia stderr must be redacted too: {}",
+            exec.0.detail
+        );
+        assert!(
+            exec.0.detail.contains("AWS_SECRET_ACCESS_KEY") && exec.0.detail.contains("show"),
+            "the message must stay diagnosable: {}",
+            exec.0.detail
         );
 
         // Every other ops failure passes through the shared mapping untouched.
@@ -1687,6 +2071,7 @@ mod router_tests {
                 max_exec_global: DEFAULT_MAX_EXEC_GLOBAL,
             },
             download_max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
+            download_chunk_timeout: Duration::from_secs(60),
             manifest_max_bytes: DEFAULT_MAX_MANIFEST_BYTES,
             snapshot_list_cap: DEFAULT_SNAPSHOT_LIST_CAP,
             client_cache: CacheLimits {
@@ -1853,13 +2238,55 @@ mod router_tests {
     async fn a_mistyped_query_parameter_is_refused_rather_than_ignored() {
         // `?limits=1` silently answered with the default page size is the kind
         // of bug a user never reports and never works around.
-        let (status, _) = send(
-            request("GET", &format!("{TREE}?limits=1"))
+        for uri in [format!("{TREE}?limits=1"), format!("{FILE}?paths=a.txt")] {
+            let (status, problem) =
+                send(request("GET", &uri).body(Body::empty()).expect("req")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            // problem+json, not axum's plain-text rejection — the SPA parses
+            // every error body as a Problem.
+            assert_eq!(kind(problem), "urn:kopiur:problem:invalid", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cross_site_download_is_refused_before_its_query_is_even_parsed() {
+        // Ordering, asserted rather than assumed: a cross-site request with a
+        // malformed query must be told it is cross-site, not told about its
+        // parameters. The 403 is also what a security review reads first.
+        let (status, problem) = send(
+            request("GET", &format!("{FILE}?paths=a.txt&nonsense=1"))
+                .header(SEC_FETCH_SITE, "cross-site")
                 .body(Body::empty())
                 .expect("req"),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(kind(problem), "urn:kopiur:problem:csrf");
+    }
+
+    #[tokio::test]
+    async fn head_on_a_file_is_refused_rather_than_served_expensively() {
+        // axum's `get()` would otherwise serve HEAD by running the whole
+        // handler — two pod execs and an exec permit — and then dropping the
+        // body, which also books a bogus incomplete-download count.
+        let (status, _) = send(
+            request("HEAD", &format!("{FILE}?path=a.txt"))
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+
+        // The other reads keep the ordinary GET/HEAD behaviour: they are cheap
+        // and answer from Job metadata.
+        for uri in [SESSION, TREE] {
+            let (status, _) = send(request("HEAD", uri).body(Body::empty()).expect("req")).await;
+            assert_ne!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "HEAD {uri} is served like its GET"
+            );
+        }
     }
 
     #[tokio::test]

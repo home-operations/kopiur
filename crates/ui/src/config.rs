@@ -163,6 +163,20 @@ pub const SESSION_READY_TIMEOUT_ENV: &str = "KOPIUR_UI_SESSION_READY_TIMEOUT";
 /// Default for [`SESSION_READY_TIMEOUT_ENV`].
 pub const DEFAULT_SESSION_READY_TIMEOUT: &str = "300s";
 
+/// How long a file download may make **no progress** before it is abandoned.
+///
+/// Not a total-transfer budget — a legitimate multi-gigabyte restore takes far
+/// longer than any fixed deadline. This bounds the *silence*: if neither the
+/// session pod (a hung kopia, a wedged exec websocket) nor the browser (a closed
+/// laptop, a half-open TCP connection) moves a byte for this long, the copy is
+/// dropped. Nothing else bounds `GET …/file` — it is deliberately exempt from
+/// the API's request timeout, because a real download outlives one — so without
+/// this a single stalled transfer holds a `pods/exec` slot, an apiserver
+/// websocket and a kopia process indefinitely.
+pub const DOWNLOAD_CHUNK_TIMEOUT_ENV: &str = "KOPIUR_UI_DOWNLOAD_CHUNK_TIMEOUT";
+/// Default for [`DOWNLOAD_CHUNK_TIMEOUT_ENV`].
+pub const DEFAULT_DOWNLOAD_CHUNK_TIMEOUT: &str = "60s";
+
 /// Cap on concurrent session-pod CREATIONS. Bounds how fast a burst of browse
 /// clicks can ask the cluster for pods.
 pub const MAX_SESSION_STARTS_ENV: &str = "KOPIUR_UI_MAX_SESSION_STARTS";
@@ -364,6 +378,10 @@ pub struct UiArgs {
     #[arg(long, env = SESSION_READY_TIMEOUT_ENV, default_value = DEFAULT_SESSION_READY_TIMEOUT)]
     pub session_ready_timeout: String,
 
+    /// How long a download may make no progress before it is abandoned (e.g. 60s).
+    #[arg(long, env = DOWNLOAD_CHUNK_TIMEOUT_ENV, default_value = DEFAULT_DOWNLOAD_CHUNK_TIMEOUT)]
+    pub download_chunk_timeout: String,
+
     /// Cap on concurrent session-pod creations.
     #[arg(long, env = MAX_SESSION_STARTS_ENV, default_value_t = DEFAULT_MAX_SESSION_STARTS)]
     pub max_session_starts: usize,
@@ -440,6 +458,8 @@ pub struct UiConfig {
     pub session: SessionLimits,
     /// Largest single file download, in bytes.
     pub download_max_bytes: u64,
+    /// How long a download may make no progress before it is abandoned.
+    pub download_chunk_timeout: Duration,
     /// Largest buffered kopia JSON manifest, in bytes.
     pub manifest_max_bytes: u64,
     /// Largest accepted `limit` on the snapshot list endpoint.
@@ -900,6 +920,11 @@ impl UiArgs {
             cache_enabled: self.cache,
             session,
             download_max_bytes: self.max_download_bytes,
+            download_chunk_timeout: parse_duration_or_default(
+                DOWNLOAD_CHUNK_TIMEOUT_ENV,
+                &self.download_chunk_timeout,
+                DEFAULT_DOWNLOAD_CHUNK_TIMEOUT,
+            )?,
             manifest_max_bytes: self.max_manifest_bytes,
             snapshot_list_cap: self.snapshot_list_cap,
             client_cache,
@@ -1259,6 +1284,7 @@ mod tests {
         assert_eq!(cfg.sar_ttl, Duration::from_secs(60));
         assert_eq!(cfg.client_cache.ttl, Duration::from_secs(600));
         assert_eq!(cfg.download_max_bytes, DEFAULT_MAX_DOWNLOAD_BYTES);
+        assert_eq!(cfg.download_chunk_timeout, Duration::from_secs(60));
         assert_eq!(cfg.manifest_max_bytes, DEFAULT_MAX_MANIFEST_BYTES);
         assert_eq!(cfg.snapshot_list_cap, DEFAULT_SNAPSHOT_LIST_CAP);
         assert_eq!(cfg.tls, None);

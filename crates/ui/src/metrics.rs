@@ -33,6 +33,16 @@ pub enum DownloadIncomplete {
     Short,
     /// The stream produced more than `entry.size` bytes, so the copy was cut off.
     Overrun,
+    /// The client went away mid-transfer (it hit Escape, closed the tab, or its
+    /// connection dropped).
+    ///
+    /// Its own bucket rather than [`Self::Short`] because it means something
+    /// completely different: nothing is wrong with the backup, and nobody is
+    /// holding a bad file. Folding it into `download-short` would make the
+    /// integrity signal non-zero the first time anyone cancels a large
+    /// download, which is exactly how a "this must stay at zero" alert gets
+    /// muted.
+    ClientCancelled,
 }
 
 impl DownloadIncomplete {
@@ -41,6 +51,20 @@ impl DownloadIncomplete {
         match self {
             Self::Short => "download-short",
             Self::Overrun => "download-overrun",
+            Self::ClientCancelled => "client-cancelled",
+        }
+    }
+
+    /// Whether this cause means the caller may be holding bytes that do not
+    /// match the snapshot.
+    ///
+    /// The distinction the metric exists to draw: `download-short` and
+    /// `download-overrun` are integrity events and should alert;
+    /// `client-cancelled` is a person changing their mind and should not.
+    pub fn is_integrity_failure(self) -> bool {
+        match self {
+            Self::Short | Self::Overrun => true,
+            Self::ClientCancelled => false,
         }
     }
 }
@@ -114,8 +138,10 @@ impl UiMetrics {
             .u64_counter("kopiur_ui_download_incomplete")
             .with_description(
                 "File downloads that did not deliver exactly the size recorded in the \
-                 snapshot entry, by cause (download-short | download-overrun). Any value \
-                 above zero means a user may hold a file that does not match the backup.",
+                 snapshot entry, by cause (download-short | download-overrun | \
+                 client-cancelled). Alert on the first two: they mean a user may hold a \
+                 file that does not match the backup. client-cancelled is someone closing \
+                 a tab and is expected to be non-zero.",
             )
             .build();
 
@@ -275,9 +301,27 @@ mod tests {
             identity_source_label(&IdentitySource::Anonymous),
         ];
         assert_ne!(labels[0], labels[1]);
-        assert_ne!(
-            DownloadIncomplete::Short.label(),
-            DownloadIncomplete::Overrun.label()
+
+        let causes = [
+            DownloadIncomplete::Short,
+            DownloadIncomplete::Overrun,
+            DownloadIncomplete::ClientCancelled,
+        ];
+        let labels: std::collections::BTreeSet<_> = causes.iter().map(|c| c.label()).collect();
+        assert_eq!(
+            labels.len(),
+            causes.len(),
+            "two causes sharing a label would merge an integrity failure into an \
+             expected-nonzero bucket: {labels:?}"
         );
+    }
+
+    #[test]
+    fn only_a_size_mismatch_counts_as_an_integrity_failure() {
+        // The split the alert rule is written against: a person cancelling a
+        // download must never fire the "the backup may be corrupt" page.
+        assert!(DownloadIncomplete::Short.is_integrity_failure());
+        assert!(DownloadIncomplete::Overrun.is_integrity_failure());
+        assert!(!DownloadIncomplete::ClientCancelled.is_integrity_failure());
     }
 }

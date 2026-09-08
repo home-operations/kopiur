@@ -177,6 +177,7 @@ mod tests {
                 max_exec_global: DEFAULT_MAX_EXEC_GLOBAL,
             },
             download_max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
+            download_chunk_timeout: std::time::Duration::from_secs(60),
             manifest_max_bytes: DEFAULT_MAX_MANIFEST_BYTES,
             snapshot_list_cap: DEFAULT_SNAPSHOT_LIST_CAP,
             client_cache: CacheLimits {
