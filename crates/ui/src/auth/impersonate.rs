@@ -7,15 +7,30 @@
 //! cache would be an unbounded socket and memory footprint keyed by whatever
 //! usernames the proxy sends.
 //!
-//! # Why the layer is outermost, and why it strips before it writes
+//! # Why the layer is outermost, and why the base config is sanitized
 //!
 //! `kube::client::ClientBuilder::with_layer` wraps the stack it is given, so a
-//! layer added last runs *first* on the way out — outside kube's own
-//! `extra_headers_layer`, which is the only other thing that would emit
-//! `Impersonate-*` (and does so solely from `Config::auth_info.impersonate*`,
-//! which kopiur-ui leaves `None`). Being outermost is what makes the removal
-//! total: no inner layer can have added a header this one did not see. The same
-//! stack carries `Client::connect`, so a browse session's `pods/exec` is
+//! layer added last is the *outermost* one and therefore runs **first** on the
+//! outbound path. That is what makes the strip total in the direction that
+//! matters: a caller's inbound `Impersonate-*` headers are removed before any
+//! inner layer — including kube's own `ExtraHeadersLayer` — has seen the request,
+//! so nothing downstream can be confused by them.
+//!
+//! Running first also means this layer cannot *undo* what an inner layer adds
+//! afterwards. Exactly one inner layer emits `Impersonate-*`: kube's
+//! `ExtraHeadersLayer`, which `extra_headers_layer()` populates from
+//! `Config::auth_info.impersonate` / `.impersonate_groups` and from
+//! `Config::headers`, and whose `call` does `headers.extend(...)` — an *append*.
+//! A base `kube::Config` inferred from a kubeconfig with `as-groups:
+//! [system:masters]` would therefore union `system:masters` onto every request
+//! this cache ever builds, no matter what identity the layer asserted.
+//!
+//! [`sanitize_base`] closes that: `ClientCache::new` clears all four
+//! `auth_info.impersonate*` fields and drops any `impersonate-*` from
+//! `Config::headers`, so the inner layer has nothing left to append. The
+//! guarantee is not "we leave those fields alone" — it is "we empty them".
+//!
+//! The same stack carries `Client::connect`, so a browse session's `pods/exec` is
 //! impersonated exactly like a `GET`.
 
 use std::collections::HashMap;
@@ -43,11 +58,59 @@ const IMPERSONATE_GROUP: &str = "impersonate-group";
 /// Prefix of `Impersonate-Extra-<key>`.
 const IMPERSONATE_EXTRA_PREFIX: &str = "impersonate-extra-";
 
+/// Which part of an identity could not be turned into a header.
+///
+/// An enum rather than a string so a new impersonation header cannot be added
+/// without every reader of this error accounting for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityHeaderKind {
+    /// `Impersonate-User`.
+    User,
+    /// `Impersonate-Group`.
+    Group,
+    /// `Impersonate-Extra-<key>` — the key or one of its values.
+    Extra,
+}
+
+impl std::fmt::Display for IdentityHeaderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::User => "user",
+            Self::Group => "group",
+            Self::Extra => "userextra",
+        })
+    }
+}
+
+/// An identity that cannot be expressed as impersonation headers.
+///
+/// [`super::identity::extract_identity`] restricts every principal to visible
+/// ASCII, so this is unreachable for anything that came through the middleware —
+/// it exists because the *failure mode* of not having it is catastrophic. Dropping
+/// a bad value and carrying on would send a request with no `Impersonate-User`,
+/// which the apiserver executes as **the UI's own ServiceAccount**: a fail-open
+/// straight past the impersonation guarantee. Refusing to build the layer at all
+/// turns that into a 500.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the caller's {what} {value:?} cannot be sent as an impersonation header. Every apiserver \
+     call kopiur-ui makes must carry the caller's identity, and a request missing one would \
+     run as the UI's own ServiceAccount instead — so it is refused rather than sent. \
+     Fix: this is a bug in kopiur-ui (identity extraction should already have rejected this \
+     value); report it at https://github.com/home-operations/kopiur/issues"
+)]
+pub struct InvalidIdentityHeader {
+    /// Which impersonation header could not be built.
+    pub what: IdentityHeaderKind,
+    /// The offending value (or, for an extra, the offending key).
+    pub value: String,
+}
+
 /// Asserts one identity on every request that passes through it.
 ///
 /// The header list is computed once, when the layer is built, so the per-request
 /// work is a fixed number of `remove`/`append` calls with no allocation.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ImpersonateLayer {
     headers: Arc<[(HeaderName, HeaderValue)]>,
 }
@@ -56,43 +119,44 @@ impl ImpersonateLayer {
     /// Build the layer that asserts `identity`, emitting only the `userextras`
     /// keys named in `extra_keys`.
     ///
-    /// A value that cannot become a `HeaderValue` is dropped with a warning
-    /// rather than panicking: [`super::identity::extract_identity`] already
-    /// restricts principals to visible ASCII, so this is unreachable for anything
-    /// that came through the middleware, and a hand-built identity should degrade
-    /// to *fewer* permissions, never to a crashed request.
-    pub fn new(identity: &Identity, extra_keys: &[String]) -> Self {
+    /// Fails — rather than degrading — on any value that cannot become a header;
+    /// see [`InvalidIdentityHeader`] for why a partial identity is worse than no
+    /// request at all.
+    pub fn new(identity: &Identity, extra_keys: &[String]) -> Result<Self, InvalidIdentityHeader> {
         let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
 
-        if let Some(value) = header_value(&identity.user, "user") {
-            headers.push((HeaderName::from_static(IMPERSONATE_USER), value));
-        }
+        headers.push((
+            HeaderName::from_static(IMPERSONATE_USER),
+            header_value(&identity.user, IdentityHeaderKind::User)?,
+        ));
         for group in &identity.groups {
-            if let Some(value) = header_value(group, "group") {
-                headers.push((HeaderName::from_static(IMPERSONATE_GROUP), value));
-            }
+            headers.push((
+                HeaderName::from_static(IMPERSONATE_GROUP),
+                header_value(group, IdentityHeaderKind::Group)?,
+            ));
         }
         for key in extra_keys {
             let Some(values) = identity.extra.get(key) else {
                 continue;
             };
-            let Ok(name) = HeaderName::try_from(format!("{IMPERSONATE_EXTRA_PREFIX}{key}")) else {
-                tracing::warn!(
-                    key,
-                    "userextras key is not a valid header name; not impersonated"
-                );
-                continue;
-            };
+            let name =
+                HeaderName::try_from(format!("{IMPERSONATE_EXTRA_PREFIX}{key}")).map_err(|_| {
+                    InvalidIdentityHeader {
+                        what: IdentityHeaderKind::Extra,
+                        value: key.clone(),
+                    }
+                })?;
             for value in values {
-                if let Some(value) = header_value(value, "userextra") {
-                    headers.push((name.clone(), value));
-                }
+                headers.push((
+                    name.clone(),
+                    header_value(value, IdentityHeaderKind::Extra)?,
+                ));
             }
         }
 
-        Self {
+        Ok(Self {
             headers: headers.into(),
-        }
+        })
     }
 
     /// The headers this layer will assert, in the order it asserts them.
@@ -104,18 +168,37 @@ impl ImpersonateLayer {
     }
 }
 
-/// Convert one identity value into a header value, warning if it cannot be.
-fn header_value(value: &str, what: &'static str) -> Option<HeaderValue> {
-    match HeaderValue::from_str(value) {
-        Ok(v) => Some(v),
-        Err(_) => {
-            tracing::warn!(
-                what,
-                "identity value cannot be sent as a header; not impersonated"
-            );
-            None
-        }
-    }
+/// Convert one identity value into a header value.
+fn header_value(
+    value: &str,
+    what: IdentityHeaderKind,
+) -> Result<HeaderValue, InvalidIdentityHeader> {
+    HeaderValue::from_str(value).map_err(|_| InvalidIdentityHeader {
+        what,
+        value: value.to_string(),
+    })
+}
+
+/// Strip every impersonation instruction out of a base `kube::Config`.
+///
+/// The UI's own credentials are the only thing the base config is allowed to
+/// carry. Anything in `auth_info.impersonate*` — a kubeconfig with `as:` /
+/// `as-groups:`, most plausibly a developer's own file picked up by
+/// `Config::infer` — is emitted by kube's inner `ExtraHeadersLayer` and *appended*
+/// to whatever [`ImpersonateLayer`] asserted, so it would silently union extra
+/// groups (up to and including `system:masters`) onto every caller's requests.
+/// The same goes for a hand-set `impersonate-*` in `Config::headers`.
+///
+/// Called by [`ClientCache::new`], so no caller has to remember it.
+pub fn sanitize_base(mut config: kube::Config) -> kube::Config {
+    config.auth_info.impersonate = None;
+    config.auth_info.impersonate_uid = None;
+    config.auth_info.impersonate_groups = None;
+    config.auth_info.impersonate_user_extra = None;
+    config
+        .headers
+        .retain(|(name, _)| !name.as_str().starts_with(IMPERSONATE_PREFIX));
+    config
 }
 
 impl<S> Layer<S> for ImpersonateLayer {
@@ -246,14 +329,31 @@ impl std::fmt::Debug for ClientCache {
     }
 }
 
+/// Why a per-identity client could not be built.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientBuildError {
+    /// The identity cannot be expressed as impersonation headers.
+    #[error(transparent)]
+    InvalidIdentity(#[from] InvalidIdentityHeader),
+
+    /// kube refused to build a client from the base configuration (TLS material,
+    /// proxy settings, a malformed cluster URL).
+    #[error(
+        "kopiur-ui could not build a Kubernetes client from its own configuration: {0}. \
+         Fix: check the UI's ServiceAccount token mount and any KUBECONFIG/proxy settings on \
+         the Deployment, then restart it"
+    )]
+    Kube(#[from] kube::Error),
+}
+
 impl ClientCache {
     /// Build a cache over `base` — the in-cluster (or inferred) config `main`
     /// resolved, whose credentials are the UI's own ServiceAccount.
     ///
-    /// `base.auth_info.impersonate*` is left untouched (and must stay `None`):
-    /// kube's own `extra_headers_layer` emits `Impersonate-User`/`-Group` from
-    /// those fields, and a value there would be asserted on *every* client,
-    /// including ones built for a different identity.
+    /// `base` is passed through [`sanitize_base`] first: any impersonation the
+    /// configuration itself carries would be *appended* by kube's inner
+    /// `ExtraHeadersLayer` to whatever identity a client asserts, so it is cleared
+    /// here rather than assumed absent.
     pub fn new(base: kube::Config, limits: CacheLimits, extra_keys: Vec<String>) -> Self {
         Self::with_clock(base, limits, extra_keys, Box::new(Instant::now))
     }
@@ -266,7 +366,7 @@ impl ClientCache {
         clock: Box<dyn Fn() -> Instant + Send + Sync>,
     ) -> Self {
         Self {
-            base,
+            base: sanitize_base(base),
             limits,
             extra_keys: extra_keys.into(),
             entries: Mutex::new(HashMap::new()),
@@ -280,7 +380,7 @@ impl ClientCache {
     /// `kube::Client`, and a miss builds one under the lock so that two
     /// simultaneous first requests from the same person cannot produce two
     /// connection pools.
-    pub fn client_for(&self, identity: &Identity) -> Result<kube::Client, kube::Error> {
+    pub fn client_for(&self, identity: &Identity) -> Result<kube::Client, ClientBuildError> {
         let now = (self.clock)();
         let key = IdentityKey::new(identity);
         let mut entries = self.lock();
@@ -332,9 +432,9 @@ impl ClientCache {
         self.len() == 0
     }
 
-    /// Build one impersonating client from the base config.
-    fn build(&self, identity: &Identity) -> Result<kube::Client, kube::Error> {
-        let layer = ImpersonateLayer::new(identity, &self.extra_keys);
+    /// Build one impersonating client from the sanitized base config.
+    fn build(&self, identity: &Identity) -> Result<kube::Client, ClientBuildError> {
+        let layer = ImpersonateLayer::new(identity, &self.extra_keys)?;
         Ok(kube::client::ClientBuilder::try_from(self.base.clone())?
             .with_layer(&layer)
             .build())
@@ -439,7 +539,11 @@ mod tests {
             .body(())
             .expect("test request");
 
-        let headers = through(ImpersonateLayer::new(&id, &[]), req).await;
+        let headers = through(
+            ImpersonateLayer::new(&id, &[]).expect("valid identity"),
+            req,
+        )
+        .await;
 
         assert_eq!(values(&headers, IMPERSONATE_USER), vec!["alice"]);
         assert_eq!(
@@ -463,7 +567,7 @@ mod tests {
         // What `extract_identity` produces: sorted and deduped.
         let id = identity("alice", &["dev", "ops", "system:authenticated"]);
         let headers = through(
-            ImpersonateLayer::new(&id, &[]),
+            ImpersonateLayer::new(&id, &[]).expect("valid identity"),
             Request::builder().body(()).expect("test request"),
         )
         .await;
@@ -483,7 +587,7 @@ mod tests {
             .insert("scopes".to_string(), vec!["openid".to_string()]);
 
         let headers = through(
-            ImpersonateLayer::new(&id, &["email".to_string()]),
+            ImpersonateLayer::new(&id, &["email".to_string()]).expect("valid identity"),
             Request::builder().body(()).expect("test request"),
         )
         .await;
@@ -502,12 +606,120 @@ mod tests {
     async fn an_identity_with_no_extras_emits_only_user_and_groups() {
         let id = identity("alice", &["system:authenticated"]);
         let headers = through(
-            ImpersonateLayer::new(&id, &["email".to_string()]),
+            ImpersonateLayer::new(&id, &["email".to_string()]).expect("valid identity"),
             Request::builder().body(()).expect("test request"),
         )
         .await;
 
         assert_eq!(headers.len(), 2, "{headers:?}");
+    }
+
+    #[test]
+    fn an_identity_that_cannot_be_a_header_is_refused_rather_than_partially_sent() {
+        // A request with no Impersonate-User runs as the UI's ServiceAccount, so
+        // "drop the bad value and carry on" would be a privilege escalation.
+        let bad_user = ImpersonateLayer::new(&identity("alice\nbob", &[]), &[])
+            .expect_err("a control character in the user must not build a layer");
+        assert_eq!(bad_user.what, IdentityHeaderKind::User);
+        assert_eq!(bad_user.value, "alice\nbob");
+
+        let bad_group = ImpersonateLayer::new(&identity("alice", &["ops\r\nx"]), &[])
+            .expect_err("a control character in a group must not build a layer");
+        assert_eq!(bad_group.what, IdentityHeaderKind::Group);
+
+        let mut with_bad_extra = identity("alice", &[]);
+        with_bad_extra
+            .extra
+            .insert("email".to_string(), vec!["a\u{0}b".to_string()]);
+        let bad_extra = ImpersonateLayer::new(&with_bad_extra, &["email".to_string()])
+            .expect_err("a control character in an extra must not build a layer");
+        assert_eq!(bad_extra.what, IdentityHeaderKind::Extra);
+
+        let mut bad_key = identity("alice", &[]);
+        bad_key
+            .extra
+            .insert("not a header".to_string(), vec!["x".to_string()]);
+        let bad_key = ImpersonateLayer::new(&bad_key, &["not a header".to_string()])
+            .expect_err("an extras key that is not a header name must not build a layer");
+        assert_eq!(bad_key.what, IdentityHeaderKind::Extra);
+        assert_eq!(bad_key.value, "not a header");
+
+        assert!(bad_user.to_string().contains("Fix:"), "{bad_user}");
+    }
+
+    // --- sanitize_base ------------------------------------------------------
+
+    /// A base config that impersonates on its own behalf — a developer's
+    /// kubeconfig with `as-groups: [system:masters]`, most plausibly.
+    fn impersonating_base() -> kube::Config {
+        let mut cfg = base_config();
+        cfg.auth_info.impersonate = Some("cluster-admin".to_string());
+        cfg.auth_info.impersonate_uid = Some("1".to_string());
+        cfg.auth_info.impersonate_groups = Some(vec!["system:masters".to_string()]);
+        cfg.auth_info.impersonate_user_extra = Some(
+            [("scopes".to_string(), vec!["everything".to_string()])]
+                .into_iter()
+                .collect(),
+        );
+        cfg.headers.push((
+            HeaderName::from_static("impersonate-group"),
+            HeaderValue::from_static("system:masters"),
+        ));
+        cfg.headers.push((
+            HeaderName::from_static("x-audit-id"),
+            HeaderValue::from_static("keep-me"),
+        ));
+        cfg
+    }
+
+    #[test]
+    fn sanitize_base_empties_every_impersonation_the_config_carries() {
+        let clean = sanitize_base(impersonating_base());
+
+        assert_eq!(clean.auth_info.impersonate, None);
+        assert_eq!(clean.auth_info.impersonate_uid, None);
+        assert_eq!(clean.auth_info.impersonate_groups, None);
+        assert_eq!(clean.auth_info.impersonate_user_extra, None);
+        assert!(
+            !clean
+                .headers
+                .iter()
+                .any(|(name, _)| name.as_str().starts_with("impersonate-")),
+            "{:?}",
+            clean.headers
+        );
+        assert!(
+            clean.headers.iter().any(|(name, _)| name == "x-audit-id"),
+            "unrelated static headers are the operator's, not ours to drop"
+        );
+    }
+
+    #[test]
+    fn a_cache_built_over_an_impersonating_config_sanitizes_it() {
+        let cache = ClientCache::new(impersonating_base(), limits(8, 600), Vec::new());
+        assert_eq!(cache.base.auth_info.impersonate_groups, None);
+        assert_eq!(cache.base.auth_info.impersonate, None);
+
+        // And the only thing left that can emit Impersonate-* is the layer, whose
+        // set is exactly the identity's.
+        let layer =
+            ImpersonateLayer::new(&identity("alice", &["ops"]), &[]).expect("valid identity");
+        let emitted: Vec<String> = layer
+            .headers()
+            .iter()
+            .map(|(name, value)| format!("{}: {}", name.as_str(), value.to_str().expect("ascii")))
+            .collect();
+        assert_eq!(
+            emitted,
+            vec![
+                "impersonate-user: alice".to_string(),
+                "impersonate-group: ops".to_string(),
+            ]
+        );
+        assert!(
+            !emitted.iter().any(|h| h.contains("system:masters")),
+            "{emitted:?}"
+        );
     }
 
     // --- ClientCache --------------------------------------------------------

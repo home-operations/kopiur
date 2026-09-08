@@ -146,6 +146,21 @@ pub enum AuthError {
     )]
     ProxySecretMissing,
 
+    /// The process is running on the placeholder
+    /// [`super::AuthState::unconfigured`] — nothing resolved a real
+    /// configuration into it.
+    ///
+    /// A build bug, never a caller error, and deliberately not a fallback: the
+    /// alternative to refusing is serving requests as *some* identity nobody
+    /// chose.
+    #[error(
+        "kopiur-ui was started without wiring its authentication state, so it cannot say who \
+         any caller is and refuses to act on their behalf. \
+         Fix: this is a build bug in kopiur-ui; report it at \
+         https://github.com/home-operations/kopiur/issues"
+    )]
+    NotWired,
+
     /// The presented shared secret is not the configured one.
     #[error(
         "the proxy shared secret in X-Kopiur-Proxy-Token does not match the one kopiur-ui was \
@@ -163,6 +178,10 @@ pub enum AuthError {
 /// RBAC entirely, and the rest name components rather than people. The single
 /// exception is [`SYSTEM_AUTHENTICATED`], which every authenticated request
 /// already carries and which many bindings target.
+///
+/// Deliberately case-sensitive: Kubernetes principals are, so `System:masters`
+/// is a different (and unprivileged) subject than `system:masters` — treating
+/// them alike would refuse a legitimate name without protecting anything.
 pub fn is_forbidden_principal(principal: &str) -> bool {
     principal.starts_with("system:") && principal != SYSTEM_AUTHENTICATED
 }
@@ -250,6 +269,11 @@ fn asserted_groups(
     for value in headers.get_all(header) {
         let raw = value_str(header.as_str(), value)?;
         for group in split_groups(raw, &cfg.groups_separator) {
+            // Bound the *raw* count as we go, not only the deduped set at the
+            // end: a proxy sending a hundred thousand repeats of one group would
+            // otherwise be validated and allocated in full before the check that
+            // was supposed to stop it.
+            check_group_bound(&groups)?;
             check_principal(header.as_str(), group)?;
             reject_forbidden(group)?;
             groups.push(group.to_string());
@@ -707,6 +731,24 @@ mod tests {
                 count: MAX_GROUPS + 2,
                 max: MAX_GROUPS,
             }
+        );
+    }
+
+    #[test]
+    fn a_flood_of_repeated_groups_is_stopped_while_it_is_being_read() {
+        // Deduping would collapse these to one group, so only the raw guard in
+        // the parse loop stops the work — the point is to refuse before
+        // validating and allocating 10 000 strings, not after.
+        let flood = vec!["ops"; 10_000].join(",");
+        let err = extract_identity(
+            &headers(&[(USER_HEADER, "alice"), (GROUPS_HEADER, &flood)]),
+            &header_cfg(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AuthError::TooManyGroups { count, max } if count > max),
+            "{err:?}"
         );
     }
 
