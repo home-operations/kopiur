@@ -119,5 +119,27 @@ mod tests {
             !repo.contains("bigint"),
             "no wire field may be typed `bigint`, got:\n{repo}"
         );
+
+        // Request bodies carry `#[ts(optional_fields = nullable)]`, so a
+        // `#[serde(default)]` option is omittable in TypeScript too.
+        let session = std::fs::read_to_string(dir.0.join("SessionCreateBody.ts")).unwrap();
+        assert!(
+            session.contains("ttlSeconds?:"),
+            "request-body options must export as optional keys, got:\n{session}"
+        );
+
+        // Exactly one file per wire type. This is the assertion that fails when a
+        // root is dropped from `export_all` (or a type stops being reachable from
+        // one), which the per-file checks above cannot catch.
+        let exported = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".ts"))
+            .count();
+        assert_eq!(
+            exported, 64,
+            "expected one .ts file per wire type; add the new type's root to \
+             `export_all` and bump this count deliberately"
+        );
     }
 }

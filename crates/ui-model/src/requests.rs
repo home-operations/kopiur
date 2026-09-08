@@ -5,6 +5,18 @@
 //! action do something other than what was asked. That matters more here than
 //! anywhere else in the contract, because these bodies create and destroy
 //! backups.
+//!
+//! Every body also carries `#[ts(optional_fields = nullable)]`, so an `Option<T>`
+//! field exports as `field?: T | null` rather than `field: T | null`. That is what
+//! `#[serde(default)]` actually means on the wire — the key may be omitted — and
+//! without it the SPA would be forced to spell out `null` for every option it does
+//! not set.
+//!
+//! Note what this deliberately does *not* cover: `SnapshotNowBody::tags` and
+//! `SnapshotNowBody::pin` are `Vec` and `bool`, not `Option`, so they stay required
+//! in TypeScript even though `#[serde(default)]` would accept them missing. That is
+//! on purpose — `pin` decides whether a snapshot is exempt from GFS pruning, so the
+//! caller should have to say `pin: false` rather than get it by omission.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -12,6 +24,7 @@ use ts_rs::TS;
 /// Take a snapshot right now under an existing `SnapshotPolicy`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub struct SnapshotNowBody {
     /// Namespace of the policy, and of the `Snapshot` to create.
@@ -39,6 +52,7 @@ pub struct SnapshotNowBody {
 /// Create a `Restore`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub struct RestoreBody {
     /// Namespace to create the `Restore` in.
@@ -65,6 +79,7 @@ pub struct RestoreBody {
 /// variant, matching the `Restore` CRD's own "exactly one of" source surface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub enum RestoreSourceBody {
     /// An existing `Snapshot` resource, named directly.
@@ -112,6 +127,7 @@ pub enum RestoreSourceBody {
 /// Where a restore writes, as an externally-tagged union — exactly one variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub enum RestoreTargetBody {
     /// An existing `PersistentVolumeClaim`.
@@ -136,6 +152,7 @@ pub enum RestoreTargetBody {
 /// A reference to a `Repository` or `ClusterRepository`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub struct RepositoryRefBody {
     /// `Repository` or `ClusterRepository`.
@@ -150,6 +167,7 @@ pub struct RepositoryRefBody {
 /// Suspend or resume a resource by flipping its `spec.suspend`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub struct SuspendBody {
     /// CRD kind of the resource to flip.
@@ -167,6 +185,7 @@ pub struct SuspendBody {
 /// Request a maintenance run right now.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub struct MaintenanceRunBody {
     /// Namespace of the `Maintenance` resource.
@@ -186,6 +205,7 @@ pub struct MaintenanceRunBody {
 /// Trigger a replication run right now.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub struct ReplicationRunBody {
     /// Namespace of the replication resource.
@@ -197,6 +217,7 @@ pub struct ReplicationRunBody {
 /// Trigger a catalog scan of a repository.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub struct ScanCatalogBody {
     /// `Repository` or `ClusterRepository`.
@@ -211,6 +232,7 @@ pub struct ScanCatalogBody {
 /// Open a browse session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(optional_fields = nullable)]
 #[ts(export)]
 pub struct SessionCreateBody {
     /// How long the session may sit idle before it is reaped; the server's
