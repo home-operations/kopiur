@@ -9,16 +9,17 @@
 //! [`MaintenanceRow::managed_by_repository`] is the field that tells a user
 //! whether editing this object will stick or be reconciled away.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 
 use kopiur_api::Maintenance;
+use kopiur_api::common::RepositoryKind;
 use kopiur_api::consts::API_VERSION;
 use kopiur_ui_model::views::{MaintenanceRow, ManualRunView, RunStatusView};
 
 use crate::AppState;
 use crate::api::problem::ApiError;
-use crate::api::{NamespaceQuery, client_for, manual_run_phase_label, repo_ref_display};
+use crate::api::{NamespaceQuery, UiQuery, client_for, manual_run_phase_label, repo_ref_display};
 use crate::auth::CurrentIdentity;
 
 /// This module's routes, relative to `/api/v1`.
@@ -61,7 +62,8 @@ fn repository_owner(m: &Maintenance) -> Option<String> {
         .find(|o| {
             o.controller == Some(true)
                 && o.api_version == API_VERSION
-                && (o.kind == "Repository" || o.kind == "ClusterRepository")
+                && (o.kind == RepositoryKind::Repository.kind_str()
+                    || o.kind == RepositoryKind::ClusterRepository.kind_str())
         })
         .map(|o| format!("{}/{}", o.kind, o.name))
 }
@@ -94,7 +96,7 @@ fn manual_run_view(run: &kopiur_api::maintenance::ManualRunStatus) -> ManualRunV
 async fn list(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<Vec<MaintenanceRow>>, ApiError> {
     let client = client_for(&app, &id)?;
     let items = app

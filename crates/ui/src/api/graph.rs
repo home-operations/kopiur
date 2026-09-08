@@ -43,8 +43,8 @@ use kopiur_ui_model::graph::{
 use crate::AppState;
 use crate::api::problem::ApiError;
 use crate::api::{
-    NamespaceQuery, client_for, gate_hits, repository_replication_phase_view,
-    snapshot_replication_phase_view,
+    NamespaceQuery, UiQuery, client_for, covering_maintenances, gate_hits,
+    repository_replication_phase_view, snapshot_replication_phase_view,
 };
 use crate::auth::CurrentIdentity;
 
@@ -229,18 +229,21 @@ fn maintenance_failing(
     maintenances: &[Arc<Maintenance>],
     kind: RepositoryKind,
     name: &str,
+    namespace: Option<&str>,
 ) -> bool {
-    maintenances
-        .iter()
-        .filter(|m| kopiur_ops::maintenance::covers_repository(m, kind, name))
-        .any(|m| {
-            let status = m.status.as_ref();
-            let failing = |track: Option<&kopiur_api::maintenance::RunStatus>| {
-                track.and_then(|t| t.consecutive_failures).unwrap_or(0) > 0
-            };
-            failing(status.and_then(|s| s.quick.as_ref()))
-                || failing(status.and_then(|s| s.full.as_ref()))
-        })
+    // `namespace` is not decoration: `covers_repository` resolves an absent ref
+    // namespace against the Maintenance's OWN namespace, so without the guard a
+    // failing compaction in `backup` would colour `media`'s same-named
+    // repository degraded. Shared with the repository detail screen, which had
+    // the guard while this did not.
+    covering_maintenances(maintenances, kind, name, namespace).any(|m| {
+        let status = m.status.as_ref();
+        let failing = |track: Option<&kopiur_api::maintenance::RunStatus>| {
+            track.and_then(|t| t.consecutive_failures).unwrap_or(0) > 0
+        };
+        failing(status.and_then(|s| s.quick.as_ref()))
+            || failing(status.and_then(|s| s.full.as_ref()))
+    })
 }
 
 /// Downgrade a healthy node when its maintenance is failing; leave every other
@@ -267,7 +270,12 @@ fn repository_node(repo: &Repository, maintenances: &[Arc<Maintenance>]) -> Grap
             repo.spec.suspend,
             &gates,
         ),
-        maintenance_failing(maintenances, RepositoryKind::Repository, &name),
+        maintenance_failing(
+            maintenances,
+            RepositoryKind::Repository,
+            &name,
+            namespace.as_deref(),
+        ),
     );
     GraphNode {
         id: repository_id(repo),
@@ -300,7 +308,9 @@ fn cluster_repository_node(
             repo.spec.suspend,
             &gates,
         ),
-        maintenance_failing(maintenances, RepositoryKind::ClusterRepository, &name),
+        // A cluster repository has no namespace of its own, and its `Maintenance`
+        // is placed wherever the operator was told to put it.
+        maintenance_failing(maintenances, RepositoryKind::ClusterRepository, &name, None),
     );
     GraphNode {
         id: cluster_repository_id(repo),
@@ -689,7 +699,7 @@ async fn load(
 async fn handler(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    axum::extract::Query(q): axum::extract::Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<RepositoryGraph>, ApiError> {
     Ok(Json(load(&app, &id, q.namespace.as_deref()).await?))
 }
@@ -1135,6 +1145,53 @@ status:
             .find(|n| n.id == "Repository/media/mirror")
             .unwrap();
         assert_eq!(mirror.health, Health::Unknown);
+    }
+
+    /// The B-I1 regression guard. `covers_repository` takes no namespace and
+    /// resolves an absent ref namespace against the Maintenance's OWN namespace,
+    /// so a `Maintenance` in `backup` pointing at `Repository nas` answers
+    /// `true` when asked about `Repository/media/nas`. Same-named repositories
+    /// across namespaces are the normal case here, so without the guard the
+    /// fleet graph coloured one namespace's repository degraded because a
+    /// different namespace's compaction was failing.
+    #[test]
+    fn a_failing_maintenance_in_another_namespace_does_not_degrade_this_repository() {
+        let repos = fixture().repositories;
+        let elsewhere: Maintenance = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Maintenance
+metadata: { name: nas-maint, namespace: backup }
+spec:
+  repository: { kind: Repository, name: nas }
+  schedule:
+    quick: { cron: "0 * * * *" }
+    full: { cron: "0 4 * * 0" }
+  ownership: { owner: kopiur/backup/nas }
+status:
+  full: { consecutiveFailures: 9 }
+"#,
+        );
+        let maintenances = vec![Arc::new(elsewhere)];
+        let graph = build(&GraphInputs {
+            repositories: &repos,
+            cluster_repositories: &[],
+            policies: &[],
+            snapshot_replications: &[],
+            repository_replications: &[],
+            maintenances: &maintenances,
+            now: Utc::now(),
+        });
+        let nas = graph
+            .nodes
+            .iter()
+            .find(|n| n.id == "Repository/media/nas")
+            .unwrap();
+        assert_eq!(
+            nas.health,
+            Health::Healthy,
+            "backup/nas's failing compaction says nothing about media/nas"
+        );
     }
 
     #[test]

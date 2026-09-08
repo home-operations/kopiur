@@ -8,7 +8,7 @@
 //! firehose, and a UI that offered one would be asking the apiserver to page
 //! through every namespace on every screen refresh.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use k8s_openapi::api::events::v1::Event;
 use kube::api::{Api, ListParams};
@@ -18,7 +18,7 @@ use kopiur_ui_model::views::EventRow;
 
 use crate::AppState;
 use crate::api::problem::{ApiError, problem};
-use crate::api::{client_for, rfc3339};
+use crate::api::{UiQuery, client_for, rfc3339};
 use crate::auth::CurrentIdentity;
 use crate::auth::redact::redact_text;
 
@@ -107,7 +107,7 @@ fn ordered(mut rows: Vec<EventRow>) -> Vec<EventRow> {
 async fn handler(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<EventQuery>,
+    UiQuery(q): UiQuery<EventQuery>,
 ) -> Result<Json<Vec<EventRow>>, ApiError> {
     if q.kind.is_empty() || q.name.is_empty() || q.namespace.is_empty() {
         return Err(incomplete_query());

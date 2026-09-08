@@ -5,7 +5,7 @@
 //! progress for a populator fan-out — so there is nothing a detail type would
 //! add beyond a second shape to keep in step.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 
 use kopiur_api::Restore;
@@ -14,7 +14,8 @@ use kopiur_ui_model::views::{RestoreClaimView, RestoreRow};
 use crate::AppState;
 use crate::api::problem::{ApiError, problem};
 use crate::api::{
-    NamespaceQuery, client_for, repo_ref_display, restore_claim_phase_label, restore_phase_view,
+    NamespaceQuery, UiPath, UiQuery, client_for, repo_ref_display, restore_claim_phase_label,
+    restore_phase_view,
 };
 use crate::auth::CurrentIdentity;
 
@@ -90,7 +91,7 @@ fn claims_view(r: &Restore) -> Vec<RestoreClaimView> {
 async fn list(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<Vec<RestoreRow>>, ApiError> {
     let client = client_for(&app, &id)?;
     let items = app
@@ -106,7 +107,7 @@ async fn list(
 async fn detail(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Path((namespace, name)): Path<(String, String)>,
+    UiPath((namespace, name)): UiPath<(String, String)>,
 ) -> Result<Json<RestoreRow>, ApiError> {
     let client = client_for(&app, &id)?;
     let restore = app

@@ -10,7 +10,7 @@
 //! [`kopiur_ui_model::views::StatusOverview::report`] is deliberately opaque on
 //! the wire and the SPA narrows it at the point of use.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use chrono::Utc;
 
@@ -23,7 +23,7 @@ use kopiur_ui_model::views::StatusOverview;
 
 use crate::AppState;
 use crate::api::problem::ApiError;
-use crate::api::{NamespaceQuery, client_for};
+use crate::api::{NamespaceQuery, UiQuery, client_for};
 use crate::auth::CurrentIdentity;
 use crate::auth::identity::Identity;
 
@@ -110,7 +110,7 @@ async fn load(
 async fn handler(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<StatusOverview>, ApiError> {
     Ok(Json(load(&app, &id, q.namespace.as_deref()).await?))
 }

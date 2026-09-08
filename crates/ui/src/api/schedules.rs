@@ -7,7 +7,7 @@
 //! matcher, so the answer is exact — but it stays *display only*: the UI never
 //! re-derives an authorization, a fire time, or which run to create from it.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 
 use kopiur_api::expand::{label_selector_string, labels_match_selector};
@@ -16,7 +16,7 @@ use kopiur_ui_model::views::ScheduleRow;
 
 use crate::AppState;
 use crate::api::problem::ApiError;
-use crate::api::{NamespaceQuery, client_for};
+use crate::api::{NamespaceQuery, UiQuery, client_for};
 use crate::auth::CurrentIdentity;
 
 /// This module's routes, relative to `/api/v1`.
@@ -84,7 +84,7 @@ pub fn fires_policy(schedule: &SnapshotSchedule, policy: &SnapshotPolicy) -> boo
 async fn list(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<Vec<ScheduleRow>>, ApiError> {
     let client = client_for(&app, &id)?;
     let items = app

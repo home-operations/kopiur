@@ -22,7 +22,7 @@
 //! subresource, and the UI's `SarCache` deliberately only asks about the kopiur
 //! API group.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
@@ -34,7 +34,7 @@ use kopiur_ui_model::identity::{Capabilities, Me};
 
 use crate::AppState;
 use crate::api::problem::ApiError;
-use crate::api::{NamespaceQuery, client_for};
+use crate::api::{NamespaceQuery, UiQuery, client_for};
 use crate::auth::CurrentIdentity;
 use crate::auth::identity::Identity;
 use crate::cache::Source;
@@ -169,7 +169,7 @@ async fn kopiur_probe(
 async fn handler(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<Me>, ApiError> {
     let namespace = q.namespace.as_deref();
     let client = client_for(&app, &id)?;

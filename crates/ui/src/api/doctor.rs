@@ -10,7 +10,7 @@
 //! rather than aborting. The endpoint therefore always answers 200 with a
 //! report; a red check is data, not an error.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use chrono::Utc;
 use serde::Deserialize;
@@ -21,7 +21,7 @@ use kopiur_ui_model::views::{DoctorCheckView, DoctorReportView};
 
 use crate::AppState;
 use crate::api::problem::{ApiError, problem};
-use crate::api::{client_for, ops_ctx};
+use crate::api::{UiQuery, client_for, ops_ctx};
 use crate::auth::CurrentIdentity;
 
 /// How long a `Snapshot`/`Restore` may sit non-terminal before doctor calls it
@@ -139,7 +139,7 @@ fn window(value: Option<u64>, default: Duration, field: &str) -> Result<Duration
 async fn handler(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<DoctorQuery>,
+    UiQuery(q): UiQuery<DoctorQuery>,
 ) -> Result<Json<DoctorReportView>, ApiError> {
     let params = DoctorParams {
         stuck_threshold: window(q.stuck_threshold, DEFAULT_STUCK_THRESHOLD, "stuckThreshold")?,

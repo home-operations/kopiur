@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -44,8 +44,8 @@ use kopiur_ui_model::views::{
 use crate::AppState;
 use crate::api::problem::{ApiError, problem};
 use crate::api::{
-    RepositoryKindPath, client_for, conditions_view, gate_hits, list_too_large, ops_ctx,
-    origin_view, paginate, repo_ref_display, snapshot_phase_view,
+    RepositoryKindPath, UiPath, UiQuery, client_for, conditions_view, gate_hits, list_too_large,
+    ops_ctx, origin_view, paginate, repo_ref_display, snapshot_phase_view,
 };
 use crate::auth::CurrentIdentity;
 use crate::auth::identity::Identity;
@@ -649,7 +649,7 @@ async fn parse_query(
 async fn list(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<SnapshotQuery>,
+    UiQuery(q): UiQuery<SnapshotQuery>,
 ) -> Result<Json<Page<SnapshotRow>>, ApiError> {
     let client = client_for(&app, &id)?;
     let filter = parse_query(&app, client.clone(), &q).await?;
@@ -676,7 +676,7 @@ async fn list(
 async fn detail(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Path((namespace, name)): Path<(String, String)>,
+    UiPath((namespace, name)): UiPath<(String, String)>,
 ) -> Result<Json<SnapshotDetail>, ApiError> {
     let client = client_for(&app, &id)?;
     let snap = app

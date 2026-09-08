@@ -6,7 +6,7 @@
 //! they have different rows and are returned side by side under one request
 //! rather than forced into a shared shape that would fit neither.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +16,7 @@ use kopiur_ui_model::views::{RepositoryReplicationRow, SnapshotReplicationRow};
 use crate::AppState;
 use crate::api::problem::ApiError;
 use crate::api::{
-    NamespaceQuery, client_for, repo_ref_display, repository_replication_phase_view,
+    NamespaceQuery, UiQuery, client_for, repo_ref_display, repository_replication_phase_view,
     snapshot_replication_phase_view,
 };
 use crate::auth::CurrentIdentity;
@@ -92,7 +92,7 @@ pub fn snapshot_replication_row(r: &SnapshotReplication) -> SnapshotReplicationR
 async fn list(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<ReplicationsView>, ApiError> {
     let namespace = q.namespace.as_deref();
     let client = client_for(&app, &id)?;

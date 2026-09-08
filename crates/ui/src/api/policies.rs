@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 
 use kopiur_api::common::repo_key;
@@ -23,7 +23,9 @@ use crate::AppState;
 use crate::api::problem::{ApiError, problem};
 use crate::api::schedules::{fires_policy, schedule_row};
 use crate::api::snapshots::view_row;
-use crate::api::{NamespaceQuery, client_for, conditions_view, gate_hits, repo_ref_display};
+use crate::api::{
+    NamespaceQuery, UiPath, UiQuery, client_for, conditions_view, gate_hits, repo_ref_display,
+};
 use crate::auth::CurrentIdentity;
 use kopiur_ops::snapshots::policy_of;
 
@@ -204,7 +206,7 @@ pub fn view_detail(
 async fn list(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<Vec<PolicyRow>>, ApiError> {
     let client = client_for(&app, &id)?;
     let policies = app
@@ -220,7 +222,7 @@ async fn list(
 async fn detail(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Path((namespace, name)): Path<(String, String)>,
+    UiPath((namespace, name)): UiPath<(String, String)>,
 ) -> Result<Json<PolicyDetail>, ApiError> {
     let client = client_for(&app, &id)?;
     let policy = app

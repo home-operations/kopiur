@@ -11,14 +11,13 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use k8s_openapi::api::batch::v1::Job;
 
 use kopiur_api::cluster_repository::AllowedNamespaces;
 use kopiur_api::common::{RepositoryKind, RepositoryMode, repo_key};
 use kopiur_api::gates::GateScope;
-use kopiur_api::snapshot_policy::repository_refs;
 use kopiur_api::{
     ClusterRepository, Maintenance, Repository, RepositoryPhase, RepositoryReplication,
     SnapshotPolicy, SnapshotReplication,
@@ -32,10 +31,11 @@ use kopiur_ui_model::views::{
 use crate::AppState;
 use crate::api::graph::repository_health;
 use crate::api::maintenance::maintenance_row;
+use crate::api::policies::writes_into;
 use crate::api::problem::{ApiError, problem};
 use crate::api::{
-    NamespaceQuery, RepositoryKindPath, client_for, conditions_view, gate_hits, ops_ctx,
-    repo_phase_view,
+    NamespaceQuery, RepositoryKindPath, UiPath, UiQuery, client_for, conditions_view,
+    covering_maintenances, gate_hits, ops_ctx, repo_phase_view,
 };
 use crate::auth::CurrentIdentity;
 
@@ -221,13 +221,13 @@ pub fn view_detail(
 }
 
 /// **Pure.** The policies whose repository set contains `key`.
+///
+/// The predicate itself is [`writes_into`], next to the policy views: it is the
+/// same question that screen asks, and it was inlined here as a second copy.
 fn policies_writing_into(policies: &[Arc<SnapshotPolicy>], key: &str) -> Vec<PolicyRef> {
     policies
         .iter()
-        .filter(|p| {
-            let owner_ns = p.metadata.namespace.clone().unwrap_or_default();
-            repository_refs(&p.spec).any(|r| repo_key(r, &owner_ns) == key)
-        })
+        .filter(|p| writes_into(p, key))
         .map(|p| PolicyRef {
             namespace: p.metadata.namespace.clone().unwrap_or_default(),
             name: p.metadata.name.clone().unwrap_or_default(),
@@ -273,24 +273,17 @@ fn replications_into(snapshot: &[Arc<SnapshotReplication>], key: &str) -> Vec<St
 
 /// **Pure.** The `Maintenance` governing this repository, managed or foreign.
 ///
-/// [`kopiur_ops::maintenance::covers_repository`] resolves an absent ref
-/// namespace against the `Maintenance`'s *own* namespace, so a namespaced
-/// repository's candidates must first be narrowed to its namespace — otherwise a
-/// same-named repository in another namespace would claim this one's
-/// maintenance.
+/// The namespace guard lives in [`covering_maintenances`], shared with the fleet
+/// graph — which did not have it, and coloured a repository degraded because a
+/// same-named one in another namespace had a failing compaction.
 fn covering_maintenance(
     maintenances: &[Arc<Maintenance>],
     kind: RepositoryKind,
     name: &str,
     namespace: Option<&str>,
 ) -> Option<Arc<Maintenance>> {
-    maintenances
-        .iter()
-        .filter(|m| match kind {
-            RepositoryKind::Repository => m.metadata.namespace.as_deref() == namespace,
-            RepositoryKind::ClusterRepository => true,
-        })
-        .find(|m| kopiur_ops::maintenance::covers_repository(m, kind, name))
+    covering_maintenances(maintenances, kind, name, namespace)
+        .next()
         .cloned()
 }
 
@@ -326,7 +319,7 @@ fn session_info(job: &Job) -> SessionInfo {
 async fn list(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Query(q): Query<NamespaceQuery>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<Vec<RepositorySummary>>, ApiError> {
     let namespace = q.namespace.as_deref();
     let client = client_for(&app, &id)?;
@@ -354,8 +347,8 @@ async fn list(
 async fn detail(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
-    Path((kind, name)): Path<(RepositoryKindPath, String)>,
-    Query(q): Query<NamespaceQuery>,
+    UiPath((kind, name)): UiPath<(RepositoryKindPath, String)>,
+    UiQuery(q): UiQuery<NamespaceQuery>,
 ) -> Result<Json<RepositoryDetail>, ApiError> {
     let client = client_for(&app, &id)?;
     let namespace = q.namespace.as_deref();

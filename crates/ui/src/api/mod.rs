@@ -52,6 +52,8 @@ pub mod snapshots;
 pub mod status;
 
 use axum::Router;
+use axum::extract::{FromRequestParts, Path, Query};
+use axum::http::request::Parts;
 use serde::Deserialize;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
@@ -178,6 +180,78 @@ pub fn ops_ctx(cfg: &UiConfig, client: kube::Client, namespace: Option<&str>) ->
         namespace,
         scope,
         field_manager: FIELD_MANAGER.to_string(),
+    }
+}
+
+/// A `Query<T>` whose rejection is an [`ApiError`].
+///
+/// axum's own `Query` rejects a malformed or incomplete query string with a
+/// `text/plain` 400, *before* any handler runs — so the carefully-worded problem
+/// a handler would have returned is unreachable for exactly the case it was
+/// written for. `GET /api/v1/events?namespace=media&name=x` with no `kind` never
+/// reached `events::incomplete_query`; it got two words of plain text.
+///
+/// That matters more here than it usually would: `crate::app` tells the SPA it
+/// may switch on the content type to decide whether a body is an error, so a
+/// `text/plain` 400 is a body the client cannot classify at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UiQuery<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for UiQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(problem(
+                400,
+                "invalid-query",
+                "The query string on this request could not be read.",
+                // axum's text names the offending parameter and what it wanted,
+                // which is the whole diagnostic value here; wrapping it rather
+                // than replacing it keeps that.
+                format!("{rejection}"),
+                "check the query parameters against the endpoint's documented ones — a required \
+                 one is missing, or one carries a value of the wrong type",
+            )
+            .with_instance(parts.uri.path().to_string())),
+        }
+    }
+}
+
+/// A `Path<T>` whose rejection is an [`ApiError`]. See [`UiQuery`].
+///
+/// The case that made this necessary: `/repositories/{kind}` takes the kebab
+/// `cluster-repository`, but `RepositorySummary.kind` hands the SPA
+/// `ClusterRepository`. A client that round-trips the field it was given gets a
+/// path rejection, and it got one as `text/plain`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UiPath<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for UiPath<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<T>::from_request_parts(parts, state).await {
+            Ok(Path(value)) => Ok(Self(value)),
+            Err(rejection) => Err(problem(
+                400,
+                "invalid-path",
+                "A path segment of this request could not be read.",
+                format!("{rejection}"),
+                "check the URL against the endpoint's shape — the repository kind segment, for \
+                 example, is the kebab-case `repository` or `cluster-repository`",
+            )
+            .with_instance(parts.uri.path().to_string())),
+        }
     }
 }
 
@@ -343,6 +417,37 @@ pub fn gate_severity_view(severity: GateSeverity) -> GateSeverityView {
         GateSeverity::Fail => GateSeverityView::Error,
         GateSeverity::Warn => GateSeverityView::Warning,
     }
+}
+
+/// **Pure.** Every `Maintenance` that governs this repository — the namespace
+/// guard included.
+///
+/// [`kopiur_ops::maintenance::covers_repository`] takes no namespace and
+/// resolves an absent ref namespace against the **`Maintenance`'s own**
+/// namespace. So a `Maintenance` in namespace `backup` pointing at
+/// `Repository nas` answers `true` when asked about `Repository/media/nas`, and
+/// same-named repositories across namespaces are the normal case in this
+/// operator. A caller that forgets the guard renders one namespace's repository
+/// with another namespace's maintenance state.
+///
+/// One helper rather than a rule written twice: the repository detail screen had
+/// the guard and the fleet graph did not, so a failing compaction in `backup`
+/// coloured `media`'s repository degraded.
+pub fn covering_maintenances<'a>(
+    maintenances: &'a [std::sync::Arc<kopiur_api::Maintenance>],
+    kind: RepositoryKind,
+    name: &'a str,
+    namespace: Option<&'a str>,
+) -> impl Iterator<Item = &'a std::sync::Arc<kopiur_api::Maintenance>> {
+    maintenances
+        .iter()
+        .filter(move |m| match kind {
+            // Same-namespace semantics, matching what `covers_repository`
+            // assumes about the slice it is handed.
+            RepositoryKind::Repository => m.metadata.namespace.as_deref() == namespace,
+            RepositoryKind::ClusterRepository => true,
+        })
+        .filter(move |m| kopiur_ops::maintenance::covers_repository(m, kind, name))
 }
 
 /// **Pure.** Which structural gates a resource's live conditions have tripped.
@@ -715,5 +820,166 @@ mod tests {
             serde_json::from_value::<RepositoryKindPath>(serde_json::json!("Repository")).is_err(),
             "the path segment is the kebab form only"
         );
+    }
+}
+
+/// Router-level tests that a rejection *before any handler runs* is still a
+/// problem document.
+///
+/// These build the real stack — the identity middleware in front of
+/// [`router`] — because that is the only way the ordering is honest: extractors
+/// run in declaration order, so `CurrentIdentity` resolves first and a test
+/// without the middleware would 500 on identity and never reach the query.
+#[cfg(test)]
+mod extractor_rejection_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header::CONTENT_TYPE};
+    use http_body_util::BodyExt as _;
+    use std::sync::Arc;
+    use tower::ServiceExt as _;
+
+    fn anonymous_auth_config() -> crate::config::AuthConfig {
+        use crate::config::*;
+        AuthConfig {
+            mode: AuthMode::AnonymousOnly(AnonymousIdentity {
+                user: "viewer".to_string(),
+                groups: Vec::new(),
+            }),
+            groups_separator: DEFAULT_GROUPS_SEPARATOR.to_string(),
+            email_header: None,
+            extra_keys: Vec::new(),
+            allowed_groups: None,
+            proxy_secret: None,
+        }
+    }
+
+    fn test_config() -> UiConfig {
+        use crate::config::*;
+        UiConfig {
+            addr: DEFAULT_ADDR.parse().unwrap(),
+            ops_addr: DEFAULT_OPS_ADDR.parse().unwrap(),
+            auth: anonymous_auth_config(),
+            operator_namespace: None,
+            mover_image: None,
+            cache_enabled: false,
+            session: SessionLimits {
+                ttl: std::time::Duration::from_secs(900),
+                ready_timeout: std::time::Duration::from_secs(300),
+                max_starts: DEFAULT_MAX_SESSION_STARTS,
+                max_exec_per_identity: DEFAULT_MAX_EXEC_PER_IDENTITY,
+                max_exec_global: DEFAULT_MAX_EXEC_GLOBAL,
+            },
+            download_max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
+            manifest_max_bytes: DEFAULT_MAX_MANIFEST_BYTES,
+            snapshot_list_cap: DEFAULT_SNAPSHOT_LIST_CAP,
+            client_cache: CacheLimits {
+                size: DEFAULT_CLIENT_CACHE_SIZE,
+                ttl: std::time::Duration::from_secs(600),
+            },
+            sar_ttl: std::time::Duration::from_secs(60),
+            sar_cache_size: DEFAULT_SAR_CACHE_SIZE,
+            tls: None,
+            cors_origins: Vec::new(),
+        }
+    }
+
+    /// An `AppState` whose auth is WIRED — `AuthState::unconfigured()` fails
+    /// closed and 500s every request, which would mask the 400 under test — and
+    /// whose anonymous identity resolves with no headers at all.
+    fn wired_state() -> AppState {
+        let provider = Arc::new(kopiur_telemetry::MetricsProvider::new("kopiur-ui-test"));
+        AppState {
+            cfg: Arc::new(test_config()),
+            metrics: Arc::new(crate::metrics::UiMetrics::new(provider)),
+            readiness: Arc::new(crate::ops_listener::Readiness::new(
+                crate::static_files::is_placeholder(),
+            )),
+            auth: Arc::new(crate::auth::AuthState::new(
+                anonymous_auth_config(),
+                // Points at nothing: these requests must fail at the extractor,
+                // long before anything would dial a cluster.
+                kube::Config::new("http://127.0.0.1:1/".parse().expect("a literal URL")),
+                crate::config::CacheLimits {
+                    size: 1,
+                    ttl: std::time::Duration::from_secs(60),
+                },
+            )),
+            source: Arc::new(crate::cache::Source::Impersonated),
+            sessions: Arc::new(crate::browse::session_pool::SessionPool::default()),
+        }
+    }
+
+    /// `GET uri` through the identity middleware and the read API.
+    async fn get(uri: &str) -> (StatusCode, Option<String>, serde_json::Value) {
+        let state = wired_state();
+        let app = router()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::identity_middleware,
+            ))
+            .with_state(state);
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, content_type, body)
+    }
+
+    #[tokio::test]
+    async fn a_missing_required_query_parameter_is_a_problem_document() {
+        // `/events` needs all three; omitting `kind` is an axum QueryRejection,
+        // which used to escape as two words of `text/plain`.
+        let (status, content_type, body) = get("/events?namespace=media&name=nightly-1").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/problem+json"),
+            "the SPA switches on the content type to decide whether a body is an error"
+        );
+        assert_eq!(body["type"], "urn:kopiur:problem:invalid-query");
+        assert_eq!(body["status"], 400);
+        assert!(
+            body["why"].as_str().is_some_and(|w| w.contains("kind")),
+            "the rejection names the parameter it wanted: {}",
+            body["why"]
+        );
+        assert!(!body["fix"].as_str().unwrap_or_default().is_empty());
+        assert_eq!(body["instance"], "/events");
+    }
+
+    #[tokio::test]
+    async fn a_bad_path_segment_is_a_problem_document() {
+        // `RepositorySummary.kind` hands the SPA `Repository`; the path segment
+        // is the kebab form. A client round-tripping the field it was given
+        // lands exactly here.
+        let (status, content_type, body) =
+            get("/repositories/Repository/nas?namespace=media").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("application/problem+json"));
+        assert_eq!(body["type"], "urn:kopiur:problem:invalid-path");
+        assert!(
+            body["fix"]
+                .as_str()
+                .is_some_and(|f| f.contains("cluster-repository")),
+            "the remedy spells the form that would have worked: {}",
+            body["fix"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_numeric_pagination_parameter_is_a_problem_document() {
+        let (status, content_type, body) = get("/snapshots?limit=lots").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(content_type.as_deref(), Some("application/problem+json"));
+        assert_eq!(body["type"], "urn:kopiur:problem:invalid-query");
     }
 }
