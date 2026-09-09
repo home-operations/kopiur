@@ -289,8 +289,10 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 ///
 /// The UI fans out to the apiserver, so an unbounded queue here becomes
 /// unbounded load there. Requests above the limit wait rather than fail, and
-/// [`API_REQUEST_TIMEOUT`] sits *outside* the limit so a request cannot queue
-/// forever: it is refused with a timeout problem instead.
+/// [`API_REQUEST_TIMEOUT`] sits *outside* the limit — see the layer table on
+/// `crate::app` — so a request cannot queue forever: the budget covers the wait
+/// for a permit, and an over-subscribed UI sheds with a timeout problem instead
+/// of growing an unbounded backlog.
 pub const MAX_CONCURRENT_API_REQUESTS: usize = 256;
 
 /// How long startup waits for the reflector stores to complete their initial
