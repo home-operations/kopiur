@@ -20,6 +20,7 @@ import { Route as RestoresRouteImport } from './routes/restores'
 import { Route as SchedulesRouteImport } from './routes/schedules'
 import { Route as SnapshotsRouteImport } from './routes/snapshots'
 import { Route as TopologyRouteImport } from './routes/topology'
+import { Route as RepositoriesKindNameRouteImport } from './routes/repositories_.$kind.$name'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -76,6 +77,11 @@ const TopologyRoute = TopologyRouteImport.update({
   path: '/topology',
   getParentRoute: () => rootRouteImport,
 } as any)
+const RepositoriesKindNameRoute = RepositoriesKindNameRouteImport.update({
+  id: '/repositories_/$kind/$name',
+  path: '/repositories/$kind/$name',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -89,6 +95,7 @@ export interface FileRoutesByFullPath {
   '/schedules': typeof SchedulesRoute
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
+  '/repositories/$kind/$name': typeof RepositoriesKindNameRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -102,6 +109,7 @@ export interface FileRoutesByTo {
   '/schedules': typeof SchedulesRoute
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
+  '/repositories/$kind/$name': typeof RepositoriesKindNameRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -116,6 +124,7 @@ export interface FileRoutesById {
   '/schedules': typeof SchedulesRoute
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
+  '/repositories_/$kind/$name': typeof RepositoriesKindNameRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -131,6 +140,7 @@ export interface FileRouteTypes {
     | '/schedules'
     | '/snapshots'
     | '/topology'
+    | '/repositories/$kind/$name'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -144,6 +154,7 @@ export interface FileRouteTypes {
     | '/schedules'
     | '/snapshots'
     | '/topology'
+    | '/repositories/$kind/$name'
   id:
     | '__root__'
     | '/'
@@ -157,6 +168,7 @@ export interface FileRouteTypes {
     | '/schedules'
     | '/snapshots'
     | '/topology'
+    | '/repositories_/$kind/$name'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -171,6 +183,7 @@ export interface RootRouteChildren {
   SchedulesRoute: typeof SchedulesRoute
   SnapshotsRoute: typeof SnapshotsRoute
   TopologyRoute: typeof TopologyRoute
+  RepositoriesKindNameRoute: typeof RepositoriesKindNameRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -252,6 +265,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof TopologyRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/repositories_/$kind/$name': {
+      id: '/repositories_/$kind/$name'
+      path: '/repositories/$kind/$name'
+      fullPath: '/repositories/$kind/$name'
+      preLoaderRoute: typeof RepositoriesKindNameRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -267,6 +287,7 @@ const rootRouteChildren: RootRouteChildren = {
   SchedulesRoute: SchedulesRoute,
   SnapshotsRoute: SnapshotsRoute,
   TopologyRoute: TopologyRoute,
+  RepositoriesKindNameRoute: RepositoriesKindNameRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

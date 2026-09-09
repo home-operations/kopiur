@@ -297,6 +297,7 @@ marker the system has.
 ### Health strip
 
 - **Style:** the fleet counted per lamp: a row of chamfered surface tiles, each a tabular count in headline weight beside its `HealthBadge`, worst first, every lamp present and dimmed at zero. Each tile is a link into the filtered list. Never a stat tile with a big number and a small label.
+- **Rule:** on the repositories list the same strip is the filter's own control. The lamp in force takes the inset tint and the 3px accent bar — the one current marker the system has — from the router's own `aria-current="page"`, and the counts stay the whole fleet's, because a strip whose numbers moved with the filter could not be used to leave one.
 
 ### Finding
 
@@ -336,6 +337,31 @@ marker the system has.
 - **Loading:** skeleton ledger rows (1.4s sheen, disabled under reduced motion), announced as busy.
 - **Empty:** icon + headline that says what would appear, body that says how it comes to exist, optional action.
 - **Error / Not permitted:** headline + the problem; a 403 swaps to the shield icon, the degraded field and a sentence about RBAC, and offers no retry. Two sections fed by one refused read say it once, across their width, not twice side by side.
+
+### Not reported
+
+- **Style:** the words _not reported_ in faint ink, italic, `cursor: help`, with the reason as the element's `title` and as a visually-hidden sentence beside it.
+- **Rule:** used only for a value the operator has never published — seven status fields the CRDs declare and no controller writes (`components/unwired.ts`, from the wiring ratchet's own list). A blank cell would read as "nothing to say", a `0` as a measurement that came back zero, and `-` (the ledger's `EMPTY_CELL`, correct for a value that legitimately has none) as "not applicable". The absence is the fact, so it is written as one.
+
+### Facts
+
+- **Style:** a `dl` of label-caps terms beside their values, the term column 9–14rem and collapsing to stacked rows below 900px. Values in ledger size, identifiers in mono.
+- **Rule:** the unit the detail screens are built from — a handful of named values per `page__section`, never a one-row table. A fact whose value is absent is dropped by the caller rather than rendered blank; the exception is _not reported_, where the absence is the value.
+
+### Action
+
+- **Style:** an `action-bar` of triggers bare on the canvas; opening one reveals an `action__confirm` panel — surface fill, hairline, 6px, max 34rem — carrying prose that says what the action will do and a primary/quiet pair. The result sits beneath the trigger.
+- **Rule:** the panel is the _first_ box, so the bar itself is never a panel and the confirmation is never a card in a card. The destructive control (suspend, which stops backups) takes the danger variant. Every trigger is `ActionButton`, so an action the caller's RBAC forbids stays visible, focusable and explained rather than hidden.
+
+### Receipt
+
+- **Style:** the problem banner's grid — icon / body — on the healthy lamp's field with a healthy-lamp border: what in semibold, the server's `note` in muted prose, any created objects as label strips, the request instant in faint mono. A live region.
+- **Rule:** the receipt is the server's `ActionReceipt`, and `note` is never dropped — it is where an action that was accepted but not performed explains itself (a suspend that changed nothing, a delete the mass-deletion breaker is holding). Three of the actions answer `202`, so the wording is _requested_, never _done_.
+
+### Reference list
+
+- **Style:** label strips in a wrapping row (`ref-list`), or stacked with their own controls (`ref-list--stacked`).
+- **Rule:** for objects a screen names but has no detail route for yet. A name with no link is honest; a link to a route that does not exist is not.
 
 ## Do's and Don'ts
 

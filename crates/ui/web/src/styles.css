@@ -1801,6 +1801,11 @@ svg {
     margin-left: 0;
     flex-basis: 100%;
   }
+
+  .facts__row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
 }
 
 @media (max-width: 560px) {
@@ -1811,4 +1816,295 @@ svg {
   .identity__source span {
     display: none;
   }
+}
+
+/* No floating tooltip inside a scrolling ledger. A scroll container clips its
+   descendants, so the reason for the last row's disabled control was cut off
+   mid-sentence — and, worse, the *hidden* tooltip still counted toward the
+   container's scrollable overflow, putting a horizontal and a vertical
+   scrollbar on a table that fits. `content: none` means the pseudo-element is
+   never generated there at all.
+
+   A ledger row says it a better way instead: a short word in the cell (always
+   visible, no hover, no keyboard trap) with the full sentence still on the
+   button's `aria-describedby` sibling and its native `title`. */
+.ledger-scroll .button[data-reason]::after {
+  content: none;
+}
+
+/* ---- not reported: a value nothing ever writes ---------------------------- */
+
+/* Set in the faint ink and in italics so the eye reads it as a note about the
+   value rather than as the value — but still a word, never a dash, because
+   the absence is the fact (see components/unwired.tsx). */
+.not-reported {
+  color: var(--fg-faint);
+  font-style: italic;
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* ---- repository ledger ---------------------------------------------------- */
+
+.repo-table__object {
+  display: grid;
+  gap: 2px;
+  min-width: 11rem;
+}
+
+/* As in the work ledger: a name wraps rather than losing characters to an
+   ellipsis, because the name is the one word the operator came for. */
+.repo-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.repo-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+.repo-table__namespace {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+}
+
+.repo-table__access {
+  display: grid;
+  gap: 2px;
+  min-width: 8rem;
+}
+
+/* A size or a count is one token: it is right-aligned and must not wrap onto
+   a second line, which reads as two numbers. */
+.repo-table .num {
+  white-space: nowrap;
+}
+
+.repo-table__note {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+/* The lamp the list is currently filtered to. `aria-current="page"` is the
+   router's own doing — the link's search is a subset of the URL's — so the
+   marker needs no state kept here. It is the one current marker the system
+   has: the inset tint and a 3px accent bar, as on the rail. */
+.health-strip__lamp[aria-current="page"] {
+  background: var(--bg-inset);
+  border-color: var(--line-strong);
+  box-shadow: inset 0 -3px 0 0 var(--accent);
+}
+
+/* ---- facts: labelled values, the detail screens' unit --------------------- */
+
+.facts {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.facts__row {
+  display: grid;
+  grid-template-columns: minmax(9rem, 14rem) minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
+.facts__row dt {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.facts__row dd {
+  margin: 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+/* ---- reference lists: named objects with no detail route yet -------------- */
+
+.ref-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ref-list--stacked {
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.ref-list--stacked > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+/* ---- actions: a control, what it will do, and what came back -------------- */
+
+.action-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  gap: var(--space-3) var(--space-4);
+}
+
+/* One level of enclosure: the bar itself is bare on the canvas, so the
+   confirmation is the first box, never a box inside a box. It sits below the
+   whole bar rather than inside one trigger, so opening it never shoves the
+   other triggers across the row. */
+.action__confirm {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 34rem;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.action__confirm .controls__field {
+  max-width: 12rem;
+}
+
+.action__prose {
+  display: grid;
+  gap: var(--space-2);
+  color: var(--fg-muted);
+  line-height: var(--leading-prose);
+}
+
+.action__prose p {
+  margin: 0;
+}
+
+.action__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* ---- receipt: what a mutating action answered ----------------------------- */
+
+.receipt {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-3);
+  max-width: 34rem;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--health-healthy-fg);
+  border-radius: var(--radius-md);
+  background: var(--health-healthy-bg);
+}
+
+.receipt__icon {
+  display: flex;
+  color: var(--health-healthy-fg);
+  padding-top: 1px;
+}
+
+.receipt__body {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.receipt__what {
+  margin: 0;
+  font-weight: var(--weight-semibold);
+}
+
+.receipt__note {
+  margin: 0;
+  color: var(--fg-muted);
+  line-height: var(--leading-prose);
+  overflow-wrap: anywhere;
+}
+
+.receipt__created {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.receipt__meta {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+}
+
+/* ---- replication ledger --------------------------------------------------- */
+
+.replication-table__object,
+.replication-table__route,
+.replication-table__schedule {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.replication-table__object {
+  min-width: 10rem;
+}
+
+/* Source, arrow and destination on one wrapping line rather than three, so a
+   route reads as a route and the arrow never sits alone. */
+.replication-table__hops {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+.replication-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.replication-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+.replication-table__namespace,
+.replication-table__note {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+.replication-table__arrow {
+  color: var(--fg-faint);
+}
+
+.replication-table__schedule .mono {
+  white-space: nowrap;
+}
+
+/* A copy that has never succeeded: the loudest cell in the table, and the one
+   a dash would have hidden. */
+.replication-table__never {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+.replication-table__run {
+  display: grid;
+  gap: var(--space-2);
+  justify-items: start;
 }
