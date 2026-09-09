@@ -38,29 +38,20 @@ use std::sync::atomic::Ordering;
 
 use clap::Parser as _;
 use tokio::signal;
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
 };
 use kube::api::{Api, PostParams};
 
-use kopiur_ui::config::{CACHE_SYNC_TIMEOUT, UiArgs, UiConfig};
+use kopiur_ui::config::{UiArgs, UiConfig};
 use kopiur_ui::metrics::UiMetrics;
 use kopiur_ui::ops_listener::{CacheState, Readiness, serve_ops};
+use kopiur_ui::startup::{CORE_GROUP, impersonation_targets, track_cache_readiness};
 use kopiur_ui::{AppState, app, auth, browse, cache, static_files};
 
 /// Exit code for a refused configuration, distinct from a crash.
 const EXIT_BAD_CONFIG: i32 = 2;
-
-/// API group of the `impersonate` verb's resources (`users`, `groups`,
-/// `userextras/<key>`). The empty string is the core group.
-const CORE_GROUP: &str = "";
-
-/// The two resources the UI must be able to `impersonate` for anything at all to
-/// work. Configured `userextras/<key>` subjects are checked alongside them.
-const IMPERSONATION_RESOURCES: [&str; 2] = ["users", "groups"];
 
 /// How often the serving certificate is re-read from disk, so a rotated leaf is
 /// picked up without a pod restart.
@@ -151,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&readiness),
     ));
 
-    let (source, reflectors) = build_source(&cfg, &ui_client, &metrics, &readiness);
+    let source = build_source(&cfg, &ui_client, &metrics, &readiness);
 
     let state = AppState {
         cfg: Arc::clone(&cfg),
@@ -164,10 +155,6 @@ async fn main() -> anyhow::Result<()> {
 
     let router = app(state);
     let addr = cfg.addr;
-
-    // Held for the process lifetime: dropping a reflector handle silently stops
-    // refreshing that kind, which serves an ever-staler cache with no signal.
-    let _reflectors = reflectors;
 
     let serve_app = async {
         match &cfg.tls {
@@ -217,29 +204,33 @@ async fn main() -> anyhow::Result<()> {
 /// readiness is [`CacheState::Disabled`] immediately; a flag nobody set would
 /// otherwise hold the pod unready forever.
 ///
-/// Returns the reflector tasks so the caller can hold them: dropping one stops
-/// refreshing that kind.
+/// The reflector tasks are owned by the supervisor `cache::stores::start`
+/// spawns, and [`track_cache_readiness`] follows the health it publishes for the
+/// process's life — including a reflector dying long after the initial sync,
+/// which must take `/readyz` down with it.
 fn build_source(
     cfg: &UiConfig,
     ui_client: &kube::Client,
     metrics: &Arc<UiMetrics>,
     readiness: &Arc<Readiness>,
-) -> (cache::Source, Vec<JoinHandle<()>>) {
+) -> cache::Source {
     if !cfg.cache_enabled {
         tracing::info!(
             "the read cache is off (KOPIUR_UI_CACHE=false): every read is one impersonated \
              call, authorized by the apiserver on the real request"
         );
         readiness.set_cache(CacheState::Disabled);
-        return (cache::Source::Impersonated, Vec::new());
+        return cache::Source::Impersonated;
     }
 
     tracing::info!(
         "starting the read cache: nine reflector stores under the UI's own ServiceAccount, \
          with every read gated by a SubjectAccessReview for the caller"
     );
-    let (stores, tasks, ready_rx) = cache::stores::start(ui_client.clone(), Arc::clone(metrics));
-    let source = cache::Source::Cache {
+    let (stores, health_rx) = cache::stores::start(ui_client.clone(), Arc::clone(metrics));
+    tokio::spawn(track_cache_readiness(health_rx, Arc::clone(readiness)));
+
+    cache::Source::Cache {
         stores,
         sar: cache::authz::SarCache::new(
             ui_client.clone(),
@@ -247,81 +238,7 @@ fn build_source(
             cfg.sar_cache_size,
             Arc::clone(metrics),
         ),
-    };
-
-    let watcher = tokio::spawn(watch_cache_readiness(ready_rx, Arc::clone(readiness)));
-    let mut tasks = tasks;
-    tasks.push(watcher);
-    (source, tasks)
-}
-
-/// Follow the stores' readiness channel and keep `/readyz` telling the truth
-/// about it.
-///
-/// Awaiting the channel rather than `Store::wait_until_ready` is load-bearing:
-/// kube delivers per-store readiness through a `oneshot` that holds exactly one
-/// waker, so a second waiter on a still-cold store can be lost forever. The
-/// single join lives in [`cache::stores::start`]; everyone else reads the
-/// channel.
-///
-/// The timeout does not disable anything — the stores keep filling and this
-/// keeps watching — it converts a silent wait into a `/readyz` answer an
-/// operator can act on, because the usual cause (the UI's ServiceAccount lacking
-/// list/watch on a CRD) never resolves on its own.
-async fn watch_cache_readiness(mut ready_rx: watch::Receiver<bool>, readiness: Arc<Readiness>) {
-    let state = initial_cache_state(&mut ready_rx).await;
-    readiness.set_cache(state);
-
-    // Only a timeout leaves anything to do. `Synced` is the happy end, and
-    // `WatchEnded` means the cache can never become correct — `cache::stores`
-    // has already logged why, and nothing here can improve on it.
-    let CacheState::SyncTimedOut = state else {
-        return;
-    };
-    tracing::error!(
-        budget_secs = CACHE_SYNC_TIMEOUT.as_secs(),
-        "the kopiur-ui reflector stores have not completed their initial list; /readyz \
-         reports cache-sync-timed-out. The usual cause is the UI's own ServiceAccount \
-         lacking list/watch on the kopiur CRDs, or the CRDs not being installed — check the \
-         chart's ui.rbac. Set KOPIUR_UI_CACHE=false to read through impersonated calls \
-         instead. Still watching."
-    );
-
-    // Past the budget, but not past caring: if the stores do come up, readiness
-    // must recover without a pod restart.
-    let late = sync_or_close(&mut ready_rx).await;
-    readiness.set_cache(late);
-    if let CacheState::Synced = late {
-        tracing::info!("the kopiur-ui cache synced after all; this pod is ready");
     }
-}
-
-/// What the first [`CACHE_SYNC_TIMEOUT`] of watching produced.
-///
-/// Never `Syncing`: the point of the budget is that "still waiting" stops being
-/// an acceptable answer once it has been exceeded.
-async fn initial_cache_state(ready_rx: &mut watch::Receiver<bool>) -> CacheState {
-    if *ready_rx.borrow_and_update() {
-        return CacheState::Synced;
-    }
-    tokio::time::timeout(CACHE_SYNC_TIMEOUT, sync_or_close(ready_rx))
-        .await
-        .unwrap_or(CacheState::SyncTimedOut)
-}
-
-/// Resolve when the stores report synced, or when the channel closes because
-/// every sender was dropped.
-async fn sync_or_close(ready_rx: &mut watch::Receiver<bool>) -> CacheState {
-    while ready_rx.changed().await.is_ok() {
-        if *ready_rx.borrow() {
-            return CacheState::Synced;
-        }
-    }
-    tracing::error!(
-        "the kopiur-ui cache readiness channel closed before the stores synced; the cache \
-         can no longer become correct and this pod will stay unready"
-    );
-    CacheState::WatchEnded
 }
 
 /// Ask the apiserver, as the UI's own ServiceAccount, whether it may impersonate.
@@ -380,24 +297,6 @@ async fn denied_impersonations(client: &kube::Client, cfg: &UiConfig) -> Vec<Str
         }
     }
     denied
-}
-
-/// Every resource the UI must be able to impersonate for this configuration.
-///
-/// `users` and `groups` always; plus `userextras/<key>` for each configured
-/// extra key, because a proxy that asserts an extra the UI may not impersonate
-/// fails every request — and fails with a message pointing at the wrong thing.
-fn impersonation_targets(cfg: &UiConfig) -> Vec<String> {
-    IMPERSONATION_RESOURCES
-        .iter()
-        .map(|resource| (*resource).to_string())
-        .chain(
-            cfg.auth
-                .extra_keys
-                .iter()
-                .map(|key| format!("userextras/{key}")),
-        )
-        .collect()
 }
 
 /// One `SelfSubjectAccessReview` for `impersonate` on `resource`.
