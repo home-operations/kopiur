@@ -65,7 +65,9 @@ describe("Doctor", () => {
     const table = await screen.findByRole("table", { name: "Doctor checks" });
     expect(bodyRows(table)).toHaveLength(4);
     const summary = screen.getByRole("heading", { level: 2, name: /4 checks/ });
-    expect(summary).toHaveTextContent("4 checks: 2 pass, 1 warn, 1 fail");
+    // The one warning here is doctor refusing to guess past the viewer's own
+    // RBAC, so it is counted as a permission gap and not as a cluster warning.
+    expect(summary).toHaveTextContent("4 checks: 2 pass, 0 warn, 1 fail, 1 not permitted");
     expect(summary.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "failed");
     expect(screen.getByText(/ran 30s ago/)).toBeInTheDocument();
 

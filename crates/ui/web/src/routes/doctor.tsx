@@ -126,12 +126,15 @@ interface SummaryProps {
 
 function Summary({ checks, ranAt, now, namespace }: SummaryProps) {
   const summary = summarizeDoctor(checks);
+  // A check the viewer's RBAC blocked is not a verdict on the cluster, so it
+  // does not light the degraded lamp — but it did not pass either, and a run
+  // that could not perform part of itself is `unknown`, not green.
   const health: HealthKey =
     summary.fail > 0
       ? "failed"
       : summary.warn > 0 || summary.other > 0
         ? "degraded"
-        : summary.total === 0
+        : summary.total === 0 || summary.rbac > 0
           ? "unknown"
           : "healthy";
   const lamp = healthLamp(health);
@@ -140,6 +143,7 @@ function Summary({ checks, ranAt, now, namespace }: SummaryProps) {
     `${summary.pass} pass`,
     `${summary.warn} warn`,
     `${summary.fail} fail`,
+    ...(summary.rbac > 0 ? [`${summary.rbac} not permitted`] : []),
     ...(summary.other > 0 ? [`${summary.other} unreadable`] : []),
   ];
   return (

@@ -5,7 +5,7 @@ import { type VerdictInputs, overviewVerdict } from "./verdict";
 const quiet: VerdictInputs = {
   repositories: { failed: 0, degraded: 0, pending: 0, unknown: 0, suspended: 0, healthy: 3 },
   stalled: 0,
-  doctor: { pass: 10, warn: 0, fail: 0, other: 0, total: 10 },
+  doctor: { pass: 10, warn: 0, rbac: 0, fail: 0, other: 0, total: 10 },
   unavailable: [],
 };
 
@@ -62,6 +62,45 @@ describe("overviewVerdict", () => {
       health: "degraded",
       text: "Mostly healthy: 3 doctor checks warning.",
     });
+  });
+
+  it("names a permission gap as one rather than calling the cluster degraded", () => {
+    // A read-only viewer on a healthy cluster: the two checks that warned did
+    // so because the console asked as them and was refused. "Mostly healthy:
+    // 2 doctor checks warning" beside a degraded lamp is a statement about
+    // the cluster, and it is not true — and the overview keeps warning detail
+    // off the screen, so there is nowhere to discover what it meant.
+    const verdict = overviewVerdict({
+      ...quiet,
+      doctor: { pass: 8, warn: 0, rbac: 2, fail: 0, other: 0, total: 10 },
+    });
+    expect(verdict.health).toBe("unknown");
+    expect(verdict.text).toBe(
+      "Cannot fully check: 2 doctor checks could not run with your permissions.",
+    );
+  });
+
+  it("keeps a warning about the cluster distinct from one about the viewer", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      doctor: { pass: 7, warn: 1, rbac: 2, fail: 0, other: 0, total: 10 },
+    });
+    expect(verdict.health).toBe("degraded");
+    expect(verdict.text).toBe(
+      "Mostly healthy: 1 doctor check warning. 2 doctor checks could not run with your permissions.",
+    );
+  });
+
+  it("says the permission gap alongside a verdict something worse already earned", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      stalled: 1,
+      doctor: { pass: 8, warn: 0, rbac: 1, fail: 0, other: 0, total: 10 },
+    });
+    expect(verdict.health).toBe("failed");
+    expect(verdict.text).toBe(
+      "Needs attention: 1 object stalled. 1 doctor check could not run with your permissions.",
+    );
   });
 
   it("never claims healthy while a source is missing", () => {

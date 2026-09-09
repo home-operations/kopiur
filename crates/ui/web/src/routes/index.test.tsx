@@ -279,6 +279,67 @@ describe("Overview", () => {
     );
   });
 
+  it("tells a read-only viewer their permissions blocked two checks, not that the cluster is degraded", async () => {
+    // Every check that could run passed; the two that warned did so because
+    // the console asked the cluster as this user and was refused. The old
+    // sentence read "Mostly healthy: 2 doctor checks warning" on a degraded
+    // lamp, and the overview shows no warning detail — so there was nowhere
+    // on this screen to learn that both were about the viewer's own RBAC.
+    mockApi({
+      "/api/v1/status": jsonResponse({
+        now: NOW,
+        report: {
+          ...(status.report as object),
+          stalled: [],
+          inFlight: { snapshots: 0, restores: 0 },
+        },
+      }),
+      "/api/v1/repositories": jsonResponse([repo("nas", "healthy")]),
+      "/api/v1/doctor": jsonResponse({
+        ranAt: NOW,
+        exitCode: 0,
+        checks: [
+          {
+            check: "crds-installed",
+            scope: "installation",
+            title: "CRDs installed",
+            outcome: "Pass",
+          },
+          {
+            check: "repositories-ready",
+            scope: "mixed",
+            title: "repositories ready",
+            outcome: "Pass",
+          },
+          {
+            check: "webhook-admits",
+            scope: "installation",
+            title: "webhook admits",
+            outcome: "Warn",
+            what: "cannot dry-run create snapshotpolicies (RBAC); grant `create` (dryRun) to enable this check",
+          },
+          {
+            check: "credentials-present",
+            scope: "mixed",
+            title: "credential secrets present",
+            outcome: "Warn",
+            what: "cannot list secrets (RBAC); grant `list` on `secrets` to enable this check",
+          },
+        ],
+      } satisfies DoctorReportView),
+    });
+    mountApp("/");
+    const verdict = await screen.findByRole("heading", {
+      level: 2,
+      name: /Cannot fully check/,
+    });
+    expect(verdict).toHaveTextContent(
+      "Cannot fully check: 2 doctor checks could not run with your permissions.",
+    );
+    expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "unknown");
+    expect(verdict).not.toHaveTextContent(/warning/);
+  });
+
   it("survives a report this bundle cannot read and says it was incomplete", async () => {
     mockApi({
       "/api/v1/status": jsonResponse({ now: NOW, report: "not-the-report" }),

@@ -11,6 +11,13 @@ import type { HealthKey } from "./health";
  * verdict `unknown` unless what did load is already worse — a green verdict
  * over a report that never arrived is exactly the lie this screen exists to
  * prevent. An empty scope is `unknown` too: nothing is not healthy.
+ *
+ * A check the viewer's own RBAC would not let doctor run (`doctor.rbac`) is
+ * that same missing data at a finer grain, and it is treated the same way: it
+ * never lights the cluster's lamp, it is named in its own words rather than
+ * counted as a warning, and on its own it makes the verdict `unknown` — the
+ * console genuinely did not verify those checks, and saying "healthy" would
+ * claim knowledge it does not have.
  */
 export interface VerdictInputs {
   repositories: Record<HealthKey, number>;
@@ -78,16 +85,27 @@ export function overviewVerdict({
 
   const missing =
     unavailable.length > 0 ? ` ${capitalize(joinList(unavailable))} did not load.` : "";
+  // Named, never counted: these checks say nothing about the cluster, and
+  // the overview keeps warning detail off the screen — so a count with no
+  // words beside it would leave the operator no way to learn what it meant.
+  const blockedSentence = `${plural(doctor.rbac, "doctor check")} could not run with your permissions.`;
+  const blocked = doctor.rbac > 0 ? ` ${blockedSentence}` : "";
 
   const failed = repositories.failed > 0 || stalled > 0 || doctor.fail > 0;
   if (failed) {
-    return { health: "failed", text: `Needs attention: ${lit.join(", ")}.${missing}` };
+    return { health: "failed", text: `Needs attention: ${lit.join(", ")}.${missing}${blocked}` };
   }
   if (unavailable.length > 0) {
-    return { health: "unknown", text: `Cannot tell: ${joinList(unavailable)} did not load.` };
+    return {
+      health: "unknown",
+      text: `Cannot tell: ${joinList(unavailable)} did not load.${blocked}`,
+    };
   }
   if (lit.length > 0) {
-    return { health: "degraded", text: `Mostly healthy: ${lit.join(", ")}.` };
+    return { health: "degraded", text: `Mostly healthy: ${lit.join(", ")}.${blocked}` };
+  }
+  if (doctor.rbac > 0) {
+    return { health: "unknown", text: `Cannot fully check: ${blockedSentence}` };
   }
 
   const total = Object.values(repositories).reduce((sum, count) => sum + count, 0);

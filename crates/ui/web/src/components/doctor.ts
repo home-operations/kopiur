@@ -80,7 +80,18 @@ export function isRbacDegraded(check: DoctorCheckView): boolean {
 /** How a report reads at a glance: counts per outcome. */
 export interface DoctorSummary {
   pass: number;
+  /**
+   * Warnings **about the cluster**. Excludes [`DoctorSummary.rbac`]: those
+   * two are different facts and a screen that adds them up says something
+   * untrue about whichever one it names.
+   */
   warn: number;
+  /**
+   * Checks that warned only because the console ran them as the signed-in
+   * user and the cluster refused. Not a verdict on the cluster — a gap in
+   * what this viewer could have verified.
+   */
+  rbac: number;
   fail: number;
   /** Outcomes this bundle could not read. */
   other: number;
@@ -88,19 +99,36 @@ export interface DoctorSummary {
 }
 
 /**
- * Counted from the checks themselves rather than read from `exitCode`: the
- * wire doc and the server's own test disagree about what `1` means, and the
- * rows are the fact either way.
+ * Counted from the checks themselves rather than read from `exitCode`, which
+ * is a two-state flag (`0` unless something failed) and so cannot tell "all
+ * clear" from "passed, but two checks could not run".
+ *
+ * `warn` and `rbac` are counted apart on purpose. A warning doctor issued
+ * because the *viewer* lacks a grant is not a warning about the cluster, and
+ * folding the two together told a read-only operator on a healthy cluster
+ * that it was degraded — with the detail suppressed from the overview, so
+ * nothing on that screen could correct the impression.
  */
 export function summarizeDoctor(checks: readonly DoctorCheckView[]): DoctorSummary {
-  const summary: DoctorSummary = { pass: 0, warn: 0, fail: 0, other: 0, total: checks.length };
+  const summary: DoctorSummary = {
+    pass: 0,
+    warn: 0,
+    rbac: 0,
+    fail: 0,
+    other: 0,
+    total: checks.length,
+  };
   for (const check of checks) {
     switch (check.outcome) {
       case "Pass":
         summary.pass += 1;
         break;
       case "Warn":
-        summary.warn += 1;
+        if (isRbacDegraded(check)) {
+          summary.rbac += 1;
+        } else {
+          summary.warn += 1;
+        }
         break;
       case "Fail":
         summary.fail += 1;

@@ -108,7 +108,47 @@ describe("summarizeDoctor", () => {
       check({ outcome: "Fail", what: "d", why: "e", fix: "f" }),
       check({ outcome: "Weird" }),
     ]);
-    expect(summary).toEqual({ pass: 1, warn: 1, fail: 2, other: 1, total: 5 });
+    expect(summary).toEqual({ pass: 1, warn: 1, rbac: 0, fail: 2, other: 1, total: 5 });
+  });
+
+  it("counts a check the viewer may not run as a permission gap, never as a cluster warning", () => {
+    // A read-only viewer on a healthy cluster: every check that could run
+    // passed, and the two that warned did so only because the console asked
+    // as them and was refused. Counting those as `warn` tells the operator
+    // their cluster is degraded when what is actually short is their RBAC.
+    const summary = summarizeDoctor([
+      check({ check: "crds-installed", outcome: "Pass" }),
+      check({ check: "controller-running", outcome: "Pass" }),
+      check({ check: "repositories-ready", outcome: "Pass" }),
+      check({ check: "no-stuck-work", outcome: "Pass" }),
+      check({
+        check: "webhook-admits",
+        outcome: "Warn",
+        what: "cannot dry-run create snapshotpolicies (RBAC); grant `create` (dryRun) on `snapshotpolicies` to enable this check",
+      }),
+      check({
+        check: "credentials-present",
+        outcome: "Warn",
+        what: "cannot list secrets (RBAC); grant `list` on `secrets` or run with a more privileged kubeconfig to enable this check",
+      }),
+    ]);
+    expect(summary).toEqual({ pass: 4, warn: 0, rbac: 2, fail: 0, other: 0, total: 6 });
+  });
+
+  it("still counts a warning about the cluster as a warning", () => {
+    const summary = summarizeDoctor([
+      check({
+        check: "recent-warnings",
+        outcome: "Warn",
+        what: "3 Warning events in the last hour",
+      }),
+      check({
+        check: "credentials-present",
+        outcome: "Warn",
+        what: "cannot list secrets (RBAC); grant `list` on `secrets`",
+      }),
+    ]);
+    expect(summary).toMatchObject({ warn: 1, rbac: 1, total: 2 });
   });
 });
 

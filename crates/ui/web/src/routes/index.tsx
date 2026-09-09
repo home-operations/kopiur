@@ -322,13 +322,25 @@ function Fixes({ checks, ranAt, now }: FixesProps) {
   const failing = checks.filter((check) => check.outcome === "Fail");
   const summary = summarizeDoctor(checks);
   if (failing.length === 0) {
+    // A check the viewer's RBAC blocked is said in its own words, not added
+    // to the warning count: the two are different facts and this screen shows
+    // neither in detail, so the sentence is the only place they can be told
+    // apart.
+    const notes: string[] = [];
+    if (summary.warn > 0) {
+      notes.push(`raised ${summary.warn} ${summary.warn === 1 ? "warning" : "warnings"}`);
+    }
+    if (summary.rbac > 0) {
+      notes.push(
+        `could not run ${summary.rbac} ${summary.rbac === 1 ? "check" : "checks"} with your permissions`,
+      );
+    }
     return (
       <EmptyState title="Nothing to fix" icon={Stethoscope}>
         Doctor ran {summary.total} {summary.total === 1 ? "check" : "checks"}{" "}
         {relativeTime(ranAt, now)}
-        {summary.warn > 0
-          ? ` and raised ${summary.warn} ${summary.warn === 1 ? "warning" : "warnings"}; a failing check would be listed here with what to do about it.`
-          : " and found nothing failing; a failing check would be listed here with what to do about it."}
+        {notes.length > 0 ? ` and ${notes.join(", and ")}` : " and found nothing failing"}; a
+        failing check would be listed here with what to do about it.
       </EmptyState>
     );
   }
