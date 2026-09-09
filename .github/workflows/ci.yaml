@@ -672,6 +672,49 @@ jobs:
       - name: Check phase-handling exhaustiveness
         run: mise run phase-check
 
+  ui:
+    if: >-
+      ${{ !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
+    name: Web UI
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          install_args: --locked
+
+      # `ui-types` runs `cargo xtask gen-ui-types`, so this job compiles the
+      # xtask binary and kopiur-ui-model. Its own cache key: the Rust jobs build
+      # a far larger dependency set and sharing one would evict theirs.
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ui
+
+      - name: Install SPA dependencies
+        run: mise run ui-install
+
+      # Regenerate rather than only `--check`: `ui-check`'s `git diff` then
+      # fails on a hand-edited generated file AND on one that is stale relative
+      # to `crates/ui-model`, with the offending diff printed in the log.
+      - name: Generate TypeScript wire types
+        run: mise run ui-types
+
+      - name: Check the SPA (tsc, eslint, vitest, generated-type drift)
+        run: mise run ui-check
+
+      - name: Build the SPA bundle
+        run: mise run ui-build
+
   workflow-lint:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')
@@ -717,6 +760,7 @@ jobs:
       - integration-test
       - rust-lint
       - rust-test
+      - ui
       - workflow-lint
     runs-on: ubuntu-24.04
     permissions: {}
