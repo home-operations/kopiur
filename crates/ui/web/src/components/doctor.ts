@@ -27,46 +27,6 @@ export function doctorOutcomeLamp(outcome: string): Lamp {
 }
 
 /**
- * What `?namespace=` does to a check.
- *
- * `namespace` — the check lists objects and a namespace narrows it.
- * `installation` — the check is about the whole installation (CRDs, the
- * operator's own Deployments, the admission webhook) and runs the same
- * whatever namespace is asked for. `unknown` — a check this bundle has never
- * heard of; the server may be newer, and guessing would be a lie either way.
- *
- * The split is the server's, in `crates/ui/src/api/doctor.rs::doctor_ctx`;
- * it is not on the wire, so it is repeated here with that pointer.
- */
-export type DoctorScope = "namespace" | "installation" | "unknown";
-
-const NAMESPACE_SCOPED: ReadonlySet<string> = new Set([
-  "repositories-ready",
-  "credentials-present",
-  "snapshot-replications",
-  "no-stuck-work",
-  "recent-failures",
-  "recent-warnings",
-]);
-
-const INSTALLATION_WIDE: ReadonlySet<string> = new Set([
-  "crds-installed",
-  "controller-running",
-  "webhook-running",
-  "webhook-admits",
-]);
-
-export function doctorCheckScope(checkId: string): DoctorScope {
-  if (NAMESPACE_SCOPED.has(checkId)) {
-    return "namespace";
-  }
-  if (INSTALLATION_WIDE.has(checkId)) {
-    return "installation";
-  }
-  return "unknown";
-}
-
-/**
  * Whether a warning is doctor degrading a check it may not perform as the
  * caller: `kopiur_ops::doctor::warn_for` writes `cannot <verb> <resource>
  * (RBAC); grant …`, and the admission probe writes its own `(RBAC)` line.

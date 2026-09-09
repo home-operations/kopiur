@@ -104,10 +104,12 @@ function Doctor() {
 
       <p className="page__prose">
         Checks run as you: a check your RBAC cannot support is reported as a warning naming the
-        grant, never as a broken cluster. A namespace scopes the checks that list objects;{" "}
+        grant, never as a broken cluster. The Scope column is the server&apos;s own account of what
+        each check read: a namespace narrows the checks that list namespaced objects, some also read
+        cluster-scoped ones whatever namespace is asked, and{" "}
         <span className="mono">crds-installed</span>, the operator&apos;s own Deployments and the
-        admission probe are about the installation and run the same whatever namespace is asked. A
-        parked object names its gate; the{" "}
+        admission probe are about the installation and do not narrow at all. A parked object names
+        its gate; the{" "}
         <Link to="/gates" search={namespace !== undefined ? { namespace } : {}}>
           gate registry
         </Link>{" "}

@@ -1,13 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { DoctorCheckView } from "../api/types";
-import {
-  DOCTOR_DEFAULTS,
-  doctorCheckScope,
-  doctorOutcomeLamp,
-  isRbacDegraded,
-  summarizeDoctor,
-} from "./doctor";
+import { DOCTOR_DEFAULTS, doctorOutcomeLamp, isRbacDegraded, summarizeDoctor } from "./doctor";
 
 const check = (over: Partial<DoctorCheckView>): DoctorCheckView => ({
   check: "crds-installed",
@@ -37,34 +31,6 @@ describe("doctorOutcomeLamp", () => {
     expect(doctorOutcomeLamp("")).toMatchObject({ key: "unknown" });
     expect(doctorOutcomeLamp("pass")).toMatchObject({ key: "unknown", word: "pass" });
     warn.mockRestore();
-  });
-});
-
-describe("doctorCheckScope", () => {
-  it("knows which checks a namespace narrows and which stay installation-wide", () => {
-    // The split is `crates/ui/src/api/doctor.rs::doctor_ctx`'s, not a guess.
-    for (const id of [
-      "crds-installed",
-      "controller-running",
-      "webhook-running",
-      "webhook-admits",
-    ]) {
-      expect(doctorCheckScope(id), id).toBe("installation");
-    }
-    for (const id of [
-      "repositories-ready",
-      "credentials-present",
-      "snapshot-replications",
-      "no-stuck-work",
-      "recent-failures",
-      "recent-warnings",
-    ]) {
-      expect(doctorCheckScope(id), id).toBe("namespace");
-    }
-  });
-
-  it("does not guess the scope of a check it has never heard of", () => {
-    expect(doctorCheckScope("quantum-parity")).toBe("unknown");
   });
 });
 

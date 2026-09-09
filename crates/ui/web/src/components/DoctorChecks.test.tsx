@@ -30,7 +30,15 @@ const checks: DoctorCheckView[] = [
     outcome: "Warn",
     what: "skipped if not installed",
   },
-  { check: "quantum-parity", scope: "installation", title: "quantum parity", outcome: "Skipped" },
+  {
+    check: "quantum-parity",
+    // A scope this bundle has never heard of: `DoctorScopeView` is a closed
+    // enum with no fallback variant, so a newer server is the only way this
+    // arrives — and it must render as the unread word, never as a guess.
+    scope: "galactic" as DoctorCheckView["scope"],
+    title: "quantum parity",
+    outcome: "Skipped",
+  },
 ];
 
 describe("DoctorChecks", () => {
@@ -63,17 +71,39 @@ describe("DoctorChecks", () => {
     warn.mockRestore();
   });
 
-  it("says which checks a namespace narrows and which stay installation-wide", () => {
+  it("says what the server says each check read, including the two that are both", () => {
+    // The scope is `DoctorCheckView.scope`, not a table kept here. The client
+    // used to own that table and it was already wrong: `list_repos` lists
+    // `Repository` inside the namespace and `ClusterRepository` cluster-wide,
+    // so the repository checks were never purely namespace-scoped and
+    // "scoped to media" over them was an overstatement.
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     render(<DoctorChecks checks={checks} namespace="media" />);
     const rows = bodyRows(screen.getByRole("table"));
-    // Namespaced check: scoped to media.
-    expect(rows[1]).toHaveTextContent("media");
-    // Installation-wide check: says so, and that the namespace does not apply.
-    expect(rows[0]).toHaveTextContent(/installation-wide/i);
-    expect(rows[3]).toHaveTextContent(/installation-wide/i);
-    // Unknown check: does not guess.
-    expect(rows[4]).toHaveTextContent(/scope not known/i);
+    // Namespace-scoped: narrowed, and only narrowed.
+    expect(nth(rows, 2)).toHaveTextContent("scoped to media");
+    expect(nth(rows, 2)).not.toHaveTextContent(/cluster-scoped/i);
+    // Mixed: narrowed for namespaced objects, and not for cluster-scoped ones.
+    expect(nth(rows, 1)).toHaveTextContent("scoped to media");
+    expect(nth(rows, 1)).toHaveTextContent(/cluster-scoped/i);
+    // Installation-wide: says so, and that the namespace does not apply.
+    expect(nth(rows, 0)).toHaveTextContent(/installation-wide/i);
+    expect(nth(rows, 3)).toHaveTextContent(/installation-wide/i);
+    // A scope this bundle cannot read renders the word, never a guess.
+    expect(nth(rows, 4)).toHaveTextContent(/scope not known/i);
+    expect(nth(rows, 4)).toHaveTextContent("galactic");
+    warn.mockRestore();
+  });
+
+  it("does not claim a namespace narrowed anything when the run had none", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    render(<DoctorChecks checks={checks} namespace={undefined} />);
+    const rows = bodyRows(screen.getByRole("table"));
+    expect(nth(rows, 2)).toHaveTextContent(/every namespace/i);
+    expect(nth(rows, 1)).toHaveTextContent(/every namespace/i);
+    expect(nth(rows, 1)).toHaveTextContent(/cluster-scoped/i);
+    expect(nth(rows, 0)).toHaveTextContent(/installation-wide/i);
+    expect(nth(rows, 0)).not.toHaveTextContent(/does not apply/i);
     warn.mockRestore();
   });
 

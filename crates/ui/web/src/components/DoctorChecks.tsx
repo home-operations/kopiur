@@ -1,10 +1,11 @@
 import { ShieldOff } from "lucide-react";
 
-import type { DoctorCheckView } from "../api/types";
+import type { DoctorCheckView, DoctorScopeView } from "../api/types";
+import { unknownVariant } from "../util/assertNever";
 import { EMPTY_CELL } from "../util/format";
 import { Finding } from "./Finding";
 import { HealthBadge } from "./HealthBadge";
-import { doctorCheckScope, doctorOutcomeLamp, isRbacDegraded } from "./doctor";
+import { doctorOutcomeLamp, isRbacDegraded } from "./doctor";
 
 /**
  * The doctor report as a ledger: one row per check, the outcome as a lamp,
@@ -21,8 +22,24 @@ export interface DoctorChecksProps {
   namespace: string | undefined;
 }
 
-function scopeCell(checkId: string, namespace: string | undefined) {
-  switch (doctorCheckScope(checkId)) {
+/**
+ * How much of the cluster a check read, in the operator's words.
+ *
+ * The value is the server's (`DoctorCheckView.scope`), exhaustive over the
+ * generated `DoctorScopeView`. It replaced a two-way table kept here beside
+ * a prose contract, and that table had already gone wrong: `list_repos` lists
+ * `Repository` inside `?namespace=` but `ClusterRepository` cluster-wide, so
+ * the repository checks were filed as namespace-scoped and the row said
+ * "scoped to media" over answers that covered every other namespace too.
+ * `mixed` is the server saying that out loud.
+ *
+ * `DoctorScopeView` is unit-only with NO fallback variant (ui-model doc), so
+ * the `default` arm is unreachable at compile time and still renders the raw
+ * word at run time — a newer server's scope must read as unread, not as a
+ * guess in either direction.
+ */
+function scopeCell(scope: DoctorScopeView, namespace: string | undefined) {
+  switch (scope) {
     case "namespace":
       return namespace !== undefined ? (
         <>
@@ -30,6 +47,17 @@ function scopeCell(checkId: string, namespace: string | undefined) {
         </>
       ) : (
         "every namespace"
+      );
+    case "mixed":
+      return namespace !== undefined ? (
+        <>
+          scoped to <span className="mono">{namespace}</span>{" "}
+          <span className="doctor-checks__note">(plus cluster-scoped objects)</span>
+        </>
+      ) : (
+        <>
+          every namespace <span className="doctor-checks__note">(and cluster-scoped objects)</span>
+        </>
       );
     case "installation":
       return namespace !== undefined ? (
@@ -39,8 +67,13 @@ function scopeCell(checkId: string, namespace: string | undefined) {
       ) : (
         "installation-wide"
       );
-    case "unknown":
-      return <span className="doctor-checks__note">scope not known to this bundle</span>;
+    default:
+      return (
+        <span className="doctor-checks__note">
+          scope not known to this bundle:{" "}
+          <span className="mono">{unknownVariant(scope, "DoctorScopeView")}</span>
+        </span>
+      );
   }
 }
 
@@ -71,7 +104,7 @@ export function DoctorChecks({ checks, namespace }: DoctorChecksProps) {
                     <span className="mono doctor-checks__id">{check.check}</span>
                   </div>
                 </td>
-                <td className="doctor-checks__scope">{scopeCell(check.check, namespace)}</td>
+                <td className="doctor-checks__scope">{scopeCell(check.scope, namespace)}</td>
                 <td>
                   <div className="doctor-checks__finding">
                     {check.what !== undefined && check.what !== null && check.what.length > 0 ? (
