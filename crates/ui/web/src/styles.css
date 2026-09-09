@@ -443,6 +443,20 @@ svg {
   transform: translateY(0);
 }
 
+/* No floating tooltip inside a scrolling ledger. A scroll container clips its
+   descendants, so the reason for the last row's disabled control was cut off
+   mid-sentence — and, worse, the *hidden* tooltip still counted toward the
+   container's scrollable overflow, putting a horizontal and a vertical
+   scrollbar on a table that fits. `content: none` means the pseudo-element is
+   never generated there at all.
+
+   A ledger row says it a better way instead: a short word in the cell (always
+   visible, no hover, no keyboard trap) with the full sentence still on the
+   button's `aria-describedby` sibling and its native `title`. */
+.ledger-scroll .button[data-reason]::after {
+  content: none;
+}
+
 /* ---- skeleton: a ledger row's silhouette, not a spinner ------------------ */
 
 .skeleton {
@@ -1455,6 +1469,12 @@ svg {
   min-width: 8rem;
 }
 
+/* A size or a count is one token: it is right-aligned and must not wrap onto
+   a second line, which reads as two numbers. */
+.repo-table .num {
+  white-space: nowrap;
+}
+
 .repo-table__note {
   font-size: var(--text-xs);
   color: var(--fg-faint);
@@ -1532,15 +1552,10 @@ svg {
   gap: var(--space-3) var(--space-4);
 }
 
-.action {
-  display: grid;
-  gap: var(--space-2);
-  justify-items: start;
-  min-width: 0;
-}
-
 /* One level of enclosure: the bar itself is bare on the canvas, so the
-   confirmation is the first box, never a box inside a box. */
+   confirmation is the first box, never a box inside a box. It sits below the
+   whole bar rather than inside one trigger, so opening it never shoves the
+   other triggers across the row. */
 .action__confirm {
   display: grid;
   gap: var(--space-3);
@@ -1549,6 +1564,10 @@ svg {
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--bg-surface);
+}
+
+.action__confirm .controls__field {
+  max-width: 12rem;
 }
 
 .action__prose {
@@ -1623,10 +1642,25 @@ svg {
 /* ---- replication ledger --------------------------------------------------- */
 
 .replication-table__object,
-.replication-table__route {
+.replication-table__route,
+.replication-table__schedule {
   display: grid;
   gap: 2px;
-  min-width: 12rem;
+  min-width: 0;
+}
+
+.replication-table__object {
+  min-width: 10rem;
+}
+
+/* Source, arrow and destination on one wrapping line rather than three, so a
+   route reads as a route and the arrow never sits alone. */
+.replication-table__hops {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
 }
 
 .replication-table .label-strip {
@@ -1649,6 +1683,10 @@ svg {
 
 .replication-table__arrow {
   color: var(--fg-faint);
+}
+
+.replication-table__schedule .mono {
+  white-space: nowrap;
 }
 
 /* A copy that has never succeeded: the loudest cell in the table, and the one

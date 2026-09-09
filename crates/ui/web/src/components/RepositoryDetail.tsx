@@ -228,26 +228,32 @@ export function RepositoryDetail({
         </Section>
       </div>
 
-      {detail.seed !== null && detail.seed !== undefined ? (
-        <Section title="Seed" icon={Sprout}>
-          <Facts
-            label="Seed"
-            facts={[
-              { term: "Mode", value: detail.seed.mode ?? EMPTY_CELL },
-              {
-                term: "Seeded from",
-                value: <span className="mono">{detail.seed.source ?? EMPTY_CELL}</span>,
-              },
-              { term: "Completed", value: instant(detail.seed.seededAt, now) },
-              { term: "Snapshots copied", value: count(detail.seed.snapshotsCopied) },
-            ]}
-          />
-        </Section>
-      ) : null}
+      {/* Seed rides beside maintenance rather than alone across the width: it
+          is four facts, and a section with three quarters of the row empty
+          reads as a gap in the page rather than as a short answer. With no
+          seed, maintenance keeps the first column. */}
+      <div className="page__pair">
+        {detail.seed !== null && detail.seed !== undefined ? (
+          <Section title="Seed" icon={Sprout}>
+            <Facts
+              label="Seed"
+              facts={[
+                { term: "Mode", value: detail.seed.mode ?? EMPTY_CELL },
+                {
+                  term: "Seeded from",
+                  value: <span className="mono">{detail.seed.source ?? EMPTY_CELL}</span>,
+                },
+                { term: "Completed", value: instant(detail.seed.seededAt, now) },
+                { term: "Snapshots copied", value: count(detail.seed.snapshotsCopied) },
+              ]}
+            />
+          </Section>
+        ) : null}
 
-      <Section title="Maintenance" icon={Wrench}>
-        <MaintenanceCoverage maintenance={detail.maintenance} now={now} />
-      </Section>
+        <Section title="Maintenance" icon={Wrench}>
+          <MaintenanceCoverage maintenance={detail.maintenance} now={now} />
+        </Section>
+      </div>
 
       <div className="page__pair">
         <Section title="Policies writing here" icon={ScrollText}>

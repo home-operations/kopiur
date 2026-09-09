@@ -46,7 +46,6 @@ export function ReplicationTable({ rows, now = new Date() }: ReplicationTablePro
             <th scope="col">Copies</th>
             <th scope="col">Schedule</th>
             <th scope="col">Last replicated</th>
-            <th scope="col">Next run</th>
             <th scope="col">Last run</th>
             <th scope="col">Run</th>
           </tr>
@@ -71,13 +70,15 @@ export function ReplicationTable({ rows, now = new Date() }: ReplicationTablePro
               </td>
               <td>
                 <div className="replication-table__route">
-                  <span className="mono">{row.source}</span>
-                  <span className="replication-table__arrow" aria-hidden="true">
-                    →
-                  </span>
-                  <span className="mono">
-                    {row.destination}
-                    <span className="visually-hidden"> (destination)</span>
+                  <span className="replication-table__hops">
+                    <span className="mono">{row.source}</span>
+                    <span className="replication-table__arrow" aria-hidden="true">
+                      →
+                    </span>
+                    <span className="mono">
+                      {row.destination}
+                      <span className="visually-hidden"> (destination)</span>
+                    </span>
                   </span>
                   <span className="replication-table__note">
                     {row.destinationIsRepository
@@ -86,16 +87,25 @@ export function ReplicationTable({ rows, now = new Date() }: ReplicationTablePro
                   </span>
                 </div>
               </td>
-              <td className="mono">{row.cron}</td>
               <td>
-                <Lag at={row.lastReplicated} now={now} />
+                {/* The next run rides here rather than in a column of its own:
+                    it is "not reported" on every row of both kinds, so a
+                    column would spend a full width saying nothing, and the
+                    cron beside it is what actually answers the question. */}
+                <div className="replication-table__schedule">
+                  <span className="mono">{row.cron}</span>
+                  <span className="replication-table__note">
+                    next run{" "}
+                    {row.destinationIsRepository ? (
+                      <NotReported reason="SnapshotReplication publishes no next-run time on its status; the cron expression is what says when the next copy is due." />
+                    ) : (
+                      <NotReported field="repositoryReplicationNextRun" />
+                    )}
+                  </span>
+                </div>
               </td>
               <td>
-                {row.destinationIsRepository ? (
-                  <NotReported reason="SnapshotReplication publishes no next-run time on its status; the cron expression is what says when the next copy is due." />
-                ) : (
-                  <NotReported field="repositoryReplicationNextRun" />
-                )}
+                <Lag at={row.lastReplicated} now={now} />
               </td>
               <td>
                 <LastRun row={row} />
@@ -145,13 +155,23 @@ function RunAction({ row }: { row: ReplicationRow }) {
     row.namespace,
     row.kindToken === "replication" ? "patchRepositoryReplications" : "patchSnapshotReplications",
   );
-  const suspended = row.suspended
-    ? `${row.name} is suspended; resume it before asking for a run.`
-    : undefined;
+  // Both halves of the refusal, kept apart on purpose: the short word goes in
+  // the cell, the sentence goes to assistive technology and to the native
+  // title. A ledger clips a floating tooltip, so the reason has to be legible
+  // without one — and a word that is always there beats a word behind a hover
+  // for someone scanning the list for what they may act on.
+  const [word, sentence] = row.suspended
+    ? ["suspended", `${row.name} is suspended; resume it before asking for a run.`]
+    : run.isPending
+      ? ["in flight", "The request is in flight."]
+      : reason !== undefined
+        ? ["not permitted", reason]
+        : [undefined, undefined];
   return (
     <div className="replication-table__run">
       <ActionButton
-        disabledReason={suspended ?? (run.isPending ? "The request is in flight." : reason)}
+        disabledReason={sentence}
+        title={sentence}
         onClick={() => {
           run.mutate({ namespace: row.namespace, name: row.name, kind: row.kindToken });
         }}
@@ -160,6 +180,7 @@ function RunAction({ row }: { row: ReplicationRow }) {
         <PlayCircle size={14} strokeWidth={2} aria-hidden="true" />
         Run now
       </ActionButton>
+      {word !== undefined ? <span className="replication-table__note">{word}</span> : null}
       <ActionResult label={`Run ${row.name}`} receipt={run.data} problem={run.error?.problem} />
     </div>
   );
