@@ -1,45 +1,48 @@
+import type { ElkNode } from "elkjs/lib/elk-api";
 import { describe, expect, it } from "vitest";
 
-import type { ElkNode } from "elkjs/lib/elk-api";
-
 import { CLIENT_PROBLEM_PREFIX } from "../../api/problem";
-import { NODE_HEIGHT, NODE_WIDTH } from "./elk";
+import { NODE_HEIGHT, NODE_WIDTH, fromElkLayout } from "./elk";
 import { FIXTURE_GRAPH, NAS } from "./fixture";
-import { type LayoutRequest, type LayoutResponse, layoutProblem, layoutTopology } from "./layout";
+import { type LayoutEngine, layoutProblem, layoutTopology } from "./layout";
 import { topologyModel } from "./model";
 
 /**
- * A worker that never runs ELK: the tests are about the transport — what is
- * posted, what is read back, and that the worker is always stopped — not
- * about the engine, which `elk.test.ts` pins on both sides.
+ * An engine that never runs ELK: the tests are about the transport — what is
+ * handed to the engine, what is read back, and that the worker is always
+ * stopped — not about the layout itself, which `elk.test.ts` pins on both
+ * sides.
  */
-class FakeWorker {
-  onmessage: ((event: MessageEvent<LayoutResponse>) => void) | null = null;
-  onerror: ((event: ErrorEvent) => void) | null = null;
-  readonly posted: LayoutRequest[] = [];
+class FakeEngine implements LayoutEngine {
+  readonly given: ElkNode[] = [];
   terminated = 0;
+  private settle: ((graph: ElkNode) => void) | null = null;
+  private refuse: ((cause: unknown) => void) | null = null;
 
-  postMessage(message: LayoutRequest): void {
-    this.posted.push(message);
+  layout(graph: ElkNode): ReturnType<LayoutEngine["layout"]> {
+    this.given.push(graph);
+    return new Promise<ElkNode>((resolve, reject) => {
+      this.settle = resolve;
+      this.refuse = reject;
+    });
   }
 
-  terminate(): void {
+  terminateWorker(): void {
     this.terminated += 1;
   }
 
-  answer(response: LayoutResponse): void {
-    this.onmessage?.(new MessageEvent<LayoutResponse>("message", { data: response }));
+  answer(graph: ElkNode): void {
+    this.settle?.(graph);
   }
 
-  fail(message: string): void {
-    this.onerror?.(new ErrorEvent("error", { message }));
+  fail(cause: unknown): void {
+    this.refuse?.(cause);
   }
 }
 
-/** A fake worker plus the factory that hands it to `layoutTopology`. */
-function fakeWorker(): { worker: FakeWorker; factory: () => Worker } {
-  const worker = new FakeWorker();
-  return { worker, factory: () => worker as unknown as Worker };
+function fakeEngine(): { engine: FakeEngine; factory: () => LayoutEngine } {
+  const engine = new FakeEngine();
+  return { engine, factory: () => engine };
 }
 
 const model = topologyModel(FIXTURE_GRAPH);
@@ -56,52 +59,34 @@ function laidOut(): ElkNode {
 }
 
 describe("layoutTopology", () => {
-  it("posts the ELK graph for the model and resolves the boxes the worker sends back", async () => {
-    const { worker, factory } = fakeWorker();
+  it("hands the engine the ELK graph for the model and resolves the boxes it answers with", async () => {
+    const { engine, factory } = fakeEngine();
     const running = layoutTopology(model, factory);
-    expect(worker.posted).toHaveLength(1);
-    // What goes over the wire is exactly `toElkGraph`'s output: every node,
+    expect(engine.given).toHaveLength(1);
+    // What goes to the engine is exactly `toElkGraph`'s output: every node,
     // by id, at the one plate size.
-    const sent = worker.posted[0]?.graph;
-    expect(sent?.children?.map((child) => child.id).sort()).toEqual(
+    expect(engine.given[0]?.children?.map((child) => child.id).sort()).toEqual(
       FIXTURE_GRAPH.nodes.map((node) => node.id).sort(),
     );
 
-    worker.answer({ ok: true, graph: laidOut() });
+    engine.answer(laidOut());
     const layout = await running.result;
-    expect(layout.width).toBe(800);
-    expect(layout.nodes.get(NAS.id)).toEqual({
-      x: 24,
-      y: 24,
-      width: NODE_WIDTH,
-      height: NODE_HEIGHT,
-    });
-    expect(worker.terminated).toBe(1);
+    expect(layout).toEqual(fromElkLayout(laidOut()));
+    expect(engine.terminated).toBe(1);
   });
 
-  it("rejects with the worker's own reason when the engine refuses the graph", async () => {
-    const { worker, factory } = fakeWorker();
+  it("rejects with the engine's own reason when it refuses the graph, and still stops it", async () => {
+    const { engine, factory } = fakeEngine();
     const running = layoutTopology(model, factory);
-    worker.answer({ ok: false, message: "no layout algorithm 'layered'" });
+    engine.fail(new Error("no layout algorithm 'layered'"));
     await expect(running.result).rejects.toThrow("no layout algorithm 'layered'");
-    expect(worker.terminated).toBe(1);
-  });
-
-  it("rejects when the worker itself errors, and still stops it", async () => {
-    const { worker, factory } = fakeWorker();
-    const running = layoutTopology(model, factory);
-    worker.fail("Script error");
-    await expect(running.result).rejects.toThrow("Script error");
-    expect(worker.terminated).toBe(1);
+    expect(engine.terminated).toBe(1);
   });
 
   it("rejects a layout that lost a node rather than drawing plates at the origin", async () => {
-    const { worker, factory } = fakeWorker();
+    const { engine, factory } = fakeEngine();
     const running = layoutTopology(model, factory);
-    worker.answer({
-      ok: true,
-      graph: { id: "topology", width: 800, height: 400, children: [{ id: NAS.id }] },
-    });
+    engine.answer({ id: "topology", width: 800, height: 400, children: [{ id: NAS.id }] });
     await expect(running.result).rejects.toThrow(NAS.id);
   });
 
@@ -113,9 +98,9 @@ describe("layoutTopology", () => {
   });
 
   it("terminates the worker on cancel", () => {
-    const { worker, factory } = fakeWorker();
+    const { engine, factory } = fakeEngine();
     layoutTopology(model, factory).cancel();
-    expect(worker.terminated).toBe(1);
+    expect(engine.terminated).toBe(1);
   });
 });
 

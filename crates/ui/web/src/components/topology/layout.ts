@@ -4,21 +4,23 @@
  * A topology of a few hundred nodes takes ELK tens to hundreds of
  * milliseconds; on the main thread that is a frozen console, and this one is
  * read at 3am. So the engine runs in a dedicated module worker
- * (`layout.worker.ts`) and this module is the only thing that talks to it.
+ * (`layout.worker.ts`) and this module is the small client that talks to it.
  *
- * It is also what keeps `elkjs` out of the bundle every page load pays for.
- * The engine is imported by the worker and by nothing else, so it is emitted
- * as the worker's own asset; this module is reached only from the lazy
- * topology route, and the entry chunk never learns either exists.
+ * It is also what keeps the engine out of the bundle every page load pays
+ * for. What lands here is `elk-api` — about 10 kB of client — and a `new
+ * Worker(new URL(…))`, the form Vite compiles into a separate emitted asset.
+ * The 1.4 MB of generated layout code is only ever in that asset, and this
+ * module is reached only from the lazy topology route.
  *
  * Everything about the *shape* of the graph — what goes to the engine and
  * what comes back — is `elk.ts`, pure and unit-tested. This module owns only
- * the transport: one worker per layout, terminated either way, and a failure
- * rendered as a client `Problem` so the board fails the way every other read
- * on this console fails.
+ * the transport: one engine per layout, its worker terminated either way, and
+ * a failure rendered as a client `Problem` so the board fails the way every
+ * other read on this console fails.
  */
 
-import type { ElkNode } from "elkjs/lib/elk-api";
+import type { ELK, ElkNode } from "elkjs/lib/elk-api";
+import ElkConstructor from "elkjs/lib/elk-api.js";
 import { useEffect, useState } from "react";
 
 import { CLIENT_PROBLEM_PREFIX } from "../../api/problem";
@@ -26,23 +28,25 @@ import type { Problem } from "../../api/types";
 import { type LaidOut, fromElkLayout, toElkGraph } from "./elk";
 import type { TopologyModel } from "./model";
 
-/** What the main thread sends: one ELK graph to lay out. */
-export interface LayoutRequest {
-  graph: ElkNode;
-}
+/** The engine's surface this module uses; the rest of `ELK` is never called. */
+export type LayoutEngine = Pick<ELK, "layout" | "terminateWorker">;
 
-/** What the worker answers: the laid-out graph, or why it could not. */
-export type LayoutResponse = { ok: true; graph: ElkNode } | { ok: false; message: string };
-
-/** How a layout worker is made — swapped in tests, which have no `Worker`. */
-export type LayoutWorkerFactory = () => Worker;
+/** How an engine is made — swapped in tests, which have no `Worker`. */
+export type LayoutEngineFactory = () => LayoutEngine;
 
 /**
- * The real worker. `new URL(…, import.meta.url)` is the form Vite compiles
- * into a separate emitted asset; anything else would inline the engine here.
+ * The real engine, driving `layout.worker.ts`.
+ *
+ * `workerFactory` rather than `workerUrl` because the URL elk would build for
+ * itself is not the hashed asset path Vite emits; handing it the constructed
+ * `Worker` is the only form that survives a production build. Constructing an
+ * `ELK` starts the worker, so this is called per layout, not at import.
  */
-export const createLayoutWorker: LayoutWorkerFactory = () =>
-  new Worker(new URL("./layout.worker.ts", import.meta.url), { type: "module" });
+export const createLayoutEngine: LayoutEngineFactory = () =>
+  new ElkConstructor({
+    workerFactory: () =>
+      new Worker(new URL("./layout.worker.ts", import.meta.url), { type: "module" }),
+  });
 
 /** A layout in flight: its answer, and the handle that stops it. */
 export interface RunningLayout {
@@ -66,19 +70,19 @@ function describeCause(cause: unknown): string {
 }
 
 /**
- * Lay one model out on a worker of its own.
+ * Lay one model out on an engine of its own.
  *
- * One worker per run rather than a pool: a layout is rare (a route visit, a
+ * One engine per run rather than a pool: a layout is rare (a route visit, a
  * 30s refetch), and a fresh worker cannot carry a previous run's state or
  * leave a stale answer to be matched up. It is terminated on success, on
  * failure and on `cancel`.
  */
 export function layoutTopology(
   model: TopologyModel,
-  factory: LayoutWorkerFactory = createLayoutWorker,
+  factory: LayoutEngineFactory = createLayoutEngine,
 ): RunningLayout {
   const graph = toElkGraph(model);
-  let started: Worker;
+  let started: LayoutEngine;
   try {
     started = factory();
   } catch (cause: unknown) {
@@ -89,31 +93,21 @@ export function layoutTopology(
       cancel: () => undefined,
     };
   }
-  const worker = started;
-  const result = new Promise<LaidOut>((resolve, reject) => {
-    worker.onmessage = (event: MessageEvent<LayoutResponse>) => {
-      worker.terminate();
-      const response = event.data;
-      if (!response.ok) {
-        reject(new Error(response.message));
-        return;
-      }
-      try {
-        resolve(fromElkLayout(response.graph));
-      } catch (cause: unknown) {
-        reject(new Error(describeCause(cause)));
-      }
-    };
-    worker.onerror = (event: ErrorEvent) => {
-      worker.terminate();
-      reject(new Error(event.message.length > 0 ? event.message : "the layout worker failed"));
-    };
-    worker.postMessage({ graph } satisfies LayoutRequest);
-  });
+  const engine = started;
+  const result = engine.layout(graph).then(
+    (laid: ElkNode) => {
+      engine.terminateWorker();
+      return fromElkLayout(laid);
+    },
+    (cause: unknown) => {
+      engine.terminateWorker();
+      throw new Error(describeCause(cause));
+    },
+  );
   return {
     result,
     cancel: () => {
-      worker.terminate();
+      engine.terminateWorker();
     },
   };
 }
