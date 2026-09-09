@@ -157,7 +157,24 @@ const PATCH_SNAPSHOT_REPLICATIONS: Probe = Probe {
     subresource: None,
     scope: ProbeScope::Namespaced,
 };
-/// Opening a browse session execs into a mover pod.
+/// A browse session IS a `batch/v1` Job — `kopiur_ops::browse::session` creates
+/// one and `delete_session` removes it — so starting and stopping one are
+/// reviewed on `jobs`, not on the exec that reads through it.
+const CREATE_SESSION_JOBS: Probe = Probe {
+    verb: "create",
+    group: "batch",
+    resource: "jobs",
+    subresource: None,
+    scope: ProbeScope::Namespaced,
+};
+const DELETE_SESSION_JOBS: Probe = Probe {
+    verb: "delete",
+    group: "batch",
+    resource: "jobs",
+    subresource: None,
+    scope: ProbeScope::Namespaced,
+};
+/// Reading through a session execs into its mover pod.
 const EXEC_SESSIONS: Probe = Probe {
     verb: "create",
     group: "",
@@ -260,11 +277,16 @@ async fn handler(
     let namespace = q.namespace.as_deref();
     let client = client_for(&app, &id)?;
 
-    // Concurrently: eleven reviews, and in impersonated mode each is its own
-    // apiserver round trip. Run in series they would put ten extra latencies on
-    // a call the SPA makes again for every namespace it scopes to. Each future
-    // is bound to the field it answers rather than collected positionally, so a
-    // probe cannot end up wired to the wrong flag.
+    // Concurrently: thirteen reviews, and in impersonated mode each is its own
+    // apiserver round trip. Run in series they would put twelve extra latencies
+    // on a call the SPA makes again for every namespace it scopes to. Each
+    // future is bound to the field it answers rather than collected
+    // positionally, so a probe cannot end up wired to the wrong flag.
+    //
+    // The last three are always `SelfSubjectAccessReview`s: `SarCache` asks only
+    // about the kopiur API group, so routing `jobs` (batch) or `pods/exec`
+    // (core, and a subresource) through it would silently answer a different
+    // question.
     let (
         create_snapshots,
         delete_snapshots,
@@ -276,10 +298,8 @@ async fn handler(
         patch_maintenances,
         patch_repository_replications,
         patch_snapshot_replications,
-        // Always a `SelfSubjectAccessReview`: `pods/exec` is a core-group
-        // subresource and `SarCache` asks only about the kopiur API group, so
-        // routing it through the cache would silently answer a different
-        // question.
+        create_session_jobs,
+        delete_session_jobs,
         exec_sessions,
     ) = tokio::try_join!(
         kopiur_probe(&app, &id, &client, &CREATE_SNAPSHOTS, namespace),
@@ -298,6 +318,8 @@ async fn handler(
             namespace
         ),
         kopiur_probe(&app, &id, &client, &PATCH_SNAPSHOT_REPLICATIONS, namespace),
+        self_review(&client, &CREATE_SESSION_JOBS, namespace),
+        self_review(&client, &DELETE_SESSION_JOBS, namespace),
         self_review(&client, &EXEC_SESSIONS, namespace),
     )?;
 
@@ -312,6 +334,8 @@ async fn handler(
         patch_maintenances,
         patch_repository_replications,
         patch_snapshot_replications,
+        create_session_jobs,
+        delete_session_jobs,
         exec_sessions,
     };
 
@@ -358,6 +382,8 @@ mod tests {
         (&PATCH_SNAPSHOT_REPLICATIONS, |c| {
             c.patch_snapshot_replications
         }),
+        (&CREATE_SESSION_JOBS, |c| c.create_session_jobs),
+        (&DELETE_SESSION_JOBS, |c| c.delete_session_jobs),
         (&EXEC_SESSIONS, |c| c.exec_sessions),
     ];
 
@@ -376,6 +402,8 @@ mod tests {
             patch_maintenances: allow(&PATCH_MAINTENANCES),
             patch_repository_replications: allow(&PATCH_REPOSITORY_REPLICATIONS),
             patch_snapshot_replications: allow(&PATCH_SNAPSHOT_REPLICATIONS),
+            create_session_jobs: allow(&CREATE_SESSION_JOBS),
+            delete_session_jobs: allow(&DELETE_SESSION_JOBS),
             exec_sessions: allow(&EXEC_SESSIONS),
         }
     }
@@ -454,45 +482,221 @@ mod tests {
         }
     }
 
-    /// Every mutating endpoint's write is covered by a probe. The four the SPA
-    /// had no signal for — `maintenance-run`, `replication-run`, `scan-catalog`
-    /// and suspend on anything but a `SnapshotPolicy` — rendered enabled for
-    /// everyone and failed at click time with a 403.
+    /// Every route that registers a mutating method, and the probes that gate
+    /// it. Paths are verbatim as registered — relative for the nested routers,
+    /// absolute for `browse`, which merges at the root.
+    const GATED_ROUTES: &[(&str, &[&Probe])] = &[
+        ("/actions/snapshot-now", &[&CREATE_SNAPSHOTS]),
+        ("/actions/restore", &[&CREATE_RESTORES]),
+        (
+            "/actions/suspend",
+            &[
+                &PATCH_POLICIES,
+                &PATCH_SCHEDULES,
+                &PATCH_REPOSITORIES,
+                &PATCH_CLUSTER_REPOSITORIES,
+                &PATCH_REPOSITORY_REPLICATIONS,
+                &PATCH_SNAPSHOT_REPLICATIONS,
+            ],
+        ),
+        ("/actions/maintenance-run", &[&PATCH_MAINTENANCES]),
+        (
+            "/actions/replication-run",
+            &[&PATCH_REPOSITORY_REPLICATIONS, &PATCH_SNAPSHOT_REPLICATIONS],
+        ),
+        (
+            "/actions/scan-catalog",
+            &[&PATCH_REPOSITORIES, &PATCH_CLUSTER_REPOSITORIES],
+        ),
+        ("/snapshots/{namespace}/{name}", &[&DELETE_SNAPSHOTS]),
+        (
+            "/api/v1/snapshots/{namespace}/{name}/session",
+            &[&CREATE_SESSION_JOBS, &DELETE_SESSION_JOBS, &EXEC_SESSIONS],
+        ),
+        (
+            "/api/v1/repositories/{kind}/{name}/session",
+            &[&DELETE_SESSION_JOBS],
+        ),
+    ];
+
+    /// Every module that builds a `Router`, as source text.
+    ///
+    /// `include_str!` rather than a reflective walk because axum's `Router` does
+    /// not expose its routing table. The scan below reads the `fn router*`
+    /// bodies out of these, so a mutating route added ANYWHERE in the API — not
+    /// just one added to a list a test author remembered to update — fails.
+    const ROUTER_SOURCES: &[(&str, &str)] = &[
+        ("api/mod.rs", include_str!("mod.rs")),
+        ("api/doctor.rs", include_str!("doctor.rs")),
+        ("api/events.rs", include_str!("events.rs")),
+        ("api/gates.rs", include_str!("gates.rs")),
+        ("api/graph.rs", include_str!("graph.rs")),
+        ("api/maintenance.rs", include_str!("maintenance.rs")),
+        ("api/me.rs", include_str!("me.rs")),
+        ("api/policies.rs", include_str!("policies.rs")),
+        ("api/replications.rs", include_str!("replications.rs")),
+        ("api/repositories.rs", include_str!("repositories.rs")),
+        ("api/restores.rs", include_str!("restores.rs")),
+        ("api/schedules.rs", include_str!("schedules.rs")),
+        ("api/snapshots.rs", include_str!("snapshots.rs")),
+        ("api/status.rs", include_str!("status.rs")),
+        ("actions/mod.rs", include_str!("../actions/mod.rs")),
+        ("browse/mod.rs", include_str!("../browse/mod.rs")),
+    ];
+
+    /// The marker every router this crate mounts is declared with. Anchored at
+    /// column 0 so it matches only a top-level item — an indented `fn router…`
+    /// (this test module's own helpers included) is not one.
+    const ROUTER_MARKER: &str = "\npub fn router";
+
+    /// The body of every top-level `pub fn router*` in `source`.
+    ///
+    /// Bounded to those bodies on purpose: a `.delete(` outside one is an
+    /// apiserver call, not a route method, and `actions/mod.rs` registers a
+    /// throwaway route inside its own `#[cfg(test)]` module. rustfmt (enforced
+    /// by `mise run fmt-check`) puts the closing brace of a top-level item at
+    /// column 0, which is what `\n}` finds.
+    fn router_bodies(source: &str) -> Vec<&str> {
+        let mut bodies = Vec::new();
+        let mut rest = source;
+        while let Some(at) = rest.find(ROUTER_MARKER) {
+            let after = &rest[at + 1..];
+            let Some(open) = after.find('{') else { break };
+            let body = &after[open..];
+            let end = body.find("\n}").map(|e| e + 1).unwrap_or(body.len());
+            bodies.push(&body[..end]);
+            rest = &after[open + end..];
+        }
+        bodies
+    }
+
+    /// Every path in `source` registered with a mutating method.
+    fn mutating_routes(source: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for body in router_bodies(source) {
+            for chunk in body.split(".route(").skip(1) {
+                let Some(open) = chunk.find('"') else {
+                    continue;
+                };
+                let Some(close) = chunk[open + 1..].find('"') else {
+                    continue;
+                };
+                let path = &chunk[open + 1..open + 1 + close];
+                // The chunk runs to the next `.route(`, which inside a router
+                // body is only ever more registration.
+                if chunk.contains("post(") || chunk.contains("delete(") {
+                    found.push(path.to_string());
+                }
+            }
+        }
+        found
+    }
+
+    /// The parser has to actually find routes, or every assertion below passes
+    /// vacuously. This is the tripwire for a reformat that breaks the scan.
     #[test]
-    fn every_mutating_endpoint_has_a_capability_flag() {
-        let probed: Vec<(&str, &str)> = PROBED_FLAGS
+    fn the_route_scan_finds_the_routers_it_is_reading() {
+        let read: usize = ROUTER_SOURCES
             .iter()
-            .map(|(p, _)| (p.verb, p.resource))
+            .map(|(_, src)| router_bodies(src).len())
+            .sum();
+        assert_eq!(
+            read, 17,
+            "one router per module in ROUTER_SOURCES, plus browse's second \
+             (`router_untimed`). If a module gained or lost one, bump this \
+             deliberately; if the count dropped to zero the scan stopped \
+             matching — fix it rather than deleting it, it is the only thing \
+             that notices an ungated endpoint."
+        );
+        let get_only = mutating_routes(include_str!("snapshots.rs"));
+        assert!(
+            get_only.is_empty(),
+            "the read API registers no mutating routes, so the scan must find none \
+             in a read module; found {get_only:?}"
+        );
+    }
+
+    /// Every mutating route the API serves has a capability flag — checked
+    /// against the ROUTERS' OWN SOURCE, not against a list this test restates.
+    ///
+    /// The previous version of this test iterated a hand-written table of
+    /// `(verb, resource)` pairs and compared it to `PROBED_FLAGS`. Both halves
+    /// described the probe table, so adding `POST /actions/foo` changed nothing
+    /// it read — and it had in fact already missed the `create`/`delete` on
+    /// `jobs` that starting and stopping a browse session perform, while the
+    /// `Capabilities` doc claimed `execSessions` covered them. A user holding
+    /// `pods/exec` but not `create jobs` saw an enabled Browse button that 403'd
+    /// on click, which is the exact failure a capability flag exists to prevent.
+    #[test]
+    fn every_mutating_route_has_a_capability_flag() {
+        let mut registered: Vec<String> = ROUTER_SOURCES
+            .iter()
+            .flat_map(|(_, src)| mutating_routes(src))
             .collect();
-        for write in [
-            // snapshot-now, delete-snapshot, restore
-            ("create", "snapshots"),
-            ("delete", "snapshots"),
-            ("create", "restores"),
-            // suspend, one per SuspendableKind
-            ("patch", "snapshotpolicies"),
-            ("patch", "snapshotschedules"),
-            ("patch", "repositories"),
-            ("patch", "clusterrepositories"),
-            ("patch", "repositoryreplications"),
-            ("patch", "snapshotreplications"),
-            // maintenance-run
-            ("patch", "maintenances"),
-            // browse sessions
-            ("create", "pods"),
-        ] {
+        registered.sort();
+        registered.dedup();
+
+        let mut gated: Vec<String> = GATED_ROUTES
+            .iter()
+            .map(|(path, _)| (*path).to_string())
+            .collect();
+        gated.sort();
+
+        assert_eq!(
+            registered, gated,
+            "a mutating route was added or removed without deciding which \
+             capability flag gates it. Add it to GATED_ROUTES with the probes \
+             its handler actually performs — reading the handler, not guessing."
+        );
+
+        // And every probe named there is one `/me` actually asks.
+        for (path, probes) in GATED_ROUTES {
+            for probe in *probes {
+                assert!(
+                    PROBED_FLAGS.iter().any(|(p, _)| std::ptr::eq(*p, *probe)),
+                    "{path} is gated on {} {} , which /me never reviews",
+                    probe.verb,
+                    probe.resource
+                );
+            }
+        }
+    }
+
+    /// The reverse direction: no probe is a round trip nothing uses.
+    #[test]
+    fn every_probe_gates_at_least_one_route() {
+        for (probe, _) in PROBED_FLAGS {
             assert!(
-                probed.contains(&write),
-                "{write:?} is a write the API performs with no capability flag"
+                GATED_ROUTES
+                    .iter()
+                    .any(|(_, probes)| probes.iter().any(|p| std::ptr::eq(*p, *probe))),
+                "{} {} is reviewed on every /me call and gates nothing",
+                probe.verb,
+                probe.resource
             );
         }
-        // scan-catalog and replication-run patch the same resources as their
-        // suspend counterparts, which is why they need no probe of their own.
+    }
+
+    /// Starting a browse session takes BOTH grants, and the doc says so.
+    ///
+    /// The Job is what `kopiur_ops::browse::session` creates
+    /// (`jobs_api.create(...)`) and the exec is what reading through it costs;
+    /// a user with one and not the other cannot browse.
+    #[test]
+    fn starting_a_session_is_gated_on_the_job_and_on_the_exec() {
+        let session = GATED_ROUTES
+            .iter()
+            .find(|(path, _)| *path == "/api/v1/snapshots/{namespace}/{name}/session")
+            .expect("the session route is gated");
+        let probes: Vec<(&str, &str)> = session.1.iter().map(|p| (p.verb, p.resource)).collect();
+        assert!(probes.contains(&("create", "jobs")));
+        assert!(probes.contains(&("delete", "jobs")));
+        assert!(probes.contains(&("create", "pods")));
         assert_eq!(
-            probed.len(),
-            11,
-            "a probe was added or removed without updating this list: {probed:?}"
+            CREATE_SESSION_JOBS.group, "batch",
+            "a session Job lives in the batch API group, not kopiur's"
         );
+        assert_eq!(DELETE_SESSION_JOBS.group, "batch");
     }
 
     /// A namespaced review of a cluster-scoped resource would report a
