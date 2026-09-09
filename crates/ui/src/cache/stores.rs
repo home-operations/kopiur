@@ -19,10 +19,12 @@
 //!
 //! kube's `Store::wait_until_ready()` does **not** drive the underlying watch —
 //! the reflector stream has to be polled separately, or readiness never
-//! arrives. [`start`] therefore returns a `JoinHandle` per kind; the caller owns
-//! them for the process lifetime. Dropping one silently stops refreshing that
-//! kind, which would serve an ever-staler cache with no signal, so they are
-//! returned rather than detached here.
+//! arrives. [`start`] therefore spawns one task per kind, and hands all nine to
+//! a single supervisor that owns them for the process lifetime. They are **not**
+//! returned: a handle a caller could hold is a handle a caller could drop, and a
+//! dropped one stops refreshing that kind while `/readyz` keeps saying ok. The
+//! supervisor is also what turns a task ending into a readiness answer, so
+//! ownership and observation are deliberately the same place.
 //!
 //! Readiness itself is published on a `tokio::sync::watch` channel rather than
 //! exposed as an awaitable function, because kube's per-store readiness holds a

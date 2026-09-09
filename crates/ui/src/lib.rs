@@ -139,21 +139,49 @@ pub struct AppState {
 /// answered with 200 and an HTML page would leave the SPA parsing
 /// `<!doctype html>` as JSON.
 pub fn app(state: AppState) -> Router {
-    app_with(state, config::API_REQUEST_TIMEOUT)
+    app_with(state, ApiBounds::shipped())
 }
 
-/// [`app`] with the request timeout as a parameter.
+/// What `/api` is bounded by: the request deadline and the in-flight cap.
 ///
-/// The seam exists for one reason: it is the only way to assert that the *real*
-/// composition carries the timeout on the timed half and not on `…/file`. A test
-/// that mounts its own router around [`with_timeout`] proves the middleware
-/// works and proves nothing about where it was applied — deleting the
-/// `route_layer` here would leave such a test green.
-fn app_with(state: AppState, budget: Duration) -> Router {
+/// Values rather than constants read at the point of use, and the only reason is
+/// testability — but it is a load-bearing reason. Both bounds are about *how the
+/// layers compose*, and neither claim can be checked at the shipped values: 30
+/// seconds is too long for a test to wait, and saturating 256 permits means 256
+/// concurrent in-flight requests. With them as parameters, the same
+/// `api_surface` a browser talks to can be driven at 50 ms and one permit, so
+/// "the timeout covers the wait for a permit" becomes an assertion instead of a
+/// comment. [`ApiBounds::shipped`] is the single place the real numbers enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApiBounds {
+    /// How long a request may take before it is answered with a 504. `…/file` is
+    /// exempt — see [`browse::router_untimed`].
+    timeout: Duration,
+    /// How many requests may be in flight at once, across both halves.
+    max_concurrent: usize,
+}
+
+impl ApiBounds {
+    /// The values this binary actually serves with, from [`config`].
+    fn shipped() -> Self {
+        Self {
+            timeout: config::API_REQUEST_TIMEOUT,
+            max_concurrent: config::MAX_CONCURRENT_API_REQUESTS,
+        }
+    }
+}
+
+/// [`app`] with the `/api` bounds as a parameter.
+///
+/// The seam exists so the *real* composition can be asserted rather than a
+/// re-creation of it. A test that mounts its own router around [`with_timeout`]
+/// proves the middleware works and proves nothing about where it was applied —
+/// deleting a `route_layer` in [`api_surface`] would leave such a test green.
+fn app_with(state: AppState, bounds: ApiBounds) -> Router {
     let cors = cors_layer(&state.cfg.cors_origins);
 
     Router::new()
-        .merge(api_surface(state.clone(), cors, budget))
+        .merge(api_surface(state.clone(), cors, bounds))
         .fallback(static_files::spa_fallback)
         .layer(CompressionLayer::new().compress_when(compressible()))
         // The three headers that belong on the app SHELL as much as on the API.
@@ -199,12 +227,13 @@ fn app_with(state: AppState, budget: Duration) -> Router {
 /// limit and the identity middleware but must escape the timeout, and the
 /// timeout has to sit *outside* the limit, so the two halves cannot share one
 /// stack. The semaphore is shared explicitly so "one limit" survives the split.
-fn api_surface(state: AppState, cors: Option<CorsLayer>, budget: Duration) -> Router<AppState> {
+fn api_surface(state: AppState, cors: Option<CorsLayer>, bounds: ApiBounds) -> Router<AppState> {
     // ONE semaphore across both halves. Two `ConcurrencyLimitLayer`s would mean
     // 2×256 in flight, and the download route — the most expensive thing the UI
     // serves — would be the half with its own private budget.
-    let permits = Arc::new(Semaphore::new(config::MAX_CONCURRENT_API_REQUESTS));
+    let permits = Arc::new(Semaphore::new(bounds.max_concurrent));
     let concurrency = GlobalConcurrencyLimitLayer::with_semaphore(Arc::clone(&permits));
+    let budget = bounds.timeout;
 
     let timed = Router::new()
         .nest("/api/v1", api::router().merge(actions::router()))
@@ -839,33 +868,66 @@ mod tests {
         (listener, format!("http://{addr}/"))
     }
 
+    /// Drive one request against a wedged cluster on a **paused** clock, jumping
+    /// well past `budget` between polls, and report whether an answer ever came.
+    ///
+    /// This is the exact discriminator the wall-clock version could not be. With
+    /// time paused, a `tokio::time::timeout` fires the instant the clock passes
+    /// its deadline while the black-hole IO never resolves — so "did a response
+    /// arrive?" answers "is this route timed?" with no race in either direction,
+    /// and in zero wall time. The wall-clock version asserted that *its own*
+    /// timer expired first, which load pushes toward passing: a timeout wrongly
+    /// applied to `…/file` could have been missed on a busy machine. A false
+    /// green is worse than a flake, because nothing ever draws attention to it.
+    ///
+    /// The first poll is what registers both the IO wait and (if the route is
+    /// timed) the timer, so the clock is only advanced after it.
+    async fn answer_after_advancing(
+        router: Router,
+        request: HttpRequest<ReqBody>,
+        budget: Duration,
+    ) -> Option<axum::response::Response> {
+        let call = router.oneshot(request);
+        futures::pin_mut!(call);
+
+        // A handful of rounds: hyper needs several polls to get through connect
+        // and the request write before it settles on the response read, and each
+        // `advance` yields so the reactor can deliver readiness in between.
+        for _ in 0..16 {
+            if let std::task::Poll::Ready(response) = futures::poll!(call.as_mut()) {
+                return Some(response.expect("the router is infallible"));
+            }
+            tokio::time::advance(budget * 4).await;
+        }
+        None
+    }
+
     /// The REAL composition carries the timeout on the timed half.
     ///
     /// `a_handler_that_outruns_its_budget_is_a_timeout_problem` proves the
     /// middleware works; it mounts its own router, so deleting the `route_layer`
     /// in `api_surface` would leave it green. This drives `app_with` — the same
-    /// function `app` calls, with a short budget — against a handler that really
-    /// does hang, so the assertion is about where the layer was applied.
-    #[tokio::test]
+    /// function `app` calls — against a handler that really does hang, so the
+    /// assertion is about where the layer was applied.
+    #[tokio::test(start_paused = true)]
     async fn the_timed_half_of_the_real_router_times_out() {
         let (_listener, url) = black_hole();
-        let router = app_with(test_state_at(&url), Duration::from_millis(50));
+        let bounds = ApiBounds {
+            timeout: Duration::from_millis(50),
+            max_concurrent: 256,
+        };
+        let router = app_with(test_state_at(&url), bounds);
 
-        // Bounded from the outside as well. Without the layer under test the
-        // request never completes at all, and a test that hangs forever is a
-        // test that reports nothing; this turns that regression into a failure.
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            router.oneshot(
-                HttpRequest::builder()
-                    .uri("/api/v1/snapshots/media/nightly-1/tree")
-                    .body(ReqBody::empty())
-                    .expect("test request"),
-            ),
+        let response = answer_after_advancing(
+            router,
+            HttpRequest::builder()
+                .uri("/api/v1/snapshots/media/nightly-1/tree")
+                .body(ReqBody::empty())
+                .expect("test request"),
+            bounds.timeout,
         )
         .await
-        .expect("the router's own 50ms budget must answer long before this one")
-        .expect("response");
+        .expect("a timed route must answer once the clock passes its budget");
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = response
@@ -886,31 +948,95 @@ mod tests {
 
     /// …and `…/file` really is exempt from it.
     ///
-    /// The assertion is the negative one, so it is made by *outliving* the
-    /// budget: with the same 50 ms timeout applied, a download against the same
-    /// wedged cluster must still be in flight an order of magnitude later. A
-    /// timeout that leaked onto this route would have answered 504 long before.
-    #[tokio::test]
+    /// The mirror of the test above: same setup, same clock advance, and the
+    /// answer must be that no answer ever came. Under a paused clock that is an
+    /// exact statement — a timeout applied here would fire the moment the clock
+    /// passed the budget — rather than a race between two wall-clock durations.
+    #[tokio::test(start_paused = true)]
     async fn the_download_route_of_the_real_router_is_not_timed() {
         let (_listener, url) = black_hole();
-        let router = app_with(test_state_at(&url), Duration::from_millis(50));
+        let bounds = ApiBounds {
+            timeout: Duration::from_millis(50),
+            max_concurrent: 256,
+        };
+        let router = app_with(test_state_at(&url), bounds);
 
-        let request = router.oneshot(
+        let answered = answer_after_advancing(
+            router,
             HttpRequest::builder()
                 .uri("/api/v1/snapshots/media/nightly-1/file?path=a.txt")
                 .header("sec-fetch-site", "same-origin")
                 .body(ReqBody::empty())
                 .expect("test request"),
-        );
+            bounds.timeout,
+        )
+        .await;
 
-        let outcome = tokio::time::timeout(Duration::from_millis(600), request).await;
         assert!(
-            outcome.is_err(),
+            answered.is_none(),
             "…/file must outlive the request budget — a legitimate multi-gigabyte restore \
              outruns any fixed deadline, so this route bounds itself on progress instead. \
              It answered: {:?}",
-            outcome.map(|r| r.map(|response| response.status())),
+            answered.map(|response| response.status()),
         );
+    }
+
+    /// The timeout is **outside** the concurrency limit: a request that cannot
+    /// get a permit is still refused within its own budget.
+    ///
+    /// This is the ordering Major-2 was about, and the one thing the two tests
+    /// above cannot see — with the layers swapped they stay green, because the
+    /// handler never completes either way. Here the difference is total:
+    ///
+    /// * timeout outside (correct): the budget starts when the request arrives,
+    ///   so it fires while the request is still queued in `poll_ready` → 504.
+    /// * timeout inside (wrong): `poll_ready` blocks before `with_timeout` is
+    ///   ever polled, so no timer exists → the request waits forever, and a
+    ///   saturated server grows an unbounded backlog instead of shedding.
+    ///
+    /// The single permit is held by a **download**, which is exempt from the
+    /// timeout and therefore holds it for as long as the wedged cluster keeps it
+    /// waiting — there is no other way to occupy a permit indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_queued_for_a_permit_still_times_out() {
+        let (_listener, url) = black_hole();
+        let bounds = ApiBounds {
+            timeout: Duration::from_millis(50),
+            max_concurrent: 1,
+        };
+        let router = app_with(test_state_at(&url), bounds);
+
+        let hog = tokio::spawn(
+            router.clone().oneshot(
+                HttpRequest::builder()
+                    .uri("/api/v1/snapshots/media/nightly-1/file?path=big.tar")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(ReqBody::empty())
+                    .expect("test request"),
+            ),
+        );
+        // Let the download take the only permit before the second request
+        // arrives; it then never gives it back.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        let response = answer_after_advancing(
+            router,
+            HttpRequest::builder()
+                .uri("/api/v1/snapshots/media/nightly-1/tree")
+                .body(ReqBody::empty())
+                .expect("test request"),
+            bounds.timeout,
+        )
+        .await
+        .expect(
+            "a request queued for a permit must still be refused within its budget; with the \
+             concurrency limit outside the timeout it would wait forever instead",
+        );
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        hog.abort();
     }
 
     /// The compression exemption is keyed on `Content-Disposition: attachment`,

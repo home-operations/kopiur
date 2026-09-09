@@ -97,7 +97,7 @@ pub async fn track_cache_readiness(
     // Whatever the cache was, it is now unattended.
     readiness.set_cache(CacheState::WatchEnded);
     tracing::error!(
-        "the kopiur-ui cache supervisor ended; nothing is watching the reflector stores any \\
+        "the kopiur-ui cache supervisor ended; nothing is watching the reflector stores any \
          more, so /readyz reports cache-watch-ended. Restart the pod."
     );
 }
@@ -148,7 +148,7 @@ fn report_cache_state(state: CacheState) {
         }
         CacheState::SyncTimedOut => report_sync_timeout(),
         CacheState::WatchEnded => tracing::error!(
-            "a kopiur-ui reflector ended, so its store is frozen and will go stale; the UI \\
+            "a kopiur-ui reflector ended, so its store is frozen and will go stale; the UI \
              has stopped reporting ready. This does not recover on its own — restart the pod."
         ),
     }
@@ -158,10 +158,10 @@ fn report_cache_state(state: CacheState) {
 fn report_sync_timeout() {
     tracing::error!(
         budget_secs = CACHE_SYNC_TIMEOUT.as_secs(),
-        "the kopiur-ui reflector stores have not completed their initial list; /readyz \\
-         reports cache-sync-timed-out. The usual cause is the UI's own ServiceAccount \\
-         lacking list/watch on the kopiur CRDs, or the CRDs not being installed — check the \\
-         chart's ui.rbac. Set KOPIUR_UI_CACHE=false to read through impersonated calls \\
+        "the kopiur-ui reflector stores have not completed their initial list; /readyz \
+         reports cache-sync-timed-out. The usual cause is the UI's own ServiceAccount \
+         lacking list/watch on the kopiur CRDs, or the CRDs not being installed — check the \
+         chart's ui.rbac. Set KOPIUR_UI_CACHE=false to read through impersonated calls \
          instead. Still watching."
     );
 }
@@ -218,6 +218,55 @@ mod tests {
             tls: None,
             cors_origins: Vec::new(),
         }
+    }
+
+    // --- the log strings an operator reads ---------------------------------
+
+    /// A multi-line log string must end its lines with a single `\` — the Rust
+    /// line continuation, which eats the newline and the next line's indentation.
+    /// `\\` is an *escaped backslash*, so the message an operator greps ends up
+    /// carrying a literal backslash, a newline and nine spaces in the middle of a
+    /// sentence.
+    ///
+    /// The two forms are one character apart, look identical in a diff, and
+    /// differ only in output nobody sees until something has already gone wrong —
+    /// which is exactly when these particular messages are read. Checked across
+    /// the whole crate rather than this file, because the mistake is not specific
+    /// to it.
+    #[test]
+    fn no_log_string_ends_a_line_with_an_escaped_backslash() {
+        let sources = [
+            ("startup.rs", include_str!("startup.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("ops_listener.rs", include_str!("ops_listener.rs")),
+            ("config.rs", include_str!("config.rs")),
+            ("metrics.rs", include_str!("metrics.rs")),
+            ("static_files.rs", include_str!("static_files.rs")),
+            ("cache/stores.rs", include_str!("cache/stores.rs")),
+            ("cache/mod.rs", include_str!("cache/mod.rs")),
+            ("cache/authz.rs", include_str!("cache/authz.rs")),
+            ("auth/mod.rs", include_str!("auth/mod.rs")),
+            ("api/problem.rs", include_str!("api/problem.rs")),
+        ];
+
+        let offenders: Vec<String> = sources
+            .iter()
+            .flat_map(|(name, source)| {
+                source
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.ends_with("\\\\"))
+                    .map(move |(n, line)| format!("{name}:{}: {}", n + 1, line.trim()))
+            })
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "these lines end with an escaped backslash where they meant a line \
+             continuation, so the rendered message carries a stray `\\` and a newline:\n{}",
+            offenders.join("\n"),
+        );
     }
 
     // --- impersonation targets ---------------------------------------------
