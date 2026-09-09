@@ -148,6 +148,21 @@ pub struct Page<T> {
 pub struct RepositorySummary {
     /// `Repository` or `ClusterRepository`.
     pub kind: String,
+    /// The `{kind}` URL segment for this row — `repository` or
+    /// `cluster-repository`.
+    ///
+    /// Here so the SPA links to `/repositories/{kindPath}/{name}` and
+    /// `DELETE /repositories/{kindPath}/{name}/session` without a local
+    /// CRD-kind-to-segment mapping table. [`Self::kind`] is the CRD kind for
+    /// display; this is the routing token, and the two differ in case and
+    /// punctuation. Both routes also *accept* [`Self::kind`] itself, so a client
+    /// that ignores this field still works — it is the canonical spelling, not
+    /// the only one.
+    ///
+    /// `RepositoryDetail` carries it as `summary.kindPath`: one field, so the
+    /// segment a row links with and the segment a detail screen links with
+    /// cannot drift.
+    pub kind_path: String,
     /// `metadata.name`.
     pub name: String,
     /// `metadata.namespace`; absent for `ClusterRepository`.
@@ -386,6 +401,19 @@ pub struct SnapshotRow {
     /// GFS pruning.
     pub pinned: bool,
     /// `spec.deletionPolicy` — `Delete`, `Retain`, or `Orphan`.
+    ///
+    /// **Absent means the CR sets none, and must not be rendered as a default.**
+    /// The schema carries no `default:` — deliberately, because the effective
+    /// policy is context-dependent: a produced backup behaves as `Delete`, a
+    /// *discovered* one is forced to `Retain`, and which of those applies is the
+    /// operator's decision at delete time, not a value this field mirrors. A UI
+    /// that filled the blank with "Delete" would tell the owner of a discovered
+    /// snapshot that confirming would destroy data the operator will in fact
+    /// keep — and a UI that filled it with "Retain" would say the opposite to
+    /// everyone else.
+    ///
+    /// Render an absent value as "not set (the operator decides)" and say what
+    /// the deletion will do only when this field says it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_policy: Option<String>,
     /// For replicated snapshots: the repository the copy came from.
@@ -488,11 +516,101 @@ pub struct SnapshotRefView {
 pub struct RetentionPreview {
     /// True when at least one retention rule keeps the snapshot.
     pub kept: bool,
-    /// The rules that matched, e.g. `keepDaily slot 3`.
+    /// The rules that hold it, each with the slot it occupies in that rule's
+    /// window — `keepDaily slot 3` means the third-newest day `keepDaily` keeps,
+    /// so a reader can see how close the snapshot is to ageing out.
+    ///
+    /// `pinned` appears alone, without a slot: a pin is not a bucket slot, it is
+    /// an exemption from bucketing.
+    ///
+    /// Empty when the snapshot is pruned. The same strings, from the same
+    /// function, as [`RetentionCandidate::rules`].
     pub reasons: Vec<String>,
     /// RFC3339 timestamp the preview was computed at — the answer moves as time
     /// passes, so the UI shows when it was true.
     pub computed_at: String,
+}
+
+/// Every snapshot competing for the same retention buckets as one snapshot,
+/// with the verdict today's GFS selection gives each.
+///
+/// This is what `GET /api/v1/snapshots/{namespace}/{name}/retention` answers,
+/// and it is the screen where a misreading costs a restore point — so the
+/// population and the bucketing are the *prune's own*
+/// (`kopiur_api::retention::retention_buckets`), never a second implementation
+/// that could disagree with what the operator will actually delete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionPlan {
+    /// One entry per bucket the policy's population splits into, keyed by the
+    /// bucket key, ordered by that key.
+    ///
+    /// Buckets are independent: a fan-out policy over seven PVCs has seven, and
+    /// no snapshot in one can displace a snapshot in another. That independence
+    /// is the whole reason this is a list of buckets rather than one list of
+    /// candidates.
+    pub buckets: Vec<RetentionBucket>,
+    /// The `SnapshotPolicy` the plan was computed from.
+    pub policy: PolicyRef,
+    /// RFC3339 timestamp the plan was computed at. GFS verdicts move as time
+    /// passes, so a plan is an answer about a moment.
+    pub computed_at: String,
+    /// True when the policy configures no retention at all.
+    ///
+    /// Nothing is pruned by GFS in that case — the operator only runs a
+    /// selection when a retention policy exists — so every candidate is reported
+    /// `kept: true` with no `rules`. Rendering an unbounded plan as "everything
+    /// will be deleted" (which is what running an empty policy through the
+    /// selection kernel would literally say) is the exact inversion this flag
+    /// exists to prevent.
+    pub unbounded: bool,
+}
+
+/// One retention bucket and the snapshots competing inside it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionBucket {
+    /// The bucket key the controller groups by: the backup source, plus the
+    /// pinned repository while the policy is multi-repo. Empty for an un-fanned,
+    /// single-repository policy, which has exactly one bucket.
+    ///
+    /// Opaque — a join key and a grouping label, not a path to parse.
+    pub key: String,
+    /// The bucket's candidates, newest first, ties broken by name — the same
+    /// order the selection kernel walks them in.
+    pub candidates: Vec<RetentionCandidate>,
+}
+
+/// One snapshot's place in its retention bucket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionCandidate {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// The end time GFS buckets on: `status.timing.endTime`, falling back to
+    /// `metadata.creationTimestamp`. Never absent — a row with neither is not in
+    /// the GFS population and so is not a candidate at all.
+    pub end_time: String,
+    /// True when today's selection keeps this snapshot.
+    pub kept: bool,
+    /// Which rules hold it and in which slot, e.g. `keepDaily slot 3`; `pinned`
+    /// alone for a pin. Empty when it is pruned. Same strings as
+    /// [`RetentionPreview::reasons`].
+    pub rules: Vec<String>,
+    /// `spec.pin` — exempt from GFS pruning entirely.
+    ///
+    /// The *spec*, which is what the prune reads. During an unpin, `status.pinned`
+    /// still says `true` and reporting that would promise a keep the next prune
+    /// will not honour.
+    pub pinned: bool,
+    /// True for the snapshot the request was about, so the SPA can highlight its
+    /// row among its competitors.
+    pub subject: bool,
 }
 
 /// Why a run failed, in the terms the operator's own error classification uses.
@@ -686,6 +804,87 @@ pub struct RestoreRow {
     pub claims: Vec<RestoreClaimView>,
 }
 
+/// Everything the restore detail screen shows.
+///
+/// # What is deliberately not here
+///
+/// **A progress percentage.** `Restore.status.progress` carries
+/// `bytesRestored`/`filesRestored` and no total to divide by, so there is
+/// nothing to compute one from; the two counters already ride
+/// [`RestoreRow`]. A `percent` field would have to be invented, and a restore
+/// that showed a fabricated "80%" is worse than one that shows bytes.
+///
+/// **Per-claim byte counts.** `RestoreClaimStatus` records a phase and a
+/// message, not counters, so a populator fan-out's progress is per-claim
+/// *state* — which is what [`RestoreClaimView`] already carries on the row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreDetail {
+    /// The same fields the table row shows, the per-claim rows included.
+    pub row: RestoreRow,
+    /// `status.resolved` — what the source was pinned to at admission.
+    ///
+    /// Absent until resolution runs. A restore never re-resolves, so this is
+    /// what the run will actually read, not what the spec asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<RestoreSourceView>,
+    /// `status.target` — where the data is actually being written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RestoreTargetView>,
+    /// `status.conditions`.
+    pub conditions: Vec<ConditionView>,
+    /// Failure detail, present when the run failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureView>,
+    /// Last lines of the mover Job's log, redacted. Empty when the run wrote
+    /// none.
+    pub log_tail: Vec<String>,
+}
+
+/// `Restore.status.resolved` — the source pinned at admission.
+///
+/// The two fields the row already carries (the repository and the kopia
+/// manifest id) are not repeated here: one value, one place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreSourceView {
+    /// `Snapshot` when the source resolved to a kopia snapshot, `NoSnapshot`
+    /// when it matched none and `onMissingSnapshot: Continue` chose an empty
+    /// volume — which is a *successful* restore of nothing, not a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// The concrete `Snapshot` resource the source resolved to, when there is
+    /// one to navigate to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotRefView>,
+    /// RFC3339 timestamp the source was pinned at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<String>,
+    /// The resolved kopia identity (`user@host:/path`) the data is read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+/// `Restore.status.target` — the PVC the data lands in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreTargetView {
+    /// Name of the `PersistentVolumeClaim` actually written to, created or
+    /// pre-existing.
+    ///
+    /// A name rather than a reference: the controller writes this claim without
+    /// a namespace because a restore only ever writes into its own, which is
+    /// `RestoreDetail.row.namespace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc: Option<String>,
+    /// The populator handshake's prime PVC, for a `target.populator` restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_prime: Option<String>,
+}
+
 /// Per-PVC progress within one restore.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -838,6 +1037,26 @@ pub struct SnapshotReplicationRow {
     /// Snapshots the last run pruned from the destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pruned: Option<u32>,
+}
+
+/// Both replication tables, as `GET /api/v1/replications` answers them.
+///
+/// The two kinds copy different things — one syncs a repository's blobs to a
+/// bare backend, the other migrates selected snapshots between repository CRs —
+/// so they keep separate row types and are returned side by side rather than
+/// forced into a shared shape that would fit neither.
+///
+/// Lives here rather than in the server crate even though it is an envelope: a
+/// wire type declared next to its handler is a type `export_all` never emits,
+/// and the SPA is forbidden from hand-writing a shape the server owns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReplicationsView {
+    /// Whole-repository blob syncs.
+    pub repository: Vec<RepositoryReplicationRow>,
+    /// Snapshot-level copies between repositories.
+    pub snapshot: Vec<SnapshotReplicationRow>,
 }
 
 /// One check from the doctor report.
@@ -1001,6 +1220,27 @@ pub struct SessionInfo {
     /// RFC3339 timestamp of when the session will be reaped if left idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// The largest single file `GET …/file` will stream, in bytes, as this
+    /// deployment is configured (`KOPIUR_UI_MAX_DOWNLOAD_BYTES`).
+    ///
+    /// Published so the file table can disable an oversized entry *with the
+    /// reason* before the user clicks. This is a second gate, not the gate: the
+    /// server still refuses an oversized download with a `413`
+    /// `download-too-large`. But a download is a top-level navigation, so that
+    /// refusal is rendered by the browser as a tab full of JSON — the SPA never
+    /// sees it and cannot turn it into a message.
+    ///
+    /// A `DirEntryView.size` of `null` means kopia reported no size, which is
+    /// the `422` `download-size-unknown` case: not comparable against this, and
+    /// not the same as zero.
+    pub download_max_bytes: i64,
+    /// The largest kopia JSON manifest the server will buffer while walking the
+    /// snapshot, in bytes (`KOPIUR_UI_MAX_MANIFEST_BYTES`).
+    ///
+    /// This is what a `422` `directory-too-large` / `catalog-too-large` is
+    /// measured against — a *listing* bound, not a download bound — so the SPA
+    /// can explain a refused directory rather than reporting it as empty.
+    pub manifest_max_bytes: i64,
 }
 
 /// What a mutating action created, returned so the SPA can navigate straight to

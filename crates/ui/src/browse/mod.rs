@@ -57,12 +57,13 @@ use kopiur_ui_model::requests::SessionCreateBody;
 use kopiur_ui_model::views::{DirEntryView, DirListing, EntryKind, SessionInfo};
 
 use crate::AppState;
+use crate::api::RepositoryKindPath;
 use crate::api::problem::{ApiError, problem};
 use crate::auth::csrf::require_same_site_navigation;
 use crate::auth::identity::Identity;
 use crate::auth::redact::redact_text;
 use crate::auth::{CurrentIdentity, mutation_guard};
-use crate::config::{FIELD_MANAGER, UiConfig};
+use crate::config::{FIELD_MANAGER, UiConfig, WireLimits};
 
 use self::session_pool::{SessionKey, session_info};
 
@@ -260,7 +261,11 @@ async fn create_session(
         app.metrics.inc_session_started();
     }
 
-    let mut info = session_info(&attached.job, attached.reused);
+    let mut info = session_info(
+        &attached.job,
+        attached.reused,
+        WireLimits::from_config(&app.cfg),
+    );
     info.pod = Some(attached.session.pod.clone());
     Ok((StatusCode::CREATED, Json(info)).into_response())
 }
@@ -280,7 +285,11 @@ async fn get_session(
     let ctx = ops_ctx(&app, &identity, &namespace)?;
     let target = resolve_target(&app.cfg, &ctx, &namespace, &name).await?;
     match find_live_job(&ctx, &target).await? {
-        Some(job) => Ok(Json(session_info(&job, true))),
+        Some(job) => Ok(Json(session_info(
+            &job,
+            true,
+            WireLimits::from_config(&app.cfg),
+        ))),
         None => Err(no_session(404, &namespace, &name)),
     }
 }
@@ -405,7 +414,7 @@ async fn tree(
         total: listing.total,
         offset: query.offset,
         limit,
-        session: session_info(&live.job, true),
+        session: session_info(&live.job, true, WireLimits::from_config(&app.cfg)),
     }))
 }
 
@@ -1095,22 +1104,29 @@ fn parse_session_body(body: &[u8]) -> Result<SessionCreateBody, ApiError> {
     })
 }
 
-/// `Repository` or `ClusterRepository` from the path segment, case-insensitively.
+/// `Repository` or `ClusterRepository` from the path segment.
+///
+/// [`RepositoryKindPath::parse`] and nothing else: this route and
+/// `GET /api/v1/repositories/{kind}/{name}` take the same segment out of the
+/// same URL shape, and this one used to reject the kebab `cluster-repository`
+/// that one requires — so a repository row could link to a detail screen and
+/// then fail to end the session it showed there.
 fn parse_repository_kind(kind: &str) -> Result<RepositoryKind, ApiError> {
-    if kind.eq_ignore_ascii_case("repository") {
-        Ok(RepositoryKind::Repository)
-    } else if kind.eq_ignore_ascii_case("clusterrepository") {
-        Ok(RepositoryKind::ClusterRepository)
-    } else {
-        Err(problem(
-            400,
-            "invalid",
-            format!("{kind:?} is not a repository kind."),
-            "Kopiur has two: the namespaced Repository and the cluster-scoped \
-             ClusterRepository.",
-            "use Repository or ClusterRepository in the URL",
-        ))
-    }
+    RepositoryKindPath::parse(kind)
+        .map(RepositoryKindPath::kind)
+        .ok_or_else(|| {
+            problem(
+                400,
+                "invalid",
+                format!("{kind:?} is not a repository kind."),
+                "Kopiur has two: the namespaced Repository and the cluster-scoped \
+                 ClusterRepository.",
+                format!(
+                    "use one of {} in the URL (any case)",
+                    RepositoryKindPath::accepted_spellings()
+                ),
+            )
+        })
 }
 
 /// A namespaced `Repository` needs its namespace named.
@@ -1732,21 +1748,36 @@ mod tests {
         assert_eq!(error.status(), 400);
     }
 
+    /// This route and `GET /api/v1/repositories/{kind}/{name}` take the same
+    /// segment, so both must accept the same set — including the kebab
+    /// `cluster-repository` this parser used to reject, which is the spelling
+    /// the read route's own links carry.
     #[test]
-    fn the_repository_kind_in_a_url_is_one_of_two_names() {
-        assert_eq!(
-            parse_repository_kind("Repository").expect("kind"),
-            RepositoryKind::Repository
-        );
-        assert_eq!(
-            parse_repository_kind("clusterrepository").expect("kind"),
-            RepositoryKind::ClusterRepository
-        );
+    fn the_repository_kind_in_a_url_takes_every_spelling_the_read_route_does() {
+        for spelling in ["repository", "Repository", "REPOSITORY"] {
+            assert_eq!(
+                parse_repository_kind(spelling).expect("kind"),
+                RepositoryKind::Repository,
+                "{spelling}"
+            );
+        }
+        for spelling in [
+            "cluster-repository",
+            "clusterrepository",
+            "ClusterRepository",
+            "Cluster-Repository",
+        ] {
+            assert_eq!(
+                parse_repository_kind(spelling).expect("kind"),
+                RepositoryKind::ClusterRepository,
+                "{spelling}"
+            );
+        }
         let error = parse_repository_kind("Secret").expect_err("not a repository kind");
         assert_eq!(error.status(), 400);
         assert!(
-            error.0.fix.contains("ClusterRepository"),
-            "{:?}",
+            error.0.fix.contains("cluster-repository"),
+            "the remedy names the canonical segment: {:?}",
             error.0.fix
         );
     }

@@ -750,7 +750,18 @@ async fn deletion_hold_note(api: &Api<Snapshot>, name: &str) -> Option<String> {
             return None;
         }
     };
+    hold_note(&snapshot)
+}
 
+/// **Pure.** The note for a `Snapshot` the mass-deletion breaker is holding.
+///
+/// Split from the re-read so the *decision* is fixture-testable: this string is
+/// what the SPA renders as the answer to "the snapshot is still there, why?",
+/// and a receipt that lost it would leave a `202` looking like a completed
+/// deletion. The condition is [`DELETION_HELD_CONDITION`] at `True` — the same
+/// condition the controller writes and `kubectl kopiur` reads, not a second
+/// opinion about what "held" means.
+fn hold_note(snapshot: &Snapshot) -> Option<String> {
     let held = snapshot
         .status
         .as_ref()
@@ -1943,6 +1954,93 @@ mod tests {
         assert!(
             !resumed.contains("namespace"),
             "a cluster-scoped object has no namespace to name: {resumed}"
+        );
+    }
+
+    /// The delete receipt's `note` is the SPA's answer to "I deleted it, why is
+    /// it still there?". A `DELETE` answers `202` whether or not the breaker is
+    /// holding, so a receipt that lost this string would leave the UI saying
+    /// "deleted" about a snapshot that is very much not gone.
+    #[test]
+    fn the_delete_receipt_carries_the_mass_deletion_breaker_text_when_it_holds() {
+        let held: Snapshot = kopiur_api::testutil::from_yaml(&format!(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata: {{ name: nightly-1, namespace: media }}
+spec: {{}}
+status:
+  phase: Deleting
+  conditions:
+    - type: {DELETION_HELD_CONDITION}
+      status: "True"
+      reason: MassDeletionThresholdExceeded
+      message: "37 snapshots would be deleted; the threshold is 10"
+      lastTransitionTime: "2026-09-08T12:00:00Z"
+"#
+        ));
+        let note = hold_note(&held).expect("a held deletion must explain itself");
+        assert!(
+            note.contains("mass-deletion breaker"),
+            "the note must name the thing that is holding it: {note}"
+        );
+        assert!(
+            note.contains("allow-mass-deletion"),
+            "and the annotation that releases it: {note}"
+        );
+
+        // The receipt is what the SPA actually reads, so assert the shape it
+        // lands in — a 202 whose `created` is empty and whose `note` explains.
+        let receipt = ActionReceipt {
+            kind: "Snapshot".to_string(),
+            created: Vec::new(),
+            requested_at: None,
+            note: Some(note),
+        };
+        let body = serde_json::to_value(&receipt).expect("a receipt serializes");
+        assert!(
+            body["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("allow-mass-deletion")),
+            "{body}"
+        );
+    }
+
+    /// An ABSENT note means nothing at all — see `delete_snapshot`'s own docs.
+    /// It is not evidence the snapshot is unheld, so these two fixtures assert
+    /// only that nothing is *invented*.
+    #[test]
+    fn a_snapshot_with_no_hold_condition_gets_no_note() {
+        let unheld: Snapshot = kopiur_api::testutil::from_yaml(&format!(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata: {{ name: nightly-1, namespace: media }}
+spec: {{}}
+status:
+  phase: Deleting
+  conditions:
+    - type: {DELETION_HELD_CONDITION}
+      status: "False"
+      reason: BelowThreshold
+      message: ""
+      lastTransitionTime: "2026-09-08T12:00:00Z"
+"#
+        ));
+        assert_eq!(hold_note(&unheld), None, "the breaker is not holding");
+
+        let bare: Snapshot = kopiur_api::testutil::from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata: { name: nightly-1, namespace: media }
+spec: {}
+"#,
+        );
+        assert_eq!(
+            hold_note(&bare),
+            None,
+            "a status the controller has not written yet says nothing either way"
         );
     }
 

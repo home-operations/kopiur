@@ -17,12 +17,14 @@ use serde::Deserialize;
 use std::time::Duration;
 
 use kopiur_ops::doctor::{DoctorCheck, DoctorParams, DoctorReport, Outcome, run_all};
+use kopiur_ops::{OpsCtx, Scope};
 use kopiur_ui_model::views::{DoctorCheckView, DoctorReportView};
 
 use crate::AppState;
 use crate::api::problem::{ApiError, problem};
 use crate::api::{UiQuery, client_for, ops_ctx};
 use crate::auth::CurrentIdentity;
+use crate::config::UiConfig;
 
 /// How long a `Snapshot`/`Restore` may sit non-terminal before doctor calls it
 /// stuck, when the caller does not say. Matches the CLI's own default.
@@ -38,9 +40,15 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/doctor", get(handler))
 }
 
-/// The two windows doctor's verdicts depend on.
+/// The two windows doctor's verdicts depend on, and the namespace to scope them
+/// to.
+///
+/// `deny_unknown_fields`: this query had no `namespace` and no denial, so
+/// `?namespace=media` was accepted and ignored — a selector that silently does
+/// nothing shows a green cluster while the namespace the user was actually
+/// asking about burns. Now it either scopes the run or is a 400.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DoctorQuery {
     /// Seconds a `Snapshot`/`Restore` may be non-terminal before it is stuck.
     #[serde(default)]
@@ -48,6 +56,44 @@ pub struct DoctorQuery {
     /// Seconds back a terminal failure still counts as current.
     #[serde(default)]
     pub failure_lookback: Option<u64>,
+    /// Restrict the checks that *can* be restricted to this namespace; absent
+    /// runs cluster-wide. See [`doctor_ctx`] for which checks it moves and which
+    /// stay installation-wide whatever this says.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+/// The context one doctor run reads through.
+///
+/// `?namespace=` narrows the run's **scope**, not its context namespace, and
+/// those are two different things here:
+///
+/// * **Scoped by `namespace`** — every check that lists objects:
+///   `repositories-ready` and `credentials-present` (both off `list_repos`),
+///   `snapshot-replications`, `no-stuck-work` and `recent-failures` (both off
+///   `list_work`), and `recent-warnings` (Events).
+/// * **Installation-wide whatever `namespace` says** — `crds-installed` (CRDs
+///   are cluster-scoped objects), `controller-running` and `webhook-running`
+///   (the operator's own Deployments, found by `operator_namespace`), and
+///   `webhook-admits`.
+///
+/// `webhook-admits` is why this is not simply `ops_ctx(cfg, client, namespace)`:
+/// it dry-run-applies a `SnapshotPolicy` into `ctx.namespace` to see whether the
+/// admission webhook answers. Moving that into the caller's namespace would make
+/// a user without `create` there see "the webhook is not admitting" — a red
+/// check about the installation, caused by their own RBAC. So the scope moves
+/// and the namespace does not.
+fn doctor_ctx(cfg: &UiConfig, client: kube::Client, namespace: Option<&str>) -> OpsCtx {
+    scoped_for(ops_ctx(cfg, client, None), namespace)
+}
+
+/// **Pure.** Narrow a cluster-wide context to one namespace's *scope*, leaving
+/// its `namespace` — the operator's — alone. See [`doctor_ctx`].
+fn scoped_for(mut ctx: OpsCtx, namespace: Option<&str>) -> OpsCtx {
+    if let Some(ns) = namespace {
+        ctx.scope = Scope::Namespace(ns.to_string());
+    }
+    ctx
 }
 
 /// **Pure.** The stable identifier for one check — its variant name in
@@ -135,7 +181,7 @@ fn window(value: Option<u64>, default: Duration, field: &str) -> Result<Duration
     }
 }
 
-/// `GET /api/v1/doctor?stuckThreshold=&failureLookback=`
+/// `GET /api/v1/doctor?stuckThreshold=&failureLookback=&namespace=`
 async fn handler(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
@@ -154,9 +200,10 @@ async fn handler(
     };
 
     let client = client_for(&app, &id)?;
-    // Cluster-wide: doctor's question is about the whole installation, and a
-    // caller who may not see part of it gets that check degraded to a Warn.
-    let ctx = ops_ctx(&app.cfg, client, None);
+    // Cluster-wide unless the caller narrowed it: doctor's question is about the
+    // whole installation, and a caller who may not see part of it gets that
+    // check degraded to a Warn rather than an error.
+    let ctx = doctor_ctx(&app.cfg, client, q.namespace.as_deref());
     let now = Utc::now();
     let report = run_all(&ctx, &params, now).await;
     Ok(Json(view_report(&report, &now.to_rfc3339())))
@@ -166,6 +213,45 @@ async fn handler(
 mod tests {
     use super::*;
     use kopiur_ops::doctor::CheckResult;
+
+    /// A context pointed at a closed port: nothing here makes a request, and a
+    /// test that accidentally did would fail loudly rather than pass for the
+    /// wrong reason.
+    fn cluster_wide_ctx() -> OpsCtx {
+        OpsCtx {
+            client: kube::Client::try_from(kube::Config::new(
+                "http://127.0.0.1:1/".parse().expect("a literal URL parses"),
+            ))
+            .expect("a Config with no auth builds a Client"),
+            namespace: "kopiur-system".to_string(),
+            scope: Scope::All,
+            field_manager: crate::config::FIELD_MANAGER.to_string(),
+        }
+    }
+
+    /// `?namespace=` moves the SCOPE and nothing else. Moving `ctx.namespace`
+    /// too would relocate the `webhook-admits` dry run into the caller's
+    /// namespace, where their own missing `create` would read as a broken
+    /// webhook.
+    #[tokio::test]
+    async fn a_doctor_namespace_narrows_the_scope_and_leaves_the_operator_namespace() {
+        let scoped = scoped_for(cluster_wide_ctx(), Some("media"));
+        assert_eq!(scoped.scope, Scope::Namespace("media".to_string()));
+        assert_eq!(
+            scoped.namespace, "kopiur-system",
+            "the webhook dry run must stay where the operator runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_doctor_namespace_stays_cluster_wide() {
+        let unscoped = scoped_for(cluster_wide_ctx(), None);
+        assert_eq!(
+            unscoped.scope,
+            Scope::All,
+            "absent means the whole installation, never the operator's namespace"
+        );
+    }
 
     #[test]
     fn a_check_id_is_its_variant_name_in_kebab_case() {

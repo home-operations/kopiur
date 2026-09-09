@@ -37,8 +37,8 @@ use kopiur_ops::snapshots::{
     resolve_repo_filter_for, sort_key,
 };
 use kopiur_ui_model::views::{
-    FailureView, Lineage, Page, RetentionPreview, SnapshotDetail, SnapshotRefView, SnapshotRow,
-    SnapshotStatsView,
+    FailureView, Lineage, Page, PolicyRef, RetentionBucket, RetentionCandidate, RetentionPlan,
+    RetentionPreview, SnapshotDetail, SnapshotRefView, SnapshotRow, SnapshotStatsView,
 };
 
 use crate::AppState;
@@ -61,11 +61,17 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/snapshots", get(list))
         .route("/snapshots/{namespace}/{name}", get(detail))
+        .route("/snapshots/{namespace}/{name}/retention", get(retention))
 }
 
 /// The snapshot table's query string.
+///
+/// `deny_unknown_fields`: with nine optional parameters, a mistyped one is the
+/// likeliest mistake a caller makes, and silently ignoring it would return a
+/// wider set than was asked for — a snapshots table showing another
+/// repository's rows under this repository's heading.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotQuery {
     /// Only snapshots in this repository.
     #[serde(default)]
@@ -268,7 +274,7 @@ fn stats_view(stats: &kopiur_api::snapshot::SnapshotStats) -> SnapshotStatsView 
 }
 
 /// **Pure.** Structured failure detail, with kopia's own text redacted.
-fn failure_view(f: &kopiur_api::common::FailureBlock) -> FailureView {
+pub fn failure_view(f: &kopiur_api::common::FailureBlock) -> FailureView {
     FailureView {
         kopia_error_class: Some(f.kopia_error_class.clone()),
         message: Some(redact_text(&f.message)),
@@ -375,17 +381,53 @@ pub fn view_retention_preview(
 
     let kept = select_kept(bucket, retention).keep.contains(&target);
 
-    let mut reasons = Vec::new();
-    if snap.spec.pin {
-        reasons.push("pinned".to_string());
-    }
-    // Rule attribution re-runs the selection over the same bucket with one rule
-    // enabled at a time. GFS buckets are a union, so a single-rule run answers
-    // "would THIS rule alone have kept it" exactly, with no second
-    // implementation of the bucketing to drift. Pins are dropped for the
-    // attribution runs only: a pinned row lands in `keep` whatever the rule
-    // says, so leaving them in would credit every configured rule with a keep it
-    // did not make.
+    let mut attribution = bucket_rules(bucket, retention);
+    // A pin keeps a snapshot no bucket selected, so `pinned` alone is a
+    // complete reason; every other kept snapshot has at least one rule.
+    Some(RetentionPreview {
+        kept,
+        reasons: attribution.remove(&target).unwrap_or_default(),
+        computed_at: now.to_rfc3339(),
+    })
+}
+
+/// **Pure.** Which rules hold each row of one bucket, and in which slot.
+///
+/// Keyed by CR name — the id the prune works in — and in the policy's own rule
+/// order (`keepLatest`, `keepHourly`, `keepDaily`, …) so two rows' reason lists
+/// read the same way.
+///
+/// # Why one pass per rule rather than one pass per row
+///
+/// Attribution re-runs the selection over the same bucket with one rule enabled
+/// at a time: GFS buckets are a union, so a single-rule run answers "would THIS
+/// rule alone have kept it" exactly, with no second implementation of the
+/// bucketing to drift from `select_kept`. Running that per row would be O(rules
+/// × rows²) on a bucket that can hold thousands of snapshots; running it once
+/// per rule and reading each row's *position* out of the result is O(rules ×
+/// rows log rows) and gives the slot for free.
+///
+/// The slot is that position, 1-based, in the rule's newest-first keep list —
+/// `keepDaily slot 3` is the third-newest day `keepDaily` holds. That is the
+/// number a user needs: it says how close a restore point is to ageing out,
+/// which a bare rule name does not.
+///
+/// # Pins are dropped for the attribution runs
+///
+/// A pinned row lands in `keep` whatever the rule says, so leaving pins in would
+/// credit every configured rule with a keep it did not make, and would shift
+/// every other row's slot number. `pinned` is prepended as its own reason
+/// instead — an exemption from bucketing, not a slot in a bucket.
+pub fn bucket_rules(
+    bucket: &[SnapshotRetentionView],
+    retention: &kopiur_api::common::Retention,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = bucket
+        .iter()
+        .filter(|v| v.pinned)
+        .map(|v| (v.name.clone(), vec!["pinned".to_string()]))
+        .collect();
+
     let unpinned: Vec<SnapshotRetentionView> = bucket
         .iter()
         .map(|v| SnapshotRetentionView {
@@ -395,16 +437,106 @@ pub fn view_retention_preview(
         })
         .collect();
     for (name, only) in single_rule_policies(retention) {
-        if select_kept(&unpinned, &only).keep.contains(&target) {
-            reasons.push(name.to_string());
+        // `keep` is newest-first, so the index IS the slot.
+        for (slot, id) in select_kept(&unpinned, &only).keep.iter().enumerate() {
+            out.entry(id.clone())
+                .or_default()
+                .push(format!("{name} slot {}", slot + 1));
         }
     }
-    // A pin keeps a snapshot no bucket selected, so `pinned` alone is a
-    // complete reason; every other kept snapshot has at least one rule.
-    Some(RetentionPreview {
-        kept,
-        reasons,
+    out
+}
+
+/// **Pure.** Every snapshot competing for the same buckets as `snap`, with the
+/// verdict today's selection gives each.
+///
+/// The population, the bucketing and the selection are all the prune's own — see
+/// [`view_retention_preview`] for why sharing them is the whole point — and this
+/// simply reports EVERY bucket rather than only the subject's, because the
+/// screen it feeds is "which snapshots will this policy keep", not "will it keep
+/// this one".
+///
+/// `namespace` is the namespace the population was listed in, which every
+/// candidate shares: peers are the policy's own children, minted beside it.
+///
+/// `None` when `snap` is not in the GFS population at all (a `Pending`,
+/// `Failed`, `Unchanged` or `Deleting` row, or one with no controller-written
+/// provenance). The subject has to be in the set for the plan to be *about* it;
+/// answering with a plan it does not appear in would read as "your snapshot is
+/// being pruned".
+pub fn view_retention_plan(
+    snap: &Snapshot,
+    namespace: &str,
+    policy: &SnapshotPolicy,
+    peers: &[Arc<Snapshot>],
+    now: DateTime<Utc>,
+) -> Option<RetentionPlan> {
+    let target = snap.metadata.name.clone()?;
+    retention_view(snap)?;
+
+    let policy_is_multi = is_multi_repo(&policy.spec);
+    let mut population: Vec<&Snapshot> = peers
+        .iter()
+        .map(Arc::as_ref)
+        .filter(|p| p.metadata.name.as_deref() != Some(target.as_str()))
+        .collect();
+    population.push(snap);
+
+    // An absent `spec.retention` is not "prune everything": the operator only
+    // runs a selection when retention is configured, so the honest plan is every
+    // candidate kept, flagged `unbounded` so the SPA can say why.
+    let retention = policy.spec.retention.clone().unwrap_or_default();
+    let unbounded = policy.spec.retention.is_none();
+
+    let buckets = retention_buckets(&population, policy_is_multi)
+        .into_iter()
+        .map(|(key, mut rows)| {
+            // The selection kernel's own order: newest first, ties broken by id.
+            rows.sort_by(|a, b| {
+                b.end_time
+                    .cmp(&a.end_time)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            let kept: std::collections::BTreeSet<String> = if unbounded {
+                rows.iter().map(|v| v.name.clone()).collect()
+            } else {
+                select_kept(&rows, &retention).keep.into_iter().collect()
+            };
+            let mut rules = if unbounded {
+                std::collections::BTreeMap::new()
+            } else {
+                bucket_rules(&rows, &retention)
+            };
+            RetentionBucket {
+                candidates: rows
+                    .into_iter()
+                    .map(|v| RetentionCandidate {
+                        kept: kept.contains(&v.name),
+                        rules: rules.remove(&v.name).unwrap_or_default(),
+                        subject: v.name == target,
+                        end_time: v.end_time.to_rfc3339(),
+                        pinned: v.pinned,
+                        namespace: namespace.to_string(),
+                        name: v.name,
+                    })
+                    .collect(),
+                key,
+            }
+        })
+        .collect();
+
+    Some(RetentionPlan {
+        buckets,
+        policy: PolicyRef {
+            namespace: policy
+                .metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| namespace.to_string()),
+            name: policy.metadata.name.clone().unwrap_or_default(),
+        },
         computed_at: now.to_rfc3339(),
+        unbounded,
     })
 }
 
@@ -715,6 +847,101 @@ async fn detail(
         &peers,
         Utc::now(),
     )))
+}
+
+/// `GET /api/v1/snapshots/{namespace}/{name}/retention`
+///
+/// The whole bucket, not one verdict: which snapshots this policy will keep and
+/// which it will prune. Its own route rather than a field on the detail because
+/// it is a different question with a different cost — a fan-out policy's plan is
+/// every child of the policy, and the detail screen should not pay for it on
+/// every open.
+async fn retention(
+    State(app): State<AppState>,
+    CurrentIdentity(id): CurrentIdentity,
+    UiPath((namespace, name)): UiPath<(String, String)>,
+) -> Result<Json<RetentionPlan>, ApiError> {
+    let client = client_for(&app, &id)?;
+    let snap = app
+        .source
+        .get::<Snapshot>(&id, &client, Some(&namespace), &name)
+        .await?
+        .ok_or_else(|| snapshot_not_found(&namespace, &name))?;
+
+    let policy = resolve_policy(&app, &id, &client, &snap, &namespace)
+        .await?
+        .ok_or_else(|| no_governing_policy(&snap, &namespace, &name))?;
+
+    // The same population the detail's preview uses, which is the same one the
+    // operator's prune uses: every snapshot carrying this policy's config label,
+    // in the snapshot's own namespace.
+    let policy_name = policy.metadata.name.clone().unwrap_or_default();
+    let peers: Vec<Arc<Snapshot>> = app
+        .source
+        .list::<Snapshot>(&id, &client, Some(&namespace))
+        .await?
+        .iter()
+        .filter(|s| policy_of(s) == Some(policy_name.as_str()))
+        .cloned()
+        .collect();
+
+    view_retention_plan(&snap, &namespace, &policy, &peers, Utc::now())
+        .map(Json)
+        .ok_or_else(|| not_retention_governed(&snap, &namespace, &name))
+}
+
+/// The 422 for a snapshot no `SnapshotPolicy` governs, or whose policy this
+/// caller cannot read.
+///
+/// Two causes, one status, deliberately different text: "this snapshot has no
+/// recipe" and "you cannot see its recipe" send a user to two different places.
+fn no_governing_policy(snap: &Snapshot, namespace: &str, name: &str) -> ApiError {
+    match snap.spec.policy_ref.as_ref() {
+        None => problem(
+            422,
+            "no-retention-policy",
+            format!("Snapshot {namespace}/{name} is not governed by a SnapshotPolicy."),
+            "GFS retention is configured on a SnapshotPolicy, and this snapshot names none — a \
+             discovered or hand-written snapshot is bounded by the catalog or by whoever made \
+             it, not by a retention plan.",
+            "look at the repository's catalog settings instead, or set spec.policyRef if this \
+             snapshot should be governed by a policy",
+        ),
+        Some(policy_ref) => problem(
+            422,
+            "no-retention-policy",
+            format!(
+                "The SnapshotPolicy {} that governs {namespace}/{name} could not be read.",
+                policy_ref.name
+            ),
+            "The plan is computed from the policy's retention rules, and this request cannot see \
+             them — the policy was deleted, or reading SnapshotPolicy in that namespace is not \
+             granted to you.",
+            "ask for `get` on snapshotpolicies in that namespace, or check whether the policy \
+             still exists",
+        ),
+    }
+}
+
+/// The 422 for a snapshot the prune does not evaluate at all.
+fn not_retention_governed(snap: &Snapshot, namespace: &str, name: &str) -> ApiError {
+    use kopiur_api::common::PhaseLabel as _;
+    let phase = snap
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_ref())
+        .map(|p| p.label().to_string())
+        .unwrap_or_else(|| "unreconciled".to_string());
+    problem(
+        422,
+        "not-retention-governed",
+        format!("Snapshot {namespace}/{name} is {phase}, so GFS retention does not evaluate it."),
+        "Only a succeeded snapshot carrying a controller-written kopia manifest competes for a \
+         retention slot; a pending, running, failed, deduplicated or deleting row is bounded by \
+         something else and has no place in a bucket.",
+        "open the retention plan from a succeeded snapshot of the same policy to see which \
+         restore points it keeps",
+    )
 }
 
 /// The `SnapshotPolicy` governing this snapshot, when it names one the caller can
@@ -1189,7 +1416,11 @@ spec:
 
         let kept = view_retention_preview(&d24, &policy, &peers, now).expect("a preview exists");
         assert!(kept.kept);
-        assert_eq!(kept.reasons, vec!["keepDaily"]);
+        assert_eq!(
+            kept.reasons,
+            vec!["keepDaily slot 1"],
+            "the newest of two kept days is slot 1 — the slot is how close it is to ageing out"
+        );
         assert!(kept.computed_at.starts_with("2026-05-24T12:00:00"));
 
         let pruned = view_retention_preview(&d22, &policy, &peers, now).unwrap();
@@ -1300,6 +1531,291 @@ spec:
                 .unwrap()
                 .kept,
             "one source's extra day must not evict another source's"
+        );
+    }
+
+    /// The plan groups the way the prune groups: seven PVCs are seven buckets,
+    /// and the snapshot asked about appears in exactly one of them.
+    ///
+    /// A plan that flattened the population would show every restore point
+    /// competing with every other, which is the #346 lie one screen up: 42 of
+    /// these 49 would read as "will be pruned".
+    #[test]
+    fn a_fanout_plan_is_one_bucket_per_source_and_the_subject_sits_in_exactly_one() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources:
+    - pvcSelector: { labelSelector: { matchLabels: { backup: "yes" } } }
+  retention: { keepDaily: 7 }
+"#,
+        );
+        let pvcs = [
+            "data-0", "data-1", "data-2", "data-3", "data-4", "data-5", "data-6",
+        ];
+        let days = [18, 19, 20, 21, 22, 23, 24];
+        let population: Vec<Arc<Snapshot>> = pvcs
+            .iter()
+            .flat_map(|pvc| days.iter().map(move |d| fanout_run(pvc, *d)))
+            .collect();
+        let now = DateTime::parse_from_rfc3339("2026-05-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let subject = &population[0]; // data-0, day 18
+        let plan = view_retention_plan(subject, "media", &policy, &population, now)
+            .expect("a succeeded child of the policy has a plan");
+
+        assert_eq!(
+            plan.buckets.len(),
+            7,
+            "one bucket per backup source, exactly as the prune splits them: {:?}",
+            plan.buckets.iter().map(|b| &b.key).collect::<Vec<_>>()
+        );
+        assert!(!plan.unbounded, "the policy configures keepDaily");
+        assert_eq!(plan.policy.name, "nightly");
+        assert_eq!(plan.policy.namespace, "media");
+
+        let subject_rows: Vec<&RetentionCandidate> = plan
+            .buckets
+            .iter()
+            .flat_map(|b| b.candidates.iter())
+            .filter(|c| c.subject)
+            .collect();
+        assert_eq!(
+            subject_rows.len(),
+            1,
+            "the snapshot asked about competes in one bucket and appears in one row"
+        );
+        assert_eq!(subject_rows[0].name, subject.metadata.name.clone().unwrap());
+        assert_eq!(subject_rows[0].namespace, "media");
+
+        // Every bucket holds that source's seven days, all kept, newest first.
+        for bucket in &plan.buckets {
+            assert_eq!(bucket.candidates.len(), 7, "bucket {}", bucket.key);
+            assert!(
+                bucket.candidates.iter().all(|c| c.kept),
+                "keepDaily: 7 keeps all seven days of each source: {}",
+                bucket.key
+            );
+            let times: Vec<&str> = bucket
+                .candidates
+                .iter()
+                .map(|c| c.end_time.as_str())
+                .collect();
+            let mut newest_first = times.clone();
+            newest_first.sort_by(|a, b| b.cmp(a));
+            assert_eq!(times, newest_first, "candidates are newest-first");
+            assert_eq!(
+                bucket.candidates[0].rules,
+                vec!["keepDaily slot 1"],
+                "the newest of a bucket occupies its rule's first slot"
+            );
+            assert_eq!(bucket.candidates[6].rules, vec!["keepDaily slot 7"]);
+        }
+    }
+
+    /// The row that falls out of its own source's window is reported pruned —
+    /// with no rules — while its siblings are untouched.
+    #[test]
+    fn a_plan_marks_the_row_past_the_window_as_pruned_with_no_rules() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 2 }
+"#,
+        );
+        let d24 = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        let d23 = nightly_run("d23", "2026-05-23T02:00:00Z", "Succeeded");
+        let d22 = nightly_run("d22", "2026-05-22T02:00:00Z", "Succeeded");
+        let peers = vec![d24.clone(), d23, d22];
+        let now = DateTime::parse_from_rfc3339("2026-05-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let plan = view_retention_plan(&d24, "media", &policy, &peers, now).expect("a plan");
+        assert_eq!(plan.buckets.len(), 1, "one source, one bucket");
+        let candidates = &plan.buckets[0].candidates;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| (c.name.as_str(), c.kept, c.rules.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("d24", true, vec!["keepDaily slot 1".to_string()]),
+                ("d23", true, vec!["keepDaily slot 2".to_string()]),
+                ("d22", false, Vec::new()),
+            ],
+            "the third-newest day falls outside keepDaily: 2 and carries no rule"
+        );
+        assert!(candidates.iter().all(|c| !c.pinned));
+        assert!(plan.computed_at.starts_with("2026-05-24T12:00:00"));
+    }
+
+    /// A policy with no retention prunes nothing, so every candidate is kept and
+    /// `unbounded` says why. Running an empty `Retention` through the selection
+    /// kernel would literally answer "delete all of them", which is the exact
+    /// inversion this branch exists to prevent.
+    #[test]
+    fn a_policy_with_no_retention_keeps_everything_and_says_it_is_unbounded() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+"#,
+        );
+        let d24 = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        let d22 = nightly_run("d22", "2026-05-22T02:00:00Z", "Succeeded");
+        let peers = vec![d24.clone(), d22];
+        let plan = view_retention_plan(&d24, "media", &policy, &peers, Utc::now())
+            .expect("an unbounded policy still has a population to show");
+
+        assert!(plan.unbounded);
+        let candidates = &plan.buckets[0].candidates;
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates.iter().all(|c| c.kept && c.rules.is_empty()),
+            "nothing is pruned by a policy that configures no retention, and no \
+             rule holds anything: {candidates:?}"
+        );
+    }
+
+    /// A pinned row is kept with `pinned` alone, and — crucially — its exemption
+    /// does not consume a slot its unpinned competitors would have had.
+    #[test]
+    fn a_plan_reports_a_pin_as_an_exemption_not_as_a_slot() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 1 }
+"#,
+        );
+        let newest = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        let old_pinned = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: keepme
+  namespace: media
+  labels: { "kopiur.home-operations.com/config": nightly }
+spec: { policyRef: { name: nightly }, pin: true }
+status:
+  phase: Succeeded
+  origin: manual
+  timing: { startTime: "2026-01-01T02:00:00Z", endTime: "2026-01-01T02:00:00Z" }
+  snapshot:
+    kopiaSnapshotID: k-keepme
+    identity: { username: kopiur, hostname: media, sourcePath: /data }
+"#,
+        );
+        let peers = vec![newest.clone(), old_pinned];
+        let plan = view_retention_plan(&newest, "media", &policy, &peers, Utc::now()).unwrap();
+        let candidates = &plan.buckets[0].candidates;
+
+        let pinned = candidates.iter().find(|c| c.name == "keepme").unwrap();
+        assert!(pinned.pinned);
+        assert!(pinned.kept);
+        assert_eq!(pinned.rules, vec!["pinned"]);
+
+        let newest_row = candidates.iter().find(|c| c.name == "d24").unwrap();
+        assert_eq!(
+            newest_row.rules,
+            vec!["keepDaily slot 1"],
+            "the pinned row is exempt from bucketing, so it must not shift the \
+             slot its competitors occupy"
+        );
+    }
+
+    /// A row the prune never evaluates has no plan, exactly as it has no
+    /// preview. Answering with a plan it does not appear in would read as
+    /// "your snapshot is being pruned".
+    #[test]
+    fn a_row_outside_the_gfs_population_has_no_plan() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 2 }
+"#,
+        );
+        let pending = nightly_run("running-1", "2026-05-24T02:00:00Z", "Running");
+        assert!(
+            view_retention_plan(
+                &pending,
+                "media",
+                &policy,
+                std::slice::from_ref(&pending),
+                Utc::now()
+            )
+            .is_none()
+        );
+        let problem = not_retention_governed(&pending, "media", "running-1");
+        assert_eq!(problem.0.status, 422);
+        assert_eq!(
+            problem.0.r#type,
+            "urn:kopiur:problem:not-retention-governed"
+        );
+        assert!(
+            problem.0.what.contains("Running"),
+            "the refusal names the phase that put it outside: {}",
+            problem.0.what
+        );
+        assert!(!problem.0.why.is_empty());
+        assert!(!problem.0.fix.is_empty());
+    }
+
+    /// Two causes for "no policy", two remedies. A user whose snapshot has no
+    /// recipe and a user who may not read the recipe go to different places.
+    #[test]
+    fn the_no_policy_refusal_distinguishes_absent_from_unreadable() {
+        let discovered = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata: { name: found-1, namespace: media }
+spec: {}
+status: { phase: Discovered }
+"#,
+        );
+        let absent = no_governing_policy(&discovered, "media", "found-1");
+        assert_eq!(absent.0.status, 422);
+        assert_eq!(absent.0.r#type, "urn:kopiur:problem:no-retention-policy");
+        assert!(absent.0.fix.contains("policyRef"), "{}", absent.0.fix);
+
+        let governed = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        let unreadable = no_governing_policy(&governed, "media", "d24");
+        assert!(
+            unreadable.0.what.contains("nightly"),
+            "the refusal names the policy it could not read: {}",
+            unreadable.0.what
+        );
+        assert!(
+            unreadable.0.fix.contains("snapshotpolicies"),
+            "the remedy names the grant that would fix it: {}",
+            unreadable.0.fix
         );
     }
 
@@ -1441,7 +1957,7 @@ status:
             view_retention_preview(&no_end, &policy, std::slice::from_ref(&no_end), Utc::now())
                 .expect("the prune evaluates this row, so the preview must too");
         assert!(preview.kept);
-        assert_eq!(preview.reasons, vec!["keepLatest"]);
+        assert_eq!(preview.reasons, vec!["keepLatest slot 1"]);
     }
 
     #[test]
@@ -1480,7 +1996,11 @@ status:
         let peers = vec![newest, old_pinned.clone()];
         let preview = view_retention_preview(&old_pinned, &policy, &peers, Utc::now()).unwrap();
         assert!(preview.kept, "a pin exempts a snapshot from GFS entirely");
-        assert_eq!(preview.reasons, vec!["pinned"]);
+        assert_eq!(
+            preview.reasons,
+            vec!["pinned"],
+            "a pin is an exemption from bucketing, so it carries no slot"
+        );
     }
 
     #[test]

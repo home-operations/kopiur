@@ -38,6 +38,7 @@ use crate::api::{
     covering_maintenances, gate_hits, ops_ctx, repo_phase_view,
 };
 use crate::auth::CurrentIdentity;
+use crate::config::WireLimits;
 
 /// This module's routes, relative to `/api/v1`.
 pub fn router() -> Router<AppState> {
@@ -49,7 +50,7 @@ pub fn router() -> Router<AppState> {
 /// The fields of a repository the two CRDs share, gathered so one projection can
 /// serve both without a trait.
 struct RepoFacts<'a> {
-    kind: &'static str,
+    kind: RepositoryKind,
     name: String,
     namespace: Option<String>,
     phase: Option<&'a RepositoryPhase>,
@@ -90,9 +91,17 @@ fn mode_label(mode: RepositoryMode) -> String {
 }
 
 /// **Pure.** The shared projection.
+///
+/// `kind` and `kind_path` are both derived from the one [`RepositoryKind`] on
+/// [`RepoFacts`], never written out side by side: the display kind and the URL
+/// segment differ in case and punctuation, and a row whose link disagreed with
+/// its own label is exactly the mismatch `RepositoryKindPath` exists to end.
 fn summary_from(facts: &RepoFacts<'_>, gates: &[GateHit]) -> RepositorySummary {
     RepositorySummary {
-        kind: facts.kind.to_string(),
+        kind: facts.kind.kind_str().to_string(),
+        kind_path: RepositoryKindPath::from_kind(facts.kind)
+            .as_path()
+            .to_string(),
         name: facts.name.clone(),
         namespace: facts.namespace.clone(),
         phase: facts.phase.map(repo_phase_view),
@@ -116,7 +125,7 @@ pub fn view_repository(repo: &Repository) -> RepositorySummary {
     let conditions = status.map(|s| s.conditions.as_slice()).unwrap_or_default();
     let stats = status.and_then(|s| s.storage_stats.as_ref());
     let facts = RepoFacts {
-        kind: "Repository",
+        kind: RepositoryKind::Repository,
         name: repo.metadata.name.clone().unwrap_or_default(),
         namespace: repo.metadata.namespace.clone(),
         phase: status.and_then(|s| s.phase.as_ref()),
@@ -144,7 +153,7 @@ pub fn view_cluster_repository(repo: &ClusterRepository) -> RepositorySummary {
     let conditions = status.map(|s| s.conditions.as_slice()).unwrap_or_default();
     let stats = status.and_then(|s| s.storage_stats.as_ref());
     let facts = RepoFacts {
-        kind: "ClusterRepository",
+        kind: RepositoryKind::ClusterRepository,
         name: repo.metadata.name.clone().unwrap_or_default(),
         namespace: None,
         phase: status.and_then(|s| s.phase.as_ref()),
@@ -305,13 +314,15 @@ fn session_expiry(job: &Job) -> Option<String> {
 /// perform, and the browse endpoints (which do exec into the pod) resolve it
 /// themselves. `reused` is always true — a session the detail screen *finds* is
 /// by definition one that already existed.
-fn session_info(job: &Job) -> SessionInfo {
+fn session_info(job: &Job, limits: WireLimits) -> SessionInfo {
     SessionInfo {
         namespace: job.metadata.namespace.clone().unwrap_or_default(),
         job: job.metadata.name.clone().unwrap_or_default(),
         pod: None,
         reused: true,
         expires_at: session_expiry(job),
+        download_max_bytes: limits.download_max_bytes,
+        manifest_max_bytes: limits.manifest_max_bytes,
     }
 }
 
@@ -487,7 +498,8 @@ async fn load_sessions(
         name,
     )
     .await?;
-    Ok(found.iter().map(session_info).collect())
+    let limits = WireLimits::from_config(&app.cfg);
+    Ok(found.iter().map(|job| session_info(job, limits)).collect())
 }
 
 /// **Pure.** `Repository.status.catalog` as the wire view.
@@ -561,6 +573,15 @@ mod tests {
     use kopiur_ui_model::graph::Health;
     use kopiur_ui_model::views::RepositoryPhaseView;
 
+    /// Deliberately not the defaults: a session must publish what this
+    /// deployment is configured with.
+    fn test_limits() -> WireLimits {
+        WireLimits {
+            download_max_bytes: 7_000,
+            manifest_max_bytes: 900,
+        }
+    }
+
     fn nas() -> Repository {
         from_yaml(
             r#"
@@ -601,6 +622,46 @@ status:
             row.allowed_namespace_count, None,
             "only a cluster repository has one"
         );
+    }
+
+    /// The row carries BOTH the CRD kind (for display) and the URL segment (for
+    /// linking), and the segment is one the routes accept — so the SPA never
+    /// builds `/repositories/{kind}/…` from `kind` and gets it wrong.
+    #[test]
+    fn a_row_carries_the_url_segment_its_own_detail_route_takes() {
+        let namespaced = view_repository(&nas());
+        assert_eq!(namespaced.kind, "Repository");
+        assert_eq!(namespaced.kind_path, "repository");
+
+        let cluster: ClusterRepository = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata: { name: shared }
+spec:
+  backend: { filesystem: { path: /repo } }
+  encryption: { passwordSecretRef: { name: pw, key: password } }
+  allowedNamespaces: { all: true }
+"#,
+        );
+        let row = view_cluster_repository(&cluster);
+        assert_eq!(row.kind, "ClusterRepository");
+        assert_eq!(
+            row.kind_path, "cluster-repository",
+            "the routing token is kebab; `kind` is the CRD spelling"
+        );
+
+        for row in [&namespaced, &row] {
+            assert_eq!(
+                RepositoryKindPath::parse(&row.kind_path).map(RepositoryKindPath::kind),
+                Some(
+                    RepositoryKindPath::parse(&row.kind)
+                        .expect("the CRD kind parses too")
+                        .kind()
+                ),
+                "the segment the row hands the SPA must resolve to the row's own kind"
+            );
+        }
     }
 
     #[test]
@@ -883,12 +944,18 @@ spec:
             "status": { "startTime": "2026-09-08T10:00:00Z" }
         }))
         .unwrap();
-        let info = session_info(&job);
+        let info = session_info(&job, test_limits());
         assert_eq!(info.namespace, "media");
         assert_eq!(info.job, "kopiur-browse-nas-deadbeef");
         assert!(
             info.reused,
             "a session the detail screen finds already existed"
+        );
+        assert_eq!(
+            (info.download_max_bytes, info.manifest_max_bytes),
+            (7_000, 900),
+            "a session listed on the detail screen publishes the same caps the \
+             browse endpoints do, so one screen cannot disagree with the other"
         );
         assert_eq!(info.pod, None, "naming the pod is the browse API's job");
         assert!(
@@ -909,7 +976,7 @@ spec:
             "spec": { "activeDeadlineSeconds": 1020 }
         }))
         .unwrap();
-        assert_eq!(session_info(&job).expires_at, None);
+        assert_eq!(session_info(&job, test_limits()).expires_at, None);
     }
 
     #[test]

@@ -523,6 +523,112 @@ async fn head_on_the_download_route_is_refused_with_an_allow_header() {
     );
 }
 
+/// The retention plan is a third route under `/snapshots/{ns}/{name}` — beside
+/// the API's own `GET` and the actions router's `DELETE`, and beside browse's
+/// absolutely-registered `…/tree` and `…/session`. All five live in one matchit
+/// tree, so "it is mounted and it resolves" is a wiring fact worth asserting:
+/// a collision here would be a 404 or a 405, not a compile error.
+#[tokio::test]
+async fn the_retention_plan_route_is_mounted_beside_the_snapshot_detail() {
+    let answer = send(
+        as_alice("GET", "/api/v1/snapshots/media/nightly-1/retention")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+
+    assert_ne!(
+        answer.status,
+        StatusCode::NOT_FOUND,
+        "…/retention must be reachable; here it fails for want of a cluster, not a route",
+    );
+    assert_ne!(
+        answer.status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "GET is the method it serves",
+    );
+    assert_eq!(
+        answer.header(CACHE_CONTROL),
+        Some(config::API_CACHE_CONTROL),
+        "a new route inherits the shared API layers, not just the router it was added to",
+    );
+}
+
+#[tokio::test]
+async fn the_retention_plan_route_needs_an_identity_like_every_other_read() {
+    let answer = send(
+        anonymous("GET", "/api/v1/snapshots/media/nightly-1/retention")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(answer.problem().r#type, "urn:kopiur:problem:proxy-secret");
+}
+
+// --- one repository-kind vocabulary -----------------------------------------
+
+/// `GET /repositories/{kind}/{name}` and `DELETE …/{kind}/{name}/session` are
+/// the same segment in the same URL shape, and they used to disagree about it:
+/// the read route took kebab `cluster-repository` case-sensitively, the session
+/// route took `clusterrepository` and rejected the hyphen. One parser now backs
+/// both, so every spelling must get past parsing on BOTH routes.
+///
+/// "Got past parsing" is asserted as *not* a 400 `invalid-path`/`invalid` and
+/// not a 404: with no cluster to reach, a resolved segment fails deeper for want
+/// of an apiserver, which is exactly the proof the routing and parsing worked.
+#[tokio::test]
+async fn both_repository_kind_routes_accept_the_same_spellings() {
+    for spelling in [
+        "repository",
+        "Repository",
+        "cluster-repository",
+        "clusterrepository",
+        "ClusterRepository",
+    ] {
+        let read = send(
+            as_alice(
+                "GET",
+                &format!("/api/v1/repositories/{spelling}/nas?namespace=media"),
+            )
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await;
+        assert_ne!(read.status, StatusCode::NOT_FOUND, "GET {spelling}");
+        assert_ne!(
+            read.problem().r#type,
+            "urn:kopiur:problem:invalid-path",
+            "GET {spelling} must be a kind the read route reads",
+        );
+
+        let session = send(
+            as_alice(
+                "DELETE",
+                // Both namespaces named, so the one refusal that is about the
+                // URL rather than the kind — a ClusterRepository session with
+                // no `sessionNamespace` — cannot mask the assertion.
+                &format!(
+                    "/api/v1/repositories/{spelling}/nas/session\
+                     ?namespace=media&sessionNamespace=media"
+                ),
+            )
+            .header(REQUEST_HEADER, REQUEST_HEADER_VALUE)
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await;
+        assert_ne!(session.status, StatusCode::NOT_FOUND, "DELETE {spelling}");
+        assert_ne!(
+            session.problem().r#type,
+            "urn:kopiur:problem:invalid",
+            "DELETE {spelling} must be a kind the session route reads",
+        );
+    }
+}
+
 // --- metrics ----------------------------------------------------------------
 
 /// The `route` label must be the matched TEMPLATE. Labelling the raw path would
