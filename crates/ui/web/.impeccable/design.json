@@ -1,0 +1,322 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-08T20:40:00Z",
+  "title": "Design System: kopiur-ui",
+  "extensions": {
+    "colorMeta": {
+      "accent-indigo": {
+        "role": "primary",
+        "displayName": "Accent Indigo",
+        "canonical": "light-dark(#4f55d2, #8b90f0)",
+        "tonalRamp": [
+          "#1a1c4a",
+          "#2a2e7e",
+          "#3b40a8",
+          "#4f55d2",
+          "#6d72dd",
+          "#8b90f0",
+          "#b0b3f5",
+          "#d9dbf8"
+        ]
+      },
+      "slate-canvas": {
+        "role": "neutral",
+        "displayName": "Slate Canvas",
+        "canonical": "light-dark(#f3f4f6, #131519)",
+        "tonalRamp": [
+          "#0f1114",
+          "#131519",
+          "#1b1e24",
+          "#22262d",
+          "#b8bec7",
+          "#d5d9df",
+          "#e9ebef",
+          "#f3f4f6"
+        ]
+      },
+      "slate-surface": {
+        "role": "neutral",
+        "displayName": "Slate Surface",
+        "canonical": "light-dark(#ffffff, #1b1e24)",
+        "tonalRamp": [
+          "#0f1114",
+          "#131519",
+          "#1b1e24",
+          "#22262d",
+          "#2c313a",
+          "#edeff2",
+          "#f3f4f6",
+          "#ffffff"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "light-dark(#1a1d21, #e6e8eb)",
+        "tonalRamp": [
+          "#1a1d21",
+          "#4f5761",
+          "#636c78",
+          "#858d98",
+          "#a7aeb8",
+          "#c9cdd3",
+          "#e6e8eb",
+          "#f3f4f6"
+        ]
+      },
+      "lamp-healthy": {
+        "role": "tertiary",
+        "displayName": "Healthy Lamp",
+        "canonical": "light-dark(#0b6e4f, #5fd3a6)",
+        "tonalRamp": [
+          "#10281f",
+          "#0b6e4f",
+          "#158a63",
+          "#2aa87c",
+          "#5fd3a6",
+          "#8fe2c1",
+          "#ddf3ea",
+          "#eefaf4"
+        ]
+      },
+      "lamp-degraded": {
+        "role": "tertiary",
+        "displayName": "Degraded Lamp",
+        "canonical": "light-dark(#7a4e00, #f2b84b)",
+        "tonalRamp": [
+          "#2e2410",
+          "#7a4e00",
+          "#a06a00",
+          "#c98a10",
+          "#f2b84b",
+          "#f7d08a",
+          "#fbefd3",
+          "#fdf7e9"
+        ]
+      },
+      "lamp-failed": {
+        "role": "tertiary",
+        "displayName": "Failed Lamp",
+        "canonical": "light-dark(#a6320b, #f28b6b)",
+        "tonalRamp": [
+          "#331a12",
+          "#a6320b",
+          "#c4441a",
+          "#e0653d",
+          "#f28b6b",
+          "#f7b09a",
+          "#fbe3d9",
+          "#fdf1ec"
+        ]
+      },
+      "lamp-pending": {
+        "role": "tertiary",
+        "displayName": "Pending Lamp",
+        "canonical": "light-dark(#0b5c8f, #6fbbef)",
+        "tonalRamp": [
+          "#10222e",
+          "#0b5c8f",
+          "#1676b4",
+          "#3a95d2",
+          "#6fbbef",
+          "#9ed2f5",
+          "#dceef8",
+          "#eef7fc"
+        ]
+      },
+      "lamp-suspended": {
+        "role": "tertiary",
+        "displayName": "Suspended / Unknown Lamp",
+        "canonical": "light-dark(#4f5761, #a7aeb8)",
+        "tonalRamp": [
+          "#23272e",
+          "#4f5761",
+          "#636c78",
+          "#858d98",
+          "#a7aeb8",
+          "#c9cdd3",
+          "#e7e9ed",
+          "#f3f4f6"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "title": { "displayName": "Title", "purpose": "The page title in the header, one per page." },
+      "headline": { "displayName": "Headline", "purpose": "Section and state titles." },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Running text; prose at 1.5 line-height, at most 65ch."
+      },
+      "ledger": {
+        "displayName": "Ledger",
+        "purpose": "Table rows, controls, the identity strip — the console's working density."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Column headers, definition terms, the KIND half of a label strip; beside data, never above a heading."
+      },
+      "identifier": {
+        "displayName": "Identifier",
+        "purpose": "Names, namespaces, paths and users — what an operator copies."
+      }
+    },
+    "shadows": [
+      {
+        "name": "shadow-1",
+        "value": "light-dark(0 1px 2px rgba(26,29,33,0.08), 0 1px 2px rgba(0,0,0,0.5))",
+        "purpose": "Rest: the pressed theme-switch option."
+      },
+      {
+        "name": "shadow-2",
+        "value": "light-dark(0 6px 16px -4px rgba(26,29,33,0.18), 0 8px 20px -6px rgba(0,0,0,0.7))",
+        "purpose": "Float: the identity panel and the disabled-reason tooltip."
+      },
+      {
+        "name": "focus-ring",
+        "value": "0 0 0 2px var(--bg-surface), 0 0 0 4px var(--accent)",
+        "purpose": "Every focusable element; inset on rail links."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "The only easing; exponential ease-out from a visible default."
+      },
+      { "name": "dur-fast", "value": "120ms", "purpose": "Hover and active tints." },
+      { "name": "dur-base", "value": "180ms", "purpose": "The reason tooltip's reveal." },
+      {
+        "name": "skeleton-sheen",
+        "value": "1.4s ease-out infinite",
+        "purpose": "Loading rows; disabled under prefers-reduced-motion."
+      }
+    ],
+    "breakpoints": [
+      { "name": "rail-collapse", "value": "900px" },
+      { "name": "icons-only", "value": "560px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one primary action on a surface; accent fill, on-accent ink.",
+      "html": "<button class=\"ds-btn ds-btn-primary\" type=\"button\">Snapshot now</button>",
+      "css": ".ds-btn { display: inline-flex; align-items: center; gap: 0.5rem; min-height: 2rem; padding: 0 0.75rem; border: 1px solid var(--line-strong, #b8bec7); border-radius: 6px; background: var(--bg-surface, #fff); color: var(--fg, #1a1d21); font: 500 0.8125rem/1 ui-sans-serif, system-ui, sans-serif; transition: background-color 120ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-primary { border-color: var(--accent, #4f55d2); background: var(--accent, #4f55d2); color: var(--fg-on-accent, #fff); } .ds-btn-primary:hover { background: color-mix(in srgb, var(--accent, #4f55d2) 88%, var(--fg, #1a1d21)); } .ds-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg-surface, #fff), 0 0 0 4px var(--accent, #4f55d2); }"
+    },
+    {
+      "name": "Button",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "The default control: surface fill, strong hairline.",
+      "html": "<button class=\"ds-btn\" type=\"button\">Retry</button>",
+      "css": ".ds-btn { display: inline-flex; align-items: center; gap: 0.5rem; min-height: 2rem; padding: 0 0.75rem; border: 1px solid var(--line-strong, #b8bec7); border-radius: 6px; background: var(--bg-surface, #fff); color: var(--fg, #1a1d21); font: 500 0.8125rem/1 ui-sans-serif, system-ui, sans-serif; } .ds-btn:hover { background: var(--bg-hover, rgba(26,29,33,0.05)); } .ds-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--bg-surface, #fff), 0 0 0 4px var(--accent, #4f55d2); }"
+    },
+    {
+      "name": "Disabled Button With Reason",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "An action the user may not perform: visible, disabled, and explained on hover and focus.",
+      "html": "<button class=\"ds-btn ds-btn-reason\" type=\"button\" aria-disabled=\"true\" data-reason=\"Delete snapshots is not permitted for alice in namespace prod. Ask a cluster admin to bind kopiur-ui-editor to your user or group.\">Delete snapshot</button>",
+      "css": ".ds-btn { position: relative; display: inline-flex; align-items: center; min-height: 2rem; padding: 0 0.75rem; border: 1px solid var(--line-strong, #b8bec7); border-radius: 6px; background: var(--bg-surface, #fff); color: var(--fg, #1a1d21); font: 500 0.8125rem/1 ui-sans-serif, system-ui, sans-serif; } .ds-btn-reason { opacity: 0.55; cursor: not-allowed; } .ds-btn-reason::after { content: attr(data-reason); position: absolute; top: calc(100% + 6px); left: 0; width: max-content; max-width: 28rem; padding: 0.5rem 0.75rem; border: 1px solid var(--line, #d5d9df); border-radius: 6px; background: var(--bg-surface, #fff); color: var(--fg, #1a1d21); box-shadow: 0 6px 16px -4px rgba(26,29,33,0.18); font-weight: 400; line-height: 1.5; white-space: normal; opacity: 0; transform: translateY(-4px); transition: opacity 180ms cubic-bezier(0.16,1,0.3,1), transform 180ms cubic-bezier(0.16,1,0.3,1); pointer-events: none; } .ds-btn-reason:hover::after, .ds-btn-reason:focus-visible::after { opacity: 1; transform: none; }"
+    },
+    {
+      "name": "Health Lamp",
+      "kind": "chip",
+      "refersTo": "health-lamp",
+      "description": "A health state as colour, icon and word together; never colour alone.",
+      "html": "<span class=\"ds-health\" data-health=\"failed\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M12 16h.01\"/><path d=\"M12 8v4\"/><path d=\"M15.312 2a2 2 0 0 1 1.414.586l4.688 4.688A2 2 0 0 1 22 8.688v6.624a2 2 0 0 1-.586 1.414l-4.688 4.688a2 2 0 0 1-1.414.586H8.688a2 2 0 0 1-1.414-.586l-4.688-4.688A2 2 0 0 1 2 15.312V8.688a2 2 0 0 1 .586-1.414l4.688-4.688A2 2 0 0 1 8.688 2z\"/></svg><span>Failed</span></span>",
+      "css": ".ds-health { display: inline-flex; align-items: center; gap: 0.35em; padding: 0.1em 0.5em 0.1em 0.4em; border-radius: 3px; font: 500 0.8125rem/1.5 ui-sans-serif, system-ui, sans-serif; white-space: nowrap; color: var(--health-unknown-fg, #4f5761); background: var(--health-unknown-bg, #e7e9ed); } .ds-health[data-health=\"failed\"] { color: var(--health-failed-fg, #a6320b); background: var(--health-failed-bg, #fbe3d9); } .ds-health[data-health=\"healthy\"] { color: var(--health-healthy-fg, #0b6e4f); background: var(--health-healthy-bg, #ddf3ea); } .ds-health[data-health=\"degraded\"] { color: var(--health-degraded-fg, #7a4e00); background: var(--health-degraded-bg, #fbefd3); } .ds-health[data-health=\"pending\"] { color: var(--health-pending-fg, #0b5c8f); background: var(--health-pending-bg, #dceef8); }"
+    },
+    {
+      "name": "Label Strip",
+      "kind": "custom",
+      "refersTo": "panel",
+      "description": "An object's identity: KIND in label caps beside its name in monospace.",
+      "html": "<span class=\"ds-strip\"><span class=\"ds-strip-kind\">Snapshot</span><span class=\"ds-strip-name\">prod/nightly-20260908-0200</span></span>",
+      "css": ".ds-strip { display: inline-flex; align-items: baseline; gap: 0.5rem; min-width: 0; } .ds-strip-kind { font: 500 0.6875rem/1.35 ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-faint, #636c78); white-space: nowrap; } .ds-strip-name { font: 400 0.8125rem/1.35 ui-monospace, 'SF Mono', Menlo, Consolas, monospace; color: var(--fg, #1a1d21); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }"
+    },
+    {
+      "name": "Rail Navigation",
+      "kind": "nav",
+      "refersTo": "nav-item",
+      "description": "Icon + label rows on the slate rail; the current row carries the one accent bar.",
+      "html": "<nav class=\"ds-rail\" aria-label=\"Primary\"><a class=\"ds-nav\" href=\"#\">Overview</a><a class=\"ds-nav\" href=\"#\" aria-current=\"page\">Snapshots</a><a class=\"ds-nav\" href=\"#\">Policies</a></nav>",
+      "css": ".ds-rail { display: flex; flex-direction: column; width: 232px; padding: 0.5rem 0; background: var(--bg-rail, #e9ebef); border-right: 1px solid var(--line, #d5d9df); } .ds-nav { position: relative; display: flex; align-items: center; gap: 0.75rem; min-height: 2.125rem; padding: 0 1rem; color: var(--fg-muted, #4f5761); font: 500 0.8125rem/1.35 ui-sans-serif, system-ui, sans-serif; text-decoration: none; transition: background-color 120ms cubic-bezier(0.16,1,0.3,1), color 120ms cubic-bezier(0.16,1,0.3,1); } .ds-nav:hover { background: var(--bg-hover, rgba(26,29,33,0.05)); color: var(--fg, #1a1d21); } .ds-nav[aria-current=\"page\"] { color: var(--fg, #1a1d21); background: var(--bg-active, rgba(26,29,33,0.09)); } .ds-nav[aria-current=\"page\"]::before { content: ''; position: absolute; inset: 4px auto 4px 0; width: 3px; border-radius: 0 2px 2px 0; background: var(--accent, #4f55d2); } .ds-nav:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--bg-surface, #fff), inset 0 0 0 4px var(--accent, #4f55d2); }"
+    },
+    {
+      "name": "Problem",
+      "kind": "card",
+      "refersTo": "problem",
+      "description": "What, why and fix — the fix on its own plate, metadata beneath.",
+      "html": "<div class=\"ds-problem\" role=\"alert\"><svg class=\"ds-problem-icon\" width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><line x1=\"12\" x2=\"12\" y1=\"8\" y2=\"12\"/><line x1=\"12\" x2=\"12.01\" y1=\"16\" y2=\"16\"/></svg><div class=\"ds-problem-body\"><div class=\"ds-problem-what\">Suspending policy nightly was refused.</div><div class=\"ds-problem-why\">The apiserver refused the request for the identity kopiur-ui impersonated.</div><div class=\"ds-problem-fix\"><span class=\"ds-problem-fix-label\">Fix</span><span>ask a cluster admin to bind kopiur-ui-editor to your user or group</span></div><div class=\"ds-problem-meta\">403 forbidden · Forbidden · /api/v1/actions/suspend</div></div></div>",
+      "css": ".ds-problem { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 0.5rem 0.75rem; align-items: start; padding: 0.75rem 1rem; border: 1px solid var(--health-failed-fg, #a6320b); border-radius: 6px; background: var(--health-failed-bg, #fbe3d9); color: var(--fg, #1a1d21); font: 400 0.8125rem/1.35 ui-sans-serif, system-ui, sans-serif; } .ds-problem-icon { color: var(--health-failed-fg, #a6320b); margin-top: 0.1em; } .ds-problem-body { display: grid; gap: 0.25rem; } .ds-problem-what { font-weight: 600; } .ds-problem-why { color: var(--fg-muted, #4f5761); } .ds-problem-fix { display: flex; gap: 0.5rem; align-items: baseline; margin-top: 0.25rem; padding: 0.5rem 0.75rem; border-radius: 3px; background: var(--bg-surface, #fff); } .ds-problem-fix-label { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent, #4f55d2); } .ds-problem-meta { font: 400 0.6875rem/1.35 ui-monospace, Menlo, monospace; color: var(--fg-faint, #636c78); }"
+    },
+    {
+      "name": "Skeleton Ledger",
+      "kind": "custom",
+      "refersTo": "panel",
+      "description": "Loading: the silhouette of the rows to come, never a spinner.",
+      "html": "<div class=\"ds-skel\" role=\"status\" aria-busy=\"true\"><div class=\"ds-skel-row\"><span style=\"width:70%\"></span><span style=\"width:85%\"></span><span style=\"width:55%\"></span></div><div class=\"ds-skel-row\"><span style=\"width:60%\"></span><span style=\"width:40%\"></span><span style=\"width:75%\"></span></div></div>",
+      "css": ".ds-skel { display: grid; gap: 0.75rem; padding: 1rem; } .ds-skel-row { display: grid; grid-template-columns: 1.4fr 2fr 1fr; gap: 1rem; } .ds-skel-row span { display: block; height: 0.9em; border-radius: 3px; background: linear-gradient(90deg, var(--skeleton-base, #e9ebef) 0%, var(--skeleton-sheen, #f6f7f9) 45%, var(--skeleton-base, #e9ebef) 90%); background-size: 200% 100%; animation: ds-sheen 1.4s cubic-bezier(0.16,1,0.3,1) infinite; } @keyframes ds-sheen { from { background-position: 120% 0; } to { background-position: -80% 0; } }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Vault Ledger",
+    "overview": "kopiur-ui is read the way a tape librarian reads the vault: rows of labelled media, each with a kind, a name and a lettered retention ring, on an anodised slate chassis that says nothing when all is well. It is an Operate surface — dense, calm, legible at a glance — opened many times a day and sometimes at 3am, so both lights are first-class and neither is a default: the daylit vault and the 3am vault are the same console under different lamps.\n\nEvery colour is declared once with light-dark() in src/styles.css; the page follows the OS until the user overrides it through data-theme on <html>, which color-scheme turns into the other set of values. Health is never a hue alone: six lamps, each an icon and a word on a tinted field, and the accent is reserved by law for selection, the current marker and the primary action. Where healthy is quiet, a failure is loud and specific — what happened, why, and the fix on its own plate.",
+    "keyCharacteristics": [
+      "Slate neutrals, cool in both lights; one indigo accent; six Okabe–Ito-derived health lamps",
+      "One system sans for everything; monospace only for identifiers and paths; tabular numerals throughout",
+      "1px hairlines and 6px chamfers; one level of enclosure, never a card inside a card",
+      "Label strips (small-caps KIND + mono name) and lettered lamps as the two recurring marks",
+      "Skeleton loading, teaching empty states, and what / why / fix errors with the fix set apart"
+    ],
+    "rules": [
+      {
+        "name": "The Lettered Lamp Rule",
+        "body": "A health colour never appears without its icon and its word. HealthBadge is the only way to render one.",
+        "section": "colors"
+      },
+      {
+        "name": "The Accent By Law Rule",
+        "body": "Indigo marks selection, the current item, focus and the primary action. It is never a health colour, never a border for emphasis, never a background wash.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Declaration Rule",
+        "body": "Every colour is written once as light-dark(light, dark). There is no dark block to keep in sync.",
+        "section": "colors"
+      },
+      {
+        "name": "The Mono For Identifiers Rule",
+        "body": "Monospace is for what gets copied — names, paths, users — never a costume for \"technical\".",
+        "section": "typography"
+      },
+      {
+        "name": "The Rank By Weight Rule",
+        "body": "Five sizes only. Rank inside a row is carried by weight, case and colour, not by another size.",
+        "section": "typography"
+      },
+      {
+        "name": "The Hairlines Only Rule",
+        "body": "Regions are divided by 1px hairlines, never by shadow or by a second box. A card inside a card is always wrong.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do render every health value through HealthBadge — icon and word, never a coloured dot.",
+      "Do declare a new colour once, as light-dark(light, dark), and check both pairs clear 4.5:1.",
+      "Do set identifiers in monospace and numbers in tabular figures.",
+      "Do disable an action the user may not perform and say why (ActionButton.disabledReason from capabilityReason).",
+      "Do render a problem's what, why and fix from the server's own text, fix set apart."
+    ],
+    "donts": [
+      "Don't put a label, kicker or eyebrow above a heading; label caps sit beside data, in table heads and definition terms only.",
+      "Don't use the accent for a health state, a border for emphasis, or a background wash.",
+      "Don't nest a panel in a panel or divide regions with shadows; use a hairline.",
+      "Don't use a spinner; loading is a skeleton of the rows to come.",
+      "Don't let an unknown or unrecognised value fall through to the healthy lamp."
+    ]
+  }
+}

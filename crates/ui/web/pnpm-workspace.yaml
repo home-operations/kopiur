@@ -1,0 +1,6 @@
+# pnpm settings live here, not in package.json (pnpm 10+).
+# esbuild ships a postinstall that stages its native binary; no other
+# dependency runs a lifecycle script, and any new one must be listed here
+# before pnpm will run it.
+allowBuilds:
+  esbuild: true
