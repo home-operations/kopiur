@@ -52,6 +52,7 @@
 //! | [`views::RestorePhaseView`] | `pending`, `resolving`, `restoring`, `completed`, `failed` | `{ unknown: { raw: string } }` | `unknown` |
 //! | [`views::ReplicationPhaseView`] | `pending`, `replicating`, `succeeded`, `failed`, `suspended` | `{ unknown: { raw: string } }` | `unknown` |
 //! | [`views::OriginView`] | `scheduled`, `manual`, `discovered`, `adopted`, `replicated` | — | **none** — `Origin` is parsed strictly and an unrecognized marker never decodes |
+//! | [`views::DoctorScopeView`] | `namespace`, `installation`, `mixed` | — | **none** |
 //! | [`views::EntryKind`] | `file`, `dir`, `symlink` | `{ other: { raw: string } }` | **`other`**, not `unknown` |
 //! | [`requests::RestoreSourceBody`] | — | `{ snapshotRef: … }`, `{ fromPolicy: … }`, `{ identity: … }` | none (a request body: the client picks the variant) |
 //! | [`requests::RestoreTargetBody`] | — | `{ pvcRef: … }`, `{ pvc: … }` | none (as above) |
@@ -200,7 +201,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 72,
+            exported, 73,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -212,7 +213,12 @@ mod tests {
              so the restore detail route stops answering with the list's row; \
              69 -> 72 for `RetentionPlan` and its `RetentionBucket` / \
              `RetentionCandidate`, so the retention screen can show the whole \
-             bucket instead of one snapshot's verdict"
+             bucket instead of one snapshot's verdict; 72 -> 73 for \
+             `DoctorScopeView`, which puts each doctor check's real scope on \
+             the wire — the client had been reconstructing it from a \
+             hand-maintained table, and the table said `repositories-ready` \
+             was namespace-scoped when `list_repos` lists `ClusterRepository` \
+             cluster-wide"
         );
     }
 }

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use kopiur_ops::doctor::{DoctorCheck, DoctorParams, DoctorReport, Outcome, run_all};
 use kopiur_ops::{OpsCtx, Scope};
-use kopiur_ui_model::views::{DoctorCheckView, DoctorReportView};
+use kopiur_ui_model::views::{DoctorCheckView, DoctorReportView, DoctorScopeView};
 
 use crate::AppState;
 use crate::api::problem::{ApiError, problem};
@@ -66,16 +66,15 @@ pub struct DoctorQuery {
 /// The context one doctor run reads through.
 ///
 /// `?namespace=` narrows the run's **scope**, not its context namespace, and
-/// those are two different things here:
+/// those are two different things here. Which checks it moves is published per
+/// row as `DoctorCheckView.scope` — see [`check_scope`], which is the contract;
+/// this comment is only orientation, and the prose that used to live here in
+/// its place was wrong about two of the ten (it called the repository checks
+/// namespace-scoped, and `list_repos` lists `ClusterRepository` cluster-wide).
 ///
-/// * **Scoped by `namespace`** — every check that lists objects:
-///   `repositories-ready` and `credentials-present` (both off `list_repos`),
-///   `snapshot-replications`, `no-stuck-work` and `recent-failures` (both off
-///   `list_work`), and `recent-warnings` (Events).
-/// * **Installation-wide whatever `namespace` says** — `crds-installed` (CRDs
-///   are cluster-scoped objects), `controller-running` and `webhook-running`
-///   (the operator's own Deployments, found by `operator_namespace`), and
-///   `webhook-admits`.
+/// Roughly: the work-backed checks and the events check narrow completely, the
+/// three repository-backed ones narrow for `Repository` and not for
+/// `ClusterRepository`, and the four installation checks do not narrow at all.
 ///
 /// `webhook-admits` is why this is not simply `ops_ctx(cfg, client, namespace)`:
 /// it dry-run-applies a `SnapshotPolicy` into `ctx.namespace` to see whether the
@@ -118,6 +117,54 @@ pub fn check_id(check: DoctorCheck) -> String {
     out
 }
 
+/// **Pure.** How much of the cluster one check actually reads.
+///
+/// Exhaustive over [`DoctorCheck`], so a check added later cannot ship without
+/// stating its scope. Each arm is derived from the *reads the check performs*,
+/// not from its title — which is the whole point. The client used to keep its
+/// own two-way table beside a prose contract in this module's docs, and the
+/// prose was a simplification: [`kopiur_ops::doctor::list_repos`] lists
+/// `Repository` inside `?namespace=` but `ClusterRepository` cluster-wide, so
+/// the UI printed "scoped to media" over two checks that also answer for every
+/// other namespace. Those two are [`DoctorScopeView::Mixed`].
+///
+/// The three installation-wide checks read cluster-scoped objects (CRDs) or the
+/// operator's own Deployments, found by chart labels across every namespace when
+/// the server does not know where the operator runs; `webhook-admits` dry-runs
+/// into the operator's namespace, never the caller's (see [`doctor_ctx`]). None
+/// of the four moves when `?namespace=` does.
+pub fn check_scope(check: DoctorCheck) -> DoctorScopeView {
+    match check {
+        // Reads `CustomResourceDefinition`, a cluster-scoped kind.
+        DoctorCheck::CrdsInstalled => DoctorScopeView::Installation,
+        // Reads the operator's own Deployment by chart labels — in
+        // `operator_namespace` when the server knows it, across all namespaces
+        // otherwise. Either way not the caller's namespace.
+        DoctorCheck::ControllerRunning | DoctorCheck::WebhookRunning => {
+            DoctorScopeView::Installation
+        }
+        // Dry-run-creates a SnapshotPolicy in the OPERATOR's namespace, so the
+        // verdict is about the installation's webhook, never about the caller's
+        // namespace or their `create` rights in it.
+        DoctorCheck::WebhookAdmits => DoctorScopeView::Installation,
+        // Both read `list_repos`: `Repository` narrowed by the scope, and
+        // `ClusterRepository` always cluster-wide. `credentials-present` then
+        // reads namespaced Secrets for whatever that returned — including the
+        // Secrets a ClusterRepository pins in namespaces the caller did not ask
+        // about.
+        DoctorCheck::RepositoriesReady | DoctorCheck::CredentialsPresent => DoctorScopeView::Mixed,
+        // Lists namespaced `SnapshotReplication`s, but resolves each one's
+        // repository refs against `list_repos` — so a ref to a
+        // `ClusterRepository` is judged on a cluster-scoped object.
+        DoctorCheck::SnapshotReplications => DoctorScopeView::Mixed,
+        // Both read `list_work`: Snapshot, Restore, SnapshotSchedule and
+        // SnapshotPolicy, every one of them namespaced.
+        DoctorCheck::NoStuckWork | DoctorCheck::RecentFailures => DoctorScopeView::Namespace,
+        // Lists `Event`s, a namespaced kind.
+        DoctorCheck::RecentWarnings => DoctorScopeView::Namespace,
+    }
+}
+
 /// **Pure.** Project one outcome onto the wire view.
 ///
 /// Exhaustive over [`Outcome`]. Only a `Fail` carries what/why/fix: a `Warn`'s
@@ -138,6 +185,7 @@ pub fn view_check(check: DoctorCheck, outcome: &Outcome) -> DoctorCheckView {
         check: check_id(check),
         title: check.title().to_string(),
         outcome: label.to_string(),
+        scope: check_scope(check),
         what,
         why,
         fix,
@@ -265,6 +313,84 @@ mod tests {
             check_id(DoctorCheck::SnapshotReplications),
             "snapshot-replications"
         );
+    }
+
+    /// The defect this field exists to kill: the UI printed "scoped to `<ns>`"
+    /// over `repositories-ready` and `credentials-present`, both of which read
+    /// `ClusterRepository` cluster-wide however the run was scoped. A check
+    /// that reads a cluster-scoped object must never call itself namespaced —
+    /// that is the statement the operator would act on and it would be false.
+    #[test]
+    fn a_check_that_reads_a_cluster_scoped_object_is_never_namespaced() {
+        // Every check whose reads include something `?namespace=` cannot
+        // narrow: CRDs and the operator's Deployments are installation state,
+        // and the three repository-backed checks all go through `list_repos`,
+        // whose `ClusterRepository` listing is `Api::all` unconditionally.
+        for check in [
+            DoctorCheck::CrdsInstalled,
+            DoctorCheck::ControllerRunning,
+            DoctorCheck::WebhookRunning,
+            DoctorCheck::WebhookAdmits,
+            DoctorCheck::RepositoriesReady,
+            DoctorCheck::CredentialsPresent,
+            DoctorCheck::SnapshotReplications,
+        ] {
+            assert_ne!(
+                check_scope(check),
+                DoctorScopeView::Namespace,
+                "{} reads a cluster-scoped object, so calling it namespaced tells the \
+                 operator a namespace-scoped run covered it when it did not",
+                check_id(check)
+            );
+        }
+
+        // And the converse, so the field cannot be made vacuously safe by
+        // answering `mixed` everywhere: the two work-backed checks and the
+        // events check read namespaced kinds only, and must say so.
+        for check in [
+            DoctorCheck::NoStuckWork,
+            DoctorCheck::RecentFailures,
+            DoctorCheck::RecentWarnings,
+        ] {
+            assert_eq!(
+                check_scope(check),
+                DoctorScopeView::Namespace,
+                "{} reads only namespaced kinds; reporting it wider hides that \
+                 `?namespace=` really did narrow it",
+                check_id(check)
+            );
+        }
+    }
+
+    /// The two repository checks are the ones the client's hand-maintained
+    /// table got wrong, so pin them by name rather than only by the loop above.
+    #[test]
+    fn the_repository_checks_report_mixed_because_of_cluster_repositories() {
+        assert_eq!(
+            check_scope(DoctorCheck::RepositoriesReady),
+            DoctorScopeView::Mixed,
+            "`list_repos` lists ClusterRepository with `Api::all`, whatever the scope"
+        );
+        assert_eq!(
+            check_scope(DoctorCheck::CredentialsPresent),
+            DoctorScopeView::Mixed,
+            "it reads the Secrets of those same cluster-scoped repositories"
+        );
+    }
+
+    /// Every check states a scope, and the wire row carries it. Iterating
+    /// `DoctorCheck::ALL` means a check added later is covered here too.
+    #[test]
+    fn every_check_publishes_its_scope_on_the_wire() {
+        for check in DoctorCheck::ALL {
+            let row = view_check(check, &Outcome::Pass);
+            assert_eq!(
+                row.scope,
+                check_scope(check),
+                "the row must carry the same scope the table states for {}",
+                check_id(check)
+            );
+        }
     }
 
     #[test]

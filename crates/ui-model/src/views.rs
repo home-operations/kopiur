@@ -1090,6 +1090,37 @@ pub struct ReplicationsView {
     pub snapshot: Vec<SnapshotReplicationRow>,
 }
 
+/// How much of the cluster one doctor check actually looked at.
+///
+/// A doctor run takes an optional namespace, and it narrows *some* checks and
+/// not others — so a UI that prints "scoped to `media`" next to every row is
+/// telling the operator something untrue about most of them. Which rows those
+/// are is a fact about what each check reads, and the client had been keeping
+/// its own copy of it. It was already wrong: `list_repos` lists `Repository`
+/// inside the namespace but `ClusterRepository` cluster-wide, so the two
+/// repository checks are neither purely one nor the other. That is what
+/// [`Self::Mixed`] exists to say out loud.
+///
+/// A closed enum, so a check added later cannot ship without stating its
+/// scope, and the SPA narrows it with the same machinery it uses for every
+/// other generated enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DoctorScopeView {
+    /// Reads only namespaced objects, so a `?namespace=` run narrows this
+    /// check completely and "scoped to `<ns>`" is the whole truth about it.
+    Namespace,
+    /// Reads installation-wide state — cluster-scoped objects, or the
+    /// operator's own workloads — and a `?namespace=` run does not narrow it
+    /// at all. Its verdict is about the installation, not about the namespace.
+    Installation,
+    /// Reads both: the namespaced objects are narrowed and the cluster-scoped
+    /// ones are not, so the check's verdict may be driven by something outside
+    /// the namespace the caller asked about.
+    Mixed,
+}
+
 /// One check from the doctor report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1101,6 +1132,9 @@ pub struct DoctorCheckView {
     pub title: String,
     /// `Pass`, `Warn`, or `Fail`.
     pub outcome: String,
+    /// How much of the cluster this check read, so the UI can say truthfully
+    /// what a namespace-scoped run covered instead of guessing from the title.
+    pub scope: DoctorScopeView,
     /// What the check found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub what: Option<String>,

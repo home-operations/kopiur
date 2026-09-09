@@ -76,6 +76,28 @@ pub enum DoctorCheck {
 }
 
 impl DoctorCheck {
+    /// Every check, in the order [`run_all`] runs them.
+    ///
+    /// Hand-written, because Rust cannot enumerate a plain enum — so this is the
+    /// one list that could silently fall behind the type. Two things stop it:
+    /// [`Self::title`] below is an exhaustive `match`, so a new variant does not
+    /// compile until it is named there, and `every_check_is_in_all` asserts the
+    /// array and the match agree. Callers that need to name "all the checks" —
+    /// the run selector's refusal, the wire scope table — read this rather than
+    /// writing the list out again.
+    pub const ALL: [Self; 10] = [
+        Self::CrdsInstalled,
+        Self::ControllerRunning,
+        Self::WebhookRunning,
+        Self::WebhookAdmits,
+        Self::RepositoriesReady,
+        Self::CredentialsPresent,
+        Self::SnapshotReplications,
+        Self::NoStuckWork,
+        Self::RecentFailures,
+        Self::RecentWarnings,
+    ];
+
     /// Human title for the report line.
     pub fn title(self) -> &'static str {
         match self {
@@ -1755,6 +1777,42 @@ mod tests {
             ["futureField"] = serde_json::json!({ "type": "string" });
         let newer: CustomResourceDefinition = serde_json::from_value(newer_json).unwrap();
         assert!(missing_spec_fields(&expected, &newer).is_empty());
+    }
+
+    /// [`DoctorCheck::ALL`] is hand-written, so it is the one place a new check
+    /// can be forgotten. The `position` match below is exhaustive: variant
+    /// eleven does not compile until somebody writes its arm, and the arm is
+    /// right next to the assertion telling them to extend `ALL` and the count.
+    #[test]
+    fn all_lists_every_check_once_in_run_order() {
+        fn position(check: DoctorCheck) -> usize {
+            match check {
+                DoctorCheck::CrdsInstalled => 0,
+                DoctorCheck::ControllerRunning => 1,
+                DoctorCheck::WebhookRunning => 2,
+                DoctorCheck::WebhookAdmits => 3,
+                DoctorCheck::RepositoriesReady => 4,
+                DoctorCheck::CredentialsPresent => 5,
+                DoctorCheck::SnapshotReplications => 6,
+                DoctorCheck::NoStuckWork => 7,
+                DoctorCheck::RecentFailures => 8,
+                DoctorCheck::RecentWarnings => 9,
+            }
+        }
+        assert_eq!(
+            DoctorCheck::ALL.len(),
+            10,
+            "a new check must be added to `DoctorCheck::ALL` (and to `position` above, \
+             and to this count) or it can never be named in `?checks=`"
+        );
+        for (i, check) in DoctorCheck::ALL.iter().enumerate() {
+            assert_eq!(
+                position(*check),
+                i,
+                "`ALL` must list every check exactly once, in run order; {check:?} is at \
+                 index {i}"
+            );
+        }
     }
 
     #[test]
