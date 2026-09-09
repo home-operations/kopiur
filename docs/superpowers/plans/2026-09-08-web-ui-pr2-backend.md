@@ -362,3 +362,77 @@ Router tests (`tests/router.rs`, using `tower::ServiceExt::oneshot` against `app
 Smoke (manual, record output in the report): against a local kind cluster with the operator installed, run `KOPIUR_UI_ANONYMOUS_USER=kubernetes-admin KOPIUR_UI_ANONYMOUS_GROUPS=kopiur:dev KOPIUR_UI_CACHE=false KOPIUR_NAMESPACE=kopiur-system cargo run -p kopiur-ui` with a ClusterRoleBinding of `cluster-admin` to group `kopiur:dev`, then `curl :8090/api/v1/graph` and `/api/v1/status`. If no kind cluster is available in this environment, say so in the report; PR5's e2e covers it.
 
 - [ ] Steps: router tests (fail) → wiring → tests pass → `mise run ci` (`mise run test clippy build gen-check wiring-check phase-check fmt-check complexity-check`) → commit `feat(ui): wire the router, security headers, readiness`.
+
+---
+
+### Task 9: Close the API contract gaps the SPA needs
+
+Added after Task 8 by a two-agent adversarial gap analysis of the SPA plan against this backend (reports: `.superpowers/sdd/2026-09-08-web-ui-pr3-spa-gap-api.md`, `…-gap-build.md`). Each item below is a verified mismatch between what the SPA must render and what the server can currently say. Fix them in code here rather than scaling the UI down — a limitation shipped into the wire contract becomes permanent.
+
+**Files:** `crates/ui-model/src/{views,identity,graph}.rs`, `crates/ui-model/src/lib.rs` (`export_all` + its exact-count test), `crates/ui/src/api/{mod,me,doctor,snapshots,replications,repositories}.rs`, `crates/ui/src/browse/mod.rs`, `crates/api/src/retention.rs`.
+
+**Interfaces:**
+- Consumes: `kopiur_api::retention::{retention_view, retention_group_key, retention_buckets, select_kept}` (moved into `kopiur-api` in Task 5), `kopiur_api::gates::STRUCTURAL_GATES`.
+- Produces: the wire additions below. Every new or changed wire type is exported by `export_all`, so the exact-count assertion in `crates/ui-model/src/lib.rs` moves with it — update the number AND the reason in its assertion message.
+
+- [ ] **Item 1 — the retention preview must show the whole bucket, not one verdict.**
+  `RetentionPreview` is `{ kept, reasons, computedAt }` for the single snapshot on the detail route. The SPA cannot draw "which snapshots this policy will keep and which it will prune", which is the one screen where a misreading costs a restore point.
+  Add `GET /api/v1/snapshots/{namespace}/{name}/retention` returning a new `RetentionPlan` wire type:
+  ```rust
+  /// Every snapshot competing for the same retention buckets as one snapshot,
+  /// with the verdict `select_kept` gives each. The bucket key is what the
+  /// controller groups by, so a fan-out policy shows one group per source.
+  pub struct RetentionPlan {
+      /// Bucket key (the `retention_group_key` value) → its candidates, newest first.
+      pub buckets: Vec<RetentionBucket>,
+      /// The policy the plan was computed from, and when.
+      pub policy: PolicyRef,
+      pub computed_at: String,
+      /// True when the policy sets no retention: nothing is pruned by GFS.
+      pub unbounded: bool,
+  }
+  pub struct RetentionBucket {
+      /// `retention_group_key` — the source path, plus the repository when the policy is multi-repo.
+      pub key: String,
+      pub candidates: Vec<RetentionCandidate>,
+  }
+  pub struct RetentionCandidate {
+      pub namespace: String,
+      pub name: String,
+      pub end_time: Option<String>,
+      pub kept: bool,
+      /// Which GFS rule holds it, e.g. `keepDaily`. Empty when it is pruned.
+      pub rules: Vec<String>,
+      pub pinned: bool,
+      /// True for the snapshot the request was about, so the SPA can highlight it.
+      pub subject: bool,
+  }
+  ```
+  It must use exactly the controller's population and grouping (`retention_view` + `retention_buckets` + `spec.pin`), so the preview cannot disagree with the prune. Test: the 7-PVC fan-out fixture yields 7 buckets, and the subject snapshot appears in exactly one.
+  Also fix `RetentionPreview.reasons`: the field doc promises `"keepDaily slot 3"` and the code pushes bare rule names — emit the slot, or correct the doc. Say which you did and why.
+
+- [ ] **Item 2 — `Capabilities` must cover every mutating endpoint.**
+  It carries five booleans; there are seven mutating endpoints and four suspendable kinds. Add flags for `maintenance-run`, `replication-run`, `scan-catalog`, and suspend on each of `SnapshotPolicy`, `SnapshotSchedule`, `Repository`, `ClusterRepository` (the existing `patchPolicies` covers only the first). Each is a `SelfSubjectAccessReview` on the same verb+resource the handler actually performs — read the handler, do not guess. Document on the type that these are namespace-scoped and that the SPA must re-fetch `/me` per namespace. Test: a fixture where the review allows exactly one verb sets exactly one flag true.
+
+- [ ] **Item 3 — one repository-kind vocabulary.**
+  `/repositories/{kind}/{name}` takes kebab-case `repository`/`cluster-repository` case-sensitively; `DELETE /repositories/{kind}/{name}/session` takes `repository`/`clusterrepository` case-insensitively and rejects the hyphen. The same-looking segment means two things. Make both accept the same set (kebab canonical, `clusterrepository` and any case tolerated), share one parser, and test that every spelling resolves on both routes. `RepositorySummary`/`RepositoryDetail` gain `kindPath: String` carrying the canonical segment, so the SPA links without a local mapping table.
+
+- [ ] **Item 4 — `/doctor` gains `namespace`, and both query types reject unknown parameters.**
+  `DoctorQuery` has no `namespace` and no `deny_unknown_fields`, so `?namespace=x` is silently ignored — a filter that does nothing is worse than none. Add `namespace: Option<String>` (scoping the checks that can be scoped; document which stay cluster-wide) and `#[serde(deny_unknown_fields)]` on `DoctorQuery`, `NamespaceQuery`, and every other read query type that lacks it, so a typo is a 400 problem instead of silence. Test one ignored-parameter case per query type.
+
+- [ ] **Item 5 — publish the download limits so the SPA can refuse before it navigates.**
+  `download_size` answers 413 `download-too-large` / 422 `download-size-unknown` as `application/problem+json` on a top-level navigation, which the browser renders as raw JSON — the SPA never sees it. Add `downloadMaxBytes: i64` and `manifestMaxBytes: i64` to `SessionInfo` (the SPA already fetches it before browsing) so the file table can disable an oversized entry with the reason. Keep the server-side refusal exactly as it is; this is a second gate, not a replacement. Test: `SessionInfo` carries the configured values, not the defaults, when the config differs.
+
+- [ ] **Item 6 — `ReplicationsView` moves into `kopiur-ui-model` and is exported.**
+  It is declared in `crates/ui/src/api/replications.rs`, so `export_all` never emits it and the SPA would have to hand-write the one type the plan's own constraint forbids. Move it, export it, bump the count assertion.
+
+- [ ] **Item 7 — the restore detail route returns a detail type.**
+  `GET /restores/{namespace}/{name}` returns the same `RestoreRow` as the list. Add `RestoreDetail` carrying what the list omits: conditions, the claim, progress if the CR reports any, the source and target as resolved, and the failure view. If a field genuinely has no source in the CR, leave it out rather than adding a field that is always `None` — and say so in the report.
+
+- [ ] **Item 8 — `deletionPolicy` and the delete receipt must not overstate.**
+  `SnapshotRow.deletionPolicy` is `Option<String>`; document that an absent value means the CR does not set one, and that the SPA must not render a default. Confirm (with a test) that the delete receipt's `note` carries the mass-deletion-breaker text when the breaker holds, since the SPA will render it as the answer to "why is it still there".
+
+- [ ] **Item 9 — document the enum wire shapes for the SPA.**
+  ts-rs renders externally-tagged enums as heterogeneous `string | object` unions, and the fallback variant is not uniformly named: `Health::Unknown` is a unit variant, `EntryKind`'s fallback is `Other { raw }`, and `OriginView`/`GateSeverityView` have none. Add a module doc to `crates/ui-model/src/lib.rs` listing every exported enum, its variant shapes, and whether it has a fallback — the SPA's exhaustiveness strategy depends on it. No code change; this is the contract the next milestone reads.
+
+- [ ] **Verify:** `cargo test --workspace --locked`, `mise run clippy fmt-check phase-check wiring-check gen-check complexity-check`. Every new endpoint gets a router-level test; every new wire field gets a test that it is populated from the source the doc claims. Commit as `feat(ui): close the API contract gaps the SPA needs`.
