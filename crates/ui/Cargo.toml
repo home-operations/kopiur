@@ -52,6 +52,10 @@ tracing = { workspace = true }
 [dev-dependencies]
 kopiur-api = { workspace = true, features = ["testutil"] }
 tower = { workspace = true, features = ["util"] }
+# `test-util` is tokio's paused clock. The cache-readiness budget is two minutes;
+# without it the tests that exercise the timeout and recovery branches would have
+# to wait that long in real time, so they would not exist.
+tokio = { workspace = true, features = ["test-util"] }
 serde_yaml = { workspace = true }
 serial_test = { workspace = true }
 

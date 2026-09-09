@@ -401,11 +401,11 @@ async fn every_api_response_carries_the_security_headers() {
     }
 }
 
-/// The SPA is not the API. `no-store` on the bundle would re-download the
-/// content-hashed assets on every navigation, defeating the year-long
-/// `immutable` those hashes exist for.
+/// `Cache-Control` is the one header that is `/api`-only. `no-store` on the
+/// bundle would re-download the content-hashed assets on every navigation,
+/// defeating the year-long `immutable` those hashes exist for.
 #[tokio::test]
-async fn the_api_headers_do_not_reach_the_spa() {
+async fn only_cache_control_is_scoped_to_the_api() {
     let answer = send(
         anonymous("GET", "/unknown-path")
             .body(Body::empty())
@@ -414,13 +414,40 @@ async fn the_api_headers_do_not_reach_the_spa() {
     .await;
 
     assert_eq!(answer.header(CACHE_CONTROL), Some("no-cache"));
-    assert!(answer.header(X_FRAME_OPTIONS).is_none());
-    assert!(answer.header(CONTENT_SECURITY_POLICY).is_none());
     assert_eq!(
         answer.header(REFERRER_POLICY),
         Some("same-origin"),
-        "the referrer policy IS everywhere — it is about the URL, not about the body",
+        "the referrer policy is about the URL, not the body",
     );
+}
+
+/// The app **shell** is the document an attacker frames, so the framing and
+/// sniffing headers must reach the HTML, not only the JSON. Scoping them to
+/// `/api` would have hardened the half nobody frames and left the half they do.
+///
+/// `GET /` — the entry point a browser actually loads — plus a deep link, which
+/// serves the same document through the SPA fallback.
+#[tokio::test]
+async fn the_spa_shell_carries_the_framing_and_sniffing_headers() {
+    for uri in ["/", "/snapshots/prod/nightly-1"] {
+        let answer = send(anonymous("GET", uri).body(Body::empty()).expect("request")).await;
+
+        assert_eq!(answer.status, StatusCode::OK, "{uri}");
+        assert_eq!(answer.header(CONTENT_TYPE), Some("text/html"), "{uri}");
+        assert_eq!(answer.header(X_FRAME_OPTIONS), Some("DENY"), "{uri}");
+        assert_eq!(
+            answer.header(X_CONTENT_TYPE_OPTIONS),
+            Some("nosniff"),
+            "{uri}"
+        );
+        let csp = answer
+            .header(CONTENT_SECURITY_POLICY)
+            .unwrap_or_else(|| panic!("{uri} must carry a CSP"));
+        assert!(
+            csp.contains("frame-ancestors 'none'"),
+            "{uri} must forbid embedding: {csp}",
+        );
+    }
 }
 
 // --- the timeout split ------------------------------------------------------
@@ -448,6 +475,34 @@ async fn the_download_route_is_mounted_outside_the_timeout() {
         answer.status,
         StatusCode::METHOD_NOT_ALLOWED,
         "GET is the method it serves",
+    );
+}
+
+/// `…/file` lives in its own un-timed router, merged separately, so its identity
+/// coverage depends on an ordering a refactor could plausibly invert — merge the
+/// untimed half *after* the identity layer (as it is merged after the timeout)
+/// and the download silently loses it. `CurrentIdentity` then answers 500
+/// `identity-missing` rather than failing to compile, and the header stack would
+/// still decorate that 500, so nothing else here would notice.
+#[tokio::test]
+async fn an_anonymous_download_is_a_401_not_a_wiring_bug() {
+    let answer = send(
+        anonymous("GET", "/api/v1/snapshots/media/nightly-1/file?path=a.txt")
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    let problem = answer.problem();
+    assert_eq!(
+        problem.r#type, "urn:kopiur:problem:proxy-secret",
+        "…/file must sit behind identity_middleware like every other API route",
+    );
+    assert_ne!(
+        problem.r#type, "urn:kopiur:problem:identity-missing",
+        "a 500 here would mean the route escaped the identity layer entirely",
     );
 }
 

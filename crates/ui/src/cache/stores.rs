@@ -28,6 +28,13 @@
 //! exposed as an awaitable function, because kube's per-store readiness holds a
 //! single waker and two concurrent waiters on one cold store can deadlock. See
 //! [`start`].
+//!
+//! That channel carries a [`CacheHealth`], not a `bool`, and it stays open for
+//! the process's life. A cache that synced and then lost a watch is not the same
+//! thing as a cache that never synced — but it is just as unservable, and a
+//! `bool` that only ever went `false → true` could not say so. The supervisor
+//! that publishes the first `Synced` therefore keeps the reflector handles and
+//! publishes `WatchEnded` the moment one of them finishes.
 
 use std::sync::Arc;
 
@@ -45,6 +52,40 @@ use kopiur_api::{
 
 use crate::cache::KopiurKind;
 use crate::metrics::UiMetrics;
+
+/// What the reflector cache is doing, as the stores themselves see it.
+///
+/// Published on the single `watch` channel [`start`] returns, which is the whole
+/// truth about the cache: nothing else in the process may decide the cache is
+/// healthy. A closed enum rather than the `bool` this used to be, because
+/// "not synced yet" and "synced, then a watch died" need completely different
+/// answers from `/readyz` and only one of them can ever improve on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheHealth {
+    /// At least one store has not completed its initial list.
+    Syncing,
+    /// Every store has listed and every reflector is still running.
+    Synced,
+    /// A reflector task ended, so this kind's store is frozen at whatever it
+    /// last held and will silently go stale.
+    ///
+    /// Terminal: a reflector that gave up does not restart itself, so this never
+    /// returns to [`CacheHealth::Synced`] without a new process.
+    WatchEnded {
+        /// The Kubernetes kind whose reflector ended.
+        kind: &'static str,
+    },
+}
+
+/// One reflector task, labelled with the kind it keeps cached.
+///
+/// The label is the whole point: a bare `JoinHandle` that finished would tell an
+/// operator that *something* stopped refreshing, which is exactly the half of the
+/// message that does not help.
+struct ReflectorTask {
+    kind: &'static str,
+    handle: JoinHandle<()>,
+}
 
 /// A watch-fed read cache for every Kopiur kind.
 ///
@@ -113,17 +154,18 @@ impl std::fmt::Debug for Stores {
 /// here would wedge all nine watches against an older apiserver with no
 /// fallback. The UI would then report ready with nine permanently empty stores.
 ///
-/// The returned handles must be kept alive for as long as the cache is served
-/// from. This function never fails: a watch that cannot start backs off and
-/// retries forever.
+/// This function never fails: a watch that cannot start backs off and retries
+/// forever. The reflector tasks are owned by the supervisor it spawns, so the
+/// caller has nothing to hold on to and nothing it can accidentally drop.
 ///
 /// # Readiness
 ///
-/// The third return value reports whether every store has completed its initial
-/// list. Until it reads `true` the cache is *cold*, and a cold store is worse
-/// than no cache: a `Snapshot` list would answer `[]`, which is exactly what a
-/// healthy cluster that has taken no backups looks like. The UI must not report
-/// ready before it flips.
+/// The second return value is the single source of truth about the cache, for
+/// the whole process's life. Until it reads [`CacheHealth::Synced`] the cache is
+/// *cold*, and a cold store is worse than no cache: a `Snapshot` list would
+/// answer `[]`, which is exactly what a healthy cluster that has taken no
+/// backups looks like. It reads [`CacheHealth::WatchEnded`] once any reflector
+/// ends, because a frozen store is the same lie told later.
 ///
 /// It is a `watch::Receiver` rather than a `wait_ready(&Stores).await` for a
 /// specific reason. kube delivers per-store readiness through `DelayedInit`,
@@ -137,8 +179,8 @@ impl std::fmt::Debug for Stores {
 pub fn start(
     client: kube::Client,
     metrics: Arc<UiMetrics>,
-) -> (Stores, Vec<JoinHandle<()>>, watch::Receiver<bool>) {
-    let mut tasks = Vec::with_capacity(10);
+) -> (Stores, watch::Receiver<CacheHealth>) {
+    let mut tasks = Vec::with_capacity(9);
 
     let repositories = spawn::<Repository>(&client, &metrics, &mut tasks);
     let cluster_repositories = spawn::<ClusterRepository>(&client, &metrics, &mut tasks);
@@ -162,22 +204,57 @@ pub fn start(
         snapshot_replications,
     };
 
-    let (ready_tx, ready_rx) = watch::channel(false);
-    tasks.push(tokio::spawn(publish_readiness(stores.clone(), ready_tx)));
+    let (health_tx, health_rx) = watch::channel(CacheHealth::Syncing);
+    tokio::spawn(supervise(stores.clone(), tasks, health_tx));
 
-    (stores, tasks, ready_rx)
+    (stores, health_rx)
 }
 
-/// The single owner of every `wait_until_ready` future.
+/// The one task that owns the readiness join AND the reflector handles.
+///
+/// Both halves live here because they are one question — "may the UI serve from
+/// this cache?" — and splitting them is what let readiness lie: a supervisor that
+/// returned after publishing `Synced` would drop the sender and never again be in
+/// a position to say otherwise, so a watch that gave up an hour later left
+/// `/readyz` answering `ok` over a store frozen at whatever it last held.
+///
+/// It therefore never returns while the process is healthy. It publishes
+/// `Synced` when every store has listed, and then waits for the *first* reflector
+/// to finish — which, since the reflector stream is infinite, only happens when
+/// that watch has given up entirely.
+async fn supervise(
+    stores: Stores,
+    tasks: Vec<ReflectorTask>,
+    health_tx: watch::Sender<CacheHealth>,
+) {
+    if initial_list_complete(&stores).await {
+        tracing::info!("kopiur-ui cache synced; all nine stores have completed initial list");
+        // A send error means every receiver was dropped, i.e. the process is
+        // shutting down. Nothing to report to.
+        let _ = health_tx.send(CacheHealth::Synced);
+    }
+
+    // Reached on both paths. A writer dropped before the first sync means its
+    // reflector task has ALREADY ended, so this resolves immediately and names
+    // the kind that the `wait_until_ready` error could not.
+    let kind = first_reflector_to_end(tasks).await;
+    tracing::error!(
+        kind,
+        "a kopiur-ui cache watch ended; that store is now frozen and will go stale, so the \
+         UI must stop serving from the cache. /readyz reports cache-watch-ended. This does \
+         not recover on its own — restart the pod, and check the apiserver's health and the \
+         UI ServiceAccount's list/watch RBAC for this kind."
+    );
+    let _ = health_tx.send(CacheHealth::WatchEnded { kind });
+}
+
+/// Await every store's initial list. `false` means a writer was dropped first, so
+/// the cache can never become correct.
 ///
 /// Joins the nine concurrently — safe, because each store has its own
 /// `DelayedInit` and so its own waker slot; the hazard is only ever two waiters
-/// on one store — and publishes `true` once all nine have listed.
-///
-/// On a dropped writer it publishes nothing and logs: the cache can never become
-/// correct, and leaving the flag `false` is what keeps the UI from reporting
-/// ready over a cache that will stay empty forever.
-async fn publish_readiness(stores: Stores, ready_tx: watch::Sender<bool>) {
+/// on one store.
+async fn initial_list_complete(stores: &Stores) -> bool {
     let synced = tokio::try_join!(
         stores.repositories.wait_until_ready(),
         stores.cluster_repositories.wait_until_ready(),
@@ -191,18 +268,45 @@ async fn publish_readiness(stores: Stores, ready_tx: watch::Sender<bool>) {
     );
 
     match synced {
-        Ok(_) => {
-            tracing::info!("kopiur-ui cache synced; all nine stores have completed initial list");
-            // A send error means every receiver was dropped, i.e. the process is
-            // shutting down. Nothing to report to.
-            let _ = ready_tx.send(true);
+        Ok(_) => true,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "a kopiur-ui cache writer was dropped before its first sync; the cache will \
+                 never become ready and the UI must not serve from it",
+            );
+            false
         }
-        Err(e) => tracing::error!(
-            error = %e,
-            "a kopiur-ui cache writer was dropped before its first sync; the cache will \
-             never become ready and the UI must not serve from it",
-        ),
     }
+}
+
+/// The kind of the first reflector task to finish.
+///
+/// Each handle is wrapped in a future that yields its own label, so the answer
+/// carries which kind died rather than merely that one did. A task that panicked
+/// counts the same as one that returned: either way that kind has stopped
+/// refreshing.
+///
+/// Never resolves while every reflector is alive, which is the healthy case.
+async fn first_reflector_to_end(tasks: Vec<ReflectorTask>) -> &'static str {
+    let waits: Vec<_> = tasks
+        .into_iter()
+        .map(|task| {
+            Box::pin(async move {
+                let _ = task.handle.await;
+                task.kind
+            })
+        })
+        .collect();
+
+    // `select_all` panics on an empty list; nine kinds are spawned
+    // unconditionally, so this is unreachable, and hanging forever would be a
+    // worse answer than saying the cache is unusable.
+    if waits.is_empty() {
+        return "none";
+    }
+    let (kind, _index, _rest) = futures::future::select_all(waits).await;
+    kind
 }
 
 /// Create one kind's store and spawn the task that keeps it filled.
@@ -213,14 +317,14 @@ async fn publish_readiness(stores: Stores, ready_tx: watch::Sender<bool>) {
 fn spawn<K: KopiurKind>(
     client: &kube::Client,
     metrics: &Arc<UiMetrics>,
-    tasks: &mut Vec<JoinHandle<()>>,
+    tasks: &mut Vec<ReflectorTask>,
 ) -> Store<K> {
     let (reader, writer) = store::<K>();
     let api: Api<K> = Api::all(client.clone());
     let gauge_reader = reader.clone();
     let metrics = Arc::clone(metrics);
 
-    tasks.push(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         // `.default_backoff()` on the watcher (not on the reflector output) so a
         // failing watch retries with jitter instead of hot-looping the
         // apiserver; the reflector then sees an already-debounced stream.
@@ -252,11 +356,17 @@ fn spawn<K: KopiurKind>(
 
         // The reflector stream is infinite, so reaching here means the watcher
         // gave up entirely. The store is now frozen at whatever it last held.
+        // `supervise` turns this task ending into `CacheHealth::WatchEnded`, so
+        // the log below is the detail and readiness is the consequence.
         tracing::error!(
             kind = K::KIND,
             "kopiur-ui cache watch ended; this kind's cache is now frozen and will go stale",
         );
-    }));
+    });
+    tasks.push(ReflectorTask {
+        kind: K::KIND,
+        handle,
+    });
 
     reader
 }
@@ -430,47 +540,183 @@ mod tests {
         );
     }
 
+    /// One reflector task per kind that never ends on its own, so a test can end
+    /// exactly the one it wants to and prove the supervisor names it.
+    fn immortal_tasks() -> Vec<ReflectorTask> {
+        KINDS
+            .iter()
+            .map(|kind| ReflectorTask {
+                kind,
+                handle: tokio::spawn(std::future::pending::<()>()),
+            })
+            .collect()
+    }
+
+    /// The nine kinds, in the order `start` spawns them.
+    const KINDS: [&str; 9] = [
+        "Repository",
+        "ClusterRepository",
+        "SnapshotPolicy",
+        "Snapshot",
+        "SnapshotSchedule",
+        "Restore",
+        "Maintenance",
+        "RepositoryReplication",
+        "SnapshotReplication",
+    ];
+
     /// Readiness must not flip until every store has listed, and must flip once
-    /// they have. This is the contract `/readyz` hangs off: a `true` here means
+    /// they have. This is the contract `/readyz` hangs off: a `Synced` here means
     /// an empty `Snapshot` list is a genuinely empty fleet rather than a cold
     /// cache.
     #[tokio::test]
     async fn readiness_flips_only_once_every_store_has_synced() {
         let mut writers = Writers::new();
         let stores = writers.stores();
-        let (tx, mut rx) = watch::channel(false);
-        let task = tokio::spawn(publish_readiness(stores, tx));
+        let (tx, mut rx) = watch::channel(CacheHealth::Syncing);
+        let tasks = immortal_tasks();
+        let task = tokio::spawn(supervise(stores, tasks, tx));
 
-        assert!(!*rx.borrow(), "a cold cache must not report ready");
+        assert_eq!(
+            *rx.borrow(),
+            CacheHealth::Syncing,
+            "a cold cache must not report ready"
+        );
 
-        // Mark eight of nine synced; readiness must still be false.
+        // Mark eight of nine synced; readiness must still be Syncing.
         writers.mark_all_ready_except_snapshots();
         tokio::task::yield_now().await;
-        assert!(
-            !*rx.borrow(),
+        assert_eq!(
+            *rx.borrow(),
+            CacheHealth::Syncing,
             "one un-synced store must hold the whole cache un-ready",
         );
 
         writers.mark_snapshots_ready();
-        rx.changed().await.expect("the publisher must send");
-        assert!(*rx.borrow(), "all nine synced means ready");
+        rx.changed().await.expect("the supervisor must send");
+        assert_eq!(
+            *rx.borrow(),
+            CacheHealth::Synced,
+            "all nine synced means ready"
+        );
 
-        task.await.expect("publisher task must not panic");
+        // And the supervisor is STILL running, holding the sender: that is what
+        // lets it degrade later. A supervisor that returned here is the bug this
+        // whole shape exists to prevent.
+        assert!(
+            !task.is_finished(),
+            "the supervisor must outlive the first Synced so it can still say otherwise",
+        );
+        task.abort();
     }
 
-    /// A dropped writer must leave readiness `false` forever rather than hang or
-    /// falsely report ready: startup has to be able to tell "still listing" from
-    /// "this cache will never work".
+    /// The degrade path: a reflector that dies AFTER the cache synced must flip
+    /// health back, naming the kind that stopped.
+    ///
+    /// This is the case a long-lived pod actually hits — a watch gives up hours
+    /// in — and the one where a `bool` that only went `false → true` left
+    /// `/readyz` answering `ok` over a store frozen at whatever it last held. A
+    /// frozen `Snapshot` store answers a shape indistinguishable from a healthy
+    /// quiet cluster, which is why this must never be silent.
+    #[tokio::test]
+    async fn a_reflector_dying_after_the_sync_degrades_the_cache_and_names_the_kind() {
+        let mut writers = Writers::new();
+        let stores = writers.stores();
+        let (tx, mut rx) = watch::channel(CacheHealth::Syncing);
+
+        // Every kind immortal except `Snapshot`, which this test ends by hand.
+        let tasks = immortal_tasks();
+        let doomed = tasks
+            .iter()
+            .position(|t| t.kind == "Snapshot")
+            .expect("Snapshot is one of the nine");
+        let doomed_handle = tasks[doomed].handle.abort_handle();
+
+        let supervisor = tokio::spawn(supervise(stores, tasks, tx));
+
+        writers.mark_all_ready_except_snapshots();
+        writers.mark_snapshots_ready();
+        rx.changed()
+            .await
+            .expect("the supervisor must publish Synced");
+        assert_eq!(*rx.borrow(), CacheHealth::Synced);
+
+        // The watch gives up.
+        doomed_handle.abort();
+
+        rx.changed()
+            .await
+            .expect("a dead reflector must be published, not swallowed");
+        assert_eq!(
+            *rx.borrow(),
+            CacheHealth::WatchEnded { kind: "Snapshot" },
+            "readiness must degrade AND name the kind whose store is now frozen",
+        );
+
+        supervisor.await.expect("the supervisor must not panic");
+    }
+
+    /// A dropped writer must leave the cache un-ready rather than hang or falsely
+    /// report ready: startup has to be able to tell "still listing" from "this
+    /// cache will never work".
+    ///
+    /// It ends as `WatchEnded` rather than staying `Syncing`, because the writer
+    /// is owned by the reflector task — a dropped writer means that task is
+    /// already gone, and "will never sync" deserves the terminal answer, not the
+    /// one that says to keep waiting.
     #[tokio::test]
     async fn a_dropped_writer_never_reports_ready() {
         let stores = empty_stores(); // every writer already dropped
-        let (tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(CacheHealth::Syncing);
 
-        // The publisher must RETURN (not hang) and must not have sent `true`.
-        publish_readiness(stores, tx).await;
-        assert!(
-            !*rx.borrow(),
+        // One already-finished task stands in for the reflector whose writer was
+        // dropped, so the supervisor RETURNS rather than hanging.
+        let tasks = vec![ReflectorTask {
+            kind: "Snapshot",
+            handle: tokio::spawn(std::future::ready(())),
+        }];
+
+        supervise(stores, tasks, tx).await;
+        assert_eq!(
+            *rx.borrow(),
+            CacheHealth::WatchEnded { kind: "Snapshot" },
             "a cache that can never sync must never report ready",
         );
+    }
+
+    /// `first_reflector_to_end` must answer with the kind that actually ended,
+    /// not merely that something did — the label is the half of the message an
+    /// operator can act on.
+    #[tokio::test]
+    async fn the_supervisor_names_whichever_reflector_ends_first() {
+        for expected in ["Repository", "Maintenance", "SnapshotReplication"] {
+            let tasks = immortal_tasks();
+            let doomed = tasks
+                .iter()
+                .position(|t| t.kind == expected)
+                .expect("a spawned kind");
+            tasks[doomed].handle.abort();
+
+            assert_eq!(first_reflector_to_end(tasks).await, expected);
+        }
+    }
+
+    /// The labels the supervisor reports must be the kinds' real names, since
+    /// they reach an operator's screen through `/readyz` and the error log.
+    #[test]
+    fn every_spawned_task_is_labelled_with_its_real_kind() {
+        fn check<K: KopiurKind>(expected: &str) {
+            assert_eq!(K::KIND, expected);
+            assert_eq!(K::KIND, <K as Resource>::kind(&()).as_ref());
+        }
+        check::<Repository>(KINDS[0]);
+        check::<ClusterRepository>(KINDS[1]);
+        check::<SnapshotPolicy>(KINDS[2]);
+        check::<Snapshot>(KINDS[3]);
+        check::<SnapshotSchedule>(KINDS[4]);
+        check::<Restore>(KINDS[5]);
+        check::<Maintenance>(KINDS[6]);
+        check::<RepositoryReplication>(KINDS[7]);
+        check::<SnapshotReplication>(KINDS[8]);
     }
 }
