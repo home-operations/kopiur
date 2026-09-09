@@ -401,6 +401,19 @@ pub struct SnapshotRow {
     /// GFS pruning.
     pub pinned: bool,
     /// `spec.deletionPolicy` — `Delete`, `Retain`, or `Orphan`.
+    ///
+    /// **Absent means the CR sets none, and must not be rendered as a default.**
+    /// The schema carries no `default:` — deliberately, because the effective
+    /// policy is context-dependent: a produced backup behaves as `Delete`, a
+    /// *discovered* one is forced to `Retain`, and which of those applies is the
+    /// operator's decision at delete time, not a value this field mirrors. A UI
+    /// that filled the blank with "Delete" would tell the owner of a discovered
+    /// snapshot that confirming would destroy data the operator will in fact
+    /// keep — and a UI that filled it with "Retain" would say the opposite to
+    /// everyone else.
+    ///
+    /// Render an absent value as "not set (the operator decides)" and say what
+    /// the deletion will do only when this field says it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_policy: Option<String>,
     /// For replicated snapshots: the repository the copy came from.
