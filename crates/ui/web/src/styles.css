@@ -907,7 +907,19 @@ svg {
 .page__section {
   display: grid;
   gap: var(--space-3);
+  align-content: start;
   min-width: 0;
+}
+
+/* A ledger that would starve its columns scrolls inside its own wrapper
+   instead of pushing the section past the viewport. */
+.ledger-scroll {
+  overflow-x: auto;
+  min-width: 0;
+}
+
+.ledger-scroll > .ledger {
+  min-width: 30rem;
 }
 
 .page__section-head {
@@ -1178,6 +1190,20 @@ svg {
 .work-table__object {
   display: grid;
   gap: 2px;
+  min-width: 12rem;
+}
+
+/* Names wrap in a ledger row; an ellipsis on the one word the operator
+   needs (the object's name) is the wrong thing to lose. */
+.work-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.work-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
 }
 
 .work-table__namespace {
@@ -1213,7 +1239,7 @@ svg {
   min-width: 0;
 }
 
-.controls__field > span {
+.controls__field > label {
   color: var(--fg-faint);
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
@@ -1285,6 +1311,12 @@ svg {
   display: grid;
   gap: var(--space-2);
   min-width: 24ch;
+}
+
+/* Inside the ledger the outcome lamp already carries the severity; the
+   finding's first line need not shout as well. */
+.doctor-checks .finding__what {
+  font-weight: var(--weight-medium);
 }
 
 .doctor-checks__rbac {

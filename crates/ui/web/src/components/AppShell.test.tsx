@@ -114,7 +114,9 @@ describe("AppShell", () => {
       status: 200,
       headers: { "content-type": "application/json" },
     });
-    mountAt("/");
+    // A placeholder section: the overview at "/" now has reads of its own,
+    // and these tests are about the shell, not the route inside it.
+    mountAt("/topology");
     await screen.findByText("alice", { selector: ".identity__user" });
     const list = screen.getByRole("list", { name: "Capabilities" });
     const items = within(list).getAllByRole("listitem");
@@ -138,7 +140,9 @@ describe("AppShell", () => {
       status: 502,
       headers: { "content-type": "text/html" },
     });
-    mountAt("/");
+    // A placeholder section: the overview at "/" now has reads of its own,
+    // and these tests are about the shell, not the route inside it.
+    mountAt("/topology");
     await screen.findByText("identity unavailable");
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Identity (/api/v1/me)");
@@ -151,7 +155,9 @@ describe("AppShell", () => {
       status: 200,
       headers: { "content-type": "application/json" },
     });
-    mountAt("/");
+    // A placeholder section: the overview at "/" now has reads of its own,
+    // and these tests are about the shell, not the route inside it.
+    mountAt("/topology");
     const group = await screen.findByRole("group", { name: "Theme" });
     expect(within(group).getByRole("button", { name: "System" })).toHaveAttribute(
       "aria-pressed",
@@ -191,6 +197,9 @@ describe("sectionFor", () => {
     expect(sectionFor("/repositories/cluster-repository/nas").label).toBe("Repositories");
     expect(sectionFor("/").label).toBe("Overview");
     expect(sectionFor("/nowhere").label).toBe("Overview");
+    // An off-rail page has its own title without becoming an eleventh section.
+    expect(sectionFor("/gates").label).toBe("Gates");
+    expect(NAV_ITEMS.map((item) => item.to)).not.toContain("/gates");
   });
 });
 

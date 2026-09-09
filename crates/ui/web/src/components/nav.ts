@@ -6,13 +6,14 @@ import {
   Database,
   LayoutDashboard,
   ScrollText,
+  ShieldAlert,
   Stethoscope,
   Waypoints,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
 
-/** The paths the rail links to — one per section, each a route file. */
+/** The paths the rail links to — one per section, each a route file — plus the off-rail pages. */
 export type NavPath =
   | "/"
   | "/topology"
@@ -23,7 +24,8 @@ export type NavPath =
   | "/restores"
   | "/maintenance"
   | "/replications"
-  | "/doctor";
+  | "/doctor"
+  | "/gates";
 
 export interface NavItem {
   to: NavPath;
@@ -47,8 +49,21 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { to: "/doctor", label: "Doctor", icon: Stethoscope },
 ];
 
+/**
+ * Pages with a title of their own that are not rail sections: reached from
+ * a section (doctor links to the gate registry), named in the header, never
+ * counted among the ten.
+ */
+export const OFF_RAIL_ITEMS: readonly NavItem[] = [
+  { to: "/gates", label: "Gates", icon: ShieldAlert },
+];
+
 /** The section a pathname belongs to, by its first segment; unknown paths read as Overview. */
 export function sectionFor(pathname: string): NavItem {
   const first = `/${pathname.split("/")[1] ?? ""}`;
-  return NAV_ITEMS.find((item) => item.to === first) ?? OVERVIEW;
+  return (
+    NAV_ITEMS.find((item) => item.to === first) ??
+    OFF_RAIL_ITEMS.find((item) => item.to === first) ??
+    OVERVIEW
+  );
 }

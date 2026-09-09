@@ -49,6 +49,11 @@ export interface WorkTableProps {
 
 /**
  * The ledger every list of work inherits: label strip, lamp, detail, age.
+ *
+ * The age column appears only when at least one row has an instant to
+ * measure — a column of empty cells says nothing and costs the detail its
+ * width. On a narrow viewport the ledger scrolls inside its wrapper rather
+ * than starving the object column to nothing.
  */
 export function WorkTable({
   caption,
@@ -60,48 +65,59 @@ export function WorkTable({
   if (rows.length === 0) {
     return <>{empty}</>;
   }
+  const showAge = rows.some((row) => row.at !== undefined && row.at !== null);
   return (
-    <table className="ledger work-table" aria-label={caption}>
-      <thead>
-        <tr>
-          <th scope="col">Object</th>
-          <th scope="col">State</th>
-          <th scope="col">Detail</th>
-          <th scope="col" className="num">
-            {ageLabel}
-          </th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((row) => (
-          <tr key={row.id}>
-            <td className="work-table__object">
-              <span className="label-strip">
-                <span className="label-strip__kind">{row.kind}</span>
-                <span className="label-strip__name">{row.nameLink ?? row.name}</span>
-              </span>
-              {row.namespace !== undefined && row.namespace !== null && row.namespace.length > 0 ? (
-                <span className="work-table__namespace mono">{row.namespace}</span>
-              ) : null}
-            </td>
-            <td>
-              <HealthBadge health={row.health} label={row.stateWord} />
-            </td>
-            <td className="work-table__detail">
-              {row.detail !== undefined && row.detail !== null && row.detail.length > 0
-                ? row.detail
-                : EMPTY_CELL}
-            </td>
-            <td className="num">
-              {row.at !== undefined && row.at !== null ? (
-                <time dateTime={row.at}>{humanAge(row.at, now)}</time>
-              ) : (
-                EMPTY_CELL
-              )}
-            </td>
+    <div className="ledger-scroll">
+      <table className="ledger work-table" aria-label={caption}>
+        <thead>
+          <tr>
+            <th scope="col">Object</th>
+            <th scope="col">State</th>
+            <th scope="col">Detail</th>
+            {showAge ? (
+              <th scope="col" className="num">
+                {ageLabel}
+              </th>
+            ) : null}
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.id}>
+              <td>
+                <div className="work-table__object">
+                  <span className="label-strip">
+                    <span className="label-strip__kind">{row.kind}</span>
+                    <span className="label-strip__name">{row.nameLink ?? row.name}</span>
+                  </span>
+                  {row.namespace !== undefined &&
+                  row.namespace !== null &&
+                  row.namespace.length > 0 ? (
+                    <span className="work-table__namespace mono">{row.namespace}</span>
+                  ) : null}
+                </div>
+              </td>
+              <td>
+                <HealthBadge health={row.health} label={row.stateWord} />
+              </td>
+              <td className="work-table__detail">
+                {row.detail !== undefined && row.detail !== null && row.detail.length > 0
+                  ? row.detail
+                  : EMPTY_CELL}
+              </td>
+              {showAge ? (
+                <td className="num">
+                  {row.at !== undefined && row.at !== null ? (
+                    <time dateTime={row.at}>{humanAge(row.at, now)}</time>
+                  ) : (
+                    EMPTY_CELL
+                  )}
+                </td>
+              ) : null}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }

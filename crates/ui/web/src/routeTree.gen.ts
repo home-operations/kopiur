@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as DoctorRouteImport } from './routes/doctor'
+import { Route as GatesRouteImport } from './routes/gates'
 import { Route as MaintenanceRouteImport } from './routes/maintenance'
 import { Route as PoliciesRouteImport } from './routes/policies'
 import { Route as ReplicationsRouteImport } from './routes/replications'
@@ -28,6 +29,11 @@ const IndexRoute = IndexRouteImport.update({
 const DoctorRoute = DoctorRouteImport.update({
   id: '/doctor',
   path: '/doctor',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const GatesRoute = GatesRouteImport.update({
+  id: '/gates',
+  path: '/gates',
   getParentRoute: () => rootRouteImport,
 } as any)
 const MaintenanceRoute = MaintenanceRouteImport.update({
@@ -74,6 +80,7 @@ const TopologyRoute = TopologyRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/doctor': typeof DoctorRoute
+  '/gates': typeof GatesRoute
   '/maintenance': typeof MaintenanceRoute
   '/policies': typeof PoliciesRoute
   '/replications': typeof ReplicationsRoute
@@ -86,6 +93,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/doctor': typeof DoctorRoute
+  '/gates': typeof GatesRoute
   '/maintenance': typeof MaintenanceRoute
   '/policies': typeof PoliciesRoute
   '/replications': typeof ReplicationsRoute
@@ -99,6 +107,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/doctor': typeof DoctorRoute
+  '/gates': typeof GatesRoute
   '/maintenance': typeof MaintenanceRoute
   '/policies': typeof PoliciesRoute
   '/replications': typeof ReplicationsRoute
@@ -113,6 +122,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/doctor'
+    | '/gates'
     | '/maintenance'
     | '/policies'
     | '/replications'
@@ -125,6 +135,7 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/doctor'
+    | '/gates'
     | '/maintenance'
     | '/policies'
     | '/replications'
@@ -137,6 +148,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/doctor'
+    | '/gates'
     | '/maintenance'
     | '/policies'
     | '/replications'
@@ -150,6 +162,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   DoctorRoute: typeof DoctorRoute
+  GatesRoute: typeof GatesRoute
   MaintenanceRoute: typeof MaintenanceRoute
   PoliciesRoute: typeof PoliciesRoute
   ReplicationsRoute: typeof ReplicationsRoute
@@ -174,6 +187,13 @@ declare module '@tanstack/react-router' {
       path: '/doctor'
       fullPath: '/doctor'
       preLoaderRoute: typeof DoctorRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/gates': {
+      id: '/gates'
+      path: '/gates'
+      fullPath: '/gates'
+      preLoaderRoute: typeof GatesRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/maintenance': {
@@ -238,6 +258,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   DoctorRoute: DoctorRoute,
+  GatesRoute: GatesRoute,
   MaintenanceRoute: MaintenanceRoute,
   PoliciesRoute: PoliciesRoute,
   ReplicationsRoute: ReplicationsRoute,

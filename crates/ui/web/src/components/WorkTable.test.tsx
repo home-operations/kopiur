@@ -69,6 +69,16 @@ describe("WorkTable", () => {
     );
   });
 
+  it("drops the age column when no row has an instant to measure", () => {
+    const undated = rows.map((row) => ({ ...row, at: null }));
+    render(<WorkTable caption="Stalled objects" rows={undated} now={now} ageLabel="Since" />);
+    const table = screen.getByRole("table", { name: "Stalled objects" });
+    expect(within(table).queryByRole("columnheader", { name: "Since" })).toBeNull();
+    expect(within(table).getAllByRole("columnheader")).toHaveLength(3);
+    // The detail cell still shows the empty cell when it has nothing.
+    expect(within(nth(bodyRows(table), 1)).getAllByText("-")).toHaveLength(1);
+  });
+
   it("renders the caller's empty state when there are no rows", () => {
     render(
       <WorkTable

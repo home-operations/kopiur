@@ -46,50 +46,56 @@ function scopeCell(checkId: string, namespace: string | undefined) {
 
 export function DoctorChecks({ checks, namespace }: DoctorChecksProps) {
   return (
-    <table className="ledger doctor-checks" aria-label="Doctor checks">
-      <thead>
-        <tr>
-          <th scope="col">Outcome</th>
-          <th scope="col">Check</th>
-          <th scope="col">Scope</th>
-          <th scope="col">Finding</th>
-        </tr>
-      </thead>
-      <tbody>
-        {checks.map((check) => {
-          const lamp = doctorOutcomeLamp(check.outcome);
-          const rbac = isRbacDegraded(check);
-          return (
-            <tr key={check.check} data-degraded={rbac ? "rbac" : undefined}>
-              <td>
-                <HealthBadge health={lamp.key} label={lamp.word} />
-              </td>
-              <td className="doctor-checks__check">
-                <span className="doctor-checks__title">{check.title}</span>
-                <span className="mono doctor-checks__id">{check.check}</span>
-              </td>
-              <td className="doctor-checks__scope">{scopeCell(check.check, namespace)}</td>
-              <td className="doctor-checks__finding">
-                {check.what !== undefined && check.what !== null && check.what.length > 0 ? (
-                  <Finding what={check.what} why={check.why} fix={check.fix} />
-                ) : (
-                  EMPTY_CELL
-                )}
-                {rbac ? (
-                  <p className="doctor-checks__rbac">
-                    <ShieldOff size={14} strokeWidth={2} aria-hidden="true" />
-                    <span>
-                      Not permitted for the signed-in user: kopiur-ui ran this check as you and the
-                      cluster refused. The grant named above enables it; the cluster itself may be
-                      fine.
-                    </span>
-                  </p>
-                ) : null}
-              </td>
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
+    <div className="ledger-scroll">
+      <table className="ledger doctor-checks" aria-label="Doctor checks">
+        <thead>
+          <tr>
+            <th scope="col">Outcome</th>
+            <th scope="col">Check</th>
+            <th scope="col">Scope</th>
+            <th scope="col">Finding</th>
+          </tr>
+        </thead>
+        <tbody>
+          {checks.map((check) => {
+            const lamp = doctorOutcomeLamp(check.outcome);
+            const rbac = isRbacDegraded(check);
+            return (
+              <tr key={check.check} data-degraded={rbac ? "rbac" : undefined}>
+                <td>
+                  <HealthBadge health={lamp.key} label={lamp.word} />
+                </td>
+                <td>
+                  <div className="doctor-checks__check">
+                    <span className="doctor-checks__title">{check.title}</span>
+                    <span className="mono doctor-checks__id">{check.check}</span>
+                  </div>
+                </td>
+                <td className="doctor-checks__scope">{scopeCell(check.check, namespace)}</td>
+                <td>
+                  <div className="doctor-checks__finding">
+                    {check.what !== undefined && check.what !== null && check.what.length > 0 ? (
+                      <Finding what={check.what} why={check.why} fix={check.fix} />
+                    ) : (
+                      EMPTY_CELL
+                    )}
+                    {rbac ? (
+                      <p className="doctor-checks__rbac">
+                        <ShieldOff size={14} strokeWidth={2} aria-hidden="true" />
+                        <span>
+                          Not permitted for the signed-in user: kopiur-ui ran this check as you and
+                          the cluster refused. The grant named above enables it; the cluster itself
+                          may be fine.
+                        </span>
+                      </p>
+                    ) : null}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
