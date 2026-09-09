@@ -148,6 +148,21 @@ pub struct Page<T> {
 pub struct RepositorySummary {
     /// `Repository` or `ClusterRepository`.
     pub kind: String,
+    /// The `{kind}` URL segment for this row — `repository` or
+    /// `cluster-repository`.
+    ///
+    /// Here so the SPA links to `/repositories/{kindPath}/{name}` and
+    /// `DELETE /repositories/{kindPath}/{name}/session` without a local
+    /// CRD-kind-to-segment mapping table. [`Self::kind`] is the CRD kind for
+    /// display; this is the routing token, and the two differ in case and
+    /// punctuation. Both routes also *accept* [`Self::kind`] itself, so a client
+    /// that ignores this field still works — it is the canonical spelling, not
+    /// the only one.
+    ///
+    /// `RepositoryDetail` carries it as `summary.kindPath`: one field, so the
+    /// segment a row links with and the segment a detail screen links with
+    /// cannot drift.
+    pub kind_path: String,
     /// `metadata.name`.
     pub name: String,
     /// `metadata.namespace`; absent for `ClusterRepository`.

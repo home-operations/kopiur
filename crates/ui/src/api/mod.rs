@@ -115,14 +115,41 @@ pub struct NamespaceQuery {
 /// A closed enum rather than a bare string so a handler cannot forget the
 /// cluster-scoped case, and kebab-case on the wire because it is a URL path
 /// segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+///
+/// # One vocabulary for every route that takes this segment
+///
+/// `GET /repositories/{kind}/{name}` and
+/// `DELETE /repositories/{kind}/{name}/session` are the *same* segment in the
+/// same URL shape, and they used to parse it two different ways: the read route
+/// took kebab-case `cluster-repository` case-**sensitively**, the browse route
+/// took `clusterrepository` case-insensitively and rejected the hyphen. The
+/// segment that linked one screen was a 400 on the other, from the same row.
+///
+/// So there is one parser — [`RepositoryKindPath::parse`] — accepting every
+/// spelling in [`REPOSITORY_KIND_PATHS`] in any case. What the API *produces* is
+/// always the canonical [`RepositoryKindPath::as_path`] (`repository` /
+/// `cluster-repository`), which is what `RepositorySummary.kindPath` hands the
+/// SPA so it never builds the segment from `kind` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepositoryKindPath {
     /// The namespaced `Repository` CRD.
     Repository,
     /// The cluster-scoped `ClusterRepository` CRD.
     ClusterRepository,
 }
+
+/// Every accepted spelling of the `{kind}` path segment, lower-cased.
+///
+/// The FIRST entry for a kind is its canonical segment — the one
+/// [`RepositoryKindPath::as_path`] returns and the one every link the API mints
+/// carries. The rest are tolerated because a caller round-tripping
+/// `RepositorySummary.kind` (`ClusterRepository`) or hand-writing the CRD kind
+/// should not earn a 400 over a hyphen.
+pub const REPOSITORY_KIND_PATHS: &[(&str, RepositoryKindPath)] = &[
+    ("repository", RepositoryKindPath::Repository),
+    ("cluster-repository", RepositoryKindPath::ClusterRepository),
+    ("clusterrepository", RepositoryKindPath::ClusterRepository),
+];
 
 impl RepositoryKindPath {
     /// The `kopiur_api` kind this path segment names. Exhaustive.
@@ -131,6 +158,64 @@ impl RepositoryKindPath {
             Self::Repository => RepositoryKind::Repository,
             Self::ClusterRepository => RepositoryKind::ClusterRepository,
         }
+    }
+
+    /// The path segment for a `kopiur_api` kind. Exhaustive, and the inverse of
+    /// [`Self::kind`], so a third repository CRD cannot compile until both
+    /// directions name it.
+    pub fn from_kind(kind: RepositoryKind) -> Self {
+        match kind {
+            RepositoryKind::Repository => Self::Repository,
+            RepositoryKind::ClusterRepository => Self::ClusterRepository,
+        }
+    }
+
+    /// The canonical path segment for this kind. Exhaustive.
+    pub fn as_path(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::ClusterRepository => "cluster-repository",
+        }
+    }
+
+    /// Parse one `{kind}` path segment, case-insensitively over every spelling
+    /// in [`REPOSITORY_KIND_PATHS`]. `None` for anything else — never a default,
+    /// because guessing `Repository` for an unreadable segment would answer
+    /// about a namespaced object when the caller named the cluster-scoped one.
+    pub fn parse(segment: &str) -> Option<Self> {
+        let want = segment.trim().to_ascii_lowercase();
+        REPOSITORY_KIND_PATHS
+            .iter()
+            .find(|(spelling, _)| *spelling == want)
+            .map(|(_, kind)| *kind)
+    }
+
+    /// The accepted spellings, comma-separated, for a refusal. One list, so a
+    /// spelling the parser accepts cannot be left out of the error that names
+    /// them.
+    pub fn accepted_spellings() -> String {
+        REPOSITORY_KIND_PATHS
+            .iter()
+            .map(|(spelling, _)| *spelling)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Hand-written rather than derived, so `{kind}` is read by [`parse`] — the one
+/// parser both routes share — instead of by serde's kebab-case rename, which is
+/// exact-match and case-sensitive.
+///
+/// [`parse`]: RepositoryKindPath::parse
+impl<'de> Deserialize<'de> for RepositoryKindPath {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Self::parse(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "`{raw}` is not a repository kind; expected one of {}",
+                Self::accepted_spellings()
+            ))
+        })
     }
 }
 
@@ -218,7 +303,9 @@ where
 /// The case that made this necessary: `/repositories/{kind}` takes the kebab
 /// `cluster-repository`, but `RepositorySummary.kind` hands the SPA
 /// `ClusterRepository`. A client that round-trips the field it was given gets a
-/// path rejection, and it got one as `text/plain`.
+/// path rejection, and it got one as `text/plain`. (The segment itself is now
+/// parsed tolerantly — see [`RepositoryKindPath`] — so that particular
+/// round-trip resolves; a genuinely unknown kind still lands here.)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UiPath<T>(pub T);
 
@@ -237,8 +324,11 @@ where
                 "invalid-path",
                 "A path segment of this request could not be read.",
                 format!("{rejection}"),
-                "check the URL against the endpoint's shape — the repository kind segment, for \
-                 example, is the kebab-case `repository` or `cluster-repository`",
+                format!(
+                    "check the URL against the endpoint's shape — the repository kind segment, \
+                     for example, is one of {} (in any case)",
+                    RepositoryKindPath::accepted_spellings()
+                ),
             )
             .with_instance(request_path(&parts.extensions, &parts.uri))),
         }
@@ -798,17 +888,75 @@ mod tests {
         let _router: Router<AppState> = router();
     }
 
+    /// The whole point of item 3: every spelling a caller could plausibly send —
+    /// the canonical kebab segment, the CRD kind `RepositorySummary.kind` hands
+    /// them, and the hyphen-less form the browse route used to insist on —
+    /// resolves to the same kind, through one parser.
     #[test]
-    fn a_repository_kind_path_segment_is_kebab_case() {
+    fn every_accepted_repository_kind_spelling_resolves_to_the_same_kind() {
+        for spelling in [
+            "cluster-repository",
+            "clusterrepository",
+            "ClusterRepository",
+            "Cluster-Repository",
+            "CLUSTERREPOSITORY",
+        ] {
+            assert_eq!(
+                RepositoryKindPath::parse(spelling).map(RepositoryKindPath::kind),
+                Some(RepositoryKind::ClusterRepository),
+                "{spelling} must name the cluster-scoped CRD"
+            );
+        }
+        for spelling in ["repository", "Repository", "REPOSITORY"] {
+            assert_eq!(
+                RepositoryKindPath::parse(spelling).map(RepositoryKindPath::kind),
+                Some(RepositoryKind::Repository),
+                "{spelling} must name the namespaced CRD"
+            );
+        }
+        assert_eq!(
+            RepositoryKindPath::parse("secret"),
+            None,
+            "an unknown segment is a refusal, never a default"
+        );
+    }
+
+    /// The extractor reads a query/path value through the same parser, so a
+    /// `?repositoryKind=ClusterRepository` is not a 400 the way it used to be.
+    #[test]
+    fn the_deserializer_is_the_shared_parser_and_its_error_names_every_spelling() {
         let cluster: RepositoryKindPath =
-            serde_json::from_value(serde_json::json!("cluster-repository")).unwrap();
+            serde_json::from_value(serde_json::json!("ClusterRepository")).unwrap();
         assert_eq!(cluster.kind(), RepositoryKind::ClusterRepository);
-        let namespaced: RepositoryKindPath =
-            serde_json::from_value(serde_json::json!("repository")).unwrap();
-        assert_eq!(namespaced.kind(), RepositoryKind::Repository);
-        assert!(
-            serde_json::from_value::<RepositoryKindPath>(serde_json::json!("Repository")).is_err(),
-            "the path segment is the kebab form only"
+        let error = serde_json::from_value::<RepositoryKindPath>(serde_json::json!("Secret"))
+            .expect_err("not a repository kind");
+        for spelling in ["repository", "cluster-repository", "clusterrepository"] {
+            assert!(
+                error.to_string().contains(spelling),
+                "the refusal must list {spelling}: {error}"
+            );
+        }
+    }
+
+    /// The canonical segment is what the API *mints*, and it round-trips.
+    #[test]
+    fn the_canonical_path_segment_round_trips_through_the_parser() {
+        for kind in [
+            RepositoryKind::Repository,
+            RepositoryKind::ClusterRepository,
+        ] {
+            let path = RepositoryKindPath::from_kind(kind);
+            assert_eq!(path.kind(), kind, "from_kind and kind must be inverses");
+            assert_eq!(
+                RepositoryKindPath::parse(path.as_path()),
+                Some(path),
+                "the segment the API hands the SPA must be one the API accepts"
+            );
+        }
+        assert_eq!(
+            RepositoryKindPath::from_kind(RepositoryKind::ClusterRepository).as_path(),
+            "cluster-repository",
+            "kebab is canonical; the other spellings are tolerated, not produced"
         );
     }
 }
@@ -949,11 +1097,11 @@ mod extractor_rejection_tests {
 
     #[tokio::test]
     async fn a_bad_path_segment_is_a_problem_document() {
-        // `RepositorySummary.kind` hands the SPA `Repository`; the path segment
-        // is the kebab form. A client round-tripping the field it was given
-        // lands exactly here.
-        let (status, content_type, body) =
-            get("/repositories/Repository/nas?namespace=media").await;
+        // A segment that is not a repository kind at all. (The kind spellings a
+        // client could plausibly round-trip — `Repository`,
+        // `ClusterRepository`, `clusterrepository` — all resolve now; see
+        // `every_accepted_repository_kind_spelling_resolves_to_the_same_kind`.)
+        let (status, content_type, body) = get("/repositories/Secret/nas?namespace=media").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(content_type.as_deref(), Some("application/problem+json"));
         assert_eq!(body["type"], "urn:kopiur:problem:invalid-path");
@@ -964,6 +1112,34 @@ mod extractor_rejection_tests {
             "the remedy spells the form that would have worked: {}",
             body["fix"]
         );
+    }
+
+    /// The read route and the browse session-delete route take the same segment
+    /// out of the same URL shape, so every spelling must resolve on BOTH. A
+    /// resolved segment means the request got past routing and path parsing into
+    /// the handler — where it fails for want of a cluster, which is neither a
+    /// 400 `invalid-path` nor a 404.
+    #[tokio::test]
+    async fn every_kind_spelling_resolves_on_the_repository_read_route() {
+        for spelling in [
+            "repository",
+            "Repository",
+            "cluster-repository",
+            "clusterrepository",
+            "ClusterRepository",
+        ] {
+            let (status, _, body) =
+                get(&format!("/repositories/{spelling}/nas?namespace=media")).await;
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{spelling} must match the route"
+            );
+            assert_ne!(
+                body["type"], "urn:kopiur:problem:invalid-path",
+                "{spelling} must be a kind this route reads, got {body}"
+            );
+        }
     }
 
     #[tokio::test]

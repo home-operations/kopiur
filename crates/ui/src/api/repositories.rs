@@ -49,7 +49,7 @@ pub fn router() -> Router<AppState> {
 /// The fields of a repository the two CRDs share, gathered so one projection can
 /// serve both without a trait.
 struct RepoFacts<'a> {
-    kind: &'static str,
+    kind: RepositoryKind,
     name: String,
     namespace: Option<String>,
     phase: Option<&'a RepositoryPhase>,
@@ -90,9 +90,17 @@ fn mode_label(mode: RepositoryMode) -> String {
 }
 
 /// **Pure.** The shared projection.
+///
+/// `kind` and `kind_path` are both derived from the one [`RepositoryKind`] on
+/// [`RepoFacts`], never written out side by side: the display kind and the URL
+/// segment differ in case and punctuation, and a row whose link disagreed with
+/// its own label is exactly the mismatch `RepositoryKindPath` exists to end.
 fn summary_from(facts: &RepoFacts<'_>, gates: &[GateHit]) -> RepositorySummary {
     RepositorySummary {
-        kind: facts.kind.to_string(),
+        kind: facts.kind.kind_str().to_string(),
+        kind_path: RepositoryKindPath::from_kind(facts.kind)
+            .as_path()
+            .to_string(),
         name: facts.name.clone(),
         namespace: facts.namespace.clone(),
         phase: facts.phase.map(repo_phase_view),
@@ -116,7 +124,7 @@ pub fn view_repository(repo: &Repository) -> RepositorySummary {
     let conditions = status.map(|s| s.conditions.as_slice()).unwrap_or_default();
     let stats = status.and_then(|s| s.storage_stats.as_ref());
     let facts = RepoFacts {
-        kind: "Repository",
+        kind: RepositoryKind::Repository,
         name: repo.metadata.name.clone().unwrap_or_default(),
         namespace: repo.metadata.namespace.clone(),
         phase: status.and_then(|s| s.phase.as_ref()),
@@ -144,7 +152,7 @@ pub fn view_cluster_repository(repo: &ClusterRepository) -> RepositorySummary {
     let conditions = status.map(|s| s.conditions.as_slice()).unwrap_or_default();
     let stats = status.and_then(|s| s.storage_stats.as_ref());
     let facts = RepoFacts {
-        kind: "ClusterRepository",
+        kind: RepositoryKind::ClusterRepository,
         name: repo.metadata.name.clone().unwrap_or_default(),
         namespace: None,
         phase: status.and_then(|s| s.phase.as_ref()),
@@ -601,6 +609,46 @@ status:
             row.allowed_namespace_count, None,
             "only a cluster repository has one"
         );
+    }
+
+    /// The row carries BOTH the CRD kind (for display) and the URL segment (for
+    /// linking), and the segment is one the routes accept — so the SPA never
+    /// builds `/repositories/{kind}/…` from `kind` and gets it wrong.
+    #[test]
+    fn a_row_carries_the_url_segment_its_own_detail_route_takes() {
+        let namespaced = view_repository(&nas());
+        assert_eq!(namespaced.kind, "Repository");
+        assert_eq!(namespaced.kind_path, "repository");
+
+        let cluster: ClusterRepository = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata: { name: shared }
+spec:
+  backend: { filesystem: { path: /repo } }
+  encryption: { passwordSecretRef: { name: pw, key: password } }
+  allowedNamespaces: { all: true }
+"#,
+        );
+        let row = view_cluster_repository(&cluster);
+        assert_eq!(row.kind, "ClusterRepository");
+        assert_eq!(
+            row.kind_path, "cluster-repository",
+            "the routing token is kebab; `kind` is the CRD spelling"
+        );
+
+        for row in [&namespaced, &row] {
+            assert_eq!(
+                RepositoryKindPath::parse(&row.kind_path).map(RepositoryKindPath::kind),
+                Some(
+                    RepositoryKindPath::parse(&row.kind)
+                        .expect("the CRD kind parses too")
+                        .kind()
+                ),
+                "the segment the row hands the SPA must resolve to the row's own kind"
+            );
+        }
     }
 
     #[test]
