@@ -436,3 +436,24 @@ Added after Task 8 by a two-agent adversarial gap analysis of the SPA plan again
   ts-rs renders externally-tagged enums as heterogeneous `string | object` unions, and the fallback variant is not uniformly named: `Health::Unknown` is a unit variant, `EntryKind`'s fallback is `Other { raw }`, and `OriginView`/`GateSeverityView` have none. Add a module doc to `crates/ui-model/src/lib.rs` listing every exported enum, its variant shapes, and whether it has a fallback — the SPA's exhaustiveness strategy depends on it. No code change; this is the contract the next milestone reads.
 
 - [ ] **Verify:** `cargo test --workspace --locked`, `mise run clippy fmt-check phase-check wiring-check gen-check complexity-check`. Every new endpoint gets a router-level test; every new wire field gets a test that it is populated from the source the doc claims. Commit as `feat(ui): close the API contract gaps the SPA needs`.
+
+---
+
+### Task 10: Three contract fixes the UI's diagnostics screen needs
+
+Added after the web application's overview and diagnostics screens were reviewed. Each item is a defect the client noticed and faithfully worked around; the workaround is worse than the fix, and two of them mean the UI currently tells the user something untrue.
+
+**Files:** `crates/ops/src/doctor.rs`, `crates/ui/src/api/doctor.rs`, `crates/ui-model/src/views.rs`, `crates/ui-model/src/lib.rs` (the export list and its exact-count test), and the CLI if it shares the affected surface.
+
+- [ ] **Item 1 — a check-subset parameter on the diagnostics endpoint.**
+  The web application's landing page needs three failure-bearing checks in order to show recent failures with their remediation text, because the status report carries none. Today it must run the whole report, which costs a dry-run create through the full admission chain, a Secret read per credential reference (so O(fleet)), and an events list — on the most-visited screen, re-fired whenever the tab regains focus past the cache window.
+  Add a `checks` selector to `DoctorParams` and to the endpoint's query type (which is `deny_unknown_fields`, so an unknown value must be a 400 problem naming the valid ones, not silence). An absent selector runs everything exactly as today. Test that a subset runs only those checks — assert on the checks that did NOT run, since the point is the work avoided.
+
+- [ ] **Item 2 — correct the exit-code documentation.**
+  `DoctorReportView.exit_code`'s doc describes three values. `kopiur_ops::doctor::exit_code` is `u8::from(any check failed)`, so `2` is unreachable and a warning maps to `0`. The CLI ships the same value, so the wrong doc also misdescribes `kubectl kopiur doctor`'s own exit contract. Fix the documentation to match the code; do not add a third value. Check whether the CLI's user-facing documentation repeats the same error and correct it there too.
+
+- [ ] **Item 3 — publish each check's scope as a typed field.**
+  The client currently reconstructs which checks are namespace-scoped from a table it maintains by hand, because the wire says nothing. That duplication has already produced a false statement: `list_repos` always lists `ClusterRepository` cluster-wide, so a report the UI labels "scoped to namespace X" includes two checks that are not.
+  Add a `scope` field to `DoctorCheckView` as a closed three-variant enum — namespaced, installation-wide, and mixed (a check that reads both) — populated from what each check actually does, not from its description. Exported by `export_all`, so the count assertion moves with a stated reason. Test that a check reading a cluster-scoped resource never reports itself as namespaced.
+
+- [ ] **Verify:** `cargo test --workspace --locked --no-fail-fast`, `mise run clippy fmt-check phase-check wiring-check gen-check complexity-check`, then `mise run ui-types` and commit any regenerated TypeScript — a wire change staled the generated types once already. Commit as `fix(ui): a check subset, an honest exit-code doc, and a typed check scope`.
