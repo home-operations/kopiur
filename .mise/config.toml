@@ -24,6 +24,11 @@ lefthook = "2.1.12"
 # `npm` on PATH (e.g. a stale/removed `/usr/bin/npm`), which silently breaks
 # `mise install` with `Cannot find module '/usr/bin/npm'`.
 node = "24.20.0"
+# Package manager for the web UI SPA (`crates/ui/web`). Resolved from the `aqua`
+# backend (`mise registry pnpm` → `aqua:pnpm/pnpm npm:pnpm`), i.e. a standalone
+# signed binary rather than an npm install into the node above — so `ui-install`
+# needs no global npm state and the lock entry carries a per-platform checksum.
+pnpm = "12.3.4"
 oxfmt = "0.66.0"
 zizmor = "1.30.0"
 helm = "4.2.4"
@@ -140,11 +145,11 @@ description = "Verify formatting without changing files (CI gate)"
 run = "cargo fmt --all -- --check"
 
 [tasks.gen]
-description = "Regenerate deploy/crds + deploy/rbac from the Rust types"
+description = "Regenerate deploy/crds + deploy/rbac + the SPA's TypeScript from the Rust types"
 run = "cargo xtask gen-all"
 
 [tasks.gen-check]
-description = "Fail if checked-in CRDs/RBAC are stale (CI drift guard)"
+description = "Fail if checked-in CRDs/RBAC/SPA types are stale (CI drift guard)"
 run = "cargo xtask gen-all --check"
 
 [tasks.wiring-check]
@@ -182,6 +187,47 @@ set -eu
 # and an exemption that matches nothing any more (delete the entry).
 cargo xtask check-phases
 '''
+
+# ---------------------------------------------------------------------------
+# Web UI (crates/ui/web) — the SPA served by `kopiur-ui`.
+#
+# `test` stays node-free on purpose: the hermetic Rust suite must run without a
+# JavaScript toolchain. Everything below needs pnpm, so it lives in its own
+# task group and its own CI job.
+# ---------------------------------------------------------------------------
+
+[tasks.ui-types]
+description = "Regenerate the SPA's TypeScript wire types from crates/ui-model (ts-rs)"
+# The same generator `gen`/`gen-check` drive; kept as its own task so a UI-only
+# change need not rebuild the CRDs.
+run = "cargo xtask gen-ui-types"
+
+[tasks.ui-install]
+description = "Install the SPA's node dependencies from the lockfile"
+dir = "crates/ui/web"
+run = "pnpm install --frozen-lockfile"
+
+[tasks.ui-dev]
+description = "Run the SPA dev server (proxies /api to a local kopiur-ui on :8090)"
+dir = "crates/ui/web"
+run = "pnpm dev"
+
+[tasks.ui-build]
+description = "Build the SPA into crates/ui/web/dist (what crates/ui/build.rs embeds)"
+dir = "crates/ui/web"
+run = "pnpm build"
+
+[tasks.ui-check]
+description = "SPA gate: tsc + eslint + vitest, then fail if a generated type was hand-edited"
+# Runs from the workspace root rather than `crates/ui/web` so the `git diff`
+# path is the one a reader recognises. The diff is the belt to gen-check's
+# braces: gen-check catches types that are stale relative to the Rust source,
+# this catches a generated file someone edited in place and never regenerated
+# (identical failure, but here it surfaces in the job that owns the SPA).
+run = [
+  "pnpm -C crates/ui/web check",
+  "git diff --exit-code crates/ui/web/src/api/types",
+]
 
 [tasks.cov]
 description = "Coverage over the hermetic suite -> lcov.info (report-only; no threshold)"
@@ -289,7 +335,9 @@ description = "Serve the MkDocs user docs locally with live reload (no rustdoc n
 run = "uv run mkdocs serve"
 
 [tasks.ci]
-description = "The full local hermetic gate: format, lint, build, test, and drift check"
+description = "The full local hermetic gate: format, lint, build, test, drift check, and the SPA"
+# `ui-check`/`ui-build` need `mise run ui-install` first (and therefore a
+# network fetch of the SPA's dependencies), which is why they are not in `test`.
 depends = [
   "fmt-check",
   "clippy",
@@ -298,6 +346,8 @@ depends = [
   "gen-check",
   "wiring-check",
   "phase-check",
+  "ui-check",
+  "ui-build",
 ]
 
 [hooks]
