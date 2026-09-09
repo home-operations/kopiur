@@ -10,8 +10,13 @@ export type DoctorReportView = {
  */
 checks: Array<DoctorCheckView>,
 /**
- * The exit code `kubectl kopiur doctor` would have returned — `0` all
- * pass, `1` warnings, `2` failures.
+ * The exit code `kubectl kopiur doctor` would have returned: `0` when no
+ * check failed — **warnings included** — and `1` when any check did.
+ *
+ * There is no third value. A warning deliberately is not a failure (an
+ * RBAC-degraded check warns, and a restricted kubeconfig must not report a
+ * broken cluster), so counting warnings from `checks` is the only way to
+ * tell "all clear" from "could not fully verify".
  */
 exitCode: number,
 /**

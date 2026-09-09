@@ -1777,6 +1777,23 @@ mod tests {
             .exit_code(),
             1
         );
+        // Two values, never three. The wire doc on `DoctorReportView.exit_code`
+        // claimed a `2` for failures and `1` for warnings, which described a
+        // contract neither this function nor `kubectl kopiur doctor` has ever
+        // had; a warning and a failure together are still exactly `1`.
+        assert_eq!(
+            report(vec![
+                Outcome::Warn("x".into()),
+                Outcome::Fail {
+                    what: "w".into(),
+                    why: "y".into(),
+                    fix: "f".into()
+                }
+            ])
+            .exit_code(),
+            1,
+            "a warning alongside a failure must not escalate the exit code past 1"
+        );
     }
 
     #[test]
