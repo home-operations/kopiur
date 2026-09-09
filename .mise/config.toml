@@ -14,6 +14,23 @@ experimental = true
 [monorepo]
 config_roots = ["crates/e2e"]
 
+# ADDING A TOOL? The `mise-lock` pre-commit hook (from the shared
+# home-operations/.github config) runs `mise lock -p
+# linux-x64,linux-arm64,macos-arm64` and `git add`s `.mise/mise.lock` for you —
+# and on the pinned mise version that regeneration is NOT limited to your new
+# tool. It also rewrites `uv` and `cargo-llvm-cov` from their `-linux-gnu`
+# release artifacts to `-linux-musl` (new URLs and checksums on both linux
+# platforms) and appends a duplicate `[[tools.node]]` entry with
+# `backend = "core:node"`. That churn is a real behaviour change and must not
+# ride along in an unrelated commit.
+#
+# So after touching this table: `git diff .mise/mise.lock` and confirm every
+# added line belongs to YOUR tool. If it does not, restore the lockfile, insert
+# only your tool's block (copy it verbatim from the `mise lock` run — the
+# per-platform checksums cannot be hand-written), and commit with `--no-verify`
+# so the hook cannot put the churn back. Verify with `mise install --locked
+# <tool>`, which fails if a checksum is wrong. The `pnpm` entry below is the
+# worked example: it was landed exactly this way.
 [tools]
 actionlint = "1.7.12"
 rust = { version = "1.98.0", components = "rustfmt,clippy,llvm-tools" }
@@ -204,29 +221,66 @@ run = "cargo xtask gen-ui-types"
 
 [tasks.ui-install]
 description = "Install the SPA's node dependencies from the lockfile"
+# Every other pnpm task `depends` on this one, so the manifest precondition
+# below is the single place that check lives — and it runs no matter which task
+# you invoke. It exits NON-ZERO on purpose. A `|| exit 0` skip-guard here would
+# be permanent and would fail open: the day someone deletes or mis-paths
+# `package.json`, the whole SPA gate would report success. A loud red until the
+# scaffold lands is the cheaper failure, and the message says which gates a
+# reader can still trust in the meantime.
 dir = "crates/ui/web"
-run = "pnpm install --frozen-lockfile"
+run = '''
+set -eu
+if [ ! -f package.json ]; then
+  echo "error: crates/ui/web/package.json is absent — the SPA scaffold has not landed yet." >&2
+  echo "       This gate is red by design until it does; nothing here is misconfigured." >&2
+  echo "       Unaffected and still meaningful: mise run test, clippy, gen-check (which" >&2
+  echo "       includes the SPA's generated TypeScript), wiring-check, phase-check." >&2
+  exit 1
+fi
+pnpm install --frozen-lockfile
+'''
 
 [tasks.ui-dev]
 description = "Run the SPA dev server (proxies /api to a local kopiur-ui on :8090)"
+# `depends`, not a note in the description: mise runs a task's dependencies
+# before its body, so this works from any entry point. Listing `ui-install` in
+# `ci` instead would NOT order it first — `ci`'s depends run concurrently.
+depends = ["ui-install"]
 dir = "crates/ui/web"
 run = "pnpm dev"
 
 [tasks.ui-build]
 description = "Build the SPA into crates/ui/web/dist (what crates/ui/build.rs embeds)"
+depends = ["ui-install"]
 dir = "crates/ui/web"
 run = "pnpm build"
 
 [tasks.ui-check]
-description = "SPA gate: tsc + eslint + vitest, then fail if a generated type was hand-edited"
-# Runs from the workspace root rather than `crates/ui/web` so the `git diff`
-# path is the one a reader recognises. The diff is the belt to gen-check's
-# braces: gen-check catches types that are stale relative to the Rust source,
-# this catches a generated file someone edited in place and never regenerated
-# (identical failure, but here it surfaces in the job that owns the SPA).
+description = "SPA gate: tsc + eslint + vitest, then fail if the generated types are not committed"
+# `ui-types` is a dependency so the tree check below has something to check: on
+# a clean tree with no preceding regeneration it would otherwise assert nothing.
+depends = ["ui-install", "ui-types"]
+# Runs from the workspace root rather than `crates/ui/web` so the path in the
+# check is the one a reader recognises.
+#
+# This is NOT a different failure from gen-check's — gen-check catches an
+# in-place hand-edit too. What it adds is (a) surfacing it in the job that owns
+# the SPA, right next to the tsc/eslint output, and (b) `--porcelain` rather
+# than `git diff`, which is blind to UNTRACKED files: a brand-new wire type
+# whose `.ts` was generated but never `git add`ed would slip past a plain diff.
 run = [
   "pnpm -C crates/ui/web check",
-  "git diff --exit-code crates/ui/web/src/api/types",
+  '''
+set -eu
+dirty="$(git status --porcelain -- crates/ui/web/src/api/types)"
+if [ -n "$dirty" ]; then
+  echo "error: crates/ui/web/src/api/types is not in sync with git after regenerating:" >&2
+  echo "$dirty" >&2
+  echo "       fix: git add the generated types (or revert a hand-edit) and commit." >&2
+  exit 1
+fi
+''',
 ]
 
 [tasks.cov]
@@ -335,9 +389,15 @@ description = "Serve the MkDocs user docs locally with live reload (no rustdoc n
 run = "uv run mkdocs serve"
 
 [tasks.ci]
-description = "The full local hermetic gate: format, lint, build, test, drift check, and the SPA"
-# `ui-check`/`ui-build` need `mise run ui-install` first (and therefore a
-# network fetch of the SPA's dependencies), which is why they are not in `test`.
+description = "The full local gate: the hermetic Rust suite plus the SPA (needs network + node)"
+# NOT hermetic, unlike `test`: `ui-install` fetches the SPA's dependencies from
+# the network. `test` stays node-free and offline; this is the superset you run
+# before pushing.
+#
+# `ui-install` and `ui-types` are absent from this list on purpose — they are
+# `depends` of `ui-check`/`ui-build`, which is what actually ORDERS them.
+# Entries here run concurrently, so listing `ui-install` alongside `ui-check`
+# would not guarantee node_modules exists by the time `ui-check` starts.
 depends = [
   "fmt-check",
   "clippy",

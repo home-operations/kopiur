@@ -44,5 +44,8 @@ exclude = [
 # and the checked-in `.ts` must move with it, or CI's gen-check is the first
 # thing that notices.
 [pre-commit.commands.ui-types]
-glob = ["crates/ui-model/src/*.rs"]
+# Both patterns: the crate is flat files today, and depending on the glob
+# engine `**/` does not necessarily match zero segments — so the plain `*.rs`
+# case is spelled out rather than assumed.
+glob = ["crates/ui-model/src/*.rs", "crates/ui-model/src/**/*.rs"]
 run = "mise run ui-types && git add crates/ui/web/src/api/types"
