@@ -109,7 +109,9 @@ export function overviewVerdict({
   }
 
   const total = Object.values(repositories).reduce((sum, count) => sum + count, 0);
-  const tail = "nothing stalled, doctor passes.";
+  // "no failing checks", not "doctor passes": the caller may have asked
+  // `/doctor` for a subset, and this sentence must be true of whatever ran.
+  const tail = "nothing stalled, no failing checks.";
   if (total === 0) {
     return { health: "unknown", text: `No repositories in scope, ${tail}` };
   }

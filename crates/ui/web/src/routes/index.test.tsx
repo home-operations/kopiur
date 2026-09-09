@@ -172,7 +172,25 @@ describe("Overview", () => {
     const paths = calledPaths();
     expect(paths).toContain("/api/v1/status?namespace=media");
     expect(paths).toContain("/api/v1/repositories?namespace=media");
-    expect(paths).toContain("/api/v1/doctor?namespace=media");
+
+    // The landing page asks for a subset, not the whole suite: running it all
+    // here meant a dryRun create through the admission chain, a Secret read
+    // per credential reference across the fleet and a cluster-wide Events
+    // list, on every visit and again whenever the tab regained focus.
+    const doctorPath = nth(
+      paths.filter((p) => p.startsWith("/api/v1/doctor")),
+      0,
+    );
+    const asked = new URL(doctorPath, "http://localhost").searchParams.get("checks");
+    expect(asked).not.toBeNull();
+    const askedFor = (asked ?? "").split(",");
+    expect(askedFor).toContain("no-stuck-work");
+    expect(askedFor).toContain("recent-failures");
+    expect(askedFor).toContain("repositories-ready");
+    // The three heaviest reads doctor makes are none of the overview's business.
+    expect(askedFor).not.toContain("webhook-admits");
+    expect(askedFor).not.toContain("credentials-present");
+    expect(askedFor).not.toContain("recent-warnings");
   });
 
   it("reads as calm when everything is healthy", async () => {
@@ -191,7 +209,7 @@ describe("Overview", () => {
     mountApp("/");
     const verdict = await screen.findByRole("heading", { level: 2, name: /All 2 repositories/ });
     expect(verdict).toHaveTextContent(
-      "All 2 repositories healthy, nothing stalled, doctor passes.",
+      "All 2 repositories healthy, nothing stalled, no failing checks.",
     );
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "healthy");
     const stalled = screen.getByRole("region", { name: "Stalled objects" });

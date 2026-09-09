@@ -13,7 +13,7 @@ describe("overviewVerdict", () => {
   it("is healthy only when every source loaded and nothing is lit", () => {
     const verdict = overviewVerdict(quiet);
     expect(verdict.health).toBe("healthy");
-    expect(verdict.text).toBe("All 3 repositories healthy, nothing stalled, doctor passes.");
+    expect(verdict.text).toBe("All 3 repositories healthy, nothing stalled, no failing checks.");
   });
 
   it("counts the suspended and pending as not lit but not healthy either", () => {
@@ -23,7 +23,7 @@ describe("overviewVerdict", () => {
     });
     expect(verdict.health).toBe("healthy");
     expect(verdict.text).toBe(
-      "2 of 4 repositories healthy (1 pending, 1 suspended), nothing stalled, doctor passes.",
+      "2 of 4 repositories healthy (1 pending, 1 suspended), nothing stalled, no failing checks.",
     );
   });
 
@@ -127,6 +127,6 @@ describe("overviewVerdict", () => {
       repositories: { failed: 0, degraded: 0, pending: 0, unknown: 0, suspended: 0, healthy: 0 },
     });
     expect(verdict.health).toBe("unknown");
-    expect(verdict.text).toBe("No repositories in scope, nothing stalled, doctor passes.");
+    expect(verdict.text).toBe("No repositories in scope, nothing stalled, no failing checks.");
   });
 });

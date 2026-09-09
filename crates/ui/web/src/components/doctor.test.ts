@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { DoctorCheckView } from "../api/types";
-import { DOCTOR_DEFAULTS, doctorOutcomeLamp, isRbacDegraded, summarizeDoctor } from "./doctor";
+import {
+  DOCTOR_DEFAULTS,
+  OVERVIEW_DOCTOR_CHECKS,
+  doctorOutcomeLamp,
+  isRbacDegraded,
+  summarizeDoctor,
+} from "./doctor";
 
 const check = (over: Partial<DoctorCheckView>): DoctorCheckView => ({
   check: "crds-installed",
@@ -115,6 +121,51 @@ describe("summarizeDoctor", () => {
       }),
     ]);
     expect(summary).toMatchObject({ warn: 1, rbac: 1, total: 2 });
+  });
+});
+
+describe("OVERVIEW_DOCTOR_CHECKS", () => {
+  it("names only checks the server knows, so the subset cannot 400 the landing page", () => {
+    // `crates/ui/src/api/doctor.rs::check_id` over `DoctorCheck::ALL`. An id
+    // nothing matches is a 400 naming every valid one, which would blank the
+    // one screen an operator opens when they suspect something is wrong.
+    const ALL = [
+      "crds-installed",
+      "controller-running",
+      "webhook-running",
+      "webhook-admits",
+      "repositories-ready",
+      "credentials-present",
+      "snapshot-replications",
+      "no-stuck-work",
+      "recent-failures",
+      "recent-warnings",
+    ];
+    for (const id of OVERVIEW_DOCTOR_CHECKS) {
+      expect(ALL, id).toContain(id);
+    }
+    expect(new Set(OVERVIEW_DOCTOR_CHECKS).size).toBe(OVERVIEW_DOCTOR_CHECKS.length);
+  });
+
+  it("leaves out the three heaviest reads and keeps every cheap failure the overview renders", () => {
+    // The overview lists failing checks with their fix text, so it asks for
+    // the checks that can fail — minus the two whose cost is the reason the
+    // suite could not be run on every visit, and minus the Events list, which
+    // only ever warns and is therefore never rendered here.
+    expect(OVERVIEW_DOCTOR_CHECKS).not.toContain("webhook-admits");
+    expect(OVERVIEW_DOCTOR_CHECKS).not.toContain("credentials-present");
+    expect(OVERVIEW_DOCTOR_CHECKS).not.toContain("recent-warnings");
+    for (const id of [
+      "crds-installed",
+      "controller-running",
+      "webhook-running",
+      "repositories-ready",
+      "snapshot-replications",
+      "no-stuck-work",
+      "recent-failures",
+    ]) {
+      expect(OVERVIEW_DOCTOR_CHECKS, id).toContain(id);
+    }
   });
 });
 

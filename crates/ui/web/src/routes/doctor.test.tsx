@@ -85,9 +85,12 @@ describe("Doctor", () => {
       "annotate namespace media",
     );
 
+    // This screen is the full report, so it names no subset: `checks` absent
+    // runs all ten, and an absent row here would read as a check that passed.
     expect(calledPaths()).toContain(
       "/api/v1/doctor?namespace=media&stuckThreshold=7200&failureLookback=86400",
     );
+    expect(calledPaths().filter((p) => p.includes("checks="))).toHaveLength(0);
     expect(screen.getByRole("link", { name: /gate registry/i })).toHaveAttribute(
       "href",
       "/gates?namespace=media",

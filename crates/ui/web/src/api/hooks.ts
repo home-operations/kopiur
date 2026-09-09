@@ -161,6 +161,15 @@ export interface DoctorParams {
   namespace?: string | undefined;
   stuckThreshold?: number | undefined;
   failureLookback?: number | undefined;
+  /**
+   * Run only these checks, by `check_id`. Absent runs all ten.
+   *
+   * A **cost** control, not a display filter: the server skips the work an
+   * unasked-for check would have done. A caller that names a subset gets a
+   * shorter report, not one with the rest passing — so a screen that asks for
+   * less must not present its row count as the whole verdict.
+   */
+  checks?: readonly string[] | undefined;
 }
 
 /** `GET /api/v1/events` — a per-object feed; all three are required. */
@@ -422,10 +431,21 @@ export function useReplications(namespace: Namespace, options: ReadOptions = {})
   );
 }
 
+/**
+ * `checks` is comma-separated on the wire, not a repeated key: the handler
+ * deserializes with `serde_urlencoded`, which has no sequence support, and
+ * the query is `deny_unknown_fields`. The key carries the subset because it
+ * changes the answer — a cached full report must never be served to a caller
+ * that asked for less, or the other way round.
+ */
 export function useDoctor(params: DoctorParams, options: ReadOptions = {}) {
+  const { checks, ...rest } = params;
   return useApiQuery<DoctorReportView>(
     queryKeys.doctor(params),
-    withQuery(paths.doctor, { ...params }),
+    withQuery(paths.doctor, {
+      ...rest,
+      checks: checks !== undefined ? checks.join(",") : undefined,
+    }),
     {
       staleTime: staleTime.doctor,
       ...options,

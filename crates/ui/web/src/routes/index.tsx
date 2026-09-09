@@ -11,7 +11,7 @@ import { Finding } from "../components/Finding";
 import { LoadingState } from "../components/LoadingState";
 import { StatusCards } from "../components/StatusCards";
 import { WorkTable, type WorkRow } from "../components/WorkTable";
-import { doctorOutcomeLamp, summarizeDoctor } from "../components/doctor";
+import { OVERVIEW_DOCTOR_CHECKS, doctorOutcomeLamp, summarizeDoctor } from "../components/doctor";
 import { countByHealth, healthLamp } from "../components/health";
 import { overviewVerdict } from "../components/verdict";
 import { relativeTime } from "../util/format";
@@ -31,7 +31,11 @@ import { useCurrentNamespace } from "../util/namespace";
  * - `/status` (`?namespace=` only, addenda item 12) for the CLI's own report:
  *   in-flight counts and the stalled objects. Its `report` is `unknown` on
  *   the wire by design and is narrowed defensively (addenda item 15).
- * - `/doctor` for the failing checks — the one source of `fix` text.
+ * - `/doctor` for the failing checks — the one source of `fix` text. It asks
+ *   for `OVERVIEW_DOCTOR_CHECKS`, not the whole suite: this page is the one
+ *   an operator opens most and it refetches on window focus, so it must not
+ *   drag a dryRun admission create, a Secret read per credential reference
+ *   and a cluster-wide Events list along with it.
  */
 export const Route = createFileRoute("/")({
   component: Overview,
@@ -41,7 +45,7 @@ function Overview() {
   const namespace = useCurrentNamespace();
   const repositories = useRepositories(namespace);
   const status = useStatus(namespace);
-  const doctor = useDoctor({ namespace });
+  const doctor = useDoctor({ namespace, checks: OVERVIEW_DOCTOR_CHECKS });
 
   const report = status.data !== undefined ? narrowStatusReport(status.data.report) : null;
   const now = status.data !== undefined ? new Date(status.data.now) : new Date();

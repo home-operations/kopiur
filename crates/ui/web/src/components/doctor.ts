@@ -105,3 +105,38 @@ export function summarizeDoctor(checks: readonly DoctorCheckView[]): DoctorSumma
  * them: an empty control means exactly this.
  */
 export const DOCTOR_DEFAULTS = { stuckThreshold: "1h", failureLookback: "24h" } as const;
+
+/**
+ * The checks the overview asks `/doctor` to run — `?checks=`, not the whole
+ * suite.
+ *
+ * The landing page is the screen an operator opens most, and it re-fetches
+ * whenever the tab regains focus. Running all ten there meant, per visit: a
+ * `dryRun` create through the admission chain (a write verb, kopiur's own
+ * webhook, an audit entry), a Secret `get` per credential reference across
+ * the fleet, and a cluster-wide Events list. `run_all` skips the work behind
+ * a check nobody asked for, so naming a subset removes those three reads
+ * outright rather than merely hiding their rows.
+ *
+ * What is asked for is what this screen renders: it lists *failing* checks
+ * with their fix text, so it wants the checks that can fail and are cheap to
+ * run. `recent-warnings` can only ever warn and is never rendered here.
+ * `webhook-admits` and `credentials-present` can fail, and are dropped
+ * anyway — they are the two expensive reads, `webhook-running` covers the
+ * common way the webhook is broken, and an unreadable credential usually
+ * shows up as a repository that is not Ready. The full report is one click
+ * away and says so.
+ *
+ * Ids are `check_id` over `DoctorCheck::ALL`
+ * (`crates/ui/src/api/doctor.rs`); an id the server does not know is a 400,
+ * not a narrower report.
+ */
+export const OVERVIEW_DOCTOR_CHECKS: readonly string[] = [
+  "crds-installed",
+  "controller-running",
+  "webhook-running",
+  "repositories-ready",
+  "snapshot-replications",
+  "no-stuck-work",
+  "recent-failures",
+];
