@@ -171,7 +171,7 @@ health vocabulary that never speaks by colour alone.
 
 ### Named Rules
 
-**The Lettered Lamp Rule.** A health colour never appears without its icon and its word. `HealthBadge` is the only way to render one.
+**The Lettered Lamp Rule.** A health colour never appears without its icon and its word. `HealthBadge` (a `Health` value) and `LampBadge` (a `Lamp` that carries its own icon, such as the dashed circle of a dangling reference) are the only two ways to render one; `HealthBadge` is `LampBadge` with the lamp looked up.
 
 **The Accent By Law Rule.** Indigo marks selection, the current item, focus and the primary action. It is never a health colour, never a border for emphasis, never a background wash.
 
@@ -310,6 +310,27 @@ marker the system has.
 
 - **Style:** a surface bar of labelled fields (label caps above a mono input on the canvas ground), a faint hint or a failed-lamp error beneath, one primary action at the end. Validation repeats the server's rule so a refused value never leaves the form.
 
+### Board (topology)
+
+- **Style:** a scrolling frame on the inset ground with a hairline edge and a 6px chamfer, holding two layers: one SVG of routed orthogonal lines, and ordinary HTML plates positioned over it. Plates are 232px wide and at least 64px tall — the label strip's two lines (kind in label caps, name in mono) over the lamp — on the surface with a strong hairline, so they read as raised off the chassis. The current plate takes the accent border and inset ring, the one current marker the system has.
+- **Lines:** direction is the arrow; _kind_ is the dash and the end marker; _health_ is the stroke colour **and**, at the middle of the line, the word — a failing replication reads "0 5 \* \* \* · Failed", never a red line alone. Five strokes, defined once in `topology/model.ts` (`edgeStyle`) and drawn from that one source by both the board and the legend.
+- **Rule:** the SVG is `aria-hidden` and everything it draws is also said in words — each plate is a button, each relationship is in the drawer for either end, and the whole edge set is listed for assistive technology beneath the board. A picture is never the only copy of a fact.
+
+### Ghost plate
+
+- **Style:** a 2px dashed failed-lamp border on the failed-lamp field, with a dashed-circle lamp reading "referenced but not found" — the one lamp on the console allowed to wrap, because truncating it would turn a dangling reference back into an ordinary failure.
+- **Rule:** a node the server marked `missing` is a backup destination that does not exist. It is the only structurally different shape on the board, so it is legible before a single word is read, and its drawer states what / why / fix.
+
+### Edge legend
+
+- **Style:** a three-column grid of sample stroke, relationship name, and one clause of meaning, drawn with the same dash, width and marker the board uses, in neutral ink — the legend is about kind, not health. One column with the sample above the words below 900px.
+- **Rule:** always on the page while a board is on it. Never a hover tooltip, never behind a disclosure: a dash vocabulary the reader has to uncover is not a vocabulary.
+
+### Drawer
+
+- **Style:** a panel in the column beside the board (a block beneath it below 900px), sticky to the top while the board scrolls, never an overlay — the plate you selected has to stay visible while you read about it. Header is the label strip and a quiet close; body is one clause saying what the kind is, a definition list of facts, any findings, the relationships at both ends grouped by direction, and a link to the section that lists the object.
+- **Rule:** opening it moves focus into the panel and closing it (button or Escape) hands focus back to the plate. Its links stop at the section: a repository's URL segment is the server's `kindPath` and is never guessed from the display kind.
+
 ### States
 
 - **Loading:** skeleton ledger rows (1.4s sheen, disabled under reduced motion), announced as busy.
@@ -325,6 +346,7 @@ marker the system has.
 - **Do** set identifiers in monospace and numbers in tabular figures.
 - **Do** disable an action the user may not perform and say why (`ActionButton.disabledReason` from `capabilityReason`).
 - **Do** render a problem's what, why and fix from the server's own text, fix set apart.
+- **Do** give a drawn relationship a word as well as a stroke — the dash says which kind, the legend says what the dash means, and a stroke colour is always joined by a word on the line, on the plate or in the drawer.
 
 ### Don't:
 
@@ -333,3 +355,4 @@ marker the system has.
 - **Don't** nest a panel in a panel or divide regions with shadows; use a hairline.
 - **Don't** use a spinner; loading is a skeleton of the rows to come.
 - **Don't** let an unknown or unrecognised value fall through to the healthy lamp.
+- **Don't** draw a graph whose only reading is visual: a picture must have a spoken twin — a button, a drawer, or a list beneath it.
