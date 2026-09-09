@@ -110,13 +110,26 @@ mod tests {
         );
     }
 
-    /// A backend-only checkout (no `web/dist`) must be recognisable at runtime,
-    /// which is what `/readyz`'s `placeholder-web` reason depends on.
+    /// Whether this test binary was built with a real `web/dist` to embed.
     ///
-    /// The assertion is conditional on the marker actually being present so the
-    /// test still passes in a full build that embeds the real SPA — and it
-    /// asserts the two functions agree either way, which is the invariant that
-    /// matters.
+    /// `build.rs` reruns when `web/dist` changes, so the embed and this check
+    /// see the same tree: the bundle is either in both or in neither.
+    fn web_dist_present() -> bool {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("web")
+            .join("dist")
+            .join(INDEX)
+            .is_file()
+    }
+
+    /// `is_placeholder()` must agree with the marker `build.rs` writes — the
+    /// invariant `/readyz`'s `placeholder-web` reason depends on — and it must
+    /// come out the right way for *whichever* tree this binary was built from.
+    ///
+    /// Both arms assert. An earlier version asserted only when `web/dist` was
+    /// absent, so a full build that embedded the real SPA asserted nothing at
+    /// all: a bundle that accidentally shipped the marker, or an embed that
+    /// silently staged the placeholder over a real `dist/`, passed the test.
     #[test]
     fn is_placeholder_agrees_with_the_embedded_marker() {
         let index = Web::get(INDEX).expect("index.html must be embedded");
@@ -126,19 +139,46 @@ mod tests {
             html.contains(PLACEHOLDER_MARKER),
             "is_placeholder() must reflect the marker build.rs writes"
         );
-        // This checkout has no `web/dist` (PR3 adds it), so the placeholder is
-        // what a `cargo build -p kopiur-ui` here embeds.
-        if !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("web")
-            .join("dist")
-            .join(INDEX)
-            .is_file()
-        {
+        if web_dist_present() {
+            assert!(
+                !is_placeholder(),
+                "web/dist exists, so the real bundle must be embedded, not the placeholder"
+            );
+        } else {
             assert!(
                 is_placeholder(),
                 "with no web/dist, the placeholder must be what is embedded"
             );
         }
+    }
+
+    /// With a real bundle embedded, the entry point is the SPA's own
+    /// `index.html` — it names a hashed script under `assets/`, which the
+    /// placeholder never does — and at least one hashed asset is embedded
+    /// beside it, so `spa_fallback` can actually serve the app rather than a
+    /// page whose script tag 404s.
+    #[test]
+    fn a_real_bundle_embeds_the_spa_index_and_its_hashed_assets() {
+        if !web_dist_present() {
+            // Nothing to assert about a bundle that was not built; the
+            // placeholder arm of `is_placeholder_agrees_with_the_embedded_marker`
+            // covers this checkout.
+            return;
+        }
+        assert!(
+            !is_placeholder(),
+            "web/dist exists, so is_placeholder() must be false"
+        );
+        let index = Web::get(INDEX).expect("index.html must be embedded");
+        let html = String::from_utf8(index.data.into_owned()).expect("index.html must be UTF-8");
+        assert!(
+            html.contains("/assets/"),
+            "the real index.html must reference the bundler's hashed assets, got: {html}"
+        );
+        assert!(
+            Web::iter().any(|path| path.starts_with(HASHED_ASSET_PREFIX)),
+            "at least one hashed asset must be embedded beside index.html"
+        );
     }
 
     #[tokio::test]
