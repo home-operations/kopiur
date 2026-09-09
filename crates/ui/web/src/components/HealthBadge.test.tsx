@@ -40,11 +40,23 @@ describe("HealthBadge", () => {
     warn.mockRestore();
   });
 
-  it("keeps the icon when the word is replaced by a count", () => {
-    const { container } = render(<HealthBadge health="failed" label="3 failed" />);
+  it("keeps the icon and the spoken word when the visible word is replaced by a count", () => {
+    // A bare "3" must still announce "Failed": with the icon aria-hidden,
+    // colour would otherwise be the only carrier for a screen reader.
+    const { container } = render(<HealthBadge health="failed" label="3" />);
     const lamp = container.querySelector(".health");
     expect(lamp).toHaveAttribute("data-health", "failed");
-    expect(lamp).toHaveTextContent("3 failed");
     expect(lamp?.querySelector("svg")).not.toBeNull();
+    expect(lamp).toHaveTextContent("3 (Failed)");
+    const hidden = lamp?.querySelector(".visually-hidden");
+    expect(hidden).toHaveTextContent("Failed");
+    // The visible span carries only the custom label.
+    expect(lamp?.querySelector("span:not(.visually-hidden)")).toHaveTextContent(/^3$/);
+  });
+
+  it("adds no hidden word when the visible word is the lamp's own", () => {
+    const { container } = render(<HealthBadge health="healthy" />);
+    expect(container.querySelector(".visually-hidden")).toBeNull();
+    expect(container.querySelector(".health")).toHaveTextContent(/^Healthy$/);
   });
 });

@@ -1,13 +1,21 @@
-import type { ButtonHTMLAttributes, MouseEvent } from "react";
+import { type ButtonHTMLAttributes, type MouseEvent, useId } from "react";
 
 /**
  * A button that can be disabled *with a reason*.
  *
  * Actions the user cannot perform are never hidden — the UI teaches the RBAC
  * model — so a control the caller's `/me` capabilities forbid stays visible,
- * reads as disabled, and says why on hover and on keyboard focus. `aria-disabled`
- * rather than `disabled` keeps it focusable so a keyboard user gets the reason
- * too; the reason is also part of the accessible name.
+ * reads as disabled, and says why on hover and on keyboard focus.
+ *
+ * The contract, for assistive technology as much as for the eye:
+ *
+ * - `aria-disabled`, not `disabled`, so the control stays focusable and a
+ *   keyboard user can reach the reason.
+ * - The reason is the control's accessible *description* (`aria-describedby`
+ *   → a visually-hidden sibling), so a screen reader announces the action's
+ *   name and then why it is unavailable — two facts, not one run-on name.
+ * - `data-reason` drives the visible tooltip (`styles.css`, `.button[data-reason]`).
+ * - A click while blocked is swallowed; `onClick` never runs.
  */
 export interface ActionButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: "default" | "primary" | "quiet" | "danger" | undefined;
@@ -23,6 +31,7 @@ export function ActionButton({
   children,
   ...rest
 }: ActionButtonProps) {
+  const reasonId = useId();
   const blocked = disabledReason !== undefined && disabledReason.length > 0;
   const classes = ["button", variant === "default" ? "" : `button--${variant}`, className ?? ""]
     .filter((c) => c.length > 0)
@@ -35,16 +44,23 @@ export function ActionButton({
     onClick?.(event);
   };
   return (
-    <button
-      type="button"
-      {...rest}
-      className={classes}
-      aria-disabled={blocked ? "true" : undefined}
-      data-reason={blocked ? disabledReason : undefined}
-      onClick={handleClick}
-    >
-      {children}
-      {blocked ? <span className="visually-hidden"> — {disabledReason}</span> : null}
-    </button>
+    <>
+      <button
+        type="button"
+        {...rest}
+        className={classes}
+        aria-disabled={blocked ? "true" : undefined}
+        aria-describedby={blocked ? reasonId : rest["aria-describedby"]}
+        data-reason={blocked ? disabledReason : undefined}
+        onClick={handleClick}
+      >
+        {children}
+      </button>
+      {blocked ? (
+        <span id={reasonId} className="visually-hidden">
+          {disabledReason}
+        </span>
+      ) : null}
+    </>
   );
 }

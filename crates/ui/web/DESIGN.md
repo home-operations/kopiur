@@ -177,6 +177,8 @@ health vocabulary that never speaks by colour alone.
 
 **The One Declaration Rule.** Every colour is written once as `light-dark(light, dark)`. There is no dark block to keep in sync.
 
+**The Browser Floor.** `light-dark()` needs Chrome 123, Firefox 120 or Safari 17.5 (all 2024); that is the console's supported floor. Below it every colour token resolves to `unset` and the page degrades to the UA's own light/dark canvas — readable, and the lamps still differ by icon and word — while a single `@supports not (color: light-dark(#000, #fff))` block in `styles.css` pins static light values for `--fg`, `--bg-canvas`, `--bg-surface` and `--focus-ring`, so keyboard focus stays visible. Do not add per-token fallbacks beyond those four; raise the floor instead.
+
 ## Typography
 
 **Display Font:** none — this is an Operate surface; the page title is the body family at 22px.
