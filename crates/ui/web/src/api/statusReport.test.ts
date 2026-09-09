@@ -48,22 +48,10 @@ const full = {
 };
 
 describe("narrowStatusReport", () => {
-  it("reads every section of a well-formed report", () => {
+  it("reads every section the overview renders", () => {
     const report = narrowStatusReport(full);
-    expect(report.repositories).toHaveLength(2);
-    expect(report.repositories[0]).toEqual({
-      kind: "Repository",
-      name: "nas",
-      namespace: "media",
-      phase: "Ready",
-      suspended: false,
-      problem: null,
-    });
-    expect(report.repositories[1]?.namespace).toBeNull();
-    expect(report.repositories[1]?.problem).toBe("password Secret offsite-pw not found");
     expect(report.policies).toBe(1);
     expect(report.schedules).toBe(1);
-    expect(report.snapshotReplications).toBe(0);
     expect(report.inFlight).toEqual({ snapshots: 2, restores: 1 });
     expect(report.stalled).toEqual([
       { kind: "Snapshot", object: "media/nightly-1", message: "MoverPermitted=False" },
@@ -72,12 +60,26 @@ describe("narrowStatusReport", () => {
     expect(report.complete).toBe(true);
   });
 
+  it("narrows nothing the overview does not render, so no unread row can flip complete", () => {
+    // The module narrows only what a route reads. `repositories` and
+    // `snapshotReplications` were narrowed and never rendered, so an
+    // unreadable repository row raised "report incomplete" on a page that
+    // shows no repository section — a warning about something invisible.
+    const report = narrowStatusReport({
+      ...full,
+      repositories: ["not-an-object", { name: "no-kind" }],
+      snapshotReplications: "not-a-list",
+    });
+    expect(report).not.toHaveProperty("repositories");
+    expect(report).not.toHaveProperty("snapshotReplications");
+    expect(report.complete).toBe(true);
+  });
+
   it("treats every field as possibly absent and says the report was incomplete", () => {
     // Addenda item 15: the report is `unknown` by design; a newer or older
     // server may omit or rename any of it. Nothing here may throw.
     for (const value of [null, undefined, 42, "text", [], {}]) {
       const report = narrowStatusReport(value);
-      expect(report.repositories).toEqual([]);
       expect(report.stalled).toEqual([]);
       expect(report.inFlight).toEqual({ snapshots: null, restores: null });
       expect(report.policies).toBeNull();
@@ -87,33 +89,35 @@ describe("narrowStatusReport", () => {
 
   it("keeps the rows it can read and drops the ones it cannot, without inventing values", () => {
     const report = narrowStatusReport({
-      repositories: [
-        { kind: "Repository", name: "ok", phase: "Ready", suspended: false },
-        { name: "no-kind" },
-        "not-an-object",
-        { kind: "Repository", name: "no-phase", suspended: "yes" },
-      ],
+      ...full,
       inFlight: { snapshots: "3", restores: 1 },
       stalled: [
-        { kind: "Snapshot", object: "a/b" },
+        { kind: "Snapshot", object: "a/b", message: 7 },
         { kind: "Snapshot", object: "c/d", message: "m" },
+        "not-an-object",
       ],
-    });
-    expect(report.repositories.map((r) => r.name)).toEqual(["ok", "no-phase"]);
-    expect(report.repositories[1]).toEqual({
-      kind: "Repository",
-      name: "no-phase",
-      namespace: null,
-      phase: null,
-      suspended: null,
-      problem: null,
     });
     // A count that is not a number is unknown, never coerced to 3 or 0.
     expect(report.inFlight).toEqual({ snapshots: null, restores: 1 });
+    // A stalled object is a real fact and is kept — but its unreadable
+    // message is `null`, not `""`. An empty string reads as "the operator
+    // said nothing", which is a claim this bundle is in no position to make.
     expect(report.stalled).toEqual([
-      { kind: "Snapshot", object: "a/b", message: "" },
+      { kind: "Snapshot", object: "a/b", message: null },
       { kind: "Snapshot", object: "c/d", message: "m" },
     ]);
+    expect(report.complete).toBe(false);
+  });
+
+  it("counts a stalled row whose message it could not read as incomplete", () => {
+    // The module doc promises a row is never "patched with a default that
+    // looks like a fact". `message: ""` was exactly that, and it left
+    // `complete` true, so the page said nothing was missing.
+    const report = narrowStatusReport({
+      ...full,
+      stalled: [{ kind: "Snapshot", object: "a/b" }],
+    });
+    expect(report.stalled).toEqual([{ kind: "Snapshot", object: "a/b", message: null }]);
     expect(report.complete).toBe(false);
   });
 });

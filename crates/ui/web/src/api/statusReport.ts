@@ -10,29 +10,29 @@
  * dropped so the route can say the report was partial rather than quietly
  * rendering less than the server sent.
  *
- * Only what the overview renders is narrowed — repositories, in-flight counts,
- * stalled rows, and section sizes. Add a field here when a route needs it.
+ * Only what the overview renders is narrowed — in-flight counts, stalled
+ * rows, and the two section sizes. Add a field here when a route needs it,
+ * and not before: `repositories` and `snapshotReplications` were narrowed
+ * and never read, so an unreadable *repository* row flipped `complete` and
+ * raised "report incomplete" on a page that displays no repository section.
+ * The overview's fleet strip comes from `/repositories`, which carries the
+ * typed `Health` this report has no notion of.
  */
-
-/** One repository line of the report, as the overview reads it. */
-export interface RepoRowView {
-  kind: string;
-  name: string;
-  /** Absent for a `ClusterRepository`. */
-  namespace: string | null;
-  /** `status.phase` as the operator wrote it; `null` when unreported. */
-  phase: string | null;
-  suspended: boolean | null;
-  /** The `Ready` condition's message when the repository is not Ready. */
-  problem: string | null;
-}
 
 /** One object carrying the kstatus `Stalled=True` condition. */
 export interface StalledRowView {
   kind: string;
   /** `namespace/name`. */
   object: string;
-  message: string;
+  /**
+   * The condition's message, or `null` when the report did not carry one.
+   *
+   * `null`, never `""`: an empty string renders as an empty cell and reads
+   * as "the operator said nothing", which is a fact this bundle cannot
+   * establish. The row itself is kept — a stalled object is real whether or
+   * not its message could be read — and `complete` records the gap.
+   */
+  message: string | null;
 }
 
 /** Counts of non-terminal work; `null` when the report did not say. */
@@ -43,16 +43,15 @@ export interface InFlightView {
 
 /** The narrowed report. */
 export interface StatusReportView {
-  repositories: RepoRowView[];
   /** How many policies the report lists; `null` when the section is absent. */
   policies: number | null;
   schedules: number | null;
-  snapshotReplications: number | null;
   inFlight: InFlightView;
   stalled: StalledRowView[];
   /**
-   * `false` when any section or row was absent or unreadable. The route
-   * renders what it has and says the report was partial.
+   * `false` when any section or row the overview renders was absent or
+   * unreadable. The route renders what it has and says the report was
+   * partial — so this must not follow a section the route does not show.
    */
   complete: boolean;
 }
@@ -67,32 +66,8 @@ function optionalString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
-function optionalBoolean(value: unknown): boolean | null {
-  return typeof value === "boolean" ? value : null;
-}
-
 function optionalCount(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
-}
-
-function repoRow(value: unknown): RepoRowView | null {
-  const row = asObject(value);
-  if (row === null) {
-    return null;
-  }
-  const kind = optionalString(row.kind);
-  const name = optionalString(row.name);
-  if (kind === null || name === null) {
-    return null;
-  }
-  return {
-    kind,
-    name,
-    namespace: optionalString(row.namespace),
-    phase: optionalString(row.phase),
-    suspended: optionalBoolean(row.suspended),
-    problem: optionalString(row.problem),
-  };
 }
 
 function stalledRow(value: unknown): StalledRowView | null {
@@ -105,7 +80,7 @@ function stalledRow(value: unknown): StalledRowView | null {
   if (kind === null || object === null) {
     return null;
   }
-  return { kind, object, message: optionalString(row.message) ?? "" };
+  return { kind, object, message: optionalString(row.message) };
 }
 
 /**
@@ -134,16 +109,13 @@ export function narrowStatusReport(report: unknown): StatusReportView {
   const root = asObject(report);
   if (root === null) {
     return {
-      repositories: [],
       policies: null,
       schedules: null,
-      snapshotReplications: null,
       inFlight: { snapshots: null, restores: null },
       stalled: [],
       complete: false,
     };
   }
-  const [repositories, reposComplete] = rows(root.repositories, repoRow);
   const [stalled, stalledComplete] = rows(root.stalled, stalledRow);
   const inFlightObject = asObject(root.inFlight);
   const inFlight: InFlightView = {
@@ -152,16 +124,12 @@ export function narrowStatusReport(report: unknown): StatusReportView {
   };
   const policies = Array.isArray(root.policies) ? root.policies.length : null;
   const schedules = Array.isArray(root.schedules) ? root.schedules.length : null;
-  const snapshotReplications = Array.isArray(root.snapshotReplications)
-    ? root.snapshotReplications.length
-    : null;
   const complete =
-    reposComplete &&
     stalledComplete &&
+    stalled.every((row) => row.message !== null) &&
     inFlight.snapshots !== null &&
     inFlight.restores !== null &&
     policies !== null &&
-    schedules !== null &&
-    snapshotReplications !== null;
-  return { repositories, policies, schedules, snapshotReplications, inFlight, stalled, complete };
+    schedules !== null;
+  return { policies, schedules, inFlight, stalled, complete };
 }
