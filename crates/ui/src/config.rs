@@ -323,7 +323,7 @@ pub struct UiArgs {
     /// `num_args = 0..=1` keeps the bare `--anonymous-fallback` form working.
     #[arg(long, env = ANONYMOUS_FALLBACK_ENV, action = ArgAction::Set,
           num_args = 0..=1, default_value_t = false, default_missing_value = "true",
-          value_parser = parse_flag_bool)]
+          value_parser = flag_bool::<false>)]
     pub anonymous_fallback: bool,
 
     /// File holding the shared secret the proxy presents in X-Kopiur-Proxy-Token.
@@ -333,7 +333,7 @@ pub struct UiArgs {
     /// Acknowledge running header mode with no proxy shared secret.
     #[arg(long, env = ACKNOWLEDGE_NO_PROXY_SECRET_ENV, action = ArgAction::Set,
           num_args = 0..=1, default_value_t = false, default_missing_value = "true",
-          value_parser = parse_flag_bool)]
+          value_parser = flag_bool::<false>)]
     pub acknowledge_no_proxy_secret: bool,
 
     /// **Debug builds only.** Allow the configured anonymous identity to be a
@@ -353,7 +353,7 @@ pub struct UiArgs {
     /// hatch at all.
     #[cfg(debug_assertions)]
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_value_t = false,
-          default_missing_value = "true", value_parser = parse_flag_bool, hide = true)]
+          default_missing_value = "true", value_parser = flag_bool::<false>, hide = true)]
     pub dev_allow_system_groups: bool,
 
     /// The operator's own namespace (the chart injects it via the downward API).
@@ -367,7 +367,7 @@ pub struct UiArgs {
     /// Back reads with watch-fed reflector stores instead of per-request LISTs.
     #[arg(long, env = CACHE_ENV, action = ArgAction::Set,
           num_args = 0..=1, default_value_t = true, default_missing_value = "true",
-          value_parser = parse_flag_bool)]
+          value_parser = flag_bool::<true>)]
     pub cache: bool,
 
     /// Idle lifetime of a browse-session pod (e.g. 15m).
@@ -1083,22 +1083,25 @@ fn parse_duration(name: &'static str, value: &str) -> Result<Duration, ConfigErr
     Ok(Duration::from_secs(secs))
 }
 
-/// clap value parser for the boolean flags.
+/// clap value parser for the boolean flags, parameterised by the flag's own
+/// default.
 ///
-/// An empty value maps to `false`, for every flag. That is right for the two
-/// opt-in flags (`--anonymous-fallback`, `--acknowledge-no-proxy-secret`), whose
-/// default is already `false`.
+/// **An empty value means "unset", so it resolves to `DEFAULT`** — the
+/// convention this repository uses everywhere, and the reason the default is a
+/// const parameter rather than a fixed `false`. Helm renders a nulled value as
+/// `KOPIUR_UI_CACHE=""`, and clap consults the environment and runs this parser
+/// *before* [`UiArgs::resolve`] ever sees the value, so `default_value_t` cannot
+/// rescue it: an empty string that mapped to `false` for every flag would have
+/// silently turned the read cache off for anyone whose values file left
+/// `ui.cache` null.
 ///
-/// It is **wrong for `--cache`**, whose default is `true`: a chart that renders
-/// `KOPIUR_UI_CACHE=""` (a nulled Helm value) silently turns the read cache off
-/// rather than leaving it at the default. clap consults the environment and runs
-/// this parser before [`UiArgs::resolve`] ever sees the value, so `default_value_t`
-/// cannot rescue it and the fix has to be here or in the flag's declaration —
-/// Task 8 owns it. Until then, set `KOPIUR_UI_CACHE` to `true`/`false` explicitly
-/// or leave it out of the environment entirely; do not render it as `""`.
-fn parse_flag_bool(value: &str) -> Result<bool, String> {
+/// The `DEFAULT` here must match the flag's `default_value_t`. They sit on
+/// adjacent lines at each declaration for exactly that reason, and
+/// `every_boolean_flag_treats_an_empty_env_var_as_unset` asserts the pairing for
+/// each flag through a real parse.
+fn flag_bool<const DEFAULT: bool>(value: &str) -> Result<bool, String> {
     match value.to_ascii_lowercase().as_str() {
-        "" => Ok(false),
+        "" => Ok(DEFAULT),
         "true" | "t" | "yes" | "y" | "on" | "1" => Ok(true),
         "false" | "f" | "no" | "n" | "off" | "0" => Ok(false),
         _ => Err(format!(
@@ -1585,6 +1588,77 @@ mod tests {
             "the startup config log must not carry the proxy secret, got: {rendered}"
         );
         assert!(rendered.contains("<redacted>"), "got: {rendered}");
+    }
+
+    // --- boolean flags ------------------------------------------------------
+
+    /// An empty value for a boolean flag means "unset", so it resolves to that
+    /// flag's own default — the same convention `--allowed-groups` follows, for
+    /// the same reason: Helm renders a nulled value as `KOPIUR_UI_CACHE=""`, and
+    /// clap runs the value parser on the environment before `resolve()` ever
+    /// sees it, so `default_value_t` cannot rescue an empty string.
+    ///
+    /// One case per flag, checked through a real parse rather than against
+    /// `flag_bool` directly: the bug this guards is a parser paired with the
+    /// wrong default at the declaration, which a direct unit test could not see.
+    /// `--cache` is the one whose default is `true`, and the one where getting
+    /// it wrong silently turns the read cache off for every deployment that left
+    /// `ui.cache` null.
+    #[test]
+    #[serial]
+    fn every_boolean_flag_treats_an_empty_env_var_as_unset() {
+        assert!(
+            parse(&["--cache", ""]).cache,
+            "an empty KOPIUR_UI_CACHE must leave the read cache at its default (on)"
+        );
+        assert!(!parse(&["--anonymous-fallback", ""]).anonymous_fallback);
+        assert!(!parse(&["--acknowledge-no-proxy-secret", ""]).acknowledge_no_proxy_secret);
+        #[cfg(debug_assertions)]
+        assert!(!parse(&["--dev-allow-system-groups", ""]).dev_allow_system_groups);
+
+        // Every flag's empty-value answer must equal what the flag resolves to
+        // when it is absent entirely. That is the whole claim of "empty ==
+        // unset", and it is what breaks if a parser is paired with the wrong
+        // default.
+        let absent = parse(&[]);
+        assert_eq!(parse(&["--cache", ""]).cache, absent.cache);
+        assert_eq!(
+            parse(&["--anonymous-fallback", ""]).anonymous_fallback,
+            absent.anonymous_fallback
+        );
+        assert_eq!(
+            parse(&["--acknowledge-no-proxy-secret", ""]).acknowledge_no_proxy_secret,
+            absent.acknowledge_no_proxy_secret
+        );
+    }
+
+    /// An explicit value still wins over the default, in both directions, and a
+    /// value that is neither is refused rather than silently defaulted.
+    #[test]
+    #[serial]
+    fn an_explicit_boolean_still_overrides_the_default() {
+        assert!(!parse(&["--cache", "false"]).cache);
+        assert!(!parse(&["--cache", "0"]).cache);
+        assert!(parse(&["--cache", "true"]).cache);
+        assert!(parse(&["--anonymous-fallback", "yes"]).anonymous_fallback);
+
+        let rejected = UiArgs::try_parse_from(["kopiur-ui", "--cache", "maybe"])
+            .expect_err("a value that is not a boolean must be refused, not defaulted");
+        let rendered = rejected.to_string();
+        assert!(
+            rendered.contains("true/false"),
+            "the refusal must name what is accepted, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_flag_parser_answers_an_empty_value_with_its_own_default() {
+        assert!(flag_bool::<true>("").expect("empty parses"));
+        assert!(!flag_bool::<false>("").expect("empty parses"));
+        // The default applies to the empty value ONLY; a spelled-out value is
+        // honoured whatever the default is.
+        assert!(!flag_bool::<true>("false").expect("false parses"));
+        assert!(flag_bool::<false>("true").expect("true parses"));
     }
 
     // --- the duration parser -----------------------------------------------
