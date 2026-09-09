@@ -28,14 +28,6 @@
 //! the kubelet to mount (`kopiur_ops::browse::resolve::session_creds_secrets`
 //! only produces names); the backend CA bundle is a `ConfigMap`.
 
-// `ApiError` wraps an RFC 9457 `Problem`: eight owned strings, ~240 bytes. Every
-// handler in the crate returns one, and `IntoResponse` is implemented on the
-// bare type — boxing it here would mean unboxing at every route boundary for a
-// stack cost that is noise next to an apiserver round-trip. Applied at the
-// module root so it covers `download` and `session_pool` too; it belongs in
-// `lib.rs` once every `/api/v1` module lands.
-#![allow(clippy::result_large_err)]
-
 pub mod download;
 pub mod session_pool;
 

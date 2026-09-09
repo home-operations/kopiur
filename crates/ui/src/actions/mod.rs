@@ -48,16 +48,6 @@
 //! the accepted request (`201` for the CRs it created, `202` for the annotations
 //! it stamped) and lets the SPA watch the object's status for the rest.
 
-// Every function here returns `Result<_, ApiError>`, and an `ApiError` is a whole
-// RFC 9457 `Problem` — six `String`s, two `Option<String>`s and a `u16`, ~200
-// bytes — so clippy objects that the success path carries the error's size on the
-// stack. That is the right complaint about the wrong place: the size belongs to
-// `api::problem::ApiError`, which is the shared error shape for this entire
-// crate, and the fix is to box the `Problem` inside it once rather than to box it
-// at every call site here. Until that lands, the cost is one ~200-byte `Result`
-// per HTTP request, which is noise next to the request itself.
-#![allow(clippy::result_large_err)]
-
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Path, Request, State};

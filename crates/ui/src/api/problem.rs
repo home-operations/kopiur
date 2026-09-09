@@ -48,8 +48,16 @@ pub const PROBLEM_TYPE_PREFIX: &str = "urn:kopiur:problem:";
 pub const PROXY_CHALLENGE: &str = "Kopiur-Proxy";
 
 /// An error rendered as `application/problem+json`.
+///
+/// The payload is **boxed**. A [`Problem`] is six owned `String`s, two
+/// `Option<String>`s and a `u16` — around 200 bytes — and every handler in this
+/// crate returns `Result<T, ApiError>`, so an unboxed payload makes the *success*
+/// path of every endpoint carry the error's size on the stack. That is what
+/// `clippy::result_large_err` objects to, and boxing here fixes it once for the
+/// whole crate rather than scattering an `allow` across thirteen modules. The
+/// wire shape is unchanged: `Box<Problem>` serializes exactly as `Problem`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ApiError(pub Problem);
+pub struct ApiError(pub Box<Problem>);
 
 impl ApiError {
     /// The status this problem will be sent with.
@@ -94,7 +102,7 @@ pub fn problem(
 ) -> ApiError {
     let what = what.into();
     let why = why.into();
-    ApiError(Problem {
+    ApiError(Box::new(Problem {
         r#type: format!("{PROBLEM_TYPE_PREFIX}{kind}"),
         title: title_for(kind),
         status,
@@ -104,7 +112,7 @@ pub fn problem(
         fix: fix.into(),
         instance: None,
         kube_reason: None,
-    })
+    }))
 }
 
 /// Turn `kind-not-installed` into `Kind not installed`.
@@ -555,6 +563,37 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use kube::core::Status;
+
+    /// The boxing is what lets the whole crate compile clean under
+    /// `clippy::result_large_err` with no `allow` anywhere. If someone unboxes
+    /// the payload, `-D warnings` starts failing in thirteen modules at once and
+    /// the tempting fix is another blanket `allow`; this test names the real
+    /// remedy instead. `size_of::<ApiError>()` is one pointer.
+    #[test]
+    fn the_problem_payload_is_boxed_so_no_module_needs_a_large_err_allow() {
+        assert_eq!(
+            std::mem::size_of::<ApiError>(),
+            std::mem::size_of::<*const Problem>(),
+            "ApiError must be one pointer wide; a `Result<T, ApiError>` is on the success \
+             path of every handler in this crate",
+        );
+        for source in [
+            include_str!("mod.rs"),
+            include_str!("../actions/mod.rs"),
+            include_str!("../browse/mod.rs"),
+            include_str!("../lib.rs"),
+        ] {
+            let offending: Vec<&str> = source
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .filter(|line| line.contains("allow(clippy::result_large_err"))
+                .collect();
+            assert!(
+                offending.is_empty(),
+                "box the Problem instead of allowing the lint: {offending:?}",
+            );
+        }
+    }
 
     use crate::auth::impersonate::{IdentityHeaderKind, InvalidIdentityHeader};
 
