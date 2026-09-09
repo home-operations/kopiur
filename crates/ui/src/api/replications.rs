@@ -8,10 +8,9 @@
 
 use axum::extract::State;
 use axum::{Json, Router, routing::get};
-use serde::{Deserialize, Serialize};
 
 use kopiur_api::{RepositoryReplication, SnapshotReplication};
-use kopiur_ui_model::views::{RepositoryReplicationRow, SnapshotReplicationRow};
+use kopiur_ui_model::views::{ReplicationsView, RepositoryReplicationRow, SnapshotReplicationRow};
 
 use crate::AppState;
 use crate::api::problem::ApiError;
@@ -24,21 +23,6 @@ use crate::auth::CurrentIdentity;
 /// This module's routes, relative to `/api/v1`.
 pub fn router() -> Router<AppState> {
     Router::new().route("/replications", get(list))
-}
-
-/// Both replication tables in one response.
-///
-/// Declared here rather than in `kopiur-ui-model` because it is an *envelope*,
-/// not a wire type: it carries no fields of its own, and the SPA's generated
-/// types already describe both halves. Keeping it local means the model crate's
-/// exported type set stays exactly the set of things the UI renders.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplicationsView {
-    /// Whole-repository blob syncs.
-    pub repository: Vec<RepositoryReplicationRow>,
-    /// Snapshot-level copies between repositories.
-    pub snapshot: Vec<SnapshotReplicationRow>,
 }
 
 /// **Pure.** One `RepositoryReplication` as a table row.

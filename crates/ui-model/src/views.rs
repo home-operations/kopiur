@@ -855,6 +855,26 @@ pub struct SnapshotReplicationRow {
     pub pruned: Option<u32>,
 }
 
+/// Both replication tables, as `GET /api/v1/replications` answers them.
+///
+/// The two kinds copy different things — one syncs a repository's blobs to a
+/// bare backend, the other migrates selected snapshots between repository CRs —
+/// so they keep separate row types and are returned side by side rather than
+/// forced into a shared shape that would fit neither.
+///
+/// Lives here rather than in the server crate even though it is an envelope: a
+/// wire type declared next to its handler is a type `export_all` never emits,
+/// and the SPA is forbidden from hand-writing a shape the server owns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReplicationsView {
+    /// Whole-repository blob syncs.
+    pub repository: Vec<RepositoryReplicationRow>,
+    /// Snapshot-level copies between repositories.
+    pub snapshot: Vec<SnapshotReplicationRow>,
+}
+
 /// One check from the doctor report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

@@ -49,6 +49,7 @@ pub fn export_all(dir: &Path) -> Result<(), ExportError> {
     views::MaintenanceRow::export_all(&cfg)?;
     views::RepositoryReplicationRow::export_all(&cfg)?;
     views::SnapshotReplicationRow::export_all(&cfg)?;
+    views::ReplicationsView::export_all(&cfg)?;
     views::DoctorReportView::export_all(&cfg)?;
     views::GateDescriptor::export_all(&cfg)?;
     views::EventRow::export_all(&cfg)?;
@@ -137,12 +138,14 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 65,
+            exported, 66,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
              `String`, so one gate registry can no longer be described by two \
-             vocabularies"
+             vocabularies; 65 -> 66 when `ReplicationsView` moved here from \
+             `kopiur-ui/src/api/replications.rs`, where it was a wire shape the \
+             SPA would have had to hand-write"
         );
     }
 }
