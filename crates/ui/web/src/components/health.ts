@@ -8,7 +8,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import type { Health } from "../api/types";
+import type { Health, RepositorySummary } from "../api/types";
 import { unknownVariant } from "../util/assertNever";
 
 /** The `data-health` keys the stylesheet colours; every lamp maps onto one. */
@@ -46,4 +46,39 @@ export function healthLamp(health: Health): Lamp {
     default:
       return { key: "unknown", word: unknownVariant(health, "Health"), icon: CircleHelp };
   }
+}
+
+/**
+ * The lamps worst first, for any strip or summary that counts by health:
+ * the eye lands on what is lit, and the order never changes with the data.
+ */
+export const HEALTH_ORDER: readonly HealthKey[] = [
+  "failed",
+  "degraded",
+  "pending",
+  "unknown",
+  "suspended",
+  "healthy",
+];
+
+/**
+ * Repositories counted per lamp, from the server's own `health` — never from
+ * a phase-to-health table in this bundle. A health this bundle has never seen
+ * files under unknown, not under healthy.
+ */
+export function countByHealth(
+  repositories: readonly RepositorySummary[],
+): Record<HealthKey, number> {
+  const counts: Record<HealthKey, number> = {
+    failed: 0,
+    degraded: 0,
+    pending: 0,
+    unknown: 0,
+    suspended: 0,
+    healthy: 0,
+  };
+  for (const repository of repositories) {
+    counts[healthLamp(repository.health).key] += 1;
+  }
+  return counts;
 }
