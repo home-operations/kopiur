@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::graph::{GateHit, Health};
+use crate::graph::{GateHit, GateSeverityView, Health};
 
 /// View of `Repository`/`ClusterRepository` `status.phase`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -161,9 +161,19 @@ pub struct RepositorySummary {
     /// Which `spec.backend` variant this repository uses (`s3`, `filesystem`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// How clients reach the repository — direct backend access or a kopia
-    /// repository server.
+    /// `spec.mode` — `ReadWrite` or `ReadOnly`.
+    ///
+    /// The same text `kubectl kopiur status` prints in its `MODE` column and
+    /// `/api/v1/status` ships in its report, so one API cannot mean two things
+    /// by `mode`. How clients *reach* the repository is [`Self::server_backed`].
     pub mode: String,
+    /// Whether a kopia repository server fronts this repository.
+    ///
+    /// `false` means every mover talks to the storage backend directly. Split
+    /// from [`Self::mode`] because access path and access rights are
+    /// independent: a read-only repository can be server-backed or direct, and
+    /// a UI that conflated them could not say which.
+    pub server_backed: bool,
     /// `spec.suspend`.
     pub suspended: bool,
     /// `status.stats.snapshotCount`.
@@ -552,6 +562,10 @@ pub struct PolicyDetail {
     /// Per-repository verification state.
     pub verification: Vec<RepoVerificationView>,
     /// Schedules that fire this policy.
+    ///
+    /// Exact, not approximate: a `policySelector` is evaluated with the same
+    /// matcher the operator's own schedule reconciler uses, `matchExpressions`
+    /// included.
     pub schedules: Vec<ScheduleRow>,
     /// The most recent snapshots this policy produced.
     pub recent_snapshots: Vec<SnapshotRow>,
@@ -877,8 +891,10 @@ pub struct GateDescriptor {
     pub blocked_status: String,
     /// The `reason` this gate writes.
     pub reason: String,
-    /// How serious the gate is — `info`, `warning`, or `error`.
-    pub severity: String,
+    /// How serious the gate is. The same type [`GateHit::severity`] carries, so
+    /// the registry a gate is *documented* by and the hit it *produces* cannot
+    /// describe it differently.
+    pub severity: GateSeverityView,
 }
 
 /// One Kubernetes `Event`, projected for display next to the object it
@@ -973,6 +989,11 @@ pub struct SessionInfo {
     /// Name of the session's Job.
     pub job: String,
     /// Name of the Job's pod, once scheduled.
+    ///
+    /// Populated by the browse endpoints, which have to resolve the pod anyway
+    /// to exec into it. Always **absent** on the sessions listed by
+    /// `RepositoryDetail.sessions`: naming the pod there would cost a `pods`
+    /// LIST per repository detail view to show a string nothing navigates by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod: Option<String>,
     /// True when an existing session was reused rather than a new one started.

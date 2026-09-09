@@ -1260,3 +1260,94 @@ fn populate_job_name_is_capped_and_injective_per_claimant() {
     let dashy = format!("{}-", "r".repeat(60));
     assert!(!populate_job_name(&dashy, "uid").contains("--populate-"));
 }
+
+/// The selector matcher's own table, moved here with
+/// [`labels_match_selector`] from `kopiur_controller::snapshot_schedule` so the
+/// three consumers that now share it also share its coverage.
+#[test]
+fn labels_match_selector_covers_labels_and_every_expression_operator() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
+    use std::collections::BTreeMap;
+
+    let labels = BTreeMap::from([
+        ("tier".to_string(), "critical".to_string()),
+        ("app".to_string(), "pg".to_string()),
+    ]);
+    // matchLabels: exact value present → match.
+    let ml = LabelSelector {
+        match_labels: Some(BTreeMap::from([(
+            "tier".to_string(),
+            "critical".to_string(),
+        )])),
+        ..Default::default()
+    };
+    assert!(labels_match_selector(&labels, &ml));
+    // Wrong value → no match.
+    let ml_wrong = LabelSelector {
+        match_labels: Some(BTreeMap::from([("tier".to_string(), "low".to_string())])),
+        ..Default::default()
+    };
+    assert!(!labels_match_selector(&labels, &ml_wrong));
+    // Empty selector matches everything.
+    assert!(labels_match_selector(&labels, &LabelSelector::default()));
+    // matchExpressions: In / Exists / DoesNotExist.
+    let me = LabelSelector {
+        match_expressions: Some(vec![
+            LabelSelectorRequirement {
+                key: "tier".into(),
+                operator: "In".into(),
+                values: Some(vec!["critical".into(), "high".into()]),
+            },
+            LabelSelectorRequirement {
+                key: "app".into(),
+                operator: "Exists".into(),
+                values: None,
+            },
+            LabelSelectorRequirement {
+                key: "deprecated".into(),
+                operator: "DoesNotExist".into(),
+                values: None,
+            },
+        ]),
+        ..Default::default()
+    };
+    assert!(labels_match_selector(&labels, &me));
+    // NotIn that excludes the present value → no match.
+    let not_in = LabelSelector {
+        match_expressions: Some(vec![LabelSelectorRequirement {
+            key: "tier".into(),
+            operator: "NotIn".into(),
+            values: Some(vec!["critical".into()]),
+        }]),
+        ..Default::default()
+    };
+    assert!(!labels_match_selector(&labels, &not_in));
+}
+
+/// A `matchExpressions`-only selector is the case a `matchLabels`-only
+/// approximation gets exactly backwards: it constrains, but an implementation
+/// that ignored it would report a match for every object in the namespace.
+#[test]
+fn a_match_expressions_only_selector_still_excludes() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
+    use std::collections::BTreeMap;
+
+    let selector = LabelSelector {
+        match_expressions: Some(vec![LabelSelectorRequirement {
+            key: "tier".into(),
+            operator: "In".into(),
+            values: Some(vec!["gold".into()]),
+        }]),
+        ..Default::default()
+    };
+    let gold = BTreeMap::from([("tier".to_string(), "gold".to_string())]);
+    let silver = BTreeMap::from([("tier".to_string(), "silver".to_string())]);
+    let unlabelled = BTreeMap::new();
+
+    assert!(labels_match_selector(&gold, &selector));
+    assert!(!labels_match_selector(&silver, &selector));
+    assert!(
+        !labels_match_selector(&unlabelled, &selector),
+        "an object with no labels at all must not match an In constraint"
+    );
+}

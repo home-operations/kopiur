@@ -444,46 +444,14 @@ pub fn should_create_backup(
 }
 
 /// Whether a `SnapshotPolicy` with the given `labels` matches a `policySelector`
-/// (ADR-0005 §10). Pure decision (the `Api::list` IO is the caller's). Implements
-/// `matchLabels` (every key must be present with the required value) plus the
-/// common `matchExpressions` operators (`In`/`NotIn`/`Exists`/`DoesNotExist`); an
-/// empty selector matches every policy. A suspended policy is the caller's concern.
-pub fn policy_matches_selector(
-    labels: &BTreeMap<String, String>,
-    selector: &k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector,
-) -> bool {
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement;
-    if let Some(ml) = &selector.match_labels {
-        for (k, v) in ml {
-            if labels.get(k) != Some(v) {
-                return false;
-            }
-        }
-    }
-    if let Some(exprs) = &selector.match_expressions {
-        for LabelSelectorRequirement {
-            key,
-            operator,
-            values,
-        } in exprs
-        {
-            let vals = values.clone().unwrap_or_default();
-            let present = labels.get(key);
-            let ok = match operator.as_str() {
-                "In" => present.is_some_and(|v| vals.iter().any(|x| x == v)),
-                "NotIn" => present.is_none_or(|v| !vals.iter().any(|x| x == v)),
-                "Exists" => present.is_some(),
-                "DoesNotExist" => present.is_none(),
-                // Unknown operator: the schema constrains the set; treat as no constraint.
-                _ => true,
-            };
-            if !ok {
-                return false;
-            }
-        }
-    }
-    true
-}
+/// (ADR-0005 §10). Pure decision (the `Api::list` IO is the caller's).
+///
+/// The matcher itself is [`kopiur_api::expand::labels_match_selector`], where the
+/// web UI can reach it too: it answers "which schedules fire this policy?" for
+/// the policy detail screen, and a second copy over there implemented only
+/// `matchLabels`. This alias keeps the schedule-shaped name at the call sites
+/// that read best with it.
+pub use kopiur_api::expand::labels_match_selector as policy_matches_selector;
 
 /// Whether a freshly-created schedule should fire one backup immediately on
 /// creation (`runOnCreate`), rather than waiting for the first cron slot. Pure
@@ -3527,66 +3495,6 @@ mod tests {
         let slot = at(2026, 5, 24, 2, 0);
         let now = at(2026, 5, 24, 1, 30); // before the slot
         assert!(!should_create_backup(&spec, slot, now, false));
-    }
-
-    #[test]
-    fn policy_selector_match_decision() {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
-            LabelSelector, LabelSelectorRequirement,
-        };
-        let labels = BTreeMap::from([
-            ("tier".to_string(), "critical".to_string()),
-            ("app".to_string(), "pg".to_string()),
-        ]);
-        // matchLabels: exact value present → match.
-        let ml = LabelSelector {
-            match_labels: Some(BTreeMap::from([(
-                "tier".to_string(),
-                "critical".to_string(),
-            )])),
-            ..Default::default()
-        };
-        assert!(policy_matches_selector(&labels, &ml));
-        // Wrong value → no match.
-        let ml_wrong = LabelSelector {
-            match_labels: Some(BTreeMap::from([("tier".to_string(), "low".to_string())])),
-            ..Default::default()
-        };
-        assert!(!policy_matches_selector(&labels, &ml_wrong));
-        // Empty selector matches everything.
-        assert!(policy_matches_selector(&labels, &LabelSelector::default()));
-        // matchExpressions: In / Exists / DoesNotExist.
-        let me = LabelSelector {
-            match_expressions: Some(vec![
-                LabelSelectorRequirement {
-                    key: "tier".into(),
-                    operator: "In".into(),
-                    values: Some(vec!["critical".into(), "high".into()]),
-                },
-                LabelSelectorRequirement {
-                    key: "app".into(),
-                    operator: "Exists".into(),
-                    values: None,
-                },
-                LabelSelectorRequirement {
-                    key: "deprecated".into(),
-                    operator: "DoesNotExist".into(),
-                    values: None,
-                },
-            ]),
-            ..Default::default()
-        };
-        assert!(policy_matches_selector(&labels, &me));
-        // NotIn that excludes the present value → no match.
-        let not_in = LabelSelector {
-            match_expressions: Some(vec![LabelSelectorRequirement {
-                key: "tier".into(),
-                operator: "NotIn".into(),
-                values: Some(vec!["critical".into()]),
-            }]),
-            ..Default::default()
-        };
-        assert!(!policy_matches_selector(&labels, &not_in));
     }
 
     /// A minimal labeled policy in a namespace, for [`select_policy_targets`]

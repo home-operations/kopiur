@@ -460,17 +460,29 @@ impl SarCache {
             return Ok(Visibility::All);
         }
 
-        let visible: BTreeSet<String> = futures::stream::iter(candidate_namespaces)
-            .map(|namespace| async move {
-                let allowed = self
-                    .allowed(id, "list", resource, Some(namespace), None)
-                    .await?;
-                Ok::<_, OpsError>(allowed.then(|| namespace.clone()))
-            })
-            .buffer_unordered(NAMESPACE_SAR_CONCURRENCY)
-            .try_filter_map(|found| std::future::ready(Ok(found)))
-            .try_collect()
-            .await?;
+        // The stream yields OWNED namespaces, not `&String` borrowed from
+        // `candidate_namespaces`. A closure whose returned future borrows its
+        // argument is not general enough over lifetimes for rustc to prove once
+        // this is awaited from an axum handler: it fails with "implementation of
+        // `FnOnce` is not general enough" reported at the *route*, pointing
+        // nowhere near here. Owning the `String` sidesteps it and costs nothing
+        // on the allow path, which cloned it anyway.
+        let visible: BTreeSet<String> = futures::stream::iter(
+            candidate_namespaces
+                .iter()
+                .cloned()
+                .collect::<Vec<String>>(),
+        )
+        .map(|namespace| async move {
+            let allowed = self
+                .allowed(id, "list", resource, Some(&namespace), None)
+                .await?;
+            Ok::<_, OpsError>(allowed.then_some(namespace))
+        })
+        .buffer_unordered(NAMESPACE_SAR_CONCURRENCY)
+        .try_filter_map(|found| std::future::ready(Ok(found)))
+        .try_collect()
+        .await?;
 
         Ok(Visibility::Namespaces(visible))
     }
