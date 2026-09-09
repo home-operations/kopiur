@@ -25,9 +25,19 @@
 //! keeps), [`normalize`] strips trailing whitespace at generation time. The
 //! checked-in tree therefore already satisfies the repo's own whitespace rule,
 //! trimming it is a no-op, and the drift comparison stays a plain byte compare.
+//!
+//! # The gate is flat, and says so out loud
+//!
+//! `list_ts` does one non-recursive `read_dir`, so only `*.ts` files directly
+//! inside [`UI_TYPES_DIR`] are compared or swept. `export_all` is flat today (a
+//! single `Config::with_out_dir`), but a future `#[ts(export_to = "sub/…")]`
+//! would land outside the gate's reach and drift undetected. Rather than leave
+//! that as an incidental property, [`export_to`] fails if the export ever
+//! produces a subdirectory.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -47,11 +57,22 @@ pub const UI_TYPES_BARREL: &str = "crates/ui/web/src/api/types.ts";
 /// The fix hint printed next to every reported difference.
 const FIX_HINT: &str = "run `mise run gen` (or `cargo xtask gen-ui-types`) and commit the result";
 
+/// Hands out a directory name no other caller can be using.
+///
+/// The PID separates processes — two `cargo xtask` runs, or two `cargo test`
+/// runs from two worktrees on the same box. The counter separates callers
+/// *within* one process, which the PID alone cannot: several tests in one
+/// multi-threaded test binary share a PID, and [`Scratch::new`] opens with
+/// `remove_dir_all`, so a shared name would have them deleting each other's
+/// fixtures mid-run.
+static SCRATCH_SEQ: AtomicU32 = AtomicU32::new(0);
+
 /// A scratch directory that removes itself when it goes out of scope.
 ///
 /// Hand-rolled rather than pulling in `tempfile`: a handful of lines beats a new
-/// dependency, and keeping the directory under `target/` means a killed process
-/// leaves its debris somewhere `cargo clean` already sweeps.
+/// dependency, and keeping it under `target/` — never the shared, possibly
+/// another user's `/tmp` — means a killed process leaves its debris somewhere
+/// `cargo clean` already sweeps.
 struct Scratch(PathBuf);
 
 impl Drop for Scratch {
@@ -60,16 +81,24 @@ impl Drop for Scratch {
     }
 }
 
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
 impl Scratch {
-    /// Create (or re-create, empty) the scratch export directory.
-    ///
-    /// The PID suffix keeps two concurrent `cargo xtask` invocations — or a test
-    /// running beside one — from exporting into each other's directory.
-    fn new() -> Result<Self> {
-        let dir = workspace_root()
-            .join("target")
-            .join("xtask")
-            .join(format!("ui-types-{}", std::process::id()));
+    /// Create an empty scratch directory under `target/xtask/`, keyed by
+    /// `label`, this process's PID and a per-process counter. See
+    /// [`SCRATCH_SEQ`] for why both keys are needed.
+    fn new(label: &str) -> Result<Self> {
+        let dir = workspace_root().join("target").join("xtask").join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating scratch directory {}", dir.display()))?;
@@ -122,11 +151,24 @@ fn list_ts(dir: &Path) -> Result<BTreeSet<String>> {
     Ok(names)
 }
 
+/// Read `dir/name` when the listing says it is there.
+///
+/// `present` comes from [`list_ts`], so `Ok(None)` means genuinely absent and an
+/// unreadable file becomes an `Err` naming the path. Swallowing that error into
+/// `None` would report a permission problem as `missing:` and send the reader
+/// off to regenerate a file that is actually there.
+fn read_listed(dir: &Path, name: &str, present: bool) -> Result<Option<Vec<u8>>> {
+    if !present {
+        return Ok(None);
+    }
+    let path = dir.join(name);
+    let body = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(body))
+}
+
 /// Describe how one file differs between the two trees, or `None` if it matches.
-fn diff_one(name: &str, exported: &Path, checked_in: &Path) -> Result<Option<String>> {
-    let left = std::fs::read(exported.join(name)).ok();
-    let right = std::fs::read(checked_in.join(name)).ok();
-    Ok(match (left, right) {
+fn diff_one(name: &str, exported: Option<&[u8]>, checked_in: Option<&[u8]>) -> Option<String> {
+    match (exported, checked_in) {
         (Some(a), Some(b)) if a == b => None,
         (Some(_), Some(_)) => Some(format!("changed: {name} differs from the generated export")),
         (Some(_), None) => Some(format!(
@@ -136,21 +178,45 @@ fn diff_one(name: &str, exported: &Path, checked_in: &Path) -> Result<Option<Str
             "stale:   {name} is in {UI_TYPES_DIR} but no longer exported"
         )),
         (None, None) => None,
-    })
+    }
 }
 
 /// Compare an exported tree against the checked-in one, returning one
 /// human-readable line per difference (missing, extra, or changed file).
 pub fn compare_trees(exported: &Path, checked_in: &Path) -> Result<Vec<String>> {
-    let mut names = list_ts(exported)?;
-    names.extend(list_ts(checked_in)?);
+    let (fresh, existing) = (list_ts(exported)?, list_ts(checked_in)?);
     let mut drift = Vec::new();
-    for name in &names {
-        if let Some(line) = diff_one(name, exported, checked_in)? {
+    for name in fresh.union(&existing) {
+        let left = read_listed(exported, name, fresh.contains(name))?;
+        let right = read_listed(checked_in, name, existing.contains(name))?;
+        if let Some(line) = diff_one(name, left.as_deref(), right.as_deref()) {
             drift.push(line);
         }
     }
     Ok(drift)
+}
+
+/// Fail if the export nested anything, because the gate cannot see inside.
+///
+/// [`list_ts`] is a single non-recursive `read_dir`, so a `.ts` under a
+/// subdirectory would be neither compared nor swept — it would drift silently.
+/// A loud failure here is the difference between "unsupported" and "quietly
+/// broken" the day someone adds `#[ts(export_to = "sub/…")]`.
+fn reject_nested_output(dir: &Path) -> Result<()> {
+    let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
+        if entry.path().is_dir() {
+            anyhow::bail!(
+                "the ts-rs export produced a subdirectory ({}), but the drift gate is flat: \
+                 only `*.ts` directly inside {UI_TYPES_DIR} is compared or swept, so nested \
+                 output would never be checked. Drop the `#[ts(export_to = \"…/…\")]` that \
+                 created it, or teach `list_ts` and `sync_tree` to recurse.",
+                entry.file_name().to_string_lossy()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Export every wire type into `dir` and normalize what `ts-rs` wrote.
@@ -161,6 +227,7 @@ pub fn export_to(dir: &Path) -> Result<()> {
             dir.display()
         )
     })?;
+    reject_nested_output(dir)?;
     for name in list_ts(dir)? {
         let path = dir.join(&name);
         let raw = std::fs::read_to_string(&path)
@@ -204,7 +271,7 @@ fn sync_tree(exported: &Path, target: &Path) -> Result<(usize, usize)> {
 /// Returns the process exit code to use — `0` on success, `1` when `--check`
 /// found any difference — matching [`crate::run`]'s contract.
 pub fn run(check: bool) -> Result<i32> {
-    let scratch = Scratch::new()?;
+    let scratch = Scratch::new("ui-types")?;
     export_to(scratch.path())?;
     let target = workspace_root().join(UI_TYPES_DIR);
 
@@ -322,6 +389,30 @@ mod tests {
         );
     }
 
+    /// A nested export escapes the flat gate entirely, so it must be an error
+    /// rather than something the comparison quietly ignores.
+    #[test]
+    fn a_nested_export_is_rejected() {
+        let flat = scratch("nested-flat");
+        std::fs::write(flat.join("Problem.ts"), "export type Problem = {};\n").unwrap();
+        reject_nested_output(&flat).expect("a flat export is fine");
+
+        let nested = scratch("nested-bad");
+        std::fs::create_dir_all(nested.join("sub")).unwrap();
+        std::fs::write(
+            nested.join("sub").join("Deep.ts"),
+            "export type Deep = {};\n",
+        )
+        .unwrap();
+
+        let err = reject_nested_output(&nested).expect_err("a nested export must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sub") && msg.contains("flat"),
+            "the error must name the offending directory and say why it is a problem, got: {msg}"
+        );
+    }
+
     /// The barrel is a sibling of the generated directory, not a file inside it,
     /// so no `gen-ui-types` run can sweep it. Asserted on the constants rather
     /// than on behaviour because the sweep never *sees* the barrel — which is
@@ -357,12 +448,22 @@ mod tests {
             .collect();
         let barrel = std::fs::read_to_string(workspace_root().join(UI_TYPES_BARREL))
             .expect("read the barrel");
-        let exported: BTreeSet<String> = barrel
+
+        // Every `export` line must parse. Silently dropping one the parser did
+        // not recognise would report it as "missing from the barrel", pointing
+        // the reader at the wrong file; this names the real problem instead.
+        let (parsed, unparsed): (Vec<_>, Vec<_>) = barrel
             .lines()
-            .filter_map(|l| l.strip_prefix("export type { "))
-            .filter_map(|l| l.split_once(" }"))
-            .map(|(name, _)| name.to_owned())
-            .collect();
+            .filter(|l| l.trim_start().starts_with("export"))
+            .map(|l| (l, parse_barrel_line(l)))
+            .partition(|(_, name)| name.is_some());
+        assert!(
+            unparsed.is_empty(),
+            "{UI_TYPES_BARREL} has export line(s) this test cannot parse; it expects \
+             `export type {{ Name }} from \"./types/Name\";`. Offending line(s): {:?}",
+            unparsed.iter().map(|(l, _)| l).collect::<Vec<_>>()
+        );
+        let exported: BTreeSet<String> = parsed.into_iter().filter_map(|(_, name)| name).collect();
 
         assert!(!generated.is_empty(), "no generated types were found");
         assert_eq!(
@@ -457,11 +558,27 @@ mod tests {
         );
     }
 
-    /// A scratch directory for one test case, emptied on creation.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kopiur-xtask-ui-types-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Pull the re-exported type name out of one barrel line, tolerating any
+    /// spacing: `export type { Name } from "./types/Name";` → `Name`.
+    fn parse_barrel_line(line: &str) -> Option<String> {
+        let (name, _) = line
+            .trim()
+            .strip_prefix("export type")?
+            .trim_start()
+            .strip_prefix('{')?
+            .split_once('}')?;
+        let name = name.trim();
+        (!name.is_empty() && !name.contains(',')).then(|| name.to_owned())
+    }
+
+    /// A scratch directory for one test case, removed when the test ends.
+    ///
+    /// The production [`Scratch`] deliberately, not a fixed `/tmp` path: two
+    /// worktrees on one box run this suite concurrently, and a shared name means
+    /// each run's `remove_dir_all` deletes the other's fixtures mid-test. A
+    /// `/tmp` path can also already be owned by another user, failing the test
+    /// with a permission error that has nothing to do with the code.
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("test-{name}")).expect("create a test scratch directory")
     }
 }
