@@ -72,9 +72,10 @@ const doctor: DoctorReportView = {
   ranAt: NOW,
   exitCode: 1,
   checks: [
-    { check: "crds-installed", title: "CRDs installed", outcome: "Pass" },
+    { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
     {
       check: "no-stuck-work",
+      scope: "namespace",
       title: "no blocked or stuck work",
       outcome: "Fail",
       what: "Snapshot media/nightly-1 is parked on MoverPermitted=False",
@@ -83,6 +84,7 @@ const doctor: DoctorReportView = {
     },
     {
       check: "recent-warnings",
+      scope: "namespace",
       title: "recent warning events",
       outcome: "Warn",
       what: "3 Warning events in the last hour",
@@ -93,7 +95,9 @@ const doctor: DoctorReportView = {
 const allGood: DoctorReportView = {
   ranAt: NOW,
   exitCode: 0,
-  checks: [{ check: "crds-installed", title: "CRDs installed", outcome: "Pass" }],
+  checks: [
+    { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
+  ],
 };
 
 beforeEach(() => {

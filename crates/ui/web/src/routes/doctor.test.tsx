@@ -22,16 +22,23 @@ const report: DoctorReportView = {
   ranAt: "2026-09-08T11:59:30Z",
   exitCode: 1,
   checks: [
-    { check: "crds-installed", title: "CRDs installed", outcome: "Pass" },
-    { check: "controller-running", title: "controller running", outcome: "Pass" },
+    { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
+    {
+      check: "controller-running",
+      scope: "installation",
+      title: "controller running",
+      outcome: "Pass",
+    },
     {
       check: "credentials-present",
+      scope: "mixed",
       title: "credential secrets present",
       outcome: "Warn",
       what: "cannot list secrets (RBAC); grant `list` on `secrets` or run with a more privileged kubeconfig to enable this check",
     },
     {
       check: "no-stuck-work",
+      scope: "namespace",
       title: "no blocked or stuck work",
       outcome: "Fail",
       what: "Snapshot media/nightly-1 is parked on MoverPermitted=False",

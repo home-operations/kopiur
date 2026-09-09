@@ -6,15 +6,17 @@ import { bodyRows, nth } from "../test-utils";
 import { DoctorChecks } from "./DoctorChecks";
 
 const checks: DoctorCheckView[] = [
-  { check: "crds-installed", title: "CRDs installed", outcome: "Pass" },
+  { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
   {
     check: "credentials-present",
+    scope: "mixed",
     title: "credential secrets present",
     outcome: "Warn",
     what: "cannot list secrets (RBAC); grant `list` on `secrets` or run with a more privileged kubeconfig to enable this check",
   },
   {
     check: "no-stuck-work",
+    scope: "namespace",
     title: "no blocked or stuck work",
     outcome: "Fail",
     what: "Snapshot media/nightly-1 is parked on MoverPermitted=False",
@@ -23,11 +25,12 @@ const checks: DoctorCheckView[] = [
   },
   {
     check: "webhook-running",
+    scope: "installation",
     title: "webhook running",
     outcome: "Warn",
     what: "skipped if not installed",
   },
-  { check: "quantum-parity", title: "quantum parity", outcome: "Skipped" },
+  { check: "quantum-parity", scope: "installation", title: "quantum parity", outcome: "Skipped" },
 ];
 
 describe("DoctorChecks", () => {

@@ -13,6 +13,10 @@ const check = (over: Partial<DoctorCheckView>): DoctorCheckView => ({
   check: "crds-installed",
   title: "CRDs installed",
   outcome: "Pass",
+  // `installation` because that is what the CRD check actually reads; the
+  // server now states each check's scope rather than leaving the client to
+  // guess it. Spread last so a case can override it.
+  scope: "installation",
   ...over,
 });
 
