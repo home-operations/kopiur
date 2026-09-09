@@ -37,19 +37,26 @@ use axum::response::{IntoResponse, Response};
 use kopiur_ui_model::identity::IdentitySource;
 
 use crate::AppState;
-use crate::api::problem::{ApiError, problem};
+use crate::api::problem::{ApiError, problem, request_path};
 use crate::config::{AuthConfig, AuthMode, CacheLimits};
 
 use self::identity::Identity;
 use self::impersonate::ClientCache;
 
-/// Route label on `kopiur_ui_requests_total` for requests counted here.
+/// How the identity behind a response was established, published on the
+/// **response** extensions.
 ///
-/// The counter's `route` label is a `&'static str` and the middleware only knows
-/// the concrete path, which carries namespaces and object names — a label the
-/// size of the fleet. The API mount point is the honest coarse answer; per-route
-/// labels belong to the router that knows its own templates.
-const REQUEST_ROUTE: &str = "/api";
+/// The counter is recorded by [`crate::record_request`], which sits *outside*
+/// [`identity_middleware`] so it can see the 401s and 403s that middleware
+/// produces and so it can read the matched route template. That places it on the
+/// wrong side of the request: `identity_middleware` moves the request (and the
+/// [`Identity`] it inserted) into the inner service, so the source has to travel
+/// back out on the response instead.
+///
+/// A newtype rather than a bare [`IdentitySource`] so nothing else in the crate
+/// can put one in the same slot by accident.
+#[derive(Debug, Clone)]
+pub struct ServedAs(pub IdentitySource);
 
 /// Everything the identity middleware needs at request time: the resolved
 /// [`AuthConfig`] and the bounded per-identity impersonating client cache.
@@ -133,8 +140,9 @@ impl AuthState {
 
     /// How this deployment establishes identity, for the
     /// `kopiur_ui_requests_total{identity_source}` label on a request that failed
-    /// before an [`Identity`] existed.
-    fn mode_source(&self) -> IdentitySource {
+    /// before an [`Identity`] existed — or that never reached a route at all, and
+    /// so never reached this middleware.
+    pub(crate) fn mode_source(&self) -> IdentitySource {
         match &self.cfg.mode {
             AuthMode::Headers { .. } => IdentitySource::TrustedHeaders,
             AuthMode::AnonymousOnly(_) => IdentitySource::Anonymous,
@@ -157,14 +165,15 @@ pub async fn identity_middleware(
     let identity = match app.auth.identify(req.headers()) {
         Ok(identity) => identity,
         Err(error) => {
-            let response = ApiError::from(error)
+            let mut response = ApiError::from(error)
                 .with_instance(req.uri().path().to_string())
                 .into_response();
-            app.metrics.inc_request(
-                REQUEST_ROUTE,
-                response.status().as_u16(),
-                &app.auth.mode_source(),
-            );
+            // No identity was resolved, so the honest label is how this
+            // deployment *would* have resolved one. Publishing it here rather
+            // than letting the metrics middleware guess keeps one answer.
+            response
+                .extensions_mut()
+                .insert(ServedAs(app.auth.mode_source()));
             return response;
         }
     };
@@ -185,10 +194,8 @@ pub async fn identity_middleware(
     );
     req.extensions_mut().insert(identity);
 
-    let response = next.run(req).await;
-    app.metrics
-        .inc_request(REQUEST_ROUTE, response.status().as_u16(), &source);
-    app.metrics.set_identity_cache_size(app.auth.clients.len());
+    let mut response = next.run(req).await;
+    response.extensions_mut().insert(ServedAs(source));
     response
 }
 
@@ -222,7 +229,7 @@ impl FromRequestParts<AppState> for CurrentIdentity {
                 "report this at https://github.com/home-operations/kopiur/issues, naming the \
                  URL you requested",
             )
-            .with_instance(parts.uri.path().to_string())),
+            .with_instance(request_path(&parts.extensions, &parts.uri))),
         }
     }
 }
@@ -249,7 +256,9 @@ pub async fn mutation_guard(req: Request, next: Next) -> Response {
         csrf::require_mutation_headers(req.headers(), has_body(req.headers()), authority.as_deref())
     {
         return ApiError::from(error)
-            .with_instance(req.uri().path().to_string())
+            // `request_path`, not `req.uri()`: this guard runs INSIDE the
+            // `/api/v1` nest for `actions/`, where the prefix has been stripped.
+            .with_instance(request_path(req.extensions(), req.uri()))
             .into_response();
     }
     next.run(req).await

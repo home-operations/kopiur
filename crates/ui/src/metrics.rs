@@ -200,11 +200,18 @@ impl UiMetrics {
     /// Count one answered request. `route` must be the route TEMPLATE
     /// (`/api/v1/snapshots/{namespace}/{name}`), never the concrete path — a
     /// per-object label would make the series cardinality the size of the fleet.
-    pub fn inc_request(&self, route: &'static str, status: u16, source: &IdentitySource) {
+    ///
+    /// `&str` rather than `&'static str` because the only honest source of a
+    /// template is [`axum::extract::MatchedPath`], which borrows one the router
+    /// owns. The bound on cardinality is therefore the *caller's* to keep, and
+    /// [`crate::record_request`] is the one place that calls this: it reads
+    /// `MatchedPath` (a fixed set, one entry per mounted route) and falls back
+    /// to a single constant for a request that matched nothing.
+    pub fn inc_request(&self, route: &str, status: u16, source: &IdentitySource) {
         self.requests.add(
             1,
             &[
-                KeyValue::new("route", route),
+                KeyValue::new("route", route.to_string()),
                 KeyValue::new("status", i64::from(status)),
                 KeyValue::new("identity_source", identity_source_label(source)),
             ],

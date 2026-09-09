@@ -22,7 +22,11 @@ k8s-openapi = { workspace = true, features = ["v1_33"] }
 
 axum = { workspace = true }
 axum-server = { workspace = true }
-tower = { workspace = true }
+# `limit` is `GlobalConcurrencyLimitLayer`, the `/api` in-flight cap. Declared
+# here rather than relied on through feature unification: kube-client happens to
+# enable it today, and a router that stopped compiling because a transitive
+# dependency dropped a feature would be a baffling failure.
+tower = { workspace = true, features = ["limit"] }
 tower-http = { workspace = true }
 rustls = { workspace = true }
 http = { workspace = true }

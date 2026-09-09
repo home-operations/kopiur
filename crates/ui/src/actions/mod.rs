@@ -48,16 +48,6 @@
 //! the accepted request (`201` for the CRs it created, `202` for the annotations
 //! it stamped) and lets the SPA watch the object's status for the rest.
 
-// Every function here returns `Result<_, ApiError>`, and an `ApiError` is a whole
-// RFC 9457 `Problem` — six `String`s, two `Option<String>`s and a `u16`, ~200
-// bytes — so clippy objects that the success path carries the error's size on the
-// stack. That is the right complaint about the wrong place: the size belongs to
-// `api::problem::ApiError`, which is the shared error shape for this entire
-// crate, and the fix is to box the `Problem` inside it once rather than to box it
-// at every call site here. Until that lands, the cost is one ~200-byte `Result`
-// per HTTP request, which is noise next to the request itself.
-#![allow(clippy::result_large_err)]
-
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Path, Request, State};
@@ -88,7 +78,7 @@ use kopiur_ui_model::requests::{
 use kopiur_ui_model::views::{ActionReceipt, SnapshotRefView};
 
 use crate::AppState;
-use crate::api::problem::{ApiError, problem};
+use crate::api::problem::{ApiError, problem, request_path};
 use crate::auth::identity::Identity;
 use crate::auth::{CurrentIdentity, mutation_guard};
 use crate::config::FIELD_MANAGER;
@@ -146,7 +136,9 @@ where
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let path = req.uri().path().to_string();
+        // `request_path`, not `req.uri()`: every mutating route is nested under
+        // `/api/v1`, where the prefix has been stripped by the time this runs.
+        let path = request_path(req.extensions(), req.uri());
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
             Err(rejection) => Err(rejected_body(&rejection).with_instance(path)),

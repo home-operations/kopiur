@@ -26,16 +26,6 @@
 //! `SelfSubjectAccessReview`, and the browse-session `Job` — go through the
 //! impersonated client directly, because they have no store and no `KopiurKind`.
 
-// Every endpoint returns `Result<Json<T>, ApiError>`, and an `ApiError` is a
-// `Problem`: eight owned `String`s of what/why/fix prose, about 200 bytes. That
-// trips `clippy::result_large_err`, whose remedy — boxing the error — is not
-// available here: axum resolves a handler's error type through `IntoResponse`,
-// which is implemented on `ApiError` itself in `problem.rs`, and the size is
-// paid once per *failed* request rather than per call in a hot loop. Allowed at
-// the module root so every child module inherits one decision instead of
-// scattering the same annotation across thirteen files.
-#![allow(clippy::result_large_err)]
-
 pub mod doctor;
 pub mod events;
 pub mod gates;
@@ -73,7 +63,7 @@ use kopiur_ui_model::views::{
 };
 
 use crate::AppState;
-use crate::api::problem::{ApiError, problem};
+use crate::api::problem::{ApiError, problem, request_path};
 use crate::auth::identity::Identity;
 use crate::config::{FIELD_MANAGER, UiConfig};
 
@@ -218,7 +208,7 @@ where
                 "check the query parameters against the endpoint's documented ones — a required \
                  one is missing, or one carries a value of the wrong type",
             )
-            .with_instance(parts.uri.path().to_string())),
+            .with_instance(request_path(&parts.extensions, &parts.uri))),
         }
     }
 }
@@ -250,7 +240,7 @@ where
                 "check the URL against the endpoint's shape — the repository kind segment, for \
                  example, is the kebab-case `repository` or `cluster-repository`",
             )
-            .with_instance(parts.uri.path().to_string())),
+            .with_instance(request_path(&parts.extensions, &parts.uri))),
         }
     }
 }
