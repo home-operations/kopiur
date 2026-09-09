@@ -463,12 +463,20 @@ pub fn view_retention_preview(
 /// number a user needs: it says how close a restore point is to ageing out,
 /// which a bare rule name does not.
 ///
-/// # Pins are dropped for the attribution runs
+/// # The pin flag is dropped for the attribution runs; the ROW is not
 ///
-/// A pinned row lands in `keep` whatever the rule says, so leaving pins in would
-/// credit every configured rule with a keep it did not make, and would shift
-/// every other row's slot number. `pinned` is prepended as its own reason
-/// instead — an exemption from bucketing, not a slot in a bucket.
+/// A pinned row lands in `keep` whatever the rule says, so running attribution
+/// with the flag on would credit every configured rule with a keep it did not
+/// make. The flag is therefore cleared — and `pinned` prepended as its own,
+/// slotless reason, an exemption from bucketing rather than a place in one.
+///
+/// The row itself stays in the counterfactual, and that is deliberate: the real
+/// prune's `keep_per_period` also walks pinned rows when it fills a bucket, so
+/// dropping them here would shift every younger row's slot to a number the
+/// operator will not use. The consequence is that a pinned snapshot which
+/// today's rules would ALSO have kept reports both reasons — `["pinned",
+/// "keepDaily slot 1"]` — which is the useful answer, because it says unpinning
+/// would not lose it. Both wire docs state this.
 pub fn bucket_rules(
     bucket: &[SnapshotRetentionView],
     retention: &kopiur_api::common::Retention,
@@ -1934,6 +1942,8 @@ status:
         let plan = view_retention_plan(&newest, "media", &policy, &peers, Utc::now()).unwrap();
         let candidates = &plan.buckets[0].candidates;
 
+        // The OLD pinned row: no rule would have kept it, so the pin is doing
+        // all the work and is the whole reason.
         let pinned = candidates.iter().find(|c| c.name == "keepme").unwrap();
         assert!(pinned.pinned);
         assert!(pinned.kept);
@@ -1943,9 +1953,71 @@ status:
         assert_eq!(
             newest_row.rules,
             vec!["keepDaily slot 1"],
-            "the pinned row is exempt from bucketing, so it must not shift the \
-             slot its competitors occupy"
+            "a pin does not exempt its holder from the counterfactual, so the \
+             slot numbers are the ones the prune's own walk produces"
         );
+    }
+
+    /// A pinned row that a rule would ALSO have kept reports BOTH — which is
+    /// the useful answer, because it says unpinning would not lose it.
+    ///
+    /// The sibling test above only covers a pin doing all the work (an old row
+    /// no rule keeps), so this is the case the wire doc's "a pin does not mean
+    /// exactly one entry" is actually about.
+    #[test]
+    fn a_pin_that_a_rule_would_also_have_kept_reports_both_reasons() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 2 }
+"#,
+        );
+        // The NEWEST row is the pinned one, so keepDaily would hold it anyway.
+        let newest_pinned = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: pinned-newest
+  namespace: media
+  labels: { "kopiur.home-operations.com/config": nightly }
+spec: { policyRef: { name: nightly }, pin: true }
+status:
+  phase: Succeeded
+  origin: manual
+  timing: { startTime: "2026-05-25T02:00:00Z", endTime: "2026-05-25T02:00:00Z" }
+  snapshot:
+    kopiaSnapshotID: k-pinned-newest
+    identity: { username: kopiur, hostname: media, sourcePath: /data }
+"#,
+        );
+        let d24 = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        let peers = vec![newest_pinned.clone(), d24];
+        let plan = view_retention_plan(&newest_pinned, "media", &policy, &peers, Utc::now())
+            .expect("a plan");
+        let row = plan.buckets[0]
+            .candidates
+            .iter()
+            .find(|c| c.name == "pinned-newest")
+            .unwrap();
+
+        assert!(row.pinned);
+        assert!(row.kept);
+        assert_eq!(
+            row.rules,
+            vec!["pinned", "keepDaily slot 1"],
+            "the pin comes first and carries no slot; the rule that would ALSO \
+             have kept it comes after, with its slot"
+        );
+
+        // And the preview, which shares the function, says exactly the same.
+        let preview = view_retention_preview(&newest_pinned, &policy, &peers, Utc::now()).unwrap();
+        assert_eq!(preview.reasons, row.rules);
     }
 
     /// The population is the PRUNE's — `CONFIG_LABEL`, not `spec.policyRef`.
