@@ -63,7 +63,7 @@ use crate::auth::csrf::require_same_site_navigation;
 use crate::auth::identity::Identity;
 use crate::auth::redact::redact_text;
 use crate::auth::{CurrentIdentity, mutation_guard};
-use crate::config::{FIELD_MANAGER, UiConfig};
+use crate::config::{FIELD_MANAGER, UiConfig, WireLimits};
 
 use self::session_pool::{SessionKey, session_info};
 
@@ -261,7 +261,11 @@ async fn create_session(
         app.metrics.inc_session_started();
     }
 
-    let mut info = session_info(&attached.job, attached.reused);
+    let mut info = session_info(
+        &attached.job,
+        attached.reused,
+        WireLimits::from_config(&app.cfg),
+    );
     info.pod = Some(attached.session.pod.clone());
     Ok((StatusCode::CREATED, Json(info)).into_response())
 }
@@ -281,7 +285,11 @@ async fn get_session(
     let ctx = ops_ctx(&app, &identity, &namespace)?;
     let target = resolve_target(&app.cfg, &ctx, &namespace, &name).await?;
     match find_live_job(&ctx, &target).await? {
-        Some(job) => Ok(Json(session_info(&job, true))),
+        Some(job) => Ok(Json(session_info(
+            &job,
+            true,
+            WireLimits::from_config(&app.cfg),
+        ))),
         None => Err(no_session(404, &namespace, &name)),
     }
 }
@@ -406,7 +414,7 @@ async fn tree(
         total: listing.total,
         offset: query.offset,
         limit,
-        session: session_info(&live.job, true),
+        session: session_info(&live.job, true, WireLimits::from_config(&app.cfg)),
     }))
 }
 

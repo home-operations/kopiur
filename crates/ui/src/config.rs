@@ -558,6 +558,48 @@ pub struct UiConfig {
     pub cors_origins: Vec<String>,
 }
 
+/// The two byte caps a `SessionInfo` publishes to the SPA.
+///
+/// A published copy of what the server already enforces, so the browse file
+/// table can disable an oversized entry *with the reason* instead of navigating
+/// into a refusal it cannot read: `GET …/file` is a top-level navigation, so its
+/// `413 download-too-large` problem is rendered by the browser as a tab full of
+/// JSON that the SPA never observes.
+///
+/// A separate type rather than two arguments so a caller cannot swap them, and
+/// so tests can build one without a whole [`UiConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireLimits {
+    /// [`UiConfig::download_max_bytes`], as the wire carries it.
+    pub download_max_bytes: i64,
+    /// [`UiConfig::manifest_max_bytes`], as the wire carries it.
+    pub manifest_max_bytes: i64,
+}
+
+impl WireLimits {
+    /// The running deployment's caps — never the defaults, which is the whole
+    /// point: an operator who raised `KOPIUR_UI_MAX_DOWNLOAD_BYTES` and got a UI
+    /// that still refused at 1 GiB would have configured nothing.
+    pub fn from_config(cfg: &UiConfig) -> Self {
+        Self {
+            download_max_bytes: wire_bytes(cfg.download_max_bytes),
+            manifest_max_bytes: wire_bytes(cfg.manifest_max_bytes),
+        }
+    }
+}
+
+/// **Pure.** A configured byte cap as the wire carries it.
+///
+/// The caps are `u64` here and `i64` on the wire, because they travel through
+/// `JSON.parse` and land as a JavaScript `number`. A cap beyond `i64::MAX`
+/// saturates rather than wrapping: saturating publishes a bound no *larger* than
+/// the one the server enforces, so the client's pre-check can only ever be
+/// stricter than the refusal. Wrapping would publish a negative cap and disable
+/// every file in the table.
+fn wire_bytes(bytes: u64) -> i64 {
+    i64::try_from(bytes).unwrap_or(i64::MAX)
+}
+
 /// How a request's identity is established, and the bounds on what the UI will
 /// impersonate once it has one.
 ///
@@ -1219,6 +1261,42 @@ mod tests {
         ];
         v.extend(extra.iter().map(|s| (*s).to_string()));
         v
+    }
+
+    /// The caps `SessionInfo` publishes are the ones this deployment enforces.
+    ///
+    /// An operator who raised `--max-download-bytes` and got a UI that still
+    /// pre-refused at the built-in 1 GiB would have configured nothing, and the
+    /// mismatch would be invisible: the server would happily serve the file the
+    /// browser refused to ask for.
+    #[test]
+    #[serial]
+    fn the_published_caps_are_the_configured_ones_not_the_defaults() {
+        let cfg = resolve(&header_mode(&[
+            "--max-download-bytes",
+            "12345",
+            "--max-manifest-bytes",
+            "678",
+        ]))
+        .expect("the byte caps resolve");
+        let limits = WireLimits::from_config(&cfg);
+        assert_eq!(limits.download_max_bytes, 12_345);
+        assert_eq!(limits.manifest_max_bytes, 678);
+        assert_ne!(
+            limits.download_max_bytes, DEFAULT_MAX_DOWNLOAD_BYTES as i64,
+            "the fixture must differ from the default, or this proves nothing"
+        );
+        assert_ne!(limits.manifest_max_bytes, DEFAULT_MAX_MANIFEST_BYTES as i64);
+    }
+
+    /// A cap larger than `i64::MAX` saturates rather than wrapping. Wrapping
+    /// would publish a NEGATIVE cap, and every file in the table would compare
+    /// as too large.
+    #[test]
+    fn a_cap_beyond_the_wires_range_saturates_downwards() {
+        assert_eq!(wire_bytes(u64::MAX), i64::MAX);
+        assert_eq!(wire_bytes(0), 0);
+        assert_eq!(wire_bytes(DEFAULT_MAX_DOWNLOAD_BYTES), 1024 * 1024 * 1024);
     }
 
     /// The debug-build-only escape hatch, and the fact that it is the *only*

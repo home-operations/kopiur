@@ -38,6 +38,7 @@ use crate::api::{
     covering_maintenances, gate_hits, ops_ctx, repo_phase_view,
 };
 use crate::auth::CurrentIdentity;
+use crate::config::WireLimits;
 
 /// This module's routes, relative to `/api/v1`.
 pub fn router() -> Router<AppState> {
@@ -313,13 +314,15 @@ fn session_expiry(job: &Job) -> Option<String> {
 /// perform, and the browse endpoints (which do exec into the pod) resolve it
 /// themselves. `reused` is always true — a session the detail screen *finds* is
 /// by definition one that already existed.
-fn session_info(job: &Job) -> SessionInfo {
+fn session_info(job: &Job, limits: WireLimits) -> SessionInfo {
     SessionInfo {
         namespace: job.metadata.namespace.clone().unwrap_or_default(),
         job: job.metadata.name.clone().unwrap_or_default(),
         pod: None,
         reused: true,
         expires_at: session_expiry(job),
+        download_max_bytes: limits.download_max_bytes,
+        manifest_max_bytes: limits.manifest_max_bytes,
     }
 }
 
@@ -495,7 +498,8 @@ async fn load_sessions(
         name,
     )
     .await?;
-    Ok(found.iter().map(session_info).collect())
+    let limits = WireLimits::from_config(&app.cfg);
+    Ok(found.iter().map(|job| session_info(job, limits)).collect())
 }
 
 /// **Pure.** `Repository.status.catalog` as the wire view.
@@ -568,6 +572,15 @@ mod tests {
     use kopiur_api::testutil::from_yaml;
     use kopiur_ui_model::graph::Health;
     use kopiur_ui_model::views::RepositoryPhaseView;
+
+    /// Deliberately not the defaults: a session must publish what this
+    /// deployment is configured with.
+    fn test_limits() -> WireLimits {
+        WireLimits {
+            download_max_bytes: 7_000,
+            manifest_max_bytes: 900,
+        }
+    }
 
     fn nas() -> Repository {
         from_yaml(
@@ -931,12 +944,18 @@ spec:
             "status": { "startTime": "2026-09-08T10:00:00Z" }
         }))
         .unwrap();
-        let info = session_info(&job);
+        let info = session_info(&job, test_limits());
         assert_eq!(info.namespace, "media");
         assert_eq!(info.job, "kopiur-browse-nas-deadbeef");
         assert!(
             info.reused,
             "a session the detail screen finds already existed"
+        );
+        assert_eq!(
+            (info.download_max_bytes, info.manifest_max_bytes),
+            (7_000, 900),
+            "a session listed on the detail screen publishes the same caps the \
+             browse endpoints do, so one screen cannot disagree with the other"
         );
         assert_eq!(info.pod, None, "naming the pod is the browse API's job");
         assert!(
@@ -957,7 +976,7 @@ spec:
             "spec": { "activeDeadlineSeconds": 1020 }
         }))
         .unwrap();
-        assert_eq!(session_info(&job).expires_at, None);
+        assert_eq!(session_info(&job, test_limits()).expires_at, None);
     }
 
     #[test]

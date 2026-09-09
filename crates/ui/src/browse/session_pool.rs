@@ -31,7 +31,7 @@ use kopiur_api::common::RepositoryKind;
 use kopiur_ui_model::views::SessionInfo;
 
 use crate::api::problem::{ApiError, problem};
-use crate::config::SessionLimits;
+use crate::config::{SessionLimits, WireLimits};
 use crate::metrics::UiMetrics;
 
 /// Above this many per-identity semaphores, idle ones are pruned on the next
@@ -356,13 +356,18 @@ fn pool_closed(what: &str) -> ApiError {
 ///
 /// `None` when the Job carries no creation timestamp or no deadline — a guessed
 /// expiry is worse than an absent one.
-pub fn session_info(job: &Job, reused: bool) -> SessionInfo {
+/// `limits` are the deployment's own caps, published so the SPA can refuse an
+/// oversized download before navigating into a problem document it cannot read.
+/// See [`WireLimits`].
+pub fn session_info(job: &Job, reused: bool, limits: WireLimits) -> SessionInfo {
     SessionInfo {
         namespace: job.namespace().unwrap_or_default(),
         job: job.name_any(),
         pod: None,
         reused,
         expires_at: session_expiry(job),
+        download_max_bytes: limits.download_max_bytes,
+        manifest_max_bytes: limits.manifest_max_bytes,
     }
 }
 
@@ -677,6 +682,15 @@ mod tests {
         drop(held);
     }
 
+    /// Deliberately not the defaults: a session publishes the caps this
+    /// deployment runs with.
+    fn test_limits() -> WireLimits {
+        WireLimits {
+            download_max_bytes: 7_000,
+            manifest_max_bytes: 900,
+        }
+    }
+
     #[test]
     fn session_info_expiry_comes_from_the_jobs_own_deadline() {
         // 1020s = a 900s TTL plus the 120s connect backstop `JobLimits` adds.
@@ -688,6 +702,7 @@ mod tests {
                 Some(1020),
             ),
             true,
+            test_limits(),
         );
         assert_eq!(info.namespace, "media");
         assert_eq!(info.job, "kopiur-browse-nas-0badc0de");
@@ -702,6 +717,7 @@ mod tests {
         let short = session_info(
             &job("j", "media", Some("2026-06-11T01:02:03Z"), Some(240)),
             true,
+            test_limits(),
         );
         assert_eq!(short.expires_at.as_deref(), Some("2026-06-11T01:06:03Z"));
 
@@ -712,10 +728,31 @@ mod tests {
             (Some("2026-06-11T01:02:03Z"), None),
             (None, None),
         ] {
-            let info = session_info(&job("j", "media", created, deadline), false);
+            let info = session_info(&job("j", "media", created, deadline), false, test_limits());
             assert_eq!(info.expires_at, None, "{created:?}/{deadline:?}");
             assert!(!info.reused);
         }
+    }
+
+    /// The caps the SPA pre-checks against are the ones the server will enforce
+    /// — carried through verbatim, never re-derived from a default. Publishing a
+    /// default here while the server refused at a configured value would have
+    /// the file table enable a file the download then rejects, into a problem
+    /// document a top-level navigation renders as raw JSON.
+    #[test]
+    fn a_session_publishes_the_deployments_own_download_caps() {
+        let info = session_info(
+            &job("j", "media", Some("2026-06-11T01:02:03Z"), Some(1020)),
+            true,
+            test_limits(),
+        );
+        assert_eq!(info.download_max_bytes, 7_000);
+        assert_eq!(info.manifest_max_bytes, 900);
+        assert_ne!(
+            info.download_max_bytes,
+            crate::config::DEFAULT_MAX_DOWNLOAD_BYTES as i64,
+            "the fixture must differ from the default, or this proves nothing"
+        );
     }
 
     #[tokio::test]

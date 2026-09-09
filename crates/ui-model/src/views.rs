@@ -1016,6 +1016,27 @@ pub struct SessionInfo {
     /// RFC3339 timestamp of when the session will be reaped if left idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    /// The largest single file `GET …/file` will stream, in bytes, as this
+    /// deployment is configured (`KOPIUR_UI_MAX_DOWNLOAD_BYTES`).
+    ///
+    /// Published so the file table can disable an oversized entry *with the
+    /// reason* before the user clicks. This is a second gate, not the gate: the
+    /// server still refuses an oversized download with a `413`
+    /// `download-too-large`. But a download is a top-level navigation, so that
+    /// refusal is rendered by the browser as a tab full of JSON — the SPA never
+    /// sees it and cannot turn it into a message.
+    ///
+    /// A `DirEntryView.size` of `null` means kopia reported no size, which is
+    /// the `422` `download-size-unknown` case: not comparable against this, and
+    /// not the same as zero.
+    pub download_max_bytes: i64,
+    /// The largest kopia JSON manifest the server will buffer while walking the
+    /// snapshot, in bytes (`KOPIUR_UI_MAX_MANIFEST_BYTES`).
+    ///
+    /// This is what a `422` `directory-too-large` / `catalog-too-large` is
+    /// measured against — a *listing* bound, not a download bound — so the SPA
+    /// can explain a refused directory rather than reporting it as empty.
+    pub manifest_max_bytes: i64,
 }
 
 /// What a mutating action created, returned so the SPA can navigate straight to
