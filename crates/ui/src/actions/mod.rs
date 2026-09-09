@@ -78,7 +78,7 @@ use kopiur_ui_model::requests::{
 use kopiur_ui_model::views::{ActionReceipt, SnapshotRefView};
 
 use crate::AppState;
-use crate::api::problem::{ApiError, problem};
+use crate::api::problem::{ApiError, problem, request_path};
 use crate::auth::identity::Identity;
 use crate::auth::{CurrentIdentity, mutation_guard};
 use crate::config::FIELD_MANAGER;
@@ -136,7 +136,9 @@ where
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let path = req.uri().path().to_string();
+        // `request_path`, not `req.uri()`: every mutating route is nested under
+        // `/api/v1`, where the prefix has been stripped by the time this runs.
+        let path = request_path(req.extensions(), req.uri());
         match axum::Json::<T>::from_request(req, state).await {
             Ok(axum::Json(value)) => Ok(Self(value)),
             Err(rejection) => Err(rejected_body(&rejection).with_instance(path)),

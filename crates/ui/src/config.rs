@@ -260,6 +260,88 @@ pub const TLS_KEY_ENV: &str = "KOPIUR_UI_TLS_KEY";
 /// meaningful.
 pub const CORS_ORIGINS_ENV: &str = "KOPIUR_UI_CORS_ORIGINS";
 
+// --- fixed router values ----------------------------------------------------
+//
+// Not configurable, and here rather than in `lib.rs` so that every number and
+// every header value the process is built from is in one file. Each one is a
+// *safety* bound rather than a tuning knob: an operator who needs a different
+// value has a problem these constants would only hide.
+
+/// How long any `/api` request may take before it is answered with a 504
+/// `urn:kopiur:problem:timeout`.
+///
+/// Generous for a JSON call and far short of a browser's own patience, so the
+/// UI gives up before the tab does and says something actionable. `GET
+/// …/file` is deliberately exempt — a multi-gigabyte restore outlives any fixed
+/// deadline, and it bounds itself on progress with
+/// [`DOWNLOAD_CHUNK_TIMEOUT_ENV`] instead.
+pub const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest request body `/api` will read, in bytes.
+///
+/// Every mutating endpoint takes a small JSON document — the biggest is a
+/// `Restore` request with a PVC template — so 64 KiB is orders of magnitude more
+/// than any legitimate call needs. It is a cheap bound on the one thing an
+/// authenticated caller could otherwise make the process allocate.
+pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
+/// How many `/api` requests may be in flight at once, across every caller.
+///
+/// The UI fans out to the apiserver, so an unbounded queue here becomes
+/// unbounded load there. Requests above the limit wait rather than fail, and
+/// [`API_REQUEST_TIMEOUT`] sits *outside* the limit so a request cannot queue
+/// forever: it is refused with a timeout problem instead.
+pub const MAX_CONCURRENT_API_REQUESTS: usize = 256;
+
+/// How long startup waits for the reflector stores to complete their initial
+/// list before giving up on them.
+///
+/// Giving up does not disable the cache — the stores keep filling and readiness
+/// still flips when they do. It converts a silent wait into a `/readyz` answer
+/// (`cache-sync-timed-out`) an operator can act on, because the usual cause is
+/// the UI's own ServiceAccount lacking list/watch on a CRD, which never resolves
+/// on its own.
+pub const CACHE_SYNC_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `Cache-Control` on every `/api` response.
+///
+/// `no-store`, not `no-cache`: an authorization-dependent answer must never be
+/// written to disk by a shared proxy or a browser's back/forward cache, where it
+/// would outlive both the session and the RoleBinding that produced it.
+pub const API_CACHE_CONTROL: &str = "no-store";
+
+/// `Content-Security-Policy` on every `/api` response.
+///
+/// The API serves JSON, so the policy is as narrow as one can be written:
+/// nothing may be loaded, and `frame-ancestors 'none'` means no page anywhere
+/// may embed a response. `style-src 'unsafe-inline'` is present because the same
+/// policy is the floor the SPA's own is built on and a bundler emits inline
+/// style attributes; it grants nothing to a JSON document.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; \
+                                           img-src 'self' data:; frame-ancestors 'none'";
+
+/// `X-Frame-Options` on every `/api` response, for browsers older than
+/// `frame-ancestors`.
+pub const X_FRAME_OPTIONS: &str = "DENY";
+
+/// `X-Content-Type-Options` on every `/api` response: never sniff a body into a
+/// type it did not declare.
+pub const X_CONTENT_TYPE_OPTIONS: &str = "nosniff";
+
+/// `Referrer-Policy` on **every** response, the SPA included.
+///
+/// Kopiur URLs carry namespaces and object names, which are fleet topology; a
+/// cross-origin referer would leak them to whatever a user clicks through to.
+pub const REFERRER_POLICY: &str = "same-origin";
+
+/// `route` label on `kopiur_ui_requests_total` for a request that matched no
+/// route at all.
+///
+/// One fixed string rather than the path: an unmatched path is attacker- or
+/// typo-controlled, so labelling it verbatim would let anyone mint unbounded
+/// time series.
+pub const UNMATCHED_ROUTE: &str = "<unmatched>";
+
 // --- the clap surface -------------------------------------------------------
 
 /// `kopiur-ui`'s command-line/environment surface. Every field is a `--flag`

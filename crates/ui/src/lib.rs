@@ -37,14 +37,25 @@ pub mod ops_listener;
 pub mod static_files;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::header::CONTENT_TYPE;
-use axum::http::{Response, StatusCode, Uri};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::{HeaderName, HeaderValue, Method, Response, StatusCode, Uri, header};
+use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::routing::any;
 
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::compression::{CompressionLayer, DefaultPredicate, Predicate};
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::TraceLayer;
+
+use crate::api::problem::{ApiError, problem};
+use crate::auth::{ServedAs, identity_middleware};
 use crate::config::UiConfig;
 use crate::metrics::UiMetrics;
 use crate::ops_listener::Readiness;
@@ -62,99 +73,392 @@ pub struct AppState {
     pub readiness: Arc<Readiness>,
     /// Identity resolution and the impersonating client cache.
     pub auth: Arc<auth::AuthState>,
-    /// Where reads come from: the reflector cache or a live impersonated call.
+    /// Where **reads** come from: the reflector cache or a live impersonated
+    /// call.
+    ///
+    /// Reads only. A mutation's input is not a view: the `SnapshotPolicy` that
+    /// `snapshot-now` reads decides how many `Snapshot` CRs get created and
+    /// against which repositories, so serving it from a store that is one watch
+    /// lag behind would not misrender a page, it would create the wrong backups.
+    /// `actions/` therefore contains zero references to this field, and a test
+    /// there greps its own source to keep it that way.
     pub source: Arc<cache::Source>,
     /// Browse-session start and exec bounds.
     pub sessions: Arc<browse::session_pool::SessionPool>,
 }
 
-/// The app router: the SPA plus `/api/v1`.
+/// The app router: the SPA plus `/api/v1`, with every shared layer applied.
 ///
-/// Task 8 mounts the real `/api/v1` routes. Until then the API namespace is
-/// explicitly claimed and answers 404 with the same `application/problem+json`
-/// shape every other endpoint uses — an unmounted route must never fall through
-/// to [`static_files::spa_fallback`], which would answer an API call with 200 and
-/// an HTML page and leave the SPA parsing `<!doctype html>` as JSON.
+/// # How the routers fit together
+///
+/// Three routers, mounted two different ways, because two of them register
+/// *relative* paths and one registers *absolute* ones:
+///
+/// * [`api::router`] and [`actions::router`] use relative paths (`/graph`,
+///   `/actions/suspend`), so they are merged together and `nest`ed under
+///   `/api/v1`.
+/// * [`browse::router`] registers absolute paths already
+///   (`/api/v1/snapshots/{namespace}/{name}/tree`), because a browse route's
+///   shape is not a suffix of one prefix. It is therefore `merge`d at the root —
+///   nesting it would produce `/api/v1/api/v1/…`.
+///
+/// **A merged router inherits nothing from a nest point.** That is the whole
+/// reason [`api_surface`] builds the merged whole first and layers *that*: a
+/// browse route outside `identity_middleware` would not 401, it would reach a
+/// handler and 500 on [`auth::CurrentIdentity`], and a browse route without the
+/// security headers would be a silent regression nobody notices.
+///
+/// # Layer order, outermost first
+///
+/// | layer | scope | why it sits where it does |
+/// |---|---|---|
+/// | [`TraceLayer`] | everything | one span per request, recording method and the *matched* path only |
+/// | `Referrer-Policy` | everything | Kopiur URLs carry namespaces and object names |
+/// | [`CompressionLayer`] | everything but a download | gzip for the SPA bundle and JSON; see [`compressible`] |
+/// | security headers ×4 | `/api` | never on the SPA: `no-store` there would defeat the immutable-asset caching |
+/// | [`CorsLayer`] | `/api` | only when `KOPIUR_UI_CORS_ORIGINS` is set, which is a dev-server affordance |
+/// | [`RequestBodyLimitLayer`] | `/api` | 64 KiB; the biggest legitimate body is a `Restore` request |
+/// | [`GlobalConcurrencyLimitLayer`] | `/api` | one shared semaphore across both halves, so the download route counts too |
+/// | [`record_request`] | `/api` | outside identity, so it sees the 401s and 403s identity produces |
+/// | [`api_timeout`] | `/api` **except** `…/file` | a fixed deadline is the wrong bound for a multi-gigabyte download |
+/// | [`identity_middleware`] | `/api` | innermost: everything above runs whether or not a caller was resolved |
+///
+/// Anything that matched no route falls through to [`static_files::spa_fallback`]
+/// so a deep link is handled by the client-side router — except under `/api`,
+/// which is claimed explicitly and answers [`api_not_found`]. An API call
+/// answered with 200 and an HTML page would leave the SPA parsing
+/// `<!doctype html>` as JSON.
 pub fn app(state: AppState) -> Router {
+    let cors = cors_layer(&state.cfg.cors_origins);
+
     Router::new()
-        .route("/api", any(api_not_found))
-        .route("/api/{*rest}", any(api_not_found))
+        .merge(api_surface(state.clone(), cors))
         .fallback(static_files::spa_fallback)
+        .layer(CompressionLayer::new().compress_when(compressible()))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            static_header(config::REFERRER_POLICY),
+        ))
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .with_state(state)
 }
 
-/// 404 for an `/api` path that no handler claims.
-async fn api_not_found(uri: Uri) -> Response<Body> {
-    problem_response(
-        StatusCode::NOT_FOUND,
-        kopiur_ui_model::problem::Problem {
-            r#type: "https://kopiur.dev/problems/not-found".to_string(),
-            title: "Endpoint not found".to_string(),
-            status: StatusCode::NOT_FOUND.as_u16(),
-            detail: format!("no kopiur-ui endpoint serves {}", uri.path()),
-            what: format!(
-                "The UI asked for {}, which this backend does not serve.",
-                uri.path()
-            ),
-            why: "The path is not part of the kopiur-ui API surface — usually a stale SPA \
-                  bundle calling an endpoint a newer or older backend has, or a typo in a \
-                  hand-made request."
-                .to_string(),
-            fix: "Reload the page to pick up the bundle this backend ships, and make sure the \
-                  kopiur-ui image and the operator come from the same release."
-                .to_string(),
-            instance: Some(uri.path().to_string()),
-            kube_reason: None,
+/// Everything under `/api`, with the layers that must not reach the SPA.
+///
+/// Split out of [`app`] so the scoping is structural rather than a comment: a
+/// layer added here cannot accidentally apply to the static bundle, and a layer
+/// added in [`app`] cannot accidentally miss a browse route.
+///
+/// `route_layer` rather than `layer` for the two middlewares that must not run
+/// on an unmatched path: `layer` also wraps the fallback, so an unknown
+/// `/api/v1/nope` would be answered by the identity middleware (401) instead of
+/// by [`api_not_found`] (404) — an honest 404 is what tells an operator their
+/// bundle and their backend disagree.
+fn api_surface(state: AppState, cors: Option<CorsLayer>) -> Router<AppState> {
+    // Two halves, differing in exactly one layer. `…/file` streams a restore
+    // that legitimately outlives any fixed deadline, so it is mounted here,
+    // after the timeout, and bounds itself on progress instead.
+    let timed = Router::new()
+        .nest("/api/v1", api::router().merge(actions::router()))
+        .merge(browse::router())
+        .route_layer(axum::middleware::from_fn(api_timeout));
+
+    // One semaphore shared by both halves rather than a limit each: two
+    // `ConcurrencyLimitLayer`s would mean 2×256 in flight, and the download
+    // route — the most expensive thing the UI serves — would be the half with
+    // its own private budget.
+    let concurrency = GlobalConcurrencyLimitLayer::new(config::MAX_CONCURRENT_API_REQUESTS);
+
+    let bounded = timed
+        .merge(browse::router_untimed())
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            identity_middleware,
+        ))
+        // Registered AFTER the identity layer and BEFORE the metrics layer, so
+        // an unknown `/api` path is a 404 rather than a 401 and is still counted.
+        .route("/api", any(api_not_found))
+        .route("/api/{*rest}", any(api_not_found))
+        .route_layer(axum::middleware::from_fn_with_state(state, record_request))
+        .layer(concurrency)
+        .layer(RequestBodyLimitLayer::new(config::MAX_REQUEST_BODY_BYTES))
+        // axum's own extractors consult `DefaultBodyLimit`, which defaults to
+        // 2 MiB and would otherwise reject before — and differently from — the
+        // layer above. One number, one refusal.
+        .layer(DefaultBodyLimit::max(config::MAX_REQUEST_BODY_BYTES));
+
+    // `Option<CorsLayer>` is not itself a `Layer`, and `tower::util::option_layer`
+    // would pull in a feature for one call. A match keeps the "absent means
+    // absent" reading obvious.
+    let bounded = match cors {
+        Some(cors) => bounded.layer(cors),
+        None => bounded,
+    };
+
+    bounded
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            static_header(config::API_CACHE_CONTROL),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            static_header(config::X_CONTENT_TYPE_OPTIONS),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_FRAME_OPTIONS,
+            static_header(config::X_FRAME_OPTIONS),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            static_header(config::CONTENT_SECURITY_POLICY),
+        ))
+}
+
+/// A `HeaderValue` for one of the fixed policy strings in [`config`].
+///
+/// Every caller passes a crate constant of visible ASCII, so the parse cannot
+/// fail; an empty value rather than a panic keeps a typo in a constant from
+/// taking the process down at the first request.
+fn static_header(value: &'static str) -> Option<HeaderValue> {
+    match HeaderValue::from_str(value) {
+        Ok(header) => Some(header),
+        Err(e) => {
+            tracing::error!(
+                value,
+                error = %e,
+                "a kopiur-ui security header constant is not a valid header value; the header \
+                 will be omitted. This is a bug in kopiur-ui — report it."
+            );
+            None
+        }
+    }
+}
+
+/// The dev-only CORS layer, or `None` when no origin is configured.
+///
+/// Production is same-origin — the SPA is served by this very process — so an
+/// unset `KOPIUR_UI_CORS_ORIGINS` is the normal case and the one that keeps the
+/// `Sec-Fetch-Site`/`Origin` half of the CSRF posture meaningful. When origins
+/// *are* named they are named exactly: never `Any`, because credentialed
+/// requests plus a wildcard origin is the combination browsers refuse anyway and
+/// that a reviewer must never have to think twice about.
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    if origins.is_empty() {
+        return None;
+    }
+    let allowed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| match HeaderValue::from_str(origin) {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::error!(
+                    origin,
+                    error = %e,
+                    "ignoring an entry of KOPIUR_UI_CORS_ORIGINS that is not a valid origin; \
+                     write it as a scheme and authority, e.g. http://localhost:5173"
+                );
+                None
+            }
+        })
+        .collect();
+
+    if allowed.is_empty() {
+        tracing::error!(
+            "KOPIUR_UI_CORS_ORIGINS named only unusable values, so no cross-origin request \
+             will be allowed; write each entry as a scheme and authority, e.g. \
+             http://localhost:5173"
+        );
+        return None;
+    }
+
+    tracing::warn!(
+        origins = ?origins,
+        "cross-origin requests to /api are ENABLED. This is a development affordance for a \
+         Vite dev server on another port; unset KOPIUR_UI_CORS_ORIGINS in production, where \
+         the SPA is same-origin."
+    );
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(allowed))
+            .allow_credentials(true)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::DELETE,
+                Method::HEAD,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                HeaderName::from_static(auth::csrf::REQUEST_HEADER),
+            ]),
+    )
+}
+
+/// Compress everything tower-http would, except a file being handed to a user.
+///
+/// A download commits a `Content-Length` before it streams — that is what makes
+/// a truncated transfer visible to the browser instead of silently saved — and
+/// compressing the response replaces it with a chunked body, destroying exactly
+/// that guarantee. `Content-Disposition: attachment` is the marker, because a
+/// tower-http predicate sees the *response*, never the request path: it is also
+/// the more durable rule, since any future attachment response inherits it.
+fn compressible() -> impl Predicate {
+    DefaultPredicate::new().and(
+        |_status: StatusCode,
+         _version: axum::http::Version,
+         headers: &axum::http::HeaderMap,
+         _extensions: &axum::http::Extensions| {
+            !headers
+                .get(header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim_start().starts_with("attachment"))
         },
     )
 }
 
-/// Render a [`kopiur_ui_model::problem::Problem`] as RFC 9457
-/// `application/problem+json`.
+/// One span per request, carrying the method and the **matched route template**.
 ///
-/// Serialized by hand rather than through `axum::Json` so the content type is
-/// unambiguously the problem type — the SPA switches on it to decide whether a
-/// body is an error.
-fn problem_response(
-    status: StatusCode,
-    problem: kopiur_ui_model::problem::Problem,
-) -> Response<Body> {
-    match serde_json::to_vec(&problem) {
-        Ok(body) => (status, [(CONTENT_TYPE, "application/problem+json")], body).into_response(),
-        // A Problem is plain owned strings, so this cannot fail; degrade to
-        // plain text rather than panic inside a handler.
-        Err(e) => {
-            tracing::error!(error = %e, "failed to serialize a Problem response");
-            (status, problem.detail).into_response()
-        }
+/// Never the concrete path: it carries namespaces and object names, which are
+/// both fleet topology and — through a browse `?path=` — a user's filenames.
+fn request_span(request: &Request<Body>) -> tracing::Span {
+    tracing::info_span!(
+        "http",
+        method = %request.method(),
+        route = request
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or(config::UNMATCHED_ROUTE, MatchedPath::as_str),
+    )
+}
+
+/// Bound how long an `/api` request may run, and refuse it with a problem.
+///
+/// `tower_http::timeout` would answer a bare 408 with an empty body, which the
+/// SPA cannot render and an operator cannot act on. Every other refusal in this
+/// crate is an `application/problem+json` with what/why/fix, and a timeout is
+/// the one a person is most likely to actually see.
+///
+/// 504 rather than 408: the work happened here, not in a client that was slow to
+/// send its request, and 504 is already this crate's `timeout` problem class.
+/// `…/file` never reaches this middleware — see [`browse::router_untimed`].
+async fn api_timeout(req: Request, next: Next) -> Response<Body> {
+    with_timeout(config::API_REQUEST_TIMEOUT, req, next).await
+}
+
+/// [`api_timeout`] with the budget as a parameter.
+///
+/// Split out for one reason: it is the only way to test the layer without either
+/// waiting 30 seconds or reaching for `tokio`'s test-util clock. A test mounts
+/// this with a 20 ms budget over a handler that sleeps, which is the same code
+/// path the router runs.
+async fn with_timeout(budget: Duration, req: Request, next: Next) -> Response<Body> {
+    let path = req.uri().path().to_string();
+    match tokio::time::timeout(budget, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => timed_out(&path, budget).into_response(),
     }
+}
+
+/// The problem an over-running request is answered with.
+fn timed_out(path: &str, budget: Duration) -> ApiError {
+    problem(
+        504,
+        "timeout",
+        format!(
+            "kopiur-ui gave up on {path} after {} seconds.",
+            budget.as_secs()
+        ),
+        "A bounded wait expired. The work itself may still be running in the cluster — the \
+         request was abandoned, not undone.",
+        "reload the page in a moment; if it keeps happening, check the apiserver's health and \
+         whether this cluster holds far more Kopiur objects than the UI's list caps expect",
+    )
+    .with_instance(path.to_string())
+}
+
+/// Count one answered `/api` request on `kopiur_ui_requests_total`.
+///
+/// Mounted OUTSIDE [`identity_middleware`], which is what lets one recording
+/// site cover both the responses handlers produce and the 401/403 the identity
+/// layer produces on its own. That places it on the wrong side of the request,
+/// though — the request, and the [`auth::identity::Identity`] in it, is moved
+/// into the inner service — so the identity layer publishes what it resolved on
+/// the *response* as [`ServedAs`] and this reads it back.
+///
+/// `route` is the matched route TEMPLATE. Labelling the raw path would make the
+/// series cardinality the size of the fleet, and an unmatched path is
+/// caller-controlled, so anyone could mint series at will.
+async fn record_request(State(app): State<AppState>, req: Request, next: Next) -> Response<Body> {
+    let route = req.extensions().get::<MatchedPath>().map_or_else(
+        || config::UNMATCHED_ROUTE.to_string(),
+        |m| m.as_str().to_string(),
+    );
+
+    let response = next.run(req).await;
+
+    let source = response
+        .extensions()
+        .get::<ServedAs>()
+        .map_or_else(|| app.auth.mode_source(), |served| served.0.clone());
+    app.metrics
+        .inc_request(&route, response.status().as_u16(), &source);
+    app.metrics.set_identity_cache_size(app.auth.clients.len());
+    response
+}
+
+/// 404 for an `/api` path that no handler claims.
+async fn api_not_found(uri: Uri) -> Response<Body> {
+    problem(
+        StatusCode::NOT_FOUND.as_u16(),
+        "not-found",
+        format!(
+            "The UI asked for {}, which this backend does not serve.",
+            uri.path()
+        ),
+        "The path is not part of the kopiur-ui API surface — usually a stale SPA bundle \
+         calling an endpoint a newer or older backend has, or a typo in a hand-made request.",
+        "reload the page to pick up the bundle this backend ships, and make sure the \
+         kopiur-ui image and the operator come from the same release",
+    )
+    .with_instance(uri.path().to_string())
+    .into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body as ReqBody;
-    use axum::http::Request;
+    use axum::http::Request as HttpRequest;
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
     fn test_state() -> AppState {
         let provider = Arc::new(kopiur_telemetry::MetricsProvider::new("kopiur-ui-test"));
+        let cfg = test_config();
         AppState {
-            cfg: Arc::new(test_config()),
             metrics: Arc::new(UiMetrics::new(provider)),
             readiness: Arc::new(Readiness::new(static_files::is_placeholder())),
-            auth: Arc::new(auth::AuthState::unconfigured()),
+            auth: Arc::new(auth::AuthState::new(
+                cfg.auth.clone(),
+                kube::Config::new(
+                    "http://127.0.0.1:1/"
+                        .parse()
+                        .expect("a literal URL parses as a Uri"),
+                ),
+                cfg.client_cache.clone(),
+            )),
             source: Arc::new(cache::Source::Impersonated),
             sessions: Arc::new(browse::session_pool::SessionPool::default()),
+            cfg: Arc::new(cfg),
         }
     }
 
     fn test_config() -> UiConfig {
         use crate::config::*;
         UiConfig {
-            addr: DEFAULT_ADDR.parse().unwrap(),
-            ops_addr: DEFAULT_OPS_ADDR.parse().unwrap(),
+            addr: DEFAULT_ADDR.parse().expect("default addr"),
+            ops_addr: DEFAULT_OPS_ADDR.parse().expect("default ops addr"),
             auth: AuthConfig {
                 mode: AuthMode::AnonymousOnly(AnonymousIdentity {
                     user: "viewer".to_string(),
@@ -170,21 +474,21 @@ mod tests {
             mover_image: None,
             cache_enabled: false,
             session: SessionLimits {
-                ttl: std::time::Duration::from_secs(900),
-                ready_timeout: std::time::Duration::from_secs(300),
+                ttl: Duration::from_secs(900),
+                ready_timeout: Duration::from_secs(300),
                 max_starts: DEFAULT_MAX_SESSION_STARTS,
                 max_exec_per_identity: DEFAULT_MAX_EXEC_PER_IDENTITY,
                 max_exec_global: DEFAULT_MAX_EXEC_GLOBAL,
             },
             download_max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
-            download_chunk_timeout: std::time::Duration::from_secs(60),
+            download_chunk_timeout: Duration::from_secs(60),
             manifest_max_bytes: DEFAULT_MAX_MANIFEST_BYTES,
             snapshot_list_cap: DEFAULT_SNAPSHOT_LIST_CAP,
             client_cache: CacheLimits {
                 size: DEFAULT_CLIENT_CACHE_SIZE,
-                ttl: std::time::Duration::from_secs(600),
+                ttl: Duration::from_secs(600),
             },
-            sar_ttl: std::time::Duration::from_secs(60),
+            sar_ttl: Duration::from_secs(60),
             sar_cache_size: crate::config::DEFAULT_SAR_CACHE_SIZE,
             tls: None,
             cors_origins: Vec::new(),
@@ -195,27 +499,37 @@ mod tests {
     async fn an_unmounted_api_path_is_a_problem_json_404_not_the_spa() {
         let response = app(test_state())
             .oneshot(
-                Request::builder()
+                HttpRequest::builder()
                     .uri("/api/v1/nothing-here")
                     .body(ReqBody::empty())
-                    .unwrap(),
+                    .expect("test request"),
             )
             .await
-            .unwrap();
+            .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             response
                 .headers()
-                .get(CONTENT_TYPE)
-                .map(|v| v.to_str().unwrap()),
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("application/problem+json"),
             "an API call must never be answered with the SPA's HTML"
         );
 
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let problem: kopiur_ui_model::problem::Problem = serde_json::from_slice(&body).unwrap();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let problem: kopiur_ui_model::problem::Problem =
+            serde_json::from_slice(&body).expect("problem+json");
         assert_eq!(problem.status, 404);
+        assert_eq!(
+            problem.r#type, "urn:kopiur:problem:not-found",
+            "one problem vocabulary, not two"
+        );
         assert_eq!(problem.instance.as_deref(), Some("/api/v1/nothing-here"));
         assert!(
             !problem.fix.is_empty(),
@@ -227,22 +541,226 @@ mod tests {
     async fn a_browser_route_falls_through_to_the_spa() {
         let response = app(test_state())
             .oneshot(
-                Request::builder()
+                HttpRequest::builder()
                     .uri("/snapshots/prod/nightly-1")
                     .body(ReqBody::empty())
-                    .unwrap(),
+                    .expect("test request"),
             )
             .await
-            .unwrap();
+            .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
                 .headers()
-                .get(CONTENT_TYPE)
-                .map(|v| v.to_str().unwrap()),
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
             Some("text/html"),
             "deep links are handled by the client-side router, not by a 404"
         );
+    }
+
+    /// The SPA must keep its own caching. `no-store` there would re-download the
+    /// hashed bundle on every navigation — the exact opposite of what the
+    /// year-long `immutable` on `assets/` is for.
+    #[tokio::test]
+    async fn the_api_security_headers_do_not_leak_onto_the_spa() {
+        let response = app(test_state())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/snapshots/prod/nightly-1")
+                    .body(ReqBody::empty())
+                    .expect("test request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "the SPA keeps static_files' own caching policy"
+        );
+        assert!(response.headers().get(header::X_FRAME_OPTIONS).is_none());
+        // Referrer-Policy is the one that IS everywhere: Kopiur URLs carry
+        // namespaces and object names.
+        assert_eq!(
+            response
+                .headers()
+                .get(header::REFERRER_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some(config::REFERRER_POLICY),
+        );
+    }
+
+    #[test]
+    fn a_download_is_never_compressed() {
+        use axum::http::HeaderMap;
+
+        let predicate = compressible();
+        let mut attachment = HeaderMap::new();
+        attachment.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=\"holiday.tar\""),
+        );
+        attachment.insert(header::CONTENT_LENGTH, HeaderValue::from_static("40000000"));
+        attachment.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+
+        // A real body: tower-http's `SizeAbove` reads the body's size hint before
+        // it reads `Content-Length`, so an empty body would be skipped for a
+        // reason that has nothing to do with the rule under test.
+        let response = |headers: HeaderMap| {
+            let mut r = Response::new(Body::from(vec![b'x'; 4096]));
+            *r.headers_mut() = headers;
+            r
+        };
+
+        assert!(
+            !predicate.should_compress(&response(attachment)),
+            "compressing a download drops the Content-Length that makes a truncated \
+             transfer visible to the browser",
+        );
+
+        let mut json = HeaderMap::new();
+        json.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        json.insert(header::CONTENT_LENGTH, HeaderValue::from_static("40000"));
+        assert!(
+            predicate.should_compress(&response(json)),
+            "everything else still compresses — the SPA bundle is the reason the layer exists",
+        );
+    }
+
+    #[test]
+    fn cors_is_off_unless_an_origin_is_named_and_never_accepts_a_bad_one() {
+        assert!(
+            cors_layer(&[]).is_none(),
+            "production is same-origin; an always-on CORS layer would undercut the \
+             Sec-Fetch-Site half of the CSRF posture",
+        );
+        assert!(cors_layer(&["http://localhost:5173".to_string()]).is_some());
+        assert!(
+            cors_layer(&["not a header value\n".to_string()]).is_none(),
+            "an unusable origin must leave CORS off rather than open",
+        );
+    }
+
+    #[test]
+    fn every_security_header_constant_is_a_usable_header_value() {
+        for value in [
+            config::API_CACHE_CONTROL,
+            config::CONTENT_SECURITY_POLICY,
+            config::X_FRAME_OPTIONS,
+            config::X_CONTENT_TYPE_OPTIONS,
+            config::REFERRER_POLICY,
+        ] {
+            assert!(
+                static_header(value).is_some(),
+                "{value:?} must survive HeaderValue::from_str",
+            );
+        }
+        assert!(
+            config::CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"),
+            "the CSP must forbid embedding: {}",
+            config::CONTENT_SECURITY_POLICY,
+        );
+    }
+
+    /// The timed half really does time out, and what comes back is a problem
+    /// document rather than the bare 408 `tower_http::timeout` would produce: a
+    /// timeout is the refusal a person is most likely to actually see, and it
+    /// has to say that the work may still be running.
+    ///
+    /// A tiny budget over a handler that sleeps, which is exactly what the
+    /// router does with a 30-second one.
+    #[tokio::test]
+    async fn a_handler_that_outruns_its_budget_is_a_timeout_problem() {
+        use axum::routing::get;
+
+        let router = Router::new()
+            .route(
+                "/api/v1/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    "never reached"
+                }),
+            )
+            .layer(axum::middleware::from_fn(|req, next| {
+                with_timeout(Duration::from_millis(20), req, next)
+            }));
+
+        let response = router
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/v1/slow")
+                    .body(ReqBody::empty())
+                    .expect("test request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json"),
+            "the SPA switches on the content type to decide whether a body is an error",
+        );
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let problem: kopiur_ui_model::problem::Problem =
+            serde_json::from_slice(&body).expect("problem+json");
+        assert_eq!(problem.r#type, "urn:kopiur:problem:timeout");
+        assert_eq!(problem.instance.as_deref(), Some("/api/v1/slow"));
+    }
+
+    /// `…/file` is deliberately NOT behind [`api_timeout`], because a legitimate
+    /// multi-gigabyte restore outlives any budget that is still useful for a JSON
+    /// call. Asserted on the routers themselves: the download route is in the
+    /// untimed half and nothing else is.
+    #[test]
+    fn only_the_download_route_is_exempt_from_the_timeout() {
+        let untimed = format!("{:?}", browse::router_untimed());
+        assert!(untimed.contains("/file"), "{untimed}");
+        for timed_only in ["/tree", "/session"] {
+            assert!(
+                !untimed.contains(timed_only),
+                "{timed_only} must stay behind the request timeout: {untimed}",
+            );
+        }
+        let timed = format!("{:?}", browse::router());
+        assert!(
+            !timed.contains("/file"),
+            "the download must not be registered twice: {timed}",
+        );
+    }
+
+    #[test]
+    fn the_timeout_problem_names_the_budget_and_what_it_means() {
+        let error = timed_out("/api/v1/graph", Duration::from_secs(30));
+        assert_eq!(error.0.status, 504);
+        assert_eq!(error.0.r#type, "urn:kopiur:problem:timeout");
+        assert!(error.0.what.contains("30"), "{}", error.0.what);
+        assert!(error.0.what.contains("/api/v1/graph"), "{}", error.0.what);
+        assert!(
+            error.0.why.contains("may still be running"),
+            "a timeout must not imply the work was undone: {}",
+            error.0.why
+        );
+        assert_eq!(error.0.instance.as_deref(), Some("/api/v1/graph"));
     }
 }

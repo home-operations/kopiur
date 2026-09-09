@@ -63,7 +63,7 @@ use kopiur_ui_model::views::{
 };
 
 use crate::AppState;
-use crate::api::problem::{ApiError, problem};
+use crate::api::problem::{ApiError, problem, request_path};
 use crate::auth::identity::Identity;
 use crate::config::{FIELD_MANAGER, UiConfig};
 
@@ -208,7 +208,7 @@ where
                 "check the query parameters against the endpoint's documented ones — a required \
                  one is missing, or one carries a value of the wrong type",
             )
-            .with_instance(parts.uri.path().to_string())),
+            .with_instance(request_path(&parts.extensions, &parts.uri))),
         }
     }
 }
@@ -240,7 +240,7 @@ where
                 "check the URL against the endpoint's shape — the repository kind segment, for \
                  example, is the kebab-case `repository` or `cluster-repository`",
             )
-            .with_instance(parts.uri.path().to_string())),
+            .with_instance(request_path(&parts.extensions, &parts.uri))),
         }
     }
 }

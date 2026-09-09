@@ -24,7 +24,8 @@
 //! names flags a browser has no way to pass.
 
 use axum::body::Body;
-use axum::http::{HeaderValue, Response, StatusCode, header};
+use axum::extract::OriginalUri;
+use axum::http::{Extensions, HeaderValue, Response, StatusCode, Uri, header};
 use axum::response::IntoResponse;
 
 use kopiur_ops::error::{OpsError, OpsErrorKind};
@@ -46,6 +47,26 @@ pub const PROBLEM_TYPE_PREFIX: &str = "urn:kopiur:problem:";
 /// authenticate" is "come back through the proxy". A bare `Basic` challenge would
 /// make browsers pop a credential dialog that can never succeed.
 pub const PROXY_CHALLENGE: &str = "Kopiur-Proxy";
+
+/// The path the CALLER asked for, for a problem's `instance`.
+///
+/// `uri` alone is not it. axum's `nest` rewrites the URI it hands the inner
+/// router, so anything mounted under `/api/v1` sees `/actions/suspend` where the
+/// browser asked for `/api/v1/actions/suspend` — and an `instance` naming a path
+/// the caller never requested is worse than none: it sends whoever reads the
+/// error hunting for an endpoint that does not exist. `OriginalUri` is what
+/// `nest` leaves in the extensions for exactly this; the fallback covers a
+/// router that was never nested, where the two are the same string.
+///
+/// Takes the two pieces rather than a `Parts` or a `Request` so it serves both:
+/// an extractor has `Parts`, a middleware has a whole `Request`, and neither
+/// should have to take the other apart to ask this question.
+pub fn request_path(extensions: &Extensions, uri: &Uri) -> String {
+    extensions.get::<OriginalUri>().map_or_else(
+        || uri.path().to_string(),
+        |original| original.path().to_string(),
+    )
+}
 
 /// An error rendered as `application/problem+json`.
 ///
