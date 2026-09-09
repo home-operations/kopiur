@@ -88,7 +88,13 @@ export function Drawer({ model, node, namespace, onClose }: DrawerProps) {
       </div>
 
       <div className="panel__body topo-drawer__body">
-        <p className="topo-drawer__meaning">{nodeMeaning(node.node.kind)}</p>
+        {/* What the kind *is* — but not for a ghost: this node is a reference,
+            not a repository, and describing what a Repository does would be
+            describing something that is not there. The finding below is the
+            whole story. */}
+        {node.missing ? null : (
+          <p className="topo-drawer__meaning">{nodeMeaning(node.node.kind)}</p>
+        )}
 
         <dl className="topo-drawer__facts">
           <dt>State</dt>

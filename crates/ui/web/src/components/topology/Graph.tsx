@@ -93,7 +93,7 @@ export function Graph({ model, layout, selected, onSelect }: GraphProps) {
               edge.style.marker === "none"
                 ? undefined
                 : `url(#${markers}-${edge.style.marker}-${edge.lamp.key})`;
-            const at = edgeLabelPoint(path.points);
+            const at = edgeLabelPoint(path.points, layout.nodes.values());
             const words = [
               edge.edge.label ?? undefined,
               edge.lamp.key === "healthy" ? undefined : edge.lamp.word,

@@ -1432,6 +1432,10 @@ svg {
    larger than the viewport more often than not, so the board scrolls in both
    directions inside its own frame rather than stretching the page. */
 .topo-board {
+  /* A grid item's automatic minimum is its content, and the canvas is wider
+     than the page more often than not — without this the board pushes past
+     its track instead of scrolling inside it. */
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--bg-inset);
@@ -1504,10 +1508,12 @@ svg {
   box-shadow: var(--focus-ring);
 }
 
-/* The one current marker the system has, applied to a plate. */
+/* The one current marker the system has, applied to a plate. An inset ring
+   rather than only a border colour, so it is still the marker on a ghost —
+   whose dashed failed-lamp border it must not overwrite. */
 .topo-node[data-selected="true"] {
   border-color: var(--accent);
-  box-shadow: inset 0 0 0 1px var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 /* The dangling reference. A dashed edge is the one structural difference on
