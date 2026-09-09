@@ -46,6 +46,7 @@ pub fn export_all(dir: &Path) -> Result<(), ExportError> {
     views::PolicyDetail::export_all(&cfg)?;
     views::ScheduleRow::export_all(&cfg)?;
     views::RestoreRow::export_all(&cfg)?;
+    views::RestoreDetail::export_all(&cfg)?;
     views::MaintenanceRow::export_all(&cfg)?;
     views::RepositoryReplicationRow::export_all(&cfg)?;
     views::SnapshotReplicationRow::export_all(&cfg)?;
@@ -138,14 +139,16 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 66,
+            exported, 69,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
              `String`, so one gate registry can no longer be described by two \
              vocabularies; 65 -> 66 when `ReplicationsView` moved here from \
              `kopiur-ui/src/api/replications.rs`, where it was a wire shape the \
-             SPA would have had to hand-write"
+             SPA would have had to hand-write; 66 -> 69 for `RestoreDetail` and \
+             its two new sub-objects (`RestoreSourceView`, `RestoreTargetView`), \
+             so the restore detail route stops answering with the list's row"
         );
     }
 }

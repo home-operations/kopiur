@@ -701,6 +701,87 @@ pub struct RestoreRow {
     pub claims: Vec<RestoreClaimView>,
 }
 
+/// Everything the restore detail screen shows.
+///
+/// # What is deliberately not here
+///
+/// **A progress percentage.** `Restore.status.progress` carries
+/// `bytesRestored`/`filesRestored` and no total to divide by, so there is
+/// nothing to compute one from; the two counters already ride
+/// [`RestoreRow`]. A `percent` field would have to be invented, and a restore
+/// that showed a fabricated "80%" is worse than one that shows bytes.
+///
+/// **Per-claim byte counts.** `RestoreClaimStatus` records a phase and a
+/// message, not counters, so a populator fan-out's progress is per-claim
+/// *state* — which is what [`RestoreClaimView`] already carries on the row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreDetail {
+    /// The same fields the table row shows, the per-claim rows included.
+    pub row: RestoreRow,
+    /// `status.resolved` — what the source was pinned to at admission.
+    ///
+    /// Absent until resolution runs. A restore never re-resolves, so this is
+    /// what the run will actually read, not what the spec asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<RestoreSourceView>,
+    /// `status.target` — where the data is actually being written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RestoreTargetView>,
+    /// `status.conditions`.
+    pub conditions: Vec<ConditionView>,
+    /// Failure detail, present when the run failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureView>,
+    /// Last lines of the mover Job's log, redacted. Empty when the run wrote
+    /// none.
+    pub log_tail: Vec<String>,
+}
+
+/// `Restore.status.resolved` — the source pinned at admission.
+///
+/// The two fields the row already carries (the repository and the kopia
+/// manifest id) are not repeated here: one value, one place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreSourceView {
+    /// `Snapshot` when the source resolved to a kopia snapshot, `NoSnapshot`
+    /// when it matched none and `onMissingSnapshot: Continue` chose an empty
+    /// volume — which is a *successful* restore of nothing, not a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// The concrete `Snapshot` resource the source resolved to, when there is
+    /// one to navigate to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotRefView>,
+    /// RFC3339 timestamp the source was pinned at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<String>,
+    /// The resolved kopia identity (`user@host:/path`) the data is read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+/// `Restore.status.target` — the PVC the data lands in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreTargetView {
+    /// Name of the `PersistentVolumeClaim` actually written to, created or
+    /// pre-existing.
+    ///
+    /// A name rather than a reference: the controller writes this claim without
+    /// a namespace because a restore only ever writes into its own, which is
+    /// `RestoreDetail.row.namespace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc: Option<String>,
+    /// The populator handshake's prime PVC, for a `target.populator` restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_prime: Option<String>,
+}
+
 /// Per-PVC progress within one restore.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

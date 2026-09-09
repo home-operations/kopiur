@@ -273,7 +273,7 @@ fn stats_view(stats: &kopiur_api::snapshot::SnapshotStats) -> SnapshotStatsView 
 }
 
 /// **Pure.** Structured failure detail, with kopia's own text redacted.
-fn failure_view(f: &kopiur_api::common::FailureBlock) -> FailureView {
+pub fn failure_view(f: &kopiur_api::common::FailureBlock) -> FailureView {
     FailureView {
         kopia_error_class: Some(f.kopia_error_class.clone()),
         message: Some(redact_text(&f.message)),
