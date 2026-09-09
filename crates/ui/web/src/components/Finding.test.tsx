@@ -22,11 +22,18 @@ describe("Finding", () => {
   });
 
   it("omits the lines it does not have rather than rendering empty plates", () => {
-    render(<Finding what="cannot list secrets (RBAC)" why={null} fix={undefined} />);
-    const finding = screen.getByRole("article");
-    expect(finding.querySelector(".finding__what")).toHaveTextContent("cannot list secrets");
-    expect(finding.querySelector(".finding__why")).toBeNull();
-    expect(finding.querySelector(".finding__fix")).toBeNull();
-    expect(finding.querySelector("h3")).toBeNull();
+    const { container } = render(
+      <Finding what="cannot list secrets (RBAC)" why={null} fix={undefined} />,
+    );
+    // Untitled — the row it sits in already names the check — so it is not an
+    // `article`: an article with no accessible name is a landmark-shaped
+    // wrapper a screen-reader user cannot tell apart from any other.
+    expect(screen.queryByRole("article")).toBeNull();
+    const finding = container.querySelector(".finding");
+    expect(finding).not.toBeNull();
+    expect(finding?.querySelector(".finding__what")).toHaveTextContent("cannot list secrets");
+    expect(finding?.querySelector(".finding__why")).toBeNull();
+    expect(finding?.querySelector(".finding__fix")).toBeNull();
+    expect(finding?.querySelector("h3")).toBeNull();
   });
 });

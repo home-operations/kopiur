@@ -14,6 +14,12 @@ import type { Lamp } from "./health";
  * A finding with only `what` is a single sentence and renders as one: a
  * warning's whole story is its one line, and an empty why/fix plate would
  * put words in the check's mouth.
+ *
+ * `title` also decides the element. Named, it is an `article` a screen-reader
+ * user can find and identify. Unnamed — inside a table row that already names
+ * the check — it is a plain `div`: an `article` whose `aria-label` is
+ * `undefined` is an article-shaped thing with no accessible name, which is
+ * noise in the a11y tree rather than structure.
  */
 export interface FindingProps {
   /** The check or gate this finding belongs to; omitted when the row already names it. */
@@ -29,8 +35,9 @@ export interface FindingProps {
 
 export function Finding({ title, what, why, fix, lamp, meta }: FindingProps) {
   const Icon = lamp?.icon;
+  const Wrapper = title !== undefined ? "article" : "div";
   return (
-    <article className="finding" data-health={lamp?.key} aria-label={title}>
+    <Wrapper className="finding" data-health={lamp?.key} aria-label={title}>
       {Icon !== undefined ? (
         <span className="finding__icon">
           <Icon size={16} strokeWidth={2} aria-hidden="true" />
@@ -50,6 +57,6 @@ export function Finding({ title, what, why, fix, lamp, meta }: FindingProps) {
         ) : null}
         {meta !== undefined && meta !== null ? <div className="finding__meta">{meta}</div> : null}
       </div>
-    </article>
+    </Wrapper>
   );
 }

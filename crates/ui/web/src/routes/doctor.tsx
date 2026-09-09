@@ -227,7 +227,9 @@ function Summary({ checks, ranAt, now, namespace }: SummaryProps) {
     ...(summary.other > 0 ? [`${summary.other} unreadable`] : []),
   ];
   return (
-    <h2 className="verdict" aria-live="polite">
+    // A named live region, not a heading: as an `h2` the run's answer read as
+    // a peer of the section headings rather than as the page's answer.
+    <p className="verdict" role="status" aria-label="Doctor verdict">
       <span className="verdict__lamp" data-health={lamp.key}>
         <Icon size={18} strokeWidth={2} aria-hidden="true" />
         <span>{lamp.word}</span>
@@ -238,7 +240,7 @@ function Summary({ checks, ranAt, now, namespace }: SummaryProps) {
       <span className="verdict__meta">
         ran {relativeTime(ranAt, now)} · {namespace ?? "whole installation"}
       </span>
-    </h2>
+    </p>
   );
 }
 

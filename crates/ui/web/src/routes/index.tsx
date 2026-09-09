@@ -198,19 +198,27 @@ interface VerdictLineProps {
   at: StatusOverview["now"] | undefined;
 }
 
-/** The one sentence. Never green while anything is still loading or failed to. */
+/**
+ * The one sentence. Never green while anything is still loading or failed to.
+ *
+ * A named live region, not a heading: as an `h2` it sat in the outline as a
+ * peer of "Repositories by health" and every other section, so a reader
+ * navigating by heading heard four equal h2s and no answer. The page's answer
+ * belongs under the shell's `h1`, and `role="status"` is also what announces
+ * it when it changes.
+ */
 function VerdictLine({ repositories, report, doctor, unavailable, pending, at }: VerdictLineProps) {
   if (pending && unavailable.length === 0) {
     const lamp = healthLamp("pending");
     const Icon = lamp.icon;
     return (
-      <h2 className="verdict" aria-live="polite">
+      <p className="verdict" role="status" aria-label="Vault verdict">
         <span className="verdict__lamp" data-health="pending">
           <Icon size={18} strokeWidth={2} aria-hidden="true" />
           <span>Checking</span>
         </span>
         <span className="verdict__text">Checking the vault…</span>
-      </h2>
+      </p>
     );
   }
   const verdict = overviewVerdict({
@@ -222,7 +230,7 @@ function VerdictLine({ repositories, report, doctor, unavailable, pending, at }:
   const lamp = healthLamp(verdict.health);
   const Icon = lamp.icon;
   return (
-    <h2 className="verdict" aria-live="polite">
+    <p className="verdict" role="status" aria-label="Vault verdict">
       <span className="verdict__lamp" data-health={lamp.key}>
         <Icon size={18} strokeWidth={2} aria-hidden="true" />
         <span>{lamp.word}</span>
@@ -231,7 +239,7 @@ function VerdictLine({ repositories, report, doctor, unavailable, pending, at }:
       {at !== undefined ? (
         <span className="verdict__meta">as of {relativeTime(at, new Date())}</span>
       ) : null}
-    </h2>
+    </p>
   );
 }
 

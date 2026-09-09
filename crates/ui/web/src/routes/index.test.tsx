@@ -119,7 +119,7 @@ describe("Overview", () => {
     mountApp("/?namespace=media");
 
     // The verdict: worst thing first, in one sentence, on a lettered lamp.
-    const verdict = await screen.findByRole("heading", { level: 2, name: /Needs attention/ });
+    const verdict = await screen.findByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent(
       "Needs attention: 1 repository failed, 1 object stalled, 1 doctor check failing, 1 warning.",
     );
@@ -207,7 +207,7 @@ describe("Overview", () => {
       "/api/v1/doctor": jsonResponse(allGood),
     });
     mountApp("/");
-    const verdict = await screen.findByRole("heading", { level: 2, name: /All 2 repositories/ });
+    const verdict = await screen.findByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent(
       "All 2 repositories healthy, nothing stalled, no failing checks.",
     );
@@ -236,10 +236,8 @@ describe("Overview", () => {
       "/api/v1/doctor": jsonResponse(allGood),
     });
     mountApp("/?namespace=empty");
-    const verdict = await screen.findByRole("heading", {
-      level: 2,
-      name: /No repositories in scope/,
-    });
+    const verdict = await screen.findByRole("status", { name: "Vault verdict" });
+    expect(verdict).toHaveTextContent("No repositories in scope");
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "unknown");
     const region = screen.getByRole("region", { name: "Repositories by health" });
     expect(within(region).getByRole("status")).toHaveTextContent("No repositories in empty");
@@ -255,8 +253,9 @@ describe("Overview", () => {
       "/api/v1/doctor": jsonResponse(allGood),
     });
     mountApp("/");
-    const verdict = await screen.findByRole("heading", { level: 2, name: /Needs attention/ });
+    const verdict = await screen.findByRole("status", { name: "Vault verdict" });
     // What did load still counts — a failed repository outranks a missing report.
+    expect(verdict).toHaveTextContent("Needs attention");
     expect(verdict).toHaveTextContent("The status report did not load.");
     // Both halves of the pair come from the one report: the refusal is said
     // once, in their place, not twice side by side.
@@ -281,7 +280,7 @@ describe("Overview", () => {
     const region = await screen.findByRole("region", { name: "Repositories by health" });
     expect(await within(region).findByRole("alert")).toHaveTextContent("answered 502");
     expect(within(region).getByRole("button", { name: "Retry" })).toBeInTheDocument();
-    const verdict = screen.getByRole("heading", { level: 2, name: /Cannot tell|Needs attention/ });
+    const verdict = screen.getByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent("did not load");
   });
 
@@ -292,7 +291,7 @@ describe("Overview", () => {
     const busy = await screen.findAllByRole("status", { busy: true });
     expect(busy.length).toBeGreaterThanOrEqual(3);
     expect(document.querySelector(".spinner")).toBeNull();
-    expect(screen.getByRole("heading", { level: 2, name: /Checking/ })).toHaveTextContent(
+    expect(screen.getByRole("status", { name: "Vault verdict" })).toHaveTextContent(
       "Checking the vault",
     );
   });
@@ -347,10 +346,7 @@ describe("Overview", () => {
       } satisfies DoctorReportView),
     });
     mountApp("/");
-    const verdict = await screen.findByRole("heading", {
-      level: 2,
-      name: /Cannot fully check/,
-    });
+    const verdict = await screen.findByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent(
       "Cannot fully check: 2 doctor checks could not run with your permissions.",
     );
@@ -365,7 +361,7 @@ describe("Overview", () => {
       "/api/v1/doctor": jsonResponse(allGood),
     });
     mountApp("/");
-    await screen.findByRole("heading", { level: 2, name: /Needs attention/ });
+    await screen.findByRole("status", { name: "Vault verdict" });
     expect(screen.getByText(/could not read part of the status report/)).toBeInTheDocument();
     // Snapshots, restores, policies, schedules: every count the report did
     // not carry is "unknown", never 0.
