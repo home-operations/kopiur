@@ -1,3 +1,7 @@
+// ESLint is pinned to the 9.x line in package.json (npm marks it deprecated):
+// eslint-plugin-jsx-a11y declares no ESLint 10 peer yet, and a11y linting is
+// load-bearing for this console's colour-blind/keyboard mandate. Move both
+// together. The other deliberate pins are explained in pnpm-workspace.yaml.
 import js from "@eslint/js";
 import jsxA11y from "eslint-plugin-jsx-a11y";
 import reactHooks from "eslint-plugin-react-hooks";
@@ -76,7 +80,12 @@ export default tseslint.config(
     rules: { "react-refresh/only-export-components": "off" },
   },
   {
-    files: ["**/*.js", "vite.config.ts"],
+    files: ["**/*.js", "**/*.mjs", "vite.config.ts"],
     ...tseslint.configs.disableTypeChecked,
+  },
+  {
+    // Build-time Node scripts (the bundle-size budget), outside the app's tsconfig.
+    files: ["scripts/**/*.mjs"],
+    languageOptions: { globals: globals.node },
   },
 );

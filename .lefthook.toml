@@ -37,15 +37,24 @@ exclude = [
   "crates/ui/web/pnpm-lock.yaml",
 ]
 
-# The SPA's generated TypeScript is byte-gated by `mise run gen-check`; nothing
-# in the shared config formats `*.ts` today, so there is no formatter to exclude
-# it from — `.prettierignore` is the guard if one is ever added. What DOES need
-# saying here is the regeneration itself: change a wire type in `crates/ui-model`
-# and the checked-in `.ts` must move with it, or CI's gen-check is the first
-# thing that notices.
+# The SPA's generated TypeScript is byte-gated by `mise run gen-check`. What
+# needs saying here is the regeneration itself: change a wire type in
+# `crates/ui-model` and the checked-in `.ts` must move with it, or CI's
+# gen-check is the first thing that notices.
 [pre-commit.commands.ui-types]
 # Both patterns: the crate is flat files today, and depending on the glob
 # engine `**/` does not necessarily match zero segments — so the plain `*.rs`
 # case is spelled out rather than assumed.
 glob = ["crates/ui-model/src/*.rs", "crates/ui-model/src/**/*.rs"]
 run = "mise run ui-types && git add crates/ui/web/src/api/types"
+
+# The SPA's authored TypeScript/TSX/CSS, formatted with the same oxfmt the
+# shared config already runs on JSON/YAML/Markdown, and auto-staged like them.
+# Generated files are excluded here AND in `.prettierignore` (which covers a
+# manual `oxfmt` run from the repo root); `pnpm format:check` inside
+# `mise run ui-check` is CI's copy of this gate.
+[pre-commit.commands.format-ts]
+glob = ["crates/ui/web/**/*.{ts,tsx,css,mjs}"]
+exclude = ["crates/ui/web/src/api/types/*.ts", "crates/ui/web/src/routeTree.gen.ts"]
+run = "oxfmt {staged_files}"
+stage_fixed = true

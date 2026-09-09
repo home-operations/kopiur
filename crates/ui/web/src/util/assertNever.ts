@@ -17,7 +17,7 @@
  * promises. Both take `never`, so a switch that misses a literal fails to
  * compile — that is the whole point of generating the types. At run time they
  * differ: a newer server can send a string this bundle has never seen, and
- * three enums (`IdentitySource`, `NodeKind`, `EdgeKind`, `OriginView`,
+ * five enums (`IdentitySource`, `NodeKind`, `EdgeKind`, `OriginView`,
  * `GateSeverityView` — see the module doc) have no fallback variant at all.
  * Rendering paths use `unknownVariant` and keep drawing; only control flow
  * that genuinely cannot continue uses `assertNever`.

@@ -4,3 +4,15 @@
 # before pnpm will run it.
 allowBuilds:
   esbuild: true
+
+# Deliberate version pins in package.json — JSON has no comments, so the
+# reasons live here. Renovate auto-merges minor/patch bumps (.renovaterc.json5),
+# so an undocumented pin gets silently re-attempted.
+#
+# - eslint 9.39.x (npm marks the 9.x line deprecated): eslint-plugin-jsx-a11y
+#   declares no ESLint 10 peer yet, and a11y linting is load-bearing for this
+#   console's colour-blind/keyboard mandate. Move to 10 together with jsx-a11y.
+# - lucide-react 1.42.0: pnpm's supply-chain policy (minimumReleaseAge, enforced
+#   once this file exists) refused the same-day 1.43.0 at pin time. Any release
+#   less than about a day old fails `pnpm install` the same way — pick the
+#   previous release or wait, do not disable the policy.
