@@ -102,8 +102,13 @@ pub fn router() -> Router<AppState> {
 /// Absent means cluster-wide, which is not the same as "the operator's
 /// namespace": a fleet view that silently narrowed to one namespace would report
 /// a healthy cluster while another namespace burned.
+///
+/// `deny_unknown_fields`, like every read query in this crate: a filter that is
+/// silently ignored is worse than no filter, because the caller reads the
+/// unnarrowed answer as the narrowed one. A typo is a 400 `invalid-query`
+/// naming the parameter.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NamespaceQuery {
     /// Restrict the listing to this namespace; absent lists cluster-wide.
     #[serde(default)]
@@ -1093,6 +1098,48 @@ mod extractor_rejection_tests {
         );
         assert!(!body["fix"].as_str().unwrap_or_default().is_empty());
         assert_eq!(body["instance"], "/events");
+    }
+
+    /// One ignored-parameter case per read query type.
+    ///
+    /// A query parameter that is accepted and silently dropped is worse than one
+    /// that is refused: the caller reads an unfiltered answer as a filtered one.
+    /// `?namespace=` on `/doctor` was exactly that — accepted, ignored,
+    /// cluster-wide anyway — which is why every read query now denies unknown
+    /// fields.
+    #[tokio::test]
+    async fn a_query_parameter_no_endpoint_knows_is_refused_rather_than_ignored() {
+        for uri in [
+            // NamespaceQuery, on each of the shapes that use it.
+            "/repositories?namespce=media",
+            "/me?nammespace=media",
+            // DoctorQuery — the finding that motivated this.
+            "/doctor?namesapce=media",
+            "/doctor?stuckTreshold=60",
+            // SnapshotQuery.
+            "/snapshots?repositoryKnd=cluster-repository",
+            // EventQuery.
+            "/events?namespace=media&kind=Snapshot&name=nightly-1&extra=1",
+        ] {
+            let (status, content_type, body) = get(uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(
+                content_type.as_deref(),
+                Some("application/problem+json"),
+                "{uri}"
+            );
+            assert_eq!(body["type"], "urn:kopiur:problem:invalid-query", "{uri}");
+        }
+    }
+
+    /// The parameter doctor gained, and the proof it is read rather than
+    /// tolerated: a well-formed `?namespace=` gets past query parsing into the
+    /// handler, where it fails for want of a cluster.
+    #[tokio::test]
+    async fn the_doctor_namespace_parameter_is_accepted() {
+        let (status, _, body) = get("/doctor?namespace=media").await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_ne!(body["type"], "urn:kopiur:problem:invalid-query", "{body}");
     }
 
     #[tokio::test]

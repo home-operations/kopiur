@@ -64,8 +64,13 @@ pub fn router() -> Router<AppState> {
 }
 
 /// The snapshot table's query string.
+///
+/// `deny_unknown_fields`: with nine optional parameters, a mistyped one is the
+/// likeliest mistake a caller makes, and silently ignoring it would return a
+/// wider set than was asked for — a snapshots table showing another
+/// repository's rows under this repository's heading.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotQuery {
     /// Only snapshots in this repository.
     #[serde(default)]

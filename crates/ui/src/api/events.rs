@@ -32,8 +32,13 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Which object's events to fetch.
+///
+/// `deny_unknown_fields`: all three parameters are required, so an extra one is
+/// always a mistake — most likely `?name=` misspelled next to a `?namespace=`
+/// that happens to parse, which would otherwise answer with a *different*
+/// object's events rather than a 400.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventQuery {
     /// Namespace the object lives in.
     pub namespace: String,
