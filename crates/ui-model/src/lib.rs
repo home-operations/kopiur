@@ -11,6 +11,66 @@
 //!
 //! TypeScript definitions are generated from these very types with [`ts_rs`] — see
 //! [`export_all`] — so the SPA's types cannot drift from what the server serializes.
+//!
+//! # The shape every exported enum takes in TypeScript
+//!
+//! This section is the contract the SPA's exhaustiveness strategy is built on.
+//! It is a **fact about the generated output**, verified against it, not a
+//! convention — nothing in this crate enforces it, so read it before writing a
+//! `switch`.
+//!
+//! ts-rs renders an externally-tagged Rust enum as a union of *string literals*
+//! (for unit variants) and *single-key objects* (for struct variants), and the
+//! two mix freely in one type. A `SnapshotPhaseView` is therefore
+//! `string | object`, and a plain `switch (phase)` neither narrows nor covers
+//! it. The shape to write is:
+//!
+//! ```ts
+//! if (typeof phase === "string") {
+//!   switch (phase) { /* … */ default: assertNever(phase); }
+//! } else if ("unknown" in phase) {
+//!   render(phase.unknown.raw);
+//! }
+//! ```
+//!
+//! **The fallback variant is not uniformly named, and three enums have none.**
+//! Writing `case "unknown"` for [`views::EntryKind`], or assuming
+//! [`graph::Health`]'s `unknown` is an object, is the mistake this table exists
+//! to prevent — and it is the *silent* kind, because an unmatched
+//! `{ unknown: { raw } }` falls through a colour map's `default`, which is
+//! usually the healthy-green arm.
+//!
+//! | type | unit variants (string literals) | struct variants (objects) | fallback |
+//! |---|---|---|---|
+//! | [`identity::IdentitySource`] | `trustedHeaders`, `anonymous` | — | **none** |
+//! | [`graph::NodeKind`] | `repository`, `clusterRepository`, `backend`, `policy`, `namespace`, `namespaceSelector` | — | **none** |
+//! | [`graph::EdgeKind`] | `snapshotReplication`, `repositoryReplication`, `seed`, `policyMembership`, `allowedNamespace` | — | **none** |
+//! | [`graph::Health`] | `healthy`, `degraded`, `failed`, `suspended`, `pending`, `unknown` | — | `"unknown"` — a **plain string**, not an object, and it carries no `raw` |
+//! | [`graph::GateSeverityView`] | `warning`, `error` | — | **none** |
+//! | [`views::RepositoryPhaseView`] | `pending`, `initializing`, `ready`, `degraded`, `failed` | `{ unknown: { raw: string } }` | `unknown` |
+//! | [`views::SnapshotPhaseView`] | `pending`, `running`, `succeeded`, `failed`, `deleting`, `discovered`, `unchanged` | `{ unknown: { raw: string } }` | `unknown` |
+//! | [`views::RestorePhaseView`] | `pending`, `resolving`, `restoring`, `completed`, `failed` | `{ unknown: { raw: string } }` | `unknown` |
+//! | [`views::ReplicationPhaseView`] | `pending`, `replicating`, `succeeded`, `failed`, `suspended` | `{ unknown: { raw: string } }` | `unknown` |
+//! | [`views::OriginView`] | `scheduled`, `manual`, `discovered`, `adopted`, `replicated` | — | **none** — `Origin` is parsed strictly and an unrecognized marker never decodes |
+//! | [`views::EntryKind`] | `file`, `dir`, `symlink` | `{ other: { raw: string } }` | **`other`**, not `unknown` |
+//! | [`requests::RestoreSourceBody`] | — | `{ snapshotRef: … }`, `{ fromPolicy: … }`, `{ identity: … }` | none (a request body: the client picks the variant) |
+//! | [`requests::RestoreTargetBody`] | — | `{ pvcRef: … }`, `{ pvc: … }` | none (as above) |
+//!
+//! An enum with **no fallback** can still receive a value this build has never
+//! heard of, because the server may be newer than the bundle. `assertNever` on
+//! such a union is correct as a *compile-time* check and wrong as a runtime
+//! assumption: keep the default arm rendering the raw string rather than
+//! throwing.
+//!
+//! # Fields that are stringly-typed on purpose
+//!
+//! Not every state is an enum here. `DoctorCheckView.outcome`
+//! (`Pass`/`Warn`/`Fail`), `ManualRunView.phase`, `RestoreClaimView.phase`,
+//! `SeedView.mode`, `ServerView.authMode`, `RepositorySummary.kind` and
+//! `RepositorySummary.mode` are `String`, so no exhaustive switch is possible
+//! over them and a `default` arm must not assume "OK". `StatusOverview.report`
+//! is `unknown`: it is `kopiur_ops`'s own report shape, passed through verbatim,
+//! and the consumer narrows it at the point of use.
 
 pub mod graph;
 pub mod identity;
