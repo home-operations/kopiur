@@ -287,11 +287,32 @@ marker the system has.
 - **Style:** grid of icon / body / dismiss on the failed-lamp field with a 1px failed-lamp border (degraded field and border for a 403); what in semibold, why in muted, the fix on a surface plate led by an accent "FIX" label, metadata in faint mono beneath.
 - **Banner variant:** full width under the header, square corners, hairline bottom only.
 
+### Verdict
+
+- **Style:** an `h2` row under the header: a lamp plate (icon + word on the lamp's field, 6px chamfer, the only lamp set at body size) beside one sentence in headline weight, metadata faint mono at the far end, a hairline beneath.
+- **Rule:** never the healthy lamp while any source is loading or refused, and never over an empty scope — "cannot tell" and "no repositories in scope" are unknown, not green. Used by the overview and the doctor summary (`components/verdict.ts`).
+
+### Health strip
+
+- **Style:** the fleet counted per lamp: a row of chamfered surface tiles, each a tabular count in headline weight beside its `HealthBadge`, worst first, every lamp present and dimmed at zero. Each tile is a link into the filtered list. Never a stat tile with a big number and a small label.
+
+### Finding
+
+- **Style:** what in semibold, why in muted prose, the fix on an inset plate led by the accent "FIX" label, metadata faint mono beneath; an optional lamp icon leads it. The same plate the problem banner uses, for things that are not request errors (a failing doctor check, a fired gate). A one-line finding renders as one line.
+
+### Work ledger
+
+- **Style:** the ledger with a label strip (KIND + mono name, wrapping — never an ellipsis on the name — with the namespace faint beneath), a lamp whose word may be the state ("Stalled"), a muted detail, and an age in tabular figures only when a row has one. Wide ledgers scroll inside `.ledger-scroll` on narrow viewports rather than starving a column.
+
+### Controls
+
+- **Style:** a surface bar of labelled fields (label caps above a mono input on the canvas ground), a faint hint or a failed-lamp error beneath, one primary action at the end. Validation repeats the server's rule so a refused value never leaves the form.
+
 ### States
 
 - **Loading:** skeleton ledger rows (1.4s sheen, disabled under reduced motion), announced as busy.
 - **Empty:** icon + headline that says what would appear, body that says how it comes to exist, optional action.
-- **Error / Not permitted:** headline + the problem; a 403 swaps to the shield icon, the degraded field and a sentence about RBAC, and offers no retry.
+- **Error / Not permitted:** headline + the problem; a 403 swaps to the shield icon, the degraded field and a sentence about RBAC, and offers no retry. Two sections fed by one refused read say it once, across their width, not twice side by side.
 
 ## Do's and Don'ts
 
