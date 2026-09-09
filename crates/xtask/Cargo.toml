@@ -11,6 +11,9 @@ publish = false
 
 [dependencies]
 kopiur-api = { workspace = true }
+# `gen-ui-types` exports the SPA's TypeScript from these wire types. The crate is
+# Kubernetes-free (serde + ts-rs only), so it adds no controller deps to codegen.
+kopiur-ui-model = { workspace = true }
 kube = { workspace = true, features = ["derive"] }
 k8s-openapi = { workspace = true, features = ["v1_33"] }
 serde = { workspace = true }

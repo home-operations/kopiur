@@ -4,6 +4,7 @@
 //!   * `gen-crds [--check]`  — write `deploy/crds/*.yaml` (one per CRD + bundle)
 //!   * `gen-rbac [--check]`  — write `deploy/rbac/*.yaml` (cluster + namespaced)
 //!   * `gen-docs [--check]`  — write `docs/field-reference.md` from the schemas
+//!   * `gen-ui-types [--check]` — write `crates/ui/web/src/api/types/*.ts`
 //!   * `gen-all  [--check]`  — all of the above (+ dashboards)
 //!   * `check-wiring`        — fail if a CRD field is read by no consumer crate
 //!   * `check-phases`        — fail if a phase branch is non-exhaustive (#359)
@@ -17,14 +18,20 @@
 
 fn usage() {
     eprintln!(
-        "usage: cargo xtask <gen-crds|gen-rbac|gen-docs|gen-all> [--check]\n\
+        "usage: cargo xtask <gen-crds|gen-rbac|gen-docs|gen-ui-types|gen-all> [--check]\n\
                 cargo xtask check-wiring\n\
                 cargo xtask check-phases\n\
          \n\
          gen-crds   generate deploy/crds/*.yaml from the kopiur-api CRD types\n\
          gen-rbac   generate deploy/rbac/*.yaml (ClusterRole + Role install modes)\n\
          gen-docs   generate docs/field-reference.md from the CRD schemas\n\
-         gen-all    run gen-crds, gen-rbac, dashboards, and gen-docs\n\
+         gen-ui-types\n\
+         \x20          generate crates/ui/web/src/api/types/*.ts from the\n\
+         \x20          kopiur-ui-model wire types (ts-rs). Deletes types the\n\
+         \x20          export no longer produces; never touches the SPA's\n\
+         \x20          hand-maintained src/api/types.ts barrel, which lives\n\
+         \x20          outside that directory.\n\
+         gen-all    run gen-crds, gen-rbac, dashboards, gen-docs, and gen-ui-types\n\
          \n\
          check-wiring\n\
          \x20          fail if a CRD field is defined and schema-generated but read\n\
@@ -60,13 +67,15 @@ fn main() {
     let check = args.iter().skip(1).any(|a| a == "--check");
 
     match cmd {
-        "gen-crds" | "gen-rbac" | "gen-docs" | "gen-all" => match xtask::run(cmd, check) {
-            Ok(code) => std::process::exit(code),
-            Err(e) => {
-                eprintln!("error: {e:#}");
-                std::process::exit(1);
+        "gen-crds" | "gen-rbac" | "gen-docs" | "gen-ui-types" | "gen-all" => {
+            match xtask::run(cmd, check) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         // Not artifact subcommands: no output files, so no --check mode.
         "check-wiring" => match xtask::wiring::run() {
             Ok(code) => std::process::exit(code),

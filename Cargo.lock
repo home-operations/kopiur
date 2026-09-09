@@ -4632,6 +4632,7 @@ dependencies = [
  "insta",
  "k8s-openapi",
  "kopiur-api",
+ "kopiur-ui-model",
  "kube",
  "serde",
  "serde_json",
