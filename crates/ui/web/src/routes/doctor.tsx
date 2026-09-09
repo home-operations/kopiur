@@ -28,16 +28,72 @@ export interface DoctorSearch {
   failureLookback?: string;
 }
 
-/** Keep a window only when it is a duration the server accepts. */
-function durationParam(value: unknown): string | undefined {
-  return typeof value === "string" && parseGoDuration(value) !== null ? value.trim() : undefined;
+/**
+ * One window as the reader wrote it — **total over `unknown`**, and it keeps
+ * a value the server would refuse.
+ *
+ * Two separate reasons for both halves.
+ *
+ * Total, because the declared `DoctorSearch` type is a claim about
+ * `validateSearch`'s output and not about what the component is handed: the
+ * router parses `?stuckThreshold=0` into the **number** `0` and the component
+ * sees that number even though the validator dropped the key. Typing this
+ * `string` and calling `.trim()` on it threw inside render and took the whole
+ * route to its error boundary — a crash any shared link could cause.
+ *
+ * Keeping a refused value, because dropping it was silent:
+ * `/doctor?stuckThreshold=1d` — the exact value the form rejects with a
+ * message — rendered an empty control and ran with the server default, so a
+ * bookmarked link reported on a window its reader never chose. Kept, the form
+ * can show it and say what is wrong with it. [`windowFor`] is the one gate on
+ * what actually reaches the server.
+ */
+function windowParam(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text.length > 0 ? text : undefined;
+  }
+  // A bare number or `true` is what the reader typed, parsed by the router.
+  // Rendered back as they wrote it so the error names their value.
+  return typeof value === "number" || typeof value === "boolean" ? String(value) : undefined;
+}
+
+/**
+ * The seconds to send for a window, or `undefined` when the server would
+ * refuse it — the one gate, so the URL cannot get past what the form
+ * enforces. `parseGoDuration` alone is not that gate: it accepts `0`, and
+ * `withQuery` keeps a `0`, so `?stuckThreshold=0` used to reach a handler
+ * that answers 400 ("must be a positive number of seconds"). Same for a
+ * window past the year `window()` caps at.
+ */
+function windowFor(value: string | undefined): number | undefined {
+  if (value === undefined || windowError(value) !== null) {
+    return undefined;
+  }
+  return parseGoDuration(value) ?? undefined;
+}
+
+/** A window the URL asked for that the report could not use. */
+interface IgnoredWindow {
+  label: string;
+  value: string;
+  fallback: string;
+}
+
+/** **Pure.** That window, or `null` when the value is usable or absent. */
+function ignoredWindow(
+  label: string,
+  value: string | undefined,
+  fallback: string,
+): IgnoredWindow | null {
+  return value !== undefined && windowError(value) !== null ? { label, value, fallback } : null;
 }
 
 export const Route = createFileRoute("/doctor")({
   validateSearch: (search: Record<string, unknown>): DoctorSearch => {
     const out: DoctorSearch = {};
-    const stuck = durationParam(search.stuckThreshold);
-    const lookback = durationParam(search.failureLookback);
+    const stuck = windowParam(search.stuckThreshold);
+    const lookback = windowParam(search.failureLookback);
     if (stuck !== undefined) {
       out.stuckThreshold = stuck;
     }
@@ -53,15 +109,25 @@ const DURATION_HINT = "a duration like 90s, 30m or 1h";
 
 function Doctor() {
   const namespace = useCurrentNamespace();
-  const { stuckThreshold, failureLookback } = Route.useSearch();
+  // Re-normalised here, not just in `validateSearch`: the router hands the
+  // component the raw parsed value for a key the validator dropped, so the
+  // declared `string` type is not something render may rely on.
+  const search: Record<string, unknown> = Route.useSearch();
+  const stuckThreshold = windowParam(search.stuckThreshold);
+  const failureLookback = windowParam(search.failureLookback);
   const doctor = useDoctor({
     namespace,
-    stuckThreshold:
-      stuckThreshold !== undefined ? (parseGoDuration(stuckThreshold) ?? undefined) : undefined,
-    failureLookback:
-      failureLookback !== undefined ? (parseGoDuration(failureLookback) ?? undefined) : undefined,
+    stuckThreshold: windowFor(stuckThreshold),
+    failureLookback: windowFor(failureLookback),
   });
   const now = new Date();
+  // A window the URL named that the report could not use. Said out loud: the
+  // control shows the value and what is wrong with it, and this says which
+  // window the run actually used instead.
+  const ignored = [
+    ignoredWindow("Stuck threshold", stuckThreshold, DOCTOR_DEFAULTS.stuckThreshold),
+    ignoredWindow("Failure lookback", failureLookback, DOCTOR_DEFAULTS.failureLookback),
+  ].filter((w): w is IgnoredWindow => w !== null);
 
   return (
     <div className="page">
@@ -73,6 +139,18 @@ function Doctor() {
         running={doctor.isFetching}
         onRerun={() => void doctor.refetch()}
       />
+
+      {ignored.length > 0 ? (
+        <p className="page__prose" role="status">
+          {ignored.map((w) => (
+            <span key={w.label}>
+              This link asked for a {w.label.toLowerCase()} of{" "}
+              <span className="mono">{w.value}</span>, which is not a window the server accepts, so
+              the report ran with the default <span className="mono">{w.fallback}</span>.{" "}
+            </span>
+          ))}
+        </p>
+      ) : null}
 
       {doctor.data !== undefined ? (
         <Summary
@@ -182,7 +260,13 @@ function Controls({ namespace, stuckThreshold, failureLookback, running, onRerun
   const [ns, setNs] = useState(namespace ?? "");
   const [stuck, setStuck] = useState(stuckThreshold ?? "");
   const [lookback, setLookback] = useState(failureLookback ?? "");
-  const [submitted, setSubmitted] = useState(false);
+  // A window that arrived invalid from the URL is already wrong, so its
+  // message shows on first paint rather than waiting for a submit the reader
+  // of a shared link has no reason to perform. The route re-keys this form
+  // on the URL, so the seed is re-evaluated whenever the URL changes.
+  const [submitted, setSubmitted] = useState(
+    () => windowError(stuckThreshold ?? "") !== null || windowError(failureLookback ?? "") !== null,
+  );
 
   const stuckError = submitted ? windowError(stuck) : null;
   const lookbackError = submitted ? windowError(lookback) : null;

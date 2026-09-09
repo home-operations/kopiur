@@ -124,6 +124,40 @@ describe("Doctor", () => {
     });
   });
 
+  it("never sends a window the server would refuse, even from the URL", async () => {
+    // `parseGoDuration("0")` is 0 and `withQuery` keeps a 0, so the old
+    // `validateSearch` let `?stuckThreshold=0` through to a handler that
+    // 400s it ("must be a positive number of seconds"). The same held for a
+    // window longer than the year `window()` caps at.
+    mockApi({ "/api/v1/doctor": jsonResponse(report) });
+    mountApp("/doctor?stuckThreshold=0&failureLookback=99999h");
+    await screen.findByRole("table", { name: "Doctor checks" });
+    expect(calledPaths().filter((p) => p.includes("stuckThreshold"))).toHaveLength(0);
+    expect(calledPaths().filter((p) => p.includes("failureLookback"))).toHaveLength(0);
+    expect(screen.getByRole("textbox", { name: "Stuck threshold" })).toHaveAttribute(
+      "aria-invalid",
+      "true",
+    );
+    expect(screen.getByText(/more than zero seconds/)).toBeInTheDocument();
+    expect(screen.getByText(/at most a year/)).toBeInTheDocument();
+  });
+
+  it("shows a window a shared link asked for that it could not use, rather than dropping it", async () => {
+    // `/doctor?stuckThreshold=1d` used to be discarded in silence: the
+    // control rendered empty and the report answered about the default, so a
+    // bookmarked link reported on a window its reader never chose.
+    mockApi({ "/api/v1/doctor": jsonResponse(report) });
+    mountApp("/doctor?stuckThreshold=1d");
+    await screen.findByRole("table", { name: "Doctor checks" });
+    const stuck = screen.getByRole("textbox", { name: "Stuck threshold" });
+    expect(stuck).toHaveValue("1d");
+    expect(stuck).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByText(/like 90s, 30m or 1h/)).toBeInTheDocument();
+    // And the page says which window actually ran.
+    expect(screen.getByText(/ran with the default/)).toHaveTextContent("1h");
+    expect(calledPaths().filter((p) => p.includes("stuckThreshold"))).toHaveLength(0);
+  });
+
   it("renders the not-permitted state for a 403", async () => {
     mockApi({
       "/api/v1/doctor": problemResponse(forbiddenProblem("Doctor was refused.", "/api/v1/doctor")),
