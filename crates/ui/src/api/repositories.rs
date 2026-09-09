@@ -38,6 +38,7 @@ use crate::api::{
     covering_maintenances, gate_hits, ops_ctx, repo_phase_view,
 };
 use crate::auth::CurrentIdentity;
+use crate::browse::session_pool::session_expiry;
 use crate::config::WireLimits;
 
 /// This module's routes, relative to `/api/v1`.
@@ -294,18 +295,6 @@ fn covering_maintenance(
     covering_maintenances(maintenances, kind, name, namespace)
         .next()
         .cloned()
-}
-
-/// **Pure.** When a browse session's Job will be reaped, from its start time and
-/// the deadline the session was launched with.
-fn session_expiry(job: &Job) -> Option<String> {
-    let started = job
-        .status
-        .as_ref()
-        .and_then(|s| s.start_time.as_ref())
-        .and_then(kopiur_ops::snapshots::meta_time)?;
-    let deadline = job.spec.as_ref().and_then(|s| s.active_deadline_seconds)?;
-    Some((started + chrono::Duration::seconds(deadline)).to_rfc3339())
 }
 
 /// **Pure.** A found session Job as the SPA's session record.
@@ -958,12 +947,51 @@ spec:
              browse endpoints do, so one screen cannot disagree with the other"
         );
         assert_eq!(info.pod, None, "naming the pod is the browse API's job");
-        assert!(
-            info.expires_at
-                .as_deref()
-                .is_some_and(|t| t.starts_with("2026-09-08T10:17:00")),
-            "start + activeDeadlineSeconds, got {:?}",
-            info.expires_at
+        assert_eq!(
+            info.expires_at.as_deref(),
+            Some("2026-09-08T10:17:00Z"),
+            "status.startTime + activeDeadlineSeconds"
+        );
+    }
+
+    /// The two `SessionInfo` builders must answer with ONE deadline for one Job.
+    ///
+    /// They used to disagree twice over — this one measured from
+    /// `status.startTime`, the browse one from `metadata.creationTimestamp`, in
+    /// two different RFC 3339 spellings — so the same session counted down
+    /// differently depending on which screen you were on, and the browse screen
+    /// (the one a user actually watches) was the one that expired early by the
+    /// scheduling delay. There is one `session_expiry` now, and this pins the
+    /// two producers against each other on a Job whose creation and start times
+    /// deliberately differ.
+    #[test]
+    fn both_session_builders_report_the_same_expiry_for_the_same_job() {
+        let job: Job = serde_json::from_value(serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "kopiur-browse-nas-deadbeef",
+                "namespace": "media",
+                // Two minutes before it started: an implementation reading this
+                // instead would answer 10:15:00.
+                "creationTimestamp": "2026-09-08T09:58:00Z",
+            },
+            "spec": { "activeDeadlineSeconds": 1020 },
+            "status": { "startTime": "2026-09-08T10:00:00Z" }
+        }))
+        .unwrap();
+
+        let detail = session_info(&job, test_limits());
+        let browse = crate::browse::session_pool::session_info(&job, true, test_limits());
+
+        assert_eq!(
+            detail.expires_at, browse.expires_at,
+            "one Job, one deadline, whichever screen asked"
+        );
+        assert_eq!(
+            detail.expires_at.as_deref(),
+            Some("2026-09-08T10:17:00Z"),
+            "and it is measured from status.startTime, not creationTimestamp"
         );
     }
 

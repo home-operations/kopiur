@@ -510,6 +510,27 @@ pub struct SnapshotRefView {
 
 /// Whether the governing GFS retention would keep this snapshot right now, and
 /// which rules say so.
+///
+/// # An absent preview is not "unknown"
+///
+/// `SnapshotDetail.retentionPreview` is `null` in four different situations,
+/// and none of them means "we could not work it out":
+///
+/// * the snapshot is not in the GFS population (a `Pending`, `Running`,
+///   `Failed`, `Unchanged` or `Deleting` row, or one with no controller-written
+///   kopia manifest) — retention does not evaluate it;
+/// * no `SnapshotPolicy` governs it, or the caller may not read the one that
+///   does;
+/// * the policy's `CONFIG_LABEL` does not select it yet (a discovered snapshot
+///   mid-adoption);
+/// * **the policy configures no retention at all** — nothing is pruned by GFS.
+///
+/// That last one is worth stating because the retention *plan* answers it
+/// differently and deliberately: `RetentionPlan.unbounded` is `true` with every
+/// candidate `kept`. A `null` here and a `kept: true` there are the same fact.
+/// Do not render the absent preview as "unknown" while the plan says "kept" —
+/// ask the plan (`GET …/retention`) when the detail has no preview and the
+/// distinction matters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -520,8 +541,16 @@ pub struct RetentionPreview {
     /// window — `keepDaily slot 3` means the third-newest day `keepDaily` keeps,
     /// so a reader can see how close the snapshot is to ageing out.
     ///
-    /// `pinned` appears alone, without a slot: a pin is not a bucket slot, it is
-    /// an exemption from bucketing.
+    /// `pinned` is a reason too, and always the FIRST one when it applies — a
+    /// pin carries no slot, because it is an exemption from bucketing rather
+    /// than a place in a bucket. It is not necessarily the only one: a pinned
+    /// snapshot that today's rules would ALSO have kept reports both
+    /// (`["pinned", "keepDaily slot 1"]`), which is the useful answer, because
+    /// it says that unpinning would not lose the snapshot. A pin that is doing
+    /// all the work reports `["pinned"]` alone.
+    ///
+    /// So render the whole list; do not read `reasons[0]` as "the" reason, and
+    /// do not assume a pin implies exactly one entry.
     ///
     /// Empty when the snapshot is pruned. The same strings, from the same
     /// function, as [`RetentionCandidate::rules`].
@@ -598,9 +627,11 @@ pub struct RetentionCandidate {
     pub end_time: String,
     /// True when today's selection keeps this snapshot.
     pub kept: bool,
-    /// Which rules hold it and in which slot, e.g. `keepDaily slot 3`; `pinned`
-    /// alone for a pin. Empty when it is pruned. Same strings as
-    /// [`RetentionPreview::reasons`].
+    /// Which rules hold it and in which slot, e.g. `keepDaily slot 3`, with
+    /// `pinned` first (and slotless) when [`Self::pinned`] is set — see
+    /// [`RetentionPreview::reasons`], which these are the same strings from the
+    /// same function as, including that a pin does not mean exactly one entry.
+    /// Empty when it is pruned.
     pub rules: Vec<String>,
     /// `spec.pin` — exempt from GFS pruning entirely.
     ///

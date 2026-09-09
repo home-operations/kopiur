@@ -78,6 +78,7 @@ use kopiur_ui_model::requests::{
 use kopiur_ui_model::views::{ActionReceipt, SnapshotRefView};
 
 use crate::AppState;
+use crate::api::RepositoryKindPath;
 use crate::api::problem::{ApiError, problem, request_path};
 use crate::auth::identity::Identity;
 use crate::auth::{CurrentIdentity, mutation_guard};
@@ -341,15 +342,20 @@ fn suspendable_kind(raw: &str) -> Result<SuspendableKind, ApiError> {
 /// Parse a repository kind — `ScanCatalogBody::kind` and
 /// `RepositoryRefBody::kind`.
 ///
-/// Same two spellings as [`suspendable_kind`], for the same reason.
+/// [`RepositoryKindPath::parse`], the same parser the two `{kind}` path routes
+/// read their segment with. It used to hand-match the three spellings here, and
+/// they happened to agree — which is exactly how the drift between the read
+/// route and the browse route began, and its refusal already listed only two of
+/// the three it accepted. One table, one parser, one error text.
 fn repository_kind(raw: &str) -> Result<RepositoryKind, ApiError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "repository" => Ok(RepositoryKind::Repository),
-        "cluster-repository" | "clusterrepository" => Ok(RepositoryKind::ClusterRepository),
-        _ => Err(invalid_body(format!(
-            "{raw:?} is not a repository kind; expected repository or cluster-repository"
-        ))),
-    }
+    RepositoryKindPath::parse(raw)
+        .map(RepositoryKindPath::kind)
+        .ok_or_else(|| {
+            invalid_body(format!(
+                "{raw:?} is not a repository kind; expected one of {}",
+                RepositoryKindPath::accepted_spellings()
+            ))
+        })
 }
 
 /// Parse `MaintenanceRunBody::mode` with the operator's own annotation parser, so
@@ -2003,6 +2009,35 @@ status:
                 .as_str()
                 .is_some_and(|n| n.contains("allow-mass-deletion")),
             "{body}"
+        );
+    }
+
+    /// …and the handler actually puts it on the receipt.
+    ///
+    /// `deletion_hold_note` takes an `Api<Snapshot>` and re-reads the object, so
+    /// the wiring itself needs a cluster and the tests above can only cover the
+    /// pure decision — a refactor that dropped the `note:` line would leave them
+    /// green while the SPA lost the only string that explains why a deleted
+    /// snapshot is still there. This reads the handler's own source instead, the
+    /// same technique `api::me` uses to check its route coverage.
+    #[test]
+    fn the_delete_handler_puts_the_hold_note_on_the_receipt() {
+        let source = include_str!("mod.rs");
+        let at = source
+            .find("async fn delete_snapshot(")
+            .expect("the delete handler is still called delete_snapshot");
+        let body = &source[at..];
+        let end = body.find("\n}").map(|e| e + 1).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("note: deletion_hold_note("),
+            "the delete receipt must carry the mass-deletion-breaker note; \
+             delete_snapshot's body no longer builds it:\n{body}"
+        );
+        assert!(
+            body.contains("StatusCode::ACCEPTED"),
+            "and it must stay a 202 — the CR delete is accepted, the kopia \
+             snapshot is not yet gone"
         );
     }
 

@@ -322,6 +322,52 @@ pub fn view_lineage(snap: &Snapshot, siblings: &[Arc<Snapshot>]) -> Lineage {
     }
 }
 
+/// **Pure.** Is this `Snapshot` in the population the prune will evaluate for
+/// `policy_name`?
+///
+/// # The prune's rule, and only the prune's rule
+///
+/// `kopiur_controller::snapshot_policy` enumerates a policy's children with
+/// `io::snapshot_children(ctx, &namespace, CONFIG_LABEL, &name)` — a
+/// `CONFIG_LABEL=<policy>` selector, in the **policy's** namespace. So that is
+/// what this asks, through [`matches_filter`], which `kopiur_ops` pins against
+/// the server-side `label_selector` the CLI sends.
+///
+/// Deliberately **not** [`policy_of`], which prefers `spec.policyRef.name` and
+/// falls back to the label. `policy_of` is the right answer to "which policy
+/// does this row *display* as" — the user wrote the spec — but it is the wrong
+/// answer to "will the prune for this policy evaluate this row". The two
+/// disagree exactly mid-adoption, when a discovered snapshot's `spec.policyRef`
+/// has been set and its label has not yet been rewritten: `policy_of` puts the
+/// row in the new policy's buckets, where it competes for keep slots against
+/// rows the operator is about to prune, while the operator's own selection has
+/// never heard of it. A preview that answers about a set the prune will not
+/// evaluate is the one thing this endpoint exists not to do.
+pub fn selected_by_policy(snap: &Snapshot, policy_name: &str) -> bool {
+    matches_filter(
+        snap,
+        &SnapshotListFilter {
+            policy: Some(policy_name.to_string()),
+            origin: None,
+        },
+    )
+}
+
+/// **Pure.** [`selected_by_policy`] over a candidate set — the rows the prune
+/// would evaluate, out of the rows the caller listed.
+pub fn policy_population<'a>(
+    candidates: &'a [Arc<Snapshot>],
+    policy_name: &str,
+) -> impl Iterator<Item = &'a Snapshot> {
+    // Owned so the returned iterator's lifetime is the candidates' alone; the
+    // one allocation is per call, not per row.
+    let wanted = policy_name.to_string();
+    candidates
+        .iter()
+        .map(Arc::as_ref)
+        .filter(move |s| selected_by_policy(s, &wanted))
+}
+
 /// **Pure.** Whether today's retention would keep this snapshot, and which rules
 /// say so.
 ///
@@ -346,10 +392,11 @@ pub fn view_lineage(snap: &Snapshot, siblings: &[Arc<Snapshot>]) -> Lineage {
 /// Only the *target's own bucket* is evaluated: buckets are independent, so the
 /// other buckets cannot change this row's verdict.
 ///
-/// `None` when the policy configures no retention, or this snapshot is not in
+/// `None` when the policy configures no retention, when this snapshot is not in
 /// the GFS population at all (a `Pending`, `Failed`, `Unchanged` or `Deleting`
-/// row) — there is no answer to preview, and inventing one would read as a
-/// guarantee.
+/// row), or when it is not in the *policy's* population by
+/// [`selected_by_policy`] — there is no answer to preview, and inventing one
+/// would read as a guarantee.
 pub fn view_retention_preview(
     snap: &Snapshot,
     policy: &SnapshotPolicy,
@@ -358,20 +405,24 @@ pub fn view_retention_preview(
 ) -> Option<RetentionPreview> {
     let retention = policy.spec.retention.as_ref()?;
     let policy_is_multi = is_multi_repo(&policy.spec);
+    let policy_name = policy.metadata.name.clone().unwrap_or_default();
 
     // The id the prune works in is the CR name, not the kopia manifest id.
     let target = snap.metadata.name.clone()?;
     // Not in the population → not previewable. Asked before bucketing so a row
-    // the prune ignores never gets an answer about a set it is not in.
+    // the prune ignores never gets an answer about a set it is not in. Both
+    // gates: the GFS one (phase + provenance) and the policy one (the label the
+    // prune selects on).
     retention_view(snap)?;
+    if !selected_by_policy(snap, &policy_name) {
+        return None;
+    }
     let bucket_key = retention_group_key(snap, policy_is_multi);
 
     // The peer set may or may not already contain this snapshot, depending on
     // how the caller assembled it; a duplicate would let one row compete with
     // itself for its own keep slot.
-    let mut population: Vec<&Snapshot> = peers
-        .iter()
-        .map(Arc::as_ref)
+    let mut population: Vec<&Snapshot> = policy_population(peers, &policy_name)
         .filter(|p| p.metadata.name.as_deref() != Some(target.as_str()))
         .collect();
     population.push(snap);
@@ -412,12 +463,20 @@ pub fn view_retention_preview(
 /// number a user needs: it says how close a restore point is to ageing out,
 /// which a bare rule name does not.
 ///
-/// # Pins are dropped for the attribution runs
+/// # The pin flag is dropped for the attribution runs; the ROW is not
 ///
-/// A pinned row lands in `keep` whatever the rule says, so leaving pins in would
-/// credit every configured rule with a keep it did not make, and would shift
-/// every other row's slot number. `pinned` is prepended as its own reason
-/// instead — an exemption from bucketing, not a slot in a bucket.
+/// A pinned row lands in `keep` whatever the rule says, so running attribution
+/// with the flag on would credit every configured rule with a keep it did not
+/// make. The flag is therefore cleared — and `pinned` prepended as its own,
+/// slotless reason, an exemption from bucketing rather than a place in one.
+///
+/// The row itself stays in the counterfactual, and that is deliberate: the real
+/// prune's `keep_per_period` also walks pinned rows when it fills a bucket, so
+/// dropping them here would shift every younger row's slot to a number the
+/// operator will not use. The consequence is that a pinned snapshot which
+/// today's rules would ALSO have kept reports both reasons — `["pinned",
+/// "keepDaily slot 1"]` — which is the useful answer, because it says unpinning
+/// would not lose it. Both wire docs state this.
 pub fn bucket_rules(
     bucket: &[SnapshotRetentionView],
     retention: &kopiur_api::common::Retention,
@@ -447,6 +506,48 @@ pub fn bucket_rules(
     out
 }
 
+/// **Pure.** The rows a plan for `snap` competes over: the policy's population,
+/// with the subject deduplicated out and then pushed back in.
+///
+/// The peer set may or may not already contain the subject, depending on how the
+/// caller assembled it, and a duplicate would let one row compete with itself
+/// for its own keep slot.
+///
+/// One assembly, two readers — [`view_retention_plan`] renders it and
+/// [`plan_candidate_count`] measures it — so the cap counts exactly the rows
+/// that would be rendered rather than an approximation of them.
+fn plan_population<'a>(
+    snap: &'a Snapshot,
+    policy_name: &str,
+    peers: &'a [Arc<Snapshot>],
+) -> Vec<&'a Snapshot> {
+    let target = snap.metadata.name.as_deref();
+    let mut population: Vec<&Snapshot> = policy_population(peers, policy_name)
+        .filter(|p| p.metadata.name.as_deref() != target)
+        .collect();
+    population.push(snap);
+    population
+}
+
+/// **Pure.** How many candidates a plan for `snap` would carry — the number
+/// [`plan_too_large`] is measured against.
+///
+/// Counted through `retention_buckets`, so rows the prune would not evaluate
+/// (wrong phase, no provenance, terminating) are not counted: the cap bounds the
+/// *response*, and those rows never reach it.
+pub fn plan_candidate_count(
+    snap: &Snapshot,
+    policy: &SnapshotPolicy,
+    peers: &[Arc<Snapshot>],
+) -> usize {
+    let policy_name = policy.metadata.name.clone().unwrap_or_default();
+    let population = plan_population(snap, &policy_name, peers);
+    retention_buckets(&population, is_multi_repo(&policy.spec))
+        .values()
+        .map(Vec::len)
+        .sum()
+}
+
 /// **Pure.** Every snapshot competing for the same buckets as `snap`, with the
 /// verdict today's selection gives each.
 ///
@@ -456,14 +557,15 @@ pub fn bucket_rules(
 /// screen it feeds is "which snapshots will this policy keep", not "will it keep
 /// this one".
 ///
-/// `namespace` is the namespace the population was listed in, which every
-/// candidate shares: peers are the policy's own children, minted beside it.
+/// `namespace` is the namespace `peers` was listed in — the **policy's**, which
+/// is where the prune enumerates, and which every candidate therefore shares.
 ///
 /// `None` when `snap` is not in the GFS population at all (a `Pending`,
 /// `Failed`, `Unchanged` or `Deleting` row, or one with no controller-written
-/// provenance). The subject has to be in the set for the plan to be *about* it;
-/// answering with a plan it does not appear in would read as "your snapshot is
-/// being pruned".
+/// provenance), or when the prune for this policy would not select it
+/// ([`selected_by_policy`]). The subject has to be in the set for the plan to be
+/// *about* it; answering with a plan it does not appear in would read as "your
+/// snapshot is being pruned".
 pub fn view_retention_plan(
     snap: &Snapshot,
     namespace: &str,
@@ -473,14 +575,13 @@ pub fn view_retention_plan(
 ) -> Option<RetentionPlan> {
     let target = snap.metadata.name.clone()?;
     retention_view(snap)?;
+    let policy_name = policy.metadata.name.clone().unwrap_or_default();
+    if !selected_by_policy(snap, &policy_name) {
+        return None;
+    }
 
     let policy_is_multi = is_multi_repo(&policy.spec);
-    let mut population: Vec<&Snapshot> = peers
-        .iter()
-        .map(Arc::as_ref)
-        .filter(|p| p.metadata.name.as_deref() != Some(target.as_str()))
-        .collect();
-    population.push(snap);
+    let population = plan_population(snap, &policy_name, peers);
 
     // An absent `spec.retention` is not "prune everything": the operator only
     // runs a selection when retention is configured, so the honest plan is every
@@ -832,13 +933,19 @@ async fn detail(
         }
     };
     // The retention preview must see the same population the operator's prune
-    // does: every snapshot carrying this policy's config label.
-    let policy_name = policy.metadata.name.clone().unwrap_or_default();
-    let peers: Vec<Arc<Snapshot>> = siblings
-        .iter()
-        .filter(|s| policy_of(s) == Some(policy_name.as_str()))
-        .cloned()
-        .collect();
+    // does — which is a LIST in the POLICY's namespace, not this snapshot's. The
+    // two coincide for every ordinary snapshot, so the rows already in hand are
+    // reused rather than re-listed; a cross-namespace `policyRef` (nothing in
+    // `validate::snapshot` forbids one) takes the second read.
+    let peers = policy_peers(
+        &app,
+        &id,
+        &client,
+        &policy,
+        &namespace,
+        Some((namespace.as_str(), &siblings)),
+    )
+    .await?;
 
     Ok(Json(view_detail(
         &snap,
@@ -847,6 +954,49 @@ async fn detail(
         &peers,
         Utc::now(),
     )))
+}
+
+/// The rows the prune would evaluate for `policy`, read as the caller.
+///
+/// Two things this gets right that the old inline filter did not:
+///
+/// * **Where.** The controller enumerates a policy's children in the *policy's*
+///   namespace. A `Snapshot` in `ns-a` naming a policy in `ns-b` was previously
+///   previewed against `ns-a`'s rows while the operator pruned `ns-b`'s.
+/// * **Which.** [`selected_by_policy`] — the `CONFIG_LABEL` the prune selects
+///   on — rather than `policy_of`'s spec-first display precedence.
+///
+/// `already_listed` is a `(namespace, rows)` pair the caller has in hand; it is
+/// used only when that namespace is the policy's, so the ordinary same-namespace
+/// case costs no extra read.
+async fn policy_peers(
+    app: &AppState,
+    id: &Identity,
+    client: &kube::Client,
+    policy: &SnapshotPolicy,
+    fallback_namespace: &str,
+    already_listed: Option<(&str, &[Arc<Snapshot>])>,
+) -> Result<Vec<Arc<Snapshot>>, ApiError> {
+    let policy_name = policy.metadata.name.clone().unwrap_or_default();
+    let policy_ns = policy
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or(fallback_namespace);
+
+    let listed = match already_listed {
+        Some((ns, rows)) if ns == policy_ns => rows.to_vec(),
+        _ => {
+            app.source
+                .list::<Snapshot>(id, client, Some(policy_ns))
+                .await?
+        }
+    };
+    Ok(listed
+        .iter()
+        .filter(|s| selected_by_policy(s, &policy_name))
+        .cloned()
+        .collect())
 }
 
 /// `GET /api/v1/snapshots/{namespace}/{name}/retention`
@@ -873,21 +1023,53 @@ async fn retention(
         .ok_or_else(|| no_governing_policy(&snap, &namespace, &name))?;
 
     // The same population the detail's preview uses, which is the same one the
-    // operator's prune uses: every snapshot carrying this policy's config label,
-    // in the snapshot's own namespace.
-    let policy_name = policy.metadata.name.clone().unwrap_or_default();
-    let peers: Vec<Arc<Snapshot>> = app
-        .source
-        .list::<Snapshot>(&id, &client, Some(&namespace))
-        .await?
-        .iter()
-        .filter(|s| policy_of(s) == Some(policy_name.as_str()))
-        .cloned()
-        .collect();
+    // operator's prune uses: the policy's `CONFIG_LABEL` children, in the
+    // policy's own namespace.
+    let peers = policy_peers(&app, &id, &client, &policy, &namespace, None).await?;
+    let policy_ns = policy.metadata.namespace.as_deref().unwrap_or(&namespace);
 
-    view_retention_plan(&snap, &namespace, &policy, &peers, Utc::now())
+    // Counted before projecting: the whole point of a plan is that a bucket is
+    // shown whole, so it cannot be truncated — but it can be refused. Ahead of
+    // the subject's own gates, because a population this size is too large to
+    // assemble whichever answer the subject would have earned.
+    let candidates = plan_candidate_count(&snap, &policy, &peers);
+    if candidates > app.cfg.snapshot_list_cap {
+        return Err(plan_too_large(candidates, app.cfg.snapshot_list_cap));
+    }
+
+    view_retention_plan(&snap, policy_ns, &policy, &peers, Utc::now())
         .map(Json)
-        .ok_or_else(|| not_retention_governed(&snap, &namespace, &name))
+        .ok_or_else(|| not_retention_governed(&snap, &policy, &namespace, &name))
+}
+
+/// The 422 a retention plan answers when the policy's population is larger than
+/// this deployment will assemble.
+///
+/// A refusal, never a truncation — and deliberately not `limit`/`offset` over
+/// candidates either. A partial bucket misreports which rows are kept: the
+/// verdicts in a GFS bucket are decided by the whole bucket competing, so half a
+/// bucket is not half an answer, it is a different answer. Showing one would be
+/// exactly the lie this endpoint exists to prevent.
+///
+/// The cap is `KOPIUR_UI_SNAPSHOT_LIST_CAP`, the same knob `/snapshots` already
+/// refuses on, so an operator has one number to reason about rather than two.
+fn plan_too_large(candidates: usize, cap: usize) -> ApiError {
+    problem(
+        422,
+        "plan-too-large",
+        format!(
+            "This policy's retention population is {candidates} snapshots, which is more than \
+             this kopiur-ui will assemble into one plan (the cap is {cap})."
+        ),
+        "A retention plan has to show each bucket WHOLE — the verdicts inside one are decided by \
+         all of its rows competing, so a truncated bucket would report keeps and prunes that are \
+         not what the operator will do. Refusing is the only honest answer that is not a lie.",
+        format!(
+            "browse the individual rows with /api/v1/snapshots?policy=<name>, which pages — or \
+             raise KOPIUR_UI_SNAPSHOT_LIST_CAP above {candidates} if this cluster really does \
+             need a plan this large"
+        ),
+    )
 }
 
 /// The 422 for a snapshot no `SnapshotPolicy` governs, or whose policy this
@@ -924,8 +1106,37 @@ fn no_governing_policy(snap: &Snapshot, namespace: &str, name: &str) -> ApiError
 }
 
 /// The 422 for a snapshot the prune does not evaluate at all.
-fn not_retention_governed(snap: &Snapshot, namespace: &str, name: &str) -> ApiError {
+///
+/// Two reasons, deliberately different text, because they send a user to two
+/// different places: the row is outside the GFS population (wrong phase, or no
+/// controller-written provenance), or it is outside *this policy's* population
+/// (the `CONFIG_LABEL` the prune selects on does not name this policy, which is
+/// what a snapshot mid-adoption looks like).
+fn not_retention_governed(
+    snap: &Snapshot,
+    policy: &SnapshotPolicy,
+    namespace: &str,
+    name: &str,
+) -> ApiError {
     use kopiur_api::common::PhaseLabel as _;
+    let policy_name = policy.metadata.name.clone().unwrap_or_default();
+    if retention_view(snap).is_some() && !selected_by_policy(snap, &policy_name) {
+        return problem(
+            422,
+            "not-retention-governed",
+            format!(
+                "Snapshot {namespace}/{name} names SnapshotPolicy {policy_name}, but the \
+                 policy's own retention run does not select it yet."
+            ),
+            "A prune enumerates its children by the kopiur config label, and this snapshot's \
+             label does not name this policy — the shape a discovered snapshot has while it is \
+             being adopted, after its spec reference is set and before the operator rewrites \
+             the label. Answering with a plan would report it competing for keep slots in a set \
+             the operator has never evaluated it in.",
+            "wait for the adoption to finish — the label follows within a reconcile — and open \
+             the plan again",
+        );
+    }
     let phase = snap
         .status
         .as_ref()
@@ -1731,6 +1942,8 @@ status:
         let plan = view_retention_plan(&newest, "media", &policy, &peers, Utc::now()).unwrap();
         let candidates = &plan.buckets[0].candidates;
 
+        // The OLD pinned row: no rule would have kept it, so the pin is doing
+        // all the work and is the whole reason.
         let pinned = candidates.iter().find(|c| c.name == "keepme").unwrap();
         assert!(pinned.pinned);
         assert!(pinned.kept);
@@ -1740,9 +1953,243 @@ status:
         assert_eq!(
             newest_row.rules,
             vec!["keepDaily slot 1"],
-            "the pinned row is exempt from bucketing, so it must not shift the \
-             slot its competitors occupy"
+            "a pin does not exempt its holder from the counterfactual, so the \
+             slot numbers are the ones the prune's own walk produces"
         );
+    }
+
+    /// A pinned row that a rule would ALSO have kept reports BOTH — which is
+    /// the useful answer, because it says unpinning would not lose it.
+    ///
+    /// The sibling test above only covers a pin doing all the work (an old row
+    /// no rule keeps), so this is the case the wire doc's "a pin does not mean
+    /// exactly one entry" is actually about.
+    #[test]
+    fn a_pin_that_a_rule_would_also_have_kept_reports_both_reasons() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 2 }
+"#,
+        );
+        // The NEWEST row is the pinned one, so keepDaily would hold it anyway.
+        let newest_pinned = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: pinned-newest
+  namespace: media
+  labels: { "kopiur.home-operations.com/config": nightly }
+spec: { policyRef: { name: nightly }, pin: true }
+status:
+  phase: Succeeded
+  origin: manual
+  timing: { startTime: "2026-05-25T02:00:00Z", endTime: "2026-05-25T02:00:00Z" }
+  snapshot:
+    kopiaSnapshotID: k-pinned-newest
+    identity: { username: kopiur, hostname: media, sourcePath: /data }
+"#,
+        );
+        let d24 = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        let peers = vec![newest_pinned.clone(), d24];
+        let plan = view_retention_plan(&newest_pinned, "media", &policy, &peers, Utc::now())
+            .expect("a plan");
+        let row = plan.buckets[0]
+            .candidates
+            .iter()
+            .find(|c| c.name == "pinned-newest")
+            .unwrap();
+
+        assert!(row.pinned);
+        assert!(row.kept);
+        assert_eq!(
+            row.rules,
+            vec!["pinned", "keepDaily slot 1"],
+            "the pin comes first and carries no slot; the rule that would ALSO \
+             have kept it comes after, with its slot"
+        );
+
+        // And the preview, which shares the function, says exactly the same.
+        let preview = view_retention_preview(&newest_pinned, &policy, &peers, Utc::now()).unwrap();
+        assert_eq!(preview.reasons, row.rules);
+    }
+
+    /// The population is the PRUNE's — `CONFIG_LABEL`, not `spec.policyRef`.
+    ///
+    /// The two disagree exactly mid-adoption: a discovered snapshot's spec
+    /// reference is set to the adopting policy before the operator rewrites its
+    /// label. `policy_of` (which the CLI and the row display correctly use)
+    /// answers "nightly"; the operator's own selection — a
+    /// `CONFIG_LABEL=nightly` LIST — has never heard of it. Counting it as a
+    /// competitor would let it take a keep slot from a row that really is in the
+    /// bucket, and give it a verdict from a set it is not in.
+    #[test]
+    fn the_population_is_the_label_the_prune_selects_on_not_the_spec_reference() {
+        // spec.policyRef says `nightly`; the label still says `legacy`.
+        let mid_adoption = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: adopting-1
+  namespace: media
+  labels: { "kopiur.home-operations.com/config": legacy }
+spec:
+  policyRef: { name: nightly }
+status:
+  phase: Succeeded
+  origin: adopted
+  timing: { startTime: "2026-05-24T03:00:00Z", endTime: "2026-05-24T03:05:00Z" }
+  snapshot:
+    kopiaSnapshotID: k-adopting
+    identity: { username: kopiur, hostname: media, sourcePath: /data }
+"#,
+        );
+        assert_eq!(
+            policy_of(&mid_adoption),
+            Some("nightly"),
+            "sanity: the display precedence really does say nightly"
+        );
+        assert!(
+            !selected_by_policy(&mid_adoption, "nightly"),
+            "but the prune's label selector does not select it"
+        );
+        assert!(
+            selected_by_policy(&mid_adoption, "legacy"),
+            "it is still in the OLD policy's population, which is where the \
+             operator will actually evaluate it"
+        );
+
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 1 }
+"#,
+        );
+        let d24 = nightly_run("d24", "2026-05-24T02:00:00Z", "Succeeded");
+        let peers = vec![d24.clone(), mid_adoption.clone()];
+        let now = DateTime::parse_from_rfc3339("2026-05-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // The plan for a row that IS selected must not count the mid-adoption
+        // row as a competitor.
+        let plan = view_retention_plan(&d24, "media", &policy, &peers, now).expect("a plan");
+        let names: Vec<&str> = plan
+            .buckets
+            .iter()
+            .flat_map(|b| b.candidates.iter())
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["d24"],
+            "only the rows a CONFIG_LABEL=nightly LIST would return"
+        );
+
+        // And the mid-adoption row itself gets no plan and no preview under
+        // `nightly` — there is no verdict to give about a set it is not in.
+        assert!(
+            view_retention_plan(&mid_adoption, "media", &policy, &peers, now).is_none(),
+            "the subject is gated by the same rule as its peers"
+        );
+        assert!(view_retention_preview(&mid_adoption, &policy, &peers, now).is_none());
+
+        // The refusal says which of the two reasons applies.
+        let refusal = not_retention_governed(&mid_adoption, &policy, "media", "adopting-1");
+        assert_eq!(refusal.0.status, 422);
+        assert!(
+            refusal.0.what.contains("does not select it"),
+            "the label case must not be reported as a phase problem: {}",
+            refusal.0.what
+        );
+        assert!(refusal.0.why.contains("config label"), "{}", refusal.0.why);
+        assert!(refusal.0.fix.contains("adoption"), "{}", refusal.0.fix);
+    }
+
+    /// The plan is refused above the cap rather than truncated: a partial bucket
+    /// reports keeps and prunes that are not what the operator will do, which is
+    /// the one lie this endpoint exists to prevent.
+    #[test]
+    fn a_population_larger_than_the_cap_is_refused_rather_than_truncated() {
+        let policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+  retention: { keepDaily: 2 }
+"#,
+        );
+        let population: Vec<Arc<Snapshot>> = (1..=5u32)
+            .map(|d| {
+                nightly_run(
+                    &format!("d{d:02}"),
+                    &format!("2026-05-{d:02}T02:00:00Z"),
+                    "Succeeded",
+                )
+            })
+            .collect();
+        let subject = population[0].clone();
+
+        assert_eq!(
+            plan_candidate_count(&subject, &policy, &population),
+            5,
+            "counted through retention_buckets, so it is the rows that would be \
+             rendered rather than the rows that were listed"
+        );
+
+        // Both sides of the boundary, on the `> cap` comparison the handler makes.
+        let count = plan_candidate_count(&subject, &policy, &population);
+        assert!(count <= 5, "at the cap, a plan is still assembled");
+        assert!(count > 4, "one above the cap, it is refused");
+
+        let refusal = plan_too_large(count, 4);
+        assert_eq!(refusal.0.status, 422);
+        assert_eq!(refusal.0.r#type, "urn:kopiur:problem:plan-too-large");
+        assert!(refusal.0.what.contains('5'), "{}", refusal.0.what);
+        assert!(
+            refusal.0.fix.contains("KOPIUR_UI_SNAPSHOT_LIST_CAP"),
+            "the remedy names the knob, and it is the SAME knob /snapshots \
+             refuses on: {}",
+            refusal.0.fix
+        );
+        assert!(
+            refusal.0.fix.contains("/api/v1/snapshots?policy="),
+            "and points at the route that CAN page: {}",
+            refusal.0.fix
+        );
+        assert!(
+            refusal.0.why.contains("WHOLE"),
+            "the why must say why truncation is not on offer: {}",
+            refusal.0.why
+        );
+
+        // A count at or below the cap really does produce a plan.
+        let plan = view_retention_plan(
+            &subject,
+            "media",
+            &policy,
+            &population,
+            DateTime::parse_from_rfc3339("2026-05-24T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .expect("under the cap, the plan is assembled");
+        assert_eq!(plan.buckets[0].candidates.len(), 5);
     }
 
     /// A row the prune never evaluates has no plan, exactly as it has no
@@ -1772,7 +2219,7 @@ spec:
             )
             .is_none()
         );
-        let problem = not_retention_governed(&pending, "media", "running-1");
+        let problem = not_retention_governed(&pending, &policy, "media", "running-1");
         assert_eq!(problem.0.status, 422);
         assert_eq!(
             problem.0.r#type,
