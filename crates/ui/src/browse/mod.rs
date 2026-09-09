@@ -105,7 +105,9 @@ const MIN_SESSION_TTL: Duration = Duration::from_secs(60);
 ///
 /// `GET …/file` is the one route that must stay outside a request timeout: a
 /// legitimate multi-gigabyte restore outlives any fixed deadline. It bounds
-/// itself with a progress watchdog instead ([`download::under_watchdog`]).
+/// itself with a progress watchdog instead ([`download::under_watchdog`]). It is
+/// therefore **not** here — it lives in [`router_untimed`], which
+/// [`crate::app`] merges back in *after* the timeout layer.
 ///
 /// # Why `route_layer` for the CSRF gate
 ///
@@ -128,6 +130,25 @@ pub fn router() -> Router<AppState> {
             delete(end_repository_session),
         )
         .route("/api/v1/snapshots/{namespace}/{name}/tree", get(tree))
+        .route_layer(middleware::from_fn(mutation_guard))
+}
+
+/// The one browse route that must not sit behind a request timeout.
+///
+/// Split out of [`router`] so [`crate::app`] can apply its `TimeoutLayer` to
+/// everything else and then merge this back in. A fixed deadline is simply the
+/// wrong bound for a download: a legitimate multi-gigabyte restore outlives any
+/// value that would still be useful for an API call, and cutting one off at 30
+/// seconds hands the browser a truncated file with a 200. The transfer bounds
+/// itself on *progress* instead — `KOPIUR_UI_DOWNLOAD_CHUNK_TIMEOUT`, applied
+/// per chunk by [`download::under_watchdog`] — which is the property that
+/// actually matters: a stalled stream dies, a slow-but-moving one does not.
+///
+/// Everything else the API router layers on — the identity middleware above all,
+/// plus the security headers, the body limit and the concurrency limit — must
+/// still reach this route. See [`router`]'s notes on merging.
+pub fn router_untimed() -> Router<AppState> {
+    Router::new()
         .route(
             "/api/v1/snapshots/{namespace}/{name}/file",
             // `get()` alone would also serve HEAD by running the handler and
@@ -141,7 +162,7 @@ pub fn router() -> Router<AppState> {
         .route_layer(middleware::from_fn(mutation_guard))
 }
 
-/// `HEAD …/file` — refused, with `Allow: GET`. See [`router`].
+/// `HEAD …/file` — refused, with `Allow: GET`. See [`router_untimed`].
 async fn head_not_allowed() -> Response {
     (
         StatusCode::METHOD_NOT_ALLOWED,
@@ -356,12 +377,17 @@ async fn tree(
     let ctx = ops_ctx(&app, &identity, &namespace)?;
     let target = resolve_target(&app.cfg, &ctx, &namespace, &name).await?;
 
-    // BEFORE the readiness wait, not after: attaching can block for up to
-    // KOPIUR_UI_SESSION_READY_TIMEOUT, and a request that will be refused
-    // anyway should be refused now rather than after holding a client and a
-    // connection for five minutes.
-    let _permit = app.sessions.exec_permit(&identity.user, &app.metrics)?;
     let live = require_live_session(&app, &ctx, &target, &namespace, &name).await?;
+    // AFTER the readiness wait, immediately before the first exec. What the
+    // permit bounds is concurrent kopia processes and apiserver websockets, and
+    // a request waiting on `attach` is neither: it can block for up to
+    // KOPIUR_UI_SESSION_READY_TIMEOUT (and, on one snapshot, behind the pool's
+    // per-key single-flight lock), so taking the permit first let four idle
+    // browser tabs spend a whole identity's exec budget while nothing was
+    // running and answer the fifth with a 429 that was not true. The "permit
+    // before exec" guarantee is what matters and it still holds — nothing below
+    // this line reaches the session pod without one.
+    let _permit = app.sessions.exec_permit(&identity.user, &app.metrics)?;
 
     let cap = app.cfg.manifest_max_bytes;
     let mut access = CappedAccess::new(live.session, cap);
@@ -408,9 +434,11 @@ async fn download(
 
     let ctx = ops_ctx(&app, &identity, &namespace)?;
     let target = resolve_target(&app.cfg, &ctx, &namespace, &name).await?;
-    // Before the readiness wait — see `tree`.
-    let permit = app.sessions.exec_permit(&identity.user, &app.metrics)?;
     let live = require_live_session(&app, &ctx, &target, &namespace, &name).await?;
+    // After the readiness wait, before the first exec — see `tree`. The permit
+    // this takes is handed to `stream_file` below and held for the whole
+    // transfer, which is exactly the window the cap exists to bound.
+    let permit = app.sessions.exec_permit(&identity.user, &app.metrics)?;
 
     let cap = app.cfg.manifest_max_bytes;
     let mut access = CappedAccess::new(live.session, cap);
@@ -2000,9 +2028,16 @@ mod router_tests {
     const TREE: &str = "/api/v1/snapshots/media/nightly-1/tree";
     const FILE: &str = "/api/v1/snapshots/media/nightly-1/file";
 
-    /// The browse router with the identity middleware in front, running as a
-    /// fixed anonymous user whose kube client points at a closed port — so any
-    /// handler that DID reach the cluster fails loudly rather than passing.
+    /// The browse routers — BOTH of them — with the identity middleware in
+    /// front, running as a fixed anonymous user whose kube client points at a
+    /// closed port, so any handler that DID reach the cluster fails loudly
+    /// rather than passing.
+    ///
+    /// `router().merge(router_untimed())` is how [`crate::app`] assembles them
+    /// too, minus the timeout that is the only reason they are two. Merging them
+    /// here is what keeps these tests honest about the surface a browser sees:
+    /// with only `router()`, every `…/file` assertion below would pass by
+    /// 404ing.
     ///
     /// A real [`AuthState::new`], never `AuthState::unconfigured()`: the
     /// unconfigured placeholder is fail-closed and 500s every request, which
@@ -2030,6 +2065,7 @@ mod router_tests {
             cfg: Arc::new(cfg),
         };
         router()
+            .merge(router_untimed())
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 identity_middleware,
@@ -2078,15 +2114,29 @@ mod router_tests {
     }
 
     async fn send(request: Request<Body>) -> (StatusCode, Option<Problem>) {
+        let (status, _, problem) = send_full(request).await;
+        (status, problem)
+    }
+
+    /// [`send`] keeping the response headers.
+    ///
+    /// The two-tuple form drops them, which is fine for the refusals most of
+    /// these tests assert — but a 405 whose whole contract is the `Allow` header
+    /// it carries cannot be checked through it, and a header nobody asserts is a
+    /// header that quietly disappears.
+    async fn send_full(
+        request: Request<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, Option<Problem>) {
         let response = app().oneshot(request).await.expect("response");
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = response
             .into_body()
             .collect()
             .await
             .expect("body")
             .to_bytes();
-        (status, serde_json::from_slice(&bytes).ok())
+        (status, headers, serde_json::from_slice(&bytes).ok())
     }
 
     fn request(method: &str, uri: &str) -> axum::http::request::Builder {
@@ -2139,6 +2189,57 @@ mod router_tests {
             let (status, _) = send(request("GET", uri).body(Body::empty()).expect("req")).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{uri} is not a browse route");
         }
+    }
+
+    #[tokio::test]
+    async fn head_on_the_download_route_is_refused_and_says_what_is_allowed() {
+        // A 405 whose entire contract is its `Allow` header: without one the
+        // answer is unactionable, and RFC 9110 requires it. The header is the
+        // reason `…/file` is `get(..).head(head_not_allowed)` rather than a bare
+        // `get(..)` — axum would otherwise serve HEAD by running `download` and
+        // discarding the body, spending two pod execs and an exec permit to
+        // produce a `Content-Length` the caller already has.
+        let (status, headers, _) = send_full(
+            request("HEAD", &format!("{FILE}?path=a.txt"))
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            headers
+                .get(header::ALLOW)
+                .map(|v| v.to_str().expect("Allow is ASCII")),
+            Some("GET"),
+            "a 405 must name the methods that would have worked",
+        );
+    }
+
+    /// The two routers together are the browse surface, and `…/file` is only in
+    /// the second one. A merge that dropped it would turn every download into a
+    /// 404 — and, because the timeout split is the only reason for the second
+    /// router, that is exactly the mistake a future refactor makes.
+    #[tokio::test]
+    async fn the_download_route_is_only_reachable_because_the_untimed_router_is_merged() {
+        let only_timed = router();
+        assert!(
+            format!("{only_timed:?}").contains("/tree"),
+            "sanity: the timed router still carries the other browse routes",
+        );
+
+        let (status, _) = send(
+            request("GET", &format!("{FILE}?path=a.txt"))
+                .header(SEC_FETCH_SITE, "same-origin")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "…/file must be mounted; it fails for want of a cluster, not for want of a route",
+        );
     }
 
     #[tokio::test]
