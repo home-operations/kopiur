@@ -114,9 +114,10 @@ describe("AppShell", () => {
       status: 200,
       headers: { "content-type": "application/json" },
     });
-    // A placeholder section: the overview at "/" now has reads of its own,
-    // and these tests are about the shell, not the route inside it.
-    mountAt("/topology");
+    // A placeholder section: the overview at "/" and the topology both have
+    // reads of their own now, and these tests are about the shell, not the
+    // route inside it.
+    mountAt("/maintenance");
     await screen.findByText("alice", { selector: ".identity__user" });
     const list = screen.getByRole("list", { name: "Capabilities" });
     const items = within(list).getAllByRole("listitem");
@@ -140,9 +141,10 @@ describe("AppShell", () => {
       status: 502,
       headers: { "content-type": "text/html" },
     });
-    // A placeholder section: the overview at "/" now has reads of its own,
-    // and these tests are about the shell, not the route inside it.
-    mountAt("/topology");
+    // A placeholder section: the overview at "/" and the topology both have
+    // reads of their own now, and these tests are about the shell, not the
+    // route inside it.
+    mountAt("/maintenance");
     await screen.findByText("identity unavailable");
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Identity (/api/v1/me)");
@@ -155,9 +157,10 @@ describe("AppShell", () => {
       status: 200,
       headers: { "content-type": "application/json" },
     });
-    // A placeholder section: the overview at "/" now has reads of its own,
-    // and these tests are about the shell, not the route inside it.
-    mountAt("/topology");
+    // A placeholder section: the overview at "/" and the topology both have
+    // reads of their own now, and these tests are about the shell, not the
+    // route inside it.
+    mountAt("/maintenance");
     const group = await screen.findByRole("group", { name: "Theme" });
     expect(within(group).getByRole("button", { name: "System" })).toHaveAttribute(
       "aria-pressed",

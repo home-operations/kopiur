@@ -1,5 +1,5 @@
 import type { Health } from "../api/types";
-import { healthLamp } from "./health";
+import { type Lamp, healthLamp } from "./health";
 
 /**
  * A health lamp: colour, icon and word, always together.
@@ -16,7 +16,26 @@ export interface HealthBadgeProps {
 }
 
 export function HealthBadge({ health, label }: HealthBadgeProps) {
-  const lamp = healthLamp(health);
+  return <LampBadge lamp={healthLamp(health)} label={label} />;
+}
+
+export interface LampBadgeProps {
+  /** The lamp to draw: its colour key, its word and its icon, together. */
+  lamp: Lamp;
+  /** Replace the visible word, e.g. a count: "3 failed". */
+  label?: string | undefined;
+}
+
+/**
+ * The same lamp, for a `Lamp` that is not a `Health` value.
+ *
+ * Some lamps carry their own icon on purpose — a dangling reference is the
+ * failed colour under a dashed circle, so it can never be read as an ordinary
+ * failure (`topology/model.ts`, `nodeLamp`) — and a caller with a whole
+ * `Lamp` in hand must be able to draw it without going back through the
+ * `Health` union and losing the icon.
+ */
+export function LampBadge({ lamp, label }: LampBadgeProps) {
   const Icon = lamp.icon;
   // A custom label replaces the visible word but never the spoken one: with
   // the icon aria-hidden, "3" alone would leave a screen reader with colour

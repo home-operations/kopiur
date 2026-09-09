@@ -29,8 +29,11 @@ export default defineConfig({
     outDir: "dist",
     rollupOptions: {
       output: {
-        // elkjs is large and only the topology route needs it; keep it in a
-        // chunk of its own so the lazy route stays lazy.
+        // Only the topology route touches elkjs; keep it in a chunk of its
+        // own so the lazy route stays lazy. What lands here is the ~10 kB
+        // `elk-api` client — the 1.4 MB engine is imported only by
+        // `topology/layout.worker.ts` and is emitted as that worker's own
+        // asset, which never enters this graph at all.
         manualChunks(id: string) {
           if (id.includes("/node_modules/elkjs/")) {
             return "elk";
