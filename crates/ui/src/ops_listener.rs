@@ -44,8 +44,18 @@ pub enum CacheState {
     Synced,
     /// The stores did not all sync within [`crate::config::CACHE_SYNC_TIMEOUT`].
     SyncTimedOut,
-    /// A reflector task exited, so at least one store has stopped refreshing and
+    /// A reflector task ended, so at least one store has stopped refreshing and
     /// is now frozen at whatever it last held.
+    ///
+    /// Reachable at **any** point in the process's life, not only before the
+    /// first sync: `cache::stores`'s supervisor keeps the reflector handles and
+    /// publishes this the moment one of them finishes, which is what stops a
+    /// watch that gave up an hour in from leaving `/readyz` answering `ok` over a
+    /// frozen store. Also covers the two ways the machinery itself can go away —
+    /// a writer dropped before the first list, and the supervisor task ending.
+    ///
+    /// Terminal: a reflector that gave up does not restart itself, so this never
+    /// returns to [`CacheState::Synced`] without a new process.
     WatchEnded,
 }
 
