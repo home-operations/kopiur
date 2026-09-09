@@ -65,6 +65,10 @@ pub async fn run(
         // The CLI does not know where the operator runs; doctor finds its
         // Deployments by the chart's component labels across all namespaces.
         operator_namespace: None,
+        // `kubectl kopiur doctor` diagnoses the whole installation, so it runs
+        // every check. The subset exists for a caller that has one question and
+        // pays for the answer on every page view — see `DoctorParams::checks`.
+        checks: None,
     };
     let report = run_all(ctx, &params, now).await;
     let exit = report.exit_code();

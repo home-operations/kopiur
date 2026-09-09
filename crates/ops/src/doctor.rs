@@ -45,7 +45,7 @@ use crate::ctx::{OpsCtx, Scope};
 
 /// Every check doctor performs. Closed enum: adding a check forces the runner
 /// and the renderer to handle it. Ten checks, run in this order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum DoctorCheck {
     /// All 9 kopiur CRDs are installed and serve `v1alpha1`.
     CrdsInstalled,
@@ -1646,86 +1646,217 @@ pub struct DoctorParams {
     /// (an in-cluster server reading `KOPIUR_NAMESPACE`). `None` — what the
     /// CLI passes — searches every namespace by the chart's component labels.
     pub operator_namespace: Option<String>,
+    /// Run only these checks. `None` — what `kubectl kopiur doctor` passes —
+    /// runs all ten, exactly as before this field existed.
+    ///
+    /// This is a **cost** control, not a display filter: [`run_all`] skips the
+    /// work an unasked-for check would have done, and the listings a group of
+    /// checks shares are skipped when the whole group is unasked-for. A caller
+    /// that wants only the failure-bearing checks therefore avoids the
+    /// `dryRun` create against the admission chain, the Secret `get` per
+    /// credential reference, and the cluster-wide Events list — the three
+    /// heaviest reads doctor makes, and the reason a dashboard could not afford
+    /// to run it on every visit.
+    ///
+    /// Checks that were not asked for produce **no row**: an absent row means
+    /// "not run", never "passed", and a caller must not read a short report as
+    /// a healthy one.
+    pub checks: Option<BTreeSet<DoctorCheck>>,
 }
 
-/// Run every check, in order, and collect the report. Never fails: an
-/// unreachable or RBAC-restricted check degrades to a `Warn`/`Fail` row rather
-/// than aborting the run, so a partial report is still a report.
-pub async fn run_all(ctx: &OpsCtx, params: &DoctorParams, now: DateTime<Utc>) -> DoctorReport {
+/// The checks [`list_repos`] feeds. If none is asked for, the repository and
+/// cluster-repository listings — and the Secret `get` per credential reference
+/// that hangs off them — are skipped entirely.
+pub const REPO_BACKED_CHECKS: [DoctorCheck; 3] = [
+    DoctorCheck::RepositoriesReady,
+    DoctorCheck::CredentialsPresent,
+    DoctorCheck::SnapshotReplications,
+];
+
+/// The checks [`list_work`] feeds. If neither is asked for, the four work
+/// listings are skipped entirely.
+pub const WORK_BACKED_CHECKS: [DoctorCheck; 2] =
+    [DoctorCheck::NoStuckWork, DoctorCheck::RecentFailures];
+
+impl DoctorParams {
+    /// **Pure.** Whether `check` is part of this run. An absent selector means
+    /// every check, so the default is unchanged behaviour.
+    pub fn wants(&self, check: DoctorCheck) -> bool {
+        self.checks
+            .as_ref()
+            .is_none_or(|selected| selected.contains(&check))
+    }
+
+    /// **Pure.** Whether any of `group` is part of this run — the question that
+    /// decides whether a shared listing is worth making at all.
+    pub fn wants_any(&self, group: &[DoctorCheck]) -> bool {
+        group.iter().any(|check| self.wants(*check))
+    }
+}
+
+/// Push `check`'s result, running `outcome` only if this run asked for it.
+///
+/// The laziness is the point: the argument is a future built by the caller and
+/// awaited here only when the check is selected, so an unasked-for check costs
+/// no request. It is a macro rather than a function because a function would
+/// have to take the future already constructed, and constructing it is where
+/// the borrow of `ctx` — and the reader's expectation that "it did not run"
+/// means "it made no request" — lives.
+macro_rules! push_if_wanted {
+    ($out:expr, $params:expr, $check:expr, $outcome:expr) => {
+        if $params.wants($check) {
+            $out.push(CheckResult {
+                check: $check,
+                outcome: $outcome.await,
+            });
+        }
+    };
+}
+
+/// The four checks about the installation itself: the CRDs and the operator's
+/// own Deployments, plus the live admission probe.
+///
+/// The webhook Deployment listing answers two checks, so it is made once, and
+/// only when at least one of them was asked for.
+async fn run_installation_checks(ctx: &OpsCtx, params: &DoctorParams, out: &mut Vec<CheckResult>) {
     let operator_ns = params.operator_namespace.as_deref();
-    let mut checks = Vec::new();
-    checks.push(CheckResult {
-        check: DoctorCheck::CrdsInstalled,
-        outcome: check_crds(ctx).await,
-    });
-    let (controller, _) = check_deployment(ctx, operator_ns, "controller", true).await;
-    checks.push(CheckResult {
-        check: DoctorCheck::ControllerRunning,
-        outcome: controller,
-    });
+    push_if_wanted!(out, params, DoctorCheck::CrdsInstalled, check_crds(ctx));
+    if params.wants(DoctorCheck::ControllerRunning) {
+        let (controller, _) = check_deployment(ctx, operator_ns, "controller", true).await;
+        out.push(CheckResult {
+            check: DoctorCheck::ControllerRunning,
+            outcome: controller,
+        });
+    }
+    if !params.wants(DoctorCheck::WebhookRunning) && !params.wants(DoctorCheck::WebhookAdmits) {
+        return;
+    }
     let (webhook, webhook_installed) = check_deployment(ctx, operator_ns, "webhook", false).await;
-    checks.push(CheckResult {
-        check: DoctorCheck::WebhookRunning,
-        outcome: webhook,
-    });
-    checks.push(CheckResult {
-        check: DoctorCheck::WebhookAdmits,
-        outcome: check_webhook_admission(ctx, webhook_installed).await,
-    });
+    if params.wants(DoctorCheck::WebhookRunning) {
+        out.push(CheckResult {
+            check: DoctorCheck::WebhookRunning,
+            outcome: webhook,
+        });
+    }
+    // The `dryRun` create: a write verb through the whole admission chain, and
+    // an audit entry, on every run that asks for it. Nothing else here reaches
+    // it, which is why a caller that skips this check skips a real cost.
+    push_if_wanted!(
+        out,
+        params,
+        DoctorCheck::WebhookAdmits,
+        check_webhook_admission(ctx, webhook_installed)
+    );
+}
+
+/// The three checks off one repository listing. Returns without listing
+/// anything when none of them was asked for — which also skips
+/// `check_credentials`' Secret `get` per credential reference, the O(fleet)
+/// read in this file.
+async fn run_repo_checks(ctx: &OpsCtx, params: &DoctorParams, out: &mut Vec<CheckResult>) {
+    if !params.wants_any(&REPO_BACKED_CHECKS) {
+        return;
+    }
     match list_repos(ctx).await {
         Ok(repos) => {
-            checks.push(CheckResult {
-                check: DoctorCheck::RepositoriesReady,
-                outcome: check_repos_ready(&repos),
-            });
-            checks.push(CheckResult {
-                check: DoctorCheck::CredentialsPresent,
-                outcome: check_credentials(ctx, &repos).await,
-            });
-            checks.push(CheckResult {
-                check: DoctorCheck::SnapshotReplications,
-                outcome: check_snapshot_replications(ctx, Some(&repos)).await,
-            });
+            if params.wants(DoctorCheck::RepositoriesReady) {
+                out.push(CheckResult {
+                    check: DoctorCheck::RepositoriesReady,
+                    outcome: check_repos_ready(&repos),
+                });
+            }
+            push_if_wanted!(
+                out,
+                params,
+                DoctorCheck::CredentialsPresent,
+                check_credentials(ctx, &repos)
+            );
+            push_if_wanted!(
+                out,
+                params,
+                DoctorCheck::SnapshotReplications,
+                check_snapshot_replications(ctx, Some(&repos))
+            );
         }
         Err(warn) => {
-            checks.push(CheckResult {
-                check: DoctorCheck::RepositoriesReady,
-                outcome: warn,
-            });
-            checks.push(CheckResult {
-                check: DoctorCheck::CredentialsPresent,
-                outcome: Outcome::Warn("skipped (repositories not listable)".into()),
-            });
+            if params.wants(DoctorCheck::RepositoriesReady) {
+                out.push(CheckResult {
+                    check: DoctorCheck::RepositoriesReady,
+                    outcome: warn,
+                });
+            }
+            if params.wants(DoctorCheck::CredentialsPresent) {
+                out.push(CheckResult {
+                    check: DoctorCheck::CredentialsPresent,
+                    outcome: Outcome::Warn("skipped (repositories not listable)".into()),
+                });
+            }
             // Repos unlistable: the ref-resolution arm is skipped, the
             // suspend/phase/overlap arms still run.
-            checks.push(CheckResult {
-                check: DoctorCheck::SnapshotReplications,
-                outcome: check_snapshot_replications(ctx, None).await,
-            });
+            push_if_wanted!(
+                out,
+                params,
+                DoctorCheck::SnapshotReplications,
+                check_snapshot_replications(ctx, None)
+            );
         }
     }
-    // One listing pass feeds both work-scoped checks. A kind that could not be
-    // listed degrades ONLY itself: whatever listed is still examined, and the
-    // unreadable kind is named next to the verdict.
+}
+
+/// The two work-scoped checks off one listing pass. A kind that could not be
+/// listed degrades ONLY itself: whatever listed is still examined, and the
+/// unreadable kind is named next to the verdict.
+async fn run_work_checks(
+    ctx: &OpsCtx,
+    params: &DoctorParams,
+    now: DateTime<Utc>,
+    out: &mut Vec<CheckResult>,
+) {
+    if !params.wants_any(&WORK_BACKED_CHECKS) {
+        return;
+    }
     let work = list_work(ctx).await;
-    checks.push(CheckResult {
-        check: DoctorCheck::NoStuckWork,
-        outcome: merge_degradation(
-            check_stuck(&work, params.stuck_threshold, now),
-            &work.degraded,
-        ),
-    });
-    checks.push(CheckResult {
-        check: DoctorCheck::RecentFailures,
-        outcome: merge_degradation(
-            check_recent_failures(&work, params.failure_lookback, now),
-            &work.degraded,
-        ),
-    });
-    checks.push(CheckResult {
-        check: DoctorCheck::RecentWarnings,
-        outcome: check_warnings(ctx, now).await,
-    });
+    if params.wants(DoctorCheck::NoStuckWork) {
+        out.push(CheckResult {
+            check: DoctorCheck::NoStuckWork,
+            outcome: merge_degradation(
+                check_stuck(&work, params.stuck_threshold, now),
+                &work.degraded,
+            ),
+        });
+    }
+    if params.wants(DoctorCheck::RecentFailures) {
+        out.push(CheckResult {
+            check: DoctorCheck::RecentFailures,
+            outcome: merge_degradation(
+                check_recent_failures(&work, params.failure_lookback, now),
+                &work.degraded,
+            ),
+        });
+    }
+}
+
+/// Run the checks this run asked for, in report order, and collect them. Never
+/// fails: an unreachable or RBAC-restricted check degrades to a `Warn`/`Fail`
+/// row rather than aborting the run, so a partial report is still a report.
+///
+/// With [`DoctorParams::checks`] absent — the CLI's case — this runs all ten,
+/// unchanged. With a subset, the checks outside it produce no row **and do no
+/// work**: the shared listings each group depends on are skipped along with the
+/// group. See [`DoctorParams::checks`] for why a caller would want that.
+pub async fn run_all(ctx: &OpsCtx, params: &DoctorParams, now: DateTime<Utc>) -> DoctorReport {
+    let mut checks = Vec::new();
+    run_installation_checks(ctx, params, &mut checks).await;
+    run_repo_checks(ctx, params, &mut checks).await;
+    run_work_checks(ctx, params, now, &mut checks).await;
+    // The Events list: one of the heaviest reads in a cluster, and the last
+    // thing a caller after a specific failure needs.
+    push_if_wanted!(
+        checks,
+        params,
+        DoctorCheck::RecentWarnings,
+        check_warnings(ctx, now)
+    );
     DoctorReport { checks }
 }
 
@@ -1777,6 +1908,149 @@ mod tests {
             ["futureField"] = serde_json::json!({ "type": "string" });
         let newer: CustomResourceDefinition = serde_json::from_value(newer_json).unwrap();
         assert!(missing_spec_fields(&expected, &newer).is_empty());
+    }
+
+    /// A context pointed at a closed port. Nothing a selected check does can
+    /// succeed against it, which is the point: the report still names exactly
+    /// the checks that ran, and a check that made no request leaves no row.
+    fn unreachable_ctx() -> OpsCtx {
+        OpsCtx {
+            client: kube::Client::try_from(kube::Config::new(
+                "http://127.0.0.1:1/".parse().expect("a literal URL parses"),
+            ))
+            .expect("a Config with no auth builds a Client"),
+            namespace: "kopiur-system".to_string(),
+            scope: Scope::All,
+            field_manager: "kopiur-test".to_string(),
+        }
+    }
+
+    fn params_for(checks: Option<BTreeSet<DoctorCheck>>) -> DoctorParams {
+        DoctorParams {
+            stuck_threshold: std::time::Duration::from_secs(3600),
+            failure_lookback: std::time::Duration::from_secs(86_400),
+            operator_namespace: Some("kopiur-system".to_string()),
+            checks,
+        }
+    }
+
+    /// The selector's whole purpose is the work it AVOIDS, so the assertions
+    /// are about the listings that must not happen.
+    ///
+    /// The overview's three failure-bearing checks need the repository listing
+    /// and the work listing — but they must not drag along the three expensive
+    /// reads the landing page was paying for on every visit: the `dryRun`
+    /// create against the admission chain (`webhook-admits`), the Secret `get`
+    /// per credential reference (`credentials-present`), and the cluster-wide
+    /// Events list (`recent-warnings`).
+    #[test]
+    fn a_subset_skips_the_listings_its_unasked_for_checks_would_have_made() {
+        let overview: BTreeSet<_> = [
+            DoctorCheck::RepositoriesReady,
+            DoctorCheck::NoStuckWork,
+            DoctorCheck::RecentFailures,
+        ]
+        .into_iter()
+        .collect();
+        let params = params_for(Some(overview));
+
+        for skipped in [
+            DoctorCheck::CrdsInstalled,
+            DoctorCheck::ControllerRunning,
+            DoctorCheck::WebhookRunning,
+            DoctorCheck::WebhookAdmits,
+            DoctorCheck::CredentialsPresent,
+            DoctorCheck::SnapshotReplications,
+            DoctorCheck::RecentWarnings,
+        ] {
+            assert!(
+                !params.wants(skipped),
+                "{skipped:?} was not asked for and must not run"
+            );
+        }
+
+        // Only checks the run needs may still make their shared listing.
+        assert!(
+            params.wants_any(&REPO_BACKED_CHECKS),
+            "repositories-ready needs the repository listing"
+        );
+        assert!(
+            params.wants_any(&WORK_BACKED_CHECKS),
+            "the two work checks need the work listing"
+        );
+
+        // A selector of installation checks alone must skip BOTH shared
+        // listings — the repository/cluster-repository lists with their Secret
+        // fan-out, and the four work lists.
+        let installation_only = params_for(Some(
+            [DoctorCheck::CrdsInstalled, DoctorCheck::ControllerRunning]
+                .into_iter()
+                .collect(),
+        ));
+        assert!(
+            !installation_only.wants_any(&REPO_BACKED_CHECKS),
+            "no repository-backed check was asked for, so `list_repos` and the Secret \
+             `get` per credential reference must never happen"
+        );
+        assert!(
+            !installation_only.wants_any(&WORK_BACKED_CHECKS),
+            "no work-backed check was asked for, so `list_work` must never happen"
+        );
+    }
+
+    /// An absent selector is exactly today's behaviour: every check runs.
+    #[test]
+    fn an_absent_selector_runs_every_check() {
+        let params = params_for(None);
+        for check in DoctorCheck::ALL {
+            assert!(params.wants(check), "{check:?} must run when none is named");
+        }
+        assert!(params.wants_any(&REPO_BACKED_CHECKS));
+        assert!(params.wants_any(&WORK_BACKED_CHECKS));
+    }
+
+    /// End to end through `run_all`: the report names the checks that ran, and
+    /// an unasked-for check leaves NO row. An absent row is "not run" — a
+    /// consumer that read it as "passed" would call a cluster healthy on the
+    /// strength of a check nobody performed.
+    #[tokio::test]
+    async fn run_all_reports_only_the_checks_it_was_asked_for() {
+        let ctx = unreachable_ctx();
+        let now = Utc::now();
+        let asked: BTreeSet<_> = [DoctorCheck::NoStuckWork, DoctorCheck::RecentFailures]
+            .into_iter()
+            .collect();
+
+        let report = run_all(&ctx, &params_for(Some(asked)), now).await;
+        let ran: Vec<DoctorCheck> = report.checks.iter().map(|c| c.check).collect();
+        assert_eq!(
+            ran,
+            vec![DoctorCheck::NoStuckWork, DoctorCheck::RecentFailures],
+            "only the asked-for checks may produce rows, in report order"
+        );
+        for skipped in [
+            DoctorCheck::WebhookAdmits,
+            DoctorCheck::CredentialsPresent,
+            DoctorCheck::RecentWarnings,
+        ] {
+            assert!(
+                !ran.contains(&skipped),
+                "{skipped:?} was not asked for, so it must not appear — not even as a Pass"
+            );
+        }
+    }
+
+    /// And the default still produces the full ten-row report against the same
+    /// unreachable context, so the subset did not quietly become the norm.
+    #[tokio::test]
+    async fn run_all_without_a_selector_still_reports_every_check() {
+        let report = run_all(&unreachable_ctx(), &params_for(None), Utc::now()).await;
+        let ran: Vec<DoctorCheck> = report.checks.iter().map(|c| c.check).collect();
+        assert_eq!(
+            ran,
+            DoctorCheck::ALL.to_vec(),
+            "an absent selector must run every check, in run order"
+        );
     }
 
     /// [`DoctorCheck::ALL`] is hand-written, so it is the one place a new check

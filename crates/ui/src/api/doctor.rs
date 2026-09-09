@@ -9,11 +9,22 @@
 //! degrades a check it may not perform to a `Warn` naming the missing grant
 //! rather than aborting. The endpoint therefore always answers 200 with a
 //! report; a red check is data, not an error.
+//!
+//! # A caller can ask for less
+//!
+//! The full run is expensive — a `dryRun` create through the admission chain, a
+//! Secret read per credential reference across the fleet, and a cluster-wide
+//! Events list — which is too much for a dashboard that re-fetches whenever a
+//! tab regains focus. `?checks=` names the subset to run, and the work behind
+//! the checks left out is not done at all. The report then carries only the
+//! rows that ran, so a consumer must count outcomes from `checks` rather than
+//! assuming ten.
 
 use axum::extract::State;
 use axum::{Json, Router, routing::get};
 use chrono::Utc;
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use kopiur_ops::doctor::{DoctorCheck, DoctorParams, DoctorReport, Outcome, run_all};
@@ -61,6 +72,21 @@ pub struct DoctorQuery {
     /// stay installation-wide whatever this says.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Run only these checks, as a comma-separated list of the ids
+    /// [`check_id`] produces (`repositories-ready,no-stuck-work`). Absent runs
+    /// all ten, exactly as before this parameter existed.
+    ///
+    /// Comma-separated rather than repeated (`?checks=a&checks=b`) because
+    /// `axum`'s `Query` deserializes with `serde_urlencoded`, which has no
+    /// sequence support: a repeated key would silently keep only one value,
+    /// which is precisely the shape of failure `deny_unknown_fields` was added
+    /// to this query to prevent. [`parse_checks`] rejects an unrecognized id
+    /// with a 400 naming every valid one.
+    ///
+    /// A caller that asks for a subset gets a **shorter report**, not a report
+    /// with the rest passing — an absent row means "not run".
+    #[serde(default)]
+    pub checks: Option<String>,
 }
 
 /// The context one doctor run reads through.
@@ -115,6 +141,73 @@ pub fn check_id(check: DoctorCheck) -> String {
         }
     }
     out
+}
+
+/// **Pure.** Every check id this endpoint accepts, comma-separated, for a
+/// refusal. Derived from [`DoctorCheck::ALL`] through the same [`check_id`] the
+/// report uses, so an id the parser accepts cannot be missing from the error
+/// that lists them — and a check added later joins both at once.
+fn accepted_check_ids() -> String {
+    DoctorCheck::ALL
+        .iter()
+        .map(|c| check_id(*c))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// **Pure.** Parse the `checks` selector. `None` in, `None` out — an absent
+/// selector runs everything.
+///
+/// Every failure names the whole accepted vocabulary rather than only the
+/// offending token: a caller who mistyped one id usually cannot see the list
+/// anywhere else, and this query is `deny_unknown_fields` precisely so that a
+/// selector which does not do what it says is a 400 rather than a quietly
+/// broader report than the caller asked for.
+fn parse_checks(raw: Option<&str>) -> Result<Option<BTreeSet<DoctorCheck>>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut selected = BTreeSet::new();
+    for token in raw.split(',') {
+        let id = token.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let found = DoctorCheck::ALL.iter().find(|c| check_id(**c) == id);
+        match found {
+            Some(check) => {
+                selected.insert(*check);
+            }
+            None => {
+                return Err(problem(
+                    400,
+                    "invalid-filter",
+                    format!("`{id}` is not a doctor check."),
+                    "`checks` selects which diagnostics to run, so an id nothing matches would \
+                     quietly narrow the report — and a check missing from a report reads as one \
+                     that passed.",
+                    format!(
+                        "use a comma-separated subset of: {}; or drop `checks` to run them all",
+                        accepted_check_ids()
+                    ),
+                ));
+            }
+        }
+    }
+    if selected.is_empty() {
+        return Err(problem(
+            400,
+            "invalid-filter",
+            "`checks` names no check.".to_string(),
+            "An empty selector would produce an empty report, which is indistinguishable from \
+             a cluster with nothing wrong.",
+            format!(
+                "name at least one of: {}; or drop `checks` to run them all",
+                accepted_check_ids()
+            ),
+        ));
+    }
+    Ok(Some(selected))
 }
 
 /// **Pure.** How much of the cluster one check actually reads.
@@ -229,7 +322,7 @@ fn window(value: Option<u64>, default: Duration, field: &str) -> Result<Duration
     }
 }
 
-/// `GET /api/v1/doctor?stuckThreshold=&failureLookback=&namespace=`
+/// `GET /api/v1/doctor?stuckThreshold=&failureLookback=&namespace=&checks=`
 async fn handler(
     State(app): State<AppState>,
     CurrentIdentity(id): CurrentIdentity,
@@ -245,6 +338,7 @@ async fn handler(
         // An in-cluster server knows where the operator runs, which saves doctor
         // the label-driven search across every namespace the CLI has to do.
         operator_namespace: app.cfg.operator_namespace.clone(),
+        checks: parse_checks(q.checks.as_deref())?,
     };
 
     let client = client_for(&app, &id)?;
@@ -478,6 +572,84 @@ mod tests {
         assert_eq!(view.exit_code, 1);
         assert_eq!(view.checks.len(), 2, "every check that ran is reported");
         assert_eq!(view.ran_at, "2026-09-08T12:00:00Z");
+    }
+
+    #[test]
+    fn an_absent_checks_selector_runs_everything() {
+        assert!(
+            parse_checks(None).unwrap().is_none(),
+            "absent must mean the full report, not an empty one"
+        );
+    }
+
+    #[test]
+    fn a_checks_selector_is_a_comma_separated_subset() {
+        let selected = parse_checks(Some("repositories-ready,no-stuck-work,recent-failures"))
+            .unwrap()
+            .expect("a named subset is Some");
+        assert_eq!(
+            selected,
+            [
+                DoctorCheck::RepositoriesReady,
+                DoctorCheck::NoStuckWork,
+                DoctorCheck::RecentFailures
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        );
+
+        // Whitespace around a token is a copy-paste artefact, not an error.
+        assert_eq!(
+            parse_checks(Some(" crds-installed , recent-warnings "))
+                .unwrap()
+                .unwrap(),
+            [DoctorCheck::CrdsInstalled, DoctorCheck::RecentWarnings]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// The query is `deny_unknown_fields` so an unknown *parameter* is a 400;
+    /// an unknown *value* has to be one too, and it has to say what the valid
+    /// ones are — a mistyped id would otherwise silently drop a diagnostic, and
+    /// a missing row reads as a passing one.
+    #[test]
+    fn an_unknown_check_is_a_400_naming_every_valid_id() {
+        let err = parse_checks(Some("repositories-ready,no-such-check")).unwrap_err();
+        assert_eq!(err.0.status, 400);
+        assert!(
+            err.0.what.contains("no-such-check"),
+            "the refusal must name the offending id, got {}",
+            err.0.what
+        );
+        // Every id, not just a hint — a caller cannot see this list anywhere
+        // else, and the list comes from `DoctorCheck::ALL` so it cannot go
+        // stale against the parser.
+        for check in DoctorCheck::ALL {
+            assert!(
+                err.0.fix.contains(&check_id(check)),
+                "the fix must name `{}`, got {}",
+                check_id(check),
+                err.0.fix
+            );
+        }
+    }
+
+    /// `?checks=` present but naming nothing would produce a zero-row report,
+    /// which looks exactly like a clean bill of health.
+    #[test]
+    fn an_empty_checks_selector_is_a_400_rather_than_an_empty_report() {
+        for raw in ["", " ", ",", " , "] {
+            let Err(err) = parse_checks(Some(raw)) else {
+                panic!("{raw:?} names no check and must be refused, not run as everything");
+            };
+            assert_eq!(err.0.status, 400);
+            assert!(
+                err.0.why.contains("empty report"),
+                "the refusal must explain why an empty selector is dangerous, got {}",
+                err.0.why
+            );
+        }
     }
 
     #[test]
