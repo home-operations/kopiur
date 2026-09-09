@@ -27,7 +27,15 @@
  * | `POST /actions/maintenance-run` | [`Self::patch_maintenances`] |
  * | `POST /actions/replication-run` | [`Self::patch_repository_replications`] or [`Self::patch_snapshot_replications`], by the kind the request names or detection finds |
  * | `POST /actions/scan-catalog` | [`Self::patch_repositories`] or [`Self::patch_cluster_repositories`], by `kind` |
- * | `POST`/`DELETE …/session`, `GET …/tree`, `GET …/file` | [`Self::exec_sessions`] |
+ * | `POST /snapshots/{ns}/{name}/session` | [`Self::create_session_jobs`] **and** [`Self::exec_sessions`] |
+ * | `DELETE /snapshots/{ns}/{name}/session`, `DELETE /repositories/{kind}/{name}/session` | [`Self::delete_session_jobs`] |
+ * | `GET …/tree`, `GET …/file` | [`Self::exec_sessions`] |
+ *
+ * Starting a browse session takes **two** grants, and the SPA must require
+ * both: the session is a `batch/v1` Job the UI creates, and reading through it
+ * is a `pods/exec`. A user holding `pods/exec` but not `create jobs` was
+ * previously shown an enabled Browse button that 403'd on click, which is the
+ * exact failure these flags exist to prevent.
  *
  * # These answers are namespace-scoped
  *
@@ -88,6 +96,19 @@ patchRepositoryReplications: boolean,
  */
 patchSnapshotReplications: boolean,
 /**
- * May open browse sessions, which exec into a mover pod.
+ * May create the `batch/v1` Job a browse session runs in.
+ *
+ * Starting a session needs this **and** [`Self::exec_sessions`]; reading
+ * through an already-running one needs only the latter.
+ */
+createSessionJobs: boolean,
+/**
+ * May delete a browse session's Job — the "stop session" control, on both
+ * the snapshot and the repository detail.
+ */
+deleteSessionJobs: boolean,
+/**
+ * May exec into a browse session's mover pod, which is what reading a
+ * directory or streaming a file costs.
  */
 execSessions: boolean, };

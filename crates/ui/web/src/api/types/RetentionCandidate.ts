@@ -23,9 +23,11 @@ endTime: string,
  */
 kept: boolean,
 /**
- * Which rules hold it and in which slot, e.g. `keepDaily slot 3`; `pinned`
- * alone for a pin. Empty when it is pruned. Same strings as
- * [`RetentionPreview::reasons`].
+ * Which rules hold it and in which slot, e.g. `keepDaily slot 3`, with
+ * `pinned` first (and slotless) when [`Self::pinned`] is set — see
+ * [`RetentionPreview::reasons`], which these are the same strings from the
+ * same function as, including that a pin does not mean exactly one entry.
+ * Empty when it is pruned.
  */
 rules: Array<string>,
 /**
