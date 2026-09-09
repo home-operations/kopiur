@@ -503,11 +503,101 @@ pub struct SnapshotRefView {
 pub struct RetentionPreview {
     /// True when at least one retention rule keeps the snapshot.
     pub kept: bool,
-    /// The rules that matched, e.g. `keepDaily slot 3`.
+    /// The rules that hold it, each with the slot it occupies in that rule's
+    /// window — `keepDaily slot 3` means the third-newest day `keepDaily` keeps,
+    /// so a reader can see how close the snapshot is to ageing out.
+    ///
+    /// `pinned` appears alone, without a slot: a pin is not a bucket slot, it is
+    /// an exemption from bucketing.
+    ///
+    /// Empty when the snapshot is pruned. The same strings, from the same
+    /// function, as [`RetentionCandidate::rules`].
     pub reasons: Vec<String>,
     /// RFC3339 timestamp the preview was computed at — the answer moves as time
     /// passes, so the UI shows when it was true.
     pub computed_at: String,
+}
+
+/// Every snapshot competing for the same retention buckets as one snapshot,
+/// with the verdict today's GFS selection gives each.
+///
+/// This is what `GET /api/v1/snapshots/{namespace}/{name}/retention` answers,
+/// and it is the screen where a misreading costs a restore point — so the
+/// population and the bucketing are the *prune's own*
+/// (`kopiur_api::retention::retention_buckets`), never a second implementation
+/// that could disagree with what the operator will actually delete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionPlan {
+    /// One entry per bucket the policy's population splits into, keyed by the
+    /// bucket key, ordered by that key.
+    ///
+    /// Buckets are independent: a fan-out policy over seven PVCs has seven, and
+    /// no snapshot in one can displace a snapshot in another. That independence
+    /// is the whole reason this is a list of buckets rather than one list of
+    /// candidates.
+    pub buckets: Vec<RetentionBucket>,
+    /// The `SnapshotPolicy` the plan was computed from.
+    pub policy: PolicyRef,
+    /// RFC3339 timestamp the plan was computed at. GFS verdicts move as time
+    /// passes, so a plan is an answer about a moment.
+    pub computed_at: String,
+    /// True when the policy configures no retention at all.
+    ///
+    /// Nothing is pruned by GFS in that case — the operator only runs a
+    /// selection when a retention policy exists — so every candidate is reported
+    /// `kept: true` with no `rules`. Rendering an unbounded plan as "everything
+    /// will be deleted" (which is what running an empty policy through the
+    /// selection kernel would literally say) is the exact inversion this flag
+    /// exists to prevent.
+    pub unbounded: bool,
+}
+
+/// One retention bucket and the snapshots competing inside it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionBucket {
+    /// The bucket key the controller groups by: the backup source, plus the
+    /// pinned repository while the policy is multi-repo. Empty for an un-fanned,
+    /// single-repository policy, which has exactly one bucket.
+    ///
+    /// Opaque — a join key and a grouping label, not a path to parse.
+    pub key: String,
+    /// The bucket's candidates, newest first, ties broken by name — the same
+    /// order the selection kernel walks them in.
+    pub candidates: Vec<RetentionCandidate>,
+}
+
+/// One snapshot's place in its retention bucket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionCandidate {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// The end time GFS buckets on: `status.timing.endTime`, falling back to
+    /// `metadata.creationTimestamp`. Never absent — a row with neither is not in
+    /// the GFS population and so is not a candidate at all.
+    pub end_time: String,
+    /// True when today's selection keeps this snapshot.
+    pub kept: bool,
+    /// Which rules hold it and in which slot, e.g. `keepDaily slot 3`; `pinned`
+    /// alone for a pin. Empty when it is pruned. Same strings as
+    /// [`RetentionPreview::reasons`].
+    pub rules: Vec<String>,
+    /// `spec.pin` — exempt from GFS pruning entirely.
+    ///
+    /// The *spec*, which is what the prune reads. During an unpin, `status.pinned`
+    /// still says `true` and reporting that would promise a keep the next prune
+    /// will not honour.
+    pub pinned: bool,
+    /// True for the snapshot the request was about, so the SPA can highlight its
+    /// row among its competitors.
+    pub subject: bool,
 }
 
 /// Why a run failed, in the terms the operator's own error classification uses.

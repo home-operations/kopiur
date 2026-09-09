@@ -42,6 +42,7 @@ pub fn export_all(dir: &Path) -> Result<(), ExportError> {
     views::RepositoryDetail::export_all(&cfg)?;
     <views::Page<views::SnapshotRow>>::export_all(&cfg)?;
     views::SnapshotDetail::export_all(&cfg)?;
+    views::RetentionPlan::export_all(&cfg)?;
     views::PolicyRow::export_all(&cfg)?;
     views::PolicyDetail::export_all(&cfg)?;
     views::ScheduleRow::export_all(&cfg)?;
@@ -139,7 +140,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 69,
+            exported, 72,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -148,7 +149,10 @@ mod tests {
              `kopiur-ui/src/api/replications.rs`, where it was a wire shape the \
              SPA would have had to hand-write; 66 -> 69 for `RestoreDetail` and \
              its two new sub-objects (`RestoreSourceView`, `RestoreTargetView`), \
-             so the restore detail route stops answering with the list's row"
+             so the restore detail route stops answering with the list's row; \
+             69 -> 72 for `RetentionPlan` and its `RetentionBucket` / \
+             `RetentionCandidate`, so the retention screen can show the whole \
+             bucket instead of one snapshot's verdict"
         );
     }
 }
