@@ -872,6 +872,7 @@ mod extractor_rejection_tests {
             },
             download_max_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
             manifest_max_bytes: DEFAULT_MAX_MANIFEST_BYTES,
+            download_chunk_timeout: std::time::Duration::from_secs(60),
             snapshot_list_cap: DEFAULT_SNAPSHOT_LIST_CAP,
             client_cache: CacheLimits {
                 size: DEFAULT_CLIENT_CACHE_SIZE,
