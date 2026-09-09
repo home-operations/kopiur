@@ -6,12 +6,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "build": "tsc --noEmit -p tsconfig.json && vite build && node scripts/check-bundle-size.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint . --max-warnings 0",
+    "format": "oxfmt src '!src/api/types/**' '!src/routeTree.gen.ts' scripts index.html *.ts *.js *.json *.yaml",
+    "format:check": "oxfmt --check src '!src/api/types/**' '!src/routeTree.gen.ts' scripts index.html *.ts *.js *.json *.yaml",
     "test": "vitest run",
-    "check": "pnpm typecheck && pnpm lint && pnpm test"
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test"
   },
   "dependencies": {
     "@tanstack/react-query": "5.102.8",

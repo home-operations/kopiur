@@ -178,6 +178,59 @@ describe("AppShell", () => {
     expect(window.localStorage.getItem("kopiur-ui.theme")).toBeNull();
   });
 
+  it("puts a skip link first, and activating it moves focus to the content", async () => {
+    fetchMock.mockResponse(JSON.stringify(alice), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    mountAt("/snapshots?namespace=prod");
+    await screen.findByRole("navigation", { name: "Primary" });
+
+    // Eleven controls sit before the content; the first Tab must land here.
+    await userEvent.tab();
+    const skip = screen.getByRole("link", { name: "Skip to content" });
+    expect(skip).toHaveFocus();
+    expect(skip).toHaveAttribute("href", "#main");
+
+    await userEvent.keyboard("{Enter}");
+    const main = screen.getByRole("main");
+    expect(main).toHaveAttribute("id", "main");
+    expect(main).toHaveFocus();
+  });
+
+  it("names every theme button independently of its visible label", async () => {
+    // Below 560px the label span is display:none and the icon is aria-hidden,
+    // so the name must come from aria-label. jsdom ignores media queries, so
+    // this asserts the attribute the name is computed from, not the query.
+    fetchMock.mockResponse(JSON.stringify(alice), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    mountAt("/");
+    const group = await screen.findByRole("group", { name: "Theme" });
+    for (const label of ["System", "Light", "Dark"]) {
+      const button = within(group).getByRole("button", { name: label });
+      expect(button).toHaveAttribute("aria-label", label);
+      // Strip the visible label the way the media query would, and the name
+      // must survive.
+      for (const span of button.querySelectorAll("span")) {
+        span.remove();
+      }
+      expect(button).toHaveAccessibleName(label);
+    }
+  });
+
+  it("keeps the namespace when the wordmark is used to go home", async () => {
+    fetchMock.mockResponse(JSON.stringify(alice), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    mountAt("/snapshots?namespace=prod");
+    await screen.findByRole("navigation", { name: "Primary" });
+    const brand = screen.getByRole("link", { name: /Kopiur/ });
+    expect(brand).toHaveAttribute("href", "/?namespace=prod");
+  });
+
   it("renders the not-found state for an address no route serves", async () => {
     fetchMock.mockResponse(JSON.stringify(alice), {
       status: 200,

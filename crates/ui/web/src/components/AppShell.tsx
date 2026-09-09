@@ -43,8 +43,9 @@ export function AppShell({ children }: AppShellProps) {
   const section = sectionFor(pathname);
   return (
     <div className="shell">
+      <SkipLink />
       <aside className="rail" aria-label="Sections">
-        <Link to="/" className="rail__brand" search={{}}>
+        <Link to="/" className="rail__brand" search={namespace !== undefined ? { namespace } : {}}>
           <VaultMark />
           <span className="rail__wordmark">Kopiur</span>
           <span className="rail__product">console</span>
@@ -81,11 +82,38 @@ export function AppShell({ children }: AppShellProps) {
           <IdentityStrip namespace={namespace} />
         </div>
       </header>
-      <main className="main" id="main">
+      <main className="main" id="main" tabIndex={-1}>
         <GlobalProblemBanner />
         <div className="content">{children}</div>
       </main>
     </div>
+  );
+}
+
+/**
+ * The first focusable element on every page. Eleven controls sit ahead of
+ * the content (the brand link and ten rail rows), so a keyboard or switch
+ * user would otherwise tab through all of them on every navigation
+ * (WCAG 2.4.1). Focus is moved explicitly rather than trusting the fragment
+ * navigation: browsers differ on whether `#main` receives focus.
+ */
+function SkipLink() {
+  return (
+    <a
+      href="#main"
+      className="skip-link"
+      onClick={(event) => {
+        const main = document.getElementById("main");
+        if (main === null) {
+          return;
+        }
+        event.preventDefault();
+        // focus() scrolls the target into view on its own.
+        main.focus();
+      }}
+    >
+      Skip to content
+    </a>
   );
 }
 
@@ -120,6 +148,9 @@ export function ThemeSwitch() {
             key={option.value}
             type="button"
             className="theme-switch__option"
+            // The visible label is hidden below 560px and the icon is
+            // aria-hidden, so the name must not depend on either.
+            aria-label={option.label}
             aria-pressed={preference === option.value}
             onClick={() => {
               setPreference(option.value);

@@ -71,6 +71,11 @@
   --fg-muted: light-dark(#4f5761, #a7aeb8);
   --fg-faint: light-dark(#636c78, #858d98);
   --fg-on-accent: light-dark(#ffffff, #0f1114);
+  /* Ink for a control the user may not use. An explicit colour, not opacity:
+     opacity would dim the control's reason tooltip too, and these controls
+     stay readable on purpose (aria-disabled, focusable) so the reason can be
+     learned. 5.6:1 / 5.5:1 on the surface, 4.8:1 / 5.0:1 on the inset. */
+  --fg-disabled: light-dark(#5f6975, #8d95a0);
 
   /* ---- hairlines ------------------------------------------------------- */
   --line: light-dark(#d5d9df, #2c313a);
@@ -114,6 +119,21 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
+}
+
+/* Browser floor: light-dark() needs Chrome 123 / Firefox 120 / Safari 17.5
+   (all 2024). Below that every var() above resolves to `unset`: the page
+   degrades to the UA's own light/dark canvas — readable, and the health lamps
+   still differ by icon and word — but the focus ring would vanish, because
+   :focus-visible suppresses the outline before painting it. These four static
+   light-theme values keep keyboard navigation visible on such a browser. */
+@supports not (color: light-dark(#000, #fff)) {
+  :root {
+    --fg: #1a1d21;
+    --bg-canvas: #f3f4f6;
+    --bg-surface: #ffffff;
+    --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #4f55d2;
+  }
 }
 
 /* ---- base ---------------------------------------------------------------- */
@@ -371,9 +391,22 @@ svg {
   border-color: var(--health-failed-fg);
 }
 
+/* Disabled reads as disabled by ink, border and fill — never by opacity, which
+   would dim the reason tooltip below (a pseudo-element inherits it). */
 .button[disabled],
 .button[aria-disabled="true"] {
-  opacity: 0.55;
+  color: var(--fg-disabled);
+  border-color: var(--line);
+  background: var(--bg-inset);
+}
+
+.button--primary[disabled],
+.button--primary[aria-disabled="true"],
+.button--danger[disabled],
+.button--danger[aria-disabled="true"] {
+  color: var(--fg-disabled);
+  border-color: var(--line);
+  background: var(--bg-inset);
 }
 
 /* The reason a control is disabled: shown on hover and on keyboard focus,
@@ -488,6 +521,34 @@ svg {
 
 .panel__body {
   padding: var(--space-4);
+}
+
+/* ---- skip link: the first focusable element, visible only on focus -------- */
+
+.skip-link {
+  position: fixed;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: 100;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--accent);
+  color: var(--fg-on-accent);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  box-shadow: var(--shadow-2);
+  transform: translateY(calc(-100% - var(--space-4)));
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.skip-link:focus-visible {
+  transform: none;
+}
+
+/* The skip target takes focus programmatically; it needs no ring of its own. */
+.main:focus-visible {
+  box-shadow: none;
 }
 
 /* ---- shell --------------------------------------------------------------- */

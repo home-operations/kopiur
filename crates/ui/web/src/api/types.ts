@@ -10,7 +10,7 @@
 // disagree, so this file cannot silently fall behind the generator.
 //
 // Import from here, never from `./types/Foo` directly:
-//     import type { SnapshotRow, Page } from "@/api/types";
+//     import type { SnapshotRow, Page } from "../api/types";
 
 export type { ActionReceipt } from "./types/ActionReceipt";
 export type { Capabilities } from "./types/Capabilities";
