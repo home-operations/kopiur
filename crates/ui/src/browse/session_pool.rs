@@ -371,11 +371,32 @@ pub fn session_info(job: &Job, reused: bool, limits: WireLimits) -> SessionInfo 
     }
 }
 
-/// **Pure.** `creationTimestamp + spec.activeDeadlineSeconds`, as RFC 3339.
-fn session_expiry(job: &Job) -> Option<String> {
-    let created = kopiur_ops::snapshots::meta_time(job.metadata.creation_timestamp.as_ref()?)?;
+/// **Pure.** When the kubelet will stop this session Job:
+/// `status.startTime + spec.activeDeadlineSeconds`, as RFC 3339.
+///
+/// # One implementation, because a Job has one deadline
+///
+/// This used to exist twice — here off `metadata.creationTimestamp`, and in
+/// `crate::api::repositories` off `status.startTime` — so the same Job reported
+/// two different expiries depending on which screen you were looking at, in two
+/// different timestamp formats. The SPA renders this as a countdown, so that is
+/// two different answers to "how long have I got".
+///
+/// `status.startTime` is the correct base: Kubernetes measures
+/// `activeDeadlineSeconds` from when the Job *started*, not from when it was
+/// created, so the creation-timestamp version expired early by however long the
+/// pod waited to be scheduled — and it was the version the browse endpoints,
+/// i.e. the ones a user actually watches, were using.
+///
+/// `None` when either half is missing, and the `startTime` half is a real state
+/// rather than an error: a Job the scheduler has not started yet HAS no
+/// deadline running, so there is no moment to count down to. An absent expiry
+/// is the honest answer; a guessed one would count down from a clock that has
+/// not started.
+pub fn session_expiry(job: &Job) -> Option<String> {
+    let started = kopiur_ops::snapshots::meta_time(job.status.as_ref()?.start_time.as_ref()?)?;
     let deadline = job.spec.as_ref()?.active_deadline_seconds?;
-    created
+    started
         .checked_add_signed(chrono::Duration::try_seconds(deadline)?)
         .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
@@ -452,10 +473,15 @@ mod tests {
         }
     }
 
+    /// A session Job. `started` is `status.startTime` — the base
+    /// `activeDeadlineSeconds` is measured from, and therefore the only clock
+    /// [`session_expiry`] reads. `metadata.creationTimestamp` is set a minute
+    /// EARLIER on purpose: a fixture where the two coincide could not tell an
+    /// implementation reading the wrong one apart from the right one.
     fn job(
         name: &str,
         namespace: &str,
-        created: Option<&str>,
+        started: Option<&str>,
         active_deadline_seconds: Option<i64>,
     ) -> Job {
         let mut value = serde_json::json!({
@@ -464,8 +490,13 @@ mod tests {
             "metadata": { "name": name, "namespace": namespace },
             "spec": { "template": { "spec": { "containers": [], "restartPolicy": "Never" } } },
         });
-        if let Some(created) = created {
-            value["metadata"]["creationTimestamp"] = serde_json::json!(created);
+        if let Some(started) = started {
+            value["status"] = serde_json::json!({ "startTime": started });
+            let created = chrono::DateTime::parse_from_rfc3339(started)
+                .expect("the fixture's start time parses")
+                - chrono::Duration::minutes(1);
+            value["metadata"]["creationTimestamp"] =
+                serde_json::json!(created.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         }
         if let Some(deadline) = active_deadline_seconds {
             value["spec"]["activeDeadlineSeconds"] = serde_json::json!(deadline);
@@ -722,16 +753,44 @@ mod tests {
         assert_eq!(short.expires_at.as_deref(), Some("2026-06-11T01:06:03Z"));
 
         // Missing either half is no expiry rather than a guess the SPA would
-        // count down from.
-        for (created, deadline) in [
+        // count down from. The `startTime`-absent row is the ORDINARY case, not
+        // a malformed one: a Job the scheduler has not started yet has no
+        // deadline running, and the fixture still carries a
+        // `creationTimestamp`, so an implementation that fell back to it would
+        // report a countdown that has not begun.
+        for (started, deadline) in [
             (None, Some(1020)),
             (Some("2026-06-11T01:02:03Z"), None),
             (None, None),
         ] {
-            let info = session_info(&job("j", "media", created, deadline), false, test_limits());
-            assert_eq!(info.expires_at, None, "{created:?}/{deadline:?}");
+            let info = session_info(&job("j", "media", started, deadline), false, test_limits());
+            assert_eq!(info.expires_at, None, "{started:?}/{deadline:?}");
             assert!(!info.reused);
         }
+
+        // A Job created a minute before it started: the deadline runs from the
+        // START, so the scheduling delay must NOT be counted against it.
+        let scheduled_late: Job = serde_json::from_value(serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "j",
+                "namespace": "media",
+                "creationTimestamp": "2026-06-11T01:00:00Z",
+            },
+            "spec": {
+                "activeDeadlineSeconds": 1020,
+                "template": { "spec": { "containers": [], "restartPolicy": "Never" } },
+            },
+            "status": { "startTime": "2026-06-11T01:02:03Z" },
+        }))
+        .expect("job fixture");
+        assert_eq!(
+            session_expiry(&scheduled_late).as_deref(),
+            Some("2026-06-11T01:19:03Z"),
+            "activeDeadlineSeconds runs from status.startTime, so a session that \
+             waited two minutes to be scheduled does not lose two minutes"
+        );
     }
 
     /// The caps the SPA pre-checks against are the ones the server will enforce
