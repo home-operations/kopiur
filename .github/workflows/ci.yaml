@@ -339,6 +339,17 @@ jobs:
             bins: "install_scope"
             backends: false
             helm_set: "installScope=namespaced"
+          # The web console. Own shard, and the only one that installs it: `ui: "1"`
+          # opts the console image into `images-load` AND layers
+          # deploy/e2e/values-ui.yaml onto the install (see crates/e2e/mise.toml),
+          # which every other shard would otherwise pay for in kind-load time and
+          # an extra Deployment. It is also the only shard that binds a browse
+          # role to a NON-ADMIN subject, which is what makes it the one place an
+          # RBAC verb missing from that role can be caught. Filesystem only.
+          - shard: ui
+            bins: "ui"
+            backends: false
+            ui: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -382,6 +393,9 @@ jobs:
       - wait: [cluster]
 
       - name: Load images into kind
+        env:
+          # Side-load the console image too, on the shard that installs it.
+          KOPIUR_E2E_UI: ${{ matrix.ui || '' }}
         run: mise run //crates/e2e:images-load
 
       # Backend-server images (MinIO/mc, SFTP, WebDAV). The lifecycle shard is
@@ -406,6 +420,9 @@ jobs:
         env:
           # Optional per-shard chart reshape (e.g. installScope=namespaced).
           KOPIUR_E2E_HELM_SET: ${{ matrix.helm_set || '' }}
+          # Layers deploy/e2e/values-ui.yaml and pre-creates the proxy-token
+          # Secret the console Deployment mounts.
+          KOPIUR_E2E_UI: ${{ matrix.ui || '' }}
         run: mise run //crates/e2e:helm
 
       - name: Run e2e tests

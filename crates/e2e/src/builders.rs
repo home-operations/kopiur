@@ -12,6 +12,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{
     ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, Secret, Service,
 };
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
 use serde_json::json;
 
 use crate::consts;
@@ -991,6 +992,66 @@ pub fn sleeper_pod(
             }],
             "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": pvc } }],
         },
+    }))
+}
+
+// --- RBAC bindings for the web-console e2e -------------------------------------
+//
+// The chart renders the ROLES and deliberately renders no bindings: who may
+// operate your backups is not a chart decision. So the console e2e has to make
+// the same grant a real administrator makes, by hand, and in the same two shapes
+// the docs prescribe — `kopiur-ui-user` cluster-wide, `kopiur-ui-browse` as a
+// namespaced RoleBinding and never cluster-wide.
+
+/// Bind a chart-rendered ClusterRole to one user, cluster-wide.
+///
+/// This is the shape `kopiur-ui-user` is meant to be bound in: the console is a
+/// fleet view, so a viewer who could only see one namespace would report a healthy
+/// cluster while another namespace burned.
+pub fn cluster_role_binding_for_user(name: &str, role: &str, user: &str) -> ClusterRoleBinding {
+    from_json(json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": name },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": role,
+        },
+        "subjects": [{
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "User",
+            "name": user,
+        }],
+    }))
+}
+
+/// Bind a chart-rendered ClusterRole to one user **in one namespace only**.
+///
+/// The only shape `kopiur-ui-browse` is ever bound in. A browse session runs a
+/// mover pod that loads the repository credentials from its own environment, and
+/// `pods/exec create` cannot be narrowed to one pod by RBAC — so this grant hands
+/// `user` the repository credentials of `namespace`, and nothing outside it.
+pub fn role_binding_for_user(
+    namespace: &str,
+    name: &str,
+    cluster_role: &str,
+    user: &str,
+) -> RoleBinding {
+    from_json(json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": { "name": name, "namespace": namespace },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": cluster_role,
+        },
+        "subjects": [{
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "User",
+            "name": user,
+        }],
     }))
 }
 

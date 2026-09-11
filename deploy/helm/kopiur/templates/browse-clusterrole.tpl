@@ -60,8 +60,17 @@ rules:
       - pods/log
     verbs: [get]
   # The read path: exec the closed kopia session-command surface into the pod.
+  #
+  # BOTH verbs, and `get` is not optional. Kubernetes authorizes a subresource
+  # request by its HTTP method, and an exec over WebSocket is an UPGRADE — a GET
+  # — so the apiserver asks for `get pods/exec`. `create` alone covers only the
+  # older SPDY POST, and a user bound to this role would be refused with a bare
+  # "cannot get resource pods/exec" that reads like a missing binding.
+  # (`deploy/rbac/operator-*.yaml` has always granted both for the workload-exec
+  # hooks; this role did not, and every browse e2e ran as cluster-admin, so
+  # nothing noticed until the console suite bound it to a real user.)
   - apiGroups: [""]
     resources:
       - pods/exec
-    verbs: [create]
+    verbs: [create, get]
 {{- end }}

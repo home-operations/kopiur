@@ -1,0 +1,67 @@
+# Extra Helm values that add the web console to the e2e install.
+#
+# Layered ON TOP of deploy/e2e/values.yaml by the `//crates/e2e:helm` task when
+# KOPIUR_E2E_UI=1 (a second `-f`), so the default e2e run — which installs no
+# console — is untouched. The `ui` shard in .github/workflows/ci.yaml sets that
+# variable; so does a local `KOPIUR_E2E_UI=1 mise run //crates/e2e:test`.
+#
+# HEADER MODE WITH A REAL PROXY SECRET, deliberately. The console's app port is a
+# ClusterIP Service, and the e2e drives it through the apiserver's `services/proxy`
+# subresource — which is exactly the hole `ui.auth.acknowledgeNoProxySecret` waves
+# through. Installing with `acknowledgeNoProxySecret: true` would make this suite
+# prove something weaker than what we ship, and would silently pass even if the
+# token comparison were removed. So the harness creates the Secret first (see the
+# `helm` task) and the console requires the token on every request.
+#
+# Keep the header names, the Secret name and the token in lockstep with
+# crates/e2e/src/ui.rs.
+
+ui:
+  enabled: true
+
+  # Locally-built :e2e image, kind-loaded by `//crates/e2e:images-load`
+  # (KOPIUR_E2E_UI=1). `Never` so kubelet uses the loaded image rather than
+  # trying to pull ghcr.io.
+  image:
+    repository: docker.io/kopiur/ui
+    tag: e2e
+    pullPolicy: Never
+
+  auth:
+    # The names oauth2-proxy emits, and — load-bearing for this suite — names the
+    # apiserver's Service proxy passes through untouched. It strips `Authorization`
+    # and re-authenticates its own `X-Remote-*` request-header names before
+    # proxying, so those could never reach the console from a host-side test; it
+    # sets only X-Forwarded-For/-Host/-Proto/-Uri itself, leaving these alone.
+    userHeader: X-Forwarded-User
+    groupsHeader: X-Forwarded-Groups
+    groupsSeparator: ","
+    proxySecret:
+      existingSecret: kopiur-ui-proxy-token
+      key: token
+
+  rbac:
+    # The human roles the test binds to `e2e-editor`.
+    userRoles: true
+    # The browse role. ON here because the browse scenarios are the whole reason
+    # this shard exists — the session pod exec is the one path that has never run
+    # against a real apiserver. The test binds it with a NAMESPACED RoleBinding,
+    # never cluster-wide, because that grant carries the namespace's repository
+    # credentials with it.
+    browseRole: true
+    # execPolicy stays OFF (chart default): a ValidatingAdmissionPolicy fails
+    # CLOSED, so enabling it for every scenario here would turn one wrong CEL
+    # expression into "browse is broken" across the shard. It has its own
+    # dedicated scenario instead.
+
+  # Reads come from watch-fed stores gated per identity by SubjectAccessReviews —
+  # the default, and the mode almost every install runs. Leaving it on means the
+  # authorization assertions exercise the SAR gate rather than bypassing it.
+  cache:
+    enabled: true
+
+  session:
+    # kind pulls nothing (the mover image is preloaded), but the node is loaded
+    # and a cold session pod still has to schedule and connect to the repository.
+    readyTimeout: 300s
+    ttl: 15m
