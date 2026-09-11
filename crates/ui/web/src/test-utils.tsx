@@ -170,3 +170,57 @@ export function calledPaths(): string[] {
     return input instanceof URL ? input.pathname + input.search : input.url;
   });
 }
+
+/**
+ * A component under a fresh query client and a bare router.
+ *
+ * The third mount, for the thing neither of the other two fits: a control
+ * that calls hooks (`/me`, a mutation) and renders `<Link>`s but is not a
+ * route — every dialog in `components/actions/` is one. `mountApp` would drag
+ * in a whole page's reads; `renderWithRouter` has no query client for the
+ * hooks to use.
+ */
+export function renderWithClient(element: ReactElement, path = "/") {
+  const root = createRootRoute({ component: () => element });
+  const router = createRouter({
+    routeTree: root,
+    history: createMemoryHistory({ initialEntries: [path] }),
+  });
+  const client = createQueryClient();
+  const result = render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return { ...result, router, client };
+}
+
+/**
+ * The JSON body of the request sent to `path`, parsed.
+ *
+ * Asserting the *body* is the point for a mutating control: a dialog that
+ * posts to the right URL with the wrong fields is the failure mode the
+ * generated request types exist to catch, and `toEqual` against a typed
+ * fixture is what catches it.
+ */
+export function sentBody(path: string): unknown {
+  const call = fetchMock.mock.calls.find(([input]) => input === path);
+  if (call === undefined) {
+    throw new Error(`no request to ${path}; sent ${calledPaths().join(", ")}`);
+  }
+  const body = call[1]?.body;
+  if (typeof body !== "string") {
+    throw new Error(`request to ${path} carried no JSON body`);
+  }
+  return JSON.parse(body) as unknown;
+}
+
+/** `ME` with only the named capabilities granted — everything else refused. */
+export function meWith(allowed: Partial<Me["can"]>): Response {
+  return jsonResponse({
+    ...ME,
+    can: Object.fromEntries(
+      Object.keys(ME.can).map((key) => [key, allowed[key as keyof Me["can"]] ?? false]),
+    ),
+  });
+}

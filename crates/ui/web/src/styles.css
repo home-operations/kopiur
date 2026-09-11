@@ -2108,3 +2108,81 @@ svg {
   gap: var(--space-2);
   justify-items: start;
 }
+
+/* ==========================================================================
+   Task 8 — policies, schedules, restores, maintenance, and the shared action
+   dialogs (src/components/actions/*). Appended as one contiguous block so the
+   three concurrent stylesheet edits stay separable; nothing above is touched.
+   ========================================================================== */
+
+/* ---- action dialogs: the shared shell ------------------------------------- */
+
+/* The wrapper holds one trigger, its confirmation and its result in a column,
+   so a dialog drops into an action bar, a detail section or a ledger cell
+   without the caller arranging three pieces. */
+.action {
+  display: grid;
+  gap: var(--space-3);
+  justify-items: start;
+  min-width: 0;
+}
+
+/* A group of radios inside a confirmation: the choice and its consequence on
+   one line each, so the cost of an answer is read beside the answer rather
+   than in prose above it. `fieldset` for the grouping a legend gives assistive
+   technology; the UA's own border is dropped because the confirmation panel is
+   already the one level of enclosure. */
+.action__choice {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.action__choice > legend {
+  padding: 0;
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+
+.action__choice > label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
+  color: var(--fg);
+  line-height: var(--leading-prose);
+}
+
+.action__choice input[type="radio"] {
+  /* Nudged down onto the first line's baseline rather than its cap height. */
+  margin: 0.2em 0 0;
+  accent-color: var(--accent);
+}
+
+/* The destructive question is the one that decides whether existing data
+   survives, so it is set off by the failed lamp's own rule rather than by a
+   second box. */
+.action__choice[data-danger="true"] {
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--health-failed-fg);
+}
+
+.action__note {
+  margin: 0;
+  color: var(--fg-faint);
+  font-size: var(--text-sm);
+  line-height: var(--leading-prose);
+}
+
+/* The clause naming an irreversible consequence, in the failed lamp's ink —
+   it is the sentence the reader must not skim. */
+.action__prose p[data-destructive="true"] {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
