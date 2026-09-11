@@ -72,6 +72,17 @@ export interface ActionPanelProps {
    */
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
+  /**
+   * Render the confirmation and the result without a trigger of their own.
+   *
+   * For a ledger: a table cell is a column, and a column squeezes a
+   * paragraph into a tall thin ribbon that shoves every other column narrow —
+   * the row version of the defect that moved the repository action bar's
+   * confirmation out of its trigger. The caller puts a bare `ActionButton` in
+   * the cell, keeps the open row in state, and renders this once *below* the
+   * ledger at full width. `open` must then be controlled.
+   */
+  hideTrigger?: boolean | undefined;
 }
 
 export function ActionPanel({
@@ -89,6 +100,7 @@ export function ActionPanel({
   children,
   open,
   onOpenChange,
+  hideTrigger = false,
 }: ActionPanelProps) {
   const [ownOpen, setOwnOpen] = useState(false);
   const controlled = open !== undefined;
@@ -109,21 +121,25 @@ export function ActionPanel({
 
   return (
     <div className="action">
-      <ActionButton
-        variant={variant}
-        disabledReason={disabledReason}
-        aria-expanded={isOpen}
-        onClick={() => {
-          setOpen(!isOpen);
-        }}
-      >
-        {Icon !== undefined ? <Icon size={14} strokeWidth={2} aria-hidden="true" /> : null}
-        {label}
-      </ActionButton>
+      {hideTrigger ? null : (
+        <>
+          <ActionButton
+            variant={variant}
+            disabledReason={disabledReason}
+            aria-expanded={isOpen}
+            onClick={() => {
+              setOpen(!isOpen);
+            }}
+          >
+            {Icon !== undefined ? <Icon size={14} strokeWidth={2} aria-hidden="true" /> : null}
+            {label}
+          </ActionButton>
 
-      {blocked && shortReason !== undefined ? (
-        <span className="action__short">{shortReason}</span>
-      ) : null}
+          {blocked && shortReason !== undefined ? (
+            <span className="action__short">{shortReason}</span>
+          ) : null}
+        </>
+      )}
 
       {isOpen ? (
         <div className="action__confirm" role="group" aria-label={label}>

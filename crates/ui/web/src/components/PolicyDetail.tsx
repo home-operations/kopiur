@@ -216,13 +216,33 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
               Nothing to verify against: this policy names no repository.
             </p>
           ) : (
-            <Facts
-              label="Verification"
-              facts={detail.verification.map((entry) => ({
-                term: entry.repository,
-                value: <LastSuccess at={entry.lastVerified} now={now} never="never verified" />,
-              }))}
-            />
+            // A ledger rather than `Facts`: the term here is a repository
+            // key, and a `Facts` term is set in label caps —
+            // `Repository/media/nas` would be shown as
+            // `REPOSITORY/MEDIA/NAS`, which is not the object's name.
+            // Identifiers stay in monospace and in their own case.
+            <div className="ledger-scroll">
+              <table className="ledger" aria-label="Verification">
+                <thead>
+                  <tr>
+                    <th scope="col">Repository</th>
+                    <th scope="col" className="num">
+                      Last verified
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {detail.verification.map((entry) => (
+                    <tr key={entry.repository}>
+                      <td className="mono">{entry.repository}</td>
+                      <td className="num">
+                        <LastSuccess at={entry.lastVerified} now={now} never="never verified" />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
           <p className="page__section-note">
             Verification reads the snapshot back out of the repository. A backup that has never been

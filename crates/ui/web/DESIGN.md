@@ -278,6 +278,8 @@ marker the system has.
 
 - **Head:** label caps in ink faint over a strong hairline.
 - **Rows:** 0.5rem × 0.75rem cells, hairline between rows, hover overlay; numeric cells right-aligned in tabular figures.
+- **Rule — an absence is worded, not dashed.** `-` (`EMPTY_CELL`) is for a value that legitimately has none. "This backup has never succeeded", "this schedule has never fired", "this policy names no repository" and a run of failed runs are the loudest cells in their ledgers, set in the failed lamp's ink; an absence that is merely an absence (no next slot computed for a suspended schedule) stays faint. A blank would hide the one fact the row exists to report.
+- **Rule — an identifier never goes in a `Facts` term.** A `dl` term is set in label caps, so `Repository/media/nas` would be shown as `REPOSITORY/MEDIA/NAS`, which is not the object's name. A handful of named values keyed by an identifier is a two-column ledger, not a definition list.
 
 ### Navigation
 
@@ -352,6 +354,25 @@ marker the system has.
 
 - **Style:** an `action-bar` of triggers bare on the canvas; opening one reveals an `action__confirm` panel — surface fill, hairline, 6px, max 34rem — carrying prose that says what the action will do and a primary/quiet pair. The result sits beneath the trigger.
 - **Rule:** the panel is the _first_ box, so the bar itself is never a panel and the confirmation is never a card in a card. The destructive control (suspend, which stops backups) takes the danger variant. Every trigger is `ActionButton`, so an action the caller's RBAC forbids stays visible, focusable and explained rather than hidden.
+- **Composition:** one `ActionPanel` (`components/actions/`) holds a dialog's trigger, confirmation and result in an `.action` wrapper, so a dialog drops into a bar, a detail section or a ledger cell as a single element. Inside an `action-bar` the wrapper is `display: contents`, which keeps the trigger in its place and lets the open panel and the receipt become rows of the bar rather than growing one trigger's slot — an open confirmation never moves the other triggers.
+- **Rule — a ledger holds the trigger only.** A cell is a column, and a column turns a paragraph into a tall thin ribbon that starves every other column. In a ledger the cell carries a bare `ActionButton`, the page keeps the open row in state, and one confirmation renders below the whole table (`ActionPanel.hideTrigger`).
+- **Rule — two refusals, not one.** `disabledReason` is "you may not" and closes the question; `blockedReason` blocks only the confirm button, for a required choice not yet made, so the form stays readable while it cannot be sent.
+- **Rule — the refusal has two lengths.** `.ledger-scroll` suppresses the floating tooltip, so a control refused inside one also shows `action__short` — a few words in faint ink — with the whole sentence still on `aria-describedby` and `title`. The word comes from `/me`'s **state** (`components/actions/reason.ts`), never from matching on the sentence: a failed `/me` reads "cannot tell", never "not permitted".
+
+### Choice
+
+- **Style:** an `action__choice` fieldset inside a confirmation: a label-caps legend, then one row per answer — the radio beside the consequence of choosing it, in prose, at reading measure. The answer that destroys or permanently keeps data takes `data-danger`, a 2px failed-lamp rule down its left edge; a sentence naming an irreversible consequence takes the failed lamp's ink.
+- **Rule:** a field whose wrong value costs data is asked, never defaulted — neither radio starts selected and the confirm button carries the reason it is blocked. The two on this console are a snapshot's `pin` (permanent exemption from pruning) and a restore's `overwrite`, whose unset value is **not** neutral: it sends no kopia flag and kopia's own default overwrites. The prose names the wire field, so the reader can find it in their own manifest.
+
+### Retention rules
+
+- **Style:** a three-column list — the count right-aligned in tabular figures, what it keeps in words, the wire field in faint mono — collapsing to two columns below 560px with the field beneath.
+- **Rule:** only the slots the policy actually sets are listed. An unset rule is not a zero: `keepHourly: 0` says keep no hourly slots, while an absent `keepHourly` says the policy never mentioned them. A policy with none says no GFS retention is configured, and says nothing about what will happen to its snapshots — because it has not been decided there.
+
+### Log tail
+
+- **Style:** a monospace block on the inset ground, hairline, 6px, capped at 22rem and scrolling, never wrapped.
+- **Rule:** a wrapped kopia line is a different line. The text is the server's, redacted at the edge; an empty tail is a sentence saying the mover wrote none, not an empty box.
 
 ### Receipt
 

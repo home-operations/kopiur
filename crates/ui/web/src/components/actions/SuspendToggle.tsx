@@ -41,6 +41,12 @@ export interface SuspendToggleProps {
    * short word in the cell. See `reason.ts`.
    */
   inLedger?: boolean | undefined;
+  /**
+   * Render the confirmation and the result with no trigger — for a ledger,
+   * where the trigger lives in the row's cell and the panel below the table.
+   * See `ActionPanel.hideTrigger`.
+   */
+  hideTrigger?: boolean | undefined;
   /** Controlled open state, for a bar that allows one open question at a time. */
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
@@ -53,6 +59,7 @@ export function SuspendToggle({
   suspended,
   consequence,
   inLedger = false,
+  hideTrigger = false,
   open,
   onOpenChange,
 }: SuspendToggleProps) {
@@ -91,6 +98,7 @@ export function SuspendToggle({
       problem={suspend.error?.problem}
       open={open}
       onOpenChange={onOpenChange}
+      hideTrigger={hideTrigger}
     >
       <p>
         This sets <span className="mono">{meta.path}</span> to{" "}

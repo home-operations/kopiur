@@ -2329,17 +2329,14 @@ svg {
   min-width: 0;
 }
 
-/* A confirmation opened inside a ledger cell is narrower than one on a page:
-   the cell grows to hold it, and 34rem would shove every other column off the
-   scroll container's edge. The panel is still the first box, so the cell
-   itself gets no border of its own. */
-.ledger .action__confirm {
-  max-width: 22rem;
-  white-space: normal;
-}
-
+/* A ledger's action cell holds only a trigger. The confirmation belongs below
+   the whole table (see `ActionPanel.hideTrigger`): a cell is a column, and a
+   column turns a paragraph into a tall thin ribbon that shoves every other
+   column narrow. This keeps the cell's own stack tidy; it is not a licence to
+   put a panel back in one. */
 .ledger .action {
   justify-items: stretch;
+  gap: var(--space-1);
 }
 
 /* ---- restore ledger and detail -------------------------------------------- */
@@ -2427,4 +2424,72 @@ svg {
   color: var(--fg-faint);
   font-size: var(--text-xs);
   overflow-wrap: anywhere;
+}
+
+/* A reference list inside a `Facts` value wraps rather than ellipsising. The
+   names here are source paths and repository keys — `pvcSelector(tier=gold,
+   app=media)` truncated to `pvcSelector(tier=gold,app=medi…` is a selector
+   the reader cannot check against their own manifest, which is the same
+   defect that made the work ledger wrap its object names. */
+.facts .ref-list .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+.facts .ref-list {
+  row-gap: var(--space-1);
+}
+
+/* A confirmation's fields are wider than a control bar's.
+   `.action__confirm .controls__field` was capped at 12rem, which is right for
+   a duration or a bare mode token and wrong for a field whose own words are
+   the content: the restore dialog's repository select read "Infer it from the"
+   with the rest clipped off, and its optional-name placeholder fared no
+   better. Same selector, later in the file, so the earlier rule is untouched
+   and simply superseded. */
+.action__confirm .controls__field {
+  max-width: 24rem;
+}
+
+.action__confirm .controls__input {
+  width: 100%;
+}
+
+/* An open confirmation must not move the other triggers.
+   `ActionPanel` keeps its trigger, panel and result in one wrapper so a dialog
+   drops anywhere as a single element — but inside an `action-bar` that wrapper
+   is a flex item, and an open 34rem panel grew it and shoved every other
+   trigger across the row. (Task 5 hit the same thing and moved the panel below
+   the bar; this is that, without splitting the component.)
+
+   `display: contents` takes the wrapper out of the layout, so the trigger is a
+   flex item of the bar and keeps its place, while the panel and the receipt
+   become full-width rows *after* every trigger. The short refusal stays beside
+   its own button in source order. */
+.action-bar > .action {
+  display: contents;
+}
+
+.action-bar > .action > .action__confirm {
+  flex: 1 0 100%;
+  order: 2;
+}
+
+.action-bar > .action > .receipt,
+.action-bar > .action > .problem {
+  flex: 1 0 100%;
+  order: 3;
+}
+
+/* The disabled-reason tooltip is 28rem wide, which is wider than the content
+   column on a phone — and an absolutely-positioned descendant counts toward
+   its ancestor's overflow even while hidden, so a refused control was pushing
+   a horizontal scrollbar onto the whole page at 390px. (The same mechanism
+   that made a ledger suppress it entirely.) Capped to the viewport at narrow
+   widths; the desktop width is untouched. */
+@media (max-width: 700px) {
+  .button[data-reason]::after {
+    max-width: calc(100vw - 4rem);
+  }
 }
