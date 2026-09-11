@@ -122,38 +122,40 @@ function LagPlot({ series }: { series: LagSeries }) {
         </span>
       </figcaption>
 
-      <svg
-        className="chart__plot"
-        viewBox={`0 0 ${String(LAG.width)} ${String(height)}`}
-        preserveAspectRatio="xMidYMid meet"
-        aria-hidden="true"
-        focusable="false"
-        onMouseLeave={() => {
-          setHovered(null);
-        }}
-      >
-        {bars.map((bar, index) => {
-          const y = LAG.top + index * LAG.rowHeight;
-          return (
-            <Bar
-              key={bar.id}
-              bar={bar}
-              y={y}
-              width={lagWidth(bar.ageMs, max)}
-              current={bar.id === shown?.id}
-              onEnter={() => {
-                setHovered(bar.id);
-              }}
-            />
-          );
-        })}
-        <text className="chart__axis" x={LAG.plotLeft} y={height - 6} textAnchor="start">
-          just now
-        </text>
-        <text className="chart__axis" x={LAG.plotRight} y={height - 6} textAnchor="end">
-          {humanDuration(max / 1000)} ago
-        </text>
-      </svg>
+      <div className="chart__scroll">
+        <svg
+          className="chart__plot"
+          viewBox={`0 0 ${String(LAG.width)} ${String(height)}`}
+          preserveAspectRatio="xMidYMid meet"
+          aria-hidden="true"
+          focusable="false"
+          onMouseLeave={() => {
+            setHovered(null);
+          }}
+        >
+          {bars.map((bar, index) => {
+            const y = LAG.top + index * LAG.rowHeight;
+            return (
+              <Bar
+                key={bar.id}
+                bar={bar}
+                y={y}
+                width={lagWidth(bar.ageMs, max)}
+                current={bar.id === shown?.id}
+                onEnter={() => {
+                  setHovered(bar.id);
+                }}
+              />
+            );
+          })}
+          <text className="chart__axis" x={LAG.plotLeft} y={height - 6} textAnchor="start">
+            just now
+          </text>
+          <text className="chart__axis" x={LAG.plotRight} y={height - 6} textAnchor="end">
+            {humanDuration(max / 1000)} ago
+          </text>
+        </svg>
+      </div>
 
       <div className="ledger-scroll">
         <table className="ledger" aria-label="Replication lag">

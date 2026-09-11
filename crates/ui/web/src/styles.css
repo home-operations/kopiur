@@ -2747,8 +2747,23 @@ svg {
   color: var(--fg-faint);
 }
 
+/* A plot scrolls; it does not shrink. Both charts are drawn in a 560-unit
+   viewBox, and `width: 100%` alone scaled that to 332px on a phone — which
+   scales the 9px axis text to 5.3px, below anything a person can read. The
+   ledgers already answered this question: keep the drawing at the size it was
+   designed for and let the narrow viewport scroll to it. */
+.chart__scroll {
+  overflow-x: auto;
+  min-width: 0;
+  /* Same reason as `.ledger-scroll`: an absolutely positioned descendant with
+     no offsets sits at its static position, and without a positioned ancestor
+     that is measured against the page. */
+  position: relative;
+}
+
 .chart__plot {
   width: 100%;
+  min-width: 35rem;
   height: auto;
   overflow: visible;
 }

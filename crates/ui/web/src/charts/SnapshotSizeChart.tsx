@@ -125,57 +125,64 @@ function PolicyChart({ series }: PolicyChartProps) {
         </span>
       </figcaption>
 
-      <svg
-        className="chart__plot"
-        viewBox={`0 0 ${String(CHART.width)} ${String(CHART.height)}`}
-        preserveAspectRatio="xMidYMid meet"
-        aria-hidden="true"
-        focusable="false"
-        onMouseLeave={() => {
-          setHovered(null);
-        }}
-      >
-        {gridlines.map((value) => (
-          <g key={value}>
-            <line
-              className="chart__grid"
-              x1={area.left}
-              x2={area.right}
-              y1={area.y(value)}
-              y2={area.y(value)}
+      <div className="chart__scroll">
+        <svg
+          className="chart__plot"
+          viewBox={`0 0 ${String(CHART.width)} ${String(CHART.height)}`}
+          preserveAspectRatio="xMidYMid meet"
+          aria-hidden="true"
+          focusable="false"
+          onMouseLeave={() => {
+            setHovered(null);
+          }}
+        >
+          {gridlines.map((value) => (
+            <g key={value}>
+              <line
+                className="chart__grid"
+                x1={area.left}
+                x2={area.right}
+                y1={area.y(value)}
+                y2={area.y(value)}
+              />
+              <text
+                className="chart__axis"
+                x={area.left - 6}
+                y={area.y(value) + 4}
+                textAnchor="end"
+              >
+                {humanBytes(Math.round(value))}
+              </text>
+            </g>
+          ))}
+
+          <path className="chart__line" d={linePath(points, area)} />
+
+          {points.map((point, index) => (
+            <Marker
+              key={`${point.namespace}/${point.name}`}
+              point={point}
+              x={area.x(point.ms)}
+              y={area.y(point.bytes)}
+              current={index === shownIndex}
+              onEnter={() => {
+                setHovered(index);
+              }}
             />
-            <text className="chart__axis" x={area.left - 6} y={area.y(value) + 4} textAnchor="end">
-              {humanBytes(Math.round(value))}
+          ))}
+
+          {first !== undefined ? (
+            <text className="chart__axis" x={area.left} y={CHART.bottom + 18} textAnchor="start">
+              {formatTimestamp(first.at)}
             </text>
-          </g>
-        ))}
-
-        <path className="chart__line" d={linePath(points, area)} />
-
-        {points.map((point, index) => (
-          <Marker
-            key={`${point.namespace}/${point.name}`}
-            point={point}
-            x={area.x(point.ms)}
-            y={area.y(point.bytes)}
-            current={index === shownIndex}
-            onEnter={() => {
-              setHovered(index);
-            }}
-          />
-        ))}
-
-        {first !== undefined ? (
-          <text className="chart__axis" x={area.left} y={CHART.bottom + 18} textAnchor="start">
-            {formatTimestamp(first.at)}
-          </text>
-        ) : null}
-        {last !== undefined && points.length > 1 ? (
-          <text className="chart__axis" x={area.right} y={CHART.bottom + 18} textAnchor="end">
-            {formatTimestamp(last.at)}
-          </text>
-        ) : null}
-      </svg>
+          ) : null}
+          {last !== undefined && points.length > 1 ? (
+            <text className="chart__axis" x={area.right} y={CHART.bottom + 18} textAnchor="end">
+              {formatTimestamp(last.at)}
+            </text>
+          ) : null}
+        </svg>
+      </div>
 
       <details className="chart__data">
         <summary>{tableSummary(series)}</summary>
