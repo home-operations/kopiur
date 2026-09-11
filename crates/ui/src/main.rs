@@ -47,9 +47,7 @@ use kube::api::{Api, PostParams};
 use kopiur_ui::config::{UiArgs, UiConfig};
 use kopiur_ui::metrics::UiMetrics;
 use kopiur_ui::ops_listener::{CacheState, Readiness, serve_ops};
-use kopiur_ui::startup::{
-    CORE_GROUP, ImpersonationTarget, impersonation_targets, track_cache_readiness,
-};
+use kopiur_ui::startup::{ImpersonationTarget, impersonation_targets, track_cache_readiness};
 use kopiur_ui::{AppState, app, auth, browse, cache, static_files};
 
 /// Exit code for a refused configuration, distinct from a crash.
