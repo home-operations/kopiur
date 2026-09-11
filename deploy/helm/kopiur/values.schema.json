@@ -1242,7 +1242,7 @@
             },
             "userRoles": {
               "default": true,
-              "description": "Render the human roles: `kopiur-ui-viewer` (read-only) and\n`kopiur-ui-editor` (the console's action buttons), which aggregate into\n`kopiur-ui-user`. Bind `kopiur-ui-user` to your people — the chart creates\nno bindings, because who may operate your backups is not a chart decision.",
+              "description": "Render the human roles: `kopiur-ui-viewer` (read-only) and\n`kopiur-ui-editor` (the console's action buttons), which aggregate into\n`kopiur-ui-user`, plus the namespaced `kopiur-ui-doctor` Role. Bind\n`kopiur-ui-user` to your people — the chart creates no bindings, because\nwho may operate your backups is not a chart decision.\n\nThese render only while `ui.enabled` is also true, so an install that does\nnot run the console gains no ClusterRoles for a component it does not have.\nThe consequence: setting `ui.enabled: false` DELETES these roles, and any\n(Cluster)RoleBinding you made to them is left with a dangling roleRef and\ngrants nothing until you re-enable the console (bindings survive, so access\nreturns by itself — nothing needs re-creating). That is only ever true\nwhile there is no console to use, which is why the roles stay gated rather\nthan appearing in every install that has never heard of the UI.",
               "title": "userRoles",
               "type": "boolean"
             }
@@ -1370,7 +1370,7 @@
             },
             "type": {
               "default": "ClusterIP",
-              "description": "Service type. Keep ClusterIP: this Service is for your proxy to reach,\nnot for the internet. A LoadBalancer here would expose a console that\ntrusts identity headers to whoever can send them.",
+              "description": "Service type. Keep ClusterIP: this Service is for your proxy to reach,\nnot for the internet — a LoadBalancer or NodePort here publishes a console\nthat trusts identity headers to whoever can send them.\n\nA non-ClusterIP type is allowed when the proxy really does live outside the\ncluster, but ONLY alongside auth.proxySecret: publishing the console AND\nsetting auth.acknowledgeNoProxySecret is refused, because the pair is an\nunauthenticated console on the network.",
               "title": "type",
               "type": "string"
             }

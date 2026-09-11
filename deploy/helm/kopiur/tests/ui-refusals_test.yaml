@@ -59,6 +59,66 @@ tests:
       - hasDocuments:
           count: 1
 
+  # Each half of the next one is defensible ALONE — an authenticating proxy
+  # outside the cluster justifies a LoadBalancer, and the acknowledgement is the
+  # documented escape hatch for a mesh or NetworkPolicy that closes the hole.
+  # Together they are an unauthenticated console reachable from the network,
+  # where anyone who sets the identity header becomes that person.
+  - it: refuses an off-cluster Service with no proxy secret — that is an open console
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.acknowledgeNoProxySecret: true
+      ui.service.type: LoadBalancer
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui\.service\.type is "LoadBalancer"'
+      # Both ways out must be named, not just the problem.
+      - failedTemplate:
+          errorPattern: 'ui\.service\.type: ClusterIP'
+      - failedTemplate:
+          errorPattern: "ui.auth.proxySecret.existingSecret"
+
+  - it: refuses a NodePort Service on the same reasoning
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.acknowledgeNoProxySecret: true
+      ui.service.type: NodePort
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui\.service\.type is "NodePort"'
+
+  - it: allows a ClusterIP Service with the acknowledgement — only the pair is refused
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.acknowledgeNoProxySecret: true
+      ui.service.type: ClusterIP
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: allows an off-cluster Service when a proxy secret proves the caller is the proxy
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.service.type: LoadBalancer
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: allows an off-cluster Service in anonymous mode — no header to forge
+    set:
+      ui.enabled: true
+      ui.auth.anonymous.enabled: true
+      ui.auth.anonymous.user: kopiur-anonymous
+      ui.service.type: LoadBalancer
+    asserts:
+      - hasDocuments:
+          count: 1
+
   - it: refuses anonymous mode with nobody to be
     set:
       ui.enabled: true

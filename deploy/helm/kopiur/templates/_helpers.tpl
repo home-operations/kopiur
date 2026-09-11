@@ -316,6 +316,17 @@ into a failed `helm upgrade`.
 {{- fail (printf "ui.auth.userHeader is set (%q) but ui.auth.proxySecret.existingSecret is empty. Identity headers are only trustworthy if nothing else can set them, and in a cluster any pod — or anyone who can reach the Service, including through the apiserver's services/proxy — can send those same headers directly to kopiur-ui and become any user, including one bound to kopiur-ui-editor. Create a Secret holding a shared token, set ui.auth.proxySecret.existingSecret to its name, and configure your proxy to send that token as the X-Kopiur-Proxy-Token header. If something else already prevents direct access (a mesh with mTLS, a NetworkPolicy — see ui.networkPolicy), set ui.auth.acknowledgeNoProxySecret: true to record that decision." $auth.userHeader) -}}
 {{- end -}}
 
+{{/* The acknowledgement says "something else stops anything but my proxy from
+     reaching the Service". A Service type that publishes the console beyond the
+     cluster is that claim's direct contradiction, and the two together are an
+     unauthenticated console on the network: whoever reaches it sets the identity
+     header and IS that person. Each half alone is legitimate — an off-cluster
+     proxy needs a LoadBalancer, and the acknowledgement is the documented escape
+     hatch — so only the pair is refused. */}}
+{{- if and $hasHeader $auth.acknowledgeNoProxySecret (ne (.Values.ui.service.type | default "ClusterIP") "ClusterIP") -}}
+{{- fail (printf "ui.service.type is %q while ui.auth.acknowledgeNoProxySecret is true and ui.auth.userHeader is set (%q). That publishes an identity-header-trusting console beyond the cluster with nothing to prove a request came from your proxy: anyone who can reach the Service sends X-Forwarded-User and is authorized as that person, including as someone bound to kopiur-ui-editor. Either keep ui.service.type: ClusterIP and point your proxy at the Service from inside the cluster, or — if the proxy really is outside — set ui.auth.proxySecret.existingSecret to a Secret holding a shared token and have the proxy send it as X-Kopiur-Proxy-Token, which makes the acknowledgement unnecessary." (.Values.ui.service.type | default "ClusterIP") $auth.userHeader) -}}
+{{- end -}}
+
 {{/* A NetworkPolicy with no peer is either a lockout or, written loosely, an
      allow-all — and the second one looks like protection. */}}
 {{- if and .Values.ui.networkPolicy.enabled (not .Values.ui.networkPolicy.proxySelector) -}}
