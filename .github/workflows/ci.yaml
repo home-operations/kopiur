@@ -627,6 +627,98 @@ jobs:
                  "ran, built natively on the runner. Releases stay amd64+arm64."
           } >> "${GITHUB_STEP_SUMMARY}"
 
+  # Publish the chart itself per pull request, so trying a branch in a GitOps
+  # repo is a one-line tag bump on an OCIRepository that already exists --
+  # rather than swapping the chart source to a GitRepository and back. A chart
+  # change is only really reviewable by rendering it where it will run.
+  #
+  # Two versions, mirroring the image tags: `<base>-pr<n>` moves with the
+  # branch, `<base>-pr<n>.g<sha>` does not. Helm demands SemVer2 and the OCI tag
+  # IS the chart version, so the tags cannot read `pr-460` the way the images
+  # do; they are prerelease identifiers on the current chart version. The `g`
+  # before the sha is not decoration -- a bare 7-hex sha that happens to be all
+  # digits and starts with `0` is a leading-zero numeric identifier, which is
+  # invalid SemVer, and this job would fail for one commit in a few hundred.
+  #
+  # appVersion is the PR image tag, so the chart resolves all four component
+  # images to this same commit's builds. Chart and binaries from one commit is
+  # the only combination anything tested; override `<component>.image.tag` to
+  # mix a released binary back in.
+  pr-chart:
+    if: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && !startsWith(github.head_ref, 'release-please--') }}
+    name: PR Chart
+    # pr-image so the chart is never published pointing at images that do not
+    # exist yet; the two chart gates so a chart failing its own tests is never
+    # published at all.
+    needs:
+      - pr-image
+      - helm-lint
+      - helm-unittest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          install_args: --locked
+
+      # helm reads the docker config this writes for OCI registry auth, which is
+      # how the release job authenticates its own `helm push`.
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package and push chart
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          base="$(yq '.version' deploy/helm/kopiur/Chart.yaml)"
+          sha="${HEAD_SHA:0:7}"
+          apptag="pr-${PR}-${sha}"
+          moving="${base}-pr${PR}"
+          pinned="${base}-pr${PR}.g${sha}"
+          for version in "${moving}" "${pinned}"; do
+            helm package deploy/helm/kopiur \
+              --version "${version}" \
+              --app-version "${apptag}"
+            helm push "kopiur-${version}.tgz" "oci://ghcr.io/${OWNER}/charts"
+          done
+          {
+            echo "### Chart"
+            echo
+            echo "Point an existing \`OCIRepository\` at this build by changing"
+            echo "one line -- no chart-source swap:"
+            echo
+            echo '```yaml'
+            echo "  ref:"
+            echo "    tag: \"${pinned}\"   # moving: ${moving}"
+            echo "  url: oci://ghcr.io/${OWNER}/charts/kopiur"
+            echo '```'
+            echo
+            echo "Its appVersion is \`${apptag}\`, so all four component images"
+            echo "resolve to this commit's builds with no image overrides. The"
+            echo "console still needs \`ui.enabled: true\` -- it is opt-in."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   helm-lint:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')
@@ -890,6 +982,7 @@ jobs:
       - helm-lint
       - helm-unittest
       - integration-test
+      - pr-chart
       - pr-image
       - rust-lint
       - rust-test
