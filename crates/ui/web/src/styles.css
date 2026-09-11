@@ -226,6 +226,12 @@ pre,
 .mono {
   font-family: var(--font-mono);
   font-size: 0.92em;
+  /* Everything wearing this class is an identifier — a field path, a Job name,
+     a kopia manifest ID — and none of them carry a break opportunity. `anywhere`
+     rather than `break-word` because it also lowers the element's min-content
+     width, which is what keeps a grid track from growing past the viewport. It
+     only breaks a token that would otherwise overflow. */
+  overflow-wrap: anywhere;
 }
 
 button,
@@ -356,8 +362,15 @@ svg {
   color: var(--fg);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
-  line-height: 1;
-  white-space: nowrap;
+  /* A label can name its object — "Run maintenance for <cluster-repository>" —
+     and that name is one unbreakable token. `nowrap` made the button as wide
+     as the name and pushed the page sideways. The button still sizes to its
+     content, so a short label never wraps; only one that cannot fit does.
+     The line height only shows once a label has two lines; a one-line button
+     is unchanged, being taller than its text either way. */
+  line-height: var(--leading-dense);
+  max-width: 100%;
+  overflow-wrap: anywhere;
   transition:
     background-color var(--dur-fast) var(--ease-out),
     border-color var(--dur-fast) var(--ease-out);
@@ -417,7 +430,10 @@ svg {
   top: calc(100% + 6px);
   left: 0;
   z-index: 20;
-  max-width: 28rem;
+  /* 28rem is the reading measure; the viewport is the hard limit. A control
+     near the right edge of a narrow screen would otherwise open a 448px panel
+     anchored to its own left edge and push the page sideways. */
+  max-width: min(28rem, calc(100vw - 2 * var(--space-4)));
   width: max-content;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--line);
@@ -683,6 +699,16 @@ svg {
   min-width: 0;
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
+}
+
+/* `min-width: 0` lets the title's BOX shrink; without this its TEXT keeps its
+   full width and paints straight over the theme switch beside it. Each part
+   truncates on its own so the section name survives longest. */
+.header__title > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .header__scope {
@@ -960,13 +986,19 @@ svg {
 
 /* ---- page: a route's sections, divided by space, not by boxes ------------ */
 
+/* `minmax(0, 1fr)`, not the implicit `auto`: an `auto` track takes its
+   minimum from its content, so one unbreakable token — a ClusterRepository
+   name, a Job name — widens the track past the viewport and takes the page
+   with it. `min-width: 0` on the item does not help; the track is what grows. */
 .page {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-6);
 }
 
 .page__section {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-3);
   align-content: start;
   min-width: 0;
@@ -977,6 +1009,16 @@ svg {
 .ledger-scroll {
   overflow-x: auto;
   min-width: 0;
+  /* Load-bearing, and not obvious: `.visually-hidden` is `position: absolute`
+     with no offsets, so it sits at its STATIC position — which, for a span in
+     a cell 1000px into a scrolled ledger, is 1000px from the left of whatever
+     its containing block is. Without a positioned ancestor that containing
+     block is the page, so a 1px screen-reader-only span drags the document's
+     scrollWidth out past the viewport and the WHOLE PAGE scrolls sideways.
+     Making the scroll box the containing block keeps it inside the ledger,
+     where it was always meant to be. Every `NotReported` and every disabled
+     control's reason is such a span. */
+  position: relative;
 }
 
 .ledger-scroll > .ledger {
@@ -1693,7 +1735,9 @@ svg {
 
   .shell {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto var(--header-height) minmax(0, 1fr);
+    /* `auto` for the header, not `var(--header-height)`: it wraps to two rows
+       at this width (see `.header` below) and a fixed row would clip it. */
+    grid-template-rows: auto auto minmax(0, 1fr);
     grid-template-areas:
       "rail"
       "header"
@@ -1742,13 +1786,62 @@ svg {
     border-radius: 2px 2px 0 0;
   }
 
+  /* Two rows, not one. At 390px the page name, the scope, the theme switch and
+     the identity strip cannot share a line — truncating them all to fit would
+     leave three ellipses and no facts. The header grows instead, so the grid
+     row that holds it has to stop being a fixed height (below). */
   .header {
     position: static;
-    padding: 0 var(--space-4);
+    height: auto;
+    min-height: var(--header-height);
+    padding: var(--space-2) var(--space-4);
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    row-gap: var(--space-2);
   }
 
   .header__title {
     font-size: var(--text-sm);
+    flex: 1 0 100%;
+  }
+
+  .header__tools {
+    flex-wrap: wrap;
+  }
+
+  /* No hover exists here, so a tooltip is a reason nobody can read — and one
+     anchored to a control's left edge would run off the page besides. The
+     refusal becomes a line under the control instead. A ledger keeps its own
+     answer (the short word in the cell, `actions/reason.ts`), so the sentence
+     stays hidden there rather than doubling up. */
+  .button[data-reason]::after {
+    content: none;
+  }
+
+  .button__reason {
+    position: static;
+    display: block;
+    width: auto;
+    height: auto;
+    margin: var(--space-1) 0 0;
+    overflow: visible;
+    clip: auto;
+    clip-path: none;
+    white-space: normal;
+    max-width: 34rem;
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    line-height: var(--leading-prose);
+  }
+
+  .ledger-scroll .button__reason {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .content {
@@ -1802,10 +1895,10 @@ svg {
     flex-basis: 100%;
   }
 
-  .facts__row {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0;
-  }
+  /* `.facts__row`'s narrow override does NOT live here — it would be dead.
+     The base rule is declared further down the file, in the facts section,
+     and an equal-specificity rule that comes later wins whatever the media
+     query says. It sits beside its base rule instead. */
 }
 
 @media (max-width: 560px) {
@@ -1932,6 +2025,18 @@ svg {
   margin: 0;
   font-size: var(--text-sm);
   overflow-wrap: anywhere;
+}
+
+/* One column below the shell's breakpoint. A 14rem label column beside a 390px
+   viewport leaves 122px for the value, which is where a repository name or a
+   Job name stops fitting and starts pushing the page sideways. This override
+   must stay AFTER the base rule above: it is the same specificity, so source
+   order — not the media query — decides which one wins. */
+@media (max-width: 900px) {
+  .facts__row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
 }
 
 /* A fact whose value is a way in, not a value: the icon marks it as a move. */
@@ -2343,10 +2448,6 @@ svg {
   .browse-pager {
     align-items: start;
     flex-direction: column;
-  }
-
-  .button[data-reason]::after {
-    max-width: calc(100vw - 4rem);
   }
 }
 
@@ -2971,6 +3072,11 @@ svg {
 .maintenance__resource {
   color: var(--fg-faint);
   font-size: var(--text-xs);
+  /* A flex item cannot shrink past its content without this pair, and a
+     `kopiur-system/<cluster-repository>-maintenance` name is long enough to
+     push a phone-width page sideways on its own. */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* A track that has never run, or a run of failures: the number is the fact,
