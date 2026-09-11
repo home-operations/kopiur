@@ -258,3 +258,24 @@ export function snapshotVerdict(row: SnapshotRow): SnapshotVerdict {
     : "";
   return { lamp, text: `${lamp.word}: ${how}${policy}.${pin}` };
 }
+
+/**
+ * How long the run took, from the two instants the row carries.
+ *
+ * `null` while a run is still going and for a row missing either end — never a
+ * `0`, which would read as a backup that finished instantly. An end before its
+ * start (clock skew across two nodes) is `null` too, rather than a negative
+ * duration rendered as an empty cell by accident.
+ */
+export function durationSeconds(row: SnapshotRow): number | null {
+  const { startTime, endTime } = row;
+  if (startTime === null || startTime === undefined || endTime === null || endTime === undefined) {
+    return null;
+  }
+  const start = new Date(startTime).getTime();
+  const end = new Date(endTime).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) {
+    return null;
+  }
+  return Math.round((end - start) / 1000);
+}

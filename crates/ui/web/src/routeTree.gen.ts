@@ -21,6 +21,7 @@ import { Route as SchedulesRouteImport } from './routes/schedules'
 import { Route as SnapshotsRouteImport } from './routes/snapshots'
 import { Route as TopologyRouteImport } from './routes/topology'
 import { Route as RepositoriesKindNameRouteImport } from './routes/repositories_.$kind.$name'
+import { Route as SnapshotsNamespaceNameRouteImport } from './routes/snapshots_.$namespace.$name'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -82,6 +83,11 @@ const RepositoriesKindNameRoute = RepositoriesKindNameRouteImport.update({
   path: '/repositories/$kind/$name',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SnapshotsNamespaceNameRoute = SnapshotsNamespaceNameRouteImport.update({
+  id: '/snapshots_/$namespace/$name',
+  path: '/snapshots/$namespace/$name',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -96,6 +102,7 @@ export interface FileRoutesByFullPath {
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
   '/repositories/$kind/$name': typeof RepositoriesKindNameRoute
+  '/snapshots/$namespace/$name': typeof SnapshotsNamespaceNameRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -110,6 +117,7 @@ export interface FileRoutesByTo {
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
   '/repositories/$kind/$name': typeof RepositoriesKindNameRoute
+  '/snapshots/$namespace/$name': typeof SnapshotsNamespaceNameRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -125,6 +133,7 @@ export interface FileRoutesById {
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
   '/repositories_/$kind/$name': typeof RepositoriesKindNameRoute
+  '/snapshots_/$namespace/$name': typeof SnapshotsNamespaceNameRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -141,6 +150,7 @@ export interface FileRouteTypes {
     | '/snapshots'
     | '/topology'
     | '/repositories/$kind/$name'
+    | '/snapshots/$namespace/$name'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -155,6 +165,7 @@ export interface FileRouteTypes {
     | '/snapshots'
     | '/topology'
     | '/repositories/$kind/$name'
+    | '/snapshots/$namespace/$name'
   id:
     | '__root__'
     | '/'
@@ -169,6 +180,7 @@ export interface FileRouteTypes {
     | '/snapshots'
     | '/topology'
     | '/repositories_/$kind/$name'
+    | '/snapshots_/$namespace/$name'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -184,6 +196,7 @@ export interface RootRouteChildren {
   SnapshotsRoute: typeof SnapshotsRoute
   TopologyRoute: typeof TopologyRoute
   RepositoriesKindNameRoute: typeof RepositoriesKindNameRoute
+  SnapshotsNamespaceNameRoute: typeof SnapshotsNamespaceNameRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -272,6 +285,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RepositoriesKindNameRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/snapshots_/$namespace/$name': {
+      id: '/snapshots_/$namespace/$name'
+      path: '/snapshots/$namespace/$name'
+      fullPath: '/snapshots/$namespace/$name'
+      preLoaderRoute: typeof SnapshotsNamespaceNameRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -288,6 +308,7 @@ const rootRouteChildren: RootRouteChildren = {
   SnapshotsRoute: SnapshotsRoute,
   TopologyRoute: TopologyRoute,
   RepositoriesKindNameRoute: RepositoriesKindNameRoute,
+  SnapshotsNamespaceNameRoute: SnapshotsNamespaceNameRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
