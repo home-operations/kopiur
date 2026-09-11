@@ -522,6 +522,111 @@ jobs:
           path: image-${{ matrix.image }}.tar.gz
           retention-days: 1
 
+  # Publish the exact images the e2e shards ran against, tagged for this pull
+  # request, so a reviewer can pull a build instead of reproducing one. The
+  # bytes are the artifact `e2e-image` already produced and the shards already
+  # tested -- not a rebuild, which could differ.
+  #
+  # Deliberately a separate job rather than a push step inside `e2e-image`: the
+  # shards need only the tarball, and a registry outage must not strand
+  # seventeen of them behind a failed `needs`.
+  #
+  # Skipped for pull requests from forks. GITHUB_TOKEN is read-only there no
+  # matter what `permissions:` asks for, so the push could only fail; `status`
+  # counts a skip as a pass.
+  pr-image:
+    if: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && !startsWith(github.head_ref, 'release-please--') }}
+    name: PR Image (${{ matrix.image }})
+    needs: e2e-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false # one image's registry failure shouldn't hide the others
+      matrix:
+        image:
+          - controller
+          - webhook
+          - mover
+          - ui
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-image-${{ matrix.image }}
+
+      - name: Load image
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker load -i "image-${IMAGE}.tar.gz"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Two tags. `pr-<n>` moves with the branch, so a reviewer can keep
+      # re-pulling one reference; `pr-<n>-<sha>` is immutable, so they can pin
+      # the build they actually tested. The sha names the head commit, though
+      # the image was built from CI's merge of it into the base -- which is the
+      # thing under review.
+      #
+      # Same package as the release (`kopiur-<component>`), so a preview and a
+      # release differ only by tag and the chart needs no `repository` override
+      # to run one. It does need `digest: ""`: release-please pins a digest into
+      # the shipped chart and `_helpers.tpl` lets a digest beat a tag, so a
+      # `tag` override alone would silently install the release instead.
+      - name: Tag and push
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          target="ghcr.io/${REPO}-${IMAGE}"
+          moving="${target}:pr-${PR}"
+          pinned="${target}:pr-${PR}-${HEAD_SHA:0:7}"
+          docker tag "kopiur/${IMAGE}:e2e" "${moving}"
+          docker tag "kopiur/${IMAGE}:e2e" "${pinned}"
+          docker push "${moving}"
+          docker push "${pinned}"
+          # The controller's image block is the chart's root `image:` -- it is
+          # the operator -- while the other three nest under their component.
+          case "${IMAGE}" in
+            controller) values="image" ;;
+            *) values="${IMAGE}.image" ;;
+          esac
+          {
+            echo "### \`${IMAGE}\`"
+            echo
+            echo '```'
+            echo "docker pull ${pinned}"
+            echo '```'
+            echo
+            echo "Also tagged \`pr-${PR}\`, which moves with the branch."
+            echo
+            echo "To run it from the chart, override the tag **and clear the"
+            echo "digest** -- a pinned digest beats a tag, so setting the tag"
+            echo "alone installs the release:"
+            echo
+            echo '```'
+            echo "--set ${values}.tag=pr-${PR}-${HEAD_SHA:0:7} \\"
+            echo "--set ${values}.digest="
+            echo '```'
+            echo
+            echo "linux/amd64 only: a preview reuses the image the e2e shards" \
+                 "ran, built natively on the runner. Releases stay amd64+arm64."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   helm-lint:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')
@@ -785,6 +890,7 @@ jobs:
       - helm-lint
       - helm-unittest
       - integration-test
+      - pr-image
       - rust-lint
       - rust-test
       - ui
