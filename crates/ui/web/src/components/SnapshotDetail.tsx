@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 import {
   Camera,
   Database,
+  FolderOpen,
   FolderTree,
   GitBranch,
   ScrollText,
@@ -19,6 +20,7 @@ import {
   humanDuration,
   relativeTime,
 } from "../util/format";
+import { useCurrentNamespace } from "../util/namespace";
 import { ConditionsTable } from "./ConditionsTable";
 import { Facts, type Fact } from "./Facts";
 import { Finding } from "./Finding";
@@ -69,6 +71,10 @@ export function SnapshotDetail({
   const { row } = detail;
   const verdict = snapshotVerdict(row);
   const Lamp = verdict.lamp.icon;
+  // The console's scope, so the browse link lands on a page still narrowed to
+  // the namespace the reader came from. Presentation still: this reads the
+  // URL the router already has, it issues no request.
+  const scope = useCurrentNamespace();
 
   return (
     <div className="page">
@@ -161,7 +167,7 @@ export function SnapshotDetail({
         </Section>
 
         <Section title="In the repository" icon={Database}>
-          <Facts label="In the repository" facts={storageFacts(detail)} />
+          <Facts label="In the repository" facts={storageFacts(detail, scope)} />
         </Section>
       </div>
 
@@ -258,7 +264,7 @@ function runFacts(detail: SnapshotDetailData, now: Date): Fact[] {
 }
 
 /** Where the snapshot lives and what happens to it. */
-function storageFacts(detail: SnapshotDetailData): Fact[] {
+function storageFacts(detail: SnapshotDetailData, scope: string | undefined): Fact[] {
   const { row } = detail;
   return [
     { term: "Repository", value: mono(row.repository) },
@@ -281,6 +287,27 @@ function storageFacts(detail: SnapshotDetailData): Fact[] {
         ? "yes"
         : (detail.browseBlocker ?? "no — the operator did not say why"),
     },
+    // Only when the operator says it is browsable. A link certain to land on
+    // "there is nothing here to list" is worse than no link: the reason is
+    // already on the row above, in the operator's own words.
+    ...(detail.browsable
+      ? [
+          {
+            term: "Files",
+            value: (
+              <Link
+                className="facts__action"
+                to="/snapshots/$namespace/$name/browse"
+                params={{ namespace: row.namespace, name: row.name }}
+                search={scope !== undefined ? { namespace: scope } : {}}
+              >
+                <FolderOpen size={14} strokeWidth={2} aria-hidden="true" />
+                Browse the files in this snapshot
+              </Link>
+            ),
+          },
+        ]
+      : []),
   ];
 }
 

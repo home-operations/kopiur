@@ -77,6 +77,32 @@ describe("SnapshotDetail", () => {
     expect(storage).not.toHaveTextContent("Deletion policyDelete");
   });
 
+  it("links to the file browser, carrying the console's namespace scope", async () => {
+    renderWithRouter(<SnapshotDetail detail={detail()} now={NOW} />, "/?namespace=media");
+    const link = await screen.findByRole("link", { name: /browse the files/i });
+    expect(link).toHaveAttribute("href", "/snapshots/media/nightly-29/browse?namespace=media");
+  });
+
+  it("omits the scope from the browse link when the console is cluster-wide", async () => {
+    renderWithRouter(<SnapshotDetail detail={detail()} now={NOW} />);
+    const link = await screen.findByRole("link", { name: /browse the files/i });
+    expect(link).toHaveAttribute("href", "/snapshots/media/nightly-29/browse");
+  });
+
+  it("offers no browse link when the operator says the snapshot cannot be browsed", async () => {
+    renderWithRouter(
+      <SnapshotDetail
+        now={NOW}
+        detail={detail({
+          browsable: false,
+          browseBlocker: "This backup failed, so it wrote no snapshot to browse.",
+        })}
+      />,
+    );
+    expect(await screen.findByText(/wrote no snapshot to browse/)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /browse the files/i })).not.toBeInTheDocument();
+  });
+
   it("says why browsing is unavailable in the blocker's own words", async () => {
     renderWithRouter(
       <SnapshotDetail

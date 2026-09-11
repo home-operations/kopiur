@@ -143,6 +143,38 @@ describe("Snapshot detail route", () => {
     expect(calledPaths()).toContain(PATH);
   });
 
+  it("reaches the file browser, and the real route tree resolves the link", async () => {
+    // The only screen that links to `…/browse`. A component test proves the
+    // href string; this one proves the app can actually go there — the two
+    // screens were built in separate worktrees and never met until now.
+    mockApi({
+      [PATH]: jsonResponse(detail()),
+      // No session yet — the browse page's ordinary first state.
+      [`${PATH}/session`]: problemResponse({
+        type: "urn:kopiur:problem:session-required",
+        title: "Session required",
+        status: 404,
+        detail: "No browse session is running for media/nightly-29.",
+        what: "No browse session is running for media/nightly-29.",
+        why: "Listing a snapshot needs a mover pod holding the repository open.",
+        fix: "start a browse session",
+        instance: `${PATH}/session`,
+        kubeReason: null,
+      }),
+    });
+    const { router } = mountApp("/snapshots/media/nightly-29?namespace=media");
+    const link = await screen.findByRole("link", { name: /browse the files/i });
+    expect(link).toHaveAttribute("href", "/snapshots/media/nightly-29/browse?namespace=media");
+    await userEvent.click(link);
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe("/snapshots/media/nightly-29/browse");
+    });
+    // Not a blank `<Outlet/>`: the browse page's own content rendered, and the
+    // scope survived the move.
+    expect(await screen.findByText("No browse session is running")).toBeInTheDocument();
+    expect(router.state.location.search).toEqual({ namespace: "media" });
+  });
+
   it("shows the cheap verdict without fetching the plan", async () => {
     mockApi({ [PATH]: jsonResponse(detail()) });
     mountApp("/snapshots/media/nightly-29");
