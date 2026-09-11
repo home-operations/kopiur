@@ -19,6 +19,9 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 croner = { workspace = true }
 cel = { workspace = true }
+# Only pulled in by the `testutil` feature, which exposes the YAML->JSON->typed
+# test bridge to downstream crates; the normal build never links it.
+serde_yaml = { workspace = true, optional = true }
 kube_quantity = "0.9.0"
 
 [dev-dependencies]
@@ -29,3 +32,7 @@ assert-json-diff = { workspace = true }
 # k8s-openapi requires exactly one version feature selected by the final artifact.
 # For this library's own builds/tests we pick a recent one; downstream binaries re-select.
 default = ["k8s-openapi/v1_33"]
+# Exposes `kopiur_api::testutil` (the YAML -> JSON value -> typed bridge the API
+# server itself uses) so downstream crates' tests parse manifests the cluster's
+# way. Test-support only — never enable it in a shipped binary.
+testutil = ["dep:serde_yaml"]

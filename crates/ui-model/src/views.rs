@@ -1,0 +1,1351 @@
+//! Read models: flattened, browser-shaped projections of the CRD status
+//! surface, one type per screen or table row.
+//!
+//! ## Why phases are *views*
+//!
+//! Each `*PhaseView` mirrors a CR's `status.phase` but adds an
+//! `Unknown { raw }` variant. The UI is versioned independently of the operator
+//! it talks to, so a newer controller writing a phase this build has never
+//! heard of must degrade to a labelled chip carrying the raw string — never to
+//! a deserialization error that blanks the whole table.
+
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+use crate::graph::{GateHit, GateSeverityView, Health};
+
+/// View of `Repository`/`ClusterRepository` `status.phase`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RepositoryPhaseView {
+    /// Not reconciled yet.
+    Pending,
+    /// Connecting to or creating the kopia repository.
+    Initializing,
+    /// Connected and usable.
+    Ready,
+    /// Usable, but a health probe or maintenance run is failing.
+    Degraded,
+    /// Unusable.
+    Failed,
+    /// A phase this build does not recognize.
+    Unknown {
+        /// The phase string exactly as the operator wrote it.
+        raw: String,
+    },
+}
+
+/// View of `Snapshot` `status.phase`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum SnapshotPhaseView {
+    /// Admitted, no mover Job yet.
+    Pending,
+    /// A mover Job is running.
+    Running,
+    /// The kopia snapshot exists.
+    Succeeded,
+    /// The run failed.
+    Failed,
+    /// The kopia snapshot is being deleted.
+    Deleting,
+    /// Adopted from a kopia manifest found in the repository rather than
+    /// produced by this operator.
+    Discovered,
+    /// The source had no changes, so no new kopia snapshot was written.
+    Unchanged,
+    /// A phase this build does not recognize.
+    Unknown {
+        /// The phase string exactly as the operator wrote it.
+        raw: String,
+    },
+}
+
+/// View of `Restore` `status.phase`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum RestorePhaseView {
+    /// Admitted, not started.
+    Pending,
+    /// Resolving the source snapshot and target claim.
+    Resolving,
+    /// A mover Job is writing files.
+    Restoring,
+    /// Files are on the target volume.
+    Completed,
+    /// The restore failed.
+    Failed,
+    /// A phase this build does not recognize.
+    Unknown {
+        /// The phase string exactly as the operator wrote it.
+        raw: String,
+    },
+}
+
+/// View of `RepositoryReplication`/`SnapshotReplication` `status.phase`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ReplicationPhaseView {
+    /// Admitted, waiting for its next scheduled run.
+    Pending,
+    /// A replication run is in flight.
+    Replicating,
+    /// The last run completed.
+    Succeeded,
+    /// The last run failed.
+    Failed,
+    /// Suspended by the user.
+    Suspended,
+    /// A phase this build does not recognize.
+    Unknown {
+        /// The phase string exactly as the operator wrote it.
+        raw: String,
+    },
+}
+
+/// View of `Snapshot` `status.origin` — how the snapshot came to exist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum OriginView {
+    /// Fired by a `SnapshotSchedule`.
+    Scheduled,
+    /// Created directly by a user.
+    Manual,
+    /// Found in the repository by a catalog scan.
+    Discovered,
+    /// A discovered snapshot that was taken over by a policy.
+    Adopted,
+    /// Copied in by a `SnapshotReplication`.
+    Replicated,
+}
+
+/// One page of a listing, carrying the window that produced it so the SPA can
+/// render "showing 21-40 of 137" without a second request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Page<T> {
+    /// The rows in this page.
+    pub items: Vec<T>,
+    /// How many rows exist across all pages.
+    pub total: usize,
+    /// Index of the first row in `items` within the full result set.
+    pub offset: usize,
+    /// Maximum rows the server was asked to return.
+    pub limit: usize,
+}
+
+/// One row of the repositories table — `Repository` and `ClusterRepository`
+/// projected into a single shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RepositorySummary {
+    /// `Repository` or `ClusterRepository`.
+    pub kind: String,
+    /// The `{kind}` URL segment for this row — `repository` or
+    /// `cluster-repository`.
+    ///
+    /// Here so the SPA links to `/repositories/{kindPath}/{name}` and
+    /// `DELETE /repositories/{kindPath}/{name}/session` without a local
+    /// CRD-kind-to-segment mapping table. [`Self::kind`] is the CRD kind for
+    /// display; this is the routing token, and the two differ in case and
+    /// punctuation. Both routes also *accept* [`Self::kind`] itself, so a client
+    /// that ignores this field still works — it is the canonical spelling, not
+    /// the only one.
+    ///
+    /// `RepositoryDetail` carries it as `summary.kindPath`: one field, so the
+    /// segment a row links with and the segment a detail screen links with
+    /// cannot drift.
+    pub kind_path: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// `metadata.namespace`; absent for `ClusterRepository`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// `status.phase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<RepositoryPhaseView>,
+    /// Coarse health derived from phase and conditions.
+    pub health: Health,
+    /// Which `spec.backend` variant this repository uses (`s3`, `filesystem`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// `spec.mode` — `ReadWrite` or `ReadOnly`.
+    ///
+    /// The same text `kubectl kopiur status` prints in its `MODE` column and
+    /// `/api/v1/status` ships in its report, so one API cannot mean two things
+    /// by `mode`. How clients *reach* the repository is [`Self::server_backed`].
+    pub mode: String,
+    /// Whether a kopia repository server fronts this repository.
+    ///
+    /// `false` means every mover talks to the storage backend directly. Split
+    /// from [`Self::mode`] because access path and access rights are
+    /// independent: a read-only repository can be server-backed or direct, and
+    /// a UI that conflated them could not say which.
+    pub server_backed: bool,
+    /// `spec.suspend`.
+    pub suspended: bool,
+    /// `status.stats.snapshotCount`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_count: Option<i64>,
+    /// `status.stats.totalSizeBytes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_size_bytes: Option<i64>,
+    /// `status.stats.indexBlobCount`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_blob_count: Option<i64>,
+    /// RFC3339 timestamp of the last successful stats observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed_at: Option<String>,
+    /// `status.server.endpoint`, when running in repository-server mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_endpoint: Option<String>,
+    /// For `ClusterRepository`: how many namespaces `spec.allowedNamespaces`
+    /// currently admits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_namespace_count: Option<i64>,
+}
+
+/// Everything the repository detail screen shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RepositoryDetail {
+    /// The same fields the table row shows.
+    pub summary: RepositorySummary,
+    /// `status.resolved.identity.cluster` — the cluster identity component the
+    /// operator resolved for snapshots written here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_cluster: Option<String>,
+    /// Catalog-scan results, when catalog discovery is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<CatalogView>,
+    /// Health-probe results, when probing is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthProbeView>,
+    /// Repository-server state, when running in server mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerView>,
+    /// Seed/bootstrap state, when this repository was seeded from another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<SeedView>,
+    /// The `Maintenance` resource governing this repository, managed or
+    /// externally authored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<MaintenanceRow>,
+    /// Gates currently holding this repository back.
+    pub gates: Vec<GateHit>,
+    /// `status.conditions`.
+    pub conditions: Vec<ConditionView>,
+    /// Policies that write into this repository.
+    pub policies: Vec<PolicyRef>,
+    /// Names of replications that read from this repository.
+    pub replications_out: Vec<String>,
+    /// Names of replications that write into this repository.
+    pub replications_in: Vec<String>,
+    /// Browse sessions currently open against this repository.
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// `Repository.status.catalog` — what a catalog scan found in the repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CatalogView {
+    /// Kopia snapshots discovered and adopted as `Snapshot` resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovered_backup_count: Option<i64>,
+    /// Kopia snapshots present in the repository that no kopiur identity claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreign_snapshot_count: Option<i64>,
+    /// RFC3339 timestamp of the last catalog scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh_at: Option<String>,
+}
+
+/// `Repository.status.health` — the periodic connectivity probe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HealthProbeView {
+    /// RFC3339 timestamp of the most recent probe, successful or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_at: Option<String>,
+    /// RFC3339 timestamp of the most recent successful probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_healthy_at: Option<String>,
+    /// Probe failures since the last success; drives the `Degraded` health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consecutive_probe_failures: Option<i64>,
+}
+
+/// `Repository.status.server` — the kopia repository server, when enabled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ServerView {
+    /// Address clients connect to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Whether the server admits writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    /// How the server authenticates clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+}
+
+/// `Repository.status.seed` — how this repository was bootstrapped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SeedView {
+    /// Which seeding strategy ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The repository that was seeded from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// RFC3339 timestamp of when seeding completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeded_at: Option<String>,
+    /// How many snapshots the seed copied across.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots_copied: Option<i64>,
+}
+
+/// One `status.conditions[]` entry, flattened for display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConditionView {
+    /// `conditions[].type`, e.g. `Ready`.
+    pub r#type: String,
+    /// `conditions[].status` — `True`, `False`, or `Unknown`.
+    pub status: String,
+    /// `conditions[].reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `conditions[].message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// `conditions[].lastTransitionTime` as RFC3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<String>,
+}
+
+/// A namespaced reference to a `SnapshotPolicy`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PolicyRef {
+    /// `metadata.namespace` of the policy.
+    pub namespace: String,
+    /// `metadata.name` of the policy.
+    pub name: String,
+}
+
+/// One row of the snapshots table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SnapshotRow {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// `status.phase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<SnapshotPhaseView>,
+    /// `status.origin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<OriginView>,
+    /// Name of the `SnapshotPolicy` this snapshot was taken under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// Name of the repository the snapshot lives in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// `status.kopiaSnapshotId` — the kopia manifest ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kopia_snapshot_id: Option<String>,
+    /// The resolved kopia identity (`user@host:/path`) the snapshot was written
+    /// under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// `status.startTime` as RFC3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    /// `status.endTime` as RFC3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<String>,
+    /// Logical size of the snapshotted tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    /// Bytes this snapshot actually added to the repository after dedup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_new: Option<i64>,
+    /// Files considered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_total: Option<i64>,
+    /// Files kopia could not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_failed: Option<i64>,
+    /// Whether the kopia manifest carries a retention pin, exempting it from
+    /// GFS pruning.
+    pub pinned: bool,
+    /// `spec.deletionPolicy` — `Delete`, `Retain`, or `Orphan`.
+    ///
+    /// **Absent means the CR sets none, and must not be rendered as a default.**
+    /// The schema carries no `default:` — deliberately, because the effective
+    /// policy is context-dependent: a produced backup behaves as `Delete`, a
+    /// *discovered* one is forced to `Retain`, and which of those applies is the
+    /// operator's decision at delete time, not a value this field mirrors. A UI
+    /// that filled the blank with "Delete" would tell the owner of a discovered
+    /// snapshot that confirming would destroy data the operator will in fact
+    /// keep — and a UI that filled it with "Retain" would say the opposite to
+    /// everyone else.
+    ///
+    /// Render an absent value as "not set (the operator decides)" and say what
+    /// the deletion will do only when this field says it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_policy: Option<String>,
+    /// For replicated snapshots: the repository the copy came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<String>,
+}
+
+/// Everything the snapshot detail screen shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SnapshotDetail {
+    /// The same fields the table row shows.
+    pub row: SnapshotRow,
+    /// Full kopia upload counters, when the run recorded them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<SnapshotStatsView>,
+    /// Wall-clock duration between `startTime` and `endTime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<i64>,
+    /// The source paths the snapshot covered.
+    pub sources: Vec<String>,
+    /// Where this snapshot came from and where it has been copied to.
+    pub lineage: Lineage,
+    /// Whether the governing retention policy would keep this snapshot today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_preview: Option<RetentionPreview>,
+    /// Failure detail, present when the run failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureView>,
+    /// Last lines of the mover Job's log.
+    pub log_tail: Vec<String>,
+    /// `status.conditions`.
+    pub conditions: Vec<ConditionView>,
+    /// Gates currently holding this snapshot back.
+    pub gates: Vec<GateHit>,
+    /// Whether the UI may open a browse session against this snapshot.
+    pub browsable: bool,
+    /// Why browsing is unavailable, when `browsable` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browse_blocker: Option<String>,
+}
+
+/// `Snapshot.status.stats` — kopia's upload counters for one run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SnapshotStatsView {
+    /// Logical size of the snapshotted tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    /// Bytes added to the repository after dedup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_new: Option<i64>,
+    /// Files seen for the first time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_new: Option<i64>,
+    /// Files whose contents changed since the previous snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_modified: Option<i64>,
+    /// Files reused unchanged from the previous snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_unchanged: Option<i64>,
+    /// Files kopia could not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_failed: Option<i64>,
+}
+
+/// Where a snapshot came from and where it has been copied to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Lineage {
+    /// The repository this snapshot was replicated in from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from_repository: Option<String>,
+    /// The kopia manifest ID in the source repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_manifest_id: Option<String>,
+    /// `Snapshot` resources that are copies of this one.
+    pub copies: Vec<SnapshotRefView>,
+}
+
+/// A namespaced reference to a `Snapshot`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SnapshotRefView {
+    /// `metadata.namespace` of the snapshot.
+    pub namespace: String,
+    /// `metadata.name` of the snapshot.
+    pub name: String,
+}
+
+/// Whether the governing GFS retention would keep this snapshot right now, and
+/// which rules say so.
+///
+/// # An absent preview is not "unknown"
+///
+/// `SnapshotDetail.retentionPreview` is `null` in four different situations,
+/// and none of them means "we could not work it out":
+///
+/// * the snapshot is not in the GFS population (a `Pending`, `Running`,
+///   `Failed`, `Unchanged` or `Deleting` row, or one with no controller-written
+///   kopia manifest) — retention does not evaluate it;
+/// * no `SnapshotPolicy` governs it, or the caller may not read the one that
+///   does;
+/// * the policy's `CONFIG_LABEL` does not select it yet (a discovered snapshot
+///   mid-adoption);
+/// * **the policy configures no retention at all** — nothing is pruned by GFS.
+///
+/// That last one is worth stating because the retention *plan* answers it
+/// differently and deliberately: `RetentionPlan.unbounded` is `true` with every
+/// candidate `kept`. A `null` here and a `kept: true` there are the same fact.
+/// Do not render the absent preview as "unknown" while the plan says "kept" —
+/// ask the plan (`GET …/retention`) when the detail has no preview and the
+/// distinction matters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionPreview {
+    /// True when at least one retention rule keeps the snapshot.
+    pub kept: bool,
+    /// The rules that hold it, each with the slot it occupies in that rule's
+    /// window — `keepDaily slot 3` means the third-newest day `keepDaily` keeps,
+    /// so a reader can see how close the snapshot is to ageing out.
+    ///
+    /// `pinned` is a reason too, and always the FIRST one when it applies — a
+    /// pin carries no slot, because it is an exemption from bucketing rather
+    /// than a place in a bucket. It is not necessarily the only one: a pinned
+    /// snapshot that today's rules would ALSO have kept reports both
+    /// (`["pinned", "keepDaily slot 1"]`), which is the useful answer, because
+    /// it says that unpinning would not lose the snapshot. A pin that is doing
+    /// all the work reports `["pinned"]` alone.
+    ///
+    /// So render the whole list; do not read `reasons[0]` as "the" reason, and
+    /// do not assume a pin implies exactly one entry.
+    ///
+    /// Empty when the snapshot is pruned. The same strings, from the same
+    /// function, as [`RetentionCandidate::rules`].
+    pub reasons: Vec<String>,
+    /// RFC3339 timestamp the preview was computed at — the answer moves as time
+    /// passes, so the UI shows when it was true.
+    pub computed_at: String,
+}
+
+/// Every snapshot competing for the same retention buckets as one snapshot,
+/// with the verdict today's GFS selection gives each.
+///
+/// This is what `GET /api/v1/snapshots/{namespace}/{name}/retention` answers,
+/// and it is the screen where a misreading costs a restore point — so the
+/// population and the bucketing are the *prune's own*
+/// (`kopiur_api::retention::retention_buckets`), never a second implementation
+/// that could disagree with what the operator will actually delete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionPlan {
+    /// One entry per bucket the policy's population splits into, keyed by the
+    /// bucket key, ordered by that key.
+    ///
+    /// Buckets are independent: a fan-out policy over seven PVCs has seven, and
+    /// no snapshot in one can displace a snapshot in another. That independence
+    /// is the whole reason this is a list of buckets rather than one list of
+    /// candidates.
+    pub buckets: Vec<RetentionBucket>,
+    /// The `SnapshotPolicy` the plan was computed from.
+    pub policy: PolicyRef,
+    /// RFC3339 timestamp the plan was computed at. GFS verdicts move as time
+    /// passes, so a plan is an answer about a moment.
+    pub computed_at: String,
+    /// True when the policy configures no retention at all.
+    ///
+    /// Nothing is pruned by GFS in that case — the operator only runs a
+    /// selection when a retention policy exists — so every candidate is reported
+    /// `kept: true` with no `rules`. Rendering an unbounded plan as "everything
+    /// will be deleted" (which is what running an empty policy through the
+    /// selection kernel would literally say) is the exact inversion this flag
+    /// exists to prevent.
+    pub unbounded: bool,
+}
+
+/// One retention bucket and the snapshots competing inside it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionBucket {
+    /// The bucket key the controller groups by: the backup source, plus the
+    /// pinned repository while the policy is multi-repo. Empty for an un-fanned,
+    /// single-repository policy, which has exactly one bucket.
+    ///
+    /// Opaque — a join key and a grouping label, not a path to parse.
+    pub key: String,
+    /// The bucket's candidates, newest first, ties broken by name — the same
+    /// order the selection kernel walks them in.
+    pub candidates: Vec<RetentionCandidate>,
+}
+
+/// One snapshot's place in its retention bucket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionCandidate {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// The end time GFS buckets on: `status.timing.endTime`, falling back to
+    /// `metadata.creationTimestamp`. Never absent — a row with neither is not in
+    /// the GFS population and so is not a candidate at all.
+    pub end_time: String,
+    /// True when today's selection keeps this snapshot.
+    pub kept: bool,
+    /// Which rules hold it and in which slot, e.g. `keepDaily slot 3`, with
+    /// `pinned` first (and slotless) when [`Self::pinned`] is set — see
+    /// [`RetentionPreview::reasons`], which these are the same strings from the
+    /// same function as, including that a pin does not mean exactly one entry.
+    /// Empty when it is pruned.
+    pub rules: Vec<String>,
+    /// `spec.pin` — exempt from GFS pruning entirely.
+    ///
+    /// The *spec*, which is what the prune reads. During an unpin, `status.pinned`
+    /// still says `true` and reporting that would promise a keep the next prune
+    /// will not honour.
+    pub pinned: bool,
+    /// True for the snapshot the request was about, so the SPA can highlight its
+    /// row among its competitors.
+    pub subject: bool,
+}
+
+/// Why a run failed, in the terms the operator's own error classification uses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FailureView {
+    /// The classified kopia error, e.g. `RepositoryUnreachable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kopia_error_class: Option<String>,
+    /// The failure message shown to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Exit code of the mover process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Whether the operator considers a retry likely to succeed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_recommended: Option<bool>,
+    /// The mover operation that failed, e.g. `snapshot`, `restore`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+}
+
+/// One row of the policies table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PolicyRow {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// Repositories this policy writes into.
+    pub repositories: Vec<String>,
+    /// True when the policy fans out to more than one repository.
+    pub multi_repo: bool,
+    /// `spec.suspend`.
+    pub suspended: bool,
+    /// RFC3339 timestamp of the most recent successful snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_snapshot: Option<String>,
+    /// RFC3339 timestamp of the most recent successful verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified: Option<String>,
+    /// How many non-deleted `Snapshot` resources this policy currently owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_snapshot_count: Option<i64>,
+}
+
+/// Everything the policy detail screen shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PolicyDetail {
+    /// The same fields the table row shows.
+    pub row: PolicyRow,
+    /// The resolved kopia identity (`user@host:/path`) snapshots are written
+    /// under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// The source paths the policy backs up.
+    pub sources: Vec<String>,
+    /// `spec.retention` — the GFS rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionView>,
+    /// Per-repository verification state.
+    pub verification: Vec<RepoVerificationView>,
+    /// Schedules that fire this policy.
+    ///
+    /// Exact, not approximate: a `policySelector` is evaluated with the same
+    /// matcher the operator's own schedule reconciler uses, `matchExpressions`
+    /// included.
+    pub schedules: Vec<ScheduleRow>,
+    /// The most recent snapshots this policy produced.
+    pub recent_snapshots: Vec<SnapshotRow>,
+    /// Gates currently holding this policy back.
+    pub gates: Vec<GateHit>,
+    /// `status.conditions`.
+    pub conditions: Vec<ConditionView>,
+}
+
+/// `SnapshotPolicy.spec.retention` — the GFS rules, `None` meaning unset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RetentionView {
+    /// Most recent snapshots to keep regardless of age.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_latest: Option<i32>,
+    /// Hourly slots to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_hourly: Option<i32>,
+    /// Daily slots to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_daily: Option<i32>,
+    /// Weekly slots to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_weekly: Option<i32>,
+    /// Monthly slots to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_monthly: Option<i32>,
+    /// Annual slots to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_annual: Option<i32>,
+}
+
+/// Verification state for one repository a policy writes into.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RepoVerificationView {
+    /// Name of the repository.
+    pub repository: String,
+    /// RFC3339 timestamp of the last successful verification there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verified: Option<String>,
+}
+
+/// One row of the schedules table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ScheduleRow {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// The single policy this schedule fires, when it names one directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    /// The label selector this schedule fires by, when it selects policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_selector: Option<String>,
+    /// `spec.schedule.cron`, including any `H` jitter token as written.
+    pub cron: String,
+    /// `spec.schedule.timezone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// `spec.suspend`.
+    pub suspended: bool,
+    /// RFC3339 timestamp of the last fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fire: Option<String>,
+    /// RFC3339 timestamp of the next computed fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire: Option<String>,
+    /// Name of the `Snapshot` the last fire produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_snapshot: Option<String>,
+    /// Failures since the last success; bounded by `failedJobsHistoryLimit`.
+    pub consecutive_failures: i64,
+}
+
+/// One row of the restores table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreRow {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// `status.phase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<RestorePhaseView>,
+    /// Which `spec.source` variant this restore uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    /// Which `spec.target` variant this restore uses.
+    pub target_kind: String,
+    /// Repository the snapshot is read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// The resolved kopia manifest ID being restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kopia_snapshot_id: Option<String>,
+    /// `status.startTime` as RFC3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    /// `status.endTime` as RFC3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<String>,
+    /// Bytes written to the target so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_restored: Option<i64>,
+    /// Files written to the target so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_restored: Option<i64>,
+    /// Per-claim progress, one entry per target PVC.
+    pub claims: Vec<RestoreClaimView>,
+}
+
+/// Everything the restore detail screen shows.
+///
+/// # What is deliberately not here
+///
+/// **A progress percentage.** `Restore.status.progress` carries
+/// `bytesRestored`/`filesRestored` and no total to divide by, so there is
+/// nothing to compute one from; the two counters already ride
+/// [`RestoreRow`]. A `percent` field would have to be invented, and a restore
+/// that showed a fabricated "80%" is worse than one that shows bytes.
+///
+/// **Per-claim byte counts.** `RestoreClaimStatus` records a phase and a
+/// message, not counters, so a populator fan-out's progress is per-claim
+/// *state* — which is what [`RestoreClaimView`] already carries on the row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreDetail {
+    /// The same fields the table row shows, the per-claim rows included.
+    pub row: RestoreRow,
+    /// `status.resolved` — what the source was pinned to at admission.
+    ///
+    /// Absent until resolution runs. A restore never re-resolves, so this is
+    /// what the run will actually read, not what the spec asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<RestoreSourceView>,
+    /// `status.target` — where the data is actually being written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RestoreTargetView>,
+    /// `status.conditions`.
+    pub conditions: Vec<ConditionView>,
+    /// Failure detail, present when the run failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureView>,
+    /// Last lines of the mover Job's log, redacted. Empty when the run wrote
+    /// none.
+    pub log_tail: Vec<String>,
+}
+
+/// `Restore.status.resolved` — the source pinned at admission.
+///
+/// The two fields the row already carries (the repository and the kopia
+/// manifest id) are not repeated here: one value, one place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreSourceView {
+    /// `Snapshot` when the source resolved to a kopia snapshot, `NoSnapshot`
+    /// when it matched none and `onMissingSnapshot: Continue` chose an empty
+    /// volume — which is a *successful* restore of nothing, not a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// The concrete `Snapshot` resource the source resolved to, when there is
+    /// one to navigate to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotRefView>,
+    /// RFC3339 timestamp the source was pinned at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<String>,
+    /// The resolved kopia identity (`user@host:/path`) the data is read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
+/// `Restore.status.target` — the PVC the data lands in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreTargetView {
+    /// Name of the `PersistentVolumeClaim` actually written to, created or
+    /// pre-existing.
+    ///
+    /// A name rather than a reference: the controller writes this claim without
+    /// a namespace because a restore only ever writes into its own, which is
+    /// `RestoreDetail.row.namespace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc: Option<String>,
+    /// The populator handshake's prime PVC, for a `target.populator` restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pvc_prime: Option<String>,
+}
+
+/// Per-PVC progress within one restore.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreClaimView {
+    /// Name of the target `PersistentVolumeClaim`.
+    pub pvc: String,
+    /// The claim's restore phase.
+    pub phase: String,
+    /// Detail for this claim, typically a failure reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One row of the maintenance table — a `Maintenance` resource's two run
+/// tracks plus any pending manual run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MaintenanceRow {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// Repository this maintenance governs.
+    pub repository: String,
+    /// The owning repository, when this `Maintenance` was projected from a
+    /// repository's `spec.maintenance`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// True when the operator owns this `Maintenance`; false when a user
+    /// authored it, in which case the operator honors it but never rewrites it.
+    pub managed_by_repository: bool,
+    /// The quick-maintenance track.
+    pub quick: RunStatusView,
+    /// The full-maintenance track.
+    pub full: RunStatusView,
+    /// A manual run the user requested, if one is pending or recent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_run: Option<ManualRunView>,
+}
+
+/// One maintenance track's run history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RunStatusView {
+    /// RFC3339 timestamp of the last run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+    /// RFC3339 timestamp of the next computed run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_scheduled_at: Option<String>,
+    /// Failures since the last success.
+    pub consecutive_failures: i64,
+    /// Bytes the last run reclaimed by dropping unreachable content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_content_reclaimed_bytes: Option<i64>,
+}
+
+/// A user-requested maintenance run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ManualRunView {
+    /// RFC3339 timestamp of when the run was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
+    /// `quick` or `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The run's current phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// RFC3339 timestamp of when the run finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+/// One row of the repository-replications table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RepositoryReplicationRow {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// Repository whose blobs are copied.
+    pub source: String,
+    /// Which backend variant the copy is written to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_backend: Option<String>,
+    /// `spec.schedule.cron`.
+    pub cron: String,
+    /// `spec.suspend`.
+    pub suspended: bool,
+    /// `status.phase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ReplicationPhaseView>,
+    /// RFC3339 timestamp of the last successful replication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replicated: Option<String>,
+    /// RFC3339 timestamp of the next computed run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_scheduled_at: Option<String>,
+    /// Bytes the last run copied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replicated_bytes: Option<i64>,
+    /// Blobs the last run copied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replicated_blobs: Option<i64>,
+}
+
+/// One row of the snapshot-replications table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SnapshotReplicationRow {
+    /// `metadata.namespace`.
+    pub namespace: String,
+    /// `metadata.name`.
+    pub name: String,
+    /// Repository snapshots are read from.
+    pub source: String,
+    /// Repository snapshots are copied into.
+    pub destination: String,
+    /// `spec.schedule.cron`.
+    pub cron: String,
+    /// `spec.suspend`.
+    pub suspended: bool,
+    /// `status.phase`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ReplicationPhaseView>,
+    /// RFC3339 timestamp of the last successful replication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replicated: Option<String>,
+    /// Kopia identities the last run's selector matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identities_selected: Option<u32>,
+    /// Snapshots the last run copied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots_copied: Option<u32>,
+    /// Snapshots the last run skipped because the destination already had them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub already_present: Option<u32>,
+    /// Snapshots the last run failed to copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<u32>,
+    /// Snapshots the last run pruned from the destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned: Option<u32>,
+}
+
+/// Both replication tables, as `GET /api/v1/replications` answers them.
+///
+/// The two kinds copy different things — one syncs a repository's blobs to a
+/// bare backend, the other migrates selected snapshots between repository CRs —
+/// so they keep separate row types and are returned side by side rather than
+/// forced into a shared shape that would fit neither.
+///
+/// Lives here rather than in the server crate even though it is an envelope: a
+/// wire type declared next to its handler is a type `export_all` never emits,
+/// and the SPA is forbidden from hand-writing a shape the server owns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReplicationsView {
+    /// Whole-repository blob syncs.
+    pub repository: Vec<RepositoryReplicationRow>,
+    /// Snapshot-level copies between repositories.
+    pub snapshot: Vec<SnapshotReplicationRow>,
+}
+
+/// How much of the cluster one doctor check actually looked at.
+///
+/// A doctor run takes an optional namespace, and it narrows *some* checks and
+/// not others — so a UI that prints "scoped to `media`" next to every row is
+/// telling the operator something untrue about most of them. Which rows those
+/// are is a fact about what each check reads, and the client had been keeping
+/// its own copy of it. It was already wrong: `list_repos` lists `Repository`
+/// inside the namespace but `ClusterRepository` cluster-wide, so the two
+/// repository checks are neither purely one nor the other. That is what
+/// [`Self::Mixed`] exists to say out loud.
+///
+/// A closed enum, so a check added later cannot ship without stating its
+/// scope, and the SPA narrows it with the same machinery it uses for every
+/// other generated enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum DoctorScopeView {
+    /// Reads only namespaced objects, so a `?namespace=` run narrows this
+    /// check completely and "scoped to `<ns>`" is the whole truth about it.
+    Namespace,
+    /// Reads installation-wide state — cluster-scoped objects, or the
+    /// operator's own workloads — and a `?namespace=` run does not narrow it
+    /// at all. Its verdict is about the installation, not about the namespace.
+    Installation,
+    /// Reads both: the namespaced objects are narrowed and the cluster-scoped
+    /// ones are not, so the check's verdict may be driven by something outside
+    /// the namespace the caller asked about.
+    Mixed,
+}
+
+/// One check from the doctor report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DoctorCheckView {
+    /// Stable check identifier, e.g. `crds-installed`.
+    pub check: String,
+    /// Human-readable name of the check.
+    pub title: String,
+    /// `Pass`, `Warn`, or `Fail`.
+    pub outcome: String,
+    /// How much of the cluster this check read, so the UI can say truthfully
+    /// what a namespace-scoped run covered instead of guessing from the title.
+    pub scope: DoctorScopeView,
+    /// What the check found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub what: Option<String>,
+    /// Why that is a problem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// What to do about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+}
+
+/// The full doctor report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DoctorReportView {
+    /// Every check that ran, in report order.
+    pub checks: Vec<DoctorCheckView>,
+    /// The exit code `kubectl kopiur doctor` would have returned: `0` when no
+    /// check failed — **warnings included** — and `1` when any check did.
+    ///
+    /// There is no third value. A warning deliberately is not a failure (an
+    /// RBAC-degraded check warns, and a restricted kubeconfig must not report a
+    /// broken cluster), so counting warnings from `checks` is the only way to
+    /// tell "all clear" from "could not fully verify".
+    pub exit_code: u8,
+    /// RFC3339 timestamp of when the report was produced.
+    pub ran_at: String,
+}
+
+/// Static documentation for one gate the operator can apply, so the UI can
+/// explain a gate it has never seen fire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct GateDescriptor {
+    /// The CRD kind this gate applies to.
+    pub scope: String,
+    /// The `status.conditions[].type` that carries the gate.
+    pub condition: String,
+    /// The `status` value that means "blocked" for this condition — `True` for
+    /// some gates, `False` for others.
+    pub blocked_status: String,
+    /// The `reason` this gate writes.
+    pub reason: String,
+    /// How serious the gate is. The same type [`GateHit::severity`] carries, so
+    /// the registry a gate is *documented* by and the hit it *produces* cannot
+    /// describe it differently.
+    pub severity: GateSeverityView,
+}
+
+/// One Kubernetes `Event`, projected for display next to the object it
+/// concerns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct EventRow {
+    /// RFC3339 timestamp of the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// `Normal` or `Warning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// The event's machine-readable reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The event's human-readable message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The object the event concerns, as `Kind/namespace/name`.
+    pub regarding: String,
+}
+
+/// What a directory entry is, inside a browse session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum EntryKind {
+    /// A regular file.
+    File,
+    /// A directory.
+    Dir,
+    /// A symbolic link.
+    Symlink,
+    /// Anything else kopia reported — a socket, a device node, or a type this
+    /// build does not recognize.
+    Other {
+        /// The entry type exactly as kopia reported it.
+        raw: String,
+    },
+}
+
+/// One entry in a browsed snapshot directory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DirEntryView {
+    /// The entry's basename.
+    pub name: String,
+    /// What the entry is.
+    pub kind: EntryKind,
+    /// Size in bytes, for files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    /// RFC3339 modification time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<String>,
+    /// Unix mode as kopia rendered it, e.g. `drwxr-xr-x`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+/// One page of a browsed directory, plus the session that served it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DirListing {
+    /// The directory path inside the snapshot.
+    pub path: String,
+    /// The entries in this page.
+    pub entries: Vec<DirEntryView>,
+    /// How many entries the directory holds in total.
+    pub total: usize,
+    /// Index of the first entry in `entries` within the directory.
+    pub offset: usize,
+    /// Maximum entries the server was asked to return.
+    pub limit: usize,
+    /// The browse session this listing came from — the SPA reuses it for the
+    /// next navigation instead of paying for a new mover pod.
+    pub session: SessionInfo,
+}
+
+/// A browse session: a long-lived mover Job the UI execs into to read a
+/// snapshot's contents.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SessionInfo {
+    /// Namespace the session's Job runs in.
+    pub namespace: String,
+    /// Name of the session's Job.
+    pub job: String,
+    /// Name of the Job's pod, once scheduled.
+    ///
+    /// Populated by the browse endpoints, which have to resolve the pod anyway
+    /// to exec into it. Always **absent** on the sessions listed by
+    /// `RepositoryDetail.sessions`: naming the pod there would cost a `pods`
+    /// LIST per repository detail view to show a string nothing navigates by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<String>,
+    /// True when an existing session was reused rather than a new one started.
+    pub reused: bool,
+    /// RFC3339 timestamp of when the session will be reaped if left idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// The largest single file `GET …/file` will stream, in bytes, as this
+    /// deployment is configured (`KOPIUR_UI_MAX_DOWNLOAD_BYTES`).
+    ///
+    /// Published so the file table can disable an oversized entry *with the
+    /// reason* before the user clicks. This is a second gate, not the gate: the
+    /// server still refuses an oversized download with a `413`
+    /// `download-too-large`. But a download is a top-level navigation, so that
+    /// refusal is rendered by the browser as a tab full of JSON — the SPA never
+    /// sees it and cannot turn it into a message.
+    ///
+    /// A `DirEntryView.size` of `null` means kopia reported no size, which is
+    /// the `422` `download-size-unknown` case: not comparable against this, and
+    /// not the same as zero.
+    pub download_max_bytes: i64,
+    /// The largest kopia JSON manifest the server will buffer while walking the
+    /// snapshot, in bytes (`KOPIUR_UI_MAX_MANIFEST_BYTES`).
+    ///
+    /// This is what a `422` `directory-too-large` / `catalog-too-large` is
+    /// measured against — a *listing* bound, not a download bound — so the SPA
+    /// can explain a refused directory rather than reporting it as empty.
+    pub manifest_max_bytes: i64,
+}
+
+/// What a mutating action created, returned so the SPA can navigate straight to
+/// the new object instead of polling a list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ActionReceipt {
+    /// Which action ran, e.g. `snapshotNow`.
+    pub kind: String,
+    /// The resources the action created.
+    pub created: Vec<SnapshotRefView>,
+    /// RFC3339 timestamp of when the action was accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
+    /// Anything the user should know about the outcome — e.g. that a fan-out
+    /// created fewer snapshots than repositories because some were suspended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The dashboard's top-level status, wrapping the `kopiur-ops` status report
+/// verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct StatusOverview {
+    /// The `kopiur_ops::status::StatusReport` as JSON, passed straight through.
+    ///
+    /// Deliberately opaque on the wire (`unknown` in TypeScript): the report is
+    /// the CLI's own shape and evolves with it, so pinning a second copy of it
+    /// here would guarantee drift. The SPA narrows it at the point of use.
+    #[ts(type = "unknown")]
+    pub report: serde_json::Value,
+    /// RFC3339 timestamp of when the server assembled the report, so relative
+    /// times ("2 minutes ago") are computed against the server's clock.
+    pub now: String,
+}

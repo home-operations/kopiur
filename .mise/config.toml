@@ -14,6 +14,23 @@ experimental = true
 [monorepo]
 config_roots = ["crates/e2e"]
 
+# ADDING A TOOL? The `mise-lock` pre-commit hook (from the shared
+# home-operations/.github config) runs `mise lock -p
+# linux-x64,linux-arm64,macos-arm64` and `git add`s `.mise/mise.lock` for you —
+# and on the pinned mise version that regeneration is NOT limited to your new
+# tool. It also rewrites `uv` and `cargo-llvm-cov` from their `-linux-gnu`
+# release artifacts to `-linux-musl` (new URLs and checksums on both linux
+# platforms) and appends a duplicate `[[tools.node]]` entry with
+# `backend = "core:node"`. That churn is a real behaviour change and must not
+# ride along in an unrelated commit.
+#
+# So after touching this table: `git diff .mise/mise.lock` and confirm every
+# added line belongs to YOUR tool. If it does not, restore the lockfile, insert
+# only your tool's block (copy it verbatim from the `mise lock` run — the
+# per-platform checksums cannot be hand-written), and commit with `--no-verify`
+# so the hook cannot put the churn back. Verify with `mise install --locked
+# <tool>`, which fails if a checksum is wrong. The `pnpm` entry below is the
+# worked example: it was landed exactly this way.
 [tools]
 actionlint = "1.7.12"
 rust = { version = "1.98.0", components = "rustfmt,clippy,llvm-tools" }
@@ -24,6 +41,11 @@ lefthook = "2.1.12"
 # `npm` on PATH (e.g. a stale/removed `/usr/bin/npm`), which silently breaks
 # `mise install` with `Cannot find module '/usr/bin/npm'`.
 node = "24.20.0"
+# Package manager for the web UI SPA (`crates/ui/web`). Resolved from the `aqua`
+# backend (`mise registry pnpm` → `aqua:pnpm/pnpm npm:pnpm`), i.e. a standalone
+# signed binary rather than an npm install into the node above — so `ui-install`
+# needs no global npm state and the lock entry carries a per-platform checksum.
+pnpm = "12.3.4"
 oxfmt = "0.66.0"
 zizmor = "1.30.0"
 helm = "4.2.4"
@@ -116,7 +138,7 @@ set -eu
 # the worst offender — so a NEW overly-complex function fails immediately
 # even while the legacy offenders are still being paid down. Refactored one
 # under the threshold? Lower BUDGET to match (the task reminds you).
-BUDGET=29
+BUDGET=28
 COUNT=$(cargo clippy --workspace --all-targets --all-features --locked -q -- -W clippy::cognitive_complexity 2>&1 \
   | grep -A1 'cognitive complexity of' | grep -oE '[-]{2}> [^ ]+' | sort -u | wc -l)
 echo "==> functions above the cognitive-complexity threshold: $COUNT (budget: $BUDGET)"
@@ -140,11 +162,11 @@ description = "Verify formatting without changing files (CI gate)"
 run = "cargo fmt --all -- --check"
 
 [tasks.gen]
-description = "Regenerate deploy/crds + deploy/rbac from the Rust types"
+description = "Regenerate deploy/crds + deploy/rbac + the SPA's TypeScript from the Rust types"
 run = "cargo xtask gen-all"
 
 [tasks.gen-check]
-description = "Fail if checked-in CRDs/RBAC are stale (CI drift guard)"
+description = "Fail if checked-in CRDs/RBAC/SPA types are stale (CI drift guard)"
 run = "cargo xtask gen-all --check"
 
 [tasks.wiring-check]
@@ -182,6 +204,84 @@ set -eu
 # and an exemption that matches nothing any more (delete the entry).
 cargo xtask check-phases
 '''
+
+# ---------------------------------------------------------------------------
+# Web UI (crates/ui/web) — the SPA served by `kopiur-ui`.
+#
+# `test` stays node-free on purpose: the hermetic Rust suite must run without a
+# JavaScript toolchain. Everything below needs pnpm, so it lives in its own
+# task group and its own CI job.
+# ---------------------------------------------------------------------------
+
+[tasks.ui-types]
+description = "Regenerate the SPA's TypeScript wire types from crates/ui-model (ts-rs)"
+# The same generator `gen`/`gen-check` drive; kept as its own task so a UI-only
+# change need not rebuild the CRDs.
+run = "cargo xtask gen-ui-types"
+
+[tasks.ui-install]
+description = "Install the SPA's node dependencies from the lockfile"
+# Every other pnpm task `depends` on this one, so the manifest precondition
+# below is the single place that check lives — and it runs no matter which task
+# you invoke. It exits NON-ZERO on purpose. A `|| exit 0` skip-guard here would
+# be permanent and would fail open: the day someone deletes or mis-paths
+# `package.json`, the whole SPA gate would report success. A loud red until the
+# scaffold lands is the cheaper failure, and the message says which gates a
+# reader can still trust in the meantime.
+dir = "crates/ui/web"
+run = '''
+set -eu
+if [ ! -f package.json ]; then
+  echo "error: crates/ui/web/package.json is absent — the SPA scaffold has not landed yet." >&2
+  echo "       This gate is red by design until it does; nothing here is misconfigured." >&2
+  echo "       Unaffected and still meaningful: mise run test, clippy, gen-check (which" >&2
+  echo "       includes the SPA's generated TypeScript), wiring-check, phase-check." >&2
+  exit 1
+fi
+pnpm install --frozen-lockfile
+'''
+
+[tasks.ui-dev]
+description = "Run the SPA dev server (proxies /api to a local kopiur-ui on :8090)"
+# `depends`, not a note in the description: mise runs a task's dependencies
+# before its body, so this works from any entry point. Listing `ui-install` in
+# `ci` instead would NOT order it first — `ci`'s depends run concurrently.
+depends = ["ui-install"]
+dir = "crates/ui/web"
+run = "pnpm dev"
+
+[tasks.ui-build]
+description = "Build the SPA into crates/ui/web/dist (what crates/ui/build.rs embeds)"
+depends = ["ui-install"]
+dir = "crates/ui/web"
+run = "pnpm build"
+
+[tasks.ui-check]
+description = "SPA gate: tsc + eslint + vitest, then fail if the generated types are not committed"
+# `ui-types` is a dependency so the tree check below has something to check: on
+# a clean tree with no preceding regeneration it would otherwise assert nothing.
+depends = ["ui-install", "ui-types"]
+# Runs from the workspace root rather than `crates/ui/web` so the path in the
+# check is the one a reader recognises.
+#
+# This is NOT a different failure from gen-check's — gen-check catches an
+# in-place hand-edit too. What it adds is (a) surfacing it in the job that owns
+# the SPA, right next to the tsc/eslint output, and (b) `--porcelain` rather
+# than `git diff`, which is blind to UNTRACKED files: a brand-new wire type
+# whose `.ts` was generated but never `git add`ed would slip past a plain diff.
+run = [
+  "pnpm -C crates/ui/web check",
+  '''
+set -eu
+dirty="$(git status --porcelain -- crates/ui/web/src/api/types)"
+if [ -n "$dirty" ]; then
+  echo "error: crates/ui/web/src/api/types is not in sync with git after regenerating:" >&2
+  echo "$dirty" >&2
+  echo "       fix: git add the generated types (or revert a hand-edit) and commit." >&2
+  exit 1
+fi
+''',
+]
 
 [tasks.cov]
 description = "Coverage over the hermetic suite -> lcov.info (report-only; no threshold)"
@@ -234,9 +334,24 @@ docker build -f docker/Dockerfile.mover \
   -t "${KOPIUR_IMAGE_PREFIX:-ghcr.io/home-operations/kopiur}/mover:${KOPIUR_IMAGE_TAG:-dev}" .
 '''
 
+[tasks.image-ui]
+description = "Build the web UI image locally (builds the SPA in-image; ships no kopia binary)"
+run = '''
+NODE_VERSION="${NODE_VERSION:-$(mise config get tools.node)}"
+PNPM_VERSION="${PNPM_VERSION:-$(mise config get tools.pnpm)}"
+RUST_VERSION="${RUST_VERSION:-$(mise config get tools.rust.version)}"
+# No KOPIA_VERSION: kopiur-ui never invokes kopia (the browse session pods do),
+# so docker/Dockerfile.ui has no kopia stage to feed.
+docker build -f docker/Dockerfile.ui \
+  --build-arg "NODE_VERSION=${NODE_VERSION}" \
+  --build-arg "PNPM_VERSION=${PNPM_VERSION}" \
+  --build-arg "RUST_VERSION=${RUST_VERSION}" \
+  -t "${KOPIUR_IMAGE_PREFIX:-ghcr.io/home-operations/kopiur}/ui:${KOPIUR_IMAGE_TAG:-dev}" .
+'''
+
 [tasks.images]
-description = "Build all three component images locally"
-depends = ["image-controller", "image-webhook", "image-mover"]
+description = "Build all four component images locally"
+depends = ["image-controller", "image-webhook", "image-mover", "image-ui"]
 
 [tasks.helm-lint]
 description = "Lint the chart and check it renders in both install scopes"
@@ -289,7 +404,15 @@ description = "Serve the MkDocs user docs locally with live reload (no rustdoc n
 run = "uv run mkdocs serve"
 
 [tasks.ci]
-description = "The full local hermetic gate: format, lint, build, test, and drift check"
+description = "The full local gate: the hermetic Rust suite plus the SPA (needs network + node)"
+# NOT hermetic, unlike `test`: `ui-install` fetches the SPA's dependencies from
+# the network. `test` stays node-free and offline; this is the superset you run
+# before pushing.
+#
+# `ui-install` and `ui-types` are absent from this list on purpose — they are
+# `depends` of `ui-check`/`ui-build`, which is what actually ORDERS them.
+# Entries here run concurrently, so listing `ui-install` alongside `ui-check`
+# would not guarantee node_modules exists by the time `ui-check` starts.
 depends = [
   "fmt-check",
   "clippy",
@@ -298,6 +421,8 @@ depends = [
   "gen-check",
   "wiring-check",
   "phase-check",
+  "ui-check",
+  "ui-build",
 ]
 
 [hooks]

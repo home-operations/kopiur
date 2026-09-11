@@ -10,6 +10,7 @@ pub mod builders;
 pub mod cli;
 pub mod consts;
 pub mod slow_mover;
+pub mod ui;
 pub mod wait;
 pub mod world;
 

@@ -1,308 +1,27 @@
 //! `kubectl kopiur restore` — the one-liner over the `Restore` CRD: exactly
 //! one source (snapshot / policy / raw identity) into exactly one target
 //! (created PVC / existing PVC / populator), with optional wait + log stream.
+//!
+//! The CR-building and terminal-phase classification live in
+//! [`kopiur_ops::actions::restore`], shared with the web UI; the clap flags are
+//! mapped onto its `RestoreRequest` by the conversion in [`crate::cli`]. What
+//! stays here is the CLI's own surface: the `--wait`/`--logs` loop and the
+//! rendering.
 
 use chrono::{DateTime, Utc};
-use kopiur_api::common::{CredentialProjection, FailurePolicy, ObjectRef, RepositoryRef};
-use kopiur_api::restore::{
-    FromPolicy, IdentitySource, PvcTemplate, RestoreOptions, RestorePolicy, RestoreSpec,
+use kopiur_api::Restore;
+use kopiur_ops::OpsError;
+use kopiur_ops::actions::restore::{
+    RestoreRequest, build_restore, create_restore, failure_detail, success_summary, terminal,
 };
-use kopiur_api::{PopulatorTarget, Restore, RestorePhase, RestoreSource, RestoreTarget};
-use kube::api::{Api, PostParams};
+use kube::api::Api;
 
 use crate::CmdOutput;
 use crate::cli::RestoreArgs;
 use crate::context::KubeCtx;
-use crate::error::{CliError, classify_kube};
-use crate::output::{OutputFormat, human_bytes};
+use crate::error::CliError;
+use crate::output::OutputFormat;
 use crate::wait::{DEFAULT_WAIT_TIMEOUT, wait_for};
-
-/// The short source token used in the default Restore name.
-fn source_token(args: &RestoreArgs) -> &str {
-    if let Some(s) = &args.from_snapshot {
-        s
-    } else if let Some(p) = &args.from_policy {
-        p
-    } else if let Some(id) = &args.identity {
-        &id.username
-    } else {
-        unreachable!("clap requires exactly one source")
-    }
-}
-
-/// Build `spec.options` from the parsed flags, or `None` when nothing was set
-/// (so a bare restore carries no optional noise on the wire). Split out of
-/// [`build_restore`] so its 13-flag "is anything set" check doesn't compound
-/// that function's cognitive complexity with the source/target dispatch.
-fn restore_options_from_args(args: &RestoreArgs) -> Option<RestoreOptions> {
-    let anything_set = args.enable_file_deletion
-        || args.ignore_permission_errors.is_some()
-        || args.write_files_atomically.is_some()
-        || args.parallel.is_some()
-        || args.write_sparse_files.is_some()
-        || args.skip_owners.is_some()
-        || args.skip_permissions.is_some()
-        || args.skip_times.is_some()
-        || args.overwrite_files.is_some()
-        || args.overwrite_directories.is_some()
-        || args.overwrite_symlinks.is_some()
-        || args.ignore_errors.is_some()
-        || args.skip_existing.is_some();
-    anything_set.then_some(RestoreOptions {
-        enable_file_deletion: args.enable_file_deletion,
-        ignore_permission_errors: args.ignore_permission_errors,
-        write_files_atomically: args.write_files_atomically,
-        parallel: args.parallel,
-        write_sparse_files: args.write_sparse_files,
-        skip_owners: args.skip_owners,
-        skip_permissions: args.skip_permissions,
-        skip_times: args.skip_times,
-        overwrite_files: args.overwrite_files,
-        overwrite_directories: args.overwrite_directories,
-        overwrite_symlinks: args.overwrite_symlinks,
-        ignore_errors: args.ignore_errors,
-        skip_existing: args.skip_existing,
-    })
-}
-
-/// Build the `Restore` CR from the parsed flags. Pure — `now` is injected so
-/// names are deterministic under test. The exactly-one-of invariants are
-/// enforced by clap groups; this maps each flag set 1:1 onto the
-/// externally-tagged enums (no field may be dropped — the restore-options bug
-/// class is regression-tested below).
-pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) -> Restore {
-    let source = match (&args.from_snapshot, &args.from_policy, &args.identity) {
-        (Some(snapshot), None, None) => RestoreSource::SnapshotRef(ObjectRef {
-            name: snapshot.clone(),
-            namespace: args.snapshot_namespace.clone(),
-        }),
-        (None, Some(policy), None) => RestoreSource::FromPolicy(FromPolicy {
-            name: policy.clone(),
-            namespace: args.policy_namespace.clone(),
-            as_of: args.as_of.clone(),
-            offset: args.offset.unwrap_or(0),
-            // The per-PVC path override (#443): `--source-path`, fromPolicy only
-            // (clap rejects it beside any other source at parse time).
-            source_path: args.source_path.clone(),
-        }),
-        (None, None, Some(identity)) => RestoreSource::Identity(IdentitySource {
-            username: identity.username.clone(),
-            hostname: identity.hostname.clone(),
-            source_path: identity.source_path.clone(),
-            snapshot_id: args.snapshot_id.clone(),
-            as_of: args.as_of.clone(),
-            offset: args.offset,
-        }),
-        _ => unreachable!("clap group enforces exactly one source"),
-    };
-
-    let target = match (&args.to_pvc, &args.create_pvc, args.populator) {
-        (Some(existing), None, false) => RestoreTarget::PvcRef(ObjectRef {
-            name: existing.clone(),
-            namespace: None,
-        }),
-        (None, Some(create), false) => RestoreTarget::Pvc(PvcTemplate {
-            name: create.clone(),
-            storage_class_name: args.storage_class.clone(),
-            capacity: args.size.clone(),
-            access_modes: args.access_modes.clone(),
-        }),
-        (None, None, true) => RestoreTarget::Populator(PopulatorTarget {}),
-        _ => unreachable!("clap group enforces exactly one target"),
-    };
-
-    let repository = args.repository.as_ref().map(|name| RepositoryRef {
-        kind: args.repository_kind.into(),
-        name: name.clone(),
-        namespace: args.repository_namespace.clone(),
-    });
-
-    let options = restore_options_from_args(args);
-
-    let policy = if args.on_missing_snapshot.is_some() || args.wait_timeout.is_some() {
-        Some(RestorePolicy {
-            on_missing_snapshot: args.on_missing_snapshot.map(Into::into),
-            wait_timeout: args.wait_timeout.clone(),
-        })
-    } else {
-        None
-    };
-
-    let failure_policy = if args.backoff_limit.is_some()
-        || args.active_deadline_seconds.is_some()
-        || args.pod_startup_deadline_seconds.is_some()
-    {
-        Some(FailurePolicy {
-            backoff_limit: args.backoff_limit,
-            active_deadline_seconds: args.active_deadline_seconds,
-            pod_startup_deadline_seconds: args.pod_startup_deadline_seconds,
-        })
-    } else {
-        None
-    };
-
-    let name = args.name.clone().unwrap_or_else(|| {
-        format!(
-            "restore-{}-{}",
-            source_token(args),
-            now.format("%Y%m%d%H%M%S")
-        )
-    });
-    let mut restore = Restore::new(
-        &name,
-        RestoreSpec {
-            repository,
-            source,
-            target,
-            options,
-            policy,
-            credential_projection: args
-                .credential_projection
-                .then_some(CredentialProjection { enabled: true }),
-            mover: None,
-            failure_policy,
-        },
-    );
-    restore.metadata.namespace = Some(namespace.to_string());
-    restore
-}
-
-/// Terminal-phase classification. Exhaustive over [`RestorePhase`].
-pub fn terminal(restore: &Restore) -> Option<Result<Box<Restore>, Box<Restore>>> {
-    match restore.status.as_ref().and_then(|s| s.phase.as_ref())? {
-        RestorePhase::Pending | RestorePhase::Resolving | RestorePhase::Restoring => None,
-        RestorePhase::Completed => Some(Ok(Box::new(restore.clone()))),
-        RestorePhase::Failed => Some(Err(Box::new(restore.clone()))),
-        // Never a terminal answer: `--wait` keeps waiting (bounded by its own
-        // timeout) rather than exiting 0 or 1 on a phase it cannot interpret.
-        RestorePhase::Unknown(_) => None,
-    }
-}
-
-/// What one claim's pin says it restored, for the success summary: the kopia
-/// snapshot id, or "empty volume" for a pinned deploy-or-restore `NoSnapshot`
-/// decision, or `?` when nothing was recorded. Pure.
-fn pinned_outcome(resolved: Option<&kopiur_api::restore::ResolvedRestore>) -> String {
-    match resolved.and_then(|r| r.resolution) {
-        Some(kopiur_api::ResolutionOutcome::NoSnapshot) => "empty volume (no snapshot)".into(),
-        Some(kopiur_api::ResolutionOutcome::Snapshot) | None => resolved
-            .and_then(|r| r.kopia_snapshot_id.as_deref())
-            .map(|id| format!("kopia id {id}"))
-            .unwrap_or_else(|| "kopia id ?".into()),
-    }
-}
-
-/// One-line success summary from the terminal object's status.
-///
-/// A populator's state lives PER CLAIM under `status.claims.<pvc>` (#443), so
-/// a fanned-out restore lists each claim's own kopia id and target rather than
-/// the top-level mirror — which is absent with several claims and would read
-/// `kopia id ?` (review wave 2, finding 8). A direct restore (no claims) keeps
-/// the classic top-level shape.
-pub fn success_summary(restore: &Restore) -> String {
-    let status = restore.status.as_ref();
-    let name = restore.metadata.name.as_deref().unwrap_or("?");
-    let claims = status.map(|s| &s.claims).filter(|c| !c.is_empty());
-    if let Some(claims) = claims {
-        let per_claim: Vec<String> = claims
-            .iter()
-            .map(|(pvc, claim)| format!("pvc/{pvc}: {}", pinned_outcome(claim.resolved.as_ref())))
-            .collect();
-        let n = claims.len();
-        return format!(
-            "restore {name} completed: {n} claim{} — {}\n",
-            if n == 1 { "" } else { "s" },
-            per_claim.join("; ")
-        );
-    }
-    let id = pinned_outcome(status.and_then(|s| s.resolved.as_ref()));
-    let bytes = status
-        .and_then(|s| s.progress.as_ref())
-        .and_then(|p| p.bytes_restored)
-        .map(human_bytes)
-        .unwrap_or_else(|| "?".into());
-    let files = status
-        .and_then(|s| s.progress.as_ref())
-        .and_then(|p| p.files_restored)
-        .map(|f| f.to_string())
-        .unwrap_or_else(|| "?".into());
-    let target = status
-        .and_then(|s| s.target.as_ref())
-        .and_then(|t| t.pvc_ref.as_ref())
-        .map(|p| format!("pvc/{}", p.name))
-        .unwrap_or_else(|| "target".into());
-    format!("restore {name} completed: {id}, {bytes} / {files} files into {target}\n")
-}
-
-/// Render one failure block + log tail pair (the mover's last words), shared by
-/// the direct and per-claim shapes. Pure.
-fn push_failure_and_tail(
-    out: &mut String,
-    failure: Option<&kopiur_api::common::FailureBlock>,
-    log_tail: Option<&str>,
-) {
-    if let Some(f) = failure {
-        out.push_str(&format!(" ({}): {}", f.kopia_error_class, f.message));
-        if let Some(stderr) = &f.stderr_tail {
-            out.push_str(&format!("\n--- kopia stderr tail ---\n{stderr}"));
-        }
-    }
-    if let Some(tail) = log_tail {
-        out.push_str(&format!("\n--- log tail ---\n{tail}"));
-    }
-}
-
-/// Failure detail from the terminal object's status, for stderr.
-///
-/// Per claim for a populator (#443, review wave 2 finding 8): with ONE claim
-/// the detail is that claim's own `failure`/`logTail`; with several, a
-/// per-claim list ("claim <pvc>: <reason> — <message>") with each failed
-/// claim's failure block and tail beneath it, so the user sees WHICH claim
-/// stalled the restore. A direct restore reads the top-level fields.
-pub fn failure_detail(restore: &Restore) -> String {
-    let name = restore.metadata.name.as_deref().unwrap_or("?");
-    let status = restore.status.as_ref();
-    let mut out = format!("restore {name} failed");
-    let claims = status.map(|s| &s.claims).filter(|c| !c.is_empty());
-    match claims {
-        None => push_failure_and_tail(
-            &mut out,
-            status.and_then(|s| s.failure.as_ref()),
-            status.and_then(|s| s.log_tail.as_deref()),
-        ),
-        Some(claims) if claims.len() == 1 => {
-            let (pvc, claim) = claims.iter().next().expect("one claim");
-            out.push_str(&format!(" (claim {pvc})"));
-            push_failure_and_tail(&mut out, claim.failure.as_ref(), claim.log_tail.as_deref());
-        }
-        Some(claims) => {
-            for (pvc, claim) in claims {
-                let phase = claim
-                    .phase
-                    .as_ref()
-                    .map(|p| serde_json::to_value(p).ok())
-                    .and_then(|v| v.and_then(|v| v.as_str().map(str::to_string)))
-                    .unwrap_or_else(|| "?".into());
-                out.push_str(&format!(
-                    "\nclaim {pvc}: {phase}/{} — {}",
-                    claim.reason.as_deref().unwrap_or("?"),
-                    claim.message.as_deref().unwrap_or("")
-                ));
-                let mut detail = String::new();
-                push_failure_and_tail(
-                    &mut detail,
-                    claim.failure.as_ref(),
-                    claim.log_tail.as_deref(),
-                );
-                if !detail.is_empty() {
-                    out.push_str(&format!("\n  claim {pvc} detail{detail}"));
-                }
-            }
-        }
-    }
-    out.push('\n');
-    out
-}
 
 /// Run `restore`.
 pub async fn run(
@@ -316,12 +35,12 @@ pub async fn run(
     }
     let ns = ctx.namespace.as_str();
     let restores: Api<Restore> = Api::namespaced(ctx.client.clone(), ns);
-    let restore = build_restore(args, ns, now);
+    // Total: clap's `source`/`target` ArgGroups already refused every other
+    // shape (see the conversion in `crate::cli`).
+    let req = RestoreRequest::from(args);
+    let restore = build_restore(&req, ns, now);
     let name = restore.metadata.name.clone().expect("name set by builder");
-    let created = restores
-        .create(&PostParams::default(), &restore)
-        .await
-        .map_err(|e| classify_kube("create", "Restore", "restores", Some(ns), Some(&name), e))?;
+    let created = create_restore(ctx, ns, restore).await?;
 
     let wait = args.wait || args.logs;
     let created_line = format!("restore.{}/{} created\n", kopiur_api::GROUP, name);
@@ -332,22 +51,25 @@ pub async fn run(
                 // Through a JSON Value first: serde_yaml would render the
                 // externally-tagged enums (source/target) as `!snapshotRef`
                 // YAML tags — not the cluster's encoding (convention #5).
-                let value =
-                    serde_json::to_value(&created).map_err(|e| CliError::Serialization {
+                let value = serde_json::to_value(&created).map_err(|e| {
+                    CliError::Ops(OpsError::Serialization {
                         what: "created Restore",
                         source: e.into(),
-                    })?;
-                serde_yaml::to_string(&value).map_err(|e| CliError::Serialization {
-                    what: "created Restore",
-                    source: e.into(),
+                    })
+                })?;
+                serde_yaml::to_string(&value).map_err(|e| {
+                    CliError::Ops(OpsError::Serialization {
+                        what: "created Restore",
+                        source: e.into(),
+                    })
                 })?
             }
             OutputFormat::Json => {
                 let mut s = serde_json::to_string_pretty(&created).map_err(|e| {
-                    CliError::Serialization {
+                    CliError::Ops(OpsError::Serialization {
                         what: "created Restore",
                         source: e.into(),
-                    }
+                    })
                 })?;
                 s.push('\n');
                 s
@@ -412,7 +134,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, Command, OnMissingSnapshotArg, RepositoryKindArg};
+    use crate::cli::{Cli, Command};
     use chrono::TimeZone;
     use clap::Parser;
 
@@ -444,37 +166,6 @@ mod tests {
     }
 
     #[test]
-    fn every_source_target_combination_builds_the_right_enums() {
-        let sources: [(&[&str], &str); 3] = [
-            (&["--from-snapshot", "snap1"], "SnapshotRef"),
-            (&["--from-policy", "pol1"], "FromPolicy"),
-            (
-                &["--identity", "u@h:/data", "--repository", "repo1"],
-                "Identity",
-            ),
-        ];
-        let targets: [(&[&str], &str); 3] = [
-            (&["--to-pvc", "existing"], "PvcRef"),
-            (&["--create-pvc", "fresh", "--size", "1Gi"], "Pvc"),
-            (&["--populator"], "Populator"),
-        ];
-        for (source_flags, source_kind) in sources {
-            for (target_flags, target_kind) in targets {
-                let mut flags: Vec<&str> = source_flags.to_vec();
-                flags.extend_from_slice(target_flags);
-                let args = parse(&flags);
-                let restore = build_restore(&args, "media", at());
-                assert_eq!(restore.spec.source.kind_str(), source_kind, "{flags:?}");
-                assert_eq!(restore.spec.target.kind_str(), target_kind, "{flags:?}");
-                // Round-trip through JSON (the cluster's encoding).
-                let wire = serde_json::to_value(&restore).unwrap();
-                let reparsed: Restore = serde_json::from_value(wire).unwrap();
-                assert_eq!(reparsed.spec, restore.spec);
-            }
-        }
-    }
-
-    #[test]
     fn missing_source_or_target_fails_at_parse_time() {
         let err = parse_err(&["--to-pvc", "x"]);
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
@@ -502,32 +193,10 @@ mod tests {
     }
 
     /// `--source-path` (#443 review wave 2, finding 3b): the per-PVC path
-    /// override, fromPolicy only. It is what restores a selector-policy member
-    /// into a differently-named PVC.
+    /// override, fromPolicy only. Any other source is a parse-time error, not a
+    /// silently dropped flag.
     #[test]
-    fn source_path_lands_on_from_policy_and_is_refused_with_other_sources() {
-        let args = parse(&[
-            "--from-policy",
-            "nightly",
-            "--source-path",
-            "/pvc/postgres-data",
-            "--to-pvc",
-            "scratch",
-        ]);
-        let restore = build_restore(&args, "media", at());
-        match &restore.spec.source {
-            RestoreSource::FromPolicy(p) => {
-                assert_eq!(p.source_path.as_deref(), Some("/pvc/postgres-data"));
-            }
-            other => panic!("expected fromPolicy, got {other:?}"),
-        }
-        // Absent ⇒ absent on the wire (the derivation applies).
-        let bare = parse(&["--from-policy", "nightly", "--to-pvc", "scratch"]);
-        match &build_restore(&bare, "media", at()).spec.source {
-            RestoreSource::FromPolicy(p) => assert!(p.source_path.is_none()),
-            other => panic!("expected fromPolicy, got {other:?}"),
-        }
-        // Any other source: a parse-time error, not a silently dropped flag.
+    fn source_path_is_refused_with_other_sources() {
         for source in [
             &["--from-snapshot", "snap1"][..],
             &["--identity", "u@h:/data", "--repository", "r"][..],
@@ -604,190 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn every_option_flag_lands_in_the_spec() {
-        // The restore-options-dropped bug class: EVERY flag must round-trip.
-        let args = parse(&[
-            "--from-policy",
-            "pol1",
-            "--policy-namespace",
-            "other",
-            "--as-of",
-            "2026-06-01T00:00:00Z",
-            "--offset",
-            "2",
-            "--create-pvc",
-            "fresh",
-            "--size",
-            "10Gi",
-            "--storage-class",
-            "fast",
-            "--access-mode",
-            "ReadWriteOnce",
-            "--access-mode",
-            "ReadOnlyMany",
-            "--enable-file-deletion",
-            "--ignore-permission-errors",
-            "false",
-            "--write-files-atomically",
-            "true",
-            "--on-missing-snapshot",
-            "continue",
-            "--wait-timeout",
-            "5m",
-            "--backoff-limit",
-            "1",
-            "--active-deadline-seconds",
-            "600",
-            "--repository",
-            "nas",
-            "--repository-kind",
-            "cluster-repository",
-            "--name",
-            "my-restore",
-        ]);
-        assert_eq!(args.repository_kind, RepositoryKindArg::ClusterRepository);
-        assert_eq!(
-            args.on_missing_snapshot,
-            Some(OnMissingSnapshotArg::Continue)
-        );
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
-        assert_eq!(wire["metadata"]["name"], "my-restore");
-        let spec = &wire["spec"];
-        assert_eq!(spec["source"]["fromPolicy"]["name"], "pol1");
-        assert_eq!(spec["source"]["fromPolicy"]["namespace"], "other");
-        assert_eq!(spec["source"]["fromPolicy"]["asOf"], "2026-06-01T00:00:00Z");
-        assert_eq!(spec["source"]["fromPolicy"]["offset"], 2);
-        assert_eq!(spec["target"]["pvc"]["name"], "fresh");
-        assert_eq!(spec["target"]["pvc"]["capacity"], "10Gi");
-        assert_eq!(spec["target"]["pvc"]["storageClassName"], "fast");
-        assert_eq!(
-            spec["target"]["pvc"]["accessModes"],
-            serde_json::json!(["ReadWriteOnce", "ReadOnlyMany"])
-        );
-        assert_eq!(spec["options"]["enableFileDeletion"], true);
-        assert_eq!(spec["options"]["ignorePermissionErrors"], false);
-        assert_eq!(spec["options"]["writeFilesAtomically"], true);
-        assert_eq!(spec["policy"]["onMissingSnapshot"], "Continue");
-        assert_eq!(spec["policy"]["waitTimeout"], "5m");
-        assert_eq!(spec["failurePolicy"]["backoffLimit"], 1);
-        assert_eq!(spec["failurePolicy"]["activeDeadlineSeconds"], 600);
-        assert_eq!(spec["repository"]["kind"], "ClusterRepository");
-        assert_eq!(spec["repository"]["name"], "nas");
-    }
-
-    #[test]
-    fn every_m2_flag_sweep_option_flag_lands_in_the_spec() {
-        // M2 flag sweep: EVERY new kopia restore tuning flag must round-trip
-        // (the same bug class `every_option_flag_lands_in_the_spec` guards for
-        // the original three options, split into its own test so this doesn't
-        // compound that test's cognitive complexity).
-        let args = parse(&[
-            "--from-snapshot",
-            "snap1",
-            "--to-pvc",
-            "data",
-            "--parallel",
-            "4",
-            "--write-sparse-files",
-            "true",
-            "--skip-owners",
-            "true",
-            "--skip-permissions",
-            "false",
-            "--skip-times",
-            "true",
-            "--overwrite-files",
-            "false",
-            "--overwrite-directories",
-            "false",
-            "--overwrite-symlinks",
-            "true",
-            "--ignore-errors",
-            "false",
-            "--skip-existing",
-            "true",
-        ]);
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
-        let opts = &wire["spec"]["options"];
-        assert_eq!(opts["parallel"], 4);
-        assert_eq!(opts["writeSparseFiles"], true);
-        assert_eq!(opts["skipOwners"], true);
-        assert_eq!(opts["skipPermissions"], false);
-        assert_eq!(opts["skipTimes"], true);
-        assert_eq!(opts["overwriteFiles"], false);
-        assert_eq!(opts["overwriteDirectories"], false);
-        assert_eq!(opts["overwriteSymlinks"], true);
-        assert_eq!(opts["ignoreErrors"], false);
-        assert_eq!(opts["skipExisting"], true);
-        // Untouched flags stay absent.
-        assert!(opts.get("enableFileDeletion").is_none());
-    }
-
-    #[test]
-    fn minimal_restore_has_no_optional_noise_on_the_wire() {
-        let args = parse(&["--from-snapshot", "snap1", "--to-pvc", "data"]);
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
-        assert_eq!(wire["metadata"]["name"], "restore-snap1-20260611030012");
-        let spec = &wire["spec"];
-        assert_eq!(spec["source"]["snapshotRef"]["name"], "snap1");
-        assert_eq!(spec["target"]["pvcRef"]["name"], "data");
-        for key in ["options", "policy", "failurePolicy", "repository", "mover"] {
-            assert!(spec.get(key).is_none(), "{key} should be absent");
-        }
-    }
-
-    #[test]
-    fn credential_projection_flag_lands_in_the_spec() {
-        let args = parse(&[
-            "--from-snapshot",
-            "snap1",
-            "--to-pvc",
-            "data",
-            "--credential-projection",
-        ]);
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
-        assert_eq!(wire["spec"]["credentialProjection"]["enabled"], true);
-    }
-
-    #[test]
-    fn identity_snapshot_id_lands_with_the_adr_capitalization() {
-        let args = parse(&[
-            "--identity",
-            "u@h:/p",
-            "--snapshot-id",
-            "abc123",
-            "--repository",
-            "nas",
-            "--to-pvc",
-            "x",
-        ]);
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
-        assert_eq!(wire["spec"]["source"]["identity"]["snapshotID"], "abc123");
-        assert_eq!(wire["spec"]["source"]["identity"]["username"], "u");
-        assert_eq!(wire["spec"]["source"]["identity"]["sourcePath"], "/p");
-    }
-
-    fn with_phase(phase: &str) -> Restore {
-        serde_json::from_value(serde_json::json!({
-            "apiVersion": "kopiur.home-operations.com/v1alpha1",
-            "kind": "Restore",
-            "metadata": { "name": "r", "namespace": "media" },
-            "spec": {
-                "source": { "snapshotRef": { "name": "s" } },
-                "target": { "pvcRef": { "name": "d" } }
-            },
-            "status": { "phase": phase }
-        }))
-        .unwrap()
-    }
-
-    #[test]
     fn yaml_output_uses_the_cluster_encoding_not_serde_yaml_tags() {
         // serde_yaml renders newtype enum variants as `!snapshotRef` tags when
         // serialized directly; the CLI must emit the cluster's plain-mapping
         // encoding (via a JSON Value) so the output is kubectl-applyable.
         let args = parse(&["--from-snapshot", "snap1", "--to-pvc", "data"]);
-        let restore = build_restore(&args, "media", at());
+        let req = RestoreRequest::from(&args);
+        let restore = build_restore(&req, "media", at());
         let value = serde_json::to_value(&restore).unwrap();
         let yaml = serde_yaml::to_string(&value).unwrap();
         assert!(yaml.contains("snapshotRef:"), "{yaml}");
@@ -802,174 +294,6 @@ mod tests {
         assert!(
             direct.contains('!'),
             "serde_yaml behavior changed: {direct}"
-        );
-    }
-
-    #[test]
-    fn terminal_classification_is_exhaustive_and_correct() {
-        for pending in ["Pending", "Resolving", "Restoring"] {
-            assert!(terminal(&with_phase(pending)).is_none(), "{pending}");
-        }
-        assert!(matches!(terminal(&with_phase("Completed")), Some(Ok(_))));
-        assert!(matches!(terminal(&with_phase("Failed")), Some(Err(_))));
-    }
-
-    /// A fanned-out populator (#443) with two claims: one restored, one
-    /// deploy-or-restore'd empty. Reused by the success and failure renderers.
-    fn two_claims(phase: &str, claims: serde_json::Value) -> Restore {
-        serde_json::from_value(serde_json::json!({
-            "apiVersion": "kopiur.home-operations.com/v1alpha1",
-            "kind": "Restore",
-            "metadata": { "name": "app" },
-            "spec": {
-                "source": { "fromPolicy": { "name": "cfg" } },
-                "target": { "populator": {} }
-            },
-            "status": { "phase": phase, "claims": claims }
-        }))
-        .unwrap()
-    }
-
-    /// Review wave 2, finding 8: the CLI reads the PER-CLAIM records. With
-    /// several claims the top-level `resolved` is absent by design, so the old
-    /// renderer printed `kopia id ?`; now each claim's own id and target is listed.
-    #[test]
-    fn success_summary_lists_every_claims_own_id_and_target() {
-        let restore = two_claims(
-            "Completed",
-            serde_json::json!({
-                "data": {
-                    "phase": "Populated", "reason": "RestoreSucceeded",
-                    "resolved": { "resolution": "Snapshot", "kopiaSnapshotID": "abc123" }
-                },
-                "logs": {
-                    "phase": "Populated", "reason": "NoSnapshotContinue",
-                    "resolved": { "resolution": "NoSnapshot" }
-                }
-            }),
-        );
-        assert_eq!(
-            success_summary(&restore),
-            "restore app completed: 2 claims — pvc/data: kopia id abc123; \
-             pvc/logs: empty volume (no snapshot)\n"
-        );
-        // One claim: still its OWN record, never `kopia id ?`.
-        let one = two_claims(
-            "Completed",
-            serde_json::json!({
-                "data": {
-                    "phase": "Populated", "reason": "RestoreSucceeded",
-                    "resolved": { "resolution": "Snapshot", "kopiaSnapshotID": "abc123" }
-                }
-            }),
-        );
-        assert_eq!(
-            success_summary(&one),
-            "restore app completed: 1 claim — pvc/data: kopia id abc123\n"
-        );
-    }
-
-    /// Review wave 2, finding 8: a failed fan-out names WHICH claim failed, with
-    /// that claim's failure block and log tail; the healthy sibling is listed
-    /// without detail. One claim reads its own record directly.
-    #[test]
-    fn failure_detail_is_per_claim() {
-        let restore = two_claims(
-            "Failed",
-            serde_json::json!({
-                "data": {
-                    "phase": "Populated", "reason": "RestoreSucceeded",
-                    "message": "restored"
-                },
-                "logs": {
-                    "phase": "Failed", "reason": "MoverJobFailed",
-                    "message": "the populator restore mover Job `app-populate-deadbeef` failed",
-                    "failure": {
-                        "kopiaErrorClass": "PermissionDenied",
-                        "message": "kopia: cannot write /data",
-                        "retryRecommended": false,
-                        "stderrTail": "ERROR permission denied"
-                    },
-                    "logTail": "mover: restore failed"
-                }
-            }),
-        );
-        let text = failure_detail(&restore);
-        assert_eq!(
-            text,
-            "restore app failed\n\
-             claim data: Populated/RestoreSucceeded — restored\n\
-             claim logs: Failed/MoverJobFailed — the populator restore mover Job \
-             `app-populate-deadbeef` failed\n  \
-             claim logs detail (PermissionDenied): kopia: cannot write /data\n\
-             --- kopia stderr tail ---\nERROR permission denied\n\
-             --- log tail ---\nmover: restore failed\n"
-        );
-
-        let one = two_claims(
-            "Failed",
-            serde_json::json!({
-                "logs": {
-                    "phase": "Failed", "reason": "MoverJobFailed",
-                    "failure": {
-                        "kopiaErrorClass": "PermissionDenied",
-                        "message": "kopia: cannot write /data",
-                        "retryRecommended": false
-                    },
-                    "logTail": "mover: restore failed"
-                }
-            }),
-        );
-        assert_eq!(
-            failure_detail(&one),
-            "restore app failed (claim logs) (PermissionDenied): kopia: cannot write /data\n\
-             --- log tail ---\nmover: restore failed\n"
-        );
-
-        // A direct restore keeps reading the top-level fields.
-        let direct: Restore = serde_json::from_value(serde_json::json!({
-            "apiVersion": "kopiur.home-operations.com/v1alpha1",
-            "kind": "Restore",
-            "metadata": { "name": "r" },
-            "spec": {
-                "source": { "snapshotRef": { "name": "s" } },
-                "target": { "pvcRef": { "name": "d" } }
-            },
-            "status": {
-                "phase": "Failed",
-                "failure": { "kopiaErrorClass": "AuthFailure", "message": "bad password",
-                             "retryRecommended": false },
-                "logTail": "tail"
-            }
-        }))
-        .unwrap();
-        assert_eq!(
-            failure_detail(&direct),
-            "restore r failed (AuthFailure): bad password\n--- log tail ---\ntail\n"
-        );
-    }
-
-    #[test]
-    fn success_summary_reports_id_bytes_files_and_target() {
-        let restore: Restore = serde_json::from_value(serde_json::json!({
-            "apiVersion": "kopiur.home-operations.com/v1alpha1",
-            "kind": "Restore",
-            "metadata": { "name": "r" },
-            "spec": {
-                "source": { "snapshotRef": { "name": "s" } },
-                "target": { "pvcRef": { "name": "d" } }
-            },
-            "status": {
-                "phase": "Completed",
-                "resolved": { "kopiaSnapshotID": "abc123" },
-                "progress": { "bytesRestored": 1536, "filesRestored": 12 },
-                "target": { "pvcRef": { "name": "d" } }
-            }
-        }))
-        .unwrap();
-        assert_eq!(
-            success_summary(&restore),
-            "restore r completed: kopia id abc123, 1.5 KiB / 12 files into pvc/d\n"
         );
     }
 }

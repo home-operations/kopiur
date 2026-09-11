@@ -1,8 +1,20 @@
 //! Output rendering: the `-o` format enum, a small padded-column table writer,
 //! and deterministic humanizers for bytes and ages. All pure — every command
 //! builds its output through these and the dispatcher prints once.
+//!
+//! The byte humanizer and the empty-cell placeholder live in
+//! [`kopiur_ops::format`] and are re-exported here: the shared layer's reports
+//! render the same cells, and a table where `-` meant one thing in the CLI and
+//! another in the web UI would be two conventions wearing one name.
 
 use chrono::{DateTime, Utc};
+
+/// Placeholder for an absent value in table cells. Re-exported from the shared
+/// operations layer so the CLI and the web UI agree on "nothing reported".
+pub use kopiur_ops::format::EMPTY_CELL;
+/// Humanize a byte count. Re-exported from the shared operations layer so a
+/// size reads identically wherever it is rendered.
+pub use kopiur_ops::format::human_bytes;
 
 /// Every `-o` value the plugin accepts. Dispatchers `match` this exhaustively,
 /// so adding a format forces every command to handle it.
@@ -91,25 +103,6 @@ impl Table {
     }
 }
 
-/// Humanize a byte count: `512 B`, `1.5 KiB`, `2.0 GiB`. Binary units, one
-/// decimal, matching kopia's own reporting style.
-pub fn human_bytes(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64;
-    let mut unit = "";
-    for u in UNITS {
-        value /= 1024.0;
-        unit = u;
-        if value < 1024.0 {
-            break;
-        }
-    }
-    format!("{value:.1} {unit}")
-}
-
 /// Humanize an age the way `kubectl get` does: the largest single unit
 /// (`42s`, `12m`, `5h`, `3d`, `2y`). Takes `now` explicitly so it is
 /// deterministic and testable.
@@ -123,10 +116,6 @@ pub fn human_age(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
         s => format!("{}y", s / (365 * 24 * 60 * 60)),
     }
 }
-
-/// Placeholder for an absent value in table cells, matching `kubectl`'s
-/// `<none>`-adjacent convention without the angle brackets.
-pub const EMPTY_CELL: &str = "-";
 
 #[cfg(test)]
 mod tests {
@@ -144,15 +133,6 @@ mod tests {
         assert_eq!(lines[1], "a-very-long-name  Running");
         assert_eq!(lines[2], "b                 Succeeded");
         assert!(lines.iter().all(|l| !l.ends_with(' ')));
-    }
-
-    #[test]
-    fn human_bytes_uses_binary_units() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1536), "1.5 KiB");
-        assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MiB");
-        assert_eq!(human_bytes(5_368_709_120), "5.0 GiB");
     }
 
     #[test]

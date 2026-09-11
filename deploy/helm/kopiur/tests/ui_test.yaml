@@ -1,0 +1,755 @@
+suite: web UI (kopiur-ui)
+release:
+  name: kopiur
+  namespace: kopiur-system
+templates:
+  - ui-deployment.tpl
+  - ui-service.tpl
+  - ui-serviceaccount.tpl
+  - ui-clusterrole.tpl
+  - ui-clusterrolebinding.tpl
+  - ui-user-clusterroles.tpl
+  - ui-browse-clusterrole.tpl
+  - ui-doctor-role.tpl
+  - ui-networkpolicy.tpl
+  - ui-poddisruptionbudget.tpl
+  - ui-servicemonitor.tpl
+  - ui-validatingadmissionpolicy.tpl
+# The configurations the chart REFUSES live in ui-refusals_test.yaml — a `fail`
+# aborts the whole render, so those need a single-template suite.
+tests:
+  - it: is off by default and renders nothing
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # =========================================================================
+  # No Ingress. Ever. Same posture as the operator's kopia server surface:
+  # kopiur does not own your edge, so it never guesses at one. An Ingress
+  # pointed straight at this Service would expose a console that trusts
+  # identity headers to anyone who can set them.
+  # =========================================================================
+
+  - it: never renders an Ingress or a route, with every optional piece turned on
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.networkPolicy.enabled: true
+      ui.networkPolicy.proxySelector:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: oauth2-proxy
+      ui.rbac.browseRole: true
+      ui.rbac.execPolicy.enabled: true
+      ui.rbac.execPolicy.subjects:
+        - kind: Group
+          name: platform
+      ui.serviceMonitor.enabled: true
+      ui.podDisruptionBudget.enabled: true
+      ui.tls.existingSecret: kopiur-ui-tls
+    asserts:
+      - isKind:
+          of: Ingress
+        not: true
+      - isKind:
+          of: HTTPRoute
+        not: true
+
+  # =========================================================================
+  # The ServiceAccount's own ClusterRole. The absences ARE the assertions:
+  # impersonate plus Secrets would let the console read every repository
+  # credential in the cluster while appearing to be nobody in particular.
+  # =========================================================================
+
+  - it: grants exactly impersonation plus the cache reads, and nothing else
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-clusterrole.tpl
+    asserts:
+      - isKind:
+          of: ClusterRole
+      - equal:
+          path: metadata.name
+          value: kopiur-ui
+      # Asserted WHOLE: a subset assertion cannot fail when someone widens a
+      # grant, which is the only direction that matters here.
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: [users]
+              verbs: [impersonate]
+            - apiGroups: [""]
+              resources: [groups]
+              verbs: [impersonate]
+            - apiGroups: [kopiur.home-operations.com]
+              resources:
+                - repositories
+                - snapshotpolicies
+                - snapshots
+                - snapshotschedules
+                - restores
+                - maintenances
+                - repositoryreplications
+                - snapshotreplications
+                - clusterrepositories
+              verbs: [get, list, watch]
+            - apiGroups: [authorization.k8s.io]
+              resources: [subjectaccessreviews]
+              verbs: [create]
+      # Spelled out separately, because these are what a reviewer looks for.
+      - notMatchRegexRaw:
+          pattern: secrets
+      - notMatchRegexRaw:
+          pattern: pods/exec
+
+  - it: names each impersonatable extra key — RBAC has no userextras wildcard
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.auth.impersonateExtraKeys: [scopes, oid]
+    template: ui-clusterrole.tpl
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [authentication.k8s.io]
+            resources: [userextras/scopes]
+            verbs: [impersonate]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [authentication.k8s.io]
+            resources: [userextras/oid]
+            verbs: [impersonate]
+      # `userextras/*` is accepted by the API and authorizes nothing, so it
+      # would fail at the first request instead of at install.
+      - notMatchRegexRaw:
+          pattern: 'userextras/\*'
+
+  - it: pins impersonation by name in anonymous mode
+    set:
+      ui.enabled: true
+      ui.auth.anonymous.enabled: true
+      ui.auth.anonymous.user: kopiur-anonymous
+      ui.auth.anonymous.groups: [kopiur-readers]
+    template: ui-clusterrole.tpl
+    asserts:
+      # Even if the header parsing were fooled, the apiserver will not let this
+      # console be anybody but the one configured anonymous identity.
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [users]
+            resourceNames: [kopiur-anonymous]
+            verbs: [impersonate]
+      # system:authenticated rides along on every impersonated identity, so a
+      # name-scoped groups rule that omitted it would reject every request.
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [groups]
+            resourceNames: [kopiur-readers, "system:authenticated"]
+            verbs: [impersonate]
+      - notMatchRegexRaw:
+          pattern: "system:masters"
+
+  - it: pins the groups rule to allowedGroups in header mode
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.auth.allowedGroups: [sre, platform]
+    template: ui-clusterrole.tpl
+    asserts:
+      # Enforced twice: once by the console's own parser, once here — so a bug
+      # in the former is still caught by the apiserver.
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [groups]
+            resourceNames: [platform, sre, "system:authenticated"]
+            verbs: [impersonate]
+      # An allow-list of groups says nothing about which humans may log in.
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [users]
+            verbs: [impersonate]
+
+  - it: drops the cache grants entirely when the cache is off
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.cache.enabled: false
+    template: ui-clusterrole.tpl
+    asserts:
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [""]
+              resources: [users]
+              verbs: [impersonate]
+            - apiGroups: [""]
+              resources: [groups]
+              verbs: [impersonate]
+      - notMatchRegexRaw:
+          pattern: subjectaccessreviews
+
+  - it: binds that ClusterRole to the console's own ServiceAccount
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-clusterrolebinding.tpl
+    asserts:
+      - equal:
+          path: roleRef.name
+          value: kopiur-ui
+      - equal:
+          path: subjects[0].name
+          value: kopiur-ui
+      - equal:
+          path: subjects[0].namespace
+          value: kopiur-system
+
+  - it: gives the console a ServiceAccount that is NOT the operator's
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-serviceaccount.tpl
+    asserts:
+      - isKind:
+          of: ServiceAccount
+      # The operator's SA reads Secrets on every reconcile; the console's must
+      # never be able to, so they are deliberately different identities.
+      - equal:
+          path: metadata.name
+          value: kopiur-ui
+      # The projected token IS how the console authenticates in order to
+      # impersonate, so it must be mounted.
+      - equal:
+          path: automountServiceAccountToken
+          value: true
+
+  # =========================================================================
+  # The human roles.
+  # =========================================================================
+
+  - it: aggregates viewer and editor into the role administrators bind
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-user-clusterroles.tpl
+    asserts:
+      - hasDocuments:
+          count: 3
+      - equal:
+          path: metadata.labels["rbac.kopiur.home-operations.com/aggregate-to-ui-user"]
+          value: "true"
+        documentIndex: 0
+      - equal:
+          path: metadata.labels["rbac.kopiur.home-operations.com/aggregate-to-ui-user"]
+          value: "true"
+        documentIndex: 1
+      - equal:
+          path: metadata.name
+          value: kopiur-ui-user
+        documentIndex: 2
+      - equal:
+          path: aggregationRule.clusterRoleSelectors[0].matchLabels["rbac.kopiur.home-operations.com/aggregate-to-ui-user"]
+          value: "true"
+        documentIndex: 2
+      # The umbrella role carries no rules of its own — the apiserver fills
+      # them in from the aggregation.
+      - notExists:
+          path: rules
+        documentIndex: 2
+
+  - it: keeps the viewer read-only
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-user-clusterroles.tpl
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: metadata.name
+          value: kopiur-ui-viewer
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [kopiur.home-operations.com]
+              resources:
+                - repositories
+                - snapshotpolicies
+                - snapshots
+                - snapshotschedules
+                - restores
+                - maintenances
+                - repositoryreplications
+                - snapshotreplications
+                - clusterrepositories
+              verbs: [get, list, watch]
+            - apiGroups: [apiextensions.k8s.io]
+              resources: [customresourcedefinitions]
+              verbs: [get, list]
+            - apiGroups: [events.k8s.io]
+              resources: [events]
+              verbs: [list]
+
+  - it: keeps the editor verb table exactly as narrow as the console's buttons
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-user-clusterroles.tpl
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: metadata.name
+          value: kopiur-ui-editor
+      # Whole-set, so a widened grant fails the build rather than a review.
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [kopiur.home-operations.com]
+              resources: [snapshots]
+              verbs: [create, delete]
+            - apiGroups: [kopiur.home-operations.com]
+              resources: [restores]
+              verbs: [create]
+            - apiGroups: [kopiur.home-operations.com]
+              resources:
+                - snapshotpolicies
+                - snapshotschedules
+                - repositories
+                - clusterrepositories
+                - maintenances
+                - repositoryreplications
+                - snapshotreplications
+              verbs: [patch]
+            - apiGroups: [""]
+              resources: [persistentvolumeclaims]
+              verbs: [list]
+
+  - it: ships browse UNaggregated — granting it grants repository credentials
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.browseRole: true
+    template: ui-browse-clusterrole.tpl
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: kopiur-ui-browse
+      # The label that would fold it into the everyday user role must be absent:
+      # a session pod loads the repository credentials from its environment, so
+      # anyone with exec in that namespace can print them.
+      - notExists:
+          path: metadata.labels["rbac.kopiur.home-operations.com/aggregate-to-ui-user"]
+      # BOTH verbs. An exec over WebSocket is an HTTP upgrade, i.e. a GET, so the
+      # apiserver authorizes it as `get pods/exec`; `create` alone covers only the
+      # older SPDY POST and leaves every browse refused with a bare "cannot get
+      # resource pods/exec". Regression guard for the bug the console e2e found
+      # (it was the first test ever to bind a browse role to a non-admin subject).
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [pods/exec]
+            verbs: [create, get]
+      # The console pins the mover image via KOPIUR_MOVER_IMAGE, so a browsing
+      # user needs no cluster-wide Deployment read.
+      - notMatchRegexRaw:
+          pattern: deployments
+      - notMatchRegexRaw:
+          pattern: secrets
+
+  - it: does not render the browse role unless it is asked for
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-browse-clusterrole.tpl
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: confines the doctor deployment read to the operator namespace
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-doctor-role.tpl
+    asserts:
+      - isKind:
+          of: Role
+      - equal:
+          path: metadata.namespace
+          value: kopiur-system
+      - equal:
+          path: rules
+          value:
+            - apiGroups: [apps]
+              resources: [deployments]
+              verbs: [get, list]
+
+  # =========================================================================
+  # The Deployment: the env contract with crates/ui/src/config.rs.
+  # =========================================================================
+
+  - it: wires the identity, proxy secret and operator env the backend expects
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.groupsHeader: X-Forwarded-Groups
+      ui.auth.emailHeader: X-Forwarded-Email
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.auth.impersonateExtraKeys: [scopes, oid]
+      ui.auth.allowedGroups: [platform, sre]
+    template: ui-deployment.tpl
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_USER_HEADER
+            value: X-Forwarded-User
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_GROUPS_HEADER
+            value: X-Forwarded-Groups
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_EMAIL_HEADER
+            value: X-Forwarded-Email
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_IMPERSONATE_EXTRA_KEYS
+            value: scopes,oid
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_ALLOWED_GROUPS
+            value: platform,sre
+      # The shared secret is MOUNTED, never read through the apiserver: the
+      # console's ServiceAccount has no `secrets` grant at all, and adding one
+      # to save a volume is the single change that would turn "can impersonate"
+      # into "can read every credential".
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_PROXY_SECRET_FILE
+            value: /etc/kopiur-ui/proxy/token
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: proxy-secret
+            secret:
+              secretName: kopiur-ui-proxy
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: proxy-secret
+            mountPath: /etc/kopiur-ui/proxy
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+      # Pinned, never discovered: without this the browse plane would read the
+      # mover image off the controller Deployment AS THE BROWSING USER, and the
+      # browse role deliberately grants no apps/deployments read.
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MOVER_IMAGE
+            value: ghcr.io/home-operations/kopiur-mover:0.10.8
+
+  - it: runs locked down, on its own ServiceAccount, probing the ops port
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-deployment.tpl
+    asserts:
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: kopiur-ui
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value: [ALL]
+      # Probes ride the OPS port: the app port is firewalled to the proxy, and
+      # probing it would either fail or force a hole in that policy.
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: ops
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet.port
+          value: ops
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: http
+            containerPort: 8090
+            protocol: TCP
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: ops
+            containerPort: 8091
+            protocol: TCP
+
+  - it: passes the anonymous identity through, and configures no header
+    set:
+      ui.enabled: true
+      ui.auth.anonymous.enabled: true
+      ui.auth.anonymous.user: kopiur-anonymous
+      ui.auth.anonymous.groups: [kopiur-readers]
+    template: ui-deployment.tpl
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_ANONYMOUS_USER
+            value: kopiur-anonymous
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_ANONYMOUS_GROUPS
+            value: kopiur-readers
+      # An empty value means "unset" to the binary, so an unconfigured knob is
+      # omitted rather than rendered as "".
+      - notMatchRegexRaw:
+          pattern: KOPIUR_UI_USER_HEADER
+      - notMatchRegexRaw:
+          pattern: KOPIUR_UI_ANONYMOUS_FALLBACK
+
+  - it: tells the backend when the no-proxy-secret posture was acknowledged
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.acknowledgeNoProxySecret: true
+    template: ui-deployment.tpl
+    asserts:
+      # Both sides must agree: the binary refuses to start in header mode
+      # without either a proxy secret or this acknowledgement.
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_ACKNOWLEDGE_NO_PROXY_SECRET
+            value: "true"
+      - notMatchRegexRaw:
+          pattern: KOPIUR_UI_PROXY_SECRET_FILE
+
+  - it: carries the resource bounds that keep one caller from exhausting it
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-deployment.tpl
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_MAX_EXEC_PER_IDENTITY
+            value: "4"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_MAX_DOWNLOAD_BYTES
+            value: "1073741824"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_MAX_MANIFEST_BYTES
+            value: "67108864"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_CACHE
+            value: "true"
+
+  # =========================================================================
+  # Service + NetworkPolicy: the app port is for the proxy, the ops port is
+  # for Prometheus, and nothing else reaches either.
+  # =========================================================================
+
+  - it: exposes both ports on a ClusterIP Service
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-service.tpl
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - contains:
+          path: spec.ports
+          content:
+            name: http
+            port: 8090
+            targetPort: http
+            protocol: TCP
+      - contains:
+          path: spec.ports
+          content:
+            name: ops
+            port: 8091
+            targetPort: ops
+            protocol: TCP
+
+  - it: admits the app port only from the proxy and the ops port only from monitoring
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.networkPolicy.enabled: true
+      ui.networkPolicy.proxySelector:
+        namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: auth
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: oauth2-proxy
+      ui.networkPolicy.monitoringSelector:
+        namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+    template: ui-networkpolicy.tpl
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - equal:
+          path: spec.policyTypes
+          value: [Ingress]
+      - equal:
+          path: spec.ingress[0].ports[0].port
+          value: http
+      - equal:
+          path: spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/name"]
+          value: oauth2-proxy
+      - equal:
+          path: spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]
+          value: auth
+      - equal:
+          path: spec.ingress[1].ports[0].port
+          value: ops
+      - equal:
+          path: spec.ingress[1].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]
+          value: monitoring
+
+  - it: leaves the ops port open when no monitoring peer is named
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.networkPolicy.enabled: true
+      ui.networkPolicy.proxySelector:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: oauth2-proxy
+    template: ui-networkpolicy.tpl
+    asserts:
+      # The kubelet probes the ops port from the node, which no namespace or pod
+      # selector can express — so an unset monitoringSelector means "any peer"
+      # rather than a policy that silently breaks readiness.
+      - notExists:
+          path: spec.ingress[1].from
+
+  # =========================================================================
+  # The exec policy: the enforcement RBAC cannot express, because
+  # `pods/exec create` is not name-scopable.
+  # =========================================================================
+
+  - it: narrows browse exec to kopia in a session pod when the policy is on
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.execPolicy.enabled: true
+      ui.rbac.execPolicy.subjects:
+        - kind: Group
+          name: platform
+        - kind: ServiceAccount
+          name: browser
+          namespace: apps
+    template: ui-validatingadmissionpolicy.tpl
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: ValidatingAdmissionPolicy
+        documentIndex: 0
+      - equal:
+          path: spec.matchConstraints.resourceRules[0].resources
+          value: [pods/exec]
+        documentIndex: 0
+      - equal:
+          path: spec.matchConstraints.resourceRules[0].operations
+          value: [CONNECT]
+        documentIndex: 0
+      # Only the browse subjects: everyone else's exec is none of this policy's
+      # business, and matching them would break unrelated operations.
+      - equal:
+          path: spec.matchConditions[0].expression
+          value: '"platform" in request.userInfo.groups || request.userInfo.username == "system:serviceaccount:apps:browser"'
+        documentIndex: 0
+      - matchRegex:
+          path: spec.validations[0].expression
+          pattern: "kopiur-browse-"
+        documentIndex: 0
+      - matchRegex:
+          path: spec.validations[1].expression
+          pattern: "/usr/local/bin/kopia"
+        documentIndex: 0
+      - isKind:
+          of: ValidatingAdmissionPolicyBinding
+        documentIndex: 1
+      # Deny, not Warn: a policy that only logs the exec it was installed to
+      # prevent is a report, not a control.
+      - equal:
+          path: spec.validationActions
+          value: [Deny]
+        documentIndex: 1
+
+  - it: is not rendered unless asked for
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-validatingadmissionpolicy.tpl
+    asserts:
+      - hasDocuments:
+          count: 0

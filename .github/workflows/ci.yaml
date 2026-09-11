@@ -339,6 +339,17 @@ jobs:
             bins: "install_scope"
             backends: false
             helm_set: "installScope=namespaced"
+          # The web console. Own shard, and the only one that installs it: `ui: "1"`
+          # opts the console image into `images-load` AND layers
+          # deploy/e2e/values-ui.yaml onto the install (see crates/e2e/mise.toml),
+          # which every other shard would otherwise pay for in kind-load time and
+          # an extra Deployment. It is also the only shard that binds a browse
+          # role to a NON-ADMIN subject, which is what makes it the one place an
+          # RBAC verb missing from that role can be caught. Filesystem only.
+          - shard: ui
+            bins: "ui"
+            backends: false
+            ui: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -382,6 +393,9 @@ jobs:
       - wait: [cluster]
 
       - name: Load images into kind
+        env:
+          # Side-load the console image too, on the shard that installs it.
+          KOPIUR_E2E_UI: ${{ matrix.ui || '' }}
         run: mise run //crates/e2e:images-load
 
       # Backend-server images (MinIO/mc, SFTP, WebDAV). The lifecycle shard is
@@ -406,6 +420,9 @@ jobs:
         env:
           # Optional per-shard chart reshape (e.g. installScope=namespaced).
           KOPIUR_E2E_HELM_SET: ${{ matrix.helm_set || '' }}
+          # Layers deploy/e2e/values-ui.yaml and pre-creates the proxy-token
+          # Secret the console Deployment mounts.
+          KOPIUR_E2E_UI: ${{ matrix.ui || '' }}
         run: mise run //crates/e2e:helm
 
       - name: Run e2e tests
@@ -429,9 +446,9 @@ jobs:
         if: always()
         run: mise run //crates/e2e:down
 
-  # Build the three component images concurrently — one matrix leg per image — so
-  # the wall-clock for this stage is the single slowest image, not the sum of all
-  # three. Each leg saves its own :e2e image as a separate artifact for the test
+  # Build the component images concurrently — one matrix leg per image — so
+  # the wall-clock for this stage is the single slowest image, not the sum of
+  # them all. Each leg saves its own :e2e image as a separate artifact for the test
   # shards to load. Per-image Rust cache keys keep the legs from contending on one
   # shared cache.
   e2e-image:
@@ -454,6 +471,16 @@ jobs:
             task: image-webhook
           - image: mover
             task: image-mover
+          # Built on every PR even though no shard installs the console yet:
+          # this leg IS the gate that a broken docker/Dockerfile.ui reddens
+          # review instead of the release. It needs no entry in `status.needs`
+          # — that list already carries `e2e-image`, and a matrix job fails as
+          # a whole when any leg fails, so a new leg cannot be forgotten there.
+          # Loading it into kind is opt-in (KOPIUR_E2E_UI=1, see
+          # crates/e2e/mise.toml); the tarball is uploaded regardless so a shard
+          # that enables the UI needs only that env var.
+          - image: ui
+            task: image-ui
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -477,7 +504,7 @@ jobs:
           KOPIUR_IMAGE_TAG: e2e
         run: mise run //:${{ matrix.task }}
 
-      # Every shard downloads all three images, so the tarballs cross the
+      # Every shard downloads every image, so the tarballs cross the
       # artifact store dozens of times per run and are worth compressing. gzip
       # because the daemon may export layers uncompressed depending on its image
       # store, and docker load reads either. shell: bash for the pipefail the
@@ -494,6 +521,216 @@ jobs:
           name: e2e-image-${{ matrix.image }}
           path: image-${{ matrix.image }}.tar.gz
           retention-days: 1
+
+  # Publish the exact images the e2e shards ran against, tagged for this pull
+  # request, so a reviewer can pull a build instead of reproducing one. The
+  # bytes are the artifact `e2e-image` already produced and the shards already
+  # tested -- not a rebuild, which could differ.
+  #
+  # Deliberately a separate job rather than a push step inside `e2e-image`: the
+  # shards need only the tarball, and a registry outage must not strand
+  # seventeen of them behind a failed `needs`.
+  #
+  # Skipped for pull requests from forks. GITHUB_TOKEN is read-only there no
+  # matter what `permissions:` asks for, so the push could only fail; `status`
+  # counts a skip as a pass.
+  pr-image:
+    if: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && !startsWith(github.head_ref, 'release-please--') }}
+    name: PR Image (${{ matrix.image }})
+    needs: e2e-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false # one image's registry failure shouldn't hide the others
+      matrix:
+        image:
+          - controller
+          - webhook
+          - mover
+          - ui
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-image-${{ matrix.image }}
+
+      - name: Load image
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker load -i "image-${IMAGE}.tar.gz"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Two tags. `pr-<n>` moves with the branch, so a reviewer can keep
+      # re-pulling one reference; `pr-<n>-<sha>` is immutable, so they can pin
+      # the build they actually tested. The sha names the head commit, though
+      # the image was built from CI's merge of it into the base -- which is the
+      # thing under review.
+      #
+      # Same package as the release (`kopiur-<component>`), so a preview and a
+      # release differ only by tag and the chart needs no `repository` override
+      # to run one. It does need `digest: ""`: release-please pins a digest into
+      # the shipped chart and `_helpers.tpl` lets a digest beat a tag, so a
+      # `tag` override alone would silently install the release instead.
+      - name: Tag and push
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          target="ghcr.io/${REPO}-${IMAGE}"
+          moving="${target}:pr-${PR}"
+          pinned="${target}:pr-${PR}-${HEAD_SHA:0:7}"
+          docker tag "kopiur/${IMAGE}:e2e" "${moving}"
+          docker tag "kopiur/${IMAGE}:e2e" "${pinned}"
+          docker push "${moving}"
+          docker push "${pinned}"
+          # The controller's image block is the chart's root `image:` -- it is
+          # the operator -- while the other three nest under their component.
+          case "${IMAGE}" in
+            controller) values="image" ;;
+            *) values="${IMAGE}.image" ;;
+          esac
+          {
+            echo "### \`${IMAGE}\`"
+            echo
+            echo '```'
+            echo "docker pull ${pinned}"
+            echo '```'
+            echo
+            echo "Also tagged \`pr-${PR}\`, which moves with the branch."
+            echo
+            echo "To run it from the chart, override the tag **and clear the"
+            echo "digest** -- a pinned digest beats a tag, so setting the tag"
+            echo "alone installs the release:"
+            echo
+            echo '```'
+            echo "--set ${values}.tag=pr-${PR}-${HEAD_SHA:0:7} \\"
+            echo "--set ${values}.digest="
+            echo '```'
+            echo
+            echo "linux/amd64 only: a preview reuses the image the e2e shards" \
+                 "ran, built natively on the runner. Releases stay amd64+arm64."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # Publish the chart itself per pull request, so trying a branch in a GitOps
+  # repo is a two-line source bump on an OCIRepository that already exists --
+  # rather than swapping the chart source to a GitRepository and back. A chart
+  # change is only really reviewable by rendering it where it will run.
+  #
+  # A SEPARATE `charts-preview/` package, never the release `charts/` one.
+  # Previews sort as SemVer prereleases and would therefore be filtered by
+  # Renovate's `ignoreUnstable` default -- but that is one unpinned default
+  # standing between a preview and somebody's cluster, and it is the only thing
+  # standing there once the chart version moves past what a consumer has
+  # pinned (`0.11.0-pr7` IS greater than `0.10.8`; `0.10.8-pr7` is not). A
+  # package a release consumer never reads cannot be proposed to them at all,
+  # by any versioning rule. It also keeps the release package's version list
+  # free of build noise, and makes preview cleanup a package to delete rather
+  # than tags to pick out of the releases.
+  #
+  # Two versions, mirroring the image tags: `<base>-pr<n>` moves with the
+  # branch, `<base>-pr<n>.g<sha>` does not. Helm demands SemVer2 and the OCI tag
+  # IS the chart version, so the tags cannot read `pr-460` the way the images
+  # do; they are prerelease identifiers on the current chart version. The `g`
+  # before the sha is not decoration -- a bare 7-hex sha that happens to be all
+  # digits and starts with `0` is a leading-zero numeric identifier, which is
+  # invalid SemVer, and this job would fail for one commit in a few hundred.
+  #
+  # appVersion is the PR image tag, so the chart resolves all four component
+  # images to this same commit's builds. Chart and binaries from one commit is
+  # the only combination anything tested; override `<component>.image.tag` to
+  # mix a released binary back in.
+  pr-chart:
+    if: >-
+      ${{ github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && !startsWith(github.head_ref, 'release-please--') }}
+    name: PR Chart
+    # pr-image so the chart is never published pointing at images that do not
+    # exist yet; the two chart gates so a chart failing its own tests is never
+    # published at all.
+    needs:
+      - pr-image
+      - helm-lint
+      - helm-unittest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          install_args: --locked
+
+      # helm reads the docker config this writes for OCI registry auth, which is
+      # how the release job authenticates its own `helm push`.
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package and push chart
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          base="$(yq '.version' deploy/helm/kopiur/Chart.yaml)"
+          sha="${HEAD_SHA:0:7}"
+          apptag="pr-${PR}-${sha}"
+          moving="${base}-pr${PR}"
+          pinned="${base}-pr${PR}.g${sha}"
+          for version in "${moving}" "${pinned}"; do
+            helm package deploy/helm/kopiur \
+              --version "${version}" \
+              --app-version "${apptag}"
+            helm push "kopiur-${version}.tgz" "oci://ghcr.io/${OWNER}/charts-preview"
+          done
+          {
+            echo "### Chart"
+            echo
+            echo "Point an existing \`OCIRepository\` at this build -- no"
+            echo "chart-source swap. Note the **preview** registry path: these"
+            echo "never land in the release package, so Renovate cannot offer"
+            echo "one to a cluster tracking releases."
+            echo
+            echo '```yaml'
+            echo "  ref:"
+            echo "    tag: \"${pinned}\"   # moving: ${moving}"
+            echo "  url: oci://ghcr.io/${OWNER}/charts-preview/kopiur"
+            echo '```'
+            echo
+            echo "Its appVersion is \`${apptag}\`, so all four component images"
+            echo "resolve to this commit's builds with no image overrides. The"
+            echo "console still needs \`ui.enabled: true\` -- it is opt-in."
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   helm-lint:
     if: >-
@@ -672,6 +909,49 @@ jobs:
       - name: Check phase-handling exhaustiveness
         run: mise run phase-check
 
+  ui:
+    if: >-
+      ${{ !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
+    name: Web UI
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          install_args: --locked
+
+      # `ui-types` runs `cargo xtask gen-ui-types`, so this job compiles the
+      # xtask binary and kopiur-ui-model. Its own cache key: the Rust jobs build
+      # a far larger dependency set and sharing one would evict theirs.
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ui
+
+      - name: Install SPA dependencies
+        run: mise run ui-install
+
+      # Regenerate rather than only `--check`: `ui-check`'s `git diff` then
+      # fails on a hand-edited generated file AND on one that is stale relative
+      # to `crates/ui-model`, with the offending diff printed in the log.
+      - name: Generate TypeScript wire types
+        run: mise run ui-types
+
+      - name: Check the SPA (tsc, eslint, vitest, generated-type drift)
+        run: mise run ui-check
+
+      - name: Build the SPA bundle
+        run: mise run ui-build
+
   workflow-lint:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')
@@ -715,8 +995,11 @@ jobs:
       - helm-lint
       - helm-unittest
       - integration-test
+      - pr-chart
+      - pr-image
       - rust-lint
       - rust-test
+      - ui
       - workflow-lint
     runs-on: ubuntu-24.04
     permissions: {}

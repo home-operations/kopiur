@@ -299,19 +299,19 @@ allow:
       manual-run block when it already reads `Running` for this exact request.
 
   # --- CLI ------------------------------------------------------------------
-  - file: crates/cli/src/cmd/doctor.rs
+  - file: crates/ops/src/doctor.rs
     snippet: "s.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&SnapshotPhase::Failed)"
     reason: >-
       `check_recent_failures` is DEFINED as the terminally-`Failed` window.
       `is_terminal()` is the wrong set here — `Succeeded`, `Unchanged` and
       `Discovered` are terminal too — and a phase added later must not join a
       "recent failures" report by inheriting an `else`.
-  - file: crates/cli/src/cmd/doctor.rs
+  - file: crates/ops/src/doctor.rs
     snippet: "r.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&RestorePhase::Failed)"
     reason: >-
       The `Restore` half of the same `check_recent_failures` window, same
       reasoning.
-  - file: crates/cli/src/cmd/snapshot.rs
+  - file: crates/ops/src/actions/snapshot.rs
     snippet: "status.and_then(|s| s.phase.as_ref()) == Some(&SnapshotPhase::Unchanged)"
     reason: >-
       `success_summary` wording pick, reached only after the exhaustive

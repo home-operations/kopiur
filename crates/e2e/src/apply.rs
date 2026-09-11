@@ -18,6 +18,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{
     ConfigMap, Namespace, PersistentVolume, PersistentVolumeClaim, Secret, Service,
 };
+use k8s_openapi::api::rbac::v1::{ClusterRoleBinding, RoleBinding};
 
 use crate::consts;
 
@@ -71,6 +72,12 @@ pub enum Fixture {
     Deployment(Deployment),
     /// Namespaced.
     Service(Service),
+    /// Cluster-scoped. Binds a chart-rendered ClusterRole to a test subject —
+    /// the web-UI suite's way of saying "this person may operate backups".
+    ClusterRoleBinding(ClusterRoleBinding),
+    /// Namespaced. The only shape `kopiur-ui-browse` is ever bound in, because
+    /// binding it cluster-wide grants every namespace's repository credentials.
+    RoleBinding(RoleBinding),
 }
 
 impl Fixture {
@@ -85,6 +92,8 @@ impl Fixture {
             Fixture::ConfigMap(o) => apply(&namespaced(client, o)?, o).await,
             Fixture::Deployment(o) => apply(&namespaced(client, o)?, o).await,
             Fixture::Service(o) => apply(&namespaced(client, o)?, o).await,
+            Fixture::ClusterRoleBinding(o) => apply(&Api::all(client.clone()), o).await,
+            Fixture::RoleBinding(o) => apply(&namespaced(client, o)?, o).await,
         }
     }
 }
@@ -122,6 +131,16 @@ impl From<Deployment> for Fixture {
 impl From<Service> for Fixture {
     fn from(o: Service) -> Self {
         Fixture::Service(o)
+    }
+}
+impl From<ClusterRoleBinding> for Fixture {
+    fn from(o: ClusterRoleBinding) -> Self {
+        Fixture::ClusterRoleBinding(o)
+    }
+}
+impl From<RoleBinding> for Fixture {
+    fn from(o: RoleBinding) -> Self {
+        Fixture::RoleBinding(o)
     }
 }
 

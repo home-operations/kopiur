@@ -111,7 +111,10 @@ pub use recorded::{
     KOPIUR_META_SCHEMA_V1, KOPIUR_META_TAG, MetaTagDecode, RecordedSnapshotMeta, RecordedSrc,
     decode_meta_tag, encode_meta_tag,
 };
-pub use retention::{KeptSet, SnapshotLike, select_kept};
+pub use retention::{
+    KeptSet, SnapshotLike, SnapshotRetentionView, retention_buckets, retention_group_key,
+    retention_view, select_kept,
+};
 pub use success_expr::{
     RestoredStats, SuccessExprInputs, VerifyStats, eval_success_expr, validate_success_expr,
 };
@@ -128,9 +131,14 @@ pub const VERSION: &str = "v1alpha1";
 /// (de)serializes exclusively via `serde_json`. Going straight through `serde_yaml`
 /// would instead exercise its non-standard `!Variant` encoding of externally-tagged
 /// enums, which the real wire format never uses — so this is the representative path.
-#[cfg(test)]
-pub(crate) mod testutil {
-    pub(crate) fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> T {
+///
+/// Enable the `testutil` feature to reach it from another crate's tests — it is
+/// test support only, and pulls `serde_yaml` in with it.
+#[cfg(any(test, feature = "testutil"))]
+pub mod testutil {
+    /// Parse a YAML manifest the way the cluster does: YAML → JSON value →
+    /// typed. Panics on either step, which is what a test wants.
+    pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> T {
         let value: serde_json::Value = serde_yaml::from_str(yaml).expect("yaml -> json value");
         serde_json::from_value(value).expect("json value -> typed")
     }

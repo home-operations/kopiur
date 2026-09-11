@@ -130,10 +130,11 @@ impl LocalSession {
             let ns = match r.namespace.as_deref() {
                 Some(ns) => ns.to_string(),
                 None => {
-                    return Err(CliError::ClusterRepoSecretNamespaceMissing {
+                    return Err(kopiur_ops::OpsError::ClusterRepoSecretNamespaceMissing {
                         secret: r.name,
                         repository: target.repo.name.clone(),
-                    });
+                    }
+                    .into());
                 }
             };
             let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
@@ -143,7 +144,7 @@ impl LocalSession {
                     namespace: ns.clone(),
                     source: Box::new(e),
                 },
-                _ => classify_kube("get", "Secret", "secrets", Some(&ns), Some(&r.name), e),
+                _ => classify_kube("get", "Secret", "secrets", Some(&ns), Some(&r.name), e).into(),
             })?;
             env.extend(secret_env(&secret));
         }

@@ -73,6 +73,22 @@ The second layer is the actual boundary, and it is RBAC. Anyone who can create p
 
 The chart ships an opt-in ClusterRole with exactly the browse permission set. Set `rbac.browseRole: true` and bind `<release>-browse` to the humans who should browse; a namespaced RoleBinding scopes them to one namespace. See the [RBAC reference](../rbac.md#browsing-snapshots-rbacbrowserole).
 
+/// warning | Binding browse in a namespace grants that namespace's repository credentials
+
+The session pod loads the repository credentials from its own environment, and RBAC cannot narrow `pods/exec create` to one pod. So anyone bound to the browse role in a namespace can exec into the session pod and print them with `env`.
+
+That is the same power as "can create pods referencing the credential Secret here", which is why it is not a new exposure in most clusters — but it is not the same as read-only, so bind it per namespace and to people you would hand those credentials to anyway.
+
+///
+
+/// note | Sessions are shared with the web console too
+
+The [web console](../ui.md) browses snapshots through this same mechanism, keyed the same way. A session started by `kubectl kopiur ls` is reused by someone opening that repository in the console, and vice versa — one warm pod per repository, whoever opened it. `kubectl kopiur session end` ends it for both.
+
+The console's equivalent role is `kopiur-ui-browse`, which carries the same rules minus `apps/deployments` (the console is told its mover image through `KOPIUR_MOVER_IMAGE` instead). Granting either has the same consequence.
+
+///
+
 /// warning | `--local` moves the credentials to your machine
 `--local` is for clusters you cannot run pods in, or backends only reachable from your workstation.
 

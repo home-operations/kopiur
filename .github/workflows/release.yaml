@@ -26,6 +26,10 @@ jobs:
     outputs:
       kopia-version: ${{ steps.versions.outputs.kopia-version }}
       rust-version: ${{ steps.versions.outputs.rust-version }}
+      # The web UI image builds the SPA in a node stage; both pins live in
+      # .mise/config.toml so a developer, CI and a release all use one version.
+      node-version: ${{ steps.versions.outputs.node-version }}
+      pnpm-version: ${{ steps.versions.outputs.pnpm-version }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,14 +45,19 @@ jobs:
 
       - name: Resolve versions
         id: versions
+        # One grouped redirect rather than four appends (shellcheck SC2129).
         run: |
-          echo "kopia-version=$(mise config get tools.kopia)" >> "$GITHUB_OUTPUT"
-          echo "rust-version=$(mise config get tools.rust.version)" >> "$GITHUB_OUTPUT"
+          {
+            echo "kopia-version=$(mise config get tools.kopia)"
+            echo "rust-version=$(mise config get tools.rust.version)"
+            echo "node-version=$(mise config get tools.node)"
+            echo "pnpm-version=$(mise config get tools.pnpm)"
+          } >> "$GITHUB_OUTPUT"
 
   # Build each component image in its own job (not a matrix over the reusable
-  # workflow). The chart pins all three image digests at release time, and a
-  # matrix collapses needs.<job>.outputs.digest to a single value — three
-  # separate jobs keep each builder's first-class `digest` output addressable.
+  # workflow). The chart pins every image digest at release time, and a
+  # matrix collapses needs.<job>.outputs.digest to a single value — separate
+  # jobs keep each builder's first-class `digest` output addressable.
   release-controller:
     name: Release (controller)
     needs: versions
@@ -159,12 +168,54 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+  # The web console. No KOPIA_VERSION build arg: kopiur-ui never invokes kopia
+  # (browse sessions run it in their own pods, off the mover image), so
+  # docker/Dockerfile.ui has no kopia stage. NODE_VERSION/PNPM_VERSION feed the
+  # SPA stage instead, which builds the bundle the binary embeds.
+  release-ui:
+    name: Release (ui)
+    needs: versions
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    uses: docker/github-builder/.github/workflows/build.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
+    with:
+      build-args: |
+        VERSION=${{ github.ref_name }}
+        REVISION=${{ github.sha }}
+        NODE_VERSION=${{ needs.versions.outputs.node-version }}
+        PNPM_VERSION=${{ needs.versions.outputs.pnpm-version }}
+        RUST_VERSION=${{ needs.versions.outputs.rust-version }}
+      cache: true
+      cache-scope: ui
+      file: docker/Dockerfile.ui
+      meta-images: ghcr.io/${{ github.repository }}-ui
+      meta-tags: |
+        type=semver,pattern={{version}}
+        type=semver,pattern={{major}}.{{minor}}
+        type=raw,value=rolling,enable=${{ github.event_name == 'release' }}
+        type=ref,event=branch
+      output: image
+      platforms: linux/amd64,linux/arm64
+      push: true
+      sbom: true
+      set-meta-annotations: true
+      set-meta-labels: true
+      sign: true
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
   helm:
     name: Helm
     needs:
       - release-controller
       - release-webhook
       - release-mover
+      - release-ui
     if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-24.04
     permissions:
@@ -189,7 +240,7 @@ jobs:
       - name: Check generated manifests
         run: cargo xtask gen-all --check
 
-      # Pin all three component images to the exact digests the builder produced
+      # Pin every component image to the exact digest the builder produced
       # — each build job's first-class `digest` output (the signed multi-arch
       # index) — so the released chart references immutable images instead of
       # floating tags. Fail closed if any digest is missing. Only the packaged
@@ -199,8 +250,9 @@ jobs:
           CONTROLLER_DIGEST: ${{ needs.release-controller.outputs.digest }}
           WEBHOOK_DIGEST: ${{ needs.release-webhook.outputs.digest }}
           MOVER_DIGEST: ${{ needs.release-mover.outputs.digest }}
+          UI_DIGEST: ${{ needs.release-ui.outputs.digest }}
         run: |
-          for pair in "controller:${CONTROLLER_DIGEST}" "webhook:${WEBHOOK_DIGEST}" "mover:${MOVER_DIGEST}"; do
+          for pair in "controller:${CONTROLLER_DIGEST}" "webhook:${WEBHOOK_DIGEST}" "mover:${MOVER_DIGEST}" "ui:${UI_DIGEST}"; do
             comp="${pair%%:*}"
             digest="${pair#*:}"
             case "${digest}" in
@@ -213,6 +265,7 @@ jobs:
               controller) path=".image.digest" ;;
               webhook)    path=".webhook.image.digest" ;;
               mover)      path=".mover.image.digest" ;;
+              ui)         path=".ui.image.digest" ;;
               *) echo "unknown component ${comp}"; exit 1 ;;
             esac
             yq -i "${path} = \"${digest}\"" deploy/helm/kopiur/values.yaml

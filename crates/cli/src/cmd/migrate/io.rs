@@ -66,7 +66,7 @@ impl SecretSource {
             SecretSource::Cluster { client } => {
                 let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
                 api.get_opt(name).await.map_err(|e| {
-                    classify_kube("get", "Secret", "secrets", Some(namespace), Some(name), e)
+                    classify_kube("get", "Secret", "secrets", Some(namespace), Some(name), e).into()
                 })
             }
             SecretSource::Files(map) => {

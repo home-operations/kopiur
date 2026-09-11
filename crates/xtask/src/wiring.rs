@@ -71,7 +71,25 @@ pub use crate::scan::{scrub, strip_cfg_test, strip_use_stmts};
 ///
 /// `migrate` only *writes* CRs, so a field only it mentions is still inert at
 /// runtime. `xtask`/`telemetry`/`e2e` are tooling.
-const CONSUMER_CRATES: &[&str] = &["controller", "mover", "kopia", "webhook", "cli"];
+const CONSUMER_CRATES: &[&str] = &[
+    "controller",
+    "mover",
+    "kopia",
+    "webhook",
+    "cli",
+    "ops",
+    "ui",
+];
+
+// `crates/ui-model` is deliberately NOT a consumer, for the same reason
+// `migrate` is not: it never READS a CRD field. It declares the web UI's wire
+// types, whose fields are named after the CRD fields they will eventually carry
+// — `lastObservedAt`, `nextScheduledAt`, `bytesNew`, `repositorySummary`,
+// `lastReplicated*`. This check is an identifier search over a text corpus, so
+// including it made nine genuinely-inert CRD fields read as wired purely because
+// a struct field somewhere shares their name, which is precisely the bug class
+// (#346, #351) the ratchet exists to catch. `crates/ui` IS a consumer: it is the
+// code that actually reads those fields to build the views.
 
 // `crates/api` is deliberately NOT a consumer, even though it owns real
 // resolver helpers (`api::identity`, `CatalogBounds`, `effective_*`). Including

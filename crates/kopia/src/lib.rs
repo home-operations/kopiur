@@ -26,4 +26,4 @@ pub use model::{
     SnapshotSource, SnapshotStats, StorageInfo, user_tags,
 };
 pub use selection::{filter_as_of, pick_offset};
-pub use session::SessionCmd;
+pub use session::{InvalidObjectId, ObjectId, SessionCmd};

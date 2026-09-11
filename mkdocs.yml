@@ -26,6 +26,19 @@ repo_name: home-operations/kopiur
 edit_uri: edit/main/docs/
 
 docs_dir: docs
+
+# Internal working documents that live under docs/ for convenience but are NOT
+# part of the published site: implementation plans written for (and by) the
+# agents building a feature. They are checked in so a plan and the code it
+# produced stay together in history, not so a user reads them.
+#
+# Excluded rather than added to `nav:`, and excluded rather than left alone:
+# `--strict` fails the build on any file under docs_dir that no nav entry
+# references, so an unpublished plan would otherwise redden the docs gate for
+# everyone. (It did — this line is why `mise run docs` is green again.)
+exclude_docs: |
+  superpowers/
+
 site_dir: site
 
 # Fail the build on a broken internal link or a nav entry pointing at a missing
@@ -198,6 +211,7 @@ nav:
       - Security context: security-context.md
       - Maintenance: maintenance.md
       - Repository health & preflight: repository-health.md
+      - Web console (kopiur-ui): ui.md
       - Web UI (kopia server): server.md
       - Troubleshooting: troubleshooting.md
   # Scenarios = end-to-end, problem-driven walkthroughs (one apply-ready bundle

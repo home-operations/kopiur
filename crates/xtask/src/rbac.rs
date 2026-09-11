@@ -23,9 +23,10 @@ use anyhow::{Context, Result};
 use k8s_openapi::Resource;
 use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::rbac::v1::{
-    ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
+    AggregationRule, ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef,
+    Subject,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use serde::Serialize;
 
 use crate::artifact::{Artifact, RBAC_HEADER};
@@ -113,8 +114,9 @@ fn rule(api_groups: &[&str], resources: &[String], vs: &[&str]) -> PolicyRule {
 }
 
 /// Like [`rule`] but scoped to specific `resourceNames` (least privilege). Use
-/// only with verbs that honor names (`get`/`update`/`patch`/`delete`) — `create`,
-/// `list`, and `watch` are NOT name-scopable and would be denied.
+/// only with verbs that honor names (`get`/`update`/`patch`/`delete`, and
+/// `impersonate` on `users`/`groups`/`userextras`) — `create`, `list`, and
+/// `watch` are NOT name-scopable and would be denied.
 fn rule_named(
     api_groups: &[&str],
     resources: &[String],
@@ -652,6 +654,364 @@ fn mover_namespaced_artifact() -> Result<Artifact> {
     Ok(Artifact::new("rbac/mover-role.yaml".to_string(), content))
 }
 
+// =============================================================================
+// kopiur-ui (the web console)
+// =============================================================================
+//
+// `kopiur-ui` never acts as itself on a user's behalf: it reads trusted identity
+// headers from an authenticating proxy and IMPERSONATES that user on every
+// apiserver call, so Kubernetes RBAC — not the console — decides what each
+// person may see and do. That design concentrates all of the risk in one place.
+// A ServiceAccount that may impersonate AND read Secrets can read every
+// repository credential in the cluster while appearing to be nobody in
+// particular, so the rules below are a short allow-list guarded by tests that
+// assert the ABSENCES (`crates/xtask/tests/ui_rbac.rs`).
+//
+// Four human roles ship alongside it. `kopiur-ui-viewer` and `kopiur-ui-editor`
+// aggregate into `kopiur-ui-user`, the everyday grant. `kopiur-ui-browse` does
+// NOT aggregate, and that is deliberate — see [`ui_browse_rules`].
+
+/// ServiceAccount + ClusterRole name for the console itself.
+const UI_SA_NAME: &str = "kopiur-ui";
+const UI_CLUSTERROLE_NAME: &str = "kopiur-ui";
+/// Read-only human role (aggregates).
+const UI_VIEWER_NAME: &str = "kopiur-ui-viewer";
+/// Action human role (aggregates).
+const UI_EDITOR_NAME: &str = "kopiur-ui-editor";
+/// The umbrella role administrators actually bind; its rules come from the
+/// aggregation, so it ships with none of its own.
+const UI_USER_NAME: &str = "kopiur-ui-user";
+/// File-browsing role. Unaggregated on purpose — see [`ui_browse_rules`].
+const UI_BROWSE_NAME: &str = "kopiur-ui-browse";
+/// Namespaced companion Role for doctor's controller check.
+const UI_DOCTOR_ROLE_NAME: &str = "kopiur-ui-doctor";
+
+/// Label that folds a ClusterRole into [`UI_USER_NAME`]. Kopiur-domained rather
+/// than `rbac.authorization.k8s.io/aggregate-to-*` so it can never widen one of
+/// Kubernetes' own built-in roles by accident.
+pub const UI_AGGREGATE_LABEL: &str = "rbac.kopiur.home-operations.com/aggregate-to-ui-user";
+
+/// The one `system:` group an impersonated identity always carries. Kubernetes
+/// adds it to every authenticated request, so a name-scoped `groups` rule that
+/// omits it rejects EVERY impersonation the UI attempts — a fail-closed trap
+/// that presents as a broken console rather than as a missing RBAC entry.
+const SYSTEM_AUTHENTICATED: &str = "system:authenticated";
+
+/// API group owning the `userextras/<key>` impersonation resources.
+const AUTHENTICATION_GROUP: &str = "authentication.k8s.io";
+
+/// The seven kinds a console action PATCHes: suspend/resume, run maintenance,
+/// run replication, scan catalog. Mirrors the capability probe table in
+/// `crates/ui/src/api/me.rs` — the UI asks whether the user may `patch` exactly
+/// these, so a kind here that is not there (or vice versa) is a bug on one side.
+const UI_PATCHED_CRDS: &[&str] = &[
+    "snapshotpolicies",
+    "snapshotschedules",
+    "repositories",
+    "clusterrepositories",
+    "maintenances",
+    "repositoryreplications",
+    "snapshotreplications",
+];
+
+/// The fixed identity an anonymous-mode console runs every request as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiAnonymous {
+    /// Username (`KOPIUR_UI_ANONYMOUS_USER`).
+    pub user: String,
+    /// Groups paired with it (`KOPIUR_UI_ANONYMOUS_GROUPS`).
+    pub groups: Vec<String>,
+}
+
+/// All nine Kopiur CRD plurals, cluster-scoped one included.
+fn all_kopia_crds() -> Vec<String> {
+    NAMESPACED_CRDS
+        .iter()
+        .chain(CLUSTER_CRDS.iter())
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// Sort + dedupe a `resourceNames` list so the generated YAML is stable
+/// regardless of the order the values arrived in.
+fn sorted_names(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The console ServiceAccount's own rules.
+///
+/// * `extra_keys` — each becomes its OWN `userextras/<key>` resource. There is
+///   no wildcard form: `userextras/*` is accepted by the API and authorizes
+///   nothing, so an install that used it would fail at the first request with a
+///   403 naming a header rather than a rule.
+/// * `allowed_groups` — when the deployment restricts which groups may be
+///   impersonated, the same list is pinned as `resourceNames` so the apiserver
+///   enforces it too and a bug in the UI's own filter is still caught.
+/// * `anonymous_only` — an anonymous-mode console has exactly one identity, so
+///   both impersonate rules are pinned to it by name. Even a fooled header
+///   parser then cannot reach a second user.
+/// * `cache` — reads are served from watch-fed stores under this ServiceAccount
+///   and filtered per user with `SubjectAccessReview`s. That is the ONLY reason
+///   the console ever reads a Kopiur object as itself, so with the cache off the
+///   grant disappears rather than lingering unused.
+///
+/// Never `secrets` and never `pods/exec`: browse execs as the *user*, and the
+/// session pod — not the console — loads the repository credentials.
+pub fn ui_rules(
+    extra_keys: &[String],
+    allowed_groups: &[String],
+    anonymous_only: Option<&UiAnonymous>,
+    cache: bool,
+) -> Vec<PolicyRule> {
+    let mut rules = Vec::new();
+
+    // Users. Pinned by name only in anonymous mode, where there is exactly one.
+    rules.push(match anonymous_only {
+        Some(anon) => rule_named(
+            &[""],
+            &["users".into()],
+            &["impersonate"],
+            std::slice::from_ref(&anon.user),
+        ),
+        None => rule(&[""], &["users".into()], &["impersonate"]),
+    });
+
+    // Groups. Pinned when anonymous mode or an explicit allow-list narrows them;
+    // `system:authenticated` is always included or nothing authorizes at all.
+    let pinned_groups: Option<Vec<String>> = match (anonymous_only, allowed_groups.is_empty()) {
+        (Some(anon), _) => {
+            let mut g = anon.groups.clone();
+            g.push(SYSTEM_AUTHENTICATED.to_string());
+            Some(sorted_names(g))
+        }
+        (None, false) => {
+            let mut g = allowed_groups.to_vec();
+            g.push(SYSTEM_AUTHENTICATED.to_string());
+            Some(sorted_names(g))
+        }
+        (None, true) => None,
+    };
+    rules.push(match pinned_groups {
+        Some(g) => rule_named(&[""], &["groups".into()], &["impersonate"], &g),
+        None => rule(&[""], &["groups".into()], &["impersonate"]),
+    });
+
+    // One rule per configured extra key. Never a wildcard.
+    for key in extra_keys {
+        rules.push(rule(
+            &[AUTHENTICATION_GROUP],
+            &[format!("userextras/{key}")],
+            &["impersonate"],
+        ));
+    }
+
+    if cache {
+        // Read-only, and only the Kopiur kinds: the stores hold nothing else.
+        rules.push(rule(&[KOPIA_GROUP], &all_kopia_crds(), READ_VERBS));
+        // Every cached read is gated by a SubjectAccessReview for the calling
+        // identity, so Kubernetes RBAC still decides what each person sees.
+        rules.push(rule(
+            &["authorization.k8s.io"],
+            &["subjectaccessreviews".into()],
+            &["create"],
+        ));
+    }
+
+    rules
+}
+
+/// `kopiur-ui-viewer`: everything the console renders, and nothing it writes.
+///
+/// The CRD read backs doctor's schema comparison; the `events.k8s.io` list backs
+/// the per-object event feed (the console reads `events.k8s.io/v1`, the group
+/// kube's Recorder writes, so the legacy core group is deliberately not granted).
+pub fn ui_viewer_rules() -> Vec<PolicyRule> {
+    vec![
+        rule(&[KOPIA_GROUP], &all_kopia_crds(), READ_VERBS),
+        rule(
+            &["apiextensions.k8s.io"],
+            &["customresourcedefinitions".into()],
+            &["get", "list"],
+        ),
+        rule(&["events.k8s.io"], &["events".into()], &["list"]),
+    ]
+}
+
+/// `kopiur-ui-editor`: exactly the verbs behind the console's buttons.
+///
+/// `create`/`delete` on `snapshots` is "snapshot now" and "delete snapshot";
+/// `create` on `restores` is the restore dialog; `patch` on the seven
+/// [`UI_PATCHED_CRDS`] is suspend/resume, run-maintenance, run-replication and
+/// scan-catalog; `list` on PVCs is what the snapshot-now dialog expands a
+/// `pvcSelector` against. Nothing here grants `update` — every console write is
+/// a merge patch — and nothing grants a read the viewer role does not already
+/// carry, so the pair is additive by construction.
+pub fn ui_editor_rules() -> Vec<PolicyRule> {
+    vec![
+        rule(&[KOPIA_GROUP], &["snapshots".into()], &["create", "delete"]),
+        rule(&[KOPIA_GROUP], &["restores".into()], &["create"]),
+        rule(
+            &[KOPIA_GROUP],
+            &UI_PATCHED_CRDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            &["patch"],
+        ),
+        rule(&[""], &["persistentvolumeclaims".into()], &["list"]),
+    ]
+}
+
+/// `kopiur-ui-browse`: the read-only file browser inside a snapshot.
+///
+/// **Granting this grants that namespace's repository credentials.** The browse
+/// data plane runs a session pod and `pods/exec`s kopia commands into it, and
+/// that pod loads the repository credentials through `envFrom` — so anyone who
+/// can exec into the namespace can simply print them with `env`. `pods/exec
+/// create` is not name-scopable, so RBAC cannot narrow it to the session pod.
+///
+/// That is why this role ships **unaggregated** and is documented as
+/// binding-only: an administrator must bind it on purpose, ideally with a
+/// namespaced RoleBinding, rather than receive it by holding `kopiur-ui-user`.
+/// (`ui.rbac.execPolicy` renders a `ValidatingAdmissionPolicy` narrowing the exec
+/// to `kopiur-browse-*` pods running kopia — the enforcement RBAC cannot express.)
+///
+/// Differs from the CLI's `<release>-browse` role by dropping `apps/deployments`:
+/// the console passes the mover image through `KOPIUR_MOVER_IMAGE`, so a browsing
+/// user never needs to discover it from the controller Deployment.
+pub fn ui_browse_rules() -> Vec<PolicyRule> {
+    vec![
+        // Resolve the Snapshot → repository chain.
+        rule(
+            &[KOPIA_GROUP],
+            &["snapshots".into(), "repositories".into()],
+            &["get", "list"],
+        ),
+        rule(&[KOPIA_GROUP], &["clusterrepositories".into()], &["get"]),
+        // The session Job (find-or-create, end).
+        rule(
+            &["batch"],
+            &["jobs".into()],
+            &["create", "get", "list", "delete"],
+        ),
+        // `get`: a repository's `tls.caBundleRef` CA-bundle ConfigMap.
+        // `delete`: reap a LEGACY session's work-spec ConfigMap.
+        rule(&[""], &["configmaps".into()], &["get", "delete"]),
+        // Wait for the session pod to become Ready; surface its logs on failure.
+        rule(&[""], &["pods".into()], READ_VERBS),
+        rule(&[""], &["pods/log".into()], &["get"]),
+        // The read path itself.
+        rule(&[""], &["pods/exec".into()], &["create"]),
+    ]
+}
+
+/// `kopiur-ui-doctor`: a namespaced Role in the operator's namespace granting
+/// the one `apps` read doctor's `ControllerRunning` check needs.
+///
+/// Namespaced rather than folded into the viewer role because a cluster-wide
+/// Deployment read is a real grant (every workload's image, env var names and
+/// replica counts) to buy one health line. Without this Role bound, doctor
+/// degrades that check to a Warn — it does not fail.
+pub fn ui_doctor_role_rules() -> Vec<PolicyRule> {
+    vec![rule(&["apps"], &["deployments".into()], &["get", "list"])]
+}
+
+/// [`metadata`] plus extra labels (the aggregation marker).
+fn metadata_labeled(name: &str, namespace: Option<&str>, extra: &[(&str, &str)]) -> ObjectMeta {
+    let mut meta = metadata(name, namespace);
+    let labels = meta.labels.get_or_insert_with(Default::default);
+    for (k, v) in extra {
+        labels.insert((*k).to_string(), (*v).to_string());
+    }
+    meta
+}
+
+/// Generate `deploy/rbac/ui.yaml`.
+///
+/// Like the operator's own artifact this is the maximal, "every feature on"
+/// flavour — cache enabled, impersonation unscoped (header mode), no extra keys
+/// configured — and the Helm chart is what narrows it per install. The static
+/// file exists for a chartless `kubectl apply` and as the reviewable baseline the
+/// chart's templates are kept in sync with.
+fn ui_artifact() -> Result<Artifact> {
+    let sa = ServiceAccount {
+        metadata: metadata(UI_SA_NAME, Some(DEFAULT_NAMESPACE)),
+        ..Default::default()
+    };
+
+    let clusterrole = ClusterRole {
+        metadata: metadata(UI_CLUSTERROLE_NAME, None),
+        rules: Some(ui_rules(&[], &[], None, true)),
+        ..Default::default()
+    };
+
+    let binding = ClusterRoleBinding {
+        metadata: metadata(UI_CLUSTERROLE_NAME, None),
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "ClusterRole".to_string(),
+            name: UI_CLUSTERROLE_NAME.to_string(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name: UI_SA_NAME.to_string(),
+            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            api_group: None,
+        }]),
+    };
+
+    let aggregate = [(UI_AGGREGATE_LABEL, "true")];
+    let viewer = ClusterRole {
+        metadata: metadata_labeled(UI_VIEWER_NAME, None, &aggregate),
+        rules: Some(ui_viewer_rules()),
+        ..Default::default()
+    };
+    let editor = ClusterRole {
+        metadata: metadata_labeled(UI_EDITOR_NAME, None, &aggregate),
+        rules: Some(ui_editor_rules()),
+        ..Default::default()
+    };
+    // The umbrella role: rules are filled in by the apiserver's aggregation
+    // controller, so `rules` stays absent here on purpose.
+    let user = ClusterRole {
+        metadata: metadata(UI_USER_NAME, None),
+        aggregation_rule: Some(AggregationRule {
+            cluster_role_selectors: Some(vec![LabelSelector {
+                match_labels: Some(std::collections::BTreeMap::from([(
+                    UI_AGGREGATE_LABEL.to_string(),
+                    "true".to_string(),
+                )])),
+                ..Default::default()
+            }]),
+        }),
+        rules: None,
+    };
+    // Deliberately NOT labelled for aggregation — see `ui_browse_rules`.
+    let browse = ClusterRole {
+        metadata: metadata(UI_BROWSE_NAME, None),
+        rules: Some(ui_browse_rules()),
+        ..Default::default()
+    };
+    let doctor = Role {
+        metadata: metadata(UI_DOCTOR_ROLE_NAME, Some(DEFAULT_NAMESPACE)),
+        rules: Some(ui_doctor_role_rules()),
+    };
+
+    let content = document(&[
+        render(&sa)?,
+        render(&clusterrole)?,
+        render(&binding)?,
+        render(&viewer)?,
+        render(&editor)?,
+        render(&user)?,
+        render(&browse)?,
+        render(&doctor)?,
+    ]);
+    Ok(Artifact::new("rbac/ui.yaml".to_string(), content))
+}
+
 /// All RBAC artifacts.
 pub fn artifacts() -> Result<Vec<Artifact>> {
     Ok(vec![
@@ -659,5 +1019,6 @@ pub fn artifacts() -> Result<Vec<Artifact>> {
         namespaced_artifact()?,
         mover_cluster_artifact()?,
         mover_namespaced_artifact()?,
+        ui_artifact()?,
     ])
 }

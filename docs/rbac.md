@@ -93,10 +93,65 @@ The chart can render an opt-in ClusterRole carrying exactly what browsing needs.
 | core → `configmaps` | delete | `session end` cleans up a legacy session's work-spec ConfigMap (the spec rides the Job env today). |
 | core → `pods` | get, list, watch | Wait for the session pod to become Ready. |
 | core → `pods/log` | get | Surface the pod's logs when the session fails to start. |
-| core → `pods/exec` | create | The read path: exec the closed kopia read-command set. |
+| core → `pods/exec` | **create, get** | The read path: exec the closed kopia read-command set. Both verbs: an exec over WebSocket is an HTTP **upgrade**, which is a `GET`, so the apiserver authorizes it as `get pods/exec`; `create` alone covers only the older SPDY `POST` and leaves the user refused with a bare "cannot get resource pods/exec". |
 
 There is deliberately **no `secrets` access**. The session pod loads the repository credentials itself, so a browsing user never reads them.
 
 Be honest about the binding's blast radius, though: `pods/exec` and `jobs delete` are namespace-wide once bound. RBAC cannot scope exec to session pods only, so bind this role only where that is acceptable.
 
 The `--local` flag is the exception. It copies the credentials to the user's machine and therefore also needs `get` on `secrets`. Grant that separately and deliberately.
+
+## The web console (`ui.enabled`)
+
+The optional [web console](ui.md) adds a **fourth principal** and **four human roles**. It is off by default; everything below renders only while `ui.enabled` is true.
+
+Role names carry the release name, like everything else the chart renders: at release `kopiur` they are `kopiur-ui-viewer` and so on, and at release `backups` they are `backups-ui-viewer`. The names below use the default.
+
+### The console's own ServiceAccount (`kopiur-ui`)
+
+Deliberately **not** the operator's. The operator reads Secrets on every reconcile; the console must never be able to.
+
+| API group → resources | Verbs | Why |
+| --- | --- | --- |
+| core → `users`, `groups` | impersonate | The whole design. Every apiserver call the console makes on your behalf is made **as you**, so Kubernetes RBAC — not the console — decides the answer. In anonymous-only mode both rules are pinned by `resourceNames` to that one identity; with `ui.auth.allowedGroups` set, the groups rule is pinned to that list, so the apiserver enforces the allow-list even if the console's own parsing were fooled. |
+| `authentication.k8s.io` → `userextras/<key>` | impersonate | One rule **per** configured `ui.auth.impersonateExtraKeys` entry. Never `userextras/*` — RBAC has no wildcard there, so the wildcard form renders happily and authorizes nothing, failing at the first request instead of at install. |
+| `kopiur.home-operations.com` → all 9 CRDs | get, list, watch | **Only when `ui.cache.enabled`** (the default): the watch-fed reflector stores behind the console's reads. Their contents are then filtered per caller with SubjectAccessReviews, so an object from a namespace you cannot list is never serialized to you. Setting `ui.cache.enabled: false` removes these rules entirely and makes every read an impersonated `LIST`. |
+| `authorization.k8s.io` → `subjectaccessreviews` | create | The per-identity filter above, and the capability flags `/api/v1/me` reports. Also only with the cache on. |
+
+There is **no `secrets` rule and no `pods/exec` rule**, in any mode. The console never reads credentials, and the browse exec is performed as the *browsing user* under `kopiur-ui-browse`, never as the console.
+
+### The four human roles
+
+You bind these; the chart creates no bindings, because who may operate your backups is not a chart decision. Until you write one, every console screen reports `Forbidden` — which is correct, not a broken install.
+
+| Role | Rules | Bind it as |
+| --- | --- | --- |
+| `kopiur-ui-viewer` | `get`/`list`/`watch` on the 9 CRDs; `get`/`list` on `customresourcedefinitions`; `list` on `events.k8s.io` events. | ClusterRoleBinding |
+| `kopiur-ui-editor` | `create`/`delete` `snapshots`; `create` `restores`; `patch` on the 7 patched kinds (policies, schedules, repositories, clusterrepositories, maintenances, and both replication kinds); `list` `persistentvolumeclaims`. | ClusterRoleBinding |
+| `kopiur-ui-user` | Both of the above, by **aggregation**. The one to bind for an operator. | ClusterRoleBinding |
+| `kopiur-ui-browse` | `get`/`list` `snapshots`+`repositories`, `get` `clusterrepositories`; `create`/`get`/`list`/`delete` `jobs`; `get`/`delete` `configmaps`; `get`/`list`/`watch` `pods`; `get` `pods/log`; **`create`+`get` `pods/exec`**. | **RoleBinding, one namespace** |
+
+Bind the first three cluster-wide: the console is a fleet view, and a viewer scoped to one namespace would report a healthy cluster while another namespace burned.
+
+`kopiur-ui-browse` carries no `apps/deployments` read, unlike the CLI's `<release>-browse` role. The console is told its mover image through `KOPIUR_MOVER_IMAGE` instead, so a browsing user never needs to read the controller Deployment.
+
+The chart also renders a namespaced `kopiur-ui-doctor` Role in the operator's own namespace, so doctor's "controller running" check can list the operator Deployment there. Without it that one check degrades to a warning and nothing else changes.
+
+### Granting `kopiur-ui-browse` grants that namespace's repository credentials
+
+A browse session runs a mover pod that **loads the repository credentials from its own environment**, and RBAC cannot narrow `pods/exec create` to one pod. So anyone bound to `kopiur-ui-browse` in a namespace can exec into that session pod and print those credentials with `env`.
+
+Bind it per namespace, with a `RoleBinding`, to people you would hand those credentials to anyway — never with a `ClusterRoleBinding`, which is every namespace's credentials at once. That is why the role is shipped separately instead of aggregating into `kopiur-ui-user`.
+
+/// note | Why `pods/exec` carries two verbs
+
+Kubernetes authorizes a subresource request by its HTTP method. An exec over
+WebSocket is an HTTP **upgrade**, which is a `GET`, so the apiserver asks the
+authorizer for `get pods/exec`. The older SPDY exec is a `POST`, which maps to
+`create`. Both roles therefore grant **both** verbs; with only `create`, every
+browse is refused with `cannot get resource "pods/exec"`, which reads like a
+missing binding rather than a missing verb.
+
+///
+
+`ui.rbac.execPolicy.enabled` renders a `ValidatingAdmissionPolicy` narrowing those subjects' `pods/exec` to `kopiur-browse-*` pods running `/usr/local/bin/kopia`. It stops `env` and a shell; it does not un-grant anything above. See [the web console page](ui.md#the-one-mitigation-rbac-cannot-express) for its current caveats.

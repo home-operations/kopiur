@@ -30,4 +30,37 @@ exclude = ["deploy/helm/kopiur/values.schema.json"]
 exclude = [
   "deploy/crds/*.yaml",
   "deploy/helm/kopiur/crds/*.yaml",
+  # Generated RBAC (`cargo xtask gen-rbac`), gated byte-for-byte by gen-check —
+  # same reasoning as the CRDs above. `.prettierignore` already excludes
+  # `deploy/rbac/`, and this list must mirror it: the hook passes staged paths
+  # explicitly, so a commit whose only YAML is a regenerated RBAC file leaves
+  # oxfmt with zero targets and it exits non-zero on the empty target set.
+  "deploy/rbac/*.yaml",
+  # pnpm's lockfile is a resolver artifact, not authored YAML: oxfmt reflows it
+  # and the next `pnpm install` writes it straight back, so the tree is dirty
+  # after every install. `.prettierignore` covers a manual `oxfmt` run; this
+  # covers the staged-file hook, which passes paths explicitly.
+  "crates/ui/web/pnpm-lock.yaml",
 ]
+
+# The SPA's generated TypeScript is byte-gated by `mise run gen-check`. What
+# needs saying here is the regeneration itself: change a wire type in
+# `crates/ui-model` and the checked-in `.ts` must move with it, or CI's
+# gen-check is the first thing that notices.
+[pre-commit.commands.ui-types]
+# Both patterns: the crate is flat files today, and depending on the glob
+# engine `**/` does not necessarily match zero segments — so the plain `*.rs`
+# case is spelled out rather than assumed.
+glob = ["crates/ui-model/src/*.rs", "crates/ui-model/src/**/*.rs"]
+run = "mise run ui-types && git add crates/ui/web/src/api/types"
+
+# The SPA's authored TypeScript/TSX/CSS, formatted with the same oxfmt the
+# shared config already runs on JSON/YAML/Markdown, and auto-staged like them.
+# Generated files are excluded here AND in `.prettierignore` (which covers a
+# manual `oxfmt` run from the repo root); `pnpm format:check` inside
+# `mise run ui-check` is CI's copy of this gate.
+[pre-commit.commands.format-ts]
+glob = ["crates/ui/web/**/*.{ts,tsx,css,mjs}"]
+exclude = ["crates/ui/web/src/api/types/*.ts", "crates/ui/web/src/routeTree.gen.ts"]
+run = "oxfmt {staged_files}"
+stage_fixed = true
