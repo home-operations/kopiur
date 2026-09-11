@@ -13,6 +13,7 @@ import {
   mountApp,
   problemResponse,
   sentBody,
+  unletteredLamps,
 } from "../test-utils";
 
 const RUN = "/api/v1/actions/maintenance-run";
@@ -108,6 +109,36 @@ describe("Maintenance", () => {
     expect(within(first).getByText("never run")).toBeInTheDocument();
     expect(first).toHaveTextContent("Full failures since success");
     expect(first).toHaveTextContent("4.0 KiB");
+  });
+
+  it("lamps a track that has never run, and the count of failures behind it", async () => {
+    mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
+    mountApp("/maintenance");
+    const first = await region("Maintenance media/nas-maintenance");
+
+    // "never run" keeps its own wording and gains the icon.
+    const never = within(first).getByText("never run").closest(".health");
+    expect(never).toHaveAttribute("data-health", "failed");
+    expect(never?.querySelector("svg")).not.toBeNull();
+
+    // The failure count is the one value that could not speak for itself: a
+    // red "2" beside a plain "0" differed by hue and nothing else, and with
+    // the icon aria-hidden a screen reader heard only the digit. Here the
+    // lamp's word IS spoken, because the operator did publish the failures.
+    const failures = within(first).getByText("2").closest(".health");
+    expect(failures).toHaveAttribute("data-health", "failed");
+    expect(failures?.querySelector("svg")).not.toBeNull();
+    expect(failures).toHaveTextContent("2 (Failed)");
+
+    // A measured zero stays quiet: an amber board hides the row that matters.
+    expect(within(first).getByText("0").closest(".health")).toBeNull();
+  });
+
+  it("leaves no health colour on this screen carried by hue alone", async () => {
+    mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
+    mountApp("/maintenance");
+    await region("Maintenance media/nas-maintenance");
+    expect(unletteredLamps(document.body)).toEqual([]);
   });
 
   it("renders the next run as 'not reported' on both tracks — nothing writes it", async () => {

@@ -15,6 +15,7 @@ import {
   nth,
   problemResponse,
   sentBody,
+  unletteredLamps,
 } from "../test-utils";
 
 const SUSPEND = "/api/v1/actions/suspend";
@@ -80,14 +81,28 @@ describe("Schedules", () => {
     expect(nth(body, 1)).toHaveTextContent("by selector");
   });
 
-  it("says a schedule has never fired, and reports a failure run as a count", async () => {
+  it("says a schedule has never fired, and lamps a failure run under its own count", async () => {
     mockApi({ "/api/v1/schedules": jsonResponse(rows) });
     mountApp("/schedules");
     const body = bodyRows(await table());
     expect(within(nth(body, 1)).getByText("never fired")).toBeInTheDocument();
-    // A count, not a lamp: the operator published the number, not a verdict.
-    expect(within(nth(body, 1)).getByText("3 failed runs")).toBeInTheDocument();
-    expect(nth(body, 1).querySelector(".health")).toBeNull();
+    // The State column is a column of lamps — the row beside this one shows
+    // the suspended lamp — so the loudest value in it is a lamp too. It was
+    // the failed ink on bare text, which said "this schedule is failing" by
+    // hue and nothing else.
+    const lamp = within(nth(body, 1)).getByText("3 failed runs").closest(".health");
+    expect(lamp).toHaveAttribute("data-health", "failed");
+    expect(lamp?.querySelector("svg")).not.toBeNull();
+    // The count keeps its own wording: a schedule publishes no health, so
+    // nothing here announces a verdict the operator never wrote.
+    expect(lamp).not.toHaveTextContent("(Failed)");
+  });
+
+  it("leaves no health colour on this screen carried by hue alone", async () => {
+    mockApi({ "/api/v1/schedules": jsonResponse(rows) });
+    mountApp("/schedules");
+    await table();
+    expect(unletteredLamps(document.body)).toEqual([]);
   });
 
   it("lights the suspended lamp only for a suspended schedule", async () => {

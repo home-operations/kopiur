@@ -161,6 +161,37 @@ export function bodyRows(table: HTMLElement): HTMLElement[] {
   return rows;
 }
 
+/**
+ * Every health colour on this screen, and what is carrying it besides the hue.
+ *
+ * The stylesheet decides *which* elements are tinted, so `styles.health.test`
+ * guards that end; this is the other one — what a rendered screen actually
+ * puts inside a tinted element. `data-health` is the attribute every lamp is
+ * keyed on, so scanning for it finds a hand-rolled `<span data-health>` as
+ * readily as a `LampBadge`, which is the point: the next violation will not be
+ * written in a component this file has heard of.
+ *
+ * Returns the offenders — a lamp with no icon, or a lamp with no word —
+ * described well enough to find. An empty array is the passing state.
+ */
+export function unletteredLamps(container: HTMLElement): string[] {
+  return Array.from(container.querySelectorAll("[data-health]"))
+    .map((lamp) => {
+      const key = lamp.getAttribute("data-health") ?? "";
+      const missing: string[] = [];
+      if (lamp.querySelector("svg") === null) {
+        missing.push("no icon");
+      }
+      if (lamp.textContent.trim().length === 0) {
+        missing.push("no word");
+      }
+      return missing.length === 0
+        ? null
+        : `[data-health="${key}"] ${lamp.className || lamp.tagName}: ${missing.join(", ")}`;
+    })
+    .filter((offender): offender is string => offender !== null);
+}
+
 /** Every URL (path + query) `fetch` was called with, in order. */
 export function calledPaths(): string[] {
   return fetchMock.mock.calls.map(([input]) => {

@@ -11,6 +11,7 @@ import {
   mountApp,
   nth,
   problemResponse,
+  unletteredLamps,
 } from "../test-utils";
 
 const rows: PolicyRow[] = [
@@ -76,6 +77,30 @@ describe("Policies", () => {
     expect(within(nth(body, 1)).getByText("never verified")).toBeInTheDocument();
     // A measured zero is a measurement, not an absence.
     expect(nth(body, 1)).toHaveTextContent("0");
+  });
+
+  it("lamps those absences, because they are the only alarm a policy row has", async () => {
+    mockApi({ "/api/v1/policies": jsonResponse(rows) });
+    mountApp("/policies");
+    const body = bodyRows(await table());
+    // There is no health column here — a policy publishes none — so the
+    // failed ink on these two cells was the whole signal, and drawn as ink
+    // alone it was a signal a colour-blind operator could not receive.
+    for (const word of ["never succeeded", "never verified"]) {
+      const lamp = within(nth(body, 1)).getByText(word).closest(".health");
+      expect(lamp).toHaveAttribute("data-health", "failed");
+      expect(lamp?.querySelector("svg")).not.toBeNull();
+      // The wording is the fact, not a verdict: nothing announces "Failed"
+      // about a policy, which is a health the operator never published.
+      expect(lamp).not.toHaveTextContent("(Failed)");
+    }
+  });
+
+  it("leaves no health colour on this screen carried by hue alone", async () => {
+    mockApi({ "/api/v1/policies": jsonResponse(rows) });
+    mountApp("/policies");
+    await table();
+    expect(unletteredLamps(document.body)).toEqual([]);
   });
 
   it("lights the suspended lamp for a suspended policy and no lamp otherwise", async () => {

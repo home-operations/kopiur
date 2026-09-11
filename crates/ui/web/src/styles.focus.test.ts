@@ -17,15 +17,11 @@
  * or be listed below as a shape that can never receive focus.
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-
 import { describe, expect, it } from "vitest";
 
-// Read off disk rather than imported: vitest stubs CSS modules to an empty
-// string (`test.css` is off), so `import "./styles.css?raw"` silently yields
-// "" and every assertion below would pass against nothing.
-const CSS = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+import { cssRules as rules, readStyles } from "./testing/css";
+
+const CSS = readStyles();
 
 /**
  * Selectors that set an elevation and cannot be focused, so they cannot hide a
@@ -42,35 +38,6 @@ const NEVER_FOCUSED = new Set([
   // The skip link — covered by its own rule, asserted separately.
   ".skip-link",
 ]);
-
-interface Rule {
-  selector: string;
-  body: string;
-  at: number;
-}
-
-/**
- * Every declaration block in source order.
- *
- * Comments come out FIRST, before anything is matched: this stylesheet's own
- * prose quotes CSS (`.ledger-scroll … { content: none }`), and a brace inside
- * a comment derails a brace-counting parse. `@media` needs no special case —
- * its body contains braces, so the inner rules are what match.
- */
-function rules(css: string): Rule[] {
-  const bare = css.replace(/\/\*[\s\S]*?\*\//g, "");
-  const out: Rule[] = [];
-  const re = /([^{}]+)\{([^{}]*)\}/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(bare)) !== null) {
-    const selector = (match[1] ?? "").trim();
-    if (selector.length === 0 || selector.startsWith("@")) {
-      continue;
-    }
-    out.push({ selector, body: match[2] ?? "", at: match.index });
-  }
-  return out;
-}
 
 function setsOuterBoxShadow(body: string): boolean {
   const declaration = /box-shadow:\s*([^;]+);/.exec(body);

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
 import type { ActionReceipt, PolicyDetail, SnapshotNowBody, SuspendBody } from "../api/types";
+import { snapshotPhaseLamp } from "../components/snapshot";
 import {
   bodyRows,
   fetchMock,
@@ -14,6 +15,7 @@ import {
   nth,
   problemResponse,
   sentBody,
+  unletteredLamps,
 } from "../test-utils";
 
 const PATH = "/api/v1/policies/media/nightly";
@@ -141,12 +143,47 @@ describe("Policy detail", () => {
     expect(schedules).toHaveTextContent("nightly-cron");
   });
 
-  it("lists recent runs with the operator's own phase word", async () => {
+  it("lists recent runs, lamping the phase exactly as the snapshots ledger does", async () => {
     mockApi({ [PATH]: jsonResponse(detail) });
     mountApp("/policies/media/nightly");
     const recent = await screen.findByRole("table", { name: "Recent snapshots" });
-    expect(nth(bodyRows(recent), 0)).toHaveTextContent("nightly-20260909");
-    expect(nth(bodyRows(recent), 0)).toHaveTextContent("succeeded");
+    const row = nth(bodyRows(recent), 0);
+    expect(row).toHaveTextContent("nightly-20260909");
+    // One fact, one rendering. This cell used to print the raw lowercase word
+    // and tint only `failed`, so the same snapshot was a lamp on /snapshots
+    // and red prose here — and here the failure was told by hue alone.
+    const lamp = row.querySelector(".health");
+    expect(lamp).toHaveAttribute("data-health", "healthy");
+    expect(lamp).toHaveTextContent(snapshotPhaseLamp("succeeded").word);
+    expect(lamp?.querySelector("svg")).not.toBeNull();
+  });
+
+  it("lamps a failed run rather than tinting the word", async () => {
+    mockApi({
+      [PATH]: jsonResponse({
+        ...detail,
+        recentSnapshots: [{ ...nth(detail.recentSnapshots, 0), phase: "failed" }],
+      }),
+    });
+    mountApp("/policies/media/nightly");
+    const recent = await screen.findByRole("table", { name: "Recent snapshots" });
+    const lamp = nth(bodyRows(recent), 0).querySelector(".health");
+    expect(lamp).toHaveAttribute("data-health", "failed");
+    expect(lamp).toHaveTextContent("Failed");
+    expect(lamp?.querySelector("svg")).not.toBeNull();
+  });
+
+  it("leaves no health colour on this screen carried by hue alone", async () => {
+    mockApi({
+      [PATH]: jsonResponse({
+        ...detail,
+        lastVerified: null,
+        recentSnapshots: [{ ...nth(detail.recentSnapshots, 0), phase: "failed" }],
+      }),
+    });
+    mountApp("/policies/media/nightly");
+    await screen.findByRole("table", { name: "Recent snapshots" });
+    expect(unletteredLamps(document.body)).toEqual([]);
   });
 
   it("renders a phase this bundle has never seen as the operator wrote it", async () => {
