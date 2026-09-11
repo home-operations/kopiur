@@ -44,6 +44,17 @@ export interface ActionPanelProps {
   variant?: "default" | "danger" | undefined;
   /** Disabled with this reason — RBAC, or a state that makes it meaningless. */
   disabledReason?: string | undefined;
+  /**
+   * A few words naming the refusal, rendered visibly beside the trigger.
+   *
+   * **Required whenever this panel sits inside a `.ledger-scroll`.** The
+   * stylesheet suppresses `ActionButton`'s floating tooltip there — a scroll
+   * container clips it, and the hidden one still drags phantom scrollbars
+   * onto a table that fits — so without this a disabled control in a ledger
+   * is a dead button with no reason a sighted mouse user can reach. The full
+   * sentence stays on `aria-describedby` and `title` either way.
+   */
+  shortReason?: string | undefined;
   /** The confirm button's words, e.g. "Take the snapshot". */
   confirmLabel: string;
   /** Blocks the confirm button only: a required choice not yet made. */
@@ -68,6 +79,7 @@ export function ActionPanel({
   icon: Icon,
   variant = "default",
   disabledReason,
+  shortReason,
   confirmLabel,
   blockedReason,
   running,
@@ -93,6 +105,7 @@ export function ActionPanel({
   // In flight beats every other reason: a second click would send a second
   // request, and "you may not" would be the wrong sentence for it.
   const confirmReason = running ? "The request is in flight." : (disabledReason ?? blockedReason);
+  const blocked = disabledReason !== undefined && disabledReason.length > 0;
 
   return (
     <div className="action">
@@ -107,6 +120,10 @@ export function ActionPanel({
         {Icon !== undefined ? <Icon size={14} strokeWidth={2} aria-hidden="true" /> : null}
         {label}
       </ActionButton>
+
+      {blocked && shortReason !== undefined ? (
+        <span className="action__short">{shortReason}</span>
+      ) : null}
 
       {isOpen ? (
         <div className="action__confirm" role="group" aria-label={label}>

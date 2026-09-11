@@ -4,8 +4,8 @@ import { useId, useState } from "react";
 import { useMaintenanceRun, useReplicationRun } from "../../api/hooks";
 import type { Capabilities, MaintenanceRunBody, ReplicationRunBody } from "../../api/types";
 import { assertNever } from "../../util/assertNever";
-import { useCapabilityReason } from "../useCapabilityReason";
 import { ActionPanel } from "./ActionPanel";
+import { useRefusal } from "./reason";
 
 /**
  * Ask for a run right now — maintenance, or a replication copy.
@@ -43,6 +43,14 @@ export interface RunDialogProps {
   target: RunTarget;
   /** Refuse the run for a reason of the caller's — a suspended object, say. */
   unavailable?: string | undefined;
+  /** The few words for `unavailable`, when this sits inside a ledger. */
+  unavailableShort?: string | undefined;
+  /**
+   * Set when this dialog sits inside a `.ledger-scroll`, which suppresses
+   * `ActionButton`'s floating tooltip — the refusal then also appears as a
+   * short word in the cell. See `reason.ts`.
+   */
+  inLedger?: boolean | undefined;
   /** Distinguish one row's trigger from another's for assistive technology. */
   labelSuffix?: string | undefined;
   open?: boolean | undefined;
@@ -66,6 +74,8 @@ function runCapability(target: RunTarget): keyof Capabilities {
 export function RunDialog({
   target,
   unavailable,
+  unavailableShort,
+  inLedger = false,
   labelSuffix,
   open,
   onOpenChange,
@@ -79,7 +89,11 @@ export function RunDialog({
   // patched: a ClusterRepository's Maintenance lives in the operator's
   // namespace, not the repository's, and each replication row is judged in
   // its own (addenda item 17).
-  const reason = useCapabilityReason(target.namespace, runCapability(target));
+  const refusal = useRefusal(target.namespace, runCapability(target));
+  // The caller's own refusal wins: "this object is suspended" is a better
+  // answer than "you may not", and it is the one the reader can act on.
+  const reason = unavailable ?? refusal?.full;
+  const short = unavailable !== undefined ? unavailableShort : refusal?.short;
 
   const maintenanceRun = target.kind === "maintenance";
   const label = maintenanceRun ? "Run maintenance" : "Run now";
@@ -112,7 +126,8 @@ export function RunDialog({
     <ActionPanel
       label={labelSuffix === undefined ? label : `${label} for ${labelSuffix}`}
       icon={Wrench}
-      disabledReason={unavailable ?? reason}
+      disabledReason={reason}
+      shortReason={inLedger ? short : undefined}
       confirmLabel="Request the run"
       running={running}
       onConfirm={run}

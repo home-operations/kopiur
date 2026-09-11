@@ -2400,3 +2400,31 @@ svg {
   white-space: pre;
   tab-size: 2;
 }
+
+/* ---- maintenance regions -------------------------------------------------- */
+
+/* The resource's own coordinate, beside the repository the region is titled
+   by — the two differ whenever a ClusterRepository's maintenance lives in the
+   operator's namespace rather than the repository's. */
+.maintenance__resource {
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+}
+
+/* A track that has never run, or a run of failures: the number is the fact,
+   and the failed lamp's ink is how it stops being skimmed past. */
+.maintenance__never {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* The refusal at its short length, beside a trigger the reader cannot press.
+   Needed wherever `.ledger-scroll` suppresses the floating tooltip: without
+   it a disabled control in a ledger is a dead button with no reason a sighted
+   mouse user can reach. The full sentence is still on the button's
+   aria-describedby sibling and its native title. */
+.action__short {
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}

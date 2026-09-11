@@ -140,6 +140,50 @@ describe("Schedules", () => {
     expect(calledPaths()).toContain("/api/v1/me?namespace=prod");
   });
 
+  it("shows the refusal in the cell, because a ledger suppresses the tooltip", async () => {
+    // `.ledger-scroll .button[data-reason]::after { content: none }` — a
+    // scroll container clips a floating tooltip, and the hidden one still
+    // drags phantom scrollbars onto a table that fits. So a refused control
+    // in a ledger says it twice: a short word visible in the cell, and the
+    // whole sentence on aria-describedby and title.
+    mockApi({ "/api/v1/schedules": jsonResponse(rows), "/api/v1/me": meWith({}) });
+    mountApp("/schedules");
+    const body = bodyRows(await table());
+    const refused = within(nth(body, 0)).getByRole("button", { name: "Suspend" });
+    await waitFor(() => {
+      expect(refused).toHaveAttribute("aria-disabled", "true");
+    });
+    expect(within(nth(body, 0)).getByText("not permitted")).toBeInTheDocument();
+    const describedBy = refused.getAttribute("aria-describedby");
+    expect(describedBy).not.toBeNull();
+    expect(document.getElementById(describedBy ?? "")).toHaveTextContent(
+      "Suspend / resume schedules is not permitted",
+    );
+  });
+
+  it("says 'cannot tell' rather than 'not permitted' when /me itself failed", async () => {
+    mockApi({
+      "/api/v1/schedules": jsonResponse(rows),
+      "/api/v1/me": new Response("<html>gateway</html>", {
+        status: 502,
+        headers: { "content-type": "text/html" },
+      }),
+    });
+    mountApp("/schedules");
+    const body = bodyRows(await table());
+    const refused = within(nth(body, 0)).getByRole("button", { name: "Suspend" });
+    await waitFor(() => {
+      expect(refused).toHaveAttribute("aria-disabled", "true");
+    });
+    // A failed /me is "nobody can say", never an RBAC verdict the console
+    // never received.
+    expect(within(nth(body, 0)).getByText("cannot tell")).toBeInTheDocument();
+    expect(refused).toHaveAttribute(
+      "data-reason",
+      expect.stringContaining("Your permissions could not be read"),
+    );
+  });
+
   it("keeps one confirmation open at a time across the whole ledger", async () => {
     mockApi({ "/api/v1/schedules": jsonResponse(rows), [SUSPEND]: jsonResponse(receipt) });
     mountApp("/schedules");

@@ -75,6 +75,9 @@ function Schedules() {
                   namespace={schedule.namespace}
                   suspended={schedule.suspended}
                   consequence="this cron is not evaluated at all, so the policy it fires goes unrun"
+                  // A ledger suppresses the floating reason tooltip, so a
+                  // refused control says so in the cell as well.
+                  inLedger
                   open={open === id}
                   onOpenChange={(next) => {
                     setOpen(next ? id : null);

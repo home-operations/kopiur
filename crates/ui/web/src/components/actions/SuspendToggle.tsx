@@ -2,8 +2,8 @@ import { PauseCircle, PlayCircle } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { useSuspend } from "../../api/hooks";
-import { useCapabilityReason } from "../useCapabilityReason";
 import { ActionPanel } from "./ActionPanel";
+import { useRefusal } from "./reason";
 import { type SuspendableKind, suspendReviewNamespace, suspendable } from "./suspendable";
 
 /**
@@ -35,6 +35,12 @@ export interface SuspendToggleProps {
    * schedule will fire it". Rendered inside the confirmation's sentence.
    */
   consequence: ReactNode;
+  /**
+   * Set when this toggle sits inside a `.ledger-scroll`, which suppresses
+   * `ActionButton`'s floating tooltip — the refusal then also appears as a
+   * short word in the cell. See `reason.ts`.
+   */
+  inLedger?: boolean | undefined;
   /** Controlled open state, for a bar that allows one open question at a time. */
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
@@ -46,12 +52,14 @@ export function SuspendToggle({
   namespace,
   suspended,
   consequence,
+  inLedger = false,
   open,
   onOpenChange,
 }: SuspendToggleProps) {
   const meta = suspendable(kind);
   const suspend = useSuspend();
-  const reason = useCapabilityReason(suspendReviewNamespace(kind, namespace), meta.capability);
+  const refusal = useRefusal(suspendReviewNamespace(kind, namespace), meta.capability);
+  const reason = refusal?.full;
 
   // A cluster-scoped kind has no namespace, whatever the page's scope is: the
   // body must not carry one, the review must not be asked about one, and the
@@ -68,6 +76,7 @@ export function SuspendToggle({
       // two is the destructive direction.
       variant={suspended ? "default" : "danger"}
       disabledReason={reason}
+      shortReason={inLedger ? refusal?.short : undefined}
       confirmLabel={suspended ? `Resume ${name}` : `Suspend ${name}`}
       running={suspend.isPending}
       onConfirm={() => {
