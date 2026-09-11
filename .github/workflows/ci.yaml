@@ -628,9 +628,20 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
   # Publish the chart itself per pull request, so trying a branch in a GitOps
-  # repo is a one-line tag bump on an OCIRepository that already exists --
+  # repo is a two-line source bump on an OCIRepository that already exists --
   # rather than swapping the chart source to a GitRepository and back. A chart
   # change is only really reviewable by rendering it where it will run.
+  #
+  # A SEPARATE `charts-preview/` package, never the release `charts/` one.
+  # Previews sort as SemVer prereleases and would therefore be filtered by
+  # Renovate's `ignoreUnstable` default -- but that is one unpinned default
+  # standing between a preview and somebody's cluster, and it is the only thing
+  # standing there once the chart version moves past what a consumer has
+  # pinned (`0.11.0-pr7` IS greater than `0.10.8`; `0.10.8-pr7` is not). A
+  # package a release consumer never reads cannot be proposed to them at all,
+  # by any versioning rule. It also keeps the release package's version list
+  # free of build noise, and makes preview cleanup a package to delete rather
+  # than tags to pick out of the releases.
   #
   # Two versions, mirroring the image tags: `<base>-pr<n>` moves with the
   # branch, `<base>-pr<n>.g<sha>` does not. Helm demands SemVer2 and the OCI tag
@@ -700,18 +711,20 @@ jobs:
             helm package deploy/helm/kopiur \
               --version "${version}" \
               --app-version "${apptag}"
-            helm push "kopiur-${version}.tgz" "oci://ghcr.io/${OWNER}/charts"
+            helm push "kopiur-${version}.tgz" "oci://ghcr.io/${OWNER}/charts-preview"
           done
           {
             echo "### Chart"
             echo
-            echo "Point an existing \`OCIRepository\` at this build by changing"
-            echo "one line -- no chart-source swap:"
+            echo "Point an existing \`OCIRepository\` at this build -- no"
+            echo "chart-source swap. Note the **preview** registry path: these"
+            echo "never land in the release package, so Renovate cannot offer"
+            echo "one to a cluster tracking releases."
             echo
             echo '```yaml'
             echo "  ref:"
             echo "    tag: \"${pinned}\"   # moving: ${moving}"
-            echo "  url: oci://ghcr.io/${OWNER}/charts/kopiur"
+            echo "  url: oci://ghcr.io/${OWNER}/charts-preview/kopiur"
             echo '```'
             echo
             echo "Its appVersion is \`${apptag}\`, so all four component images"
