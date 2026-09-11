@@ -321,7 +321,11 @@ async fn may_impersonate(
         spec: SelfSubjectAccessReviewSpec {
             resource_attributes: Some(ResourceAttributes {
                 verb: Some("impersonate".to_string()),
-                group: Some(CORE_GROUP.to_string()),
+                // From the target, not a constant: `userextras/<key>` lives in
+                // authentication.k8s.io while `users` and `groups` live in the
+                // core group, and asking in the wrong one is denied exactly like
+                // asking with the wrong name.
+                group: Some(target.api_group.clone()),
                 resource: Some(resource),
                 subresource,
                 name: target.name.clone(),

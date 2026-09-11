@@ -22,9 +22,19 @@ use crate::cache::stores::CacheHealth;
 use crate::config::{AuthConfig, AuthMode, CACHE_SYNC_TIMEOUT, UiConfig};
 use crate::ops_listener::{CacheState, Readiness};
 
-/// API group of the `impersonate` verb's resources (`users`, `groups`,
-/// `userextras/<key>`). The empty string is the core group.
+/// API group of `users` and `groups`. The empty string is the core group.
 pub const CORE_GROUP: &str = "";
+
+/// API group of `userextras/<key>` — which is NOT the core group.
+///
+/// This line used to be a comment on [`CORE_GROUP`] claiming all three
+/// impersonation resources lived there, and the startup check believed it, so a
+/// deployment with `impersonateExtraKeys` asked about `userextras/<key>` in the
+/// core group while the role granted it in this one. The review came back
+/// denied and the pod never became ready — the same symptom as the
+/// `resourceNames` mismatch, from an unrelated cause, and latent until someone
+/// configured an extra key.
+pub const AUTHENTICATION_GROUP: &str = "authentication.k8s.io";
 
 /// The two resources the UI must be able to `impersonate` for anything at all to
 /// work. Configured `userextras/<key>` subjects are checked alongside them.
@@ -46,6 +56,9 @@ pub const IMPERSONATION_RESOURCES: [&str; 2] = ["users", "groups"];
 /// will actually exercise, so the two cannot drift apart again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImpersonationTarget {
+    /// API group the resource lives in: [`CORE_GROUP`] for `users` and `groups`,
+    /// [`AUTHENTICATION_GROUP`] for `userextras/<key>`.
+    pub api_group: String,
     /// `users`, `groups`, or `userextras/<key>`.
     pub resource: String,
     /// The single principal this deployment can impersonate for `resource`, when
@@ -56,27 +69,45 @@ pub struct ImpersonationTarget {
 }
 
 impl ImpersonationTarget {
-    /// A target whose RBAC grant is not name-scoped.
+    /// A core-group target whose RBAC grant is not name-scoped.
     fn any(resource: impl Into<String>) -> Self {
         Self {
+            api_group: CORE_GROUP.to_string(),
             resource: resource.into(),
             name: None,
         }
     }
 
-    /// A target pinned to one principal, mirroring a `resourceNames` rule.
+    /// A core-group target pinned to one principal, mirroring `resourceNames`.
     fn named(resource: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
+            api_group: CORE_GROUP.to_string(),
             resource: resource.into(),
             name: Some(name.into()),
+        }
+    }
+
+    /// A `userextras/<key>` target, which lives in a different API group and is
+    /// never name-scoped — Kubernetes RBAC has no `userextras/*`, so the chart
+    /// emits one unscoped rule per key.
+    fn extra(key: &str) -> Self {
+        Self {
+            api_group: AUTHENTICATION_GROUP.to_string(),
+            resource: format!("userextras/{key}"),
+            name: None,
         }
     }
 }
 
 impl fmt::Display for ImpersonationTarget {
-    /// `users/kopiur-console`, or bare `users` — the form an operator would
-    /// write in a `kubectl auth can-i`, so the error message is copy-pasteable.
+    /// `users/kopiur-console`, bare `users`, or
+    /// `authentication.k8s.io/userextras/scopes` — the group is shown only when
+    /// it is not the core one, because that is precisely the detail that was
+    /// wrong and an operator reading the error needs it to write the rule.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.api_group.is_empty() {
+            write!(f, "{}/", self.api_group)?;
+        }
         match &self.name {
             Some(name) => write!(f, "{}/{name}", self.resource),
             None => f.write_str(&self.resource),
@@ -109,7 +140,7 @@ pub fn impersonation_targets(cfg: &UiConfig) -> Vec<ImpersonationTarget> {
         cfg.auth
             .extra_keys
             .iter()
-            .map(|key| ImpersonationTarget::any(format!("userextras/{key}"))),
+            .map(|key| ImpersonationTarget::extra(key)),
     );
     targets
 }
@@ -488,6 +519,103 @@ mod tests {
         assert_eq!(shown(&cfg), ["users", "groups"]);
     }
 
+    // --- the check against the grant ---------------------------------------
+
+    /// Does `rule` authorize `target`, by Kubernetes' RBAC semantics?
+    ///
+    /// The `resourceNames` arm is the whole point. A rule that carries names
+    /// authorizes ONLY requests naming one of them — an unnamed request is not
+    /// "less specific and therefore covered", it is simply not matched. Getting
+    /// this backwards is what shipped.
+    fn authorizes(
+        rule: &k8s_openapi::api::rbac::v1::PolicyRule,
+        target: &ImpersonationTarget,
+    ) -> bool {
+        let has = |list: &Option<Vec<String>>, want: &str| {
+            list.as_ref().is_some_and(|v| v.iter().any(|x| x == want))
+        };
+        if !rule.verbs.iter().any(|v| v == "impersonate")
+            || !has(&rule.api_groups, &target.api_group)
+            || !has(&rule.resources, &target.resource)
+        {
+            return false;
+        }
+        match (rule.resource_names.as_ref(), target.name.as_ref()) {
+            (None, _) => true,
+            (Some(names), _) if names.is_empty() => true,
+            (Some(names), Some(name)) => names.iter().any(|n| n == name),
+            // A named rule cannot answer an unnamed question.
+            (Some(_), None) => false,
+        }
+    }
+
+    /// Every permission the console checks for must be one the generated role
+    /// grants — checked under real RBAC semantics, for every mode.
+    ///
+    /// This is the test that was missing. The console's startup check and
+    /// xtask's role generator are two halves of one decision, written months
+    /// apart in different crates, and nothing compared them: the check asked
+    /// unnamed questions, the generator emitted `resourceNames` for anonymous
+    /// mode, both had passing unit tests, and the pod never became ready. Any
+    /// future edit to either half that breaks the pairing fails here instead of
+    /// in someone's cluster.
+    #[test]
+    fn every_checked_impersonation_is_one_the_generated_role_grants() {
+        let anon = xtask::rbac::UiAnonymous {
+            user: "kopiur-console".to_string(),
+            groups: vec!["platform".to_string()],
+        };
+
+        let mut anonymous_cfg = config(&["scopes"]);
+        anonymous_cfg.auth.mode = AuthMode::AnonymousOnly(AnonymousIdentity {
+            user: anon.user.clone(),
+            groups: anon.groups.clone(),
+        });
+
+        let mut header_cfg = config(&["scopes"]);
+        header_cfg.auth.mode = AuthMode::Headers {
+            user: HeaderName::from_static("x-forwarded-user"),
+            groups: Some(HeaderName::from_static("x-forwarded-groups")),
+            anonymous_fallback: None,
+        };
+
+        let mut allowlist_cfg = header_cfg.clone();
+        allowlist_cfg.auth.allowed_groups =
+            Some(["ops", "dev"].iter().map(|g| (*g).to_string()).collect());
+
+        let extras = vec!["scopes".to_string()];
+        let allowed = vec!["ops".to_string(), "dev".to_string()];
+        let cases: [(&str, &UiConfig, Vec<k8s_openapi::api::rbac::v1::PolicyRule>); 3] = [
+            (
+                "anonymous-only",
+                &anonymous_cfg,
+                xtask::rbac::ui_rules(&extras, &[], Some(&anon), true),
+            ),
+            (
+                "header, no allowlist",
+                &header_cfg,
+                xtask::rbac::ui_rules(&extras, &[], None, true),
+            ),
+            (
+                "header + allowedGroups",
+                &allowlist_cfg,
+                xtask::rbac::ui_rules(&extras, &allowed, None, true),
+            ),
+        ];
+
+        for (mode, cfg, rules) in cases {
+            for target in impersonation_targets(cfg) {
+                assert!(
+                    rules.iter().any(|rule| authorizes(rule, &target)),
+                    "in {mode} mode the console checks `impersonate {target}` at startup, but \
+                     no generated rule authorizes it — so /readyz would report \
+                     impersonation-unavailable forever and Helm would roll the release back. \
+                     Rules: {rules:#?}",
+                );
+            }
+        }
+    }
+
     /// With `allowedGroups` the chart pins the groups rule to the allowlist plus
     /// `system:authenticated`, so the check is name-scoped for groups only.
     #[test]
@@ -523,9 +651,11 @@ mod tests {
                 "users/viewer",
                 "groups/system:authenticated",
                 // Never name-scoped: the chart emits one unscoped rule per key,
-                // because Kubernetes RBAC has no `userextras/*`.
-                "userextras/scopes",
-                "userextras/auth-time",
+                // because Kubernetes RBAC has no `userextras/*`. And NOT in the
+                // core group — that mismatch was the second bug the coupling
+                // test below found, so the group is spelled out here.
+                "authentication.k8s.io/userextras/scopes",
+                "authentication.k8s.io/userextras/auth-time",
             ],
         );
     }

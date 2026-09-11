@@ -51,6 +51,12 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 kopiur-api = { workspace = true, features = ["testutil"] }
+# Test-only, and the reason is the bug it exists to prevent: the console decides
+# which `impersonate` permissions to CHECK at startup, and xtask decides which to
+# GRANT. Both were right on their own and disagreed about `resourceNames`, which
+# no test could see while neither could see the other. `startup.rs` now asserts
+# the grant answers the question. Dev-only, so nothing ships this edge.
+xtask = { path = "../xtask" }
 tower = { workspace = true, features = ["util"] }
 # `test-util` is tokio's paused clock. The cache-readiness budget is two minutes;
 # without it the tests that exercise the timeout and recovery branches would have
