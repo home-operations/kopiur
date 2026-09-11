@@ -22,6 +22,7 @@ import { Route as SnapshotsRouteImport } from './routes/snapshots'
 import { Route as TopologyRouteImport } from './routes/topology'
 import { Route as PoliciesNamespaceNameRouteImport } from './routes/policies_.$namespace.$name'
 import { Route as RepositoriesKindNameRouteImport } from './routes/repositories_.$kind.$name'
+import { Route as RestoresNamespaceNameRouteImport } from './routes/restores_.$namespace.$name'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -88,6 +89,11 @@ const RepositoriesKindNameRoute = RepositoriesKindNameRouteImport.update({
   path: '/repositories/$kind/$name',
   getParentRoute: () => rootRouteImport,
 } as any)
+const RestoresNamespaceNameRoute = RestoresNamespaceNameRouteImport.update({
+  id: '/restores_/$namespace/$name',
+  path: '/restores/$namespace/$name',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -103,6 +109,7 @@ export interface FileRoutesByFullPath {
   '/topology': typeof TopologyRoute
   '/policies/$namespace/$name': typeof PoliciesNamespaceNameRoute
   '/repositories/$kind/$name': typeof RepositoriesKindNameRoute
+  '/restores/$namespace/$name': typeof RestoresNamespaceNameRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -118,6 +125,7 @@ export interface FileRoutesByTo {
   '/topology': typeof TopologyRoute
   '/policies/$namespace/$name': typeof PoliciesNamespaceNameRoute
   '/repositories/$kind/$name': typeof RepositoriesKindNameRoute
+  '/restores/$namespace/$name': typeof RestoresNamespaceNameRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -134,6 +142,7 @@ export interface FileRoutesById {
   '/topology': typeof TopologyRoute
   '/policies_/$namespace/$name': typeof PoliciesNamespaceNameRoute
   '/repositories_/$kind/$name': typeof RepositoriesKindNameRoute
+  '/restores_/$namespace/$name': typeof RestoresNamespaceNameRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -151,6 +160,7 @@ export interface FileRouteTypes {
     | '/topology'
     | '/policies/$namespace/$name'
     | '/repositories/$kind/$name'
+    | '/restores/$namespace/$name'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -166,6 +176,7 @@ export interface FileRouteTypes {
     | '/topology'
     | '/policies/$namespace/$name'
     | '/repositories/$kind/$name'
+    | '/restores/$namespace/$name'
   id:
     | '__root__'
     | '/'
@@ -181,6 +192,7 @@ export interface FileRouteTypes {
     | '/topology'
     | '/policies_/$namespace/$name'
     | '/repositories_/$kind/$name'
+    | '/restores_/$namespace/$name'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -197,6 +209,7 @@ export interface RootRouteChildren {
   TopologyRoute: typeof TopologyRoute
   PoliciesNamespaceNameRoute: typeof PoliciesNamespaceNameRoute
   RepositoriesKindNameRoute: typeof RepositoriesKindNameRoute
+  RestoresNamespaceNameRoute: typeof RestoresNamespaceNameRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -292,6 +305,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RepositoriesKindNameRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/restores_/$namespace/$name': {
+      id: '/restores_/$namespace/$name'
+      path: '/restores/$namespace/$name'
+      fullPath: '/restores/$namespace/$name'
+      preLoaderRoute: typeof RestoresNamespaceNameRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -309,6 +329,7 @@ const rootRouteChildren: RootRouteChildren = {
   TopologyRoute: TopologyRoute,
   PoliciesNamespaceNameRoute: PoliciesNamespaceNameRoute,
   RepositoriesKindNameRoute: RepositoriesKindNameRoute,
+  RestoresNamespaceNameRoute: RestoresNamespaceNameRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

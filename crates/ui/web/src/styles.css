@@ -2341,3 +2341,62 @@ svg {
 .ledger .action {
   justify-items: stretch;
 }
+
+/* ---- restore ledger and detail -------------------------------------------- */
+
+.restore-table__object {
+  display: grid;
+  gap: 2px;
+  min-width: 9rem;
+}
+
+.restore-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.restore-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+/* Source, arrow and target on one wrapping line, so a route reads as a route
+   and the arrow never ends up stranded on a line of its own. */
+.restore-table__route {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+.restore-table__arrow {
+  color: var(--fg-faint);
+}
+
+.restore-table__namespace,
+.restore-table__note,
+.restore-table__absent {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+/* The mover's own output: a scrolling block on the inset ground, monospace,
+   never wrapped — a wrapped kopia line is a different line. */
+.log-tail {
+  margin: 0;
+  padding: var(--space-3);
+  max-height: 22rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-prose);
+  white-space: pre;
+  tab-size: 2;
+}
