@@ -137,9 +137,12 @@ fn names_for(rules: &[PolicyRule], resource: &str) -> Option<Vec<String>> {
         .and_then(|r| r.resource_names.clone())
 }
 
-/// A rule reduced to its comparable shape, so a whole rule SET can be asserted
-/// (a subset assertion cannot catch a widened grant; an equality one can).
-fn shape(r: &PolicyRule) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+/// A rule reduced to its comparable parts: (apiGroups, resources, verbs,
+/// resourceNames). Comparing whole SETS of these is what lets a test fail on a
+/// WIDENED grant — a `contains`-style assertion never can.
+type Shape = (Vec<String>, Vec<String>, Vec<String>, Vec<String>);
+
+fn shape(r: &PolicyRule) -> Shape {
     (
         r.api_groups.clone().unwrap_or_default(),
         r.resources.clone().unwrap_or_default(),
@@ -148,7 +151,7 @@ fn shape(r: &PolicyRule) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>)
     )
 }
 
-fn shapes(rules: &[PolicyRule]) -> BTreeSet<(Vec<String>, Vec<String>, Vec<String>, Vec<String>)> {
+fn shapes(rules: &[PolicyRule]) -> BTreeSet<Shape> {
     rules.iter().map(shape).collect()
 }
 

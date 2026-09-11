@@ -773,7 +773,7 @@ pub fn ui_rules(
             &[""],
             &["users".into()],
             &["impersonate"],
-            &[anon.user.clone()],
+            std::slice::from_ref(&anon.user),
         ),
         None => rule(&[""], &["users".into()], &["impersonate"]),
     });
