@@ -2108,3 +2108,226 @@ svg {
   gap: var(--space-2);
   justify-items: start;
 }
+
+/* ---- snapshot file browser: session, breadcrumbs, dir ledger, pager ------- */
+
+/* The intro and the way back out, on one line at width and stacked below it.
+   The prose is capped like every other `page__prose`; the button does not
+   stretch to meet it. */
+.browse-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-5);
+  flex-wrap: wrap;
+}
+
+.browse-head .page__prose {
+  margin: 0;
+}
+
+/* The one panel on this screen, and the one place the cost of browsing is
+   stated. A panel on the canvas: the warning plate inside it is the same
+   device the Finding's fix plate is, not a second card. */
+.browse-session {
+  display: grid;
+  gap: var(--space-3);
+  justify-items: start;
+  max-width: 46rem;
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.browse-session__title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  line-height: 1.25;
+}
+
+.browse-session__prose {
+  margin: 0;
+  max-width: 65ch;
+  color: var(--fg-muted);
+  line-height: var(--leading-prose);
+}
+
+/* The sentence the screen exists to say out loud: that starting a session runs
+   a pod with this repository's credentials mounted. On the degraded lamp's
+   field with its border and a key icon — the same pairing the not-permitted
+   banner uses — so it is a caution carrying an icon and words, never a hue
+   alone. The only tinted region on the panel, so it is read first. */
+.browse-session__warning {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: start;
+  margin: 0;
+  max-width: 65ch;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--health-degraded-fg);
+  border-radius: var(--radius-md);
+  background: var(--health-degraded-bg);
+  line-height: var(--leading-prose);
+}
+
+.browse-session__warning-icon {
+  color: var(--health-degraded-fg);
+  margin-top: 2px;
+}
+
+.browse-session__warning strong {
+  font-weight: var(--weight-semibold);
+}
+
+.browse-session .facts {
+  width: 100%;
+}
+
+/* An absent deadline is not "never" and not "expired": it is a value the
+   server did not publish, written the way every other unpublished value is. */
+.browse-session__no-expiry {
+  color: var(--fg-faint);
+  font-style: italic;
+}
+
+.browse-session__lapsed {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* The trail back to the snapshot root. An ordered list, because the order is
+   the meaning; the separator is drawn between items rather than inside them so
+   the first crumb never carries a leading chevron. */
+.browse-crumbs ol {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-sm);
+}
+
+.browse-crumbs li {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.browse-crumbs__sep {
+  color: var(--fg-faint);
+  flex: none;
+}
+
+/* Where you are: the same monospace as the links beside it, in full ink, and
+   not a link — a control that navigates to the page you are on is not one. */
+.browse-crumbs__here {
+  color: var(--fg);
+  font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+/* The directory ledger. Names wrap rather than losing characters to an
+   ellipsis, as everywhere else on this console: a filename truncated to
+   nothing is the one thing this screen must not do.
+
+   Six columns need more than `.ledger-scroll > .ledger`'s 30rem floor. Below
+   it the Entry column was squeezed to about two characters and a filename
+   wrapped one letter per line — technically not truncated, and completely
+   unreadable. Same selector shape as the rule it raises (later wins at equal
+   specificity), so the ledger scrolls on a narrow viewport instead, which is
+   the console's documented answer for a wide ledger. */
+.ledger-scroll > .dir-table {
+  min-width: 52rem;
+}
+
+.dir-table__entry {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  /* A floor, not `0`: this is the cell that must stay readable when every
+     other column is competing for the same row. */
+  min-width: 11rem;
+}
+
+.dir-table__icon {
+  color: var(--fg-faint);
+  flex: none;
+  align-self: center;
+}
+
+.dir-table__name {
+  overflow-wrap: anywhere;
+}
+
+.dir-table__note {
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+}
+
+/* The download control, live or refused, is one width in both states, so a
+   column of them does not jitter between an anchor and a disabled button. */
+.dir-table__download {
+  min-width: 8.5rem;
+  justify-content: start;
+}
+
+/* A refused download and its short word. The word is in the cell rather than
+   in a hover tooltip because a ledger scrolls, and a scroll container clips
+   the tooltip a disabled control would carry — see `.ledger-scroll
+   .button[data-reason]::after`. The full sentence is still on the button's
+   `aria-describedby` sibling and its native `title`. */
+.dir-table__file {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+/* The window and the two steps either side, on the canvas under the ledger. */
+.browse-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-4);
+  flex-wrap: wrap;
+  margin-top: var(--space-3);
+}
+
+.browse-pager__window {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.browse-pager__steps {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+@media (max-width: 700px) {
+  /* The warning stops reserving a column for its icon: at this width the
+     sentence needs every character of the line more than the icon needs to
+     sit beside it. */
+  .browse-session__warning {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-2);
+  }
+
+  .browse-head {
+    flex-direction: column;
+  }
+
+  .browse-pager {
+    align-items: start;
+    flex-direction: column;
+  }
+}
