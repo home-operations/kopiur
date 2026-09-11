@@ -2270,3 +2270,74 @@ svg {
     grid-column: 2;
   }
 }
+
+/* ---- schedule ledger ------------------------------------------------------ */
+
+.schedule-table__object,
+.schedule-table__fires {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.schedule-table__object {
+  min-width: 9rem;
+}
+
+.schedule-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.schedule-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+/* A cron is read as one token; breaking it across lines makes five fields
+   look like two. */
+.schedule-table__cron {
+  white-space: nowrap;
+}
+
+.schedule-table__namespace,
+.schedule-table__note {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+.schedule-table__active {
+  color: var(--fg-muted);
+}
+
+/* A clock that has never fired, a run of failures, or a schedule that fires
+   nothing at all — each is the loudest cell in its row. */
+.schedule-table__never {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* An absence that is merely an absence (no next slot computed) stays quiet:
+   it is usually just a suspended schedule. */
+.schedule-table__absent {
+  color: var(--fg-faint);
+}
+
+.schedule-table__action {
+  min-width: 0;
+}
+
+/* A confirmation opened inside a ledger cell is narrower than one on a page:
+   the cell grows to hold it, and 34rem would shove every other column off the
+   scroll container's edge. The panel is still the first box, so the cell
+   itself gets no border of its own. */
+.ledger .action__confirm {
+  max-width: 22rem;
+  white-space: normal;
+}
+
+.ledger .action {
+  justify-items: stretch;
+}
