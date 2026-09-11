@@ -21,6 +21,7 @@ import { LastSuccess } from "./PolicyTable";
 import { gateSeverityLamp } from "./gates";
 import { healthLamp } from "./health";
 import { policyVerdict, retentionRules, snapshotCount } from "./policy";
+import { snapshotPhaseLamp } from "./snapshot";
 import { scheduleCron, scheduleFires, firesBySelector } from "./schedule";
 
 /**
@@ -420,22 +421,25 @@ function RecentSnapshots({ snapshots, now }: { snapshots: readonly SnapshotRow[]
 }
 
 /**
- * A snapshot's phase as the operator's own word.
+ * A snapshot's phase, drawn the one way this console draws a phase.
  *
- * The union is heterogeneous: the object arm is `{ unknown: { raw } }` and
- * renders that raw string, so a phase a newer operator writes appears rather
- * than vanishing. No narrowing needed beyond that — the word is the word.
+ * This used to narrow the union here and render the raw lowercase word,
+ * colouring only `failed` — so the *same fact* was a lamp on `/snapshots` and
+ * red prose here, and on this screen the failure was told by hue alone.
+ * `snapshotPhaseLamp` is the single reading of the union (the `{ unknown:
+ * { raw } }` arm included, so a phase a newer operator writes still appears,
+ * under the unknown lamp rather than vanishing or reading as healthy), and
+ * `LampBadge` is the single way to draw one.
+ *
+ * An absent phase is passed through too, and reads "Unreconciled" as it does
+ * on `/snapshots`: the operator has written no phase at all, which is a thing
+ * worth saying, and the em-dash this cell used to show read as "not
+ * applicable".
  */
 function SnapshotPhase({ phase, pinned }: { phase: SnapshotRow["phase"]; pinned: boolean }) {
-  const word =
-    phase === null || phase === undefined
-      ? EMPTY_CELL
-      : typeof phase === "string"
-        ? phase
-        : phase.unknown.raw;
   return (
     <>
-      <span className={word === "failed" ? "policy-table__never" : undefined}>{word}</span>
+      <LampBadge lamp={snapshotPhaseLamp(phase)} />
       {pinned ? <span className="policy-table__note"> pinned</span> : null}
     </>
   );

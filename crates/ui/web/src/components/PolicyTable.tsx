@@ -3,7 +3,7 @@ import { Link } from "@tanstack/react-router";
 import type { PolicyRow } from "../api/types";
 import { relativeTime } from "../util/format";
 import { LampBadge } from "./HealthBadge";
-import { healthLamp } from "./health";
+import { healthLamp, loudLamp } from "./health";
 import { snapshotCount } from "./policy";
 
 /**
@@ -108,10 +108,16 @@ function Repositories({ policy }: { policy: PolicyRow }) {
  * An instant with a direction, or the loud word for a thing that has never
  * happened. A dash here would read as "not applicable"; for "has this backup
  * ever worked" it never is.
+ *
+ * The absence is a lamp, not coloured prose. This column is the only alarm a
+ * policy row has — there is no health column, because a policy has no health
+ * — so drawing it in the failed ink alone left a colour-blind reader with
+ * "never verified" set exactly like "3 days ago". `loudLamp` keeps the
+ * wording and adds the icon; nothing here claims a `Health`.
  */
 function Instant({ at, now, never }: { at: string | null | undefined; now: Date; never: string }) {
   if (at === null || at === undefined || at.length === 0) {
-    return <span className="policy-table__never">{never}</span>;
+    return <LampBadge lamp={loudLamp(never)} />;
   }
   return (
     <time dateTime={at} title={at}>
