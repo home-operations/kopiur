@@ -1,0 +1,126 @@
+suite: web UI refusals
+release:
+  name: kopiur
+  namespace: kopiur-system
+# Scoped to the one template that always renders when the console is enabled.
+# `kopiur.ui.validate` is included by EVERY ui-*.tpl, so any of them would carry
+# these failures — but a `fail` aborts the whole render, and a multi-template
+# suite cannot attribute the resulting error to a specific file.
+templates:
+  - ui-deployment.tpl
+tests:
+  # Each case below is a configuration that would DEPLOY AND WORK, while quietly
+  # letting the wrong person act as someone else. `fail` beats a comment: the
+  # install stops, and the message names the value to set.
+
+  - it: refuses a namespaced install — impersonation is inherently cluster-wide
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      installScope: namespaced
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui\.enabled requires installScope: cluster'
+      - failedTemplate:
+          errorPattern: "Set installScope: cluster, or ui.enabled: false"
+
+  - it: refuses when no identity source is configured at all
+    set:
+      ui.enabled: true
+    asserts:
+      # Without one, every request runs as the console's own ServiceAccount —
+      # which can impersonate anyone.
+      - failedTemplate:
+          errorPattern: "kopiur-ui has no identity source"
+      - failedTemplate:
+          errorPattern: "ui.auth.userHeader"
+      - failedTemplate:
+          errorPattern: "ui.auth.anonymous.enabled"
+
+  - it: refuses header mode with no proxy shared secret
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui\.auth\.proxySecret\.existingSecret is empty'
+      - failedTemplate:
+          errorPattern: "X-Kopiur-Proxy-Token"
+      - failedTemplate:
+          errorPattern: "ui.auth.acknowledgeNoProxySecret: true"
+
+  - it: allows header mode with no proxy secret once it is acknowledged in values
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.acknowledgeNoProxySecret: true
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: refuses anonymous mode with nobody to be
+    set:
+      ui.enabled: true
+      ui.auth.anonymous.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui\.auth\.anonymous\.user is empty'
+
+  - it: refuses an anonymous fallback with nothing to fall back to
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.auth.anonymous.fallback: true
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui\.auth\.anonymous\.fallback is true but no anonymous identity'
+
+  - it: refuses a NetworkPolicy with no proxy peer rather than one that protects nothing
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.networkPolicy.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui\.networkPolicy\.proxySelector is empty'
+
+  - it: refuses an exec policy with no subjects rather than one that matches nobody
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.execPolicy.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui\.rbac\.execPolicy\.subjects is empty'
+
+  - it: refuses an exec-policy subject kind it cannot translate
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.execPolicy.enabled: true
+      ui.rbac.execPolicy.subjects:
+        - kind: Robot
+          name: hal
+    asserts:
+      - failedTemplate:
+          errorPattern: "unknown subject kind"
+
+  - it: refuses a ServiceAccount exec-policy subject with no namespace
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.execPolicy.enabled: true
+      ui.rbac.execPolicy.subjects:
+        - kind: ServiceAccount
+          name: browser
+    asserts:
+      # A ServiceAccount username is namespace-qualified, so an unqualified one
+      # would render a policy matching nobody.
+      - failedTemplate:
+          errorPattern: "has no namespace"

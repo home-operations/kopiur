@@ -155,6 +155,79 @@ The 9 CRDs ship in the chart's special `crds/` directory. Helm installs them on 
 | streamingLists | bool | `true` | Use the Kubernetes WatchList streaming-list API for the controller's cluster-wide watches, lowering peak memory during the initial resync by streaming pages instead of buffering them (the startup burst the resources note below warns about). On by default: WatchList is GA in Kubernetes 1.34 (beta 1.32/1.33) and the chart's kubeVersion floor is 1.32. Set `false` if your apiserver has the WatchList feature gate disabled — the watches degrade to paged lists either way, but turning it off skips the feature probe. |
 | tolerations | list | `[]` |  |
 | topologySpreadConstraints | list | `[]` | Spread controller replicas across nodes/zones. Only meaningful with replicaCount > 1; pairs with podDisruptionBudget so a drain can't collapse both replicas onto one node and then evict them together. |
+| ui.affinity | object | `{}` |  |
+| ui.auth.acknowledgeNoProxySecret | bool | `false` | Deploy header mode WITHOUT a proxy shared secret. Mirrors the repositories' `acknowledgeInsecure`: the unsafe posture stays reachable, but only for someone who wrote down that they meant it — and it is greppable in your values afterwards. Only set this when something else (a service mesh with mTLS, a NetworkPolicy) genuinely prevents anything but your proxy from reaching the Service. |
+| ui.auth.allowedGroups | list | `[]` | Allow-list of groups the console may impersonate. Empty means "whatever groups the proxy asserts". Set, it is enforced TWICE: the console filters inbound groups, and the same list is pinned as `resourceNames` on the impersonate rule so the apiserver enforces it even if the console did not. |
+| ui.auth.anonymous.enabled | bool | `false` | Run every request as one fixed identity instead of reading a header. Sensible only where an outer layer has already authenticated everyone identically, or for a read-only demo. The console's impersonate rules are then pinned by NAME to this identity, so it cannot become anyone else even if the header parsing were fooled. |
+| ui.auth.anonymous.fallback | bool | `false` | In HEADER mode, serve a request whose identity header is absent as the anonymous identity instead of rejecting it with 401. Off by default and never implicit: a silent downgrade from "the proxy said who you are" to "everyone is this fixed user" is exactly the failure this flag exists to make deliberate. Requires anonymous.enabled and anonymous.user. |
+| ui.auth.anonymous.groups | list | `[]` | Groups paired with that user. |
+| ui.auth.anonymous.user | string | `""` | The username to impersonate. Required when anonymous.enabled. May not be a `system:` principal (`system:masters` least of all) — the console refuses to start on one, and so does this chart's RBAC. |
+| ui.auth.emailHeader | string | `""` | Header carrying the caller's email. Display only: never impersonated, never used for authorization. |
+| ui.auth.groupsHeader | string | `""` | Header carrying the caller's groups (e.g. X-Forwarded-Groups). Optional — an identity with no groups is valid, it just matches fewer RoleBindings. |
+| ui.auth.groupsSeparator | string | `","` | Separator the groups header uses. oauth2-proxy emits ",". |
+| ui.auth.impersonateExtraKeys | list | `[]` | `userextras` keys the console may impersonate, as a list. Each one becomes its OWN `userextras/<key>` rule in the console's ClusterRole — Kubernetes RBAC has no wildcard there, so a `userextras/*` would authorize nothing and fail at the first request instead of at install. |
+| ui.auth.proxySecret.existingSecret | string | `""` | Name of an existing Secret holding the shared token the proxy must send in `X-Kopiur-Proxy-Token`. YOU create it (and configure the proxy to send it); the chart only mounts it. This is what makes the identity headers trustworthy, so without it — and without the acknowledgement below — the chart refuses to render. |
+| ui.auth.proxySecret.key | string | `"token"` | Key within that Secret holding the token. |
+| ui.auth.userHeader | string | `""` | Header the proxy puts the authenticated username in (e.g. X-Forwarded-User). Setting it selects header mode; a request without it gets a 401 unless auth.anonymous.fallback is on. |
+| ui.cache.enabled | bool | `true` | Serve reads from watch-fed stores under the console's own ServiceAccount, filtered per user with SubjectAccessReviews, instead of one impersonated LIST per request. This is the ONLY reason the console reads a Kopiur object as itself, so turning it off REMOVES those grants from its ClusterRole entirely. Leave it on unless you want every read impersonated. |
+| ui.download.chunkTimeout | string | `"60s"` | How long a download may make NO progress before it is abandoned. Not a total-transfer budget (a real restore outlives any fixed deadline) — it bounds the silence, so one stalled transfer cannot hold an exec slot and a kopia process forever. |
+| ui.download.maxBytes | int | `1073741824` | Largest single file the console will stream, in bytes (default 1 GiB). Checked before streaming starts, so an oversized request is a 413 rather than a half-gigabyte of wasted egress. |
+| ui.enabled | bool | `false` | Deploy the web console. Requires installScope: cluster — impersonation and the console's cluster-wide reads cannot be expressed in a namespaced Role, so the chart refuses a namespaced install rather than ship a console that 403s on its first request. |
+| ui.extraEnv | list | `[]` | Extra environment variables for the console container, appended after the chart-managed env. Anything in `crates/ui/src/config.rs` can be set here. |
+| ui.image.digest | string | `""` | Pin by digest (e.g. "sha256:..."); takes precedence over tag. |
+| ui.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy for the console. |
+| ui.image.repository | string | `"ghcr.io/home-operations/kopiur-ui"` | Full web UI image repository (registry + path). |
+| ui.image.tag | string | `""` | Defaults to .Chart.AppVersion when empty. |
+| ui.limits.clientCacheSize | int | `256` | How many per-identity impersonating clients to keep. Each holds a connection pool, so this is a socket and memory bound. |
+| ui.limits.clientCacheTtl | string | `"10m"` | How long an idle cached client survives. |
+| ui.limits.maxManifestBytes | int | `67108864` | Largest kopia JSON manifest the console will buffer from an exec, in bytes (default 64 MiB). A directory with a million entries must fail as a 422, not as an OOM kill. |
+| ui.limits.sarCacheSize | int | `4096` | How many SubjectAccessReview answers to retain. |
+| ui.limits.sarTtl | string | `"60s"` | How long a SubjectAccessReview answer is reused. Short by design: a revoked RoleBinding must stop hiding behind the cache quickly. |
+| ui.limits.snapshotListCap | int | `5000` | Largest `limit` the snapshot list endpoint accepts. |
+| ui.livenessProbe | object | `{"httpGet":{"path":"/healthz","port":"ops"},"initialDelaySeconds":5,"periodSeconds":15}` | Liveness probe. On the OPS port, never the app port: the app port is firewalled to the proxy, and a probe there would either fail or force a hole. |
+| ui.networkPolicy.enabled | bool | `false` | Render a NetworkPolicy admitting the app port only from your proxy and the ops port only from your monitoring stack. STRONGLY RECOMMENDED in header mode: it is what makes "only the proxy can set identity headers" true at the network layer rather than only on paper. |
+| ui.networkPolicy.monitoringSelector | object | `{}` | Ingress peer allowed to reach the ops port (/metrics, probes). Leave empty to admit the ops port from anywhere in the cluster, which is the usual posture for a metrics endpoint that exposes no user data. |
+| ui.networkPolicy.proxySelector | object | `{}` | Ingress peer allowed to reach the app port, as a NetworkPolicy peer (`namespaceSelector` and/or `podSelector`). Required when enabled — a policy with no peer would admit nothing, or (written loosely) everything. |
+| ui.nodeSelector | object | `{}` | Scheduling controls (fall back to global.* when left empty). |
+| ui.opsPort | int | `8091` | Container port serving /metrics, /healthz and /readyz. A SECOND listener on purpose: probes and Prometheus must stay reachable from the monitoring namespace while the app port is restricted to the proxy, and /metrics must never sit behind the identity middleware. |
+| ui.podAnnotations | object | `{}` |  |
+| ui.podDisruptionBudget.enabled | bool | `false` | PodDisruptionBudget for the console. Pair with replicaCount > 1. |
+| ui.podDisruptionBudget.minAvailable | int | `1` |  |
+| ui.podLabels | object | `{}` |  |
+| ui.podSecurityContext | object | `{"fsGroup":65532,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532,"seccompProfile":{"type":"RuntimeDefault"}}` | Pod security context for the console pod. Same locked-down posture as the webhook: it runs no kopia, writes no files, and needs no privileges. |
+| ui.port | int | `8090` | Container port serving the SPA and /api. Rendered into KOPIUR_UI_ADDR as "[::]:<port>" (dual-stack wildcard). |
+| ui.priorityClassName | string | `""` |  |
+| ui.rbac.browseRole | bool | `false` | Render `kopiur-ui-browse`, the role behind the in-snapshot file browser.  READ THIS BEFORE ENABLING. Browsing runs a session pod and `pods/exec`s kopia into it, and that pod loads the repository credentials from its own environment — so anyone who can exec in that namespace can print them with `env`. `pods/exec create` cannot be narrowed to one pod by RBAC. Granting browse in a namespace therefore GRANTS THAT NAMESPACE'S REPOSITORY CREDENTIALS. It is deliberately NOT aggregated into `kopiur-ui-user`: bind it on purpose, ideally with a namespaced RoleBinding, and see execPolicy below for the enforcement RBAC cannot express. |
+| ui.rbac.execPolicy.enabled | bool | `false` | Render a ValidatingAdmissionPolicy that narrows browse `pods/exec` to `kopiur-browse-*` pods running `/usr/local/bin/kopia`, turning the console's closed command set into one the APISERVER enforces. This is the only real mitigation for what browseRole grants; it does NOT stop someone from exec'ing kopia commands, only from exec'ing `env` or a shell. |
+| ui.rbac.execPolicy.extraPodPrefixes | list | `[]` | Extra pod-name prefixes the policy also accepts, for a non-default session naming scheme. The built-in `kopiur-browse-` is always allowed. |
+| ui.rbac.execPolicy.subjects | list | `[]` | Subjects the policy applies to — the same users/groups you bound `kopiur-ui-browse` to, as `{kind: User|Group|ServiceAccount, name, namespace}`. Required when enabled: a policy matching nobody enforces nothing, so the chart refuses to render one. |
+| ui.rbac.userRoles | bool | `true` | Render the human roles: `kopiur-ui-viewer` (read-only) and `kopiur-ui-editor` (the console's action buttons), which aggregate into `kopiur-ui-user`. Bind `kopiur-ui-user` to your people — the chart creates no bindings, because who may operate your backups is not a chart decision. |
+| ui.readinessProbe | object | `{"httpGet":{"path":"/readyz","port":"ops"},"initialDelaySeconds":5,"periodSeconds":10}` | Readiness probe (same passthrough as livenessProbe; `{}` drops it). /readyz reports the cache sync, so a console whose stores have not filled does not take traffic and answer with an empty fleet. |
+| ui.replicaCount | int | `1` | Number of console replicas. Stateless: browse sessions live in the cluster as Jobs, not in the process, so any replica can serve any request. |
+| ui.resources.requests.cpu | string | `"25m"` |  |
+| ui.resources.requests.memory | string | `"64Mi"` |  |
+| ui.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true}` | Container security context for the console. |
+| ui.service.annotations | object | `{}` | Extra annotations on the console Service. |
+| ui.service.labels | object | `{}` | Extra labels on the console Service. |
+| ui.service.type | string | `"ClusterIP"` | Service type. Keep ClusterIP: this Service is for your proxy to reach, not for the internet. A LoadBalancer here would expose a console that trusts identity headers to whoever can send them. |
+| ui.serviceAccount.annotations | object | `{}` | Extra annotations (e.g. IRSA / Workload Identity role bindings). |
+| ui.serviceAccount.automount | bool | `true` | Mount the ServiceAccount token into the console pod. Required — the token IS how the console authenticates to impersonate. |
+| ui.serviceAccount.create | bool | `true` | Create the console's own ServiceAccount. It is deliberately NOT the operator's: the operator reads Secrets, and the console must never be able to (it impersonates instead, so every read is a user's read). |
+| ui.serviceAccount.name | string | `""` | Name to use; defaults to "<fullname>-ui" when empty. |
+| ui.serviceMonitor.enabled | bool | `false` | Create a Prometheus-Operator ServiceMonitor scraping the console's /metrics on the ops port (plain HTTP). |
+| ui.serviceMonitor.interval | string | `"30s"` |  |
+| ui.serviceMonitor.labels | object | `{}` |  |
+| ui.serviceMonitor.metricRelabelings | list | `[]` |  |
+| ui.serviceMonitor.relabelings | list | `[]` |  |
+| ui.serviceMonitor.scrapeTimeout | string | `"10s"` |  |
+| ui.session.maxExecGlobal | int | `64` | Process-wide cap on concurrent pods/exec calls. |
+| ui.session.maxExecPerIdentity | int | `4` | Cap on concurrent pods/exec calls ONE identity may have in flight. |
+| ui.session.maxStarts | int | `4` | Cap on concurrent session-pod CREATIONS. |
+| ui.session.readyTimeout | string | `"300s"` | How long `POST …/session` waits for the session pod to become ready. Generous: the pod may have to pull the mover image. |
+| ui.session.ttl | string | `"15m"` | How long an idle browse-session pod lives before it is reaped. |
+| ui.tls.existingSecret | string | `""` | Serve the app port over HTTPS from an existing kubernetes.io/tls Secret. Usually unnecessary: the proxy terminates TLS and this hop is in-cluster. |
+| ui.tolerations | list | `[]` |  |
+| ui.topologySpreadConstraints | list | `[]` |  |
 | webhook.affinity | object | `{}` |  |
 | webhook.caBundle | string | `""` | Base64-encoded PEM CA bundle injected into the webhook configurations. Only used when tls.mode is manual; required there so the API server trusts the serving cert. Ignored in self and cert-manager modes (caBundle is populated by the operator or cert-manager's ca-injector respectively). |
 | webhook.certManager.issuerRef | object | `{"kind":"Issuer","name":""}` | Use an existing Issuer/ClusterIssuer instead of the self-signed Issuer this chart creates. Only used when tls.mode is cert-manager. Leave name empty to use the chart-managed self-signed Issuer. |

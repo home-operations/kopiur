@@ -610,3 +610,298 @@ mover:
     digest: ""
     # -- Pull policy used on the mover Job pods.
     pullPolicy: IfNotPresent
+
+# =============================================================================
+# Web UI (kopiur-ui)
+# =============================================================================
+# An optional in-cluster web console: a Deployment + ClusterIP Service, off by
+# default. It has no login page of its own. You put an authenticating proxy
+# (oauth2-proxy, Authelia, Pomerium, ...) in front of it; the proxy asserts who
+# the caller is in a header, and kopiur-ui IMPERSONATES that user on every
+# apiserver call. Kubernetes RBAC — not the console — then decides what each
+# person may see and do, which is why the console's own ServiceAccount can do
+# almost nothing except impersonate.
+#
+# Two consequences worth reading before you enable this:
+#
+#  1. Identity headers are only trustworthy if nothing else can set them, and in
+#     a cluster anything that can reach the Service (including the apiserver's
+#     services/proxy) can send the same headers. So header mode requires a
+#     shared secret the proxy proves it knows (auth.proxySecret), or an explicit
+#     acknowledgement that something else closes that hole. The chart REFUSES to
+#     render otherwise — see auth.acknowledgeNoProxySecret.
+#  2. **The chart never renders an Ingress.** Same posture as `spec.server`:
+#     kopiur does not own your edge. Point your proxy at the Service, and put
+#     your own Ingress/HTTPRoute in front of the PROXY, never in front of this.
+ui:
+  # -- Deploy the web console. Requires installScope: cluster — impersonation
+  # and the console's cluster-wide reads cannot be expressed in a namespaced
+  # Role, so the chart refuses a namespaced install rather than ship a console
+  # that 403s on its first request.
+  enabled: false
+  # -- Number of console replicas. Stateless: browse sessions live in the
+  # cluster as Jobs, not in the process, so any replica can serve any request.
+  replicaCount: 1
+  image:
+    # -- Full web UI image repository (registry + path).
+    repository: ghcr.io/home-operations/kopiur-ui
+    # -- Defaults to .Chart.AppVersion when empty.
+    tag: ""
+    # -- Pin by digest (e.g. "sha256:..."); takes precedence over tag.
+    digest: ""
+    # -- Image pull policy for the console.
+    pullPolicy: IfNotPresent
+  # -- Container port serving the SPA and /api. Rendered into KOPIUR_UI_ADDR as
+  # "[::]:<port>" (dual-stack wildcard).
+  port: 8090
+  # -- Container port serving /metrics, /healthz and /readyz. A SECOND listener
+  # on purpose: probes and Prometheus must stay reachable from the monitoring
+  # namespace while the app port is restricted to the proxy, and /metrics must
+  # never sit behind the identity middleware.
+  opsPort: 8091
+  service:
+    # -- Service type. Keep ClusterIP: this Service is for your proxy to reach,
+    # not for the internet. A LoadBalancer here would expose a console that
+    # trusts identity headers to whoever can send them.
+    type: ClusterIP
+    # -- Extra annotations on the console Service.
+    annotations: {}
+    # -- Extra labels on the console Service.
+    labels: {}
+  serviceAccount:
+    # -- Create the console's own ServiceAccount. It is deliberately NOT the
+    # operator's: the operator reads Secrets, and the console must never be able
+    # to (it impersonates instead, so every read is a user's read).
+    create: true
+    # -- Name to use; defaults to "<fullname>-ui" when empty.
+    name: ""
+    # -- Mount the ServiceAccount token into the console pod. Required — the
+    # token IS how the console authenticates to impersonate.
+    automount: true
+    # -- Extra annotations (e.g. IRSA / Workload Identity role bindings).
+    annotations: {}
+  # Identity: how the console learns who is calling. Exactly one of header mode
+  # (auth.userHeader) or anonymous-only mode (auth.anonymous) must be
+  # configured, or the chart refuses to render — a console with no identity
+  # source would run every request as its own ServiceAccount, which can
+  # impersonate anyone.
+  auth:
+    # -- Header the proxy puts the authenticated username in (e.g.
+    # X-Forwarded-User). Setting it selects header mode; a request without it
+    # gets a 401 unless auth.anonymous.fallback is on.
+    userHeader: ""
+    # -- Header carrying the caller's groups (e.g. X-Forwarded-Groups). Optional
+    # — an identity with no groups is valid, it just matches fewer RoleBindings.
+    groupsHeader: ""
+    # -- Separator the groups header uses. oauth2-proxy emits ",".
+    groupsSeparator: ","
+    # -- Header carrying the caller's email. Display only: never impersonated,
+    # never used for authorization.
+    emailHeader: ""
+    # -- `userextras` keys the console may impersonate, as a list. Each one
+    # becomes its OWN `userextras/<key>` rule in the console's ClusterRole —
+    # Kubernetes RBAC has no wildcard there, so a `userextras/*` would authorize
+    # nothing and fail at the first request instead of at install.
+    impersonateExtraKeys: []
+    # -- Allow-list of groups the console may impersonate. Empty means "whatever
+    # groups the proxy asserts". Set, it is enforced TWICE: the console filters
+    # inbound groups, and the same list is pinned as `resourceNames` on the
+    # impersonate rule so the apiserver enforces it even if the console did not.
+    allowedGroups: []
+    proxySecret:
+      # -- Name of an existing Secret holding the shared token the proxy must
+      # send in `X-Kopiur-Proxy-Token`. YOU create it (and configure the proxy to
+      # send it); the chart only mounts it. This is what makes the identity
+      # headers trustworthy, so without it — and without the acknowledgement
+      # below — the chart refuses to render.
+      existingSecret: ""
+      # -- Key within that Secret holding the token.
+      key: token
+    # -- Deploy header mode WITHOUT a proxy shared secret. Mirrors the
+    # repositories' `acknowledgeInsecure`: the unsafe posture stays reachable,
+    # but only for someone who wrote down that they meant it — and it is
+    # greppable in your values afterwards. Only set this when something else
+    # (a service mesh with mTLS, a NetworkPolicy) genuinely prevents anything
+    # but your proxy from reaching the Service.
+    acknowledgeNoProxySecret: false
+    anonymous:
+      # -- Run every request as one fixed identity instead of reading a header.
+      # Sensible only where an outer layer has already authenticated everyone
+      # identically, or for a read-only demo. The console's impersonate rules
+      # are then pinned by NAME to this identity, so it cannot become anyone
+      # else even if the header parsing were fooled.
+      enabled: false
+      # -- The username to impersonate. Required when anonymous.enabled. May not
+      # be a `system:` principal (`system:masters` least of all) — the console
+      # refuses to start on one, and so does this chart's RBAC.
+      user: ""
+      # -- Groups paired with that user.
+      groups: []
+      # -- In HEADER mode, serve a request whose identity header is absent as the
+      # anonymous identity instead of rejecting it with 401. Off by default and
+      # never implicit: a silent downgrade from "the proxy said who you are" to
+      # "everyone is this fixed user" is exactly the failure this flag exists to
+      # make deliberate. Requires anonymous.enabled and anonymous.user.
+      fallback: false
+  cache:
+    # -- Serve reads from watch-fed stores under the console's own
+    # ServiceAccount, filtered per user with SubjectAccessReviews, instead of one
+    # impersonated LIST per request. This is the ONLY reason the console reads a
+    # Kopiur object as itself, so turning it off REMOVES those grants from its
+    # ClusterRole entirely. Leave it on unless you want every read impersonated.
+    enabled: true
+  session:
+    # -- How long an idle browse-session pod lives before it is reaped.
+    ttl: 15m
+    # -- How long `POST …/session` waits for the session pod to become ready.
+    # Generous: the pod may have to pull the mover image.
+    readyTimeout: 300s
+    # -- Cap on concurrent session-pod CREATIONS.
+    maxStarts: 4
+    # -- Cap on concurrent pods/exec calls ONE identity may have in flight.
+    maxExecPerIdentity: 4
+    # -- Process-wide cap on concurrent pods/exec calls.
+    maxExecGlobal: 64
+  download:
+    # -- Largest single file the console will stream, in bytes (default 1 GiB).
+    # Checked before streaming starts, so an oversized request is a 413 rather
+    # than a half-gigabyte of wasted egress.
+    maxBytes: 1073741824
+    # -- How long a download may make NO progress before it is abandoned. Not a
+    # total-transfer budget (a real restore outlives any fixed deadline) — it
+    # bounds the silence, so one stalled transfer cannot hold an exec slot and a
+    # kopia process forever.
+    chunkTimeout: 60s
+  limits:
+    # -- Largest kopia JSON manifest the console will buffer from an exec, in
+    # bytes (default 64 MiB). A directory with a million entries must fail as a
+    # 422, not as an OOM kill.
+    maxManifestBytes: 67108864
+    # -- Largest `limit` the snapshot list endpoint accepts.
+    snapshotListCap: 5000
+    # -- How many per-identity impersonating clients to keep. Each holds a
+    # connection pool, so this is a socket and memory bound.
+    clientCacheSize: 256
+    # -- How long an idle cached client survives.
+    clientCacheTtl: 10m
+    # -- How long a SubjectAccessReview answer is reused. Short by design: a
+    # revoked RoleBinding must stop hiding behind the cache quickly.
+    sarTtl: 60s
+    # -- How many SubjectAccessReview answers to retain.
+    sarCacheSize: 4096
+  rbac:
+    # -- Render the human roles: `kopiur-ui-viewer` (read-only) and
+    # `kopiur-ui-editor` (the console's action buttons), which aggregate into
+    # `kopiur-ui-user`. Bind `kopiur-ui-user` to your people — the chart creates
+    # no bindings, because who may operate your backups is not a chart decision.
+    userRoles: true
+    # -- Render `kopiur-ui-browse`, the role behind the in-snapshot file browser.
+    #
+    # READ THIS BEFORE ENABLING. Browsing runs a session pod and `pods/exec`s
+    # kopia into it, and that pod loads the repository credentials from its own
+    # environment — so anyone who can exec in that namespace can print them with
+    # `env`. `pods/exec create` cannot be narrowed to one pod by RBAC. Granting
+    # browse in a namespace therefore GRANTS THAT NAMESPACE'S REPOSITORY
+    # CREDENTIALS. It is deliberately NOT aggregated into `kopiur-ui-user`: bind
+    # it on purpose, ideally with a namespaced RoleBinding, and see execPolicy
+    # below for the enforcement RBAC cannot express.
+    browseRole: false
+    execPolicy:
+      # -- Render a ValidatingAdmissionPolicy that narrows browse `pods/exec` to
+      # `kopiur-browse-*` pods running `/usr/local/bin/kopia`, turning the
+      # console's closed command set into one the APISERVER enforces. This is the
+      # only real mitigation for what browseRole grants; it does NOT stop someone
+      # from exec'ing kopia commands, only from exec'ing `env` or a shell.
+      enabled: false
+      # -- Subjects the policy applies to — the same users/groups you bound
+      # `kopiur-ui-browse` to, as `{kind: User|Group|ServiceAccount, name, namespace}`.
+      # Required when enabled: a policy matching nobody enforces nothing, so the
+      # chart refuses to render one.
+      subjects: []
+      # -- Extra pod-name prefixes the policy also accepts, for a non-default
+      # session naming scheme. The built-in `kopiur-browse-` is always allowed.
+      extraPodPrefixes: []
+  networkPolicy:
+    # -- Render a NetworkPolicy admitting the app port only from your proxy and
+    # the ops port only from your monitoring stack. STRONGLY RECOMMENDED in
+    # header mode: it is what makes "only the proxy can set identity headers"
+    # true at the network layer rather than only on paper.
+    enabled: false
+    # -- Ingress peer allowed to reach the app port, as a NetworkPolicy peer
+    # (`namespaceSelector` and/or `podSelector`). Required when enabled — a
+    # policy with no peer would admit nothing, or (written loosely) everything.
+    proxySelector: {}
+    # -- Ingress peer allowed to reach the ops port (/metrics, probes). Leave
+    # empty to admit the ops port from anywhere in the cluster, which is the
+    # usual posture for a metrics endpoint that exposes no user data.
+    monitoringSelector: {}
+  tls:
+    # -- Serve the app port over HTTPS from an existing kubernetes.io/tls Secret.
+    # Usually unnecessary: the proxy terminates TLS and this hop is in-cluster.
+    existingSecret: ""
+  # No limits by default (see the controller resources note). The console is
+  # I/O-bound — it fans out to the apiserver and streams — so requests reserve a
+  # fair share and limits are left to you.
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    # limits:
+    #   memory: 512Mi
+  # -- Pod security context for the console pod. Same locked-down posture as the
+  # webhook: it runs no kopia, writes no files, and needs no privileges.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  # -- Container security context for the console.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  # -- Liveness probe. On the OPS port, never the app port: the app port is
+  # firewalled to the proxy, and a probe there would either fail or force a hole.
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: ops
+    initialDelaySeconds: 5
+    periodSeconds: 15
+  # -- Readiness probe (same passthrough as livenessProbe; `{}` drops it).
+  # /readyz reports the cache sync, so a console whose stores have not filled
+  # does not take traffic and answer with an empty fleet.
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: ops
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  podDisruptionBudget:
+    # -- PodDisruptionBudget for the console. Pair with replicaCount > 1.
+    enabled: false
+    minAvailable: 1
+  serviceMonitor:
+    # -- Create a Prometheus-Operator ServiceMonitor scraping the console's
+    # /metrics on the ops port (plain HTTP).
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    relabelings: []
+    metricRelabelings: []
+  # -- Scheduling controls (fall back to global.* when left empty).
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  podLabels: {}
+  podAnnotations: {}
+  # -- Extra environment variables for the console container, appended after the
+  # chart-managed env. Anything in `crates/ui/src/config.rs` can be set here.
+  extraEnv: []
