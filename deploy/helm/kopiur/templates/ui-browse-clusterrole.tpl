@@ -56,7 +56,18 @@ rules:
     resources: [pods/log]
     verbs: [get]
   # The read path itself — and the reason this role is dangerous.
+  #
+  # BOTH verbs, and `get` is not optional. Kubernetes authorizes a subresource
+  # request by its HTTP method, and an exec is a WebSocket UPGRADE, which is a
+  # GET — so the apiserver asks for `get pods/exec`, not `create`. A role with
+  # `create` alone authorizes the SPDY exec that `kubectl exec` historically
+  # used and refuses every exec this console makes, with a bare
+  # "cannot get resource pods/exec" that reads like a missing binding.
+  # `deploy/rbac/operator-*.yaml` has carried both verbs all along for the
+  # workload-exec hooks; these two hand-written browse roles did not, and no
+  # test caught it until the console e2e became the first thing to bind one to
+  # a real subject instead of running as cluster-admin.
   - apiGroups: [""]
     resources: [pods/exec]
-    verbs: [create]
+    verbs: [create, get]
 {{- end }}

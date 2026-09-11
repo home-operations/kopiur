@@ -363,12 +363,17 @@ tests:
       # anyone with exec in that namespace can print them.
       - notExists:
           path: metadata.labels["rbac.kopiur.home-operations.com/aggregate-to-ui-user"]
+      # BOTH verbs. An exec over WebSocket is an HTTP upgrade, i.e. a GET, so the
+      # apiserver authorizes it as `get pods/exec`; `create` alone covers only the
+      # older SPDY POST and leaves every browse refused with a bare "cannot get
+      # resource pods/exec". Regression guard for the bug the console e2e found
+      # (it was the first test ever to bind a browse role to a non-admin subject).
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: [pods/exec]
-            verbs: [create]
+            verbs: [create, get]
       # The console pins the mover image via KOPIUR_MOVER_IMAGE, so a browsing
       # user needs no cluster-wide Deployment read.
       - notMatchRegexRaw:
