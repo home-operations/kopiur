@@ -98,11 +98,35 @@ describe("SnapshotSizeChart", () => {
     expect(screen.queryByRole("figure")).not.toBeInTheDocument();
   });
 
-  it("draws a single measurement without collapsing into an invisible line", () => {
+  it("states a lone measurement as a number instead of drawing a chart of it", () => {
+    // "Over time" needs a second point. One dot in an empty frame with an
+    // invented axis top is a picture of nothing; the value is the whole story.
     const { container } = render(<SnapshotSizeChart rows={[row({ name: "only" })]} />);
+    expect(container.querySelector(".chart__plot")).toBeNull();
+    const tile = screen.getByRole("figure", { name: /Snapshot size for nightly/ });
+    expect(tile).toHaveTextContent("1.0 KiB");
+    expect(tile).toHaveTextContent("only");
+    expect(tile).toHaveTextContent(/one run recorded a size/i);
+  });
+
+  it("draws the plot as soon as there are two measurements to join", () => {
+    const { container } = render(
+      <SnapshotSizeChart
+        rows={[
+          row({ name: "a" }),
+          row({ name: "b", endTime: "2026-09-08T01:04:00Z", sizeBytes: 2048 }),
+        ]}
+      />,
+    );
     const path = container.querySelector(".chart__line");
     expect(path?.getAttribute("d")).not.toMatch(/NaN/);
-    expect(container.querySelectorAll(".chart__dot")).toHaveLength(1);
+    expect(container.querySelectorAll(".chart__dot")).toHaveLength(2);
+  });
+
+  it("still gives a lone measurement its row in a table", () => {
+    render(<SnapshotSizeChart rows={[row({ name: "only" })]} />);
+    const table = screen.getByRole("table", { name: /Snapshot sizes for nightly/ });
+    expect(bodyRows(table)).toHaveLength(1);
   });
 
   it("caps how many policies it draws and names the rest", () => {

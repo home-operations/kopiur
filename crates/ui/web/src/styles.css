@@ -2773,6 +2773,58 @@ svg {
   fill: transparent;
 }
 
+/* ---- the lag bars -------------------------------------------------------- */
+
+/* The unfilled remainder of each row: the same inset the ledgers use, so the
+   bar reads as a length against a known track rather than as a floating mark. */
+.lag__track {
+  fill: var(--bg-inset);
+}
+
+/* One series, one hue. Nothing here encodes state in colour — the only state
+   that matters, suspension, is a word in the table. */
+.lag__bar {
+  fill: var(--fg-muted);
+}
+
+/* A stopped schedule: the age is real, the alarm is not, so the bar recedes.
+   Opacity rather than a second fill, so it composes with selection below —
+   a suspended bar under the pointer must still show it is the selected one.
+   The word in the table is what actually says why it is dimmed. */
+.lag__bar[data-suspended="true"] {
+  opacity: 0.55;
+}
+
+/* Selection, which is what the accent is for. The 2px surface ring is the
+   mark spec's gap between overlapping fills. */
+.lag__bar[data-current="true"] {
+  fill: var(--accent);
+  stroke: var(--bg-surface);
+  stroke-width: 2;
+}
+
+.lag__suspended {
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+}
+
+/* A lone measurement: the value IS the chart, so it is set as a figure rather
+   than plotted as one dot in an empty frame. */
+.chart__figure {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.chart__figure-value {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
 .chart__data > summary {
   font-size: var(--text-xs);
   color: var(--fg-muted);

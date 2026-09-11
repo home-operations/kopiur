@@ -91,6 +91,13 @@ interface PolicyChartProps {
 function PolicyChart({ series }: PolicyChartProps) {
   const { points } = series;
   const [hovered, setHovered] = useState<number | null>(null);
+  // One point is not a trend, and "over time" needs two. A lone dot in an
+  // empty frame, under an axis top invented from a single value, is a picture
+  // of nothing — the dataviz form heuristic calls for a stat tile instead.
+  // The table stays either way, because the number is the point.
+  if (points.length < 2) {
+    return <PolicyTile series={series} />;
+  }
   const area = plotArea(points);
   const latestIndex = points.length - 1;
   const shownIndex = hovered ?? latestIndex;
@@ -171,38 +178,87 @@ function PolicyChart({ series }: PolicyChartProps) {
       </svg>
 
       <details className="chart__data">
-        <summary>
-          {points.length} {points.length === 1 ? "measurement" : "measurements"} as a table
-          {series.excluded > 0
-            ? ` · ${String(series.excluded)} run${series.excluded === 1 ? "" : "s"} recorded no size and ${series.excluded === 1 ? "is" : "are"} not plotted`
-            : ""}
-        </summary>
-        <div className="ledger-scroll">
-          <table className="ledger" aria-label={`Snapshot sizes for ${series.policy}`}>
-            <thead>
-              <tr>
-                <th scope="col">Snapshot</th>
-                <th scope="col">Backed up</th>
-                <th scope="col" className="num">
-                  Size
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {[...points].reverse().map((point) => (
-                <tr key={`${point.namespace}/${point.name}`}>
-                  <td className="mono">{point.name}</td>
-                  <td className="mono">
-                    <time dateTime={point.at}>{formatTimestamp(point.at)}</time>
-                  </td>
-                  <td className="num">{humanBytes(point.bytes)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <summary>{tableSummary(series)}</summary>
+        <SizeTable series={series} />
       </details>
     </figure>
+  );
+}
+
+/**
+ * One measurement, stated rather than plotted.
+ *
+ * The value leads; the run that produced it and the fact that there is only
+ * one are the two things that stop it being mistaken for a trend. The table
+ * is still here, unfolded — with a single row there is nothing to disclose.
+ */
+function PolicyTile({ series }: PolicyChartProps) {
+  const point = series.points[0];
+  if (point === undefined) {
+    return null;
+  }
+  return (
+    <figure className="chart" aria-label={`Snapshot size for ${series.policy}`}>
+      <figcaption className="chart__caption">
+        <span className="chart__title">
+          Snapshot size · <span className="mono">{series.policy}</span>
+        </span>
+      </figcaption>
+      <p className="chart__figure">
+        <span className="chart__figure-value">{humanBytes(point.bytes)}</span>{" "}
+        <span className="mono chart__readout-meta">
+          {point.name} · {formatTimestamp(point.at)}
+        </span>
+      </p>
+      <p className="page__section-note">
+        Only one run recorded a size under this policy, so there is no change to draw yet. A second
+        successful run makes this a chart.
+        {series.excluded > 0 ? ` ${excludedText(series.excluded)}` : ""}
+      </p>
+      <SizeTable series={series} />
+    </figure>
+  );
+}
+
+/** The disclosure's own line: how many points, and what was left out. */
+function tableSummary(series: PolicySeries): string {
+  const { length } = series.points;
+  const head = `${String(length)} ${length === 1 ? "measurement" : "measurements"} as a table`;
+  return series.excluded > 0 ? `${head} · ${excludedText(series.excluded)}` : head;
+}
+
+function excludedText(excluded: number): string {
+  const runs = `${String(excluded)} run${excluded === 1 ? "" : "s"}`;
+  return `${runs} recorded no size and ${excluded === 1 ? "is" : "are"} not plotted.`;
+}
+
+/** Every plotted point as a row — the number a picture cannot be read for. */
+function SizeTable({ series }: PolicyChartProps) {
+  return (
+    <div className="ledger-scroll">
+      <table className="ledger" aria-label={`Snapshot sizes for ${series.policy}`}>
+        <thead>
+          <tr>
+            <th scope="col">Snapshot</th>
+            <th scope="col">Backed up</th>
+            <th scope="col" className="num">
+              Size
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {[...series.points].reverse().map((point) => (
+            <tr key={`${point.namespace}/${point.name}`}>
+              <td className="mono">{point.name}</td>
+              <td className="mono">
+                <time dateTime={point.at}>{formatTimestamp(point.at)}</time>
+              </td>
+              <td className="num">{humanBytes(point.bytes)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
