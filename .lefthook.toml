@@ -30,6 +30,12 @@ exclude = ["deploy/helm/kopiur/values.schema.json"]
 exclude = [
   "deploy/crds/*.yaml",
   "deploy/helm/kopiur/crds/*.yaml",
+  # Generated RBAC (`cargo xtask gen-rbac`), gated byte-for-byte by gen-check —
+  # same reasoning as the CRDs above. `.prettierignore` already excludes
+  # `deploy/rbac/`, and this list must mirror it: the hook passes staged paths
+  # explicitly, so a commit whose only YAML is a regenerated RBAC file leaves
+  # oxfmt with zero targets and it exits non-zero on the empty target set.
+  "deploy/rbac/*.yaml",
   # pnpm's lockfile is a resolver artifact, not authored YAML: oxfmt reflows it
   # and the next `pnpm install` writes it straight back, so the tree is dirty
   # after every install. `.prettierignore` covers a manual `oxfmt` run; this
