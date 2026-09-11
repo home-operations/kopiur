@@ -86,12 +86,18 @@
   --accent-soft: light-dark(rgba(79, 85, 210, 0.12), rgba(139, 144, 240, 0.16));
   --selection: light-dark(#d9dbf8, #34397a);
 
-  /* ---- depth: an offset and a soft blur, or a lighter surface step ----- */
-  --shadow-1: light-dark(0 1px 2px rgba(26, 29, 33, 0.08), 0 1px 2px rgba(0, 0, 0, 0.5));
-  --shadow-2: light-dark(
-    0 6px 16px -4px rgba(26, 29, 33, 0.18),
-    0 8px 20px -6px rgba(0, 0, 0, 0.7)
-  );
+  /* ---- depth: an offset and a soft blur, or a lighter surface step -----
+     `light-dark()` produces a COLOUR and nothing else. Wrapping a whole
+     shadow list in it — which this file did until a browser was pointed at
+     it — makes the declaration invalid at computed-value time, so `box-shadow`
+     falls back to `none` and every elevation in the console silently
+     disappears: the disabled-control tooltip, the identity panel, the skip
+     link, the selected theme option. The geometry is the same in both themes
+     anyway, so only the ink switches. */
+  --shadow-ink-1: light-dark(rgba(26, 29, 33, 0.08), rgba(0, 0, 0, 0.5));
+  --shadow-ink-2: light-dark(rgba(26, 29, 33, 0.18), rgba(0, 0, 0, 0.7));
+  --shadow-1: 0 1px 2px var(--shadow-ink-1);
+  --shadow-2: 0 6px 16px -4px var(--shadow-ink-2), 0 8px 20px -6px var(--shadow-ink-2);
   --focus-ring: 0 0 0 2px var(--bg-surface), 0 0 0 4px var(--accent);
 
   /* ---- health lamps: fg on bg, always with an icon and a word ---------- */
@@ -558,8 +564,15 @@ svg {
   transition: transform var(--dur-fast) var(--ease-out);
 }
 
+/* The ring is repeated here, and that is not redundancy. The global
+   `:focus-visible` rule sets `box-shadow`, and so does `.skip-link` above —
+   same specificity, later in the file, so the elevation shadow wins and the
+   FIRST control a keyboard user reaches has no visible focus. Any rule that
+   sets a non-inset `box-shadow` after that global rule owes its own
+   `:focus-visible`; `styles.focus.test.ts` fails the build if one forgets. */
 .skip-link:focus-visible {
   transform: none;
+  box-shadow: var(--focus-ring), var(--shadow-2);
 }
 
 /* The skip target takes focus programmatically; it needs no ring of its own. */
@@ -854,6 +867,13 @@ svg {
   background: var(--bg-surface);
   color: var(--fg);
   box-shadow: var(--shadow-1);
+}
+
+/* The selected option's elevation would otherwise eat the focus ring — see the
+   note on `.skip-link:focus-visible`. The ring leads and the elevation stays,
+   so tabbing across the switch shows a ring on all three, not two of three. */
+.theme-switch__option[aria-pressed="true"]:focus-visible {
+  box-shadow: var(--focus-ring), var(--shadow-1);
 }
 
 /* ---- problem banner: what, why, fix — fix set apart ----------------------- */

@@ -4,6 +4,7 @@ import { type ReactNode, useState } from "react";
 import type { ActionReceipt, Problem } from "../../api/types";
 import { ActionButton } from "../ActionButton";
 import { ActionResult } from "../ActionResult";
+import { useConfirmFocus } from "./useConfirmFocus";
 
 /**
  * The shell every mutating control on this console is built from: a trigger,
@@ -12,10 +13,20 @@ import { ActionResult } from "../ActionResult";
  * It is a confirmation *panel*, not a modal. The committed direction's
  * **Action** pattern (DESIGN.md) is a bare `action-bar` of triggers whose
  * first box is the `action__confirm` panel below them; a `<dialog>` here
- * would be a second enclosure over the same content, and the focus-trap pass
- * that a real modal needs is Task 9's. Every dialog in this directory is
- * therefore this shell plus its own fields, which is also why they can be
- * dropped into a ledger row, a detail page or an action bar unchanged.
+ * would be a second enclosure over the same content. Every dialog in this
+ * directory is therefore this shell plus its own fields, which is also why
+ * they can be dropped into a ledger row, a detail page or an action bar
+ * unchanged.
+ *
+ * **Focus is managed, not trapped**, and that is the deliberate reading of
+ * "a dialog traps focus". Nothing here is modal: the page behind the panel
+ * stays visible and usable, so capturing the tab order would strand a reader
+ * who wants to go back and check what they are about to confirm — the exact
+ * thing a destructive confirmation should encourage. What the panel owes
+ * instead is that focus never goes missing, which is three rules: it moves
+ * into the panel when it opens (the `group` takes it, so its accessible name
+ * is announced), Escape closes it, and closing it — by Escape, by Cancel, or
+ * by confirming — returns focus to whatever opened it.
  *
  * The four rules it exists to keep, so no caller has to remember them:
  *
@@ -114,6 +125,12 @@ export function ActionPanel({
     setOwnOpen(next);
   };
 
+  // Managed focus and Escape — the same implementation the two bespoke action
+  // bars use, so a confirmation cannot behave one way here and another there.
+  const panelRef = useConfirmFocus(isOpen, () => {
+    setOpen(false);
+  });
+
   // In flight beats every other reason: a second click would send a second
   // request, and "you may not" would be the wrong sentence for it.
   const confirmReason = running ? "The request is in flight." : (disabledReason ?? blockedReason);
@@ -142,7 +159,13 @@ export function ActionPanel({
       )}
 
       {isOpen ? (
-        <div className="action__confirm" role="group" aria-label={label}>
+        <div
+          className="action__confirm"
+          role="group"
+          aria-label={label}
+          ref={panelRef}
+          tabIndex={-1}
+        >
           <div className="action__prose">{children}</div>
           <div className="action__actions">
             <ActionButton

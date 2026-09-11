@@ -5,6 +5,7 @@ import { useDeleteSnapshot, useSnapshotNow } from "../api/hooks";
 import type { SnapshotRow } from "../api/types";
 import { ActionButton } from "./ActionButton";
 import { ActionResult } from "./ActionResult";
+import { useConfirmFocus } from "./actions/useConfirmFocus";
 import { deletionConsequence, deletionPolicyLabel } from "./snapshot";
 import { useCapabilityReason } from "./useCapabilityReason";
 
@@ -49,6 +50,15 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
   const remove = useDeleteSnapshot();
   const [open, setOpen] = useState<ActionId | null>(null);
   const [pin, setPin] = useState(false);
+  // This bar is hand-rolled rather than built from `ActionPanel` (it predates
+  // it), so it borrows the shared focus behaviour directly: opening moves
+  // focus into the panel, Escape closes it, and closing returns focus to the
+  // trigger instead of dropping the reader on `<body>`.
+  const close = () => {
+    setOpen(null);
+  };
+  const snapshotNowRef = useConfirmFocus(open === "snapshot-now", close);
+  const deleteRef = useConfirmFocus(open === "delete", close);
 
   const policy = row.policy;
   const hasPolicy = policy !== null && policy !== undefined && policy.length > 0;
@@ -92,7 +102,13 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
       </div>
 
       {open === "snapshot-now" && hasPolicy ? (
-        <div className="action__confirm" role="group" aria-label="Snapshot now">
+        <div
+          className="action__confirm"
+          role="group"
+          aria-label="Snapshot now"
+          ref={snapshotNowRef}
+          tabIndex={-1}
+        >
           <div className="action__prose">
             <p>
               This creates a new <span className="mono">Snapshot</span> under SnapshotPolicy{" "}
@@ -152,7 +168,13 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
       ) : null}
 
       {open === "delete" ? (
-        <div className="action__confirm" role="group" aria-label="Delete">
+        <div
+          className="action__confirm"
+          role="group"
+          aria-label="Delete"
+          ref={deleteRef}
+          tabIndex={-1}
+        >
           <div className="action__prose">
             <p>
               This requests deletion of the <span className="mono">Snapshot</span> resource{" "}
