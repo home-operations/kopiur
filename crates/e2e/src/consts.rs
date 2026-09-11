@@ -232,7 +232,29 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // sensitive setting there is — and any other scenario's external Snapshot
     // delete against a shared repository would trip it.
     "conc-replace",
+    // The web console e2e (tests/ui.rs). Its own repo: the browse scenarios hold a
+    // long-lived session pod open against it, and the authorization scenarios create
+    // and delete Snapshots as two different impersonated users.
+    "ui",
+    // The console e2e's ClusterRepository, over its OWN dir: `/repositories/
+    // cluster-repository/{name}` must resolve against a real cluster-scoped
+    // object, and sharing the namespaced repository's dir would put two CRs on
+    // one kopia repo.
+    "ui-cluster",
 ];
+// --- web console (kopiur-ui) roles and bindings ---------------------------------
+/// The aggregate human ClusterRole the chart renders (`ui.rbac.userRoles`). Bound
+/// cluster-wide, because the console is a fleet view.
+pub const UI_USER_ROLE: &str = "kopiur-ui-user";
+/// The e2e's ClusterRoleBinding of [`UI_USER_ROLE`] to the permitted subject.
+pub const UI_USER_BINDING: &str = "kopiur-e2e-ui-user";
+/// The in-snapshot file-browser ClusterRole (`ui.rbac.browseRole`). Deliberately
+/// NOT aggregated into [`UI_USER_ROLE`], and bound only by namespaced RoleBinding:
+/// granting it in a namespace grants that namespace's repository credentials.
+pub const UI_BROWSE_ROLE: &str = "kopiur-ui-browse";
+/// The e2e's namespaced RoleBinding of [`UI_BROWSE_ROLE`] to the permitted subject.
+pub const UI_BROWSE_BINDING: &str = "kopiur-e2e-ui-browse";
+
 /// The in-pod mount path for an isolated per-scenario repo: the PVC root is mounted
 /// here and `kopia --path` points here, so the kopia repo IS this dir (one repo per
 /// PVC ⇒ true isolation). A fixed path is fine because each scenario binds a

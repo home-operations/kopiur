@@ -150,7 +150,7 @@ docker exec "$NODE" sh -c '
   # PVC ROOT is the kopia repo — a subdir under one shared PVC gives no isolation.
   # Each scenario binds its own PVC over one of these dirs. KEEP IN LOCKSTEP with
   # crates/e2e/src/consts.rs::REPO_SUBPATHS.
-  for s in moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate repl-src repl-dst repl-s3-src repl-run-src repl-run-dst projgate hooks gfs errh colocation colocation-off colocation-missing copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-heldprune adopt-prune adopt-ignore adopt-quiet polcasc-retain polcasc-delete polcasc-simul recrestore waitanchor waitref multipvc-fanout multipvc-group populator-fanout unchanged-dedup unchanged-default srepl-src srepl-dst srepl-coex-src srepl-coex-dst srepl-sel-src srepl-sel-dst srepl-susp-src srepl-susp-dst srepl-run-src srepl-run-dst mrepo-a mrepo-b mrepo-ret-a mrepo-ret-b mrepo-down-a mrepo-down-b mrepo-rest-a mrepo-rest-b seed-primary seed-mirror seed-blob seed-mig-src seed-mig-dst seed-empty-src seed-empty-dst conc-cap conc-counted conc-restore conc-uncapped conc-env-a conc-env-b conc-replace; do
+  for s in moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate repl-src repl-dst repl-s3-src repl-run-src repl-run-dst projgate hooks gfs errh colocation colocation-off colocation-missing copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-heldprune adopt-prune adopt-ignore adopt-quiet polcasc-retain polcasc-delete polcasc-simul recrestore waitanchor waitref multipvc-fanout multipvc-group populator-fanout unchanged-dedup unchanged-default srepl-src srepl-dst srepl-coex-src srepl-coex-dst srepl-sel-src srepl-sel-dst srepl-susp-src srepl-susp-dst srepl-run-src srepl-run-dst mrepo-a mrepo-b mrepo-ret-a mrepo-ret-b mrepo-down-a mrepo-down-b mrepo-rest-a mrepo-rest-b seed-primary seed-mirror seed-blob seed-mig-src seed-mig-dst seed-empty-src seed-empty-dst conc-cap conc-counted conc-restore conc-uncapped conc-env-a conc-env-b conc-replace ui ui-cluster; do
     mkdir -p "/kopiur-e2e/repos/$s"
   done
   # Source dir with one UNREADABLE file for the errorHandling.ignoreFileErrors
@@ -245,6 +245,21 @@ env = { KUBECONFIG = "{{config_root}}/../../target/e2e/kubeconfig" }
 run = """
 set -eu
 echo "==> helm install"
+# The web console is opt-in (KOPIUR_E2E_UI=1) and needs two things BEFORE the
+# chart renders. Its values live in a second `-f` rather than a `--set` soup so
+# the install shape is reviewable; and the proxy shared-token Secret must already
+# exist, because the console Deployment mounts it and `helm --wait` would
+# otherwise time out on a pod stuck in ContainerCreating. Keep the Secret name,
+# key and value in lockstep with crates/e2e/src/ui.rs.
+UI_VALUES=""
+if [ "${KOPIUR_E2E_UI:-0}" = "1" ]; then
+  kubectl create namespace kopiur-e2e --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  kubectl -n kopiur-e2e create secret generic kopiur-ui-proxy-token \\
+    --from-literal=token=kopiur-e2e-proxy-shared-token \\
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  UI_VALUES="-f deploy/e2e/values-ui.yaml"
+  echo "==> web console ENABLED for this install (deploy/e2e/values-ui.yaml)"
+fi
 # KOPIUR_E2E_HELM_SET — optional extra `--set` overrides for a shard that needs a
 # non-default install shape (e.g. the install-scope shard sets
 # `installScope=namespaced` to prove a Role-only install actually reconciles).
@@ -252,6 +267,7 @@ helm upgrade --install kopiur deploy/helm/kopiur \\
   --namespace kopiur-e2e --create-namespace \\
   --wait --timeout 5m \\
   -f deploy/e2e/values.yaml \\
+  ${UI_VALUES} \\
   ${KOPIUR_E2E_HELM_SET:+--set "$KOPIUR_E2E_HELM_SET"}
 
 # `--wait` above only covers Deployment readiness (pods Ready), not the
@@ -381,6 +397,22 @@ kubectl get pvc -A -o 'jsonpath={range .items[*]}{.metadata.namespace}{" "}{.met
   | while read -r pns ppvc pphase; do [ -n "$ppvc" ] || continue; [ "$pphase" = "Bound" ] && continue; echo "== $pns/$ppvc ($pphase) ==" >&2; kubectl describe pvc -n "$pns" "$ppvc" >&2 2>&1; done
 echo "---- controller logs (tail 400) ----" >&2
 kubectl logs -n "$NS" -l app.kubernetes.io/component=controller --tail=400 --all-containers >&2 2>&1
+# Web console (only installed on the `ui` shard / KOPIUR_E2E_UI=1). Three
+# things, because a console failure is unreadable without all three: the pod's
+# own logs (one audit line per request — user, route, status — plus the
+# impersonation self-check's verdict at startup), /readyz (which names the
+# subsystem holding the pod out of the Service, e.g. impersonation-unavailable),
+# and the browse session Jobs/pods the suite creates. Silent no-ops when the
+# console is not installed.
+echo "---- kopiur-ui logs (tail 400) ----" >&2
+kubectl logs -n "$NS" -l app.kubernetes.io/component=ui --tail=400 --all-containers >&2 2>&1
+echo "---- kopiur-ui /readyz ----" >&2
+kubectl get --raw "/api/v1/namespaces/$NS/services/kopiur-ui:8091/proxy/readyz" >&2 2>&1; echo >&2
+echo "---- browse session Jobs/pods (kopiur.home-operations.com/session=browse) ----" >&2
+kubectl get jobs,pods -A -l kopiur.home-operations.com/session=browse -o wide >&2 2>&1
+kubectl get pods -A -l kopiur.home-operations.com/session=browse \
+  -o 'jsonpath={range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+  | while read -r bns bpod; do [ -n "$bpod" ] || continue; echo "-- $bns/$bpod --" >&2; kubectl logs -n "$bns" "$bpod" --tail=200 --all-containers >&2 2>&1; done
 echo "---- snapshot-controller + csi-hostpathplugin logs ----" >&2
 kubectl logs -n kube-system -l app.kubernetes.io/name=snapshot-controller --tail=120 >&2 2>&1
 kubectl logs -n default -l app.kubernetes.io/name=csi-hostpathplugin --tail=120 --all-containers --max-log-requests=12 >&2 2>&1
