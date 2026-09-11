@@ -2186,3 +2186,87 @@ svg {
   color: var(--health-failed-fg);
   font-weight: var(--weight-medium);
 }
+
+/* ---- policy ledger and detail --------------------------------------------- */
+
+.policy-table__object,
+.policy-table__repos {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.policy-table__object {
+  min-width: 9rem;
+}
+
+/* A policy name wraps rather than ellipsising: the name is the one thing the
+   reader came to the row for. */
+.policy-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.policy-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+.policy-table__namespace,
+.policy-table__note {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+/* Not suspended is a word, not a lamp: a policy carries no operator health,
+   and a green lamp here would claim one. */
+.policy-table__active {
+  color: var(--fg-muted);
+}
+
+/* A recipe that has never succeeded, or names no repository at all — the
+   loudest cell in the ledger, and the one an empty cell would have hidden. */
+.policy-table__never {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* The GFS rules as a count, what it keeps, and the field it is written as —
+   three columns so the numbers line up and the manifest field stays findable. */
+.retention-rules {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.retention-rules > li {
+  display: grid;
+  grid-template-columns: 2.5rem minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+}
+
+.retention-rules__count {
+  text-align: right;
+  font-weight: var(--weight-medium);
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-rules__field {
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+}
+
+@media (max-width: 560px) {
+  .retention-rules > li {
+    grid-template-columns: 2.5rem minmax(0, 1fr);
+  }
+
+  .retention-rules__field {
+    grid-column: 2;
+  }
+}
