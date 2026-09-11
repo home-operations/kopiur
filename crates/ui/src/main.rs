@@ -47,7 +47,9 @@ use kube::api::{Api, PostParams};
 use kopiur_ui::config::{UiArgs, UiConfig};
 use kopiur_ui::metrics::UiMetrics;
 use kopiur_ui::ops_listener::{CacheState, Readiness, serve_ops};
-use kopiur_ui::startup::{CORE_GROUP, impersonation_targets, track_cache_readiness};
+use kopiur_ui::startup::{
+    CORE_GROUP, ImpersonationTarget, impersonation_targets, track_cache_readiness,
+};
 use kopiur_ui::{AppState, app, auth, browse, cache, static_files};
 
 /// Exit code for a refused configuration, distinct from a crash.
@@ -279,12 +281,12 @@ async fn check_impersonation(client: kube::Client, cfg: Arc<UiConfig>, readiness
 /// Service and 403 every caller.
 async fn denied_impersonations(client: &kube::Client, cfg: &UiConfig) -> Vec<String> {
     let mut denied = Vec::new();
-    for resource in impersonation_targets(cfg) {
-        let allowed = match may_impersonate(client, &resource).await {
+    for target in impersonation_targets(cfg) {
+        let allowed = match may_impersonate(client, &target).await {
             Ok(allowed) => allowed,
             Err(e) => {
                 tracing::error!(
-                    resource = %resource,
+                    target = %target,
                     error = %e,
                     "kopiur-ui could not ask the apiserver whether it may impersonate; \
                      treating it as denied. /readyz reports impersonation-unavailable."
@@ -293,17 +295,26 @@ async fn denied_impersonations(client: &kube::Client, cfg: &UiConfig) -> Vec<Str
             }
         };
         if !allowed {
-            denied.push(resource);
+            denied.push(target.to_string());
         }
     }
     denied
 }
 
-/// One `SelfSubjectAccessReview` for `impersonate` on `resource`.
-async fn may_impersonate(client: &kube::Client, resource: &str) -> Result<bool, kube::Error> {
-    let (resource, subresource) = match resource.split_once('/') {
+/// One `SelfSubjectAccessReview` for `impersonate` on one target.
+///
+/// The target's name is sent when it has one. Omitting it is not a harmless
+/// simplification: RBAC answers the unnamed question only from rules that carry
+/// no `resourceNames`, so against the narrow rule the chart ships for anonymous
+/// mode an unnamed review is correctly DENIED while every real request — which
+/// does name a principal — would have been allowed.
+async fn may_impersonate(
+    client: &kube::Client,
+    target: &ImpersonationTarget,
+) -> Result<bool, kube::Error> {
+    let (resource, subresource) = match target.resource.split_once('/') {
         Some((head, tail)) => (head.to_string(), Some(tail.to_string())),
-        None => (resource.to_string(), None),
+        None => (target.resource.clone(), None),
     };
     let review = SelfSubjectAccessReview {
         metadata: Default::default(),
@@ -313,6 +324,7 @@ async fn may_impersonate(client: &kube::Client, resource: &str) -> Result<bool, 
                 group: Some(CORE_GROUP.to_string()),
                 resource: Some(resource),
                 subresource,
+                name: target.name.clone(),
                 ..Default::default()
             }),
             ..Default::default()

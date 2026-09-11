@@ -11,12 +11,15 @@
 //! So they live here instead. What stays in `main` is the IO around them: build
 //! the client, spawn the tasks, hand the results to these functions.
 
+use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::Arc;
 
 use tokio::sync::watch;
 
+use crate::auth::identity::SYSTEM_AUTHENTICATED;
 use crate::cache::stores::CacheHealth;
-use crate::config::{CACHE_SYNC_TIMEOUT, UiConfig};
+use crate::config::{AuthConfig, AuthMode, CACHE_SYNC_TIMEOUT, UiConfig};
 use crate::ops_listener::{CacheState, Readiness};
 
 /// API group of the `impersonate` verb's resources (`users`, `groups`,
@@ -27,24 +30,137 @@ pub const CORE_GROUP: &str = "";
 /// work. Configured `userextras/<key>` subjects are checked alongside them.
 pub const IMPERSONATION_RESOURCES: [&str; 2] = ["users", "groups"];
 
-/// Every resource the UI must be able to impersonate for this configuration.
+/// One `impersonate` permission this deployment needs, phrased the way the
+/// apiserver will be asked about it.
+///
+/// The `name` is the load-bearing part. An RBAC rule carrying
+/// `resourceNames: ["kopiur-console"]` authorizes `impersonate users/kopiur-console`
+/// and NOTHING ELSE — in particular it does not authorize the *unnamed* question
+/// "may I impersonate users?", which is what a `SelfSubjectAccessReview` asks
+/// when its `ResourceAttributes` carry no name. So a startup check that always
+/// asked the unnamed question was denied by exactly the narrow grant the chart
+/// ships for anonymous mode, and the pod never became ready: the grant and the
+/// check were each right on their own and never met.
+///
+/// Carrying the name here makes the check ask for the permission the deployment
+/// will actually exercise, so the two cannot drift apart again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImpersonationTarget {
+    /// `users`, `groups`, or `userextras/<key>`.
+    pub resource: String,
+    /// The single principal this deployment can impersonate for `resource`, when
+    /// that set is closed and known at startup. `None` means the deployment may
+    /// impersonate arbitrary names, which is also how the RBAC is written, so
+    /// the unnamed question is the right one to ask.
+    pub name: Option<String>,
+}
+
+impl ImpersonationTarget {
+    /// A target whose RBAC grant is not name-scoped.
+    fn any(resource: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+            name: None,
+        }
+    }
+
+    /// A target pinned to one principal, mirroring a `resourceNames` rule.
+    fn named(resource: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+            name: Some(name.into()),
+        }
+    }
+}
+
+impl fmt::Display for ImpersonationTarget {
+    /// `users/kopiur-console`, or bare `users` — the form an operator would
+    /// write in a `kubectl auth can-i`, so the error message is copy-pasteable.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "{}/{name}", self.resource),
+            None => f.write_str(&self.resource),
+        }
+    }
+}
+
+/// Every impersonation permission the UI must hold for this configuration.
 ///
 /// `users` and `groups` always; plus `userextras/<key>` for each configured
 /// extra key, because a proxy that asserts an extra the UI may not impersonate
 /// fails every request — and fails with a message pointing at the wrong thing.
+///
+/// Each target is name-scoped exactly when the chart's rule for it is, so the
+/// question asked matches the grant given:
+///
+/// | mode | `users` | `groups` |
+/// |---|---|---|
+/// | anonymous-only | the anonymous user | its groups + `system:authenticated` |
+/// | header, `allowedGroups` set | any | the allowlist + `system:authenticated` |
+/// | header, no allowlist | any | any |
+///
+/// `userextras/<key>` is never name-scoped: the chart emits one unscoped rule
+/// per key, because Kubernetes RBAC has no `userextras/*`.
 #[must_use]
-pub fn impersonation_targets(cfg: &UiConfig) -> Vec<String> {
-    IMPERSONATION_RESOURCES
-        .iter()
-        .map(|resource| (*resource).to_string())
-        .chain(
-            cfg.auth
-                .extra_keys
-                .iter()
-                .map(|key| format!("userextras/{key}")),
-        )
+pub fn impersonation_targets(cfg: &UiConfig) -> Vec<ImpersonationTarget> {
+    let mut targets = vec![user_target(&cfg.auth.mode)];
+    targets.extend(group_targets(&cfg.auth));
+    targets.extend(
+        cfg.auth
+            .extra_keys
+            .iter()
+            .map(|key| ImpersonationTarget::any(format!("userextras/{key}"))),
+    );
+    targets
+}
+
+/// The `users` permission: one fixed name in anonymous-only mode, any name when
+/// a proxy asserts whoever authenticated.
+fn user_target(mode: &AuthMode) -> ImpersonationTarget {
+    match mode {
+        AuthMode::AnonymousOnly(anonymous) => {
+            ImpersonationTarget::named(USERS_RESOURCE, &anonymous.user)
+        }
+        // Header mode covers the `anonymous_fallback` case too: a fallback does
+        // not close the set, because the header can still assert anyone.
+        AuthMode::Headers { .. } => ImpersonationTarget::any(USERS_RESOURCE),
+    }
+}
+
+/// The `groups` permissions, one per name whenever the impersonatable set is
+/// closed.
+///
+/// `system:authenticated` is appended to every identity by
+/// `auth::identity::finish`, and it is never filtered by the allowlist, so it
+/// belongs in every closed set here — a check that omitted it would pass while
+/// the first real request was refused for the one group the console always
+/// sends.
+fn group_targets(auth: &AuthConfig) -> Vec<ImpersonationTarget> {
+    let closed: BTreeSet<&str> = match (&auth.mode, &auth.allowed_groups) {
+        (AuthMode::AnonymousOnly(anonymous), _) => {
+            anonymous.groups.iter().map(String::as_str).collect()
+        }
+        (AuthMode::Headers { .. }, Some(allowed)) => allowed.iter().map(String::as_str).collect(),
+        // Nothing closes the set, and the RBAC rule is unscoped to match.
+        (AuthMode::Headers { .. }, None) => {
+            return vec![ImpersonationTarget::any(GROUPS_RESOURCE)];
+        }
+    };
+
+    closed
+        .into_iter()
+        .chain(std::iter::once(SYSTEM_AUTHENTICATED))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|group| ImpersonationTarget::named(GROUPS_RESOURCE, group))
         .collect()
 }
+
+/// `IMPERSONATION_RESOURCES[0]`, named so the two constructors below read.
+const USERS_RESOURCE: &str = IMPERSONATION_RESOURCES[0];
+
+/// `IMPERSONATION_RESOURCES[1]`.
+const GROUPS_RESOURCE: &str = IMPERSONATION_RESOURCES[1];
 
 /// What one [`CacheHealth`] means for `/readyz`.
 ///
@@ -172,6 +288,8 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use http::HeaderName;
+
     use crate::config::{
         AnonymousIdentity, AuthConfig, AuthMode, CacheLimits, DEFAULT_ADDR,
         DEFAULT_CLIENT_CACHE_SIZE, DEFAULT_GROUPS_SEPARATOR, DEFAULT_MAX_DOWNLOAD_BYTES,
@@ -271,9 +389,126 @@ mod tests {
 
     // --- impersonation targets ---------------------------------------------
 
+    /// Render targets the way the error message and the review do, so a test
+    /// failure reads like the thing an operator would paste into `can-i`.
+    fn shown(cfg: &UiConfig) -> Vec<String> {
+        impersonation_targets(cfg)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
     #[test]
     fn the_two_mandatory_impersonation_resources_are_always_checked() {
-        assert_eq!(impersonation_targets(&config(&[])), ["users", "groups"]);
+        assert_eq!(
+            shown(&config(&[])),
+            ["users/viewer", "groups/system:authenticated"],
+        );
+    }
+
+    /// The regression this whole type exists for.
+    ///
+    /// Anonymous mode's ClusterRole pins `resourceNames`, and a name-scoped RBAC
+    /// rule does not answer the unnamed question. The startup check asked the
+    /// unnamed question anyway, so the apiserver said no, `/readyz` stayed 503
+    /// for the pod's whole life, and Helm rolled the release back after four
+    /// attempts — with both halves individually correct. Found by deploying it,
+    /// not by reading it: the previous version of the test above asserted bare
+    /// `["users", "groups"]` against an anonymous-mode config and so agreed with
+    /// the bug.
+    #[test]
+    fn anonymous_mode_asks_about_the_one_identity_its_rbac_actually_grants() {
+        let mut cfg = config(&[]);
+        cfg.auth.mode = AuthMode::AnonymousOnly(AnonymousIdentity {
+            user: "kopiur-console".to_string(),
+            groups: vec!["platform".to_string()],
+        });
+
+        assert_eq!(
+            shown(&cfg),
+            [
+                "users/kopiur-console",
+                "groups/platform",
+                "groups/system:authenticated",
+            ],
+        );
+        assert!(
+            impersonation_targets(&cfg).iter().all(|t| t.name.is_some()),
+            "every anonymous-mode target must be name-scoped: the chart's rules are, \
+             and an unnamed review against a resourceNames rule is denied",
+        );
+    }
+
+    /// `system:authenticated` is appended to every identity and is never
+    /// filtered by the allowlist, so a check that omitted it would pass while
+    /// the first real request was refused for the one group always sent.
+    #[test]
+    fn the_always_appended_group_is_checked_even_when_no_groups_are_configured() {
+        let mut cfg = config(&[]);
+        cfg.auth.mode = AuthMode::AnonymousOnly(AnonymousIdentity {
+            user: "solo".to_string(),
+            groups: Vec::new(),
+        });
+
+        assert_eq!(shown(&cfg), ["users/solo", "groups/system:authenticated"]);
+    }
+
+    /// Header mode cannot close the user set — the proxy asserts whoever
+    /// authenticated — so the RBAC rule is unscoped and the unnamed question is
+    /// the right one. A name here would be denied by an unscoped rule's absence
+    /// of that name... no: it would be *allowed*, which is worse, because it
+    /// would prove nothing about the arbitrary names actually impersonated.
+    #[test]
+    fn header_mode_leaves_the_user_question_unnamed_because_its_grant_is() {
+        let mut cfg = config(&[]);
+        cfg.auth.mode = AuthMode::Headers {
+            user: HeaderName::from_static("x-forwarded-user"),
+            groups: Some(HeaderName::from_static("x-forwarded-groups")),
+            anonymous_fallback: None,
+        };
+
+        assert_eq!(shown(&cfg), ["users", "groups"]);
+    }
+
+    /// An anonymous *fallback* does not close the set: the header can still
+    /// assert anyone, and the chart's `$anonOnly` guard agrees (it requires an
+    /// empty `userHeader`).
+    #[test]
+    fn an_anonymous_fallback_does_not_make_header_mode_name_scoped() {
+        let mut cfg = config(&[]);
+        cfg.auth.mode = AuthMode::Headers {
+            user: HeaderName::from_static("x-forwarded-user"),
+            groups: None,
+            anonymous_fallback: Some(AnonymousIdentity {
+                user: "guest".to_string(),
+                groups: Vec::new(),
+            }),
+        };
+
+        assert_eq!(shown(&cfg), ["users", "groups"]);
+    }
+
+    /// With `allowedGroups` the chart pins the groups rule to the allowlist plus
+    /// `system:authenticated`, so the check is name-scoped for groups only.
+    #[test]
+    fn an_allowlist_closes_the_group_set_but_not_the_user_set() {
+        let mut cfg = config(&[]);
+        cfg.auth.mode = AuthMode::Headers {
+            user: HeaderName::from_static("x-forwarded-user"),
+            groups: Some(HeaderName::from_static("x-forwarded-groups")),
+            anonymous_fallback: None,
+        };
+        cfg.auth.allowed_groups = Some(["ops", "dev"].iter().map(|g| (*g).to_string()).collect());
+
+        assert_eq!(
+            shown(&cfg),
+            [
+                "users",
+                "groups/dev",
+                "groups/ops",
+                "groups/system:authenticated",
+            ],
+        );
     }
 
     /// The fan-out addendum 11 asked for: a deployment that forwards extras must
@@ -283,10 +518,12 @@ mod tests {
     #[test]
     fn every_configured_extra_key_becomes_its_own_userextras_subresource() {
         assert_eq!(
-            impersonation_targets(&config(&["scopes", "auth-time"])),
+            shown(&config(&["scopes", "auth-time"])),
             [
-                "users",
-                "groups",
+                "users/viewer",
+                "groups/system:authenticated",
+                // Never name-scoped: the chart emits one unscoped rule per key,
+                // because Kubernetes RBAC has no `userextras/*`.
                 "userextras/scopes",
                 "userextras/auth-time",
             ],
