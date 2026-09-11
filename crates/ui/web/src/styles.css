@@ -86,12 +86,18 @@
   --accent-soft: light-dark(rgba(79, 85, 210, 0.12), rgba(139, 144, 240, 0.16));
   --selection: light-dark(#d9dbf8, #34397a);
 
-  /* ---- depth: an offset and a soft blur, or a lighter surface step ----- */
-  --shadow-1: light-dark(0 1px 2px rgba(26, 29, 33, 0.08), 0 1px 2px rgba(0, 0, 0, 0.5));
-  --shadow-2: light-dark(
-    0 6px 16px -4px rgba(26, 29, 33, 0.18),
-    0 8px 20px -6px rgba(0, 0, 0, 0.7)
-  );
+  /* ---- depth: an offset and a soft blur, or a lighter surface step -----
+     `light-dark()` produces a COLOUR and nothing else. Wrapping a whole
+     shadow list in it — which this file did until a browser was pointed at
+     it — makes the declaration invalid at computed-value time, so `box-shadow`
+     falls back to `none` and every elevation in the console silently
+     disappears: the disabled-control tooltip, the identity panel, the skip
+     link, the selected theme option. The geometry is the same in both themes
+     anyway, so only the ink switches. */
+  --shadow-ink-1: light-dark(rgba(26, 29, 33, 0.08), rgba(0, 0, 0, 0.5));
+  --shadow-ink-2: light-dark(rgba(26, 29, 33, 0.18), rgba(0, 0, 0, 0.7));
+  --shadow-1: 0 1px 2px var(--shadow-ink-1);
+  --shadow-2: 0 6px 16px -4px var(--shadow-ink-2), 0 8px 20px -6px var(--shadow-ink-2);
   --focus-ring: 0 0 0 2px var(--bg-surface), 0 0 0 4px var(--accent);
 
   /* ---- health lamps: fg on bg, always with an icon and a word ---------- */
@@ -226,6 +232,12 @@ pre,
 .mono {
   font-family: var(--font-mono);
   font-size: 0.92em;
+  /* Everything wearing this class is an identifier — a field path, a Job name,
+     a kopia manifest ID — and none of them carry a break opportunity. `anywhere`
+     rather than `break-word` because it also lowers the element's min-content
+     width, which is what keeps a grid track from growing past the viewport. It
+     only breaks a token that would otherwise overflow. */
+  overflow-wrap: anywhere;
 }
 
 button,
@@ -356,8 +368,15 @@ svg {
   color: var(--fg);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
-  line-height: 1;
-  white-space: nowrap;
+  /* A label can name its object — "Run maintenance for <cluster-repository>" —
+     and that name is one unbreakable token. `nowrap` made the button as wide
+     as the name and pushed the page sideways. The button still sizes to its
+     content, so a short label never wraps; only one that cannot fit does.
+     The line height only shows once a label has two lines; a one-line button
+     is unchanged, being taller than its text either way. */
+  line-height: var(--leading-dense);
+  max-width: 100%;
+  overflow-wrap: anywhere;
   transition:
     background-color var(--dur-fast) var(--ease-out),
     border-color var(--dur-fast) var(--ease-out);
@@ -417,7 +436,10 @@ svg {
   top: calc(100% + 6px);
   left: 0;
   z-index: 20;
-  max-width: 28rem;
+  /* 28rem is the reading measure; the viewport is the hard limit. A control
+     near the right edge of a narrow screen would otherwise open a 448px panel
+     anchored to its own left edge and push the page sideways. */
+  max-width: min(28rem, calc(100vw - 2 * var(--space-4)));
   width: max-content;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--line);
@@ -542,8 +564,15 @@ svg {
   transition: transform var(--dur-fast) var(--ease-out);
 }
 
+/* The ring is repeated here, and that is not redundancy. The global
+   `:focus-visible` rule sets `box-shadow`, and so does `.skip-link` above —
+   same specificity, later in the file, so the elevation shadow wins and the
+   FIRST control a keyboard user reaches has no visible focus. Any rule that
+   sets a non-inset `box-shadow` after that global rule owes its own
+   `:focus-visible`; `styles.focus.test.ts` fails the build if one forgets. */
 .skip-link:focus-visible {
   transform: none;
+  box-shadow: var(--focus-ring), var(--shadow-2);
 }
 
 /* The skip target takes focus programmatically; it needs no ring of its own. */
@@ -683,6 +712,16 @@ svg {
   min-width: 0;
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
+}
+
+/* `min-width: 0` lets the title's BOX shrink; without this its TEXT keeps its
+   full width and paints straight over the theme switch beside it. Each part
+   truncates on its own so the section name survives longest. */
+.header__title > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .header__scope {
@@ -830,6 +869,13 @@ svg {
   box-shadow: var(--shadow-1);
 }
 
+/* The selected option's elevation would otherwise eat the focus ring — see the
+   note on `.skip-link:focus-visible`. The ring leads and the elevation stays,
+   so tabbing across the switch shows a ring on all three, not two of three. */
+.theme-switch__option[aria-pressed="true"]:focus-visible {
+  box-shadow: var(--focus-ring), var(--shadow-1);
+}
+
 /* ---- problem banner: what, why, fix — fix set apart ----------------------- */
 
 .problem {
@@ -960,13 +1006,19 @@ svg {
 
 /* ---- page: a route's sections, divided by space, not by boxes ------------ */
 
+/* `minmax(0, 1fr)`, not the implicit `auto`: an `auto` track takes its
+   minimum from its content, so one unbreakable token — a ClusterRepository
+   name, a Job name — widens the track past the viewport and takes the page
+   with it. `min-width: 0` on the item does not help; the track is what grows. */
 .page {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-6);
 }
 
 .page__section {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-3);
   align-content: start;
   min-width: 0;
@@ -977,6 +1029,16 @@ svg {
 .ledger-scroll {
   overflow-x: auto;
   min-width: 0;
+  /* Load-bearing, and not obvious: `.visually-hidden` is `position: absolute`
+     with no offsets, so it sits at its STATIC position — which, for a span in
+     a cell 1000px into a scrolled ledger, is 1000px from the left of whatever
+     its containing block is. Without a positioned ancestor that containing
+     block is the page, so a 1px screen-reader-only span drags the document's
+     scrollWidth out past the viewport and the WHOLE PAGE scrolls sideways.
+     Making the scroll box the containing block keeps it inside the ledger,
+     where it was always meant to be. Every `NotReported` and every disabled
+     control's reason is such a span. */
+  position: relative;
 }
 
 .ledger-scroll > .ledger {
@@ -1693,7 +1755,9 @@ svg {
 
   .shell {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto var(--header-height) minmax(0, 1fr);
+    /* `auto` for the header, not `var(--header-height)`: it wraps to two rows
+       at this width (see `.header` below) and a fixed row would clip it. */
+    grid-template-rows: auto auto minmax(0, 1fr);
     grid-template-areas:
       "rail"
       "header"
@@ -1742,13 +1806,62 @@ svg {
     border-radius: 2px 2px 0 0;
   }
 
+  /* Two rows, not one. At 390px the page name, the scope, the theme switch and
+     the identity strip cannot share a line — truncating them all to fit would
+     leave three ellipses and no facts. The header grows instead, so the grid
+     row that holds it has to stop being a fixed height (below). */
   .header {
     position: static;
-    padding: 0 var(--space-4);
+    height: auto;
+    min-height: var(--header-height);
+    padding: var(--space-2) var(--space-4);
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    row-gap: var(--space-2);
   }
 
   .header__title {
     font-size: var(--text-sm);
+    flex: 1 0 100%;
+  }
+
+  .header__tools {
+    flex-wrap: wrap;
+  }
+
+  /* No hover exists here, so a tooltip is a reason nobody can read — and one
+     anchored to a control's left edge would run off the page besides. The
+     refusal becomes a line under the control instead. A ledger keeps its own
+     answer (the short word in the cell, `actions/reason.ts`), so the sentence
+     stays hidden there rather than doubling up. */
+  .button[data-reason]::after {
+    content: none;
+  }
+
+  .button__reason {
+    position: static;
+    display: block;
+    width: auto;
+    height: auto;
+    margin: var(--space-1) 0 0;
+    overflow: visible;
+    clip: auto;
+    clip-path: none;
+    white-space: normal;
+    max-width: 34rem;
+    color: var(--fg-muted);
+    font-size: var(--text-xs);
+    line-height: var(--leading-prose);
+  }
+
+  .ledger-scroll .button__reason {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 
   .content {
@@ -1802,10 +1915,10 @@ svg {
     flex-basis: 100%;
   }
 
-  .facts__row {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 0;
-  }
+  /* `.facts__row`'s narrow override does NOT live here — it would be dead.
+     The base rule is declared further down the file, in the facts section,
+     and an equal-specificity rule that comes later wins whatever the media
+     query says. It sits beside its base rule instead. */
 }
 
 @media (max-width: 560px) {
@@ -1932,6 +2045,25 @@ svg {
   margin: 0;
   font-size: var(--text-sm);
   overflow-wrap: anywhere;
+}
+
+/* One column below the shell's breakpoint. A 14rem label column beside a 390px
+   viewport leaves 122px for the value, which is where a repository name or a
+   Job name stops fitting and starts pushing the page sideways. This override
+   must stay AFTER the base rule above: it is the same specificity, so source
+   order — not the media query — decides which one wins. */
+@media (max-width: 900px) {
+  .facts__row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+}
+
+/* A fact whose value is a way in, not a value: the icon marks it as a move. */
+.facts__action {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 /* ---- reference lists: named objects with no detail route yet -------------- */
@@ -2337,10 +2469,6 @@ svg {
     align-items: start;
     flex-direction: column;
   }
-
-  .button[data-reason]::after {
-    max-width: calc(100vw - 4rem);
-  }
 }
 
 /* ==========================================================================
@@ -2619,8 +2747,23 @@ svg {
   color: var(--fg-faint);
 }
 
+/* A plot scrolls; it does not shrink. Both charts are drawn in a 560-unit
+   viewBox, and `width: 100%` alone scaled that to 332px on a phone — which
+   scales the 9px axis text to 5.3px, below anything a person can read. The
+   ledgers already answered this question: keep the drawing at the size it was
+   designed for and let the narrow viewport scroll to it. */
+.chart__scroll {
+  overflow-x: auto;
+  min-width: 0;
+  /* Same reason as `.ledger-scroll`: an absolutely positioned descendant with
+     no offsets sits at its static position, and without a positioned ancestor
+     that is measured against the page. */
+  position: relative;
+}
+
 .chart__plot {
   width: 100%;
+  min-width: 35rem;
   height: auto;
   overflow: visible;
 }
@@ -2663,6 +2806,58 @@ svg {
    hitting it. */
 .chart__hit {
   fill: transparent;
+}
+
+/* ---- the lag bars -------------------------------------------------------- */
+
+/* The unfilled remainder of each row: the same inset the ledgers use, so the
+   bar reads as a length against a known track rather than as a floating mark. */
+.lag__track {
+  fill: var(--bg-inset);
+}
+
+/* One series, one hue. Nothing here encodes state in colour — the only state
+   that matters, suspension, is a word in the table. */
+.lag__bar {
+  fill: var(--fg-muted);
+}
+
+/* A stopped schedule: the age is real, the alarm is not, so the bar recedes.
+   Opacity rather than a second fill, so it composes with selection below —
+   a suspended bar under the pointer must still show it is the selected one.
+   The word in the table is what actually says why it is dimmed. */
+.lag__bar[data-suspended="true"] {
+  opacity: 0.55;
+}
+
+/* Selection, which is what the accent is for. The 2px surface ring is the
+   mark spec's gap between overlapping fills. */
+.lag__bar[data-current="true"] {
+  fill: var(--accent);
+  stroke: var(--bg-surface);
+  stroke-width: 2;
+}
+
+.lag__suspended {
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+}
+
+/* A lone measurement: the value IS the chart, so it is set as a figure rather
+   than plotted as one dot in an empty frame. */
+.chart__figure {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.chart__figure-value {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
 }
 
 .chart__data > summary {
@@ -2964,6 +3159,11 @@ svg {
 .maintenance__resource {
   color: var(--fg-faint);
   font-size: var(--text-xs);
+  /* A flex item cannot shrink past its content without this pair, and a
+     `kopiur-system/<cluster-repository>-maintenance` name is long enough to
+     push a phone-width page sideways on its own. */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* A track that has never run, or a run of failures: the number is the fact,

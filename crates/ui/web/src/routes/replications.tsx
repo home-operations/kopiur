@@ -1,7 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { ArrowLeftRight } from "lucide-react";
+import { ArrowLeftRight, Hourglass } from "lucide-react";
 
 import { useReplications } from "../api/hooks";
+import { ReplicationLagChart } from "../charts/ReplicationLagChart";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
@@ -59,6 +60,21 @@ function Replications() {
           <ReplicationTable rows={rows} />
         )}
       </section>
+
+      {rows.length > 0 ? (
+        <section className="page__section" aria-label="Replication lag">
+          <div className="page__section-head">
+            <h2>
+              <Hourglass size={16} strokeWidth={2} aria-hidden="true" />
+              Replication lag
+            </h2>
+          </div>
+          <p className="page__section-note">
+            The same rows, ordered by how long it has been since each one last finished a copy.
+          </p>
+          <ReplicationLagChart rows={rows} />
+        </section>
+      ) : null}
 
       <p className="page__prose">
         &ldquo;Next run&rdquo; reads <em>not reported</em> for every row, and that is the

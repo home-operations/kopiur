@@ -16,6 +16,12 @@ import { type ButtonHTMLAttributes, type MouseEvent, useId } from "react";
  *   name and then why it is unavailable — two facts, not one run-on name.
  * - `data-reason` drives the visible tooltip (`styles.css`, `.button[data-reason]`).
  * - A click while blocked is swallowed; `onClick` never runs.
+ *
+ * The hidden sibling also carries `button__reason`, which the stylesheet uses
+ * to *reveal* it below 900px. There is no hover on a phone, so the tooltip is
+ * unreachable there and the reason would simply be invisible; inline, it is
+ * read by everyone. Inside a `.ledger-scroll` it stays hidden, because a
+ * ledger shows the short word in the cell instead (`actions/reason.ts`).
  */
 export interface ActionButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: "default" | "primary" | "quiet" | "danger" | undefined;
@@ -57,7 +63,7 @@ export function ActionButton({
         {children}
       </button>
       {blocked ? (
-        <span id={reasonId} className="visually-hidden">
+        <span id={reasonId} className="visually-hidden button__reason">
           {disabledReason}
         </span>
       ) : null}

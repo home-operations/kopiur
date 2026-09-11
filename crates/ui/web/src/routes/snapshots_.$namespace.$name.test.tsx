@@ -143,6 +143,38 @@ describe("Snapshot detail route", () => {
     expect(calledPaths()).toContain(PATH);
   });
 
+  it("reaches the file browser, and the real route tree resolves the link", async () => {
+    // The only screen that links to `…/browse`. A component test proves the
+    // href string; this one proves the app can actually go there — the two
+    // screens were built in separate worktrees and never met until now.
+    mockApi({
+      [PATH]: jsonResponse(detail()),
+      // No session yet — the browse page's ordinary first state.
+      [`${PATH}/session`]: problemResponse({
+        type: "urn:kopiur:problem:session-required",
+        title: "Session required",
+        status: 404,
+        detail: "No browse session is running for media/nightly-29.",
+        what: "No browse session is running for media/nightly-29.",
+        why: "Listing a snapshot needs a mover pod holding the repository open.",
+        fix: "start a browse session",
+        instance: `${PATH}/session`,
+        kubeReason: null,
+      }),
+    });
+    const { router } = mountApp("/snapshots/media/nightly-29?namespace=media");
+    const link = await screen.findByRole("link", { name: /browse the files/i });
+    expect(link).toHaveAttribute("href", "/snapshots/media/nightly-29/browse?namespace=media");
+    await userEvent.click(link);
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe("/snapshots/media/nightly-29/browse");
+    });
+    // Not a blank `<Outlet/>`: the browse page's own content rendered, and the
+    // scope survived the move.
+    expect(await screen.findByText("No browse session is running")).toBeInTheDocument();
+    expect(router.state.location.search).toEqual({ namespace: "media" });
+  });
+
   it("shows the cheap verdict without fetching the plan", async () => {
     mockApi({ [PATH]: jsonResponse(detail()) });
     mountApp("/snapshots/media/nightly-29");
@@ -238,6 +270,50 @@ describe("Snapshot detail route", () => {
     // 202: requested, not performed.
     expect(confirm).toHaveTextContent(/requested/);
     expect(screen.getByRole("button", { name: "Request deletion" })).toBeInTheDocument();
+  });
+
+  it("manages focus on the delete confirmation, which is not an ActionPanel", async () => {
+    // This action bar is hand-rolled rather than built from `ActionPanel`, so
+    // the shared component's own focus tests say nothing about it. Both use
+    // `useConfirmFocus`; this asserts the most destructive control on the
+    // console actually got it.
+    mockApi({ [PATH]: jsonResponse(detail()) });
+    mountApp("/snapshots/media/nightly-29");
+    const user = userEvent.setup();
+    const trigger = await screen.findByRole("button", { name: /^Delete/ });
+    await user.click(trigger);
+    expect(screen.getByRole("group", { name: "Delete" })).toHaveFocus();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("group", { name: "Delete" })).not.toBeInTheDocument();
+    // Not dropped on `<body>`: the reader carries on from the control they used.
+    expect(trigger).toHaveFocus();
+  });
+
+  it("gives focus back after the deletion is requested", async () => {
+    // The GET and the DELETE share a pathname, so the handler switches on method.
+    fetchMock.resetMocks();
+    fetchMock.mockResponse((request) => {
+      const url = new URL(request.url, "http://localhost");
+      if (url.pathname === "/api/v1/me") {
+        return Promise.resolve(jsonResponse(ME));
+      }
+      if (url.pathname === PATH && request.method === "DELETE") {
+        return Promise.resolve(
+          jsonResponse({ kind: "deleteSnapshot", created: [], requestedAt: null, note: null }, 202),
+        );
+      }
+      return Promise.resolve(jsonResponse(detail()));
+    });
+    mountApp("/snapshots/media/nightly-29");
+    const user = userEvent.setup();
+    const trigger = await screen.findByRole("button", { name: /^Delete/ });
+    await user.click(trigger);
+    await user.click(screen.getByRole("button", { name: "Request deletion" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("group", { name: "Delete" })).not.toBeInTheDocument();
+    });
+    expect(trigger).toHaveFocus();
   });
 
   it("refuses to guess the consequence when the CR sets no deletion policy", async () => {

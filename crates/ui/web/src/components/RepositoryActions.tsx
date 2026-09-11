@@ -11,6 +11,7 @@ import {
   repositoryPatchCapability,
   suspendKindToken,
 } from "./repository";
+import { useConfirmFocus } from "./actions/useConfirmFocus";
 import { useCapabilityReason } from "./useCapabilityReason";
 
 /**
@@ -213,6 +214,11 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
   ];
 
   const opened = actions.find((action) => action.id === open);
+  // Hand-rolled rather than built from `ActionPanel` (it predates it), so it
+  // borrows the shared focus behaviour directly — see `useConfirmFocus`.
+  const panelRef = useConfirmFocus(opened !== undefined, () => {
+    setOpen(null);
+  });
 
   return (
     <>
@@ -237,7 +243,13 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
       </div>
 
       {opened !== undefined ? (
-        <div className="action__confirm" role="group" aria-label={opened.label}>
+        <div
+          className="action__confirm"
+          role="group"
+          aria-label={opened.label}
+          ref={panelRef}
+          tabIndex={-1}
+        >
           <div className="action__prose">{opened.prose}</div>
           <div className="action__actions">
             <ActionButton
