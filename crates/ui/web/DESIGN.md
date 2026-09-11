@@ -173,6 +173,8 @@ health vocabulary that never speaks by colour alone.
 
 **The Lettered Lamp Rule.** A health colour never appears without its icon and its word. `HealthBadge` (a `Health` value) and `LampBadge` (a `Lamp` that carries its own icon, such as the dashed circle of a dangling reference) are the only two ways to render one; `HealthBadge` is `LampBadge` with the lamp looked up.
 
+A surface can be loud without the server having published a `Health` — a policy and a schedule publish none, yet "never verified" and "3 failed runs" are the loudest thing on their row. That is a lamp too, built by `loudLamp(word)`: the failed lamp's ink and icon wearing the **fact's own wording**, so nothing announces a verdict the operator never wrote. Reaching for `--health-*` directly instead is how this rule rots, because the colour is always the right colour and the missing half is the half nobody is looking at; `styles.health.test.ts` is the ratchet, and it holds a short list of text that wears a health colour legitimately — each entry a sentence that already names the fault in words, each with its call sites pinned so a blessed class cannot quietly acquire a second meaning.
+
 **The Accent By Law Rule.** Indigo marks selection, the current item, focus and the primary action. It is never a health colour, never a border for emphasis, never a background wash.
 
 **The One Declaration Rule.** Every colour is written once as `light-dark(light, dark)`. There is no dark block to keep in sync.

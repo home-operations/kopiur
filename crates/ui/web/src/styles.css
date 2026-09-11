@@ -3007,8 +3007,15 @@ svg {
   color: var(--fg-muted);
 }
 
-/* A recipe that has never succeeded, or names no repository at all — the
-   loudest cell in the ledger, and the one an empty cell would have hidden. */
+/* A recipe that names no repository at all — the loudest cell in the ledger,
+   and the one an empty cell would have hidden.
+
+   Ink without a lamp, deliberately: the cell is a whole clause naming the
+   defect ("names no repository"), so the colour is emphasis on a sentence
+   that already carries the meaning, not the meaning itself. The absences that
+   were only a *word* ("never verified", "never succeeded") are lamps now —
+   see `loudLamp` in components/health.ts, and styles.health.test.ts, which is
+   what stops this class growing a second job. */
 .policy-table__never {
   color: var(--health-failed-fg);
   font-weight: var(--weight-medium);
@@ -3083,8 +3090,12 @@ svg {
   color: var(--fg-muted);
 }
 
-/* A clock that has never fired, a run of failures, or a schedule that fires
-   nothing at all — each is the loudest cell in its row. */
+/* A schedule that fires nothing at all — the loudest cell in its row.
+
+   Ink without a lamp, on the same terms as `.policy-table__never`: the cell
+   is the sentence "nothing — it names no policy and sets no selector", which
+   says the defect in words. The run of failures that used to share this class
+   was a state in a column of lamps, and is one (`loudLamp`). */
 .schedule-table__never {
   color: var(--health-failed-fg);
   font-weight: var(--weight-medium);
@@ -3164,13 +3175,6 @@ svg {
      push a phone-width page sideways on its own. */
   min-width: 0;
   overflow-wrap: anywhere;
-}
-
-/* A track that has never run, or a run of failures: the number is the fact,
-   and the failed lamp's ink is how it stops being skimmed past. */
-.maintenance__never {
-  color: var(--health-failed-fg);
-  font-weight: var(--weight-medium);
 }
 
 /* The refusal at its short length, beside a trigger the reader cannot press.

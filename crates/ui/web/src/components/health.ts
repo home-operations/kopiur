@@ -49,6 +49,29 @@ export function healthLamp(health: Health): Lamp {
 }
 
 /**
+ * The failed lamp's ink and icon, wearing the fact's own word.
+ *
+ * Some surfaces are loud without the server having published a `Health`. A
+ * policy and a schedule carry no operator health at all (`policy.ts`,
+ * `schedule.ts`), yet "never verified" and "3 failed runs" are the loudest
+ * thing on their row, and the console has always drawn them in the failed
+ * lamp's ink. Drawn as *ink alone* that broke the Lettered Lamp Rule: a
+ * colour-blind reader saw "never verified" set exactly like "3 days ago", and
+ * the one cell the screen exists to point at stopped pointing.
+ *
+ * So the fact keeps its own words and gains the icon, rather than being turned
+ * into a `Health` nobody published — `nodeLamp` does the same for a dangling
+ * reference ("referenced but not found"), and `snapshot.ts` for a phase's own
+ * word. Deliberately **not** routed through `LampBadge`'s `label`: that
+ * appends a spoken "(Failed)", which here would be this bundle inventing the
+ * verdict `policy.ts` and `schedule.ts` exist to refuse. Reach for `label`
+ * only where the visible text is a bare count and cannot speak for itself.
+ */
+export function loudLamp(word: string): Lamp {
+  return { key: "failed", word, icon: OctagonX };
+}
+
+/**
  * The lamps worst first, for any strip or summary that counts by health:
  * the eye lands on what is lit, and the order never changes with the data.
  */

@@ -4,6 +4,8 @@ import type { ReactNode } from "react";
 import type { MaintenanceRow, RunStatusView } from "../api/types";
 import { humanBytes, relativeTime } from "../util/format";
 import { Facts, type Fact } from "./Facts";
+import { healthLamp, loudLamp } from "./health";
+import { LampBadge } from "./HealthBadge";
 import { NotReported } from "./NotReported";
 
 /**
@@ -104,7 +106,7 @@ function trackFacts(
             {relativeTime(track.lastRunAt, now)}
           </time>
         ) : (
-          <span className="maintenance__never">never run</span>
+          <LampBadge lamp={loudLamp("never run")} />
         ),
     },
     {
@@ -118,9 +120,14 @@ function trackFacts(
     },
     {
       term: `${label} failures since success`,
+      // The one place a bare number carried the alarm: a red "2" beside a
+      // plain "0" differed by hue and nothing else, and with the icon
+      // `aria-hidden` a screen reader heard only the digit. This is the case
+      // `LampBadge`'s `label` was written for — the count stays the visible
+      // word, and the lamp's own word is spoken after it.
       value:
         track.consecutiveFailures > 0 ? (
-          <span className="maintenance__never">{track.consecutiveFailures}</span>
+          <LampBadge lamp={healthLamp("failed")} label={String(track.consecutiveFailures)} />
         ) : (
           "0"
         ),

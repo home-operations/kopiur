@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import type { ScheduleRow } from "../api/types";
 import { relativeTime } from "../util/format";
 import { LampBadge } from "./HealthBadge";
-import { healthLamp } from "./health";
+import { healthLamp, loudLamp } from "./health";
 import { firesBySelector, scheduleCron, scheduleFires } from "./schedule";
 
 /**
@@ -123,18 +123,23 @@ function Fires({ schedule }: { schedule: ScheduleRow }) {
   );
 }
 
-/** Suspended lamp, a loud failure run, or the quiet word for "it is firing". */
+/**
+ * Suspended lamp, a loud failure run, or the quiet word for "it is firing".
+ *
+ * All three are one column, so all three are read the same way: two lamps and
+ * one deliberately quiet word. The failure run used to be the failed ink on
+ * bare text while the row beside it carried a suspended *lamp* — one column,
+ * two encodings, and the louder of the two was the one a colour-blind reader
+ * could not pick out. It keeps its own count-and-noun (`loudLamp`), because a
+ * schedule publishes no health for this bundle to name.
+ */
 function State({ schedule }: { schedule: ScheduleRow }) {
   if (schedule.suspended) {
     return <LampBadge lamp={healthLamp("suspended")} />;
   }
   if (schedule.consecutiveFailures > 0) {
     const runs = schedule.consecutiveFailures === 1 ? "run" : "runs";
-    return (
-      <span className="schedule-table__never">
-        {schedule.consecutiveFailures} failed {runs}
-      </span>
-    );
+    return <LampBadge lamp={loudLamp(`${schedule.consecutiveFailures} failed ${runs}`)} />;
   }
   return <span className="schedule-table__active">Active</span>;
 }
