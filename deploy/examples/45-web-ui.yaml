@@ -1,0 +1,318 @@
+# Example 45 — The web console behind your own authenticating proxy
+#
+# What this demonstrates: how to turn on `kopiur-ui` (the in-cluster web
+# console), how to put an SSO proxy in front of it, and how to grant people
+# access to it.
+#
+# READ THIS FIRST — THE SPLIT OF OWNERSHIP.
+#
+#   Kopiur owns   : the console Deployment, its ClusterIP Service, the console's
+#                   own ServiceAccount and impersonation ClusterRole, and the
+#                   four human roles you bind below.
+#   YOU own       : the authenticating proxy, the Secret holding the shared
+#                   token, the Ingress/HTTPRoute, the TLS certificate, and the
+#                   decision about who gets which role.
+#
+# The chart renders NO Ingress, in any mode, and never will. The console decides
+# who you are by reading a header, so anything that can reach it and set that
+# header is that person. Your proxy is the trust boundary; the chart cannot be.
+#
+# The oauth2-proxy half of this file is therefore an EXAMPLE OF YOUR WIRING, not
+# a Kopiur API. Its field names belong to oauth2-proxy (and the alpha config
+# below is explicitly alpha, so check it against the version you run). Any proxy
+# that authenticates a user and sets the two headers works just as well.
+#
+# THIS FILE IS NOT ONE `kubectl apply`. The first document is Helm values
+# (`helm upgrade -f`); everything after it is cluster objects. The docs page
+# pulls each section separately — see docs/ui.md.
+
+# --8<-- [start:values]
+# ---------------------------------------------------------------------------
+# Helm values — `helm upgrade --install kopiur ... -f this-excerpt.yaml`
+# ---------------------------------------------------------------------------
+ui:
+  enabled: true
+
+  auth:
+    # Header mode. Your proxy strips these headers from the client and sets them
+    # itself from the authenticated session.
+    userHeader: X-Forwarded-User
+    groupsHeader: X-Forwarded-Groups
+    groupsSeparator: ","
+    # Display only — never impersonated, never used for authorization.
+    emailHeader: X-Forwarded-Email
+
+    # What makes the headers above trustworthy. The proxy sends this token as
+    # `X-Kopiur-Proxy-Token`; the console compares it in constant time and
+    # answers 401 when it does not match.
+    #
+    # Without it the chart refuses to render, because any pod in the cluster —
+    # or anyone who can reach the Service through the apiserver's
+    # `services/proxy` subresource — could otherwise send `X-Forwarded-User` and
+    # be authorized as that person.
+    proxySecret:
+      existingSecret: kopiur-ui-proxy-token
+      key: token
+
+  rbac:
+    # The read-only and action roles, aggregated into `kopiur-ui-user`.
+    userRoles: true
+    # The in-snapshot file browser. OFF by default, and left off here unless you
+    # have read what it grants — see the RoleBinding at the end of this file.
+    browseRole: false
+
+  # Only your proxy may reach the app port; only your monitoring namespace may
+  # reach the ops port (/metrics, /healthz, /readyz). Defence in depth beside
+  # the shared token, not instead of it.
+  networkPolicy:
+    enabled: true
+    proxySelector:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: sso
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: oauth2-proxy
+    monitoringSelector:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+# --8<-- [end:values]
+
+# --8<-- [start:proxy-secret]
+---
+# The shared token. YOU create it; the chart only mounts it. Generate something
+# long and random, e.g. `openssl rand -hex 32`.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kopiur-ui-proxy-token
+  namespace: kopiur-system
+type: Opaque
+stringData:
+  token: REPLACE_ME
+---
+# The same value, in the proxy's namespace, so the proxy can send it. One value,
+# two namespaces: the console reads it from a mounted file, the proxy from an
+# environment variable.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kopiur-ui-proxy-token
+  namespace: sso
+type: Opaque
+stringData:
+  token: REPLACE_ME
+# --8<-- [end:proxy-secret]
+
+# --8<-- [start:oauth2-proxy]
+---
+# oauth2-proxy's alpha config: it authenticates the user with your IdP, then
+# proxies to the console with the two identity headers and the shared token set.
+#
+# `injectRequestHeaders` REPLACES whatever the client sent under those names, so
+# a browser that forges `X-Forwarded-User` cannot get past this.
+#
+# `secretSource.fromEnv` rather than `secretSource.value`: `value` expects
+# base64 and has historically been injected without decoding. An env var has no
+# such ambiguity.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oauth2-proxy-alpha
+  namespace: sso
+data:
+  alpha-config.yaml: |
+    upstreamConfig:
+      upstreams:
+        - id: kopiur-ui
+          path: /
+          # The console's ClusterIP Service, in the operator's namespace.
+          uri: http://kopiur-ui.kopiur-system.svc.cluster.local:8090
+    injectRequestHeaders:
+      - name: X-Forwarded-User
+        values:
+          - claimSource:
+              claim: user
+      - name: X-Forwarded-Email
+        values:
+          - claimSource:
+              claim: email
+      - name: X-Forwarded-Groups
+        values:
+          - claimSource:
+              claim: groups
+      - name: X-Kopiur-Proxy-Token
+        values:
+          - secretSource:
+              fromEnv: KOPIUR_PROXY_TOKEN
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: sso
+  labels:
+    app.kubernetes.io/name: oauth2-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oauth2-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oauth2-proxy
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.14.0
+          args:
+            - --http-address=0.0.0.0:4180
+            - --alpha-config=/etc/oauth2-proxy/alpha-config.yaml
+            - --provider=oidc
+            - --oidc-issuer-url=https://sso.example.com
+            - --email-domain=*
+            - --cookie-secure=true
+            # Your IdP must return a `groups` claim for the group bindings below
+            # to match anything.
+            - --scope=openid email profile groups
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              value: REPLACE_ME
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: oauth2-proxy, key: client-secret }
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef: { name: oauth2-proxy, key: cookie-secret }
+            # Injected into X-Kopiur-Proxy-Token by the alpha config above.
+            - name: KOPIUR_PROXY_TOKEN
+              valueFrom:
+                secretKeyRef: { name: kopiur-ui-proxy-token, key: token }
+          ports:
+            - name: http
+              containerPort: 4180
+          volumeMounts:
+            - name: alpha-config
+              mountPath: /etc/oauth2-proxy
+              readOnly: true
+      volumes:
+        - name: alpha-config
+          configMap:
+            name: oauth2-proxy-alpha
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy
+  namespace: sso
+spec:
+  selector:
+    app.kubernetes.io/name: oauth2-proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+# --8<-- [end:oauth2-proxy]
+
+# --8<-- [start:ingress]
+---
+# Your edge, pointed at the PROXY — never at the console Service. An Ingress
+# that targets `kopiur-ui` directly publishes a console that believes whatever
+# header the caller sends.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kopiur-ui
+  namespace: sso
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [backups.example.com]
+      secretName: kopiur-ui-tls
+  rules:
+    - host: backups.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: oauth2-proxy
+                port:
+                  name: http
+# --8<-- [end:ingress]
+
+# --8<-- [start:httproute]
+---
+# The Gateway API variant of the same thing. Same rule: the backend is the
+# proxy, not the console.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: kopiur-ui
+  namespace: sso
+spec:
+  parentRefs:
+    - name: external
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - backups.example.com
+  rules:
+    - backendRefs:
+        - name: oauth2-proxy
+          port: 80
+# --8<-- [end:httproute]
+
+# --8<-- [start:bindings]
+---
+# WHO MAY USE THE CONSOLE. Until one of these exists, everyone who signs in gets
+# "Forbidden" on every screen — the console grants nothing by itself, and that
+# first experience is correct, not a bug.
+#
+# `kopiur-ui-user` cluster-wide: the console is a fleet view, and a viewer who
+# could see only one namespace would report a healthy cluster while another
+# namespace burned.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kopiur-ui-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kopiur-ui-user
+subjects:
+  # Matched against X-Forwarded-Groups, which your proxy fills from the IdP's
+  # `groups` claim. Swap for `kind: User` to name one person.
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: platform
+---
+# THE FILE BROWSER, AND WHAT IT REALLY GRANTS.
+#
+# Browsing a snapshot runs a session pod and `pods/exec`s kopia into it. That
+# pod loads the repository credentials from its own environment, and RBAC cannot
+# narrow `pods/exec create` to one pod. So binding this role in a namespace
+# gives the subject that namespace's repository credentials: they can exec into
+# the session pod and print them.
+#
+# Bind it per namespace, to people you would hand those credentials to anyway.
+# Requires `ui.rbac.browseRole: true` in the values above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kopiur-ui-browse
+  # ONE namespace. Never a ClusterRoleBinding: that would be every namespace's
+  # repository credentials at once.
+  namespace: media
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kopiur-ui-browse
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: media-admins
+# --8<-- [end:bindings]

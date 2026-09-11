@@ -283,6 +283,30 @@ helm upgrade kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system
 
 See [`docs/dev/observability.md`](dev/observability.md) for the full metric list, OTLP details, and a sample collector config.
 
+## The web console (optional)
+
+Kopiur ships an optional in-cluster web console, `kopiur-ui`, off by default. It needs three things, and refuses to render without them:
+
+1. `installScope: cluster` — impersonation and the console's cluster-wide reads cannot be expressed in a namespaced Role.
+2. An identity source — the header your authenticating proxy sets, or an explicit anonymous identity.
+3. In header mode, a **proxy shared secret**, so the console can tell your proxy's requests from anything else in the cluster that can reach its Service.
+
+The chart renders the console, its Service and its roles. It does **not** render an Ingress and it creates **no** role bindings, so a freshly-enabled console reports `Forbidden` on every screen until you bind someone — which is the correct first experience, not a broken install.
+
+```bash
+# You create the shared token first; the chart only mounts it.
+kubectl -n kopiur-system create secret generic kopiur-ui-proxy-token \
+  --from-literal=token="$(openssl rand -hex 32)"
+
+helm upgrade kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system \
+  --set ui.enabled=true \
+  --set ui.auth.userHeader=X-Forwarded-User \
+  --set ui.auth.groupsHeader=X-Forwarded-Groups \
+  --set ui.auth.proxySecret.existingSecret=kopiur-ui-proxy-token
+```
+
+Read [Web console (kopiur-ui)](ui.md) before exposing it: it covers the trust model, the four roles, what granting the file browser really hands over, and a worked oauth2-proxy deployment.
+
 ## Upgrade / uninstall
 
 ```bash
@@ -295,4 +319,5 @@ Upgrading **from 0.5.x** needs a one-time pre-step, so the CRD move does not del
 ## See also
 
 - Every chart value, walked through: [Helm chart values](configuration.md)
+- The optional web console, and who it lets in: [Web console (kopiur-ui)](ui.md)
 - Chart values & modes: [`deploy/helm/kopiur/README.md`](https://github.com/home-operations/kopiur/blob/main/deploy/helm/kopiur/README.md)

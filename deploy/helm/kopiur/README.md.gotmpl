@@ -68,6 +68,22 @@ Disable the webhook entirely with `webhook.enabled=false` (validation then falls
 
 The 9 CRDs ship in the chart's special `crds/` directory. Helm installs them on `helm install`, and — because Helm never touches `crds/` on `helm upgrade` — an accidental `helm uninstall` leaves them (and every `kopiur.home-operations.com` object) untouched, exactly what you want for a backup operator. The flip side: a plain helm-CLI **upgrade** does not update the CRD schema as the `v1alpha1` API evolves. For a helm-CLI upgrade, apply the new schema yourself with `kubectl apply --server-side -f deploy/crds/`; GitOps tooling with a `CreateReplace` CRD policy (e.g. Flux) upgrades the `crds/`-shipped CRDs automatically. **Upgrading from 0.5.x to 0.6.0 is a one-time special case** — the CRDs moved out of Helm-templated resources into this `crds/` directory, so the crossing removes and re-installs them (cascade-deleting your CRs) unless you pin them first; see [`docs/upgrade.md`](../../../docs/upgrade.md) before upgrading.
 
+### Web console (`ui.enabled`)
+
+Off by default. `ui.enabled: true` deploys `kopiur-ui`, an in-cluster web console that reads and acts on the kopiur CRDs **as the signed-in user**: it takes the user's identity from a header your authenticating proxy sets, and impersonates them on every apiserver call, so Kubernetes RBAC — not the console — decides what each person may see and do.
+
+Three things are required, and the chart `fail`s at render time (naming the value to set) rather than shipping a console that quietly lets the wrong person act as someone else:
+
+- **`installScope: cluster`** — impersonation and the console's cluster-wide reads cannot be expressed in a namespaced `Role`.
+- **An identity source** — `ui.auth.userHeader` (header mode) or `ui.auth.anonymous.*` (one fixed identity). With neither, every request would run as the console's own ServiceAccount, which can impersonate anyone.
+- **A proxy shared secret in header mode** — `ui.auth.proxySecret.existingSecret`, a token your proxy sends as `X-Kopiur-Proxy-Token`. Without it, any pod that can reach the Service (or anyone with `services/proxy`) can send `X-Forwarded-User` and be authorized as that person. `ui.auth.acknowledgeNoProxySecret: true` overrides it, and is refused outright alongside a non-`ClusterIP` `ui.service.type`.
+
+The chart renders **no Ingress**, in any mode, and creates **no role bindings**. Point your own proxy at the `ClusterIP` Service, put your edge in front of the proxy, and bind `<release>-ui-user` to your people — until you do, a freshly-enabled console reports `Forbidden` on every screen, which is the correct first experience rather than a broken install.
+
+`ui.rbac.browseRole` is separate and off by default for a reason: **granting the in-snapshot file browser in a namespace grants that namespace's repository credentials**, because the browse session pod loads them from its environment and `pods/exec` cannot be narrowed to one pod by RBAC. Bind it with a namespaced `RoleBinding`, never cluster-wide.
+
+Full documentation — trust model, the four roles, browse sessions, caps, and troubleshooting by problem type — is in [`docs/ui.md`](../../../docs/ui.md), with a worked oauth2-proxy deployment in [`deploy/examples/45-web-ui.yaml`](../../examples/45-web-ui.yaml).
+
 {{ template "chart.valuesSection" . }}
 
 ### Observability

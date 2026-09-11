@@ -363,6 +363,31 @@ These `podSecurityContext` and `securityContext` blocks govern the **controller 
 
 ///
 
+## Web console (`ui.*`)
+
+The optional in-cluster web console, off by default. `ui.enabled: true` needs `installScope: cluster` and an identity source, and in header mode a proxy shared secret — the chart refuses to render otherwise, naming the value to set.
+
+| Value | Default | What it does |
+| --- | --- | --- |
+| `ui.enabled` | `false` | Deploy the console. |
+| `ui.auth.userHeader` / `groupsHeader` / `emailHeader` | `""` | Headers your proxy sets. Setting `userHeader` selects header mode. `emailHeader` is display only — never impersonated. |
+| `ui.auth.groupsSeparator` | `,` | What the groups header is split on. |
+| `ui.auth.proxySecret.existingSecret` / `.key` | `""` / `token` | Secret holding the shared token the proxy sends as `X-Kopiur-Proxy-Token`. **Required in header mode.** |
+| `ui.auth.acknowledgeNoProxySecret` | `false` | Deploy header mode without that token. Only when a mesh or `NetworkPolicy` genuinely admits nothing but your proxy. |
+| `ui.auth.allowedGroups` | `[]` | Restrict impersonatable groups. Enforced twice — by the console, and as `resourceNames` on its impersonate rule. |
+| `ui.auth.anonymous.*` | disabled | Run every request as one fixed identity. `fallback: true` additionally serves header-less requests that way. |
+| `ui.rbac.userRoles` | `true` | Render `kopiur-ui-viewer`/`-editor`/`-user` and the namespaced `-doctor` Role. No bindings — you write those. |
+| `ui.rbac.browseRole` | `false` | Render `kopiur-ui-browse`. **Read [what it grants](ui.md#granting-browse-grants-that-namespaces-repository-credentials) first.** |
+| `ui.rbac.execPolicy.*` | disabled | A `ValidatingAdmissionPolicy` narrowing browse `pods/exec` to `kopiur-browse-*` pods running kopia. |
+| `ui.networkPolicy.enabled` + `proxySelector` | `false` | Admit the app port only from your proxy, the ops port only from monitoring. |
+| `ui.cache.enabled` | `true` | Serve reads from watch-fed stores, filtered per user with SubjectAccessReviews. Off means every read is an impersonated `LIST`, and removes those grants from the console's ClusterRole. |
+| `ui.session.*` | ttl `15m` | Browse session pod lifetime, readiness budget, and the exec/start concurrency caps. |
+| `ui.download.maxBytes` / `chunkTimeout` | 1 GiB / `60s` | Largest streamable file, and how long a transfer may make no progress. |
+| `ui.limits.*` | see values | Manifest buffer cap, snapshot list cap, client and SAR cache sizes and TTLs. |
+| `ui.service.type` | `ClusterIP` | **Keep it.** The chart renders no Ingress; point your proxy at this Service from inside the cluster. |
+
+The console is documented in full — trust model, roles, sessions, caps, troubleshooting by problem type — on [Web console (kopiur-ui)](ui.md).
+
 ## A ready-made observability overlay
 
 The repo ships an overlay that turns the whole metrics and dashboard surface on at once. Pass it with `helm -f`:
@@ -392,6 +417,7 @@ The whole annotated file, exactly as the chart ships it:
 ## See also
 
 - [Installation](install.md): quickstart, scope, webhook-TLS `--set` recipes, CRD lifecycle.
+- [Web console (kopiur-ui)](ui.md): the `ui.*` surface in context — who it lets in, and what each role grants.
 - [Movers, RBAC & credentials](movers.md): what the mover Jobs need and how projection works.
 - [Observability](dev/observability.md): the full metric list, OTLP details, collector config.
 - The chart's own [`README.md`](https://github.com/home-operations/kopiur/blob/main/deploy/helm/kopiur/README.md), generated from the same values.
