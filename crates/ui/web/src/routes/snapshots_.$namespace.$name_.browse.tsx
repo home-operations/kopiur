@@ -51,7 +51,7 @@ export interface BrowseSearch {
   offset?: number;
 }
 
-export const Route = createFileRoute("/snapshots_/$namespace/$name/browse")({
+export const Route = createFileRoute("/snapshots_/$namespace/$name_/browse")({
   validateSearch: (search: Record<string, unknown>): BrowseSearch => {
     const out: BrowseSearch = {};
     const path = browsePathParam(search.path);

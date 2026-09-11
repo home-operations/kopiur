@@ -2331,3 +2331,352 @@ svg {
     flex-direction: column;
   }
 }
+
+/* ==========================================================================
+   Snapshots: the ledger, the detail, the retention plan and the size chart
+   (src/components/{SnapshotTable,SnapshotDetail,SnapshotActions,RetentionPreview,
+   LineageTrail,ConditionsTable}.tsx, src/charts/*, src/routes/snapshots*.tsx)
+
+   Every value below comes from an existing token. No new colour, no new
+   radius: the retention screen in particular is deliberately calm, because
+   the one loud thing on it is the verdict line, and it can only stay loud if
+   nothing around it competes.
+   ========================================================================== */
+
+/* ---- the snapshots ledger ------------------------------------------------ */
+
+.snapshot-table__object {
+  display: grid;
+  gap: 2px;
+  min-width: 9rem;
+}
+
+/* Names wrap rather than ellipsise: a truncated object name cannot be matched
+   against `kubectl get` output, which is what the reader does next. */
+.snapshot-table__name {
+  overflow-wrap: anywhere;
+}
+
+.snapshot-table__namespace {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+/* A pin is permanent and exempts the snapshot from pruning, so it rides in
+   the object cell rather than in a column an eye could skip. */
+.snapshot-table__pin {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  justify-self: start;
+  padding: 0.1em 0.4em;
+  border-radius: var(--radius-sm);
+  background: var(--bg-inset);
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+/* Files kopia could not read: the difference between a backup and a backup
+   with holes in it. */
+.snapshot-table__failed {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+}
+
+.snapshot-table__repository {
+  overflow-wrap: anywhere;
+  min-width: 8rem;
+}
+
+/* ---- the detail ---------------------------------------------------------- */
+
+.facts__age {
+  color: var(--fg-faint);
+}
+
+/* The mover's own last lines, already redacted server-side. */
+.log-tail {
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-dense);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22rem;
+  overflow-y: auto;
+}
+
+/* A checkbox whose consequence is permanent gets the consequence beside it,
+   not in a hover. */
+.action__switch {
+  display: grid;
+  gap: var(--space-1);
+  margin-top: var(--space-3);
+}
+
+.action__switch label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: var(--weight-medium);
+}
+
+/* ---- lineage: one hop up, one hop down ----------------------------------- */
+
+.lineage {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: var(--space-2) var(--space-4);
+}
+
+.lineage__step {
+  display: grid;
+  gap: var(--space-1);
+  align-content: start;
+  min-width: 0;
+  max-width: 24rem;
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+/* The subject takes the accent border — the one current marker the system
+   has — never a fill, and never a health colour. */
+.lineage__step[data-step="subject"] {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.lineage__meta {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+.lineage__note {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  line-height: var(--leading-prose);
+}
+
+.lineage .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.lineage .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+/* ---- the retention plan -------------------------------------------------- */
+
+.retention {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.retention__bucket {
+  gap: var(--space-2);
+}
+
+.retention__count {
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.retention-table__object {
+  display: grid;
+  gap: 2px;
+  min-width: 9rem;
+}
+
+.retention-table__object > a {
+  overflow-wrap: anywhere;
+}
+
+/* "this snapshot" — the subject's own marker inside a table of its
+   competitors. The accent, because this IS the current item. */
+.retention-table__subject {
+  justify-self: start;
+  padding: 0.1em 0.4em;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.retention-table__when {
+  white-space: nowrap;
+}
+
+.retention-table__age {
+  display: block;
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+}
+
+/* The holding rule is a sentence, not a chip: it is the whole explanation of
+   the verdict, and it is never behind a hover. */
+.retention-table__rule {
+  min-width: 12rem;
+  color: var(--fg-muted);
+}
+
+.retention-table tr[data-subject="true"] td {
+  background: var(--accent-soft);
+}
+
+.retention-table tr[data-subject="true"] td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--accent);
+}
+
+/* A pruned row is quieter than a kept one but never struck through or hidden:
+   it is still a snapshot that exists today. */
+.retention-table tr[data-kept="false"] .retention-table__rule {
+  color: var(--fg-faint);
+}
+
+/* ---- the size chart ------------------------------------------------------ */
+
+.charts {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.chart {
+  margin: 0;
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.chart__caption {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+}
+
+.chart__title {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+/* The readout sits in the flow, never floating over the plot: an absolutely
+   positioned layer changes its container's scroll geometry even while hidden,
+   which is the defect a visual round found on the ledgers. */
+.chart__readout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.chart__readout-value {
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart__readout-meta {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+}
+
+.chart__plot {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.chart__grid {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.chart__axis {
+  fill: var(--fg-faint);
+  font-family: var(--font-sans);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* One series, so no categorical palette: the body ink the console already
+   uses, at the 2px the mark specs ask for. */
+.chart__line {
+  fill: none;
+  stroke: var(--fg-muted);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart__dot {
+  fill: var(--fg-muted);
+}
+
+/* The point under the pointer takes the accent — selection, which is what the
+   accent is for. */
+.chart__dot[data-current="true"] {
+  fill: var(--accent);
+  stroke: var(--bg-surface);
+  stroke-width: 2;
+}
+
+/* A 9px hit target under a 3px dot: pointing at a value should not require
+   hitting it. */
+.chart__hit {
+  fill: transparent;
+}
+
+.chart__data > summary {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.chart__data[open] > summary {
+  margin-bottom: var(--space-2);
+}
+
+/* ---- the list's filter bar and pager ------------------------------------- */
+
+.snapshot-filters {
+  align-items: end;
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.pager__window {
+  font-size: var(--text-sm);
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}

@@ -363,6 +363,21 @@ marker the system has.
 - **Style:** label strips in a wrapping row (`ref-list`), or stacked with their own controls (`ref-list--stacked`).
 - **Rule:** for objects a screen names but has no detail route for yet. A name with no link is honest; a link to a route that does not exist is not.
 
+### Retention plan
+
+- **Style:** a verdict line, one prose paragraph of arithmetic, then one `page__section` per bucket — each headed by the bucket key (mono when it is a fan-out token, a sentence when the policy has only one bucket) with its own "N of M kept" count and its own ledger. Every row carries the snapshot, the instant it was backed up with its age beneath, a lamp, and the holding rule **as text in a column**. The subject's row takes the accent wash and a 3px accent bar in the first cell — the one current marker — plus the words "this snapshot".
+- **Rule:** the screen is deliberately calm so that one thing can be loud. Pruned rows take a neutral lamp under their own icon, because a GFS policy dropping older snapshots is the policy working, and a ledger of amber would hide the row that matters. The degraded lamp appears exactly once, on the verdict line, and only when the **subject** is the row being dropped. The holding rule is never behind a hover: it is the only thing that explains the verdict. `unbounded` reads as "no GFS retention is configured", never as a prune. Buckets are never merged and never paged — half a bucket is not half an answer, it is a different answer.
+
+### Chart
+
+- **Style:** a `figure` on the surface with a hairline and a 6px chamfer: a caption row of title and value readout, an SVG plot, and a `details` holding the same numbers as a ledger. A 2px line in body ink, 3px dots over invisible 9px hit targets, three recessive gridlines, a zero-based y axis, and only the first and last instants labelled on x.
+- **Rule:** one series per chart, so there is no categorical palette to assign and no hue is ever cycled — several policies are several charts (small multiples), because two policies' sizes are not comparable quantities. The accent marks only the point under the pointer, which is selection. The readout sits **in the flow**, never floating over the plot: an absolutely positioned layer changes its container's scroll geometry even while hidden. The SVG is `aria-hidden` and the `details` table is its spoken twin — a picture is never the only copy of a fact. A value the operator never recorded is excluded and counted, never plotted at the baseline.
+
+### Trail
+
+- **Style:** a wrapping `ol` of chamfered surface steps, each a label strip over faint mono metadata; the subject step takes the accent border and inset ring.
+- **Rule:** one hop up and one hop down, because that is all the correlation honestly carries. A step whose object lives outside this cluster is named and **not** linked — the reference-list rule, applied to a trail.
+
 ## Do's and Don'ts
 
 ### Do:

@@ -21,7 +21,8 @@ import { Route as SchedulesRouteImport } from './routes/schedules'
 import { Route as SnapshotsRouteImport } from './routes/snapshots'
 import { Route as TopologyRouteImport } from './routes/topology'
 import { Route as RepositoriesKindNameRouteImport } from './routes/repositories_.$kind.$name'
-import { Route as SnapshotsNamespaceNameBrowseRouteImport } from './routes/snapshots_.$namespace.$name.browse'
+import { Route as SnapshotsNamespaceNameRouteImport } from './routes/snapshots_.$namespace.$name'
+import { Route as SnapshotsNamespaceNameBrowseRouteImport } from './routes/snapshots_.$namespace.$name_.browse'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -83,9 +84,14 @@ const RepositoriesKindNameRoute = RepositoriesKindNameRouteImport.update({
   path: '/repositories/$kind/$name',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SnapshotsNamespaceNameRoute = SnapshotsNamespaceNameRouteImport.update({
+  id: '/snapshots_/$namespace/$name',
+  path: '/snapshots/$namespace/$name',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SnapshotsNamespaceNameBrowseRoute =
   SnapshotsNamespaceNameBrowseRouteImport.update({
-    id: '/snapshots_/$namespace/$name/browse',
+    id: '/snapshots_/$namespace/$name_/browse',
     path: '/snapshots/$namespace/$name/browse',
     getParentRoute: () => rootRouteImport,
   } as any)
@@ -103,6 +109,7 @@ export interface FileRoutesByFullPath {
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
   '/repositories/$kind/$name': typeof RepositoriesKindNameRoute
+  '/snapshots/$namespace/$name': typeof SnapshotsNamespaceNameRoute
   '/snapshots/$namespace/$name/browse': typeof SnapshotsNamespaceNameBrowseRoute
 }
 export interface FileRoutesByTo {
@@ -118,6 +125,7 @@ export interface FileRoutesByTo {
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
   '/repositories/$kind/$name': typeof RepositoriesKindNameRoute
+  '/snapshots/$namespace/$name': typeof SnapshotsNamespaceNameRoute
   '/snapshots/$namespace/$name/browse': typeof SnapshotsNamespaceNameBrowseRoute
 }
 export interface FileRoutesById {
@@ -134,7 +142,8 @@ export interface FileRoutesById {
   '/snapshots': typeof SnapshotsRoute
   '/topology': typeof TopologyRoute
   '/repositories_/$kind/$name': typeof RepositoriesKindNameRoute
-  '/snapshots_/$namespace/$name/browse': typeof SnapshotsNamespaceNameBrowseRoute
+  '/snapshots_/$namespace/$name': typeof SnapshotsNamespaceNameRoute
+  '/snapshots_/$namespace/$name_/browse': typeof SnapshotsNamespaceNameBrowseRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -151,6 +160,7 @@ export interface FileRouteTypes {
     | '/snapshots'
     | '/topology'
     | '/repositories/$kind/$name'
+    | '/snapshots/$namespace/$name'
     | '/snapshots/$namespace/$name/browse'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -166,6 +176,7 @@ export interface FileRouteTypes {
     | '/snapshots'
     | '/topology'
     | '/repositories/$kind/$name'
+    | '/snapshots/$namespace/$name'
     | '/snapshots/$namespace/$name/browse'
   id:
     | '__root__'
@@ -181,7 +192,8 @@ export interface FileRouteTypes {
     | '/snapshots'
     | '/topology'
     | '/repositories_/$kind/$name'
-    | '/snapshots_/$namespace/$name/browse'
+    | '/snapshots_/$namespace/$name'
+    | '/snapshots_/$namespace/$name_/browse'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -197,6 +209,7 @@ export interface RootRouteChildren {
   SnapshotsRoute: typeof SnapshotsRoute
   TopologyRoute: typeof TopologyRoute
   RepositoriesKindNameRoute: typeof RepositoriesKindNameRoute
+  SnapshotsNamespaceNameRoute: typeof SnapshotsNamespaceNameRoute
   SnapshotsNamespaceNameBrowseRoute: typeof SnapshotsNamespaceNameBrowseRoute
 }
 
@@ -286,8 +299,15 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RepositoriesKindNameRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/snapshots_/$namespace/$name/browse': {
-      id: '/snapshots_/$namespace/$name/browse'
+    '/snapshots_/$namespace/$name': {
+      id: '/snapshots_/$namespace/$name'
+      path: '/snapshots/$namespace/$name'
+      fullPath: '/snapshots/$namespace/$name'
+      preLoaderRoute: typeof SnapshotsNamespaceNameRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/snapshots_/$namespace/$name_/browse': {
+      id: '/snapshots_/$namespace/$name_/browse'
       path: '/snapshots/$namespace/$name/browse'
       fullPath: '/snapshots/$namespace/$name/browse'
       preLoaderRoute: typeof SnapshotsNamespaceNameBrowseRouteImport
@@ -309,6 +329,7 @@ const rootRouteChildren: RootRouteChildren = {
   SnapshotsRoute: SnapshotsRoute,
   TopologyRoute: TopologyRoute,
   RepositoriesKindNameRoute: RepositoriesKindNameRoute,
+  SnapshotsNamespaceNameRoute: SnapshotsNamespaceNameRoute,
   SnapshotsNamespaceNameBrowseRoute: SnapshotsNamespaceNameBrowseRoute,
 }
 export const routeTree = rootRouteImport
