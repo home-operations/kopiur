@@ -334,9 +334,24 @@ docker build -f docker/Dockerfile.mover \
   -t "${KOPIUR_IMAGE_PREFIX:-ghcr.io/home-operations/kopiur}/mover:${KOPIUR_IMAGE_TAG:-dev}" .
 '''
 
+[tasks.image-ui]
+description = "Build the web UI image locally (builds the SPA in-image; ships no kopia binary)"
+run = '''
+NODE_VERSION="${NODE_VERSION:-$(mise config get tools.node)}"
+PNPM_VERSION="${PNPM_VERSION:-$(mise config get tools.pnpm)}"
+RUST_VERSION="${RUST_VERSION:-$(mise config get tools.rust.version)}"
+# No KOPIA_VERSION: kopiur-ui never invokes kopia (the browse session pods do),
+# so docker/Dockerfile.ui has no kopia stage to feed.
+docker build -f docker/Dockerfile.ui \
+  --build-arg "NODE_VERSION=${NODE_VERSION}" \
+  --build-arg "PNPM_VERSION=${PNPM_VERSION}" \
+  --build-arg "RUST_VERSION=${RUST_VERSION}" \
+  -t "${KOPIUR_IMAGE_PREFIX:-ghcr.io/home-operations/kopiur}/ui:${KOPIUR_IMAGE_TAG:-dev}" .
+'''
+
 [tasks.images]
-description = "Build all three component images locally"
-depends = ["image-controller", "image-webhook", "image-mover"]
+description = "Build all four component images locally"
+depends = ["image-controller", "image-webhook", "image-mover", "image-ui"]
 
 [tasks.helm-lint]
 description = "Lint the chart and check it renders in both install scopes"
