@@ -429,9 +429,9 @@ jobs:
         if: always()
         run: mise run //crates/e2e:down
 
-  # Build the three component images concurrently — one matrix leg per image — so
-  # the wall-clock for this stage is the single slowest image, not the sum of all
-  # three. Each leg saves its own :e2e image as a separate artifact for the test
+  # Build the component images concurrently — one matrix leg per image — so
+  # the wall-clock for this stage is the single slowest image, not the sum of
+  # them all. Each leg saves its own :e2e image as a separate artifact for the test
   # shards to load. Per-image Rust cache keys keep the legs from contending on one
   # shared cache.
   e2e-image:
@@ -454,6 +454,16 @@ jobs:
             task: image-webhook
           - image: mover
             task: image-mover
+          # Built on every PR even though no shard installs the console yet:
+          # this leg IS the gate that a broken docker/Dockerfile.ui reddens
+          # review instead of the release. It needs no entry in `status.needs`
+          # — that list already carries `e2e-image`, and a matrix job fails as
+          # a whole when any leg fails, so a new leg cannot be forgotten there.
+          # Loading it into kind is opt-in (KOPIUR_E2E_UI=1, see
+          # crates/e2e/mise.toml); the tarball is uploaded regardless so a shard
+          # that enables the UI needs only that env var.
+          - image: ui
+            task: image-ui
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -477,7 +487,7 @@ jobs:
           KOPIUR_IMAGE_TAG: e2e
         run: mise run //:${{ matrix.task }}
 
-      # Every shard downloads all three images, so the tarballs cross the
+      # Every shard downloads every image, so the tarballs cross the
       # artifact store dozens of times per run and are worth compressing. gzip
       # because the daemon may export layers uncompressed depending on its image
       # store, and docker load reads either. shell: bash for the pipefail the

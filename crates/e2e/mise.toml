@@ -13,7 +13,7 @@
 # `kopiur-e2e` cluster — never the user's real context.
 
 [tasks.images]
-description = "Build the controller/webhook/mover images tagged :e2e"
+description = "Build the controller/webhook/mover images tagged :e2e (plus the web UI when KOPIUR_E2E_UI=1)"
 dir = "{{config_root}}/../.."
 run = """
 set -eu
@@ -21,6 +21,12 @@ export KOPIUR_IMAGE_PREFIX=kopiur KOPIUR_IMAGE_TAG=e2e
 mise run //:image-controller
 mise run //:image-webhook
 mise run //:image-mover
+# The web console is OFF in the default e2e install, so building it would buy
+# the default run nothing and cost it a full SPA toolchain plus a second
+# release-profile link. KOPIUR_E2E_UI=1 opts in; a shard that enables the UI in
+# its chart values must set it (and must also set it for `images-load`, which
+# is the step that puts the image in the node).
+if [ "${KOPIUR_E2E_UI:-0}" = "1" ]; then mise run //:image-ui; fi
 """
 # NOTE: the e2e-only `mover-slow` fixture image is NOT built here — it derives
 # FROM the mover image, and CI shards skip this task entirely
@@ -86,6 +92,14 @@ set -eu
 # crates/e2e/src/consts.rs::SLOW_MOVER_IMAGE (a hermetic test asserts it).
 mise run //crates/e2e:image-mover-slow
 kind load docker-image kopiur/controller:e2e kopiur/webhook:e2e kopiur/mover:e2e kopiur/mover-slow:e2e --name kopiur-e2e
+# Same opt-in as `images`. `kind load` is the expensive half — it streams the
+# whole image into the node's containerd — so the default run never pays for a
+# console it does not install. In CI the tarball is already in the local daemon
+# (the E2E Image matrix builds and uploads it either way); this is the only step
+# that has to be told to care.
+if [ "${KOPIUR_E2E_UI:-0}" = "1" ]; then
+  kind load docker-image kopiur/ui:e2e --name kopiur-e2e
+fi
 """
 
 [tasks.minio-preload]
