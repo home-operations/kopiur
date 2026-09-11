@@ -39,6 +39,29 @@ const alice: Me = {
   },
 };
 
+/**
+ * Every request answers as the shell needs it: `alice` for `/me`, and an
+ * empty list for anything else.
+ *
+ * It used to answer `alice` to *every* path, which was harmless while the
+ * routes it mounts were inert placeholders. They are real views now, and a
+ * `Me` object is not a list — a list route handed one throws inside its own
+ * `map`, the router's CatchBoundary swallows it, and the shell's assertions
+ * fail with no hint that the body was the problem. Answering `[]` keeps these
+ * tests about the shell rather than about whichever route happens to be
+ * mounted under it.
+ */
+function mockShell() {
+  fetchMock.resetMocks();
+  fetchMock.mockResponse((request) => {
+    const url = new URL(request.url, "http://localhost");
+    const body = url.pathname === "/api/v1/me" ? JSON.stringify(alice) : "[]";
+    return Promise.resolve(
+      new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+    );
+  });
+}
+
 function mountAt(path: string) {
   const router = createRouter({
     routeTree,
@@ -65,10 +88,7 @@ afterEach(() => {
 
 describe("AppShell", () => {
   it("lists the ten sections, marks the current one, and scopes the header to the namespace", async () => {
-    fetchMock.mockResponse(JSON.stringify(alice), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    mockShell();
     mountAt("/snapshots?namespace=prod");
 
     const nav = await screen.findByRole("navigation", { name: "Primary" });
@@ -92,10 +112,7 @@ describe("AppShell", () => {
   });
 
   it("shows the signed-in identity and re-asks /me for the current namespace", async () => {
-    fetchMock.mockResponse(JSON.stringify(alice), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    mockShell();
     mountAt("/policies?namespace=prod");
 
     const summary = await screen.findByText("alice", { selector: ".identity__user" });
@@ -110,10 +127,7 @@ describe("AppShell", () => {
   });
 
   it("lists every capability with a check or a cross and the word", async () => {
-    fetchMock.mockResponse(JSON.stringify(alice), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    mockShell();
     // A placeholder section: the overview at "/" and the topology both have
     // reads of their own now, and these tests are about the shell, not the
     // route inside it.
@@ -141,10 +155,11 @@ describe("AppShell", () => {
       status: 502,
       headers: { "content-type": "text/html" },
     });
-    // A placeholder section: the overview at "/" and the topology both have
-    // reads of their own now, and these tests are about the shell, not the
-    // route inside it.
-    mountAt("/maintenance");
+    // The one address with no read of its own. Every section is a real view
+    // now, so any of them would answer this blanket 502 with an error state
+    // of its own and put a second alert on the page — and this test is about
+    // the shell's global banner, not about whichever route is under it.
+    mountAt("/nowhere/at/all");
     await screen.findByText("identity unavailable");
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Identity (/api/v1/me)");
@@ -153,10 +168,7 @@ describe("AppShell", () => {
   });
 
   it("lets the user override the OS theme and go back to following it", async () => {
-    fetchMock.mockResponse(JSON.stringify(alice), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    mockShell();
     // A placeholder section: the overview at "/" and the topology both have
     // reads of their own now, and these tests are about the shell, not the
     // route inside it.
@@ -182,10 +194,7 @@ describe("AppShell", () => {
   });
 
   it("puts a skip link first, and activating it moves focus to the content", async () => {
-    fetchMock.mockResponse(JSON.stringify(alice), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    mockShell();
     mountAt("/snapshots?namespace=prod");
     await screen.findByRole("navigation", { name: "Primary" });
 
@@ -205,10 +214,7 @@ describe("AppShell", () => {
     // Below 560px the label span is display:none and the icon is aria-hidden,
     // so the name must come from aria-label. jsdom ignores media queries, so
     // this asserts the attribute the name is computed from, not the query.
-    fetchMock.mockResponse(JSON.stringify(alice), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    mockShell();
     mountAt("/");
     const group = await screen.findByRole("group", { name: "Theme" });
     for (const label of ["System", "Light", "Dark"]) {
@@ -224,10 +230,7 @@ describe("AppShell", () => {
   });
 
   it("keeps the namespace when the wordmark is used to go home", async () => {
-    fetchMock.mockResponse(JSON.stringify(alice), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    mockShell();
     mountAt("/snapshots?namespace=prod");
     await screen.findByRole("navigation", { name: "Primary" });
     const brand = screen.getByRole("link", { name: /Kopiur/ });
@@ -235,10 +238,7 @@ describe("AppShell", () => {
   });
 
   it("renders the not-found state for an address no route serves", async () => {
-    fetchMock.mockResponse(JSON.stringify(alice), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    mockShell();
     mountAt("/nowhere/at/all");
     await act(async () => {
       await Promise.resolve();

@@ -1816,6 +1816,13 @@ svg {
   .identity__source span {
     display: none;
   }
+  .retention-rules > li {
+    grid-template-columns: 2.5rem minmax(0, 1fr);
+  }
+
+  .retention-rules__field {
+    grid-column: 2;
+  }
 }
 
 /* No floating tooltip inside a scrolling ledger. A scroll container clips its
@@ -2330,6 +2337,10 @@ svg {
     align-items: start;
     flex-direction: column;
   }
+
+  .button[data-reason]::after {
+    max-width: calc(100vw - 4rem);
+  }
 }
 
 /* ==========================================================================
@@ -2401,17 +2412,20 @@ svg {
 .log-tail {
   margin: 0;
   padding: var(--space-3);
+  max-height: 22rem;
+  overflow: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--bg-inset);
-  color: var(--fg-muted);
+  color: var(--fg);
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   line-height: var(--leading-dense);
+  /* Wrap instead of scrolling sideways: the end of a long error line is the
+     part the reader came for, and a horizontal scrollbar hides it. */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  max-height: 22rem;
-  overflow-y: auto;
+  tab-size: 2;
 }
 
 /* A checkbox whose consequence is permanent gets the consequence beside it,
@@ -2679,4 +2693,338 @@ svg {
   font-size: var(--text-sm);
   color: var(--fg-muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   Task 8 — policies, schedules, restores, maintenance, and the shared action
+   dialogs (src/components/actions/*). Appended as one contiguous block so the
+   three concurrent stylesheet edits stay separable; nothing above is touched.
+   ========================================================================== */
+
+/* ---- action dialogs: the shared shell ------------------------------------- */
+
+/* The wrapper holds one trigger, its confirmation and its result in a column,
+   so a dialog drops into an action bar, a detail section or a ledger cell
+   without the caller arranging three pieces. */
+.action {
+  display: grid;
+  gap: var(--space-3);
+  justify-items: start;
+  min-width: 0;
+}
+
+/* A group of radios inside a confirmation: the choice and its consequence on
+   one line each, so the cost of an answer is read beside the answer rather
+   than in prose above it. `fieldset` for the grouping a legend gives assistive
+   technology; the UA's own border is dropped because the confirmation panel is
+   already the one level of enclosure. */
+.action__choice {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.action__choice > legend {
+  padding: 0;
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+
+.action__choice > label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2);
+  color: var(--fg);
+  line-height: var(--leading-prose);
+}
+
+.action__choice input[type="radio"] {
+  /* Nudged down onto the first line's baseline rather than its cap height. */
+  margin: 0.2em 0 0;
+  accent-color: var(--accent);
+}
+
+/* The destructive question is the one that decides whether existing data
+   survives, so it is set off by the failed lamp's own rule rather than by a
+   second box. */
+.action__choice[data-danger="true"] {
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--health-failed-fg);
+}
+
+.action__note {
+  margin: 0;
+  color: var(--fg-faint);
+  font-size: var(--text-sm);
+  line-height: var(--leading-prose);
+}
+
+/* The clause naming an irreversible consequence, in the failed lamp's ink —
+   it is the sentence the reader must not skim. */
+.action__prose p[data-destructive="true"] {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* ---- policy ledger and detail --------------------------------------------- */
+
+.policy-table__object,
+.policy-table__repos {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.policy-table__object {
+  min-width: 9rem;
+}
+
+/* A policy name wraps rather than ellipsising: the name is the one thing the
+   reader came to the row for. */
+.policy-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.policy-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+.policy-table__namespace,
+.policy-table__note {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+/* Not suspended is a word, not a lamp: a policy carries no operator health,
+   and a green lamp here would claim one. */
+.policy-table__active {
+  color: var(--fg-muted);
+}
+
+/* A recipe that has never succeeded, or names no repository at all — the
+   loudest cell in the ledger, and the one an empty cell would have hidden. */
+.policy-table__never {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* The GFS rules as a count, what it keeps, and the field it is written as —
+   three columns so the numbers line up and the manifest field stays findable. */
+.retention-rules {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.retention-rules > li {
+  display: grid;
+  grid-template-columns: 2.5rem minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+}
+
+.retention-rules__count {
+  text-align: right;
+  font-weight: var(--weight-medium);
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-rules__field {
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+}
+
+/* ---- schedule ledger ------------------------------------------------------ */
+
+.schedule-table__object,
+.schedule-table__fires {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.schedule-table__object {
+  min-width: 9rem;
+}
+
+.schedule-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.schedule-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+/* A cron is read as one token; breaking it across lines makes five fields
+   look like two. */
+.schedule-table__cron {
+  white-space: nowrap;
+}
+
+.schedule-table__namespace,
+.schedule-table__note {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+.schedule-table__active {
+  color: var(--fg-muted);
+}
+
+/* A clock that has never fired, a run of failures, or a schedule that fires
+   nothing at all — each is the loudest cell in its row. */
+.schedule-table__never {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* An absence that is merely an absence (no next slot computed) stays quiet:
+   it is usually just a suspended schedule. */
+.schedule-table__absent {
+  color: var(--fg-faint);
+}
+
+.schedule-table__action {
+  min-width: 0;
+}
+
+/* A ledger's action cell holds only a trigger. The confirmation belongs below
+   the whole table (see `ActionPanel.hideTrigger`): a cell is a column, and a
+   column turns a paragraph into a tall thin ribbon that shoves every other
+   column narrow. This keeps the cell's own stack tidy; it is not a licence to
+   put a panel back in one. */
+.ledger .action {
+  justify-items: stretch;
+  gap: var(--space-1);
+}
+
+/* ---- restore ledger and detail -------------------------------------------- */
+
+.restore-table__object {
+  display: grid;
+  gap: 2px;
+  min-width: 9rem;
+}
+
+.restore-table .label-strip {
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.restore-table .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+/* Source, arrow and target on one wrapping line, so a route reads as a route
+   and the arrow never ends up stranded on a line of its own. */
+.restore-table__route {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+}
+
+.restore-table__arrow {
+  color: var(--fg-faint);
+}
+
+.restore-table__namespace,
+.restore-table__note,
+.restore-table__absent {
+  font-size: var(--text-xs);
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+
+/* ---- maintenance regions -------------------------------------------------- */
+
+/* The resource's own coordinate, beside the repository the region is titled
+   by — the two differ whenever a ClusterRepository's maintenance lives in the
+   operator's namespace rather than the repository's. */
+.maintenance__resource {
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+}
+
+/* A track that has never run, or a run of failures: the number is the fact,
+   and the failed lamp's ink is how it stops being skimmed past. */
+.maintenance__never {
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-medium);
+}
+
+/* The refusal at its short length, beside a trigger the reader cannot press.
+   Needed wherever `.ledger-scroll` suppresses the floating tooltip: without
+   it a disabled control in a ledger is a dead button with no reason a sighted
+   mouse user can reach. The full sentence is still on the button's
+   aria-describedby sibling and its native title. */
+.action__short {
+  color: var(--fg-faint);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+/* A reference list inside a `Facts` value wraps rather than ellipsising. The
+   names here are source paths and repository keys — `pvcSelector(tier=gold,
+   app=media)` truncated to `pvcSelector(tier=gold,app=medi…` is a selector
+   the reader cannot check against their own manifest, which is the same
+   defect that made the work ledger wrap its object names. */
+.facts .ref-list .label-strip__name {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+
+.facts .ref-list {
+  row-gap: var(--space-1);
+}
+
+.action__confirm .controls__input {
+  width: 100%;
+}
+
+/* An open confirmation must not move the other triggers.
+   `ActionPanel` keeps its trigger, panel and result in one wrapper so a dialog
+   drops anywhere as a single element — but inside an `action-bar` that wrapper
+   is a flex item, and an open 34rem panel grew it and shoved every other
+   trigger across the row. (Task 5 hit the same thing and moved the panel below
+   the bar; this is that, without splitting the component.)
+
+   `display: contents` takes the wrapper out of the layout, so the trigger is a
+   flex item of the bar and keeps its place, while the panel and the receipt
+   become full-width rows *after* every trigger. The short refusal stays beside
+   its own button in source order. */
+.action-bar > .action {
+  display: contents;
+}
+
+.action-bar > .action > .action__confirm {
+  flex: 1 0 100%;
+  order: 2;
+}
+
+.action-bar > .action > .receipt,
+.action-bar > .action > .problem {
+  flex: 1 0 100%;
+  order: 3;
 }
