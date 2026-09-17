@@ -159,10 +159,12 @@ fn timeout_message_names_the_field_to_raise() {
 /// pathologically slow. Pin the override so a future refactor cannot silently drop it.
 #[test]
 fn exec_buffers_are_raised_above_the_kube_default() {
-    assert!(
-        EXEC_STREAM_BUF >= 1024 * 1024,
-        "the exec stream buffer must be well above kube-rs's 1 KiB default"
-    );
+    const {
+        assert!(
+            EXEC_STREAM_BUF >= 1024 * 1024,
+            "the exec stream buffer must be well above kube-rs's 1 KiB default"
+        )
+    };
 }
 
 #[tokio::test]

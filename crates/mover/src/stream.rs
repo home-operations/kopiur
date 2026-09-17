@@ -185,7 +185,7 @@ pub async fn resolve_pod(client: &kube::Client, namespace: &str, selector: &str)
             detail: format!("listing pods with selector `{selector}` in `{namespace}` failed: {e}"),
         })?;
     pick_stream_pod(&listed.items, selector, namespace)
-        .map(|p| p.clone())
+        .cloned()
         .map_err(|detail| MoverError::StreamPodResolve { detail })
 }
 
@@ -314,15 +314,14 @@ pub async fn feed_from_pod(
     // dump — a hang that would look exactly like a slow database.
     let mut stderr_tail = String::new();
     let transfer = async {
-        let pumped = match errs.as_mut() {
+        match errs.as_mut() {
             Some(e) => {
                 let (pumped, tail) = tokio::join!(pump(&mut out, stdin), drain_stderr(e));
                 stderr_tail = tail;
                 pumped
             }
             None => pump(&mut out, stdin).await,
-        };
-        pumped
+        }
     };
 
     let pumped = match tokio::time::timeout(timeout, transfer).await {
