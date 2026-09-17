@@ -7,7 +7,7 @@ A `Restore` reads a snapshot back into a PersistentVolumeClaim (PVC). It answers
 ```yaml
 spec:
     source: { <one of three>: ... } # FROM: which snapshot
-    target: { <one of three>: ... } # TO: pvc | pvcRef | populator: {}  (REQUIRED)
+    target: { <one of four>: ... } # TO: pvc | pvcRef | populator | streamExec  (REQUIRED)
     options: { ... } # HOW kopia writes (file deletion, permissions)
     policy: { ... } # what to do if the snapshot is missing
 ```
