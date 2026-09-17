@@ -183,6 +183,41 @@ where
     )
 }
 
+/// Both halves a **second-in-pass gate write** needs from the LIVE object: the
+/// `conditions` array to build on, and the `status` value to compare a
+/// patch-if-changed body against.
+///
+/// A gate refusal does two things that must agree on ONE observation of the
+/// object: it rebuilds `status.conditions` (a patch REPLACES the array, so a
+/// stale base erases whatever an earlier writer in this same pass just wrote —
+/// see [`live_conditions_source`]) and it decides, via
+/// [`super::patch_status_if_changed`], whether the write is a real transition
+/// worth an Event and a refusal metric. Sourcing the array from a live re-read
+/// while comparing against the reconcile-start copy would report a spurious
+/// transition on every pass, re-firing the Event forever — so the two come from
+/// the same object here, or neither does.
+///
+/// On a gone/unreadable object this returns the caller's stale copy, matching
+/// [`live_conditions`]: the subsequent patch then 404s and surfaces as the
+/// reconcile's error, exactly as the unconditional `obj.status` it replaces did.
+pub async fn live_conditions_and_status<K>(
+    api: &Api<K>,
+    name: &str,
+    fallback: &K,
+) -> (Vec<Condition>, Option<serde_json::Value>)
+where
+    K: Clone + serde::Serialize + DeserializeOwned + std::fmt::Debug + Resource,
+    K::DynamicType: Default,
+{
+    let obj = live_conditions_source(api, name, fallback)
+        .await
+        .unwrap_or_else(|| fallback.clone());
+    let status = serde_json::to_value(&obj)
+        .ok()
+        .and_then(|v| v.get("status").cloned());
+    (super::conditions_from_status(status.as_ref()), status)
+}
+
 /// Upsert a status condition by `type_`, returning the full conditions vector to
 /// patch. An existing condition of the same `type_` keeps its
 /// `lastTransitionTime` while its `status` is unchanged (the timestamp marks the

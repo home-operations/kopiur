@@ -1460,6 +1460,81 @@ where
     Ok(())
 }
 
+/// Clear a standing `<condition>=False` on a `Snapshot`/`Restore` whose blocker is
+/// now gone — the shared shape behind the `MoverPermitted` and
+/// `CredentialsAvailable` clears on both work kinds.
+///
+/// Two-stage on purpose, the [`crate::snapshot::clear_source_pvc_gate_if_parked`]
+/// discipline:
+/// 1. a cheap pre-check on the reconcile-start copy, so the overwhelming majority
+///    of runs (which never tripped the gate) pay no live GET and write nothing at
+///    all; then
+/// 2. a live re-read as the patch BASE and a re-check against it, because a
+///    `conditions` patch REPLACES the array and this clear is never the first
+///    conditions writer of its pass — the #464 inherit heal runs ahead of it, and
+///    seeding from the start-of-pass copy would resurrect the hold onto a run that
+///    has already resolved its securityContext. That resurrection is precisely what
+///    made `kubectl kopiur doctor` name a scaled-up workload as the blocker while
+///    the real one (a missing Secret) sat one slot later in the same array.
+///
+/// Returns without writing when the object vanished mid-reconcile.
+pub async fn clear_work_condition_if_stale<K>(
+    api: &Api<K>,
+    obj: &K,
+    condition: &str,
+    reason: &str,
+    message: &str,
+) -> Result<()>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+{
+    let stale = super::conditions_from_status(
+        serde_json::to_value(obj)
+            .ok()
+            .and_then(|v| v.get("status").cloned())
+            .as_ref(),
+    );
+    if !condition_is_not_true(&stale, condition) {
+        return Ok(());
+    }
+    let name = obj.name_any();
+    let Some(live) = super::live_conditions_source(api, &name, obj).await else {
+        return Ok(()); // deleted mid-reconcile
+    };
+    let existing = super::conditions_from_status(
+        serde_json::to_value(&live)
+            .ok()
+            .and_then(|v| v.get("status").cloned())
+            .as_ref(),
+    );
+    if !condition_is_not_true(&existing, condition) {
+        return Ok(());
+    }
+    let conditions = super::upsert_condition(
+        &existing,
+        condition,
+        true,
+        reason,
+        message,
+        obj.meta().generation,
+    );
+    super::patch_status(api, &name, serde_json::json!({ "conditions": conditions })).await?;
+    Ok(())
+}
+
+/// Whether `conditions` carries `condition` at a non-`True` status — i.e. a stale
+/// block worth clearing. Pure, so both stages of
+/// [`clear_work_condition_if_stale`] agree by construction.
+pub(crate) fn condition_is_not_true(conditions: &[Condition], condition: &str) -> bool {
+    conditions
+        .iter()
+        .any(|c| c.type_ == condition && c.status != "True")
+}
+
 /// The conditions array that CLEARS a standing `SecurityContextResolved=False`, or `None` when
 /// no hold is standing (so the caller writes nothing at all and the status stays byte-identical
 /// to a run that was never held — the property that keeps this off the hot-loop).

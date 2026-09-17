@@ -4611,6 +4611,294 @@ fn every_registered_gate_has_a_writer() {
     );
 }
 
+// --- reachability of a NON-TERMINAL gate's CLEARER -------------------------
+//
+// `every_registered_gate_has_a_writer` above pins that a registry row is WRITTEN.
+// Nothing pinned that a non-terminal gate's CLEARER is REACHABLE on the paths that
+// leave the object non-terminal — and that absence is exactly how the #464 inherit
+// heal came to sit 56 lines PAST the credential gate that parks the same object.
+//
+// Why reachability of the clearer is load-bearing, and not merely tidy:
+// `kubectl kopiur doctor`'s `first_gate` walks `status.conditions` in ARRAY ORDER
+// and returns on the FIRST registered `Fail` row. `upsert_condition_status` is
+// order-stable and only ever APPENDS a new `type`, so the gate written EARLIEST in
+// an object's life occupies index 0 FOREVER and outranks every later gate. On a
+// TERMINAL phase that is harmless (`doctor` suppresses stale gates there). On a
+// NON-TERMINAL one it is a false diagnosis: a Snapshot that parked on
+// `SecurityContextResolved=False` while its workload was scaled to zero, then came
+// back up with its credential Secret still missing, showed
+// `[SecurityContextResolved=False, CredentialsAvailable=False]` at `Pending` —
+// and `doctor` told the operator to scale up a workload that was already up.
+
+/// Whether a Snapshot/Restore gate's writer can strand a STALE
+/// `SecurityContextResolved=False` ahead of itself, and therefore whether the
+/// inherit heal must be ordered before it.
+///
+/// Exhaustive by design (CLAUDE.md's load-bearing idea): a new work-kind gate row
+/// has to pick an arm, which is the decision that was never made for the four
+/// writers between the securityContext resolve and the old heal site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkGatePark {
+    /// The writer stamps a TERMINAL phase (`Failed` + `Stalled=True`), where
+    /// `doctor` suppresses every stale gate — so no ordering is required.
+    Terminal,
+    /// Non-terminal, but written on a path where the heal provably has NOT run:
+    /// before `resolve_mover_security_contexts` in the launch path, or off the
+    /// launch path entirely (deletion). A standing hold is not yet PROVABLY stale
+    /// there, so the heal must not be hoisted ahead of it and this test requires
+    /// no ordering. The residual exposure is recorded in the note.
+    NonTerminalNoHealPossible,
+    /// Non-terminal AND reachable only after `resolve_mover_security_contexts`
+    /// returned `Ok` — the point at which a standing hold IS provably stale. The
+    /// heal MUST be ordered before this writer, or `doctor` reports the stale hold
+    /// instead of this gate.
+    NonTerminalHealMustPrecede {
+        /// A source substring unique to this writer, used to check the ordering.
+        marker: &'static str,
+    },
+}
+
+/// Every Snapshot/Restore-scoped registry row, classified. Kept in lockstep with
+/// `STRUCTURAL_GATES` by `work_gate_parks_cover_every_work_scoped_row`.
+const WORK_GATE_PARKS: &[(&str, &str, WorkGatePark, &str)] = &[
+    (
+        kopiur_api::consts::MOVER_PERMITTED_CONDITION,
+        kopiur_api::consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
+        WorkGatePark::NonTerminalHealMustPrecede {
+            marker: "gates::PRIVILEGED_MOVER_GATE",
+        },
+        "snapshot/restore privileged-mover refusal, after the resolve",
+    ),
+    (
+        kopiur_api::consts::CREDENTIALS_AVAILABLE_CONDITION,
+        kopiur_api::consts::MISSING_CREDENTIALS_REASON,
+        WorkGatePark::NonTerminalHealMustPrecede {
+            marker: "gates::MISSING_CREDENTIALS_GATE",
+        },
+        "snapshot/restore resolve_mover_creds_for refusal — THE case that motivated \
+         this test",
+    ),
+    (
+        kopiur_api::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+        kopiur_api::consts::SOURCE_PVC_MISSING_REASON,
+        WorkGatePark::NonTerminalHealMustPrecede {
+            marker: "return handle_missing_source_pvc(",
+        },
+        "snapshot colocation park (Pending until the deadline, then Failed)",
+    ),
+    (
+        kopiur_api::consts::MOVER_PERMITTED_CONDITION,
+        kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+        WorkGatePark::NonTerminalNoHealPossible,
+        "stream-exec namespace opt-in, refused BEFORE the resolve. Residual: a \
+         namespace whose opt-in annotation is REVOKED between a held pass and the \
+         next one keeps the stale hold at index 0 — narrow, and unfixable by \
+         ordering because the hold is not yet provably stale here",
+    ),
+    (
+        kopiur_api::consts::CREDENTIALS_AVAILABLE_CONDITION,
+        kopiur_api::consts::MISSING_SERVICE_ACCOUNT_REASON,
+        WorkGatePark::NonTerminalNoHealPossible,
+        "mover ServiceAccount preflight, before the resolve. Same narrow residual \
+         as the stream-exec row",
+    ),
+    (
+        kopiur_api::consts::CREDENTIALS_AVAILABLE_CONDITION,
+        kopiur_api::consts::MISSING_CA_BUNDLE_REASON,
+        WorkGatePark::NonTerminalNoHealPossible,
+        "CA-bundle resolution, before the resolve",
+    ),
+    (
+        kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
+        kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON,
+        WorkGatePark::NonTerminalNoHealPossible,
+        "THE gate this test is about: its own park returns from the reconcile, and \
+         its clearer is `heal_inherit_source_missing`",
+    ),
+    (
+        kopiur_api::consts::RESTORE_REFERENT_AVAILABLE_CONDITION,
+        kopiur_api::consts::RESTORE_REFERENT_MISSING_REASON,
+        WorkGatePark::NonTerminalNoHealPossible,
+        "restore repository-referent park, before the resolve",
+    ),
+    (
+        kopiur_api::consts::DELETION_HELD_CONDITION,
+        kopiur_api::consts::MASS_DELETION_BREAKER_REASON,
+        WorkGatePark::NonTerminalNoHealPossible,
+        "Snapshot deletion hold — the deletion path, which never runs the resolve",
+    ),
+    (
+        kopiur_api::consts::REPOSITORY_WRITABLE_CONDITION,
+        kopiur_api::consts::REPOSITORY_READ_ONLY_REASON,
+        WorkGatePark::Terminal,
+        "read-only repository refusal stamps Failed + Stalled=True",
+    ),
+];
+
+/// Registry ↔ classification lockstep: a NEW Snapshot/Restore gate row cannot land
+/// without someone deciding whether the inherit heal has to precede its writer.
+#[test]
+fn work_gate_parks_cover_every_work_scoped_row() {
+    use kopiur_api::gates::STRUCTURAL_GATES;
+    let work: Vec<_> = STRUCTURAL_GATES
+        .iter()
+        .filter(|g| g.applies_to.covers_snapshot() || g.applies_to.covers_restore())
+        .collect();
+    for gate in &work {
+        assert!(
+            WORK_GATE_PARKS
+                .iter()
+                .any(|(condition, reason, ..)| *condition == gate.condition
+                    && *reason == gate.reason),
+            "{gate:?} is a Snapshot/Restore gate with no WorkGatePark classification. \
+             Decide whether its writer parks the object NON-TERMINALLY after the \
+             securityContext resolve — if it does, the #464 inherit heal must be \
+             ordered BEFORE it or `doctor` will report a stale \
+             SecurityContextResolved=False instead of this gate."
+        );
+    }
+    for (condition, reason, _, note) in WORK_GATE_PARKS {
+        assert!(
+            work.iter()
+                .any(|g| g.condition == *condition && g.reason == *reason),
+            "{note} classifies {condition}/{reason}, which is not a Snapshot/Restore \
+             row in STRUCTURAL_GATES — drop the entry or fix the scope"
+        );
+    }
+    assert_eq!(
+        WORK_GATE_PARKS.len(),
+        work.len(),
+        "one classification per Snapshot/Restore registry row"
+    );
+}
+
+/// THE ratchet: in both work reconcilers, the inherit heal is ordered after the
+/// resolve that proves the hold stale, is the FIRST conditions writer past it, and
+/// precedes every gate that parks the object non-terminally from there on.
+///
+/// Source-text rather than behavioral because the property IS an ordering of writes
+/// within one reconcile pass, which no pure unit can observe and no fake client
+/// reproduces faithfully (the clobber depends on real read-after-write). The
+/// markers are deliberately the exact strings a reader would grep for.
+#[test]
+fn the_inherit_heal_precedes_every_non_terminal_gate_it_could_shadow() {
+    const SNAPSHOT_SRC: &str = include_str!("../snapshot/mod.rs");
+    const RESTORE_SRC: &str = include_str!("../restore/mod.rs");
+    const HEAL: &str = "io::heal_inherit_source_missing(";
+    const RESOLVE: &str = "io::resolve_mover_security_contexts(";
+
+    for (kind, src) in [("snapshot", SNAPSHOT_SRC), ("restore", RESTORE_SRC)] {
+        let resolve = src
+            .find(RESOLVE)
+            .unwrap_or_else(|| panic!("{kind}: no securityContext resolve"));
+        let heal = src.find(HEAL).unwrap_or_else(|| {
+            panic!(
+                "{kind}: the #464 inherit heal is GONE — a hold would then never clear and \
+                 `doctor` would report it for the whole mover run"
+            )
+        });
+        assert!(
+            resolve < heal,
+            "{kind}: the heal must follow `resolve_mover_security_contexts`; only a \
+             SUCCESSFUL resolve proves a standing hold stale"
+        );
+
+        // Nothing may write `conditions` between the two: such a writer would seed
+        // from the reconcile-start copy or race the heal, and it is precisely the
+        // slot the four clobbering writers occupied.
+        let between = &src[resolve..heal];
+        for forbidden in [
+            "io::upsert_gate(",
+            "io::upsert_condition(",
+            "io::clear_work_condition_if_stale(",
+            "\"conditions\":",
+        ] {
+            assert!(
+                !between.contains(forbidden),
+                "{kind}: `{forbidden}` appears between the securityContext resolve and \
+                 the #464 heal. Move it after the heal (and seed it from \
+                 `io::live_conditions`), or the heal is written onto an array that \
+                 writer is about to replace."
+            );
+        }
+
+        for (condition, _, park, note) in WORK_GATE_PARKS {
+            let WorkGatePark::NonTerminalHealMustPrecede { marker } = park else {
+                continue;
+            };
+            let Some(at) = src.find(marker) else {
+                continue; // that gate is not written in this reconciler
+            };
+            assert!(
+                heal < at,
+                "{kind}: `{marker}` ({condition}) parks the object NON-TERMINALLY after \
+                 the securityContext resolve, but it is written BEFORE the #464 inherit \
+                 heal — so a stale `SecurityContextResolved=False` keeps index 0 and \
+                 `doctor` reports it INSTEAD of this gate. Move the heal above it. \
+                 ({note})"
+            );
+        }
+    }
+}
+
+/// The durability half, pure: a gate written on top of a HEALED array keeps the heal,
+/// leaving exactly one non-`True` registered `Fail` row — the real blocker — for
+/// `doctor` to find wherever in the array it sits.
+#[test]
+fn a_gate_written_after_the_heal_leaves_only_the_real_blocker_failing() {
+    use kopiur_api::gates::{GateSeverity, STRUCTURAL_GATES};
+
+    // The array as the GitOps bring-up leaves it: pass A parked on the inherit hold.
+    let parked = upsert_gate(
+        &[],
+        &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+        "no pod matched app=pg",
+        Some(1),
+    );
+    // Pass B: the workload is back, so the resolve succeeds and the heal fires…
+    let healed =
+        crate::io::inherit_source_heal_conditions(&parked, Some(1)).expect("a standing hold heals");
+    // …then the credential Secret is still missing, and that gate seeds from the
+    // healed (live) array.
+    let after = upsert_gate(
+        &healed,
+        &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
+        "Secret `pg-repo` not found",
+        Some(1),
+    );
+
+    // Order-stable: the hold stays at index 0, now `True`, and the real blocker is
+    // appended. Both facts matter — the first is what makes a repeat write a
+    // server-side no-op, the second is what `doctor` must land on.
+    assert_eq!(
+        after[0].type_,
+        kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION
+    );
+    assert_eq!(after[0].status, "True");
+
+    let failing: Vec<&str> = after
+        .iter()
+        .filter(|c| {
+            STRUCTURAL_GATES.iter().any(|g| {
+                g.applies_to.covers_snapshot()
+                    && g.severity == GateSeverity::Fail
+                    && g.matches(&c.type_, &c.status, &c.reason)
+            })
+        })
+        .map(|c| c.type_.as_str())
+        .collect();
+    assert_eq!(
+        failing,
+        vec![kopiur_api::consts::CREDENTIALS_AVAILABLE_CONDITION],
+        "exactly one registered Fail row must stand, and it must be the real blocker \
+         — this is the false diagnosis #464 round 3 removed"
+    );
+
+    // And the heal is a no-op when no hold stands, so a run that was never held keeps
+    // a byte-identical status (the property that keeps it off the hot loop).
+    assert!(crate::io::inherit_source_heal_conditions(&after, Some(1)).is_none());
+}
+
 #[test]
 fn upsert_gate_writes_exactly_what_the_row_declares() {
     use kopiur_api::gates::STRUCTURAL_GATES;
