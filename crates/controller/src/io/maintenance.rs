@@ -262,10 +262,16 @@ pub fn maintenance_covered_by_foreign(
 /// maintenance against the same repository, so either one's recount is a valid
 /// observation of it. With several covering CRs the newest `observedAt` wins —
 /// comparison is lexicographic on the RFC3339 string, which is exactly
-/// chronological for the `Utc::to_rfc3339` form the mover writes, and a
-/// malformed value simply loses the comparison here (the authoritative
-/// freshness decision, including malformed stamps, is
-/// [`crate::health::newest_index_blob_observation`]).
+/// chronological for the `Utc::to_rfc3339` form the mover writes.
+///
+/// An observation whose `observedAt` does not PARSE as RFC3339 is discarded
+/// here rather than ranked. That is not defensive decoration: a hand-authored
+/// or server-side-defaulted EMPTY [`ObservedIndexBlobs`] sub-object decodes to
+/// `count: 0` with an empty stamp, and a zero count is the one value that must
+/// never reach the fold — on a repository with no count of its own it would be
+/// adopted outright and published as "0 index blobs", i.e. a perfectly healthy
+/// index, silently clearing a real `IndexBlobHealth` warning. A stamp we cannot
+/// place in time is not an observation.
 pub fn newest_observed_index_blobs(
     items: impl IntoIterator<Item = Maintenance>,
     kind: RepositoryKind,
@@ -282,6 +288,7 @@ pub fn newest_observed_index_blobs(
         })
         .filter_map(|m| {
             let observed = m.status?.observed_index_blobs?;
+            chrono::DateTime::parse_from_rfc3339(&observed.observed_at).ok()?;
             Some((observed.count, observed.observed_at))
         })
         .max_by(|a, b| a.1.cmp(&b.1))
@@ -808,6 +815,51 @@ mod tests {
                 None
             ),
             None
+        );
+    }
+
+    /// An [`ObservedIndexBlobs`] sub-object with no real content —
+    /// hand-authored, or server-side-defaulted by the apiserver — decodes to
+    /// `count: 0` with an empty stamp. It must be discarded, not ranked: a zero
+    /// count adopted onto a repository with no count of its own would publish
+    /// "0 index blobs", reading as a perfectly healthy index and clearing a real
+    /// warning. Same for any stamp we cannot place in time.
+    #[test]
+    fn an_unparseable_observation_stamp_is_not_an_observation() {
+        for stamp in ["", "soon", "2026-06-02"] {
+            let items = vec![maint(
+                "prod",
+                RepositoryKind::Repository,
+                "nas",
+                None,
+                Some((0, stamp)),
+            )];
+            assert_eq!(
+                newest_observed_index_blobs(items, RepositoryKind::Repository, "nas", Some("prod")),
+                None,
+                "a {stamp:?} stamp must not be ranked as an observation"
+            );
+        }
+        // ...while a real observation beside it still wins.
+        let items = vec![
+            maint(
+                "prod",
+                RepositoryKind::Repository,
+                "nas",
+                None,
+                Some((0, "")),
+            ),
+            maint(
+                "other",
+                RepositoryKind::Repository,
+                "nas",
+                Some("prod"),
+                Some((312, "2026-06-02T09:30:00Z")),
+            ),
+        ];
+        assert_eq!(
+            newest_observed_index_blobs(items, RepositoryKind::Repository, "nas", Some("prod")),
+            Some((312, "2026-06-02T09:30:00Z".to_string()))
         );
     }
 

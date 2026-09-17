@@ -789,23 +789,38 @@ pub struct MaintenanceObservations {
 /// advances the quick clock (full subsumes quick).
 ///
 /// `lastContentReclaimedBytes` is stamped on **only the mode that actually
-/// ran**. On a full run the subsumed quick block carries an explicit `null`,
-/// which the merge-patch turns into "key removed": its `lastRunAt` is being
-/// bumped by a run that was not a quick run, so leaving the previous quick run's
-/// byte figure standing beside the new timestamp would misattribute it — the
-/// exact class of lie #458 is about. It was previously hardcoded to `0`, which
-/// reported "reclaimed nothing" for a run that freed gigabytes.
+/// ran**, and is written on EVERY successful run — as a number when the run was
+/// measured, and as an explicit `null` when it was not.
+///
+/// The `null` matters as much as the number. This is a merge patch, so an
+/// omitted key leaves whatever was there before; a bumped `lastRunAt` beside the
+/// PREVIOUS run's byte figure reads as "this run reclaimed 3.9 GB" for a run
+/// whose figure is unknown, which is the exact class of lie #458 was filed
+/// about. `null` removes the key instead, so an unmeasured run reports nothing
+/// rather than someone else's number. Two paths reach it: a post-run
+/// `maintenance info` that failed or timed out, and — permanently — a quick run
+/// on a repository using the epoch index manager, which deletes no blobs.
+///
+/// The same reasoning covers the other direction: on a full run the subsumed
+/// quick block also carries an explicit `null`, because its `lastRunAt` is being
+/// bumped by a run that was not a quick run.
+///
+/// The field was previously hardcoded to `0`, which reported "reclaimed
+/// nothing" for a run that freed gigabytes. `0` now means a measured zero, and
+/// absent means unmeasured; they are never conflated.
 pub fn maintenance_ran_body(
     op: &MaintenanceOp,
     now: &chrono::DateTime<chrono::Utc>,
     obs: &MaintenanceObservations,
 ) -> serde_json::Value {
     let ts = now.to_rfc3339();
-    // The block for the mode that ran: it owns the measured figures.
-    let mut ran = serde_json::json!({ "lastRunAt": ts });
-    if let Some(bytes) = obs.reclaimed_bytes {
-        ran["lastContentReclaimedBytes"] = serde_json::json!(bytes);
-    }
+    // The block for the mode that ran: it owns the measured figures. The key is
+    // ALWAYS present — `null` when unmeasured, so the merge patch CLEARS a
+    // previous run's figure rather than leaving it beside the new `lastRunAt`.
+    let ran = serde_json::json!({
+        "lastRunAt": ts,
+        "lastContentReclaimedBytes": obs.reclaimed_bytes,
+    });
     let mut status = serde_json::json!({
         "ownership": { "owner": op.owner, "claimedAt": ts },
         "conditions": [lease_condition_body("True", "LeaseClaimed", "maintenance lease claimed", now)],
@@ -1832,11 +1847,15 @@ mod tests {
         );
     }
 
-    /// An unmeasurable run (a quick run on an epoch repository, or a failed
-    /// post-run `maintenance info`) must omit the key entirely rather than
-    /// report `0` — the hardcoded `0` was the #458 bug.
+    /// An unmeasurable run (a quick run on an epoch repository, or a failed or
+    /// timed-out post-run `maintenance info`) must CLEAR the figure — not report
+    /// `0`, and not leave the previous run's number standing. An omitted key in
+    /// a merge patch is a no-op, so only an EXPLICIT null actually removes it:
+    /// the same treatment `full_run_stamps_reclaimed_bytes_only_on_full` pins
+    /// for the subsumed quick clock. Without it, a bumped `lastRunAt` sits
+    /// beside a stale byte figure — the #458 lie in a new costume.
     #[test]
-    fn unmeasured_run_omits_reclaimed_bytes_rather_than_reporting_zero() {
+    fn unmeasured_run_clears_reclaimed_bytes_rather_than_leaving_a_stale_figure() {
         let now = chrono::Utc::now();
         for mode in [MaintenanceMode::Quick, MaintenanceMode::Full] {
             let body =
@@ -1846,10 +1865,19 @@ mod tests {
                 MaintenanceMode::Full => &body["status"]["full"],
             };
             assert!(
-                !ran.as_object()
+                ran["lastContentReclaimedBytes"].is_null(),
+                "{mode:?}: an unmeasured run must not claim a figure"
+            );
+            assert!(
+                ran.as_object()
                     .expect("run block")
                     .contains_key("lastContentReclaimedBytes"),
-                "{mode:?}: an unmeasured run must not claim a figure"
+                "{mode:?}: the clear must be an EXPLICIT null (merge-patch key removal), not \
+                 an omission — an omitted key leaves the previous run's figure standing"
+            );
+            assert!(
+                ran["lastRunAt"].is_string(),
+                "{mode:?}: the clock still advances"
             );
         }
     }

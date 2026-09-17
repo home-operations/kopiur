@@ -225,6 +225,15 @@ fn unknown_extra_kinds_and_null_data_decode() {
     .unwrap();
     assert_eq!(future.extra[0].kind, "teleportPacksStats");
     assert!(future.delete_unreferenced_packs_stats().is_none());
+
+    // A run with no `end` at all — an in-flight entry, or a kopia that starts
+    // eliding the zero time. Guaranteed by the `Option`, but every captured
+    // fixture happens to carry `end`, so nothing else covers it.
+    let running: MaintenanceRun =
+        serde_json::from_str(r#"{"start":"2026-06-01T20:00:00Z","success":true}"#).unwrap();
+    assert!(running.start.is_some());
+    assert!(running.end.is_none());
+    assert!(running.extra.is_empty());
 }
 
 /// The end-to-end claim of C5, against the two REAL captures: the delta over the

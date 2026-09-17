@@ -199,6 +199,28 @@ pub struct IndexBlobRecountFold {
     pub storage_stats: Option<serde_json::Value>,
 }
 
+impl IndexBlobRecountFold {
+    /// The steady-state status patch this fold implies: the folded conditions,
+    /// plus the partial `storageStats` when there was anything to observe.
+    ///
+    /// Assembling it here rather than at each call site is deliberate. The
+    /// `Repository` and `ClusterRepository` steady-state arms are hand-written
+    /// twins, and a patch built independently in each is exactly where a
+    /// copy/paste divergence hides — one arm folding the conditions but
+    /// forgetting the `storageStats`, or restating the whole `storageStats` and
+    /// wiping `snapshotCount`. One implementation, one test.
+    ///
+    /// The conditions go in whole because a status patch REPLACES the
+    /// conditions array; there is no partial condition write.
+    pub fn status_patch(&self) -> serde_json::Value {
+        let mut patch = serde_json::json!({ "conditions": self.conditions });
+        if let Some(storage_stats) = &self.storage_stats {
+            patch["storageStats"] = storage_stats.clone();
+        }
+        patch
+    }
+}
+
 /// Fold the freshest index-blob observation — the repository's own or a
 /// post-maintenance recount, whichever is newer — into conditions and a
 /// `storageStats` patch.
@@ -2021,6 +2043,66 @@ mod tests {
         assert_eq!(patch["indexBlobCount"], 4200);
         let ev = fold.event.expect("over threshold warns");
         assert!(ev.message.contains("4200"));
+    }
+
+    /// The steady-state WIRING, not just the decision: what both repository
+    /// arms actually send. A fold with an observation must carry the folded
+    /// conditions AND the partial `storageStats` in one patch; a fold without
+    /// one must send conditions alone, so a repository that has never been
+    /// counted does not get a `storageStats` key invented for it.
+    #[test]
+    fn fold_status_patch_carries_conditions_and_storage_stats_together() {
+        let stats = StorageStats {
+            snapshot_count: Some(40),
+            index_blob_count: Some(8000),
+            index_blob_count_at: Some("2026-06-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let fold = fold_index_blob_recount(
+            vec![cond("False")],
+            Some(&stats),
+            Some((312, "2026-06-02T09:30:00Z")),
+            1000,
+            Some(3),
+        );
+        let patch = fold.status_patch();
+        assert_eq!(patch["storageStats"]["indexBlobCount"], 312);
+        assert_eq!(
+            patch["storageStats"]["indexBlobCountAt"],
+            "2026-06-02T09:30:00Z"
+        );
+        assert!(
+            patch["storageStats"].get("snapshotCount").is_none(),
+            "a PARTIAL storageStats merge: restating it would be how snapshotCount gets wiped"
+        );
+        // The conditions in the patch are the FOLDED ones — the same array the
+        // arm then hands to `ensure_*_maintenance`, since a status patch
+        // replaces the whole array.
+        let conds = patch["conditions"]
+            .as_array()
+            .expect("conditions is an array");
+        let c = conds
+            .iter()
+            .find(|c| c["type"] == INDEX_BLOB_HEALTH_CONDITION)
+            .expect("the folded IndexBlobHealth condition");
+        assert_eq!(c["status"], "True", "312 blobs cleared the stale warning");
+        assert_eq!(
+            serde_json::to_value(&fold.conditions).unwrap(),
+            patch["conditions"],
+            "the patch must carry the fold's own conditions, not a re-read copy"
+        );
+
+        // Nothing observed: conditions only, no invented storageStats.
+        let bare = fold_index_blob_recount(vec![cond("False")], None, None, 1000, Some(3));
+        let patch = bare.status_patch();
+        assert!(
+            patch
+                .as_object()
+                .expect("patch")
+                .get("storageStats")
+                .is_none()
+        );
+        assert!(patch["conditions"].is_array());
     }
 
     #[test]

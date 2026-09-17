@@ -1398,11 +1398,8 @@ async fn bootstrap_via_mover(
             resolve_index_blob_warn_threshold(repo.spec.health.as_ref()),
             repo.metadata.generation,
         );
+        let status_patch = fold.status_patch();
         let conditions = fold.conditions;
-        let mut status_patch = serde_json::json!({ "conditions": conditions });
-        if let Some(stats) = fold.storage_stats {
-            status_patch["storageStats"] = stats;
-        }
         let current = fresh
             .as_ref()
             .and_then(|f| serde_json::to_value(&f.status).ok());

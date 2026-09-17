@@ -792,20 +792,29 @@ pub struct StorageStats {
     /// RFC 3339 timestamp these stats were last observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observed_at: Option<String>,
-    /// Number of content-index blobs (`kopia index list`) observed at the last bootstrap.
+    /// Number of content-index blobs (`kopia index list`): the freshest count
+    /// available, from either the last bootstrap or the recount a maintenance
+    /// run takes right after compacting. `indexBlobCountAt` says when.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_blob_count: Option<i64>,
-    /// RFC3339 instant [`Self::index_blob_count`] was observed.
+    /// RFC3339 instant `indexBlobCount` was observed.
     ///
-    /// Distinct from [`Self::last_observed_at`] (the catalog scan's timestamp)
-    /// and from `status.health.lastProbeAt` (the backend probe's): the index-blob
-    /// count has its own writers, and this is what lets the reconciler decide
-    /// whether a post-maintenance recount
-    /// (`Maintenance.status.observedIndexBlobs`) is fresher than the bootstrap's
-    /// own count. Without it the two observations were incomparable, so the
+    /// Distinct from `lastObservedAt` (the catalog scan's timestamp) and from
+    /// `status.health.lastProbeAt` (the backend probe's): the index-blob count
+    /// has its own writers, and this is what lets the reconciler decide whether
+    /// a post-maintenance recount is fresher than the bootstrap's own count.
+    /// Without it the two observations were incomparable, so the
     /// `IndexBlobHealth` warning could only ever quote the bootstrap figure —
     /// which is pre-compaction, and stayed pre-compaction until the next
     /// bootstrap ran (#458).
+    ///
+    /// The two writers mean subtly different things, deliberately. A bootstrap
+    /// stamps "when this count was FIRST seen at this value", reusing the
+    /// previous stamp while the number is unchanged — that arm re-observes on
+    /// every reconcile, and a stamp that always moved would make the status
+    /// always-changed and the reconcile a hot loop. A post-maintenance recount
+    /// always carries its own instant, because it is a distinct observation
+    /// taken at a known time and its whole purpose is to be comparable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_blob_count_at: Option<String>,
 }

@@ -2589,45 +2589,69 @@ async fn write_result_configmap(
     Ok(())
 }
 
+/// How long EACH post-maintenance measurement may take before it is abandoned.
+///
+/// Both measurements are bounded, and neither bound is optional. Every kopia
+/// call here happens AFTER `maintenance run` already succeeded, and the success
+/// patch (`lastRunAt`, `ownership.claimedAt`, `LeaseOwned=True`) has not been
+/// sent yet — so a call that hangs does not merely lose a metric, it loses the
+/// record that maintenance ran at all: the Job sits until the
+/// `activeDeadlineSeconds` backstop, is killed `Failed`, and `backoffLimit`
+/// then re-runs the maintenance that had already completed. That is strictly
+/// worse than the stale figures this whole change exists to fix.
+///
+/// A `KopiaClient` bound cannot be relied on instead: the mover only sets
+/// `default_timeout` from `spec.options.operationTimeoutSecs`, which nothing in
+/// the repo populates, so in practice these calls are otherwise unbounded.
+///
+/// The bound is per measurement rather than shared so a slow (but completing)
+/// `maintenance info` cannot eat the recount's budget, and so each failure keeps
+/// its own actionable log line. `kopia index list` is normally milliseconds —
+/// but the repository this measurement is *for* is the unhealthy one with
+/// thousands of uncompacted index blobs, which is exactly where it is slowest
+/// and where a wedged object store stalls it.
+const MAINTENANCE_MEASURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Measure what a just-completed maintenance run did, for
 /// [`maintenance_ran_body`]. Best-effort by contract: every failure degrades to
 /// "not measured" (`None`) and is logged, never propagated — the run already
-/// succeeded, and a metric is not worth failing a Job over.
+/// succeeded, and a metric is not worth failing a Job over. Every call is
+/// bounded by [`MAINTENANCE_MEASURE_TIMEOUT`]; see there for why that is
+/// load-bearing rather than tidy.
 ///
 /// `before` is the `maintenance info` the lease decision already read, so the
-/// only extra kopia call is the post-run one.
+/// only extra kopia call for the reclaimed figure is the post-run one.
 async fn measure_maintenance(
     client: &KopiaClient,
     before: &kopiur_kopia::MaintenanceInfo,
 ) -> MaintenanceObservations {
-    let after = match client.maintenance_info().await {
-        Ok(after) => after,
-        Err(e) => {
-            warn!(
-                class = %e.class(),
-                "maintenance run succeeded but the post-run `maintenance info` failed; \
+    let after =
+        match tokio::time::timeout(MAINTENANCE_MEASURE_TIMEOUT, client.maintenance_info()).await {
+            Ok(Ok(after)) => Some(after),
+            Ok(Err(e)) => {
+                warn!(
+                    class = %e.class(),
+                    "maintenance run succeeded but the post-run `maintenance info` failed; \
+                     reporting no reclaimed-bytes figure for this run"
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = MAINTENANCE_MEASURE_TIMEOUT.as_secs(),
+                    "maintenance run succeeded but the post-run `maintenance info` timed out; \
                  reporting no reclaimed-bytes figure for this run"
-            );
-            return MaintenanceObservations::default();
-        }
-    };
+                );
+                None
+            }
+        };
     MaintenanceObservations {
-        reclaimed_bytes: kopiur_kopia::reclaimed_bytes_since(before, &after),
+        reclaimed_bytes: after
+            .as_ref()
+            .and_then(|after| kopiur_kopia::reclaimed_bytes_since(before, after)),
         index_blob_count: recount_index_blobs(client).await,
     }
 }
-
-/// How long the post-maintenance index-blob recount may take before it is
-/// abandoned.
-///
-/// `kopia index list` is a single blob-metadata LIST and normally takes
-/// milliseconds — but the repository this measurement is *for* is the unhealthy
-/// one with thousands of uncompacted index blobs, which is exactly where the
-/// call is slowest and where a wedged object store hangs it. The run has already
-/// succeeded by this point, so an explicit bound is what keeps a slow LIST from
-/// holding the Job open (and, past `activeDeadlineSeconds`, turning a completed
-/// maintenance into a Failed one the operator then retries).
-const INDEX_RECOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Re-count the repository's content-index blobs after a successful maintenance
 /// run, so the repository's `IndexBlobHealth` condition stops quoting a
@@ -2637,7 +2661,7 @@ const INDEX_RECOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// `None` ("not recounted"), which leaves the repository's existing bootstrap
 /// observation standing rather than overwriting it with a guess.
 async fn recount_index_blobs(client: &KopiaClient) -> Option<i64> {
-    match tokio::time::timeout(INDEX_RECOUNT_TIMEOUT, client.index_blob_count()).await {
+    match tokio::time::timeout(MAINTENANCE_MEASURE_TIMEOUT, client.index_blob_count()).await {
         Ok(Ok(count)) => Some(count),
         Ok(Err(e)) => {
             warn!(
@@ -2649,7 +2673,7 @@ async fn recount_index_blobs(client: &KopiaClient) -> Option<i64> {
         }
         Err(_) => {
             warn!(
-                timeout_secs = INDEX_RECOUNT_TIMEOUT.as_secs(),
+                timeout_secs = MAINTENANCE_MEASURE_TIMEOUT.as_secs(),
                 "maintenance run succeeded but the post-run index-blob recount timed out; \
                  leaving the repository's previous count standing"
             );

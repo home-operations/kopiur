@@ -622,7 +622,8 @@ pub struct MaintenanceCadence {
 /// (`repo/maintenance/maintenance_schedule.go`). It carries **no** `omitempty`,
 /// so a repository that has never run maintenance emits `"runs": null` rather
 /// than omitting the key — hence [`Self::runs`] must tolerate an explicit null,
-/// which `#[serde(default)]` on a `BTreeMap` does.
+/// which `#[serde(default)]` alone does NOT (a default applies only to an
+/// ABSENT key). See the field for the deserializer that does.
 ///
 /// kopia's `Schedule.ReportRun` **prepends** each new run and truncates the
 /// history to 50 entries per task. Never key a before/after comparison on index
@@ -933,9 +934,13 @@ fn runs_since<'a>(
 pub fn reclaimed_bytes_since(before: &MaintenanceInfo, after: &MaintenanceInfo) -> Option<i64> {
     let mut total = 0i64;
     let mut measured = false;
+    // `saturating_add`, not `+=`: the summands come from kopia's `extra[].data`,
+    // which is an untyped JSON object this crate does not validate. A release
+    // build would WRAP an overflowing sum into a negative "reclaimed" figure —
+    // a number worse than no number at all on a backup operator.
     let mut add = |bytes: i64| {
         measured = true;
-        total += bytes;
+        total = total.saturating_add(bytes);
     };
     for task in [TASK_QUICK_DELETE_BLOBS, TASK_FULL_DELETE_BLOBS] {
         for run in runs_since(before, after, task) {
