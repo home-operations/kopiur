@@ -2317,7 +2317,7 @@ spec:
                           A `bool` rather than a unit variant because an externally-tagged unit variant
                           serializes as the bare string `"Disabled"`, mixing string and object forms in one
                           `oneOf` and breaking the structural schema. Same shape, and same reason, as
-                          [`crate::cluster_repository::AllowedNamespaces::All`].
+                          [`AllowedNamespaces::All`](crate::cluster_repository::AllowedNamespaces::All).
 
                           This is distinct from omitting `blobRetention` entirely: absent means "leave the
                           repository alone", so deleting the block from a manifest can never silently strip
@@ -6330,7 +6330,7 @@ spec:
                           A `bool` rather than a unit variant because an externally-tagged unit variant
                           serializes as the bare string `"Disabled"`, mixing string and object forms in one
                           `oneOf` and breaking the structural schema. Same shape, and same reason, as
-                          [`crate::cluster_repository::AllowedNamespaces::All`].
+                          [`AllowedNamespaces::All`](crate::cluster_repository::AllowedNamespaces::All).
 
                           This is distinct from omitting `blobRetention` entirely: absent means "leave the
                           repository alone", so deleting the block from a manifest can never silently strip
@@ -9853,7 +9853,8 @@ spec:
                   scheduled run also uses.
 
                   Two deliberate exclusions:
-                  - `mover.cache` here is **run-scoped only**. It sets this run's kopia cache
+
+                  * `mover.cache` here is **run-scoped only**. It sets this run's kopia cache
                     budgets (`--content-cache-size-mb`/`--metadata-cache-size-mb`) and, when
                     the cache is `Ephemeral`, that Job's cache-volume `capacity` and
                     `storageClassName` — a generic ephemeral volume bound to this pod and
@@ -9862,7 +9863,8 @@ spec:
                     PVC), and under `mode: Persistent` the PVC's own `capacity`/
                     `storageClassName` come from the policy alone, because that claim is
                     named per-POLICY and every sibling `Snapshot` depends on it.
-                  - `inheritSecurityContextFrom.snapshot` is restore-only and rejected here,
+
+                  * `inheritSecurityContextFrom.snapshot` is restore-only and rejected here,
                     exactly as on `SnapshotPolicy`: a backup's identity comes from the live
                     workload; it is the run that *records* an identity.
 

@@ -270,12 +270,13 @@ fn epoch_floor_errors(
     let mut errs = Vec::new();
     let field = |name: &str| format!("{context} spec.parameters.epoch.{name}");
 
-    for (name, value, floor, why) in [
+    for (name, value, floor, why, whole_call_refused) in [
         (
             "advanceOnCount",
             epoch.advance_on_count,
             KOPIA_MIN_ADVANCE_ON_COUNT,
             "kopia refuses anything lower with \"epoch advance on count too low\"",
+            true,
         ),
         (
             "advanceOnSizeMiB",
@@ -283,12 +284,14 @@ fn epoch_floor_errors(
             KOPIA_MIN_ADVANCE_ON_SIZE_MIB,
             "kopia refuses anything lower with \"epoch advance on size too low\" (it stores \
              the value as `MiB << 20` bytes, so 1 is the smallest representable threshold)",
+            true,
         ),
         (
             "checkpointFrequency",
             epoch.checkpoint_frequency,
             KOPIA_MIN_CHECKPOINT_FREQUENCY,
             "kopia refuses anything lower with \"invalid epoch range compaction period\"",
+            true,
         ),
         (
             "deleteParallelism",
@@ -296,6 +299,11 @@ fn epoch_floor_errors(
             KOPIUR_MIN_DELETE_PARALLELISM,
             "kopia does not validate this field at all — the floor is kopiur's own, because \
              a non-positive parallelism asks kopia to run epoch cleanup with no workers",
+            // kopia's own set-parameters merge-then-validate-whole-set behavior (why the
+            // other three fields carry WHOLE_CALL_REFUSED) cannot apply here: kopia never
+            // looks at this field, so violating this floor can never be what trips kopia's
+            // whole-call refusal.
+            false,
         ),
     ] {
         let Some(v) = value else { continue };
@@ -303,18 +311,21 @@ fn epoch_floor_errors(
             // The zero note is only true OF A ZERO. Concatenating it onto every out-of-range
             // value buried the part that applied under ~230 characters of the part that did
             // not.
-            let zero_note = if v == 0 {
-                format!(" {ZERO_IS_DROPPED}")
-            } else {
-                String::new()
-            };
+            let mut reason = format!("{v} is below the minimum of {floor}: {why}.");
+            if whole_call_refused {
+                reason.push(' ');
+                reason.push_str(WHOLE_CALL_REFUSED);
+            }
+            if v == 0 {
+                reason.push(' ');
+                reason.push_str(ZERO_IS_DROPPED);
+            }
+            reason.push_str(&format!(
+                " Use {floor} or more, or omit the field to leave kopia's current value untouched"
+            ));
             errs.push(ValidationError::InvalidFieldValue {
                 field: field(name),
-                reason: format!(
-                    "{v} is below the minimum of {floor}: {why}. {WHOLE_CALL_REFUSED}\
-                     {zero_note} Use {floor} or more, or omit the field to leave kopia's \
-                     current value untouched"
-                ),
+                reason,
             });
         }
     }
