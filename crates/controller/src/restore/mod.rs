@@ -3251,9 +3251,19 @@ async fn run_restore_mover(
     // exec-capable identity AND the namespace opt-in — same reasoning, same
     // annotation, as the backup side.
     let uses_stream = matches!(dispatch.destination, RestoreDestination::Stream(_));
-    if uses_stream && !io::namespace_allows_stream_exec(&ctx.client, namespace).await? {
-        let sa = io::stream_mover_name(&ctx.mover_clusterrole);
-        let msg = io::stream_exec_not_allowed_message("Restore", name, namespace, &sa);
+    // EXHAUSTIVE over the three-state opt-in — see the SnapshotPolicy gate for
+    // why "not annotated" and "not allowed to look" must not be one `bool`.
+    let stream_refusal = match uses_stream {
+        false => None,
+        true => io::stream_exec_refusal(
+            io::namespace_stream_exec_opt_in(&ctx.client, namespace).await?,
+            "Restore",
+            name,
+            namespace,
+            &io::stream_mover_name(&ctx.mover_clusterrole),
+        ),
+    };
+    if let Some(msg) = stream_refusal {
         let existing = restore
             .status
             .as_ref()
@@ -3265,21 +3275,35 @@ async fn run_restore_mover(
             &msg,
             restore.metadata.generation,
         );
-        io::patch_status(
+        // Guarded like the privileged gate: the message is stable across retries,
+        // so only a real transition should emit the Event.
+        let current = serde_json::to_value(&restore.status).ok();
+        let wrote = io::patch_status_if_changed(
             api,
             name,
+            current.as_ref(),
             serde_json::json!({ "phase": "Pending", "conditions": conditions }),
         )
         .await?;
-        io::publish_warning_event(
-            ctx,
-            restore,
-            kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
-            crate::consts::ALLOW_STREAM_EXEC_ACTION,
-            &msg,
-        )
-        .await;
-        return Ok(MoverOutcome::Running { created: false });
+        if wrote {
+            io::publish_warning_event(
+                ctx,
+                restore,
+                kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+                crate::consts::ALLOW_STREAM_EXEC_ACTION,
+                &msg,
+            )
+            .await;
+        }
+        // `BlockedOnGrant`, NOT `Ok(MoverOutcome::Running { created: false })`
+        // (#451). That `Ok` was actively harmful, not merely imprecise: the
+        // caller treats a `Running` outcome as "the mover is progressing" and
+        // OVERWRITES the `Pending` phase this gate just wrote with `Restoring`,
+        // so a permission refusal was reported to the user as a restore in
+        // flight — indefinitely, since no Job exists to ever finish. The
+        // identically-shaped privileged gate below already returned
+        // `BlockedOnGrant`; this is the same error for the same reason.
+        return Err(Error::BlockedOnGrant(msg));
     }
     let identity_result = if uses_stream {
         io::ensure_stream_mover_identity(

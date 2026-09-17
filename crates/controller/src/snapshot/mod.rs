@@ -1180,14 +1180,21 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // SnapshotPolicy here could otherwise run arbitrary commands in any pod in the
     // namespace without holding `pods/exec` themselves — a verb Kubernetes separates
     // from ordinary write access deliberately.
-    if uses_stream && !io::namespace_allows_stream_exec(&ctx.client, &namespace).await? {
-        let sa = io::stream_mover_name(&ctx.mover_clusterrole);
-        let msg = io::stream_exec_not_allowed_message(
+    // EXHAUSTIVE over the three-state opt-in: "not annotated" and "we are not
+    // allowed to look" are different refusals with different fixes, and a `bool`
+    // collapsed them into a message that told a namespaced-install admin to
+    // annotate a namespace the operator will never be able to read.
+    let stream_refusal = match uses_stream {
+        false => None,
+        true => io::stream_exec_refusal(
+            io::namespace_stream_exec_opt_in(&ctx.client, &namespace).await?,
             "SnapshotPolicy",
             &config.name_any(),
             &namespace,
-            &sa,
-        );
+            &io::stream_mover_name(&ctx.mover_clusterrole),
+        ),
+    };
+    if let Some(msg) = stream_refusal {
         let existing = backup
             .status
             .as_ref()
@@ -1224,10 +1231,16 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             )
             .await;
         }
-        // Same as the privileged gate: the blocker is an annotation an admin adds
-        // out-of-band, and the Namespace watch re-enqueues this Snapshot the moment
-        // it lands, so the requeue is only a backstop.
-        return Ok(Action::requeue(std::time::Duration::from_secs(30)));
+        // Aligned with the privileged gate (#451): a permission refusal is
+        // `BlockedOnGrant`, NOT a green `Action::requeue`. The old return said
+        // "reconciled fine, come back in 30s", which hot-looped the refusal on
+        // the fast cadence and gave the error policy nothing to classify — while
+        // the identically-shaped privileged refusal two hundred lines below
+        // already returned `BlockedOnGrant` and got the slow structural cadence.
+        // The blocker is an annotation an admin adds out-of-band and the
+        // Namespace watch re-enqueues the moment it lands, so any requeue is
+        // only a watch-desync backstop.
+        return Err(Error::BlockedOnGrant(msg));
     }
 
     let identity_result = if uses_stream {
