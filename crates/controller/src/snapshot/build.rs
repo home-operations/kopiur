@@ -94,7 +94,14 @@ pub(super) fn build_backup_run(
                 }),
             )
         }
-        _ => match (&eff.pvc, &source.nfs) {
+        // Everything that MOUNTS something. Listed explicitly rather than `_ =>`:
+        // a new source kind must decide what kopia records and what is mounted
+        // before it compiles, which is the whole point of `source_shape` being an
+        // enum (CLAUDE.md, "the one load-bearing idea"). The inner match is the
+        // pre-existing `(pvc, nfs)` resolution, unchanged.
+        kopiur_api::SourceShape::Pvc(_)
+        | kopiur_api::SourceShape::PvcSelector(_)
+        | kopiur_api::SourceShape::Nfs(_) => match (&eff.pvc, &source.nfs) {
             (Some(pvc), None) => {
                 let path = eff
                     .kopia_source_path(strategy)
@@ -221,12 +228,36 @@ pub(super) fn build_backup_run(
 /// what the mover will actually execute, so the RBAC minted and the gate applied
 /// cannot drift from what the Job does.
 pub(super) fn work_spec_uses_stream(spec: &kopiur_mover::workspec::MoverWorkSpec) -> bool {
+    use kopiur_mover::workspec::{Operation, RestoreOutput, SnapshotInput};
+    // EXHAUSTIVE over `Operation`, with no `_ =>`: this decision mints
+    // `pods/exec` RBAC for the mover's ServiceAccount. A `_ => false` arm means a
+    // future operation that execs into a pod compiles clean and then fails at
+    // runtime with a Forbidden — or, worse, a future operation that does NOT need
+    // exec silently keeps the grant because someone widened the arm above it.
+    // Either way the blast radius is an RBAC escalation, so the compiler decides.
     match &spec.operation {
-        kopiur_mover::workspec::Operation::Snapshot(op) => matches!(
+        Operation::Snapshot(op) => matches!(
             kopiur_mover::workspec::snapshot_input(op),
-            kopiur_mover::workspec::SnapshotInput::Stream(_)
+            SnapshotInput::Stream(_)
         ),
-        _ => false,
+        // A `streamExec` restore target execs into a workload pod exactly as a
+        // `stream` source does — read off `RestoreOutput` so the RBAC minted and
+        // the Job's actual behavior come from the same resolver.
+        Operation::Restore(op) => matches!(
+            kopiur_mover::workspec::restore_output(op),
+            RestoreOutput::Stream(_)
+        ),
+        // Repository-only work: these talk to the kopia backend and never to the
+        // Kubernetes API on a workload's behalf, so none of them needs `pods/exec`.
+        Operation::SnapshotDelete(_)
+        | Operation::SnapshotDeleteBatch(_)
+        | Operation::BootstrapRepository(_)
+        | Operation::Maintenance(_)
+        | Operation::SnapshotPin(_)
+        | Operation::Verify(_)
+        | Operation::Replicate(_)
+        | Operation::BrowseSession(_)
+        | Operation::SnapshotReplicate(_) => false,
     }
 }
 
@@ -307,22 +338,14 @@ pub(super) fn resolve_identity_for(
     // `sources.first()`, which for a `pvcSelector` policy has no `pvc` at all —
     // so every child of an expansion would have resolved the SAME path-less
     // identity and written into one shared kopia source (#346).
-    let eff = crate::expand::effective_source(config, pin)
+    // THE shared derivation (#451): `/pvc/<name>` (honoring `sourcePathStrategy`
+    // for selector sources), the NFS export path, `/stream/<fileName>`, or an
+    // explicit `sourcePathOverride` — whichever this source's shape calls for.
+    // Every other identity site calls the same function, so the path the backup
+    // RECORDS and the path a restore/verify/adoption/collision check LOOKS FOR
+    // cannot disagree.
+    let source_path = crate::expand::identity_source_path(config, pin)
         .map_err(|e| Error::Validation(e.to_string()))?;
-    let strategy = config
-        .spec
-        .sources
-        .get(eff.index)
-        .map(crate::expand::strategy_for)
-        .unwrap_or_default();
-    // The resolved kopia path, honoring `sourcePathStrategy` for selector
-    // sources. Passed as the override so the identity kernel uses it verbatim
-    // rather than re-deriving `/pvc/<name>` from the PVC name alone.
-    let resolved_path = eff.kopia_source_path(strategy);
-    let pvc_name = eff.pvc.as_ref().map(|p| p.name.clone());
-    // A non-PVC NFS source supplies the sourcePath default (the export path).
-    let nfs_source_path = eff.nfs_path.clone();
-    let source_path_override = resolved_path;
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
         namespace,
@@ -330,9 +353,7 @@ pub(super) fn resolve_identity_for(
         defaults,
         labels: config.metadata.labels.as_ref(),
         annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: source_path.as_deref(),
     };
     let resolved: ApiResolvedIdentity =
         kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))?;

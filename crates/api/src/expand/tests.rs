@@ -1259,3 +1259,121 @@ fn populate_job_name_is_capped_and_injective_per_claimant() {
     let dashy = format!("{}-", "r".repeat(60));
     assert!(!populate_job_name(&dashy, "uid").contains("--populate-"));
 }
+
+// --- the ONE identity-path derivation (#451) --------------------------------
+//
+// Five identity sites (`config_identity`, `config_identity_for_path`,
+// `resolve_config_identity`, `verify_identity`, the webhook's
+// `resolve_policy_identity`) used to each re-derive the kopia source path from
+// `sources.first()`'s `pvc`/`nfs` by hand. A `stream` source has NEITHER, so
+// every one of them resolved a pathless-or-`/data` identity while the BACKUP
+// side recorded `/stream/<fileName>` — silently making a streamed snapshot
+// unrestorable via `fromPolicy`, unverifiable, unadoptable, and invisible to the
+// collision guard. They all route through [`identity_source_path`] now.
+
+/// A `stream` source as the API SERVER delivers it — the schema defaults
+/// (`readOnly`, `sourcePathStrategy`) materialized onto it, which is what a
+/// hand-built `Source` literal cannot reproduce.
+fn stream_source(file_name: &str) -> Source {
+    crate::testutil::from_yaml(&format!(
+        r#"
+stream:
+  fileName: {file_name}
+  workloadExec:
+    podSelector:
+      matchLabels: {{ app: postgres }}
+    command: ["sh", "-ec", "pg_dumpall"]
+readOnly: true
+sourcePathStrategy: PvcName
+"#
+    ))
+}
+
+/// The load-bearing assertion: the ONE derivation every identity site now calls
+/// yields the stream root, and specifically NOT `/data`, NOT `/pvc/...`, and NOT
+/// the pathless form. A sixth site cannot drift because [`IdentityInputs`] no
+/// longer accepts the raw `pvc`/`nfs` pieces to re-derive from — it takes only
+/// this function's answer.
+#[test]
+fn identity_source_path_of_a_stream_policy_is_the_stream_root() {
+    let policy = policy_with(vec![stream_source("postgres.sql")]);
+    let path = identity_source_path(&policy, None).expect("a stream policy derives a path");
+    assert_eq!(path.as_deref(), Some("/stream/postgres.sql"));
+    // The three wrong answers the five sites used to give.
+    assert_ne!(path.as_deref(), Some("/data"));
+    assert_ne!(path.as_deref(), Some("/pvc/app"));
+    assert!(path.is_some(), "a pathless identity matches every source");
+}
+
+/// `sourcePathOverride` still wins over the stream root, exactly as it does for a
+/// PVC or NFS source.
+#[test]
+fn identity_source_path_honours_an_override_on_a_stream_source() {
+    let mut source = stream_source("postgres.sql");
+    source.source_path_override = Some("/custom/dump".to_string());
+    let policy = policy_with(vec![source]);
+    assert_eq!(
+        identity_source_path(&policy, None).unwrap().as_deref(),
+        Some("/custom/dump")
+    );
+}
+
+/// The non-stream shapes are byte-identical to what the five sites derived by
+/// hand — this function replaces them, it does not change them.
+#[test]
+fn identity_source_path_reproduces_the_pvc_nfs_and_selector_answers() {
+    // A plain `pvc:` source: `/pvc/<name>`.
+    assert_eq!(
+        identity_source_path(&policy_with(vec![pvc_source("data")]), None)
+            .unwrap()
+            .as_deref(),
+        Some("/pvc/data")
+    );
+    // An NFS source: the export path.
+    let mut nfs = pvc_source("ignored");
+    nfs.pvc = None;
+    nfs.nfs = Some(crate::backend::NfsVolume {
+        server: "nas".into(),
+        path: "/mnt/eros/Media".into(),
+    });
+    assert_eq!(
+        identity_source_path(&policy_with(vec![nfs]), None)
+            .unwrap()
+            .as_deref(),
+        Some("/mnt/eros/Media")
+    );
+    // A selector source with no pin: pathless, as before. (The backup side always
+    // passes a per-member pin; the restore side fails closed via
+    // `restore_source_path` rather than relying on this.)
+    assert_eq!(
+        identity_source_path(&policy_with(vec![selector_source(None, vec![])]), None).unwrap(),
+        None
+    );
+    // A zero-source legacy policy: pathless, NOT an error — a working restore must
+    // not become a terminal failure on upgrade.
+    assert_eq!(
+        identity_source_path(&policy_with(vec![]), None).unwrap(),
+        None
+    );
+}
+
+/// A fanned-out child still resolves its OWN member path through the same
+/// function, so the selector fan-out keeps the #346 per-member identity.
+#[test]
+fn identity_source_path_honours_a_fanout_pin() {
+    let policy = policy_with(vec![selector_source(
+        Some(SourcePathStrategy::PvcNamespacedName),
+        vec![],
+    )]);
+    let pin = SnapshotSourceRef {
+        source_index: 0,
+        target: SnapshotSourceTarget::Pvc(target("media", "data-1")),
+        group: None,
+    };
+    assert_eq!(
+        identity_source_path(&policy, Some(&pin))
+            .unwrap()
+            .as_deref(),
+        Some("/pvc/media/data-1")
+    );
+}

@@ -130,16 +130,35 @@ pub fn effective_source(
     policy: &SnapshotPolicy,
     pin: Option<&SnapshotSourceRef>,
 ) -> Result<EffectiveSource, ValidationError> {
-    let sources = &policy.spec.sources;
+    effective_source_in(
+        &policy.spec.sources,
+        &policy.namespace().unwrap_or_default(),
+        &policy.name_any(),
+        pin,
+    )
+}
+
+/// [`effective_source`] over a bare `sources[]` + namespace + name.
+///
+/// The webhook validates a `SnapshotPolicySpec` it has no full object for, so the
+/// derivation has to be reachable without one. `effective_source` is a thin
+/// wrapper over this, which keeps the two on ONE code path — a spec-level
+/// derivation that drifted from the object-level one is exactly the class of bug
+/// [`identity_source_path_in`] exists to make impossible.
+pub fn effective_source_in(
+    sources: &[Source],
+    policy_namespace: &str,
+    policy_name: &str,
+    pin: Option<&SnapshotSourceRef>,
+) -> Result<EffectiveSource, ValidationError> {
     let index = pin.map(|p| p.source_index as usize).unwrap_or(0);
     let Some(source) = sources.get(index) else {
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.source.sourceIndex".to_string(),
             reason: format!(
-                "`spec.source.sourceIndex` is {index} but SnapshotPolicy `{}` now has {} source(s); \
-             the recipe was edited after this Snapshot was created. Delete this Snapshot and let \
-             the schedule re-fire, or recreate it against the current recipe.",
-                policy.name_any(),
+                "`spec.source.sourceIndex` is {index} but SnapshotPolicy `{policy_name}` now has \
+             {} source(s); the recipe was edited after this Snapshot was created. Delete this \
+             Snapshot and let the schedule re-fire, or recreate it against the current recipe.",
                 sources.len()
             ),
         });
@@ -159,10 +178,100 @@ pub fn effective_source(
         Some(SnapshotSourceTarget::Pvc(t)) => Ok(common(Some(t.clone()))),
         None => Ok(common(source.pvc.as_ref().map(|p| PvcTargetRef {
             // A non-selector `pvc:` source is always same-namespace.
-            namespace: policy.namespace().unwrap_or_default(),
+            namespace: policy_namespace.to_string(),
             name: p.name.clone(),
         }))),
     }
+}
+
+/// **THE** kopia source path a `SnapshotPolicy`'s governing source records —
+/// the single derivation every identity site must use (#451).
+///
+/// # Why this function exists
+///
+/// Six places resolve a policy's kopia identity: the backup mover
+/// (`snapshot::build::resolve_identity_for`), the policy reconciler's
+/// `config_identity` / `config_identity_for_path` / `resolve_config_identity`,
+/// the verification reconciler's `verify_identity`, and the webhook's
+/// `identity_collision::resolve_policy_identity`. Each of them used to re-derive
+/// the path inline from `sources.first()`'s `pvc`/`nfs` — a pattern that is
+/// *correct only for the two source kinds that existed when it was written*.
+///
+/// A `stream` source has neither a `pvc` nor an `nfs`, so five of the six
+/// resolved a PATHLESS (or `/data`) identity while the backup side recorded
+/// `/stream/<fileName>`. Every consequence was silent: a `fromPolicy` `Restore`
+/// looked for `user@host:/data` and reported `SnapshotNotFound`; quick
+/// verification verified a path with no manifests and **exited 0**; the
+/// collision webhook collapsed every stream policy onto one pathless identity,
+/// raising false collisions and missing real ones; and `identities_match`
+/// compares source paths field-by-field, so a discovered stream snapshot could
+/// never be adopted.
+///
+/// Routing every site through here — and removing the raw `pvc`/`nfs` pieces
+/// from [`crate::IdentityInputs`], so no caller *can* re-derive a path — makes a
+/// seventh site structurally unable to drift.
+///
+/// # Semantics
+///
+/// Exactly [`EffectiveSource::kopia_source_path`] under the governing source's
+/// [`strategy_for`], which is byte-identical to the old inline derivation for
+/// every `pvc`/`nfs`/selector/override shape and additionally correct for
+/// `stream`. `Ok(None)` is kopia's identity-only `username@hostname` form:
+/// a selector source with no fan-out pin, or a **zero-source** legacy policy,
+/// which is deliberately tolerated rather than turned into a terminal error
+/// (admission forbids it; a hand-patched object may still carry it, and a
+/// working restore must not break on upgrade).
+pub fn identity_source_path(
+    policy: &SnapshotPolicy,
+    pin: Option<&SnapshotSourceRef>,
+) -> Result<Option<String>, ValidationError> {
+    identity_source_path_in(
+        &policy.spec.sources,
+        &policy.namespace().unwrap_or_default(),
+        &policy.name_any(),
+        pin,
+    )
+}
+
+/// The kopia source path ONE policy source records, by index — the per-source
+/// form of [`identity_source_path`], for the `status.resolved.sources[]` mirror.
+///
+/// Same derivation, so a human reading status sees exactly what kopia stores:
+/// `/pvc/<name>`, the NFS export path, `/stream/<fileName>`, or an explicit
+/// `sourcePathOverride`. `None` only for a selector source, whose path is
+/// per-member and therefore not a property of the source alone.
+pub fn source_kopia_path(source: &Source, index: usize, policy_namespace: &str) -> Option<String> {
+    let eff = EffectiveSource {
+        index,
+        pvc: source.pvc.as_ref().map(|p| PvcTargetRef {
+            // A non-selector `pvc:` source is always same-namespace.
+            namespace: policy_namespace.to_string(),
+            name: p.name.clone(),
+        }),
+        nfs_path: source.nfs.as_ref().map(|n| n.path.clone()),
+        stream: source.stream.clone(),
+        source_path_override: source.source_path_override.clone(),
+        read_only: snapshot_policy::source_read_only(source),
+    };
+    eff.kopia_source_path(strategy_for(source))
+}
+
+/// [`identity_source_path`] over a bare `sources[]` (the webhook's spec-only shape).
+pub fn identity_source_path_in(
+    sources: &[Source],
+    policy_namespace: &str,
+    policy_name: &str,
+    pin: Option<&SnapshotSourceRef>,
+) -> Result<Option<String>, ValidationError> {
+    // Zero-source legacy tolerance, checked BEFORE `effective_source_in` so it
+    // stays a pathless identity rather than the out-of-range error. A pin on a
+    // zero-source policy is still the real error it has always been.
+    if sources.is_empty() && pin.is_none() {
+        return Ok(None);
+    }
+    let eff = effective_source_in(sources, policy_namespace, policy_name, pin)?;
+    let strategy = sources.get(eff.index).map(strategy_for).unwrap_or_default();
+    Ok(eff.kopia_source_path(strategy))
 }
 
 /// The `sourcePathStrategy` governing a source.

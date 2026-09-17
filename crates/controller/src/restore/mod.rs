@@ -2706,24 +2706,32 @@ async fn drive_direct_restore(
     selection: Option<&RestoreSelection>,
     source_target: Option<&kopiur_api::snapshot::PvcTargetRef>,
 ) -> Result<Action> {
-    // Resolve the target PVC for the restore Job. DirectTarget is only reached for
-    // an explicit PVC target (populator routes to AwaitingClaim in the reconcile
-    // dispatch). Exhaustive over RestoreTarget so a new variant must be considered.
-    // Owned PVC name (when there is one) so the borrow in `destination` outlives
-    // the awaits below.
-    let target_pvc: Option<String> = match &restore.spec.target {
-        RestoreTarget::PvcRef(r) => Some(r.name.clone()),
+    // Resolve where this restore's bytes go. DirectTarget is only reached for an
+    // explicit PVC or stream target (populator routes to AwaitingClaim in the
+    // reconcile dispatch). ONE exhaustive match over `RestoreTarget`, so a new
+    // variant cannot compile until it decides what it writes into.
+    //
+    // `DirectDestination` exists purely to OWN the PVC name: `RestoreDestination`
+    // borrows, and that borrow has to outlive the awaits between here and the
+    // dispatch below. Resolving in two matches — one producing `Option<String>`,
+    // one re-matching the target against it — is what the borrow used to force,
+    // and it cost the type-safety property: a future non-PVC variant yielding
+    // `None` compiled clean and produced a runtime `Invariant` error instead of a
+    // compile error. Owning the intermediate collapses the second match to a
+    // total, unreachable-free conversion.
+    let direct: DirectDestination<'_> = match &restore.spec.target {
+        RestoreTarget::PvcRef(r) => DirectDestination::Pvc(r.name.clone()),
         // `target.pvc` means the operator CREATES the PVC (ADR §3.6) — without
         // this the mover Job references a claim nobody made and sits Pending
         // forever (FailedScheduling: persistentvolumeclaim not found). This also
         // provisions the empty volume for the deploy-or-restore (no-snapshot) case.
         RestoreTarget::Pvc(t) => {
             ensure_restore_target_pvc(ctx, namespace, t).await?;
-            Some(t.name.clone())
+            DirectDestination::Pvc(t.name.clone())
         }
         // A stream target creates nothing: the mover reads one virtual file out of
         // the snapshot and pipes it into a command's stdin.
-        RestoreTarget::StreamExec(_) => None,
+        RestoreTarget::StreamExec(t) => DirectDestination::Stream(t),
         RestoreTarget::Populator(_) => {
             return Err(Error::Invariant(
                 "DirectTarget restore reached with a populator target (should route to \
@@ -2732,16 +2740,7 @@ async fn drive_direct_restore(
             ));
         }
     };
-    let destination = match (&restore.spec.target, target_pvc.as_deref()) {
-        (RestoreTarget::StreamExec(t), _) => RestoreDestination::Stream(t),
-        (_, Some(pvc)) => RestoreDestination::Pvc(pvc),
-        // Unreachable: every non-stream direct arm above produced a name.
-        (_, None) => {
-            return Err(Error::Invariant(
-                "direct restore resolved no target PVC and no stream target".into(),
-            ));
-        }
-    };
+    let destination = direct.borrowed();
 
     let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
 
@@ -3117,6 +3116,32 @@ pub(super) enum RestoreDestination<'a> {
     /// PVC-shaped machinery (colocation, target-PVC securityContext assessment)
     /// applies.
     Stream(&'a kopiur_api::restore::StreamExecTarget),
+}
+
+/// [`RestoreDestination`] with the PVC name OWNED.
+///
+/// `RestoreDestination::Pvc` borrows a `&str`, which cannot be produced inside
+/// the same `match` that awaits `ensure_restore_target_pvc` and then outlive it.
+/// This carries the `String` so `drive_direct_restore` resolves its target in ONE
+/// exhaustive match over [`kopiur_api::restore::RestoreTarget`] and converts once,
+/// instead of matching twice with a `_` in the target position — which is how the
+/// "a new variant cannot compile until every handler accounts for it" property
+/// gets lost in practice.
+pub(super) enum DirectDestination<'a> {
+    /// The PVC the mover writes into, owned.
+    Pvc(String),
+    /// The stream consumer, borrowed from the `Restore` spec (which outlives us).
+    Stream(&'a kopiur_api::restore::StreamExecTarget),
+}
+
+impl<'a> DirectDestination<'a> {
+    /// The borrowing form. Total and exhaustive — no unreachable arm to get wrong.
+    pub(super) fn borrowed(&'a self) -> RestoreDestination<'a> {
+        match self {
+            DirectDestination::Pvc(name) => RestoreDestination::Pvc(name),
+            DirectDestination::Stream(t) => RestoreDestination::Stream(t),
+        }
+    }
 }
 
 impl<'a> RestoreDestination<'a> {
@@ -4341,6 +4366,90 @@ async fn ensure_restore_target_pvc(
     }
 }
 
+/// The policy's OWN kopia source path, for a restore whose target is not a PVC
+/// (today: `target.streamExec`).
+///
+/// The per-PVC derivation in [`kopiur_api::expand::restore_source_path`] answers
+/// "which member of a selector policy fills THIS volume" — a question a stream
+/// restore does not ask, because it fills no volume. A stream policy is
+/// admission-restricted to a single `stream` source, so its effective source is
+/// unambiguous and [`kopiur_api::expand::identity_source_path`] yields
+/// `/stream/<fileName>` — exactly what the backup side recorded. An explicit
+/// `source.fromPolicy.sourcePath` still wins, as it does on the per-PVC path.
+///
+/// # Why this FAILS CLOSED for a non-stream policy
+///
+/// It would be easy to mirror step (3) of `restore_source_path` unconditionally
+/// and hand back whatever `sources[0]` produces. That is wrong, and in one
+/// reachable configuration it is a data-integrity bug: `target.streamExec` with
+/// `source.fromPolicy` naming a `pvcSelector` policy that carries a SHARED
+/// `sourcePathOverride`. `kopia_source_path` returns that override before it ever
+/// looks at a PVC, the resolved identity then matches the newest snapshot of ANY
+/// matched member, and the mover pipes an arbitrary volume's bytes into the
+/// user's `psql`/`mysql` stdin. That is precisely the configuration
+/// `restore_source_path` step (5) refuses — step (3)'s body is only sound behind
+/// step (3)'s `!has_selector` precondition.
+///
+/// Nothing upstream prevents the pair: `validate_restore` checks only `fileName`
+/// and `workloadExec` on a `StreamExec` target, and cross-CR validation is not
+/// available at admission at all. So the guard lives here, and it is a shape
+/// check on the EFFECTIVE SOURCE rather than a selector check — a streamExec
+/// restore of a PVC/NFS policy has no single file to read either, and answering
+/// it with a volume's root path would be just as wrong.
+///
+/// Returns the ready-to-surface message (not an [`Error`]) for the same reason
+/// [`from_policy_identity`] does: it is a DOMAIN outcome about the spec pair.
+fn policy_own_source_path(
+    config: &kopiur_api::SnapshotPolicy,
+    source_path_override: Option<&str>,
+) -> std::result::Result<kopiur_api::expand::RestoreSourcePath, String> {
+    if let Some(over) = source_path_override {
+        return Ok(kopiur_api::expand::RestoreSourcePath::Override(
+            over.to_string(),
+        ));
+    }
+    // Zero-source legacy tolerance, exactly as `restore_source_path` step (3) has
+    // it: admission forbids a zero-source policy, but a hand-patched object may
+    // carry one, and a working restore must not become a terminal error on
+    // upgrade. The pathless identity is the honest answer — there is no source to
+    // be wrong about.
+    if config.spec.sources.is_empty() {
+        return Ok(kopiur_api::expand::RestoreSourcePath::PolicySource(None));
+    }
+    let eff = kopiur_api::expand::effective_source(config, None).map_err(|e| e.to_string())?;
+    if eff.stream.is_none() {
+        return Err(stream_restore_needs_a_stream_policy_message(
+            config, eff.index,
+        ));
+    }
+    // THE shared derivation (#451) — the same call the backup side makes.
+    Ok(kopiur_api::expand::RestoreSourcePath::PolicySource(
+        kopiur_api::expand::identity_source_path(config, None).map_err(|e| e.to_string())?,
+    ))
+}
+
+/// The what/why/fix text for a `streamExec` restore pointed at a policy whose
+/// governing source is not a `stream` source. Pure so the exact wording is
+/// unit-asserted.
+fn stream_restore_needs_a_stream_policy_message(
+    config: &kopiur_api::SnapshotPolicy,
+    index: usize,
+) -> String {
+    format!(
+        "this Restore's target is `streamExec`, which reads ONE virtual file out of a snapshot \
+         and pipes it into a command's stdin — but `source.fromPolicy` names SnapshotPolicy \
+         `{}`, whose governing source #{index} is not a `stream` source, so it recorded a volume \
+         tree rather than a file and there is no single kopia source path to read. Resolving one \
+         anyway would match the newest snapshot of whatever that policy backed up (for a \
+         `pvcSelector` policy sharing one `sourcePathOverride`, an arbitrary member volume) and \
+         feed it to the command, so kopiur fails closed. Fix: point `source.fromPolicy` at a \
+         SnapshotPolicy whose source is `stream`, use `source.snapshotRef` to name the snapshot \
+         directly, or set `source.fromPolicy.sourcePath` to the exact kopia source path the file \
+         lives under.",
+        config.name_any(),
+    )
+}
+
 /// The kopia identity a `fromPolicy` restore of `target` must read under — the
 /// #443 cross-volume fix, in one place so the resolution path and the
 /// recorded-identity catalog search can never disagree.
@@ -4356,39 +4465,10 @@ async fn ensure_restore_target_pvc(
 /// [`Error`]: it is a DOMAIN outcome (a valid `Restore` plus a valid
 /// `SnapshotPolicy` that together name no single volume), reported on the
 /// affected claim's own record rather than as a reconcile failure.
-/// The policy's OWN kopia source path, for a restore whose target is not a PVC
-/// (today: `target.streamExec`).
 ///
-/// The per-PVC derivation in [`kopiur_api::expand::restore_source_path`] answers
-/// "which member of a selector policy fills THIS volume" — a question a stream
-/// restore does not ask, because it fills no volume. A stream policy is
-/// admission-restricted to a single `stream` source, so its effective source is
-/// unambiguous and `kopia_source_path` yields `/stream/<fileName>`. An explicit
-/// `source.fromPolicy.sourcePath` still wins, exactly as it does on the per-PVC
-/// path.
-///
-/// Returns the ready-to-surface message (not an [`Error`]) for the same reason
-/// [`from_policy_identity`] does: it is a DOMAIN outcome about the spec pair.
-fn policy_own_source_path(
-    config: &kopiur_api::SnapshotPolicy,
-    source_path_override: Option<&str>,
-) -> std::result::Result<kopiur_api::expand::RestoreSourcePath, String> {
-    if let Some(over) = source_path_override {
-        return Ok(kopiur_api::expand::RestoreSourcePath::Override(
-            over.to_string(),
-        ));
-    }
-    // Mirrors step (3) of `restore_source_path`, including its zero-source legacy
-    // tolerance: no sources means no path to record, not an error.
-    let Some(first) = config.spec.sources.first() else {
-        return Ok(kopiur_api::expand::RestoreSourcePath::PolicySource(None));
-    };
-    let eff = kopiur_api::expand::effective_source(config, None).map_err(|e| e.to_string())?;
-    Ok(kopiur_api::expand::RestoreSourcePath::PolicySource(
-        eff.kopia_source_path(kopiur_api::expand::strategy_for(first)),
-    ))
-}
-
+/// `target: None` is a restore that fills no volume (`target.streamExec`); it
+/// routes to [`policy_own_source_path`], which fails closed the same way for a
+/// policy that recorded a volume tree rather than a file.
 fn from_policy_identity(
     config: &kopiur_api::SnapshotPolicy,
     config_namespace: &str,

@@ -3656,3 +3656,211 @@ fn claim_wait_window_is_per_claim_only_and_opens_now_on_the_first_pass() {
         1_748_736_000
     );
 }
+
+// --- stream restore: the `fromPolicy` identity derivation (#451) -------------
+//
+// `from_policy_identity(.., target: None)` is the arm a `target.streamExec`
+// restore takes. It had ZERO coverage in any tier: no unit test named it, and the
+// only e2e stream restore uses `source.snapshotRef`, which never reaches it.
+// These five tests pin the whole derivation, pure and hermetic.
+
+/// A policy whose single source streams `file_name` out of a command.
+fn stream_policy(file_name: &str) -> kopiur_api::SnapshotPolicy {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "pg", "namespace": "db" },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{
+                "stream": {
+                    "fileName": file_name,
+                    "workloadExec": {
+                        "podSelector": { "matchLabels": { "app": "postgres" } },
+                        "command": ["sh", "-ec", "pg_dumpall"],
+                    },
+                },
+                // Materialized by the API server from the CRD schema defaults.
+                "readOnly": true,
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .expect("a valid stream SnapshotPolicy")
+}
+
+/// A `pvcSelector` policy whose members ALL share one `sourcePathOverride` — the
+/// shape `restore_source_path` step (5) refuses, because no derivation can say
+/// which member a given path holds.
+fn flattened_selector_policy() -> kopiur_api::SnapshotPolicy {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "all-volumes", "namespace": "db" },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "backup": "yes" } } },
+                "sourcePathOverride": "/data",
+                "readOnly": true,
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .expect("a valid selector SnapshotPolicy")
+}
+
+/// (a) THE regression guard for the whole feature: a `streamExec` restore whose
+/// source is `fromPolicy` must resolve the identity the BACKUP recorded —
+/// `/stream/<fileName>` — and specifically not `/data` (what the old
+/// `config_identity_for_path` fallback produced) nor `/pvc/...` nor the pathless
+/// form (which matches every source and takes the newest of them).
+#[test]
+fn a_stream_from_policy_restore_resolves_the_stream_root_identity() {
+    let policy = stream_policy("postgres.sql");
+    let id = from_policy_identity(&policy, "db", None, None, None)
+        .expect("a stream policy resolves its own identity");
+    assert_eq!(id.source_path.as_deref(), Some("/stream/postgres.sql"));
+    assert_ne!(id.source_path.as_deref(), Some("/data"));
+    assert!(
+        !id.source_path
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("/pvc/"),
+        "a stream artifact must never resolve a volume path"
+    );
+    assert!(
+        id.source_path.is_some(),
+        "a pathless identity matches the newest snapshot of ANY source"
+    );
+    // The name half still comes from the policy, exactly as on the backup side.
+    assert_eq!(id.username, "pg");
+    assert_eq!(id.hostname, "db");
+}
+
+/// (b) An explicit `source.fromPolicy.sourcePath` wins over the derived stream
+/// root, exactly as it does on the per-PVC path.
+#[test]
+fn a_stream_from_policy_restore_honours_an_explicit_source_path() {
+    let policy = stream_policy("postgres.sql");
+    let id = from_policy_identity(&policy, "db", None, Some("/custom/dump"), None)
+        .expect("an explicit path is never second-guessed");
+    assert_eq!(id.source_path.as_deref(), Some("/custom/dump"));
+}
+
+/// (c) The data-integrity hole: `target.streamExec` + `source.fromPolicy` naming a
+/// `pvcSelector` policy with a SHARED `sourcePathOverride`. `kopia_source_path`
+/// returns that override at its first branch, so the resolved identity would match
+/// the newest snapshot of an ARBITRARY matched member and the mover would pipe
+/// that volume's bytes into the user's `psql` stdin. `policy_own_source_path`
+/// applied step (3) of `restore_source_path` without step (3)'s `!has_selector`
+/// precondition, so this resolved `/data` and looked fine.
+///
+/// It must fail closed with the what/why/fix text instead.
+#[test]
+fn a_stream_restore_of_a_non_stream_policy_fails_closed() {
+    let policy = flattened_selector_policy();
+    let err = from_policy_identity(&policy, "db", None, None, None)
+        .expect_err("a streamExec restore of a selector policy must be refused");
+    // Not the wrong answer the bug produced.
+    assert!(
+        !err.contains("/data") || err.contains("fails closed"),
+        "the refusal must not read as a resolved path: {err}"
+    );
+    // what / why / fix.
+    assert!(err.contains("streamExec"), "must name the target: {err}");
+    assert!(
+        err.contains("all-volumes"),
+        "must name the offending policy: {err}"
+    );
+    assert!(err.contains("not a `stream` source"), "must say why: {err}");
+    assert!(err.contains("Fix:"), "must say how to fix it: {err}");
+    // The same refusal for a plain PVC policy: a streamExec restore of a volume
+    // tree has no single file to read either.
+    let pvc_policy: kopiur_api::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "vol", "namespace": "db" },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{ "pvc": { "name": "data" }, "readOnly": true }],
+        },
+    }))
+    .unwrap();
+    from_policy_identity(&pvc_policy, "db", None, None, None)
+        .expect_err("a streamExec restore of a pvc policy must be refused too");
+}
+
+/// (d) A zero-source legacy policy keeps the PATHLESS identity-only form. Admission
+/// forbids writing one, but a hand-patched object may carry it, and a working
+/// restore must not become a terminal error on upgrade — so this is deliberately
+/// NOT the fail-closed arm.
+#[test]
+fn a_stream_restore_of_a_zero_source_policy_stays_pathless() {
+    let mut policy = stream_policy("postgres.sql");
+    policy.spec.sources.clear();
+    let id = from_policy_identity(&policy, "db", None, None, None)
+        .expect("a zero-source policy is tolerated, not refused");
+    assert_eq!(id.source_path, None);
+}
+
+/// (e) The negative guard: a PVC target still routes through
+/// `restore_source_path`, so the stream-only `None` branch cannot silently widen.
+/// Same policy, same call, `Some(target)` — and the answer is the PER-PVC
+/// derivation, which for a flattened selector is the #443 ambiguity refusal, NOT
+/// `policy_own_source_path`'s stream-shape refusal.
+#[test]
+fn a_pvc_target_still_routes_through_the_per_pvc_derivation() {
+    let target = kopiur_api::snapshot::PvcTargetRef {
+        namespace: "db".into(),
+        name: "data-1".into(),
+    };
+    // A plain selector (no shared override) derives the member path per-PVC.
+    let plain: kopiur_api::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "all-volumes", "namespace": "db" },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "backup": "yes" } } },
+                "readOnly": true,
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .unwrap();
+    let id = from_policy_identity(&plain, "db", None, None, Some(&target))
+        .expect("a PVC target derives its own member path");
+    assert_eq!(id.source_path.as_deref(), Some("/pvc/data-1"));
+
+    // The flattened selector refuses through the #443 message, not the stream one.
+    let err = from_policy_identity(
+        &flattened_selector_policy(),
+        "db",
+        None,
+        None,
+        Some(&target),
+    )
+    .expect_err("a flattened selector is ambiguous for a PVC target");
+    assert!(
+        err.contains("sourcePathStrategy") || err.contains("sourcePathOverride"),
+        "expected the #443 ambiguity refusal, got: {err}"
+    );
+    assert!(
+        !err.contains("streamExec"),
+        "a PVC target must not take the stream arm: {err}"
+    );
+
+    // And a STREAM policy with a PVC target does NOT get the stream root — it goes
+    // through `restore_source_path`, which sees a non-PVC, non-selector source and
+    // falls back to the policy's own path. The two derivations stay separate.
+    let stream_with_pvc_target =
+        from_policy_identity(&stream_policy("x.sql"), "db", None, None, Some(&target))
+            .expect("the per-PVC derivation is total for a single-source policy");
+    assert_eq!(
+        stream_with_pvc_target.source_path.as_deref(),
+        Some("/stream/x.sql"),
+        "a single-source policy's step-(3) fallback is its own path, stream included"
+    );
+}

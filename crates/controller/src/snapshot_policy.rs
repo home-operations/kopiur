@@ -2155,10 +2155,11 @@ pub fn config_identity(
     namespace: &str,
     defaults: Option<&kopiur_api::IdentityDefaults>,
 ) -> Result<kopiur_api::common::ResolvedIdentity> {
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    let source_path_override = first.and_then(|s| s.source_path_override.clone());
+    // THE shared derivation (#451) — the same call the backup side makes, so a
+    // `stream` source resolves `/stream/<fileName>` here instead of the pathless
+    // identity the old inline `pvc`/`nfs` derivation produced.
+    let source_path = kopiur_api::expand::identity_source_path(config, None)
+        .map_err(|e| Error::Validation(e.to_string()))?;
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
         namespace,
@@ -2166,9 +2167,7 @@ pub fn config_identity(
         defaults,
         labels: config.metadata.labels.as_ref(),
         annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: source_path.as_deref(),
     };
     kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))
 }
@@ -2215,14 +2214,13 @@ pub fn config_identity_for_path(
     defaults: Option<&kopiur_api::IdentityDefaults>,
     source_path: Option<&str>,
 ) -> Result<kopiur_api::common::ResolvedIdentity> {
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    // The caller's derived path wins; without one, the governing source's own
-    // `sourcePathOverride` still applies exactly as `config_identity` applies it.
-    let source_path_override = match source_path {
+    // The caller's derived path wins; without one, fall back to THE shared
+    // derivation (#451) — which is exactly what `config_identity` resolves, and
+    // which yields `/stream/<fileName>` for a stream source.
+    let resolved_path = match source_path {
         Some(p) => Some(p.to_string()),
-        None => first.and_then(|s| s.source_path_override.clone()),
+        None => kopiur_api::expand::identity_source_path(config, None)
+            .map_err(|e| Error::Validation(e.to_string()))?,
     };
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
@@ -2231,9 +2229,7 @@ pub fn config_identity_for_path(
         defaults,
         labels: config.metadata.labels.as_ref(),
         annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: resolved_path.as_deref(),
     };
     let mut resolved =
         kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))?;
@@ -2291,10 +2287,9 @@ fn resolve_config_identity(
     defaults: Option<&kopiur_api::IdentityDefaults>,
 ) -> Result<kopiur_api::snapshot_policy::ResolvedPolicy> {
     use kopiur_api::snapshot_policy::{ResolvedPolicy, ResolvedPolicySource};
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    let source_path_override = first.and_then(|s| s.source_path_override.clone());
+    // THE shared derivation (#451).
+    let source_path = kopiur_api::expand::identity_source_path(config, None)
+        .map_err(|e| Error::Validation(e.to_string()))?;
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
         namespace,
@@ -2302,23 +2297,22 @@ fn resolve_config_identity(
         defaults,
         labels: config.metadata.labels.as_ref(),
         annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: source_path.as_deref(),
     };
     let identity =
         kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))?;
+    // Per-source `status.resolved.sources[]` rows, also through the shared
+    // derivation (#451): the mirror a human reads must show the path kopia
+    // actually records, `/stream/<fileName>` included — the old inline
+    // `override → /pvc/<name> → nfs.path` chain left a stream source's row blank.
     let sources = config
         .spec
         .sources
         .iter()
-        .map(|s| ResolvedPolicySource {
+        .enumerate()
+        .map(|(index, s)| ResolvedPolicySource {
             pvc: s.pvc.as_ref().map(|p| format!("{namespace}/{}", p.name)),
-            source_path: s
-                .source_path_override
-                .clone()
-                .or_else(|| s.pvc.as_ref().map(|p| format!("/pvc/{}", p.name)))
-                .or_else(|| s.nfs.as_ref().map(|n| n.path.clone())),
+            source_path: kopiur_api::expand::source_kopia_path(s, index, namespace),
         })
         .collect();
     Ok(ResolvedPolicy {
@@ -3552,6 +3546,105 @@ mod tests {
         assert!(
             !requests.iter().any(|r| r.starts_with("POST ")),
             "no adopted-row create may fire for a vanished candidate: {requests:?}"
+        );
+    }
+
+    // --- every identity site derives a stream policy's path (#451) ---------------
+    //
+    // Five sites re-derived the kopia source path inline from `sources.first()`'s
+    // `pvc`/`nfs`. A `stream` source has NEITHER, so each resolved a pathless (or
+    // `/data`) identity while the backup side recorded `/stream/<fileName>`. All the
+    // consequences were silent: `fromPolicy` restores reported SnapshotNotFound,
+    // quick verification verified a path with no manifests and exited 0, the
+    // collision webhook collapsed every stream policy onto one identity, and
+    // `adoption::identities_match` compares source paths field-by-field so a
+    // discovered stream snapshot could never be adopted.
+    //
+    // These tests pin the three sites that live in this file. The other two are
+    // pinned in `verification.rs` and `crates/webhook/src/identity_collision.rs`;
+    // the shared derivation itself in `kopiur_api::expand`.
+
+    /// A policy whose single source streams `postgres.sql` out of a command, as the
+    /// API server delivers it (schema defaults materialized).
+    fn stream_config() -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "db" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "nas" },
+                "sources": [{
+                    "stream": {
+                        "fileName": "postgres.sql",
+                        "workloadExec": {
+                            "podSelector": { "matchLabels": { "app": "postgres" } },
+                            "command": ["sh", "-ec", "pg_dumpall"],
+                        },
+                    },
+                    "readOnly": true,
+                    "sourcePathStrategy": "PvcName",
+                }],
+            },
+        }))
+        .expect("a valid stream SnapshotPolicy")
+    }
+
+    #[test]
+    fn config_identity_of_a_stream_policy_is_the_stream_root() {
+        let id = config_identity(&stream_config(), "db", None).expect("resolves");
+        assert_eq!(id.source_path.as_deref(), Some("/stream/postgres.sql"));
+        assert_eq!(
+            kopiur_api::identity_string(&id),
+            "pg@db:/stream/postgres.sql"
+        );
+    }
+
+    #[test]
+    fn config_identity_for_path_of_a_stream_policy_needs_no_caller_path() {
+        // `None` is what a stream restore passes — there is no per-PVC path to derive.
+        // It must NOT fall through to the `/data` fallback.
+        let id = config_identity_for_path(&stream_config(), "db", None, None).expect("resolves");
+        assert_eq!(id.source_path.as_deref(), Some("/stream/postgres.sql"));
+        assert_ne!(id.source_path.as_deref(), Some("/data"));
+    }
+
+    #[test]
+    fn resolved_status_mirrors_a_stream_policys_source_path() {
+        let resolved = resolve_config_identity(&stream_config(), "db", None).expect("resolves");
+        assert_eq!(
+            resolved
+                .identity
+                .as_ref()
+                .and_then(|i| i.source_path.as_deref()),
+            Some("/stream/postgres.sql")
+        );
+        // The per-source row a human reads in `status.resolved.sources[]` — blank
+        // before this, because the old chain only knew `override → pvc → nfs`.
+        assert_eq!(resolved.sources.len(), 1);
+        assert_eq!(
+            resolved.sources[0].source_path.as_deref(),
+            Some("/stream/postgres.sql")
+        );
+        assert_eq!(resolved.sources[0].pvc, None);
+    }
+
+    /// A discovered `/stream/...` snapshot is adoptable only because the policy side
+    /// now resolves the same path: `adoption::identities_match` compares
+    /// `source_path` field-by-field, so a pathless policy identity could never match
+    /// a kopia row (kopia rows always carry a path).
+    #[test]
+    fn a_stream_policys_identity_matches_a_discovered_stream_row() {
+        let policy_id = config_identity(&stream_config(), "db", None).expect("resolves");
+        let discovered = kopiur_api::common::ResolvedIdentity {
+            username: "pg".into(),
+            hostname: "db".into(),
+            source_path: Some("/stream/postgres.sql".into()),
+        };
+        assert_eq!(policy_id.username, discovered.username);
+        assert_eq!(policy_id.hostname, discovered.hostname);
+        assert_eq!(
+            policy_id.source_path, discovered.source_path,
+            "an unadoptable stream snapshot is exactly a source_path mismatch here"
         );
     }
 }

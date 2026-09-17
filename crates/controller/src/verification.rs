@@ -842,10 +842,14 @@ fn verify_identity(
     namespace: &str,
     repo: &ResolvedRepository,
 ) -> ResolvedIdentity {
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    let source_path_override = first.and_then(|s| s.source_path_override.clone());
+    // THE shared derivation (#451). Before this, a `stream` policy verified the
+    // EMPTY path: kopia reads `user@host:` as a RELATIVE filesystem path, matches
+    // no manifests, and the quick tier exits 0 — a verification that passes by
+    // looking at nothing. It now verifies `/stream/<fileName>`, the path the
+    // backup recorded.
+    let source_path = kopiur_api::expand::identity_source_path(config, None)
+        .ok()
+        .flatten();
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
         namespace,
@@ -853,9 +857,7 @@ fn verify_identity(
         defaults: repo.identity_defaults.as_ref(),
         labels: config.metadata.labels.as_ref(),
         annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: source_path.as_deref(),
     };
     match kopiur_api::resolve_identity(&inputs) {
         Ok(r) => ResolvedIdentity {
@@ -1815,5 +1817,25 @@ mod tests {
             !st.ignored,
             "repo-supplied capacity should make the SC honored"
         );
+    }
+
+    /// Site 4 of 5 (#451): the verify identity. Before the shared derivation, a
+    /// `stream` policy verified the EMPTY source path — and kopia reads
+    /// `user@host:` as a RELATIVE filesystem path, so it matches no manifests and
+    /// `snapshot verify` exits **0**. A quick verification that looked at nothing
+    /// reported a green `Verified=True`, which is the worst possible answer from a
+    /// verification feature.
+    #[test]
+    fn verify_identity_of_a_stream_policy_is_the_stream_root() {
+        let mut policy = sample_policy(verification(Some("0 4 * * *"), None));
+        policy.metadata.namespace = Some("db".into());
+        policy.spec.sources = vec![crate::testutil_stream_source()];
+        let id = verify_identity(&policy, "db", &sample_repo());
+        assert_eq!(id.source_path, "/stream/postgres.sql");
+        // Not the empty path — the false-pass that made this a data-integrity bug
+        // rather than a cosmetic one.
+        assert!(!id.source_path.is_empty());
+        assert_eq!(id.username, "pg");
+        assert_eq!(id.hostname, "db");
     }
 }

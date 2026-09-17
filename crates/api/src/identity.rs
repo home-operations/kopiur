@@ -89,16 +89,23 @@ pub struct IdentityInputs<'a> {
     pub labels: Option<&'a BTreeMap<String, String>>,
     /// The consumer's `metadata.annotations`, exposed to CEL as `annotations`.
     pub annotations: Option<&'a BTreeMap<String, String>>,
-    /// The PVC name backing `sourcePath`'s `/pvc/<name>` default. `None` for
-    /// surfaces without a single PVC (a non-PVC source like NFS, or a maintenance
-    /// identity). When set it takes precedence over [`Self::default_source_path`].
-    pub pvc_name: Option<&'a str>,
-    /// The `sourcePath` default for a non-PVC source (e.g. an NFS export's path),
-    /// used when there is no `pvc_name` and no override. `None` leaves `sourcePath`
-    /// unset (kopia's identity-only `username@hostname` form).
-    pub default_source_path: Option<&'a str>,
-    /// An explicit `sourcePathOverride` (ADR §3.3), which beats every default.
-    pub source_path_override: Option<&'a str>,
+    /// The kopia `sourcePath` to record, fully derived by the caller.
+    ///
+    /// Deliberately ONE field rather than the `pvc_name` / `default_source_path`
+    /// / `source_path_override` triple it replaces. Those three invited every
+    /// identity site to re-derive the path inline from a source's `pvc`/`nfs`,
+    /// and five of them therefore resolved a pathless identity for a `stream`
+    /// source while the backup side recorded `/stream/<fileName>` (#451). With
+    /// only the answer accepted here, a caller MUST go through
+    /// [`crate::expand::identity_source_path`] — the single derivation — so a new
+    /// source kind cannot silently resolve the wrong path at some sites and the
+    /// right one at others.
+    ///
+    /// `None` leaves `sourcePath` unset: kopia's identity-only
+    /// `username@hostname` form, which matches any path. Used by surfaces that
+    /// genuinely have no single source path (a maintenance identity, a selector
+    /// policy with no fan-out pin, a zero-source legacy policy).
+    pub source_path: Option<&'a str>,
 }
 
 /// Compile a CEL identity expression, enforcing the [`MAX_EXPR_LEN`] budget first.
@@ -199,9 +206,7 @@ pub fn validate_identity_expr(expr: &str) -> ValidationResult {
         defaults: Some(&trial_defaults),
         labels: Some(&labels),
         annotations: Some(&annotations),
-        pvc_name: None,
-        default_source_path: None,
-        source_path_override: None,
+        source_path: None,
     };
     let ctx = identity_context(&inputs);
     match program.execute(&ctx) {
@@ -251,9 +256,7 @@ pub fn validate_identity_expr(expr: &str) -> ValidationResult {
 ///     defaults: None,
 ///     labels: None,
 ///     annotations: None,
-///     pvc_name: Some("postgres-data"),
-///     default_source_path: None,
-///     source_path_override: None,
+///     source_path: Some("/pvc/postgres-data"),
 /// };
 /// let id = resolve_identity(&inputs).unwrap();
 /// assert_eq!(id.username, "postgres-data");
@@ -288,13 +291,7 @@ pub fn resolve_identity(inputs: &IdentityInputs<'_>) -> ValidationResult<Resolve
         },
     };
 
-    let source_path = match inputs.source_path_override {
-        Some(p) => Some(p.to_string()),
-        None => inputs
-            .pvc_name
-            .map(|n| format!("/pvc/{n}"))
-            .or_else(|| inputs.default_source_path.map(String::from)),
-    };
+    let source_path = inputs.source_path.map(String::from);
 
     // Shape-check the fully-resolved identity, regardless of where each component came
     // from (explicit override, CEL expression result, or the name/namespace/PVC
@@ -330,9 +327,7 @@ pub fn resolve_identity(inputs: &IdentityInputs<'_>) -> ValidationResult<Resolve
 ///     defaults: None,
 ///     labels: None,
 ///     annotations: None,
-///     pvc_name: None,
-///     default_source_path: None,
-///     source_path_override: None,
+///     source_path: None,
 /// };
 /// let id = resolve_identity(&inputs).unwrap();
 /// assert_eq!(id.source_path, None);
@@ -437,7 +432,7 @@ mod tests {
         ns: &'a str,
         overrides: Option<&'a Identity>,
         defaults: Option<&'a IdentityDefaults>,
-        pvc: Option<&'a str>,
+        source_path: Option<&'a str>,
     ) -> IdentityInputs<'a> {
         IdentityInputs {
             object_name: name,
@@ -446,9 +441,7 @@ mod tests {
             defaults,
             labels: None,
             annotations: None,
-            pvc_name: pvc,
-            default_source_path: None,
-            source_path_override: None,
+            source_path,
         }
     }
 
@@ -475,9 +468,10 @@ mod tests {
 
     #[test]
     fn nfs_source_uses_default_source_path() {
-        // No PVC, but an NFS export supplies the sourcePath default.
+        // No PVC, but an NFS export supplies the sourcePath (derived by
+        // `expand::identity_source_path` from the export path).
         let mut i = inputs("media", "default", None, None, None);
-        i.default_source_path = Some("/mnt/eros/Media");
+        i.source_path = Some("/mnt/eros/Media");
         let r = resolve_identity(&i).unwrap();
         assert_eq!(r.source_path.as_deref(), Some("/mnt/eros/Media"));
         assert_eq!(identity_string(&r), "media@default:/mnt/eros/Media");
@@ -485,9 +479,11 @@ mod tests {
 
     #[test]
     fn override_beats_default_source_path() {
+        // `sourcePathOverride` precedence now lives in
+        // `EffectiveSource::kopia_source_path`, which is what supplies this field —
+        // so the kernel simply records what it is handed.
         let mut i = inputs("media", "default", None, None, None);
-        i.default_source_path = Some("/mnt/eros/Media");
-        i.source_path_override = Some("/data");
+        i.source_path = Some("/data");
         let r = resolve_identity(&i).unwrap();
         assert_eq!(r.source_path.as_deref(), Some("/data"));
     }
@@ -499,7 +495,7 @@ mod tests {
             "billing",
             None,
             None,
-            Some("postgres-data"),
+            Some("/pvc/postgres-data"),
         ))
         .unwrap();
         assert_eq!(r.username, "postgres-data");
@@ -683,11 +679,22 @@ mod tests {
     }
 
     #[test]
-    fn source_path_override_beats_default() {
-        let mut i = inputs("cfg", "ns", None, None, Some("vol"));
-        i.source_path_override = Some("/data");
-        let r = resolve_identity(&i).unwrap();
-        assert_eq!(r.source_path.as_deref(), Some("/data"));
+    /// The kernel records `source_path` VERBATIM — it never re-derives, never
+    /// prepends `/pvc/`, never substitutes a default. That is the property that
+    /// lets `expand::identity_source_path` be the single derivation (#451): if the
+    /// kernel massaged the value, a stream path could still come out wrong here.
+    fn source_path_is_recorded_verbatim() {
+        for path in [
+            "/data",
+            "/pvc/vol",
+            "/stream/postgres.sql",
+            "/mnt/eros/Media",
+        ] {
+            let mut i = inputs("cfg", "ns", None, None, None);
+            i.source_path = Some(path);
+            let r = resolve_identity(&i).unwrap();
+            assert_eq!(r.source_path.as_deref(), Some(path));
+        }
     }
 
     #[test]
