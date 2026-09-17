@@ -2613,6 +2613,48 @@ async fn measure_maintenance(
     };
     MaintenanceObservations {
         reclaimed_bytes: kopiur_kopia::reclaimed_bytes_since(before, &after),
+        index_blob_count: recount_index_blobs(client).await,
+    }
+}
+
+/// How long the post-maintenance index-blob recount may take before it is
+/// abandoned.
+///
+/// `kopia index list` is a single blob-metadata LIST and normally takes
+/// milliseconds — but the repository this measurement is *for* is the unhealthy
+/// one with thousands of uncompacted index blobs, which is exactly where the
+/// call is slowest and where a wedged object store hangs it. The run has already
+/// succeeded by this point, so an explicit bound is what keeps a slow LIST from
+/// holding the Job open (and, past `activeDeadlineSeconds`, turning a completed
+/// maintenance into a Failed one the operator then retries).
+const INDEX_RECOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Re-count the repository's content-index blobs after a successful maintenance
+/// run, so the repository's `IndexBlobHealth` condition stops quoting a
+/// pre-compaction number (#458).
+///
+/// Best-effort in both directions — a kopia error and a timeout both degrade to
+/// `None` ("not recounted"), which leaves the repository's existing bootstrap
+/// observation standing rather than overwriting it with a guess.
+async fn recount_index_blobs(client: &KopiaClient) -> Option<i64> {
+    match tokio::time::timeout(INDEX_RECOUNT_TIMEOUT, client.index_blob_count()).await {
+        Ok(Ok(count)) => Some(count),
+        Ok(Err(e)) => {
+            warn!(
+                class = %e.class(),
+                "maintenance run succeeded but the post-run index-blob recount failed; \
+                 leaving the repository's previous count standing"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = INDEX_RECOUNT_TIMEOUT.as_secs(),
+                "maintenance run succeeded but the post-run index-blob recount timed out; \
+                 leaving the repository's previous count standing"
+            );
+            None
+        }
     }
 }
 
@@ -2764,7 +2806,13 @@ async fn run_maintenance_flow(
                 &maintenance_ran_body(op, &chrono::Utc::now(), &observations),
             )
             .await;
-            info!(?action, mode = ?op.mode, reclaimed_bytes = ?observations.reclaimed_bytes, "maintenance run succeeded");
+            info!(
+                ?action,
+                mode = ?op.mode,
+                reclaimed_bytes = ?observations.reclaimed_bytes,
+                index_blobs = ?observations.index_blob_count,
+                "maintenance run succeeded"
+            );
             Ok(())
         }
     }

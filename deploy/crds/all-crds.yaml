@@ -3853,6 +3853,21 @@ spec:
                     format: int64
                     nullable: true
                     type: integer
+                  indexBlobCountAt:
+                    description: |-
+                      RFC3339 instant [`Self::index_blob_count`] was observed.
+
+                      Distinct from [`Self::last_observed_at`] (the catalog scan's timestamp)
+                      and from `status.health.lastProbeAt` (the backend probe's): the index-blob
+                      count has its own writers, and this is what lets the reconciler decide
+                      whether a post-maintenance recount
+                      (`Maintenance.status.observedIndexBlobs`) is fresher than the bootstrap's
+                      own count. Without it the two observations were incomparable, so the
+                      `IndexBlobHealth` warning could only ever quote the bootstrap figure —
+                      which is pre-compaction, and stayed pre-compaction until the next
+                      bootstrap ran (#458).
+                    nullable: true
+                    type: string
                   lastObservedAt:
                     description: RFC 3339 timestamp these stats were last observed.
                     nullable: true
@@ -7823,6 +7838,21 @@ spec:
                     format: int64
                     nullable: true
                     type: integer
+                  indexBlobCountAt:
+                    description: |-
+                      RFC3339 instant [`Self::index_blob_count`] was observed.
+
+                      Distinct from [`Self::last_observed_at`] (the catalog scan's timestamp)
+                      and from `status.health.lastProbeAt` (the backend probe's): the index-blob
+                      count has its own writers, and this is what lets the reconciler decide
+                      whether a post-maintenance recount
+                      (`Maintenance.status.observedIndexBlobs`) is fresher than the bootstrap's
+                      own count. Without it the two observations were incomparable, so the
+                      `IndexBlobHealth` warning could only ever quote the bootstrap figure —
+                      which is pre-compaction, and stayed pre-compaction until the next
+                      bootstrap ran (#458).
+                    nullable: true
+                    type: string
                   lastObservedAt:
                     description: RFC 3339 timestamp these stats were last observed.
                     nullable: true
@@ -12465,6 +12495,23 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              observedIndexBlobs:
+                description: Content-index blob count re-counted right after the most recent successful run.
+                nullable: true
+                properties:
+                  count:
+                    default: 0
+                    description: Number of content-index blobs (`kopia index list`) after the run.
+                    format: int64
+                    type: integer
+                  observedAt:
+                    default: ''
+                    description: |-
+                      RFC3339 instant the recount was taken. What makes this observation
+                      comparable against the repository's own `storageStats.indexBlobCountAt`,
+                      so whichever is newer wins rather than whichever was written last.
+                    type: string
+                type: object
               ownership:
                 description: Current lease holder, if the lease has been claimed.
                 nullable: true

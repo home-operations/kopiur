@@ -1317,6 +1317,15 @@ async fn bootstrap_cluster_via_mover(
                                 .and_then(|fp| fp.active_deadline_seconds),
                         )
                     });
+                // The Job's own completion time is when its index-blob count
+                // was observed; fall back to now only if the apiserver recorded
+                // none (#458).
+                let index_blob_observed_at = job
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.completion_time.as_ref())
+                    .map(|t| t.0.to_string())
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
                 finalize_cluster_bootstrap(
                     ctx,
                     repo,
@@ -1329,6 +1338,7 @@ async fn bootstrap_cluster_via_mover(
                     job_deadline_secs,
                     probe_run,
                     seed_armed,
+                    &index_blob_observed_at,
                 )
                 .await
             }
@@ -1379,16 +1389,37 @@ async fn bootstrap_cluster_via_mover(
         // write from the FRESH conditions (no clobber, skipped when unchanged);
         // ensure_maintenance then builds on the folded array.
         let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
+        // Adopt a post-maintenance index-blob recount when it is fresher than
+        // this repository's own bootstrap observation (#458) — see the
+        // namespaced twin. `match_namespace` is `None` because a
+        // `ClusterRepository` is cluster-scoped; note the recount may be absent
+        // under a NAMESPACED install whose `spec.maintenance.namespace` puts the
+        // covering `Maintenance` outside the watched namespace, and absent must
+        // mean "leave the bootstrap count standing", never zero.
+        let fold = health::fold_index_blob_recount(
+            conditions,
+            fresh
+                .as_ref()
+                .and_then(|f| f.status.as_ref())
+                .and_then(|s| s.storage_stats.as_ref()),
+            io::observed_index_blobs(ctx, RepositoryKind::ClusterRepository, name, None)
+                .as_ref()
+                .map(|(count, observed_at)| (*count, observed_at.as_str())),
+            resolve_index_blob_warn_threshold(repo.spec.health.as_ref()),
+            repo.metadata.generation,
+        );
+        let conditions = fold.conditions;
+        let mut status_patch = serde_json::json!({ "conditions": conditions });
+        if let Some(stats) = fold.storage_stats {
+            status_patch["storageStats"] = stats;
+        }
         let current = fresh
             .as_ref()
             .and_then(|f| serde_json::to_value(&f.status).ok());
-        io::patch_status_if_changed(
-            api,
-            name,
-            current.as_ref(),
-            serde_json::json!({ "conditions": conditions }),
-        )
-        .await?;
+        io::patch_status_if_changed(api, name, current.as_ref(), status_patch).await?;
+        if let Some(w) = fold.event {
+            io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+        }
         ensure_cluster_maintenance(ctx, repo, name, api, &conditions).await;
         return Ok(Action::requeue(cluster_probe_aware_reconcile_interval(
             repo,
@@ -1929,6 +1960,11 @@ async fn finalize_cluster_bootstrap(
     // drives the mover-skew guard and the `Seeded` condition fold. See the
     // namespaced twin for why a pre-seed Job can never reach here mis-labelled.
     seed_armed: bool,
+    // When the Job that produced this result FINISHED — the instant its
+    // index-blob count was actually observed. Stable across the re-runs this arm
+    // makes while the finished Job lingers, which is what keeps a stale
+    // observation from outranking a fresher post-maintenance recount (#458).
+    index_blob_observed_at: &str,
 ) -> Result<Action> {
     let result = read_cluster_bootstrap_result(ctx, job_ns, job_name).await?;
 
@@ -1991,6 +2027,21 @@ async fn finalize_cluster_bootstrap(
         conditions = upd.conditions;
         index_blob_event = upd.event;
         storage_stats["indexBlobCount"] = serde_json::json!(count);
+        // `indexBlobCountAt` (#458): WHEN the count was observed, so the
+        // steady-state pass can tell whether a maintenance recount superseded
+        // it. The Job's completion time, NOT `now` — this arm re-runs on every
+        // reconcile while the finished Job lingers, and re-stamping the same
+        // Job's observation as "just now" would let a stale count outrank a
+        // fresher recount taken after compaction.
+        let prior = health::prior_index_blob_observation(
+            repo.status.as_ref().and_then(|s| s.storage_stats.as_ref()),
+        );
+        storage_stats["indexBlobCountAt"] = serde_json::json!(health::index_blob_count_stamp(
+            prior.map(|(c, _)| c),
+            prior.and_then(|(_, at)| at),
+            count,
+            index_blob_observed_at,
+        ));
     }
     // Unified success fold (#345): ANY successful finalize — probe or strict —
     // is a fresh backend verdict, so fold probe-success health (stamp

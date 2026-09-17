@@ -1062,6 +1062,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`) observed at the last bootstrap. |
+| `indexBlobCountAt` | string | — | RFC3339 instant `Self::index_blob_count` was observed.<br>Distinct from `Self::last_observed_at` (the catalog scan's timestamp) and from `status.health.lastProbeAt` (the backend probe's): the index-blob count has its own writers, and this is what lets the reconciler decide whether a post-maintenance recount (`Maintenance.status.observedIndexBlobs`) is fresher than the bootstrap's own count. Without it the two observations were incomparable, so the `IndexBlobHealth` warning could only ever quote the bootstrap figure — which is pre-compaction, and stayed pre-compaction until the next bootstrap ran (#458). |
 | `lastObservedAt` | string | — | RFC 3339 timestamp these stats were last observed. |
 | `snapshotCount` | integer | — | Total snapshots present in the repository (across all identities). |
 | `totalSize` | string | — | Human-readable total on-disk size (e.g. `412Gi`). |
@@ -2132,6 +2133,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`) observed at the last bootstrap. |
+| `indexBlobCountAt` | string | — | RFC3339 instant `Self::index_blob_count` was observed.<br>Distinct from `Self::last_observed_at` (the catalog scan's timestamp) and from `status.health.lastProbeAt` (the backend probe's): the index-blob count has its own writers, and this is what lets the reconciler decide whether a post-maintenance recount (`Maintenance.status.observedIndexBlobs`) is fresher than the bootstrap's own count. Without it the two observations were incomparable, so the `IndexBlobHealth` warning could only ever quote the bootstrap figure — which is pre-compaction, and stayed pre-compaction until the next bootstrap ran (#458). |
 | `lastObservedAt` | string | — | RFC 3339 timestamp these stats were last observed. |
 | `snapshotCount` | integer | — | Total snapshots present in the repository (across all identities). |
 | `totalSize` | string | — | Human-readable total on-disk size (e.g. `412Gi`). |
@@ -3366,6 +3368,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `full` | [object](#maintenance-status-full) | — | Last/next-run state for the full maintenance schedule. |
 | `manualRun` | [object](#maintenance-status-manualrun) | — | State of the most recent annotation-requested out-of-band run; absent until one is requested. |
 | `observedGeneration` | integer | — | The `metadata.generation` this status reflects, for staleness detection. |
+| `observedIndexBlobs` | [object](#maintenance-status-observedindexblobs) | — | Content-index blob count re-counted right after the most recent successful run. |
 | `ownership` | [object](#maintenance-status-ownership) | — | Current lease holder, if the lease has been claimed. |
 | `quick` | [object](#maintenance-status-quick) | — | Last/next-run state for the quick maintenance schedule. |
 
@@ -3398,6 +3401,13 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `mode` | enum: quick \| full | — | Which maintenance kind a manual (annotation-requested) run performs; the wire values are the `run-mode` annotation values. Defaults to `quick`. |
 | `phase` | enum: Running \| Succeeded \| Failed | — | Lifecycle of a manual run. Closed enum. |
 | `requestedAt` | string | — | The `run-requested` annotation value this status reflects (RFC3339). |
+
+#### `status.observedIndexBlobs` { #maintenance-status-observedindexblobs }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `count` | integer | `0` | Number of content-index blobs (`kopia index list`) after the run. |
+| `observedAt` | string | `` | RFC3339 instant the recount was taken. What makes this observation comparable against the repository's own `storageStats.indexBlobCountAt`, so whichever is newer wins rather than whichever was written last. |
 
 #### `status.ownership` { #maintenance-status-ownership }
 

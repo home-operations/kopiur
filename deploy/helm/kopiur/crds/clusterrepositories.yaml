@@ -3917,6 +3917,21 @@ spec:
                     format: int64
                     nullable: true
                     type: integer
+                  indexBlobCountAt:
+                    description: |-
+                      RFC3339 instant [`Self::index_blob_count`] was observed.
+
+                      Distinct from [`Self::last_observed_at`] (the catalog scan's timestamp)
+                      and from `status.health.lastProbeAt` (the backend probe's): the index-blob
+                      count has its own writers, and this is what lets the reconciler decide
+                      whether a post-maintenance recount
+                      (`Maintenance.status.observedIndexBlobs`) is fresher than the bootstrap's
+                      own count. Without it the two observations were incomparable, so the
+                      `IndexBlobHealth` warning could only ever quote the bootstrap figure —
+                      which is pre-compaction, and stayed pre-compaction until the next
+                      bootstrap ran (#458).
+                    nullable: true
+                    type: string
                   lastObservedAt:
                     description: RFC 3339 timestamp these stats were last observed.
                     nullable: true

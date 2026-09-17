@@ -777,6 +777,12 @@ pub struct MaintenanceObservations {
     /// `kopia maintenance info` run-history delta
     /// ([`kopiur_kopia::reclaimed_bytes_since`]).
     pub reclaimed_bytes: Option<i64>,
+    /// Content-index blob count re-counted after the run (`kopia index list`).
+    ///
+    /// The repository reconcilers adopt this when it is newer than their own
+    /// bootstrap observation, so the `IndexBlobHealth` warning stops quoting a
+    /// pre-compaction number (#458).
+    pub index_blob_count: Option<i64>,
 }
 
 /// `{ "status": ... }` body for a successful maintenance run. A full run also
@@ -804,6 +810,15 @@ pub fn maintenance_ran_body(
         "ownership": { "owner": op.owner, "claimedAt": ts },
         "conditions": [lease_condition_body("True", "LeaseClaimed", "maintenance lease claimed", now)],
     });
+    // The recount is mode-independent — it describes the repository, not this
+    // run's kind — so it sits at the top of the status rather than inside the
+    // per-mode block, and carries its own timestamp so the repository
+    // reconcilers can tell it apart from their own (older) bootstrap
+    // observation. Omitted entirely when the recount did not complete: a `0`
+    // here would read as a perfectly healthy index.
+    if let Some(count) = obs.index_blob_count {
+        status["observedIndexBlobs"] = serde_json::json!({ "count": count, "observedAt": ts });
+    }
     match op.mode {
         MaintenanceMode::Quick => {
             status["quick"] = ran;
@@ -1753,6 +1768,7 @@ mod tests {
             &now,
             &MaintenanceObservations {
                 reclaimed_bytes: Some(4096),
+                index_blob_count: None,
             },
         );
         assert!(body["status"]["quick"]["lastRunAt"].is_string());
@@ -1793,6 +1809,7 @@ mod tests {
             &now,
             &MaintenanceObservations {
                 reclaimed_bytes: Some(3_900_000_000),
+                index_blob_count: None,
             },
         );
         assert_eq!(
@@ -1837,6 +1854,54 @@ mod tests {
         }
     }
 
+    /// #458: the post-run index-blob recount rides the same body, at the TOP of
+    /// the status (it describes the repository, not the run's kind) and with its
+    /// own timestamp so the repository reconcilers can compare it against their
+    /// bootstrap observation.
+    #[test]
+    fn ran_body_carries_the_index_blob_recount_with_its_own_timestamp() {
+        let now = ts();
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Full),
+            &now,
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(1),
+                index_blob_count: Some(312),
+            },
+        );
+        assert_eq!(body["status"]["observedIndexBlobs"]["count"], 312);
+        assert_eq!(
+            body["status"]["observedIndexBlobs"]["observedAt"],
+            now.to_rfc3339()
+        );
+        // It is NOT nested under the per-mode blocks: a quick and a full run
+        // observe the same repository.
+        assert!(body["status"]["full"].get("observedIndexBlobs").is_none());
+        assert!(body["status"]["quick"].get("observedIndexBlobs").is_none());
+    }
+
+    /// A recount that timed out or failed must leave the key absent — `0` would
+    /// read as a perfectly healthy index and silently clear a real warning.
+    #[test]
+    fn unmeasured_recount_omits_observed_index_blobs() {
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Quick),
+            &ts(),
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(0),
+                index_blob_count: None,
+            },
+        );
+        assert!(
+            body["status"]
+                .as_object()
+                .expect("status")
+                .get("observedIndexBlobs")
+                .is_none(),
+            "an unmeasured recount must not publish a zero count"
+        );
+    }
+
     /// A measured zero is a real observation and must be reported as `0`, which
     /// is exactly why `None` may not also be written as `0`.
     #[test]
@@ -1846,6 +1911,7 @@ mod tests {
             &chrono::Utc::now(),
             &MaintenanceObservations {
                 reclaimed_bytes: Some(0),
+                index_blob_count: None,
             },
         );
         assert_eq!(body["status"]["quick"]["lastContentReclaimedBytes"], 0);

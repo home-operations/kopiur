@@ -679,6 +679,23 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              observedIndexBlobs:
+                description: Content-index blob count re-counted right after the most recent successful run.
+                nullable: true
+                properties:
+                  count:
+                    default: 0
+                    description: Number of content-index blobs (`kopia index list`) after the run.
+                    format: int64
+                    type: integer
+                  observedAt:
+                    default: ''
+                    description: |-
+                      RFC3339 instant the recount was taken. What makes this observation
+                      comparable against the repository's own `storageStats.indexBlobCountAt`,
+                      so whichever is newer wins rather than whichever was written last.
+                    type: string
+                type: object
               ownership:
                 description: Current lease holder, if the lease has been claimed.
                 nullable: true

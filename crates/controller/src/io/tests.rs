@@ -1549,6 +1549,7 @@ fn repo_status_to_inputs_maps_fields_and_sentinels() {
         total_size_bytes: Some(4096),
         last_observed_at: None,
         index_blob_count: Some(3),
+        index_blob_count_at: None,
     };
     let health = RepositoryHealthStatus {
         last_healthy_at: Some("2026-01-01T00:00:00Z".into()),

@@ -585,7 +585,23 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 conditions = upd.conditions;
                 index_blob_event = upd.event;
                 status_patch["conditions"] = serde_json::to_value(&conditions).unwrap_or_default();
-                status_patch["storageStats"] = serde_json::json!({ "indexBlobCount": count });
+                // Stamp WHEN the count was observed, so a post-maintenance
+                // recount can be compared against it (#458). Via
+                // `index_blob_count_stamp`, because this arm re-counts on every
+                // reconcile and minting a fresh `now` each time would make the
+                // status always-changed and this reconcile a hot loop.
+                let prior = health::prior_index_blob_observation(
+                    repo.status.as_ref().and_then(|s| s.storage_stats.as_ref()),
+                );
+                status_patch["storageStats"] = serde_json::json!({
+                    "indexBlobCount": count,
+                    "indexBlobCountAt": health::index_blob_count_stamp(
+                        prior.map(|(c, _)| c),
+                        prior.and_then(|(_, at)| at),
+                        count,
+                        &chrono::Utc::now().to_rfc3339(),
+                    ),
+                });
             }
             // Record a `Snapshot`'s reverify nudge as honored. Unlike the mover
             // bootstrap path, this in-process arm re-probes on every reconcile (the
@@ -1290,6 +1306,15 @@ async fn bootstrap_via_mover(
                                 .and_then(|fp| fp.active_deadline_seconds),
                         )
                     });
+                // The Job's own completion time is when its index-blob count
+                // was observed; fall back to now only if the apiserver recorded
+                // none (#458).
+                let index_blob_observed_at = job
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.completion_time.as_ref())
+                    .map(|t| t.0.to_string())
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
                 finalize_bootstrap(
                     ctx,
                     repo,
@@ -1303,6 +1328,7 @@ async fn bootstrap_via_mover(
                     job_deadline_secs,
                     probe_run,
                     seed_armed,
+                    &index_blob_observed_at,
                 )
                 .await
             }
@@ -1350,16 +1376,40 @@ async fn bootstrap_via_mover(
         // of them (no clobber) and is skipped when unchanged; ensure_maintenance
         // then builds on the folded array.
         let conditions = fold_mass_deletion(ctx, repo, &conditions).await;
+        // Adopt a post-maintenance index-blob recount when it is fresher than
+        // this repository's own bootstrap observation (#458). Without it the
+        // `IndexBlobHealth` warning quotes a PRE-compaction count until the next
+        // bootstrap Job happens to run — a day later on the catalog cadence — so
+        // the repository reads "8000 index blobs, maintenance is not compacting
+        // them" long after maintenance compacted it to a few hundred. Folded
+        // into the SAME conditions array and the SAME guarded patch, because a
+        // conditions write replaces the whole array. The Maintenance watch this
+        // reconcile already has is what delivers the recount; nothing new is
+        // needed to notice it.
+        let fold = health::fold_index_blob_recount(
+            conditions,
+            fresh
+                .as_ref()
+                .and_then(|f| f.status.as_ref())
+                .and_then(|s| s.storage_stats.as_ref()),
+            io::observed_index_blobs(ctx, RepositoryKind::Repository, name, Some(namespace))
+                .as_ref()
+                .map(|(count, observed_at)| (*count, observed_at.as_str())),
+            resolve_index_blob_warn_threshold(repo.spec.health.as_ref()),
+            repo.metadata.generation,
+        );
+        let conditions = fold.conditions;
+        let mut status_patch = serde_json::json!({ "conditions": conditions });
+        if let Some(stats) = fold.storage_stats {
+            status_patch["storageStats"] = stats;
+        }
         let current = fresh
             .as_ref()
             .and_then(|f| serde_json::to_value(&f.status).ok());
-        io::patch_status_if_changed(
-            api,
-            name,
-            current.as_ref(),
-            serde_json::json!({ "conditions": conditions }),
-        )
-        .await?;
+        io::patch_status_if_changed(api, name, current.as_ref(), status_patch).await?;
+        if let Some(w) = fold.event {
+            io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
+        }
         ensure_repo_maintenance(ctx, repo, namespace, name, api, &conditions).await;
         return Ok(Action::requeue(probe_aware_reconcile_interval(repo)));
     }
@@ -2122,6 +2172,11 @@ async fn finalize_bootstrap(
     // `metadata.generation`, and `stale_bootstrap_job` recycles a terminal Job
     // stamped with an older one before its result is ever read.
     seed_armed: bool,
+    // When the Job that produced this result FINISHED — the instant its
+    // index-blob count was actually observed. Stable across the re-runs this
+    // arm makes while the finished Job lingers, which is what keeps a stale
+    // observation from outranking a fresher post-maintenance recount (#458).
+    index_blob_observed_at: &str,
 ) -> Result<Action> {
     let result = read_bootstrap_result(ctx, namespace, job_name).await?;
 
@@ -2223,7 +2278,24 @@ async fn finalize_bootstrap(
         conditions = upd.conditions;
         index_blob_event = upd.event;
         // Merge-patch: setting storageStats.indexBlobCount preserves snapshotCount.
-        status_patch["storageStats"] = serde_json::json!({ "indexBlobCount": count });
+        // `indexBlobCountAt` (#458) records WHEN the count was observed, so the
+        // steady-state pass can tell whether a maintenance recount superseded
+        // it. It is the Job's completion time, NOT `now`: this arm re-runs on
+        // every reconcile while the finished Job lingers, and re-stamping the
+        // same Job's observation as "just now" would let a stale count outrank
+        // a genuinely fresher recount taken after compaction.
+        let prior = health::prior_index_blob_observation(
+            repo.status.as_ref().and_then(|s| s.storage_stats.as_ref()),
+        );
+        status_patch["storageStats"] = serde_json::json!({
+            "indexBlobCount": count,
+            "indexBlobCountAt": health::index_blob_count_stamp(
+                prior.map(|(c, _)| c),
+                prior.and_then(|(_, at)| at),
+                count,
+                index_blob_observed_at,
+            ),
+        });
     }
     // Unified success fold (#345): ANY successful finalize — probe or strict —
     // is a fresh backend verdict, so fold probe-success health (stamp
