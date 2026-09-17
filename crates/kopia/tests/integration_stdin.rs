@@ -364,3 +364,82 @@ async fn show_to_streams_bytes_and_fails_loudly_on_a_bad_object() {
         .expect_err("a missing entry must fail");
     assert!(empty.is_empty());
 }
+
+/// **The item-10 question, answered by reality rather than by reasoning**: does
+/// `kopia snapshot restore <id> <dir>` materialise a stdin-created snapshot's
+/// single virtual file on disk?
+///
+/// It decides whether DEEP verification (`verification.deep`, which
+/// scratch-restores the latest snapshot into an ephemeral volume and optionally
+/// evaluates a CEL `successExpr` over the result) can work at all for a stream
+/// policy. If the restore produced nothing, a deep verify would "pass" over an
+/// empty directory — a false green — and admission would have to reject
+/// `verification.deep` on a stream policy instead.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn a_stdin_snapshot_restores_its_virtual_file_to_a_directory() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    let payload = b"-- pg_dumpall output\nCREATE DATABASE app;\n".to_vec();
+    let expected = payload.clone();
+    let outcome = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/postgres.sql",
+                stdin_file: "postgres.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("pg@db:/stream/postgres.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            async |stdin: &mut tokio::process::ChildStdin| {
+                stdin.write_all(&payload).await.expect("write");
+                Ok(StdinOutcome::Commit {
+                    bytes: payload.len() as u64,
+                })
+            },
+        )
+        .await
+        .expect("snapshot");
+    let id = match outcome {
+        SnapshotCreateOutcome::Created(r) => r.id.clone(),
+        SnapshotCreateOutcome::Unchanged => panic!("never unchanged"),
+    };
+
+    let into = tempfile::tempdir().unwrap();
+    let target = into.path().join("restored");
+    client
+        .snapshot_restore_with(&id, &target.to_string_lossy(), &Default::default())
+        .await
+        .expect("restoring a stdin snapshot into a directory must succeed");
+
+    // The virtual directory's single entry lands as a real file named after
+    // `--stdin-file`, so a deep verify has something to look at.
+    let file = target.join("postgres.sql");
+    assert!(
+        file.is_file(),
+        "expected {} to exist; directory holds {:?}",
+        file.display(),
+        std::fs::read_dir(&target)
+            .map(|rd| rd
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("read the restored file"),
+        expected,
+        "the restored bytes must be what was streamed in"
+    );
+    // The mover's deep tier counts what the scratch-restore produced and exposes it
+    // to a CEL `successExpr` as `restored.files`. Exactly one file means a
+    // `restored.files > 0` expression is meaningful rather than vacuously false —
+    // which is what makes `verification.deep` usable on a stream policy at all.
+    let entries: Vec<_> = std::fs::read_dir(&target)
+        .expect("read the restore dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1, "expected exactly one restored entry");
+}

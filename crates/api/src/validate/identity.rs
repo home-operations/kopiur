@@ -410,6 +410,32 @@ fn selector_source_strategies(spec: &SnapshotPolicySpec) -> BTreeMap<usize, &'st
         .collect()
 }
 
+/// The kopia path each `stream` source records, keyed by position.
+///
+/// Keyed by INDEX, like [`selector_source_strategies`] and for the same reason: a
+/// stream source has no PVC name to key on. Unlike a selector, though, its path
+/// is not a shape — it IS the identity: a `stream` source records
+/// `/stream/<fileName>` (or its `sourcePathOverride`), and renaming `fileName`
+/// rewrites that path, re-identifying the source and orphaning every manifest it
+/// has ever taken. That is precisely the fork this guard exists to catch, and it
+/// was uncovered while `stream` was new: `pvc_source_effective_path` returns
+/// `None` for a source with no `pvc`, so a `fileName` rename passed admission
+/// silently and the next backup started a fresh history under the new path while
+/// the old one aged out under retention.
+///
+/// Routed through [`crate::expand::source_kopia_path`] — the one derivation every
+/// identity site uses — so the guard keys on exactly the string the backup
+/// records. The namespace it takes is inert for a stream source (it only shapes a
+/// PVC path), hence the empty argument.
+fn stream_source_paths(spec: &SnapshotPolicySpec) -> BTreeMap<usize, String> {
+    spec.sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.stream.is_some())
+        .filter_map(|(i, s)| crate::expand::source_kopia_path(s, i, "").map(|p| (i, p)))
+        .collect()
+}
+
 /// Pure decision for the fork-on-edit guard on a per-source path change. A PVC's kopia
 /// source path is part of its identity, so changing `sourcePathOverride` on a PVC that
 /// already has history orphans that PVC's snapshots exactly as a username/hostname
@@ -452,6 +478,22 @@ pub fn detect_source_path_fork(
             return Some(ValidationError::IdentityWouldFork {
                 old: (*old_shape).to_string(),
                 new: new_shape.to_string(),
+            });
+        }
+    }
+    // And for `stream` sources, where the path IS the identity: renaming
+    // `fileName` (or setting/changing `sourcePathOverride`) moves the source from
+    // `/stream/<old>` to `/stream/<new>`, so the next backup starts a fresh
+    // history while the old one silently ages out under retention. Keyed by
+    // position because a stream source has no PVC name to match across the edit.
+    let old_streams = stream_source_paths(old);
+    for (index, new_path) in stream_source_paths(new) {
+        if let Some(old_path) = old_streams.get(&index)
+            && *old_path != new_path
+        {
+            return Some(ValidationError::IdentityWouldFork {
+                old: old_path.clone(),
+                new: new_path,
             });
         }
     }

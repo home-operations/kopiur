@@ -7779,3 +7779,121 @@ sources:
         "expected an only-source rejection, got {errs:?}"
     );
 }
+
+/// A `stream` source's kopia path IS its identity, so renaming `fileName` forks
+/// it exactly as changing a PVC's `sourcePathOverride` forks that PVC (#451).
+///
+/// This was uncovered: `pvc_source_effective_path` returns `None` for a source
+/// with no `pvc`, so a `fileName` rename passed admission silently and the next
+/// backup started a fresh history under `/stream/<new>` while the old
+/// `/stream/<old>` aged out under retention — the same orphan-every-manifest
+/// outcome the guard exists to prevent, with no warning and no ack.
+#[test]
+fn source_path_fork_catches_a_renamed_stream_file() {
+    let mk = |file: &str, path_override: Option<&str>| -> SnapshotPolicySpec {
+        let mut s: SnapshotPolicySpec = crate::testutil::from_yaml(&format!(
+            r#"
+repository: {{ kind: Repository, name: r }}
+sources:
+  - stream:
+      fileName: {file}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: postgres }} }}
+        command: ["sh", "-ec", "pg_dumpall"]
+    readOnly: true
+    sourcePathStrategy: PvcName
+"#
+        ));
+        s.sources[0].source_path_override = path_override.map(String::from);
+        s
+    };
+
+    // `postgres.sql` → `pg.sql`: /stream/postgres.sql → /stream/pg.sql ⇒ fork.
+    let old = mk("postgres.sql", None);
+    let new = mk("pg.sql", None);
+    let err = detect_source_path_fork(&old, &new, true, false)
+        .expect("renaming a stream fileName must trip IdentityWouldFork");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/stream/postgres.sql");
+            assert_eq!(new, "/stream/pg.sql");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+
+    // The escape hatches behave exactly as they do for a PVC source.
+    assert!(
+        detect_source_path_fork(&old, &new, true, true).is_none(),
+        "the allow-identity-change ack must release it"
+    );
+    assert!(
+        detect_source_path_fork(&old, &new, false, false).is_none(),
+        "no history means nothing to orphan"
+    );
+    assert!(
+        detect_source_path_fork(&old, &mk("postgres.sql", None), true, false).is_none(),
+        "an unchanged fileName is not a fork"
+    );
+
+    // Adding a `sourcePathOverride` moves the recorded path too, so it forks.
+    assert!(
+        detect_source_path_fork(&old, &mk("postgres.sql", Some("/dumps/pg")), true, false)
+            .is_some(),
+        "overriding a stream source's path re-identifies it"
+    );
+    // ...and removing it forks back.
+    assert!(
+        detect_source_path_fork(&mk("postgres.sql", Some("/dumps/pg")), &old, true, false)
+            .is_some()
+    );
+}
+
+/// Keyed by POSITION, because a stream source has no PVC name to match across an
+/// edit. Two stream sources swapping places therefore fork — correctly: each
+/// index's recorded path changed, and index is what
+/// `Snapshot.spec.source.sourceIndex` pins.
+#[test]
+fn stream_source_forks_are_keyed_by_position() {
+    let two = |a: &str, b: &str| -> SnapshotPolicySpec {
+        crate::testutil::from_yaml(&format!(
+            r#"
+repository: {{ kind: Repository, name: r }}
+sources:
+  - stream:
+      fileName: {a}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: a }} }}
+        command: ["a"]
+  - stream:
+      fileName: {b}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: b }} }}
+        command: ["b"]
+"#
+        ))
+    };
+    // Same set, different order ⇒ both indices' paths changed ⇒ fork.
+    assert!(
+        detect_source_path_fork(&two("a.sql", "b.sql"), &two("b.sql", "a.sql"), true, false)
+            .is_some()
+    );
+    // Identical ⇒ no fork.
+    assert!(
+        detect_source_path_fork(&two("a.sql", "b.sql"), &two("a.sql", "b.sql"), true, false)
+            .is_none()
+    );
+    // A source APPENDED at a new index has no old baseline, so it never forks —
+    // same rule the selector guard uses.
+    let one: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - stream:
+      fileName: a.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: a } }
+        command: ["a"]
+"#,
+    );
+    assert!(detect_source_path_fork(&one, &two("a.sql", "b.sql"), true, false).is_none());
+}

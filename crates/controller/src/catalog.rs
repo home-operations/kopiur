@@ -3288,4 +3288,78 @@ mod tests {
         got.sort();
         assert_eq!(got, vec!["a2", "a3"]);
     }
+
+    // --- a `/stream/...` discovered entry (#451) -----------------------------
+
+    /// The catalog must treat a streamed artifact as its own identity, keyed on
+    /// the `/stream/<fileName>` path the backup recorded.
+    ///
+    /// Two stream policies in one namespace share `username@hostname` and differ
+    /// ONLY in that path, so if the path did not participate in
+    /// [`identity_key`] they would collapse into one identity: `perIdentity`
+    /// retention would count them together and expire one policy's history to
+    /// make room for the other's. This is the catalog-side half of the identity
+    /// fix — the policy side now resolves the same path, which is what makes such
+    /// an entry adoptable at all (`adoption::tests`).
+    #[test]
+    fn stream_entries_are_distinct_identities_keyed_by_their_file() {
+        let pg = entry("kpg", ("shared", "db", "/stream/postgres.sql"), t(10));
+        let my = entry("kmy", ("shared", "db", "/stream/mysql.sql"), t(9));
+        assert_ne!(
+            identity_key(&pg.source),
+            identity_key(&my.source),
+            "two streamed artifacts under one user@host must not share an identity"
+        );
+        // And neither collides with a volume backup by the same policy identity.
+        let vol = entry("kvol", ("shared", "db", "/pvc/data"), t(8));
+        assert_ne!(identity_key(&pg.source), identity_key(&vol.source));
+
+        // `perIdentity: 1` keeps ONE per identity, so all three survive — before
+        // the identity carried a path they would have been one bucket and two of
+        // the three would have been dropped from the catalog.
+        let listing = vec![pg, my, vol];
+        let plan = plan_catalog(
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            false,
+            Some(&CatalogRetain {
+                per_identity: Some(1),
+                max_age_days: None,
+            }),
+            Utc::now(),
+        );
+        let mut created = ids(&plan);
+        created.sort_unstable();
+        assert_eq!(created, vec!["kmy", "kpg", "kvol"]);
+    }
+
+    /// A discovered stream entry survives a second scan as an EXISTING row rather
+    /// than being re-created or expired — the ordinary catalog convergence, pinned
+    /// for the `/stream/...` path because that path is new and every identity
+    /// comparison in the scan is string equality.
+    #[test]
+    fn a_discovered_stream_row_converges_across_scans() {
+        let listed = entry("kpg", ("shared", "db", "/stream/postgres.sql"), t(10));
+        let listing = vec![listed.clone()];
+        let existing = vec![row("pol-adopted-kpg", "kpg", Some(t(10)))];
+        let plan = plan_catalog(
+            &existing,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            false,
+            None,
+            Utc::now(),
+        );
+        assert!(
+            ids(&plan).is_empty(),
+            "an already-materialized stream row must not be re-created"
+        );
+        assert!(
+            expired(&plan).is_empty(),
+            "a stream row still present in the repository must not be expired"
+        );
+    }
 }

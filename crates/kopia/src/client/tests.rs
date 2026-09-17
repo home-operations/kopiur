@@ -1846,3 +1846,70 @@ fn the_stdin_finalize_budget_is_never_unbounded() {
     );
     assert!(crate::client::STDIN_FINALIZE_GRACE > Duration::ZERO);
 }
+
+/// The "an empty dump is a failure" rule, as a pure decision (#451).
+///
+/// It lives in `classify_fed` rather than in each producer so there is exactly
+/// one place that can get it wrong, and so it is assertable without spawning
+/// kopia. A producer that exits 0 having written nothing almost certainly failed
+/// and its exit status cannot be trusted to say so: `pg_dump` exits 0 against an
+/// instance whose credentials see no databases, and `sh -c 'a | b'` reports only
+/// `b`'s status.
+#[test]
+fn a_zero_byte_commit_is_classified_as_an_abort() {
+    use crate::client::{AbortReason, FedVerdict, classify_fed};
+
+    // Zero bytes reported as SUCCESS ⇒ abort, with its own named reason.
+    match classify_fed(Ok(StdinOutcome::Commit { bytes: 0 })) {
+        FedVerdict::Abort(AbortReason::WroteNothing) => {}
+        other => panic!("a zero-byte commit must abort, got {other:?}"),
+    }
+    // One byte is enough to be a real dump — the rule is emptiness, not size.
+    match classify_fed(Ok(StdinOutcome::Commit { bytes: 1 })) {
+        FedVerdict::Commit { bytes: 1 } => {}
+        other => panic!("a non-empty commit must commit, got {other:?}"),
+    }
+    // An explicit producer failure keeps its own reason, distinct from emptiness:
+    // the two produce different messages and an operator needs to tell them apart.
+    match classify_fed(Ok(StdinOutcome::Abort)) {
+        FedVerdict::Abort(AbortReason::ProducerFailed) => {}
+        other => panic!("an explicit abort must stay ProducerFailed, got {other:?}"),
+    }
+    // The producer's own error is returned VERBATIM — kopia's stderr would only
+    // describe the kill the runner just performed, not the cause.
+    let cause = KopiaError::EmptyOutput {
+        context: "synthetic".into(),
+        stderr_tail: String::new(),
+    };
+    match classify_fed(Err(cause)) {
+        FedVerdict::Abort(reason) => {
+            let err = reason.into_error("snapshot create".into(), "kopia was killed");
+            assert!(
+                matches!(err, KopiaError::EmptyOutput { .. }),
+                "the producer's error must survive, got {err:?}"
+            );
+        }
+        other => panic!("a producer error must abort, got {other:?}"),
+    }
+}
+
+/// Both abort reasons classify TERMINAL (`Unknown` ⇒ not retryable), so a Job's
+/// `backoffLimit` never re-execs the same broken command against the user's
+/// database.
+#[test]
+fn both_stdin_abort_reasons_are_non_retryable() {
+    use crate::client::{FedVerdict, classify_fed};
+    for fed in [
+        Ok(StdinOutcome::Commit { bytes: 0 }),
+        Ok(StdinOutcome::Abort),
+    ] {
+        let FedVerdict::Abort(reason) = classify_fed(fed) else {
+            panic!("both must abort");
+        };
+        let err = reason.into_error("snapshot create".into(), "");
+        assert!(
+            !err.class().is_retryable(),
+            "a failed stdin producer must not be retried: {err}"
+        );
+    }
+}

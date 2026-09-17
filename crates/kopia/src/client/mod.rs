@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::error::{KopiaError, KopiaErrorClass, tail_lines};
 use crate::model::{
@@ -1126,6 +1127,117 @@ pub enum StdinOutcome {
     Abort,
 }
 
+/// What the runner does with a `feed` result: commit the snapshot, or abort it.
+///
+/// Separated from [`StdinOutcome`] because they answer different questions.
+/// `StdinOutcome` is what the PRODUCER reports; this is what the RUNNER decides,
+/// and the two differ in exactly one case that matters — a producer that reported
+/// success having written zero bytes.
+#[derive(Debug)]
+enum FedVerdict {
+    /// Close the writer and let kopia finalize.
+    Commit {
+        /// Bytes the producer moved (logged; the emptiness decision already happened).
+        bytes: u64,
+    },
+    /// Kill kopia with stdin still open, then fail with this reason's error.
+    Abort(AbortReason),
+}
+
+/// Why a stdin-fed run is being aborted. Carries everything needed to build the
+/// error EXCEPT kopia's stderr, which is only available after the kill.
+#[derive(Debug)]
+enum AbortReason {
+    /// The producer reported failure ([`StdinOutcome::Abort`]).
+    ProducerFailed,
+    /// The producer reported success but wrote NOTHING.
+    WroteNothing,
+    /// The producer's own error, returned verbatim.
+    ProducerError(KopiaError),
+}
+
+impl AbortReason {
+    /// The error this abort returns, given the drained kopia stderr.
+    fn into_error(self, args: String, stderr: &str) -> KopiaError {
+        match self {
+            AbortReason::ProducerFailed => KopiaError::StdinProducerFailed {
+                detail: "the stdin producer did not complete successfully; the kopia \
+                         snapshot was aborted before any manifest was written"
+                    .to_string(),
+                stderr_tail: tail_lines(stderr),
+            },
+            AbortReason::WroteNothing => KopiaError::StdinProducerWroteNothing {
+                args,
+                stderr_tail: tail_lines(stderr),
+            },
+            // The producer's error is the diagnosis; kopia's stderr would only
+            // describe the kill we just performed.
+            AbortReason::ProducerError(e) => e,
+        }
+    }
+}
+
+/// Turn a `feed` result into the runner's lifecycle decision. **Pure** and
+/// exhaustive, so the "an empty dump is a failure" rule lives in exactly one
+/// place and is unit-testable without spawning kopia.
+///
+/// The zero-byte arm is the deliberate one. A producer that exited 0 having
+/// written nothing almost certainly failed, and its exit status cannot be trusted
+/// to say so: `pg_dump` exits 0 against an instance whose credentials see no
+/// databases, `mysqldump` exits 0 with empty grants, and `sh -c 'a | b'` reports
+/// only `b`'s status. Committing would put a zero-byte "restore point" into the
+/// repository that retention keeps and a restore would write over a live database
+/// with.
+fn classify_fed(fed: Result<StdinOutcome, KopiaError>) -> FedVerdict {
+    match fed {
+        Ok(StdinOutcome::Commit { bytes: 0 }) => FedVerdict::Abort(AbortReason::WroteNothing),
+        Ok(StdinOutcome::Commit { bytes }) => FedVerdict::Commit { bytes },
+        Ok(StdinOutcome::Abort) => FedVerdict::Abort(AbortReason::ProducerFailed),
+        Err(e) => FedVerdict::Abort(AbortReason::ProducerError(e)),
+    }
+}
+
+/// The background stdout/stderr drains for a stdin-fed run.
+///
+/// Spawned as TASKS, not awaited alongside `feed` in a `join!`. Draining to EOF
+/// only completes when kopia EXITS, and kopia cannot exit until stdin closes —
+/// which happens after `feed` returns. Awaiting both together therefore
+/// deadlocks: `feed` finishes writing, the drain waits for an exit that waits for
+/// the close that waits for the drain. Spawning keeps the pipes flowing (so
+/// kopia's progress chatter never blocks its stdin read) while leaving the
+/// close/kill decision to the runner.
+struct StdioDrains {
+    out: tokio::task::JoinHandle<String>,
+    err: tokio::task::JoinHandle<String>,
+}
+
+impl StdioDrains {
+    /// Take `child`'s stdout/stderr pipes and start draining both.
+    fn spawn(child: &mut tokio::process::Child) -> Self {
+        fn drain(pipe: Option<impl AsyncReadExt + Unpin + Send + 'static>) -> JoinHandle<String> {
+            tokio::spawn(async move {
+                let mut buf = String::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_string(&mut buf).await;
+                }
+                buf
+            })
+        }
+        Self {
+            out: drain(child.stdout.take()),
+            err: drain(child.stderr.take()),
+        }
+    }
+
+    /// Await both drains, as `(stdout, stderr)`. A panicked drain yields an empty
+    /// string rather than failing the run: the run's own outcome is authoritative,
+    /// and losing a diagnostic must never turn a committed snapshot into an error.
+    async fn join(self) -> (String, String) {
+        let (out, err) = tokio::join!(self.out, self.err);
+        (out.unwrap_or_default(), err.unwrap_or_default())
+    }
+}
+
 /// Everything a stdin-fed snapshot needs except the producer itself.
 ///
 /// A named struct rather than six positional parameters, for one specific
@@ -1438,10 +1550,11 @@ impl KopiaClient {
         // producer's outcome. Keeping it here is what makes `Abort` able to kill kopia
         // with stdin still open. (Caught by
         // `integration_stdin::abort_after_full_payload_leaves_no_snapshot`.)
-        // `kill_and_reap` FIRST on this path: returning here with a live child and
-        // no writer leaves a kopia blocked forever on a `read(2)` of a pipe nobody
-        // will ever write to or close, holding a repository session open, until
-        // the mover pod is evicted. `?` on a `take()` is a zombie leak.
+        //
+        // `kill_and_reap` FIRST on the missing-pipe path: returning there with a live
+        // child and no writer leaves a kopia blocked forever on a `read(2)` of a pipe
+        // nobody will ever write to or close, holding a repository session open, until
+        // the mover pod is evicted. A bare `?` on a `take()` is a zombie leak.
         let mut stdin = match child.stdin.take() {
             Some(pipe) => pipe,
             None => {
@@ -1452,117 +1565,60 @@ impl KopiaClient {
                 });
             }
         };
+        let drains = StdioDrains::spawn(&mut child);
 
-        // Drain stdout/stderr in BACKGROUND TASKS, not alongside `feed` in a `join!`.
-        // Draining to EOF only completes when kopia EXITS, and kopia cannot exit until
-        // stdin closes — which happens after `feed` returns. Awaiting both together
-        // therefore deadlocks: `feed` finishes writing, the drain waits for an exit
-        // that waits for the close that waits for the drain. Spawning the drains keeps
-        // the pipes flowing (so kopia's progress chatter never blocks its stdin read)
-        // while leaving the close/kill decision to us.
-        let mut out = child.stdout.take();
-        let mut err = child.stderr.take();
-        let out_task = tokio::spawn(async move {
-            let mut so = String::new();
-            if let Some(o) = out.as_mut() {
-                let _ = o.read_to_string(&mut so).await;
-            }
-            so
-        });
-        let err_task = tokio::spawn(async move {
-            let mut se = String::new();
-            if let Some(e) = err.as_mut() {
-                let _ = e.read_to_string(&mut se).await;
-            }
-            se
-        });
-
-        let fed = feed(&mut stdin).await;
-
-        // Every abort arm has the SAME ordering, and the order is the safety
-        // property: kill the child while `stdin` is still alive, so kopia never
-        // reaches EOF and never writes a manifest; drop the writer only afterwards.
-        // Reversing the two would let kopia commit the partial snapshot in the
-        // window before the signal lands.
-        macro_rules! abort_holding_stdin {
-            () => {{
+        let bytes = match classify_fed(feed(&mut stdin).await) {
+            // ORDER IS THE SAFETY PROPERTY: kill the child while `stdin` is still
+            // alive, so kopia never reaches EOF and never writes a manifest; drop
+            // the writer only afterwards. Reversing the two would let kopia commit
+            // the partial snapshot in the window before the signal lands.
+            FedVerdict::Abort(reason) => {
                 kill_and_reap(&mut child).await;
                 drop(stdin);
-                let stderr = err_task.await.unwrap_or_default();
-                let _ = out_task.await;
-                stderr
-            }};
-        }
+                let stderr = drains.join().await.1;
+                return Err(reason.into_error(display_args, &stderr));
+            }
+            FedVerdict::Commit { bytes } => bytes,
+        };
 
-        match fed {
-            // A producer that exited 0 having written NOTHING. Deliberately an
-            // abort, not a commit: an empty `pg_dumpall` is not a backup, and
-            // committing it would put a zero-byte "restore point" into the
-            // repository that retention would then keep and a restore would
-            // happily write over a live database. The producer's own exit status
-            // cannot catch this — `pg_dump` exits 0 when it connects to an empty
-            // instance, and a `sh -c` pipeline hides the real program's status.
-            Ok(StdinOutcome::Commit { bytes: 0 }) => {
-                let stderr = abort_holding_stdin!();
-                Err(KopiaError::StdinProducerWroteNothing {
+        // Close the writer NOW — this is the commit point. kopia sees EOF and
+        // finalizes the manifest.
+        drop(stdin);
+        // BOUNDED (#451). This wait used to be `child.wait()` with no timeout at
+        // all, so a kopia wedged finalizing — a hung object-store PUT of the last
+        // content blob, a stalled manifest write — pinned the mover Job forever,
+        // outside any `activeDeadlineSeconds` accounting and with no status to
+        // explain it.
+        //
+        // A timeout here is honestly ambiguous: the snapshot MAY have committed
+        // before we gave up. That is why it surfaces as an error and never as
+        // success — if a manifest did land, the catalog scanner discovers it as a
+        // foreign snapshot rather than this CR claiming it.
+        let budget = self.finalize_budget(finalize_timeout);
+        let status = match tokio::time::timeout(budget, child.wait()).await {
+            Ok(res) => res.map_err(|source| KopiaError::Spawn {
+                binary: self.binary.display().to_string(),
+                source,
+            })?,
+            Err(_) => {
+                kill_and_reap(&mut child).await;
+                drains.join().await;
+                return Err(KopiaError::Timeout {
                     args: display_args,
-                    stderr_tail: tail_lines(&stderr),
-                })
+                    seconds: budget.as_secs(),
+                });
             }
-            Ok(StdinOutcome::Commit { bytes }) => {
-                // Close the writer NOW — this is the commit point. kopia sees EOF and
-                // finalizes the manifest.
-                drop(stdin);
-                // BOUNDED (#451). This wait used to be `child.wait()` with no
-                // timeout at all, so a kopia wedged finalizing — a hung object-store
-                // PUT of the last content blob, a stalled manifest write — pinned the
-                // mover Job forever, past `activeDeadlineSeconds` accounting and with
-                // no status to explain it.
-                //
-                // A timeout here is honestly ambiguous: the snapshot MAY have
-                // committed before we gave up. That is why it surfaces as an error
-                // and never as success — if a manifest did land, the catalog scanner
-                // discovers it as a foreign snapshot rather than this CR claiming it.
-                let budget = self.finalize_budget(finalize_timeout);
-                let status = match tokio::time::timeout(budget, child.wait()).await {
-                    Ok(res) => res.map_err(|source| KopiaError::Spawn {
-                        binary: self.binary.display().to_string(),
-                        source,
-                    })?,
-                    Err(_) => {
-                        kill_and_reap(&mut child).await;
-                        let _ = out_task.await;
-                        let _ = err_task.await;
-                        return Err(KopiaError::Timeout {
-                            args: display_args,
-                            seconds: budget.as_secs(),
-                        });
-                    }
-                };
-                tracing::debug!(
-                    bytes,
-                    "stdin producer committed; kopia finalized the snapshot"
-                );
-                Ok(RawOutput {
-                    code: status.code(),
-                    stdout: out_task.await.unwrap_or_default(),
-                    stderr: err_task.await.unwrap_or_default(),
-                })
-            }
-            Ok(StdinOutcome::Abort) => {
-                let stderr = abort_holding_stdin!();
-                Err(KopiaError::StdinProducerFailed {
-                    detail: "the stdin producer did not complete successfully; the kopia \
-                             snapshot was aborted before any manifest was written"
-                        .to_string(),
-                    stderr_tail: tail_lines(&stderr),
-                })
-            }
-            Err(e) => {
-                let _ = abort_holding_stdin!();
-                Err(e)
-            }
-        }
+        };
+        tracing::debug!(
+            bytes,
+            "stdin producer committed; kopia finalized the snapshot"
+        );
+        let (stdout, stderr) = drains.join().await;
+        Ok(RawOutput {
+            code: status.code(),
+            stdout,
+            stderr,
+        })
     }
 
     async fn run_ok_full(
