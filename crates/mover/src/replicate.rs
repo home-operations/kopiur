@@ -338,6 +338,9 @@ pub fn build_copy_snapshot(
             on_schedule_delete: None,
             pin: false,
             description: None,
+            // A replication copy CR runs no mover of its own — it records an
+            // already-existing destination-side snapshot.
+            mover: None,
         },
     );
     snapshot.metadata.name = Some(cr_name);

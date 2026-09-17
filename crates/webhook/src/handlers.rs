@@ -370,6 +370,10 @@ async fn handle_snapshot(
     // actionable reconcile error. Both are gated on `policyRef` being present,
     // so rows that carry none — `SnapshotReplication` copy CRs above all —
     // never enter this branch.
+    // Seeded from whatever is already on the response (the unrecognized-origin
+    // warning above), because `with_warnings` REPLACES the list rather than appending —
+    // building a fresh Vec here would silently drop that warning.
+    let mut warnings: Vec<String> = resp.warnings.clone().unwrap_or_default();
     if req.operation == Operation::Create
         && let Some(client) = client
         && let Some(policy_ref) = spec.policy_ref.as_ref()
@@ -421,6 +425,21 @@ async fn handle_snapshot(
                     return Err(AdmissionError::Invalid(vec![e]));
                 }
             }
+            // Best-effort securityContext-compatibility warning for THIS run's
+            // effective mover — `spec.mover` merged over the policy's (#464). Judging
+            // it from the policy's mover alone would warn (or stay silent) about a
+            // context this Snapshot has overridden. Same fail-open contract as the
+            // SnapshotPolicy surface: the policy GET above already happened, so this
+            // costs one Pod LIST and nothing else.
+            warnings.extend(
+                crate::secctx::backup_warnings(
+                    Some(client),
+                    Some(ns),
+                    api::snapshot::effective_backup_mover(&spec, &policy.spec).as_ref(),
+                    &policy.spec.sources,
+                )
+                .await,
+            );
         }
     }
 
@@ -480,7 +499,7 @@ async fn handle_snapshot(
         ops.push(config_label_op(&obj.metadata, &value));
     }
 
-    with_patch(resp, ops)
+    with_patch(with_warnings(resp, warnings), ops)
 }
 
 /// Decide whether a `Snapshot` referencing a `SnapshotPolicy` should have

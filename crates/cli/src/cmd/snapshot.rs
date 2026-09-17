@@ -76,6 +76,7 @@ pub fn build_snapshot_for(
             // `snapshot now` creates a manual Snapshot with no owning schedule.
             on_schedule_delete: None,
             pin: args.pin,
+            mover: None,
             description: args.description.clone(),
         },
     );

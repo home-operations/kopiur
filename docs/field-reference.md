@@ -2623,6 +2623,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `deletionPolicy` | enum: Delete \| Retain \| Orphan | — | Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted. Produced backups default to `Delete`; discovered snapshots are forced to `Retain`. |
 | `description` | string | —<br><sub>maxLength 1024</sub> | Free-form text recorded on the kopia snapshot manifest (`snapshot create --description`). Per-invocation by nature — scheduled/discovered `Snapshot`s never set this (no templated descriptions). |
 | `failurePolicy` | [object](#snapshot-spec-failurepolicy) | — | Mover Job retry and deadline limits for this run. |
+| `mover` | [object](#snapshot-spec-mover) | — | Per-run mover overrides for THIS snapshot's Job (resources, cache budgets, `securityContext`, `privilegedMode`, `ttlSecondsAfterFinished`).<br>Layered field-wise as `repository.moverDefaults &lt; policyRef's mover &lt; this mover` — the highest layer that sets a field wins, and a field you omit falls through, so a partial override here can only adjust what it names. This exists so an ad-hoc one-shot (`kubectl create` before a risky change, a debug run that needs more memory or a different UID) does not require editing the shared, GitOps-managed `SnapshotPolicy` that every scheduled run also uses.<br>Two deliberate exclusions: - `mover.cache` here changes only this run's kopia cache **budgets**   (`--content-cache-size-mb`/`--metadata-cache-size-mb`) and the ephemeral   cache volume. It never resizes or re-classes a `cache.mode: Persistent`   cache PVC: that PVC is named per-POLICY and shared by every sibling   `Snapshot`, so a per-run override must not mutate state the siblings   depend on. - `inheritSecurityContextFrom.snapshot` is restore-only and rejected here,   exactly as on `SnapshotPolicy`: a backup's identity comes from the live   workload; it is the run that *records* an identity.<br>An elevated mover assembled here is gated by the namespace's `privileged-movers` opt-in just like a policy-level one — the gate runs on the merged result. |
 | `onScheduleDelete` | enum: Retain \| Delete | — | What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it produced (which Kubernetes GC cascade-deletes via their ownerReference). Default `Retain`: the CRs are removed but their kopia snapshots survive and the catalog rediscovers them as `origin: discovered`. `Delete` opts into the cascade: each Snapshot's own `deletionPolicy` applies.<br>Deliberately 2-variant (not reusing `DeletionPolicy`): an `Orphan` in cascade position would differ from `Retain` only in per-CR event/metric bookkeeping — an invalid state made unrepresentable. The guard's `Retain` is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm (no per-CR "orphaned" event/metric for every produced Snapshot). |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |
@@ -2637,6 +2638,51 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `activeDeadlineSeconds` | integer | — | Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed. |
 | `backoffLimit` | integer | — | Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed. |
 | `podStartupDeadlineSeconds` | integer | — | Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s. |
+
+#### `spec.mover` { #snapshot-spec-mover }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cache` | [object](#snapshot-spec-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
+| `inheritSecurityContextFrom` | [union](#snapshot-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
+| `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
+| `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
+| `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
+
+##### `spec.mover.cache` { #snapshot-spec-mover-cache }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
+| `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+##### `spec.mover.inheritSecurityContextFrom` { #snapshot-spec-mover-inheritsecuritycontextfrom }
+
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `pvcConsumer` | [object](#snapshot-spec-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
+| `workloadSelector` | [object](#snapshot-spec-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
+
+###### `spec.mover.inheritSecurityContextFrom.pvcConsumer` { #snapshot-spec-mover-inheritsecuritycontextfrom-pvcconsumer }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `container` | string | — | Which container within the matched consumer pod to inherit from; absent uses the first/only. |
+
+###### `spec.mover.inheritSecurityContextFrom.workloadSelector` { #snapshot-spec-mover-inheritsecuritycontextfrom-workloadselector }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `podSelector` | core/v1 LabelSelector | **required** | Label selector matching the workload pod(s) to read context/hooks from. |
+| `container` | string | — | Which container within the matched pod; absent uses the first/only container. |
 
 #### `spec.policyRef` { #snapshot-spec-policyref }
 

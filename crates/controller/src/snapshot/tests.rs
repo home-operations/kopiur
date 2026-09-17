@@ -403,6 +403,7 @@ fn backup_with_policy_ref(pinned_repo: Option<kopiur_api::common::RepositoryRef>
             deletion_policy: None,
             on_schedule_delete: None,
             pin: false,
+            mover: None,
             description: None,
         },
     );
@@ -595,6 +596,7 @@ fn dummy_backup() -> Snapshot {
             deletion_policy: None,
             on_schedule_delete: None,
             pin: false,
+            mover: None,
             description: None,
         },
     )
@@ -4749,4 +4751,155 @@ fn the_in_flight_heal_needs_the_pinned_repository() {
             .is_none()
     );
     assert!(in_flight_heal_target(&backup).is_none());
+}
+
+// --- Snapshot.spec.mover: per-run override over the policy's (#464) --------
+
+/// A `Snapshot` carrying a per-run `mover`, decoded the cluster's way.
+fn backup_with_mover(mover_json: serde_json::Value) -> Snapshot {
+    let mut backup = dummy_backup();
+    backup.spec.mover = Some(serde_json::from_value(mover_json).expect("valid MoverSpec JSON"));
+    backup
+}
+
+#[test]
+fn build_backup_run_lets_a_snapshot_mover_cache_win_the_per_run_budgets() {
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let mut cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "data".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    // The shared recipe's budgets.
+    cfg.spec.mover = Some(
+        serde_json::from_value(serde_json::json!({
+            "cache": { "capacity": "8Gi", "contentCacheSizeMb": 4096, "metadataCacheSizeMb": 512 },
+        }))
+        .expect("valid MoverSpec"),
+    );
+    let repo = resolved_s3_repo();
+
+    // No per-run override → the recipe's budgets, exactly as before this feature.
+    let (ws, ..) = build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "pg").unwrap();
+    assert_eq!(ws.cache.content_cache_size_mb, Some(4096));
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(512));
+
+    // A one-shot raising only `contentCacheSizeMb` wins that field and inherits the
+    // rest — the whole point of a partial per-run override on a GitOps-managed recipe.
+    let backup = backup_with_mover(serde_json::json!({
+        "cache": { "contentCacheSizeMb": 16384 },
+    }));
+    let (ws, ..) = build_backup_run(&backup, &cfg, &repo, "ns", "pg").unwrap();
+    assert_eq!(ws.cache.content_cache_size_mb, Some(16384));
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(512));
+}
+
+#[test]
+fn a_snapshot_mover_cache_never_changes_the_policy_owned_persistent_cache_pvc() {
+    use kopiur_api::common::CacheVolumeMode;
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let mut cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "data".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    // A PERSISTENT cache: one controller-owned PVC named per-policy and shared by
+    // every child Snapshot of this policy.
+    cfg.spec.mover = Some(
+        serde_json::from_value(serde_json::json!({
+            "cache": {
+                "capacity": "8Gi",
+                "storageClassName": "fast",
+                "mode": "Persistent",
+                "contentCacheSizeMb": 4096,
+            },
+        }))
+        .expect("valid MoverSpec"),
+    );
+    let repo = resolved_s3_repo();
+
+    // An ad-hoc Snapshot that tries to resize AND re-class the cache.
+    let hostile = backup_with_mover(serde_json::json!({
+        "cache": { "capacity": "500Gi", "storageClassName": "slow", "mode": "Ephemeral" },
+    }));
+
+    // The PVC's spec is derived from the POLICY alone. `persistent_cache_spec` takes no
+    // `Snapshot` at all — the absent parameter is the guarantee — so the two calls
+    // below are necessarily identical; this pins the resolved values so a future
+    // refactor that threads the per-run layer in has to change this test.
+    let pvc_spec = super::persistent_cache_spec(&repo, &cfg).expect("policy sets a cache");
+    assert_eq!(pvc_spec.capacity.as_deref(), Some("8Gi"));
+    assert_eq!(pvc_spec.storage_class_name.as_deref(), Some("fast"));
+    assert_eq!(pvc_spec.mode, Some(CacheVolumeMode::Persistent));
+
+    // Meanwhile the MERGED view — what this run's Job-scoped budgets use — does honor
+    // the override. The two deliberately diverge, which is exactly why the PVC path
+    // must not use the merged one.
+    let merged = kopiur_api::snapshot::effective_backup_mover(&hostile.spec, &cfg.spec)
+        .and_then(|m| m.cache)
+        .expect("merged cache");
+    assert_eq!(merged.capacity.as_deref(), Some("500Gi"));
+    assert_eq!(merged.storage_class_name.as_deref(), Some("slow"));
+    assert_eq!(merged.mode, Some(CacheVolumeMode::Ephemeral));
+    assert_ne!(
+        pvc_spec, merged,
+        "the persistent cache PVC's spec must NOT track a per-run mover.cache override"
+    );
+
+    // And the per-run BUDGETS still flow through (the override left them unset, so the
+    // policy's survive) — the override changed the volume knobs without dropping them.
+    let (ws, ..) = build_backup_run(&hostile, &cfg, &repo, "ns", "pg").unwrap();
+    assert_eq!(ws.cache.content_cache_size_mb, Some(4096));
+}
+
+#[test]
+fn recorded_meta_reports_a_snapshot_level_security_context_as_the_identity_source() {
+    use crate::io::InheritOutcome;
+    use kopiur_api::RecordedSrc;
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let mut cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "data".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    cfg.spec.mover = Some(
+        serde_json::from_value(serde_json::json!({
+            "securityContext": { "runAsUser": 1000 },
+        }))
+        .expect("valid MoverSpec"),
+    );
+    let backup = backup_with_mover(serde_json::json!({
+        "securityContext": { "runAsUser": 2000 },
+    }));
+
+    // The merged recipe mover is what the reconciler threads into `recorded_meta`, so
+    // the `kopiur-meta` tag records the UID this run actually ran as — 2000, not the
+    // policy's 1000.
+    let recipe = kopiur_api::snapshot::effective_backup_mover(&backup.spec, &cfg.spec);
+    let resolved = kopiur_api::common::resolve_mover(
+        None,
+        recipe.as_ref().and_then(|m| m.security_context.as_ref()),
+        recipe
+            .as_ref()
+            .and_then(|m| m.pod_security_context.as_ref()),
+        None,
+        None,
+        None,
+    );
+    let recorded =
+        super::build::recorded_meta(&resolved, &InheritOutcome::NotRequested, recipe.as_ref());
+    assert_eq!(recorded.uid, Some(2000));
+    assert_eq!(recorded.src, RecordedSrc::Explicit);
 }

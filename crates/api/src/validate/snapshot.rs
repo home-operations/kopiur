@@ -642,6 +642,34 @@ pub fn validate_backup(spec: &SnapshotSpec, origin: Option<Origin>) -> Vec<Valid
         errs.push(e);
     }
     errs.extend(validate_snapshot_tags(spec.tags.as_ref()));
+    if let Some(m) = &spec.mover {
+        // Same two rules the recipe layer gets, because this is the same layer one
+        // step up (#464): a per-run `mover` is merged OVER the policy's, so anything
+        // inadmissible there is inadmissible here.
+        //
+        // `inheritSecurityContextFrom.snapshot` replays the identity RECORDED on a
+        // backup; a backup has no recorded identity to replay — it is the run that
+        // records one.
+        if let Err(e) = forbid_snapshot_inherit(
+            m,
+            "snapshot",
+            "a backup mover's identity is read from the live workload \
+             (pvcConsumer/workloadSelector), not from a snapshot; `snapshot` is restore-only",
+        ) {
+            errs.push(e);
+        }
+        if let Err(e) = validate_mover(m, "Snapshot mover") {
+            errs.push(e);
+        }
+        // NOT rejected here: `inheritSecurityContextFrom.pvcConsumer`. Validators are
+        // spec-only and client-free, so this one cannot see the referenced
+        // `SnapshotPolicy`'s sources to know whether a source PVC exists to derive a
+        // consumer from. Refusing on that guess would reject the common, correct case
+        // (a one-shot against an ordinary `source.pvc` policy); admitting it lets the
+        // controller resolve it and, when it cannot, park the run on a condition that
+        // names the reason — which is strictly more informative than an admission
+        // error built on missing information.
+    }
     errs
 }
 

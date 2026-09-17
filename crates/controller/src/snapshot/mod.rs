@@ -1217,18 +1217,29 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         jobs::MountSource::Pvc { claim_name } => Some(claim_name.as_str()),
         jobs::MountSource::Nfs { .. } => None,
     });
+    // THE recipe mover for this run: `Snapshot.spec.mover` merged field-wise OVER the
+    // policy's (#464), so an ad-hoc one-shot can adjust resources/cache budgets/
+    // securityContext/TTL without editing the shared, GitOps-managed SnapshotPolicy.
+    // Computed ONCE and threaded through every consumer below — the inherit resolution,
+    // the privileged gate, `resolve_mover`, the recorded `kopiur-meta` identity and the
+    // inherit-outcome report — so none of them can disagree about what this run asked
+    // for. The repository's `moverDefaults` still enters UNDERNEATH it inside
+    // `resolve_mover`, giving the full ladder
+    // `hardened ⊂ moverDefaults ⊂ inherited ⊂ policy.mover ⊂ snapshot.mover`.
+    let recipe_mover = kopiur_api::snapshot::effective_backup_mover(&backup.spec, &config.spec);
     let mover_security = io::resolve_mover_security_contexts(
         &ctx.client,
         &namespace,
-        config.spec.mover.as_ref(),
+        recipe_mover.as_ref(),
         source_pvc,
         // `inheritSecurityContextFrom.snapshot` is restore-only (admission-rejected
-        // on SnapshotPolicy), so a backup never has a recorded source to pass.
+        // on SnapshotPolicy AND on Snapshot), so a backup never has a recorded source
+        // to pass.
         None,
     )
     .await?;
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
-    let privileged_mode = config.spec.mover.as_ref().and_then(|m| m.privileged_mode);
+    let privileged_mode = recipe_mover.as_ref().and_then(|m| m.privileged_mode);
 
     // Field-wise merge the repository's moverDefaults under the recipe's effective
     // contexts/resources/cache: `hardened ⊂ moverDefaults ⊂ recipe` (ADR-0004 §1/§2).
@@ -1239,16 +1250,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         repo.mover_defaults.as_ref(),
         effective_sc.as_ref(),
         effective_pod_sc.as_ref(),
-        config
-            .spec
-            .mover
-            .as_ref()
-            .and_then(|m| m.resources.as_ref()),
-        config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
+        recipe_mover.as_ref().and_then(|m| m.resources.as_ref()),
+        recipe_mover.as_ref().and_then(|m| m.cache.as_ref()),
         // Recipe `mover.ttlSecondsAfterFinished` wins over the repo default (§12).
-        config
-            .spec
-            .mover
+        recipe_mover
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
@@ -1261,7 +1266,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let recorded = recorded_meta(
         &resolved_mover,
         &mover_security.outcome,
-        config.spec.mover.as_ref(),
+        recipe_mover.as_ref(),
     );
     match &mut work_spec.operation {
         Operation::Snapshot(op) => {
@@ -1402,7 +1407,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         backup,
         &mover_security,
         &resolved_mover,
-        config.spec.mover.as_ref(),
+        // The MERGED recipe mover, not the policy's: the "explicit context" this
+        // verdict is computed against must be what THIS run actually asked for, or a
+        // Snapshot that overrides `securityContext` gets an inherit verdict derived
+        // from the policy's context instead of its own.
+        recipe_mover.as_ref(),
         ctx,
     )
     .await;
@@ -1754,11 +1763,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         &namespace,
         io::owner_ref_for(&config, "SnapshotPolicy")?,
         &cache_pvc,
-        crate::cache::effective_cache(
-            &repo,
-            config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
-        )
-        .as_ref(),
+        persistent_cache_spec(&repo, &config).as_ref(),
     )
     .await?;
     // RWO Multi-Attach avoidance: pin the mover to the node the source PVC is
@@ -4744,6 +4749,29 @@ async fn assess_backup_security_context(
     }
     // Undecidable / likely-incompatible from securityContext alone → stay silent on the
     // reconcile path (no false alarms). The mover verifies it for real at runtime.
+}
+
+/// The cache config for the **policy-owned persistent** cache PVC.
+///
+/// Deliberately takes the `SnapshotPolicy` and NOT the `Snapshot`: the claim is named
+/// per-POLICY (`kopiur_api::expand::cache_pvc_name(&config.name_any(), …)`) and is
+/// SHARED by every child `Snapshot` of that policy, so honoring a per-run
+/// `Snapshot.spec.mover.cache` here would let one ad-hoc Snapshot resize or re-class a
+/// PVC its siblings depend on — a per-run override silently mutating shared state
+/// (#464). The absent parameter is the guarantee: a future caller cannot thread the
+/// per-run layer in by accident, because there is nowhere to put it.
+///
+/// A `Snapshot`'s own `mover.cache` still governs this run's kopia cache BUDGETS and
+/// the size of an *ephemeral* cache volume — both Job-scoped (see `build.rs`'s
+/// `cache_tuning`). Only the persistent PVC's own spec is policy-owned.
+fn persistent_cache_spec(
+    repo: &io::ResolvedRepository,
+    config: &SnapshotPolicy,
+) -> Option<kopiur_api::common::CacheDefaults> {
+    crate::cache::effective_cache(
+        repo,
+        config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
+    )
 }
 
 /// Report what `mover.inheritSecurityContextFrom` actually achieved, when it achieved

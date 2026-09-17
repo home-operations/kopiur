@@ -66,6 +66,60 @@ impl MoverSpec {
             self.privileged_mode,
         )
     }
+
+    /// Overlay `self` — the **HIGHER** layer — onto `base`, field by field, producing
+    /// one `MoverSpec` that stands in for both. This is what lets an invocation carry
+    /// its own mover overrides on top of a shared, GitOps-managed recipe:
+    /// `Snapshot.spec.mover` merged over `SnapshotPolicy.spec.mover` (#464).
+    ///
+    /// The merge delegates to the SAME primitives the repository-layer merge uses, so a
+    /// per-run override can never resolve differently from a per-recipe one:
+    ///
+    /// - `securityContext`/`podSecurityContext` go through [`merge_context_pair`] as one
+    ///   `(container, pod)` layer pair — field-wise per dimension **plus** identity
+    ///   promotion, so a policy's container-level `runAsUser` can never shadow a
+    ///   snapshot's pod-level one. That merge is associative, so folding these two
+    ///   layers here and then handing the result to [`resolve_mover`] is identical to a
+    ///   flat `hardened ⊂ moverDefaults ⊂ inherited ⊂ policy ⊂ snapshot` merge.
+    /// - `resources` via [`merge_resources_opt`] (per-key requests/limits).
+    /// - `cache` via [`CacheDefaults::merge`] (per-field).
+    /// - `privilegedMode`, `ttlSecondsAfterFinished` and `inheritSecurityContextFrom`
+    ///   are whole-value knobs with no inner structure to merge, so the higher layer's
+    ///   value wins outright and `None` falls through to `base`.
+    ///
+    /// `base: None` is the identity: the result is `self` unchanged. Because the layer
+    /// order is fixed by this signature, a caller cannot accidentally invert it.
+    pub fn merge_over(&self, base: Option<&MoverSpec>) -> MoverSpec {
+        let Some(base) = base else {
+            return self.clone();
+        };
+        // One layer pair, not two independent dimension merges — a lone
+        // `merge_security_context` here would reintroduce cross-dimension identity
+        // shadowing (see `merge_context_pair`'s docs).
+        let (security_context, pod_security_context) = merge_context_pair(
+            base.security_context.as_ref(),
+            base.pod_security_context.as_ref(),
+            self.security_context.as_ref(),
+            self.pod_security_context.as_ref(),
+        );
+        MoverSpec {
+            resources: merge_resources_opt(base.resources.as_ref(), self.resources.as_ref()),
+            cache: CacheDefaults::merge(base.cache.as_ref(), self.cache.as_ref()),
+            security_context,
+            pod_security_context,
+            privileged_mode: self.privileged_mode.or(base.privileged_mode),
+            // Whole-value: a higher layer that names its own inherit source replaces the
+            // lower layer's outright rather than blending two workload selectors into
+            // something neither manifest asked for.
+            inherit_security_context_from: self
+                .inherit_security_context_from
+                .clone()
+                .or_else(|| base.inherit_security_context_from.clone()),
+            ttl_seconds_after_finished: self
+                .ttl_seconds_after_finished
+                .or(base.ttl_seconds_after_finished),
+        }
+    }
 }
 
 /// How the mover co-locates with the node an RWO source/destination PVC is attached to.
