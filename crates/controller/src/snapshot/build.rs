@@ -115,13 +115,21 @@ pub(super) fn build_backup_run(
     let creds_secrets = io::plain_creds(io::mover_creds_secrets(&repo.backend, &repo.encryption));
 
     // Effective kopia cache budgets: the repository's cacheDefaults overlaid by this
-    // recipe's mover.cache (ADR §3.1).
+    // run's effective mover.cache (ADR §3.1) — the policy's, with this Snapshot's
+    // `mover.cache` merged over it (#464). These are the PER-RUN budgets
+    // (`--content-cache-size-mb`/`--metadata-cache-size-mb`), scoped to this Job, so a
+    // one-shot may raise them freely. The cache VOLUME is decided separately in
+    // `mod.rs`'s `cache_volume_spec`, which splits it: an ephemeral volume takes this
+    // same merged layer, while the cache MODE and a `Persistent` PVC's own spec stay
+    // policy-owned (that claim is named per-policy and shared by every sibling
+    // Snapshot).
+    //
+    // `effective_backup_mover` is pure, so computing it here as well as in the
+    // reconciler cannot diverge from it.
+    let recipe_mover = kopiur_api::snapshot::effective_backup_mover(&backup.spec, &config.spec);
     let cache = crate::cache::cache_tuning(
-        crate::cache::effective_cache(
-            repo,
-            config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
-        )
-        .as_ref(),
+        crate::cache::effective_cache(repo, recipe_mover.as_ref().and_then(|m| m.cache.as_ref()))
+            .as_ref(),
     );
     let work_spec = MoverWorkSpec {
         version: 1,

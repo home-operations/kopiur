@@ -1,5 +1,6 @@
 //! e2e: `moverDefaults` inheritance, the bootstrap-gap fix, and the field-wise
-//! security-context merge (ADR-0004 §1/§2).
+//! security-context merge across all three layers — `moverDefaults` ⊂
+//! `SnapshotPolicy.spec.mover` ⊂ `Snapshot.spec.mover` (ADR-0004 §1/§2, #464).
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
 //! `mise run //crates/e2e:test`. Skips gracefully without a cluster.
@@ -20,7 +21,8 @@ use kopiur_e2e::{E2E_NAMESPACE, Need, World};
 /// (1) the BOOTSTRAP Job's pod (the bootstrap-gap fix — before ADR-0004 the
 /// connect/create Job ignored moverDefaults, so a filesystem repo on a
 /// non-65532-owned dir was un-bootstrappable), and (2) the backup mover's pod. A
-/// per-recipe `mover.securityContext.runAsUser` then merges OVER moverDefaults, and
+/// per-recipe `mover.securityContext.runAsUser` then merges OVER moverDefaults, a
+/// PER-RUN `Snapshot.spec.mover.securityContext.runAsUser` merges over THAT (#464), and
 /// in every rendered container the hardened `drop:[ALL]`/seccomp SURVIVES.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
@@ -126,7 +128,67 @@ async fn mover_defaults_inherited_by_bootstrap_and_backup_with_recipe_override()
     );
     assert_hardening_survives(&bsc, "backup (recipe override)");
 
+    // (3) THE THIRD LAYER (#464): the SAME policy, with a PER-RUN
+    //     `Snapshot.spec.mover.securityContext.runAsUser` (3001) merged OVER the
+    //     recipe's 3000, which is itself over moverDefaults' 65532. This is what lets
+    //     an ad-hoc one-shot pick its own mover identity without editing the shared,
+    //     GitOps-managed SnapshotPolicy every scheduled run also uses. The pod fsGroup
+    //     must STILL come from moverDefaults (neither the recipe nor the run sets one),
+    //     proving the per-run layer merges field-wise rather than replacing the chain.
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-md-backup-run",
+                "e2e-md-policy",
+                // Bare spec fields, NOT a `{"spec": ...}` wrapper: a wrapper is dropped
+                // by serde AND pruned by the apiserver, and the test would then silently
+                // run against the recipe's 3000 and "pass".
+                serde_json::json!({
+                    "mover": { "securityContext": { "runAsUser": 3001, "runAsNonRoot": true } }
+                }),
+            )),
+        )
+        .await
+        .expect("create Snapshot with a per-run mover override");
+
+    // Read the CR BACK and assert the field actually landed. A CRD that never
+    // regenerated would prune `spec.mover` server-side, and every assertion below
+    // would then be satisfied by the recipe's own 3000 — a green test proving nothing.
+    let stored = backups
+        .get("e2e-md-backup-run")
+        .await
+        .expect("read the Snapshot back");
+    assert_eq!(
+        stored
+            .spec
+            .mover
+            .as_ref()
+            .and_then(|m| m.security_context.as_ref())
+            .and_then(|sc| sc.run_as_user),
+        Some(3001),
+        "spec.mover.securityContext.runAsUser must survive the apiserver round-trip —          if it is absent, the Snapshot CRD is stale and pruned the field"
+    );
+
+    let rjob = wait_for_job(&jobs, "e2e-md-backup-run").await;
+    let rsc = job_container_sc(&rjob).expect("per-run backup container securityContext");
+    assert_eq!(
+        rsc.run_as_user,
+        Some(3001),
+        "Snapshot.spec.mover.securityContext.runAsUser (3001) must win over the          recipe's (3000) and moverDefaults' (65532)"
+    );
+    assert_eq!(
+        job_pod_sc(&rjob).and_then(|sc| sc.fs_group),
+        Some(65532),
+        "the per-run mover pod must STILL inherit moverDefaults.podSecurityContext.fsGroup          (neither the recipe nor the run set one) — the per-run layer merges, it does not          replace the chain"
+    );
+    assert_hardening_survives(&rsc, "backup (per-run override)");
+
     // Cleanup.
+    let _ = backups
+        .delete("e2e-md-backup-run", &DeleteParams::default())
+        .await;
     let _ = backups
         .delete("e2e-md-backup", &DeleteParams::default())
         .await;

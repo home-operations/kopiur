@@ -1900,6 +1900,7 @@ fn backup_aggregate_rejects_discovered_delete() {
         deletion_policy: Some(DeletionPolicy::Delete),
         on_schedule_delete: None,
         pin: false,
+        mover: None,
     };
     let errs = validate_backup(&spec, Some(Origin::Discovered));
     assert_eq!(errs.len(), 1);
@@ -2017,6 +2018,7 @@ fn backup_aggregate_rejects_reserved_tags() {
         deletion_policy: None,
         on_schedule_delete: None,
         pin: false,
+        mover: None,
     };
     let errs = validate_backup(&spec, Some(Origin::Manual));
     assert!(
@@ -2078,6 +2080,7 @@ fn backup_aggregate_rejects_discovered_on_schedule_delete() {
         deletion_policy: None,
         on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
         pin: false,
+        mover: None,
     };
     let errs = validate_backup(&spec, Some(Origin::Discovered));
     assert!(errs.iter().any(|e| matches!(
@@ -2102,6 +2105,7 @@ fn backup_aggregate_with_unparseable_origin_skips_gated_rules_but_not_the_rest()
         deletion_policy: Some(DeletionPolicy::Delete),
         on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
         pin: false,
+        mover: None,
     };
     assert!(validate_backup(&gated_only, None).is_empty());
 
@@ -8048,4 +8052,147 @@ fn m1_admission_messages_are_well_formed() {
             "M1 message not well-formed: {e}"
         );
     }
+}
+
+// --- Snapshot.spec.mover (#464) ---
+
+#[test]
+fn snapshot_mover_rejects_requests_exceeding_limits() {
+    use crate::snapshot::SnapshotSpec;
+    let spec: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 resources:\n\
+         \x20   requests: { memory: 4Gi }\n\
+         \x20   limits: { memory: 1Gi }\n",
+    );
+    let errs = validate_backup(&spec, Some(Origin::Manual));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    match &errs[0] {
+        ValidationError::InvalidFieldValue { field, reason } => {
+            assert_eq!(field, "Snapshot mover resources.requests.memory");
+            assert!(reason.contains("exceeds limit"), "{reason}");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_mover_rejects_the_restore_only_snapshot_inherit() {
+    use crate::snapshot::SnapshotSpec;
+    let spec: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 inheritSecurityContextFrom: { snapshot: {} }\n",
+    );
+    let errs = validate_backup(&spec, Some(Origin::Manual));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    match &errs[0] {
+        ValidationError::InvalidFieldValue { field, reason } => {
+            assert_eq!(field, "snapshot.mover.inheritSecurityContextFrom.snapshot");
+            assert!(reason.contains("restore-only"), "{reason}");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_mover_admits_pvc_consumer_and_a_plain_override() {
+    use crate::snapshot::SnapshotSpec;
+    // `pvcConsumer` is deliberately ADMITTED: `validate_backup` is client-free, so it
+    // cannot see whether the referenced policy has a source PVC to derive a consumer
+    // from. The controller resolves it and parks the run with a named reason when it
+    // cannot — better than an admission refusal built on missing information.
+    let consumer: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 inheritSecurityContextFrom: { pvcConsumer: {} }\n",
+    );
+    assert!(
+        validate_backup(&consumer, Some(Origin::Manual)).is_empty(),
+        "pvcConsumer must be admitted on a Snapshot"
+    );
+
+    let plain: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 resources: { requests: { memory: 2Gi } }\n\
+         \x20 securityContext: { runAsUser: 1000 }\n\
+         \x20 cache: { capacity: 20Gi }\n\
+         \x20 ttlSecondsAfterFinished: 60\n",
+    );
+    assert!(validate_backup(&plain, Some(Origin::Manual)).is_empty());
+    let m = plain.mover.as_ref().expect("mover decoded");
+    assert_eq!(
+        m.security_context.as_ref().and_then(|s| s.run_as_user),
+        Some(1000)
+    );
+    assert_eq!(
+        m.cache.as_ref().and_then(|c| c.capacity.as_deref()),
+        Some("20Gi")
+    );
+    assert_eq!(m.ttl_seconds_after_finished, Some(60));
+}
+
+#[test]
+fn effective_backup_mover_layers_snapshot_over_policy() {
+    use crate::snapshot::{SnapshotSpec, effective_backup_mover};
+    use crate::snapshot_policy::SnapshotPolicySpec;
+
+    let policy: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         mover:\n\
+         \x20 securityContext: { runAsUser: 1000 }\n\
+         \x20 cache: { capacity: 8Gi, contentCacheSizeMb: 4096 }\n\
+         \x20 ttlSecondsAfterFinished: 3600\n",
+    );
+    let snapshot: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 cache: { contentCacheSizeMb: 16384 }\n\
+         \x20 resources: { requests: { memory: 4Gi } }\n",
+    );
+
+    let merged = effective_backup_mover(&snapshot, &policy).expect("both layers present");
+    // Snapshot-set field wins…
+    assert_eq!(
+        merged.cache.as_ref().and_then(|c| c.content_cache_size_mb),
+        Some(16384)
+    );
+    // …snapshot-only field lands…
+    assert_eq!(
+        merged
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|r| r.get("memory"))
+            .map(|q| q.0.as_str()),
+        Some("4Gi")
+    );
+    // …and everything the snapshot omits falls through to the policy.
+    assert_eq!(
+        merged.cache.as_ref().and_then(|c| c.capacity.as_deref()),
+        Some("8Gi")
+    );
+    assert_eq!(
+        merged.security_context.as_ref().and_then(|s| s.run_as_user),
+        Some(1000)
+    );
+    assert_eq!(merged.ttl_seconds_after_finished, Some(3600));
+
+    // Either layer alone passes through verbatim; neither yields None (so a
+    // pre-feature Snapshot resolves exactly as before).
+    let bare: SnapshotSpec = crate::testutil::from_yaml("policyRef: { name: pg }\n");
+    assert_eq!(
+        effective_backup_mover(&bare, &policy).as_ref(),
+        policy.mover.as_ref()
+    );
+    let mut policy_no_mover = policy.clone();
+    policy_no_mover.mover = None;
+    assert_eq!(
+        effective_backup_mover(&snapshot, &policy_no_mover).as_ref(),
+        snapshot.mover.as_ref()
+    );
+    assert!(effective_backup_mover(&bare, &policy_no_mover).is_none());
 }

@@ -200,6 +200,7 @@ async fn backup_gets_finalizer_and_delete_path_removes_cr() {
             deletion_policy: Some(kopiur_api::DeletionPolicy::Orphan),
             on_schedule_delete: None,
             pin: false,
+            mover: None,
             description: None,
         },
     );

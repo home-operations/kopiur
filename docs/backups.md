@@ -737,6 +737,43 @@ spec:
     description: pre-upgrade snapshot before the v14→v15 migration
 ```
 
+### `mover` — override the recipe's mover for one run
+
+`Snapshot.spec.mover` is the same `MoverSpec` a [`SnapshotPolicy`](#mover--resources-cache-security-context) and a [`Restore`](restores.md#mover-cache--failure-policy) expose, and it exists for the case the recipe cannot serve: a **one-off** run that needs different mover settings than the nightly schedule. Without it, giving an ad-hoc pre-upgrade snapshot more memory or a different UID means editing the shared, GitOps-managed `SnapshotPolicy` that every scheduled run also uses — and remembering to edit it back.
+
+It merges **field by field** over the recipe's, which in turn merges over the repository's `moverDefaults`:
+
+```text
+Repository.moverDefaults  <  SnapshotPolicy.spec.mover  <  Snapshot.spec.mover
+```
+
+The highest layer that sets a field wins; a field you omit falls through. So a partial override adjusts only what it names, and it can only ever *tighten* the hardened base — it never drops `capabilities.drop: [ALL]` or the seccomp profile.
+
+```yaml
+--8<-- "deploy/examples/09-mover-permissions.yaml:snapshot-mover"
+```
+
+Every knob is available: `resources`, `cache`, `securityContext`, `podSecurityContext`, `inheritSecurityContextFrom`, `privilegedMode`, `ttlSecondsAfterFinished`. Three behaviors are worth knowing before you use it.
+
+/// warning | `mover.cache` here is run-scoped: it never touches a **persistent** cache PVC
+
+What a per-run `cache` affects is everything that lives and dies with this one Job: the kopia cache **budgets** (`contentCacheSizeMb`/`metadataCacheSizeMb`), and — when the cache is **`Ephemeral`** — that Job's cache-volume `capacity` and `storageClassName`. An ephemeral cache volume is bound to this run's pod and garbage-collected with it, so there is no shared storage for a per-run size or class to disturb. A per-run `capacity` against a policy that sets none does the obvious thing: it upgrades this run off an `emptyDir` onto a sized volume.
+
+Two things stay **policy-owned**, because they are shared:
+
+- **`cache.mode`.** A per-run `mode` is ignored, so an ad-hoc snapshot can never promote itself onto — or coerce the policy away from — the shared cache PVC.
+- **A `mode: Persistent` PVC's own `capacity`/`storageClassName`.** That cache lives in one controller-owned PVC named after the **`SnapshotPolicy`** and shared by every `Snapshot` that policy produces; letting one ad-hoc snapshot resize or re-class it would change storage every sibling run depends on. Under `Persistent`, the per-run volume knobs are dropped and the policy's are used.
+
+To change the persistent PVC, change the `SnapshotPolicy`.
+///
+
+/// warning | An elevated per-run mover still needs the namespace opt-in
+
+The privileged-mover gate runs on the **merged** result, so a `runAsUser: 0` / `privilegedMode: true` / added-capability context assembled here is refused with `MoverPermitted=False` exactly like a policy-level one, unless the namespace carries the `kopiur.home-operations.com/privileged-movers` annotation. A per-run override is a convenience, not an escape hatch. See [Movers → Privileged movers](movers.md#privileged-movers).
+///
+
+`inheritSecurityContextFrom` works here too, with the same backup-side rules: `pvcConsumer` and `workloadSelector` are valid, `snapshot: {}` is rejected at admission because it replays the identity *recorded on a backup* and a backup is what records one. Setting it on a `Snapshot` replaces the policy's inherit source outright rather than blending two selectors, and the policy's explicit `securityContext` still survives underneath as the inherit **fallback**.
+
 ### `failurePolicy` — retry & deadline for the mover Job
 
 `Snapshot.spec.failurePolicy` controls the mover `Job`'s retry and wall-clock limits. It is the same surface a [`Restore`](restores.md#mover-cache--failure-policy) has:

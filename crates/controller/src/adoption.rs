@@ -434,6 +434,7 @@ pub fn build_adopted_snapshot(
             // Adopted rows have no owning schedule.
             on_schedule_delete: None,
             pin: candidate.pinned,
+            mover: None,
             description: None,
         },
     );

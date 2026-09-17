@@ -1,6 +1,7 @@
 use super::*;
 use k8s_openapi::api::core::v1::{PodSecurityContext, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 
 fn ref_of(kind: RepositoryKind, name: &str, namespace: Option<&str>) -> RepositoryRef {
     RepositoryRef {
@@ -1724,4 +1725,320 @@ fn resolve_mover_passes_pod_metadata_through_from_defaults() {
     let m = resolve_mover(Some(&only_labels), None, None, None, None, None);
     assert_eq!(m.pod_labels.as_ref(), Some(&labels));
     assert!(m.pod_annotations.is_none());
+}
+
+// --- MoverSpec::merge_over (policy.mover ⊂ snapshot.mover, #464) ---
+
+/// A `MoverSpec` with EVERY field populated, distinctly per `tag`, so a merge test can
+/// tell which layer a field came from.
+fn full_mover(tag: i64) -> MoverSpec {
+    use k8s_openapi::api::core::v1::{Capabilities, SecurityContext};
+    MoverSpec {
+        resources: Some(ResourceRequirements {
+            requests: Some(std::collections::BTreeMap::from([(
+                "memory".to_string(),
+                Quantity(format!("{tag}Mi")),
+            )])),
+            ..Default::default()
+        }),
+        cache: Some(CacheDefaults {
+            capacity: Some(format!("{tag}Gi")),
+            ..Default::default()
+        }),
+        security_context: Some(SecurityContext {
+            run_as_user: Some(tag),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                add: None,
+            }),
+            ..Default::default()
+        }),
+        pod_security_context: Some(PodSecurityContext {
+            fs_group: Some(tag),
+            ..Default::default()
+        }),
+        privileged_mode: Some(tag == 1),
+        inherit_security_context_from: Some(InheritSecurityContextFrom::WorkloadSelector(
+            PodSelector {
+                pod_selector: LabelSelector {
+                    match_labels: Some(std::collections::BTreeMap::from([(
+                        "app".to_string(),
+                        tag.to_string(),
+                    )])),
+                    ..Default::default()
+                },
+                container: None,
+            },
+        )),
+        ttl_seconds_after_finished: Some(tag * 100),
+    }
+}
+
+#[test]
+fn merge_over_none_base_is_the_identity() {
+    let over = full_mover(7);
+    assert_eq!(over.merge_over(None), over);
+    // And the degenerate both-empty case stays empty.
+    assert_eq!(
+        MoverSpec::default().merge_over(Some(&MoverSpec::default())),
+        MoverSpec::default()
+    );
+}
+
+#[test]
+fn merge_over_lets_the_higher_layer_win_every_field() {
+    let base = full_mover(1);
+    let over = full_mover(2);
+    let merged = over.merge_over(Some(&base));
+
+    // resources: the over layer's per-key request wins.
+    assert_eq!(
+        merged
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|r| r.get("memory"))
+            .map(|q| q.0.as_str()),
+        Some("2Mi")
+    );
+    // cache: the over layer's capacity wins.
+    assert_eq!(
+        merged.cache.as_ref().and_then(|c| c.capacity.as_deref()),
+        Some("2Gi")
+    );
+    // identity: the over layer's UID wins, container AND pod fsGroup.
+    assert_eq!(
+        merged.security_context.as_ref().and_then(|s| s.run_as_user),
+        Some(2)
+    );
+    assert_eq!(
+        merged
+            .pod_security_context
+            .as_ref()
+            .and_then(|p| p.fs_group),
+        Some(2)
+    );
+    // whole-value knobs: the over layer replaces.
+    assert_eq!(merged.privileged_mode, Some(false));
+    assert_eq!(merged.ttl_seconds_after_finished, Some(200));
+    match merged.inherit_security_context_from.as_ref() {
+        Some(InheritSecurityContextFrom::WorkloadSelector(p)) => assert_eq!(
+            p.pod_selector
+                .match_labels
+                .as_ref()
+                .and_then(|l| l.get("app"))
+                .map(String::as_str),
+            Some("2")
+        ),
+        other => panic!("expected the over layer's workloadSelector, got {other:?}"),
+    }
+}
+
+#[test]
+fn merge_over_falls_through_to_the_base_per_field() {
+    let base = full_mover(1);
+    // An override that names ONLY a memory request: every other field must fall
+    // through to the base, which is the whole point of a per-run override on a
+    // shared recipe.
+    let over = MoverSpec {
+        resources: Some(ResourceRequirements {
+            limits: Some(std::collections::BTreeMap::from([(
+                "memory".to_string(),
+                Quantity("4Gi".into()),
+            )])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let merged = over.merge_over(Some(&base));
+
+    // resources merge per key/section: the base's request survives alongside the
+    // override's limit.
+    let res = merged.resources.as_ref().expect("resources merged");
+    assert_eq!(
+        res.requests
+            .as_ref()
+            .and_then(|r| r.get("memory"))
+            .map(|q| q.0.as_str()),
+        Some("1Mi")
+    );
+    assert_eq!(
+        res.limits
+            .as_ref()
+            .and_then(|l| l.get("memory"))
+            .map(|q| q.0.as_str()),
+        Some("4Gi")
+    );
+    assert_eq!(
+        merged.cache.as_ref().and_then(|c| c.capacity.as_deref()),
+        Some("1Gi")
+    );
+    assert_eq!(
+        merged.security_context.as_ref().and_then(|s| s.run_as_user),
+        Some(1)
+    );
+    assert_eq!(
+        merged
+            .pod_security_context
+            .as_ref()
+            .and_then(|p| p.fs_group),
+        Some(1)
+    );
+    assert_eq!(merged.privileged_mode, Some(true));
+    assert_eq!(merged.ttl_seconds_after_finished, Some(100));
+    assert!(merged.inherit_security_context_from.is_some());
+}
+
+#[test]
+fn merge_over_promotes_identity_across_the_container_pod_dimensions() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+    // The shadowing bug this must not have: the LOWER layer pins a container-level
+    // UID, the HIGHER layer pins only a pod-level one. The kubelet resolves
+    // `container ?? pod`, so a naive per-dimension merge would leave the base's
+    // container UID winning and invert the layer ladder.
+    let base = MoverSpec {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(1000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let over = MoverSpec {
+        pod_security_context: Some(PodSecurityContext {
+            run_as_user: Some(2000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let merged = over.merge_over(Some(&base));
+    assert_eq!(
+        merged.security_context.as_ref().and_then(|s| s.run_as_user),
+        Some(2000),
+        "the higher layer's pod-level UID must be promoted over the base's container UID"
+    );
+}
+
+#[test]
+fn merge_over_is_associative_with_the_repository_layer() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+    // Folding policy ⊂ snapshot here and then handing the result to `resolve_mover`
+    // must equal folding the repository layer in first — that associativity is what
+    // lets the controller pre-merge the two recipe layers.
+    let defaults = MoverDefaults {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(10),
+            run_as_group: Some(10),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let policy = MoverSpec {
+        security_context: Some(SecurityContext {
+            run_as_group: Some(20),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let snapshot = MoverSpec {
+        pod_security_context: Some(PodSecurityContext {
+            run_as_user: Some(30),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let pre_folded = snapshot.merge_over(Some(&policy));
+    let via_pre_fold = resolve_mover(
+        Some(&defaults),
+        pre_folded.security_context.as_ref(),
+        pre_folded.pod_security_context.as_ref(),
+        None,
+        None,
+        None,
+    );
+    // The flat equivalent: hardened ⊂ defaults ⊂ policy, then ⊂ snapshot.
+    let lower = resolve_mover(
+        Some(&defaults),
+        policy.security_context.as_ref(),
+        policy.pod_security_context.as_ref(),
+        None,
+        None,
+        None,
+    );
+    let (flat_sc, flat_psc) = merge_context_pair(
+        Some(&lower.security_context),
+        lower.pod_security_context.as_ref(),
+        snapshot.security_context.as_ref(),
+        snapshot.pod_security_context.as_ref(),
+    );
+    assert_eq!(
+        via_pre_fold.security_context.run_as_user,
+        flat_sc.as_ref().and_then(|s| s.run_as_user)
+    );
+    assert_eq!(
+        via_pre_fold.security_context.run_as_group,
+        flat_sc.as_ref().and_then(|s| s.run_as_group)
+    );
+    assert_eq!(
+        via_pre_fold
+            .pod_security_context
+            .as_ref()
+            .and_then(|p| p.run_as_user),
+        flat_psc.as_ref().and_then(|p| p.run_as_user)
+    );
+    // Sanity: the highest layer that pinned each knob is the one that won.
+    assert_eq!(via_pre_fold.security_context.run_as_user, Some(30));
+    assert_eq!(via_pre_fold.security_context.run_as_group, Some(20));
+}
+
+#[test]
+fn merge_over_covers_every_mover_spec_field() {
+    // CHANGE DETECTOR (two ways) for `MoverSpec::merge_over`.
+    //
+    // 1. Compile-time: this destructuring has no `..` rest pattern, so adding an
+    //    eighth field to `MoverSpec` fails to build here until someone looks at
+    //    `merge_over` and decides how the new field layers.
+    let MoverSpec {
+        resources,
+        cache,
+        security_context,
+        pod_security_context,
+        privileged_mode,
+        inherit_security_context_from,
+        ttl_seconds_after_finished,
+    } = full_mover(1);
+    let named = [
+        resources.is_some(),
+        cache.is_some(),
+        security_context.is_some(),
+        pod_security_context.is_some(),
+        privileged_mode.is_some(),
+        inherit_security_context_from.is_some(),
+        ttl_seconds_after_finished.is_some(),
+    ];
+    assert!(
+        named.iter().all(|set| *set),
+        "full_mover must set every field"
+    );
+
+    // 2. Runtime: the serialized field count. A field added with a `#[serde(skip)]`
+    //    or a rename would still be caught by (1); this catches a field added to the
+    //    WIRE without a merge rule.
+    let wire = serde_json::to_value(full_mover(1)).expect("MoverSpec serializes");
+    let keys = wire.as_object().expect("an object").len();
+    assert_eq!(
+        keys,
+        named.len(),
+        "MoverSpec now serializes {keys} fields but `merge_over` and this test know \
+         {} — add the new field to `MoverSpec::merge_over` (and to `full_mover`), then \
+         bump this assertion",
+        named.len()
+    );
+
+    // And the merge really does route every field: a full base under a full override
+    // yields the override's value everywhere (proved field-by-field in
+    // `merge_over_lets_the_higher_layer_win_every_field`), while a full base under an
+    // EMPTY override yields the base verbatim — no field silently dropped.
+    let base = full_mover(1);
+    assert_eq!(MoverSpec::default().merge_over(Some(&base)), base);
 }

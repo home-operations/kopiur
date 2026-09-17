@@ -1383,6 +1383,7 @@ async fn materialize_discovered(
             on_schedule_delete: None,
             // Discovered snapshots are not pinned by the operator.
             pin: false,
+            mover: None,
             // Discovered snapshots never carry a templated description (out
             // of scope for M4 — description is per-invocation only).
             description: None,
@@ -2603,6 +2604,7 @@ mod tests {
                     deletion_policy: None,
                     on_schedule_delete: None,
                     pin: false,
+                    mover: None,
                     description: None,
                 },
             );

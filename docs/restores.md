@@ -303,6 +303,8 @@ A repository being initialized from a replica with [`spec.seed`](repositories.md
 
 A restore writes data **into** a PVC, so the mover doing the writing has the same concerns a backup's mover does. `Restore.spec.mover` is the same `MoverSpec` a `SnapshotPolicy` exposes, and `Restore.spec.failurePolicy` mirrors `Snapshot.spec.failurePolicy`. See the full manifest in [example 12](examples.md#example-12--restore-mover-cache--failure-policy).
 
+A `Restore` **is** the invocation, so this block is already per-run — there is no recipe to override. The backup side reaches the same place in two steps: the recipe's [`SnapshotPolicy.spec.mover`](backups.md#mover--resources-cache-security-context), overridden for a single ad-hoc run by [`Snapshot.spec.mover`](backups.md#mover--override-the-recipes-mover-for-one-run).
+
 ```yaml
 spec:
     mover:
