@@ -447,6 +447,38 @@ Verification only ever runs against a snapshot that actually exists. On a brand-
 
 While gated, `status.lastVerified` stays unset and no verify Job is created. The `SnapshotPolicy` keeps reconciling on a steady background cadence rather than the tight polling it uses once a verify Job is actually in flight, because there is nothing wrong to report, just nothing to verify yet. As soon as the gate opens, which typically means the first backup succeeds, the operator catches up and runs the first due verification promptly, without waiting for the next cron slot. Before this gate existed, a fresh policy with `verification` configured but no backup yet could spawn a verify Job that failed hard against an empty repository (GitHub #168).
 
+### verification with a `pvcSelector` — one run per matched volume
+
+A policy whose source is a [`pvcSelector`](#sources--what-to-back-up) backs up **one kopia source per matched PVC**, so verification checks **one per matched PVC** too. Each matched volume gets its own verify Job, carrying that volume's own kopia source path, and its own recorded result.
+
+You do not configure any of this. `verification` is written exactly as above; the fan-out follows the selector.
+
+Where it shows up:
+
+- **Verify Jobs.** One per matched PVC, named `<policy>-vfy-<q|d>-m<tag>-<slot>`, where `<tag>` identifies the volume. A policy with a single source volume keeps the plain `<policy>-vfy-<q|d>-<slot>` name.
+- **`status.verificationStamps`.** Each member records its own timestamp under its own key. A policy with a single source volume keeps writing the flat `status.lastVerified` directly, with no stamp map.
+- **`status.lastVerified`.** The **oldest** member timestamp, so it reads as _"every volume in this policy is verified as of T"_. It stays unset until **every** member has verified at least once: a partially verified policy must not show a reassuring timestamp. The same rule applies one level up for a [multi-repository policy](#repositories--one-recipe-several-repositories-fan-out), where `status.verification[].lastVerified` is the oldest across that repository's volumes.
+- **A selector that currently matches nothing.** Nothing is verified and nothing is stamped, and the operator logs a warning naming the policy. It never runs a verification that covers no volume.
+- **The gate is per volume.** The [gate above](#verification-scheduling--gated-until-there-is-something-to-verify) applies to each member individually: a PVC that joins the selector later stays unverified until **its own** first backup succeeds. A sibling's success does not unlock it, because verifying a volume the repository has never seen is the silent false pass described below.
+
+`quick` members of one repository run **concurrently** — they are short, read-only, metadata-heavy runs. `deep` members run **one at a time**, because each deep member provisions its own scratch volume of `deep.capacity`; four volumes at `capacity: 500Gi` would otherwise ask the cluster for 2 TiB of ephemeral storage at once. A held member starts as soon as the running one finishes, so a full deep drill of an N-volume policy simply takes N sequential restores.
+
+/// warning | If you were already running verification on a `pvcSelector` policy
+
+Before this fan-out existed (GitHub #456), verification on a selector policy resolved an **empty** kopia source path. `deep` failed loudly with `deep verify found no snapshot to restore for source path ""`. `quick` failed **silently**: kopia matched zero snapshots, exited successfully, and the operator stamped `status.lastVerified` anyway. **Any `lastVerified` such a policy shows from before the upgrade is not evidence that anything was verified.**
+
+On the first reconcile after upgrading, the operator clears that stale flat `status.lastVerified` once and starts recording per-member results, so the next scheduled slot performs a real verification of every matched volume. A selector policy that matches exactly **one** volume keeps the flat field; its stale value simply defers the next verify by at most one cron period, after which it verifies for real.
+
+///
+
+/// note | Two smaller changes that came with the fan-out
+
+A policy that has a source but from which no path can be derived now verifies under `/data`, which is the path its backups were actually written under, instead of an empty path.
+
+A policy whose `identityDefaults.usernameExpr`/`hostnameExpr` cannot be evaluated now **parks** with a validation error on the `SnapshotPolicy` instead of quietly verifying under a `kopiur-verify@<namespace>` placeholder — which matched nothing and reported success. Fix the expression and the policy resumes.
+
+///
+
 `successExpr` is a CEL predicate returning a bool over the verify result. The environment is:
 
 - `stats{files,bytes,errors}`, for **both** tiers. `quick` has no machine-readable counts of its own, so the operator fills `stats.files` and `stats.bytes` from the verified snapshot's manifest and reports `errors: 0` on a passing run. That means `stats.files > 0 && stats.errors == 0` works on `quick`, not just `deep`.

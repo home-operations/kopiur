@@ -405,6 +405,53 @@ fn multi_repo_has_success(backups: &[Snapshot], repo_key: &str) -> bool {
     })
 }
 
+/// **Pure.** The kopia source path a child `Snapshot` actually backed up,
+/// derived exactly the way the backup side derived it
+/// ([`kopiur_api::expand::effective_source`] + `strategy_for`). `None` when it
+/// cannot be derived — a child minted against an older recipe shape, which must
+/// never be mistaken for a match.
+fn child_kopia_source_path(policy: &SnapshotPolicy, child: &Snapshot) -> Option<String> {
+    let eff = kopiur_api::expand::effective_source(policy, child.spec.source.as_ref()).ok()?;
+    let strategy = kopiur_api::expand::strategy_for(policy.spec.sources.get(eff.index)?);
+    eff.kopia_source_path(strategy)
+}
+
+/// **Pure.** Whether a SUCCEEDED child of this policy already covers
+/// `member_path` — the PER-MEMBER #168 verification gate (#456).
+///
+/// Per member, not per policy: a PVC that joins the selector LATER has no
+/// snapshot of its own, and unlocking it because a SIBLING succeeded reopens
+/// exactly the #456 false pass — its quick verify would filter on a path with
+/// no manifests, match zero and exit 0.
+///
+/// `repo_key` narrows to one repository for a multi-repo policy (a child counts
+/// only for the repository its `spec.repository` pin names, same rule as
+/// [`multi_repo_has_success`]).
+fn member_has_success(
+    policy: &SnapshotPolicy,
+    backups: &[Snapshot],
+    repo_key: Option<&str>,
+    member_path: &str,
+) -> bool {
+    backups.iter().any(|b| {
+        if retention_view(b).is_none() {
+            return false;
+        }
+        if let Some(key) = repo_key {
+            let ns = b.namespace().unwrap_or_default();
+            let pinned_here = b
+                .spec
+                .repository
+                .as_ref()
+                .is_some_and(|pin| kopiur_api::common::repo_key(pin, &ns) == key);
+            if !pinned_here {
+                return false;
+            }
+        }
+        child_kopia_source_path(policy, b).as_deref() == Some(member_path)
+    })
+}
+
 /// The terminal ordering key for a Snapshot: `status.timing.endTime`, falling
 /// back to `metadata.creationTimestamp`.
 fn snapshot_end_or_creation(b: &Snapshot) -> Option<DateTime<Utc>> {
@@ -1635,13 +1682,21 @@ async fn run_verify_steps(
     let mut deep_hold = false;
     for t in ready {
         let repo_key = is_multi.then(|| kopiur_api::common::repo_key(&t.rref, namespace));
-        let has_successful = match repo_key.as_deref() {
+        let repo_has_successful = match repo_key.as_deref() {
             Some(key) => multi_repo_has_success(backups, key),
             None => has_successful_snapshot,
         };
         let has_discovered =
-            crate::verification::has_discovered_snapshots(ctx, &t.repo, has_successful).await?;
+            crate::verification::has_discovered_snapshots(ctx, &t.repo, repo_has_successful)
+                .await?;
         for member in verify_members {
+            // #456: gate PER MEMBER when the member has a derived path of its
+            // own. A path-less (non-selector) member keeps the per-policy /
+            // per-repository input, byte-identically.
+            let has_successful = match member.source_path.as_deref() {
+                Some(path) => member_has_success(config, backups, repo_key.as_deref(), path),
+                None => repo_has_successful,
+            };
             let key =
                 crate::verification::stamp_key(repo_key.as_deref(), member.member6.as_deref());
             let vt = crate::verification::VerifyTarget {
@@ -3489,6 +3544,80 @@ mod tests {
         // Unpinned successes count for NO repo (their repository is not
         // knowable from the spec; the backfill pass pins them promptly).
         assert!(!multi_repo_has_success(&rows, "Repository/apps/repo-c"));
+    }
+
+    #[test]
+    fn member_has_success_gates_each_member_on_its_own_backup() {
+        // #456: a PVC that joins the selector LATER must stay gated until ITS
+        // OWN first backup succeeds. Unlocking it because a sibling succeeded
+        // reopens the false pass — quick verify on a path with no manifests
+        // matches zero and exits 0.
+        let policy: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "apps" },
+            "spec": {
+                "repository": { "name": "r" },
+                "sources": [{
+                    "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+                    "sourcePathStrategy": "PvcName",
+                }],
+            },
+        }))
+        .expect("typed policy");
+        let member = |b: Snapshot, pvc: &str| {
+            let mut b = b;
+            b.metadata.namespace = Some("apps".into());
+            b.spec.source = Some(
+                serde_json::from_value(serde_json::json!({
+                    "sourceIndex": 0,
+                    "target": { "pvc": { "namespace": "apps", "name": pvc } },
+                }))
+                .expect("typed source pin"),
+            );
+            b
+        };
+        let rows = vec![
+            member(succeeded_backup("a1", at(2026, 5, 1)), "data-a"),
+            member(failed_backup("b1", at(2026, 5, 1)), "data-b"),
+        ];
+        assert!(member_has_success(&policy, &rows, None, "/pvc/data-a"));
+        assert!(
+            !member_has_success(&policy, &rows, None, "/pvc/data-b"),
+            "a FAILED run is not a verifiable snapshot"
+        );
+        assert!(
+            !member_has_success(&policy, &rows, None, "/pvc/data-c"),
+            "a member with no child of its own must stay gated even though a sibling \
+             succeeded — that is the #456 false pass"
+        );
+        // Multi-repo: a child counts only for the repository it is pinned to.
+        let pinned = vec![pin(
+            member(succeeded_backup("a1", at(2026, 5, 1)), "data-a"),
+            "repo-a",
+        )];
+        assert!(member_has_success(
+            &policy,
+            &pinned,
+            Some("Repository/apps/repo-a"),
+            "/pvc/data-a"
+        ));
+        assert!(!member_has_success(
+            &policy,
+            &pinned,
+            Some("Repository/apps/repo-b"),
+            "/pvc/data-a"
+        ));
+        // A child from an older recipe shape (no source pin) derives no path
+        // under a selector source, so it never false-matches a member.
+        let legacy = vec![member_less(succeeded_backup("old", at(2026, 5, 1)))];
+        assert!(!member_has_success(&policy, &legacy, None, "/pvc/data-a"));
+    }
+
+    /// A child with no `spec.source` pin, namespaced like the rest.
+    fn member_less(mut b: Snapshot) -> Snapshot {
+        b.metadata.namespace = Some("apps".into());
+        b
     }
 
     // --- #382 M3: store-served enumeration data-safety boundaries -----------

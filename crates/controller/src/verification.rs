@@ -677,46 +677,76 @@ pub async fn verify_step(
             }),
         },
         None => {
-            // The deep tier's single-flight is member-AGNOSTIC (`member6: None`
-            // below), which is what makes deep members sequential ACROSS
-            // reconciles and operator restarts, not just within one pass.
-            let flight_member = match tier {
-                VerifyTierKind::Quick => target.member6,
-                VerifyTierKind::Deep => None,
-            };
-            if has_active_verify_job(&job_api, &name, repo6.as_deref(), flight_member).await? {
-                return Ok(VerifyStepResult {
-                    requeue: Some(REQUEUE_RUNNING),
-                    deep_active: tier == VerifyTierKind::Deep,
-                });
-            }
-            spawn_verify_job(
+            spawn_if_slot_free(
                 config,
                 ctx,
                 target,
                 namespace,
-                &name,
-                &job_name,
+                &job_api,
+                (&name, &job_name),
                 verification,
                 tier,
                 slot,
+                repo6.as_deref(),
             )
-            .await?;
-            tracing::info!(
-                policy = %name,
-                ?tier,
-                repo = target.repo_key.as_deref().unwrap_or("<single>"),
-                member = target.member6.unwrap_or("<single>"),
-                source_path = target.source_path.unwrap_or("<identity-derived>"),
-                slot = %slot.to_rfc3339(),
-                "spawned verification Job"
-            );
-            Ok(VerifyStepResult {
-                requeue: Some(REQUEUE_RUNNING),
-                deep_active: tier == VerifyTierKind::Deep,
-            })
+            .await
         }
     }
+}
+
+/// The single-flight check + spawn for a slot that has no Job yet — the
+/// `None` arm of [`verify_step`]'s per-slot lookup, extracted so `verify_step`
+/// stays under the cognitive-complexity ratchet.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_if_slot_free(
+    config: &SnapshotPolicy,
+    ctx: &Context,
+    target: &VerifyTarget<'_>,
+    namespace: &str,
+    job_api: &Api<Job>,
+    names: (&str, &str),
+    verification: &Verification,
+    tier: VerifyTierKind,
+    slot: DateTime<Utc>,
+    repo6: Option<&str>,
+) -> Result<VerifyStepResult> {
+    let (policy_name, job_name) = names;
+    let held = VerifyStepResult {
+        requeue: Some(REQUEUE_RUNNING),
+        deep_active: tier == VerifyTierKind::Deep,
+    };
+    // The deep tier's single-flight is member-AGNOSTIC (`member6: None`), which
+    // is what makes deep members sequential ACROSS reconciles and operator
+    // restarts, not just within one pass.
+    let flight_member = match tier {
+        VerifyTierKind::Quick => target.member6,
+        VerifyTierKind::Deep => None,
+    };
+    if has_active_verify_job(job_api, policy_name, repo6, flight_member).await? {
+        return Ok(held);
+    }
+    spawn_verify_job(
+        config,
+        ctx,
+        target,
+        namespace,
+        policy_name,
+        job_name,
+        verification,
+        tier,
+        slot,
+    )
+    .await?;
+    tracing::info!(
+        policy = %policy_name,
+        ?tier,
+        repo = target.repo_key.as_deref().unwrap_or("<single>"),
+        member = target.member6.unwrap_or("<single>"),
+        source_path = target.source_path.unwrap_or("<identity-derived>"),
+        slot = %slot.to_rfc3339(),
+        "spawned verification Job"
+    );
+    Ok(held)
 }
 
 /// Build + apply the per-slot verification mover Job.
