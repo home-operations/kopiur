@@ -2404,6 +2404,8 @@ spec:
                         description: |-
                           Index blobs in an epoch that trigger an advance, once older than `minDuration`
                           (kopia default `20`).
+
+                          At least `10` — kopia refuses anything lower with "epoch advance on count too low".
                         format: int64
                         nullable: true
                         type: integer
@@ -2411,6 +2413,9 @@ spec:
                         description: |-
                           Total index size in an epoch that triggers an advance, once older than `minDuration`
                           (kopia default `10` MiB).
+
+                          At least `1` — kopia refuses anything lower with "epoch advance on size too low",
+                          and 1 MiB is the smallest threshold the flag can express.
 
                           Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
                           (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
@@ -2421,12 +2426,20 @@ spec:
                         nullable: true
                         type: integer
                       checkpointFrequency:
-                        description: Epochs between full index checkpoints (kopia default `7`).
+                        description: |-
+                          Epochs between full index checkpoints (kopia default `7`).
+
+                          At least `1` — kopia refuses anything lower with "invalid epoch range compaction
+                          period".
                         format: int64
                         nullable: true
                         type: integer
                       deleteParallelism:
-                        description: Parallelism for epoch cleanup deletions (kopia default `4`).
+                        description: |-
+                          Parallelism for epoch cleanup deletions (kopia default `4`).
+
+                          At least `1`. This floor is kopiur's own: kopia does not validate the field, so a
+                          non-positive value would ask it to run epoch cleanup with no workers.
                         format: int64
                         nullable: true
                         type: integer
@@ -2434,10 +2447,20 @@ spec:
                         description: |-
                           Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
                           (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+
+                          Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`.
+                          When `refreshFrequency` is not declared, that second bound is measured against
+                          kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or
+                          declare a `refreshFrequency` of a third of it or less alongside it.
                         nullable: true
                         type: string
                       refreshFrequency:
-                        description: How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+                        description: |-
+                          How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+
+                          At most `80m`: kopia requires `cleanupSafetyMargin >= 3x` this value, and
+                          `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's
+                          `4h` default and `4h / 3` is a hard ceiling.
                         nullable: true
                         type: string
                     type: object
@@ -3754,7 +3777,13 @@ spec:
                         format: int64
                         type: integer
                       advanceOnSizeMiB:
-                        description: Observed total index size (MiB) that triggers an epoch advance.
+                        description: |-
+                          Observed total index size (MiB) that triggers an epoch advance, **rounded up**.
+
+                          kopia reports this threshold in BYTES and it need not be a whole number of MiB, so
+                          the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a
+                          value the repository does not actually hold. Drift against `spec` is computed on the
+                          exact byte count, never on this rounded mirror.
                         format: int64
                         type: integer
                       checkpointFrequency:

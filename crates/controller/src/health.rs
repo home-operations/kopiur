@@ -40,6 +40,22 @@ pub const ENSURE_MAINTENANCE_ACTION: &str = "EnsureMaintenance";
 /// evidence is a `status.parameters.epoch` that quietly disagrees with `spec`.
 pub const EPOCH_PARAMETERS_NOT_APPLIED_REASON: &str = "EpochParametersNotApplied";
 /// Remediation label for [`EPOCH_PARAMETERS_NOT_APPLIED_REASON`].
+///
+/// "Fix" means "bring the declared values inside kopia's own ranges", and since #458 the
+/// admission webhook enforces those ranges up front
+/// (`kopiur_api::validate::validate_repository_parameters`), so a CR that reaches this event
+/// is one that was admitted before the floors existed, or one whose repository disagrees
+/// with the floors for a reason kopiur cannot see at admission time. The floors:
+/// `minDuration` >= `10m` and >= 3x `refreshFrequency` (kopia's `20m` default when none is
+/// declared — so `10m` alone never applies and `60m` is the smallest self-sufficient value);
+/// `refreshFrequency` <= `80m` (kopia needs `cleanupSafetyMargin >= 3x` it, and that margin
+/// is stuck at kopia's `4h` default); `advanceOnCount` >= `10`; `advanceOnSizeMiB` >= `1`;
+/// `checkpointFrequency` >= `1`; `deleteParallelism` >= `1`.
+///
+/// Worth naming here because of HOW kopia fails: `set-parameters` merges the declared flags
+/// into the repository's existing parameters and validates the whole resulting set, so one
+/// out-of-range value refuses the entire call — the event means every parameter in that
+/// apply was discarded, not just the offending one.
 pub const FIX_EPOCH_PARAMETERS_ACTION: &str = "FixEpochParameters";
 
 /// Machine reason when the count is within threshold.

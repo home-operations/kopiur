@@ -5637,6 +5637,242 @@ fn cluster_repository_gets_the_identical_parameters_rules() {
     assert!(validate_cluster_repository(&spec).is_empty());
 }
 
+// --- #458: kopia's own epoch floors ---------------------------------------
+//
+// Every floor here was verified against the pinned kopia 0.23.1 binary, not read off the
+// source: `kopia repository set-parameters --epoch-advance-on-count=5` really does exit
+// non-zero with "epoch advance on count too low", and because `set-parameters` MERGES the
+// flags into the repository's existing parameters before validating the whole set, that one
+// rejection also discards every other flag in the same call. That merge is why these are
+// admission errors and not warnings: the reporter on #458 declared advanceOnCount: 5 and
+// advanceOnSizeMiB: 2 alongside a legal minDuration, and lost the minDuration too.
+
+#[test]
+fn kopia_default_epoch_parameters_pass_admission() {
+    // The floors must never tax the values kopia itself ships with (refresh 20m,
+    // minDuration 24h, advanceOnCount 20, advanceOnSizeMiB 10, checkpointFrequency 7,
+    // deleteParallelism 4) — a floor that rejects kopia's own defaults is a broken floor.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 24h\n    refreshFrequency: 20m\n    \
+         advanceOnCount: 20\n    advanceOnSizeMiB: 10\n    checkpointFrequency: 7\n    \
+         deleteParallelism: 4\n"
+    ));
+    assert!(
+        validate_repository(&spec).is_empty(),
+        "{:?}",
+        validate_repository(&spec)
+    );
+}
+
+#[test]
+fn epoch_advance_on_count_below_kopias_floor_is_rejected() {
+    // The reporter's exact value. kopia: "epoch advance on count too low".
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnCount: 5\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "advanceOnCount: 5 must be rejected");
+    assert!(msg.contains("advanceOnCount"), "{msg}");
+    assert!(msg.contains("10"), "must name the floor: {msg}");
+    assert!(
+        msg.contains("epoch advance on count too low"),
+        "must quote kopia's own error text: {msg}"
+    );
+    assert!(
+        msg.contains("set-parameters"),
+        "must say the whole call is refused: {msg}"
+    );
+
+    // Exactly at the floor is fine.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnCount: 10\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+}
+
+#[test]
+fn epoch_advance_on_size_below_one_mib_is_rejected() {
+    // 2 MiB — the reporter's other value — is LEGAL; only sub-MiB is not, and since the
+    // field's unit is MiB the only sub-floor integers are 0 and negatives. Verified on
+    // 0.23.1: `--epoch-advance-on-size-mb=-1` errors "epoch advance on size too low",
+    // while `=0` is silently dropped by kopia's CLI as "no changes" — which is worse,
+    // because the user sees success and nothing happens.
+    for bad in ["0", "-1"] {
+        let spec = repo_yaml(&format!(
+            "{REPO_BASE}parameters:\n  epoch:\n    advanceOnSizeMiB: {bad}\n"
+        ));
+        let errs = validate_repository(&spec);
+        let msg = format!("{errs:?}");
+        assert!(!errs.is_empty(), "advanceOnSizeMiB: {bad} must be rejected");
+        assert!(msg.contains("advanceOnSizeMiB"), "{msg}");
+        assert!(
+            msg.contains("epoch advance on size too low"),
+            "must quote kopia: {msg}"
+        );
+    }
+
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnSizeMiB: 2\n"
+    ));
+    assert!(
+        validate_repository(&spec).is_empty(),
+        "2 MiB is above kopia's 1 MiB floor and must be accepted"
+    );
+}
+
+#[test]
+fn epoch_refresh_frequency_above_the_cleanup_safety_margin_is_rejected() {
+    // kopia requires cleanupSafetyMargin >= 3 x refreshFrequency, and kopiur has NO
+    // cleanupSafetyMargin field at all — so the margin is always kopia's 4h default and
+    // any refresh above 80m is guaranteed to fail. Verified: `--epoch-refresh-frequency=90m`
+    // errors "invalid cleanup safety margin, must be at least 3x epoch refresh frequency".
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: 90m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "refreshFrequency: 90m must be rejected");
+    assert!(msg.contains("refreshFrequency"), "{msg}");
+    assert!(msg.contains("80m"), "must name the ceiling: {msg}");
+    assert!(
+        msg.contains("cleanup safety margin"),
+        "must quote kopia: {msg}"
+    );
+
+    // 80m is exactly 4h/3 — the boundary is inclusive.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: 80m\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+}
+
+#[test]
+fn min_duration_must_clear_both_the_absolute_and_the_refresh_derived_floor() {
+    // (a) minDuration: 10m DECLARED ALONE fails on the live repository, even though 10m is
+    // exactly kopia's absolute floor: the repository's untouched refresh of 20m makes
+    // 20m x 3 = 60m > 10m, and kopia answers "epoch refresh period is too long, must be
+    // 1/3 of minimal epoch duration or shorter". Verified on 0.23.1. This is the single
+    // most confusing failure in the whole block, so the message has to spell out both fixes.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 10m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(
+        !errs.is_empty(),
+        "minDuration: 10m declared alone always fails on the live repository"
+    );
+    assert!(msg.contains("minDuration"), "{msg}");
+    assert!(msg.contains("60m"), "must name the derived floor: {msg}");
+    assert!(
+        msg.contains("refreshFrequency"),
+        "must offer the other fix — lower the refresh: {msg}"
+    );
+    assert!(
+        msg.contains("epoch refresh period is too long"),
+        "must quote kopia: {msg}"
+    );
+
+    // (b) 60m alone clears 3 x kopia's 20m default.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 60m\n"
+    ));
+    assert!(
+        validate_repository(&spec).is_empty(),
+        "minDuration: 60m alone is exactly 3 x kopia's 20m refresh default"
+    );
+
+    // (c) 10m becomes legal the moment a small enough refresh is declared WITH it —
+    // `--epoch-min-duration=10m --epoch-refresh-frequency=3m` genuinely succeeds.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 10m\n    refreshFrequency: 3m\n"
+    ));
+    assert!(
+        validate_repository(&spec).is_empty(),
+        "a declared refreshFrequency <= minDuration/3 makes 10m legal"
+    );
+
+    // (d) …but the ABSOLUTE 10m floor still bites: 5m + 1m satisfies the 3x rule and kopia
+    // still refuses with "minimum epoch duration too low: 5m0s".
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 5m\n    refreshFrequency: 1m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "5m is below kopia's absolute 10m floor");
+    assert!(
+        msg.contains("minimum epoch duration too low"),
+        "must quote kopia: {msg}"
+    );
+}
+
+#[test]
+fn epoch_checkpoint_frequency_and_delete_parallelism_floors() {
+    // checkpointFrequency is kopia's rule ("invalid epoch range compaction period", verified
+    // with `--epoch-checkpoint-frequency=-1`); deleteParallelism is KOPIUR's own — kopia's
+    // Validate() never looks at it — and the message must say so rather than imply kopia
+    // would catch it.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    checkpointFrequency: 0\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "checkpointFrequency: 0 must be rejected");
+    assert!(
+        msg.contains("invalid epoch range compaction period"),
+        "must quote kopia: {msg}"
+    );
+
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    deleteParallelism: 0\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "deleteParallelism: 0 must be rejected");
+    assert!(
+        msg.contains("kopia does not validate"),
+        "must be honest that this floor is kopiur's own: {msg}"
+    );
+
+    // 1 is the floor for both.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    checkpointFrequency: 1\n    deleteParallelism: 1\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+}
+
+#[test]
+fn cluster_repository_rejects_the_same_epoch_floors() {
+    // validate_repository_parameters is shared, but the two kinds have fully duplicated
+    // reconcilers and this is the classic way half an API surface ships inert.
+    let base = "backend: { filesystem: { path: /repo } }\n\
+                encryption: { passwordSecretRef: { name: s, namespace: kopiur-system, key: KOPIA_PASSWORD } }\n\
+                allowedNamespaces: { all: true }\n";
+    // The reporter's exact declaration, on the kind they actually used.
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}parameters:\n  epoch:\n    minDuration: 6h\n    advanceOnCount: 5\n    \
+         advanceOnSizeMiB: 2\n"
+    ));
+    let errs = validate_cluster_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert_eq!(
+        errs.len(),
+        1,
+        "only advanceOnCount is out of range — advanceOnSizeMiB: 2 and minDuration: 6h are \
+         both legal: {msg}"
+    );
+    assert!(msg.contains("advanceOnCount"), "{msg}");
+
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}parameters:\n  epoch:\n    minDuration: 10m\n"
+    ));
+    assert!(
+        !validate_cluster_repository(&spec).is_empty(),
+        "the derived minDuration floor must apply to ClusterRepository too"
+    );
+}
+
 // --- #332: object-lock blob retention -------------------------------------------------
 
 /// An object-lock-capable base. `REPO_BASE` is `filesystem`, which blob retention rejects.
