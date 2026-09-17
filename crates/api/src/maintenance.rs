@@ -510,6 +510,38 @@ pub struct MaintenanceStatus {
     /// State of the most recent annotation-requested out-of-band run; absent until one is requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_run: Option<ManualRunStatus>,
+    /// Content-index blob count re-counted right after the most recent successful run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_index_blobs: Option<ObservedIndexBlobs>,
+}
+
+/// The repository's content-index blob count as re-counted immediately after a
+/// successful maintenance run, with the instant it was taken.
+///
+/// Why this lives on `Maintenance` and not only on the repository: the
+/// repository's own `status.storageStats.indexBlobCount` is written by the
+/// bootstrap path, which runs on the catalog cadence and can be hours or days
+/// stale. Compaction happens during maintenance, so the count right after a run
+/// is the freshest truth there is — and without it the `IndexBlobHealth`
+/// warning keeps quoting a pre-compaction number long after compaction fixed
+/// it. The repository reconciler reads this and adopts it when it is newer than
+/// its own observation, which is what the timestamp is for.
+///
+/// Written by the **mover**, best-effort (a `kopia index list` on an unhealthy
+/// repository is exactly the slow case), and read by the repository
+/// reconcilers. Absent when the recount did not complete — never `0`, which
+/// would read as a perfectly healthy index.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedIndexBlobs {
+    /// Number of content-index blobs (`kopia index list`) after the run.
+    #[serde(default)]
+    pub count: i64,
+    /// RFC3339 instant the recount was taken. What makes this observation
+    /// comparable against the repository's own `storageStats.indexBlobCountAt`,
+    /// so whichever is newer wins rather than whichever was written last.
+    #[serde(default)]
+    pub observed_at: String,
 }
 
 /// Which maintenance kind a manual (annotation-requested) run performs; the wire
@@ -658,7 +690,15 @@ pub struct RunStatus {
     /// Count of back-to-back failed runs of this kind; resets on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_failures: Option<i64>,
-    /// Bytes of storage reclaimed by the most recent run of this kind.
+    /// Bytes of backend storage the most recent run of this kind actually freed:
+    /// the blobs kopia deleted (unreferenced packs, superseded epoch indexes and
+    /// expired logs), summed from the run history `kopia maintenance info`
+    /// reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only
+    /// marks contents deleted in the index and frees no storage until a later run
+    /// removes the blobs. Absent when the run reclaimed nothing measurable — a
+    /// quick run on an epoch-enabled repository only advances and compacts
+    /// epochs, so there is no figure to report; `0` always means a measured zero,
+    /// never "unknown".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_content_reclaimed_bytes: Option<i64>,
 }
@@ -894,6 +934,46 @@ full:
         let json = serde_json::to_value(&status).unwrap();
         let reparsed: MaintenanceStatus = serde_json::from_value(json).unwrap();
         assert_eq!(status, reparsed);
+    }
+
+    /// #458: the post-maintenance index-blob recount, parsed the cluster's way.
+    #[test]
+    fn observed_index_blobs_roundtrips_camel_case() {
+        let status: MaintenanceStatus =
+            from_yaml("observedIndexBlobs:\n  count: 312\n  observedAt: 2026-06-02T09:30:00Z\n");
+        let obs = status.observed_index_blobs.as_ref().expect("decodes");
+        assert_eq!(obs.count, 312);
+        assert_eq!(obs.observed_at, "2026-06-02T09:30:00Z");
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["observedIndexBlobs"]["count"], 312);
+        assert_eq!(
+            json["observedIndexBlobs"]["observedAt"],
+            "2026-06-02T09:30:00Z"
+        );
+        let reparsed: MaintenanceStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status, reparsed);
+
+        // Absent stays elided: a run that could not recount must not publish a
+        // zero count, which would read as a perfectly healthy index.
+        let empty: MaintenanceStatus = from_yaml("{}\n");
+        assert!(empty.observed_index_blobs.is_none());
+        assert!(
+            serde_json::to_value(&empty)
+                .unwrap()
+                .get("observedIndexBlobs")
+                .is_none()
+        );
+    }
+
+    /// The CRD must actually carry the recount sub-object, with both keys — the
+    /// repository reconciler reads them by name.
+    #[test]
+    fn maintenance_crd_exposes_observed_index_blobs() {
+        let crd = serde_json::to_value(Maintenance::crd()).expect("crd");
+        let props = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"]["observedIndexBlobs"]["properties"];
+        assert_eq!(props["count"]["type"], "integer");
+        assert_eq!(props["observedAt"]["type"], "string");
     }
 
     #[test]

@@ -253,6 +253,81 @@ pub fn maintenance_covered_by_foreign(
     .0
 }
 
+/// The freshest post-maintenance index-blob recount among every `Maintenance`
+/// covering repository `(kind, name)`, as `(count, observedAt)`.
+///
+/// Pure over an iterator of `Maintenance` so it is unit-tested without a
+/// cluster. Unlike [`classify_maintenance`] it does not care whether the
+/// covering `Maintenance` is operator-managed or hand-authored: both run real
+/// maintenance against the same repository, so either one's recount is a valid
+/// observation of it. With several covering CRs the newest `observedAt` wins —
+/// comparison is lexicographic on the RFC3339 string, which is exactly
+/// chronological for the `Utc::to_rfc3339` form the mover writes.
+///
+/// An observation whose `observedAt` does not PARSE as RFC3339 is discarded
+/// here rather than ranked. That is not defensive decoration: a hand-authored
+/// or server-side-defaulted EMPTY [`ObservedIndexBlobs`] sub-object decodes to
+/// `count: 0` with an empty stamp, and a zero count is the one value that must
+/// never reach the fold — on a repository with no count of its own it would be
+/// adopted outright and published as "0 index blobs", i.e. a perfectly healthy
+/// index, silently clearing a real `IndexBlobHealth` warning. A stamp we cannot
+/// place in time is not an observation.
+pub fn newest_observed_index_blobs(
+    items: impl IntoIterator<Item = Maintenance>,
+    kind: RepositoryKind,
+    name: &str,
+    match_namespace: Option<&str>,
+) -> Option<(i64, String)> {
+    items
+        .into_iter()
+        .filter(|m| {
+            let owner_ns = m.metadata.namespace.as_deref().unwrap_or_default();
+            m.spec
+                .repository
+                .resolves_to(owner_ns, kind, name, match_namespace)
+        })
+        .filter_map(|m| {
+            let observed = m.status?.observed_index_blobs?;
+            chrono::DateTime::parse_from_rfc3339(&observed.observed_at).ok()?;
+            Some((observed.count, observed.observed_at))
+        })
+        .max_by(|a, b| a.1.cmp(&b.1))
+}
+
+/// [`newest_observed_index_blobs`] against the shared `Maintenance` informer
+/// store — the repository reconcilers' entry point. No new watch is needed:
+/// both repository controllers already `.watches(Api::<Maintenance>)`, so the
+/// mover's status patch wakes the reconcile that reads this.
+///
+/// Returns `None` — meaning "no recount, leave the repository's own count
+/// standing" — in two distinct situations that must both be no-ops rather than
+/// zeroes:
+///
+/// * the store has not synced yet (the same cold-cache degradation
+///   [`maintenance_covered_by_foreign`] makes);
+/// * the covering `Maintenance` is not in the store at all. Under a **namespaced**
+///   install the informer is namespace-scoped, while a `ClusterRepository`'s
+///   `Maintenance` lives wherever `spec.maintenance.namespace` puts it — so a
+///   foreign maintenance namespace is genuinely invisible here. Treating that as
+///   "zero index blobs" would silently clear a real `IndexBlobHealth` warning,
+///   which is the opposite of what #458 asks for.
+pub fn observed_index_blobs(
+    ctx: &Context,
+    kind: RepositoryKind,
+    name: &str,
+    match_namespace: Option<&str>,
+) -> Option<(i64, String)> {
+    if !ctx.maintenance_synced.load(Ordering::Relaxed) {
+        return None;
+    }
+    newest_observed_index_blobs(
+        ctx.maintenance_store.state().iter().map(|m| (**m).clone()),
+        kind,
+        name,
+        match_namespace,
+    )
+}
+
 /// The `BootstrapRepositoryOp` maintenance-owner / restamp-policy / alias
 /// triple for a repository's bootstrap work spec (M6).
 ///
@@ -607,5 +682,258 @@ fn coverage_without_managed(foreign: bool) -> MaintenanceCoverage {
         MaintenanceCoverage::CoveredByForeign
     } else {
         MaintenanceCoverage::DisabledBySpec
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kopiur_api::maintenance::{MaintenanceStatus, ObservedIndexBlobs};
+
+    /// A `Maintenance` referencing `(kind, name[, namespace])`, optionally
+    /// carrying a post-run index-blob recount.
+    fn maint(
+        ns: &str,
+        kind: RepositoryKind,
+        repo_name: &str,
+        repo_ns: Option<&str>,
+        observed: Option<(i64, &str)>,
+    ) -> Maintenance {
+        let mut m = Maintenance::new(
+            &format!("{repo_name}-maint"),
+            MaintenanceSpec {
+                repository: RepositoryRef {
+                    kind,
+                    name: repo_name.into(),
+                    namespace: repo_ns.map(str::to_string),
+                },
+                schedule: default_maintenance_schedule(),
+                ownership: Ownership {
+                    owner: "lease".into(),
+                    owner_aliases: Vec::new(),
+                    takeover_policy: Default::default(),
+                },
+                mover: None,
+                failure_policy: None,
+                credential_projection: None,
+            },
+        );
+        m.metadata.namespace = Some(ns.into());
+        m.status = Some(MaintenanceStatus {
+            observed_index_blobs: observed.map(|(count, observed_at)| ObservedIndexBlobs {
+                count,
+                observed_at: observed_at.into(),
+            }),
+            ..Default::default()
+        });
+        m
+    }
+
+    /// #458: the recount is read from whichever `Maintenance` covers the
+    /// repository — managed or hand-authored, since both run real maintenance
+    /// against the same repository — and an unrelated one must never leak in.
+    #[test]
+    fn newest_observed_index_blobs_reads_the_covering_maintenance() {
+        let items = vec![
+            maint(
+                "prod",
+                RepositoryKind::Repository,
+                "nas",
+                None,
+                Some((312, "2026-06-02T09:30:00Z")),
+            ),
+            // A different repository in the same namespace: not ours.
+            maint(
+                "prod",
+                RepositoryKind::Repository,
+                "other",
+                None,
+                Some((9999, "2026-06-09T00:00:00Z")),
+            ),
+        ];
+        assert_eq!(
+            newest_observed_index_blobs(
+                items.clone(),
+                RepositoryKind::Repository,
+                "nas",
+                Some("prod")
+            ),
+            Some((312, "2026-06-02T09:30:00Z".to_string()))
+        );
+        // A repository nothing covers has no recount — NOT a zero count.
+        assert_eq!(
+            newest_observed_index_blobs(items, RepositoryKind::Repository, "absent", Some("prod")),
+            None
+        );
+    }
+
+    /// With several covering `Maintenance` CRs the newest recount wins, and a
+    /// covering CR that has never completed a run contributes nothing (rather
+    /// than a zero that would read as a perfectly healthy index).
+    #[test]
+    fn newest_observed_index_blobs_picks_the_newest_and_skips_unmeasured() {
+        let items = vec![
+            maint(
+                "ops",
+                RepositoryKind::ClusterRepository,
+                "shared",
+                None,
+                Some((800, "2026-06-01T00:00:00Z")),
+            ),
+            maint(
+                "other",
+                RepositoryKind::ClusterRepository,
+                "shared",
+                None,
+                Some((312, "2026-06-05T00:00:00Z")),
+            ),
+            maint(
+                "third",
+                RepositoryKind::ClusterRepository,
+                "shared",
+                None,
+                None,
+            ),
+        ];
+        assert_eq!(
+            newest_observed_index_blobs(items, RepositoryKind::ClusterRepository, "shared", None),
+            Some((312, "2026-06-05T00:00:00Z".to_string()))
+        );
+
+        let never_ran = vec![maint(
+            "ops",
+            RepositoryKind::ClusterRepository,
+            "shared",
+            None,
+            None,
+        )];
+        assert_eq!(
+            newest_observed_index_blobs(
+                never_ran,
+                RepositoryKind::ClusterRepository,
+                "shared",
+                None
+            ),
+            None
+        );
+    }
+
+    /// An [`ObservedIndexBlobs`] sub-object with no real content —
+    /// hand-authored, or server-side-defaulted by the apiserver — decodes to
+    /// `count: 0` with an empty stamp. It must be discarded, not ranked: a zero
+    /// count adopted onto a repository with no count of its own would publish
+    /// "0 index blobs", reading as a perfectly healthy index and clearing a real
+    /// warning. Same for any stamp we cannot place in time.
+    #[test]
+    fn an_unparseable_observation_stamp_is_not_an_observation() {
+        for stamp in ["", "soon", "2026-06-02"] {
+            let items = vec![maint(
+                "prod",
+                RepositoryKind::Repository,
+                "nas",
+                None,
+                Some((0, stamp)),
+            )];
+            assert_eq!(
+                newest_observed_index_blobs(items, RepositoryKind::Repository, "nas", Some("prod")),
+                None,
+                "a {stamp:?} stamp must not be ranked as an observation"
+            );
+        }
+        // ...while a real observation beside it still wins.
+        let items = vec![
+            maint(
+                "prod",
+                RepositoryKind::Repository,
+                "nas",
+                None,
+                Some((0, "")),
+            ),
+            maint(
+                "other",
+                RepositoryKind::Repository,
+                "nas",
+                Some("prod"),
+                Some((312, "2026-06-02T09:30:00Z")),
+            ),
+        ];
+        assert_eq!(
+            newest_observed_index_blobs(items, RepositoryKind::Repository, "nas", Some("prod")),
+            Some((312, "2026-06-02T09:30:00Z".to_string()))
+        );
+    }
+
+    /// The namespaced-install scope caveat, as a test: a `ClusterRepository`
+    /// whose `Maintenance` was placed in a namespace the informer does not
+    /// watch is simply NOT in the store, and "not in the store" must be `None`
+    /// — leave the bootstrap count standing — never a zero.
+    #[test]
+    fn a_maintenance_outside_the_watched_scope_is_simply_absent() {
+        // What a namespace-scoped informer holds: everything except the
+        // foreign-namespace Maintenance that actually covers `shared`.
+        let visible = vec![maint(
+            "watched",
+            RepositoryKind::Repository,
+            "unrelated",
+            None,
+            Some((7, "2026-06-05T00:00:00Z")),
+        )];
+        assert_eq!(
+            newest_observed_index_blobs(visible, RepositoryKind::ClusterRepository, "shared", None),
+            None,
+            "an out-of-scope Maintenance must read as no observation at all"
+        );
+    }
+
+    /// Field ownership for the post-run measurements on `Maintenance.status`
+    /// (#458): the **mover** writes `quick`/`full.last_content_reclaimed_bytes`
+    /// and `observed_index_blobs`; the controller only ever READS them (typed,
+    /// through `MaintenanceStatus`, which is why their camelCase wire spellings
+    /// have no business appearing in controller source at all).
+    ///
+    /// This matters because `Maintenance.status` has two writers and a merge
+    /// patch on `conditions` replaces the whole array — a controller-side write
+    /// that also named these keys could clobber a figure the mover measured
+    /// seconds earlier, resurrecting exactly the "this number is a lie" report
+    /// #458 was filed for. A source scan is crude but catches the mistake at the
+    /// moment someone makes it; the keys are distinctive enough that a false
+    /// positive is not plausible.
+    ///
+    /// The needles are assembled at runtime so this test's own source does not
+    /// contain them.
+    #[test]
+    fn controller_never_writes_the_movers_maintenance_measurements() {
+        let needles = [
+            concat!("lastContentReclaimed", "Bytes"),
+            concat!("observedIndex", "Blobs"),
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut files = vec![src];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).expect("read controller src") {
+                    files.push(entry.expect("dir entry").path());
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).expect("read source file");
+            for needle in needles {
+                if body.contains(needle) {
+                    offenders.push(format!("{} names {needle}", path.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the controller must not write the mover-owned Maintenance status keys: \
+             {offenders:?}. If the hit is a doc comment, name the Rust field \
+             (`observed_index_blobs`) or link the type instead of writing the camelCase \
+             wire spelling — the scan is deliberately literal so that a real \
+             `json!({{ \"...\": … }})` status write cannot hide from it."
+        );
     }
 }

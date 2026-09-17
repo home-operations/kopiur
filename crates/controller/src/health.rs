@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 
 use kopiur_api::RepositoryPhase;
-use kopiur_api::repository::{ProbeOnFailure, RepositoryHealthStatus};
+use kopiur_api::repository::{ProbeOnFailure, RepositoryHealthStatus, StorageStats};
 
 use crate::consts::{
     BACKEND_REACHABLE_CONDITION, BACKEND_REACHABLE_REASON, BACKEND_UNREACHABLE_REASON,
@@ -99,6 +99,251 @@ pub fn classify_index_blob_health(count: i64, threshold: i64) -> IndexBlobHealth
     } else {
         IndexBlobHealth::Healthy
     }
+}
+
+/// The freshest index-blob observation available for a repository, as picked by
+/// [`newest_index_blob_observation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexBlobObservation<'a> {
+    /// The count to report and to classify against the warn threshold.
+    pub count: i64,
+    /// When it was observed, when that is known. `None` only for a pre-#458
+    /// repository status that carries a count with no timestamp — there is
+    /// nothing to stamp, so the caller writes the count alone.
+    pub observed_at: Option<&'a str>,
+}
+
+/// Pick the fresher of a repository's own index-blob count and the recount a
+/// maintenance run took right after compacting.
+///
+/// Why this comparison exists: the repository's count is written only by the
+/// bootstrap path, which runs on the catalog cadence. Compaction happens during
+/// *maintenance*, so between bootstraps the `IndexBlobHealth` warning kept
+/// quoting a pre-compaction number — thousands of blobs — long after real
+/// compaction had fixed it (#458). The post-run recount is the fresher truth,
+/// but only when it genuinely is newer: a bootstrap that ran *after* the last
+/// maintenance has the better number, and adopting the older one would move the
+/// count backwards.
+///
+/// Ordering rules, in full:
+///
+/// * neither observation → `None` (nothing to report; never a zero count);
+/// * one observation → that one;
+/// * both, and the recount is strictly newer → the recount;
+/// * both, and the repository's is newer or equal → the repository's. Equal
+///   timestamps resolve to the repository's so a steady state re-writes the
+///   value it already holds, which `patch_status_if_changed` skips (no
+///   self-triggered reconcile loop);
+/// * the repository has a count but NO timestamp (pre-#458 status) → the
+///   recount, because a stamped observation beats one of unknown age. The write
+///   then adds the missing stamp, so this resolves once rather than flapping;
+/// * an unparseable timestamp on either side loses. It cannot be *proven*
+///   newer, and a count that moves on the strength of a malformed timestamp is
+///   worse than a stale one.
+///
+/// ```
+/// use kopiur_controller::health::newest_index_blob_observation;
+///
+/// // The recount after maintenance wins over an older bootstrap count.
+/// let obs = newest_index_blob_observation(
+///     Some((8000, Some("2026-06-01T00:00:00Z"))),
+///     Some((312, "2026-06-02T09:30:00Z")),
+/// )
+/// .expect("an observation");
+/// assert_eq!(obs.count, 312);
+/// assert_eq!(obs.observed_at, Some("2026-06-02T09:30:00Z"));
+///
+/// // ...but a bootstrap that ran later keeps its own.
+/// let obs = newest_index_blob_observation(
+///     Some((900, Some("2026-06-03T00:00:00Z"))),
+///     Some((312, "2026-06-02T09:30:00Z")),
+/// )
+/// .expect("an observation");
+/// assert_eq!(obs.count, 900);
+///
+/// // No maintenance recount in the store (a namespaced install whose
+/// // ClusterRepository keeps its Maintenance elsewhere): the bootstrap value
+/// // stands, untouched.
+/// let obs = newest_index_blob_observation(Some((8000, None)), None).expect("an observation");
+/// assert_eq!(obs.count, 8000);
+/// assert_eq!(obs.observed_at, None);
+///
+/// assert!(newest_index_blob_observation(None, None).is_none());
+/// ```
+pub fn newest_index_blob_observation<'a>(
+    repo: Option<(i64, Option<&'a str>)>,
+    maint: Option<(i64, &'a str)>,
+) -> Option<IndexBlobObservation<'a>> {
+    let from_maint = |(count, observed_at): (i64, &'a str)| IndexBlobObservation {
+        count,
+        observed_at: Some(observed_at),
+    };
+    let from_repo =
+        |(count, observed_at): (i64, Option<&'a str>)| IndexBlobObservation { count, observed_at };
+    match (repo, maint) {
+        (None, None) => None,
+        (None, Some(m)) => Some(from_maint(m)),
+        (Some(r), None) => Some(from_repo(r)),
+        (Some(r), Some(m)) => {
+            let newer = match (r.1.and_then(parse_rfc3339), parse_rfc3339(m.1)) {
+                // Both stamped: strictly newer wins, ties go to the repository.
+                (Some(repo_at), Some(maint_at)) => maint_at > repo_at,
+                // The repository's count is of unknown age; a stamped recount
+                // beats it.
+                (None, Some(_)) => true,
+                // The recount cannot be proven newer.
+                (_, None) => false,
+            };
+            Some(if newer { from_maint(m) } else { from_repo(r) })
+        }
+    }
+}
+
+/// Everything the steady-state index-blob fold produces: the conditions to
+/// patch, the Warning event to publish on a transition, and the
+/// `storageStats` sub-object to merge (`None` when there is no observation at
+/// all, so the patch stays a pure conditions write).
+pub struct IndexBlobRecountFold {
+    /// Conditions with `IndexBlobHealth` upserted, or `existing` untouched when
+    /// there was nothing to observe.
+    pub conditions: Vec<Condition>,
+    /// `Some` only on the transition into unhealthy.
+    pub event: Option<IndexBlobWarning>,
+    /// Partial `storageStats` to merge: `indexBlobCount`, plus
+    /// `indexBlobCountAt` when the winning observation is stamped. A merge
+    /// patch, so `snapshotCount` and the rest survive.
+    pub storage_stats: Option<serde_json::Value>,
+}
+
+impl IndexBlobRecountFold {
+    /// The steady-state status patch this fold implies: the folded conditions,
+    /// plus the partial `storageStats` when there was anything to observe.
+    ///
+    /// Assembling it here rather than at each call site is deliberate. The
+    /// `Repository` and `ClusterRepository` steady-state arms are hand-written
+    /// twins, and a patch built independently in each is exactly where a
+    /// copy/paste divergence hides — one arm folding the conditions but
+    /// forgetting the `storageStats`, or restating the whole `storageStats` and
+    /// wiping `snapshotCount`. One implementation, one test.
+    ///
+    /// The conditions go in whole because a status patch REPLACES the
+    /// conditions array; there is no partial condition write.
+    pub fn status_patch(&self) -> serde_json::Value {
+        let mut patch = serde_json::json!({ "conditions": self.conditions });
+        if let Some(storage_stats) = &self.storage_stats {
+            patch["storageStats"] = storage_stats.clone();
+        }
+        patch
+    }
+}
+
+/// Fold the freshest index-blob observation — the repository's own or a
+/// post-maintenance recount, whichever is newer — into conditions and a
+/// `storageStats` patch.
+///
+/// This is the whole of #458(e) as a pure function: `recount` is
+/// [`kopiur_api::maintenance::ObservedIndexBlobs`] as `(count, observed_at)`,
+/// read from the shared informer store by
+/// [`crate::io::maintenance::observed_index_blobs`]. `None` there means "no
+/// recount available" — an unsynced cache, or a covering `Maintenance` that a
+/// namespace-scoped informer genuinely cannot see — and MUST leave the
+/// repository's own count standing rather than zero it.
+///
+/// Writing the winner back unconditionally is deliberate: when the winner is the
+/// value the repository already holds, the resulting patch is byte-identical and
+/// `crate::io::patch_status_if_changed` skips it, so the steady state stays a
+/// no-op instead of a reconcile hot-loop.
+pub fn fold_index_blob_recount(
+    existing: Vec<Condition>,
+    stats: Option<&StorageStats>,
+    recount: Option<(i64, &str)>,
+    threshold: i64,
+    generation: Option<i64>,
+) -> IndexBlobRecountFold {
+    let Some(observation) =
+        newest_index_blob_observation(prior_index_blob_observation(stats), recount)
+    else {
+        return IndexBlobRecountFold {
+            conditions: existing,
+            event: None,
+            storage_stats: None,
+        };
+    };
+    let upd = reconcile_index_blob_health(&existing, observation.count, threshold, generation);
+    let mut storage_stats = serde_json::json!({ "indexBlobCount": observation.count });
+    if let Some(observed_at) = observation.observed_at {
+        storage_stats["indexBlobCountAt"] = serde_json::json!(observed_at);
+    }
+    IndexBlobRecountFold {
+        conditions: upd.conditions,
+        event: upd.event,
+        storage_stats: Some(storage_stats),
+    }
+}
+
+/// A repository's own index-blob observation, read off its `storageStats`, in
+/// the `(count, observedAt)` shape [`newest_index_blob_observation`] takes.
+///
+/// `index_blob_count_at` is `None` on a status written before #458 — the count
+/// is then of unknown age, which the comparison handles explicitly.
+pub fn prior_index_blob_observation(stats: Option<&StorageStats>) -> Option<(i64, Option<&str>)> {
+    let stats = stats?;
+    Some((
+        stats.index_blob_count?,
+        stats.index_blob_count_at.as_deref(),
+    ))
+}
+
+/// The timestamp to record beside a freshly-observed index-blob count.
+///
+/// Reuses the prior stamp when the count is **unchanged**, so a pass that
+/// re-observes the same number produces a byte-identical status and
+/// `patch_status_if_changed` skips the write. That guard is not cosmetic: the
+/// in-process filesystem arm re-counts on EVERY reconcile, and a status that
+/// always changes bumps `resourceVersion`, wakes the watch and re-triggers the
+/// reconcile in a tight loop. A new stamp is minted only when the count moved
+/// (or when there is no stamp yet, i.e. a status written before #458), which
+/// makes the recorded meaning "when this count was first observed at this
+/// value" — deliberately conservative, since the only thing it is compared
+/// against is a post-maintenance recount that should win any tie.
+///
+/// ```
+/// use kopiur_controller::health::index_blob_count_stamp;
+///
+/// // Unchanged count keeps its stamp (so the status patch is a no-op).
+/// assert_eq!(
+///     index_blob_count_stamp(Some(312), Some("2026-06-01T00:00:00Z"), 312, "2026-06-02T00:00:00Z"),
+///     "2026-06-01T00:00:00Z"
+/// );
+/// // A changed count is a new observation.
+/// assert_eq!(
+///     index_blob_count_stamp(Some(8000), Some("2026-06-01T00:00:00Z"), 312, "2026-06-02T00:00:00Z"),
+///     "2026-06-02T00:00:00Z"
+/// );
+/// // A pre-#458 status carries a count and no stamp: supply one.
+/// assert_eq!(
+///     index_blob_count_stamp(Some(312), None, 312, "2026-06-02T00:00:00Z"),
+///     "2026-06-02T00:00:00Z"
+/// );
+/// ```
+pub fn index_blob_count_stamp(
+    prior_count: Option<i64>,
+    prior_at: Option<&str>,
+    count: i64,
+    observed_at: &str,
+) -> String {
+    match (prior_count, prior_at) {
+        (Some(prior), Some(at)) if prior == count => at.to_string(),
+        _ => observed_at.to_string(),
+    }
+}
+
+/// Parse an RFC3339 instant, discarding a malformed one. Used only where an
+/// unparseable timestamp must lose a comparison rather than abort a reconcile.
+fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// The outcome of folding the index-blob count into a repository's conditions:
@@ -1632,6 +1877,248 @@ mod tests {
         assert_eq!(c.status, "True");
         assert_eq!(c.reason, INDEX_BLOBS_HEALTHY_REASON);
         assert!(upd.event.is_none());
+    }
+
+    /// #458: the ordering rules of [`newest_index_blob_observation`], in both
+    /// directions plus every degenerate input. The whole point is that the
+    /// count may only move FORWARD in time, never merely "to whatever was
+    /// written last".
+    #[test]
+    fn newest_index_blob_observation_picks_the_fresher_side_either_way() {
+        // Post-maintenance recount is newer: adopt it (the #458 fix — 8000
+        // pre-compaction blobs become the real 312).
+        let obs = newest_index_blob_observation(
+            Some((8000, Some("2026-06-01T00:00:00Z"))),
+            Some((312, "2026-06-02T09:30:00Z")),
+        )
+        .expect("an observation");
+        assert_eq!(
+            (obs.count, obs.observed_at),
+            (312, Some("2026-06-02T09:30:00Z"))
+        );
+
+        // Bootstrap ran later: its count is the fresher one. Adopting the
+        // maintenance recount here would move the count BACKWARDS in time.
+        let obs = newest_index_blob_observation(
+            Some((900, Some("2026-06-03T00:00:00Z"))),
+            Some((312, "2026-06-02T09:30:00Z")),
+        )
+        .expect("an observation");
+        assert_eq!(obs.count, 900);
+
+        // Identical timestamps resolve to the repository's own value, so a
+        // steady-state pass re-writes what it already holds and the guarded
+        // patch is a no-op (no self-triggered reconcile).
+        let obs = newest_index_blob_observation(
+            Some((312, Some("2026-06-02T09:30:00Z"))),
+            Some((999, "2026-06-02T09:30:00Z")),
+        )
+        .expect("an observation");
+        assert_eq!(obs.count, 312);
+    }
+
+    #[test]
+    fn newest_index_blob_observation_handles_missing_and_malformed_stamps() {
+        // A pre-#458 status: a count with no stamp loses to a stamped recount,
+        // and the write then supplies the missing stamp (so this resolves once).
+        let obs =
+            newest_index_blob_observation(Some((8000, None)), Some((312, "2026-06-02T09:30:00Z")))
+                .expect("an observation");
+        assert_eq!(
+            (obs.count, obs.observed_at),
+            (312, Some("2026-06-02T09:30:00Z"))
+        );
+
+        // A malformed recount stamp cannot be PROVEN newer, so it loses: a
+        // stale count beats one that moved on the strength of a bad timestamp.
+        let obs = newest_index_blob_observation(
+            Some((8000, Some("2026-06-01T00:00:00Z"))),
+            Some((312, "last tuesday")),
+        )
+        .expect("an observation");
+        assert_eq!(obs.count, 8000);
+
+        // A malformed REPOSITORY stamp is of unknown age, so the stamped
+        // recount wins.
+        let obs = newest_index_blob_observation(
+            Some((8000, Some("nonsense"))),
+            Some((312, "2026-06-02T09:30:00Z")),
+        )
+        .expect("an observation");
+        assert_eq!(obs.count, 312);
+    }
+
+    /// Not-in-store must leave the bootstrap value standing, and "no
+    /// observation at all" must stay `None` — never a zero count, which would
+    /// read as a perfectly healthy index and silently clear a real warning.
+    #[test]
+    fn newest_index_blob_observation_without_a_recount_is_a_no_op() {
+        let obs = newest_index_blob_observation(Some((8000, Some("2026-06-01T00:00:00Z"))), None)
+            .expect("an observation");
+        assert_eq!(
+            (obs.count, obs.observed_at),
+            (8000, Some("2026-06-01T00:00:00Z"))
+        );
+        assert!(newest_index_blob_observation(None, None).is_none());
+
+        // A repository with no count of its own adopts the recount outright.
+        let obs = newest_index_blob_observation(None, Some((312, "2026-06-02T09:30:00Z")))
+            .expect("an observation");
+        assert_eq!(obs.count, 312);
+    }
+
+    /// #458 end to end on the controller side: a steady-state pass that sees a
+    /// fresher post-maintenance recount adopts it, clears the stale
+    /// `IndexBlobHealth` warning, and writes BOTH the count and its timestamp —
+    /// a partial `storageStats` merge, so `snapshotCount` survives.
+    #[test]
+    fn fold_index_blob_recount_adopts_a_fresher_recount() {
+        let stats = StorageStats {
+            snapshot_count: Some(40),
+            index_blob_count: Some(8000),
+            index_blob_count_at: Some("2026-06-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let fold = fold_index_blob_recount(
+            vec![cond("False")],
+            Some(&stats),
+            Some((312, "2026-06-02T09:30:00Z")),
+            1000,
+            Some(3),
+        );
+        let patch = fold.storage_stats.expect("a storageStats patch");
+        assert_eq!(patch["indexBlobCount"], 312);
+        assert_eq!(patch["indexBlobCountAt"], "2026-06-02T09:30:00Z");
+        assert!(
+            patch.get("snapshotCount").is_none(),
+            "a PARTIAL merge: the fold must not restate (or clear) snapshotCount"
+        );
+        let c = fold
+            .conditions
+            .iter()
+            .find(|c| c.type_ == INDEX_BLOB_HEALTH_CONDITION)
+            .expect("the condition");
+        assert_eq!(c.status, "True", "312 blobs is under the 1000 threshold");
+        assert_eq!(c.reason, INDEX_BLOBS_HEALTHY_REASON);
+        assert!(fold.event.is_none(), "healthy fires no Warning");
+    }
+
+    /// No recount available — an unsynced cache, or a covering `Maintenance`
+    /// the namespace-scoped informer cannot see — must leave the bootstrap
+    /// observation standing. The write is the value already held, so the
+    /// guarded status patch is a no-op rather than a hot loop.
+    #[test]
+    fn fold_index_blob_recount_without_a_recount_restates_the_bootstrap_value() {
+        let stats = StorageStats {
+            index_blob_count: Some(8000),
+            index_blob_count_at: Some("2026-06-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let fold = fold_index_blob_recount(vec![], Some(&stats), None, 1000, Some(3));
+        let patch = fold.storage_stats.expect("a storageStats patch");
+        assert_eq!(patch["indexBlobCount"], 8000);
+        assert_eq!(patch["indexBlobCountAt"], "2026-06-01T00:00:00Z");
+        // ...and the warning it deserves still fires (first crossing).
+        let ev = fold.event.expect("the first crossing warns");
+        assert_eq!(ev.reason, TOO_MANY_INDEX_BLOBS_REASON);
+    }
+
+    /// Nothing observed at all: no `storageStats` touched and the conditions
+    /// handed in come back verbatim. A zero count here would read as a
+    /// perfectly healthy index and silently clear a real warning.
+    #[test]
+    fn fold_index_blob_recount_with_no_observation_is_a_pure_no_op() {
+        let fold = fold_index_blob_recount(vec![cond("False")], None, None, 1000, Some(3));
+        assert!(fold.storage_stats.is_none());
+        assert!(fold.event.is_none());
+        assert_eq!(fold.conditions.len(), 1);
+        assert_eq!(fold.conditions[0].status, "False");
+
+        // A repository with an EMPTY storageStats is the same case.
+        let empty = StorageStats::default();
+        assert!(
+            fold_index_blob_recount(vec![], Some(&empty), None, 1000, None)
+                .storage_stats
+                .is_none()
+        );
+    }
+
+    /// A repository with no count of its own adopts the recount outright, and
+    /// an over-threshold recount warns — the recount is a real observation, not
+    /// a second-class one.
+    #[test]
+    fn fold_index_blob_recount_adopts_a_recount_on_a_countless_repository() {
+        let fold = fold_index_blob_recount(
+            vec![],
+            None,
+            Some((4200, "2026-06-02T09:30:00Z")),
+            1000,
+            Some(1),
+        );
+        let patch = fold.storage_stats.expect("a storageStats patch");
+        assert_eq!(patch["indexBlobCount"], 4200);
+        let ev = fold.event.expect("over threshold warns");
+        assert!(ev.message.contains("4200"));
+    }
+
+    /// The steady-state WIRING, not just the decision: what both repository
+    /// arms actually send. A fold with an observation must carry the folded
+    /// conditions AND the partial `storageStats` in one patch; a fold without
+    /// one must send conditions alone, so a repository that has never been
+    /// counted does not get a `storageStats` key invented for it.
+    #[test]
+    fn fold_status_patch_carries_conditions_and_storage_stats_together() {
+        let stats = StorageStats {
+            snapshot_count: Some(40),
+            index_blob_count: Some(8000),
+            index_blob_count_at: Some("2026-06-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let fold = fold_index_blob_recount(
+            vec![cond("False")],
+            Some(&stats),
+            Some((312, "2026-06-02T09:30:00Z")),
+            1000,
+            Some(3),
+        );
+        let patch = fold.status_patch();
+        assert_eq!(patch["storageStats"]["indexBlobCount"], 312);
+        assert_eq!(
+            patch["storageStats"]["indexBlobCountAt"],
+            "2026-06-02T09:30:00Z"
+        );
+        assert!(
+            patch["storageStats"].get("snapshotCount").is_none(),
+            "a PARTIAL storageStats merge: restating it would be how snapshotCount gets wiped"
+        );
+        // The conditions in the patch are the FOLDED ones — the same array the
+        // arm then hands to `ensure_*_maintenance`, since a status patch
+        // replaces the whole array.
+        let conds = patch["conditions"]
+            .as_array()
+            .expect("conditions is an array");
+        let c = conds
+            .iter()
+            .find(|c| c["type"] == INDEX_BLOB_HEALTH_CONDITION)
+            .expect("the folded IndexBlobHealth condition");
+        assert_eq!(c["status"], "True", "312 blobs cleared the stale warning");
+        assert_eq!(
+            serde_json::to_value(&fold.conditions).unwrap(),
+            patch["conditions"],
+            "the patch must carry the fold's own conditions, not a re-read copy"
+        );
+
+        // Nothing observed: conditions only, no invented storageStats.
+        let bare = fold_index_blob_recount(vec![cond("False")], None, None, 1000, Some(3));
+        let patch = bare.status_patch();
+        assert!(
+            patch
+                .as_object()
+                .expect("patch")
+                .get("storageStats")
+                .is_none()
+        );
+        assert!(patch["conditions"].is_array());
     }
 
     #[test]

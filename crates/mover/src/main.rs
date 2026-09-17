@@ -40,9 +40,9 @@ use kopiur_mover::replicate as srepl;
 use kopiur_mover::resolve::{match_current_manifest, matches_source};
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::{
-    SnapshotReplicationRunStats, StatusReporter, StatusUpdate, lease_blocked_body,
-    maintenance_failed_body, maintenance_failed_body_from_mover, maintenance_ran_body,
-    replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
+    MaintenanceObservations, SnapshotReplicationRunStats, StatusReporter, StatusUpdate,
+    lease_blocked_body, maintenance_failed_body, maintenance_failed_body_from_mover,
+    maintenance_ran_body, replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
     snapshot_replicate_ok_body, split_api_version, verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
@@ -2589,6 +2589,99 @@ async fn write_result_configmap(
     Ok(())
 }
 
+/// How long EACH post-maintenance measurement may take before it is abandoned.
+///
+/// Both measurements are bounded, and neither bound is optional. Every kopia
+/// call here happens AFTER `maintenance run` already succeeded, and the success
+/// patch (`lastRunAt`, `ownership.claimedAt`, `LeaseOwned=True`) has not been
+/// sent yet — so a call that hangs does not merely lose a metric, it loses the
+/// record that maintenance ran at all: the Job sits until the
+/// `activeDeadlineSeconds` backstop, is killed `Failed`, and `backoffLimit`
+/// then re-runs the maintenance that had already completed. That is strictly
+/// worse than the stale figures this whole change exists to fix.
+///
+/// A `KopiaClient` bound cannot be relied on instead: the mover only sets
+/// `default_timeout` from `spec.options.operationTimeoutSecs`, which nothing in
+/// the repo populates, so in practice these calls are otherwise unbounded.
+///
+/// The bound is per measurement rather than shared so a slow (but completing)
+/// `maintenance info` cannot eat the recount's budget, and so each failure keeps
+/// its own actionable log line. `kopia index list` is normally milliseconds —
+/// but the repository this measurement is *for* is the unhealthy one with
+/// thousands of uncompacted index blobs, which is exactly where it is slowest
+/// and where a wedged object store stalls it.
+const MAINTENANCE_MEASURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Measure what a just-completed maintenance run did, for
+/// [`maintenance_ran_body`]. Best-effort by contract: every failure degrades to
+/// "not measured" (`None`) and is logged, never propagated — the run already
+/// succeeded, and a metric is not worth failing a Job over. Every call is
+/// bounded by [`MAINTENANCE_MEASURE_TIMEOUT`]; see there for why that is
+/// load-bearing rather than tidy.
+///
+/// `before` is the `maintenance info` the lease decision already read, so the
+/// only extra kopia call for the reclaimed figure is the post-run one.
+async fn measure_maintenance(
+    client: &KopiaClient,
+    before: &kopiur_kopia::MaintenanceInfo,
+) -> MaintenanceObservations {
+    let after =
+        match tokio::time::timeout(MAINTENANCE_MEASURE_TIMEOUT, client.maintenance_info()).await {
+            Ok(Ok(after)) => Some(after),
+            Ok(Err(e)) => {
+                warn!(
+                    class = %e.class(),
+                    "maintenance run succeeded but the post-run `maintenance info` failed; \
+                     reporting no reclaimed-bytes figure for this run"
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = MAINTENANCE_MEASURE_TIMEOUT.as_secs(),
+                    "maintenance run succeeded but the post-run `maintenance info` timed out; \
+                 reporting no reclaimed-bytes figure for this run"
+                );
+                None
+            }
+        };
+    MaintenanceObservations {
+        reclaimed_bytes: after
+            .as_ref()
+            .and_then(|after| kopiur_kopia::reclaimed_bytes_since(before, after)),
+        index_blob_count: recount_index_blobs(client).await,
+    }
+}
+
+/// Re-count the repository's content-index blobs after a successful maintenance
+/// run, so the repository's `IndexBlobHealth` condition stops quoting a
+/// pre-compaction number (#458).
+///
+/// Best-effort in both directions — a kopia error and a timeout both degrade to
+/// `None` ("not recounted"), which leaves the repository's existing bootstrap
+/// observation standing rather than overwriting it with a guess.
+async fn recount_index_blobs(client: &KopiaClient) -> Option<i64> {
+    match tokio::time::timeout(MAINTENANCE_MEASURE_TIMEOUT, client.index_blob_count()).await {
+        Ok(Ok(count)) => Some(count),
+        Ok(Err(e)) => {
+            warn!(
+                class = %e.class(),
+                "maintenance run succeeded but the post-run index-blob recount failed; \
+                 leaving the repository's previous count standing"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = MAINTENANCE_MEASURE_TIMEOUT.as_secs(),
+                "maintenance run succeeded but the post-run index-blob recount timed out; \
+                 leaving the repository's previous count standing"
+            );
+            None
+        }
+    }
+}
+
 /// Drive a `Maintenance` run: connect, read the ownership lease, apply the
 /// takeover policy, run `kopia maintenance run` when we hold the lease, and PATCH
 /// the `Maintenance` `.status` directly (ADR §3.7). Returns an error (non-zero
@@ -2723,12 +2816,27 @@ async fn run_maintenance_flow(
                     source: e,
                 });
             }
+            // The run itself succeeded; everything below is MEASUREMENT and is
+            // strictly best-effort. `kopia maintenance run` prints nothing
+            // machine-readable, so the only way to learn what it reclaimed is to
+            // diff the per-task run history it appended to the schedule blob
+            // against the pre-run `info` read above for the lease decision (which
+            // makes "before" free). A failure here must never turn a successful
+            // maintenance run into a failed Job — it would make the operator
+            // retry work that already completed.
+            let observations = measure_maintenance(client, &info).await;
             patch_maintenance_status(
                 &spec.target_ref,
-                &maintenance_ran_body(op, &chrono::Utc::now()),
+                &maintenance_ran_body(op, &chrono::Utc::now(), &observations),
             )
             .await;
-            info!(?action, mode = ?op.mode, "maintenance run succeeded");
+            info!(
+                ?action,
+                mode = ?op.mode,
+                reclaimed_bytes = ?observations.reclaimed_bytes,
+                index_blobs = ?observations.index_blob_count,
+                "maintenance run succeeded"
+            );
             Ok(())
         }
     }

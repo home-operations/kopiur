@@ -20,10 +20,12 @@ pub use error::{
 };
 pub use humanize::{exit_code_desc, humanize_tail};
 pub use model::{
-    BlobRetention, ClientOptions, ContentFormat, DirEntry, DirManifest, DirSummary, DirSummaryLite,
-    EntryError, IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceSchedule,
-    RepositoryStatus, RootEntry, SnapshotCreateOutcome, SnapshotCreateResult, SnapshotListEntry,
-    SnapshotSource, SnapshotStats, StorageInfo, user_tags,
+    BlobRetention, CleanupLogsStats, CleanupSupersededIndexesStats, ClientOptions, ContentFormat,
+    DeleteUnreferencedPacksStats, DirEntry, DirManifest, DirSummary, DirSummaryLite, EntryError,
+    IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceRun, MaintenanceRunExtra,
+    MaintenanceSchedule, RepositoryStatus, RootEntry, SnapshotCreateOutcome, SnapshotCreateResult,
+    SnapshotListEntry, SnapshotSource, SnapshotStats, StorageInfo, reclaimed_bytes_since,
+    user_tags,
 };
 pub use selection::{filter_as_of, pick_offset};
 pub use session::SessionCmd;

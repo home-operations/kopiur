@@ -1061,7 +1061,8 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`) observed at the last bootstrap. |
+| `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`): the freshest count available, from either the last bootstrap or the recount a maintenance run takes right after compacting. `indexBlobCountAt` says when. |
+| `indexBlobCountAt` | string | — | RFC3339 instant `indexBlobCount` was observed.<br>Distinct from `lastObservedAt` (the catalog scan's timestamp) and from `status.health.lastProbeAt` (the backend probe's): the index-blob count has its own writers, and this is what lets the reconciler decide whether a post-maintenance recount is fresher than the bootstrap's own count. Without it the two observations were incomparable, so the `IndexBlobHealth` warning could only ever quote the bootstrap figure — which is pre-compaction, and stayed pre-compaction until the next bootstrap ran (#458).<br>The two writers mean subtly different things, deliberately. A bootstrap stamps "when this count was FIRST seen at this value", reusing the previous stamp while the number is unchanged — that arm re-observes on every reconcile, and a stamp that always moved would make the status always-changed and the reconcile a hot loop. A post-maintenance recount always carries its own instant, because it is a distinct observation taken at a known time and its whole purpose is to be comparable. |
 | `lastObservedAt` | string | — | RFC 3339 timestamp these stats were last observed. |
 | `snapshotCount` | integer | — | Total snapshots present in the repository (across all identities). |
 | `totalSize` | string | — | Human-readable total on-disk size (e.g. `412Gi`). |
@@ -2131,7 +2132,8 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`) observed at the last bootstrap. |
+| `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`): the freshest count available, from either the last bootstrap or the recount a maintenance run takes right after compacting. `indexBlobCountAt` says when. |
+| `indexBlobCountAt` | string | — | RFC3339 instant `indexBlobCount` was observed.<br>Distinct from `lastObservedAt` (the catalog scan's timestamp) and from `status.health.lastProbeAt` (the backend probe's): the index-blob count has its own writers, and this is what lets the reconciler decide whether a post-maintenance recount is fresher than the bootstrap's own count. Without it the two observations were incomparable, so the `IndexBlobHealth` warning could only ever quote the bootstrap figure — which is pre-compaction, and stayed pre-compaction until the next bootstrap ran (#458).<br>The two writers mean subtly different things, deliberately. A bootstrap stamps "when this count was FIRST seen at this value", reusing the previous stamp while the number is unchanged — that arm re-observes on every reconcile, and a stamp that always moved would make the status always-changed and the reconcile a hot loop. A post-maintenance recount always carries its own instant, because it is a distinct observation taken at a known time and its whole purpose is to be comparable. |
 | `lastObservedAt` | string | — | RFC 3339 timestamp these stats were last observed. |
 | `snapshotCount` | integer | — | Total snapshots present in the repository (across all identities). |
 | `totalSize` | string | — | Human-readable total on-disk size (e.g. `412Gi`). |
@@ -3412,6 +3414,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `full` | [object](#maintenance-status-full) | — | Last/next-run state for the full maintenance schedule. |
 | `manualRun` | [object](#maintenance-status-manualrun) | — | State of the most recent annotation-requested out-of-band run; absent until one is requested. |
 | `observedGeneration` | integer | — | The `metadata.generation` this status reflects, for staleness detection. |
+| `observedIndexBlobs` | [object](#maintenance-status-observedindexblobs) | — | Content-index blob count re-counted right after the most recent successful run. |
 | `ownership` | [object](#maintenance-status-ownership) | — | Current lease holder, if the lease has been claimed. |
 | `quick` | [object](#maintenance-status-quick) | — | Last/next-run state for the quick maintenance schedule. |
 
@@ -3431,7 +3434,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `consecutiveFailures` | integer | — | Count of back-to-back failed runs of this kind; resets on success. |
-| `lastContentReclaimedBytes` | integer | — | Bytes of storage reclaimed by the most recent run of this kind. |
+| `lastContentReclaimedBytes` | integer | — | Bytes of backend storage the most recent run of this kind actually freed: the blobs kopia deleted (unreferenced packs, superseded epoch indexes and expired logs), summed from the run history `kopia maintenance info` reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only marks contents deleted in the index and frees no storage until a later run removes the blobs. Absent when the run reclaimed nothing measurable — a quick run on an epoch-enabled repository only advances and compacts epochs, so there is no figure to report; `0` always means a measured zero, never "unknown". |
 | `lastHandledAt` | string | — | RFC3339 instant the controller last observed this kind's per-slot Job reach terminal success. |
 | `lastRunAt` | string | — | RFC3339 instant of the most recent run of this kind. |
 | `nextScheduledAt` | string | — | RFC3339 instant of the next scheduled run of this kind (cron + jitter, pinned). |
@@ -3445,6 +3448,13 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `phase` | enum: Running \| Succeeded \| Failed | — | Lifecycle of a manual run. Closed enum. |
 | `requestedAt` | string | — | The `run-requested` annotation value this status reflects (RFC3339). |
 
+#### `status.observedIndexBlobs` { #maintenance-status-observedindexblobs }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `count` | integer | `0` | Number of content-index blobs (`kopia index list`) after the run. |
+| `observedAt` | string | `` | RFC3339 instant the recount was taken. What makes this observation comparable against the repository's own `storageStats.indexBlobCountAt`, so whichever is newer wins rather than whichever was written last. |
+
 #### `status.ownership` { #maintenance-status-ownership }
 
 | Field | Type | Default | Description |
@@ -3457,7 +3467,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `consecutiveFailures` | integer | — | Count of back-to-back failed runs of this kind; resets on success. |
-| `lastContentReclaimedBytes` | integer | — | Bytes of storage reclaimed by the most recent run of this kind. |
+| `lastContentReclaimedBytes` | integer | — | Bytes of backend storage the most recent run of this kind actually freed: the blobs kopia deleted (unreferenced packs, superseded epoch indexes and expired logs), summed from the run history `kopia maintenance info` reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only marks contents deleted in the index and frees no storage until a later run removes the blobs. Absent when the run reclaimed nothing measurable — a quick run on an epoch-enabled repository only advances and compacts epochs, so there is no figure to report; `0` always means a measured zero, never "unknown". |
 | `lastHandledAt` | string | — | RFC3339 instant the controller last observed this kind's per-slot Job reach terminal success. |
 | `lastRunAt` | string | — | RFC3339 instant of the most recent run of this kind. |
 | `nextScheduledAt` | string | — | RFC3339 instant of the next scheduled run of this kind (cron + jitter, pinned). |
