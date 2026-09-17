@@ -747,8 +747,10 @@ fn condition_of(status: &serde_json::Value, type_: &str) -> Option<serde_json::V
 fn mirrored_status(
     claims: &std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus>,
 ) -> serde_json::Value {
+    let restore = restore_with_anchor(None);
     fanout_status(
-        &restore_with_anchor(None),
+        &restore,
+        &existing_conditions(&restore),
         &std::collections::BTreeMap::new(),
         claims,
         &[],
@@ -955,7 +957,7 @@ fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
     for (restore, top_level_present) in [(&legacy_pinned, true), (&bare, false)] {
         // Pinned, one claim ⇒ written (whatever stood there before).
         let one = claims_of(&[("data", pinned())]);
-        let s = fanout_status(restore, &none, &one, &[]);
+        let s = fanout_status(restore, &existing_conditions(restore), &none, &one, &[]);
         assert_eq!(
             s["resolved"]["resolution"],
             serde_json::json!("Snapshot"),
@@ -966,14 +968,14 @@ fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
         // Unpinned, one claim ⇒ `resolved` OMITTED — the adopted legacy pin (or
         // nothing) stays. `target` still names the prime being written.
         let one = claims_of(&[("data", unpinned())]);
-        let s = fanout_status(restore, &none, &one, &[]);
+        let s = fanout_status(restore, &existing_conditions(restore), &none, &one, &[]);
         assert!(
             s.get("resolved").is_none(),
             "top_level_present={top_level_present}: {s}"
         );
         assert_eq!(s["target"]["pvcPrime"], "prime-u1");
         // …and the same on the heartbeat, where `prev` is that same record.
-        let s = fanout_status(restore, &one, &one, &[]);
+        let s = fanout_status(restore, &existing_conditions(restore), &one, &one, &[]);
         assert!(s.get("resolved").is_none(), "{s}");
 
         // Unpinned, one claim, but the CLAIMANT CHANGED (a re-arm): the pin that
@@ -981,13 +983,20 @@ fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
         let mut fresh = unpinned();
         fresh.uid = Some("u-new".into());
         let rearmed = claims_of(&[("data", fresh)]);
-        let s = fanout_status(restore, &claims_of(&[("data", pinned())]), &rearmed, &[]);
+        let s = fanout_status(
+            restore,
+            &existing_conditions(restore),
+            &claims_of(&[("data", pinned())]),
+            &rearmed,
+            &[],
+        );
         assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
 
         // Unpinned survivor while a SIBLING's record is dropped: the dropped
         // claim's mirrored pin is stale — reset it.
         let s = fanout_status(
             restore,
+            &existing_conditions(restore),
             &claims_of(&[("data", unpinned()), ("logs", pinned())]),
             &claims_of(&[("data", unpinned())]),
             &["logs".to_string()],
@@ -998,10 +1007,16 @@ fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
         let mut second = pinned();
         second.uid = Some("u2".into());
         let two = claims_of(&[("data", pinned()), ("logs", second)]);
-        let s = fanout_status(restore, &claims_of(&[("data", pinned())]), &two, &[]);
+        let s = fanout_status(
+            restore,
+            &existing_conditions(restore),
+            &claims_of(&[("data", pinned())]),
+            &two,
+            &[],
+        );
         assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
         assert_eq!(s["target"], serde_json::Value::Null, "{s}");
-        let s = fanout_status(restore, &two, &two, &[]);
+        let s = fanout_status(restore, &existing_conditions(restore), &two, &two, &[]);
         assert!(s.get("resolved").is_none(), "{s}");
     }
 }
@@ -1066,7 +1081,14 @@ fn several_claims_clear_the_mirror_and_report_the_aggregate() {
             Some(ResolutionOutcome::Snapshot),
         ),
     )]);
-    let status = fanout_status(&restore_with_anchor(None), &was_single, &two, &[]);
+    let anchored = restore_with_anchor(None);
+    let status = fanout_status(
+        &anchored,
+        &existing_conditions(&anchored),
+        &was_single,
+        &two,
+        &[],
+    );
     assert_eq!(
         status["resolved"],
         serde_json::Value::Null,
@@ -1075,7 +1097,7 @@ fn several_claims_clear_the_mirror_and_report_the_aggregate() {
     assert_eq!(status["target"], serde_json::Value::Null, "{status}");
     // Many→Many heartbeat: nothing to clear, so `resolved` is not named — a
     // `null` there is what erased an adopted legacy pin (finding 5).
-    let steady = fanout_status(&restore_with_anchor(None), &two, &two, &[]);
+    let steady = fanout_status(&anchored, &existing_conditions(&anchored), &two, &two, &[]);
     assert!(
         steady.get("resolved").is_none(),
         "the many-claim heartbeat must leave `resolved` alone: {steady}"
@@ -3888,5 +3910,72 @@ fn a_pvc_target_still_routes_through_the_per_pvc_derivation() {
         stream_with_pvc_target.source_path.as_deref(),
         Some("/stream/x.sql"),
         "a single-source policy's step-(3) fallback is its own path, stream included"
+    );
+}
+
+// --- #464 round 2: the inherit heal must survive the fan-out's end-of-pass write ----------
+
+/// The populator twin of `snapshot::tests::the_inherit_heal_survives_the_rest_of_the_launch_pass`.
+///
+/// On the fan-out path the #464 heal is written deep inside `drive_one_claim` (via
+/// `run_restore_mover`), and [`fanout_status`] then builds the pass's ONE top-level body.
+/// Seeded from `restore.status` — the reconcile-start copy, which is what it used before
+/// this fix — that body replaces the conditions array and writes the hold back onto a
+/// populator that is restoring successfully; the next pass heals and clobbers it again from
+/// its own start-of-pass copy, so `doctor` reports a working restore as blocked forever.
+#[test]
+fn the_fanout_status_body_preserves_a_healed_inherit_hold() {
+    let restore = restore_with_anchor(None);
+    let healed = crate::io::inherit_source_heal_conditions(
+        &crate::io::upsert_gate(
+            &[],
+            &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+            "HELD: workloadSelector `app=pg` matched no pod",
+            Some(1),
+        ),
+        Some(1),
+    )
+    .expect("a standing hold heals");
+
+    let claims = claims_of(&[(
+        "data",
+        mirror_record(
+            kopiur_api::RestoreClaimPhase::Populating,
+            crate::consts::POPULATING_PRIME_PVC_REASON,
+            "populator: restoring into the prime PVC",
+            None,
+        ),
+    )]);
+    let none = std::collections::BTreeMap::new();
+    let live_based = fanout_status(&restore, &healed, &none, &claims, &[]);
+    let row = |body: &serde_json::Value| -> serde_json::Value {
+        body["conditions"]
+            .as_array()
+            .expect("conditions written")
+            .iter()
+            .find(|c| c["type"] == kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    assert_eq!(
+        row(&live_based)["status"],
+        "True",
+        "a LIVE base must carry the heal through the fan-out body: {live_based:#}"
+    );
+
+    // The pre-fix shape: the same body over the reconcile-start copy DROPS the healed row
+    // entirely (this fixture carries no conditions), so the fan-out patch replaces the array
+    // with one that has no record of the resolution at all.
+    let stale_based = fanout_status(
+        &restore,
+        &existing_conditions(&restore),
+        &none,
+        &claims,
+        &[],
+    );
+    assert_eq!(
+        row(&stale_based),
+        serde_json::Value::Null,
+        "pinning the defect: a stale base erases the heal from the fan-out body"
     );
 }

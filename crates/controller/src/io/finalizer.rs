@@ -155,6 +155,34 @@ where
     }
 }
 
+/// The `status.conditions` array a writer that is NOT the first in its reconcile must build
+/// on: the LIVE one, or the caller's (possibly stale) copy when the object is gone or
+/// unreadable.
+///
+/// The thin `Vec<Condition>` face of [`live_conditions_source`], for the common shape where a
+/// later writer needs only the ARRAY and must keep taking `observedGeneration` from the
+/// object the reconcile actually observed — seeding both from a live re-read would stamp an
+/// `observedGeneration` for a spec this pass never reconciled.
+///
+/// Returning the stale array on a gone/unreadable object is deliberate: it keeps such a
+/// writer byte-identical to the unconditional `backup.status.conditions` it replaces, which
+/// patched anyway and let the 404 surface as the reconcile's error.
+pub async fn live_conditions<K>(api: &Api<K>, name: &str, fallback: &K) -> Vec<Condition>
+where
+    K: Clone + serde::Serialize + DeserializeOwned + std::fmt::Debug + Resource,
+    K::DynamicType: Default,
+{
+    let obj = live_conditions_source(api, name, fallback)
+        .await
+        .unwrap_or_else(|| fallback.clone());
+    super::conditions_from_status(
+        serde_json::to_value(&obj)
+            .ok()
+            .and_then(|v| v.get("status").cloned())
+            .as_ref(),
+    )
+}
+
 /// Upsert a status condition by `type_`, returning the full conditions vector to
 /// patch. An existing condition of the same `type_` keeps its
 /// `lastTransitionTime` while its `status` is unchanged (the timestamp marks the

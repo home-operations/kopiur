@@ -594,6 +594,13 @@ pub const RECORDED_APPLIED_REASON: &str = "RecordedApplied";
 /// Event `action` (remediation hint) when recorded-identity inherit cannot proceed or
 /// contributed nothing: pin `mover.securityContext` explicitly (or drop the inherit).
 pub const SET_EXPLICIT_MOVER_CONTEXT_ACTION: &str = "SetExplicitMoverSecurityContext";
+/// Event `action` (remediation hint) for the `SecurityContextResolved=False` hold
+/// ([`kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON`], #464): a live-pod
+/// inherit resolved nothing and no fallback identity is pinned. Names BOTH ways
+/// out, because which one applies is the user's call — bring the workload back up
+/// (or fix the selector), or pin `mover.securityContext.runAsUser` so the run
+/// proceeds on an explicit identity while the workload is down.
+pub const SCALE_WORKLOAD_OR_PIN_MOVER_UID_ACTION: &str = "ScaleWorkloadOrPinMoverRunAsUser";
 /// `Restore` condition reporting whether the *future* consumer of the restore target PVC
 /// will be able to read what the mover writes (a securityContext-only heuristic; no runtime
 /// layer exists for restore since the consumer may not exist yet). Same tri-state semantics

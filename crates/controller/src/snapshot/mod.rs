@@ -1310,7 +1310,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // `resolve_mover`, giving the full ladder
     // `hardened ⊂ moverDefaults ⊂ inherited ⊂ policy.mover ⊂ snapshot.mover`.
     let recipe_mover = kopiur_api::snapshot::effective_backup_mover(&backup.spec, &config.spec);
-    let mover_security = io::resolve_mover_security_contexts(
+    let mover_security = match io::resolve_mover_security_contexts(
         &ctx.client,
         &namespace,
         recipe_mover.as_ref(),
@@ -1320,7 +1320,21 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         // to pass.
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(s) => s,
+        // A live-pod inherit that resolved NOTHING and has no pinned fallback identity
+        // (#464): the workload is scaled to zero — precisely when a quiesced backup is
+        // most useful — or the selector matches nothing. Park it behind the registered
+        // `SecurityContextResolved=False` gate with a message naming the selector, then
+        // requeue on the slow structural cadence. A bare `?` here surfaced a generic,
+        // condition-less `MissingDependency` that re-checked every 30s forever.
+        Err(Error::InheritSourceMissing(msg)) => {
+            io::park_on_inherit_source_missing(&api, backup, ctx, &msg).await?;
+            return Err(Error::InheritSourceMissing(msg));
+        }
+        Err(e) => return Err(e),
+    };
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = recipe_mover.as_ref().and_then(|m| m.privileged_mode);
 
@@ -1580,6 +1594,25 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         );
         io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
     }
+    // The hold's healing half (#464): a run that was parked on
+    // `SecurityContextResolved=False` is the SAME object that proceeds once the workload is
+    // back, so the gate must be cleared here or `doctor` keeps reporting "blocked … will wait
+    // forever" for the whole mover run — `doctor` suppresses a stale gate only on a TERMINAL
+    // phase, and this one parks at `Pending` and then runs. Writes nothing at all unless a
+    // hold is actually standing, so a run that was never held stays byte-identical.
+    //
+    // Placed HERE, past the "clear any stale MoverPermitted/CredentialsAvailable" blocks
+    // above rather than at the resolve site, because each of those still rebuilds
+    // `conditions` from the RECONCILE-START copy and a `conditions` patch REPLACES the array
+    // — a heal written before them would simply be erased. The runs this placement skips are
+    // the ones those gates refuse, and they carry their own registered `Fail` row, so
+    // `doctor` still reports them as blocked, which they are.
+    //
+    // Everything that can write `conditions` AFTER this point in the pass instead seeds from
+    // `io::live_conditions`, which is what makes the heal DURABLE rather than clobbered ~57
+    // lines later by staging (see `staged_conditions`). Adding a later writer that seeds from
+    // the start-of-pass copy re-opens the bug.
+    io::heal_inherit_source_missing(&api, backup).await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     // ADR §4.8: beforeSnapshot hooks (quiesce/flush) run to completion BEFORE the
@@ -1662,14 +1695,12 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     mount.read_only,
                 );
             }
-            let existing = backup
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
-            let conditions = io::upsert_condition(
-                &existing,
-                SOURCE_STAGED_CONDITION,
+            // LIVE conditions base, not `backup`: staging runs LATE in the launch pass
+            // and this patch REPLACES the array, so the reconcile-start copy would ERASE
+            // the `CredentialsAvailable` clear and the #464 inherit heal written above it,
+            // resurrecting the very values they cleared — see `staged_conditions`.
+            let conditions = staged_conditions(
+                &io::live_conditions(&api, &name, backup).await,
                 true,
                 SOURCE_STAGED_REASON,
                 &format!(
@@ -1712,14 +1743,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // transient) `status.error` as diagnostic context; that is NOT a
             // failure — see `StagingOutcome::Failed` for the deadline that is
             // (issue #198).
-            let existing = backup
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
-            let conditions = io::upsert_condition(
-                &existing,
-                SOURCE_STAGED_CONDITION,
+            // LIVE conditions base — same reason as the `Ready` arm above, and it matters
+            // MORE here: this arm returns `Err`, so the run does not reach the
+            // Job-creation patch that would otherwise re-fold a clobbered heal.
+            let conditions = staged_conditions(
+                &io::live_conditions(&api, &name, backup).await,
                 false,
                 reason,
                 &msg,
@@ -2363,11 +2391,15 @@ async fn clear_source_pvc_gate_if_parked(
     pvc_ns: &str,
     pvc_name: &str,
 ) -> Result<()> {
-    let existing = backup
-        .status
-        .as_ref()
-        .map(|s| s.conditions.clone())
-        .unwrap_or_default();
+    // Cheap pre-check on the reconcile-start copy FIRST: the overwhelming majority of runs
+    // never touched this gate, and they must not pay a live GET to learn that.
+    if !source_pvc_gate_clear_needed(&existing_conditions(backup)) {
+        return Ok(());
+    }
+    // A run that DID park reaches here after the #464 inherit heal (and the
+    // `CredentialsAvailable` clear) wrote to the same array, which this patch REPLACES — so
+    // re-read live and re-check against THAT, the `fold_slot_heal` discipline.
+    let existing = io::live_conditions(api, name, backup).await;
     if !source_pvc_gate_clear_needed(&existing) {
         return Ok(());
     }
@@ -2404,11 +2436,12 @@ async fn handle_missing_source_pvc(
     pvc_name: &str,
 ) -> Result<Action> {
     let msg = source_pvc_missing_message(pvc_ns, pvc_name);
-    let existing = backup
-        .status
-        .as_ref()
-        .map(|s| s.conditions.clone())
-        .unwrap_or_default();
+    // LIVE base: this park runs after the #464 inherit heal in the same pass, and the
+    // reconcile-start copy would resurrect the hold onto a run whose REAL block is the
+    // missing PVC. It also makes the two derivations below read the freshest array — the
+    // deadline anchor and the Event transition both live IN the condition, so a start-of-pass
+    // copy that predates this pass's own stamp would re-anchor the deadline and re-Event.
+    let existing = io::live_conditions(api, name, backup).await;
     let newly_missing = should_publish_source_pvc_missing_event(&existing);
     // Anchor BEFORE this pass's write: a first sighting has no anchor (this
     // write stamps it), so it can never expire on the same pass it was seen.
@@ -2423,8 +2456,9 @@ async fn handle_missing_source_pvc(
     } else {
         SnapshotPhase::Pending
     };
-    let status = snapshot_ready_status_with_condition(
+    let status = snapshot_ready_status_with_condition_on(
         backup,
+        &existing,
         phase,
         crate::consts::SOURCE_PVC_MISSING_REASON,
         &msg,

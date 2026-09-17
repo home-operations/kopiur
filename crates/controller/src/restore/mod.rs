@@ -1381,7 +1381,12 @@ async fn drive_populator_fanout(
         .as_ref()
         .map(serde_json::to_value)
         .transpose()?;
-    let status = fanout_status(restore, &prev, &next, &gone);
+    // LIVE conditions base. This is the pass's only top-level status write, but
+    // `drive_one_claim` above already patched the same array from inside
+    // `run_restore_mover` (the `CredentialsAvailable` clear, the #464 inherit heal) — and a
+    // `conditions` patch REPLACES it. See `fanout_status`.
+    let base = io::live_conditions(api, name, restore).await;
+    let status = fanout_status(restore, &base, &prev, &next, &gone);
     io::patch_status_if_changed(api, name, current.as_ref(), status).await?;
 
     run_deferred_finalizers(ctx, namespace, name, finalizers).await?;
@@ -3410,6 +3415,16 @@ async fn run_restore_mover(
             report_missing_recorded_identity(restore, api, &msg, ctx).await?;
             return Err(Error::MissingRecordedIdentity(msg));
         }
+        // The LIVE-pod inherit hold (#464): `workloadSelector`/`pvcConsumer` resolved no
+        // securityContext at all AND the recipe pins no fallback identity. Its own
+        // registered gate (`SecurityContextResolved=False`, naming the selector) and the
+        // same slow structural requeue — distinct from the advisory
+        // `SecurityContextInherited` report above, which only ever describes a run that
+        // PROCEEDED.
+        Err(Error::InheritSourceMissing(msg)) => {
+            io::park_on_inherit_source_missing(api, restore, ctx, &msg).await?;
+            return Err(Error::InheritSourceMissing(msg));
+        }
         Err(e) => return Err(e),
     };
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
@@ -3634,6 +3649,26 @@ async fn run_restore_mover(
         );
         io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
     }
+    // The hold's healing half (#464): a run that was parked on
+    // `SecurityContextResolved=False` is the SAME object that proceeds once the workload is
+    // back, so the gate must be cleared here or `doctor` keeps reporting "blocked … will wait
+    // forever" for the whole mover run — `doctor` suppresses a stale gate only on a TERMINAL
+    // phase, and this one parks at `Pending` and then runs. Writes nothing at all unless a
+    // hold is actually standing, so a run that was never held stays byte-identical.
+    //
+    // Placed HERE, past the "clear any stale MoverPermitted/CredentialsAvailable" blocks
+    // above rather than at the resolve site, because each of those still rebuilds
+    // `conditions` from the RECONCILE-START copy and a `conditions` patch REPLACES the array
+    // — a heal written before them would simply be erased. The runs this placement skips are
+    // the ones those gates refuse, and they carry their own registered `Fail` row, so
+    // `doctor` still reports them as blocked, which they are.
+    //
+    // Everything that can write `conditions` AFTER this point in the pass instead seeds from
+    // `io::live_conditions`, which is what makes the heal DURABLE: the direct path's
+    // `MoverOutcome` arms already did, and the populator's end-of-pass body now does too (see
+    // `plan::fanout_status`). Adding a later writer that seeds from the start-of-pass copy
+    // re-opens the bug.
+    io::heal_inherit_source_missing(api, restore).await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     let identity = MoverIdentity {

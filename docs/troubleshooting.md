@@ -239,7 +239,14 @@ Or drop the elevated `securityContext`, `podSecurityContext` or `privilegedMode`
 
 ### `inheritSecurityContextFrom` can't resolve a workload pod
 
-When `mover.inheritSecurityContextFrom` is set, the controller reads the live workload pod's container **and** pod security contexts onto the mover. If it cannot, the Backup or Restore is held with a `MissingDependency`-style condition and Event whose message names exactly what is wrong:
+When `mover.inheritSecurityContextFrom` is set, the controller reads the live workload pod's container **and** pod security contexts onto the mover. If it cannot, and the recipe pins no fallback `runAsUser`, the Backup or Restore is **held** at `phase: Pending` with `SecurityContextResolved=False` / `InheritSourceMissing` and a Warning Event. Start there — the message names the selector (or source PVC) that resolved nothing:
+
+```console
+$ kubectl get snapshot <name> \
+    -o jsonpath='{.status.conditions[?(@.type=="SecurityContextResolved")].message}'
+```
+
+This is a registered structural gate, so `kubectl kopiur doctor` also reports it rather than passing a cluster whose backups are parked. It re-checks every few minutes and starts by itself once the workload is readable again — no re-apply. The message tells you exactly what is wrong:
 
 | Message contains… | Cause | Fix |
 | --- | --- | --- |
@@ -248,6 +255,8 @@ When `mover.inheritSecurityContextFrom` is set, the controller reads the live wo
 | `has no container` | `inheritSecurityContextFrom…container` names a container the pod doesn't have. | Fix the `container` name, or omit it to take the pod's first container. |
 | `sets no securityContext … to inherit` | The matched pod sets **neither** a container nor a pod-level `securityContext`. | Set one on the workload, or use an explicit `mover.securityContext` or `mover.podSecurityContext` instead. |
 | `pvcConsumer … is only valid for a backup source` | `pvcConsumer` was set on a `Restore` or `Maintenance`, which admission rejects. | Use `workloadSelector` on a Restore, or an explicit `mover.securityContext`. |
+
+The last row is the one exception that is *not* this hold: `pvcConsumer` with no backup source PVC is a spec error rather than an absent workload, so it stays an ordinary transient `MissingDependency`. The restore-only `snapshot` mode has its own hold, `SecurityContextInherited=False` / `MissingRecordedIdentity`.
 
 `securityContext` (or `podSecurityContext`) and `inheritSecurityContextFrom` **combine**, so setting both is fine. The explicit context is the higher merge layer. Each field you set overrides the inherited one, fields you omit are inherited, and the whole thing stands in alone when no workload pod can be resolved. Earlier versions rejected the pair at admission.
 
@@ -281,7 +290,7 @@ $ kubectl get snapshot <name> -o jsonpath='{.status.conditions[?(@.type=="Securi
 | --- | --- |
 | `True` / `InheritApplied` | Inheritance resolved and stuck. The message names the pod and the uid the mover runs as. |
 | `False` / `InheritPinnedNoUid` | The resolved workload pins no identity beyond the mover's own defaults, so inheriting copied nothing. The message names the uid the mover actually runs as, which is `65532` unless `moverDefaults` supplied one. |
-| `False` / `InheritFallback` | No workload pod resolved. The run proceeded on your explicit `mover.securityContext` instead of being held. |
+| `False` / `InheritFallback` | No workload pod resolved. The run proceeded on your explicit `mover.securityContext` instead of being held with `SecurityContextResolved=False`. |
 | `False` / `InheritOverridden` | Inherit resolved a UID, but this recipe's explicit `runAsUser` overrode it. Inherit is a no-op for that field and won't follow the workload. The message names the exact field that won. Only the recipe can displace an inherited UID, never the repository's `moverDefaults`. |
 
 ### Admission warning: securityContext likely can't read the source

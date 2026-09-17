@@ -414,6 +414,33 @@ pub const SOURCE_PVC_MISSING_GATE: StructuralGate = StructuralGate {
     severity: GateSeverity::Fail,
 };
 
+/// A `Snapshot` or `Restore` whose `mover.inheritSecurityContextFrom` names a
+/// LIVE-pod source that resolved nothing — no pod matched the selector (the
+/// workload is scaled to zero, which is precisely when a quiesced backup is
+/// most useful), the named container is absent, or the matched pod sets neither
+/// a container nor a pod-level `securityContext` — and whose recipe pins no
+/// fallback `runAsUser` to proceed on (#464).
+///
+/// The run parks at `phase: Pending` and re-checks on the slow structural
+/// cadence. Holding is deliberate: a backup taken as the wrong UID is worse
+/// than a backup that did not run. Nothing in kopiur can scale a workload up,
+/// fix a label selector, or invent the identity the data expects, so this is
+/// squarely "needs a human" — hence Fail, and hence registered: before #464 the
+/// hold surfaced as a generic transient `MissingDependency` with no condition
+/// naming the selector that matched nothing.
+///
+/// Its own condition rather than a reason on the advisory
+/// `SecurityContextInherited` — see
+/// [`consts::SECURITY_CONTEXT_RESOLVED_CONDITION`] for why that distinction is
+/// load-bearing for `kubectl kopiur doctor`.
+pub const INHERIT_SOURCE_MISSING_GATE: StructuralGate = StructuralGate {
+    applies_to: GateScope::SnapshotOrRestore,
+    condition: consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
+    blocked_status: CONDITION_FALSE,
+    reason: consts::INHERIT_SOURCE_MISSING_REASON,
+    severity: GateSeverity::Fail,
+};
+
 /// A `spec.seed` in migrate mode whose SOURCE repository is missing or not
 /// `Ready` (issue #380). The repository parks `Pending` with `Seeded=False`
 /// and re-checks; nothing in kopiur can bring the source up, so it is squarely
@@ -600,6 +627,7 @@ pub const STRUCTURAL_GATES: &[StructuralGate] = &[
     SCHEDULE_FANOUT_CAPPED_GATE,
     POLICY_REPOSITORY_NOT_READY_GATE,
     SOURCE_PVC_MISSING_GATE,
+    INHERIT_SOURCE_MISSING_GATE,
     RESTORE_REFERENT_MISSING_GATE,
     SEED_SOURCE_NOT_READY_GATE,
     SEED_SOURCE_AUTH_CONFLICT_GATE,
@@ -943,6 +971,13 @@ mod tests {
                 GateSeverity::Fail,
             ),
             (
+                consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
+                CONDITION_FALSE,
+                consts::INHERIT_SOURCE_MISSING_REASON,
+                GateScope::SnapshotOrRestore,
+                GateSeverity::Fail,
+            ),
+            (
                 consts::RESTORE_REFERENT_AVAILABLE_CONDITION,
                 CONDITION_FALSE,
                 consts::RESTORE_REFERENT_MISSING_REASON,
@@ -1096,5 +1131,43 @@ mod tests {
     fn severity_labels_are_stable_and_distinct() {
         assert_eq!(GateSeverity::Fail.label(), "Fail");
         assert_eq!(GateSeverity::Warn.label(), "Warn");
+    }
+
+    #[test]
+    fn the_inherit_hold_is_registered_and_the_advisory_report_is_not() {
+        // #464. The HOLD — a live-pod `inheritSecurityContextFrom` that resolved
+        // nothing, with no pinned fallback — is a real park a human must clear,
+        // so it must be visible to `kubectl kopiur doctor` on both work kinds.
+        let hits: Vec<_> = STRUCTURAL_GATES
+            .iter()
+            .filter(|g| {
+                g.matches(
+                    consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
+                    CONDITION_FALSE,
+                    consts::INHERIT_SOURCE_MISSING_REASON,
+                )
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "the inherit hold selects exactly one row");
+        assert_eq!(hits[0].severity, GateSeverity::Fail);
+        assert!(hits[0].applies_to.covers_snapshot());
+        assert!(hits[0].applies_to.covers_restore());
+
+        // …and `SecurityContextInherited` must stay OUT of the registry. It is
+        // written with five advisory reasons (InheritFallback,
+        // InheritPinnedNoUid, InheritOverridden, MissingRecordedIdentity,
+        // RecordedPinnedNoUid), all on runs that PROCEEDED. Registering any one
+        // of them would make `doctor`'s `first_gate` report the other four as
+        // "blocked with a reason this plugin does not know (the operator is
+        // newer than the plugin)" — a false diagnosis handed to somebody
+        // mid-incident. The string is spelled out because the const is
+        // deliberately controller-side, not in this crate.
+        assert!(
+            !STRUCTURAL_GATES
+                .iter()
+                .any(|g| g.condition == "SecurityContextInherited"),
+            "SecurityContextInherited is advisory; registering one of its reasons would make \
+             doctor false-diagnose the rest as an operator/plugin skew (#464)"
+        );
     }
 }

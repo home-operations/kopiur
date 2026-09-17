@@ -5008,3 +5008,134 @@ fn recorded_meta_reports_a_snapshot_level_security_context_as_the_identity_sourc
     assert_eq!(recorded.uid, Some(2000));
     assert_eq!(recorded.src, RecordedSrc::Explicit);
 }
+
+// --- #464 round 2: the inherit heal must SURVIVE the rest of the launch pass -------------
+
+/// The condition-writers-clobber guard for the #464 heal. Round 1 got the heal WRITTEN
+/// (`io::tests::inherit_source_heal_conditions_clears_a_standing_hold_in_place` covers
+/// that); this covers the half that actually decides whether `doctor` lies: the healed
+/// `True` surviving every writer that follows it in the SAME reconcile.
+///
+/// A `conditions` merge patch REPLACES the array, so each later writer's BASE is the whole
+/// question. Fed the LIVE array — what [`io::live_conditions`] now returns at each of those
+/// sites — the heal survives. Fed the reconcile-START copy, as round 1's staging arms were,
+/// the SAME writer resurrects `SecurityContextResolved=False` onto a Snapshot that is about
+/// to go `Running`; and because the next pass builds from its own start-of-pass copy, the
+/// heal is clobbered again, forever. That is not a cosmetic status wobble: `doctor`
+/// suppresses a stale gate only on a TERMINAL phase, so it reports a healthy
+/// `copyMethod: Snapshot` backup as "blocked … it will wait forever".
+#[test]
+fn the_inherit_heal_survives_the_rest_of_the_launch_pass() {
+    let observed = Some(7);
+    let held = io::upsert_gate(
+        &[],
+        &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+        "HELD: workloadSelector `app=pg` matched no pod",
+        observed,
+    );
+    let healed =
+        io::inherit_source_heal_conditions(&held, observed).expect("a standing hold heals");
+    let resolved = |c: &[Condition]| -> (String, String) {
+        let row = c
+            .iter()
+            .find(|c| c.type_ == kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION)
+            .expect("the gate row must still be present, healed rather than removed");
+        (row.status.clone(), row.reason.clone())
+    };
+
+    // Every writer that can follow the heal in the same launch pass, in the order
+    // `reconcile_inner` runs them, each seeded from what the previous one produced — which
+    // is exactly what a live re-read hands it.
+    let waiting = staged_conditions(
+        &healed,
+        false,
+        crate::consts::STAGING_WAITING_REASON,
+        "waiting for the VolumeSnapshot to become readyToUse",
+        observed,
+    );
+    let ready = staged_conditions(
+        &waiting,
+        true,
+        SOURCE_STAGED_REASON,
+        "staged source ready (Snapshot): pvc `staged`",
+        observed,
+    );
+    let after_colocation = io::upsert_condition(
+        &ready,
+        crate::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+        true,
+        crate::consts::SOURCE_PVC_FOUND_REASON,
+        "source PVC `ns/data` found; the backup can launch",
+        observed,
+    );
+    assert_eq!(
+        resolved(&after_colocation),
+        (
+            "True".to_string(),
+            kopiur_api::consts::INHERIT_SOURCE_RESOLVED_REASON.to_string()
+        ),
+        "the heal must survive staging + the colocation gate clear: {after_colocation:#?}"
+    );
+
+    // The round-1 shape, pinned as the defect: the SAME staging writer seeded from the
+    // reconcile-START copy (`held`) instead of the live array. It does not merely fail to
+    // heal — it writes the hold BACK.
+    let clobbered = staged_conditions(
+        &held,
+        true,
+        SOURCE_STAGED_REASON,
+        "staged source ready (Snapshot): pvc `staged`",
+        observed,
+    );
+    assert_eq!(
+        resolved(&clobbered),
+        (
+            "False".to_string(),
+            kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON.to_string()
+        ),
+        "a stale-seeded staging write resurrects the hold — the bug this fix removes"
+    );
+}
+
+/// The same guard for the OTHER clobber shape on the Snapshot side: the missing-source-PVC
+/// park, which writes phase `Pending` (NON-terminal, so `doctor` does not suppress it) plus
+/// its own gate. It must report the block it actually found and nothing else.
+#[test]
+fn the_missing_source_pvc_park_does_not_resurrect_the_inherit_hold() {
+    let observed = Some(3);
+    let healed = io::inherit_source_heal_conditions(
+        &io::upsert_gate(
+            &[],
+            &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+            "HELD",
+            observed,
+        ),
+        observed,
+    )
+    .expect("a standing hold heals");
+    let backup: Snapshot = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Snapshot",
+        "metadata": { "name": "b", "namespace": "ns", "generation": 3 },
+        "spec": { "snapshotPolicyRef": { "name": "p" } },
+    }))
+    .expect("Snapshot fixture");
+    let status = snapshot_ready_status_with_condition_on(
+        &backup,
+        &healed,
+        SnapshotPhase::Pending,
+        crate::consts::SOURCE_PVC_MISSING_REASON,
+        "source PVC `ns/data` does not exist",
+        crate::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+        false,
+    );
+    let conds = status["conditions"].as_array().expect("conditions written");
+    let row = conds
+        .iter()
+        .find(|c| c["type"] == kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION)
+        .expect("the healed gate row must survive the park");
+    assert_eq!(
+        row["status"], "True",
+        "the park must not re-report a block that has cleared: {status:#}"
+    );
+}
