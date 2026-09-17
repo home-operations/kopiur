@@ -131,8 +131,8 @@ pub const VERIFY_REPO_LABEL: &str = "kopiur.home-operations.com/verify-repo";
 /// [`VERIFY_REPO_LABEL`], so narrowing the LIST by it would stop seeing that
 /// Job and spawn N fresh ones beside it — for the deep tier, N+1 concurrent
 /// scratch restores. The gate therefore LISTs without it and filters
-/// client-side ([`crate::verification::job_blocks_member`]), where an
-/// unlabelled non-terminal Job still holds every member's slot.
+/// client-side (`verification::job_blocks_cell`), where an unlabelled
+/// non-terminal Job still holds every cell's slot.
 pub const VERIFY_MEMBER_LABEL: &str = "kopiur.home-operations.com/verify-member";
 
 /// `COMPONENT_LABEL` value for replication mover Jobs (ADR-0005 §13(d)).

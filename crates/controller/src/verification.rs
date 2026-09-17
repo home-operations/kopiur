@@ -121,9 +121,19 @@ fn slot_for(
 /// brand-new policy it would fire a verify Job *before any backup exists*, and the
 /// mover fails hard (`deep verify found no snapshot to restore …`, #168). Gate it:
 /// schedule no verify until either this policy has produced a successful backup
-/// (`has_successful`) OR its resolved repository already contains **discovered**
-/// (adopted) snapshots (`has_discovered`) — the adopted-repo escape hatch, where
-/// deep verify legitimately resolves the latest repo snapshot for the identity.
+/// covering THIS member's path (`snapshot_policy::member_has_success`)
+/// OR its resolved repository already contains a **discovered** (adopted) or
+/// **replicated** row AT THIS MEMBER'S IDENTITY
+/// (`discovered_identities`) — the adopted-repo escape hatch, where deep
+/// verify legitimately resolves the latest repo snapshot for the identity.
+///
+/// Both inputs are per (repository x member). An earlier shape ORed in "this
+/// repository holds SOME discovered/replicated row", which is the ordinary state
+/// of a new policy on a shared repository (see
+/// `AdoptionSummary::last_scan_unmatched`): it unlocked verification for an
+/// identity with no manifest at all, and since a quick verify that covered
+/// nothing is now terminal, that meant a FAILED verify Job every slot until the
+/// policy's first own backup landed.
 pub fn verification_unlocked(has_successful: bool, has_discovered: bool) -> bool {
     has_successful || has_discovered
 }
@@ -146,7 +156,7 @@ pub enum DiscoveredProbeScope {
     ClusterWide,
 }
 
-/// **Pure.** Decide where [`repo_has_discovered_snapshots`] should LIST, from the
+/// **Pure.** Decide where [`discovered_identities`] should LIST, from the
 /// resolved repository's own namespace ([`ResolvedRepository::repo_namespace`]).
 ///
 /// Namespaced repos probe **their own** namespace, not the probing policy's: the
@@ -231,7 +241,7 @@ pub struct VerifyMember {
 /// exists), so verification must too. Returning the union instead would derive
 /// a path the repository has no snapshot for and fail the whole policy.
 ///
-/// Built on [`EffectiveSource::kopia_source_path`] + [`strategy_for`] — the
+/// Built on `EffectiveSource::kopia_source_path` + `strategy_for` — the
 /// same two functions `expand_sources` uses — and deliberately NOT on
 /// [`kopiur_api::expand::ExpandedMember::name`]: that name carries a 63-char
 /// bound that can error, and verification mints no child CRs, so it needs no
@@ -300,7 +310,7 @@ pub fn verify_members(
 /// otherwise multiply the LIST by the repository count).
 ///
 /// The LIST is skipped entirely for a policy with no `pvcSelector` source:
-/// [`crate::expand::match_pvcs`] iterates sources and `continue`s past every
+/// `crate::expand::match_pvcs` iterates sources and `continue`s past every
 /// non-selector one, so it performs no cluster IO there.
 pub async fn resolve_verify_members(
     ctx: &Context,
@@ -308,6 +318,28 @@ pub async fn resolve_verify_members(
 ) -> Result<Vec<VerifyMember>> {
     let matched = crate::expand::match_pvcs(&ctx.client, policy).await?;
     Ok(verify_members(policy, &matched))
+}
+
+/// How many `Snapshot` rows one page of the #168 discovered-identity probe
+/// reads. Only the identity triples are retained, so this bounds the request
+/// size, not the result.
+const DISCOVERED_PROBE_PAGE_SIZE: u32 = 500;
+
+/// A kopia identity reduced to its comparable triple —
+/// `(username, hostname, sourcePath)` — for the #168 discovered-row probe.
+///
+/// Same equality rule as adoption's own structural match: all three components
+/// must be equal, and `None` is deliberately DISTINCT from `Some("")` (a
+/// pathless identity is a different kopia address from one with an empty path).
+pub type IdentityKey = (String, String, Option<String>);
+
+/// **Pure.** See [`IdentityKey`].
+pub fn identity_key(id: &kopiur_api::common::ResolvedIdentity) -> IdentityKey {
+    (
+        id.username.clone(),
+        id.hostname.clone(),
+        id.source_path.clone(),
+    )
 }
 
 /// **Pure.** The `status.verificationStamps` key one (repository, member) cell
@@ -634,7 +666,7 @@ pub async fn verify_step(
     // any backup, and the mover fails hard. Unlocked once this policy has a Succeeded
     // snapshot OR its repo already carries discovered (adopted) or replicated
     // snapshots (a replication DEST repo holding only copies is not empty). The
-    // probe itself ([`repo_has_discovered_snapshots`]) is hoisted to per-target by
+    // probe itself ([`discovered_identities`]) is hoisted to per-target by
     // the caller — it is a per-REPOSITORY fact, so repeating it per member would
     // multiply the LIST by the member count for no new information.
     let unlocked = verification_unlocked(has_successful, has_discovered);
@@ -1278,11 +1310,11 @@ fn verify_identity_for(
 /// [`discovered_probe_scope`]) selects namespaced vs cluster-wide so an
 /// adopted `ClusterRepository`'s scattered rows are seen. Thin IO over the
 /// pure [`verification_unlocked`] gate.
-async fn repo_has_discovered_snapshots(
+async fn discovered_identities(
     client: &kube::Client,
     scope: &DiscoveredProbeScope,
     repo_uid: &str,
-) -> Result<bool> {
+) -> Result<BTreeSet<IdentityKey>> {
     let api: Api<Snapshot> = match scope {
         DiscoveredProbeScope::Namespace(ns) => Api::namespaced(client.clone(), ns),
         DiscoveredProbeScope::ClusterWide => Api::all(client.clone()),
@@ -1292,8 +1324,33 @@ async fn repo_has_discovered_snapshots(
         Origin::Discovered.label_value(),
         Origin::Replicated.label_value()
     );
-    let lp = ListParams::default().labels(&selector).limit(1);
-    Ok(!api.list(&lp).await?.items.is_empty())
+    let mut found: BTreeSet<IdentityKey> = BTreeSet::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut lp = ListParams::default()
+            .labels(&selector)
+            .limit(DISCOVERED_PROBE_PAGE_SIZE);
+        if let Some(t) = &token {
+            lp = lp.continue_token(t);
+        }
+        let page = api.list(&lp).await?;
+        token = page.metadata.continue_.clone().filter(|t| !t.is_empty());
+        // Only the identity triples are kept, never the objects, so a shared
+        // repository with a large foreign catalog costs a bounded amount of
+        // memory. Paginated rather than `.limit()`ed because COMPLETENESS is
+        // load-bearing: a truncated read would look like "this identity has no
+        // adopted snapshot" and leave an adopted repository's verification
+        // silently gated forever.
+        found.extend(
+            page.items
+                .iter()
+                .filter_map(|s| s.status.as_ref()?.snapshot.as_ref())
+                .map(|info| identity_key(&info.identity)),
+        );
+        if token.is_none() {
+            return Ok(found);
+        }
+    }
 }
 
 /// **Pure.** The verification tier an existing verify Job runs, read off its
@@ -1372,25 +1429,25 @@ fn verify_flight_selector(policy_name: &str, repo6: Option<&str>) -> String {
     selector
 }
 
-/// Thin IO: the #168 escape-hatch probe for ONE repository — hoisted out of
+/// Thin IO: the #168 escape-hatch index for ONE repository — hoisted out of
 /// [`verify_step`] by the caller so a fanned-out policy runs it once per
-/// repository instead of once per (repository x member) cell. `false` without
-/// any LIST once a successful backup already unlocks the gate.
+/// repository instead of once per (repository x member) cell, and skipped
+/// entirely (`needed: false`) when no member is still gated.
 ///
 /// Probed in the repository's OWN namespace (not the policy's — `RepositoryRef`
 /// allows a cross-namespace reference), or cluster-wide for a cluster-scoped
 /// repository (`repo_namespace == None`), which scatters its discovered rows
 /// across per-identity namespaces.
-pub async fn has_discovered_snapshots(
+pub async fn discovered_identity_index(
     ctx: &Context,
     repo: &ResolvedRepository,
-    has_successful: bool,
-) -> Result<bool> {
-    if has_successful {
-        return Ok(false);
+    needed: bool,
+) -> Result<BTreeSet<IdentityKey>> {
+    if !needed {
+        return Ok(BTreeSet::new());
     }
     let scope = discovered_probe_scope(repo.repo_namespace.as_deref());
-    repo_has_discovered_snapshots(&ctx.client, &scope, &repo.owner_ref.uid).await
+    discovered_identities(&ctx.client, &scope, &repo.owner_ref.uid).await
 }
 
 /// Whether any non-terminal verify Job holds this cell's single-flight slot.
@@ -2490,7 +2547,7 @@ mod tests {
     }
 
     #[test]
-    fn non_selector_and_one_member_policies_keep_the_pre_fix_shape() {
+    fn non_selector_policies_keep_the_pre_fix_shape_but_one_pvc_selectors_do_not() {
         // A plain `pvc:`/`nfs:` policy: ONE member, no path of its own (the
         // identity kernel derives it from the governing source exactly as
         // before) and no member dimension.
@@ -2519,6 +2576,27 @@ mod tests {
             Some(member_tag6("/pvc/only").as_str()),
             "a one-PVC selector keeps its member dimension"
         );
+    }
+
+    #[test]
+    fn a_one_pvc_selector_with_an_override_verifies_the_override_path() {
+        // #456 review: this combination is a footgun but NOT refused at
+        // admission, because with exactly one matched PVC it works — the
+        // override wins, there is no collision for `expand_sources` to refuse,
+        // and real snapshots exist at that path. Verification must therefore
+        // check THAT path, not `/pvc/<name>` and not an empty one.
+        let policy = selector_policy(serde_json::json!([{
+            "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+            "sourcePathOverride": "/data",
+        }]));
+        let members = verify_members(&policy, &matched(&[(0, &[("ns", "only")])]));
+        assert_eq!(paths(&members), vec!["/data"]);
+        // A SECOND matching PVC makes the backup itself refuse (both would land
+        // on `/data`), so nothing is written there for the new member — and the
+        // mover now fails a quick verify that covered no snapshot instead of
+        // falsely passing. Verification still derives the one shared path once.
+        let two = verify_members(&policy, &matched(&[(0, &[("ns", "a"), ("ns", "b")])]));
+        assert_eq!(paths(&two), vec!["/data"]);
     }
 
     #[test]
@@ -2726,6 +2804,60 @@ mod tests {
         assert_eq!(parse_stamp_key(""), ("", None));
         assert_eq!(parse_stamp_key("#"), ("", Some("")));
         assert_eq!(parse_stamp_key("a#b#c"), ("a#b", Some("c")));
+    }
+
+    #[test]
+    fn the_discovered_unlock_is_keyed_on_identity_not_merely_on_the_repository() {
+        // #456 review: the escape hatch used to be "this repository holds SOME
+        // discovered/replicated row", with no identity filter. That is the
+        // ORDINARY state of a new policy on a shared repository (see
+        // `AdoptionSummary::last_scan_unmatched`), so it unlocked verification
+        // for an identity with no manifest at all — and once a quick verify
+        // that covered nothing became terminal, that meant a FAILED verify Job
+        // every slot until the first own backup landed.
+        let id = |u: &str, h: &str, p: Option<&str>| kopiur_api::common::ResolvedIdentity {
+            username: u.to_string(),
+            hostname: h.to_string(),
+            source_path: p.map(str::to_string),
+        };
+        // What a shared repository's catalog looks like to a brand-new policy:
+        // plenty of rows, none of them this member's.
+        let foreign: BTreeSet<IdentityKey> = [
+            id("other", "ns", Some("/pvc/theirs")),
+            id("pg", "otherns", Some("/pvc/data-a")),
+            id("pg", "ns", Some("/pvc/data-z")),
+        ]
+        .iter()
+        .map(identity_key)
+        .collect();
+        let mine = identity_key(&id("pg", "ns", Some("/pvc/data-a")));
+        assert!(
+            !foreign.contains(&mine),
+            "a foreign catalog must NOT unlock this member"
+        );
+        assert!(
+            !verification_unlocked(false, foreign.contains(&mine)),
+            "so the gate stays closed until this member's own first backup"
+        );
+        // An adopted repository that really does hold THIS identity still
+        // unlocks — the escape hatch #168 added must keep working.
+        let adopted: BTreeSet<IdentityKey> = std::iter::once(mine.clone()).collect();
+        assert!(verification_unlocked(false, adopted.contains(&mine)));
+
+        // All three components matter, and `None` is NOT `Some("")`: a pathless
+        // identity is a different kopia address from one with an empty path.
+        for other in [
+            id("pg", "ns", None),
+            id("pg", "ns", Some("")),
+            id("pg", "ns2", Some("/pvc/data-a")),
+            id("pg2", "ns", Some("/pvc/data-a")),
+        ] {
+            assert_ne!(
+                identity_key(&other),
+                mine,
+                "{other:?} must not be treated as the same identity"
+            );
+        }
     }
 
     #[test]

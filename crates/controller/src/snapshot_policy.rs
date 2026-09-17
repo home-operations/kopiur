@@ -1686,17 +1686,44 @@ async fn run_verify_steps(
             Some(key) => multi_repo_has_success(backups, key),
             None => has_successful_snapshot,
         };
-        let has_discovered =
-            crate::verification::has_discovered_snapshots(ctx, &t.repo, repo_has_successful)
-                .await?;
-        for member in verify_members {
-            // #456: gate PER MEMBER when the member has a derived path of its
-            // own. A path-less (non-selector) member keeps the per-policy /
-            // per-repository input, byte-identically.
-            let has_successful = match member.source_path.as_deref() {
+        // #456: the #168 gate is per (repository x member). A member has a
+        // verifiable snapshot when a Succeeded child of this policy covers ITS
+        // path, or when the repository holds a discovered/replicated row AT ITS
+        // IDENTITY. A path-less (non-selector) member keeps the per-policy /
+        // per-repository success input, byte-identically.
+        let member_success: Vec<bool> = verify_members
+            .iter()
+            .map(|m| match m.source_path.as_deref() {
                 Some(path) => member_has_success(config, backups, repo_key.as_deref(), path),
                 None => repo_has_successful,
-            };
+            })
+            .collect();
+        // The identities of this repository's adopted/replicated rows, read ONCE
+        // per repository and only while at least one member is still gated.
+        // Narrowed by identity rather than a bare "this repository holds SOME
+        // foreign row": that unlocked a brand-new policy on a SHARED repository
+        // (the ordinary shape there) for an identity with no manifest, which,
+        // now that a quick verify covering nothing is terminal, meant a FAILED
+        // verify Job every slot until its first own backup.
+        let discovered = crate::verification::discovered_identity_index(
+            ctx,
+            &t.repo,
+            member_success.iter().any(|ok| !ok),
+        )
+        .await?;
+        for (member, &has_successful) in verify_members.iter().zip(member_success.iter()) {
+            // The member's own resolved identity, under THIS repository's
+            // identityDefaults. `?` rather than a silent `false`: an
+            // unresolvable CEL identity must park the policy loudly, and a
+            // gated cell never reaches the work-spec build that would otherwise
+            // surface it.
+            let identity = config_identity_for_path(
+                config,
+                namespace,
+                t.repo.identity_defaults.as_ref(),
+                member.source_path.as_deref(),
+            )?;
+            let has_discovered = discovered.contains(&crate::verification::identity_key(&identity));
             let key =
                 crate::verification::stamp_key(repo_key.as_deref(), member.member6.as_deref());
             let vt = crate::verification::VerifyTarget {

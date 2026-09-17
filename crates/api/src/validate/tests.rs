@@ -4948,60 +4948,104 @@ fn staging_overrides_rejected_for_nfs_but_honored_for_pvc_selector_sources() {
 }
 
 #[test]
-fn a_source_path_override_on_a_selector_is_refused_at_admission() {
-    // #456: a `sourcePathOverride` is one LITERAL path, so on a selector it
-    // collapses every matched PVC onto ONE kopia source — N volumes' histories
-    // merged into one stream, pruning each other under a single retention pin.
-    // `expand_sources` already refuses it at run time, so nothing was ever
-    // written, which left the shape admissible but INERT: verification would
-    // then legitimately derive one member for a path the repository has no
-    // snapshot for. Refusing it at admission deletes the shape.
+fn a_source_path_override_on_a_selector_stays_admissible() {
+    // #456 review: refusing this combination parked a configuration that
+    // genuinely works. A pure validator cannot see how many PVCs the selector
+    // currently matches, and the two cases are not the same:
+    //
+    //  * ONE matched PVC: the override wins, there is no path COLLISION for
+    //    `expand_sources` to refuse, the backup is minted and real snapshots
+    //    exist at that path. A working single-volume policy with a custom path.
+    //  * TWO OR MORE: `expand_sources` refuses the RUN (its collision check),
+    //    so nothing is written, and the mover now fails a verify that covered
+    //    no snapshot instead of falsely passing.
+    //
+    // Refusing both would have parked the whole policy on upgrade —
+    // `reconcile_inner` validates first and returns on the first error, so
+    // retention pruning, adoption, status and the repository summary would stop
+    // too. The run-time refusal already catches the broken case, loudly, at the
+    // moment it becomes broken.
     let source: Source = crate::testutil::from_yaml(
-        "pvcSelector: { labelSelector: { matchLabels: { app: pg } } }\n\
-         sourcePathOverride: /data\n",
+        "pvcSelector: { labelSelector: { matchLabels: { app: pg } } }\nsourcePathOverride: /data\n",
     );
-    let err = validate_source(&source).expect_err("selector + sourcePathOverride must be refused");
-    let msg = err.to_string();
-    assert!(msg.contains("sourcePathOverride"), "{msg}");
-    assert!(msg.contains("pvcSelector"), "{msg}");
-    // The message must name the supported alternative, not just say no.
-    assert!(msg.contains("sourcePathStrategy"), "{msg}");
-
-    // Both halves remain legal on their own.
-    let selector_only: Source = crate::testutil::from_yaml(
-        "pvcSelector: { labelSelector: { matchLabels: { app: pg } } }\n\
-         sourcePathStrategy: PvcNamespacedName\n",
-    );
-    assert!(validate_source(&selector_only).is_ok());
-    let plain_pvc_with_override: Source =
-        crate::testutil::from_yaml("pvc: { name: data }\nsourcePathOverride: /data\n");
     assert!(
-        validate_source(&plain_pvc_with_override).is_ok(),
-        "an override on a single-PVC source addresses exactly one volume and stays supported"
+        validate_source(&source).is_ok(),
+        "a selector + sourcePathOverride must stay admissible: it works for one matched PVC"
     );
-    // And an nfs source keeps its own override behavior untouched.
-    let nfs_with_override: Source = crate::testutil::from_yaml(
-        "nfs: { server: nas.local, path: /export }\nsourcePathOverride: /data\n",
-    );
-    assert!(validate_source(&nfs_with_override).is_ok());
-
-    // It must reach ADMISSION, not just the leaf validator: `validate_backup_config`
-    // is what the webhook and the controller both call.
     let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
         "repository: { kind: Repository, name: r }\n\
          groupBy: None\n\
          sources: [ { pvcSelector: { labelSelector: { matchLabels: { app: pg } } }, \
                       sourcePathOverride: /data } ]\n",
     );
-    let msg = validate_backup_config(&spec)
-        .iter()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
     assert!(
-        msg.contains("sourcePathOverride") && msg.contains("sourcePathStrategy"),
-        "the refusal must surface through validate_backup_config: {msg}"
+        validate_backup_config(&spec).is_empty(),
+        "admission must not park such a policy: {:?}",
+        validate_backup_config(&spec)
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn a_one_pvc_selector_with_an_override_expands_to_that_override_path() {
+    // The working case, end to end on the pure kernel: ONE matched PVC, so no
+    // collision, and the member's kopia source path IS the override — which is
+    // what the backup writes and therefore what verification must check.
+    use crate::expand::{effective_source, expand_sources, strategy_for};
+    use crate::snapshot::PvcTargetRef;
+    let policy: crate::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "pg", "namespace": "apps" },
+        "spec": {
+            "repository": { "name": "r" },
+            "groupBy": "None",
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "app": "pg" } } },
+                "sourcePathOverride": "/data",
+            }],
+        },
+    }))
+    .expect("typed policy");
+    let matched = std::collections::BTreeMap::from([(
+        0usize,
+        vec![PvcTargetRef {
+            namespace: "apps".into(),
+            name: "only".into(),
+        }],
+    )]);
+    let members = expand_sources(&policy, "pg-1", &matched)
+        .expect("one matched PVC cannot collide with itself")
+        .expect("a selector policy expands");
+    assert_eq!(members.len(), 1);
+    let eff = effective_source(&policy, Some(&members[0].source)).expect("effective");
+    assert_eq!(
+        eff.kopia_source_path(strategy_for(&policy.spec.sources[eff.index]))
+            .as_deref(),
+        Some("/data"),
+        "the override wins over the strategy, so this is the path the backup writes"
+    );
+
+    // Add a SECOND matching PVC and the same expansion is refused — both would
+    // land on `/data`, merging two volumes' histories into one stream.
+    let matched = std::collections::BTreeMap::from([(
+        0usize,
+        vec![
+            PvcTargetRef {
+                namespace: "apps".into(),
+                name: "one".into(),
+            },
+            PvcTargetRef {
+                namespace: "apps".into(),
+                name: "two".into(),
+            },
+        ],
+    )]);
+    let err = expand_sources(&policy, "pg-1", &matched)
+        .expect_err("two members on one path must be refused at run time");
+    assert!(err.to_string().contains("/data"), "{err}");
 }
 
 #[test]

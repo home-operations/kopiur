@@ -157,28 +157,30 @@ pub fn validate_source(source: &Source) -> ValidationResult {
                 }
                 validate_nfs_volume(nfs, "snapshot source")
             }
+            // `pvcSelector` + `sourcePathOverride` is deliberately NOT refused
+            // here. It is a footgun, but a pure validator cannot see how many
+            // PVCs the selector currently matches, and the two cases differ:
+            //
+            //  * ONE matched PVC — a working single-volume policy with a custom
+            //    path. The override wins at `kopia_source_path`'s first branch,
+            //    there is no path COLLISION for `expand_sources` to refuse, the
+            //    backup is minted and real snapshots exist there. Refusing it
+            //    would park the WHOLE policy on upgrade (`reconcile_inner`
+            //    validates first and returns on the first error), stopping
+            //    retention pruning, adoption, status and the repository summary
+            //    along with verification.
+            //  * TWO OR MORE — `expand_sources` refuses the run via its
+            //    path-collision check (N members on one path would merge their
+            //    histories into one stream and prune each other), so nothing is
+            //    ever written; and a quick verify of that path now FAILS loudly
+            //    rather than falsely passing, because the mover treats "covered
+            //    no snapshot" as terminal (#456).
+            //
+            // So the broken case is already caught at run time, loudly, at the
+            // moment it becomes broken — and the working one keeps working. The
+            // `sourcePathOverride` field documentation carries the warning.
             None => match source.pvc_selector.as_ref() {
-                Some(selector) => {
-                    // A `sourcePathOverride` is a LITERAL path, so on a selector
-                    // it collapses every matched PVC onto ONE kopia source: N
-                    // volumes' histories merged into one stream, pruning each
-                    // other under a single retention pin. `expand_sources`
-                    // already refuses that at run time (nothing is ever
-                    // written), which left the shape admissible but inert — and
-                    // verification then legitimately derives one member for a
-                    // path the repository has no snapshot for. Refuse it here
-                    // so the shape cannot exist. `sourcePathStrategy` is the
-                    // supported knob, and it is per-PVC by construction.
-                    if source.source_path_override.is_some() {
-                        return Err(ValidationError::MutuallyExclusive {
-                            a: "sourcePathOverride".to_string(),
-                            b: "pvcSelector".to_string(),
-                            context: "snapshot source: a sourcePathOverride is one literal                                       path, so it would collapse every matched PVC onto a                                       single kopia source and merge their histories. Use                                       sourcePathStrategy (PvcName / PvcNamespacedName),                                       which derives a distinct path per PVC, or move the                                       override to its own `pvc:` source"
-                                .to_string(),
-                        });
-                    }
-                    validate_pvc_selector(selector)
-                }
+                Some(selector) => validate_pvc_selector(selector),
                 None => Ok(()),
             },
         },
