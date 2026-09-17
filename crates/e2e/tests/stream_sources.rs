@@ -101,7 +101,7 @@ fn snapshot_json(name: &str, policy: &str) -> serde_json::Value {
 
 /// Acceptance 1 + 5: known bytes out, byte-identical bytes back in.
 #[tokio::test]
-#[cfg_attr(not(feature = "e2e"), ignore)]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn stream_backup_and_restore_is_byte_identical() {
     let Some(world) = World::connect().await else {
         eprintln!("no cluster; skipping");
@@ -233,7 +233,7 @@ async fn stream_backup_and_restore_is_byte_identical() {
 /// Acceptance 2 — THE correctness criterion. The producer emits real bytes and then
 /// fails; the Snapshot must fail AND leave no usable snapshot behind.
 #[tokio::test]
-#[cfg_attr(not(feature = "e2e"), ignore)]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn failing_producer_leaves_no_usable_snapshot() {
     let Some(world) = World::connect().await else {
         eprintln!("no cluster; skipping");
@@ -320,7 +320,7 @@ async fn failing_producer_leaves_no_usable_snapshot() {
 
 /// Acceptance 3 — selector mismatches fail clearly, and say what to do.
 #[tokio::test]
-#[cfg_attr(not(feature = "e2e"), ignore)]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn zero_pod_matches_fails_with_an_actionable_message() {
     let Some(world) = World::connect().await else {
         eprintln!("no cluster; skipping");
@@ -387,7 +387,7 @@ async fn zero_pod_matches_fails_with_an_actionable_message() {
 /// plausible byte count, and contents that depend on scheduling. So this asserts
 /// the Snapshot FAILS and that the message names the count and the pods.
 #[tokio::test]
-#[cfg_attr(not(feature = "e2e"), ignore)]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn two_running_pod_matches_fails_naming_the_candidates() {
     let Some(world) = World::connect().await else {
         eprintln!("no cluster; skipping");
@@ -470,7 +470,7 @@ async fn two_running_pod_matches_fails_naming_the_candidates() {
 
 /// Acceptance 4 — the dump must not leak into logs, Events, or CR status.
 #[tokio::test]
-#[cfg_attr(not(feature = "e2e"), ignore)]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn stream_content_never_appears_in_logs_or_status() {
     let Some(world) = World::connect().await else {
         eprintln!("no cluster; skipping");
@@ -525,7 +525,7 @@ async fn stream_content_never_appears_in_logs_or_status() {
 /// The namespace opt-in actually gates: without the annotation the run parks
 /// instead of exec'ing. Uses its own policy so it cannot race the others.
 #[tokio::test]
-#[cfg_attr(not(feature = "e2e"), ignore)]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn gate_blocks_until_namespace_opts_in() {
     let Some(world) = World::connect().await else {
         eprintln!("no cluster; skipping");
