@@ -169,16 +169,19 @@ pub fn validate_source(source: &Source) -> ValidationResult {
             //    validates first and returns on the first error), stopping
             //    retention pruning, adoption, status and the repository summary
             //    along with verification.
-            //  * TWO OR MORE — `expand_sources` refuses the run via its
+            //  * TWO OR MORE — `expand_sources` refuses the RUN via its
             //    path-collision check (N members on one path would merge their
-            //    histories into one stream and prune each other), so nothing is
-            //    ever written; and a quick verify of that path now FAILS loudly
-            //    rather than falsely passing, because the mover treats "covered
-            //    no snapshot" as terminal (#456).
+            //    histories into one stream and prune each other), so no further
+            //    snapshot is minted for that source.
             //
-            // So the broken case is already caught at run time, loudly, at the
-            // moment it becomes broken — and the working one keeps working. The
-            // `sourcePathOverride` field documentation carries the warning.
+            // So the broken case IS caught at run time, at the moment it
+            // becomes broken, and the working one keeps working. The loud signal
+            // there is the refused backup — the failed schedule fire — NOT
+            // verification: on a policy that was working, the earlier snapshots
+            // still sit at that path, so verification keeps passing. (It fails
+            // only where the path never received a backup, which the mover now
+            // treats as terminal rather than a false pass, #456.) The
+            // `sourcePathOverride` field documentation says exactly that.
             None => match source.pvc_selector.as_ref() {
                 Some(selector) => validate_pvc_selector(selector),
                 None => Ok(()),

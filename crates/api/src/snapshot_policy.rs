@@ -363,9 +363,14 @@ pub struct Source {
     /// On a `pvcSelector` source this is a footgun. It is ONE literal path, so
     /// it works only while the selector matches exactly one PVC; the moment a
     /// second PVC matches, both would land on that same kopia source, merging
-    /// their histories into one stream where they also prune each other — so
-    /// the backup is refused at run time and the next verification of that path
-    /// fails. Prefer `sourcePathStrategy`, which derives a distinct path per
+    /// their histories into one stream where they also prune each other, so the
+    /// BACKUP is refused at run time and no further snapshots are minted for
+    /// that source.
+    ///
+    /// Watch the failed schedule fire, not verification: the earlier snapshots
+    /// remain at that path, so verification keeps passing while backups have
+    /// stopped. (Verification only fails on a path that never received a
+    /// backup.) Prefer `sourcePathStrategy`, which derives a distinct path per
     /// PVC, or put the override on its own `pvc:` source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]

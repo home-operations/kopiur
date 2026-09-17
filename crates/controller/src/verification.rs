@@ -342,6 +342,23 @@ pub fn identity_key(id: &kopiur_api::common::ResolvedIdentity) -> IdentityKey {
     )
 }
 
+/// **Pure.** Which identities the #168 catalog probe is worth asking about:
+/// the still-GATED members' only, given `(has_successful, identity key)` per
+/// member.
+///
+/// An EMPTY result means skip the read entirely — once every member has a
+/// Succeeded child covering its own path, no adopted row can change any
+/// outcome, so the paged LIST is not worth a request. Handing the wanted set to
+/// [`discovered_identities`] also lets it drop every irrelevant row and stop as
+/// soon as all of them are found, which collapses the common case to one page.
+pub fn probe_identities(cells: &[(bool, IdentityKey)]) -> BTreeSet<IdentityKey> {
+    cells
+        .iter()
+        .filter(|(has_successful, _)| !has_successful)
+        .map(|(_, key)| key.clone())
+        .collect()
+}
+
 /// **Pure.** The `status.verificationStamps` key one (repository, member) cell
 /// stamps, or `None` for the classic flat `status.lastVerified` write.
 ///
@@ -508,13 +525,13 @@ fn idle_requeue(
 ///
 /// `repo6` is the 6-hex per-repository tag ([`crate::naming::repo_tag6`]),
 /// present ONLY for a multi-repository policy: `<policy>-vfy-<q|d>-<r6>-<unix>`.
-/// `member6` is the 6-hex per-member tag ([`member_tag6`]), present ONLY when
-/// the policy fans out to more than one member (#456):
+/// `member6` is the 6-hex per-member tag ([`member_tag6`]), present for every
+/// member of a `pvcSelector` policy (#456) — a one-match selector included:
 /// `<policy>-vfy-<q|d>[-<r6>]-m<m6>-<unix>`. Both are spliced BETWEEN the tier
-/// and the unix slot, so the single-repo single-member shape (both `None`)
-/// stays byte-identical to every prior operator and an in-flight slot's Job is
-/// still found by name across an upgrade (slot continuity — a renamed slot
-/// would double-spawn).
+/// and the unix slot, so the single-repo non-selector shape (both `None`) stays
+/// byte-identical to every prior operator and an in-flight slot's Job is still
+/// found by name across an upgrade (slot continuity — a renamed slot would
+/// double-spawn).
 ///
 /// `MAX` is **52, not 63**: the remaining 11 bytes of the 63-byte label budget
 /// are reserved for the `-<5-char>` pod-name suffix Kubernetes appends.
@@ -573,8 +590,12 @@ pub struct VerifyTarget<'a> {
     /// governing source's own `pvc`/`nfs`/`sourcePathOverride`, and a PATHLESS
     /// identity for a zero-source legacy policy.
     pub source_path: Option<&'a str>,
-    /// `Some(6-hex member tag)` ONLY when the policy fans out to more than one
-    /// member (#456). Orthogonal to [`Self::repo_key`]: the repo dimension
+    /// `Some(6-hex member tag)` for every member of a `pvcSelector` policy
+    /// (#456) — including a selector currently matching exactly ONE PVC, which
+    /// is deliberately not collapsed; `None` only for a non-selector source.
+    /// See [`VerifyMember::member6`].
+    ///
+    /// Orthogonal to [`Self::repo_key`]: the repo dimension
     /// drives `repo_tag6`, the [`VERIFY_REPO_LABEL`] value and the projected
     /// credentials prefix (members under one (policy, repository) SHARE that
     /// Secret), while this drives only the `-m<6>` Job-name segment, the
@@ -832,8 +853,9 @@ async fn spawn_verify_job(
     labels.insert(COMPONENT_LABEL.to_string(), VERIFY_COMPONENT.to_string());
     labels.insert(VERIFY_INSTANCE_LABEL.to_string(), policy_name.to_string());
     // #456 fan-out: label the member so the per-member single-flight can tell
-    // sibling members apart client-side. Stamped ONLY when the policy fans out,
-    // so a single-member Job's label set stays byte-identical.
+    // sibling members apart client-side. Present for every `pvcSelector`
+    // member (a one-match selector included); absent only for a non-selector
+    // source, whose label set therefore stays byte-identical.
     if let Some(m6) = target.member6 {
         labels.insert(VERIFY_MEMBER_LABEL.to_string(), m6.to_string());
     }
@@ -1314,6 +1336,7 @@ async fn discovered_identities(
     client: &kube::Client,
     scope: &DiscoveredProbeScope,
     repo_uid: &str,
+    wanted: &BTreeSet<IdentityKey>,
 ) -> Result<BTreeSet<IdentityKey>> {
     let api: Api<Snapshot> = match scope {
         DiscoveredProbeScope::Namespace(ns) => Api::namespaced(client.clone(), ns),
@@ -1335,19 +1358,24 @@ async fn discovered_identities(
         }
         let page = api.list(&lp).await?;
         token = page.metadata.continue_.clone().filter(|t| !t.is_empty());
-        // Only the identity triples are kept, never the objects, so a shared
-        // repository with a large foreign catalog costs a bounded amount of
-        // memory. Paginated rather than `.limit()`ed because COMPLETENESS is
-        // load-bearing: a truncated read would look like "this identity has no
-        // adopted snapshot" and leave an adopted repository's verification
-        // silently gated forever.
+        // Only the WANTED identity triples are kept, never the objects, so a
+        // shared repository with a large foreign catalog costs memory bounded
+        // by the gated member count rather than by the catalog. Paginated
+        // rather than `.limit()`ed because COMPLETENESS is load-bearing: a
+        // truncated read is indistinguishable from "this identity has no
+        // adopted snapshot" and would leave an adopted repository's
+        // verification silently gated forever.
         found.extend(
             page.items
                 .iter()
                 .filter_map(|s| s.status.as_ref()?.snapshot.as_ref())
-                .map(|info| identity_key(&info.identity)),
+                .map(|info| identity_key(&info.identity))
+                .filter(|k| wanted.contains(k)),
         );
-        if token.is_none() {
+        // Every gated member is accounted for: no later page can change an
+        // answer, so stop. This does NOT weaken completeness — it only skips
+        // reading rows whose identities we already have.
+        if found.len() == wanted.len() || token.is_none() {
             return Ok(found);
         }
     }
@@ -1431,8 +1459,11 @@ fn verify_flight_selector(policy_name: &str, repo6: Option<&str>) -> String {
 
 /// Thin IO: the #168 escape-hatch index for ONE repository — hoisted out of
 /// [`verify_step`] by the caller so a fanned-out policy runs it once per
-/// repository instead of once per (repository x member) cell, and skipped
-/// entirely (`needed: false`) when no member is still gated.
+/// repository instead of once per (repository x member) cell.
+///
+/// `wanted` is [`probe_identities`]' output: which of this repository's
+/// identities are still gated and therefore worth asking about. An empty set
+/// skips the read entirely, with no request at all.
 ///
 /// Probed in the repository's OWN namespace (not the policy's — `RepositoryRef`
 /// allows a cross-namespace reference), or cluster-wide for a cluster-scoped
@@ -1441,13 +1472,13 @@ fn verify_flight_selector(policy_name: &str, repo6: Option<&str>) -> String {
 pub async fn discovered_identity_index(
     ctx: &Context,
     repo: &ResolvedRepository,
-    needed: bool,
+    wanted: &BTreeSet<IdentityKey>,
 ) -> Result<BTreeSet<IdentityKey>> {
-    if !needed {
+    if wanted.is_empty() {
         return Ok(BTreeSet::new());
     }
     let scope = discovered_probe_scope(repo.repo_namespace.as_deref());
-    discovered_identities(&ctx.client, &scope, &repo.owner_ref.uid).await
+    discovered_identities(&ctx.client, &scope, &repo.owner_ref.uid, wanted).await
 }
 
 /// Whether any non-terminal verify Job holds this cell's single-flight slot.
@@ -2591,10 +2622,13 @@ mod tests {
         }]));
         let members = verify_members(&policy, &matched(&[(0, &[("ns", "only")])]));
         assert_eq!(paths(&members), vec!["/data"]);
-        // A SECOND matching PVC makes the backup itself refuse (both would land
-        // on `/data`), so nothing is written there for the new member — and the
-        // mover now fails a quick verify that covered no snapshot instead of
-        // falsely passing. Verification still derives the one shared path once.
+        // A SECOND matching PVC makes the BACKUP itself refuse (both would land
+        // on `/data`), so no further snapshot is minted. Verification still
+        // derives the one shared path once — and deliberately keeps PASSING,
+        // because the snapshots taken before the second PVC appeared are still
+        // there. The loud signal for this drift is the refused schedule fire,
+        // not verification; verification only fails where the path never
+        // received a backup at all.
         let two = verify_members(&policy, &matched(&[(0, &[("ns", "a"), ("ns", "b")])]));
         assert_eq!(paths(&two), vec!["/data"]);
     }
@@ -2804,6 +2838,110 @@ mod tests {
         assert_eq!(parse_stamp_key(""), ("", None));
         assert_eq!(parse_stamp_key("#"), ("", Some("")));
         assert_eq!(parse_stamp_key("a#b#c"), ("a#b", Some("c")));
+    }
+
+    #[test]
+    fn the_member_path_is_what_makes_the_discovered_unlock_match() {
+        // WIRING guard for the #168 escape hatch (#456 review). The unlock
+        // compares a member's resolved identity against what the catalog
+        // recorded for a discovered/replicated row, and the catalog records the
+        // PER-MEMBER kopia source path (`status.snapshot.identity.sourcePath`,
+        // straight off the kopia manifest). So `run_verify_steps` must resolve
+        // each member's identity with THAT member's own derived path.
+        //
+        // Passing `None` instead — the obvious-looking simplification — is
+        // fail-CLOSED: the keys would systematically disagree, no adopted row
+        // would ever match, and the escape hatch would be silently dead
+        // forever with nothing to notice it. That is exactly the failure this
+        // asserts against.
+        let policy = selector_policy(serde_json::json!([{
+            "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+            "sourcePathStrategy": "PvcName",
+        }]));
+        let members = verify_members(
+            &policy,
+            &matched(&[(0, &[("ns", "data-a"), ("ns", "data-b")])]),
+        );
+        assert_eq!(members.len(), 2);
+
+        // What the catalog holds: one adopted row per member, recorded at the
+        // member's own path under the policy's identity.
+        let catalog: BTreeSet<IdentityKey> = members
+            .iter()
+            .map(|m| {
+                identity_key(&kopiur_api::common::ResolvedIdentity {
+                    username: "pg".into(),
+                    hostname: "ns".into(),
+                    source_path: m.source_path.clone(),
+                })
+            })
+            .collect();
+        assert_eq!(catalog.len(), 2, "two distinct recorded identities");
+
+        // The composition `run_verify_steps` performs, per member.
+        for m in &members {
+            let resolved = crate::snapshot_policy::config_identity_for_path(
+                &policy,
+                "ns",
+                None,
+                m.source_path.as_deref(),
+            )
+            .expect("identity resolves");
+            assert_eq!(
+                resolved.source_path, m.source_path,
+                "the member's own path must ride through to the identity verbatim"
+            );
+            assert!(
+                catalog.contains(&identity_key(&resolved)),
+                "member {:?} must match its own adopted row",
+                m.source_path
+            );
+        }
+
+        // And the negative: resolving with `None` produces ONE address for both
+        // members that matches NEITHER row, so the hatch would never open.
+        let pathless = crate::snapshot_policy::config_identity_for_path(&policy, "ns", None, None)
+            .expect("identity resolves");
+        assert!(
+            !catalog.contains(&identity_key(&pathless)),
+            "passing None would silently kill the escape hatch: {:?} vs {catalog:?}",
+            identity_key(&pathless)
+        );
+    }
+
+    #[test]
+    fn the_catalog_probe_asks_only_about_gated_members_and_is_skipped_when_none_are() {
+        let key = |p: &str| {
+            identity_key(&kopiur_api::common::ResolvedIdentity {
+                username: "pg".into(),
+                hostname: "ns".into(),
+                source_path: Some(p.to_string()),
+            })
+        };
+        let a = key("/pvc/data-a");
+        let b = key("/pvc/data-b");
+
+        // Every member already has its own successful backup: no adopted row
+        // could change any outcome, so the paged LIST is skipped entirely (an
+        // empty wanted set short-circuits `discovered_identity_index` before
+        // any request).
+        assert!(
+            probe_identities(&[(true, a.clone()), (true, b.clone())]).is_empty(),
+            "an all-verified repository must not be re-read every reconcile"
+        );
+
+        // Only the gated member is asked about — which is also what lets
+        // `discovered_identities` drop every irrelevant row and stop as soon as
+        // it has them all.
+        assert_eq!(
+            probe_identities(&[(true, a.clone()), (false, b.clone())]),
+            std::iter::once(b.clone()).collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            probe_identities(&[(false, a.clone()), (false, b.clone())]),
+            [a, b].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert!(probe_identities(&[]).is_empty());
     }
 
     #[test]

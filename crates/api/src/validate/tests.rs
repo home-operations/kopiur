@@ -4957,8 +4957,10 @@ fn a_source_path_override_on_a_selector_stays_admissible() {
     //    `expand_sources` to refuse, the backup is minted and real snapshots
     //    exist at that path. A working single-volume policy with a custom path.
     //  * TWO OR MORE: `expand_sources` refuses the RUN (its collision check),
-    //    so nothing is written, and the mover now fails a verify that covered
-    //    no snapshot instead of falsely passing.
+    //    so no further snapshot is minted. The signal there is the refused
+    //    backup, not verification: a policy that WAS working still has
+    //    snapshots at that path, so verification keeps passing (it fails only
+    //    where the path never received a backup).
     //
     // Refusing both would have parked the whole policy on upgrade —
     // `reconcile_inner` validates first and returns on the first error, so
@@ -5045,7 +5047,62 @@ fn a_one_pvc_selector_with_an_override_expands_to_that_override_path() {
     )]);
     let err = expand_sources(&policy, "pg-1", &matched)
         .expect_err("two members on one path must be refused at run time");
-    assert!(err.to_string().contains("/data"), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("/data"), "{msg}");
+    // The remedy must be the one that actually applies. `sourcePathStrategy` is
+    // NEVER consulted while an override is set (the override wins at
+    // `kopia_source_path`'s first branch), so "set sourcePathStrategy:
+    // PvcNamespacedName" — the message for a strategy-derived collision —
+    // would be a fix that changes nothing.
+    assert!(
+        msg.contains("sourcePathOverride"),
+        "the message must name the override as the cause: {msg}"
+    );
+    assert!(
+        msg.contains("Remove that `sourcePathOverride`"),
+        "and tell the user to remove it: {msg}"
+    );
+    assert!(
+        !msg.contains("Set `sourcePathStrategy: PvcNamespacedName` on that source"),
+        "the strategy remedy is inert while an override is set: {msg}"
+    );
+
+    // A collision with NO override still gets the strategy remedy, unchanged.
+    let strategy_policy: crate::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "pg", "namespace": "apps" },
+        "spec": {
+            "repository": { "name": "r" },
+            "groupBy": "None",
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "app": "pg" } } },
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .expect("typed policy");
+    let cross_ns = std::collections::BTreeMap::from([(
+        0usize,
+        vec![
+            PvcTargetRef {
+                namespace: "a".into(),
+                name: "data".into(),
+            },
+            PvcTargetRef {
+                namespace: "b".into(),
+                name: "data".into(),
+            },
+        ],
+    )]);
+    let msg = expand_sources(&strategy_policy, "pg-1", &cross_ns)
+        .expect_err("two same-named PVCs on PvcName collide")
+        .to_string();
+    assert!(
+        msg.contains("Set `sourcePathStrategy: PvcNamespacedName` on that source"),
+        "a strategy-derived collision keeps the strategy remedy: {msg}"
+    );
+    assert!(!msg.contains("sourcePathOverride"), "{msg}");
 }
 
 #[test]

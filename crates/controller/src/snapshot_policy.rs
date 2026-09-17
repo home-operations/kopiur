@@ -1649,6 +1649,56 @@ struct VerifySteps<'a> {
     has_successful_snapshot: bool,
 }
 
+/// The per-repository inputs [`verify_verify_cells`] needs, grouped so its
+/// signature stays readable.
+struct VerifyCellInputs<'a> {
+    /// This policy's child Snapshots (the per-member success input).
+    backups: &'a [Snapshot],
+    /// `Some(normalized repo key)` for a multi-repository policy.
+    repo_key: Option<&'a str>,
+    /// Whether this repository holds ANY successful backup from the policy —
+    /// the input a path-less (non-selector) member keeps using.
+    repo_has_successful: bool,
+}
+
+/// One `(has_successful, identity key)` pair per verification member, under ONE
+/// repository. Fallible: the identity resolves through
+/// [`config_identity_for_path`], so an unresolvable CEL expression parks the
+/// policy here rather than silently gating it forever (a gated cell never
+/// reaches the work-spec build that would otherwise surface it).
+///
+/// **The `source_path` argument is load-bearing.** It must be the MEMBER's own
+/// derived path, not `None`: the identity key is compared against what the
+/// catalog recorded for a discovered/replicated row, and the catalog records
+/// the per-member path. Passing `None` here would resolve a different address
+/// for every selector member, the #168 escape hatch would never match, and it
+/// would be silently dead forever (fail-closed, so nothing would notice).
+/// Guarded by `verification::tests::the_member_path_is_what_makes_the_discovered_unlock_match`.
+fn verify_verify_cells(
+    config: &SnapshotPolicy,
+    namespace: &str,
+    target: &PolicyRepoTarget,
+    verify_members: &[crate::verification::VerifyMember],
+    inputs: VerifyCellInputs<'_>,
+) -> Result<Vec<(bool, crate::verification::IdentityKey)>> {
+    verify_members
+        .iter()
+        .map(|m| {
+            let has_successful = match m.source_path.as_deref() {
+                Some(path) => member_has_success(config, inputs.backups, inputs.repo_key, path),
+                None => inputs.repo_has_successful,
+            };
+            let identity = config_identity_for_path(
+                config,
+                namespace,
+                target.repo.identity_defaults.as_ref(),
+                m.source_path.as_deref(),
+            )?;
+            Ok((has_successful, crate::verification::identity_key(&identity)))
+        })
+        .collect()
+}
+
 /// See [`VerifySteps`].
 async fn run_verify_steps(
     config: &SnapshotPolicy,
@@ -1691,39 +1741,33 @@ async fn run_verify_steps(
         // path, or when the repository holds a discovered/replicated row AT ITS
         // IDENTITY. A path-less (non-selector) member keeps the per-policy /
         // per-repository success input, byte-identically.
-        let member_success: Vec<bool> = verify_members
-            .iter()
-            .map(|m| match m.source_path.as_deref() {
-                Some(path) => member_has_success(config, backups, repo_key.as_deref(), path),
-                None => repo_has_successful,
-            })
-            .collect();
+        let cells = verify_verify_cells(
+            config,
+            namespace,
+            t,
+            verify_members,
+            VerifyCellInputs {
+                backups,
+                repo_key: repo_key.as_deref(),
+                repo_has_successful,
+            },
+        )?;
         // The identities of this repository's adopted/replicated rows, read ONCE
-        // per repository and only while at least one member is still gated.
-        // Narrowed by identity rather than a bare "this repository holds SOME
-        // foreign row": that unlocked a brand-new policy on a SHARED repository
-        // (the ordinary shape there) for an identity with no manifest, which,
-        // now that a quick verify covering nothing is terminal, meant a FAILED
-        // verify Job every slot until its first own backup.
+        // per repository and only for the identities still GATED. Narrowed by
+        // identity rather than a bare "this repository holds SOME foreign row":
+        // that unlocked a brand-new policy on a SHARED repository (the ordinary
+        // shape there) for an identity with no manifest, which, now that a
+        // quick verify covering nothing is terminal, meant a FAILED verify Job
+        // every slot until its first own backup.
         let discovered = crate::verification::discovered_identity_index(
             ctx,
             &t.repo,
-            member_success.iter().any(|ok| !ok),
+            &crate::verification::probe_identities(&cells),
         )
         .await?;
-        for (member, &has_successful) in verify_members.iter().zip(member_success.iter()) {
-            // The member's own resolved identity, under THIS repository's
-            // identityDefaults. `?` rather than a silent `false`: an
-            // unresolvable CEL identity must park the policy loudly, and a
-            // gated cell never reaches the work-spec build that would otherwise
-            // surface it.
-            let identity = config_identity_for_path(
-                config,
-                namespace,
-                t.repo.identity_defaults.as_ref(),
-                member.source_path.as_deref(),
-            )?;
-            let has_discovered = discovered.contains(&crate::verification::identity_key(&identity));
+        for (member, (has_successful, identity)) in verify_members.iter().zip(cells.iter()) {
+            let has_successful = *has_successful;
+            let has_discovered = discovered.contains(identity);
             let key =
                 crate::verification::stamp_key(repo_key.as_deref(), member.member6.as_deref());
             let vt = crate::verification::VerifyTarget {

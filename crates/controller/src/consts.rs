@@ -122,9 +122,12 @@ pub const VERIFY_REPO_LABEL: &str = "kopiur.home-operations.com/verify-repo";
 /// DERIVED source path — label-safe where the raw `/pvc/<name>` path (slashes)
 /// is not.
 ///
-/// Stamped ONLY when the policy fans out to MORE THAN ONE member, so a
-/// single-member policy's Job names, labels and status stamps stay
-/// byte-identical to every prior operator.
+/// Stamped on every member of a `pvcSelector` policy — including a selector
+/// that currently matches exactly ONE PVC, which is deliberately NOT collapsed
+/// to the flat shape (see [`crate::verification::VerifyMember::member6`]).
+/// Absent only for a non-selector source (`pvc:`/`nfs:`), whose Job names,
+/// labels and status stamps therefore stay byte-identical to every prior
+/// operator.
 ///
 /// Deliberately **not** part of the single-flight LIST selector. An in-flight
 /// verify Job minted by an OLDER operator carries neither this label nor
