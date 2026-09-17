@@ -117,7 +117,7 @@ Repository-wide storage figures from the last catalog scan.
 - `snapshotCount` is the total number of snapshots in the repository, across all identities.
 - `totalSize` is the total on-disk size in human-readable form, such as `412Gi`.
 - `lastObservedAt` is the RFC 3339 timestamp when these figures were last seen.
-- `indexBlobCount` is the number of content-index blobs seen at the last bootstrap. Kopia compacts these during maintenance. A count that climbs without limit means maintenance is not keeping up, and crossing `spec.health.indexBlobWarnThreshold` raises the `IndexBlobHealth` warning. It is also the `IndexBlobs` print column.
+- `indexBlobCount` is the number of content-index blobs, observed at bootstrap and re-observed after each successful maintenance run (the newer observation wins). Kopia compacts these during maintenance. A count that climbs without limit means maintenance is not keeping up, and crossing `spec.health.indexBlobWarnThreshold` raises the `IndexBlobHealth` warning. It is also the `IndexBlobs` print column.
 
 ### `parameters`
 

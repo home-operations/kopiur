@@ -296,9 +296,13 @@ pub enum MoverError {
         source: std::io::Error,
     },
 
-    /// Deep verification found no snapshot to scratch-restore.
+    /// Verification found no snapshot for this source path's identity — raised
+    /// by both tiers: the quick tier when `kopia snapshot verify --sources`
+    /// matches zero manifests (kopia exits 0 for that, so this is what turns
+    /// it into a failure rather than a false pass), and the deep tier when
+    /// there is no snapshot to scratch-restore.
     #[error(
-        "deep verify found no snapshot to restore for source path {source_path:?}: the \
+        "verification found no snapshot for source path {source_path:?}: the \
          repository has no snapshot for this identity yet. Run a backup first (the operator \
          normally schedules verification only after the first successful backup)"
     )]
@@ -854,7 +858,7 @@ mod tests {
         let msg = err.to_string();
         // what: no snapshot found for the source path
         assert!(msg.contains("/pvc/agregarr"), "{msg}");
-        assert!(msg.contains("no snapshot to restore"), "{msg}");
+        assert!(msg.contains("verification found no snapshot"), "{msg}");
         // why: the repository has no snapshot for this identity yet
         assert!(msg.contains("no snapshot for this identity yet"), "{msg}");
         // fix: run a backup first
