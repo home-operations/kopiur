@@ -3250,6 +3250,16 @@ async fn run_restore_mover(
             report_missing_recorded_identity(restore, api, &msg, ctx).await?;
             return Err(Error::MissingRecordedIdentity(msg));
         }
+        // The LIVE-pod inherit hold (#464): `workloadSelector`/`pvcConsumer` resolved no
+        // securityContext at all AND the recipe pins no fallback identity. Its own
+        // registered gate (`SecurityContextResolved=False`, naming the selector) and the
+        // same slow structural requeue — distinct from the advisory
+        // `SecurityContextInherited` report above, which only ever describes a run that
+        // PROCEEDED.
+        Err(Error::InheritSourceMissing(msg)) => {
+            io::park_on_inherit_source_missing(api, restore, ctx, &msg).await?;
+            return Err(Error::InheritSourceMissing(msg));
+        }
         Err(e) => return Err(e),
     };
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();

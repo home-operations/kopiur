@@ -9,7 +9,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector, OwnerReference};
 use kube::api::{DeleteParams, ListParams, PostParams};
 use kube::core::ObjectMeta;
 use kube::{Api, ResourceExt};
@@ -1061,6 +1061,148 @@ pub async fn ensure_cache_pvc(
     }
 }
 
+/// How a **live-pod** `mover.inheritSecurityContextFrom` names its source, rendered for a
+/// human: the label selector that was queried, or the source PVC whose consumer was hunted.
+///
+/// `None` for the modes this hold does not cover — the restore-only `snapshot` variant (whose
+/// unresolvable case is the `MissingRecordedIdentity` hold, reported by the restore
+/// reconciler) and a `pvcConsumer` on a run that has no source PVC at all (a spec error, not
+/// an absent workload: telling that user to "scale the workload up" would be a wrong answer).
+/// A `None` therefore means "leave this error exactly as it propagates today".
+pub(crate) fn live_inherit_source_label(
+    inherit: Option<&InheritSecurityContextFrom>,
+    source_pvc: Option<&str>,
+) -> Option<String> {
+    // Exhaustive over the variants (the type-safety thesis): a new inherit mode must be
+    // classified here deliberately rather than silently inheriting the `snapshot` arm's
+    // leave-it-alone behavior.
+    match inherit? {
+        InheritSecurityContextFrom::WorkloadSelector(sel) => {
+            let query = label_selector_to_string(&sel.pod_selector);
+            Some(if query.is_empty() {
+                "workloadSelector with an EMPTY podSelector".to_string()
+            } else {
+                format!("workloadSelector `{query}`")
+            })
+        }
+        InheritSecurityContextFrom::PvcConsumer(_) => {
+            source_pvc.map(|claim| format!("pvcConsumer of source PVC `{claim}`"))
+        }
+        InheritSecurityContextFrom::Snapshot(_) => None,
+    }
+}
+
+/// The condition/Event message for the `SecurityContextResolved=False` hold (#464): what
+/// happened, why the run is HELD rather than proceeding, and the three levers that clear it.
+///
+/// `source` is [`live_inherit_source_label`]'s rendering, so the selector that matched
+/// nothing is always named — the reporter's point in #464 was that a warning naming the
+/// selector is worth more than any override. `cause` is the resolver's own actionable
+/// sentence (which pod, which container, which namespace), quoted verbatim rather than
+/// paraphrased.
+///
+/// Pure and byte-stable: it rides a 300s requeue, so a volatile byte here would re-write
+/// status on every pass, wake the primary watch and hot-loop the reconciler.
+pub fn inherit_source_missing_message(source: &str, cause: &str) -> String {
+    format!(
+        "mover.inheritSecurityContextFrom ({source}) resolved no securityContext to inherit, \
+         and this recipe pins no fallback identity — so the run is HELD instead of running as \
+         the wrong UID. Cause: {cause} Fix, whichever fits: bring the workload back up \
+         (inheriting reads a LIVE pod, so a workload scaled to zero has no identity to copy); \
+         correct the selector so it matches the workload; or set \
+         mover.securityContext.runAsUser to the UID the data expects — an explicit context \
+         that pins an identity becomes the deliberate fallback and the run proceeds on it. The \
+         run stays `Pending` and re-checks every few minutes; it starts by itself once one of \
+         those is true."
+    )
+}
+
+/// The `status.conditions` array of a SERIALIZED custom resource, as typed conditions.
+///
+/// The gate park below is generic over `Snapshot`/`Restore` (one writer, two reconcilers), and
+/// neither `kube::Resource` nor any trait in this repo exposes `status.conditions` — so the
+/// live object is read back through JSON. A single unparseable entry is DROPPED with a warning
+/// rather than failing the whole extraction: returning an empty vec on one malformed condition
+/// would make the upsert REPLACE (and so erase) every healthy condition beside it.
+pub(crate) fn conditions_from_status(status: Option<&serde_json::Value>) -> Vec<Condition> {
+    let Some(items) = status
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match serde_json::from_value::<Condition>(item.clone()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "conditions: skipping an unparseable status condition");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Park a `Snapshot`/`Restore` on the `SecurityContextResolved=False` hold (#464): write the
+/// registered gate condition at `phase: Pending` and fire ONE Warning Event per transition.
+///
+/// Generic over the two work kinds on purpose — the hold is identical on both, and two
+/// hand-written copies is exactly how a reason drifts on one side only.
+///
+/// Two properties are load-bearing, both learned the hard way elsewhere in this crate:
+///
+/// - the conditions array is built from a LIVE re-read ([`super::live_conditions_source`]),
+///   because a `conditions` merge patch REPLACES the array — a second writer in the same
+///   reconcile that builds from the stale in-memory copy silently erases the first one's
+///   condition;
+/// - the Event fires only when [`super::patch_status_if_changed`] reports a real write, so the
+///   300s structural requeue cannot re-fire an identical Warning forever.
+pub async fn park_on_inherit_source_missing<K>(
+    api: &Api<K>,
+    obj: &K,
+    ctx: &crate::context::Context,
+    message: &str,
+) -> Result<()>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+{
+    let name = obj.name_any();
+    let Some(live) = super::live_conditions_source(api, &name, obj).await else {
+        return Ok(()); // deleted mid-reconcile
+    };
+    let status = serde_json::to_value(&live)
+        .ok()
+        .and_then(|v| v.get("status").cloned());
+    let conditions = super::upsert_gate(
+        &conditions_from_status(status.as_ref()),
+        &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+        message,
+        obj.meta().generation,
+    );
+    if super::patch_status_if_changed(
+        api,
+        &name,
+        status.as_ref(),
+        serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+    )
+    .await?
+    {
+        super::publish_warning_event(
+            ctx,
+            obj,
+            kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON,
+            crate::consts::SCALE_WORKLOAD_OR_PIN_MOVER_UID_ACTION,
+            message,
+        )
+        .await;
+    }
+    Ok(())
+}
+
 /// The mover's **recipe-layer** container AND pod security contexts, plus how they were
 /// arrived at. Each context is `None` when unset (the Job builder then applies the hardened
 /// container default and no pod context). The result feeds BOTH the privileged-mover gate and
@@ -1186,6 +1328,30 @@ pub async fn resolve_mover_security_contexts(
                 outcome: InheritOutcome::Fallback { reason },
                 unfiltered_pods: None,
             });
+        }
+        // A LIVE-pod inherit that resolved nothing, with NO pinned fallback (#464): the
+        // workload is scaled to zero, the selector matches nothing, the named container is
+        // absent, or the matched pod sets no context at all. This is a hold a human must
+        // clear, not a transient blip, so it gets its own typed error — the reconcilers park
+        // it behind the registered `SecurityContextResolved=False` gate on the slow structural
+        // cadence, with a message that NAMES the selector. Before #464 it propagated as a bare
+        // `MissingDependency`: a fast, condition-less retry loop with a generic message.
+        //
+        // `live_inherit_source_label` returning `None` is what keeps the OTHER unresolvable
+        // modes exactly as they are: the restore-only `snapshot` variant stays a
+        // `MissingDependency` so the restore reconciler's `MissingRecordedIdentity` arm still
+        // catches it, and a `pvcConsumer` with no source PVC at all stays one too (a spec
+        // error, where "scale the workload up" would be the wrong advice).
+        Err(Error::MissingDependency(reason)) => {
+            return match live_inherit_source_label(
+                m.inherit_security_context_from.as_ref(),
+                source_pvc,
+            ) {
+                Some(source) => Err(Error::InheritSourceMissing(inherit_source_missing_message(
+                    &source, &reason,
+                ))),
+                None => Err(Error::MissingDependency(reason)),
+            };
         }
         // Everything else propagates, including `Error::Kube` (e.g. a 403 listing pods).
         // A workload that isn't running is workload state; a broken API call is an operator

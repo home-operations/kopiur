@@ -1227,7 +1227,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // `resolve_mover`, giving the full ladder
     // `hardened ⊂ moverDefaults ⊂ inherited ⊂ policy.mover ⊂ snapshot.mover`.
     let recipe_mover = kopiur_api::snapshot::effective_backup_mover(&backup.spec, &config.spec);
-    let mover_security = io::resolve_mover_security_contexts(
+    let mover_security = match io::resolve_mover_security_contexts(
         &ctx.client,
         &namespace,
         recipe_mover.as_ref(),
@@ -1237,7 +1237,21 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         // to pass.
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(s) => s,
+        // A live-pod inherit that resolved NOTHING and has no pinned fallback identity
+        // (#464): the workload is scaled to zero — precisely when a quiesced backup is
+        // most useful — or the selector matches nothing. Park it behind the registered
+        // `SecurityContextResolved=False` gate with a message naming the selector, then
+        // requeue on the slow structural cadence. A bare `?` here surfaced a generic,
+        // condition-less `MissingDependency` that re-checked every 30s forever.
+        Err(Error::InheritSourceMissing(msg)) => {
+            io::park_on_inherit_source_missing(&api, backup, ctx, &msg).await?;
+            return Err(Error::InheritSourceMissing(msg));
+        }
+        Err(e) => return Err(e),
+    };
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = recipe_mover.as_ref().and_then(|m| m.privileged_mode);
 

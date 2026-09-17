@@ -3404,6 +3404,211 @@ fn a_context_pinning_no_identity_is_not_a_fallback() {
     );
 }
 
+// --- #464: the dedicated hold for an unresolvable live-pod inherit -----------
+//
+// Before #464 a `workloadSelector` matching no pod (the workload scaled to zero — precisely
+// when a quiesced backup is most useful) surfaced as a generic transient `MissingDependency`
+// with no condition: nothing named the selector, and the run re-checked every 30s forever.
+// These pin the replacement: a typed hold whose message names the selector, behind its own
+// REGISTERED gate so `kubectl kopiur doctor` can see the park.
+
+#[test]
+fn inherit_source_missing_message_is_exactly_this_text() {
+    // Pinned verbatim, not by substring: this string IS the user-facing artifact (the
+    // condition message and the Warning Event note), and the reporter's ask in #464 was
+    // specifically that it NAME the selector that matched nothing.
+    let msg = inherit_source_missing_message(
+        "workloadSelector `app=postgres,tier=db`",
+        "no pod matches mover.inheritSecurityContextFrom (`app=postgres,tier=db`) in namespace \
+         `billing`.",
+    );
+    assert_eq!(
+        msg,
+        "mover.inheritSecurityContextFrom (workloadSelector `app=postgres,tier=db`) resolved no \
+         securityContext to inherit, and this recipe pins no fallback identity — so the run is \
+         HELD instead of running as the wrong UID. Cause: no pod matches \
+         mover.inheritSecurityContextFrom (`app=postgres,tier=db`) in namespace `billing`. Fix, \
+         whichever fits: bring the workload back up (inheriting reads a LIVE pod, so a workload \
+         scaled to zero has no identity to copy); correct the selector so it matches the \
+         workload; or set mover.securityContext.runAsUser to the UID the data expects — an \
+         explicit context that pins an identity becomes the deliberate fallback and the run \
+         proceeds on it. The run stays `Pending` and re-checks every few minutes; it starts by \
+         itself once one of those is true."
+    );
+    // Byte-stable across renders: the message rides a 300s requeue, so a volatile byte would
+    // re-write status every pass, wake the primary watch and hot-loop the reconciler.
+    assert_eq!(
+        msg,
+        inherit_source_missing_message(
+            "workloadSelector `app=postgres,tier=db`",
+            "no pod matches mover.inheritSecurityContextFrom (`app=postgres,tier=db`) in \
+             namespace `billing`."
+        )
+    );
+}
+
+#[test]
+fn the_hold_message_carries_the_resolver_cause_for_every_unresolvable_shape() {
+    // The three cases that reach the hold — no pod matched, the named container is absent, the
+    // pod sets no context at all — each contribute their OWN resolver sentence, so the held
+    // object explains which of the three it is rather than a single generic phrasing.
+    let pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
+    let bare = pod_with(Some("Running"), &[("app", None)], None);
+    let causes = [
+        inherited_security_context_from_pods(&[], Some("app"), "billing", "app=x").unwrap_err(),
+        inherited_security_context_from_pods(&[pod], Some("nope"), "billing", "app=x").unwrap_err(),
+        inherited_security_context_from_pods(&[bare], Some("app"), "billing", "app=x").unwrap_err(),
+    ];
+    for cause in causes {
+        let msg = inherit_source_missing_message("workloadSelector `app=x`", &cause.to_string());
+        assert!(msg.contains("app=x"), "the selector must be named: {msg}");
+        assert!(msg.contains("HELD"), "the run is held, say so: {msg}");
+        assert!(
+            msg.contains("mover.securityContext.runAsUser"),
+            "the fallback lever must be offered: {msg}"
+        );
+        // The resolver's own diagnosis survives into the held object's message.
+        assert!(
+            msg.contains(cause.to_string().split(" — ").next().unwrap()),
+            "the cause must be quoted, not paraphrased: {msg}"
+        );
+    }
+}
+
+#[test]
+fn only_live_pod_inherit_modes_earn_the_dedicated_hold() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+    use kopiur_api::common::{
+        InheritSecurityContextFrom, PodSelector, PvcConsumerInherit, SnapshotInherit,
+    };
+
+    // `workloadSelector`: the rendered query is what the message names.
+    let sel = InheritSecurityContextFrom::WorkloadSelector(PodSelector {
+        pod_selector: LabelSelector {
+            match_labels: Some(std::collections::BTreeMap::from([(
+                "app".to_string(),
+                "pg".to_string(),
+            )])),
+            match_expressions: None,
+        },
+        container: None,
+    });
+    assert_eq!(
+        live_inherit_source_label(Some(&sel), None).as_deref(),
+        Some("workloadSelector `app=pg`")
+    );
+
+    // An empty selector is still the selector's fault, and still a hold — but it must not
+    // render as an empty pair of backticks, which reads like a rendering bug.
+    let empty = InheritSecurityContextFrom::WorkloadSelector(PodSelector {
+        pod_selector: LabelSelector::default(),
+        container: None,
+    });
+    assert_eq!(
+        live_inherit_source_label(Some(&empty), None).as_deref(),
+        Some("workloadSelector with an EMPTY podSelector")
+    );
+
+    // `pvcConsumer` names the claim whose consumer was hunted.
+    let pvc = InheritSecurityContextFrom::PvcConsumer(PvcConsumerInherit::default());
+    assert_eq!(
+        live_inherit_source_label(Some(&pvc), Some("pg-data")).as_deref(),
+        Some("pvcConsumer of source PVC `pg-data`")
+    );
+
+    // …but `pvcConsumer` on a run with NO source PVC is a spec error, not an absent workload.
+    // "Bring the workload back up" would be the wrong advice, so it keeps its existing
+    // transient propagation instead of earning the hold.
+    assert_eq!(live_inherit_source_label(Some(&pvc), None), None);
+
+    // The restore-only `snapshot` variant is NOT this hold: its unresolvable case is the
+    // `MissingRecordedIdentity` hold the restore reconciler already writes, and stealing it
+    // here would replace that condition with a message telling the user to scale up a workload
+    // that has nothing to do with it.
+    let snap = InheritSecurityContextFrom::Snapshot(SnapshotInherit::default());
+    assert_eq!(
+        live_inherit_source_label(Some(&snap), Some("pg-data")),
+        None
+    );
+
+    // No inherit requested at all: nothing to hold on.
+    assert_eq!(live_inherit_source_label(None, Some("pg-data")), None);
+}
+
+#[test]
+fn conditions_from_status_preserves_the_healthy_conditions_beside_a_malformed_one() {
+    // The generic park re-reads the live object through JSON (no trait in this repo exposes
+    // `status.conditions` across kinds). A `conditions` patch REPLACES the array, so dropping
+    // the whole extraction on one unparseable entry would ERASE every healthy condition next
+    // to it — the same clobber the live re-read exists to prevent.
+    let status = serde_json::json!({
+        "conditions": [
+            {
+                "type": "Ready",
+                "status": "False",
+                "reason": "Pending",
+                "message": "waiting",
+                "lastTransitionTime": "2026-01-01T00:00:00Z",
+            },
+            { "type": "Garbage" },
+            {
+                "type": "SecurityContextCompatible",
+                "status": "Unknown",
+                "reason": "Undecidable",
+                "message": "cannot tell",
+                "lastTransitionTime": "2026-01-01T00:00:00Z",
+            },
+        ],
+    });
+    let conds = conditions_from_status(Some(&status));
+    let types: Vec<&str> = conds.iter().map(|c| c.type_.as_str()).collect();
+    assert_eq!(types, vec!["Ready", "SecurityContextCompatible"]);
+
+    // A status with no conditions, and no status at all, are both simply empty.
+    assert!(conditions_from_status(Some(&serde_json::json!({ "phase": "Pending" }))).is_empty());
+    assert!(conditions_from_status(None).is_empty());
+
+    // …and the upsert then ADDS the gate rather than replacing a healthy condition.
+    let after = upsert_gate(
+        &conds,
+        &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+        "held",
+        Some(3),
+    );
+    assert_eq!(after.len(), 3);
+    assert_eq!(
+        after[2].type_,
+        kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION
+    );
+    assert_eq!(
+        after[2].reason,
+        kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON
+    );
+    assert_eq!(after[2].status, "False");
+}
+
+#[test]
+fn the_inherit_hold_is_structural_and_keeps_its_own_event_reason() {
+    // The hold must requeue on the slow structural cadence (300s), not the fast transient one
+    // the old `MissingDependency` used, and its Event must carry the SAME reason as the
+    // registered gate so the condition and the Event read as one signal.
+    let err = crate::error::Error::InheritSourceMissing(inherit_source_missing_message(
+        "workloadSelector `app=pg`",
+        "no pod matches.",
+    ));
+    assert_eq!(err.class(), crate::error::ErrorClass::Structural);
+    let event = reconcile_failure_event(&err, 65532);
+    assert_eq!(
+        event.reason,
+        kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON
+    );
+    assert_eq!(
+        event.action,
+        crate::consts::SCALE_WORKLOAD_OR_PIN_MOVER_UID_ACTION
+    );
+    assert!(event.note.contains("app=pg"), "{}", event.note);
+}
+
 #[test]
 fn pvc_consumer_inherits_the_container_that_mounts_the_claim_not_the_first() {
     use k8s_openapi::api::core::v1::{
@@ -4018,6 +4223,20 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         false,
         crate::consts::SOURCE_PVC_MISSING_REASON,
         "snapshot::handle_missing_source_pvc (computed polarity)",
+    ),
+    // The #464 live-pod inherit hold, written by ONE generic helper
+    // (`io::park_on_inherit_source_missing`, via
+    // io::upsert_gate(&INHERIT_SOURCE_MISSING_GATE, ...)) from two call sites:
+    // `snapshot::reconcile_inner`'s and `restore::run_restore_mover`'s
+    // `Error::InheritSourceMissing` arms around `resolve_mover_security_contexts`.
+    // Never cleared in place — the run either proceeds (and the gate was never
+    // written) or stays parked until the workload/selector/explicit UID changes.
+    (
+        kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
+        false,
+        kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON,
+        "snapshot::reconcile_inner + restore::run_restore_mover inherit-source arm, via \
+         io::park_on_inherit_source_missing (upsert_gate)",
     ),
     // `restore::park_on_missing_referent` via
     // io::upsert_gate(&RESTORE_REFERENT_MISSING_GATE, ...) — the tri-state
