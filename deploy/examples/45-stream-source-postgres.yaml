@@ -1,4 +1,4 @@
-# Example 41 — logical PostgreSQL backup with a `stream` source.
+# Example 45 — logical PostgreSQL backup with a `stream` source.
 #
 # A stream source captures a command's STDOUT as one virtual file inside a normal
 # kopia snapshot. Nothing is mounted: the mover execs the command in the running

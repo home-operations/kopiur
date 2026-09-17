@@ -76,7 +76,7 @@ consent to it.
 ## Writing the policy
 
 ```yaml
---8<-- "deploy/examples/41-stream-source-postgres.yaml:policy"
+--8<-- "deploy/examples/45-stream-source-postgres.yaml:policy"
 ```
 
 ### `fileName`
@@ -150,7 +150,7 @@ Write your command so it keeps that true: send diagnostics to stderr, and never
 ## Restoring
 
 ```yaml
---8<-- "deploy/examples/42-restore-stream-exec.yaml:restore"
+--8<-- "deploy/examples/46-restore-stream-exec.yaml:restore"
 ```
 
 kopia streams the stored file straight into the command's stdin — no PVC, no

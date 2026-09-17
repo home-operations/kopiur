@@ -1,6 +1,6 @@
-# Example 42 — restore a logical dump back into a database with `streamExec`.
+# Example 46 — restore a logical dump back into a database with `streamExec`.
 #
-# The mirror of example 41: kopia streams the stored virtual file straight into a
+# The mirror of example 45: kopia streams the stored virtual file straight into a
 # command's stdin in a running pod. No PVC is written and nothing is staged on disk.
 #
 # POINT THIS AT A SCRATCH DATABASE. It runs whatever you name against whatever the
