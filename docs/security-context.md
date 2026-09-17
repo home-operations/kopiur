@@ -541,6 +541,7 @@ That's the behavior when the recipe has **nothing else to go on**, as here. Add 
 | Default if unset | UID `65532` (reads world-readable / `65532`-owned only), pod `fsGroup: 65532` | UID `65532` (files land owned by `65532`), pod `fsGroup: 65532` |
 | Preserve original ownership | n/a (kopia records it) | needs root + `privilegedMode: true` |
 | Inherit from workload | `SnapshotPolicy.spec.mover.inheritSecurityContextFrom` (`pvcConsumer`/`workloadSelector`) | `Restore.spec.mover.inheritSecurityContextFrom` (`workloadSelector`, or `snapshot: {}`, the backup's recorded identity, no live pod) |
+| Override it for ONE run | `Snapshot.spec.mover`, merged field-wise over the policy's — see [Backups → `mover` for one run](backups.md#mover--override-the-recipes-mover-for-one-run) | a `Restore` **is** the invocation, so `Restore.spec.mover` is already per-run |
 | Elevated context | namespace `privileged-movers` opt-in | same opt-in |
 | Tolerate permission errors | fails on unreadable files | `spec.options.ignorePermissionErrors` (default `true`) reports instead of failing |
 

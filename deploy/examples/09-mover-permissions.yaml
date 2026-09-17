@@ -4,7 +4,7 @@
 # data. By default movers run unprivileged as the image user (UID 65532) with a
 # hardened securityContext (runAsNonRoot, drop ALL caps, seccomp RuntimeDefault).
 #
-# WHERE to set the UID/GID — two layers:
+# WHERE to set the UID/GID — three layers, lowest first:
 #   * `Repository.spec.moverDefaults` — the SINGLE place to set PUID/PGID for the
 #     whole repository. Every mover it spawns (bootstrap, backup, restore,
 #     maintenance) inherits these. This is the new home of the old KOPIUR_PUID /
@@ -13,10 +13,14 @@
 #   * `SnapshotPolicy.spec.mover` / `Restore.spec.mover` — a per-recipe override.
 #     It MERGES field-wise over moverDefaults and the hardened base (it can only
 #     tighten — a partial override never drops drop:[ALL]/seccomp).
+#   * `Snapshot.spec.mover` — a PER-RUN override for one ad-hoc snapshot, merged
+#     over the policy's. Use it so a one-shot debug run does not require editing
+#     the shared, GitOps-managed SnapshotPolicy every scheduled run also uses.
 #
-# This example sets both: a repository-wide default (1000:1000 + fsGroup 1000) and
-# a per-recipe tweak, to show the layering. See the Permissions guide for how to
-# find the right numbers.
+# This example sets all three: a repository-wide default (1000:1000 + fsGroup
+# 1000), a per-recipe tweak, and a one-shot Snapshot that overrides the recipe,
+# to show the layering. See the Permissions guide for how to find the right
+# numbers.
 #
 # Field shapes verified against crates/api: `moverDefaults.{securityContext,
 # podSecurityContext}` and `spec.mover.securityContext` are standard core/v1
@@ -117,3 +121,52 @@ spec:
     #   runAsNonRoot: false
     # privilegedMode: true     # also preserves UID/GID ownership on RESTORE
 # --8<-- [end:mover]
+---
+# ── Per-RUN override on a one-shot Snapshot (MERGES over the policy) ───────────
+# An ad-hoc snapshot before a risky change, which needs more memory and a bigger
+# kopia content cache than the nightly schedule. Only the fields named here
+# change; runAsGroup, fsGroup, the cache capacity/class and the hardened base all
+# still come from the SnapshotPolicy and moverDefaults above.
+#
+# Precedence, lowest to highest:
+#   moverDefaults  <  SnapshotPolicy.spec.mover  <  Snapshot.spec.mover
+#
+# Two things this does NOT do:
+#   * It never resizes or re-classes a `cache.mode: Persistent` cache PVC. That
+#     PVC is named per-POLICY and shared by every sibling Snapshot, so a per-run
+#     override must not mutate state the siblings depend on. `cache` here moves
+#     this run's kopia cache BUDGETS and the size of an *ephemeral* cache volume.
+#   * It does not escape the privileged-mover gate. An elevated context assembled
+#     here still needs the namespace opt-in, because the gate runs on the MERGED
+#     result.
+# --8<-- [start:snapshot-mover]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  # `generateName` (not `name`) so you can repeat this apply.
+  generateName: app-data-preupgrade-
+  namespace: app
+spec:
+  policyRef:
+    name: app-data
+  tags:
+    reason: pre-upgrade
+  # Per-RUN mover overrides, merged field-wise over the SnapshotPolicy's:
+  #   moverDefaults  <  SnapshotPolicy.spec.mover  <  Snapshot.spec.mover
+  mover:
+    # This app's archive directory is owned by a different UID than the rest of
+    # its data; override just that for this one run.
+    securityContext:
+      runAsUser: 1001
+    # More headroom for a one-off full re-read.
+    resources:
+      requests:
+        memory: 1Gi
+      limits:
+        memory: 4Gi
+    # Per-run kopia cache BUDGETS only (see the note above).
+    cache:
+      contentCacheSizeMb: 20000
+    # Keep this Job around longer than the 1h default so you can read its logs.
+    ttlSecondsAfterFinished: 21600
+# --8<-- [end:snapshot-mover]
