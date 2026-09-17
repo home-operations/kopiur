@@ -57,6 +57,18 @@ pub const EXEC_STREAM_BUF: usize = 4 * 1024 * 1024;
 /// Exec stderr never exceeds a line or two of diagnostics; keep its buffer small.
 pub const EXEC_STDERR_BUF: usize = 64 * 1024;
 
+/// How long the exec UPGRADE itself may take, before any data moves.
+///
+/// Deliberately a short fixed budget rather than the producer's own
+/// `workloadExec.timeout`. Those are different failures with different fixes:
+/// establishing the SPDY/websocket upgrade against the apiserver is a control-plane
+/// round trip that either works in seconds or is not going to, while the timeout the
+/// user configured is the budget for their DUMP. Spending a two-hour dump budget
+/// waiting for an attach that will never succeed turns an immediate, obvious
+/// "cannot exec into this pod" into a two-hour silent hang, and the message that
+/// eventually appears points at the wrong knob.
+pub const EXEC_START_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Pick the one pod a stream source may exec into.
 ///
 /// Requires EXACTLY ONE `Running`, non-terminating match. Zero, several, or
@@ -175,6 +187,52 @@ pub fn timeout_message(pod: &str, command: &[String], timeout: Duration, field: 
     )
 }
 
+/// The what/why/fix text for an exec that never finished upgrading. Pure so the
+/// exact wording is unit-asserted.
+pub fn exec_start_timeout_message(pod: &str, namespace: &str) -> String {
+    format!(
+        "the exec into pod `{pod}` did not start within {}s, so nothing was streamed and no \
+         snapshot was written. This is the apiserver upgrade failing, not a slow command: check \
+         that the apiserver can reach the kubelet on `{namespace}/{pod}`'s node, that no \
+         NetworkPolicy or webhook is blocking `pods/exec`, and that the container is still \
+         running. It is NOT `workloadExec.timeout` — that budget covers the transfer and was \
+         not touched.",
+        EXEC_START_TIMEOUT.as_secs()
+    )
+}
+
+/// The kube client the stream paths exec through.
+///
+/// NOT [`kube::Client::try_default`]. That infers a [`kube::Config`] carrying
+/// kube's 295 s `write_timeout` default, which `hyper_timeout::TimeoutConnector`
+/// applies as a PER-WRITE timeout on the connection — so a single stalled write
+/// tears the connection down. On a `streamExec` restore WE are the writer
+/// (`kopia show` piped into the consumer's stdin), and a `psql` applying one
+/// enormous statement legitimately backpressures for longer than that. The
+/// restore would then fail with a transport error and the message would blame the
+/// user's command for a timeout kopiur imposed on itself.
+///
+/// `read_timeout` is already `None` in kube 4.x precisely so exec/attach sessions
+/// survive; `write_timeout` was left at its default. Both are cleared here, and
+/// `connect_timeout` is deliberately KEPT — a connection that cannot be
+/// established should fail fast.
+///
+/// The exec's status channel rides the same [`kube::api::AttachedProcess`], so one
+/// client covers the transfer and the verdict; there is no second, differently
+/// configured client that could time out where the first did not.
+pub async fn exec_client() -> Result<kube::Client> {
+    let mut config = kube::Config::infer()
+        .await
+        .map_err(|e| MoverError::KubeClient {
+            source: Box::new(kube::Error::InferConfig(e)),
+        })?;
+    config.write_timeout = None;
+    config.read_timeout = None;
+    kube::Client::try_from(config).map_err(|e| MoverError::KubeClient {
+        source: Box::new(e),
+    })
+}
+
 /// Resolve the single workload pod for `selector` in `namespace`.
 pub async fn resolve_pod(client: &kube::Client, namespace: &str, selector: &str) -> Result<Pod> {
     let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
@@ -223,20 +281,57 @@ pub fn consumer_attach_params(container: Option<&str>) -> AttachParams {
     p
 }
 
-/// Read at most [`EXEC_STDERR_CAP`] bytes of `reader` into a string.
+/// Drain `reader` to EOF, keeping only the LAST [`EXEC_STDERR_CAP`] bytes.
 ///
-/// Bounded so a chatty command can neither stall on a full pipe nor turn a failure
-/// message into a log dump.
+/// # Why it must read to EOF
+///
+/// This used to be `reader.take(CAP).read_to_end(..)`, which STOPS READING at the
+/// cap. stderr and stdout ride the SAME websocket, so a producer that printed
+/// more than 8 KiB of diagnostics would fill the stderr channel, block kube-rs's
+/// message loop, and stall the stdout pump — the dump would simply stop moving.
+/// From the outside that is indistinguishable from a slow database: no error, no
+/// progress, until the transfer timeout fires and blames the user's command. A
+/// verbose `pg_dumpall` (every `--verbose` line goes to stderr) is enough to
+/// trigger it.
+///
+/// Draining to EOF keeps the channel flowing. The cap then applies to what is
+/// RETAINED, not to what is read, so the diagnostic stays bounded without
+/// throttling the transfer.
+///
+/// # Why the tail and not the head
+///
+/// The last lines of a failed command are the ones that say why it failed; the
+/// first 8 KiB of a verbose dump are its banner. The field this feeds is already
+/// called `stderr_tail`.
 pub async fn drain_stderr<R>(reader: &mut R) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut buf = Vec::new();
-    let _ = reader
-        .take(EXEC_STDERR_CAP as u64)
-        .read_to_end(&mut buf)
-        .await;
-    String::from_utf8_lossy(&buf).into_owned()
+    let mut kept: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+    let mut chunk = vec![0u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            // EOF, or a read error (the channel died) — either way we are done, and
+            // whatever was retained is still worth reporting.
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                kept.extend(&chunk[..n]);
+                if kept.len() > EXEC_STDERR_CAP {
+                    kept.drain(..kept.len() - EXEC_STDERR_CAP);
+                }
+            }
+        }
+    }
+    let bytes: Vec<u8> = kept.into();
+    // A byte-exact tail can start mid-UTF-8-sequence or mid-line; `from_utf8_lossy`
+    // handles the former, and dropping everything before the first newline handles
+    // the latter so the message never opens on half a word.
+    let trimmed = match bytes.iter().position(|b| *b == b'\n') {
+        // Only trim when we actually truncated — a short stderr keeps its first line.
+        Some(i) if bytes.len() == EXEC_STDERR_CAP => &bytes[i + 1..],
+        _ => &bytes[..],
+    };
+    String::from_utf8_lossy(trimmed).into_owned()
 }
 
 /// Copy `reader` into `writer` until EOF, returning the byte count.
@@ -283,7 +378,9 @@ pub async fn feed_from_pod(
     let api: Api<Pod> = Api::namespaced(client.clone(), &spec.namespace);
     let params = producer_attach_params(spec.container.as_deref());
     let attach = api.exec(&pod_name, spec.command.clone(), &params);
-    let mut attached = match tokio::time::timeout(timeout, attach).await {
+    // The UPGRADE gets its own short budget; `timeout` is the DUMP's budget and is
+    // spent below on the transfer. See [`EXEC_START_TIMEOUT`].
+    let mut attached = match tokio::time::timeout(EXEC_START_TIMEOUT, attach).await {
         Ok(Ok(a)) => a,
         Ok(Err(e)) => {
             *failure = Some(format!(
@@ -294,10 +391,7 @@ pub async fn feed_from_pod(
             return StdinOutcome::Abort;
         }
         Err(_) => {
-            *failure = Some(format!(
-                "the exec into pod `{pod_name}` did not start within {}s",
-                timeout.as_secs()
-            ));
+            *failure = Some(exec_start_timeout_message(&pod_name, &spec.namespace));
             return StdinOutcome::Abort;
         }
     };
@@ -410,13 +504,10 @@ pub async fn restore_into_pod(
     let api: Api<Pod> = Api::namespaced(client.clone(), &spec.namespace);
     let params = consumer_attach_params(spec.container.as_deref());
     let attach = api.exec(&pod_name, spec.command.clone(), &params);
-    let mut attached = tokio::time::timeout(timeout, attach)
+    let mut attached = tokio::time::timeout(EXEC_START_TIMEOUT, attach)
         .await
         .map_err(|_| MoverError::StreamExecFailed {
-            detail: format!(
-                "the exec into pod `{pod_name}` did not start within {}s",
-                timeout.as_secs()
-            ),
+            detail: exec_start_timeout_message(&pod_name, &spec.namespace),
         })?
         .map_err(|e| MoverError::StreamExecFailed {
             detail: format!(

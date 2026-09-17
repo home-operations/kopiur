@@ -184,3 +184,104 @@ async fn pump_moves_every_byte() {
     assert_eq!(n as usize, payload.len());
     assert_eq!(dst, payload);
 }
+
+// --- drain_stderr must not throttle the shared websocket (#451) -------------
+
+/// THE regression guard. `drain_stderr` used to be `take(CAP).read_to_end(..)`,
+/// which STOPS READING at the cap. stderr and stdout ride the same websocket, so
+/// a producer printing more than 8 KiB of diagnostics (any `pg_dumpall
+/// --verbose`) would fill the stderr channel, block kube-rs's message loop and
+/// stall the stdout pump — a hang indistinguishable from a slow database until the
+/// transfer timeout fired and blamed the user's command.
+///
+/// Proven by exhausting the reader: a `Cursor` whose position reaches its length
+/// was read to EOF.
+#[tokio::test]
+async fn drain_stderr_reads_to_eof_even_far_past_the_cap() {
+    let big = vec![b'x'; EXEC_STDERR_CAP * 5];
+    let total = big.len() as u64;
+    let mut r = std::io::Cursor::new(big);
+    let got = drain_stderr(&mut r).await;
+    assert_eq!(
+        r.position(),
+        total,
+        "drain_stderr must consume the whole channel, not stop at the cap — \
+         stopping stalls the stdout pump on the shared websocket"
+    );
+    assert!(
+        got.len() <= EXEC_STDERR_CAP,
+        "what is RETAINED is still bounded: {}",
+        got.len()
+    );
+}
+
+/// The cap applies to the TAIL: the last lines of a failed command say why it
+/// failed, the first 8 KiB of a verbose dump are its banner. The field this feeds
+/// is called `stderr_tail`.
+#[tokio::test]
+async fn drain_stderr_keeps_the_tail_not_the_head() {
+    let mut blob = String::new();
+    for i in 0..4000 {
+        blob.push_str(&format!("pg_dump: dumping contents of table number {i}\n"));
+    }
+    blob.push_str("pg_dump: error: query failed: permission denied for table secrets\n");
+    assert!(blob.len() > EXEC_STDERR_CAP * 2, "must actually truncate");
+
+    let mut r = std::io::Cursor::new(blob.into_bytes());
+    let got = drain_stderr(&mut r).await;
+    assert!(
+        got.contains("permission denied for table secrets"),
+        "the actual error must survive truncation: {got}"
+    );
+    assert!(
+        !got.contains("table number 0\n"),
+        "the banner must be the part that is dropped"
+    );
+    // Truncation never opens mid-line.
+    assert!(
+        got.starts_with("pg_dump: "),
+        "a truncated tail must start at a line boundary: {:?}",
+        &got[..got.len().min(60)]
+    );
+}
+
+/// A short stderr is returned verbatim — the line-boundary trim only applies when
+/// the tail was actually truncated.
+#[tokio::test]
+async fn drain_stderr_keeps_a_short_stderr_whole() {
+    let mut r = std::io::Cursor::new(b"line one\nline two\n".to_vec());
+    assert_eq!(drain_stderr(&mut r).await, "line one\nline two\n");
+}
+
+// --- the exec-start budget is not the dump budget (#451) --------------------
+
+/// The exec UPGRADE gets a short fixed budget, not the user's
+/// `workloadExec.timeout`. Spending a two-hour dump budget waiting for an attach
+/// that will never succeed turns an immediate "cannot exec into this pod" into a
+/// two-hour silent hang and then points at the wrong knob.
+#[test]
+fn the_exec_start_budget_is_short_and_fixed() {
+    use std::time::Duration;
+    assert!(EXEC_START_TIMEOUT <= Duration::from_secs(60));
+    assert!(EXEC_START_TIMEOUT >= Duration::from_secs(10));
+    // And it is emphatically NOT the default dump budget.
+    assert_ne!(
+        EXEC_START_TIMEOUT,
+        Duration::from_secs(kopiur_api::snapshot_policy::DEFAULT_STREAM_TIMEOUT_SECS)
+    );
+}
+
+/// The message must send the operator to the control plane, not to
+/// `workloadExec.timeout` — which this failure never consumed.
+#[test]
+fn the_exec_start_timeout_message_names_the_right_cause() {
+    let msg = exec_start_timeout_message("postgres-0", "db");
+    assert!(msg.contains("postgres-0"), "{msg}");
+    assert!(msg.contains("db/postgres-0"), "{msg}");
+    assert!(msg.contains("no snapshot was written"), "{msg}");
+    assert!(msg.contains("pods/exec"), "{msg}");
+    assert!(
+        msg.contains("NOT `workloadExec.timeout`"),
+        "must steer away from the wrong knob: {msg}"
+    );
+}

@@ -604,12 +604,10 @@ async fn run_operation(
                     .await
                     .map_err(kopia(KopiaOp::SnapshotCreate))?,
                 kopiur_mover::workspec::SnapshotInput::Stream(producer) => {
-                    let kube_client =
-                        kube::Client::try_default()
-                            .await
-                            .map_err(|e| MoverError::KubeClient {
-                                source: Box::new(e),
-                            })?;
+                    // `exec_client`, not `try_default`: kube's inferred 295 s
+                    // `write_timeout` is a PER-WRITE connection timeout that would
+                    // tear down a long exec (#451).
+                    let kube_client = kopiur_mover::stream::exec_client().await?;
                     // `failure` is how the producer's verdict escapes the closure:
                     // the kopia runner only learns Commit/Abort, and the actionable
                     // text has to reach the status. It holds ONLY the verdict and a
@@ -870,34 +868,115 @@ async fn restore_stream(
     };
 
     // The sub-path form needs the ROOT ENTRY object id, so look the snapshot up.
-    let listed = client
-        .snapshot_list_all()
-        .await
-        .map_err(|source| MoverError::Kopia {
-            op: KopiaOp::RestoreSnapshotList,
-            source,
-        })?;
-    let root_obj = listed
+    let (snapshot_id, root_obj) =
+        stream_root_object(client, op, &snapshot_id, &consumer.file_name).await?;
+    let object_id = format!("{root_obj}/{}", consumer.file_name);
+
+    // The write-timeout case that matters most: on a stream RESTORE we are the
+    // writer, piping `kopia show` into the consumer's stdin, and a `psql` applying
+    // one enormous statement legitimately backpressures past kube's 295 s default.
+    let kube_client = kopiur_mover::stream::exec_client().await?;
+    kopiur_mover::stream::restore_into_pod(&kube_client, client, consumer, &object_id).await?;
+    Ok(StatusUpdate::completed(&snapshot_id, chrono::Utc::now()))
+}
+
+/// Resolve `snapshot_id` to its ROOT ENTRY object id, self-healing a stale id
+/// through the snapshot's stable anchor.
+///
+/// Two fixes over the naive lookup this replaces (#451):
+///
+/// 1. **The anchor self-heal.** kopia REWRITES a snapshot's manifest id when the
+///    snapshot is pinned (`UpdateSnapshot`), so the id the controller pinned into
+///    `status.resolved` can name a manifest that no longer exists. Every other
+///    id-consuming path in the mover already heals through
+///    [`RestoreOp::anchor`] (`restore_with_heal`, `delete_one`); the stream path
+///    did not, so a `streamExec` restore of a pinned snapshot failed with "could
+///    not be resolved to a root object" and no hint that pinning was the cause.
+///    The heal reuses [`resolve_live_id`], so it inherits the same
+///    path(+identity)(+start-time) safety: without a `start_time` disambiguator a
+///    path-only match must be UNIQUE, which is what stops it silently selecting
+///    the identity's next backup.
+/// 2. **The listing is scoped.** This used `snapshot_list_all()` — every snapshot
+///    in the repository, for every source, only to find one id. On a shared
+///    repository holding thousands of manifests that is a large listing decoded
+///    for nothing, and it makes the operation's cost depend on OTHER policies'
+///    history. `snapshot_list(Some(&source))` asks kopia for the one identity.
+///
+/// Returns the id actually resolved (which may differ from the one passed in) so
+/// the caller records the manifest it really read.
+async fn stream_root_object(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    snapshot_id: &str,
+    file_name: &str,
+) -> Result<(String, String)> {
+    // Scope the listing to the snapshot's own identity when the anchor carries
+    // one; fall back to the unscoped listing only when it does not (an anchor
+    // captured before identity was recorded), because a filter built from an
+    // EMPTY path/identity matches nothing rather than everything.
+    let listed = match anchor_source_filter(&op.anchor) {
+        Some(source) => client.snapshot_list(Some(&source)).await,
+        None => client.snapshot_list_all().await,
+    }
+    .map_err(|source| MoverError::Kopia {
+        op: KopiaOp::RestoreSnapshotList,
+        source,
+    })?;
+
+    if let Some(obj) = root_object_of(&listed, snapshot_id) {
+        return Ok((snapshot_id.to_string(), obj));
+    }
+
+    // Stale id: re-resolve the live manifest from the stable anchor.
+    if let Some(live) = resolve_live_id(client, &op.anchor).await
+        && live != snapshot_id
+        && let Some(obj) = root_object_of(&listed, &live)
+    {
+        warn!(
+            stale = %snapshot_id,
+            live = %live,
+            "stream restore snapshot id not found; healing to the live manifest \
+             re-resolved from the snapshot's identity (kopia rewrites the id on pin)",
+        );
+        return Ok((live, obj));
+    }
+
+    Err(MoverError::StreamExecFailed {
+        detail: format!(
+            "snapshot `{snapshot_id}` could not be resolved to a root object, so the file \
+             `{file_name}` inside it cannot be addressed. Nothing was piped into the \
+             command, so no partial load happened. The manifest is absent from the \
+             repository — it may have been deleted or expired by maintenance; re-resolve \
+             the restore against a snapshot that still exists"
+        ),
+    })
+}
+
+/// The root-entry object id of `snapshot_id` in `listed`, if present.
+fn root_object_of(listed: &[kopiur_kopia::SnapshotListEntry], snapshot_id: &str) -> Option<String> {
+    listed
         .iter()
         .find(|e| e.id == snapshot_id)
         .and_then(|e| e.root_entry.as_ref())
         .map(|r| r.obj.clone())
-        .ok_or_else(|| MoverError::StreamExecFailed {
-            detail: format!(
-                "snapshot `{snapshot_id}` could not be resolved to a root object, so the file \
-                 `{}` inside it cannot be addressed",
-                consumer.file_name
-            ),
-        })?;
-    let object_id = format!("{root_obj}/{}", consumer.file_name);
+}
 
-    let kube_client = kube::Client::try_default()
-        .await
-        .map_err(|e| MoverError::KubeClient {
-            source: Box::new(e),
-        })?;
-    kopiur_mover::stream::restore_into_pod(&kube_client, client, consumer, &object_id).await?;
-    Ok(StatusUpdate::completed(&snapshot_id, chrono::Utc::now()))
+/// A kopia listing filter for an anchor's own identity, or `None` when the anchor
+/// does not carry a complete one.
+///
+/// Fail-OPEN to the unscoped listing on purpose: a `SnapshotSource` built from a
+/// partial anchor would filter on an EMPTY username/hostname and match nothing,
+/// turning a cost optimization into a restore that cannot find its snapshot.
+fn anchor_source_filter(anchor: &SnapshotAnchor) -> Option<SnapshotSource> {
+    if anchor.source_path.is_empty() {
+        return None;
+    }
+    let (user_name, host) = anchor.identity_filter()?;
+    Some(SnapshotSource {
+        user_name: user_name.to_string(),
+        host: host.to_string(),
+        path: anchor.source_path.clone(),
+    })
 }
 
 async fn restore_with_heal(
@@ -4706,5 +4785,73 @@ esac
                 .expect("every member succeeds");
             assert_eq!(update.phase.as_deref(), Some("Succeeded"));
         }
+    }
+
+    // --- #451: the stream restore's root-object resolution -------------------
+
+    fn stream_anchor(path: &str, start: Option<&str>) -> SnapshotAnchor {
+        SnapshotAnchor {
+            source_path: path.to_string(),
+            start_time: start.map(str::to_string),
+            username: Some("pg".to_string()),
+            hostname: Some("db".to_string()),
+        }
+    }
+
+    /// The listing MUST be scoped to the snapshot's own identity rather than
+    /// `snapshot_list_all()`: on a shared repository holding thousands of
+    /// manifests, resolving one root object used to decode every one of them, so
+    /// the cost of a stream restore depended on OTHER policies' history.
+    #[test]
+    fn a_complete_anchor_scopes_the_stream_listing() {
+        let filter = anchor_source_filter(&stream_anchor("/stream/postgres.sql", None))
+            .expect("a complete anchor yields a filter");
+        assert_eq!(filter.user_name, "pg");
+        assert_eq!(filter.host, "db");
+        assert_eq!(filter.path, "/stream/postgres.sql");
+    }
+
+    /// And it fails OPEN to the unscoped listing for an incomplete anchor. A
+    /// `SnapshotSource` built from a partial anchor would filter on an EMPTY
+    /// username/hostname and match NOTHING, turning a cost optimization into a
+    /// restore that cannot find a snapshot that is right there.
+    #[test]
+    fn an_incomplete_anchor_falls_back_to_the_unscoped_listing() {
+        // No path at all (a pre-feature work spec).
+        assert!(anchor_source_filter(&stream_anchor("", None)).is_none());
+        // Path but no recorded identity (an anchor captured before identity was).
+        let mut partial = stream_anchor("/stream/postgres.sql", None);
+        partial.username = None;
+        assert!(anchor_source_filter(&partial).is_none());
+        partial = stream_anchor("/stream/postgres.sql", None);
+        partial.hostname = None;
+        assert!(anchor_source_filter(&partial).is_none());
+    }
+
+    fn listed_entry(id: &str, obj: &str) -> kopiur_kopia::SnapshotListEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "source": { "userName": "pg", "host": "db", "path": "/stream/postgres.sql" },
+            "startTime": "2024-01-01T00:00:00Z",
+            "endTime": "2024-01-01T00:01:00Z",
+            "rootEntry": { "name": "postgres.sql", "obj": obj, "type": "d" },
+        }))
+        .expect("a valid SnapshotListEntry")
+    }
+
+    /// The sub-path form (`<root>/<name>`) needs the ROOT ENTRY object id; a
+    /// manifest id fails with "parent is not a directory". Pin the extraction,
+    /// including the two misses that make the self-heal necessary.
+    #[test]
+    fn the_root_object_is_read_off_the_matching_entry_only() {
+        let listed = vec![listed_entry("kaaa", "k111"), listed_entry("kbbb", "k222")];
+        assert_eq!(root_object_of(&listed, "kbbb").as_deref(), Some("k222"));
+        // A STALE id — what kopia leaves behind after rewriting a manifest on pin
+        // — finds nothing, which is what drives the anchor self-heal.
+        assert_eq!(root_object_of(&listed, "kold"), None);
+        // An entry with no root entry cannot be addressed either.
+        let mut rootless = listed_entry("kccc", "k333");
+        rootless.root_entry = None;
+        assert_eq!(root_object_of(&[rootless], "kccc"), None);
     }
 }
