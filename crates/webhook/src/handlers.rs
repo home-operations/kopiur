@@ -436,7 +436,7 @@ async fn handle_snapshot(
                     Some(client),
                     Some(ns),
                     api::snapshot::effective_backup_mover(&spec, &policy.spec).as_ref(),
-                    &policy.spec.sources,
+                    assessable_sources(&spec, &policy.spec),
                 )
                 .await,
             );
@@ -500,6 +500,36 @@ async fn handle_snapshot(
     }
 
     with_patch(with_warnings(resp, warnings), ops)
+}
+
+/// Which of the policy's `sources[]` this `Snapshot`'s admission warning may judge.
+///
+/// A `Snapshot` is a NARROWER object than the policy it runs: when it carries
+/// `spec.source`, that pin names the ONE source this run covers, and the field exists
+/// precisely so nothing has to guess (never a silent fallback to `sources[0]`). Warning
+/// about the policy's other sources would name PVCs this run does not touch — up to
+/// `N-1` spurious warnings per fanned-out child, repeated every schedule slot.
+///
+/// An out-of-range index yields an EMPTY slice, so admission stays silent rather than
+/// warning about whichever source happens to sit at another position: the policy shrank
+/// out from under the pin, and that is the reconciler's named terminal failure to
+/// report, not something to guess at here.
+///
+/// With no pin (the ordinary single-source case, and pre-pin rows) the whole list is
+/// assessable, exactly as on the `SnapshotPolicy` surface. Pure, so it unit-tests
+/// without a cluster.
+fn assessable_sources<'a>(
+    spec: &SnapshotSpec,
+    policy: &'a api::snapshot_policy::SnapshotPolicySpec,
+) -> &'a [api::snapshot_policy::Source] {
+    match spec.source.as_ref() {
+        Some(pin) => policy
+            .sources
+            .get(pin.source_index as usize)
+            .map(std::slice::from_ref)
+            .unwrap_or_default(),
+        None => &policy.sources,
+    }
 }
 
 /// Decide whether a `Snapshot` referencing a `SnapshotPolicy` should have
@@ -3253,5 +3283,68 @@ mod tests {
         });
         let resp = dispatch(&admission_request("Repository", spec), None).await;
         assert!(resp.allowed, "{:?}", resp.result.message);
+    }
+
+    // --- assessable_sources: a pinned Snapshot judges ONE source (#464) ----------
+
+    /// A policy with `n` PVC sources named `pvc-0`..`pvc-{n-1}`, decoded the
+    /// cluster's way (JSON value -> typed, never serde_yaml into a typed value).
+    fn policy_with_sources(n: usize) -> api::snapshot_policy::SnapshotPolicySpec {
+        let sources: Vec<Value> = (0..n)
+            .map(|i| json!({ "pvc": { "name": format!("pvc-{i}") } }))
+            .collect();
+        serde_json::from_value(json!({
+            "repository": { "kind": "Repository", "name": "r" },
+            "sources": sources,
+        }))
+        .expect("valid SnapshotPolicySpec")
+    }
+
+    /// A Snapshot pinning `source_index` (or none).
+    fn snapshot_pinning(source_index: Option<u32>) -> SnapshotSpec {
+        let mut obj = json!({ "policyRef": { "name": "pg" } });
+        if let Some(i) = source_index {
+            obj["source"] = json!({
+                "sourceIndex": i,
+                "target": { "pvc": { "name": format!("pvc-{i}"), "namespace": "ns" } },
+            });
+        }
+        serde_json::from_value(obj).expect("valid SnapshotSpec")
+    }
+
+    fn claim_names(sources: &[api::snapshot_policy::Source]) -> Vec<&str> {
+        sources
+            .iter()
+            .filter_map(|s| s.pvc.as_ref().map(|p| p.name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_pinned_snapshot_is_assessed_against_only_its_own_source() {
+        let policy = policy_with_sources(4);
+        // The pin narrows to exactly one source — not 4 warnings, 3 of them naming
+        // PVCs this run never touches.
+        assert_eq!(
+            claim_names(assessable_sources(&snapshot_pinning(Some(2)), &policy)),
+            vec!["pvc-2"]
+        );
+        // No pin (the ordinary single-source case, and pre-pin rows): the whole list,
+        // exactly as on the SnapshotPolicy surface.
+        assert_eq!(
+            claim_names(assessable_sources(&snapshot_pinning(None), &policy)),
+            vec!["pvc-0", "pvc-1", "pvc-2", "pvc-3"]
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_pin_is_assessed_against_nothing() {
+        // The policy shrank out from under the pin. Staying silent is right: guessing
+        // whichever source now sits at another index would warn about a PVC this run
+        // was never pointed at, and the reconciler reports the shrink as a named
+        // terminal failure.
+        let policy = policy_with_sources(2);
+        assert!(assessable_sources(&snapshot_pinning(Some(7)), &policy).is_empty());
+        // And an empty policy with no pin is simply nothing to assess.
+        assert!(assessable_sources(&snapshot_pinning(None), &policy_with_sources(0)).is_empty());
     }
 }

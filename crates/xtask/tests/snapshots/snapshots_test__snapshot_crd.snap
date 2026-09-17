@@ -95,12 +95,15 @@ spec:
                   scheduled run also uses.
 
                   Two deliberate exclusions:
-                  - `mover.cache` here changes only this run's kopia cache **budgets**
-                    (`--content-cache-size-mb`/`--metadata-cache-size-mb`) and the ephemeral
-                    cache volume. It never resizes or re-classes a `cache.mode: Persistent`
-                    cache PVC: that PVC is named per-POLICY and shared by every sibling
-                    `Snapshot`, so a per-run override must not mutate state the siblings
-                    depend on.
+                  - `mover.cache` here is **run-scoped only**. It sets this run's kopia cache
+                    budgets (`--content-cache-size-mb`/`--metadata-cache-size-mb`) and, when
+                    the cache is `Ephemeral`, that Job's cache-volume `capacity` and
+                    `storageClassName` — a generic ephemeral volume bound to this pod and
+                    GC'd with it. What it cannot touch is anything **shared**: `cache.mode`
+                    is policy-owned (a per-run `mode: Persistent` never mints the shared
+                    PVC), and under `mode: Persistent` the PVC's own `capacity`/
+                    `storageClassName` come from the policy alone, because that claim is
+                    named per-POLICY and every sibling `Snapshot` depends on it.
                   - `inheritSecurityContextFrom.snapshot` is restore-only and rejected here,
                     exactly as on `SnapshotPolicy`: a backup's identity comes from the live
                     workload; it is the run that *records* an identity.

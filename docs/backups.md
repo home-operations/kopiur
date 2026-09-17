@@ -755,11 +755,16 @@ The highest layer that sets a field wins; a field you omit falls through. So a p
 
 Every knob is available: `resources`, `cache`, `securityContext`, `podSecurityContext`, `inheritSecurityContextFrom`, `privilegedMode`, `ttlSecondsAfterFinished`. Three behaviors are worth knowing before you use it.
 
-/// warning | `mover.cache` here never resizes a **persistent** cache PVC
+/// warning | `mover.cache` here is run-scoped: it never touches a **persistent** cache PVC
 
-A `cache.mode: Persistent` cache lives in one controller-owned PVC named after the **`SnapshotPolicy`** and shared by every `Snapshot` that policy produces. A per-run `capacity`/`storageClassName`/`mode` is therefore deliberately **ignored** for that PVC's own spec: letting one ad-hoc snapshot resize or re-class it would change storage every sibling run depends on.
+What a per-run `cache` affects is everything that lives and dies with this one Job: the kopia cache **budgets** (`contentCacheSizeMb`/`metadataCacheSizeMb`), and — when the cache is **`Ephemeral`** — that Job's cache-volume `capacity` and `storageClassName`. An ephemeral cache volume is bound to this run's pod and garbage-collected with it, so there is no shared storage for a per-run size or class to disturb. A per-run `capacity` against a policy that sets none does the obvious thing: it upgrades this run off an `emptyDir` onto a sized volume.
 
-What a per-run `cache` *does* affect is Job-scoped and safe: this run's kopia cache budgets (`contentCacheSizeMb`/`metadataCacheSizeMb`) and the size of an **ephemeral** cache volume. To change the persistent PVC, change the `SnapshotPolicy`.
+Two things stay **policy-owned**, because they are shared:
+
+- **`cache.mode`.** A per-run `mode` is ignored, so an ad-hoc snapshot can never promote itself onto — or coerce the policy away from — the shared cache PVC.
+- **A `mode: Persistent` PVC's own `capacity`/`storageClassName`.** That cache lives in one controller-owned PVC named after the **`SnapshotPolicy`** and shared by every `Snapshot` that policy produces; letting one ad-hoc snapshot resize or re-class it would change storage every sibling run depends on. Under `Persistent`, the per-run volume knobs are dropped and the policy's are used.
+
+To change the persistent PVC, change the `SnapshotPolicy`.
 ///
 
 /// warning | An elevated per-run mover still needs the namespace opt-in

@@ -117,11 +117,12 @@ pub(super) fn build_backup_run(
     // Effective kopia cache budgets: the repository's cacheDefaults overlaid by this
     // run's effective mover.cache (ADR §3.1) — the policy's, with this Snapshot's
     // `mover.cache` merged over it (#464). These are the PER-RUN budgets
-    // (`--content-cache-size-mb`/`--metadata-cache-size-mb`) plus the ephemeral cache
-    // volume's size, all scoped to this Job, so a one-shot may raise them freely. The
-    // *persistent* cache PVC's own spec deliberately does NOT take the per-run layer —
-    // it is named per-policy and shared by every sibling Snapshot (see the comment at
-    // its `resolve_cache_volume` call in `mod.rs`).
+    // (`--content-cache-size-mb`/`--metadata-cache-size-mb`), scoped to this Job, so a
+    // one-shot may raise them freely. The cache VOLUME is decided separately in
+    // `mod.rs`'s `cache_volume_spec`, which splits it: an ephemeral volume takes this
+    // same merged layer, while the cache MODE and a `Persistent` PVC's own spec stay
+    // policy-owned (that claim is named per-policy and shared by every sibling
+    // Snapshot).
     //
     // `effective_backup_mover` is pure, so computing it here as well as in the
     // reconciler cannot diverge from it.

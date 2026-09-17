@@ -1763,7 +1763,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         &namespace,
         io::owner_ref_for(&config, "SnapshotPolicy")?,
         &cache_pvc,
-        persistent_cache_spec(&repo, &config).as_ref(),
+        cache_volume_spec(&repo, &config, recipe_mover.as_ref()).as_ref(),
     )
     .await?;
     // RWO Multi-Attach avoidance: pin the mover to the node the source PVC is
@@ -4751,20 +4751,29 @@ async fn assess_backup_security_context(
     // reconcile path (no false alarms). The mover verifies it for real at runtime.
 }
 
-/// The cache config for the **policy-owned persistent** cache PVC.
+/// The **policy-owned** slice of the effective cache config: the repository's
+/// `moverDefaults.cache` overlaid by the `SnapshotPolicy`'s `mover.cache`, and
+/// nothing else.
 ///
-/// Deliberately takes the `SnapshotPolicy` and NOT the `Snapshot`: the claim is named
-/// per-POLICY (`kopiur_api::expand::cache_pvc_name(&config.name_any(), …)`) and is
-/// SHARED by every child `Snapshot` of that policy, so honoring a per-run
-/// `Snapshot.spec.mover.cache` here would let one ad-hoc Snapshot resize or re-class a
-/// PVC its siblings depend on — a per-run override silently mutating shared state
-/// (#464). The absent parameter is the guarantee: a future caller cannot thread the
-/// per-run layer in by accident, because there is nowhere to put it.
+/// Deliberately takes the `SnapshotPolicy` and NOT the `Snapshot`. Two things about a
+/// backup's cache must stay policy-owned, and this function is what makes that
+/// structural rather than a comment someone can delete:
 ///
-/// A `Snapshot`'s own `mover.cache` still governs this run's kopia cache BUDGETS and
-/// the size of an *ephemeral* cache volume — both Job-scoped (see `build.rs`'s
-/// `cache_tuning`). Only the persistent PVC's own spec is policy-owned.
-fn persistent_cache_spec(
+/// 1. The cache **mode**. `mode: Persistent` means "mint/reuse the PVC named after
+///    this policy"; letting a per-run value pick the mode would let one ad-hoc
+///    Snapshot create — or coerce away from — shared storage.
+/// 2. The **persistent PVC's own spec** (`capacity`/`storageClassName`). The claim is
+///    named per-POLICY (`kopiur_api::expand::cache_pvc_name(&config.name_any(), …)`)
+///    and is shared by every child `Snapshot` of that policy, so honoring a per-run
+///    size or class there would resize/re-class storage its siblings depend on (#464).
+///
+/// The absent parameter is the guarantee: a future caller cannot thread the per-run
+/// layer into either decision by accident, because there is nowhere to put it.
+///
+/// Everything else about the cache IS run-scoped and does take the per-run layer — the
+/// kopia budgets (`build.rs`'s `cache_tuning`) and, via [`cache_volume_spec`], the size
+/// and class of an **ephemeral** cache volume, which lives and dies with this one Job.
+fn policy_cache_spec(
     repo: &io::ResolvedRepository,
     config: &SnapshotPolicy,
 ) -> Option<kopiur_api::common::CacheDefaults> {
@@ -4772,6 +4781,50 @@ fn persistent_cache_spec(
         repo,
         config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
     )
+}
+
+/// The cache config governing this run's cache **volume**, splitting the decision by
+/// who owns what (#464):
+///
+/// - The **mode** comes from [`policy_cache_spec`] alone, defaulting to `Ephemeral`.
+/// - `Persistent` → the policy's spec, verbatim. The per-run layer never reaches
+///   `ensure_cache_pvc`, so an ad-hoc Snapshot cannot resize or re-class the
+///   policy-named, sibling-shared PVC.
+/// - `Ephemeral` → the MERGED `capacity`/`storageClassName` (policy ⊂ snapshot), with
+///   `mode` pinned back to `Ephemeral`. A generic ephemeral volume is bound to this
+///   Job's pod and auto-GC'd with it, so there is no shared state for a per-run size or
+///   class to corrupt — and a per-run `capacity` against a policy that set none
+///   correctly upgrades the run off an `emptyDir` instead of being silently dropped.
+///   Re-pinning `mode` is what stops a per-run `mode: Persistent` from minting the
+///   shared PVC through this path.
+///
+/// Pure, so the whole split is unit-testable; the async provisioning in
+/// [`crate::cache::resolve_cache_volume`] is thin IO over it, deciding nothing this
+/// function has not already decided.
+fn cache_volume_spec(
+    repo: &io::ResolvedRepository,
+    config: &SnapshotPolicy,
+    run_mover: Option<&kopiur_api::common::MoverSpec>,
+) -> Option<kopiur_api::common::CacheDefaults> {
+    use kopiur_api::common::{CacheDefaults, CacheVolumeMode};
+    let policy = policy_cache_spec(repo, config);
+    // Exhaustive over the mode (no `_ =>`): a new provisioning mode must decide here
+    // whether it is shared — and therefore policy-owned — or per-run.
+    match policy
+        .as_ref()
+        .map(CacheDefaults::effective_mode)
+        .unwrap_or_default()
+    {
+        CacheVolumeMode::Persistent => policy,
+        CacheVolumeMode::Ephemeral => {
+            crate::cache::effective_cache(repo, run_mover.and_then(|m| m.cache.as_ref())).map(|c| {
+                CacheDefaults {
+                    mode: Some(CacheVolumeMode::Ephemeral),
+                    ..c
+                }
+            })
+        }
+    }
 }
 
 /// Report what `mover.inheritSecurityContextFrom` actually achieved, when it achieved

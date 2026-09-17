@@ -4798,9 +4798,8 @@ fn build_backup_run_lets_a_snapshot_mover_cache_win_the_per_run_budgets() {
     assert_eq!(ws.cache.metadata_cache_size_mb, Some(512));
 }
 
-#[test]
-fn a_snapshot_mover_cache_never_changes_the_policy_owned_persistent_cache_pvc() {
-    use kopiur_api::common::CacheVolumeMode;
+/// A `SnapshotPolicy` with one PVC source and the given `mover` JSON.
+fn policy_with_mover(mover_json: serde_json::Value) -> SnapshotPolicy {
     use kopiur_api::snapshot_policy::{PvcSource, Source};
     let mut cfg = config_with_source(
         "pg",
@@ -4811,44 +4810,48 @@ fn a_snapshot_mover_cache_never_changes_the_policy_owned_persistent_cache_pvc() 
             ..Default::default()
         },
     );
+    cfg.spec.mover = Some(serde_json::from_value(mover_json).expect("valid MoverSpec JSON"));
+    cfg
+}
+
+#[test]
+fn a_snapshot_mover_cache_never_changes_the_policy_owned_persistent_cache_pvc() {
+    use kopiur_api::common::CacheVolumeMode;
     // A PERSISTENT cache: one controller-owned PVC named per-policy and shared by
     // every child Snapshot of this policy.
-    cfg.spec.mover = Some(
-        serde_json::from_value(serde_json::json!({
-            "cache": {
-                "capacity": "8Gi",
-                "storageClassName": "fast",
-                "mode": "Persistent",
-                "contentCacheSizeMb": 4096,
-            },
-        }))
-        .expect("valid MoverSpec"),
-    );
+    let cfg = policy_with_mover(serde_json::json!({
+        "cache": {
+            "capacity": "8Gi",
+            "storageClassName": "fast",
+            "mode": "Persistent",
+            "contentCacheSizeMb": 4096,
+        },
+    }));
     let repo = resolved_s3_repo();
 
-    // An ad-hoc Snapshot that tries to resize AND re-class the cache.
+    // An ad-hoc Snapshot that tries to resize AND re-class the shared cache.
     let hostile = backup_with_mover(serde_json::json!({
         "cache": { "capacity": "500Gi", "storageClassName": "slow", "mode": "Ephemeral" },
     }));
 
-    // The PVC's spec is derived from the POLICY alone. `persistent_cache_spec` takes no
-    // `Snapshot` at all — the absent parameter is the guarantee — so the two calls
-    // below are necessarily identical; this pins the resolved values so a future
-    // refactor that threads the per-run layer in has to change this test.
-    let pvc_spec = super::persistent_cache_spec(&repo, &cfg).expect("policy sets a cache");
+    // Under `Persistent` the volume spec is derived from the POLICY alone.
+    // `policy_cache_spec` takes no `Snapshot` at all — the absent parameter is the
+    // guarantee — and `cache_volume_spec` hands exactly that through, so nothing the
+    // Snapshot said can reach `ensure_cache_pvc`.
+    let pvc_spec = super::cache_volume_spec(&repo, &cfg, hostile.spec.mover.as_ref())
+        .expect("policy sets a cache");
+    assert_eq!(pvc_spec, super::policy_cache_spec(&repo, &cfg).unwrap());
     assert_eq!(pvc_spec.capacity.as_deref(), Some("8Gi"));
     assert_eq!(pvc_spec.storage_class_name.as_deref(), Some("fast"));
     assert_eq!(pvc_spec.mode, Some(CacheVolumeMode::Persistent));
 
-    // Meanwhile the MERGED view — what this run's Job-scoped budgets use — does honor
-    // the override. The two deliberately diverge, which is exactly why the PVC path
-    // must not use the merged one.
+    // Meanwhile the MERGED view — what this run's Job-scoped BUDGETS use — does honor
+    // the override. The two deliberately diverge under `Persistent`, which is exactly
+    // why the PVC path must not use the merged one.
     let merged = kopiur_api::snapshot::effective_backup_mover(&hostile.spec, &cfg.spec)
         .and_then(|m| m.cache)
         .expect("merged cache");
     assert_eq!(merged.capacity.as_deref(), Some("500Gi"));
-    assert_eq!(merged.storage_class_name.as_deref(), Some("slow"));
-    assert_eq!(merged.mode, Some(CacheVolumeMode::Ephemeral));
     assert_ne!(
         pvc_spec, merged,
         "the persistent cache PVC's spec must NOT track a per-run mover.cache override"
@@ -4858,6 +4861,107 @@ fn a_snapshot_mover_cache_never_changes_the_policy_owned_persistent_cache_pvc() 
     // policy's survive) — the override changed the volume knobs without dropping them.
     let (ws, ..) = build_backup_run(&hostile, &cfg, &repo, "ns", "pg").unwrap();
     assert_eq!(ws.cache.content_cache_size_mb, Some(4096));
+}
+
+#[test]
+fn a_snapshot_mover_cache_does_size_and_class_an_ephemeral_cache_volume() {
+    use kopiur_api::common::CacheVolumeMode;
+    let repo = resolved_s3_repo();
+
+    // (a) Policy mode EPHEMERAL: the volume is bound to THIS Job's pod and auto-GC'd
+    //     with it, so there is no sibling-shared state and the per-run size/class win.
+    let cfg = policy_with_mover(serde_json::json!({
+        "cache": { "capacity": "8Gi", "storageClassName": "fast", "mode": "Ephemeral" },
+    }));
+    let run = backup_with_mover(serde_json::json!({
+        "cache": { "capacity": "500Gi", "storageClassName": "slow" },
+    }));
+    let spec =
+        super::cache_volume_spec(&repo, &cfg, run.spec.mover.as_ref()).expect("a cache is set");
+    assert_eq!(spec.capacity.as_deref(), Some("500Gi"));
+    assert_eq!(spec.storage_class_name.as_deref(), Some("slow"));
+    assert_eq!(spec.mode, Some(CacheVolumeMode::Ephemeral));
+
+    // (b) Policy sets NO cache at all: the mode defaults to Ephemeral, so a per-run
+    //     `capacity` must upgrade the run off an `emptyDir` rather than be dropped.
+    let mut bare = cfg.clone();
+    bare.spec.mover = None;
+    let spec = super::cache_volume_spec(&repo, &bare, run.spec.mover.as_ref())
+        .expect("the per-run layer alone sets a cache");
+    assert_eq!(spec.capacity.as_deref(), Some("500Gi"));
+    assert_eq!(spec.mode, Some(CacheVolumeMode::Ephemeral));
+
+    // (c) A per-run `mode: Persistent` must NOT mint the policy-named shared PVC.
+    //     The mode is policy-owned, so it stays Ephemeral.
+    let escalate = backup_with_mover(serde_json::json!({
+        "cache": { "capacity": "500Gi", "mode": "Persistent" },
+    }));
+    let spec = super::cache_volume_spec(&repo, &cfg, escalate.spec.mover.as_ref())
+        .expect("a cache is set");
+    assert_eq!(
+        spec.mode,
+        Some(CacheVolumeMode::Ephemeral),
+        "a per-run `mode: Persistent` must never promote the run onto the shared PVC"
+    );
+
+    // (d) Nothing anywhere is still an emptyDir.
+    assert_eq!(
+        super::cache_volume_spec(&repo, &bare, None),
+        None,
+        "no cache on any layer must stay `None` (emptyDir)"
+    );
+}
+
+/// The Ephemeral spec really does reach the mounted volume, and gets there without a
+/// single API call: the mock client below fails EVERY request, so this also proves the
+/// ephemeral path never touches `ensure_cache_pvc` (which is what would let a per-run
+/// size escape its Job).
+#[tokio::test]
+async fn an_ephemeral_per_run_capacity_reaches_the_mover_volume_with_no_api_call() {
+    use http::{Request, Response, StatusCode};
+    use kopiur_mover::jobs::CacheVolume;
+    use kube::client::Body;
+
+    let svc = tower::service_fn(move |_req: Request<Body>| async move {
+        Ok::<_, std::convert::Infallible>(
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    br#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":500}"#
+                        .to_vec(),
+                ))
+                .unwrap(),
+        )
+    });
+    let client = kube::Client::new(svc, "ns");
+
+    let repo = resolved_s3_repo();
+    let cfg = policy_with_mover(serde_json::json!({
+        "cache": { "capacity": "8Gi", "storageClassName": "fast", "mode": "Ephemeral" },
+    }));
+    let run = backup_with_mover(serde_json::json!({
+        "cache": { "capacity": "500Gi", "storageClassName": "slow" },
+    }));
+
+    let volume = crate::cache::resolve_cache_volume(
+        &client,
+        "ns",
+        Default::default(),
+        "kopiur-cache-pg-ns-abc123",
+        super::cache_volume_spec(&repo, &cfg, run.spec.mover.as_ref()).as_ref(),
+    )
+    .await
+    .expect("the ephemeral path provisions nothing, so it cannot fail on the client");
+
+    assert_eq!(
+        volume,
+        CacheVolume::Ephemeral {
+            capacity: "500Gi".into(),
+            storage_class: Some("slow".into()),
+        },
+        "the per-run capacity/class must reach the mover's cache volume"
+    );
 }
 
 #[test]

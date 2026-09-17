@@ -131,19 +131,21 @@ spec:
 # Precedence, lowest to highest:
 #   moverDefaults  <  SnapshotPolicy.spec.mover  <  Snapshot.spec.mover
 #
-# Two things this does NOT do:
-#   * It never resizes or re-classes a `cache.mode: Persistent` cache PVC. That
-#     PVC is named per-POLICY and shared by every sibling Snapshot, so a per-run
-#     override must not mutate state the siblings depend on. `cache` here moves
-#     this run's kopia cache BUDGETS and the size of an *ephemeral* cache volume.
-#   * It does not escape the privileged-mover gate. An elevated context assembled
-#     here still needs the namespace opt-in, because the gate runs on the MERGED
-#     result.
+# `mover.cache` here is RUN-SCOPED. It moves this run's kopia cache BUDGETS and,
+# when the cache is `Ephemeral`, this Job's cache-volume capacity/storageClassName
+# (an ephemeral volume is bound to this pod and GC'd with it). It cannot change
+# `cache.mode`, and under `mode: Persistent` the PVC's own capacity/class come from
+# the SnapshotPolicy alone — that claim is named per-POLICY and shared by every
+# sibling Snapshot, so a per-run override must not mutate state they depend on.
+#
+# It also does not escape the privileged-mover gate: an elevated context assembled
+# here still needs the namespace opt-in, because the gate runs on the MERGED result.
 # --8<-- [start:snapshot-mover]
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
 metadata:
-  # `generateName` (not `name`) so you can repeat this apply.
+  # Server-named, so `kubectl create` (not apply) — a nameless object cannot be
+  # applied. The generated suffix lets you repeat the command for each ad-hoc run.
   generateName: app-data-preupgrade-
   namespace: app
 spec:
@@ -164,7 +166,9 @@ spec:
         memory: 1Gi
       limits:
         memory: 4Gi
-    # Per-run kopia cache BUDGETS only (see the note above).
+    # Per-run kopia cache budgets (see the note above). A `capacity`/
+    # `storageClassName` here would also size THIS Job's cache volume, since this
+    # policy's cache is Ephemeral.
     cache:
       contentCacheSizeMb: 20000
     # Keep this Job around longer than the 1h default so you can read its logs.
