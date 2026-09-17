@@ -981,11 +981,17 @@ mod tests {
         );
     }
 
-    /// Both stdin-producer failures are TERMINAL through the mover wrapper, so
-    /// `backoffLimit` never burns retries re-running the same broken dump
-    /// command (#451). The repository was never at fault: an identical Job
-    /// attempt reproduces the same failure, and each retry re-execs the user's
-    /// command against their live database.
+    /// Both stdin-producer failures are TERMINAL through the mover wrapper
+    /// (#451): the repository was never at fault, an identical attempt reproduces
+    /// the same failure, and each attempt re-execs the user's command against
+    /// their live database.
+    ///
+    /// SCOPE: "terminal" here means `retry_recommended() == false`, which is what
+    /// rides on `status.failure.retryRecommended` and what the OPERATOR reasons
+    /// about. It does NOT stop the Kubernetes Job retrying — the mover exits
+    /// non-zero and the Job's `backoffLimit` (default 2) may schedule replacement
+    /// pods; nothing reads `retryRecommended` today. Stopping the kubelet needs
+    /// the Job deleted, as the controller's wedged-pod path does.
     #[test]
     fn stdin_producer_failures_are_terminal() {
         for source in [

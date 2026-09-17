@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use kopiur_kopia::{
     ConnectSpec, KopiaClient, SnapshotCreateOptions, SnapshotCreateOutcome, SnapshotSource,
-    StdinOutcome, StdinSnapshot,
+    StdinOutcome, StdinSnapshot, StdinWriter,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -84,7 +84,7 @@ async fn stdin_snapshot_roundtrips_byte_identical() {
                 // that `child.wait()` is never unbounded (#451).
                 finalize_timeout: Some(std::time::Duration::from_secs(120)),
             },
-            async |stdin: &mut tokio::process::ChildStdin| {
+            async |stdin: &mut StdinWriter<'_>| {
                 stdin.write_all(&payload).await.expect("write payload");
                 Ok(StdinOutcome::Commit {
                     bytes: payload.len() as u64,
@@ -107,7 +107,7 @@ async fn stdin_snapshot_roundtrips_byte_identical() {
     let root_obj = root.obj.clone();
     let mut got: Vec<u8> = Vec::new();
     client
-        .show_to(&format!("{root_obj}/dump.sql"), &mut got)
+        .show_to(&format!("{root_obj}/dump.sql"), None, &mut got)
         .await
         .expect("show the stored file");
     assert_eq!(got.len(), expected.len(), "restored length differs");
@@ -141,7 +141,7 @@ async fn abort_after_full_payload_leaves_no_snapshot() {
                 // that `child.wait()` is never unbounded (#451).
                 finalize_timeout: Some(std::time::Duration::from_secs(120)),
             },
-            async |stdin: &mut tokio::process::ChildStdin| {
+            async |stdin: &mut StdinWriter<'_>| {
                 stdin
                     .write_all(b"a complete and perfectly valid looking dump\n")
                     .await
@@ -193,7 +193,7 @@ async fn producer_error_propagates_and_leaves_no_snapshot() {
                 // that `child.wait()` is never unbounded (#451).
                 finalize_timeout: Some(std::time::Duration::from_secs(120)),
             },
-            async |stdin: &mut tokio::process::ChildStdin| {
+            async |stdin: &mut StdinWriter<'_>| {
                 stdin.write_all(b"partial").await.expect("write");
                 Err(kopiur_kopia::KopiaError::EmptyOutput {
                     context: "synthetic producer failure".to_string(),
@@ -230,7 +230,7 @@ async fn stdin_snapshot_records_the_overridden_identity() {
                 // that `child.wait()` is never unbounded (#451).
                 finalize_timeout: Some(std::time::Duration::from_secs(120)),
             },
-            async |stdin: &mut tokio::process::ChildStdin| {
+            async |stdin: &mut StdinWriter<'_>| {
                 stdin.write_all(b"SELECT 1;\n").await.unwrap();
                 Ok(StdinOutcome::Commit { bytes: 10 })
             },
@@ -284,7 +284,7 @@ async fn a_producer_that_writes_nothing_commits_no_snapshot() {
             },
             // Writes NOTHING and reports success — the shape a silently-failed
             // dump command has.
-            async |_stdin: &mut tokio::process::ChildStdin| Ok(StdinOutcome::Commit { bytes: 0 }),
+            async |_stdin: &mut StdinWriter<'_>| Ok(StdinOutcome::Commit { bytes: 0 }),
         )
         .await
         .expect_err("a zero-byte dump must not be committed");
@@ -334,7 +334,7 @@ async fn show_to_streams_bytes_and_fails_loudly_on_a_bad_object() {
                 opts: &SnapshotCreateOptions::default(),
                 finalize_timeout: Some(std::time::Duration::from_secs(120)),
             },
-            async |stdin: &mut tokio::process::ChildStdin| {
+            async |stdin: &mut StdinWriter<'_>| {
                 stdin.write_all(&payload).await.expect("write");
                 Ok(StdinOutcome::Commit {
                     bytes: payload.len() as u64,
@@ -350,7 +350,7 @@ async fn show_to_streams_bytes_and_fails_loudly_on_a_bad_object() {
 
     let mut got: Vec<u8> = Vec::new();
     client
-        .show_to(&format!("{root}/dump.sql"), &mut got)
+        .show_to(&format!("{root}/dump.sql"), None, &mut got)
         .await
         .expect("show the stored file");
     assert_eq!(got, expected);
@@ -359,7 +359,7 @@ async fn show_to_streams_bytes_and_fails_loudly_on_a_bad_object() {
     // that pipes nothing into `psql` and reports Completed is the worst outcome.
     let mut empty: Vec<u8> = Vec::new();
     client
-        .show_to(&format!("{root}/not-there.sql"), &mut empty)
+        .show_to(&format!("{root}/not-there.sql"), None, &mut empty)
         .await
         .expect_err("a missing entry must fail");
     assert!(empty.is_empty());
@@ -394,7 +394,7 @@ async fn a_stdin_snapshot_restores_its_virtual_file_to_a_directory() {
                 opts: &SnapshotCreateOptions::default(),
                 finalize_timeout: Some(std::time::Duration::from_secs(120)),
             },
-            async |stdin: &mut tokio::process::ChildStdin| {
+            async |stdin: &mut StdinWriter<'_>| {
                 stdin.write_all(&payload).await.expect("write");
                 Ok(StdinOutcome::Commit {
                     bytes: payload.len() as u64,

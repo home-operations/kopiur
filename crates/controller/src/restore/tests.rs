@@ -3775,20 +3775,27 @@ fn a_stream_restore_of_a_non_stream_policy_fails_closed() {
     );
     assert!(err.contains("not a `stream` source"), "must say why: {err}");
     assert!(err.contains("Fix:"), "must say how to fix it: {err}");
-    // The same refusal for a plain PVC policy: a streamExec restore of a volume
-    // tree has no single file to read either.
-    let pvc_policy: kopiur_api::SnapshotPolicy = serde_json::from_value(serde_json::json!({
-        "apiVersion": "kopiur.home-operations.com/v1alpha1",
-        "kind": "SnapshotPolicy",
-        "metadata": { "name": "vol", "namespace": "db" },
-        "spec": {
-            "repository": { "kind": "Repository", "name": "nas" },
-            "sources": [{ "pvc": { "name": "data" }, "readOnly": true }],
-        },
-    }))
-    .unwrap();
-    from_policy_identity(&pvc_policy, "db", None, None, None)
-        .expect_err("a streamExec restore of a pvc policy must be refused too");
+    // The same refusal for every OTHER source kind: a streamExec restore of a
+    // volume tree or an NFS export has no single file to read either, and each
+    // takes a different branch of `kopia_source_path` on the way to the guard.
+    for source in [
+        serde_json::json!({ "pvc": { "name": "data" }, "readOnly": true }),
+        serde_json::json!({ "nfs": { "server": "nas", "path": "/export/db" }, "readOnly": true }),
+    ] {
+        let policy: kopiur_api::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "vol", "namespace": "db" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "nas" },
+                "sources": [source],
+            },
+        }))
+        .unwrap();
+        let err = from_policy_identity(&policy, "db", None, None, None)
+            .expect_err("a streamExec restore of a non-stream policy must be refused");
+        assert!(err.contains("not a `stream` source"), "{err}");
+    }
 }
 
 /// (d) A zero-source legacy policy keeps the PATHLESS identity-only form. Admission

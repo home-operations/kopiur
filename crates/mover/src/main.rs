@@ -632,7 +632,7 @@ async fn run_operation(
                                         + kopiur_kopia::STDIN_FINALIZE_GRACE,
                                 ),
                             },
-                            async |stdin: &mut tokio::process::ChildStdin| {
+                            async |stdin: &mut kopiur_kopia::StdinWriter<'_>| {
                                 Ok(kopiur_mover::stream::feed_from_pod(
                                     &kube_client,
                                     producer,

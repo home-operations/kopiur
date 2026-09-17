@@ -436,6 +436,33 @@ fn stream_source_paths(spec: &SnapshotPolicySpec) -> BTreeMap<usize, String> {
         .collect()
 }
 
+/// The kopia path EVERY source records, keyed by position — regardless of kind.
+///
+/// The backstop arm. The other two key on things that only exist within a kind
+/// (a PVC name, a stream `fileName`), so a source that CHANGES KIND at a fixed
+/// index slipped past both: `stream → pvc` at index 0 rewrites the recorded path
+/// from `/stream/dump.sql` to `/pvc/data`, but the PVC arm finds no old entry
+/// under the new name and `stream_source_paths(new)` is empty, so neither fires.
+/// That is the orphan-every-manifest outcome this guard exists for, reached by
+/// the most obvious edit a user could make.
+///
+/// Keyed by INDEX because index is what `Snapshot.spec.source.sourceIndex` pins:
+/// the child at index 0 would start backing up something else. That also means
+/// REORDERING two plain `pvc:` sources trips this arm, which is correct for the
+/// same reason (and for a selector-free policy only `sources[0]` is ever backed
+/// up, so the reorder genuinely changes what is captured). The
+/// `allow-identity-change` ack releases it like any other fork.
+///
+/// A source with no derivable path (a selector, whose path is per-member)
+/// contributes nothing here; the strategy arm covers those.
+fn source_paths_by_index(spec: &SnapshotPolicySpec) -> BTreeMap<usize, String> {
+    spec.sources
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| crate::expand::source_kopia_path(s, i, "").map(|p| (i, p)))
+        .collect()
+}
+
 /// Pure decision for the fork-on-edit guard on a per-source path change. A PVC's kopia
 /// source path is part of its identity, so changing `sourcePathOverride` on a PVC that
 /// already has history orphans that PVC's snapshots exactly as a username/hostname
@@ -489,6 +516,22 @@ pub fn detect_source_path_fork(
     let old_streams = stream_source_paths(old);
     for (index, new_path) in stream_source_paths(new) {
         if let Some(old_path) = old_streams.get(&index)
+            && *old_path != new_path
+        {
+            return Some(ValidationError::IdentityWouldFork {
+                old: old_path.clone(),
+                new: new_path,
+            });
+        }
+    }
+    // Backstop: ANY source kind, keyed by position. Catches a source that changed
+    // KIND at a fixed index (`stream → pvc`, `pvc → nfs`, ...), which the two
+    // kind-specific arms above structurally cannot see. Runs LAST so the
+    // kind-specific arms keep producing their better-targeted messages — this one
+    // only fires for the cases they missed. See [`source_paths_by_index`].
+    let old_by_index = source_paths_by_index(old);
+    for (index, new_path) in source_paths_by_index(new) {
+        if let Some(old_path) = old_by_index.get(&index)
             && *old_path != new_path
         {
             return Some(ValidationError::IdentityWouldFork {

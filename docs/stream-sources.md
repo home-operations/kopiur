@@ -73,6 +73,47 @@ because the pod name is not known until the selector resolves at run time, and R
 has no label-selector form. The namespace is the boundary; the annotation is how you
 consent to it.
 
+### If Kopiur is installed namespace-scoped
+
+Checking that annotation means **reading the Namespace**, which is a cluster-scoped
+read. A `installScope: cluster` install already has it. A
+`installScope: namespaced` install does **not** — its Role cannot reach a
+cluster-scoped resource — so Kopiur cannot tell whether the namespace opted in.
+
+When that happens it **refuses**, and says so:
+
+> `SnapshotPolicy` … uses a `stream` source, but kopiur cannot read Namespace … to
+> check the `kopiur.home-operations.com/stream-exec-movers` opt-in (the API server
+> returned 403), so it refuses to mint the `pods/exec` permission the stream mover
+> needs.
+
+This is deliberate, and it differs from the [privileged-mover
+opt-in](movers.md#privileged-movers), which fails *open* under a namespaced
+install. `pods/exec` is
+a much larger grant — arbitrary code execution in every pod in the namespace, on a
+ServiceAccount that outlives the Job — and a 403 on `namespaces get` is
+indistinguishable from an authorization layer an admin added on purpose. Kopiur will
+not hand that out on a guess.
+
+Two ways forward:
+
+```yaml
+# Option A — keep the namespaced install, add just the one read.
+installScope: namespaced
+rbacNamespaceReadForStreamSources: true
+```
+
+That emits a small supplementary `ClusterRole` granting **`get` on `namespaces`
+and nothing else** (not even `list`/`watch`), plus its binding.
+
+```yaml
+# Option B — install cluster-scoped, which already has the read.
+installScope: cluster
+```
+
+Neither is needed for `pvc` or `nfs` sources. If you do not use stream sources,
+leave `rbacNamespaceReadForStreamSources` at its default `false`.
+
 ## Writing the policy
 
 ```yaml

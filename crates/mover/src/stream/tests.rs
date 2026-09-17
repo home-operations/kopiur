@@ -285,3 +285,83 @@ fn the_exec_start_timeout_message_names_the_right_cause() {
         "must steer away from the wrong knob: {msg}"
     );
 }
+
+/// A stderr of EXACTLY the cap was never truncated, so it must keep its first
+/// line. Inferring truncation from `len() == CAP` dropped it.
+#[tokio::test]
+async fn drain_stderr_keeps_the_first_line_of_an_exactly_cap_sized_stderr() {
+    // "first\n" then filler, totalling exactly the cap.
+    let head = b"first\n";
+    let mut blob = head.to_vec();
+    blob.resize(EXEC_STDERR_CAP, b'x');
+    assert_eq!(blob.len(), EXEC_STDERR_CAP);
+
+    let mut r = std::io::Cursor::new(blob);
+    let got = drain_stderr(&mut r).await;
+    assert_eq!(got.len(), EXEC_STDERR_CAP, "nothing was truncated");
+    assert!(
+        got.starts_with("first\n"),
+        "an untruncated stderr must keep its first line: {:?}",
+        &got[..got.len().min(20)]
+    );
+}
+
+/// A kopia-side timeout during a stream restore must name
+/// `spec.target.streamExec.workloadExec.timeout`, not kopia's argv (#451).
+///
+/// Deleting `run_streaming_stdout` in favour of `run_raw_streaming` handed
+/// `show_to` a second, invisible budget: the mover derives `default_timeout` from
+/// `spec.options.operationTimeout`, so a user who set that for unrelated reasons
+/// would have seen a large stream restore fail with a `Timeout` quoting
+/// `show <oid>` and a seconds count — the exact blames-the-wrong-knob failure the
+/// exec-start split exists to eliminate. `show_to` now takes the CONSUMER's own
+/// budget, and the expiry is translated by `object_read_failure_message`.
+#[test]
+fn a_kopia_read_timeout_names_the_stream_target_field() {
+    let msg = object_read_failure_message(
+        "postgres.sql",
+        &kopiur_kopia::KopiaError::Timeout {
+            args: "show k1234/postgres.sql".into(),
+            seconds: 7200,
+        },
+    );
+    // what
+    assert!(msg.contains("postgres.sql"), "{msg}");
+    assert!(msg.contains("7200s"), "{msg}");
+    assert!(msg.contains("abandoned mid-stream"), "{msg}");
+    // why the operator should care: the consumer got a truncated input
+    assert!(msg.contains("PARTIAL load"), "{msg}");
+    // fix — the field the user actually set, NOT kopia's argv
+    assert!(
+        msg.contains("spec.target.streamExec.workloadExec.timeout"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("operationTimeout"),
+        "the consumer's own budget bounds this, not the client-wide one: {msg}"
+    );
+    assert!(
+        !msg.contains("show k1234"),
+        "kopia's argv is not a knob the user can turn: {msg}"
+    );
+}
+
+/// Every other read failure passes the underlying error through verbatim — the
+/// translation is for the timeout alone, which is the only one whose cause is a
+/// kopiur-imposed budget rather than something kopia reports.
+#[test]
+fn other_object_read_failures_pass_the_kopia_error_through() {
+    let msg = object_read_failure_message(
+        "postgres.sql",
+        &kopiur_kopia::KopiaError::EmptyOutput {
+            context: "show".into(),
+            stderr_tail: "error: object not found".into(),
+        },
+    );
+    assert!(msg.contains("postgres.sql"), "{msg}");
+    assert!(msg.contains("object not found"), "{msg}");
+    assert!(
+        !msg.contains("workloadExec.timeout"),
+        "a non-timeout must not point at the timeout knob: {msg}"
+    );
+}

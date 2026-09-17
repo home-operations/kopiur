@@ -1893,9 +1893,15 @@ fn a_zero_byte_commit_is_classified_as_an_abort() {
     }
 }
 
-/// Both abort reasons classify TERMINAL (`Unknown` ⇒ not retryable), so a Job's
-/// `backoffLimit` never re-execs the same broken command against the user's
-/// database.
+/// Both abort reasons classify TERMINAL (`Unknown` ⇒ `is_retryable() == false`),
+/// so the OPERATOR does not treat the run as retryable and
+/// `status.failure.retryRecommended` reports it honestly.
+///
+/// This is deliberately NOT a claim that the Kubernetes Job stops retrying. The
+/// mover exits non-zero and the Job's own `backoffLimit` (default 2) may schedule
+/// replacement pods that re-exec the producer's command; nothing in the
+/// controller reads `retryRecommended` today. Stopping the kubelet needs the Job
+/// deleted, the way the wedged-pod path does.
 #[test]
 fn both_stdin_abort_reasons_are_non_retryable() {
     use crate::client::{FedVerdict, classify_fed};
@@ -1912,4 +1918,65 @@ fn both_stdin_abort_reasons_are_non_retryable() {
             "a failed stdin producer must not be retried: {err}"
         );
     }
+}
+
+/// The safety property is now STRUCTURAL: a producer cannot close kopia's stdin.
+///
+/// The runner's ownership of that pipe is what makes `StdinOutcome::Abort` able
+/// to kill kopia before it ever sees EOF. A producer that called `shutdown()` on
+/// a bare `ChildStdin` would hand kopia EOF while the runner still believed it
+/// held the commit point, and the later kill would land on a kopia that had
+/// already written a manifest for a TRUNCATED dump. `StdinWriter::poll_shutdown`
+/// is a no-op, so `AsyncWriteExt::shutdown()` cannot reach the pipe — the bad
+/// state is unrepresentable rather than merely untaken.
+#[tokio::test]
+async fn a_stdin_writer_shutdown_cannot_close_the_pipe() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    // `cat` echoes stdin, so stdout reaching EOF proves stdin was closed.
+    let mut child = Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let mut raw = child.stdin.take().expect("stdin piped");
+    let mut out = child.stdout.take().expect("stdout piped");
+
+    {
+        let mut writer = crate::client::StdinWriter(&mut raw);
+        writer.write_all(b"payload\n").await.expect("write");
+        // A producer doing the idiomatic thing at the end of a copy pipeline.
+        writer.shutdown().await.expect("shutdown reports success");
+    }
+
+    // The pipe is STILL OPEN: `cat` echoed the payload but has not exited, so a
+    // read past it would block. Prove it by reading exactly the payload back and
+    // then observing that EOF has NOT arrived within a short window.
+    let mut got = vec![0u8; 8];
+    tokio::io::AsyncReadExt::read_exact(&mut out, &mut got)
+        .await
+        .expect("cat echoes the payload");
+    assert_eq!(&got, b"payload\n");
+    let mut more = [0u8; 1];
+    let eof = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read(&mut out, &mut more),
+    )
+    .await;
+    assert!(
+        eof.is_err(),
+        "stdin must still be open after a producer's shutdown() — got {eof:?}"
+    );
+
+    // Only the RUNNER closing it gives EOF, which is the commit point.
+    drop(raw);
+    assert_eq!(
+        tokio::io::AsyncReadExt::read(&mut out, &mut more)
+            .await
+            .expect("read after the runner closes stdin"),
+        0,
+        "dropping the writer is what ends the stream"
+    );
+    let _ = child.wait().await;
 }

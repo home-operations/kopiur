@@ -476,8 +476,18 @@ impl KopiaError {
             // NOT retryable; the fix is in the workload or the policy.
             KopiaError::StdinProducerFailed { .. } => KopiaErrorClass::Unknown,
             // Same reasoning: the repository was never at fault, and re-running
-            // the Job re-runs the same command that produced nothing. TERMINAL,
-            // so `backoffLimit` never burns retries on it.
+            // the same command would reproduce the same empty output.
+            //
+            // NOTE what this class does and does NOT do. It makes the failure
+            // TERMINAL for the operator: `MoverError::retry_recommended()` is
+            // false, so `status.failure.retryRecommended` says so and the
+            // controller does not treat the run as retryable. It does NOT stop
+            // the Kubernetes Job from retrying — the mover exits non-zero and the
+            // Job's own `backoffLimit` (default 2) may schedule replacement pods
+            // that re-exec the producer's command. Preventing that needs the Job
+            // DELETED, the way the wedged-pod path in
+            // `controller::snapshot` does; nothing reads
+            // `retryRecommended` today. Tracked separately.
             KopiaError::StdinProducerWroteNothing { .. } => KopiaErrorClass::Unknown,
         }
     }

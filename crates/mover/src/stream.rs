@@ -201,6 +201,29 @@ pub fn exec_start_timeout_message(pod: &str, namespace: &str) -> String {
     )
 }
 
+/// The message for a failure while reading the snapshot's virtual file out of the
+/// repository. Pure so the exact text is unit-asserted.
+///
+/// A TIMEOUT is translated to name the field the user actually set. Left as the
+/// raw [`kopiur_kopia::KopiaError::Timeout`] it would quote kopia's argv (`show
+/// <object-id>`) and a seconds count with no hint which knob produced them — the
+/// same blames-the-wrong-knob failure that [`EXEC_START_TIMEOUT`] exists to
+/// avoid. It also says what it means for the CONSUMER: its stdin was cut short,
+/// so whatever it had already applied is a partial load.
+pub fn object_read_failure_message(file_name: &str, err: &kopiur_kopia::KopiaError) -> String {
+    match err {
+        kopiur_kopia::KopiaError::Timeout { seconds, .. } => format!(
+            "reading `{file_name}` out of the snapshot did not finish within {seconds}s, so \
+             the restore was abandoned mid-stream and the command's input was cut short — \
+             whatever it had already applied is a PARTIAL load. The budget is \
+             `spec.target.streamExec.workloadExec.timeout`, which bounds the whole transfer \
+             including kopia's read. Raise it for a large artifact, or check whether the \
+             repository backend is stalling."
+        ),
+        other => format!("reading `{file_name}` out of the snapshot failed: {other}"),
+    }
+}
+
 /// The kube client the stream paths exec through.
 ///
 /// NOT [`kube::Client::try_default`]. That infers a [`kube::Config`] carrying
@@ -309,6 +332,10 @@ where
 {
     let mut kept: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
     let mut chunk = vec![0u8; 8 * 1024];
+    // Tracked explicitly rather than inferred from `kept.len() == CAP`: a stderr
+    // that happens to be EXACTLY the cap was never truncated, and inferring would
+    // drop its genuine first line.
+    let mut truncated = false;
     loop {
         match reader.read(&mut chunk).await {
             // EOF, or a read error (the channel died) — either way we are done, and
@@ -318,6 +345,7 @@ where
                 kept.extend(&chunk[..n]);
                 if kept.len() > EXEC_STDERR_CAP {
                     kept.drain(..kept.len() - EXEC_STDERR_CAP);
+                    truncated = true;
                 }
             }
         }
@@ -325,10 +353,10 @@ where
     let bytes: Vec<u8> = kept.into();
     // A byte-exact tail can start mid-UTF-8-sequence or mid-line; `from_utf8_lossy`
     // handles the former, and dropping everything before the first newline handles
-    // the latter so the message never opens on half a word.
+    // the latter so the message never opens on half a word. Only when we actually
+    // truncated — an untruncated stderr keeps its first line.
     let trimmed = match bytes.iter().position(|b| *b == b'\n') {
-        // Only trim when we actually truncated — a short stderr keeps its first line.
-        Some(i) if bytes.len() == EXEC_STDERR_CAP => &bytes[i + 1..],
+        Some(i) if truncated => &bytes[i + 1..],
         _ => &bytes[..],
     };
     String::from_utf8_lossy(trimmed).into_owned()
@@ -362,7 +390,7 @@ where
 pub async fn feed_from_pod(
     client: &kube::Client,
     spec: &StreamProducerSpec,
-    stdin: &mut tokio::process::ChildStdin,
+    stdin: &mut kopiur_kopia::StdinWriter<'_>,
     failure: &mut Option<String>,
 ) -> StdinOutcome {
     let timeout = Duration::from_secs(spec.timeout_seconds);
@@ -528,8 +556,12 @@ pub async fn restore_into_pod(
     let mut stderr_tail = String::new();
     let shipped = {
         let ship = async {
-            // `show_to` streams the object straight into the exec's stdin.
-            let r = kopia.show_to(object_id, &mut stdin).await;
+            // `show_to` streams the object straight into the exec's stdin, bounded
+            // by THIS consumer's own `workloadExec.timeout` rather than by the
+            // client-wide `spec.options.operationTimeout` (#451): sharing the
+            // latter would let a large restore fail with a `Timeout` naming
+            // kopia's argv, pointing the user at a knob unrelated to the restore.
+            let r = kopia.show_to(object_id, Some(timeout), &mut stdin).await;
             // Close stdin so the consumer sees EOF and can finish (psql will not exit
             // while its input is still open).
             let _ = stdin.shutdown().await;
@@ -565,10 +597,11 @@ pub async fn restore_into_pod(
         }
     };
     shipped.map_err(|e| MoverError::StreamExecFailed {
-        detail: format!(
-            "reading `{}` out of the snapshot failed: {e}",
-            spec.file_name
-        ),
+        // A kopia-side timeout is translated to name the field the user set. Left
+        // as the raw `KopiaError::Timeout` it would quote kopia's argv and a
+        // seconds count with no hint which knob produced it — the same
+        // blames-the-wrong-knob failure the exec-start split exists to avoid.
+        detail: object_read_failure_message(&spec.file_name, &e),
     })?;
 
     let verdict = match status_fut {

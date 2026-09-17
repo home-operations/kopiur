@@ -1127,6 +1127,56 @@ pub enum StdinOutcome {
     Abort,
 }
 
+/// The writer a stdin producer is handed: kopia's stdin, with the ability to
+/// CLOSE it removed.
+///
+/// The runner's ownership of that pipe IS the safety property. kopia finalizes
+/// the snapshot when — and only when — stdin reaches EOF, so whoever can close
+/// the pipe decides whether the snapshot commits. A producer that called
+/// `shutdown()` on a bare `ChildStdin` would hand kopia EOF while the runner
+/// still believed it held the commit point, and a subsequent
+/// [`StdinOutcome::Abort`] would then arrive too late: the kill would land on a
+/// kopia that had already written a manifest for a TRUNCATED dump.
+///
+/// No producer in this repository does that. This type means none ever can —
+/// which is the difference between a bad state being untaken and being
+/// unrepresentable.
+///
+/// [`tokio::io::AsyncWrite`] is implemented so `tokio::io::copy` still works (the
+/// pipe-to-pipe transfer must stay constant-memory and must never buffer the
+/// user's dump), but `poll_shutdown` is a deliberate NO-OP: it reports success
+/// without touching the pipe, so `AsyncWriteExt::shutdown()` cannot reach it
+/// either.
+pub struct StdinWriter<'a>(&'a mut tokio::process::ChildStdin);
+
+impl tokio::io::AsyncWrite for StdinWriter<'_> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.0).poll_flush(cx)
+    }
+
+    /// Deliberately does NOT close the pipe. Closing it is the COMMIT decision,
+    /// and it belongs to the runner alone — see the type's own documentation.
+    /// Reports success so a producer that flushes-and-shuts-down (the idiomatic
+    /// end of a `tokio::io::copy` pipeline) is not made to look like a failure.
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 /// What the runner does with a `feed` result: commit the snapshot, or abort it.
 ///
 /// Separated from [`StdinOutcome`] because they answer different questions.
@@ -1535,7 +1585,7 @@ impl KopiaClient {
         feed: F,
     ) -> Result<RawOutput, KopiaError>
     where
-        F: AsyncFnOnce(&mut tokio::process::ChildStdin) -> Result<StdinOutcome, KopiaError>,
+        F: AsyncFnOnce(&mut StdinWriter<'_>) -> Result<StdinOutcome, KopiaError>,
     {
         let display_args = args.join(" ");
         let mut cmd = self.base_command(args);
@@ -1567,7 +1617,11 @@ impl KopiaClient {
         };
         let drains = StdioDrains::spawn(&mut child);
 
-        let bytes = match classify_fed(feed(&mut stdin).await) {
+        // `feed` gets a `StdinWriter`, not the `ChildStdin` itself: it may write and
+        // flush, but it CANNOT close the pipe, which is what keeps the commit
+        // decision here. The borrow ends when `feed` returns, so the abort arms can
+        // still kill the child while `stdin` is alive and drop it afterwards.
+        let bytes = match classify_fed(feed(&mut StdinWriter(&mut stdin)).await) {
             // ORDER IS THE SAFETY PROPERTY: kill the child while `stdin` is still
             // alive, so kopia never reaches EOF and never writes a manifest; drop
             // the writer only afterwards. Reversing the two would let kopia commit
@@ -1592,8 +1646,13 @@ impl KopiaClient {
         //
         // A timeout here is honestly ambiguous: the snapshot MAY have committed
         // before we gave up. That is why it surfaces as an error and never as
-        // success — if a manifest did land, the catalog scanner discovers it as a
-        // foreign snapshot rather than this CR claiming it.
+        // success — this CR must not claim a manifest it cannot prove exists.
+        // WHERE DISCOVERY IS ENABLED on the repository, a manifest that did land
+        // is picked up by the catalog scanner as a foreign snapshot and becomes
+        // governable. Where it is not, it is orphaned outside every retention
+        // path (GFS is driven off `Snapshot` CRs) until a full maintenance pass
+        // or a manual `kopia snapshot delete`. The budget makes this rare, not
+        // impossible.
         let budget = self.finalize_budget(finalize_timeout);
         let status = match tokio::time::timeout(budget, child.wait()).await {
             Ok(res) => res.map_err(|source| KopiaError::Spawn {
@@ -1922,7 +1981,7 @@ impl KopiaClient {
         feed: F,
     ) -> Result<SnapshotCreateOutcome, KopiaError>
     where
-        F: AsyncFnOnce(&mut tokio::process::ChildStdin) -> Result<StdinOutcome, KopiaError>,
+        F: AsyncFnOnce(&mut StdinWriter<'_>) -> Result<StdinOutcome, KopiaError>,
     {
         let args = snapshot_create_args(
             snapshot.source_path,
@@ -1972,17 +2031,33 @@ impl KopiaClient {
     /// kopia streams the object, so this is constant-memory regardless of file size,
     /// and the bytes go straight into `sink` — never buffered here, never logged,
     /// never attached to an error.
-    pub async fn show_to<W>(&self, object_id: &str, mut sink: W) -> Result<(), KopiaError>
+    pub async fn show_to<W>(
+        &self,
+        object_id: &str,
+        budget: Option<Duration>,
+        mut sink: W,
+    ) -> Result<(), KopiaError>
     where
         W: tokio::io::AsyncWrite + Unpin + Send,
     {
-        // Two lines over [`Self::run_raw_streaming`], which already does exactly
-        // this for the browse data plane — byte-for-byte copy, bounded stderr, the
-        // shared spawn retry, and `default_timeout` honoured. It previously had a
-        // near-duplicate of its own (`run_streaming_stdout`) that skipped the retry
-        // AND the timeout, so a `streamExec` restore could hang on a wedged kopia.
+        // A thin wrapper over [`Self::run_raw_streaming`], which already does
+        // exactly this for the browse data plane — byte-for-byte copy, bounded
+        // stderr, the shared spawn retry. It previously had a near-duplicate of its
+        // own (`run_streaming_stdout`) that skipped both the retry and any timeout,
+        // so a `streamExec` restore could hang on a wedged kopia.
+        //
+        // `budget` is EXPLICIT rather than inherited from `default_timeout` because
+        // sharing that one would give a stream restore a second, invisible bound: the
+        // mover derives `default_timeout` from `spec.options.operationTimeout`, so a
+        // user who set that for unrelated reasons would see a large stream restore
+        // fail with a `Timeout` naming kopia's argv — pointing at a knob that has
+        // nothing to do with the restore. The stream caller passes the CONSUMER's own
+        // `workloadExec.timeout` instead, and translates the expiry into a message
+        // naming that field. `None` falls back to `default_timeout`.
         let args: Vec<String> = vec!["show".into(), object_id.to_string()];
-        self.run_raw_streaming(&args, &mut sink).await.map(|_| ())
+        self.run_raw_streaming_within(&args, budget, &mut sink)
+            .await
+            .map(|_| ())
     }
 
     /// [`Self::snapshot_create_with`], but able to say "kopia deliberately
@@ -2350,6 +2425,23 @@ impl KopiaClient {
         args: &[String],
         sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     ) -> Result<u64, KopiaError> {
+        self.run_raw_streaming_within(args, None, sink).await
+    }
+
+    /// [`Self::run_raw_streaming`] with an EXPLICIT budget that overrides this
+    /// client's `default_timeout`.
+    ///
+    /// Exists because two callers want different bounds over the same mechanics:
+    /// the browse data plane is happy with the client-wide
+    /// `spec.options.operationTimeout`, while a `streamExec` restore must be
+    /// bounded by the consumer command's own `workloadExec.timeout` so an expiry
+    /// names the field the user actually set. `None` keeps `default_timeout`.
+    pub async fn run_raw_streaming_within(
+        &self,
+        args: &[String],
+        budget: Option<Duration>,
+        sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+    ) -> Result<u64, KopiaError> {
         let display_args = args.join(" ");
         let mut cmd = self.base_command(args);
         cmd.stdin(Stdio::null());
@@ -2370,7 +2462,7 @@ impl KopiaClient {
             Ok::<_, std::io::Error>((copied?, err?, status?))
         };
 
-        let (bytes, stderr, status) = match self.default_timeout {
+        let (bytes, stderr, status) = match budget.or(self.default_timeout) {
             Some(t) => match tokio::time::timeout(t, wait_with_io).await {
                 Ok(res) => res.map_err(|source| KopiaError::Spawn {
                     binary: self.binary.display().to_string(),

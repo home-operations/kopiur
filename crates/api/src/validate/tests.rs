@@ -7897,3 +7897,84 @@ sources:
     );
     assert!(detect_source_path_fork(&one, &two("a.sql", "b.sql"), true, false).is_none());
 }
+
+/// A source that CHANGES KIND at a fixed index forks, and neither kind-specific
+/// arm could see it: the PVC arm keys on PVC name (absent from the stream side)
+/// and the stream arm keys on `fileName` (absent from the PVC side), so
+/// `stream → pvc` at index 0 rewrote `/stream/dump.sql` to `/pvc/data` — the
+/// orphan-every-manifest outcome the guard exists for — and passed admission
+/// silently. The index-keyed backstop catches it in both directions.
+#[test]
+fn source_path_fork_catches_a_source_that_changes_kind_at_one_index() {
+    let stream: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - stream:
+      fileName: dump.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: postgres } }
+        command: ["pg_dumpall"]
+"#,
+    );
+    let pvc: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: data } } ]\n",
+    );
+    let nfs: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { nfs: { server: nas, path: /export/db } } ]\n",
+    );
+
+    // stream → pvc, and back.
+    let err = detect_source_path_fork(&stream, &pvc, true, false)
+        .expect("stream -> pvc at index 0 re-identifies the source");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/stream/dump.sql");
+            assert_eq!(new, "/pvc/data");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+    assert!(detect_source_path_fork(&pvc, &stream, true, false).is_some());
+
+    // stream → nfs, pvc → nfs, and back: every kind pair at a fixed index.
+    for (a, b) in [(&stream, &nfs), (&nfs, &stream), (&pvc, &nfs), (&nfs, &pvc)] {
+        assert!(
+            detect_source_path_fork(a, b, true, false).is_some(),
+            "a kind change at index 0 always re-identifies the source"
+        );
+    }
+
+    // The escape hatches still apply, and an unchanged spec is never a fork.
+    assert!(detect_source_path_fork(&stream, &pvc, true, true).is_none());
+    assert!(detect_source_path_fork(&stream, &pvc, false, false).is_none());
+    for same in [&stream, &pvc, &nfs] {
+        assert!(detect_source_path_fork(same, same, true, false).is_none());
+    }
+}
+
+/// REORDERING two plain `pvc:` sources trips the backstop, deliberately. Index is
+/// what `Snapshot.spec.source.sourceIndex` pins, and for a selector-free policy
+/// only `sources[0]` is ever backed up — so the swap genuinely changes which
+/// volume the policy captures. It needs the `allow-identity-change` ack, which is
+/// exactly the confirmation such an edit deserves.
+#[test]
+fn reordering_plain_pvc_sources_needs_the_ack() {
+    let order = |a: &str, b: &str| -> SnapshotPolicySpec {
+        crate::testutil::from_yaml(&format!(
+            "repository: {{ kind: Repository, name: r }}\n\
+             sources: [ {{ pvc: {{ name: {a} }} }}, {{ pvc: {{ name: {b} }} }} ]\n"
+        ))
+    };
+    let err = detect_source_path_fork(&order("a", "b"), &order("b", "a"), true, false)
+        .expect("swapping sources[0] changes what the policy backs up");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/pvc/a");
+            assert_eq!(new, "/pvc/b");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+    assert!(detect_source_path_fork(&order("a", "b"), &order("b", "a"), true, true).is_none());
+    assert!(detect_source_path_fork(&order("a", "b"), &order("a", "b"), true, false).is_none());
+}
