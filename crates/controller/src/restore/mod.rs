@@ -3225,7 +3225,7 @@ async fn run_restore_mover(
     // A stream destination execs into a workload pod, so it needs the dedicated
     // exec-capable identity AND the namespace opt-in — same reasoning, same
     // annotation, as the backup side.
-    let uses_stream = matches!(destination, RestoreDestination::Stream(_));
+    let uses_stream = matches!(dispatch.destination, RestoreDestination::Stream(_));
     if uses_stream && !io::namespace_allows_stream_exec(&ctx.client, namespace).await? {
         let sa = io::stream_mover_name(&ctx.mover_clusterrole);
         let msg = io::stream_exec_not_allowed_message("Restore", name, namespace, &sa);
@@ -3615,7 +3615,7 @@ async fn run_restore_mover(
             // A stream destination replaces the filesystem write entirely: the
             // mover reads ONE virtual file out of the snapshot and pipes it into a
             // command's stdin, so `target_path` below is inert for it.
-            stdout: match destination {
+            stdout: match dispatch.destination {
                 RestoreDestination::Pvc(_) => None,
                 RestoreDestination::Stream(t) => Some(kopiur_mover::workspec::StreamConsumerSpec {
                     namespace: namespace.to_string(),
