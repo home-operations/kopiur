@@ -1195,6 +1195,21 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         ),
     };
     if let Some(msg) = stream_refusal {
+        // The reconcile-start copy is the CORRECT base here, and deliberately so:
+        // this refusal is the FIRST conditions writer of its pass on the launch
+        // path. Every earlier conditions write in `reconcile_inner` RETURNS before
+        // reaching it (the CA-bundle gate, the read-only-repository `Failed`, the
+        // repository-not-Ready park, both preflight arms), the one write that does
+        // continue touches only `preflightSince`, and `pool_gate`'s `Admit` arm
+        // writes nothing at all — it hands the slot heal back as a `bool` for
+        // `fold_slot_heal` to apply in the pass's LAST write. So there is nothing
+        // in this array yet for a live re-read to recover, and none is taken.
+        //
+        // This also sits BEFORE `resolve_mover_security_contexts`, so the #464
+        // inherit heal provably has not run and cannot be ordered ahead of it —
+        // see `io::tests::WORK_GATE_PARKS`, which records that classification and
+        // the narrow residual it leaves (an opt-in annotation revoked between a
+        // held pass and the next one).
         let existing = backup
             .status
             .as_ref()
@@ -1335,6 +1350,32 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         }
         Err(e) => return Err(e),
     };
+    // The hold's healing half (#464), the instant the resolve that parks it SUCCEEDS.
+    //
+    // A run parked on `SecurityContextResolved=False` is the SAME object that proceeds once
+    // the workload is back, so the gate must clear or `doctor` keeps reporting "blocked …
+    // will wait forever" — it suppresses a stale gate only on a TERMINAL phase, and this one
+    // parks at `Pending`. Writes nothing at all unless a hold is actually standing, so a run
+    // that was never held stays byte-identical.
+    //
+    // Placed HERE, not after the credentials/privileged blocks below, because `doctor`
+    // (`first_gate`) returns on the FIRST registered `Fail` row it meets in an array
+    // `upsert_condition_status` only ever APPENDS to — so a stale `SecurityContextResolved=
+    // False` written earliest in the object's life outranks every later gate FOREVER, and
+    // three of the paths this used to sit behind (the repository-not-Ready park, the
+    // Maintenance-cache preflight, and `pool_gate`'s `Parked` arm) carry no registered row
+    // at all while leaving the object non-terminal. Healing late meant the GitOps bring-up
+    // case — workload scaled to zero, then up, with the credential Secret still missing —
+    // diagnosed "scale the workload up" for a workload that was already up.
+    //
+    // What makes that safe is that EVERY conditions writer after this point seeds from a live
+    // re-read (`io::live_conditions`/`live_conditions_and_status`/
+    // `clear_work_condition_if_stale`), not from the reconcile-start copy, because a
+    // `conditions` patch REPLACES the array. Adding a later writer that seeds from the
+    // start-of-pass copy re-opens the bug, and
+    // `io::tests::the_inherit_heal_precedes_every_non_terminal_gate_it_could_shadow`
+    // pins the ordering half.
+    io::heal_inherit_source_missing(&api, backup).await?;
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = recipe_mover.as_ref().and_then(|m| m.privileged_mode);
 
@@ -1447,11 +1488,12 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         };
         let msg =
             io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, &namespace, sa);
-        let existing = backup
-            .status
-            .as_ref()
-            .map(|s| s.conditions.clone())
-            .unwrap_or_default();
+        // LIVE base for the array AND the no-op comparison: the #464 inherit heal
+        // wrote to this same array moments ago and a `conditions` patch REPLACES
+        // it, so the reconcile-start copy would resurrect the hold onto a run
+        // whose REAL block is this refusal — and `doctor` would then name the
+        // resurrected row instead of the one it is being refused for.
+        let (existing, current) = io::live_conditions_and_status(&api, &name, backup).await;
         let conditions = io::upsert_gate(
             &existing,
             &kopiur_api::gates::PRIVILEGED_MOVER_GATE,
@@ -1462,7 +1504,6 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         // transition, not on every 30 s transient retry while the namespace
         // opt-in is still absent (the message is stable, so a repeat is a
         // true no-op).
-        let current = serde_json::to_value(&backup.status).ok();
         let wrote = io::patch_status_if_changed(
             &api,
             &name,
@@ -1493,21 +1534,16 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         return Err(Error::BlockedOnGrant(msg));
     }
     // Permitted: clear any stale `MoverPermitted=False` from a prior reconcile.
-    if let Some(conds) = backup.status.as_ref().map(|s| s.conditions.as_slice())
-        && conds
-            .iter()
-            .any(|c| c.type_ == MOVER_PERMITTED_CONDITION && c.status != "True")
-    {
-        let conditions = io::upsert_condition(
-            conds,
-            MOVER_PERMITTED_CONDITION,
-            true,
-            "Permitted",
-            "the mover is permitted in this namespace",
-            backup.meta().generation,
-        );
-        io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
-    }
+    // Live-based (see `io::clear_work_condition_if_stale`) — the #464 heal ran
+    // above and this patch replaces the array it wrote.
+    io::clear_work_condition_if_stale(
+        &api,
+        backup,
+        MOVER_PERMITTED_CONDITION,
+        "Permitted",
+        "the mover is permitted in this namespace",
+    )
+    .await?;
 
     // SecurityContext-compatibility (positive-only, best-effort): confirm `True` only when the
     // RESOLVED mover provably can read the source. Every inherit mode goes through the same
@@ -1577,11 +1613,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     {
         Ok(c) => c,
         Err(Error::MissingDependency(msg)) => {
-            let existing = backup
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
+            // LIVE base, for the reason the privileged refusal above states: the
+            // #464 heal already wrote this array in this pass, and seeding from
+            // the reconcile-start copy would put a stale
+            // `SecurityContextResolved=False` back at index 0 — where `doctor`
+            // reports it INSTEAD of the missing Secret that is the actual
+            // blocker. That false diagnosis is the bug this ordering removes.
+            let existing = io::live_conditions(&api, &name, backup).await;
             let conditions = io::upsert_gate(
                 &existing,
                 &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
@@ -1606,51 +1644,19 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // Creds are present (or were just projected): clear any stale
     // `CredentialsAvailable=False` from a prior reconcile so a fixed problem stops
     // showing on the object.
-    if let Some(conds) = backup.status.as_ref().map(|s| s.conditions.as_slice())
-        && conds
-            .iter()
-            .any(|c| c.type_ == CREDENTIALS_AVAILABLE_CONDITION && c.status != "True")
-    {
-        let (reason, note) = if creds.projected > 0 {
-            (
-                CREDENTIALS_PROJECTED_REASON,
-                "credential Secret(s) projected into the mover namespace",
-            )
-        } else {
-            (
-                "Available",
-                "credentials Secret(s) present in the mover namespace",
-            )
-        };
-        let conditions = io::upsert_condition(
-            conds,
-            CREDENTIALS_AVAILABLE_CONDITION,
-            true,
-            reason,
-            note,
-            backup.meta().generation,
-        );
-        io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
-    }
-    // The hold's healing half (#464): a run that was parked on
-    // `SecurityContextResolved=False` is the SAME object that proceeds once the workload is
-    // back, so the gate must be cleared here or `doctor` keeps reporting "blocked … will wait
-    // forever" for the whole mover run — `doctor` suppresses a stale gate only on a TERMINAL
-    // phase, and this one parks at `Pending` and then runs. Writes nothing at all unless a
-    // hold is actually standing, so a run that was never held stays byte-identical.
-    //
-    // Placed HERE, past the "clear any stale MoverPermitted/CredentialsAvailable" blocks
-    // above rather than at the resolve site, because each of those still rebuilds
-    // `conditions` from the RECONCILE-START copy and a `conditions` patch REPLACES the array
-    // — a heal written before them would simply be erased. The runs this placement skips are
-    // the ones those gates refuse, and they carry their own registered `Fail` row, so
-    // `doctor` still reports them as blocked, which they are.
-    //
-    // Everything that can write `conditions` AFTER this point in the pass instead seeds from
-    // `io::live_conditions`, which is what makes the heal DURABLE rather than clobbered ~57
-    // lines later by staging (see `staged_conditions`). Adding a later writer that seeds from
-    // the start-of-pass copy re-opens the bug.
-    io::heal_inherit_source_missing(&api, backup).await?;
+    let (reason, note) = if creds.projected > 0 {
+        (
+            CREDENTIALS_PROJECTED_REASON,
+            "credential Secret(s) projected into the mover namespace",
+        )
+    } else {
+        (
+            "Available",
+            "credentials Secret(s) present in the mover namespace",
+        )
+    };
+    io::clear_work_condition_if_stale(&api, backup, CREDENTIALS_AVAILABLE_CONDITION, reason, note)
+        .await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     // ADR §4.8: beforeSnapshot hooks (quiesce/flush) run to completion BEFORE the

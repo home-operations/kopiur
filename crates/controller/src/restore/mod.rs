@@ -2876,11 +2876,19 @@ async fn drive_direct_restore(
         }
         MoverOutcome::Wedged { message } => {
             if phase != Some(&RestorePhase::Failed) {
+                // Live conditions base, like the three arms above: this write
+                // follows the SAME pass's launch-time condition patches (the
+                // #464 inherit heal, `SecurityContextInherited`, the
+                // `MoverPermitted` clear), and `restore_ready_status` rebuilds
+                // the whole array from its argument.
+                let Some(live) = io::live_conditions_source(api, name, restore).await else {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(120)));
+                };
                 io::patch_status(
                     api,
                     name,
                     restore_ready_status(
-                        restore,
+                        &live,
                         RestorePhase::Failed,
                         MOVER_POD_WEDGED_REASON,
                         &message,
@@ -3427,6 +3435,18 @@ async fn run_restore_mover(
         }
         Err(e) => return Err(e),
     };
+    // The hold's healing half (#464), the instant the resolve that parks it SUCCEEDS.
+    // Mirrors the Snapshot side, for the same reason and with the same safety argument:
+    // `doctor` (`first_gate`) returns on the FIRST registered `Fail` row of an append-only
+    // array, so a stale `SecurityContextResolved=False` written earliest outranks every
+    // later gate forever — including the readiness gate's `Held` arm, which parks
+    // non-terminally with no registered row of its own and returns long before the old heal
+    // site. Every conditions writer past this point seeds from a live re-read (the
+    // `MoverOutcome` arms, the inherit/compat reporters, the clears below, and the
+    // populator's `plan::fanout_status`), which is what makes the heal durable.
+    // `io::tests::the_inherit_heal_precedes_every_non_terminal_gate_it_could_shadow`
+    // pins the ordering half.
+    io::heal_inherit_source_missing(api, restore).await?;
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = restore.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
@@ -3498,11 +3518,10 @@ async fn run_restore_mover(
         };
         let msg =
             io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, namespace, sa);
-        let existing = restore
-            .status
-            .as_ref()
-            .map(|s| s.conditions.clone())
-            .unwrap_or_default();
+        // LIVE base: the #464 heal wrote this same array moments ago and a
+        // `conditions` patch REPLACES it, so the reconcile-start copy would
+        // resurrect the hold and `doctor` would name it instead of this refusal.
+        let existing = io::live_conditions(api, name, restore).await;
         let conditions = io::upsert_gate(
             &existing,
             &kopiur_api::gates::PRIVILEGED_MOVER_GATE,
@@ -3529,21 +3548,16 @@ async fn run_restore_mover(
         return Err(Error::BlockedOnGrant(msg));
     }
     // Permitted: clear any stale `MoverPermitted=False` from a prior reconcile.
-    if let Some(conds) = restore.status.as_ref().map(|s| s.conditions.as_slice())
-        && conds
-            .iter()
-            .any(|c| c.type_ == MOVER_PERMITTED_CONDITION && c.status != "True")
-    {
-        let conditions = io::upsert_condition(
-            conds,
-            MOVER_PERMITTED_CONDITION,
-            true,
-            "Permitted",
-            "the mover is permitted in this namespace",
-            restore.metadata.generation,
-        );
-        io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
-    }
+    // Live-based (see `io::clear_work_condition_if_stale`) — the #464 heal ran
+    // above and this patch replaces the array it wrote.
+    io::clear_work_condition_if_stale(
+        api,
+        restore,
+        MOVER_PERMITTED_CONDITION,
+        "Permitted",
+        "the mover is permitted in this namespace",
+    )
+    .await?;
 
     // A restore that falls back to its explicit context is NOT tracking the workload it named —
     // report it, exactly as a backup does.
@@ -3627,11 +3641,10 @@ async fn run_restore_mover(
     {
         Ok(c) => c,
         Err(Error::MissingDependency(msg)) => {
-            let existing = restore
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
+            // LIVE base: same reason as the privileged refusal above — a stale
+            // `SecurityContextResolved=False` resurrected at index 0 is the row
+            // `doctor` would report INSTEAD of the missing Secret.
+            let existing = io::live_conditions(api, name, restore).await;
             let conditions = io::upsert_gate(
                 &existing,
                 &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
@@ -3654,52 +3667,19 @@ async fn run_restore_mover(
             .inc_secrets_projected(namespace, creds.projected);
     }
     // Creds present (or projected): clear any stale `CredentialsAvailable=False`.
-    if let Some(conds) = restore.status.as_ref().map(|s| s.conditions.as_slice())
-        && conds
-            .iter()
-            .any(|c| c.type_ == CREDENTIALS_AVAILABLE_CONDITION && c.status != "True")
-    {
-        let (reason, note) = if creds.projected > 0 {
-            (
-                CREDENTIALS_PROJECTED_REASON,
-                "credential Secret(s) projected into the mover namespace",
-            )
-        } else {
-            (
-                "Available",
-                "credentials Secret(s) present in the mover namespace",
-            )
-        };
-        let conditions = io::upsert_condition(
-            conds,
-            CREDENTIALS_AVAILABLE_CONDITION,
-            true,
-            reason,
-            note,
-            restore.metadata.generation,
-        );
-        io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
-    }
-    // The hold's healing half (#464): a run that was parked on
-    // `SecurityContextResolved=False` is the SAME object that proceeds once the workload is
-    // back, so the gate must be cleared here or `doctor` keeps reporting "blocked … will wait
-    // forever" for the whole mover run — `doctor` suppresses a stale gate only on a TERMINAL
-    // phase, and this one parks at `Pending` and then runs. Writes nothing at all unless a
-    // hold is actually standing, so a run that was never held stays byte-identical.
-    //
-    // Placed HERE, past the "clear any stale MoverPermitted/CredentialsAvailable" blocks
-    // above rather than at the resolve site, because each of those still rebuilds
-    // `conditions` from the RECONCILE-START copy and a `conditions` patch REPLACES the array
-    // — a heal written before them would simply be erased. The runs this placement skips are
-    // the ones those gates refuse, and they carry their own registered `Fail` row, so
-    // `doctor` still reports them as blocked, which they are.
-    //
-    // Everything that can write `conditions` AFTER this point in the pass instead seeds from
-    // `io::live_conditions`, which is what makes the heal DURABLE: the direct path's
-    // `MoverOutcome` arms already did, and the populator's end-of-pass body now does too (see
-    // `plan::fanout_status`). Adding a later writer that seeds from the start-of-pass copy
-    // re-opens the bug.
-    io::heal_inherit_source_missing(api, restore).await?;
+    let (reason, note) = if creds.projected > 0 {
+        (
+            CREDENTIALS_PROJECTED_REASON,
+            "credential Secret(s) projected into the mover namespace",
+        )
+    } else {
+        (
+            "Available",
+            "credentials Secret(s) present in the mover namespace",
+        )
+    };
+    io::clear_work_condition_if_stale(api, restore, CREDENTIALS_AVAILABLE_CONDITION, reason, note)
+        .await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     let identity = MoverIdentity {

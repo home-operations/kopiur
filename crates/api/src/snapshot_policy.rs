@@ -1917,23 +1917,98 @@ suspend: true
         assert!(bare_json.get("errorHandling").is_none());
     }
 
-    #[test]
-    fn source_schema_carries_exactly_one_of_validation() {
-        // §15: the Source sub-object schema carries the exactly-one-of(pvc/
-        // pvcSelector/nfs) rule, surviving kube's structural-schema rewriter even as a
-        // list-item sub-object.
+    /// The `sources[]` item schema's operator-authored CEL rule, as the API server
+    /// will see it. Shared by both guards below.
+    fn source_cel_rule() -> String {
         let crd = SnapshotPolicy::crd();
         let json = serde_json::to_value(&crd).expect("serialize CRD");
         let source = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
             ["properties"]["sources"]["items"];
         let rules = source["x-kubernetes-validations"]
             .as_array()
-            .expect("sources.items.x-kubernetes-validations present");
-        assert!(rules.iter().any(|r| {
-            r["rule"]
-                .as_str()
-                .is_some_and(|s| s.contains("pvcSelector") && s.contains("nfs"))
-        }));
+            .expect("sources.items.x-kubernetes-validations present")
+            .clone();
+        rules
+            .iter()
+            .find_map(|r| r["rule"].as_str().map(str::to_string))
+            .expect("a CEL rule is present on sources.items")
+    }
+
+    #[test]
+    fn source_schema_carries_exactly_one_of_validation() {
+        // §15: the Source sub-object schema carries the exactly-one-of(pvc/
+        // pvcSelector/nfs/stream) rule, surviving kube's structural-schema rewriter even
+        // as a list-item sub-object.
+        let rule = source_cel_rule();
+        assert!(rule.contains("pvcSelector") && rule.contains("nfs"));
+        assert!(
+            rule.contains("== 1"),
+            "it must be an exactly-one-of: {rule}"
+        );
+    }
+
+    /// The `sources[]` CEL rule must name EVERY [`SourceShape`] variant.
+    ///
+    /// The mirror of `restore::cel_guard_tests::restore_target_cel_rule_lists_every_variant`,
+    /// and it exists for the same reason that one does. `source_shape` being an exhaustive
+    /// enum does NOT keep this rule in step: the rule lives in the generated schema and is
+    /// enforced by the API SERVER, before the webhook or any reconciler runs. A form added
+    /// to [`Source`] (hence to [`SourceShape`]) but missing from the rule compiles, passes
+    /// clippy, passes every other test, and `cargo xtask gen-all` regenerates the CRD with
+    /// the stale rule intact — `gen-all --check` only detects DRIFT, which a developer
+    /// clears by regenerating. The first evidence is `kubectl apply` failing in a real
+    /// cluster with a message naming only the old forms. That is exactly how `streamExec`
+    /// failed on the Restore side, and this side had no guard at all.
+    ///
+    /// It also catches the reverse edit: dropping `(has(self.stream) ? 1 : 0)` from a rule
+    /// this branch TOUCHED — a plausible merge-conflict resolution — makes every stream
+    /// policy unapplyable cluster-wide, and nothing else here would notice.
+    ///
+    /// Driving the expectation off `kind_str()` over a one-value-per-variant array means a
+    /// new variant fails to COMPILE here, with an instruction, rather than in a cluster.
+    #[test]
+    fn source_cel_rule_lists_every_variant() {
+        let stream = StreamSource {
+            file_name: "dump.sql".into(),
+            workload_exec: StreamExec {
+                pod_selector: Default::default(),
+                container: None,
+                command: vec!["true".into()],
+                timeout: None,
+            },
+        };
+        let pvc = PvcSource {
+            name: "data".into(),
+        };
+        let selector = PvcSelector {
+            namespace_selector: None,
+            label_selector: None,
+        };
+        let nfs = NfsVolume {
+            server: "nfs.example".into(),
+            path: "/export/data".into(),
+        };
+        // One value per variant, so adding a variant makes this array fail to compile
+        // and forces the author to extend it.
+        let all = [
+            SourceShape::Pvc(&pvc),
+            SourceShape::PvcSelector(&selector),
+            SourceShape::Nfs(&nfs),
+            SourceShape::Stream(&stream),
+        ];
+
+        let rule = source_cel_rule();
+        for shape in &all {
+            // `kind_str` is already the camelCase wire key for this struct.
+            let wire = shape.kind_str();
+            assert!(
+                rule.contains(&format!("has(self.{wire})")),
+                "the Source CEL rule does not mention `{wire}`, so the API SERVER will \
+                 REJECT that source form before the webhook ever sees it. Add \
+                 `(has(self.{wire}) ? 1 : 0)` to the rule (and its message) in \
+                 snapshot_policy.rs, then re-run `cargo xtask gen-all`.\nrule: {rule}"
+            );
+        }
     }
 
     #[test]

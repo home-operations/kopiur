@@ -93,6 +93,17 @@ impl EffectiveSource {
     /// `sourcePathOverride` wins. Otherwise a PVC yields `/pvc/<name>` or
     /// `/pvc/<namespace>/<name>` depending on the governing source's
     /// [`SourcePathStrategy`], and an NFS source yields its export path.
+    ///
+    /// The `pvc`-before-`stream` order is safe because the combination is
+    /// UNREPRESENTABLE, not because PVC is the better guess: a `Source` is
+    /// exactly-one-of, and [`effective_source_in`] refuses a PVC pin against a
+    /// source that is not PVC-shaped (see the comment there for what the divergence
+    /// used to cost). Every other constructor sets `stream: None` wherever it sets
+    /// `pvc`. Anything that starts building an `EffectiveSource` with both must
+    /// decide which path is authoritative FIRST — the two consumers
+    /// ([`identity_source_path`], which records the manifest, and
+    /// `snapshot::build`, which fills the work spec) do not read this function the
+    /// same way.
     pub fn kopia_source_path(&self, strategy: SourcePathStrategy) -> Option<String> {
         if let Some(o) = &self.source_path_override {
             return Some(o.clone());
@@ -175,7 +186,57 @@ pub fn effective_source_in(
     match pin.map(|p| &p.target) {
         // A fanned-out child names its own PVC; the policy source it came from
         // is a selector and has no `pvc` of its own.
-        Some(SnapshotSourceTarget::Pvc(t)) => Ok(common(Some(t.clone()))),
+        //
+        // The governing source must be PVC-SHAPED for that to mean anything, and the
+        // check is here rather than downstream so the bad state is unrepresentable:
+        // an `EffectiveSource` carrying BOTH a `pvc` target and a `stream` producer
+        // has two different kopia paths, and the two consumers pick different ones.
+        // `kopia_source_path` checks `pvc` first, so `identity_source_path` (hence the
+        // mover's `--override-source`, hence the RECORDED manifest) said `/pvc/data`,
+        // while `snapshot::build`'s stream arm derives `/stream/<fileName>` for the
+        // work spec — and verification and every `fromPolicy` restore look at the
+        // stream path, which no snapshot was ever written under. The quick verify then
+        // fails TERMINALLY on a policy whose snapshots are perfectly real.
+        //
+        // Nothing upstream rejects the input: `validate::snapshot` does not validate
+        // `Snapshot.spec.source` at all, and the webhook's pin refusals only fire for a
+        // selector policy MISSING a pin and for multi-repo membership. So a
+        // hand-written `spec.source: {sourceIndex: 0, target: {pvc: …}}` against a
+        // `stream` (or `nfs`) policy is admitted, and this is where it stops.
+        //
+        // Exhaustive over the wire form rather than an `is_some()` test, so a fifth
+        // source form must decide whether a PVC pin means anything for it before it
+        // compiles. A malformed source propagates its own error instead of silently
+        // accepting the pin.
+        Some(SnapshotSourceTarget::Pvc(t)) => match snapshot_policy::source_shape(source)? {
+            // Both PVC-shaped: a selector's fanned-out member (the ordinary case), and
+            // a plain `pvc:` source addressed by an explicit pin (the pre-existing
+            // one-shot shape, unchanged).
+            snapshot_policy::SourceShape::PvcSelector(_) | snapshot_policy::SourceShape::Pvc(_) => {
+                Ok(common(Some(t.clone())))
+            }
+            // A stream source's bytes come from a command's stdout and an NFS source's
+            // from an export; neither has a PVC to pin, and neither can be MOUNTED as
+            // the pinned claim either.
+            shape @ (snapshot_policy::SourceShape::Stream(_)
+            | snapshot_policy::SourceShape::Nfs(_)) => Err(ValidationError::InvalidFieldValue {
+                field: "spec.source.target.pvc".to_string(),
+                reason: format!(
+                    "`spec.source.target.pvc` pins PVC `{}/{}` onto SnapshotPolicy \
+                         `{policy_name}`'s sources[{index}], which is a `{}` source and has no \
+                         PVC to back up. A PVC pin belongs only to a `pvcSelector` fan-out \
+                         member or a plain `pvc:` source; pinning one here would record the \
+                         kopia manifest under a /pvc/… path while verification and every \
+                         fromPolicy restore look under the source's own path, so kopiur \
+                         refuses it. Fix: drop `spec.source` (the policy has a single \
+                         non-selector source, so it needs no pin), or point this Snapshot at \
+                         a policy whose sources[{index}] is PVC-shaped.",
+                    t.namespace,
+                    t.name,
+                    shape.kind_str(),
+                ),
+            }),
+        },
         None => Ok(common(source.pvc.as_ref().map(|p| PvcTargetRef {
             // A non-selector `pvc:` source is always same-namespace.
             namespace: policy_namespace.to_string(),
@@ -376,24 +437,45 @@ enum SourceShape<'a> {
     /// is perfectly VALID and reporting it as malformed would send a future
     /// reader hunting a spec bug that isn't there.
     Stream,
-    /// None of `pvc`/`pvcSelector`/`nfs`/`stream` is set. Admission forbids it; a
-    /// hand-patched object may carry it. Contributes nothing.
+    /// The source is not a singular, recognized wire form: none of
+    /// `pvc`/`pvcSelector`/`nfs`/`stream` is set, or several are — i.e. exactly the
+    /// cases [`snapshot_policy::source_shape`] reports as a
+    /// [`ValidationError`]. Admission (the CRD's own CEL rule AND the webhook)
+    /// forbids both; a hand-patched object, or one written against an older CRD
+    /// schema, may carry either.
+    ///
+    /// Contributes nothing to a derivation, and fails the derivation CLOSED when it is
+    /// the governing source — see [`restore_source_path`] step (3). Guessing which of
+    /// several set forms "wins" is how a malformed policy came to resolve a real path
+    /// holding ANOTHER volume's data.
     Invalid,
 }
 
 /// Classify one source. Pure and total.
+///
+/// **Driven off [`snapshot_policy::source_shape`], not off the raw `Option` fields.**
+/// That is what makes the two classifiers compile-coupled: a fifth wire form adds a
+/// [`snapshot_policy::SourceShape`] variant, this `match` stops being exhaustive, and
+/// the build fails until someone decides what the new form means for a restore. The
+/// old `match (&source.pvc, &source.nfs, &source.stream)` could not do that — a fifth
+/// `Source` FIELD simply folded into [`SourceShape::Invalid`], which
+/// [`restore_source_path`] then answered for by accident. (A hardcoded list in a test
+/// cannot close that gap either: the test's inputs would just never name the new form.)
+///
+/// A malformed source — no form set, or several — becomes [`SourceShape::Invalid`]
+/// rather than whichever field an ad-hoc precedence happened to check first.
 fn source_shape(source: &Source) -> SourceShape<'_> {
-    if source.pvc_selector.is_some() {
-        return SourceShape::Selector {
+    match snapshot_policy::source_shape(source) {
+        Ok(snapshot_policy::SourceShape::PvcSelector(_)) => SourceShape::Selector {
             strategy: strategy_for(source),
             source_path_override: source.source_path_override.as_deref(),
-        };
-    }
-    match (&source.pvc, &source.nfs, &source.stream) {
-        (Some(p), _, _) => SourceShape::Pvc { name: &p.name },
-        (None, Some(_), _) => SourceShape::Nfs,
-        (None, None, Some(_)) => SourceShape::Stream,
-        (None, None, None) => SourceShape::Invalid,
+        },
+        Ok(snapshot_policy::SourceShape::Pvc(p)) => SourceShape::Pvc { name: &p.name },
+        Ok(snapshot_policy::SourceShape::Nfs(_)) => SourceShape::Nfs,
+        Ok(snapshot_policy::SourceShape::Stream(_)) => SourceShape::Stream,
+        // Nothing set, or several set. Either way there is no honest answer, and
+        // `restore_source_path` step (3) fails closed rather than deriving from it.
+        Err(_) => SourceShape::Invalid,
     }
 }
 
@@ -547,6 +629,26 @@ pub fn restore_source_path(
         let Some(first) = policy.spec.sources.first() else {
             return Ok(RestoreSourcePath::PolicySource(None));
         };
+        // …but only when `sources[0]` is a source this build can classify. A
+        // MALFORMED governing source is the #451 failure mode reached from the
+        // other end: it is not a selector, so it lands here, and
+        // `effective_source` hands back an all-`None` source whose
+        // `kopia_source_path` is `None` — the PATHLESS identity `user@host:`,
+        // which kopia reads as a relative filesystem path and matches against
+        // EVERY member of the repository. A multi-set source (say `pvc` beside
+        // `pvcSelector`) was worse still under the old field-order precedence:
+        // it answered with `sources[0]`'s own `/pvc/<name>`, a real path holding
+        // another volume's data, under a green `Completed`. Fail closed instead.
+        //
+        // Deliberately scoped to the GOVERNING source, not to any source: a
+        // malformed sibling alongside a working selector is irrelevant to (4)'s
+        // derivation and must not break a restore that has an honest answer
+        // (`restore_path_ignores_nfs_and_malformed_siblings_of_a_selector`). And
+        // a ZERO-source legacy policy keeps its tolerance above — it has no
+        // source to be malformed.
+        if shapes.first() == Some(&SourceShape::Invalid) {
+            return Err(malformed_source_path(policy));
+        }
         let eff = effective_source(policy, None)?;
         return Ok(RestoreSourcePath::PolicySource(
             eff.kopia_source_path(strategy_for(first)),
@@ -597,6 +699,27 @@ pub fn restore_source_path(
         // (5) A shared `sourcePathOverride`, or (defensively) no selector at all
         // after the `has_selector` check.
         Some((_, Some(_))) | None => Err(ambiguous_source_path(policy)),
+    }
+}
+
+/// The fail-closed error for the malformed-governing-source case of
+/// [`restore_source_path`] step (3): the source does not set exactly one of the four
+/// forms, so no path can be derived from it — what / why / fix.
+fn malformed_source_path(policy: &SnapshotPolicy) -> ValidationError {
+    ValidationError::InvalidFieldValue {
+        field: "spec.source.fromPolicy.sourcePath".to_string(),
+        reason: format!(
+            "SnapshotPolicy `{}` has a source that does not set exactly one of \
+             pvc/pvcSelector/nfs/stream, so kopiur cannot tell which kopia source path its \
+             snapshots were written under. Deriving one anyway would either match every \
+             snapshot in the repository (an empty path) or name another volume's path, and \
+             either could fill this volume with the wrong data — so kopiur fails closed. \
+             Fix: repair the SnapshotPolicy's sources[] (admission normally rejects this \
+             shape; a hand-patched object or one written against an older CRD schema can \
+             carry it), or set source.fromPolicy.sourcePath explicitly to name the path to \
+             restore.",
+            policy.name_any()
+        ),
     }
 }
 
