@@ -688,6 +688,14 @@ async fn spawn_maintenance_job(
     // mover is hardened/gated exactly like backup/restore (and inherits moverDefaults,
     // closing the drift the ClusterRepository hardcoded-context bug caused).
     // No backup source PVC for maintenance — `pvcConsumer` is not valid here.
+    //
+    // A bare `?` on purpose (#464): an unresolvable live-pod `workloadSelector` now returns
+    // `Error::InheritSourceMissing`, so maintenance deliberately inherits its Structural
+    // cadence (300s, up from the old Transient 30s) and its selector-naming message, but NOT
+    // the `SecurityContextResolved` gate condition — that gate's scope is
+    // `GateScope::SnapshotOrRestore`, and broadening the registry to a third kind was judged
+    // not worth it for a mover that reads no user data. The Warning Event still names the
+    // selector, so the hold is not silent.
     let (effective_sc, effective_pod_sc) = io::resolve_mover_security_contexts(
         &ctx.client,
         namespace,

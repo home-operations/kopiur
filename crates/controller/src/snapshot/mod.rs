@@ -1511,6 +1511,21 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         );
         io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
     }
+    // The hold's healing half (#464): a run that was parked on
+    // `SecurityContextResolved=False` is the SAME object that proceeds once the workload is
+    // back, so the gate must be cleared here or `doctor` keeps reporting "blocked … will wait
+    // forever" for the whole mover run — `doctor` suppresses a stale gate only on a TERMINAL
+    // phase, and this one parks at `Pending` and then runs. Writes nothing at all unless a
+    // hold is actually standing, so a run that was never held stays byte-identical.
+    //
+    // Placed HERE, past the "clear any stale MoverPermitted/CredentialsAvailable" blocks
+    // above rather than at the resolve site, for the reason those blocks force: each rebuilds
+    // `conditions` from the RECONCILE-START copy, so a condition written before them is
+    // erased and then re-written next pass, forever (the same hazard documented at
+    // `report_restore_inherit_fallback`). The runs this placement skips are the ones those
+    // gates refuse — and they carry their own registered `Fail` row, so `doctor` still
+    // reports them as blocked, which they are.
+    io::heal_inherit_source_missing(&api, backup).await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     // ADR §4.8: beforeSnapshot hooks (quiesce/flush) run to completion BEFORE the

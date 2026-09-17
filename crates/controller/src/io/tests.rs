@@ -3417,6 +3417,11 @@ fn inherit_source_missing_message_is_exactly_this_text() {
     // Pinned verbatim, not by substring: this string IS the user-facing artifact (the
     // condition message and the Warning Event note), and the reporter's ask in #464 was
     // specifically that it NAME the selector that matched nothing.
+    //
+    // It is also pinned SHORT. The first cut restated all three remediation levers that the
+    // resolver cause already carries, twice over at ~1050 characters — poor signal for a
+    // `kubectl describe` at 3am. The cause owns the levers; the wrapper owns the framing and
+    // the park contract.
     let msg = inherit_source_missing_message(
         "workloadSelector `app=postgres,tier=db`",
         "no pod matches mover.inheritSecurityContextFrom (`app=postgres,tier=db`) in namespace \
@@ -3426,14 +3431,10 @@ fn inherit_source_missing_message_is_exactly_this_text() {
         msg,
         "mover.inheritSecurityContextFrom (workloadSelector `app=postgres,tier=db`) resolved no \
          securityContext to inherit, and this recipe pins no fallback identity — so the run is \
-         HELD instead of running as the wrong UID. Cause: no pod matches \
-         mover.inheritSecurityContextFrom (`app=postgres,tier=db`) in namespace `billing`. Fix, \
-         whichever fits: bring the workload back up (inheriting reads a LIVE pod, so a workload \
-         scaled to zero has no identity to copy); correct the selector so it matches the \
-         workload; or set mover.securityContext.runAsUser to the UID the data expects — an \
-         explicit context that pins an identity becomes the deliberate fallback and the run \
-         proceeds on it. The run stays `Pending` and re-checks every few minutes; it starts by \
-         itself once one of those is true."
+         HELD rather than run as the wrong UID. no pod matches \
+         mover.inheritSecurityContextFrom (`app=postgres,tier=db`) in namespace `billing`. The \
+         run stays `Pending` and re-checks every few minutes; it starts by itself once that is \
+         fixed, with no re-apply."
     );
     // Byte-stable across renders: the message rides a 300s requeue, so a volatile byte would
     // re-write status every pass, wake the primary watch and hot-loop the reconciler.
@@ -3445,33 +3446,118 @@ fn inherit_source_missing_message_is_exactly_this_text() {
              namespace `billing`."
         )
     );
+    // …and no lever is stated twice. The cause here names all three; the wrapper adds none.
+    assert_eq!(
+        msg.matches("mover.securityContext.runAsUser").count(),
+        0,
+        "the wrapper must not restate a lever the cause owns: {msg}"
+    );
+}
+
+#[test]
+fn the_hold_message_never_runs_a_cause_into_the_next_sentence() {
+    // Two resolver causes do NOT end in punctuation — the empty-selector one ends
+    // `(UID/GID match)` and the missing-container one ends in a backticked field name — and
+    // both used to run straight on into the wrapper's next sentence.
+    let pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
+    let unpunctuated = [
+        inherited_security_context_from_pods(&[pod], Some("nope"), "billing", "app=x")
+            .unwrap_err()
+            .to_string(),
+        "mover.inheritSecurityContextFrom.podSelector is empty in namespace `billing` — set \
+         matchLabels/matchExpressions identifying the workload pod whose securityContext the \
+         mover should inherit (UID/GID match)"
+            .to_string(),
+    ];
+    for cause in &unpunctuated {
+        assert!(
+            !cause.trim_end().ends_with('.'),
+            "fixture must be unpunctuated or this test proves nothing: {cause}"
+        );
+        let msg = inherit_source_missing_message("workloadSelector `app=x`", cause);
+        assert!(
+            msg.contains(". The run stays `Pending`"),
+            "the cause must be terminated before the park contract: {msg}"
+        );
+    }
+    // An already-punctuated cause is not double-punctuated.
+    let msg = inherit_source_missing_message("workloadSelector `app=x`", "no pod matches.");
+    assert!(!msg.contains(".."), "{msg}");
+
+    // The empty-`podSelector` case must LEAD with the selector fix, not with "scale the
+    // workload up" — the workload is fine there, only the selector is empty. That ordering is
+    // now the resolver cause's, which is why the wrapper adds no levers of its own.
+    let empty = &unpunctuated[1];
+    let msg = inherit_source_missing_message("workloadSelector with an EMPTY podSelector", empty);
+    let fix_at = msg.find("set matchLabels").expect("selector fix is named");
+    assert!(
+        !msg[..fix_at].contains("workload back up") && !msg[..fix_at].contains("Scale it up"),
+        "nothing may suggest scaling before the selector fix here: {msg}"
+    );
 }
 
 #[test]
 fn the_hold_message_carries_the_resolver_cause_for_every_unresolvable_shape() {
     // The three cases that reach the hold — no pod matched, the named container is absent, the
     // pod sets no context at all — each contribute their OWN resolver sentence, so the held
-    // object explains which of the three it is rather than a single generic phrasing.
+    // object explains which of the three it is rather than a single generic phrasing. And
+    // since the wrapper no longer restates any lever, the cause is now the ONLY place the fix
+    // comes from: each case must carry one.
     let pod = pod_with(Some("Running"), &[("app", Some(1000))], None);
     let bare = pod_with(Some("Running"), &[("app", None)], None);
-    let causes = [
-        inherited_security_context_from_pods(&[], Some("app"), "billing", "app=x").unwrap_err(),
-        inherited_security_context_from_pods(&[pod], Some("nope"), "billing", "app=x").unwrap_err(),
-        inherited_security_context_from_pods(&[bare], Some("app"), "billing", "app=x").unwrap_err(),
+    // The inner String, exactly as `resolve_mover_security_contexts` destructures it — not
+    // `Error::to_string()`, which prefixes "missing dependency: " that never reaches the user.
+    let reason = |e: crate::error::Error| match e {
+        crate::error::Error::MissingDependency(m) => m,
+        other => panic!("expected MissingDependency, got {other}"),
+    };
+    let cases = [
+        (
+            reason(
+                inherited_security_context_from_pods(&[], Some("app"), "billing", "app=x")
+                    .unwrap_err(),
+            ),
+            "no pod matches",
+            "mover.securityContext.runAsUser",
+        ),
+        (
+            reason(
+                inherited_security_context_from_pods(&[pod], Some("nope"), "billing", "app=x")
+                    .unwrap_err(),
+            ),
+            "no container `nope`",
+            "inheritSecurityContextFrom.container",
+        ),
+        (
+            reason(
+                inherited_security_context_from_pods(&[bare], Some("app"), "billing", "app=x")
+                    .unwrap_err(),
+            ),
+            "sets no securityContext",
+            "mover.securityContext.runAsUser",
+        ),
     ];
-    for cause in causes {
-        let msg = inherit_source_missing_message("workloadSelector `app=x`", &cause.to_string());
+    for (cause, diagnosis, fix) in &cases {
+        let msg = inherit_source_missing_message("workloadSelector `app=x`", cause);
         assert!(msg.contains("app=x"), "the selector must be named: {msg}");
         assert!(msg.contains("HELD"), "the run is held, say so: {msg}");
         assert!(
-            msg.contains("mover.securityContext.runAsUser"),
-            "the fallback lever must be offered: {msg}"
+            msg.contains("re-checks every few minutes"),
+            "the park/re-check contract is the wrapper's job: {msg}"
         );
-        // The resolver's own diagnosis survives into the held object's message.
         assert!(
-            msg.contains(cause.to_string().split(" — ").next().unwrap()),
-            "the cause must be quoted, not paraphrased: {msg}"
+            msg.contains(diagnosis),
+            "the cause's own diagnosis must survive verbatim: {msg}"
         );
+        assert!(
+            msg.contains(fix),
+            "with the wrapper silent on levers, the cause must carry the fix: {msg}"
+        );
+        // Bounded: the whole point of the trim. The first cut was ~1050 characters with every
+        // lever said twice; the ceiling here is the wrapper's ~310 characters of framing plus
+        // the longest single resolver cause, with no duplication left to remove. A regression
+        // that re-adds a restated lever pushes past this.
+        assert!(msg.len() <= 800, "{} chars is too long: {msg}", msg.len());
     }
 }
 
@@ -3585,6 +3671,100 @@ fn conditions_from_status_preserves_the_healthy_conditions_beside_a_malformed_on
         kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON
     );
     assert_eq!(after[2].status, "False");
+}
+
+#[test]
+fn inherit_source_heal_conditions_clears_a_standing_hold_in_place() {
+    // Important-1. The object that was PARKED is the object that then runs, and `doctor`
+    // suppresses a stale gate only for a TERMINAL phase — so a `Running` Snapshot still
+    // carrying `SecurityContextResolved=False` is reported as "blocked … it will wait forever",
+    // which is the inverse of the false diagnosis this condition exists to prevent, in the
+    // same tool. The heal is what makes that impossible.
+    let ready = upsert_condition(&[], "Ready", false, "Pending", "waiting", Some(3));
+    let held = upsert_gate(
+        &ready,
+        &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+        "held: the workload is scaled to zero",
+        Some(3),
+    );
+    let healed = inherit_source_heal_conditions(&held, Some(3)).expect("a standing hold heals");
+    // ORDER-STABLE upsert: the gate is replaced IN PLACE, and the unrelated condition beside
+    // it survives untouched. An append-at-the-end heal would reorder the array on every
+    // alternating write and hot-loop the primary watch.
+    assert_eq!(healed.len(), 2);
+    assert_eq!(healed[0].type_, "Ready");
+    assert_eq!(
+        healed[1].type_,
+        kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION
+    );
+    assert_eq!(healed[1].status, "True");
+    assert_eq!(
+        healed[1].reason,
+        kopiur_api::consts::INHERIT_SOURCE_RESOLVED_REASON
+    );
+
+    // The healed `True` must be invisible to the gate registry — neither a match nor a
+    // reason-agnostic trip — or `doctor` would read it as an unregistered gate from a newer
+    // operator and hand the user an upgrade-your-plugin diagnosis for a healthy run.
+    for g in kopiur_api::gates::STRUCTURAL_GATES {
+        assert!(
+            !g.matches(&healed[1].type_, &healed[1].status, &healed[1].reason),
+            "{g:?} must not match the healed True"
+        );
+        assert!(
+            !g.trips(&healed[1].type_, &healed[1].status),
+            "{g:?} must not trip on the healed True"
+        );
+    }
+}
+
+#[test]
+fn inherit_source_heal_conditions_writes_nothing_when_no_hold_is_standing() {
+    // The guard that keeps the heal off the hot-loop: a run that was never held (the
+    // overwhelming majority) must produce NO patch at all, so its status stays byte-identical
+    // to a build without the gate. Same contract as `snapshot::slot_heal_conditions`.
+    assert!(inherit_source_heal_conditions(&[], Some(1)).is_none());
+
+    let unrelated = upsert_gate(
+        &[],
+        &kopiur_api::gates::PRIVILEGED_MOVER_GATE,
+        "not this gate",
+        Some(1),
+    );
+    assert!(inherit_source_heal_conditions(&unrelated, Some(1)).is_none());
+
+    // Already healed: idempotent, so the second reconcile writes nothing.
+    let healed = inherit_source_heal_conditions(
+        &upsert_gate(
+            &[],
+            &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+            "held",
+            Some(1),
+        ),
+        Some(1),
+    )
+    .expect("first heal writes");
+    assert!(
+        inherit_source_heal_conditions(&healed, Some(1)).is_none(),
+        "the heal must be idempotent or it re-patches every reconcile"
+    );
+}
+
+#[test]
+fn inherit_source_heal_also_clears_an_unknown_status_hold() {
+    // The guard is `status != "True"`, not `status == "False"`: a tri-state or newer-operator
+    // `Unknown` on this condition is still a non-healthy standing value that must be cleared
+    // once resolution succeeds, exactly like the `MoverPermitted` heal it copies.
+    let unknown = upsert_condition_status(
+        &[],
+        kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
+        "Unknown",
+        "SomeFutureReason",
+        "cannot tell",
+        Some(2),
+    );
+    let healed = inherit_source_heal_conditions(&unknown, Some(2)).expect("Unknown heals too");
+    assert_eq!(healed[0].status, "True");
 }
 
 #[test]
@@ -4229,8 +4409,11 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
     // io::upsert_gate(&INHERIT_SOURCE_MISSING_GATE, ...)) from two call sites:
     // `snapshot::reconcile_inner`'s and `restore::run_restore_mover`'s
     // `Error::InheritSourceMissing` arms around `resolve_mover_security_contexts`.
-    // Never cleared in place — the run either proceeds (and the gate was never
-    // written) or stays parked until the workload/selector/explicit UID changes.
+    // A BOTH-polarity writer: the same two reconcilers clear it to `True`
+    // (`io::heal_inherit_source_missing`, reason `InheritSourceResolved`) once
+    // resolution succeeds, because the object that was parked is the object that
+    // then goes `Running` — and `doctor` suppresses a stale gate only on a
+    // TERMINAL phase. Pinned by `inherit_source_heal_conditions_*`.
     (
         kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
         false,

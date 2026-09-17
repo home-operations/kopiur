@@ -1093,28 +1093,45 @@ pub(crate) fn live_inherit_source_label(
 }
 
 /// The condition/Event message for the `SecurityContextResolved=False` hold (#464): what
-/// happened, why the run is HELD rather than proceeding, and the three levers that clear it.
+/// happened, why the run is HELD rather than proceeding, and how long it will wait.
 ///
 /// `source` is [`live_inherit_source_label`]'s rendering, so the selector that matched
 /// nothing is always named — the reporter's point in #464 was that a warning naming the
-/// selector is worth more than any override. `cause` is the resolver's own actionable
-/// sentence (which pod, which container, which namespace), quoted verbatim rather than
-/// paraphrased.
+/// selector is worth more than any override.
+///
+/// **The REMEDIATION is `cause`'s job, not this wrapper's.** `cause` is the resolver's own
+/// actionable sentence, and those sentences already name the levers that apply to the case
+/// they diagnose — and they must keep doing so, because the same strings are the
+/// `MissingDependency` text on the *fallback* path, where no wrapper runs. Restating them
+/// here produced a ~1050-character message that said each lever twice, two of them nearly
+/// verbatim, and offered "bring the workload back up" for an empty `podSelector`, where the
+/// workload is fine. One owner: the cause. This wrapper contributes framing (what resolved
+/// nothing, why that HOLDS rather than proceeding) and the park/re-check contract.
 ///
 /// Pure and byte-stable: it rides a 300s requeue, so a volatile byte here would re-write
 /// status on every pass, wake the primary watch and hot-loop the reconciler.
 pub fn inherit_source_missing_message(source: &str, cause: &str) -> String {
     format!(
         "mover.inheritSecurityContextFrom ({source}) resolved no securityContext to inherit, \
-         and this recipe pins no fallback identity — so the run is HELD instead of running as \
-         the wrong UID. Cause: {cause} Fix, whichever fits: bring the workload back up \
-         (inheriting reads a LIVE pod, so a workload scaled to zero has no identity to copy); \
-         correct the selector so it matches the workload; or set \
-         mover.securityContext.runAsUser to the UID the data expects — an explicit context \
-         that pins an identity becomes the deliberate fallback and the run proceeds on it. The \
-         run stays `Pending` and re-checks every few minutes; it starts by itself once one of \
-         those is true."
+         and this recipe pins no fallback identity — so the run is HELD rather than run as the \
+         wrong UID. {} The run stays `Pending` and re-checks every few minutes; it starts by \
+         itself once that is fixed, with no re-apply.",
+        end_sentence(cause)
     )
+}
+
+/// `text` with a terminating `.` added when it does not already end in sentence punctuation.
+///
+/// The resolver causes are not uniform: two end in a full stop, but the empty-selector one
+/// ends `(UID/GID match)` and the missing-container one ends in a backticked field name. Both
+/// ran on into the next sentence of the composed hold message.
+fn end_sentence(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.ends_with(['.', '!', '?', ':']) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
 }
 
 /// The `status.conditions` array of a SERIALIZED custom resource, as typed conditions.
@@ -1200,6 +1217,77 @@ where
         )
         .await;
     }
+    Ok(())
+}
+
+/// The conditions array that CLEARS a standing `SecurityContextResolved=False`, or `None` when
+/// no hold is standing (so the caller writes nothing at all and the status stays byte-identical
+/// to a run that was never held — the property that keeps this off the hot-loop).
+///
+/// Pure, so the guard is unit-tested directly. Same shape as
+/// [`crate::snapshot::slot_heal_conditions`], which heals the pool gate for the same reason.
+///
+/// Healing is not cosmetic. `kubectl kopiur doctor` suppresses a stale gate only for a
+/// TERMINAL phase, and the hold parks at `Pending` — so the very Snapshot that was held is the
+/// one that later goes `Running`, and without this it would carry `SecurityContextResolved=
+/// False` for the whole mover run (minutes on a small PVC, hours on a large first backup) while
+/// `doctor` insisted it was "blocked … it will wait forever however new it is". That is the
+/// exact inverse of the false diagnosis this condition was introduced to avoid, in the same
+/// tool.
+pub(crate) fn inherit_source_heal_conditions(
+    existing: &[Condition],
+    generation: Option<i64>,
+) -> Option<Vec<Condition>> {
+    let held = existing.iter().any(|c| {
+        c.type_ == kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION && c.status != "True"
+    });
+    if !held {
+        return None;
+    }
+    Some(super::upsert_condition(
+        existing,
+        kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
+        true,
+        kopiur_api::consts::INHERIT_SOURCE_RESOLVED_REASON,
+        "the mover securityContext resolved; the inherit hold has cleared",
+        generation,
+    ))
+}
+
+/// Clear a standing `SecurityContextResolved=False` on a `Snapshot`/`Restore` that has now
+/// resolved its mover securityContext — the healing half of
+/// [`park_on_inherit_source_missing`], which makes that row a BOTH-polarity gate writer.
+///
+/// Generic over the two work kinds, like the park. Reads the LIVE conditions rather than the
+/// reconcile-start copy: the caller is never the first conditions writer of its reconcile
+/// (the privileged-mover and credentials clears run around it), and a `conditions` patch
+/// REPLACES the array.
+///
+/// Writes NOTHING when no hold is standing ([`inherit_source_heal_conditions`] returns `None`),
+/// which is the overwhelmingly common case — so the heal costs one cached read and cannot churn
+/// `resourceVersion` on a healthy run.
+pub async fn heal_inherit_source_missing<K>(api: &Api<K>, obj: &K) -> Result<()>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+{
+    let name = obj.name_any();
+    let Some(live) = super::live_conditions_source(api, &name, obj).await else {
+        return Ok(()); // deleted mid-reconcile
+    };
+    let status = serde_json::to_value(&live)
+        .ok()
+        .and_then(|v| v.get("status").cloned());
+    let Some(conditions) = inherit_source_heal_conditions(
+        &conditions_from_status(status.as_ref()),
+        obj.meta().generation,
+    ) else {
+        return Ok(());
+    };
+    super::patch_status(api, &name, serde_json::json!({ "conditions": conditions })).await?;
     Ok(())
 }
 

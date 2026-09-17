@@ -497,6 +497,19 @@ pub const SECURITY_CONTEXT_RESOLVED_CONDITION: &str = "SecurityContextResolved";
 /// workload comes up, the selector is corrected, or an explicit
 /// `mover.securityContext.runAsUser` is set.
 pub const INHERIT_SOURCE_MISSING_REASON: &str = "InheritSourceMissing";
+/// `reason` for [`SECURITY_CONTEXT_RESOLVED_CONDITION`] = `True`: the hold above
+/// has CLEARED — the workload came back, the selector was corrected, or an
+/// explicit `runAsUser` was pinned — and the run is proceeding.
+///
+/// Written only when a non-`True` condition is already standing, so a run that
+/// was never held stays byte-identical and cannot hot-loop. Healing matters as
+/// much as holding: `kubectl kopiur doctor` suppresses a stale gate only on a
+/// TERMINAL phase, so a `Running` Snapshot still carrying the `False` would be
+/// reported as "blocked … will wait forever" for the whole mover run — the exact
+/// inverse of the false diagnosis this condition exists to prevent.
+/// [`crate::gates::StructuralGate::trips`] requires the blocked status, so a
+/// `True` matches no row and can never be read as an unregistered trip.
+pub const INHERIT_SOURCE_RESOLVED_REASON: &str = "InheritSourceResolved";
 
 /// Condition recording whether this run holds a slot in its repository's
 /// mover-Job pool (`spec.concurrency.maxConcurrentJobs`). `False` with

@@ -284,7 +284,8 @@ There are two different questions, and they get two different conditions. `Secur
 
 | `status` / `reason` | What happened | What to do |
 | --- | --- | --- |
-| `False` / `InheritSourceMissing` | A live-pod inherit resolved **nothing** — no pod matched the selector, the named container is absent, or the matched pod sets neither a container nor a pod-level `securityContext` — and the recipe pins no fallback `runAsUser`. The run is parked at `phase: Pending` and re-checked every few minutes. The message **names the selector** (or the source PVC) that found nothing. | Bring the workload back up, correct the selector, or set `mover.securityContext.runAsUser`. The run starts by itself once one of those is true; no re-apply. |
+| `False` / `InheritSourceMissing` | A live-pod inherit resolved **nothing** — no pod matched the selector, the named container is absent, or the matched pod sets neither a container nor a pod-level `securityContext` — and the recipe pins no fallback `runAsUser`. The run is parked at `phase: Pending` and re-checked every few minutes. The message **names the selector** (or the source PVC) that found nothing, and quotes the resolver's own diagnosis and fix. | Bring the workload back up, correct the selector, or set `mover.securityContext.runAsUser`. The run starts by itself once one of those is true; no re-apply. |
+| `True` / `InheritSourceResolved` | A previously-held run resolved its mover identity and is proceeding. | Nothing. |
 
 ```console
 $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextResolved")]}'
@@ -293,6 +294,8 @@ $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="Sec
 ```
 
 Holding is deliberate: a backup taken as the wrong UID is worse than a backup that did not run. This is a **registered structural gate**, so [`kubectl kopiur doctor`](cli/operations.md) reports it as a blocked run rather than passing a cluster whose backups are quietly parked. One Warning Event fires per transition, not per reconcile.
+
+The condition is **written only when the answer is no, and cleared when it becomes yes**. A run that was never held never carries it at all, and a held run that recovers flips to `True` / `InheritSourceResolved` before its mover Job starts — otherwise `doctor`, which forgives a stale gate only on a *terminal* phase, would keep calling a `Running` backup blocked for the whole run.
 
 The restore-only `inheritSecurityContextFrom.snapshot` mode has its own hold, reported on `SecurityContextInherited` as `MissingRecordedIdentity` — see [`snapshot` — inherit the backup's recorded identity](#snapshot--inherit-the-backups-recorded-identity-restore).
 
