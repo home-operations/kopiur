@@ -617,11 +617,23 @@ async fn run_operation(
                     let mut failure: Option<String> = None;
                     let res = client
                         .snapshot_create_stdin_outcome_with(
-                            &op.source_path,
-                            &producer.file_name,
-                            &op.tags,
-                            Some(&override_source),
-                            &op.create_options(),
+                            kopiur_kopia::StdinSnapshot {
+                                source_path: &op.source_path,
+                                stdin_file: &producer.file_name,
+                                tags: &op.tags,
+                                override_source: Some(&override_source),
+                                opts: &op.create_options(),
+                                // Bound kopia's FINALIZE phase (after stdin
+                                // closes), which no existing timeout owned: the
+                                // producer phase is already bounded inside
+                                // `feed_from_pod` by `workloadExec.timeout`.
+                                // Without this the mover Job could hang forever on
+                                // a kopia wedged writing a manifest (#451).
+                                finalize_timeout: Some(
+                                    std::time::Duration::from_secs(producer.timeout_seconds)
+                                        + kopiur_kopia::STDIN_FINALIZE_GRACE,
+                                ),
+                            },
                             async |stdin: &mut tokio::process::ChildStdin| {
                                 Ok(kopiur_mover::stream::feed_from_pod(
                                     &kube_client,

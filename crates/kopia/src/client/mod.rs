@@ -1068,6 +1068,24 @@ pub struct KopiaClient {
     default_timeout: Option<Duration>,
 }
 
+/// Fallback budget for kopia's finalize step after a stdin-fed snapshot's writer
+/// closes, when neither the caller nor the client supplies one.
+///
+/// Generous on purpose — at EOF a `--stdin-file` snapshot has already streamed
+/// almost all of its content blobs, so the remaining work is the last blob plus
+/// the manifest, and a slow object store can still make that take minutes. The
+/// value is not a performance knob; it is the difference between "this run fails
+/// with a Timeout" and "this mover Job never ends".
+pub const DEFAULT_STDIN_FINALIZE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Grace a caller should add on top of a producer's own timeout when asking
+/// [`KopiaClient::snapshot_create_stdin_outcome_with`] to bound kopia's finalize.
+///
+/// The producer phase is already bounded by the work spec's
+/// `workloadExec.timeout`; this covers the phase AFTER it, which no existing
+/// timeout owned.
+pub const STDIN_FINALIZE_GRACE: Duration = Duration::from_secs(600);
+
 /// SIGKILL a timed-out kopia child AND reap it before returning
 /// (`Child::kill()` = `start_kill` + `wait`). Without the wait the killed
 /// child lingers as a zombie until tokio's SIGCHLD-driven orphan reaper gets
@@ -1092,12 +1110,50 @@ async fn kill_and_reap(child: &mut tokio::process::Child) {
 /// which one it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdinOutcome {
-    /// The producer finished successfully and has closed the writer. Let kopia see
-    /// EOF, finalize the snapshot, and exit.
-    Commit,
+    /// The producer finished successfully, having written `bytes` to the writer.
+    /// Let kopia see EOF, finalize the snapshot, and exit.
+    ///
+    /// The count is not telemetry: `bytes == 0` is treated as a FAILURE by the
+    /// runner (see [`KopiaError::StdinProducerWroteNothing`]). Carrying it here
+    /// rather than leaving each producer to check for itself keeps that decision
+    /// in one place, which is the same reason this is an enum and not a `bool`.
+    Commit {
+        /// Bytes the producer moved into kopia's stdin.
+        bytes: u64,
+    },
     /// The producer did not finish successfully. Kill kopia with stdin still open so
     /// it never writes a manifest — no partial snapshot is left behind.
     Abort,
+}
+
+/// Everything a stdin-fed snapshot needs except the producer itself.
+///
+/// A named struct rather than six positional parameters, for one specific
+/// reason beyond the argument count: `source_path` and `stdin_file` are both
+/// `&str` and are trivially transposable at a call site. Swapping them would
+/// record the snapshot under the FILE name as its kopia source path — a silent
+/// identity change, which orphans the whole history for that source and is
+/// exactly the class of mistake this repo builds types to prevent.
+#[derive(Debug, Clone)]
+pub struct StdinSnapshot<'a> {
+    /// The VIRTUAL root kopia records the artifact under, e.g.
+    /// `/stream/postgres.sql`. Nothing is read from the pod's filesystem.
+    pub source_path: &'a str,
+    /// The single virtual file name stored inside that root, e.g.
+    /// `postgres.sql`. Becomes kopia's `--stdin-file`.
+    pub stdin_file: &'a str,
+    /// Tags to stamp on the manifest.
+    pub tags: &'a BTreeMap<String, String>,
+    /// `username@hostname:path` identity to record, overriding the mover pod's
+    /// ambient user/host.
+    pub override_source: Option<&'a str>,
+    /// `snapshot create` argv options.
+    pub opts: &'a SnapshotCreateOptions,
+    /// How long kopia may take to FINALIZE after the writer closes. `None` falls
+    /// back to the client's `default_timeout`, then
+    /// [`DEFAULT_STDIN_FINALIZE_TIMEOUT`] — never unbounded. Callers derive it
+    /// from the producer's own timeout plus [`STDIN_FINALIZE_GRACE`].
+    pub finalize_timeout: Option<Duration>,
 }
 
 struct RawOutput {
@@ -1179,6 +1235,61 @@ impl KopiaClient {
         cmd
     }
 
+    /// Spawn `cmd`, retrying the transient fork/exec errnos.
+    ///
+    /// ETXTBSY (26) and EAGAIN (11) are not "the binary is wrong" failures —
+    /// they are races: ETXTBSY appears when another thread in a multithreaded
+    /// process forks-for-exec while the target file still has a writable fd open
+    /// elsewhere (the classic fork/exec race), and EAGAIN appears under fork
+    /// pressure on a busy node. A real bad-binary error (ENOENT, EACCES) is
+    /// returned immediately. Retries are quick and capped.
+    ///
+    /// Shared by EVERY runner. The stdin and raw-streaming runners each carried
+    /// their own copy (or, in the stdin runner's case, no retry at all), which is
+    /// exactly the kind of divergence that shows up as a rare parallel-test flake
+    /// on one machine and nowhere else.
+    async fn spawn_with_retry(
+        &self,
+        cmd: &mut Command,
+    ) -> Result<tokio::process::Child, KopiaError> {
+        let mut attempt = 0u32;
+        loop {
+            match cmd.spawn() {
+                Ok(c) => return Ok(c),
+                Err(e) if matches!(e.raw_os_error(), Some(26) | Some(11)) && attempt < 10 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(source) => {
+                    return Err(KopiaError::Spawn {
+                        binary: self.binary.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+    }
+
+    /// How long kopia gets to finalize after a stdin-fed snapshot's writer closes.
+    ///
+    /// `requested` (the caller's budget, derived from the producer's own timeout)
+    /// wins; then this client's [`default_timeout`](Self::default_timeout); then
+    /// [`DEFAULT_STDIN_FINALIZE_TIMEOUT`]. Never unbounded: the point is that a
+    /// kopia wedged writing a manifest cannot pin the mover Job forever.
+    fn finalize_budget(&self, requested: Option<Duration>) -> Duration {
+        requested
+            .or(self.default_timeout)
+            .unwrap_or(DEFAULT_STDIN_FINALIZE_TIMEOUT)
+    }
+
+    /// Test-only accessor for [`Self::finalize_budget`] — the budget is the
+    /// difference between "this run fails with a Timeout" and "this mover Job
+    /// never ends", so it is asserted directly rather than inferred.
+    #[cfg(test)]
+    pub(crate) fn finalize_budget_for_test(&self, requested: Option<Duration>) -> Duration {
+        self.finalize_budget(requested)
+    }
+
     async fn run_with_env(
         &self,
         args: &[String],
@@ -1197,31 +1308,7 @@ impl KopiaClient {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        // Spawn with a bounded retry on transient errnos. ETXTBSY (26) and
-        // EAGAIN (11) are not "the binary is wrong" failures — they're transient
-        // races: ETXTBSY appears when another thread in a multithreaded process
-        // forks-for-exec while the target file still has a writable fd open
-        // elsewhere (the classic fork/exec race), and EAGAIN appears under fork
-        // pressure on a busy node. A real bad-binary error (ENOENT, EACCES) is
-        // returned immediately. Retries are quick and capped.
-        let mut child = {
-            let mut attempt = 0u32;
-            loop {
-                match cmd.spawn() {
-                    Ok(c) => break c,
-                    Err(e) if matches!(e.raw_os_error(), Some(26) | Some(11)) && attempt < 10 => {
-                        attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                    Err(source) => {
-                        return Err(KopiaError::Spawn {
-                            binary: self.binary.display().to_string(),
-                            source,
-                        });
-                    }
-                }
-            }
-        };
+        let mut child = self.spawn_with_retry(&mut cmd).await?;
 
         // Take the pipes so we can read both concurrently without deadlocking
         // on a full pipe buffer.
@@ -1329,18 +1416,21 @@ impl KopiaClient {
     ///
     /// stdout/stderr are captured as usual. `feed`'s own error is returned verbatim,
     /// after the child has been killed and reaped.
-    async fn run_with_stdin<F>(&self, args: &[String], feed: F) -> Result<RawOutput, KopiaError>
+    async fn run_with_stdin<F>(
+        &self,
+        args: &[String],
+        finalize_timeout: Option<Duration>,
+        feed: F,
+    ) -> Result<RawOutput, KopiaError>
     where
         F: AsyncFnOnce(&mut tokio::process::ChildStdin) -> Result<StdinOutcome, KopiaError>,
     {
+        let display_args = args.join(" ");
         let mut cmd = self.base_command(args);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|source| KopiaError::Spawn {
-            binary: self.binary.display().to_string(),
-            source,
-        })?;
+        let mut child = self.spawn_with_retry(&mut cmd).await?;
         // The RUNNER owns the writer, and `feed` only borrows it. That ownership is
         // load-bearing, not a style choice: if `feed` owned it, the writer would be
         // dropped when `feed`'s future completes — closing the pipe, giving kopia EOF,
@@ -1348,10 +1438,20 @@ impl KopiaClient {
         // producer's outcome. Keeping it here is what makes `Abort` able to kill kopia
         // with stdin still open. (Caught by
         // `integration_stdin::abort_after_full_payload_leaves_no_snapshot`.)
-        let mut stdin = child.stdin.take().ok_or_else(|| KopiaError::Spawn {
-            binary: self.binary.display().to_string(),
-            source: std::io::Error::other("kopia stdin pipe was not created"),
-        })?;
+        // `kill_and_reap` FIRST on this path: returning here with a live child and
+        // no writer leaves a kopia blocked forever on a `read(2)` of a pipe nobody
+        // will ever write to or close, holding a repository session open, until
+        // the mover pod is evicted. `?` on a `take()` is a zombie leak.
+        let mut stdin = match child.stdin.take() {
+            Some(pipe) => pipe,
+            None => {
+                kill_and_reap(&mut child).await;
+                return Err(KopiaError::Spawn {
+                    binary: self.binary.display().to_string(),
+                    source: std::io::Error::other("kopia stdin pipe was not created"),
+                });
+            }
+        };
 
         // Drain stdout/stderr in BACKGROUND TASKS, not alongside `feed` in a `join!`.
         // Draining to EOF only completes when kopia EXITS, and kopia cannot exit until
@@ -1379,15 +1479,70 @@ impl KopiaClient {
 
         let fed = feed(&mut stdin).await;
 
+        // Every abort arm has the SAME ordering, and the order is the safety
+        // property: kill the child while `stdin` is still alive, so kopia never
+        // reaches EOF and never writes a manifest; drop the writer only afterwards.
+        // Reversing the two would let kopia commit the partial snapshot in the
+        // window before the signal lands.
+        macro_rules! abort_holding_stdin {
+            () => {{
+                kill_and_reap(&mut child).await;
+                drop(stdin);
+                let stderr = err_task.await.unwrap_or_default();
+                let _ = out_task.await;
+                stderr
+            }};
+        }
+
         match fed {
-            Ok(StdinOutcome::Commit) => {
+            // A producer that exited 0 having written NOTHING. Deliberately an
+            // abort, not a commit: an empty `pg_dumpall` is not a backup, and
+            // committing it would put a zero-byte "restore point" into the
+            // repository that retention would then keep and a restore would
+            // happily write over a live database. The producer's own exit status
+            // cannot catch this — `pg_dump` exits 0 when it connects to an empty
+            // instance, and a `sh -c` pipeline hides the real program's status.
+            Ok(StdinOutcome::Commit { bytes: 0 }) => {
+                let stderr = abort_holding_stdin!();
+                Err(KopiaError::StdinProducerWroteNothing {
+                    args: display_args,
+                    stderr_tail: tail_lines(&stderr),
+                })
+            }
+            Ok(StdinOutcome::Commit { bytes }) => {
                 // Close the writer NOW — this is the commit point. kopia sees EOF and
                 // finalizes the manifest.
                 drop(stdin);
-                let status = child.wait().await.map_err(|source| KopiaError::Spawn {
-                    binary: self.binary.display().to_string(),
-                    source,
-                })?;
+                // BOUNDED (#451). This wait used to be `child.wait()` with no
+                // timeout at all, so a kopia wedged finalizing — a hung object-store
+                // PUT of the last content blob, a stalled manifest write — pinned the
+                // mover Job forever, past `activeDeadlineSeconds` accounting and with
+                // no status to explain it.
+                //
+                // A timeout here is honestly ambiguous: the snapshot MAY have
+                // committed before we gave up. That is why it surfaces as an error
+                // and never as success — if a manifest did land, the catalog scanner
+                // discovers it as a foreign snapshot rather than this CR claiming it.
+                let budget = self.finalize_budget(finalize_timeout);
+                let status = match tokio::time::timeout(budget, child.wait()).await {
+                    Ok(res) => res.map_err(|source| KopiaError::Spawn {
+                        binary: self.binary.display().to_string(),
+                        source,
+                    })?,
+                    Err(_) => {
+                        kill_and_reap(&mut child).await;
+                        let _ = out_task.await;
+                        let _ = err_task.await;
+                        return Err(KopiaError::Timeout {
+                            args: display_args,
+                            seconds: budget.as_secs(),
+                        });
+                    }
+                };
+                tracing::debug!(
+                    bytes,
+                    "stdin producer committed; kopia finalized the snapshot"
+                );
                 Ok(RawOutput {
                     code: status.code(),
                     stdout: out_task.await.unwrap_or_default(),
@@ -1395,12 +1550,7 @@ impl KopiaClient {
                 })
             }
             Ok(StdinOutcome::Abort) => {
-                // Kill with stdin STILL OPEN — `stdin` is dropped only after this — so
-                // kopia never reaches EOF and never writes a manifest.
-                let _ = child.kill().await;
-                drop(stdin);
-                let stderr = err_task.await.unwrap_or_default();
-                let _ = out_task.await;
+                let stderr = abort_holding_stdin!();
                 Err(KopiaError::StdinProducerFailed {
                     detail: "the stdin producer did not complete successfully; the kopia \
                              snapshot was aborted before any manifest was written"
@@ -1409,63 +1559,9 @@ impl KopiaClient {
                 })
             }
             Err(e) => {
-                // Same ordering as `Abort`: kill first, close second.
-                let _ = child.kill().await;
-                drop(stdin);
-                let _ = err_task.await;
-                let _ = out_task.await;
+                let _ = abort_holding_stdin!();
                 Err(e)
             }
-        }
-    }
-
-    /// Run kopia streaming its stdout into `sink` (constant memory), capturing only
-    /// stderr for diagnostics. Used by [`Self::show_to`], where stdout IS user data
-    /// and must never be collected into a `String`.
-    async fn run_streaming_stdout<W>(&self, args: &[String], mut sink: W) -> Result<(), KopiaError>
-    where
-        W: tokio::io::AsyncWrite + Unpin,
-    {
-        let mut cmd = self.base_command(args);
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|source| KopiaError::Spawn {
-            binary: self.binary.display().to_string(),
-            source,
-        })?;
-        let mut out = child.stdout.take().ok_or_else(|| KopiaError::Spawn {
-            binary: self.binary.display().to_string(),
-            source: std::io::Error::other("kopia stdout pipe was not created"),
-        })?;
-        let mut err = child.stderr.take();
-        let mut stderr = String::new();
-        let copied = {
-            let drain = async {
-                if let Some(e) = err.as_mut() {
-                    let _ = e.read_to_string(&mut stderr).await;
-                }
-            };
-            let (copied, ()) = tokio::join!(tokio::io::copy(&mut out, &mut sink), drain);
-            copied
-        };
-        let status = child.wait().await.map_err(|source| KopiaError::Spawn {
-            binary: self.binary.display().to_string(),
-            source,
-        })?;
-        copied.map_err(|source| KopiaError::Spawn {
-            binary: self.binary.display().to_string(),
-            source,
-        })?;
-        if status.code() == Some(0) {
-            Ok(())
-        } else {
-            Err(KopiaError::NonZeroExit {
-                args: args.join(" "),
-                code: status.code(),
-                class: KopiaErrorClass::classify(&stderr),
-                stderr_tail: tail_lines(&stderr),
-            })
         }
     }
 
@@ -1766,18 +1862,22 @@ impl KopiaClient {
     /// no path by which they could reach a log line or an error message.
     pub async fn snapshot_create_stdin_outcome_with<F>(
         &self,
-        source_path: &str,
-        stdin_file: &str,
-        tags: &BTreeMap<String, String>,
-        override_source: Option<&str>,
-        opts: &SnapshotCreateOptions,
+        snapshot: StdinSnapshot<'_>,
         feed: F,
     ) -> Result<SnapshotCreateOutcome, KopiaError>
     where
         F: AsyncFnOnce(&mut tokio::process::ChildStdin) -> Result<StdinOutcome, KopiaError>,
     {
-        let args = snapshot_create_args(source_path, Some(stdin_file), tags, override_source, opts);
-        let out = self.run_with_stdin(&args, feed).await?;
+        let args = snapshot_create_args(
+            snapshot.source_path,
+            Some(snapshot.stdin_file),
+            snapshot.tags,
+            snapshot.override_source,
+            snapshot.opts,
+        );
+        let out = self
+            .run_with_stdin(&args, snapshot.finalize_timeout, feed)
+            .await?;
         if out.code != Some(0) {
             return Err(KopiaError::NonZeroExit {
                 args: args.join(" "),
@@ -1816,12 +1916,17 @@ impl KopiaClient {
     /// kopia streams the object, so this is constant-memory regardless of file size,
     /// and the bytes go straight into `sink` — never buffered here, never logged,
     /// never attached to an error.
-    pub async fn show_to<W>(&self, object_id: &str, sink: W) -> Result<(), KopiaError>
+    pub async fn show_to<W>(&self, object_id: &str, mut sink: W) -> Result<(), KopiaError>
     where
-        W: tokio::io::AsyncWrite + Unpin,
+        W: tokio::io::AsyncWrite + Unpin + Send,
     {
+        // Two lines over [`Self::run_raw_streaming`], which already does exactly
+        // this for the browse data plane — byte-for-byte copy, bounded stderr, the
+        // shared spawn retry, and `default_timeout` honoured. It previously had a
+        // near-duplicate of its own (`run_streaming_stdout`) that skipped the retry
+        // AND the timeout, so a `streamExec` restore could hang on a wedged kopia.
         let args: Vec<String> = vec!["show".into(), object_id.to_string()];
-        self.run_streaming_stdout(&args, sink).await
+        self.run_raw_streaming(&args, &mut sink).await.map(|_| ())
     }
 
     /// [`Self::snapshot_create_with`], but able to say "kopia deliberately
@@ -2190,39 +2295,12 @@ impl KopiaClient {
         sink: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     ) -> Result<u64, KopiaError> {
         let display_args = args.join(" ");
-        let mut cmd = Command::new(&self.binary);
-        for (k, v) in &self.common_env {
-            cmd.env(k, v);
-        }
-        for k in &self.common_env_remove {
-            cmd.env_remove(k);
-        }
-        cmd.args(args);
-        cmd.args(&self.common_args);
+        let mut cmd = self.base_command(args);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        // Same bounded transient-errno retry as `run` (ETXTBSY/EAGAIN are
-        // fork/exec races, not bad-binary failures).
-        let mut child = {
-            let mut attempt = 0u32;
-            loop {
-                match cmd.spawn() {
-                    Ok(c) => break c,
-                    Err(e) if matches!(e.raw_os_error(), Some(26) | Some(11)) && attempt < 10 => {
-                        attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                    Err(source) => {
-                        return Err(KopiaError::Spawn {
-                            binary: self.binary.display().to_string(),
-                            source,
-                        });
-                    }
-                }
-            }
-        };
+        let mut child = self.spawn_with_retry(&mut cmd).await?;
         let mut stdout_pipe = child.stdout.take().expect("stdout piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");
 

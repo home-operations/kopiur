@@ -1805,3 +1805,44 @@ async fn timed_out_child_is_killed_and_reaped_not_left_a_zombie() {
         );
     }
 }
+
+// --- the stdin runner's finalize budget (#451) ------------------------------
+
+/// `run_with_stdin` used to call `child.wait()` with no timeout at all, so a
+/// kopia wedged finalizing a manifest pinned the mover Job forever. The budget
+/// is now always finite, with the caller's value winning over the client's
+/// default and a named constant as the floor of last resort.
+#[test]
+fn the_stdin_finalize_budget_is_never_unbounded() {
+    use std::time::Duration;
+
+    // Neither the caller nor the client sets one: still bounded.
+    let bare = KopiaClient::builder().build();
+    assert_eq!(bare.default_timeout(), None);
+    assert_eq!(
+        bare.finalize_budget_for_test(None),
+        crate::client::DEFAULT_STDIN_FINALIZE_TIMEOUT
+    );
+
+    // The client's `default_timeout` is honoured when the caller has no opinion.
+    let timed = KopiaClient::builder()
+        .default_timeout(Duration::from_secs(120))
+        .build();
+    assert_eq!(
+        timed.finalize_budget_for_test(None),
+        Duration::from_secs(120)
+    );
+
+    // The caller's budget wins over both — the mover derives it from the
+    // producer's own `workloadExec.timeout` plus the grace, which can legitimately
+    // exceed the client default for a multi-hour dump.
+    assert_eq!(
+        timed.finalize_budget_for_test(Some(Duration::from_secs(7200))),
+        Duration::from_secs(7200)
+    );
+    assert_eq!(
+        bare.finalize_budget_for_test(Some(Duration::from_secs(30))),
+        Duration::from_secs(30)
+    );
+    assert!(crate::client::STDIN_FINALIZE_GRACE > Duration::ZERO);
+}

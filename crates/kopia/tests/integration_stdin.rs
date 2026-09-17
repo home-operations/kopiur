@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use kopiur_kopia::{
     ConnectSpec, KopiaClient, SnapshotCreateOptions, SnapshotCreateOutcome, SnapshotSource,
-    StdinOutcome,
+    StdinOutcome, StdinSnapshot,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -74,14 +74,21 @@ async fn stdin_snapshot_roundtrips_byte_identical() {
 
     let outcome = client
         .snapshot_create_stdin_outcome_with(
-            "/stream/dump.sql",
-            "dump.sql",
-            &BTreeMap::new(),
-            Some("tester@host:/stream/dump.sql"),
-            &SnapshotCreateOptions::default(),
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                // A generous but BOUNDED budget; the point of the field is
+                // that `child.wait()` is never unbounded (#451).
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
             async |stdin: &mut tokio::process::ChildStdin| {
                 stdin.write_all(&payload).await.expect("write payload");
-                Ok(StdinOutcome::Commit)
+                Ok(StdinOutcome::Commit {
+                    bytes: payload.len() as u64,
+                })
             },
         )
         .await
@@ -124,11 +131,16 @@ async fn abort_after_full_payload_leaves_no_snapshot() {
 
     let err = client
         .snapshot_create_stdin_outcome_with(
-            "/stream/dump.sql",
-            "dump.sql",
-            &BTreeMap::new(),
-            Some("tester@host:/stream/dump.sql"),
-            &SnapshotCreateOptions::default(),
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                // A generous but BOUNDED budget; the point of the field is
+                // that `child.wait()` is never unbounded (#451).
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
             async |stdin: &mut tokio::process::ChildStdin| {
                 stdin
                     .write_all(b"a complete and perfectly valid looking dump\n")
@@ -171,11 +183,16 @@ async fn producer_error_propagates_and_leaves_no_snapshot() {
 
     let err = client
         .snapshot_create_stdin_outcome_with(
-            "/stream/dump.sql",
-            "dump.sql",
-            &BTreeMap::new(),
-            Some("tester@host:/stream/dump.sql"),
-            &SnapshotCreateOptions::default(),
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                // A generous but BOUNDED budget; the point of the field is
+                // that `child.wait()` is never unbounded (#451).
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
             async |stdin: &mut tokio::process::ChildStdin| {
                 stdin.write_all(b"partial").await.expect("write");
                 Err(kopiur_kopia::KopiaError::EmptyOutput {
@@ -203,14 +220,19 @@ async fn stdin_snapshot_records_the_overridden_identity() {
 
     client
         .snapshot_create_stdin_outcome_with(
-            "/stream/postgres.sql",
-            "postgres.sql",
-            &BTreeMap::new(),
-            Some("bundlecop@k7:/stream/postgres.sql"),
-            &SnapshotCreateOptions::default(),
+            StdinSnapshot {
+                source_path: "/stream/postgres.sql",
+                stdin_file: "postgres.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("bundlecop@k7:/stream/postgres.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                // A generous but BOUNDED budget; the point of the field is
+                // that `child.wait()` is never unbounded (#451).
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
             async |stdin: &mut tokio::process::ChildStdin| {
                 stdin.write_all(b"SELECT 1;\n").await.unwrap();
-                Ok(StdinOutcome::Commit)
+                Ok(StdinOutcome::Commit { bytes: 10 })
             },
         )
         .await
@@ -231,4 +253,114 @@ async fn stdin_snapshot_records_the_overridden_identity() {
     );
     assert_eq!(listed[0].source.user_name, "bundlecop");
     assert_eq!(listed[0].source.host, "k7");
+}
+
+/// The empty-dump decision (#451), settled deliberately rather than left to
+/// chance: a producer that exits SUCCESSFULLY having written zero bytes is
+/// treated as a FAILURE and commits nothing.
+///
+/// This case is reachable without any bug in kopiur: `pg_dump` exits 0 against
+/// an instance whose credentials see no databases, `mysqldump` exits 0 when its
+/// grants are empty, and `sh -c 'pg_dumpall | gzip'` reports only `gzip`'s
+/// status, so a dead first stage looks like success. Committing the result would
+/// put a zero-byte "restore point" into the repository that retention keeps and
+/// a restore would cheerfully write over a live database with.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn a_producer_that_writes_nothing_commits_no_snapshot() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    let err = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            // Writes NOTHING and reports success — the shape a silently-failed
+            // dump command has.
+            async |_stdin: &mut tokio::process::ChildStdin| Ok(StdinOutcome::Commit { bytes: 0 }),
+        )
+        .await
+        .expect_err("a zero-byte dump must not be committed");
+
+    assert!(
+        matches!(
+            err,
+            kopiur_kopia::KopiaError::StdinProducerWroteNothing { .. }
+        ),
+        "expected StdinProducerWroteNothing, got {err:?}"
+    );
+    // The message has to tell the operator what to actually change.
+    let msg = err.to_string();
+    assert!(msg.contains("wrote no data"), "{msg}");
+    assert!(msg.contains("workloadExec.command"), "{msg}");
+    assert!(msg.contains("pipefail"), "{msg}");
+
+    // And the safety property holds exactly as it does for an explicit Abort:
+    // kopia was killed with stdin still open, so no manifest exists.
+    let after = client.snapshot_list_all().await.expect("list after");
+    assert!(
+        after.is_empty(),
+        "an empty dump must leave NO snapshot manifest, found {after:#?}"
+    );
+}
+
+/// `show_to` now wraps `run_raw_streaming` rather than a near-duplicate runner
+/// that skipped both the spawn retry and `default_timeout`. Pin that it still
+/// streams bytes out byte-for-byte AND that a bad object id fails rather than
+/// silently producing an empty sink.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn show_to_streams_bytes_and_fails_loudly_on_a_bad_object() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    let payload = b"BEGIN;\nSELECT 1;\nCOMMIT;\n".to_vec();
+    let expected = payload.clone();
+    let outcome = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            async |stdin: &mut tokio::process::ChildStdin| {
+                stdin.write_all(&payload).await.expect("write");
+                Ok(StdinOutcome::Commit {
+                    bytes: payload.len() as u64,
+                })
+            },
+        )
+        .await
+        .expect("snapshot");
+    let root = match outcome {
+        SnapshotCreateOutcome::Created(r) => r.root_entry.expect("root entry").obj,
+        SnapshotCreateOutcome::Unchanged => panic!("never unchanged"),
+    };
+
+    let mut got: Vec<u8> = Vec::new();
+    client
+        .show_to(&format!("{root}/dump.sql"), &mut got)
+        .await
+        .expect("show the stored file");
+    assert_eq!(got, expected);
+
+    // A non-existent entry must be an error, not an empty success — a restore
+    // that pipes nothing into `psql` and reports Completed is the worst outcome.
+    let mut empty: Vec<u8> = Vec::new();
+    client
+        .show_to(&format!("{root}/not-there.sql"), &mut empty)
+        .await
+        .expect_err("a missing entry must fail");
+    assert!(empty.is_empty());
 }

@@ -404,6 +404,34 @@ pub enum KopiaError {
         stderr_tail: String,
     },
 
+    /// The stdin producer exited **successfully** having written ZERO bytes, so
+    /// the snapshot was aborted before any manifest was written.
+    ///
+    /// Deliberately a failure rather than an empty snapshot. A producer's exit
+    /// status cannot be trusted to catch this on its own: `pg_dump` exits 0
+    /// against an instance it cannot see any databases in, `mysqldump` exits 0
+    /// when its credentials grant nothing, and a `sh -c 'a | b'` pipeline reports
+    /// only `b`'s status. Committing the result would put a zero-byte "restore
+    /// point" into the repository that retention keeps and a restore would
+    /// cheerfully write over a live database with.
+    #[error(
+        "the snapshot was aborted because its stdin producer exited successfully but wrote no \
+         data at all — an empty dump is not a backup, so nothing was committed. Check that the \
+         command in `workloadExec.command` actually writes to stdout (a `pg_dump`/`mysqldump` \
+         can exit 0 and emit nothing when its credentials see no databases, and a `sh -c 'a | b'` \
+         pipeline reports only the LAST program's status — add `set -o pipefail`). Args: \
+         {args}{}",
+        if stderr_tail.is_empty() { String::new() } else { format!(" (kopia stderr: {stderr_tail})") }
+    )]
+    StdinProducerWroteNothing {
+        /// The kopia argv, for correlation with the Job log.
+        args: String,
+        /// Bounded tail of kopia's own stderr. NEVER the producer's stdout — that
+        /// is the user's data and this crate offers no path by which it could
+        /// reach an error message.
+        stderr_tail: String,
+    },
+
     /// We expected a JSON object/array on stdout but found none (kopia printed
     /// only progress / nothing) even though it exited **0**.
     ///
@@ -447,6 +475,10 @@ impl KopiaError {
             // Retrying the same Job re-runs the same failing command, so this is
             // NOT retryable; the fix is in the workload or the policy.
             KopiaError::StdinProducerFailed { .. } => KopiaErrorClass::Unknown,
+            // Same reasoning: the repository was never at fault, and re-running
+            // the Job re-runs the same command that produced nothing. TERMINAL,
+            // so `backoffLimit` never burns retries on it.
+            KopiaError::StdinProducerWroteNothing { .. } => KopiaErrorClass::Unknown,
         }
     }
 
@@ -461,7 +493,10 @@ impl KopiaError {
             }
             // Bounded kopia stderr only. The producer's own diagnostics ride in
             // `detail`, and its STDOUT — the backup data — is never captured at all.
-            KopiaError::StdinProducerFailed { stderr_tail, .. } if !stderr_tail.is_empty() => {
+            KopiaError::StdinProducerFailed { stderr_tail, .. }
+            | KopiaError::StdinProducerWroteNothing { stderr_tail, .. }
+                if !stderr_tail.is_empty() =>
+            {
                 Some(stderr_tail.as_str())
             }
             _ => None,

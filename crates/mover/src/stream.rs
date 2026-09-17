@@ -365,13 +365,19 @@ pub async fn feed_from_pod(
 
     match verdict {
         ExecVerdict::Success => {
+            let bytes = pumped.unwrap_or(0);
             tracing::info!(
                 pod = %pod_name,
-                bytes = pumped.unwrap_or(0),
+                bytes,
                 file = %spec.file_name,
                 "stream producer finished; committing the snapshot"
             );
-            StdinOutcome::Commit
+            // The count is load-bearing, not telemetry: the runner refuses to
+            // commit a ZERO-byte snapshot. A `pg_dump` that exits 0 while seeing
+            // no databases, or a `sh -c 'a | b'` pipeline whose first stage died
+            // (only `b`'s status is reported), reaches here as a clean Success —
+            // and an empty dump is not a backup.
+            StdinOutcome::Commit { bytes }
         }
         other => {
             *failure = Some(producer_failure_message(

@@ -10,10 +10,11 @@ pub mod selection;
 pub mod session;
 
 pub use client::{
-    CacheTuning, ConnectOptions, ConnectSpec, CreateOptions, KopiaClient, KopiaClientBuilder,
-    MaintenanceMode, MigratePolicies, MigrateSources, PolicyArgs, RestoreOptions, ServerAuthMode,
-    ServerStartSpec, SnapshotCreateOptions, SnapshotMigrateOptions, StdinOutcome, SyncToOptions,
-    ThrottleArgs, VerifyOptions, split_policy_scopes,
+    CacheTuning, ConnectOptions, ConnectSpec, CreateOptions, DEFAULT_STDIN_FINALIZE_TIMEOUT,
+    KopiaClient, KopiaClientBuilder, MaintenanceMode, MigratePolicies, MigrateSources, PolicyArgs,
+    RestoreOptions, STDIN_FINALIZE_GRACE, ServerAuthMode, ServerStartSpec, SnapshotCreateOptions,
+    SnapshotMigrateOptions, StdinOutcome, StdinSnapshot, SyncToOptions, ThrottleArgs,
+    VerifyOptions, split_policy_scopes,
 };
 pub use error::{
     KopiaError, KopiaErrorClass, notfound_is_uninitialized, snapshot_skipped_unchanged,

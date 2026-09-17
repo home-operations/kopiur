@@ -980,4 +980,33 @@ mod tests {
             "the KopiaError source must stay inspectable"
         );
     }
+
+    /// Both stdin-producer failures are TERMINAL through the mover wrapper, so
+    /// `backoffLimit` never burns retries re-running the same broken dump
+    /// command (#451). The repository was never at fault: an identical Job
+    /// attempt reproduces the same failure, and each retry re-execs the user's
+    /// command against their live database.
+    #[test]
+    fn stdin_producer_failures_are_terminal() {
+        for source in [
+            KopiaError::StdinProducerFailed {
+                detail: "the producer exited 2".into(),
+                stderr_tail: String::new(),
+            },
+            KopiaError::StdinProducerWroteNothing {
+                args: "snapshot create /stream/dump.sql --stdin-file dump.sql".into(),
+                stderr_tail: String::new(),
+            },
+        ] {
+            let err = MoverError::Kopia {
+                op: KopiaOp::SnapshotCreate,
+                source,
+            };
+            assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+            assert!(
+                !err.retry_recommended(),
+                "a failed stdin producer must never be retried: {err}"
+            );
+        }
+    }
 }

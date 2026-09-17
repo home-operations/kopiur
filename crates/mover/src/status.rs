@@ -148,8 +148,10 @@ impl From<&crate::error::MoverError> for FailureBlock {
                     | KopiaError::EmptyOutput { .. }
                     // kopia was killed on purpose, so its exit code says nothing
                     // about the failure — the producer's does, and it is in the
-                    // message.
+                    // message. Same for a producer that wrote nothing: kopia never
+                    // got to EOF, so there is no exit status of its own to report.
                     | KopiaError::StdinProducerFailed { .. }
+                    | KopiaError::StdinProducerWroteNothing { .. }
                     | KopiaError::Timeout { .. } => None,
                 },
                 Some(op.as_str().to_string()),
