@@ -658,7 +658,15 @@ pub struct RunStatus {
     /// Count of back-to-back failed runs of this kind; resets on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_failures: Option<i64>,
-    /// Bytes of storage reclaimed by the most recent run of this kind.
+    /// Bytes of backend storage the most recent run of this kind actually freed:
+    /// the blobs kopia deleted (unreferenced packs, superseded epoch indexes and
+    /// expired logs), summed from the run history `kopia maintenance info`
+    /// reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only
+    /// marks contents deleted in the index and frees no storage until a later run
+    /// removes the blobs. Absent when the run reclaimed nothing measurable — a
+    /// quick run on an epoch-enabled repository only advances and compacts
+    /// epochs, so there is no figure to report; `0` always means a measured zero,
+    /// never "unknown".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_content_reclaimed_bytes: Option<i64>,
 }

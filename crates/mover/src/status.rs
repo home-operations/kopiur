@@ -762,27 +762,57 @@ pub fn snapshot_replicate_failed_body(
     serde_json::json!({ "status": status })
 }
 
+/// What a successful maintenance run measured about the repository, for
+/// [`maintenance_ran_body`]. A sub-object rather than positional `Option<i64>`
+/// arguments so the two figures — which are both nullable integers — cannot be
+/// silently transposed at a call site.
+///
+/// Every field is best-effort: `kopia maintenance run` emits no machine-readable
+/// result, so each figure comes from a follow-up kopia call that must never turn
+/// a successful run into a failed Job. `None` is therefore "not measured", and is
+/// written as an omitted key, never as `0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceObservations {
+    /// Bytes of backend storage the run actually freed, from the
+    /// `kopia maintenance info` run-history delta
+    /// ([`kopiur_kopia::reclaimed_bytes_since`]).
+    pub reclaimed_bytes: Option<i64>,
+}
+
 /// `{ "status": ... }` body for a successful maintenance run. A full run also
-/// advances the quick clock (full subsumes quick). `lastContentReclaimedBytes`
-/// is `0`: `kopia maintenance run` emits no JSON, so the precise figure needs a
-/// `maintenance info` delta (tracked separately; the field round-trips).
+/// advances the quick clock (full subsumes quick).
+///
+/// `lastContentReclaimedBytes` is stamped on **only the mode that actually
+/// ran**. On a full run the subsumed quick block carries an explicit `null`,
+/// which the merge-patch turns into "key removed": its `lastRunAt` is being
+/// bumped by a run that was not a quick run, so leaving the previous quick run's
+/// byte figure standing beside the new timestamp would misattribute it — the
+/// exact class of lie #458 is about. It was previously hardcoded to `0`, which
+/// reported "reclaimed nothing" for a run that freed gigabytes.
 pub fn maintenance_ran_body(
     op: &MaintenanceOp,
     now: &chrono::DateTime<chrono::Utc>,
+    obs: &MaintenanceObservations,
 ) -> serde_json::Value {
     let ts = now.to_rfc3339();
-    let run = serde_json::json!({ "lastRunAt": ts, "lastContentReclaimedBytes": 0 });
+    // The block for the mode that ran: it owns the measured figures.
+    let mut ran = serde_json::json!({ "lastRunAt": ts });
+    if let Some(bytes) = obs.reclaimed_bytes {
+        ran["lastContentReclaimedBytes"] = serde_json::json!(bytes);
+    }
     let mut status = serde_json::json!({
         "ownership": { "owner": op.owner, "claimedAt": ts },
         "conditions": [lease_condition_body("True", "LeaseClaimed", "maintenance lease claimed", now)],
     });
     match op.mode {
         MaintenanceMode::Quick => {
-            status["quick"] = run;
+            status["quick"] = ran;
         }
         MaintenanceMode::Full => {
-            status["quick"] = run.clone();
-            status["full"] = run;
+            // Clock-only for quick, plus the explicit clear described above.
+            status["quick"] =
+                serde_json::json!({ "lastRunAt": ts, "lastContentReclaimedBytes": null });
+            status["full"] = ran;
         }
     }
     serde_json::json!({ "status": status })
@@ -1718,8 +1748,15 @@ mod tests {
     #[test]
     fn quick_run_advances_only_quick_clock() {
         let now = chrono::Utc::now();
-        let body = maintenance_ran_body(&maint_op(MaintenanceMode::Quick), &now);
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Quick),
+            &now,
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(4096),
+            },
+        );
         assert!(body["status"]["quick"]["lastRunAt"].is_string());
+        assert_eq!(body["status"]["quick"]["lastContentReclaimedBytes"], 4096);
         assert!(
             body["status"]["full"].is_null(),
             "a quick run must not stamp the full clock"
@@ -1730,7 +1767,11 @@ mod tests {
     #[test]
     fn full_run_subsumes_quick_clock() {
         let now = chrono::Utc::now();
-        let body = maintenance_ran_body(&maint_op(MaintenanceMode::Full), &now);
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Full),
+            &now,
+            &MaintenanceObservations::default(),
+        );
         // Full subsumes quick: both clocks advance so quick isn't immediately due.
         assert!(body["status"]["full"]["lastRunAt"].is_string());
         assert!(body["status"]["quick"]["lastRunAt"].is_string());
@@ -1738,6 +1779,76 @@ mod tests {
             body["status"]["full"]["lastRunAt"],
             body["status"]["quick"]["lastRunAt"]
         );
+    }
+
+    /// #458: the reclaimed figure belongs to the mode that RAN. A full run must
+    /// not stamp it on `quick` — `crates/controller/src/maintenance/mod.rs` reads
+    /// `full.lastContentReclaimedBytes` for the gauge, and an operator reading
+    /// `quick` must not be shown a full run's bytes.
+    #[test]
+    fn full_run_stamps_reclaimed_bytes_only_on_full() {
+        let now = chrono::Utc::now();
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Full),
+            &now,
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(3_900_000_000),
+            },
+        );
+        assert_eq!(
+            body["status"]["full"]["lastContentReclaimedBytes"],
+            3_900_000_000i64
+        );
+        // Explicit null, not the figure and not a leftover: the merge-patch
+        // removes the key, so the subsumed quick clock carries no byte figure
+        // that a quick run did not measure.
+        assert!(
+            body["status"]["quick"]["lastContentReclaimedBytes"].is_null(),
+            "a full run must clear, never stamp, quick's reclaimed figure"
+        );
+        assert!(
+            body["status"]["quick"]
+                .as_object()
+                .expect("quick is an object")
+                .contains_key("lastContentReclaimedBytes"),
+            "the clear must be an EXPLICIT null (merge-patch key removal), not an omission"
+        );
+    }
+
+    /// An unmeasurable run (a quick run on an epoch repository, or a failed
+    /// post-run `maintenance info`) must omit the key entirely rather than
+    /// report `0` — the hardcoded `0` was the #458 bug.
+    #[test]
+    fn unmeasured_run_omits_reclaimed_bytes_rather_than_reporting_zero() {
+        let now = chrono::Utc::now();
+        for mode in [MaintenanceMode::Quick, MaintenanceMode::Full] {
+            let body =
+                maintenance_ran_body(&maint_op(mode), &now, &MaintenanceObservations::default());
+            let ran = match mode {
+                MaintenanceMode::Quick => &body["status"]["quick"],
+                MaintenanceMode::Full => &body["status"]["full"],
+            };
+            assert!(
+                !ran.as_object()
+                    .expect("run block")
+                    .contains_key("lastContentReclaimedBytes"),
+                "{mode:?}: an unmeasured run must not claim a figure"
+            );
+        }
+    }
+
+    /// A measured zero is a real observation and must be reported as `0`, which
+    /// is exactly why `None` may not also be written as `0`.
+    #[test]
+    fn measured_zero_is_reported() {
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Quick),
+            &chrono::Utc::now(),
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(0),
+            },
+        );
+        assert_eq!(body["status"]["quick"]["lastContentReclaimedBytes"], 0);
     }
 
     #[test]

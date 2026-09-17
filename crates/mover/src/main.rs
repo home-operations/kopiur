@@ -40,9 +40,9 @@ use kopiur_mover::replicate as srepl;
 use kopiur_mover::resolve::{match_current_manifest, matches_source};
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::{
-    SnapshotReplicationRunStats, StatusReporter, StatusUpdate, lease_blocked_body,
-    maintenance_failed_body, maintenance_failed_body_from_mover, maintenance_ran_body,
-    replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
+    MaintenanceObservations, SnapshotReplicationRunStats, StatusReporter, StatusUpdate,
+    lease_blocked_body, maintenance_failed_body, maintenance_failed_body_from_mover,
+    maintenance_ran_body, replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
     snapshot_replicate_ok_body, split_api_version, verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
@@ -2589,6 +2589,33 @@ async fn write_result_configmap(
     Ok(())
 }
 
+/// Measure what a just-completed maintenance run did, for
+/// [`maintenance_ran_body`]. Best-effort by contract: every failure degrades to
+/// "not measured" (`None`) and is logged, never propagated — the run already
+/// succeeded, and a metric is not worth failing a Job over.
+///
+/// `before` is the `maintenance info` the lease decision already read, so the
+/// only extra kopia call is the post-run one.
+async fn measure_maintenance(
+    client: &KopiaClient,
+    before: &kopiur_kopia::MaintenanceInfo,
+) -> MaintenanceObservations {
+    let after = match client.maintenance_info().await {
+        Ok(after) => after,
+        Err(e) => {
+            warn!(
+                class = %e.class(),
+                "maintenance run succeeded but the post-run `maintenance info` failed; \
+                 reporting no reclaimed-bytes figure for this run"
+            );
+            return MaintenanceObservations::default();
+        }
+    };
+    MaintenanceObservations {
+        reclaimed_bytes: kopiur_kopia::reclaimed_bytes_since(before, &after),
+    }
+}
+
 /// Drive a `Maintenance` run: connect, read the ownership lease, apply the
 /// takeover policy, run `kopia maintenance run` when we hold the lease, and PATCH
 /// the `Maintenance` `.status` directly (ADR §3.7). Returns an error (non-zero
@@ -2723,12 +2750,21 @@ async fn run_maintenance_flow(
                     source: e,
                 });
             }
+            // The run itself succeeded; everything below is MEASUREMENT and is
+            // strictly best-effort. `kopia maintenance run` prints nothing
+            // machine-readable, so the only way to learn what it reclaimed is to
+            // diff the per-task run history it appended to the schedule blob
+            // against the pre-run `info` read above for the lease decision (which
+            // makes "before" free). A failure here must never turn a successful
+            // maintenance run into a failed Job — it would make the operator
+            // retry work that already completed.
+            let observations = measure_maintenance(client, &info).await;
             patch_maintenance_status(
                 &spec.target_ref,
-                &maintenance_ran_body(op, &chrono::Utc::now()),
+                &maintenance_ran_body(op, &chrono::Utc::now(), &observations),
             )
             .await;
-            info!(?action, mode = ?op.mode, "maintenance run succeeded");
+            info!(?action, mode = ?op.mode, reclaimed_bytes = ?observations.reclaimed_bytes, "maintenance run succeeded");
             Ok(())
         }
     }

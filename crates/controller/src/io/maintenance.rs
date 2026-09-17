@@ -609,3 +609,54 @@ fn coverage_without_managed(foreign: bool) -> MaintenanceCoverage {
         MaintenanceCoverage::DisabledBySpec
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Field ownership for the post-run measurements on `Maintenance.status`
+    /// (#458): the **mover** writes `quick`/`full.last_content_reclaimed_bytes`
+    /// and `observed_index_blobs`; the controller only ever READS them (typed,
+    /// through `MaintenanceStatus`, which is why their camelCase wire spellings
+    /// have no business appearing in controller source at all).
+    ///
+    /// This matters because `Maintenance.status` has two writers and a merge
+    /// patch on `conditions` replaces the whole array — a controller-side write
+    /// that also named these keys could clobber a figure the mover measured
+    /// seconds earlier, resurrecting exactly the "this number is a lie" report
+    /// #458 was filed for. A source scan is crude but catches the mistake at the
+    /// moment someone makes it; the keys are distinctive enough that a false
+    /// positive is not plausible.
+    ///
+    /// The needles are assembled at runtime so this test's own source does not
+    /// contain them.
+    #[test]
+    fn controller_never_writes_the_movers_maintenance_measurements() {
+        let needles = [
+            concat!("lastContentReclaimed", "Bytes"),
+            concat!("observedIndex", "Blobs"),
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut files = vec![src];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).expect("read controller src") {
+                    files.push(entry.expect("dir entry").path());
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).expect("read source file");
+            for needle in needles {
+                if body.contains(needle) {
+                    offenders.push(format!("{} names {needle}", path.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the controller must not write the mover-owned Maintenance status keys: {offenders:?}"
+        );
+    }
+}

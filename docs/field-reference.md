@@ -3385,7 +3385,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `consecutiveFailures` | integer | — | Count of back-to-back failed runs of this kind; resets on success. |
-| `lastContentReclaimedBytes` | integer | — | Bytes of storage reclaimed by the most recent run of this kind. |
+| `lastContentReclaimedBytes` | integer | — | Bytes of backend storage the most recent run of this kind actually freed: the blobs kopia deleted (unreferenced packs, superseded epoch indexes and expired logs), summed from the run history `kopia maintenance info` reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only marks contents deleted in the index and frees no storage until a later run removes the blobs. Absent when the run reclaimed nothing measurable — a quick run on an epoch-enabled repository only advances and compacts epochs, so there is no figure to report; `0` always means a measured zero, never "unknown". |
 | `lastHandledAt` | string | — | RFC3339 instant the controller last observed this kind's per-slot Job reach terminal success. |
 | `lastRunAt` | string | — | RFC3339 instant of the most recent run of this kind. |
 | `nextScheduledAt` | string | — | RFC3339 instant of the next scheduled run of this kind (cron + jitter, pinned). |
@@ -3411,7 +3411,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `consecutiveFailures` | integer | — | Count of back-to-back failed runs of this kind; resets on success. |
-| `lastContentReclaimedBytes` | integer | — | Bytes of storage reclaimed by the most recent run of this kind. |
+| `lastContentReclaimedBytes` | integer | — | Bytes of backend storage the most recent run of this kind actually freed: the blobs kopia deleted (unreferenced packs, superseded epoch indexes and expired logs), summed from the run history `kopia maintenance info` reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only marks contents deleted in the index and frees no storage until a later run removes the blobs. Absent when the run reclaimed nothing measurable — a quick run on an epoch-enabled repository only advances and compacts epochs, so there is no figure to report; `0` always means a measured zero, never "unknown". |
 | `lastHandledAt` | string | — | RFC3339 instant the controller last observed this kind's per-slot Job reach terminal success. |
 | `lastRunAt` | string | — | RFC3339 instant of the most recent run of this kind. |
 | `nextScheduledAt` | string | — | RFC3339 instant of the next scheduled run of this kind (cron + jitter, pinned). |
