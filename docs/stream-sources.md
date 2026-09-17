@@ -73,6 +73,11 @@ because the pod name is not known until the selector resolves at run time, and R
 has no label-selector form. The namespace is the boundary; the annotation is how you
 consent to it.
 
+Consent is easier to give than to take back, so read
+[Revoking the opt-in](#revoking-the-opt-in) before you grant it: the annotation
+gates when Kopiur *mints* the `pods/exec` ServiceAccount, and removing the
+annotation later does not delete what was minted.
+
 ### If Kopiur is installed namespace-scoped
 
 Checking that annotation means **reading the Namespace**, which is a cluster-scoped
@@ -113,6 +118,57 @@ installScope: cluster
 
 Neither is needed for `pvc` or `nfs` sources. If you do not use stream sources,
 leave `rbacNamespaceReadForStreamSources` at its default `false`.
+
+### Revoking the opt-in
+
+/// warning | Removing the annotation does **not** take the grant back
+
+This is the one place the stream opt-in differs from the [privileged-mover
+opt-in](movers.md#privileged-movers), and it matters. A privileged mover's privilege
+lives in the pod spec, so dropping the annotation genuinely revokes it on the next
+run. The `pods/exec` grant lives in a **ServiceAccount and RoleBinding** that Kopiur
+mints in your namespace the first time a stream Job runs there — and those carry
+**no owner reference**, so nothing deletes them. Not deleting the policy, not
+deleting the namespace annotation, not uninstalling the last stream `Snapshot`.
+
+Removing the annotation stops Kopiur from starting *new* stream Jobs. It leaves the
+`…-stream-mover` ServiceAccount, still bound to a role carrying
+`create pods/exec`, sitting in the namespace. **Anyone who can create a Pod in that
+namespace can set `serviceAccountName` to it and exec into every pod there** — the
+exact escalation the gate above exists to prevent.
+///
+
+So withdrawing consent is two steps: drop the annotation, then delete what was
+minted. Make sure no stream mover Job is still running first — deleting the binding
+under a live Job makes it fail on a forbidden `pods/exec` mid-transfer:
+
+```sh
+# 1. Stop new stream runs.
+kubectl annotate namespace bundlecop \
+  kopiur.home-operations.com/stream-exec-movers-
+
+# 2. Confirm nothing is mid-flight.
+kubectl get jobs -n bundlecop -l app.kubernetes.io/managed-by=kopiur
+
+# 3. Delete the grant — the RoleBinding FIRST; it is what carries the privilege.
+kubectl delete rolebinding    kopiur-stream-mover -n bundlecop
+kubectl delete serviceaccount kopiur-stream-mover -n bundlecop
+```
+
+Substitute your release's prefix if the chart's `fullname` is not `kopiur`; the
+exact name is whatever `kubectl get clusterrole | grep stream-mover` shows. If you
+later re-annotate the namespace, Kopiur mints both objects again on the next stream
+run, so deleting them is safe and non-destructive — it costs one reconcile, not a
+backup.
+
+A `kubectl get rolebinding -A | grep stream-mover` is the audit query: every row is
+a namespace where `pods/exec` is currently delegated to a Kopiur ServiceAccount.
+
+Your GitOps controller will not clean these up for you either: both objects are
+stamped `app.kubernetes.io/managed-by: kopiur` precisely so Flux and Argo treat them
+as controller-owned and neither prune them nor report them `OutOfSync`. That is the
+right call for the generic mover ServiceAccount, which holds nothing — but it means
+the stream mover's grant is yours to remove.
 
 ## Writing the policy
 

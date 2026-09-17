@@ -159,7 +159,9 @@ $ kubectl apply -f privileged-mover-namespace.yaml
 
 Or do it imperatively with `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`.
 
-Anything that trips the privileged detector needs that opt-in: `runAsUser: 0`, `privileged: true`, `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot: false`, or `privilegedMode: true`. The full detail and the revoke path are in [Movers → Privileged movers](movers.md#privileged-movers).
+Anything that trips the privileged detector needs that opt-in: `runAsUser: 0`, `privileged: true`, `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot: false`, or `privilegedMode: true`. The full detail and the revoke path are in [Movers → Privileged movers](movers.md#privileged-movers). Removing the annotation is a real revoke **here**, because a privileged mover's privilege lives in the pod spec. The separate [stream-exec opt-in](stream-sources.md#revoking-the-opt-in) is **not** like that: its privilege lives in a minted ServiceAccount that outlives the annotation and has to be deleted explicitly.
+
+The condition names the layer that actually carries the elevation — `Repository.spec.moverDefaults`, the recipe's `spec.mover`, an inherited workload context, or a per-run `Snapshot.spec.mover` — so you edit the spec that raised it rather than reaching for the namespace-wide annotation to unblock one ad-hoc run.
 
 /// tip | Prefer matching the UID over going root
 
@@ -271,7 +273,7 @@ The `status.stats` numbers and the `app-data-manual-abc12` and `<mover-pod>` nam
 | ---------------------------------------------- | ------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | Backup `Succeeded` but **0 files / 0 bytes**   | `Snapshot` `.status`             | Mover UID can't read the source files.                     | Match `spec.mover.securityContext.runAsUser/Group` to the data owner (Steps 1–2). To try a UID without touching the shared recipe, set it on a one-shot `Snapshot.spec.mover`. |
 | Mover log: `permission denied` reading source  | Mover pod logs                 | Same as above: partial read.                              | Same as above; or a root mover if UIDs can't be matched.                                                           |
-| Backup stuck `Pending`, `MoverPermitted=False`, reason `PrivilegedMoverNotPermitted` | `Snapshot` condition / Event     | Mover requests privilege; namespace not opted in.          | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`, or drop the elevated context. |
+| Backup stuck `Pending`, `MoverPermitted=False`, reason `PrivilegedMoverNotPermitted` | `Snapshot` condition / Event     | The **merged** mover requests privilege; namespace not opted in. The message names the layer that carries it — `moverDefaults`, the policy's `spec.mover`, an inherited workload context, or a per-run `Snapshot.spec.mover`. | Drop the elevated context from the object the message names. Only reach for `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true` if you mean to allow it for **every** mover in that namespace. |
 | `Repository` `Failed`, `PermissionDenied`      | `Repository` Event / condition | Filesystem repo path not writable by the operator UID.     | `chown -R <uid> <path>` (the Event names the UID), then reconcile.                                                 |
 | Restored files unreadable by the app           | After restore                  | Files restored as the mover's UID, not the original owner. | Set `Restore.spec.mover.securityContext.runAsUser/Group` to the app's UID (or `inheritSecurityContextFrom`); use a root mover with `privilegedMode: true` to preserve the original ownership exactly. |
 | Restore stuck `Pending`, `MoverPermitted=False`, reason `PrivilegedMoverNotPermitted` | `Restore` condition / Event   | Restore mover requests privilege; namespace not opted in.  | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`, or drop the elevated context. |
@@ -290,6 +292,7 @@ The `status.stats` numbers and the `app-data-manual-abc12` and `<mover-pod>` nam
 | Root / preserve-ownership        | `runAsUser: 0` + `privilegedMode: true` (needs the namespace opt-in)                |
 | Privileged-mover opt-in          | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true` |
 | Stream-exec opt-in (`stream` / `streamExec`) | `kubectl annotate namespace <ns> kopiur.home-operations.com/stream-exec-movers=true`. Separate from, and not implied by, the privileged-mover annotation: it authorizes `pods/exec` in that namespace, which is arbitrary code execution in every pod there. Fails **closed** — including when the Namespace cannot be read. See [Streamed command sources](stream-sources.md) |
+| Revoking the stream-exec opt-in | Removing the annotation stops new runs but does **not** revoke the grant. Also `kubectl delete rolebinding <release>-stream-mover -n <ns>` and `kubectl delete serviceaccount <release>-stream-mover -n <ns>`. See [Revoking the opt-in](stream-sources.md#revoking-the-opt-in) |
 | Filesystem repo not writable     | Event prints `chown -R <uid> <path>` with the real operator UID                     |
 | Restore ignore/permission errors | `Restore.spec.options.ignorePermissionErrors` (default `true`)                      |
 

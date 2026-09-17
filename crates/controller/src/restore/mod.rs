@@ -3466,7 +3466,38 @@ async fn run_restore_mover(
             .mover_service_account
             .as_deref()
             .unwrap_or(config::DEFAULT_MOVER_NAME);
-        let msg = io::privileged_mover_message("Restore", name, namespace, sa);
+        // Name the layer that actually carries the elevation, not always the
+        // `Restore` — the gate runs on the MERGED mover, and an elevation authored
+        // in the repository's `moverDefaults` sent the operator to a `Restore`
+        // spec with nothing elevated in it (mirrors the Snapshot gate, #464).
+        let repo_ref = repo.repository_ref();
+        let layer = io::attribute_elevation(
+            // A Restore has no per-run layer above its own spec.
+            false,
+            restore
+                .spec
+                .mover
+                .as_ref()
+                .is_some_and(|m| m.requires_privilege()),
+            io::mover_defaults_require_privilege(repo.mover_defaults.as_ref()),
+        );
+        let (carrier_kind, carrier_name, carrier_field) = match layer {
+            io::ElevationLayer::Invocation | io::ElevationLayer::Recipe => {
+                ("Restore", name, "spec.mover")
+            }
+            io::ElevationLayer::RepositoryDefaults => (
+                io::repo_kind_str(repo_ref.kind),
+                repo_ref.name.as_str(),
+                "spec.moverDefaults",
+            ),
+            io::ElevationLayer::Composed => (
+                "Restore",
+                name,
+                "spec.mover (including any securityContext it inherits from a workload)",
+            ),
+        };
+        let msg =
+            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, namespace, sa);
         let existing = restore
             .status
             .as_ref()

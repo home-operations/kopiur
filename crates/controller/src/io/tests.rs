@@ -2208,29 +2208,123 @@ fn repo_kind_str_maps_both_variants() {
 
 #[test]
 fn privileged_mover_message_is_actionable() {
-    let msg = privileged_mover_message("SnapshotPolicy", "trilium-rain", "trilium", "kopiur-mover");
-    // What: the owning kind + name + namespace.
-    assert!(msg.contains("SnapshotPolicy `trilium-rain`"));
-    assert!(msg.contains("`trilium`"));
+    let msg = privileged_mover_message(
+        "SnapshotPolicy",
+        "trilium-rain",
+        "spec.mover",
+        "trilium",
+        "kopiur-mover",
+    );
+    // What: the object that CARRIES the elevation, its field, and the namespace.
+    assert!(
+        msg.contains("SnapshotPolicy `trilium-rain` `spec.mover`"),
+        "{msg}"
+    );
+    assert!(msg.contains("`trilium`"), "{msg}");
     // Why: tenant could reuse the minted SA at that privilege.
-    assert!(msg.contains("kopiur-mover"));
-    assert!(msg.contains("reuse"));
-    // How: the exact annotate command with the real annotation key.
-    assert!(msg.contains("kubectl annotate namespace trilium"));
-    assert!(msg.contains(PRIVILEGED_MOVERS_ANNOTATION));
-    assert!(msg.contains("=true"));
-    // Alternative fix: drop the elevated context, named for the right object.
-    assert!(msg.contains("securityContext"));
-    assert!(msg.contains("from the SnapshotPolicy `spec.mover`"));
+    assert!(msg.contains("kopiur-mover"), "{msg}");
+    assert!(msg.contains("reuse"), "{msg}");
+    // How: the exact annotate command with the real annotation key…
+    assert!(msg.contains("kubectl annotate namespace trilium"), "{msg}");
+    assert!(msg.contains(PRIVILEGED_MOVERS_ANNOTATION), "{msg}");
+    assert!(msg.contains("=true"), "{msg}");
+    // …but the SPEC fix comes first, and the annotation is labelled for what it is:
+    // a standing grant for every mover in the namespace, not a per-run unblock.
+    assert!(msg.contains("securityContext"), "{msg}");
+    assert!(
+        msg.find("remove the elevated").expect("spec fix named")
+            < msg.find("kubectl annotate").expect("annotate named"),
+        "the spec-edit fix must be offered before the namespace-wide grant: {msg}"
+    );
+    assert!(msg.contains("EVERY mover in namespace"), "{msg}");
 }
 
 #[test]
 fn privileged_mover_message_names_restore_kind() {
     // The same gate guards restores; the message must name the Restore to fix.
-    let msg = privileged_mover_message("Restore", "pg-restore", "billing", "kopiur-mover");
-    assert!(msg.contains("Restore `pg-restore`"));
-    assert!(msg.contains("from the Restore `spec.mover`"));
-    assert!(msg.contains("kubectl annotate namespace billing"));
+    let msg = privileged_mover_message(
+        "Restore",
+        "pg-restore",
+        "spec.mover",
+        "billing",
+        "kopiur-mover",
+    );
+    assert!(msg.contains("Restore `pg-restore` `spec.mover`"), "{msg}");
+    assert!(msg.contains("kubectl annotate namespace billing"), "{msg}");
+}
+
+#[test]
+fn privileged_mover_message_can_name_the_repository_defaults() {
+    // An elevation authored in `Repository.spec.moverDefaults` must not read as
+    // "edit your SnapshotPolicy" — the policy contains nothing to remove.
+    let msg = privileged_mover_message(
+        "Repository",
+        "nas-primary",
+        "spec.moverDefaults",
+        "billing",
+        "kopiur-mover",
+    );
+    assert!(
+        msg.contains("Repository `nas-primary` `spec.moverDefaults`"),
+        "{msg}"
+    );
+    assert!(!msg.contains("SnapshotPolicy"), "{msg}");
+}
+
+/// #464: the elevation can be authored in three places, and the refusal has to
+/// name the one that actually carries it. Attribution is most-specific-first, so a
+/// one-shot `Snapshot.spec.mover` wins over the shared recipe it overrides.
+#[test]
+fn elevation_is_attributed_to_the_most_specific_authored_layer() {
+    use ElevationLayer::*;
+    // (invocation, recipe, repositoryDefaults) -> layer
+    for (inputs, want) in [
+        ((true, false, false), Invocation),
+        ((true, true, true), Invocation),
+        ((false, true, false), Recipe),
+        ((false, true, true), Recipe),
+        ((false, false, true), RepositoryDefaults),
+        // Nothing elevated alone: inherited from a workload pod, or assembled from
+        // layers that are each benign. Never silently attributed to the recipe.
+        ((false, false, false), Composed),
+    ] {
+        let (invocation, recipe, defaults) = inputs;
+        assert_eq!(
+            attribute_elevation(invocation, recipe, defaults),
+            want,
+            "inputs {inputs:?}"
+        );
+    }
+}
+
+/// `moverDefaults` has no `privilegedMode` field, so only its two security
+/// contexts can raise it — and an absent `moverDefaults` is never elevated.
+#[test]
+fn mover_defaults_privilege_reads_both_contexts() {
+    use k8s_openapi::api::core::v1::{PodSecurityContext, SecurityContext};
+    use kopiur_api::common::MoverDefaults;
+
+    assert!(!mover_defaults_require_privilege(None));
+    let benign = MoverDefaults::default();
+    assert!(!mover_defaults_require_privilege(Some(&benign)));
+
+    let root_container = MoverDefaults {
+        security_context: Some(SecurityContext {
+            run_as_user: Some(0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(mover_defaults_require_privilege(Some(&root_container)));
+
+    let root_pod = MoverDefaults {
+        pod_security_context: Some(PodSecurityContext {
+            run_as_user: Some(0),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(mover_defaults_require_privilege(Some(&root_pod)));
 }
 
 #[test]

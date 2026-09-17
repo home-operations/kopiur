@@ -248,6 +248,20 @@ pub fn build_mover_rolebinding(
 /// `FailedCreate`s with `serviceaccount ... not found` and never schedules a pod).
 /// The objects are kopiur-managed and shared across all mover Jobs in the
 /// namespace (no owner reference, so deleting one Snapshot does not revoke them).
+///
+/// **Nothing reaps these**, deliberately: they are shared per-namespace
+/// infrastructure, the operator holds no `delete` on `serviceaccounts` or
+/// `rolebindings` (see `deploy/rbac/operator-clusterrole.yaml` — granting it would
+/// be cluster-wide SA deletion), and a reap keyed on "no consumer remains" would
+/// flap against a GitOps prune-then-apply cycle. For the generic and
+/// snapshot-replication movers the residue is inert: the SA holds only status-patch
+/// verbs.
+///
+/// For the STREAM mover it is not inert — the residue IS the `pods/exec` privilege,
+/// and it outlives both the policy and the namespace opt-in annotation. Withdrawing
+/// that opt-in stops new stream Jobs; it does not take the grant back. That is a
+/// documented, explicit two-command revoke (`docs/stream-sources.md`
+/// "Revoking the opt-in", `docs/rbac.md`), NOT something this function undoes.
 pub async fn ensure_mover_rbac(
     client: &kube::Client,
     ns: &str,
@@ -902,18 +916,97 @@ pub async fn namespace_allows_privileged_movers(client: &kube::Client, ns: &str)
     }
 }
 
+/// Which authored layer of the mover ladder
+/// (`moverDefaults ⊂ inherited ⊂ recipe.mover ⊂ invocation.mover`) made the mover
+/// elevated, so the privileged-mover refusal names the object that actually carries
+/// the elevation.
+///
+/// #464 is why this exists. Once a per-run `Snapshot.spec.mover` became the common
+/// source of elevation, a refusal that always named the `SnapshotPolicy` sent the
+/// operator to a spec containing nothing elevated — so they reached for the only
+/// other fix the message offered, `kubectl annotate namespace … privileged-movers`,
+/// permanently granting EVERY future backup in that namespace the right to run
+/// privileged in order to unblock one ad-hoc run.
+///
+/// An enum with an exhaustive `match` at the call site rather than a `&str`, so a
+/// future layer cannot be added without every refusal deciding what it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElevationLayer {
+    /// The invocation's own `spec.mover` — a per-run `Snapshot.spec.mover` (#464).
+    Invocation,
+    /// The recipe's `spec.mover` (`SnapshotPolicy`, `Restore`, `Maintenance`).
+    Recipe,
+    /// The repository's `spec.moverDefaults`.
+    RepositoryDefaults,
+    /// No single authored layer is elevated on its own: the elevation was inherited
+    /// from a workload pod via `mover.inheritSecurityContextFrom`, or assembled
+    /// across layers that are each benign alone. The recipe is then where to pin
+    /// it, and the message says so without claiming the recipe carries it.
+    Composed,
+}
+
+/// Attribute a refused elevation to the most specific authored layer that is
+/// elevated **on its own**, invocation → recipe → repository defaults.
+///
+/// Pure, and advisory only: the gate still evaluates the MERGED mover, so this can
+/// never widen or narrow what is refused — it only decides which object the message
+/// tells the operator to edit.
+pub fn attribute_elevation(
+    invocation: bool,
+    recipe: bool,
+    repository_defaults: bool,
+) -> ElevationLayer {
+    if invocation {
+        ElevationLayer::Invocation
+    } else if recipe {
+        ElevationLayer::Recipe
+    } else if repository_defaults {
+        ElevationLayer::RepositoryDefaults
+    } else {
+        ElevationLayer::Composed
+    }
+}
+
+/// Whether a repository's `moverDefaults` is elevated **on its own** — the
+/// `RepositoryDefaults` input to [`attribute_elevation`]. `moverDefaults` carries no
+/// `privilegedMode` knob, so only the two security contexts can raise it.
+pub fn mover_defaults_require_privilege(
+    defaults: Option<&kopiur_api::common::MoverDefaults>,
+) -> bool {
+    defaults.is_some_and(|d| {
+        kopiur_api::common::requires_privilege_resolved(
+            d.security_context.as_ref(),
+            d.pod_security_context.as_ref(),
+            None,
+        )
+    })
+}
+
 /// The actionable message for a privileged mover refused in a namespace that has
 /// not opted in (what / why / how-to-fix). Pure so the exact text is unit-asserted.
-/// `kind` is the owning resource's kind (e.g. `SnapshotPolicy`, `Restore`) and `name`
-/// its name, so the message names the right object to fix.
-pub fn privileged_mover_message(kind: &str, name: &str, ns: &str, mover_sa: &str) -> String {
+///
+/// `kind`/`name` identify the object that CARRIES the elevation (see
+/// [`attribute_elevation`]) and `field` the spec path inside it — `spec.mover` on an
+/// invocation or recipe, `spec.moverDefaults` on a repository. Naming the merged
+/// result's recipe regardless would point the operator at a spec with nothing
+/// elevated in it, and the only other fix on offer is a permanent namespace-wide
+/// grant. The spec-edit fix is therefore stated FIRST, and the annotation is labelled
+/// for what it is.
+pub fn privileged_mover_message(
+    kind: &str,
+    name: &str,
+    field: &str,
+    ns: &str,
+    mover_sa: &str,
+) -> String {
     format!(
-        "{kind} `{name}` requests a privileged mover (e.g. `runAsUser: 0`, `privileged: true`, \
+        "the mover for this run is privileged (e.g. `runAsUser: 0`, `privileged: true`, \
          added capabilities, or `privilegedMode`), but namespace `{ns}` has not opted in — a \
-         tenant with access to `{ns}` could reuse the minted `{mover_sa}` ServiceAccount at that \
-         privilege. Fix: a cluster admin runs `kubectl annotate namespace {ns} \
-         {PRIVILEGED_MOVERS_ANNOTATION}=true`, or remove the elevated securityContext/\
-         privilegedMode from the {kind} `spec.mover`."
+         tenant with access to `{ns}` could reuse the minted `{mover_sa}` ServiceAccount at \
+         that privilege. The elevation comes from {kind} `{name}` `{field}`. Fix: remove the \
+         elevated securityContext/privilegedMode there; or, to allow it for EVERY mover in \
+         namespace `{ns}` from now on, a cluster admin runs `kubectl annotate namespace {ns} \
+         {PRIVILEGED_MOVERS_ANNOTATION}=true`."
     )
 }
 

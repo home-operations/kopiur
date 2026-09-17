@@ -730,7 +730,35 @@ async fn spawn_maintenance_job(
             .mover_service_account
             .as_deref()
             .unwrap_or(config::DEFAULT_MOVER_NAME);
-        let msg = io::privileged_mover_message("Maintenance", cr_name, namespace, sa);
+        // Same attribution as the Snapshot/Restore gates: a `moverDefaults`
+        // elevation must not read as "edit this Maintenance".
+        let repo_ref = repo.repository_ref();
+        let layer = io::attribute_elevation(
+            false,
+            maint
+                .spec
+                .mover
+                .as_ref()
+                .is_some_and(|m| m.requires_privilege()),
+            io::mover_defaults_require_privilege(repo.mover_defaults.as_ref()),
+        );
+        let (carrier_kind, carrier_name, carrier_field) = match layer {
+            io::ElevationLayer::Invocation | io::ElevationLayer::Recipe => {
+                ("Maintenance", cr_name, "spec.mover")
+            }
+            io::ElevationLayer::RepositoryDefaults => (
+                io::repo_kind_str(repo_ref.kind),
+                repo_ref.name.as_str(),
+                "spec.moverDefaults",
+            ),
+            io::ElevationLayer::Composed => (
+                "Maintenance",
+                cr_name,
+                "spec.mover (including any securityContext it inherits from a workload)",
+            ),
+        };
+        let msg =
+            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, namespace, sa);
         tracing::warn!(maintenance = %cr_name, namespace = %namespace, "{msg}; skipping maintenance run");
         return Ok(());
     }

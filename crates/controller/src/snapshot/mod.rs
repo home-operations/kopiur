@@ -1407,8 +1407,46 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .mover_service_account
             .as_deref()
             .unwrap_or(config::DEFAULT_MOVER_NAME);
+        // Name the object that actually CARRIES the elevation. The gate above is on
+        // the merged mover — correct, so a per-run override cannot bypass the opt-in
+        // — but the merge has four authored layers, and telling an operator to edit
+        // the policy when the elevation is in their one-shot `Snapshot.spec.mover`
+        // (#464) sends them to a spec with nothing elevated in it. They then reach
+        // for the only other fix on offer: annotating the namespace, which
+        // permanently grants every future backup there the right to run privileged.
+        let policy_name = config.name_any();
+        let layer = io::attribute_elevation(
+            backup
+                .spec
+                .mover
+                .as_ref()
+                .is_some_and(|m| m.requires_privilege()),
+            config
+                .spec
+                .mover
+                .as_ref()
+                .is_some_and(|m| m.requires_privilege()),
+            io::mover_defaults_require_privilege(repo.mover_defaults.as_ref()),
+        );
+        let (carrier_kind, carrier_name, carrier_field) = match layer {
+            io::ElevationLayer::Invocation => ("Snapshot", name.as_str(), "spec.mover"),
+            io::ElevationLayer::Recipe => ("SnapshotPolicy", policy_name.as_str(), "spec.mover"),
+            io::ElevationLayer::RepositoryDefaults => (
+                io::repo_kind_str(repo_ref.kind),
+                repo_ref.name.as_str(),
+                "spec.moverDefaults",
+            ),
+            // Nothing is elevated on its own: the context was inherited from a
+            // workload pod, or assembled from layers that are each benign. The
+            // recipe is where `inheritSecurityContextFrom` is pinned or dropped.
+            io::ElevationLayer::Composed => (
+                "SnapshotPolicy",
+                policy_name.as_str(),
+                "spec.mover (including any securityContext it inherits from a workload)",
+            ),
+        };
         let msg =
-            io::privileged_mover_message("SnapshotPolicy", &config.name_any(), &namespace, sa);
+            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, &namespace, sa);
         let existing = backup
             .status
             .as_ref()
