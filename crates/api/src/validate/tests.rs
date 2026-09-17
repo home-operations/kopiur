@@ -4948,6 +4948,63 @@ fn staging_overrides_rejected_for_nfs_but_honored_for_pvc_selector_sources() {
 }
 
 #[test]
+fn a_source_path_override_on_a_selector_is_refused_at_admission() {
+    // #456: a `sourcePathOverride` is one LITERAL path, so on a selector it
+    // collapses every matched PVC onto ONE kopia source — N volumes' histories
+    // merged into one stream, pruning each other under a single retention pin.
+    // `expand_sources` already refuses it at run time, so nothing was ever
+    // written, which left the shape admissible but INERT: verification would
+    // then legitimately derive one member for a path the repository has no
+    // snapshot for. Refusing it at admission deletes the shape.
+    let source: Source = crate::testutil::from_yaml(
+        "pvcSelector: { labelSelector: { matchLabels: { app: pg } } }\n\
+         sourcePathOverride: /data\n",
+    );
+    let err = validate_source(&source).expect_err("selector + sourcePathOverride must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("sourcePathOverride"), "{msg}");
+    assert!(msg.contains("pvcSelector"), "{msg}");
+    // The message must name the supported alternative, not just say no.
+    assert!(msg.contains("sourcePathStrategy"), "{msg}");
+
+    // Both halves remain legal on their own.
+    let selector_only: Source = crate::testutil::from_yaml(
+        "pvcSelector: { labelSelector: { matchLabels: { app: pg } } }\n\
+         sourcePathStrategy: PvcNamespacedName\n",
+    );
+    assert!(validate_source(&selector_only).is_ok());
+    let plain_pvc_with_override: Source =
+        crate::testutil::from_yaml("pvc: { name: data }\nsourcePathOverride: /data\n");
+    assert!(
+        validate_source(&plain_pvc_with_override).is_ok(),
+        "an override on a single-PVC source addresses exactly one volume and stays supported"
+    );
+    // And an nfs source keeps its own override behavior untouched.
+    let nfs_with_override: Source = crate::testutil::from_yaml(
+        "nfs: { server: nas.local, path: /export }\nsourcePathOverride: /data\n",
+    );
+    assert!(validate_source(&nfs_with_override).is_ok());
+
+    // It must reach ADMISSION, not just the leaf validator: `validate_backup_config`
+    // is what the webhook and the controller both call.
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         groupBy: None\n\
+         sources: [ { pvcSelector: { labelSelector: { matchLabels: { app: pg } } }, \
+                      sourcePathOverride: /data } ]\n",
+    );
+    let msg = validate_backup_config(&spec)
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        msg.contains("sourcePathOverride") && msg.contains("sourcePathStrategy"),
+        "the refusal must surface through validate_backup_config: {msg}"
+    );
+}
+
+#[test]
 fn flipping_source_path_strategy_forks_a_selector_source() {
     // A `PvcName` -> `PvcNamespacedName` flip rewrites EVERY matched PVC's kopia
     // path at once (`/pvc/x` -> `/pvc/ns/x`), re-identifying the source and

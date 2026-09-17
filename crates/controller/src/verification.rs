@@ -203,11 +203,22 @@ pub struct VerifyMember {
     /// only shape a non-selector policy ever takes, and it keeps a zero-source
     /// legacy policy's PATHLESS identity byte-for-byte.
     pub source_path: Option<String>,
-    /// The stable 6-hex member tag ([`member_tag6`]), `Some` **only** when the
-    /// policy fans out to MORE THAN ONE member. A one-member policy — every
-    /// non-selector policy, and a selector that matched exactly one PVC —
-    /// keeps `None`, so its Job names, labels and status stamps stay
-    /// byte-identical to every prior operator.
+    /// The stable 6-hex member tag ([`member_tag6`]), `Some` for **every**
+    /// member of a `pvcSelector` policy — including a selector that currently
+    /// matches exactly ONE PVC — and `None` only for a non-selector policy.
+    ///
+    /// A one-member selector policy is deliberately NOT collapsed to `None`.
+    /// Its byte-identity to a pre-#456 operator is already gone (a different
+    /// identity source path is the entire fix), and keeping it in flat mode
+    /// would leave the pre-#456 false-pass `status.lastVerified` in place as
+    /// both a displayed lie AND, via `verify_cell_anchor`, the anchor that
+    /// defers the first REAL verification by up to a full period of the
+    /// coarsest due tier — a month, for a monthly deep drill. Stamps-map mode
+    /// gets that value cleared on the first reconcile with no new state, and it
+    /// also means growing the selector 1 -> 2 no longer discards the verified
+    /// member's real result. Job-name continuity is moot here: the legacy
+    /// unlabelled in-flight Job blocks the new name anyway
+    /// ([`job_blocks_cell`]).
     pub member6: Option<String>,
 }
 
@@ -230,7 +241,9 @@ pub struct VerifyMember {
 ///   `member6: None` (the pre-#456 identity, verbatim);
 /// * a selector matching nothing ⇒ an EMPTY Vec, mirroring
 ///   `SlotMintPlan::NothingMatched`. The caller warns, spawns nothing and
-///   stamps nothing — never a pathless run that false-passes.
+///   stamps nothing — never a pathless run that false-passes;
+/// * a selector matching exactly ONE PVC still gets a `member6`. See
+///   [`VerifyMember::member6`] for why that shape is not collapsed.
 pub fn verify_members(
     policy: &SnapshotPolicy,
     matched: &BTreeMap<usize, Vec<kopiur_api::snapshot::PvcTargetRef>>,
@@ -257,9 +270,15 @@ pub fn verify_members(
                 source_path_override: source.source_path_override.clone(),
                 read_only: kopiur_api::snapshot_policy::source_read_only(source),
             };
-            let Some(path) = eff.kopia_source_path(strategy) else {
-                continue;
-            };
+            // `/data` is not a guess, it is the byte-for-byte mirror of
+            // `expand_sources`' own fallback for this case, so verification
+            // looks exactly where the backup wrote. A silent `continue` here
+            // would drop a member from a COVERAGE calculation, which is the
+            // wrong default even for a branch a PVC-bearing `EffectiveSource`
+            // cannot currently reach.
+            let path = eff
+                .kopia_source_path(strategy)
+                .unwrap_or_else(|| "/data".to_string());
             // Two selector sources landing on one path is a configuration error
             // `expand_sources` REFUSES; verification only ever reads, so it
             // degrades to verifying that one path once rather than parking the
@@ -272,11 +291,6 @@ pub fn verify_members(
                 source_path: Some(path),
             });
         }
-    }
-    // A one-member fan-out is NOT a fan-out: drop the member dimension so the
-    // Job name, the labels and the stamp stay byte-identical to single-member.
-    if members.len() == 1 {
-        members[0].member6 = None;
     }
     members
 }
@@ -304,6 +318,16 @@ pub async fn resolve_verify_members(
 /// [`parse_stamp_key`] total and unambiguous. A member-only key (a single-repo
 /// policy that fans out) is therefore `#<member6>` — an empty repo segment.
 pub fn stamp_key(repo_key: Option<&str>, member6: Option<&str>) -> Option<String> {
+    // The load-bearing invariant of the whole prune. If a repo key ever
+    // admitted '#', `parse_stamp_key` would split it in the wrong place, the
+    // repo segment would not match any current key, and `stamp_key_live` would
+    // delete a LIVE stamp every reconcile — `lastVerified` would silently never
+    // advance and a due deep verify would re-fire forever. Asserted over real
+    // `repo_key` output in `tests::repo_keys_are_hash_free_so_the_separator_is_unambiguous`.
+    debug_assert!(
+        repo_key.is_none_or(|r| !r.contains('#')),
+        "repository key {repo_key:?} contains the '#' member separator"
+    );
     match (repo_key, member6) {
         (None, None) => None,
         (Some(r), None) => Some(r.to_string()),
@@ -715,14 +739,11 @@ async fn spawn_if_slot_free(
         requeue: Some(REQUEUE_RUNNING),
         deep_active: tier == VerifyTierKind::Deep,
     };
-    // The deep tier's single-flight is member-AGNOSTIC (`member6: None`), which
-    // is what makes deep members sequential ACROSS reconciles and operator
-    // restarts, not just within one pass.
-    let flight_member = match tier {
-        VerifyTierKind::Quick => target.member6,
-        VerifyTierKind::Deep => None,
-    };
-    if has_active_verify_job(job_api, policy_name, repo6, flight_member).await? {
+    // The deep tier's single-flight is member-AGNOSTIC but tier-SCOPED
+    // ([`job_blocks_cell`]): that is what makes deep members sequential ACROSS
+    // reconciles and operator restarts rather than only within one pass, while
+    // an unrelated member's short QUICK run never defers the drill.
+    if has_active_verify_job(job_api, policy_name, repo6, tier, target.member6).await? {
         return Ok(held);
     }
     spawn_verify_job(
@@ -1275,26 +1296,80 @@ async fn repo_has_discovered_snapshots(
     Ok(!api.list(&lp).await?.items.is_empty())
 }
 
+/// **Pure.** The verification tier an existing verify Job runs, read off its
+/// per-slot name.
+///
+/// Every shape [`verify_job_name`] has ever produced ends in
+/// `-vfy-<q|d>[-<r6>][-m<m6>]-<unix>`, and nothing after the marker contains
+/// another `-vfy-`, so the LAST occurrence is authoritative even for a policy
+/// whose own name contains the marker. Derived from the name rather than a new
+/// label precisely so it works on Jobs already in flight across an upgrade.
+///
+/// `None` = "cannot tell", which callers treat as blocking. There is no tier
+/// label to add retroactively, so an unreadable name must never be assumed
+/// harmless.
+fn job_tier(job: &Job) -> Option<VerifyTierKind> {
+    let (_, tail) = job.metadata.name.as_deref()?.rsplit_once("-vfy-")?;
+    if tail.starts_with("q-") {
+        Some(VerifyTierKind::Quick)
+    } else if tail.starts_with("d-") {
+        Some(VerifyTierKind::Deep)
+    } else {
+        None
+    }
+}
+
 /// **Pure.** Whether one existing verify Job holds the single-flight slot of
-/// the member identified by `member6`.
+/// the cell described by (`tier`, `member6`).
 ///
 /// This is the client-side half of the #456 upgrade guard. The LIST selector
-/// deliberately omits [`VERIFY_MEMBER_LABEL`] (see its doc comment), so the
-/// filtering happens here:
+/// deliberately omits [`VERIFY_MEMBER_LABEL`] (see [`verify_flight_selector`]),
+/// so the filtering happens here:
 ///
-/// * a Job with **no** member label blocks EVERY member. That is a Job minted
-///   by an operator that predates the label — for the deep tier, letting N
-///   fresh members start beside it would mean N+1 concurrent scratch restores;
-/// * while we are not fanning out (`member6: None`), any labelled Job blocks
-///   too. Conservative and transient (it happens only while a fan-out is
-///   collapsing to one member), and it never double-spawns;
-/// * otherwise only the SAME member blocks, so sibling quick members run
-///   concurrently.
-fn job_blocks_member(job: &Job, member6: Option<&str>) -> bool {
-    match (member6, job.labels().get(VERIFY_MEMBER_LABEL)) {
-        (_, None) | (None, Some(_)) => true,
-        (Some(mine), Some(theirs)) => mine == theirs,
+/// * a Job with **no** member label, or whose name yields no tier, blocks
+///   EVERY cell. That is a Job minted by an operator that predates this
+///   design — for the deep tier, letting N fresh members start beside it would
+///   mean N+1 concurrent scratch restores;
+/// * **quick** is per-member: only the same member's Job holds the slot, so
+///   sibling quick members run concurrently. While not fanning out
+///   (`member6: None`) any labelled Job blocks, which is conservative and
+///   transient;
+/// * **deep** is sequential across members, but only against other DEEP Jobs.
+///   Blocking it on any in-flight QUICK Job (as the first cut did) starves the
+///   drill on a wide policy: with N members and a tight quick cron the chance
+///   that some quick Job is running at deep-due time scales with N, and a
+///   held deep also suppresses that member's own quick (`due_tier` prefers
+///   deep). The sequencing property that matters — at most one deep scratch
+///   restore per (policy, repository), across reconciles and operator
+///   restarts, not merely within one pass — is preserved.
+fn job_blocks_cell(job: &Job, tier: VerifyTierKind, member6: Option<&str>) -> bool {
+    match (job.labels().get(VERIFY_MEMBER_LABEL), job_tier(job)) {
+        (None, _) | (_, None) => true,
+        (Some(theirs), Some(job_tier)) => match tier {
+            VerifyTierKind::Quick => member6.is_none_or(|mine| mine == theirs),
+            VerifyTierKind::Deep => job_tier == VerifyTierKind::Deep,
+        },
     }
+}
+
+/// **Pure.** The single-flight LIST selector for one (policy, repository)
+/// scope.
+///
+/// It **must never** contain [`VERIFY_MEMBER_LABEL`]: a Job minted by an
+/// operator predating that label would stop matching, and the reconciler would
+/// spawn one fresh Job per member alongside it — for the deep tier, N+1
+/// concurrent scratch restores. The member (and tier) narrowing happens
+/// client-side in [`job_blocks_cell`]. Extracted as a pure function so that
+/// invariant is actually asserted
+/// ([`tests::the_flight_selector_never_narrows_by_member`]) rather than left to
+/// a reviewer noticing a one-line change.
+fn verify_flight_selector(policy_name: &str, repo6: Option<&str>) -> String {
+    let mut selector =
+        format!("{COMPONENT_LABEL}={VERIFY_COMPONENT},{VERIFY_INSTANCE_LABEL}={policy_name}");
+    if let Some(r6) = repo6 {
+        selector.push_str(&format!(",{VERIFY_REPO_LABEL}={r6}"));
+    }
+    selector
 }
 
 /// Thin IO: the #168 escape-hatch probe for ONE repository — hoisted out of
@@ -1326,27 +1401,23 @@ pub async fn has_discovered_snapshots(
 /// keeps the policy-wide selector, which also matches in-flight Jobs from
 /// older operators that predate the repo label.
 ///
-/// `member6` narrows further, but **client-side only** ([`job_blocks_member`]):
-/// adding the member label to the LIST would make a legacy unlabelled Job
-/// invisible and spawn N new Jobs alongside it.
+/// `tier` and `member6` narrow further, but **client-side only**
+/// ([`job_blocks_cell`]): adding either to the LIST would make a legacy
+/// unlabelled Job invisible and spawn N new Jobs alongside it.
 async fn has_active_verify_job(
     job_api: &Api<Job>,
     policy_name: &str,
     repo6: Option<&str>,
+    tier: VerifyTierKind,
     member6: Option<&str>,
 ) -> Result<bool> {
-    let mut selector =
-        format!("{COMPONENT_LABEL}={VERIFY_COMPONENT},{VERIFY_INSTANCE_LABEL}={policy_name}");
-    if let Some(r6) = repo6 {
-        selector.push_str(&format!(",{VERIFY_REPO_LABEL}={r6}"));
-    }
     let jobs = job_api
-        .list(&ListParams::default().labels(&selector))
+        .list(&ListParams::default().labels(&verify_flight_selector(policy_name, repo6)))
         .await?;
     Ok(jobs
         .items
         .iter()
-        .any(|j| job_terminal_state(j).is_none() && job_blocks_member(j, member6)))
+        .any(|j| job_terminal_state(j).is_none() && job_blocks_cell(j, tier, member6)))
 }
 
 #[cfg(test)]
@@ -2433,15 +2504,21 @@ mod tests {
             assert_eq!(members[0].source_path, None, "{sources}");
             assert_eq!(members[0].member6, None, "{sources}");
         }
-        // A selector matching exactly ONE PVC still needs the derived path (that
-        // is the bug), but is not a fan-out: no member dimension, so its Job
-        // name, labels and stamp stay byte-identical to a single-member policy.
+        // A selector matching exactly ONE PVC is NOT collapsed to the flat
+        // shape: it needs the derived path (that is the bug), and it needs
+        // stamps-map mode so the pre-#456 false-pass `lastVerified` — which
+        // also ANCHORS the next due slot — is cleared instead of deferring the
+        // first real verification by up to a full deep period.
         let one = selector_policy(serde_json::json!([{
             "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
         }]));
         let members = verify_members(&one, &matched(&[(0, &[("ns", "only")])]));
         assert_eq!(paths(&members), vec!["/pvc/only"]);
-        assert_eq!(members[0].member6, None);
+        assert_eq!(
+            members[0].member6.as_deref(),
+            Some(member_tag6("/pvc/only").as_str()),
+            "a one-PVC selector keeps its member dimension"
+        );
     }
 
     #[test]
@@ -2652,6 +2729,32 @@ mod tests {
     }
 
     #[test]
+    fn repo_keys_are_hash_free_so_the_separator_is_unambiguous() {
+        // `parse_stamp_key` splits on the LAST '#'. That is only total because a
+        // repository key cannot contain one. Asserted over REAL `repo_key`
+        // output (not a hand-written string) across every ref shape, plus the
+        // member tag's own alphabet, so a future key format that admitted '#'
+        // fails here instead of silently pruning a live stamp every reconcile.
+        for r in [
+            rref("Repository", Some("ns"), "nas"),
+            rref("Repository", None, "nas"),
+            rref("ClusterRepository", None, "offsite"),
+            rref("ClusterRepository", Some("ignored"), "offsite"),
+        ] {
+            let key = kopiur_api::common::repo_key(&r, "ns");
+            assert!(!key.contains('#'), "repo key {key:?} must be '#'-free");
+            // And it round-trips through the pair unchanged.
+            let stamp = stamp_key(Some(&key), Some("abc123")).expect("keyed");
+            assert_eq!(parse_stamp_key(&stamp), (key.as_str(), Some("abc123")));
+        }
+        let tag = member_tag6("/pvc/data#weird");
+        assert!(
+            tag.chars().all(|c| c.is_ascii_hexdigit()),
+            "the member tag must stay hex ({tag}) — it is the segment AFTER the separator"
+        );
+    }
+
+    #[test]
     fn the_prune_keeps_member_keys_and_drops_only_dead_cells() {
         // The #368 prune kept a key only when it equalled a current REPO key
         // exactly, so it deleted every member-keyed stamp on the next
@@ -2754,7 +2857,7 @@ mod tests {
 
     // --- single-flight across an upgrade -------------------------------------
 
-    fn verify_job(member6: Option<&str>) -> Job {
+    fn verify_job(name: &str, member6: Option<&str>) -> Job {
         let mut labels = BTreeMap::new();
         labels.insert(COMPONENT_LABEL.to_string(), VERIFY_COMPONENT.to_string());
         labels.insert(VERIFY_INSTANCE_LABEL.to_string(), "pg".to_string());
@@ -2763,7 +2866,7 @@ mod tests {
         }
         Job {
             metadata: kube::core::ObjectMeta {
-                name: Some("pg-vfy-d-1".into()),
+                name: Some(name.to_string()),
                 labels: Some(labels),
                 ..Default::default()
             },
@@ -2772,30 +2875,127 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_unlabelled_verify_job_blocks_every_member() {
-        // THE upgrade hazard. An in-flight Job minted by an operator predating
-        // the member label carries neither VERIFY_MEMBER_LABEL nor
-        // VERIFY_REPO_LABEL. If the member label joined the LIST selector that
-        // Job would become invisible and we would spawn N fresh ones beside it
-        // — for the deep tier, N+1 concurrent scratch restores.
-        let legacy = verify_job(None);
-        assert!(job_blocks_member(&legacy, None));
-        assert!(job_blocks_member(&legacy, Some("m1")));
-        assert!(job_blocks_member(&legacy, Some("m2")));
+    fn the_flight_selector_never_narrows_by_member() {
+        // THE invariant of the upgrade guard, asserted rather than left to a
+        // reviewer noticing a one-line change. Putting VERIFY_MEMBER_LABEL in
+        // the LIST makes a Job minted by an older operator (which carries
+        // neither the member nor the repo label) invisible, and the reconciler
+        // then spawns one fresh Job per member beside it — for the deep tier,
+        // N+1 concurrent scratch restores. A regression here is silent.
+        for repo6 in [None, Some("abc123")] {
+            let selector = verify_flight_selector("pg", repo6);
+            assert!(
+                !selector.contains(VERIFY_MEMBER_LABEL),
+                "the single-flight LIST must never narrow by member: {selector}"
+            );
+            assert!(selector.contains(&format!("{COMPONENT_LABEL}={VERIFY_COMPONENT}")));
+            assert!(selector.contains(&format!("{VERIFY_INSTANCE_LABEL}=pg")));
+        }
+        // The repository scope IS part of the LIST (repo A's verify must not
+        // block repo B's), and absent for the single-repo shape so in-flight
+        // Jobs from operators predating that label still match.
+        assert!(
+            verify_flight_selector("pg", Some("abc123"))
+                .contains(&format!("{VERIFY_REPO_LABEL}=abc123"))
+        );
+        assert!(!verify_flight_selector("pg", None).contains(VERIFY_REPO_LABEL));
     }
 
     #[test]
-    fn sibling_members_do_not_block_each_other_but_the_same_member_does() {
-        let m1 = verify_job(Some("m1"));
-        assert!(job_blocks_member(&m1, Some("m1")));
+    fn job_tier_reads_the_tier_off_every_name_shape_verify_job_name_produces() {
+        let slot = DateTime::parse_from_rfc3339("2026-06-09T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let r6 = crate::naming::repo_tag6("Repository/backups/nas");
+        let m6 = member_tag6("/pvc/data-a");
+        for (repo, member) in [
+            (None, None),
+            (None, Some(m6.as_str())),
+            (Some(r6.as_str()), None),
+            (Some(r6.as_str()), Some(m6.as_str())),
+        ] {
+            for tier in [VerifyTierKind::Quick, VerifyTierKind::Deep] {
+                // A policy name that itself contains the marker: the LAST
+                // occurrence is the authoritative one.
+                for policy in ["pg", "app-vfy-q-1"] {
+                    let name = verify_job_name(policy, tier, slot, repo, member);
+                    assert_eq!(
+                        job_tier(&verify_job(&name, member)),
+                        Some(tier),
+                        "could not read the tier off {name}"
+                    );
+                }
+            }
+        }
+        // An unreadable name is "cannot tell", which must block (there is no
+        // tier label to add retroactively).
+        assert_eq!(job_tier(&verify_job("hand-renamed", None)), None);
+        assert!(job_blocks_cell(
+            &verify_job("hand-renamed", Some("m1")),
+            VerifyTierKind::Deep,
+            Some("m2")
+        ));
+    }
+
+    #[test]
+    fn a_legacy_unlabelled_verify_job_blocks_every_cell() {
+        // THE upgrade hazard. An in-flight Job minted by an operator predating
+        // the member label carries neither VERIFY_MEMBER_LABEL nor
+        // VERIFY_REPO_LABEL. It is found because the LIST does not narrow by
+        // member, and it must hold every cell's slot.
+        let legacy = verify_job("pg-vfy-d-1780000000", None);
+        for tier in [VerifyTierKind::Quick, VerifyTierKind::Deep] {
+            for member in [None, Some("m1"), Some("m2")] {
+                assert!(
+                    job_blocks_cell(&legacy, tier, member),
+                    "legacy Job must block {tier:?}/{member:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quick_members_run_concurrently_while_deep_members_run_one_at_a_time() {
+        let quick_m1 = verify_job("pg-vfy-q-m111111-1780000000", Some("m111111"));
+        let deep_m1 = verify_job("pg-vfy-d-m111111-1780000000", Some("m111111"));
+
+        // Quick is per-member.
+        assert!(job_blocks_cell(
+            &quick_m1,
+            VerifyTierKind::Quick,
+            Some("m111111")
+        ));
         assert!(
-            !job_blocks_member(&m1, Some("m2")),
-            "quick members of one repository run concurrently"
+            !job_blocks_cell(&quick_m1, VerifyTierKind::Quick, Some("m222222")),
+            "sibling quick members are independent short reads and run concurrently"
         );
         assert!(
-            job_blocks_member(&m1, None),
-            "while NOT fanning out (and for the always-sequential deep tier, which \
-             passes None) any labelled Job holds the slot"
+            job_blocks_cell(&quick_m1, VerifyTierKind::Quick, None),
+            "while NOT fanning out, any labelled Job holds the slot"
+        );
+
+        // Deep is sequential across members — but ONLY against other deep
+        // Jobs. Blocking it on an unrelated member's quick run starves the
+        // drill on a wide policy (the odds some quick Job is live at deep-due
+        // time scale with N, and a held deep suppresses that member's quick
+        // too, since due_tier prefers deep).
+        assert!(job_blocks_cell(
+            &deep_m1,
+            VerifyTierKind::Deep,
+            Some("m222222")
+        ));
+        assert!(job_blocks_cell(
+            &deep_m1,
+            VerifyTierKind::Deep,
+            Some("m111111")
+        ));
+        assert!(
+            !job_blocks_cell(&quick_m1, VerifyTierKind::Deep, Some("m222222")),
+            "an unrelated member's QUICK Job must not defer the deep drill"
+        );
+        assert!(
+            !job_blocks_cell(&deep_m1, VerifyTierKind::Quick, Some("m222222")),
+            "and a deep drill must not block a sibling's quick verify either"
         );
     }
 }

@@ -159,6 +159,7 @@ Consequences worth knowing:
 - **A hand-written `Snapshot` with only a `policyRef` is rejected** against a selector policy. It does not say which PVC it covers, and the operator will not pick one of N on your behalf. Use `kubectl kopiur snapshot now` or a schedule; both expand for you.
 - **The selector only matches PVCs in the policy's own namespace.** `namespaceSelector` is refused, because a mover Pod can only mount PersistentVolumeClaims in its own namespace, and the mover Job runs in the `Snapshot`'s namespace, which is the policy's. Use one `SnapshotPolicy` per namespace; they can share a repository.
 - **Two selector sources may not match the same PVC.** Both would resolve to one kopia source path and one `Snapshot` name, so one of the two backups would silently overwrite the other. Narrow the selectors instead.
+- **`sourcePathOverride` is refused on a selector source.** It is one literal path, so it would collapse every matched PVC onto a single kopia source and merge their histories into one stream, where they would also prune each other under a single retention pin. Use `sourcePathStrategy`, which derives a distinct path per PVC, or put the override on its own `pvc:` source.
 - **`sourcePathStrategy` is part of your data identity.** `PvcName` gives each PVC the kopia path `/pvc/<name>`; `PvcNamespacedName` qualifies it with the namespace. Changing the strategy later re-identifies every source, so it is guarded like any other identity change. See [Identity](#identity--what-kopia-records-usernamehostnamepath).
 - **`groupBy`** decides whether the captures are crash-consistent with each other. See [copy methods → multi-PVC and consistency groups](copy-methods.md#multi-pvc-and-consistency-groups).
 
@@ -461,7 +462,15 @@ Where it shows up:
 - **A selector that currently matches nothing.** Nothing is verified and nothing is stamped, and the operator logs a warning naming the policy. It never runs a verification that covers no volume.
 - **The gate is per volume.** The [gate above](#verification-scheduling--gated-until-there-is-something-to-verify) applies to each member individually: a PVC that joins the selector later stays unverified until **its own** first backup succeeds. A sibling's success does not unlock it, because verifying a volume the repository has never seen is the silent false pass described below.
 
-`quick` members of one repository run **concurrently** — they are short, read-only, metadata-heavy runs. `deep` members run **one at a time**, because each deep member provisions its own scratch volume of `deep.capacity`; four volumes at `capacity: 500Gi` would otherwise ask the cluster for 2 TiB of ephemeral storage at once. A held member starts as soon as the running one finishes, so a full deep drill of an N-volume policy simply takes N sequential restores.
+`quick` members of one repository run **concurrently** — they are short, read-only, metadata-heavy runs. `deep` members run **one at a time**, because each deep member provisions its own scratch volume of `deep.capacity`; four volumes at `capacity: 500Gi` would otherwise ask the cluster for 2 TiB of ephemeral storage at once. A held member starts as soon as the running one finishes, so a full deep drill of an N-volume policy simply takes N sequential restores. Only other `deep` runs hold a `deep` member back; a sibling's `quick` run never defers the drill.
+
+/// warning | A verification that covered nothing is a failure
+
+`kopia snapshot verify --sources <identity>` **exits 0 when its filter matches no snapshot at all**, so "the verify command succeeded" is not by itself evidence that anything was verified. The mover therefore fails the run, with `no snapshot ... for <identity>` naming the source path, whenever it cannot find a snapshot for the identity it just verified — for either tier.
+
+You can hit this without doing anything wrong. Changing a source's `sourcePathStrategy`, or its `sourcePathOverride`, re-addresses the kopia source: the existing snapshots stay under the **old** path and the new identity has none yet, so the first verification after such an edit fails until a backup runs under the new address. (The webhook rejects that edit outright on a policy that already has snapshots unless you acknowledge it — see [identity changes](#identity--what-kopia-records-usernamehostnamepath).) The same applies when the snapshots themselves are gone, for example after an external deletion.
+
+///
 
 /// warning | If you were already running verification on a `pvcSelector` policy
 
@@ -471,9 +480,7 @@ On the first reconcile after upgrading, the operator clears that stale flat `sta
 
 ///
 
-/// note | Two smaller changes that came with the fan-out
-
-A policy that has a source but from which no path can be derived now verifies under `/data`, which is the path its backups were actually written under, instead of an empty path.
+/// note | One smaller change that came with the fan-out
 
 A policy whose `identityDefaults.usernameExpr`/`hostnameExpr` cannot be evaluated now **parks** with a validation error on the `SnapshotPolicy` instead of quietly verifying under a `kopiur-verify@<namespace>` placeholder — which matched nothing and reported success. Fix the expression and the policy resumes.
 

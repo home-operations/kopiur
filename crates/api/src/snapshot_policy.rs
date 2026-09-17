@@ -359,6 +359,11 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledge_live_mutation: Option<bool>,
     /// What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
+    ///
+    /// Refused on a `pvcSelector` source: it is one literal path, so it would
+    /// collapse every matched PVC onto a single kopia source and merge their
+    /// histories into one stream. Use `sourcePathStrategy`, which derives a
+    /// distinct path per PVC, or put the override on its own `pvc:` source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
     pub source_path_override: Option<String>,
@@ -873,10 +878,17 @@ pub struct SnapshotPolicyStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_successful_snapshot: Option<String>,
     /// RFC3339 timestamp of the most recent successful verification (any tier).
-    /// Single-repo: stamped directly by the verify mover. Multi-repo: computed
-    /// by the controller as the MINIMUM `lastVerified` across the CURRENT
-    /// repositories ("everything is verified as of T"), absent until every
-    /// current repository has verified at least once.
+    ///
+    /// Verification runs once per (repository x source) cell: a
+    /// `spec.repositories` fan-out adds the repository dimension, and a
+    /// `pvcSelector` source adds one cell per matched PVC (each has its own
+    /// kopia source path, so each needs its own verification).
+    ///
+    /// * one repository, one source: stamped directly by the verify mover;
+    /// * otherwise: computed by the controller as the MINIMUM across the
+    ///   CURRENT cells ("everything is verified as of T"), and absent until
+    ///   EVERY current cell has verified at least once — a partially verified
+    ///   policy must not display a reassuring timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verified: Option<String>,
     /// Per-repository verification records for a multi-repository policy
@@ -886,14 +898,27 @@ pub struct SnapshotPolicyStatus {
     /// wire stays byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification: Vec<RepoVerification>,
-    /// Internal write channel for per-repository verification (#368): RFC3339
-    /// markers keyed by the normalized repository key
-    /// ([`repo_key`](crate::common::repo_key)). Each verify mover merge-patches
-    /// ONLY its own key — a JSON merge patch merges map keys, so two concurrent
-    /// per-repo verifies can never clobber one another (a Vec would be replaced
-    /// wholesale). The controller folds these into `verification` on its next
-    /// pass and prunes keys for repositories no longer in the spec. Never
-    /// written for the single-repo shape.
+    /// Internal write channel for per-cell verification: RFC3339 markers keyed
+    /// by the (repository x source) cell a verify run covered.
+    ///
+    /// Key shapes, where the repository segment is the normalized repository
+    /// key ([`repo_key`](crate::common::repo_key)) and the member segment is a
+    /// stable 6-hex tag over the matched PVC's derived kopia source path:
+    ///
+    /// * `<repository>` — a `spec.repositories` fan-out with a single source;
+    /// * `<repository>#<member>` — a fan-out over both dimensions;
+    /// * `#<member>` — one repository, a `pvcSelector` source (the repository
+    ///   segment is empty).
+    ///
+    /// `#` is the separator because a repository key cannot contain one.
+    ///
+    /// Each verify mover merge-patches ONLY its own key — a JSON merge patch
+    /// merges map keys, so concurrent cells can never clobber one another (a
+    /// Vec would be replaced wholesale). The controller folds these into
+    /// `verification` and `lastVerified` on its next pass and prunes keys whose
+    /// repository or matched PVC is gone. Not written when the policy targets
+    /// one repository with a non-selector source, whose wire stays
+    /// byte-identical.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub verification_stamps: std::collections::BTreeMap<String, String>,
     /// Human-readable summary of the policy's repository target(s) for the
@@ -919,6 +944,11 @@ pub struct RepoVerification {
     pub repository: RepositoryRef,
     /// RFC3339 timestamp of the most recent successful verification (any tier)
     /// against THIS repository; absent until its first successful verify.
+    ///
+    /// When the policy's source is a `pvcSelector`, this is the MINIMUM across
+    /// that repository's matched PVCs, and absent until every one of them has
+    /// verified — a repository whose volumes are only partly verified must not
+    /// look fully verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verified: Option<String>,
 }

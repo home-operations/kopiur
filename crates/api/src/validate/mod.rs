@@ -158,7 +158,27 @@ pub fn validate_source(source: &Source) -> ValidationResult {
                 validate_nfs_volume(nfs, "snapshot source")
             }
             None => match source.pvc_selector.as_ref() {
-                Some(selector) => validate_pvc_selector(selector),
+                Some(selector) => {
+                    // A `sourcePathOverride` is a LITERAL path, so on a selector
+                    // it collapses every matched PVC onto ONE kopia source: N
+                    // volumes' histories merged into one stream, pruning each
+                    // other under a single retention pin. `expand_sources`
+                    // already refuses that at run time (nothing is ever
+                    // written), which left the shape admissible but inert — and
+                    // verification then legitimately derives one member for a
+                    // path the repository has no snapshot for. Refuse it here
+                    // so the shape cannot exist. `sourcePathStrategy` is the
+                    // supported knob, and it is per-PVC by construction.
+                    if source.source_path_override.is_some() {
+                        return Err(ValidationError::MutuallyExclusive {
+                            a: "sourcePathOverride".to_string(),
+                            b: "pvcSelector".to_string(),
+                            context: "snapshot source: a sourcePathOverride is one literal                                       path, so it would collapse every matched PVC onto a                                       single kopia source and merge their histories. Use                                       sourcePathStrategy (PvcName / PvcNamespacedName),                                       which derives a distinct path per PVC, or move the                                       override to its own `pvc:` source"
+                                .to_string(),
+                        });
+                    }
+                    validate_pvc_selector(selector)
+                }
                 None => Ok(()),
             },
         },
