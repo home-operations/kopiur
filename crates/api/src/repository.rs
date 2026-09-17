@@ -283,13 +283,15 @@ pub struct RetentionWindow {
 /// **Every field here has an admission floor** (#458), because `kopia repository
 /// set-parameters` merges the flags it is given into the repository's existing parameters and
 /// then validates the whole resulting set — so ONE out-of-range value refuses the entire
-/// call and discards every other parameter in the same apply. The floors are: `minDuration`
-/// >= `10m` and >= 3x `refreshFrequency` (kopia's untouched `20m` default when none is
-/// declared, which is why `minDuration: 10m` alone is rejected and `60m` is the smallest
-/// value that stands on its own); `refreshFrequency` <= `80m` (kopia needs
-/// `cleanupSafetyMargin >= 3x` it, and the margin is stuck at kopia's `4h` default because
-/// kopiur cannot set it); `advanceOnCount` >= `10`; `advanceOnSizeMiB` >= `1`;
-/// `checkpointFrequency` >= `1`; `deleteParallelism` >= `1`.
+/// call and discards every other parameter in the same apply. The floors:
+///
+/// - `minDuration`: at least `10m`, and at least 3x `refreshFrequency` (kopia's untouched
+///   `20m` default when none is declared — which is why `minDuration: 10m` alone is
+///   rejected, and `60m` is the smallest value that stands on its own).
+/// - `refreshFrequency`: at most `80m`, because kopia needs `cleanupSafetyMargin` to be at
+///   least 3x it and the margin is stuck at kopia's `4h` default (kopiur cannot set it).
+/// - `advanceOnCount`: at least `10`. `advanceOnSizeMiB`: at least `1`.
+/// - `checkpointFrequency`: at least `1`. `deleteParallelism`: at least `1`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EpochParameters {
