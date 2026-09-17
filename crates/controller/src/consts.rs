@@ -119,13 +119,13 @@ pub const VERIFY_REPO_LABEL: &str = "kopiur.home-operations.com/verify-repo";
 
 /// Label tying a verification Job to the ONE selector-expanded member (one
 /// matched PVC's derived kopia source path) it verifies (#456 fan-out). Value:
-/// the stable 6-hex member tag ([`crate::verification::member_tag6`]) over that
+/// the stable 12-hex member tag ([`crate::verification::member_tag`]) over that
 /// DERIVED source path — label-safe where the raw `/pvc/<name>` path (slashes)
 /// is not.
 ///
 /// Stamped on every member of a `pvcSelector` policy — including a selector
 /// that currently matches exactly ONE PVC, which is deliberately NOT collapsed
-/// to the flat shape (see [`crate::verification::VerifyMember::member6`]).
+/// to the flat shape (see [`crate::verification::VerifyMember::member_tag`]).
 /// Absent only for a non-selector source (`pvc:`/`nfs:`), whose Job names,
 /// labels and status stamps therefore stay byte-identical to every prior
 /// operator.

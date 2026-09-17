@@ -258,7 +258,7 @@ async fn verification_fans_out_per_matched_pvc() {
         assert_eq!(
             spec["operation"]["verify"]["stampKey"].as_str(),
             Some(format!("#{member}").as_str()),
-            "a single-repository fan-out stamps `#<member6>`"
+            "a single-repository fan-out stamps `#<member tag>`"
         );
         paths.push(path);
     }
