@@ -260,9 +260,18 @@ pub fn maintenance_covered_by_foreign(
 /// cluster. Unlike [`classify_maintenance`] it does not care whether the
 /// covering `Maintenance` is operator-managed or hand-authored: both run real
 /// maintenance against the same repository, so either one's recount is a valid
-/// observation of it. With several covering CRs the newest `observedAt` wins —
-/// comparison is lexicographic on the RFC3339 string, which is exactly
-/// chronological for the `Utc::to_rfc3339` form the mover writes.
+/// observation of it. With several covering CRs the newest `observedAt` wins,
+/// ranked on the PARSED instant — never on the raw RFC3339 string.
+///
+/// The string order is chronological only for ONE spelling of the offset. The
+/// mover writes `DateTime<Utc>::to_rfc3339()` (a literal `+00:00`), but a
+/// hand-authored `Maintenance` — or a `kubectl patch` — may carry `Z` or any
+/// other offset, and `Z` (0x5a) sorts ABOVE every digit. `…T00:00:00Z` would
+/// then outrank the strictly later `…T00:00:01+00:00`, so a STALE
+/// pre-compaction count could beat the fresh post-maintenance recount and
+/// `IndexBlobHealth` would quote exactly the number #458 exists to stop
+/// quoting. Parsing already happens (below) to reject unplaceable stamps; this
+/// keeps the result instead of throwing it away.
 ///
 /// An observation whose `observedAt` does not PARSE as RFC3339 is discarded
 /// here rather than ranked. That is not defensive decoration: a hand-authored
@@ -288,10 +297,11 @@ pub fn newest_observed_index_blobs(
         })
         .filter_map(|m| {
             let observed = m.status?.observed_index_blobs?;
-            chrono::DateTime::parse_from_rfc3339(&observed.observed_at).ok()?;
-            Some((observed.count, observed.observed_at))
+            let at = chrono::DateTime::parse_from_rfc3339(&observed.observed_at).ok()?;
+            Some((at.to_utc(), observed.count, observed.observed_at))
         })
-        .max_by(|a, b| a.1.cmp(&b.1))
+        .max_by_key(|(at, _, _)| *at)
+        .map(|(_, count, observed_at)| (count, observed_at))
 }
 
 /// [`newest_observed_index_blobs`] against the shared `Maintenance` informer
@@ -815,6 +825,65 @@ mod tests {
                 None
             ),
             None
+        );
+    }
+
+    /// F3: the newest recount is chosen on the PARSED instant, so a mixed
+    /// offset spelling cannot promote a stale count.
+    ///
+    /// `Z` (0x5a) sorts above `+` (0x2b) and `-` (0x2d), so a raw-string `max`
+    /// ranks `…T00:00:00Z` ABOVE the strictly later `…T00:00:00-01:00`. The
+    /// mover always writes the `+00:00` form, but a hand-authored `Maintenance`
+    /// — or a `kubectl patch` — writes `Z`, and then the STALE pre-compaction
+    /// count wins and `IndexBlobHealth` quotes the number #458 exists to stop
+    /// quoting.
+    #[test]
+    fn the_newest_recount_is_ranked_chronologically_not_lexicographically() {
+        let items = vec![
+            // STALE (00:00Z), hand-patched with a `Z` — which sorts ABOVE the
+            // `-` of the fresher stamp at the very same character position.
+            maint(
+                "ops",
+                RepositoryKind::ClusterRepository,
+                "shared",
+                None,
+                Some((9_999, "2026-06-09T00:00:00Z")),
+            ),
+            // FRESH: 01:00Z, an hour LATER, yet its string sorts lower.
+            maint(
+                "other",
+                RepositoryKind::ClusterRepository,
+                "shared",
+                None,
+                Some((312, "2026-06-09T00:00:00-01:00")),
+            ),
+        ];
+        assert_eq!(
+            newest_observed_index_blobs(items, RepositoryKind::ClusterRepository, "shared", None),
+            Some((312, "2026-06-09T00:00:00-01:00".to_string())),
+            "the later instant must win regardless of how its offset is spelled"
+        );
+        // And a non-UTC offset is placed on the real timeline, not on its digits.
+        let offsets = vec![
+            maint(
+                "ops",
+                RepositoryKind::ClusterRepository,
+                "shared",
+                None,
+                Some((9_999, "2026-06-09T02:00:00+00:00")),
+            ),
+            maint(
+                "other",
+                RepositoryKind::ClusterRepository,
+                "shared",
+                None,
+                // 03:00Z — later, though "01" sorts below "02".
+                Some((312, "2026-06-09T01:00:00-02:00")),
+            ),
+        ];
+        assert_eq!(
+            newest_observed_index_blobs(offsets, RepositoryKind::ClusterRepository, "shared", None),
+            Some((312, "2026-06-09T01:00:00-02:00".to_string()))
         );
     }
 

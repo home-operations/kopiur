@@ -643,20 +643,44 @@ pub fn verify_ok_body(
     }
 }
 
-/// `{ "status": ... }` body for a failed verification: a `Verified=False` condition.
-pub fn verify_failed_body(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "status": {
-            "conditions": [{
-                "type": "Verified",
-                "status": "False",
-                "reason": "VerificationFailed",
-                "message": message,
-                "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
-                "observedGeneration": 0,
-            }],
-        }
-    })
+/// The `{ "status": ... }` body for a failed verification, or `None` when this
+/// run must not write one.
+///
+/// `stamp_key` is the SAME discriminator [`verify_ok_body`] takes, and for the
+/// same reason:
+///
+/// * `None` (the classic flat flow — one repository, one verification member):
+///   there is exactly ONE verify mover per policy, so it owns the conditions
+///   array and reports `Verified=False` — byte-identical to every prior
+///   operator.
+/// * `Some(_)` (one cell of a (repository x member) grid): write NOTHING. A
+///   JSON merge patch REPLACES arrays, and #456's fan-out means N concurrent
+///   movers per policy; a bare `conditions` array from each of them clobbers
+///   its siblings and erases the controller's own `Ready` row. The success path
+///   already omits the array for exactly this reason, so the failure path must
+///   too — a writer that cannot write safely must not write.
+///
+/// A failed cell is NOT silent: its Job is `Failed` (pod logs retained to its
+/// TTL, and `verify_step` reads the terminal state), its stamp is never
+/// written, so the controller's fold cannot advance `lastVerified` for the
+/// repository — which is what `kopiur_snapshot_verified` staleness alerting
+/// watches — and the mover logs the classified error before exiting non-zero.
+pub fn verify_failed_body(stamp_key: Option<&str>, message: &str) -> Option<serde_json::Value> {
+    match stamp_key {
+        Some(_) => None,
+        None => Some(serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Verified",
+                    "status": "False",
+                    "reason": "VerificationFailed",
+                    "message": message,
+                    "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+                    "observedGeneration": 0,
+                }],
+            }
+        })),
+    }
 }
 
 /// `{ "status": ... }` body for a successful replication: stamp `lastReplicated`,
@@ -2106,6 +2130,87 @@ mod tests {
         let b = verify_ok_body("quick", Some("#bbbbbb"), &now);
         assert!(a["status"]["verificationStamps"]["#bbbbbb"].is_null());
         assert!(b["status"]["verificationStamps"]["#aaaaaa"].is_null());
+    }
+
+    #[test]
+    fn verify_failed_body_is_written_only_by_the_run_that_owns_the_conditions_array() {
+        // The classic flat flow: ONE verify mover per policy, so it owns the
+        // array and reports the failure — byte-identical to every prior
+        // operator.
+        let flat = verify_failed_body(None, "deep verify found no snapshot")
+            .expect("the flat flow reports Verified=False");
+        assert_eq!(flat["status"]["conditions"][0]["type"], "Verified");
+        assert_eq!(flat["status"]["conditions"][0]["status"], "False");
+        assert_eq!(
+            flat["status"]["conditions"][0]["reason"],
+            "VerificationFailed"
+        );
+        // Every KEYED shape — #368's per-repository dimension, #456's
+        // per-member dimension, or both — writes nothing. N of these run
+        // CONCURRENTLY on one policy, and a merge-patched `conditions` array
+        // replaces the array wholesale, so each one would erase its siblings'
+        // rows and the controller's own. `verify_ok_body` already omits the
+        // array for exactly this reason (asserted just above); the failure path
+        // must agree or the fan-out reintroduced the clobber.
+        for key in [
+            "Repository/backups/nas",
+            "#a1b2c3",
+            "Repository/backups/nas#a1b2c3",
+        ] {
+            assert!(
+                verify_failed_body(Some(key), "boom").is_none(),
+                "a fan-out cell must not write the replace-on-merge conditions array: {key}"
+            );
+        }
+    }
+
+    /// The concrete damage the keyed arm avoids: with N members failing, a bare
+    /// `conditions` array from each mover REPLACES what the controller wrote,
+    /// so the policy's `Ready` row disappears on a merge patch.
+    #[test]
+    fn a_fanned_out_failure_cannot_erase_the_controllers_ready_row() {
+        fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+            // RFC 7396: object keys merge, arrays are REPLACED.
+            match (target.as_object_mut(), patch.as_object()) {
+                (Some(t), Some(p)) => {
+                    for (k, v) in p {
+                        match (
+                            v.is_null(),
+                            v.is_object() && t.get(k).is_some_and(|c| c.is_object()),
+                        ) {
+                            (true, _) => {
+                                t.remove(k);
+                            }
+                            (false, true) => {
+                                merge(t.get_mut(k).expect("checked present just above"), v)
+                            }
+                            (false, false) => {
+                                t.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                _ => *target = patch.clone(),
+            }
+        }
+        // What the controller wrote this reconcile.
+        let mut stored = serde_json::json!({
+            "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
+        });
+        // Two sibling members of one fanned-out policy both fail.
+        for key in ["#aaaaaa", "#bbbbbb"] {
+            if let Some(body) = verify_failed_body(Some(key), "boom") {
+                merge(&mut stored, &body);
+            }
+        }
+        assert_eq!(
+            stored["status"]["conditions"][0]["type"], "Ready",
+            "the controller's Ready row must survive N concurrent member failures: {stored}"
+        );
+        assert_eq!(
+            stored["status"]["conditions"].as_array().map(Vec::len),
+            Some(1)
+        );
     }
 
     /// THE race the entry-keyed design exists for: two per-repo verify movers

@@ -3128,7 +3128,7 @@ async fn run_verify_flow(
     // any other data flow.
     if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
         let e = e.into_mover_error(KopiaOp::VerifyConnect);
-        patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
+        patch_verify_failure(spec, op, &e.to_string()).await;
         error!(class = %e.kopia_class(), "could not open a capped connection to the repository being verified");
         return Err(e);
     }
@@ -3147,7 +3147,7 @@ async fn run_verify_flow(
             let mut opts = q.to_kopia();
             opts.sources = vec![spec.identity.source_spec()];
             if let Err(e) = client.snapshot_verify(&opts).await {
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
+                patch_verify_failure(spec, op, &e.to_string()).await;
                 error!(class = %e.class(), "snapshot verify failed");
                 return Err(MoverError::Kopia {
                     op: KopiaOp::SnapshotVerify,
@@ -3193,7 +3193,7 @@ async fn run_verify_flow(
                          path and this identity is new.",
                         spec.identity.source_spec()
                     );
-                    patch_verify_status(&spec.target_ref, &verify_failed_body(&msg)).await;
+                    patch_verify_failure(spec, op, &msg).await;
                     error!(class = %err.kopia_class(), "{msg}");
                     return Err(err);
                 }
@@ -3201,8 +3201,7 @@ async fn run_verify_flow(
                 // the integrity verdict above may well be sound, but we cannot
                 // PROVE what was covered, so we must not claim success.
                 Err(e) => {
-                    patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string()))
-                        .await;
+                    patch_verify_failure(spec, op, &e.to_string()).await;
                     error!(class = %e.class(), "could not list snapshots to confirm what the quick verify covered");
                     return Err(MoverError::Kopia {
                         op: KopiaOp::SnapshotVerify,
@@ -3222,16 +3221,11 @@ async fn run_verify_flow(
                         let err = MoverError::VerifyNoSnapshot {
                             source_path: spec.identity.source_path.clone(),
                         };
-                        patch_verify_status(
-                            &spec.target_ref,
-                            &verify_failed_body(&err.to_string()),
-                        )
-                        .await;
+                        patch_verify_failure(spec, op, &err.to_string()).await;
                         return Err(err);
                     }
                     Err(e) => {
-                        patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string()))
-                            .await;
+                        patch_verify_failure(spec, op, &e.to_string()).await;
                         return Err(MoverError::Kopia {
                             op: KopiaOp::DeepVerifySnapshotList,
                             source: e,
@@ -3250,7 +3244,7 @@ async fn run_verify_flow(
                     uid: kopiur_api::common::MOVER_NONROOT_ID,
                     source,
                 };
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&err.to_string())).await;
+                patch_verify_failure(spec, op, &err.to_string()).await;
                 error!(class = %err.kopia_class(), "deep verify scratch path not writable");
                 return Err(err);
             }
@@ -3265,7 +3259,7 @@ async fn run_verify_flow(
                 )
                 .await
             {
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
+                patch_verify_failure(spec, op, &e.to_string()).await;
                 error!(class = %e.class(), "deep verify scratch-restore failed");
                 return Err(MoverError::Kopia {
                     op: KopiaOp::DeepVerifyRestore,
@@ -3310,13 +3304,13 @@ async fn run_verify_flow(
             Ok(false) => {
                 let err = MoverError::SuccessExprFalse { expr: expr.clone() };
                 let msg = err.to_string();
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&msg)).await;
+                patch_verify_failure(spec, op, &msg).await;
                 warn!("{msg}");
                 return Err(err);
             }
             Err(e) => {
                 let err = MoverError::SuccessExprEval { source: e };
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&err.to_string())).await;
+                patch_verify_failure(spec, op, &err.to_string()).await;
                 return Err(err);
             }
         }
@@ -3326,11 +3320,7 @@ async fn run_verify_flow(
         &spec.target_ref,
         &verify_ok_body(
             op.tier.kind_str(),
-            // #456: the (repository x member) stamp key. `repository_key` is
-            // the pre-#456 fallback, so a Job already in flight across the
-            // upgrade (its work spec rides its own env) still stamps the
-            // per-repository entry it was minted for.
-            op.stamp_key.as_deref().or(op.repository_key.as_deref()),
+            verify_stamp_key(op),
             &chrono::Utc::now(),
         ),
     )
@@ -3388,6 +3378,30 @@ fn count_files(dir: &str) -> Option<i64> {
 /// [`patch_maintenance_status`].
 async fn patch_verify_status(target: &workspec::TargetRef, body: &serde_json::Value) {
     patch_maintenance_status(target, body).await;
+}
+
+/// The (repository x member) `verificationStamps` key this verify run owns, or
+/// `None` for the classic flat flow (one repository, one verification member).
+///
+/// `repository_key` is the pre-#456 fallback, so a Job already in flight across
+/// the upgrade (its work spec rides its own env) still stamps the per-repository
+/// entry it was minted for. It is ALSO the discriminator for who may write the
+/// `status.conditions` array — see [`verify_failed_body`].
+fn verify_stamp_key(op: &VerifyOp) -> Option<&str> {
+    op.stamp_key.as_deref().or(op.repository_key.as_deref())
+}
+
+/// Report a failed verification on the `SnapshotPolicy`, from the one run that
+/// owns the conditions array.
+///
+/// A cell of #456's (repository x member) fan-out writes NOTHING here: N of
+/// them run concurrently on one policy and a merge-patched `conditions` array
+/// replaces its siblings' — and the controller's `Ready`. See
+/// [`verify_failed_body`] for what surfaces the failure instead.
+async fn patch_verify_failure(spec: &MoverWorkSpec, op: &VerifyOp, message: &str) {
+    if let Some(body) = verify_failed_body(verify_stamp_key(op), message) {
+        patch_verify_status(&spec.target_ref, &body).await;
+    }
 }
 
 /// Drive a `Replicate` run (ADR-0005 §13(d)): connect to the *source* repository,

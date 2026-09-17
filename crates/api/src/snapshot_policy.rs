@@ -1106,7 +1106,7 @@ pub struct SnapshotPolicyStatus {
     ///
     /// Key shapes, where the repository segment is the normalized repository
     /// key ([`repo_key`](crate::common::repo_key)) and the member segment is a
-    /// stable 6-hex tag over the matched PVC's derived kopia source path:
+    /// stable 12-hex tag over the matched PVC's derived kopia source path:
     ///
     /// * `<repository>` — a `spec.repositories` fan-out with a single source;
     /// * `<repository>#<member>` — a fan-out over both dimensions;

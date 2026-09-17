@@ -1270,7 +1270,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         conditions,
         last_successful.as_deref(),
         &repo_targets,
-        folded.as_ref(),
+        &folded,
     )?;
     io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
 
@@ -1279,9 +1279,16 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // stamps `status.lastVerified` on a successful quick/deep verify (single-repo);
     // for multi the folded MIN across current repos is the honest fleet-wide age.
     // No-op until a first verify lands.
-    let flat_verified = match folded.as_ref() {
-        Some(f) => f.folded.flat.clone(),
-        None => config.status.as_ref().and_then(|s| s.last_verified.clone()),
+    // `Flat` reads the value the mover stamped directly; `Undecided` made no
+    // decision, so the gauge keeps reporting the last real verification and
+    // AGES — which is exactly what staleness alerting fires on. Clearing it
+    // instead would delete the series and make "nothing is being verified"
+    // unalertable (review S1).
+    let flat_verified = match &folded {
+        VerifyFold::Grid(f) => f.folded.flat.clone(),
+        VerifyFold::Flat | VerifyFold::Undecided => {
+            config.status.as_ref().and_then(|s| s.last_verified.clone())
+        }
     };
     if let Some(ts) = flat_verified.as_deref().and_then(rfc3339_unix_secs) {
         ctx.metrics.set_snapshot_verified(&namespace, &name, ts);
@@ -1301,7 +1308,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         &namespace,
         &VerifySteps {
             ready: &ready,
-            folded: folded.as_ref(),
+            folded: folded.grid(),
             members: &verify_members,
             backups: &backups,
             has_successful_snapshot,
@@ -1328,15 +1335,64 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     Ok(Action::requeue(requeue))
 }
 
+/// What this reconcile is entitled to SAY about verification status.
+///
+/// The three arms were ONE `Option` before, and collapsing the middle one into
+/// `None` was a data-integrity bug with two faces (review F2 + S1): a
+/// `pvcSelector` that matched nothing produced no members, which read as "this
+/// policy has no member dimension", so [`final_status_body`] nulled
+/// `verificationStamps` WHOLESALE while never naming `lastVerified` — and
+/// RFC 7386 treats an omitted key as a no-op. The claim survived; the evidence
+/// under it did not. One relabelled app, or one reconcile of watch lag, and
+/// every member's stamp was gone: `verify_cell_anchor` then found nothing,
+/// `tier_after(None)` anchored a year in the past, `due_tier` preferred DEEP
+/// for EVERY member, and a 4-PVC policy at `deep.capacity: 500Gi` ran four
+/// sequential full scratch restores for volumes verified yesterday.
+enum VerifyFold {
+    /// No verification grid: one repository, and no member dimension. The
+    /// mover stamps the flat `status.lastVerified` directly and the multi-only
+    /// surfaces can be retired (a multi→single spec edit).
+    Flat,
+    /// `spec.verification` IS configured and the policy's `pvcSelector`
+    /// matched NO `PersistentVolumeClaim`: the reconcile has no verification
+    /// observation to fold and **makes no verification status decision at
+    /// all** — no `lastVerified`, no `verification`, no stamp prune.
+    ///
+    /// The residual error is deliberate and is the safe one: a member that was
+    /// genuinely removed keeps an inert stamp until the selector matches
+    /// something again, at which point `stamp_key_live` prunes it as usual. An
+    /// orphan stamp can never make a missing member look verified — the fold
+    /// only ever LOOKS UP the keys of CURRENT members, so an extra key is read
+    /// by nobody — whereas deleting a live one costs hours of backend egress
+    /// and erases the `kopiur_snapshot_verified` series that staleness
+    /// alerting fires on. A frozen `lastVerified` also keeps AGEING, so it
+    /// trips that same alert; a cleared one is silent. Nothing is quietly
+    /// claimed here either: the caller logs a `WARN` naming the selector.
+    Undecided,
+    /// The (repository x member) grid: a repository dimension, a member
+    /// dimension, or both.
+    Grid(MultiVerification),
+}
+
+impl VerifyFold {
+    /// The grid, when this pass has one. [`VerifyFold::Undecided`] is
+    /// deliberately NOT a grid: every consumer that folds or prunes must see
+    /// "no decision", not "an empty grid".
+    fn grid(&self) -> Option<&MultiVerification> {
+        match self {
+            VerifyFold::Grid(mv) => Some(mv),
+            VerifyFold::Flat | VerifyFold::Undecided => None,
+        }
+    }
+}
+
 /// The entry-keyed verification fold inputs + result: the CURRENT stamp grid
-/// (repositories x members) and the folded state. `None` for the classic flat
-/// shape — a single-repository policy with at most one verification member,
-/// whose `status.lastVerified` the mover stamps directly. Extracted so
+/// (repositories x members) and the folded state. Extracted so
 /// `reconcile_inner` only gains a call (complexity ratchet).
 struct MultiVerification {
     /// `(normalized ref, stamp-key repository segment)` per current repo, spec
     /// order. A single-repository policy carries exactly one pair whose segment
-    /// is the EMPTY string — the repo-agnostic segment its `#<member6>` stamp
+    /// is the EMPTY string — the repo-agnostic segment its `#<member_tag>` stamp
     /// keys use.
     current_repos: Vec<(RepositoryRef, String)>,
     /// The current member tags (#456), empty when the policy does not fan out.
@@ -1349,21 +1405,31 @@ struct MultiVerification {
     folded: crate::verification::FoldedVerification,
 }
 
-/// See [`MultiVerification`].
+/// See [`VerifyFold`] and [`MultiVerification`].
 fn fold_multi_verification(
     config: &SnapshotPolicy,
     is_multi: bool,
     repo_targets: &[&RepositoryRef],
     verify_members: &[crate::verification::VerifyMember],
     namespace: &str,
-) -> Option<MultiVerification> {
+) -> VerifyFold {
+    // Configured, but nothing matched: make NO verification status decision
+    // this pass. Checked BEFORE everything else because it is invisible
+    // downstream — an empty member list is indistinguishable from "no member
+    // dimension" in the single-repo branch, and in the multi-repo branch it
+    // makes `member_keys` empty so the prune deletes every `#<tag>` stamp
+    // there is. `run_verify_steps` already has this guard; `final_status_body`
+    // runs FIRST and did not. See [`VerifyFold::Undecided`].
+    if config.spec.verification.is_some() && verify_members.is_empty() {
+        return VerifyFold::Undecided;
+    }
     let members: Vec<String> = verify_members
         .iter()
-        .filter_map(|m| m.member6.clone())
+        .filter_map(|m| m.member_tag.clone())
         .collect();
     // Stamps-map mode: a repository dimension, a member dimension, or both.
     if !is_multi && members.is_empty() {
-        return None;
+        return VerifyFold::Flat;
     }
     let current_repos: Vec<(RepositoryRef, String)> = match is_multi {
         true => repo_targets
@@ -1387,7 +1453,7 @@ fn fold_multi_verification(
             .collect(),
     };
     if current_repos.is_empty() {
-        return None;
+        return VerifyFold::Flat;
     }
     let existing_entries = config
         .status
@@ -1406,7 +1472,7 @@ fn fold_multi_verification(
         &members,
         namespace,
     );
-    Some(MultiVerification {
+    VerifyFold::Grid(MultiVerification {
         current_repos,
         members,
         publish_entries: is_multi,
@@ -1498,13 +1564,18 @@ fn select_scratch_state(
 /// its multi-only surfaces (`verification`, `verificationStamps`) nulled once.
 /// Every conditional is keyed off the PRIOR status so the steady-state body
 /// compares equal and the guarded write stays a no-op.
+///
+/// [`VerifyFold::Undecided`] names none of those keys: a merge patch that does
+/// not mention a key leaves it exactly as it was, which is the whole point —
+/// see that variant for why preserving a possibly-orphaned stamp is the safe
+/// error and deleting a live one is not.
 fn final_status_body(
     config: &SnapshotPolicy,
     generation: Option<i64>,
     conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
     last_successful: Option<&str>,
     repo_targets: &[&RepositoryRef],
-    folded: Option<&MultiVerification>,
+    folded: &VerifyFold,
 ) -> Result<serde_json::Value> {
     let names: Vec<&str> = repo_targets.iter().map(|r| r.name.as_str()).collect();
     let mut status = serde_json::json!({
@@ -1517,7 +1588,7 @@ fn final_status_body(
     }
     let prior = config.status.as_ref();
     match folded {
-        Some(mv) => {
+        VerifyFold::Grid(mv) => {
             if mv.publish_entries {
                 status["verification"] = serde_json::to_value(&mv.folded.entries)?;
             } else if prior.is_some_and(|s| !s.verification.is_empty()) {
@@ -1557,7 +1628,7 @@ fn final_status_body(
                 status["verificationStamps"] = serde_json::Value::Object(stale);
             }
         }
-        None => {
+        VerifyFold::Flat => {
             // multi→single edit: the multi-only surfaces would otherwise
             // linger forever. Null them exactly once (conditional on the prior
             // status actually carrying them).
@@ -1568,6 +1639,12 @@ fn final_status_body(
                 status["verificationStamps"] = serde_json::Value::Null;
             }
         }
+        // Name NOTHING verification-related. This pass observed no cell, so it
+        // has nothing to say. Falling into the `Flat` arm instead — which is
+        // what an empty member set used to do — deleted a working policy's
+        // whole stamp map on a one-reconcile selector blip (S1) while leaving
+        // its `lastVerified` claim standing over the hole (F2).
+        VerifyFold::Undecided => {}
     }
     Ok(status)
 }
@@ -1769,7 +1846,7 @@ async fn run_verify_steps(
             let has_successful = *has_successful;
             let has_discovered = discovered.contains(identity);
             let key =
-                crate::verification::stamp_key(repo_key.as_deref(), member.member6.as_deref());
+                crate::verification::stamp_key(repo_key.as_deref(), member.member_tag.as_deref());
             let vt = crate::verification::VerifyTarget {
                 rref: &t.rref,
                 repo: &t.repo,
@@ -1779,13 +1856,13 @@ async fn run_verify_steps(
                     folded,
                     &stamps,
                     key.as_deref(),
-                    member.member6.is_some(),
+                    member.member_tag.is_some(),
                     repo_key.as_deref(),
                     namespace,
                 ),
                 has_successful,
                 source_path: member.source_path.as_deref(),
-                member6: member.member6.as_deref(),
+                member_tag: member.member_tag.as_deref(),
             };
             let out = crate::verification::verify_step(
                 config,
@@ -4008,6 +4085,283 @@ mod tests {
         assert_eq!(
             policy_id.source_path, discovered.source_path,
             "an unadoptable stream snapshot is exactly a source_path mismatch here"
+        );
+    }
+
+    // --- F2 / S1: the verification status decision -----------------------------
+
+    /// A `SnapshotPolicy` the way the apiserver hands one over — a decoded JSON
+    /// body into the typed struct, never `serde_yaml` straight into a typed
+    /// value (0.9 mis-encodes externally-tagged enums).
+    fn verify_policy(sources: serde_json::Value, status: serde_json::Value) -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "ns", "generation": 4 },
+            "spec": {
+                "repository": { "name": "r" },
+                "sources": sources,
+                "verification": { "quick": { "schedule": { "cron": "*/5 * * * *" } } },
+            },
+            "status": status,
+        }))
+        .expect("typed SnapshotPolicy")
+    }
+
+    fn selector_sources() -> serde_json::Value {
+        serde_json::json!([{
+            "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+        }])
+    }
+
+    /// A policy that verified three PVCs cleanly and holds their stamps.
+    fn a_verified_three_pvc_policy() -> SnapshotPolicy {
+        verify_policy(
+            selector_sources(),
+            serde_json::json!({
+                "lastVerified": "2026-09-16T02:00:00+00:00",
+                "verificationStamps": {
+                    "#aaaaaaaaaaaa": "2026-09-16T02:00:00+00:00",
+                    "#bbbbbbbbbbbb": "2026-09-16T02:05:00+00:00",
+                    "#cccccccccccc": "2026-09-16T02:10:00+00:00",
+                },
+            }),
+        )
+    }
+
+    fn rref(name: &str) -> RepositoryRef {
+        RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::Repository,
+            name: name.into(),
+            namespace: Some("ns".into()),
+        }
+    }
+
+    fn member(tag: &str, path: &str) -> crate::verification::VerifyMember {
+        crate::verification::VerifyMember {
+            source_path: Some(path.into()),
+            member_tag: Some(tag.into()),
+        }
+    }
+
+    fn body_of(policy: &SnapshotPolicy, folded: &VerifyFold) -> serde_json::Value {
+        let r = rref("r");
+        final_status_body(policy, Some(4), Vec::new(), None, &[&r], folded).expect("status body")
+    }
+
+    /// The distinction F2 and S1 both turn on. "Verification is configured and
+    /// the selector matched nothing" is NOT "this policy has no member
+    /// dimension", and collapsing the two into one `None` is what let a
+    /// one-reconcile label blip destroy weeks of stamps.
+    #[test]
+    fn the_fold_distinguishes_no_member_dimension_from_a_selector_that_matched_nothing() {
+        let policy = a_verified_three_pvc_policy();
+        let r = rref("r");
+        // Configured + matched nothing, single-repo AND multi-repo: both are
+        // Undecided. The multi-repo branch used to fold with an empty member
+        // set, which made `member_keys` empty and pruned every `#<tag>` stamp.
+        for is_multi in [false, true] {
+            assert!(
+                matches!(
+                    fold_multi_verification(&policy, is_multi, &[&r], &[], "ns"),
+                    VerifyFold::Undecided
+                ),
+                "is_multi={is_multi}"
+            );
+        }
+        // No member dimension and one repository: the classic flat shape.
+        let flat_policy = verify_policy(
+            serde_json::json!([{ "pvc": { "name": "data" } }]),
+            serde_json::json!({}),
+        );
+        let one_flat_member = [crate::verification::VerifyMember {
+            source_path: None,
+            member_tag: None,
+        }];
+        assert!(matches!(
+            fold_multi_verification(&flat_policy, false, &[&r], &one_flat_member, "ns"),
+            VerifyFold::Flat
+        ));
+        // And a live grid is still a grid.
+        assert!(matches!(
+            fold_multi_verification(
+                &policy,
+                false,
+                &[&r],
+                &[member("aaaaaaaaaaaa", "/pvc/a")],
+                "ns"
+            ),
+            VerifyFold::Grid(_)
+        ));
+    }
+
+    /// S1: the stamps are the EVIDENCE. A pass that observed nothing must not
+    /// delete them — `tier_after(None)` anchors a year in the past, so the next
+    /// pass would prefer DEEP for every member and run N full scratch restores
+    /// at `deep.capacity` each for volumes verified yesterday.
+    ///
+    /// F2: and it must not leave a `lastVerified` claim standing over deleted
+    /// evidence either. Naming NOTHING keeps claim and evidence consistent, and
+    /// the frozen timestamp keeps ageing into the staleness alert.
+    #[test]
+    fn a_selector_that_matched_nothing_makes_no_verification_status_decision() {
+        let policy = a_verified_three_pvc_policy();
+        let nas = rref("nas");
+        let offsite = rref("offsite");
+        // Both dimensions, driven through the REAL fold — the single-repo
+        // branch destroyed the map wholesale, the multi-repo branch destroyed
+        // it one `null` key at a time.
+        for targets in [vec![&nas], vec![&nas, &offsite]] {
+            let is_multi = targets.len() > 1;
+            let folded = fold_multi_verification(&policy, is_multi, &targets, &[], "ns");
+            let body = final_status_body(&policy, Some(4), Vec::new(), None, &targets, &folded)
+                .expect("status body");
+            for key in ["verificationStamps", "lastVerified", "verification"] {
+                assert!(
+                    body.get(key).is_none(),
+                    "an observation-free pass must not name {key} at all (is_multi={is_multi}): \
+                     {body}"
+                );
+            }
+            // The rest of the status write is untouched — this is not a bail-out.
+            assert_eq!(body["observedGeneration"], 4);
+            assert!(body.get("repositorySummary").is_some());
+        }
+    }
+
+    /// The other half of the distinction: a genuine multi→single spec edit still
+    /// retires the multi-only surfaces exactly once, so an `Undecided` arm that
+    /// swallowed this case would leave them forever.
+    #[test]
+    fn the_flat_arm_still_retires_the_multi_only_surfaces_once() {
+        let policy = a_verified_three_pvc_policy();
+        let body = body_of(&policy, &VerifyFold::Flat);
+        assert!(body["verificationStamps"].is_null(), "{body}");
+        // ... and stays silent when there is nothing to retire.
+        let fresh = verify_policy(selector_sources(), serde_json::json!({}));
+        let body = body_of(&fresh, &VerifyFold::Flat);
+        assert!(body.get("verificationStamps").is_none());
+        assert!(body.get("verification").is_none());
+    }
+
+    /// The grid arm keeps pruning dead cells — the `Undecided` fix must not make
+    /// a genuinely removed member's stamp immortal. As soon as the selector
+    /// matches ANYTHING again, `stamp_key_live` reaps the orphans.
+    #[test]
+    fn the_grid_arm_still_prunes_the_stamp_of_a_member_that_is_really_gone() {
+        let policy = a_verified_three_pvc_policy();
+        let folded = fold_multi_verification(
+            &policy,
+            false,
+            &[&rref("r")],
+            // `#bbbbbbbbbbbb` and `#cccccccccccc` are no longer matched.
+            &[member("aaaaaaaaaaaa", "/pvc/a")],
+            "ns",
+        );
+        assert!(matches!(folded, VerifyFold::Grid(_)));
+        let body = body_of(&policy, &folded);
+        let stale = &body["verificationStamps"];
+        assert!(
+            stale["#bbbbbbbbbbbb"].is_null() && stale["#cccccccccccc"].is_null(),
+            "{body}"
+        );
+        assert!(
+            stale.get("#aaaaaaaaaaaa").is_none(),
+            "the LIVE member's stamp must survive the prune: {body}"
+        );
+        // One member with a stamp = the whole (1 x 1) grid is verified, so the
+        // flat field is that stamp.
+        assert_eq!(body["lastVerified"], "2026-09-16T02:00:00+00:00", "{body}");
+    }
+
+    /// A member with no stamp yet leaves the fold incomplete, and the flat claim
+    /// is cleared rather than inherited from the members that HAVE verified.
+    #[test]
+    fn a_grid_with_an_unverified_member_clears_the_flat_claim_once() {
+        let policy = a_verified_three_pvc_policy();
+        let folded = fold_multi_verification(
+            &policy,
+            false,
+            &[&rref("r")],
+            &[
+                member("aaaaaaaaaaaa", "/pvc/a"),
+                member("dddddddddddd", "/pvc/d"),
+            ],
+            "ns",
+        );
+        let body = body_of(&policy, &folded);
+        assert!(
+            body["lastVerified"].is_null(),
+            "a partially verified policy must not display a reassuring timestamp: {body}"
+        );
+    }
+
+    // --- verify_cell_anchor ----------------------------------------------------
+
+    #[test]
+    fn a_fan_out_member_anchors_on_its_own_stamp_never_a_siblings_or_the_flat_field() {
+        let policy = a_verified_three_pvc_policy();
+        let stamps: BTreeMap<String, String> = [
+            ("#aaaaaaaaaaaa", "2026-09-16T02:00:00+00:00"),
+            ("#bbbbbbbbbbbb", "2026-09-16T02:05:00+00:00"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let anchor = |key: Option<&str>| {
+            verify_cell_anchor(&policy, None, &stamps, key, true, None, "ns")
+                .map(|t| t.to_rfc3339())
+        };
+        assert_eq!(
+            anchor(Some("#aaaaaaaaaaaa")).as_deref(),
+            Some("2026-09-16T02:00:00+00:00")
+        );
+        assert_eq!(
+            anchor(Some("#bbbbbbbbbbbb")).as_deref(),
+            Some("2026-09-16T02:05:00+00:00"),
+            "a sibling's recent verify must never defer this member's due slot"
+        );
+        // A member with no stamp is UNVERIFIED — it must not inherit the flat
+        // field, which is what deferred the first real verification by a whole
+        // deep period before #456.
+        assert_eq!(
+            anchor(Some("#dddddddddddd")),
+            None,
+            "an unstamped member has no anchor, even though status.lastVerified is set"
+        );
+    }
+
+    #[test]
+    fn a_non_fan_out_cell_anchors_on_its_repo_entry_and_the_classic_shape_on_the_flat_field() {
+        let policy = a_verified_three_pvc_policy();
+        let stamps = BTreeMap::new();
+        // Multi-repo, single member: the folded per-repo entry, so a fresh repo
+        // B is immediately due without repo A's recent verify deferring it.
+        let folded = fold_multi_verification(
+            &policy,
+            true,
+            &[&rref("nas"), &rref("offsite")],
+            &[crate::verification::VerifyMember {
+                source_path: None,
+                member_tag: None,
+            }],
+            "ns",
+        );
+        let VerifyFold::Grid(mv) = &folded else {
+            panic!("a multi-repo policy folds to a grid, got a non-grid fold");
+        };
+        let key = kopiur_api::common::repo_key(&rref("nas"), "ns");
+        assert_eq!(
+            verify_cell_anchor(&policy, Some(mv), &stamps, None, false, Some(&key), "ns"),
+            None,
+            "no stamp for this repository yet, so no anchor — NOT the flat field"
+        );
+        // The classic single-repo, single-member cell: the flat field, verbatim.
+        assert_eq!(
+            verify_cell_anchor(&policy, None, &stamps, None, false, None, "ns")
+                .map(|t| t.to_rfc3339())
+                .as_deref(),
+            Some("2026-09-16T02:00:00+00:00")
         );
     }
 }
