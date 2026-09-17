@@ -2150,7 +2150,7 @@ mod tests {
             "False",
             kopiur_api::consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
             "the mover needs elevated privileges; run: kubectl annotate namespace media \
-             kopiur.home-operations.com/privileged-movers=allow",
+             kopiur.home-operations.com/privileged-movers=true",
         )
     }
 

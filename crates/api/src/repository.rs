@@ -225,7 +225,7 @@ pub enum BlobRetention {
     /// A `bool` rather than a unit variant because an externally-tagged unit variant
     /// serializes as the bare string `"Disabled"`, mixing string and object forms in one
     /// `oneOf` and breaking the structural schema. Same shape, and same reason, as
-    /// [`crate::cluster_repository::AllowedNamespaces::All`].
+    /// [`AllowedNamespaces::All`](crate::cluster_repository::AllowedNamespaces::All).
     ///
     /// This is distinct from omitting `blobRetention` entirely: absent means "leave the
     /// repository alone", so deleting the block from a manifest can never silently strip

@@ -201,11 +201,16 @@ the `SnapshotPolicy` itself.
 
 ### `workloadExec.podSelector`
 
-Must match **exactly one running pod**. Zero matches, several matches, matches that
-are all unready, and matches that are terminating are each a distinct, named
-failure — never an arbitrary pick. A backup that quietly dumped a different replica
-than you meant is worse than one that stops and tells you why. For a replicated
-database, add whatever label identifies the primary.
+Must match **exactly one** pod in `Running` phase that is not terminating (no
+`deletionTimestamp`). Zero matches, several such pods, and matches that are all
+not-Running-or-terminating are each a distinct, named failure — never an arbitrary
+pick.
+
+**Readiness is not checked.** A pod can be `Running` and still fail its readiness
+probe — still starting up, or unhealthy — and it is picked (or counted toward
+"several") exactly like a Ready one. For a replicated database, add a label that
+identifies the primary specifically (not just "any Running replica"), or the
+selector can silently dump from an unready primary that has not finished starting.
 
 ### `workloadExec.timeout`
 
@@ -229,11 +234,27 @@ then commits:
 | Command exited non-zero | Kill kopia with the input still open — **no snapshot is written** |
 | Exec connection dropped (no exit status) | Same: kill, no snapshot |
 | `timeout` elapsed | Same: kill, no snapshot |
+| Command exited `0`, but kopia doesn't finish finalizing in time | Kopiur has already closed kopia's input at this point, so the snapshot **may have committed** — Kopiur cannot tell, and reports the run as failed either way |
 
-Because kopia only writes its manifest at end-of-file, aborting leaves nothing
-restorable — not a partial snapshot that gets cleaned up afterwards, but no snapshot
-at all. A failed dump can never be retained as a successful backup. The leftover
-data blocks are unreferenced and repository maintenance reclaims them.
+Because kopia only writes its manifest at end-of-file, aborting (any of the first
+four rows) leaves nothing restorable — not a partial snapshot that gets cleaned up
+afterwards, but no snapshot at all. A failed dump can never be retained as a
+successful backup. The leftover data blocks are unreferenced and repository
+maintenance reclaims them.
+
+The last row is different: the input was already closed, so kopia may have finished
+writing a complete manifest before the wait timed out — this is not a partial
+snapshot either, kopia never leaves one of those. If it did commit, the manifest
+sits in the repository like any snapshot kopia wrote outside Kopiur, until the next
+[catalog scan](repositories.md#the-catalog--discovered-snapshots) surfaces it as a
+discovered `Snapshot` CR (`origin: discovered`) and it becomes governable like any
+other. A scan always runs once on bootstrap and again on any spec change — there is
+no way to skip that. Only *repeating* it on a timer is opt-in
+(`catalog.periodicRefresh`, off by default), so a manifest that committed between
+spec changes can wait a while for the next scan. This is rare — the finalize wait has
+its own budget precisely to make it rare — and it is not a false-backup risk (nothing
+reads this manifest as your latest good backup), just an occasional orphaned manifest
+that takes longer than usual to become visible.
 
 ## Your data never reaches the logs
 
@@ -274,12 +295,14 @@ Rather than accept them silently, admission rejects them and says why:
 | `acknowledgeLiveMutation` | It acknowledges the kubelet rewriting a mounted volume's ownership. |
 | `sourcePathStrategy` | It derives a path from a matched PVC's name. |
 | `volumeSnapshotClassName` | There is no PVC to CSI-snapshot. |
-| `staging.*` | There is no staged PVC to override. |
+| `staging.storageClassName`, `staging.accessModes` | There is no staged PVC to override. |
 
 `copyMethod` and `groupBy` are **ignored** rather than rejected, for the same reason
 they are on an NFS source: `copyMethod` defaults to `Snapshot` server-side, so an
 unset field is indistinguishable from a deliberate one and rejecting it would refuse
-a policy nobody wrote wrong.
+a policy nobody wrote wrong. `staging.timeout` is likewise **accepted and inert**
+here — admission still checks that it parses as a Go duration, but a stream source
+never stages a PVC, so the value itself has nothing to bound.
 
 A stream source must also be the **only** source in its `SnapshotPolicy`. It produces
 exactly one artifact per Snapshot and is never expanded, so pairing it with other
