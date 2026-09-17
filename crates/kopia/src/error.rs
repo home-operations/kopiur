@@ -471,12 +471,16 @@ impl KopiaError {
             KopiaError::Json { .. } | KopiaError::EmptyOutput { .. } => KopiaErrorClass::Unknown,
             // Timeouts are usually a slow backend → worth a retry.
             KopiaError::Timeout { .. } => KopiaErrorClass::RepositoryUnavailable,
-            // The repository was never at fault — the user's dump command was.
-            // Retrying the same Job re-runs the same failing command, so this is
-            // NOT retryable; the fix is in the workload or the policy.
-            KopiaError::StdinProducerFailed { .. } => KopiaErrorClass::Unknown,
-            // Same reasoning: the repository was never at fault, and re-running
-            // the same command would reproduce the same empty output.
+            // Both stdin-producer failures: the repository was never at fault —
+            // the user's dump command was. Re-running the same command would
+            // reproduce the same failure, or the same empty output, so the fix
+            // is in the workload or the policy, never in another attempt.
+            //
+            // They share ONE arm deliberately. These two comments used to sit on
+            // separate arms and drifted: one kept the honest scope below while
+            // the other went on claiming outright that the failure is not
+            // retried. Same class, same reasoning, one arm — so the claim cannot
+            // rot on only one half again.
             //
             // NOTE what this class does and does NOT do. It makes the failure
             // TERMINAL for the operator: `MoverError::retry_recommended()` is
@@ -485,10 +489,10 @@ impl KopiaError {
             // the Kubernetes Job from retrying — the mover exits non-zero and the
             // Job's own `backoffLimit` (default 2) may schedule replacement pods
             // that re-exec the producer's command. Preventing that needs the Job
-            // DELETED, the way the wedged-pod path in
-            // `controller::snapshot` does; nothing reads
-            // `retryRecommended` today. Tracked separately.
-            KopiaError::StdinProducerWroteNothing { .. } => KopiaErrorClass::Unknown,
+            // DELETED, the way the wedged-pod path in `controller::snapshot`
+            // does; nothing reads `retryRecommended` today. Tracked separately.
+            KopiaError::StdinProducerFailed { .. }
+            | KopiaError::StdinProducerWroteNothing { .. } => KopiaErrorClass::Unknown,
         }
     }
 
