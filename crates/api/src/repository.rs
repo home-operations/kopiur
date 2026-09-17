@@ -279,22 +279,49 @@ pub struct RetentionWindow {
 /// `cleanupSafetyMargin` is deliberately **observable but not settable**: its job is to stop
 /// kopia deleting index blobs a concurrent writer still needs, and there is no safe generic
 /// advice for lowering it.
+///
+/// **Every field here has an admission floor** (#458), because `kopia repository
+/// set-parameters` merges the flags it is given into the repository's existing parameters and
+/// then validates the whole resulting set — so ONE out-of-range value refuses the entire
+/// call and discards every other parameter in the same apply. The floors:
+///
+/// - `minDuration`: at least `10m`, and at least 3x `refreshFrequency` (kopia's untouched
+///   `20m` default when none is declared — which is why `minDuration: 10m` alone is
+///   rejected, and `60m` is the smallest value that stands on its own).
+/// - `refreshFrequency`: at most `80m`, because kopia needs `cleanupSafetyMargin` to be at
+///   least 3x it and the margin is stuck at kopia's `4h` default (kopiur cannot set it).
+/// - `advanceOnCount`: at least `10`. `advanceOnSizeMiB`: at least `1`.
+/// - `checkpointFrequency`: at least `1`. `deleteParallelism`: at least `1`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EpochParameters {
     /// Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
     /// (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+    ///
+    /// Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`.
+    /// When `refreshFrequency` is not declared, that second bound is measured against
+    /// kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or
+    /// declare a `refreshFrequency` of a third of it or less alongside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_duration: Option<String>,
     /// How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+    ///
+    /// At most `80m`: kopia requires `cleanupSafetyMargin >= 3x` this value, and
+    /// `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's
+    /// `4h` default and `4h / 3` is a hard ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_frequency: Option<String>,
     /// Index blobs in an epoch that trigger an advance, once older than `minDuration`
     /// (kopia default `20`).
+    ///
+    /// At least `10` — kopia refuses anything lower with "epoch advance on count too low".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advance_on_count: Option<i64>,
     /// Total index size in an epoch that triggers an advance, once older than `minDuration`
     /// (kopia default `10` MiB).
+    ///
+    /// At least `1` — kopia refuses anything lower with "epoch advance on size too low",
+    /// and 1 MiB is the smallest threshold the flag can express.
     ///
     /// Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
     /// (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
@@ -308,9 +335,15 @@ pub struct EpochParameters {
     )]
     pub advance_on_size_mb: Option<i64>,
     /// Epochs between full index checkpoints (kopia default `7`).
+    ///
+    /// At least `1` — kopia refuses anything lower with "invalid epoch range compaction
+    /// period".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_frequency: Option<i64>,
     /// Parallelism for epoch cleanup deletions (kopia default `4`).
+    ///
+    /// At least `1`. This floor is kopiur's own: kopia does not validate the field, so a
+    /// non-positive value would ask it to run epoch cleanup with no workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_parallelism: Option<i64>,
 }
@@ -340,7 +373,12 @@ pub struct ObservedEpochParameters {
     pub cleanup_safety_margin: String,
     /// Observed index-blob count that triggers an epoch advance.
     pub advance_on_count: i64,
-    /// Observed total index size (MiB) that triggers an epoch advance.
+    /// Observed total index size (MiB) that triggers an epoch advance, **rounded up**.
+    ///
+    /// kopia reports this threshold in BYTES and it need not be a whole number of MiB, so
+    /// the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a
+    /// value the repository does not actually hold. Drift against `spec` is computed on the
+    /// exact byte count, never on this rounded mirror.
     #[serde(rename = "advanceOnSizeMiB")]
     pub advance_on_size_mb: i64,
     /// Observed epochs between full index checkpoints.

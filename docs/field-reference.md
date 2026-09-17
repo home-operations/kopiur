@@ -564,12 +564,12 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`). |
-| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
-| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`). |
-| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`). |
-| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this. |
-| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration. |
+| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`).<br>At least `10` — kopia refuses anything lower with "epoch advance on count too low". |
+| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>At least `1` — kopia refuses anything lower with "epoch advance on size too low", and 1 MiB is the smallest threshold the flag can express.<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
+| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`).<br>At least `1` — kopia refuses anything lower with "invalid epoch range compaction period". |
+| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`).<br>At least `1`. This floor is kopiur's own: kopia does not validate the field, so a non-positive value would ask it to run epoch cleanup with no workers. |
+| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.<br>Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`. When `refreshFrequency` is not declared, that second bound is measured against kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or declare a `refreshFrequency` of a third of it or less alongside it. |
+| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration.<br>At most `80m`: kopia requires `cleanupSafetyMargin &gt;= 3x` this value, and `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's `4h` default and `4h / 3` is a hard ceiling. |
 
 #### `spec.scheduleDefaults` { #repository-spec-scheduledefaults }
 
@@ -1021,7 +1021,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `advanceOnCount` | integer | **required** | Observed index-blob count that triggers an epoch advance. |
-| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance. |
+| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance, **rounded up**.<br>kopia reports this threshold in BYTES and it need not be a whole number of MiB, so the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a value the repository does not actually hold. Drift against `spec` is computed on the exact byte count, never on this rounded mirror. |
 | `checkpointFrequency` | integer | **required** | Observed epochs between full index checkpoints. |
 | `cleanupSafetyMargin` | string | **required** | Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis; not settable through `spec.parameters`. |
 | `deleteParallelism` | integer | **required** | Observed epoch-cleanup delete parallelism. |
@@ -1632,12 +1632,12 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`). |
-| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
-| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`). |
-| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`). |
-| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this. |
-| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration. |
+| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`).<br>At least `10` — kopia refuses anything lower with "epoch advance on count too low". |
+| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>At least `1` — kopia refuses anything lower with "epoch advance on size too low", and 1 MiB is the smallest threshold the flag can express.<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
+| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`).<br>At least `1` — kopia refuses anything lower with "invalid epoch range compaction period". |
+| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`).<br>At least `1`. This floor is kopiur's own: kopia does not validate the field, so a non-positive value would ask it to run epoch cleanup with no workers. |
+| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.<br>Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`. When `refreshFrequency` is not declared, that second bound is measured against kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or declare a `refreshFrequency` of a third of it or less alongside it. |
+| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration.<br>At most `80m`: kopia requires `cleanupSafetyMargin &gt;= 3x` this value, and `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's `4h` default and `4h / 3` is a hard ceiling. |
 
 #### `spec.scheduleDefaults` { #clusterrepository-spec-scheduledefaults }
 
@@ -2091,7 +2091,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `advanceOnCount` | integer | **required** | Observed index-blob count that triggers an epoch advance. |
-| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance. |
+| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance, **rounded up**.<br>kopia reports this threshold in BYTES and it need not be a whole number of MiB, so the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a value the repository does not actually hold. Drift against `spec` is computed on the exact byte count, never on this rounded mirror. |
 | `checkpointFrequency` | integer | **required** | Observed epochs between full index checkpoints. |
 | `cleanupSafetyMargin` | string | **required** | Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis; not settable through `spec.parameters`. |
 | `deleteParallelism` | integer | **required** | Observed epoch-cleanup delete parallelism. |

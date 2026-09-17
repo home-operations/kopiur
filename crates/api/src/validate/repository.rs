@@ -142,10 +142,12 @@ pub fn validate_backup_deletion_policy(
 ///
 /// Two classes of rule:
 ///
-/// - **Grammar.** Every duration must parse, and every count must be positive. The
-///   grammar check matters more here than elsewhere: these are the first CRD durations
-///   that reach a kopia CLI, and this module's contract is that a value the webhook
-///   admits never fails at reconcile time.
+/// - **Grammar and range.** Every duration must parse and fall inside kopia's own bounds,
+///   and every count must clear its floor (see [`epoch_floor_errors`], which owns the
+///   ranges). These checks matter more here than elsewhere: these are the first CRD
+///   durations that reach a kopia CLI, and this module's contract is that a value the
+///   webhook admits never fails at reconcile time — nor, since #458, silently applies
+///   nothing.
 /// - **Applicability.** A `mode: ReadOnly` repository can never apply them — kopia
 ///   hard-errors `set-parameters` on a read-only connection — so declaring them there is
 ///   a configuration mistake. Reject it rather than silently ignore the block, matching
@@ -218,25 +220,318 @@ pub fn validate_repository_parameters(
     duration("minDuration", &epoch.min_duration);
     duration("refreshFrequency", &epoch.refresh_frequency);
 
-    let mut positive = |field: &str, v: Option<i64>| {
-        if let Some(v) = v
-            && v <= 0
-        {
+    // Range floors (#458). Grammar above, applicability below, floors here — kept in their
+    // own pure function because they are the rules with real arithmetic in them (the
+    // minDuration one derives its floor from a sibling field), and because they are the
+    // rules that most need to be readable next to kopia's own `Parameters.Validate()`.
+    errs.extend(epoch_floor_errors(epoch, context));
+    errs
+}
+
+/// kopia's own epoch floors, from `internal/epoch/epoch_manager.go` `Parameters.Validate()`
+/// and re-verified empirically against the pinned kopia 0.23.1 binary (see
+/// `crates/kopia/tests/integration_epoch_floors.rs`, which asserts every quoted error text
+/// below against the real CLI).
+///
+/// **Why these are admission errors and not runtime warnings** — issue #458. `kopia
+/// repository set-parameters` MERGES the flags it is given into the repository's existing
+/// parameters and then validates the whole resulting set. One out-of-range value therefore
+/// refuses the entire call, discarding every other parameter in the same apply. The reporter
+/// declared `advanceOnCount: 5` + `advanceOnSizeMiB: 2` alongside a perfectly legal
+/// `minDuration`, and lost the `minDuration` too: kopiur had already accepted the object, so
+/// the only evidence was a Warning event and a `status.parameters.epoch` that quietly
+/// disagreed with `spec`.
+///
+/// Pure, and takes the spec sub-object rather than the whole spec, so every rule is unit
+/// testable on its own (`validate/tests.rs`, `#458` section).
+///
+/// **What a pure validator cannot know.** Three of these rules involve the repository's LIVE
+/// parameters, which admission cannot read, so each one substitutes kopia's default. That is
+/// right for every repository kopiur itself configured, and can be wrong for one changed out
+/// of band — in which case kopiur rejects a call kopia would accept. The messages say so and
+/// point at `status.parameters.epoch.*`, where the live values are already mirrored:
+///
+/// - The `minDuration` bound measures against kopia's `20m` refresh default when no
+///   `refreshFrequency` is declared. Reachable through kopiur itself: apply
+///   `{minDuration: 60m, refreshFrequency: 5m}`, then drop `refreshFrequency` from spec (a
+///   spec `None` means "don't touch", so the live `5m` stays) and `minDuration: 30m` becomes
+///   legal on that repository while this rule still rejects it.
+/// - The `refreshFrequency` ceiling assumes the `4h` `cleanupSafetyMargin` default. kopiur
+///   has no field for the margin, but kopia's CLI does (`--epoch-cleanup-safety-margin`), so
+///   a margin raised to, say, `23h` makes `refreshFrequency: 90m` legal.
+/// - **Not enforced at all**, for the same reason: the mirror of the `minDuration` rule — a
+///   `refreshFrequency` declared ALONE must also satisfy `3 x refresh <= live minDuration`.
+///   Substituting kopia's `24h` default there would reject almost nothing, so only the
+///   margin ceiling is applied to that field.
+fn epoch_floor_errors(
+    epoch: &crate::repository::EpochParameters,
+    context: &str,
+) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    let field = |name: &str| format!("{context} spec.parameters.epoch.{name}");
+
+    for (name, value, floor, why) in [
+        (
+            "advanceOnCount",
+            epoch.advance_on_count,
+            KOPIA_MIN_ADVANCE_ON_COUNT,
+            "kopia refuses anything lower with \"epoch advance on count too low\"",
+        ),
+        (
+            "advanceOnSizeMiB",
+            epoch.advance_on_size_mb,
+            KOPIA_MIN_ADVANCE_ON_SIZE_MIB,
+            "kopia refuses anything lower with \"epoch advance on size too low\" (it stores \
+             the value as `MiB << 20` bytes, so 1 is the smallest representable threshold)",
+        ),
+        (
+            "checkpointFrequency",
+            epoch.checkpoint_frequency,
+            KOPIA_MIN_CHECKPOINT_FREQUENCY,
+            "kopia refuses anything lower with \"invalid epoch range compaction period\"",
+        ),
+        (
+            "deleteParallelism",
+            epoch.delete_parallelism,
+            KOPIUR_MIN_DELETE_PARALLELISM,
+            "kopia does not validate this field at all — the floor is kopiur's own, because \
+             a non-positive parallelism asks kopia to run epoch cleanup with no workers",
+        ),
+    ] {
+        let Some(v) = value else { continue };
+        if v < floor {
+            // The zero note is only true OF A ZERO. Concatenating it onto every out-of-range
+            // value buried the part that applied under ~230 characters of the part that did
+            // not.
+            let zero_note = if v == 0 {
+                format!(" {ZERO_IS_DROPPED}")
+            } else {
+                String::new()
+            };
             errs.push(ValidationError::InvalidFieldValue {
-                field: format!("{context} spec.parameters.epoch.{field}"),
+                field: field(name),
                 reason: format!(
-                    "must be > 0 (got {v}); omit the field to leave kopia's current value \
-                     untouched"
+                    "{v} is below the minimum of {floor}: {why}. {WHOLE_CALL_REFUSED}\
+                     {zero_note} Use {floor} or more, or omit the field to leave kopia's \
+                     current value untouched"
                 ),
             });
         }
-    };
-    positive("advanceOnCount", epoch.advance_on_count);
-    positive("advanceOnSizeMiB", epoch.advance_on_size_mb);
-    positive("checkpointFrequency", epoch.checkpoint_frequency);
-    positive("deleteParallelism", epoch.delete_parallelism);
+    }
+
+    // Durations are re-parsed here rather than threaded in from the grammar pass above, so
+    // this function stays pure and independently testable. An unparseable value yields
+    // `None` and is skipped — it already has its own, better, grammar error.
+    let parse = |raw: &Option<String>| raw.as_deref().and_then(crate::duration::parse_go_duration);
+    let declared_refresh = parse(&epoch.refresh_frequency);
+
+    let refresh_raw = epoch.refresh_frequency.as_deref().unwrap_or_default();
+    // A parsed ZERO is the #458 failure mode itself, on the one epoch field that has a
+    // ceiling but no floor. kopia's `setDurationParameter` is `if v == 0 { return }`, so the
+    // flag never reaches the format blob, `anyChange` stays false, and the command exits 0
+    // with `no changes`. Worse than a no-op downstream: the spec renders `"0s"`, the drift
+    // comparator sees 0 against the live 20m forever, and kopiur re-sends the flag on every
+    // single bootstrap while `status` permanently disagrees with `spec`.
+    //
+    // `minDuration` needs no zero rule of its own — 0 is below its 10m floor — and the four
+    // integers are all caught by their own `>= 1` floors. This is the last field.
+    if declared_refresh == Some(std::time::Duration::ZERO) {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: field("refreshFrequency"),
+            reason: format!(
+                "{refresh_raw:?} is zero, and kopia treats a zero duration as \"flag not \
+                 set\": `set-parameters` skips it, exits 0 and reports `no changes`, so the \
+                 repository silently keeps its existing refresh frequency. kopiur would then \
+                 read that as permanent drift and re-issue the flag on every bootstrap — \
+                 invalidating every other kopia client's cached format blob each time — \
+                 while `status.parameters.epoch.refreshFrequency` never agrees with `spec`. \
+                 Use a positive duration (1s or more), or omit the field to leave kopia's \
+                 current value untouched"
+            ),
+        });
+    } else if declared_refresh.is_some_and(|r| r > MAX_EPOCH_REFRESH_FREQUENCY) {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: field("refreshFrequency"),
+            reason: format!(
+                "{refresh_raw:?} exceeds the maximum of 80m: kopia requires \
+                 `cleanupSafetyMargin >= 3 x refreshFrequency` and refuses the call with \
+                 \"invalid cleanup safety margin, must be at least 3x epoch refresh \
+                 frequency\". 80m is 4h/3, and kopiur ASSUMES the margin is kopia's 4h \
+                 default because a validator cannot read the live repository — kopiur has no \
+                 `cleanupSafetyMargin` field, but kopia's own CLI does \
+                 (`--epoch-cleanup-safety-margin`), so a repository whose margin was raised \
+                 out of band would in fact accept this. Check the live value at \
+                 `status.parameters.epoch.cleanupSafetyMargin`; if it is genuinely above 3x \
+                 this frequency, apply the change with kopia directly. {WHOLE_CALL_REFUSED} \
+                 Otherwise use 80m or less"
+            ),
+        });
+    }
+
+    if let Some(min) = parse(&epoch.min_duration) {
+        errs.extend(min_duration_floor_error(
+            min,
+            epoch.min_duration.as_deref().unwrap_or_default(),
+            declared_refresh,
+            epoch.refresh_frequency.is_some(),
+            &field("minDuration"),
+        ));
+    }
     errs
 }
+
+/// The `minDuration` floor, split out because it is the only rule whose bound is DERIVED —
+/// `max(10m, 3 x refreshFrequency)` — and the only one where TWO of kopia's rules can bite
+/// at once.
+///
+/// `refresh_declared` distinguishes "the user set a refreshFrequency we could parse" from
+/// "the user set one we could not" (grammar error already emitted → skip the derived bound
+/// rather than measure against a default they plainly did not intend).
+///
+/// Both violated rules are reported when both apply. Naming the derived floor while
+/// explaining only the absolute one mismatched why-against-floor, and it withheld the fix
+/// that actually works for a sub-10m value: raise `minDuration` TO 10m and declare a small
+/// `refreshFrequency` beside it. "Lowering the refresh cannot help" is only true with
+/// `minDuration` held fixed, which is precisely what the user is being asked to change.
+fn min_duration_floor_error(
+    min: std::time::Duration,
+    raw: &str,
+    declared_refresh: Option<std::time::Duration>,
+    refresh_declared: bool,
+    field: &str,
+) -> Vec<ValidationError> {
+    // An unparseable refreshFrequency makes the 3x bound unknowable; the absolute floor
+    // still applies.
+    let refresh = match (refresh_declared, declared_refresh) {
+        (true, None) => None,
+        (true, Some(r)) => Some((r, "the refreshFrequency declared alongside it")),
+        (false, _) => Some((
+            KOPIA_DEFAULT_EPOCH_REFRESH_FREQUENCY,
+            "kopia's 20m refreshFrequency default, which kopiur has to assume because a \
+             validator cannot read the live repository — check \
+             `status.parameters.epoch.refreshFrequency` for what this repository actually has",
+        )),
+    };
+    let derived = refresh.map(|(r, source)| (r.saturating_mul(3), source));
+    let floor = derived.map_or(KOPIA_MIN_EPOCH_DURATION, |(d, _)| {
+        d.max(KOPIA_MIN_EPOCH_DURATION)
+    });
+    if min >= floor {
+        return Vec::new();
+    }
+
+    // WHICH of kopia's two rules the value breaks. Both can, and then both are named.
+    let below_absolute = min < KOPIA_MIN_EPOCH_DURATION;
+    let derived_bites = derived.is_some_and(|(d, _)| min < d && d > KOPIA_MIN_EPOCH_DURATION);
+    let mut why = Vec::new();
+    if below_absolute {
+        why.push(
+            "kopia's absolute minimum is 10m — it refuses anything lower with \"minimum \
+             epoch duration too low\""
+                .to_string(),
+        );
+    }
+    if derived_bites {
+        let (_, source) = derived.expect("derived_bites implies a derived bound");
+        why.push(format!(
+            "kopia requires `minDuration >= 3 x refreshFrequency`, refusing the call \
+             with \"epoch refresh period is too long, must be 1/3 of minimal epoch duration \
+             or shorter\" — and that 3x bound comes from {source}"
+        ));
+    }
+
+    // …and the fix for exactly that combination. The refresh suggestion is always computed
+    // from a minDuration that would itself be legal, so following it cannot fail the other
+    // rule on the next apply.
+    let fix = match (below_absolute, derived_bites) {
+        (true, true) => format!(
+            "Use {} or more; or, since no refreshFrequency can rescue a value below kopia's \
+             10m floor, raise minDuration to 10m and declare a `refreshFrequency` of {} or \
+             less alongside it",
+            render_minutes(floor),
+            suggest_refresh(KOPIA_MIN_EPOCH_DURATION),
+        ),
+        (false, true) => format!(
+            "Use {} or more, or declare a `refreshFrequency` of {} or less alongside it",
+            render_minutes(floor),
+            suggest_refresh(min),
+        ),
+        // Below 10m with the 3x rule already satisfied: raising minDuration is the only move.
+        (true, false) => format!("Use {} or more", render_minutes(floor)),
+        (false, false) => unreachable!("min < floor implies at least one rule was broken"),
+    };
+    vec![ValidationError::InvalidFieldValue {
+        field: field.to_string(),
+        reason: format!(
+            "{raw:?} is below the minimum of {}: {}. {WHOLE_CALL_REFUSED} {fix}",
+            render_minutes(floor),
+            why.join("; and "),
+        ),
+    }]
+}
+
+/// The largest `refreshFrequency` that would make `min` a legal `minDuration`, rounded DOWN
+/// to a whole minute so the suggestion reads like something a human would write (`3m`, not
+/// `200s`). Rounding down can only make the suggestion safer — it never pushes
+/// `3 x refresh` back above `minDuration`.
+///
+/// CAPPED at [`MAX_EPOCH_REFRESH_FREQUENCY`], because the naive third is only valid while it
+/// stays under that ceiling: `minDuration: 300m` would otherwise suggest `100m`, which the
+/// ceiling immediately rejects. Advice that fails the very next admission is worse than no
+/// advice.
+fn suggest_refresh(min: std::time::Duration) -> String {
+    let third = std::time::Duration::from_secs(min.as_secs() / 3).min(MAX_EPOCH_REFRESH_FREQUENCY);
+    if third.as_secs() >= 60 {
+        format!("{}m", third.as_secs() / 60)
+    } else {
+        crate::render_go_duration(third)
+    }
+}
+
+/// Render an epoch floor the way the docs and the issue talk about it — in minutes (`60m`,
+/// not `render_go_duration`'s `1h`). Every floor in this module lives in the minutes range
+/// (the largest possible is 3 x the 80m refresh ceiling), so minutes is the unit that makes
+/// two floors comparable at a glance; anything not a whole minute falls back.
+fn render_minutes(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs != 0 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        crate::render_go_duration(d)
+    }
+}
+
+/// The sentence every epoch-floor message carries, and the whole reason #458 was a data
+/// problem rather than a cosmetic one.
+const WHOLE_CALL_REFUSED: &str = "`kopia repository set-parameters` merges the \
+     declared flags into the repository's existing parameters and validates the whole \
+     resulting set, so ONE out-of-range value refuses the entire call — every other \
+     parameter in the same apply is discarded with it.";
+
+/// Why `0` is rejected rather than tolerated as "leave it alone": kopia's CLI treats `0` on
+/// these integer flags as "flag not set" and prints `no changes`, which is the worst of both
+/// worlds — the user sees success and the repository is untouched. Verified on 0.23.1.
+const ZERO_IS_DROPPED: &str = "A `0` would not even reach kopia's parameter \
+     validation: its CLI treats 0 on these flags as \"not set\" and reports `no changes`, \
+     so it looks like it applied and does nothing.";
+
+/// kopia's `minEpochAdvanceOnCount`: "epoch advance on count too low" below this.
+const KOPIA_MIN_ADVANCE_ON_COUNT: i64 = 10;
+/// kopia's minimum advance-on-size threshold, in MiB: "epoch advance on size too low".
+const KOPIA_MIN_ADVANCE_ON_SIZE_MIB: i64 = 1;
+/// kopia's minimum full-checkpoint frequency: "invalid epoch range compaction period".
+const KOPIA_MIN_CHECKPOINT_FREQUENCY: i64 = 1;
+/// kopiur's own floor — kopia never validates `DeleteParallelism`.
+const KOPIUR_MIN_DELETE_PARALLELISM: i64 = 1;
+/// kopia's `minEpochDuration`: "minimum epoch duration too low" below this.
+const KOPIA_MIN_EPOCH_DURATION: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// kopia's default `EpochRefreshFrequency`, which is what a repository still has when the
+/// user declares only `minDuration`. The reason `minDuration: 10m` alone always fails.
+const KOPIA_DEFAULT_EPOCH_REFRESH_FREQUENCY: std::time::Duration =
+    std::time::Duration::from_secs(20 * 60);
+/// kopia's default `CleanupSafetyMargin` (4h) divided by 3. kopiur cannot set the margin, so
+/// this is a constant ceiling on `refreshFrequency`.
+const MAX_EPOCH_REFRESH_FREQUENCY: std::time::Duration = std::time::Duration::from_secs(80 * 60);
 
 /// kopia's minimum blob-retention period, straight from its own `Validate()`:
 /// "invalid retention-period, the minimum required is 1-day and there is no maximum limit".
