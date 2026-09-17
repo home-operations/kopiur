@@ -22,16 +22,17 @@
 
 mod common;
 
-use common::{cr, ensure_repo, repository_json, wait_phase};
+use common::{
+    cr, drop_producer, ensure_producer, ensure_producer_labeled, ensure_repo, repository_json,
+    wait_phase,
+};
 use kube::api::{DeleteParams, ListParams, LogParams, PostParams};
 use kube::{Api, Client, ResourceExt};
 
 use k8s_openapi::api::core::v1::{Namespace, Pod};
 
 use kopiur_api::{Repository, Restore, Snapshot, SnapshotPolicy};
-use kopiur_e2e::{
-    E2E_NAMESPACE, Need, World, builders, default_timeout, poll_interval, wait_until,
-};
+use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wait_until};
 
 const SUBPATH: &str = "stream";
 const REPO: &str = "e2e-stream-repo";
@@ -58,26 +59,6 @@ async fn annotate_namespace(client: &Client, ns: &str, on: bool) {
     )
     .await
     .expect("annotate namespace for stream-exec");
-}
-
-/// A long-lived pod that plays the part of the database: it just sleeps, and the
-/// stream source execs a command inside it.
-fn producer_pod(ns: &str, name: &str) -> Pod {
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": { "name": name, "namespace": ns, "labels": { "app": name } },
-        "spec": {
-            "restartPolicy": "Never",
-            "containers": [{
-                "name": "db",
-                "image": kopiur_e2e::consts::BUSYBOX_IMAGE,
-                "imagePullPolicy": "IfNotPresent",
-                "command": ["sleep", "3600"],
-            }],
-        },
-    }))
-    .expect("producer pod")
 }
 
 fn stream_policy_json(
@@ -116,30 +97,6 @@ fn snapshot_json(name: &str, policy: &str) -> serde_json::Value {
         "metadata": { "name": name, "namespace": E2E_NAMESPACE },
         "spec": { "policyRef": { "name": policy } }
     })
-}
-
-async fn ensure_producer(client: &Client, name: &str) {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    if pods.get_opt(name).await.ok().flatten().is_none() {
-        let _ = pods
-            .create(&PostParams::default(), &producer_pod(E2E_NAMESPACE, name))
-            .await;
-    }
-    wait_until(
-        &format!("{name} Running"),
-        default_timeout(),
-        poll_interval(),
-        || async {
-            Ok(pods
-                .get_opt(name)
-                .await?
-                .and_then(|p| p.status.and_then(|s| s.phase))
-                .filter(|ph| ph == "Running")
-                .map(|_| ()))
-        },
-    )
-    .await
-    .expect("the producer pod should reach Running");
 }
 
 /// Acceptance 1 + 5: known bytes out, byte-identical bytes back in.
@@ -416,6 +373,98 @@ async fn zero_pod_matches_fails_with_an_actionable_message() {
     assert!(
         text.contains("no pod matches podSelector"),
         "the failure must name the selector problem, got: {text}"
+    );
+}
+
+/// Acceptance 3b — TWO Running matches is a named refusal, never an arbitrary pick.
+///
+/// The one the unit tests cannot prove. `pick_stream_pod` is pure and already
+/// covered off-cluster, but the thing that matters operationally is that a real
+/// two-replica workload reaches that function at all — i.e. that the mover LISTS
+/// by the rendered selector rather than taking the first pod the controller
+/// happened to resolve at plan time. A backup that silently dumped whichever
+/// replica was scheduled first would look completely healthy: green Snapshot,
+/// plausible byte count, and contents that depend on scheduling. So this asserts
+/// the Snapshot FAILS and that the message names the count and the pods.
+#[tokio::test]
+#[cfg_attr(not(feature = "e2e"), ignore)]
+async fn two_running_pod_matches_fails_naming_the_candidates() {
+    let Some(world) = World::connect().await else {
+        eprintln!("no cluster; skipping");
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    ensure_repo(&client, SUBPATH).await;
+    annotate_namespace(&client, E2E_NAMESPACE, true).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(REPO, SUBPATH, serde_json::json!({}))),
+        )
+        .await;
+    wait_phase(&repos, REPO, "Ready").await.expect("repo Ready");
+
+    // Two pods, ONE label. A dedicated label so no other scenario's selector can
+    // see them, and both are torn down before returning (the binary is
+    // --test-threads=1, so a leftover would break every later scenario).
+    const APP: &str = "stream-replicas";
+    ensure_producer_labeled(&client, "stream-replica-a", APP).await;
+    ensure_producer_labeled(&client, "stream-replica-b", APP).await;
+
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = policies
+        .create(
+            &PostParams::default(),
+            &cr(stream_policy_json(
+                "stream-twopod-policy",
+                REPO,
+                APP,
+                serde_json::json!(["sh", "-c", "echo hi"]),
+                "dump.sql",
+            )),
+        )
+        .await;
+
+    let snaps: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = snaps
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json("stream-twopod-snap", "stream-twopod-policy")),
+        )
+        .await;
+    let verdict = wait_phase(&snaps, "stream-twopod-snap", "Failed").await;
+
+    let got = snaps.get("stream-twopod-snap").await.expect("snapshot");
+    let text = serde_json::to_string(&got.status).unwrap_or_default();
+
+    // Tear down before asserting, so a failed assertion cannot poison the rest of
+    // the run with two same-labelled pods still standing.
+    drop_producer(&client, "stream-replica-a").await;
+    drop_producer(&client, "stream-replica-b").await;
+
+    verdict.expect("two Running matches must FAIL the Snapshot, never pick one");
+    assert!(
+        text.contains("matched 2 RUNNING pods"),
+        "the failure must name the count, got: {text}"
+    );
+    assert!(
+        text.contains("stream-replica-a") && text.contains("stream-replica-b"),
+        "the failure must name the candidate pods so an admin can narrow the \
+         selector, got: {text}"
+    );
+    // And nothing was written: an arbitrary pick would have produced a snapshot.
+    assert!(
+        got.status
+            .as_ref()
+            .and_then(|s| s.snapshot.as_ref())
+            .is_none(),
+        "a refused multi-match must leave no kopia snapshot recorded: {text}"
     );
 }
 

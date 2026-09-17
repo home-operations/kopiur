@@ -249,11 +249,26 @@ pub async fn exec_client() -> Result<kube::Client> {
         .map_err(|e| MoverError::KubeClient {
             source: Box::new(kube::Error::InferConfig(e)),
         })?;
-    config.write_timeout = None;
-    config.read_timeout = None;
+    clear_exec_timeouts(&mut config);
     kube::Client::try_from(config).map_err(|e| MoverError::KubeClient {
         source: Box::new(e),
     })
+}
+
+/// Strip the per-request timeouts an exec/attach session must not carry.
+///
+/// Split out of [`exec_client`] so it is unit-testable: `Config::infer` needs a
+/// kubeconfig or in-cluster environment, so the only hermetic way to prove the
+/// 295 s `write_timeout` is really gone is to test the transformation itself.
+/// Without that proof the guarantee rests on two assignments that a later edit
+/// could drop silently — and the symptom would be a large `streamExec` restore
+/// failing partway through with a transport error that blames the user's command.
+///
+/// `connect_timeout` is deliberately LEFT ALONE: a connection that cannot be
+/// established should fail fast.
+fn clear_exec_timeouts(config: &mut kube::Config) {
+    config.write_timeout = None;
+    config.read_timeout = None;
 }
 
 /// Resolve the single workload pod for `selector` in `namespace`.

@@ -365,3 +365,48 @@ fn other_object_read_failures_pass_the_kopia_error_through() {
         "a non-timeout must not point at the timeout knob: {msg}"
     );
 }
+
+/// The `>295 s consumer is not killed` guarantee, pinned without a cluster.
+///
+/// kube 4.x infers a 295 s `write_timeout`, which `hyper_timeout::TimeoutConnector`
+/// applies PER WRITE and enforces by tearing the connection down. On a `streamExec`
+/// restore kopiur is the writer (`kopia show` piped into the consumer's stdin), so a
+/// `psql` legitimately backpressuring on one enormous statement for five minutes
+/// would kill the restore — and the transport error would read as though the user's
+/// command had timed out, when the budget was kopiur's own.
+///
+/// The real e2e proof costs five minutes of wall clock on every CI shard, for a
+/// property that is entirely decided by two field assignments. This asserts those
+/// instead: the default really does carry a finite write timeout (so the clearing is
+/// load-bearing, not decoration), and after `clear_exec_timeouts` both per-request
+/// timeouts are gone while `connect_timeout` survives.
+#[test]
+fn the_exec_client_config_carries_no_write_timeout() {
+    let mut config = kube::Config::new("https://example.invalid".parse().expect("a valid url"));
+
+    // Guard against the test silently becoming vacuous: if a future kube release
+    // defaults `write_timeout` to None, clearing it proves nothing and this test
+    // must be re-pointed at whatever the new bound is.
+    assert!(
+        config.write_timeout.is_some(),
+        "kube still defaults to a finite write_timeout; if this fails, the timeout \
+         this guards moved and the comment above is stale"
+    );
+    let connect = config.connect_timeout;
+
+    clear_exec_timeouts(&mut config);
+
+    assert!(
+        config.write_timeout.is_none(),
+        "a consumer that backpressures longer than kube's default must not be killed"
+    );
+    assert!(
+        config.read_timeout.is_none(),
+        "an exec/attach session must not carry a per-read timeout either"
+    );
+    assert_eq!(
+        config.connect_timeout, connect,
+        "connect_timeout is deliberately kept: a connection that cannot be \
+         established should fail fast"
+    );
+}

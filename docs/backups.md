@@ -132,7 +132,7 @@ Helm never upgrades the chart's `crds/` directory, so on an existing install the
 
 ### Sources — what to back up
 
-`sources` is a list. Each entry is **exactly one of** a single PVC, a label selector, or an inline NFS export. They are mutually exclusive, and the webhook rejects setting more than one on a source.
+`sources` is a list. Each entry is **exactly one of** a single PVC, a label selector, an inline NFS export, or a streamed command. They are mutually exclusive, and the webhook rejects setting more than one on a source.
 
 ```yaml
 sources:
@@ -173,6 +173,22 @@ sources:
 ```
 
 The operator mounts the export read-only into the backup mover and kopia snapshots it. By default kopia records the export `path` as the snapshot `sourcePath`; override it with `sourcePathOverride`. An NFS source works with **any** repository backend.
+
+Or capture a **command's stdout** as one virtual file, with nothing mounted at all — the logical-backup source for a database dump. See [Streamed command sources](stream-sources.md) and [example 45](https://github.com/home-operations/kopiur/blob/main/deploy/examples/45-stream-source-postgres.yaml):
+
+```yaml
+sources:
+    - stream:
+          fileName: postgres.sql # the one virtual file in the snapshot
+          workloadExec:
+              podSelector:
+                  matchLabels: { app: postgres }
+              command: ["sh", "-ec", "pg_dumpall -U postgres"]
+```
+
+The mover execs the command in the **workload's** container and pipes its stdout straight into kopia, so the dump uses the credentials already present there and the mover never sees repository credentials. The snapshot root is a virtual directory at `/stream/<fileName>` — deliberately distinct from a PVC source's `/pvc/<name>`, so a streamed artifact and a volume backup can never share a kopia identity. Exactly one **Running** pod must match `podSelector`; zero, several, or only not-running matches are each a named failure rather than an arbitrary pick.
+
+A stream source needs `pods/exec` in the workload namespace, which is a much larger grant than an ordinary backup, so it is gated behind its own namespace opt-in that **fails closed**. Restoring one is the mirror `streamExec` target, which pipes the file back into a command's stdin. Both are covered on the [Streamed command sources](stream-sources.md) page.
 
 #### `readOnly` — the source mount
 
@@ -1064,4 +1080,5 @@ A `SnapshotPolicy` describes the work. A `SnapshotSchedule`, or you, turns it in
 - [Repositories & backends](repositories.md): where snapshots are stored.
 - [Restores](restores.md): reading a snapshot back.
 - [Movers, RBAC & credentials](movers.md): where backups actually run and what they need.
+- [Streamed command sources](stream-sources.md): the `stream` source form — capture `pg_dumpall`/`mysqldump` stdout with nothing mounted, and its `streamExec` restore.
 - [Examples](examples.md): [01 scheduled](examples.md#example-01--single-pvc-scheduled), [04 multi-PVC](examples.md#example-04--multi-pvc-selector), [06 manual](examples.md#example-06--manual-one-shot-backup).

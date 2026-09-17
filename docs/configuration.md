@@ -51,7 +51,7 @@ Each of the three images is configured next to the component it belongs to, and 
 - **mover**: `mover.image.*`, with its own `mover.image.pullPolicy`.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:62:86"
+--8<-- "deploy/helm/kopiur/values.yaml:83:107"
 ```
 
 Each image takes a `tag`, which defaults to the chart's `appVersion` when empty, or a `digest`. `mover.image.pullPolicy` sets the `imagePullPolicy` on every mover **Job** pod the controller creates, using `Always`, `IfNotPresent` or `Never`. When it is unset, the controller infers `IfNotPresent` whenever an explicit mover image is configured, so a pinned image, for example one loaded locally, is never re-pulled. Otherwise it leaves the cluster default in charge.
@@ -67,7 +67,7 @@ The mover image runs your data-protection Jobs. A floating `:latest`, or any mut
 ## Install scope & CRDs
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:45:60"
+--8<-- "deploy/helm/kopiur/values.yaml:45:81"
 ```
 
 | `installScope` | RBAC | Manages | `ClusterRepository` |
@@ -76,6 +76,8 @@ The mover image runs your data-protection Jobs. A floating `:latest`, or any mut
 | `namespaced` | `Role` + `RoleBinding` | the release namespace only | **not** reconciled |
 
 `cluster` is the default because a namespace-scoped `Role` silently disables the `ClusterRepository` kind. A cluster-scoped resource is out of a `Role`'s reach, so a namespaced install turns Kopiur into a shared-backup-tier operator that can't do shared backup tiers. Choose `namespaced` as the explicit least-privilege opt-down for a single-team install, where the reduced blast radius is worth losing cluster-scoped repositories.
+
+`rbacNamespaceReadForStreamSources` is the one supplementary grant a namespaced install may need, and only if you use [`stream` sources](stream-sources.md). A stream source execs a command inside a workload pod, so the operator has to mint `pods/exec` for the mover, and it refuses to do that unless a cluster admin has annotated the namespace. Checking that annotation needs `get` on `namespaces`, which is cluster-scoped and therefore absent from a `Role` entirely — so the check **fails closed** and `stream` sources are refused. Setting this to `true` adds a small supplementary `ClusterRole` granting `get` on `namespaces` and nothing else. It is ignored under `installScope: cluster`, which already has that read, and `pvc` and `nfs` sources never need it. See [RBAC](rbac.md) and [Streamed command sources](stream-sources.md#if-kopiur-is-installed-namespace-scoped).
 
 /// info | How the CRDs are installed
 
@@ -94,7 +96,7 @@ A GitOps flow with a `CreateReplace` sync applies them automatically. There is n
 A couple of opt-in features need the operator to **write Secrets** in the namespaces it manages. Each is gated behind a Helm flag, because the chart does **not** grant cluster-wide `secrets` write by default. That is least privilege. The flag names match the CRD field that triggers them.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:303:333"
+--8<-- "deploy/helm/kopiur/values.yaml:324:354"
 ```
 
 | CRD field you set… | …needs this Helm flag | Grants `secrets` |
@@ -111,7 +113,7 @@ A couple of opt-in features need the operator to **write Secrets** in the namesp
 ## ServiceAccount
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:290:301"
+--8<-- "deploy/helm/kopiur/values.yaml:311:322"
 ```
 
 Set `serviceAccount.create: false` to bring your own. The `annotations` map is where IRSA and GKE Workload Identity role bindings go, so the operator, and the mover Jobs that inherit it, can authenticate to cloud object storage without a static credential Secret. `serviceAccount.automount`, default `true`, controls whether the token is mounted into the controller and webhook pods.
@@ -121,7 +123,7 @@ Set `serviceAccount.create: false` to bring your own. The `annotations` map is w
 The controller's knobs live at the **root** of the values file, with no `controller.` prefix. A root-level workload key applies to the controller alone.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:89:239"
+--8<-- "deploy/helm/kopiur/values.yaml:110:260"
 ```
 
 This is the operator itself. The settings worth knowing:
@@ -203,7 +205,7 @@ On start or restart the controller reconciles every existing resource at once, s
 ### Controller port & probes
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:263:288"
+--8<-- "deploy/helm/kopiur/values.yaml:284:309"
 ```
 
 The controller has a single operational port, `metrics.port`, default `8081`, which co-hosts `/metrics`, `/healthz`, and `/readyz`. The chart renders the **dual-stack wildcard** bind address `[::]:<port>` into the `KOPIUR_HTTP_ADDR` env, which serves both IPv4 and IPv6 kubelets. A wildcard IPv6 bind also accepts IPv4 on Linux when `net.ipv6.bindv6only=0`, the default, so probes work on either. The metrics `Service` and the probes both target this port.
@@ -223,7 +225,7 @@ The webhook is a **separate** Deployment plus Service, and the Service maps `443
 The webhook is a **full component** with its own `webhook:` block. That covers its own `webhook.image`; `webhook.port`, the container port, default `8443`, where the chart renders `[::]:<port>` into `KOPIUR_WEBHOOK_ADDR` and the Service maps `443` to it; `webhook.replicaCount`; scheduling through `webhook.nodeSelector`, `tolerations`, `affinity` and `topologySpreadConstraints`; its own `webhook.podDisruptionBudget`; and its own security context, see [Pod security](#pod-security). A root-level workload key never touches it.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:455:510"
+--8<-- "deploy/helm/kopiur/values.yaml:476:531"
 ```
 
 - **`enabled`**: when `false`, validation falls back to the controller's
@@ -241,7 +243,7 @@ The webhook is a **full component** with its own `webhook:` block. That covers i
 ### Webhook TLS
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:563:593"
+--8<-- "deploy/helm/kopiur/values.yaml:584:614"
 ```
 
 The webhook **always** serves TLS, because Kubernetes requires HTTPS for admission. `webhook.tls.mode` only chooses how the serving cert is provisioned:
@@ -257,7 +259,7 @@ The default `self` mode needs **zero** configuration and no external dependency.
 ## Monitoring (Prometheus & Grafana)
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:392:453"
+--8<-- "deploy/helm/kopiur/values.yaml:413:474"
 ```
 
 All metrics are under the `kopiur_` namespace and served through a Prometheus **pull** endpoint on the controller's port, `metrics.port`. The controller's metrics `Service` is **always** created, because that listener co-hosts `/metrics` with `/healthz` and `/readyz`, so there's nothing to disable. The `monitoring:` block additionally connects the Prometheus Operator and Grafana:
@@ -297,7 +299,7 @@ The webhook's own HTTPS scrape lives separately under
 ## OpenTelemetry (OTLP)
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:368:390"
+--8<-- "deploy/helm/kopiur/values.yaml:389:411"
 ```
 
 This is off by default. Metrics are **always** available through the `/metrics` pull endpoint. Turning on OpenTelemetry Protocol (OTLP) _adds_ a push path plus **traces and logs**. When enabled, the controller, webhook, and mover Jobs all export to the configured collector, because the controller forwards the same `OTEL_*` env to the movers it spawns. Only gRPC is compiled in, so `endpoint` must point at the collector's gRPC port, 4317.
@@ -307,7 +309,7 @@ This is off by default. Metrics are **always** available through the `/metrics` 
 ## Logging
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:349:366"
+--8<-- "deploy/helm/kopiur/values.yaml:370:387"
 ```
 
 This controls the stdout logging, what `kubectl logs` shows, that every component writes. The controller passes `RUST_LOG` and `KOPIUR_LOG_FORMAT` through to mover Jobs, so a mover honors the same level and format.
@@ -348,13 +350,13 @@ A typo'd configuration value used to be silently swallowed. A garbage `KOPIUR_WO
 Security contexts are now **per-component**. The root `podSecurityContext` and `securityContext` are the **controller's**. The webhook carries its own `webhook.podSecurityContext` and `webhook.securityContext` with the same restricted defaults, so relaxing the controller never loosens the webhook. You might relax the controller with, say, `runAsUser: 1000` plus an `fsGroup` to read a filesystem or NFS-backed repository for in-process kopia ops.
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:241:261"
+--8<-- "deploy/helm/kopiur/values.yaml:262:282"
 ```
 
 The defaults for both: non-root **uid/gid 65534 (nobody)**, `runAsNonRoot`, a `RuntimeDefault` seccomp profile, no privilege escalation, a read-only root filesystem, and all capabilities dropped. The images are `distroless:nonroot`. The webhook's own block:
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:511:527"
+--8<-- "deploy/helm/kopiur/values.yaml:532:548"
 ```
 
 /// note | This is the operator's security context, not the mover's

@@ -271,10 +271,11 @@ The `status.stats` numbers and the `app-data-manual-abc12` and `<mover-pod>` nam
 | ---------------------------------------------- | ------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | Backup `Succeeded` but **0 files / 0 bytes**   | `Snapshot` `.status`             | Mover UID can't read the source files.                     | Match `spec.mover.securityContext.runAsUser/Group` to the data owner (Steps 1–2). To try a UID without touching the shared recipe, set it on a one-shot `Snapshot.spec.mover`. |
 | Mover log: `permission denied` reading source  | Mover pod logs                 | Same as above: partial read.                              | Same as above; or a root mover if UIDs can't be matched.                                                           |
-| Backup stuck `Pending`, `MoverPermitted=False` | `Snapshot` condition / Event     | Mover requests privilege; namespace not opted in.          | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`, or drop the elevated context. |
+| Backup stuck `Pending`, `MoverPermitted=False`, reason `PrivilegedMoverNotPermitted` | `Snapshot` condition / Event     | Mover requests privilege; namespace not opted in.          | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`, or drop the elevated context. |
 | `Repository` `Failed`, `PermissionDenied`      | `Repository` Event / condition | Filesystem repo path not writable by the operator UID.     | `chown -R <uid> <path>` (the Event names the UID), then reconcile.                                                 |
 | Restored files unreadable by the app           | After restore                  | Files restored as the mover's UID, not the original owner. | Set `Restore.spec.mover.securityContext.runAsUser/Group` to the app's UID (or `inheritSecurityContextFrom`); use a root mover with `privilegedMode: true` to preserve the original ownership exactly. |
-| Restore stuck `Pending`, `MoverPermitted=False` | `Restore` condition / Event   | Restore mover requests privilege; namespace not opted in.  | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`, or drop the elevated context. |
+| Restore stuck `Pending`, `MoverPermitted=False`, reason `PrivilegedMoverNotPermitted` | `Restore` condition / Event   | Restore mover requests privilege; namespace not opted in.  | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true`, or drop the elevated context. |
+| Backup or restore stuck `Pending`, `MoverPermitted=False`, reason `StreamExecNotPermitted` | `Snapshot` / `Restore` condition / Event | A **different** capability on the same condition: a `stream` source or `streamExec` target needs `pods/exec` in the workload namespace, and that has its **own** opt-in. The privileged-movers annotation does not grant it. | `kubectl annotate namespace <ns> kopiur.home-operations.com/stream-exec-movers=true`. Under a namespaced install also set `rbacNamespaceReadForStreamSources: true` — the check needs cluster-scoped `get` on `namespaces` and **fails closed** without it. See [Streamed command sources](stream-sources.md#if-kopiur-is-installed-namespace-scoped). |
 
 ## Quick reference
 
@@ -288,6 +289,7 @@ The `status.stats` numbers and the `app-data-manual-abc12` and `<mover-pod>` nam
 | `fsGroup`                        | `spec.mover.podSecurityContext.fsGroup`, which **defaults to `65532`** (keeps the cache writable); override to make a fresh restore volume writable by a mover running as a different UID |
 | Root / preserve-ownership        | `runAsUser: 0` + `privilegedMode: true` (needs the namespace opt-in)                |
 | Privileged-mover opt-in          | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true` |
+| Stream-exec opt-in (`stream` / `streamExec`) | `kubectl annotate namespace <ns> kopiur.home-operations.com/stream-exec-movers=true`. Separate from, and not implied by, the privileged-mover annotation: it authorizes `pods/exec` in that namespace, which is arbitrary code execution in every pod there. Fails **closed** — including when the Namespace cannot be read. See [Streamed command sources](stream-sources.md) |
 | Filesystem repo not writable     | Event prints `chown -R <uid> <path>` with the real operator UID                     |
 | Restore ignore/permission errors | `Restore.spec.options.ignorePermissionErrors` (default `true`)                      |
 
@@ -296,3 +298,4 @@ The `status.stats` numbers and the `app-data-manual-abc12` and `<mover-pod>` nam
 - [Movers, RBAC & credentials](movers.md) covers privileged movers, the minted ServiceAccount, and credential placement.
 - [Backend configuration](backends/index.md) covers the filesystem and SFTP backends, where ownership matters most.
 - [Restores](restores.md) covers restore targets and options.
+- [Streamed command sources](stream-sources.md) covers the `stream-exec-movers` opt-in, which gates `pods/exec` for `stream` sources and `streamExec` restore targets.
