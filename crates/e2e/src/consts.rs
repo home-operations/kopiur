@@ -105,6 +105,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // #346 multi-PVC fan-out + VolumeGroupSnapshot group staging.
     "multipvc-fanout",
     "multipvc-group",
+    // #456 verification fan-out (crates/e2e/tests/verification_fanout.rs): the
+    // scenario asserts a stamp PER MEMBER and that the flat `lastVerified` is
+    // their MIN, so no other scenario's verify traffic may write into this repo.
+    "vfyfanout",
     // #443: the populator fan-out scenario needs its own repo so no other
     // scenario's snapshots land under the same identity and confuse a
     // per-member path assertion.

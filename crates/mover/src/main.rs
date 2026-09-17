@@ -2855,6 +2855,33 @@ fn probe_scratch_writable(path: &str) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
+/// **Pure.** The quick tier's `successExpr` environment derived from the newest
+/// snapshot manifest for its identity: `(stats, snapshot id)`.
+///
+/// `kopia snapshot verify` reports no machine-readable file/byte counts of its
+/// own, so a healthy quick verify of a non-empty snapshot satisfies the common
+/// `stats.files > 0` predicate from the manifest instead of always failing on a
+/// hardcoded 0. `errors` is 0 — a passing verify found no integrity errors.
+/// Counts saturate rather than wrap, so an absurd manifest cannot make a
+/// predicate read a small number.
+///
+/// Deliberately takes the manifest that WAS found. "No manifest for this
+/// identity" is not an environment to report, it is a terminal verdict
+/// ([`MoverError::VerifyNoSnapshot`]): `kopia snapshot verify --sources` exits 0
+/// when its filter matches ZERO manifests, so reporting success there stamps
+/// `status.lastVerified` for a source path the repository holds no snapshot for
+/// — the #456 false pass.
+fn quick_coverage(entry: kopiur_kopia::SnapshotListEntry) -> (kopiur_api::VerifyStats, String) {
+    (
+        kopiur_api::VerifyStats {
+            files: i64::try_from(entry.stats.file_count).unwrap_or(i64::MAX),
+            bytes: i64::try_from(entry.stats.total_size).unwrap_or(i64::MAX),
+            errors: 0,
+        },
+        entry.id,
+    )
+}
+
 /// Drive a `Verify` run (ADR-0005 §4): connect, run the quick (`kopia snapshot
 /// verify`) or deep (scratch-restore) tier, evaluate the optional CEL `successExpr`
 /// over the result, and PATCH the `SnapshotPolicy` `.status.lastVerified` on
@@ -2907,20 +2934,57 @@ async fn run_verify_flow(
             // its own, so derive the predicate environment from the snapshot manifest:
             // a healthy quick verify of a non-empty snapshot then satisfies the common
             // `stats.files > 0` predicate instead of always failing on a hardcoded 0.
-            // `errors` is 0 — a passing verify found no integrity errors. Best-effort:
-            // if the manifest can't be listed we fall back to 0/0/0 and the exit code
-            // remains the integrity verdict.
+            // `errors` is 0 — a passing verify found no integrity errors.
+            //
+            // The three arms are EXHAUSTIVE and mean three different things. The
+            // `_ =>` catch-all they replace (#456) conflated "this identity has no
+            // snapshot" with "the listing failed", and reported SUCCESS for both.
             match resolve_latest_snapshot(client, spec).await {
-                Ok(Some(entry)) => (
-                    kopiur_api::VerifyStats {
-                        files: i64::try_from(entry.stats.file_count).unwrap_or(i64::MAX),
-                        bytes: i64::try_from(entry.stats.total_size).unwrap_or(i64::MAX),
-                        errors: 0,
-                    },
-                    None,
-                    Some(entry.id),
-                ),
-                _ => (kopiur_api::VerifyStats::default(), None, None),
+                Ok(Some(entry)) => {
+                    let (stats, id) = quick_coverage(entry);
+                    (stats, None, Some(id))
+                }
+                // TERMINAL, exactly as the deep arm below already treats it —
+                // this is the #456 defect itself, not merely its trigger.
+                // `kopia snapshot verify --sources <spec>` exits 0 when the
+                // filter matches ZERO manifests, so falling through here
+                // stamped `status.lastVerified` for a source path the
+                // repository holds no snapshot for. A verification that covered
+                // NOTHING is a failure, and the mover is the only place that
+                // can know it: the controller's scheduling gate is an inference
+                // about coverage from Snapshot CRs, which a strategy/override
+                // change or an external deletion invalidates. Failing here
+                // demotes that gate to an optimisation.
+                Ok(None) => {
+                    let err = MoverError::VerifyNoSnapshot {
+                        source_path: spec.identity.source_path.clone(),
+                    };
+                    let msg = format!(
+                        "quick verification covered NO snapshot: the repository holds no \
+                         snapshot for {}. `kopia snapshot verify` exits 0 when its \
+                         --sources filter matches nothing, so this is reported as a \
+                         failure rather than a false pass. Run a backup for this source \
+                         first; if you just changed sourcePathStrategy or \
+                         sourcePathOverride, the previous snapshots live under the OLD \
+                         path and this identity is new.",
+                        spec.identity.source_spec()
+                    );
+                    patch_verify_status(&spec.target_ref, &verify_failed_body(&msg)).await;
+                    error!(class = %err.kopia_class(), "{msg}");
+                    return Err(err);
+                }
+                // A LISTING failure is a different verdict from "no snapshot":
+                // the integrity verdict above may well be sound, but we cannot
+                // PROVE what was covered, so we must not claim success.
+                Err(e) => {
+                    patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string()))
+                        .await;
+                    error!(class = %e.class(), "could not list snapshots to confirm what the quick verify covered");
+                    return Err(MoverError::Kopia {
+                        op: KopiaOp::SnapshotVerify,
+                        source: e,
+                    });
+                }
             }
         }
         VerifyTier::Deep(d) => {
@@ -3038,7 +3102,11 @@ async fn run_verify_flow(
         &spec.target_ref,
         &verify_ok_body(
             op.tier.kind_str(),
-            op.repository_key.as_deref(),
+            // #456: the (repository x member) stamp key. `repository_key` is
+            // the pre-#456 fallback, so a Job already in flight across the
+            // upgrade (its work spec rides its own env) still stamps the
+            // per-repository entry it was minted for.
+            op.stamp_key.as_deref().or(op.repository_key.as_deref()),
             &chrono::Utc::now(),
         ),
     )
@@ -3939,6 +4007,62 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #456: the quick tier's coverage verdict -----------------------------
+
+    /// A manifest entry with the given counts, for [`quick_coverage`].
+    fn manifest(id: &str, files: u64, bytes: u64) -> kopiur_kopia::SnapshotListEntry {
+        let mut e: kopiur_kopia::SnapshotListEntry = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "source": { "host": "h", "userName": "u", "path": "/pvc/data" },
+            "startTime": "2026-08-01T00:00:00Z",
+            "endTime": "2026-08-01T00:01:00Z",
+        }))
+        .expect("typed manifest entry");
+        e.stats.file_count = files;
+        e.stats.total_size = bytes;
+        e
+    }
+
+    #[test]
+    fn quick_coverage_reports_the_manifest_counts_and_saturates() {
+        let (stats, id) = quick_coverage(manifest("k1", 42, 4096));
+        assert_eq!(id, "k1");
+        assert_eq!(stats.files, 42);
+        assert_eq!(stats.bytes, 4096);
+        assert_eq!(
+            stats.errors, 0,
+            "a passing quick verify found no integrity errors"
+        );
+        // Saturate, never wrap: a wrapped count could make `stats.files > 0`
+        // read false (or a byte budget read small) on an absurd manifest.
+        let (stats, _) = quick_coverage(manifest("k2", u64::MAX, u64::MAX));
+        assert_eq!(stats.files, i64::MAX);
+        assert_eq!(stats.bytes, i64::MAX);
+    }
+
+    #[test]
+    fn a_quick_verify_that_covered_no_snapshot_is_a_terminal_failure_not_a_pass() {
+        // #456's actual defect. `kopia snapshot verify --sources <spec>` exits 0
+        // when its filter matches ZERO manifests, so the quick arm's old `_ =>`
+        // catch-all stamped `status.lastVerified` for a source path the
+        // repository holds no snapshot for. The arm now returns this error; the
+        // guarantees it must keep are that it is TERMINAL (a retry cannot make
+        // a missing snapshot appear) and that it NAMES the path, since "which
+        // path?" is the whole diagnosis.
+        let err = MoverError::VerifyNoSnapshot {
+            source_path: "/pvc/data-b".into(),
+        };
+        assert!(
+            err.to_string().contains("/pvc/data-b"),
+            "the message must name the derived path: {err}"
+        );
+        assert!(
+            !err.retry_recommended(),
+            "a missing snapshot cannot be retried into existence, so a blind re-run \
+             must not be recommended"
+        );
+    }
 
     // --- #435: `bootstrap_declined` is three-way, not two-way ----------------
 

@@ -1680,6 +1680,23 @@ pub struct VerifyOp {
     /// single-repo flow, whose status write stays byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_key: Option<String>,
+    /// The `status.verificationStamps` key this run owns (#456). A verify run
+    /// is one cell of a (repository x member) grid: the repository dimension
+    /// comes from a multi-repository policy (#368) and the member dimension
+    /// from a `pvcSelector` policy fanning out one kopia source per matched PVC.
+    /// Shapes: `<repo key>` (repository only, the #368 wire),
+    /// `<repo key>#<member6>`, or `#<member6>` (a single-repository fan-out).
+    ///
+    /// A DISTINCT field from [`Self::repository_key`] rather than a
+    /// reinterpretation of it, because that one also drives the Job's
+    /// `repo_tag6` name segment, its `verify-repo` label value and the
+    /// projected-credentials prefix — and in-flight Jobs minted before #456
+    /// carry the old shape in their embedded work spec, so the mover falls back
+    /// to `repository_key` when this is absent.
+    ///
+    /// `None` = the classic flat `status.lastVerified` write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp_key: Option<String>,
 }
 
 /// Payload for a repository-replication run (ADR-0005 §13(d)). The mover connects

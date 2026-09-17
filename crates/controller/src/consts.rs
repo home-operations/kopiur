@@ -116,6 +116,28 @@ pub const VERIFY_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/verify-slot
 /// upgrade.
 pub const VERIFY_REPO_LABEL: &str = "kopiur.home-operations.com/verify-repo";
 
+/// Label tying a verification Job to the ONE selector-expanded member (one
+/// matched PVC's derived kopia source path) it verifies (#456 fan-out). Value:
+/// the stable 6-hex member tag ([`crate::verification::member_tag6`]) over that
+/// DERIVED source path — label-safe where the raw `/pvc/<name>` path (slashes)
+/// is not.
+///
+/// Stamped on every member of a `pvcSelector` policy — including a selector
+/// that currently matches exactly ONE PVC, which is deliberately NOT collapsed
+/// to the flat shape (see [`crate::verification::VerifyMember::member6`]).
+/// Absent only for a non-selector source (`pvc:`/`nfs:`), whose Job names,
+/// labels and status stamps therefore stay byte-identical to every prior
+/// operator.
+///
+/// Deliberately **not** part of the single-flight LIST selector. An in-flight
+/// verify Job minted by an OLDER operator carries neither this label nor
+/// [`VERIFY_REPO_LABEL`], so narrowing the LIST by it would stop seeing that
+/// Job and spawn N fresh ones beside it — for the deep tier, N+1 concurrent
+/// scratch restores. The gate therefore LISTs without it and filters
+/// client-side (`verification::job_blocks_cell`), where an unlabelled
+/// non-terminal Job still holds every cell's slot.
+pub const VERIFY_MEMBER_LABEL: &str = "kopiur.home-operations.com/verify-member";
+
 /// `COMPONENT_LABEL` value for replication mover Jobs (ADR-0005 §13(d)).
 pub const REPLICATION_COMPONENT: &str = "replication";
 /// Label tying a replication Job back to its owning `RepositoryReplication`

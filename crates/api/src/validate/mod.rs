@@ -157,6 +157,31 @@ pub fn validate_source(source: &Source) -> ValidationResult {
                 }
                 validate_nfs_volume(nfs, "snapshot source")
             }
+            // `pvcSelector` + `sourcePathOverride` is deliberately NOT refused
+            // here. It is a footgun, but a pure validator cannot see how many
+            // PVCs the selector currently matches, and the two cases differ:
+            //
+            //  * ONE matched PVC — a working single-volume policy with a custom
+            //    path. The override wins at `kopia_source_path`'s first branch,
+            //    there is no path COLLISION for `expand_sources` to refuse, the
+            //    backup is minted and real snapshots exist there. Refusing it
+            //    would park the WHOLE policy on upgrade (`reconcile_inner`
+            //    validates first and returns on the first error), stopping
+            //    retention pruning, adoption, status and the repository summary
+            //    along with verification.
+            //  * TWO OR MORE — `expand_sources` refuses the RUN via its
+            //    path-collision check (N members on one path would merge their
+            //    histories into one stream and prune each other), so no further
+            //    snapshot is minted for that source.
+            //
+            // So the broken case IS caught at run time, at the moment it
+            // becomes broken, and the working one keeps working. The loud signal
+            // there is the refused backup — the failed schedule fire — NOT
+            // verification: on a policy that was working, the earlier snapshots
+            // still sit at that path, so verification keeps passing. (It fails
+            // only where the path never received a backup, which the mover now
+            // treats as terminal rather than a false pass, #456.) The
+            // `sourcePathOverride` field documentation says exactly that.
             None => match source.pvc_selector.as_ref() {
                 Some(selector) => validate_pvc_selector(selector),
                 None => Ok(()),

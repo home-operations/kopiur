@@ -1055,6 +1055,36 @@ pub fn expand_sources(
                         target.namespace,
                         target.name,
                     )
+                } else if let Some(i) = [index, prev_index].into_iter().find(|i| {
+                    policy
+                        .spec
+                        .sources
+                        .get(*i)
+                        .and_then(|s| s.source_path_override.as_deref())
+                        == Some(path.as_str())
+                }) {
+                    // A `sourcePathOverride` PRODUCED this path: it wins at
+                    // `kopia_source_path`'s first branch, so the strategy is
+                    // never consulted and "set sourcePathStrategy" would be a
+                    // remedy that does nothing. Name the real cause instead.
+                    format!(
+                        "SnapshotPolicy `{}`'s pvcSelector matches both `{}/{}` and `{}/{}`, \
+                         which resolve to the SAME kopia source path `{path}` because \
+                         `spec.sources[{i}].sourcePathOverride` pins every matched PVC to that \
+                         one literal path. Their backups would merge into one snapshot history \
+                         and prune each other. Remove that `sourcePathOverride` — a \
+                         `sourcePathOverride` can only ever address ONE volume, so it does not \
+                         work on a selector that matches several, and `sourcePathStrategy` is \
+                         ignored while it is set. Use `sourcePathStrategy` (`PvcName`, or \
+                         `PvcNamespacedName` to disambiguate same-named PVCs across \
+                         namespaces), which derives a distinct path per PVC; or move the \
+                         override onto its own `pvc:` source.",
+                        policy.name_any(),
+                        prev.namespace,
+                        prev.name,
+                        target.namespace,
+                        target.name,
+                    )
                 } else {
                     format!(
                         "SnapshotPolicy `{}`'s pvcSelector matches both `{}/{}` and `{}/{}`, \

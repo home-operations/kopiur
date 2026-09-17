@@ -4952,6 +4952,164 @@ fn staging_overrides_rejected_for_nfs_but_honored_for_pvc_selector_sources() {
 }
 
 #[test]
+fn a_source_path_override_on_a_selector_stays_admissible() {
+    // #456 review: refusing this combination parked a configuration that
+    // genuinely works. A pure validator cannot see how many PVCs the selector
+    // currently matches, and the two cases are not the same:
+    //
+    //  * ONE matched PVC: the override wins, there is no path COLLISION for
+    //    `expand_sources` to refuse, the backup is minted and real snapshots
+    //    exist at that path. A working single-volume policy with a custom path.
+    //  * TWO OR MORE: `expand_sources` refuses the RUN (its collision check),
+    //    so no further snapshot is minted. The signal there is the refused
+    //    backup, not verification: a policy that WAS working still has
+    //    snapshots at that path, so verification keeps passing (it fails only
+    //    where the path never received a backup).
+    //
+    // Refusing both would have parked the whole policy on upgrade —
+    // `reconcile_inner` validates first and returns on the first error, so
+    // retention pruning, adoption, status and the repository summary would stop
+    // too. The run-time refusal already catches the broken case, loudly, at the
+    // moment it becomes broken.
+    let source: Source = crate::testutil::from_yaml(
+        "pvcSelector: { labelSelector: { matchLabels: { app: pg } } }\nsourcePathOverride: /data\n",
+    );
+    assert!(
+        validate_source(&source).is_ok(),
+        "a selector + sourcePathOverride must stay admissible: it works for one matched PVC"
+    );
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         groupBy: None\n\
+         sources: [ { pvcSelector: { labelSelector: { matchLabels: { app: pg } } }, \
+                      sourcePathOverride: /data } ]\n",
+    );
+    assert!(
+        validate_backup_config(&spec).is_empty(),
+        "admission must not park such a policy: {:?}",
+        validate_backup_config(&spec)
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_one_pvc_selector_with_an_override_expands_to_that_override_path() {
+    // The working case, end to end on the pure kernel: ONE matched PVC, so no
+    // collision, and the member's kopia source path IS the override — which is
+    // what the backup writes and therefore what verification must check.
+    use crate::expand::{effective_source, expand_sources, strategy_for};
+    use crate::snapshot::PvcTargetRef;
+    let policy: crate::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "pg", "namespace": "apps" },
+        "spec": {
+            "repository": { "name": "r" },
+            "groupBy": "None",
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "app": "pg" } } },
+                "sourcePathOverride": "/data",
+            }],
+        },
+    }))
+    .expect("typed policy");
+    let matched = std::collections::BTreeMap::from([(
+        0usize,
+        vec![PvcTargetRef {
+            namespace: "apps".into(),
+            name: "only".into(),
+        }],
+    )]);
+    let members = expand_sources(&policy, "pg-1", &matched)
+        .expect("one matched PVC cannot collide with itself")
+        .expect("a selector policy expands");
+    assert_eq!(members.len(), 1);
+    let eff = effective_source(&policy, Some(&members[0].source)).expect("effective");
+    assert_eq!(
+        eff.kopia_source_path(strategy_for(&policy.spec.sources[eff.index]))
+            .as_deref(),
+        Some("/data"),
+        "the override wins over the strategy, so this is the path the backup writes"
+    );
+
+    // Add a SECOND matching PVC and the same expansion is refused — both would
+    // land on `/data`, merging two volumes' histories into one stream.
+    let matched = std::collections::BTreeMap::from([(
+        0usize,
+        vec![
+            PvcTargetRef {
+                namespace: "apps".into(),
+                name: "one".into(),
+            },
+            PvcTargetRef {
+                namespace: "apps".into(),
+                name: "two".into(),
+            },
+        ],
+    )]);
+    let err = expand_sources(&policy, "pg-1", &matched)
+        .expect_err("two members on one path must be refused at run time");
+    let msg = err.to_string();
+    assert!(msg.contains("/data"), "{msg}");
+    // The remedy must be the one that actually applies. `sourcePathStrategy` is
+    // NEVER consulted while an override is set (the override wins at
+    // `kopia_source_path`'s first branch), so "set sourcePathStrategy:
+    // PvcNamespacedName" — the message for a strategy-derived collision —
+    // would be a fix that changes nothing.
+    assert!(
+        msg.contains("sourcePathOverride"),
+        "the message must name the override as the cause: {msg}"
+    );
+    assert!(
+        msg.contains("Remove that `sourcePathOverride`"),
+        "and tell the user to remove it: {msg}"
+    );
+    assert!(
+        !msg.contains("Set `sourcePathStrategy: PvcNamespacedName` on that source"),
+        "the strategy remedy is inert while an override is set: {msg}"
+    );
+
+    // A collision with NO override still gets the strategy remedy, unchanged.
+    let strategy_policy: crate::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "pg", "namespace": "apps" },
+        "spec": {
+            "repository": { "name": "r" },
+            "groupBy": "None",
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "app": "pg" } } },
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .expect("typed policy");
+    let cross_ns = std::collections::BTreeMap::from([(
+        0usize,
+        vec![
+            PvcTargetRef {
+                namespace: "a".into(),
+                name: "data".into(),
+            },
+            PvcTargetRef {
+                namespace: "b".into(),
+                name: "data".into(),
+            },
+        ],
+    )]);
+    let msg = expand_sources(&strategy_policy, "pg-1", &cross_ns)
+        .expect_err("two same-named PVCs on PvcName collide")
+        .to_string();
+    assert!(
+        msg.contains("Set `sourcePathStrategy: PvcNamespacedName` on that source"),
+        "a strategy-derived collision keeps the strategy remedy: {msg}"
+    );
+    assert!(!msg.contains("sourcePathOverride"), "{msg}");
+}
+
+#[test]
 fn flipping_source_path_strategy_forks_a_selector_source() {
     // A `PvcName` -> `PvcNamespacedName` flip rewrites EVERY matched PVC's kopia
     // path at once (`/pvc/x` -> `/pvc/ns/x`), re-identifying the source and
