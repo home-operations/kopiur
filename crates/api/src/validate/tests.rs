@@ -5843,6 +5843,171 @@ fn epoch_checkpoint_frequency_and_delete_parallelism_floors() {
 }
 
 #[test]
+fn a_parsed_zero_refresh_frequency_is_rejected() {
+    // The #458 failure mode, surviving on the one epoch field that got a ceiling but no
+    // floor. `parse_go_duration` accepts "0s"/"0" as a real zero, and kopia's
+    // `setDurationParameter` is `if v == 0 { return }` — so the flag is dropped, `anyChange`
+    // stays false, and the command exits 0 with `no changes`. Verified on 0.23.1: the
+    // repository keeps its 20m and reports it.
+    //
+    // Downstream that is worse than a plain no-op: `EpochParametersSpec::from_api` renders
+    // "0s", `dur_drift` compares 0 against 1_200_000_000_000 forever, so the flag is
+    // re-sent on EVERY bootstrap while `status.parameters.epoch.refreshFrequency`
+    // permanently disagrees with spec and the user sees success.
+    for zero in ["0s", "0", "0m", "0h"] {
+        let spec = repo_yaml(&format!(
+            "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: {zero:?}\n"
+        ));
+        let errs = validate_repository(&spec);
+        let msg = format!("{errs:?}");
+        assert!(
+            !errs.is_empty(),
+            "refreshFrequency: {zero:?} must be rejected"
+        );
+        assert!(msg.contains("refreshFrequency"), "{msg}");
+        assert!(
+            msg.contains("no changes"),
+            "must say kopia drops it silently: {msg}"
+        );
+    }
+
+    // The smallest NON-zero value stays valid — the floor must not tax anyone.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: 1s\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+
+    // And the sibling durations are already covered: minDuration: 0s falls to the 10m
+    // branch rather than needing a zero rule of its own. Asserted so a future refactor
+    // cannot quietly open that hole.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 0s\n"
+    ));
+    assert!(
+        !validate_repository(&spec).is_empty(),
+        "minDuration: 0s must still be rejected (by the 10m floor)"
+    );
+}
+
+#[test]
+fn the_derived_bounds_admit_that_they_assume_kopias_defaults() {
+    // Both derived bounds can reject a call the LIVE repository would accept, because a pure
+    // validator cannot read live state:
+    //
+    //  * the 80m ceiling assumes the 4h cleanupSafetyMargin default, but kopia's CLI exposes
+    //    `--epoch-cleanup-safety-margin` — raise it to 23h out of band and 90m is legal
+    //    (verified on 0.23.1);
+    //  * the minDuration bound assumes the 20m refresh default, but applying
+    //    `{minDuration: 60m, refreshFrequency: 5m}` and then dropping refreshFrequency from
+    //    spec leaves the live 5m in place, which makes minDuration: 30m legal.
+    //
+    // The bounds stay (they are right for every repository kopiur itself configured), so the
+    // MESSAGE has to own the assumption and point at where the live values are mirrored.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: 90m\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(
+        msg.contains("status.parameters.epoch.cleanupSafetyMargin"),
+        "must point at the mirrored live margin: {msg}"
+    );
+    assert!(
+        msg.contains("cannot read"),
+        "must own the assumption rather than state it as fact: {msg}"
+    );
+
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 30m\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(
+        msg.contains("status.parameters.epoch.refreshFrequency"),
+        "must point at the mirrored live refresh: {msg}"
+    );
+    assert!(msg.contains("cannot read"), "{msg}");
+}
+
+#[test]
+fn the_suggested_refresh_frequency_never_breaks_its_own_ceiling() {
+    // `minDuration / 3` is only the right suggestion while it stays under the 80m ceiling.
+    // With minDuration: 300m the naive third is 100m, which the ceiling rejects — advice
+    // that fails the very next admission is worse than no advice.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 300m\n    refreshFrequency: 200m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty());
+    assert!(
+        !msg.contains("100m or less"),
+        "must not suggest a refreshFrequency its own ceiling forbids: {msg}"
+    );
+    assert!(msg.contains("80m or less"), "capped at the ceiling: {msg}");
+}
+
+#[test]
+fn a_min_duration_below_the_absolute_floor_explains_both_rules() {
+    // `minDuration: 5m` alone violates BOTH bounds: the absolute 10m floor and the derived
+    // 60m one. Reporting the 60m figure while explaining only the 10m rule mismatches
+    // why-against-floor, and the old message withheld the fix that does work — 10m WITH a
+    // small refreshFrequency. "Lowering refreshFrequency cannot help" is only true with
+    // minDuration held fixed, which is not what the user is being asked to do.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 5m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty());
+    assert!(
+        msg.contains("minimum epoch duration too low"),
+        "the absolute rule: {msg}"
+    );
+    assert!(
+        msg.contains("3 x refreshFrequency"),
+        "…and the derived rule, since the reported floor is the derived one: {msg}"
+    );
+    assert!(
+        msg.contains("10m"),
+        "must offer the 10m + small-refresh route that actually works: {msg}"
+    );
+
+    // Below 10m WITH a refresh small enough to satisfy the 3x rule, only the absolute rule
+    // bites — and then the message must not drag in the derived one.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 5m\n    refreshFrequency: 1m\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(msg.contains("minimum epoch duration too low"), "{msg}");
+    assert!(
+        !msg.contains("3 x refreshFrequency"),
+        "the 3x rule is satisfied here and must not be blamed: {msg}"
+    );
+}
+
+#[test]
+fn the_zero_is_dropped_note_only_appears_for_a_zero() {
+    // The note is ~230 characters about what kopia does with a `0`. On `advanceOnCount: 5`
+    // it is simply not true of the value in hand, and it crowds out the part that is.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnCount: 5\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(
+        !msg.contains("no changes"),
+        "a non-zero value must not carry the zero-is-dropped note: {msg}"
+    );
+
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnCount: 0\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(
+        msg.contains("no changes"),
+        "a zero must still explain that kopia drops it silently: {msg}"
+    );
+}
+
+#[test]
 fn cluster_repository_rejects_the_same_epoch_floors() {
     // validate_repository_parameters is shared, but the two kinds have fully duplicated
     // reconcilers and this is the classic way half an API surface ships inert.

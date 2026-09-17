@@ -11,8 +11,10 @@
 //!
 //! The kopia binary comes from mise's PATH — the SAME pin (`v0.23.1`) the mover image
 //! ships — so a Renovate bump moves both and this test fails loudly on semantic drift.
-//! That is the whole point: `kopiur_api::validate::epoch_floor_errors` QUOTES kopia's
-//! error strings back to the user, and a quote nobody checks is a lie waiting to happen.
+//! That is the whole point: the epoch floors behind
+//! `kopiur_api::validate::validate_repository_parameters` (the private `epoch_floor_errors`
+//! in `crates/api/src/validate/repository.rs`) QUOTE kopia's error strings back to the user,
+//! and a quote nobody checks is a lie waiting to happen.
 //!
 //! What it pins against kopia 0.23.1:
 //!
@@ -41,6 +43,15 @@
 //!   treating it as "leave this alone".
 //! * **The reporter's values, corrected, actually apply and are visible** in
 //!   `repository status --json`.
+//! * **A zero DURATION is dropped exactly like a zero integer**, which is the hole the first
+//!   pass at #458 left open: `refreshFrequency` had a ceiling but no floor, so `0s` was
+//!   admitted, silently applied nothing, and would then read as permanent drift on every
+//!   bootstrap.
+//! * **The 80m ceiling's assumption is an assumption.** kopia's CLI exposes
+//!   `--epoch-cleanup-safety-margin` (kopiur has no field for it), and with the margin
+//!   raised to 23h a 90m refresh is genuinely accepted — so the ceiling can reject a call
+//!   kopia would allow. The admission message says so and points at the mirrored live value
+//!   rather than claiming the 4h default as fact.
 //! * **`maintenance set --owner` does not rewrite `schedule.runs`.** Load-bearing for the
 //!   before/after run-delta work that builds on this: if setting the owner also rewrote
 //!   the run history, a delta taken across an owner restamp would be meaningless.
@@ -329,6 +340,72 @@ async fn kopia_rejects_every_out_of_range_epoch_parameter_and_refuses_the_whole_
         2 * MIB,
         "kopia stores the MiB flag as `v << 20`, which is why kopiur's drift check compares \
          in bytes and not in truncated MiB"
+    );
+
+    // (8) A ZERO DURATION is dropped exactly like a zero integer: exit 0, `no changes`, and
+    // the repository keeps the refresh set back at step (6). This is the hole #458's first
+    // pass left open — `refreshFrequency` had a ceiling but no floor — and it is the worst
+    // shape of the bug, because kopiur's drift comparator then reads the untouched live
+    // value as permanent drift and re-issues the flag on every bootstrap forever. The
+    // admission message quotes this behavior, so it is pinned here.
+    let before_zero = observed(&client).await.epoch_refresh_frequency_ns;
+    client
+        .repository_set_parameters(&SetParametersArgs {
+            epoch_refresh_frequency: Some("0s".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("kopia accepts a zero duration and does nothing at all");
+    assert_eq!(
+        observed(&client).await.epoch_refresh_frequency_ns,
+        before_zero,
+        "a zero duration must have changed nothing — the silent no-op the floor prevents"
+    );
+
+    // (9) THE CEILING'S ASSUMPTION, stated honestly in the admission message: 80m is 4h/3
+    // and kopiur assumes the 4h default because a validator cannot read live state — but
+    // kopia's CLI DOES expose `--epoch-cleanup-safety-margin`, so a repository whose margin
+    // was raised out of band genuinely accepts a 90m refresh. kopiur has no field for the
+    // margin, so this is driven through raw argv. Last, because it mutates the premise every
+    // step above rests on.
+    let out = std::process::Command::new("kopia")
+        .args([
+            "repository",
+            "set-parameters",
+            "--epoch-cleanup-safety-margin=23h",
+        ])
+        .env("KOPIA_PASSWORD", PASSWORD)
+        .env("KOPIA_CONFIG_PATH", config_path(cfg.path()))
+        .env("KOPIA_CACHE_DIRECTORY", cfg.path().join("cache"))
+        .env("KOPIA_LOG_DIR", cfg.path().join("logs"))
+        .env("KOPIA_CHECK_FOR_UPDATES", "false")
+        .output()
+        .expect("run kopia repository set-parameters --epoch-cleanup-safety-margin");
+    assert!(
+        out.status.success(),
+        "kopia must expose --epoch-cleanup-safety-margin: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `minDuration` rides along, restored to kopia's 24h default: step (6) left it at 10m,
+    // and a 90m refresh also has to clear `minDuration >= 3 x refresh` (270m). Sending both
+    // isolates the margin rule — and is itself the merge semantics at work, this time
+    // admitting a call that either value alone would fail.
+    client
+        .repository_set_parameters(&SetParametersArgs {
+            epoch_refresh_frequency: Some("90m".into()),
+            epoch_min_duration: Some("24h".into()),
+            ..Default::default()
+        })
+        .await
+        .expect(
+            "with the margin at 23h, a 90m refresh is LEGAL — so kopiur's 80m ceiling can \
+             reject a call kopia would accept, which is why its message owns the assumption \
+             and points at status.parameters.epoch.cleanupSafetyMargin",
+        );
+    assert_eq!(
+        observed(&client).await.epoch_refresh_frequency_ns,
+        5_400_000_000_000,
+        "90m"
     );
 }
 
