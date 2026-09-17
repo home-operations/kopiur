@@ -12,7 +12,9 @@ authors.workspace = true
 kopiur-api = { workspace = true }
 kopiur-kopia = { workspace = true }
 kopiur-telemetry = { workspace = true }
-kube = { workspace = true, features = ["client", "rustls-tls"] }
+# `ws` adds the websocket transport `Api::exec` needs: a stream source execs a
+# command in a workload pod and pipes its stdout into kopia (crates/mover/src/stream.rs).
+kube = { workspace = true, features = ["client", "rustls-tls", "ws"] }
 rustls = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_33"] }
 serde = { workspace = true }

@@ -111,6 +111,18 @@ RoleBinding per namespace, only for snapshot-replication mover Jobs.
 {{- end }}
 
 {{/*
+Dedicated stream-source mover identity. The controller DERIVES this name from
+KOPIUR_MOVER_CLUSTERROLE by replacing the `-mover` suffix
+(`io::stream_mover_name`), so this helper MUST stay `<fullname>-stream-mover` —
+renaming either side alone breaks the runtime RoleBinding's roleRef. The
+controller mints the same-named SA + RoleBinding per namespace, only for
+SnapshotPolicies that use a `stream` source.
+*/}}
+{{- define "kopiur.streamMoverName" -}}
+{{- printf "%s-stream-mover" (include "kopiur.fullname" .) | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Webhook component name.
 */}}
 {{- define "kopiur.webhook.fullname" -}}

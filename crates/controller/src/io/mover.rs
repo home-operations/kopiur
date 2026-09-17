@@ -17,7 +17,7 @@ use kube::{Api, ResourceExt};
 use kopiur_api::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
 use kopiur_api::secctx_compat::{is_managed_by_kopiur, pod_mounts_claim};
 
-use crate::consts::PRIVILEGED_MOVERS_ANNOTATION;
+use crate::consts::{PRIVILEGED_MOVERS_ANNOTATION, STREAM_EXEC_ANNOTATION};
 use crate::error::{Error, Result};
 
 /// Apply a mover run's objects (server-side): the `Job` (which carries the
@@ -383,6 +383,220 @@ pub async fn ensure_snapshot_replication_mover_identity(
         service_account: Some(sa_name),
         azure_workload_identity: azure,
     })
+}
+
+/// The dedicated stream-source mover identity's name, derived from the generic
+/// mover role name the same way [`snapshot_replication_mover_name`] is.
+///
+/// Keep in lockstep with the chart's `kopiur.streamMoverName` helper: the
+/// controller derives the roleRef from `KOPIUR_MOVER_CLUSTERROLE`, so renaming
+/// either side alone leaves the RoleBinding pointing at a role that does not exist.
+pub fn stream_mover_name(base: &str) -> String {
+    match base.strip_suffix("-mover") {
+        Some(stem) => format!("{stem}-stream-mover"),
+        None => format!("{base}-stream"),
+    }
+}
+
+/// Resolve the identity a STREAM-SOURCE mover Job runs as and ensure its RBAC —
+/// the dedicated-SA sibling of [`ensure_mover_identity`].
+///
+/// This mover holds `pods/exec` in the workload namespace, which the generic
+/// `kopiur-mover` role must never hold: every ordinary mover Job in the namespace
+/// runs as that SA, so granting it there would let any backup Job run arbitrary
+/// commands in any pod in the namespace. So a stream Job runs as its own
+/// `…-stream-mover` ServiceAccount bound to the equally dedicated role, minted here
+/// per namespace exactly like the generic and snapshot-replication pairs.
+///
+/// Workload-identity backends still win the SA choice (the cloud federation names
+/// the SA the pod must run as); the dedicated role is then bound to the user's SA
+/// under a distinct `kopiur-stream-mover-wi-<sa>` binding name — RoleBinding
+/// `roleRef` is immutable, so reusing the generic `kopiur-mover-wi-<sa>` binding
+/// would 422 whenever both movers share one WI ServiceAccount.
+pub async fn ensure_stream_mover_identity(
+    client: &kube::Client,
+    ns: &str,
+    backends: &[&kopiur_api::backend::Backend],
+    mover_role_base: &str,
+    role_kind: &str,
+) -> Result<MoverRunIdentity> {
+    use kopiur_api::creds::{WorkloadIdentityCloud, backend_workload_identity};
+    let dedicated = stream_mover_name(mover_role_base);
+    let wi: Vec<_> = backends
+        .iter()
+        .filter_map(|b| backend_workload_identity(b))
+        .collect();
+    let Some((first, first_cloud)) = wi.first() else {
+        ensure_mover_rbac(client, ns, &dedicated, role_kind, &dedicated).await?;
+        return Ok(MoverRunIdentity {
+            service_account: Some(dedicated),
+            azure_workload_identity: false,
+        });
+    };
+    let sa_name = first.service_account_name.clone();
+    let azure = wi
+        .iter()
+        .any(|(_, cloud)| *cloud == WorkloadIdentityCloud::Azure);
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), ns);
+    if sa_api
+        .get_opt(&sa_name)
+        .await
+        .map_err(Error::Kube)?
+        .is_none()
+    {
+        return Err(Error::MissingDependency(
+            missing_workload_identity_sa_message(&sa_name, ns, *first_cloud, WI_CONSUMER_MOVER),
+        ));
+    }
+    let mut rb = build_mover_rolebinding(ns, &sa_name, role_kind, &dedicated);
+    rb.metadata.name = Some(wi_rolebinding_named("kopiur-stream-mover-wi-", &sa_name));
+    let rb_name = rb.metadata.name.clone().unwrap_or_default();
+    let rb_api: Api<RoleBinding> = Api::namespaced(client.clone(), ns);
+    apply(&rb_api, &rb_name, &rb).await?;
+    Ok(MoverRunIdentity {
+        service_account: Some(sa_name),
+        azure_workload_identity: azure,
+    })
+}
+
+/// The stream-exec opt-in state of a namespace — and, when it cannot be
+/// determined, the fact that it could not be.
+///
+/// A three-state enum rather than a `bool`, because "not opted in" and "we are
+/// not allowed to look" are different refusals with different fixes, and
+/// collapsing them produced a message telling a namespaced-install admin to
+/// annotate a namespace the operator will never be able to read. Matched
+/// exhaustively at both call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamExecOptIn {
+    /// The namespace carries `<annotation>=true`.
+    Allowed,
+    /// The namespace is readable and has NOT opted in.
+    NotAnnotated,
+    /// The operator cannot read Namespaces at all (403). Refused — see
+    /// [`namespace_stream_exec_opt_in`] for why this one fails CLOSED.
+    Undeterminable,
+}
+
+/// The stream-source opt-in state of `ns`.
+///
+/// The guard exists because a stream source is an RBAC escalation: anyone who can
+/// write a `SnapshotPolicy` in `ns` could otherwise cause arbitrary commands to run
+/// in any pod in `ns`, without themselves holding `pods/exec`. Kubernetes separates
+/// that verb deliberately; this keeps that separation meaningful.
+///
+/// # A DELIBERATE divergence from [`namespace_allows_privileged_movers`]
+///
+/// That check fails **OPEN** on a 403, and the reasoning is sound for what it
+/// guards: a namespaced install cannot read Namespaces, it is already confined to
+/// admin-selected namespaces, and the thing being granted is an elevated
+/// *container* inside a Job the operator already runs there.
+///
+/// `pods/exec` in a namespace is a materially larger grant than an elevated
+/// container. It is arbitrary code execution in EVERY pod in the namespace,
+/// including pods the operator has nothing to do with, and it is minted onto a
+/// long-lived ServiceAccount that outlives the Job. Failing open would hand that
+/// out on the strength of an inference ("we cannot read Namespaces, so this must
+/// be a namespaced install") that the operator cannot actually verify — a 403 on
+/// `namespaces get` can equally be a misconfigured cluster-scoped install, or an
+/// admission/authorization layer the admin added on purpose. So this one fails
+/// CLOSED, and [`stream_exec_opt_in_unreadable_message`] tells the admin exactly
+/// which of the two grants to make.
+pub async fn namespace_stream_exec_opt_in(
+    client: &kube::Client,
+    ns: &str,
+) -> Result<StreamExecOptIn> {
+    use k8s_openapi::api::core::v1::Namespace;
+    let api: Api<Namespace> = Api::all(client.clone());
+    match api.get(ns).await {
+        Ok(namespace) => Ok(stream_exec_opt_in_of(&namespace)),
+        Err(kube::Error::Api(e)) if e.code == 403 => {
+            tracing::warn!(
+                namespace = ns,
+                "cannot read namespace to check the stream-exec opt-in (operator lacks \
+                 namespaces:get); REFUSING the stream mover — `pods/exec` is too large a \
+                 grant to hand out on an unverifiable inference"
+            );
+            Ok(StreamExecOptIn::Undeterminable)
+        }
+        Err(e) => Err(Error::Kube(e)),
+    }
+}
+
+/// The opt-in a READABLE Namespace declares. Pure, so the annotation parsing is
+/// unit-tested without a cluster (thin IO over a tested pure fn).
+///
+/// Only the exact string `"true"` opts in: `"True"`, `"1"` and `"yes"` do not.
+/// Deliberately strict — this annotation gates `pods/exec`, and an admin who
+/// typo'd it should see the refusal rather than accidentally grant it.
+pub fn stream_exec_opt_in_of(ns: &k8s_openapi::api::core::v1::Namespace) -> StreamExecOptIn {
+    if ns
+        .annotations()
+        .get(STREAM_EXEC_ANNOTATION)
+        .is_some_and(|v| v == "true")
+    {
+        StreamExecOptIn::Allowed
+    } else {
+        StreamExecOptIn::NotAnnotated
+    }
+}
+
+/// The refusal message for an opt-in state, or `None` when the stream mover may
+/// run. **Pure** and EXHAUSTIVE, so a new opt-in state cannot compile until it
+/// decides whether it permits `pods/exec` — and so both the `SnapshotPolicy` and
+/// the `Restore` gate reach that decision through the same function rather than
+/// two hand-written matches that can disagree.
+pub fn stream_exec_refusal(
+    state: StreamExecOptIn,
+    kind: &str,
+    name: &str,
+    ns: &str,
+    mover_sa: &str,
+) -> Option<String> {
+    match state {
+        StreamExecOptIn::Allowed => None,
+        StreamExecOptIn::NotAnnotated => {
+            Some(stream_exec_not_allowed_message(kind, name, ns, mover_sa))
+        }
+        StreamExecOptIn::Undeterminable => {
+            Some(stream_exec_opt_in_unreadable_message(kind, name, ns))
+        }
+    }
+}
+
+/// The actionable message for a stream source refused in a namespace that has not
+/// opted in (what / why / how-to-fix). Pure so the exact text is unit-asserted.
+pub fn stream_exec_not_allowed_message(kind: &str, name: &str, ns: &str, mover_sa: &str) -> String {
+    format!(
+        "{kind} `{name}` uses a `stream` source, which execs a command inside a running pod in \
+         namespace `{ns}`, but that namespace has not opted in. Anyone able to write a {kind} in \
+         `{ns}` could otherwise run arbitrary commands in any pod there without holding \
+         `pods/exec` themselves, and the minted `{mover_sa}` ServiceAccount would carry that \
+         permission for the whole namespace. Fix: a cluster admin runs `kubectl annotate \
+         namespace {ns} {STREAM_EXEC_ANNOTATION}=true`, or use a PVC source instead."
+    )
+}
+
+/// The actionable message for a stream source refused because the operator cannot
+/// read the Namespace to check the opt-in at all. Pure so the exact text is
+/// unit-asserted.
+///
+/// Names BOTH fixes, because the admin's situation decides which one applies: a
+/// namespaced-scope install needs the cluster-scoped `namespaces get` added, while
+/// a cluster-scoped install that is getting a 403 has something else denying it.
+pub fn stream_exec_opt_in_unreadable_message(kind: &str, name: &str, ns: &str) -> String {
+    format!(
+        "{kind} `{name}` uses a `stream` source, but kopiur cannot read Namespace `{ns}` to \
+         check the `{STREAM_EXEC_ANNOTATION}` opt-in (the API server returned 403), so it \
+         refuses to mint the `pods/exec` permission the stream mover needs. Unlike the \
+         elevated-mover check, this one fails CLOSED on purpose: `pods/exec` in `{ns}` is \
+         arbitrary code execution in every pod there, carried on a ServiceAccount that \
+         outlives the Job, and kopiur cannot verify from a 403 alone that handing it out is \
+         safe. Fix: grant the kopiur operator ServiceAccount `get` on the cluster-scoped \
+         `namespaces` resource (a namespaced-scope install has no such rule by default), or \
+         deploy kopiur cluster-scoped — stream sources require the opt-in to be readable. \
+         Otherwise use a PVC source, which needs neither."
+    )
 }
 
 /// 8-hex-char content hash for name truncation (same idiom as the

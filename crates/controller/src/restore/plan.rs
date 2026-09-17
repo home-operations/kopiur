@@ -74,7 +74,11 @@ pub fn restore_job_duration_seconds(job: &k8s_openapi::api::batch::v1::Job) -> O
 pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
     match target {
         RestoreTarget::Populator(_) => PopulatorState::AwaitingClaim,
-        RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => PopulatorState::DirectTarget,
+        // `streamExec` is operator-driven like pvc/pvcRef — the mover reads one
+        // virtual file and pipes it into a command. Nothing claims it.
+        RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) | RestoreTarget::StreamExec(_) => {
+            PopulatorState::DirectTarget
+        }
     }
 }
 

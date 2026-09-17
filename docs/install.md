@@ -165,6 +165,8 @@ Choose **namespaced** as the explicit least-privilege opt-down for a single-team
 
 In namespaced scope the controller's watches are narrowed to the release namespace, to match the Role-only RBAC; the chart passes `--namespace={{ .Release.Namespace }}`. Cluster-scoped kinds are skipped entirely: `ClusterRepository` is not reconciled, and the [privileged-movers namespace opt-in](permissions.md) check fails **open**, because the operator is already confined to admin-chosen namespaces there.
 
+The [stream-source opt-in](stream-sources.md#if-kopiur-is-installed-namespace-scoped) fails **closed** there instead — `pods/exec` is a far larger grant than an elevated container — so `stream` sources are refused under a namespaced install until you set `rbacNamespaceReadForStreamSources: true`, which adds a supplementary ClusterRole granting `get` on `namespaces` alone. `pvc` and `nfs` sources are unaffected.
+
 /// warning | Features that need cluster RBAC are refused in namespaced scope
 
 Two features read or write cluster-scoped objects that a Role can never grant: PersistentVolumes, StorageClasses and VolumeSnapshotClasses. A namespaced install refuses them **up front with an actionable message** rather than retrying forever.

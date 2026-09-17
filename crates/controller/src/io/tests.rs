@@ -3930,6 +3930,15 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
         crate::consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON,
         "snapshot::reconcile_inner + restore::run_restore_mover (upsert_gate)",
     ),
+    // Same condition, different capability: a `stream` source needs `pods/exec` in
+    // the workload namespace, which requires its own namespace opt-in annotation.
+    // Its own reason so an admin is pointed at the right annotation.
+    (
+        crate::consts::MOVER_PERMITTED_CONDITION,
+        false,
+        crate::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+        "snapshot::reconcile_inner stream-exec gate (upsert_gate)",
+    ),
     // The `Error::MissingDependency` credential arm in `snapshot::reconcile_inner`
     // and `restore::run_restore_mover`, via
     // io::upsert_gate(&MISSING_CREDENTIALS_GATE, …).
@@ -4280,4 +4289,126 @@ fn merge_noop_agrees_with_the_shallow_predicate_on_flat_statuses() {
             "the two predicates must agree on a flat status: {desired}"
         );
     }
+}
+
+// --- the stream-exec opt-in fails CLOSED (#451) ------------------------------
+
+fn namespace_with(annotations: &[(&str, &str)]) -> k8s_openapi::api::core::v1::Namespace {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": "db",
+            "annotations": annotations
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        },
+    }))
+    .expect("a valid Namespace")
+}
+
+/// Only the exact string `"true"` opts in. Deliberately strict: this annotation
+/// gates `pods/exec`, so an admin who typo'd it must see the refusal rather than
+/// accidentally grant arbitrary code execution in every pod in the namespace.
+#[test]
+fn only_an_exact_true_annotation_opts_a_namespace_in() {
+    assert_eq!(
+        stream_exec_opt_in_of(&namespace_with(&[(
+            kopiur_api::consts::STREAM_EXEC_ANNOTATION,
+            "true"
+        )])),
+        StreamExecOptIn::Allowed
+    );
+    for near_miss in ["True", "TRUE", "1", "yes", "false", ""] {
+        assert_eq!(
+            stream_exec_opt_in_of(&namespace_with(&[(
+                kopiur_api::consts::STREAM_EXEC_ANNOTATION,
+                near_miss
+            )])),
+            StreamExecOptIn::NotAnnotated,
+            "`{near_miss}` must not opt a namespace in"
+        );
+    }
+    assert_eq!(
+        stream_exec_opt_in_of(&namespace_with(&[])),
+        StreamExecOptIn::NotAnnotated
+    );
+}
+
+/// THE item-9 decision: an UNREADABLE namespace (403) is a REFUSAL, not a pass.
+///
+/// This is a deliberate divergence from `namespace_allows_privileged_movers`,
+/// which fails OPEN on a 403 on the reasoning that a namespaced install cannot
+/// read Namespaces and is already confined to admin-selected ones. `pods/exec` is
+/// a materially larger grant — arbitrary code execution in every pod in the
+/// namespace, on a ServiceAccount that outlives the Job — and a 403 on
+/// `namespaces get` can equally be a misconfigured cluster-scoped install or an
+/// authorization layer the admin added on purpose. kopiur cannot tell those apart,
+/// so it refuses.
+#[test]
+fn an_unreadable_namespace_refuses_the_stream_mover() {
+    // Exhaustive over the three states: exactly one of them permits the mover.
+    let permitted: Vec<StreamExecOptIn> = [
+        StreamExecOptIn::Allowed,
+        StreamExecOptIn::NotAnnotated,
+        StreamExecOptIn::Undeterminable,
+    ]
+    .into_iter()
+    .filter(|s| {
+        stream_exec_refusal(*s, "SnapshotPolicy", "pg", "db", "kopiur-stream-mover").is_none()
+    })
+    .collect();
+    assert_eq!(permitted, vec![StreamExecOptIn::Allowed]);
+
+    let msg = stream_exec_refusal(
+        StreamExecOptIn::Undeterminable,
+        "SnapshotPolicy",
+        "pg",
+        "db",
+        "kopiur-stream-mover",
+    )
+    .expect("an undeterminable opt-in must refuse");
+    // what
+    assert!(msg.contains("SnapshotPolicy `pg`"), "{msg}");
+    assert!(msg.contains("cannot read Namespace `db`"), "{msg}");
+    assert!(msg.contains("403"), "{msg}");
+    // why — and that the fail-closed choice is stated, not implied
+    assert!(msg.contains("fails CLOSED"), "{msg}");
+    assert!(msg.contains("pods/exec"), "{msg}");
+    // fix — BOTH options a namespaced-install admin needs
+    assert!(
+        msg.contains("`get` on the cluster-scoped \\`namespaces\\` resource")
+            || (msg.contains("namespaces") && msg.contains("get")),
+        "must name the exact grant: {msg}"
+    );
+    assert!(
+        msg.contains("cluster-scoped"),
+        "must offer the cluster-scoped install alternative: {msg}"
+    );
+    // And it must NOT send the admin to annotate a namespace it cannot read.
+    assert!(
+        !msg.contains("kubectl annotate"),
+        "the annotate fix is useless when the namespace is unreadable: {msg}"
+    );
+}
+
+/// The not-annotated refusal keeps pointing at the annotation, which IS the fix
+/// there — the two refusals must not be interchangeable.
+#[test]
+fn the_not_annotated_refusal_names_the_annotation() {
+    let msg = stream_exec_refusal(
+        StreamExecOptIn::NotAnnotated,
+        "Restore",
+        "pg-restore",
+        "db",
+        "kopiur-stream-mover",
+    )
+    .expect("a namespace that has not opted in must refuse");
+    assert!(msg.contains("kubectl annotate namespace db"), "{msg}");
+    assert!(msg.contains("Restore `pg-restore`"), "{msg}");
+    assert!(
+        !msg.contains("403"),
+        "a readable namespace's refusal must not mention a 403: {msg}"
+    );
 }

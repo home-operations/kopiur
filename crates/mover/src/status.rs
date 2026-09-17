@@ -146,6 +146,12 @@ impl From<&crate::error::MoverError> for FailureBlock {
                     KopiaError::Spawn { .. }
                     | KopiaError::Json { .. }
                     | KopiaError::EmptyOutput { .. }
+                    // kopia was killed on purpose, so its exit code says nothing
+                    // about the failure — the producer's does, and it is in the
+                    // message. Same for a producer that wrote nothing: kopia never
+                    // got to EOF, so there is no exit status of its own to report.
+                    | KopiaError::StdinProducerFailed { .. }
+                    | KopiaError::StdinProducerWroteNothing { .. }
                     | KopiaError::Timeout { .. } => None,
                 },
                 Some(op.as_str().to_string()),
@@ -164,6 +170,10 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::RestoreNoSnapshot { .. }
             | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::ScratchNotWritable { .. }
+            // A failed dump command / unresolvable pod is the user's config, not a
+            // transient fault: re-running the same Job re-runs the same command.
+            | MoverError::StreamPodResolve { .. }
+            | MoverError::StreamExecFailed { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }

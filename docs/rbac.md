@@ -36,6 +36,8 @@ What each rule is **for**, grouped by purpose:
 
 † In a **namespaced install**, meaning `installScope: namespaced`, the Role drops three things: `clusterrepositories`, because it is a cluster-scoped kind, the webhook-configuration rule, and the `namespaces` rule. Dropping `namespaces` is also why the privileged-mover gate fails *open* there: the operator cannot read namespace annotations, and the install is already confined to admin-chosen namespaces.
 
+The [stream-exec gate](stream-sources.md#if-kopiur-is-installed-namespace-scoped) is the one exception that fails **closed** instead, because `pods/exec` in a namespace is a much larger grant than an elevated container — arbitrary code execution in every pod there, on a ServiceAccount that outlives the Job. A namespaced install therefore refuses `stream` sources until you add the one read back with `rbacNamespaceReadForStreamSources: true`, which emits a supplementary ClusterRole granting `get` on `namespaces` and nothing else. `pvc` and `nfs` sources need none of this.
+
 ## The mover (`kopiur-mover`)
 
 The mover is deliberately tiny. It can only report its result and read back what a prior attempt reported:

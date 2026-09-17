@@ -277,6 +277,11 @@ pub fn verify_members(
                 index,
                 pvc: Some(target.clone()),
                 nfs_path: None,
+                // Structurally None, not a default: the loop above `continue`s
+                // unless `source.pvc_selector.is_some()`, so only PVC-selector
+                // members reach this literal. A `stream` source yields its one
+                // member through the no-selector early return instead (#451).
+                stream: None,
                 source_path_override: source.source_path_override.clone(),
                 read_only: kopiur_api::snapshot_policy::source_read_only(source),
             };
@@ -1307,6 +1312,16 @@ fn verify_identity_for(
     repo: &ResolvedRepository,
     path: Option<&str>,
 ) -> Result<ResolvedIdentity> {
+    // The path reaches `IdentityInputs` through ONE derivation (#451):
+    // `config_identity_for_path` prefers the caller's `path` and otherwise falls
+    // back to `expand::identity_source_path`. Nothing here re-derives it from
+    // `first.pvc` / `first.nfs` / `first.source_path_override`.
+    //
+    // That matters most for a `stream` policy, which the inline chain resolved to
+    // the EMPTY path: kopia reads `user@host:` as a RELATIVE filesystem path,
+    // matches no manifests, and the quick tier exits 0 — a verification that
+    // passes by looking at nothing. It now verifies `/stream/<fileName>`, the path
+    // the backup actually recorded.
     let r = crate::snapshot_policy::config_identity_for_path(
         config,
         namespace,
@@ -3267,5 +3282,27 @@ mod tests {
             !job_blocks_cell(&deep_m1, VerifyTierKind::Quick, Some("m222222")),
             "and a deep drill must not block a sibling's quick verify either"
         );
+    }
+
+    /// Site 4 of 5 (#451): the verify identity. Before the shared derivation, a
+    /// `stream` policy verified the EMPTY source path — and kopia reads
+    /// `user@host:` as a RELATIVE filesystem path, so it matches no manifests and
+    /// `snapshot verify` exits **0**. A quick verification that looked at nothing
+    /// reported a green `Verified=True`, which is the worst possible answer from a
+    /// verification feature.
+    #[test]
+    fn verify_identity_of_a_stream_policy_is_the_stream_root() {
+        let mut policy = sample_policy(verification(Some("0 4 * * *"), None));
+        policy.metadata.namespace = Some("db".into());
+        policy.spec.sources = vec![crate::testutil_stream_source()];
+        // `path: None` => the shared derivation supplies it (#451 + #456).
+        let id = verify_identity_for(&policy, "db", &sample_repo(), None)
+            .expect("a stream policy's identity resolves");
+        assert_eq!(id.source_path, "/stream/postgres.sql");
+        // Not the empty path — the false-pass that made this a data-integrity bug
+        // rather than a cosmetic one.
+        assert!(!id.source_path.is_empty());
+        assert_eq!(id.username, "pg");
+        assert_eq!(id.hostname, "db");
     }
 }

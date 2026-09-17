@@ -59,6 +59,27 @@ global:
 #     cluster-scoped repositories.
 installScope: cluster
 
+# -- Under `installScope: namespaced`, also grant the operator cluster-scoped
+# `get` on `namespaces` (and nothing else) via a small supplementary ClusterRole.
+#
+# ONLY needed for `stream` sources. A stream source execs a command inside a
+# workload pod, which requires the operator to mint `pods/exec` for the mover —
+# arbitrary code execution in every pod in that namespace, on a ServiceAccount
+# that outlives the Job. Kopiur therefore refuses unless a cluster admin has
+# annotated the namespace `kopiur.home-operations.com/stream-exec-movers=true`,
+# and it FAILS CLOSED when it cannot read the Namespace to check (unlike the
+# elevated-mover opt-in, which fails open — `pods/exec` is the larger grant, and
+# a 403 on `namespaces get` cannot be distinguished from a deny an admin added on
+# purpose).
+#
+# A namespaced install has no `namespaces` rule at all, so stream sources are
+# refused permanently there. Set this to `true` to add just that one read, or use
+# `installScope: cluster` (which already has it). Leave it `false` if you do not
+# use stream sources: PVC and NFS sources need nothing here.
+#
+# Ignored under `installScope: cluster`.
+rbacNamespaceReadForStreamSources: false
+
 # =============================================================================
 # Controller image
 # =============================================================================

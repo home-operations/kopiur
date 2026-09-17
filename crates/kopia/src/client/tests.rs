@@ -620,12 +620,19 @@ fn snapshot_create_args_default_is_todays_argv() {
     let mut tags = BTreeMap::new();
     tags.insert("app".to_string(), "db".to_string());
     assert_eq!(
-        snapshot_create_args("/data", &tags, None, &SnapshotCreateOptions::default()),
+        snapshot_create_args(
+            "/data",
+            None,
+            &tags,
+            None,
+            &SnapshotCreateOptions::default()
+        ),
         vec!["snapshot", "create", "/data", "--json", "--tags", "app:db"]
     );
     assert_eq!(
         snapshot_create_args(
             "/data",
+            None,
             &BTreeMap::new(),
             Some("u@h:/data"),
             &SnapshotCreateOptions::default()
@@ -651,7 +658,7 @@ fn snapshot_create_args_fail_fast_upload_limit_and_description() {
         description: Some("smoke test".to_string()),
     };
     assert_eq!(
-        snapshot_create_args("/data", &BTreeMap::new(), None, &opts),
+        snapshot_create_args("/data", None, &BTreeMap::new(), None, &opts),
         vec![
             "snapshot",
             "create",
@@ -672,7 +679,7 @@ fn snapshot_create_args_fail_fast_upload_limit_and_description() {
         ..Default::default()
     };
     assert_eq!(
-        snapshot_create_args("/data", &BTreeMap::new(), None, &opts_false),
+        snapshot_create_args("/data", None, &BTreeMap::new(), None, &opts_false),
         vec!["snapshot", "create", "/data", "--json", "--no-fail-fast"]
     );
 }
@@ -1797,4 +1804,179 @@ async fn timed_out_child_is_killed_and_reaped_not_left_a_zombie() {
              Timeout returned — killed but not reaped before returning"
         );
     }
+}
+
+// --- the stdin runner's finalize budget (#451) ------------------------------
+
+/// `run_with_stdin` used to call `child.wait()` with no timeout at all, so a
+/// kopia wedged finalizing a manifest pinned the mover Job forever. The budget
+/// is now always finite, with the caller's value winning over the client's
+/// default and a named constant as the floor of last resort.
+#[test]
+fn the_stdin_finalize_budget_is_never_unbounded() {
+    use std::time::Duration;
+
+    // Neither the caller nor the client sets one: still bounded.
+    let bare = KopiaClient::builder().build();
+    assert_eq!(bare.default_timeout(), None);
+    assert_eq!(
+        bare.finalize_budget_for_test(None),
+        crate::client::DEFAULT_STDIN_FINALIZE_TIMEOUT
+    );
+
+    // The client's `default_timeout` is honoured when the caller has no opinion.
+    let timed = KopiaClient::builder()
+        .default_timeout(Duration::from_secs(120))
+        .build();
+    assert_eq!(
+        timed.finalize_budget_for_test(None),
+        Duration::from_secs(120)
+    );
+
+    // The caller's budget wins over both — the mover derives it from the
+    // producer's own `workloadExec.timeout` plus the grace, which can legitimately
+    // exceed the client default for a multi-hour dump.
+    assert_eq!(
+        timed.finalize_budget_for_test(Some(Duration::from_secs(7200))),
+        Duration::from_secs(7200)
+    );
+    assert_eq!(
+        bare.finalize_budget_for_test(Some(Duration::from_secs(30))),
+        Duration::from_secs(30)
+    );
+    assert!(crate::client::STDIN_FINALIZE_GRACE > Duration::ZERO);
+}
+
+/// The "an empty dump is a failure" rule, as a pure decision (#451).
+///
+/// It lives in `classify_fed` rather than in each producer so there is exactly
+/// one place that can get it wrong, and so it is assertable without spawning
+/// kopia. A producer that exits 0 having written nothing almost certainly failed
+/// and its exit status cannot be trusted to say so: `pg_dump` exits 0 against an
+/// instance whose credentials see no databases, and `sh -c 'a | b'` reports only
+/// `b`'s status.
+#[test]
+fn a_zero_byte_commit_is_classified_as_an_abort() {
+    use crate::client::{AbortReason, FedVerdict, classify_fed};
+
+    // Zero bytes reported as SUCCESS ⇒ abort, with its own named reason.
+    match classify_fed(Ok(StdinOutcome::Commit { bytes: 0 })) {
+        FedVerdict::Abort(AbortReason::WroteNothing) => {}
+        other => panic!("a zero-byte commit must abort, got {other:?}"),
+    }
+    // One byte is enough to be a real dump — the rule is emptiness, not size.
+    match classify_fed(Ok(StdinOutcome::Commit { bytes: 1 })) {
+        FedVerdict::Commit { bytes: 1 } => {}
+        other => panic!("a non-empty commit must commit, got {other:?}"),
+    }
+    // An explicit producer failure keeps its own reason, distinct from emptiness:
+    // the two produce different messages and an operator needs to tell them apart.
+    match classify_fed(Ok(StdinOutcome::Abort)) {
+        FedVerdict::Abort(AbortReason::ProducerFailed) => {}
+        other => panic!("an explicit abort must stay ProducerFailed, got {other:?}"),
+    }
+    // The producer's own error is returned VERBATIM — kopia's stderr would only
+    // describe the kill the runner just performed, not the cause.
+    let cause = KopiaError::EmptyOutput {
+        context: "synthetic".into(),
+        stderr_tail: String::new(),
+    };
+    match classify_fed(Err(cause)) {
+        FedVerdict::Abort(reason) => {
+            let err = reason.into_error("snapshot create".into(), "kopia was killed");
+            assert!(
+                matches!(err, KopiaError::EmptyOutput { .. }),
+                "the producer's error must survive, got {err:?}"
+            );
+        }
+        other => panic!("a producer error must abort, got {other:?}"),
+    }
+}
+
+/// Both abort reasons classify TERMINAL (`Unknown` ⇒ `is_retryable() == false`),
+/// so the OPERATOR does not treat the run as retryable and
+/// `status.failure.retryRecommended` reports it honestly.
+///
+/// This is deliberately NOT a claim that the Kubernetes Job stops retrying. The
+/// mover exits non-zero and the Job's own `backoffLimit` (default 2) may schedule
+/// replacement pods that re-exec the producer's command; nothing in the
+/// controller reads `retryRecommended` today. Stopping the kubelet needs the Job
+/// deleted, the way the wedged-pod path does.
+#[test]
+fn both_stdin_abort_reasons_are_non_retryable() {
+    use crate::client::{FedVerdict, classify_fed};
+    for fed in [
+        Ok(StdinOutcome::Commit { bytes: 0 }),
+        Ok(StdinOutcome::Abort),
+    ] {
+        let FedVerdict::Abort(reason) = classify_fed(fed) else {
+            panic!("both must abort");
+        };
+        let err = reason.into_error("snapshot create".into(), "");
+        assert!(
+            !err.class().is_retryable(),
+            "a failed stdin producer must not be retried: {err}"
+        );
+    }
+}
+
+/// The safety property is now STRUCTURAL: a producer cannot close kopia's stdin.
+///
+/// The runner's ownership of that pipe is what makes `StdinOutcome::Abort` able
+/// to kill kopia before it ever sees EOF. A producer that called `shutdown()` on
+/// a bare `ChildStdin` would hand kopia EOF while the runner still believed it
+/// held the commit point, and the later kill would land on a kopia that had
+/// already written a manifest for a TRUNCATED dump. `StdinWriter::poll_shutdown`
+/// is a no-op, so `AsyncWriteExt::shutdown()` cannot reach the pipe — the bad
+/// state is unrepresentable rather than merely untaken.
+#[tokio::test]
+async fn a_stdin_writer_shutdown_cannot_close_the_pipe() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    // `cat` echoes stdin, so stdout reaching EOF proves stdin was closed.
+    let mut child = Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let mut raw = child.stdin.take().expect("stdin piped");
+    let mut out = child.stdout.take().expect("stdout piped");
+
+    {
+        let mut writer = crate::client::StdinWriter(&mut raw);
+        writer.write_all(b"payload\n").await.expect("write");
+        // A producer doing the idiomatic thing at the end of a copy pipeline.
+        writer.shutdown().await.expect("shutdown reports success");
+    }
+
+    // The pipe is STILL OPEN: `cat` echoed the payload but has not exited, so a
+    // read past it would block. Prove it by reading exactly the payload back and
+    // then observing that EOF has NOT arrived within a short window.
+    let mut got = vec![0u8; 8];
+    tokio::io::AsyncReadExt::read_exact(&mut out, &mut got)
+        .await
+        .expect("cat echoes the payload");
+    assert_eq!(&got, b"payload\n");
+    let mut more = [0u8; 1];
+    let eof = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::io::AsyncReadExt::read(&mut out, &mut more),
+    )
+    .await;
+    assert!(
+        eof.is_err(),
+        "stdin must still be open after a producer's shutdown() — got {eof:?}"
+    );
+
+    // Only the RUNNER closing it gives EOF, which is the commit point.
+    drop(raw);
+    assert_eq!(
+        tokio::io::AsyncReadExt::read(&mut out, &mut more)
+            .await
+            .expect("read after the runner closes stdin"),
+        0,
+        "dropping the writer is what ends the stream"
+    );
+    let _ = child.wait().await;
 }

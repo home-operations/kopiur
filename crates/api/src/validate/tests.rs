@@ -8354,3 +8354,333 @@ fn effective_backup_mover_layers_snapshot_over_policy() {
     );
     assert!(effective_backup_mover(&bare, &policy_no_mover).is_none());
 }
+
+// --- stream sources -------------------------------------------------------
+//
+// These go through the YAML→JSON→typed bridge (the API-server path) rather than
+// building `Source` literals, because the bug they guard only exists on that path:
+// `readOnly` and `sourcePathStrategy` carry SCHEMA DEFAULTS the API server
+// materializes onto every source before admission runs, so a hand-built literal
+// with `read_only: None` cannot reproduce what the cluster actually sends.
+
+/// The shape the API server delivers: the policy as written, plus the defaults it
+/// stamps in. Anything asserting "the user did not set this" must be tested here.
+fn stream_source_as_served(extra: &str) -> Source {
+    let yaml = format!(
+        r#"
+stream:
+  fileName: postgres.sql
+  workloadExec:
+    podSelector:
+      matchLabels: {{ app: postgres }}
+    container: postgres
+    command: ["sh", "-ec", "pg_dumpall"]
+# --- materialized by the API server from the CRD schema defaults ---
+readOnly: true
+sourcePathStrategy: PvcName
+{extra}
+"#
+    );
+    crate::testutil::from_yaml(&yaml)
+}
+
+/// The regression this file exists for: a stream policy written WITHOUT any
+/// PVC-only field must still be accepted after the API server has defaulted
+/// `readOnly: true` and `sourcePathStrategy: PvcName` onto it.
+///
+/// This failed against a real cluster — every valid stream policy was rejected with
+/// "readOnly does not apply to a stream source" for a field the user never wrote.
+#[test]
+fn a_stream_source_survives_the_api_servers_materialized_defaults() {
+    let source = stream_source_as_served("");
+    assert!(
+        validate_source(&source).is_ok(),
+        "materialized schema defaults must not be mistaken for user intent: {:?}",
+        validate_source(&source)
+    );
+}
+
+/// The value that would actually mean something is still refused.
+#[test]
+fn read_only_false_is_rejected_on_a_stream_source() {
+    let mut source = stream_source_as_served("");
+    source.read_only = Some(false);
+    let err = validate_source(&source).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("readOnly: false does not apply"), "{msg}");
+    assert!(msg.contains("nothing is mounted"), "{msg}");
+}
+
+/// A non-default path strategy is a real request, and meaningless here.
+#[test]
+fn a_non_default_source_path_strategy_is_rejected_on_a_stream_source() {
+    let mut source = stream_source_as_served("");
+    source.source_path_strategy =
+        Some(crate::snapshot_policy::SourcePathStrategy::PvcNamespacedName);
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("sourcePathStrategy"), "{err}");
+}
+
+/// `acknowledgeLiveMutation` has NO schema default, so its presence IS user intent.
+#[test]
+fn acknowledge_live_mutation_is_rejected_on_a_stream_source() {
+    let source = stream_source_as_served("acknowledgeLiveMutation: true");
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("acknowledgeLiveMutation"), "{err}");
+}
+
+/// A path-shaped `fileName` is a security problem, not a style one: kopia stores it
+/// verbatim as the entry name, so a restore would write outside its destination.
+#[test]
+fn a_path_shaped_file_name_is_rejected() {
+    for bad in ["../escape.sql", "sub/dir.sql", "/abs.sql", ".", "..", ""] {
+        let mut source = stream_source_as_served("");
+        source.stream.as_mut().unwrap().file_name = bad.to_string();
+        let err =
+            validate_source(&source).expect_err(&format!("`{bad}` must be rejected as a fileName"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("single file name") || msg.contains("not a usable file name"),
+            "`{bad}`: {msg}"
+        );
+    }
+}
+
+/// An empty selector matches every pod in the namespace — never what was meant.
+#[test]
+fn an_empty_pod_selector_is_rejected() {
+    let source: Source = crate::testutil::from_yaml(
+        r#"
+stream:
+  fileName: postgres.sql
+  workloadExec:
+    podSelector: {}
+    command: ["pg_dumpall"]
+readOnly: true
+"#,
+    );
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("matches EVERY pod"), "{err}");
+}
+
+/// A stream source cannot share a policy with other sources: expansion only fans out
+/// selector sources, so the others would be silently skipped.
+#[test]
+fn a_stream_source_must_be_its_policys_only_source() {
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - pvc: { name: data }
+  - stream:
+      fileName: postgres.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: postgres } }
+        command: ["pg_dumpall"]
+"#,
+    );
+    let errs = validate_backup_config(&spec);
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("only source")),
+        "expected an only-source rejection, got {errs:?}"
+    );
+}
+
+/// A `stream` source's kopia path IS its identity, so renaming `fileName` forks
+/// it exactly as changing a PVC's `sourcePathOverride` forks that PVC (#451).
+///
+/// This was uncovered: `pvc_source_effective_path` returns `None` for a source
+/// with no `pvc`, so a `fileName` rename passed admission silently and the next
+/// backup started a fresh history under `/stream/<new>` while the old
+/// `/stream/<old>` aged out under retention — the same orphan-every-manifest
+/// outcome the guard exists to prevent, with no warning and no ack.
+#[test]
+fn source_path_fork_catches_a_renamed_stream_file() {
+    let mk = |file: &str, path_override: Option<&str>| -> SnapshotPolicySpec {
+        let mut s: SnapshotPolicySpec = crate::testutil::from_yaml(&format!(
+            r#"
+repository: {{ kind: Repository, name: r }}
+sources:
+  - stream:
+      fileName: {file}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: postgres }} }}
+        command: ["sh", "-ec", "pg_dumpall"]
+    readOnly: true
+    sourcePathStrategy: PvcName
+"#
+        ));
+        s.sources[0].source_path_override = path_override.map(String::from);
+        s
+    };
+
+    // `postgres.sql` → `pg.sql`: /stream/postgres.sql → /stream/pg.sql ⇒ fork.
+    let old = mk("postgres.sql", None);
+    let new = mk("pg.sql", None);
+    let err = detect_source_path_fork(&old, &new, true, false)
+        .expect("renaming a stream fileName must trip IdentityWouldFork");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/stream/postgres.sql");
+            assert_eq!(new, "/stream/pg.sql");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+
+    // The escape hatches behave exactly as they do for a PVC source.
+    assert!(
+        detect_source_path_fork(&old, &new, true, true).is_none(),
+        "the allow-identity-change ack must release it"
+    );
+    assert!(
+        detect_source_path_fork(&old, &new, false, false).is_none(),
+        "no history means nothing to orphan"
+    );
+    assert!(
+        detect_source_path_fork(&old, &mk("postgres.sql", None), true, false).is_none(),
+        "an unchanged fileName is not a fork"
+    );
+
+    // Adding a `sourcePathOverride` moves the recorded path too, so it forks.
+    assert!(
+        detect_source_path_fork(&old, &mk("postgres.sql", Some("/dumps/pg")), true, false)
+            .is_some(),
+        "overriding a stream source's path re-identifies it"
+    );
+    // ...and removing it forks back.
+    assert!(
+        detect_source_path_fork(&mk("postgres.sql", Some("/dumps/pg")), &old, true, false)
+            .is_some()
+    );
+}
+
+/// Keyed by POSITION, because a stream source has no PVC name to match across an
+/// edit. Two stream sources swapping places therefore fork — correctly: each
+/// index's recorded path changed, and index is what
+/// `Snapshot.spec.source.sourceIndex` pins.
+#[test]
+fn stream_source_forks_are_keyed_by_position() {
+    let two = |a: &str, b: &str| -> SnapshotPolicySpec {
+        crate::testutil::from_yaml(&format!(
+            r#"
+repository: {{ kind: Repository, name: r }}
+sources:
+  - stream:
+      fileName: {a}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: a }} }}
+        command: ["a"]
+  - stream:
+      fileName: {b}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: b }} }}
+        command: ["b"]
+"#
+        ))
+    };
+    // Same set, different order ⇒ both indices' paths changed ⇒ fork.
+    assert!(
+        detect_source_path_fork(&two("a.sql", "b.sql"), &two("b.sql", "a.sql"), true, false)
+            .is_some()
+    );
+    // Identical ⇒ no fork.
+    assert!(
+        detect_source_path_fork(&two("a.sql", "b.sql"), &two("a.sql", "b.sql"), true, false)
+            .is_none()
+    );
+    // A source APPENDED at a new index has no old baseline, so it never forks —
+    // same rule the selector guard uses.
+    let one: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - stream:
+      fileName: a.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: a } }
+        command: ["a"]
+"#,
+    );
+    assert!(detect_source_path_fork(&one, &two("a.sql", "b.sql"), true, false).is_none());
+}
+
+/// A source that CHANGES KIND at a fixed index forks, and neither kind-specific
+/// arm could see it: the PVC arm keys on PVC name (absent from the stream side)
+/// and the stream arm keys on `fileName` (absent from the PVC side), so
+/// `stream → pvc` at index 0 rewrote `/stream/dump.sql` to `/pvc/data` — the
+/// orphan-every-manifest outcome the guard exists for — and passed admission
+/// silently. The index-keyed backstop catches it in both directions.
+#[test]
+fn source_path_fork_catches_a_source_that_changes_kind_at_one_index() {
+    let stream: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - stream:
+      fileName: dump.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: postgres } }
+        command: ["pg_dumpall"]
+"#,
+    );
+    let pvc: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: data } } ]\n",
+    );
+    let nfs: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { nfs: { server: nas, path: /export/db } } ]\n",
+    );
+
+    // stream → pvc, and back.
+    let err = detect_source_path_fork(&stream, &pvc, true, false)
+        .expect("stream -> pvc at index 0 re-identifies the source");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/stream/dump.sql");
+            assert_eq!(new, "/pvc/data");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+    assert!(detect_source_path_fork(&pvc, &stream, true, false).is_some());
+
+    // stream → nfs, pvc → nfs, and back: every kind pair at a fixed index.
+    for (a, b) in [(&stream, &nfs), (&nfs, &stream), (&pvc, &nfs), (&nfs, &pvc)] {
+        assert!(
+            detect_source_path_fork(a, b, true, false).is_some(),
+            "a kind change at index 0 always re-identifies the source"
+        );
+    }
+
+    // The escape hatches still apply, and an unchanged spec is never a fork.
+    assert!(detect_source_path_fork(&stream, &pvc, true, true).is_none());
+    assert!(detect_source_path_fork(&stream, &pvc, false, false).is_none());
+    for same in [&stream, &pvc, &nfs] {
+        assert!(detect_source_path_fork(same, same, true, false).is_none());
+    }
+}
+
+/// REORDERING two plain `pvc:` sources trips the backstop, deliberately. Index is
+/// what `Snapshot.spec.source.sourceIndex` pins, and for a selector-free policy
+/// only `sources[0]` is ever backed up — so the swap genuinely changes which
+/// volume the policy captures. It needs the `allow-identity-change` ack, which is
+/// exactly the confirmation such an edit deserves.
+#[test]
+fn reordering_plain_pvc_sources_needs_the_ack() {
+    let order = |a: &str, b: &str| -> SnapshotPolicySpec {
+        crate::testutil::from_yaml(&format!(
+            "repository: {{ kind: Repository, name: r }}\n\
+             sources: [ {{ pvc: {{ name: {a} }} }}, {{ pvc: {{ name: {b} }} }} ]\n"
+        ))
+    };
+    let err = detect_source_path_fork(&order("a", "b"), &order("b", "a"), true, false)
+        .expect("swapping sources[0] changes what the policy backs up");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/pvc/a");
+            assert_eq!(new, "/pvc/b");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+    assert!(detect_source_path_fork(&order("a", "b"), &order("b", "a"), true, true).is_none());
+    assert!(detect_source_path_fork(&order("a", "b"), &order("a", "b"), true, false).is_none());
+}

@@ -58,6 +58,8 @@ pub const HOSTPATH_REPOS_ROOT: &str = "/kopiur-e2e/repos";
 /// that reuse them). The mise `e2e-node-seed` task creates `HOSTPATH_REPOS_ROOT/<s>`
 /// at 0777 for each — keep the two lists in lockstep.
 pub const REPO_SUBPATHS: &[&str] = &[
+    "stream",
+    "stream-fail",
     "moverdefaults",
     "scc-shadow",
     "recmeta",

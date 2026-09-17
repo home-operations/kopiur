@@ -366,6 +366,26 @@ pub enum MoverError {
         source: kopiur_api::ValidationError,
     },
 
+    /// The single workload pod a stream source must exec into could not be
+    /// resolved: nothing matched, several matched, or none was running.
+    ///
+    /// Its own variant rather than a generic kube error because the fix is always
+    /// in the user's selector or workload, never in the operator — and because
+    /// "which pod" is exactly the question an operator asks first.
+    #[error("{detail}")]
+    StreamPodResolve {
+        /// What the selector matched and what to do about it.
+        detail: String,
+    },
+
+    /// A stream producer/consumer exec failed, timed out, or lost its connection.
+    /// Carries only bounded stderr — never the streamed data.
+    #[error("{detail}")]
+    StreamExecFailed {
+        /// What went wrong, already free of any streamed bytes.
+        detail: String,
+    },
+
     /// A kube client could not be built (the side-channel status PATCHes need
     /// in-cluster ServiceAccount credentials).
     #[error(
@@ -596,6 +616,10 @@ impl MoverError {
             | MoverError::RestoreNoSnapshot { .. }
             | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::ScratchNotWritable { .. }
+            // A failed dump command / unresolvable pod is the user's config, not a
+            // transient fault: re-running the same Job re-runs the same command.
+            | MoverError::StreamPodResolve { .. }
+            | MoverError::StreamExecFailed { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }
@@ -955,5 +979,40 @@ mod tests {
             std::error::Error::source(&err).is_some(),
             "the KopiaError source must stay inspectable"
         );
+    }
+
+    /// Both stdin-producer failures are TERMINAL through the mover wrapper
+    /// (#451): the repository was never at fault, an identical attempt reproduces
+    /// the same failure, and each attempt re-execs the user's command against
+    /// their live database.
+    ///
+    /// SCOPE: "terminal" here means `retry_recommended() == false`, which is what
+    /// rides on `status.failure.retryRecommended` and what the OPERATOR reasons
+    /// about. It does NOT stop the Kubernetes Job retrying — the mover exits
+    /// non-zero and the Job's `backoffLimit` (default 2) may schedule replacement
+    /// pods; nothing reads `retryRecommended` today. Stopping the kubelet needs
+    /// the Job deleted, as the controller's wedged-pod path does.
+    #[test]
+    fn stdin_producer_failures_are_terminal() {
+        for source in [
+            KopiaError::StdinProducerFailed {
+                detail: "the producer exited 2".into(),
+                stderr_tail: String::new(),
+            },
+            KopiaError::StdinProducerWroteNothing {
+                args: "snapshot create /stream/dump.sql --stdin-file dump.sql".into(),
+                stderr_tail: String::new(),
+            },
+        ] {
+            let err = MoverError::Kopia {
+                op: KopiaOp::SnapshotCreate,
+                source,
+            };
+            assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
+            assert!(
+                !err.retry_recommended(),
+                "a failed stdin producer must never be retried: {err}"
+            );
+        }
     }
 }

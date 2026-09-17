@@ -39,3 +39,24 @@ pub mod watch;
 pub mod webhook_tls;
 
 pub use startup::run;
+
+/// A `stream` source fixture shared by the #451 identity-site tests across
+/// modules (`snapshot_policy`, `verification`, `snapshot::build`). Built through
+/// the YAML→JSON→typed bridge the API server uses, so the schema defaults
+/// (`readOnly`, `sourcePathStrategy`) are materialized exactly as a real cluster
+/// delivers them — a hand-built literal cannot reproduce that.
+#[cfg(test)]
+pub(crate) fn testutil_stream_source() -> kopiur_api::snapshot_policy::Source {
+    serde_json::from_value(serde_json::json!({
+        "stream": {
+            "fileName": "postgres.sql",
+            "workloadExec": {
+                "podSelector": { "matchLabels": { "app": "postgres" } },
+                "command": ["sh", "-ec", "pg_dumpall"],
+            },
+        },
+        "readOnly": true,
+        "sourcePathStrategy": "PvcName",
+    }))
+    .expect("a valid stream Source")
+}
