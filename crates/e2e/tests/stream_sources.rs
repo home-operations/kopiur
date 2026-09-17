@@ -52,9 +52,17 @@ async fn annotate_namespace(client: &Client, ns: &str, on: bool) {
             kopiur_api::consts::STREAM_EXEC_ANNOTATION: if on { Some("true") } else { None },
         }}
     });
+    // `PatchParams::default()`, NOT `apply(..).force()`: kube-client validates
+    // that `force` is only meaningful with `Patch::Apply` and rejects the call
+    // outright ("PatchParams::force only works with Patch::Apply") before it ever
+    // reaches the API server. A merge patch is what this needs anyway — turning
+    // the opt-in OFF relies on RFC-7386's explicit `null` clearing the key, and
+    // server-side apply cannot express a removal that way (it drops fields by
+    // omitting them from the applied config, and treats a `null` as invalid).
+    // Matches `kopiur_e2e::annotate_namespace`, which has always done this.
     api.patch(
         ns,
-        &kube::api::PatchParams::apply("kopiur-e2e").force(),
+        &kube::api::PatchParams::default(),
         &kube::api::Patch::Merge(&patch),
     )
     .await
