@@ -1241,11 +1241,21 @@ pub fn epoch_drift(
             o.epoch_refresh_frequency_ns,
         ),
         epoch_advance_on_count: num_drift(desired.advance_on_count, o.advance_on_count),
-        // MiB on the flag, bytes in the report.
-        epoch_advance_on_size_mb: num_drift(
-            desired.advance_on_size_mb,
-            o.advance_on_total_size_bytes / MIB,
-        ),
+        // MiB on the flag, bytes in the report — so compare in BYTES, never in MiB (#458).
+        //
+        // kopia stores this threshold as `declared << 20`, so `desired * MIB` is bit-for-bit
+        // what a converged repository reports and the comparison converges exactly. The
+        // inverse (`observed / MIB`) truncates: a repository holding 10 MiB + 1 byte reads
+        // back as `10`, a declared `10` looks converged, and kopiur silently never corrects
+        // a threshold the user asked for.
+        //
+        // `saturating_mul`, not `*`: a declared value near i64::MAX would otherwise overflow
+        // (a debug-build panic in the mover, a wrapped negative in release). Saturation can
+        // only ever read as drift, which sends the value to kopia and surfaces its refusal
+        // as the Warning event — the honest outcome for a value no repository can hold.
+        epoch_advance_on_size_mb: desired
+            .advance_on_size_mb
+            .filter(|w| w.saturating_mul(MIB) != o.advance_on_total_size_bytes),
         epoch_checkpoint_frequency: num_drift(desired.checkpoint_frequency, o.checkpoint_frequency),
         epoch_delete_parallelism: num_drift(desired.delete_parallelism, o.delete_parallelism),
         // Epoch drift never touches retention; `parameters_drift` merges the two.
@@ -1253,6 +1263,21 @@ pub fn epoch_drift(
         retention_period: None,
     };
     (!args.is_empty()).then_some(args)
+}
+
+/// `bytes → MiB`, rounded UP — hand-rolled because `i64::div_ceil` is still unstable
+/// (`int_roundings`) and this crate builds on stable.
+///
+/// `saturating_add` keeps the `+ (MIB - 1)` bias from overflowing on a pathological
+/// observation. The negative branch is not decoration: Rust's integer division truncates
+/// toward zero, which for a negative value already IS the ceiling, so routing negatives
+/// through the biased form would round them the wrong way.
+fn bytes_to_mib_ceil(bytes: i64) -> i64 {
+    if bytes < 0 {
+        bytes / MIB
+    } else {
+        bytes.saturating_add(MIB - 1) / MIB
+    }
 }
 
 /// Mirror kopia's reported epoch parameters into the api crate's status type, rendering
@@ -1269,7 +1294,14 @@ pub fn observed_epoch(
         refresh_frequency: dur(o.epoch_refresh_frequency_ns),
         cleanup_safety_margin: dur(o.cleanup_safety_margin_ns),
         advance_on_count: o.advance_on_count,
-        advance_on_size_mb: o.advance_on_total_size_bytes / MIB,
+        // Rounded UP (#458). The mirror exists to be honest about what the repository holds,
+        // and kopia's byte threshold need not be a whole number of MiB (`set-parameters`
+        // only writes multiples, but a repository configured by hand or by a future kopia
+        // need not be). Rounding down would print exactly the declared value while the
+        // repository held something else — re-introducing, in `status`, the silent
+        // convergence that `epoch_drift` was just fixed to stop. Drift itself is computed on
+        // the exact byte count, never on this rounded mirror.
+        advance_on_size_mb: bytes_to_mib_ceil(o.advance_on_total_size_bytes),
         checkpoint_frequency: o.checkpoint_frequency,
         delete_parallelism: o.delete_parallelism,
     }

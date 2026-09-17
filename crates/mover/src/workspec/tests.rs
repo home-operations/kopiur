@@ -2289,6 +2289,74 @@ fn observed_epoch_renders_nanoseconds_back_to_go_durations() {
     assert_eq!(o.delete_parallelism, 4);
 }
 
+#[test]
+fn epoch_drift_compares_the_size_threshold_byte_exactly() {
+    // #458. The old comparator divided the OBSERVED bytes by MiB and compared the quotient,
+    // which truncates: a repository sitting at 10 MiB + 1 byte reads back as "10" and a
+    // declared 10 looks converged, so kopiur never corrects it. Compare in bytes instead —
+    // `desired * MIB` is exactly what kopia stores (`v << 20`), so the comparison converges
+    // precisely and cannot hide a sub-MiB remainder.
+    let mut observed = observed_defaults();
+    observed.advance_on_total_size_bytes = 10 * 1_048_576 + 1;
+    let desired = EpochParametersSpec {
+        advance_on_size_mb: Some(10),
+        ..Default::default()
+    };
+    let args = epoch_drift(&desired, Some(&observed)).expect(
+        "10 MiB + 1 byte is NOT 10 MiB — the old `observed / MIB` truncation reported \
+         convergence here and left the repository uncorrected",
+    );
+    assert_eq!(args.epoch_advance_on_size_mb, Some(10));
+
+    // …and the exact multiple is still not drift, so the fix does not trade a hidden
+    // no-op for a re-apply on every bootstrap (which invalidates every other kopia
+    // client's cached format blob).
+    observed.advance_on_total_size_bytes = 10 * 1_048_576;
+    assert!(
+        epoch_drift(&desired, Some(&observed)).is_none(),
+        "an exact MiB multiple must stay converged"
+    );
+
+    // One byte BELOW is drift too — truncation hid this direction as well.
+    observed.advance_on_total_size_bytes = 10 * 1_048_576 - 1;
+    assert_eq!(
+        epoch_drift(&desired, Some(&observed))
+            .expect("10 MiB - 1 byte is drift")
+            .epoch_advance_on_size_mb,
+        Some(10)
+    );
+}
+
+#[test]
+fn observed_epoch_rounds_the_size_threshold_up() {
+    // The mirror's job is to be honest about what the repository holds. Rounding DOWN would
+    // print exactly the value the user declared while the repository held something else —
+    // the silent-convergence bug one layer up. Rounding up keeps a sub-MiB remainder
+    // visible as disagreement with `spec`.
+    let mut o = observed_defaults();
+    o.advance_on_total_size_bytes = 10 * 1_048_576 + 1;
+    assert_eq!(
+        observed_epoch(&o).advance_on_size_mb,
+        11,
+        "10 MiB + 1 byte must not mirror as a flat 10"
+    );
+
+    o.advance_on_total_size_bytes = 10 * 1_048_576;
+    assert_eq!(
+        observed_epoch(&o).advance_on_size_mb,
+        10,
+        "exact stays exact"
+    );
+
+    // A sub-MiB threshold kopia could only have been given by hand: 1 byte is not 0 MiB.
+    o.advance_on_total_size_bytes = 1;
+    assert_eq!(observed_epoch(&o).advance_on_size_mb, 1);
+
+    // And nothing observed is still nothing.
+    o.advance_on_total_size_bytes = 0;
+    assert_eq!(observed_epoch(&o).advance_on_size_mb, 0);
+}
+
 // --- #332: object-lock blob retention -------------------------------------------------
 
 fn retention_on(mode: &str, ns: i64) -> kopiur_kopia::model::BlobRetention {
