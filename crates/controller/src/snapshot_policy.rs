@@ -1152,7 +1152,26 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // `status.verification` Vec (multi only; the controller is the vec's single
     // writer — see `verification::fold_verification`). `None` for the classic
     // single-repo shape, whose flat `lastVerified` the mover stamps directly.
-    let folded = fold_multi_verification(config, is_multi, &repo_targets, &namespace);
+    // #456: the verification member grid. ONE `match_pvcs` LIST per RECONCILE
+    // (never per repository — `verify_step` runs once per repository and would
+    // otherwise multiply it by the repository count), and only for a policy
+    // that actually configures verification. A `pvcSelector` policy fans out to
+    // one cell per matched PVC, each verifying its OWN kopia source path; every
+    // other shape yields exactly one member with no member dimension.
+    let verify_members = match config.spec.verification.is_some() {
+        true => crate::verification::resolve_verify_members(ctx, config).await?,
+        false => Vec::new(),
+    };
+    if config.spec.verification.is_some() && verify_members.is_empty() {
+        tracing::warn!(
+            policy = %name,
+            "verification is configured but this policy's pvcSelector matched no \
+             PersistentVolumeClaim: nothing to verify, so no verify Job is spawned and no \
+             lastVerified is stamped. Check the selector's labels."
+        );
+    }
+    let folded =
+        fold_multi_verification(config, is_multi, &repo_targets, &verify_members, &namespace);
 
     // Final status: Ready when every repository is (Reconciling + the
     // registered `RepositoriesReady` gate otherwise), the observedGeneration,
@@ -1233,10 +1252,13 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         config,
         ctx,
         &namespace,
-        &ready,
-        folded.as_ref(),
-        &backups,
-        has_successful_snapshot,
+        &VerifySteps {
+            ready: &ready,
+            folded: folded.as_ref(),
+            members: &verify_members,
+            backups: &backups,
+            has_successful_snapshot,
+        },
     )
     .await?;
     let base = match verify_requeue {
@@ -1259,13 +1281,24 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     Ok(Action::requeue(requeue))
 }
 
-/// The multi-repo verification fold inputs + result: the CURRENT repo set as
-/// `(normalized ref, key)` pairs and the folded per-repo state. `None` for the
-/// single-repo shape. Extracted so `reconcile_inner` only gains a call
-/// (complexity ratchet).
+/// The entry-keyed verification fold inputs + result: the CURRENT stamp grid
+/// (repositories x members) and the folded state. `None` for the classic flat
+/// shape — a single-repository policy with at most one verification member,
+/// whose `status.lastVerified` the mover stamps directly. Extracted so
+/// `reconcile_inner` only gains a call (complexity ratchet).
 struct MultiVerification {
-    /// `(normalized ref, normalized repo key)` per current repo, spec order.
+    /// `(normalized ref, stamp-key repository segment)` per current repo, spec
+    /// order. A single-repository policy carries exactly one pair whose segment
+    /// is the EMPTY string — the repo-agnostic segment its `#<member6>` stamp
+    /// keys use.
     current_repos: Vec<(RepositoryRef, String)>,
+    /// The current member tags (#456), empty when the policy does not fan out.
+    members: Vec<String>,
+    /// Whether to publish the per-repo `status.verification` Vec. `true` only
+    /// for a genuinely multi-repository policy: a single-repo fan-out has no
+    /// per-repository dimension to surface, and inventing a one-entry Vec for
+    /// it would change a status wire nobody asked to change.
+    publish_entries: bool,
     folded: crate::verification::FoldedVerification,
 }
 
@@ -1274,20 +1307,41 @@ fn fold_multi_verification(
     config: &SnapshotPolicy,
     is_multi: bool,
     repo_targets: &[&RepositoryRef],
+    verify_members: &[crate::verification::VerifyMember],
     namespace: &str,
 ) -> Option<MultiVerification> {
-    if !is_multi {
+    let members: Vec<String> = verify_members
+        .iter()
+        .filter_map(|m| m.member6.clone())
+        .collect();
+    // Stamps-map mode: a repository dimension, a member dimension, or both.
+    if !is_multi && members.is_empty() {
         return None;
     }
-    let current_repos: Vec<(RepositoryRef, String)> = repo_targets
-        .iter()
-        .map(|r| {
-            (
-                kopiur_api::common::normalized_repository_ref(r, namespace),
-                kopiur_api::common::repo_key(r, namespace),
-            )
-        })
-        .collect();
+    let current_repos: Vec<(RepositoryRef, String)> = match is_multi {
+        true => repo_targets
+            .iter()
+            .map(|r| {
+                (
+                    kopiur_api::common::normalized_repository_ref(r, namespace),
+                    kopiur_api::common::repo_key(r, namespace),
+                )
+            })
+            .collect(),
+        false => repo_targets
+            .iter()
+            .take(1)
+            .map(|r| {
+                (
+                    kopiur_api::common::normalized_repository_ref(r, namespace),
+                    String::new(),
+                )
+            })
+            .collect(),
+    };
+    if current_repos.is_empty() {
+        return None;
+    }
     let existing_entries = config
         .status
         .as_ref()
@@ -1302,10 +1356,13 @@ fn fold_multi_verification(
         &current_repos,
         &existing_entries,
         &stamps,
+        &members,
         namespace,
     );
     Some(MultiVerification {
         current_repos,
+        members,
+        publish_entries: is_multi,
         folded,
     })
 }
@@ -1414,22 +1471,37 @@ fn final_status_body(
     let prior = config.status.as_ref();
     match folded {
         Some(mv) => {
-            status["verification"] = serde_json::to_value(&mv.folded.entries)?;
+            if mv.publish_entries {
+                status["verification"] = serde_json::to_value(&mv.folded.entries)?;
+            } else if prior.is_some_and(|s| !s.verification.is_empty()) {
+                // multi -> single-repo-with-fan-out edit: the per-repo Vec has
+                // no meaning here, and would otherwise linger forever.
+                status["verification"] = serde_json::Value::Null;
+            }
             let prior_flat = prior.is_some_and(|s| s.last_verified.is_some());
             match (&mv.folded.flat, prior_flat) {
                 (Some(ts), _) => status["lastVerified"] = serde_json::json!(ts),
-                // Regressed to unknown (a current repo has never verified)
-                // while a prior value exists: clear it once, then stay silent.
+                // Regressed to unknown while a prior value exists: clear it
+                // once, then stay silent. This is also what clears the #456
+                // false-pass timestamp on a selector policy's FIRST fan-out
+                // reconcile — the pre-fix flat `lastVerified` was stamped by a
+                // pathless quick verify that matched zero manifests and exited
+                // 0, so it is not proof of anything and must not anchor the
+                // catch-up.
                 (None, true) => status["lastVerified"] = serde_json::Value::Null,
                 (None, false) => {}
             }
-            let current_keys: std::collections::BTreeSet<&str> =
+            let repo_keys: std::collections::BTreeSet<&str> =
                 mv.current_repos.iter().map(|(_, k)| k.as_str()).collect();
+            let member_keys: std::collections::BTreeSet<&str> =
+                mv.members.iter().map(String::as_str).collect();
             let stale: serde_json::Map<String, serde_json::Value> = prior
                 .map(|s| {
                     s.verification_stamps
                         .keys()
-                        .filter(|k| !current_keys.contains(k.as_str()))
+                        .filter(|k| {
+                            !crate::verification::stamp_key_live(k, &repo_keys, &member_keys)
+                        })
                         .map(|k| (k.clone(), serde_json::Value::Null))
                         .collect()
                 })
@@ -1453,66 +1525,154 @@ fn final_status_body(
     Ok(status)
 }
 
-/// The per-target verification scheduling loop (thin orchestration over
-/// [`crate::verification::verify_step`]): the single-repo shape runs exactly
-/// one step with the flat `lastVerified` anchor (byte-identical behavior); a
-/// multi-repo policy runs one step per READY repository, each anchored on its
-/// own folded entry and gated on ITS OWN #168 input. Returns the minimum
-/// requested requeue.
-async fn run_verify_steps(
+/// **Pure.** One (repository x member) verify cell's last-verified anchor.
+///
+/// * a fan-out member anchors on ITS OWN stamp, so member B's recent verify
+///   never defers member A's due slot (the same per-repository reasoning #368
+///   applied one dimension up);
+/// * a multi-repo, single-member cell anchors on its folded per-repo entry;
+/// * the classic single-repo single-member cell anchors on the flat
+///   `status.lastVerified` — byte-identical behavior.
+fn verify_cell_anchor(
     config: &SnapshotPolicy,
-    ctx: &Context,
-    namespace: &str,
-    ready: &[&PolicyRepoTarget],
     folded: Option<&MultiVerification>,
-    backups: &[Snapshot],
-    has_successful_snapshot: bool,
-) -> Result<Option<std::time::Duration>> {
+    stamps: &std::collections::BTreeMap<String, String>,
+    stamp_key: Option<&str>,
+    is_fanout: bool,
+    repo_key: Option<&str>,
+    namespace: &str,
+) -> Option<DateTime<Utc>> {
     let parse_ts = |s: &str| {
         DateTime::parse_from_rfc3339(s)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     };
+    if is_fanout {
+        return stamp_key
+            .and_then(|k| stamps.get(k))
+            .map(String::as_str)
+            .and_then(parse_ts);
+    }
+    match (folded, repo_key) {
+        (Some(mv), Some(key)) => mv
+            .folded
+            .entries
+            .iter()
+            .find(|e| kopiur_api::common::repo_key(&e.repository, namespace) == key)
+            .and_then(|e| e.last_verified.as_deref())
+            .and_then(parse_ts),
+        _ => config
+            .status
+            .as_ref()
+            .and_then(|s| s.last_verified.as_deref())
+            .and_then(parse_ts),
+    }
+}
+
+/// The verification scheduling loop over the (READY repository x member) grid
+/// (thin orchestration over [`crate::verification::verify_step`]).
+///
+/// The classic shape — a single repository and a single member — runs exactly
+/// one step with the flat `lastVerified` anchor (byte-identical behavior). A
+/// multi-repo policy adds a repository dimension (#368) and a `pvcSelector`
+/// policy adds a member dimension (#456); both together are the full grid.
+///
+/// Two hoists, both because this function runs ONCE per reconcile while
+/// `verify_step` runs once per cell: `match_pvcs` (the caller's
+/// `verify_members`) and the #168 discovered-snapshot probe (per repository —
+/// it is a per-repository fact).
+///
+/// Concurrency: quick members of one repository run CONCURRENTLY (independent
+/// short reads), while deep members run SEQUENTIALLY (`deep_hold`) — each deep
+/// member provisions its own `deep.capacity` of scratch, so a 4-PVC policy at
+/// `500Gi` would otherwise ask for 2 TiB of ephemeral storage at once.
+///
+/// Returns the minimum requested requeue.
+struct VerifySteps<'a> {
+    /// The READY repository targets, in spec order.
+    ready: &'a [&'a PolicyRepoTarget],
+    /// The entry-keyed fold, `None` for the classic flat shape.
+    folded: Option<&'a MultiVerification>,
+    /// The verification members (#456) — one per matched PVC for a selector
+    /// policy, exactly one otherwise, EMPTY when a selector matched nothing.
+    members: &'a [crate::verification::VerifyMember],
+    /// This policy's child Snapshots (the #168 gate's per-repository input).
+    backups: &'a [Snapshot],
+    /// Whether this policy has any successful backup (the single-repo #168 input).
+    has_successful_snapshot: bool,
+}
+
+/// See [`VerifySteps`].
+async fn run_verify_steps(
+    config: &SnapshotPolicy,
+    ctx: &Context,
+    namespace: &str,
+    steps: &VerifySteps<'_>,
+) -> Result<Option<std::time::Duration>> {
+    let VerifySteps {
+        ready,
+        folded,
+        members: verify_members,
+        backups,
+        has_successful_snapshot,
+    } = *steps;
+    if config.spec.verification.is_none() {
+        return Ok(None);
+    }
+    // A `pvcSelector` that matched nothing: spawn nothing, stamp nothing (the
+    // caller warned). Mirrors `SlotMintPlan::NothingMatched` on the backup side
+    // — emphatically NOT a pathless run, which is what #456 was.
+    if verify_members.is_empty() {
+        return Ok(None);
+    }
+    let is_multi = kopiur_api::is_multi_repo(&config.spec);
+    let stamps = config
+        .status
+        .as_ref()
+        .map(|s| s.verification_stamps.clone())
+        .unwrap_or_default();
     let mut min_requeue: Option<std::time::Duration> = None;
-    match folded {
-        None => {
-            if let Some(t) = ready.first() {
-                let vt = crate::verification::VerifyTarget {
-                    rref: &t.rref,
-                    repo: &t.repo,
-                    repo_key: None,
-                    last_verified: config
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.last_verified.as_deref())
-                        .and_then(parse_ts),
-                    has_successful: has_successful_snapshot,
-                };
-                min_requeue = crate::verification::verify_step(config, ctx, &vt, namespace).await?;
-            }
-        }
-        Some(mv) => {
-            for t in ready {
-                let key = kopiur_api::common::repo_key(&t.rref, namespace);
-                let last = mv
-                    .folded
-                    .entries
-                    .iter()
-                    .find(|e| kopiur_api::common::repo_key(&e.repository, namespace) == key)
-                    .and_then(|e| e.last_verified.as_deref())
-                    .and_then(parse_ts);
-                let vt = crate::verification::VerifyTarget {
-                    rref: &t.rref,
-                    repo: &t.repo,
-                    has_successful: multi_repo_has_success(backups, &key),
-                    repo_key: Some(key),
-                    last_verified: last,
-                };
-                if let Some(rq) =
-                    crate::verification::verify_step(config, ctx, &vt, namespace).await?
-                {
-                    min_requeue = Some(min_requeue.map_or(rq, |c| c.min(rq)));
-                }
+    let mut deep_hold = false;
+    for t in ready {
+        let repo_key = is_multi.then(|| kopiur_api::common::repo_key(&t.rref, namespace));
+        let has_successful = match repo_key.as_deref() {
+            Some(key) => multi_repo_has_success(backups, key),
+            None => has_successful_snapshot,
+        };
+        let has_discovered =
+            crate::verification::has_discovered_snapshots(ctx, &t.repo, has_successful).await?;
+        for member in verify_members {
+            let key =
+                crate::verification::stamp_key(repo_key.as_deref(), member.member6.as_deref());
+            let vt = crate::verification::VerifyTarget {
+                rref: &t.rref,
+                repo: &t.repo,
+                repo_key: repo_key.clone(),
+                last_verified: verify_cell_anchor(
+                    config,
+                    folded,
+                    &stamps,
+                    key.as_deref(),
+                    member.member6.is_some(),
+                    repo_key.as_deref(),
+                    namespace,
+                ),
+                has_successful,
+                source_path: member.source_path.as_deref(),
+                member6: member.member6.as_deref(),
+            };
+            let out = crate::verification::verify_step(
+                config,
+                ctx,
+                &vt,
+                namespace,
+                has_discovered,
+                deep_hold,
+            )
+            .await?;
+            deep_hold |= out.deep_active;
+            if let Some(rq) = out.requeue {
+                min_requeue = Some(min_requeue.map_or(rq, |c: std::time::Duration| c.min(rq)));
             }
         }
     }

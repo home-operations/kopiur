@@ -1490,6 +1490,7 @@ fn verify_quick_roundtrip_and_wire_shape() {
             }),
             success_expr: Some("stats.files > 0 && stats.errors == 0".into()),
             repository_key: None,
+            stamp_key: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -1555,6 +1556,7 @@ fn verify_deep_roundtrip_and_wire_shape() {
             }),
             success_expr: None,
             repository_key: Some("Repository/backups/nas".into()),
+            stamp_key: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -1589,6 +1591,57 @@ fn verify_deep_roundtrip_and_wire_shape() {
     } else {
         panic!("expected verify op");
     }
+}
+
+// --- #456: the (repository x member) stamp key ---
+
+#[test]
+fn verify_stamp_key_roundtrips_in_every_shape_and_old_wire_json_still_decodes() {
+    // A NEW field, never a reinterpretation of `repositoryKey`: that one also
+    // drives the Job's repo_tag6 name segment, its verify-repo label value and
+    // the projected-credentials prefix.
+    for (repository_key, stamp_key) in [
+        (None, None),
+        (
+            Some("Repository/backups/nas"),
+            Some("Repository/backups/nas"),
+        ),
+        (None, Some("#a1b2c3")),
+        (
+            Some("Repository/backups/nas"),
+            Some("Repository/backups/nas#a1b2c3"),
+        ),
+    ] {
+        let op = VerifyOp {
+            tier: VerifyTier::Deep(DeepVerify {
+                scratch_path: "/scratch".into(),
+                snapshot_id: None,
+                parallel: None,
+            }),
+            success_expr: None,
+            repository_key: repository_key.map(str::to_string),
+            stamp_key: stamp_key.map(str::to_string),
+        };
+        let v: serde_json::Value = serde_json::to_value(&op).unwrap();
+        match stamp_key {
+            Some(k) => assert_eq!(v["stampKey"], k, "camelCased on the wire"),
+            None => assert!(
+                v.get("stampKey").is_none(),
+                "an absent stamp key must not appear on the wire (old-shape parity)"
+            ),
+        }
+        assert_eq!(serde_json::from_value::<VerifyOp>(v).unwrap(), op);
+    }
+
+    // A Job minted before #456 carries no `stampKey` at all; its embedded work
+    // spec must still decode on the upgraded mover.
+    let old = r#"{"tier":{"quick":{}},"repositoryKey":"Repository/backups/nas"}"#;
+    let parsed: VerifyOp = serde_json::from_str(old).unwrap();
+    assert_eq!(parsed.stamp_key, None);
+    assert_eq!(
+        parsed.repository_key.as_deref(),
+        Some("Repository/backups/nas")
+    );
 }
 
 // --- M3 (issue #216 category sweep): quick tuning knobs + deep restore parallelism ---

@@ -16,7 +16,7 @@
 //! The scheduling decisions ([`due_tier`], [`next_verify_wakeup`]) are **pure** and
 //! unit-tested; the Job spawn is thin IO.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -33,7 +33,7 @@ use kopiur_mover::workspec::{
 
 use crate::consts::{
     API_VERSION, COMPONENT_LABEL, ORIGIN_LABEL, REPOSITORY_UID_LABEL, VERIFY_COMPONENT,
-    VERIFY_INSTANCE_LABEL, VERIFY_REPO_LABEL, VERIFY_SLOT_ANNOTATION,
+    VERIFY_INSTANCE_LABEL, VERIFY_MEMBER_LABEL, VERIFY_REPO_LABEL, VERIFY_SLOT_ANNOTATION,
 };
 use crate::context::Context;
 use crate::error::Result;
@@ -166,6 +166,185 @@ pub fn discovered_probe_scope(repo_namespace: Option<&str>) -> DiscoveredProbeSc
     }
 }
 
+// --- #456: the (repository x member) verify grid -----------------------------
+
+/// The stable 6-hex per-member tag: [`crate::naming::short_hash`] over the
+/// member's DERIVED kopia source path, truncated to 6 — the same budget
+/// reasoning as [`crate::naming::repo_tag6`], and label-safe where the raw
+/// `/pvc/<name>` path (slashes) is not. Keyed on the PATH rather than the PVC
+/// name so it is stable under `sourcePathStrategy` (two same-named PVCs in
+/// different namespaces get different tags exactly when they get different
+/// paths).
+pub fn member_tag6(source_path: &str) -> String {
+    crate::naming::short_hash(source_path)
+        .chars()
+        .take(6)
+        .collect()
+}
+
+/// One member of a policy's verification fan-out (#456): the single kopia
+/// source path one verify run covers.
+///
+/// A `pvcSelector` policy has **N** of these — one per matched PVC — because
+/// the backup side minted one kopia source per matched PVC. Verifying such a
+/// policy as ONE run resolved a PATHLESS identity (`user@host:`), which kopia's
+/// `ParseSourceInfo` then treats as a relative filesystem path: deep verify
+/// failed with `deep verify found no snapshot to restore for source path ""`
+/// and, worse, **quick verify matched zero manifests and exited 0** — a silent
+/// false pass that still stamped `lastVerified`. That is #456.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyMember {
+    /// The DERIVED kopia source path this member verifies, passed to the
+    /// identity kernel as a `sourcePathOverride` so it is used VERBATIM — the
+    /// same thing the backup did when it wrote the snapshot.
+    ///
+    /// `None` means "derive the path the way the pre-#456 verify did": the
+    /// governing source's own `pvc`/`nfs`/`sourcePathOverride`. That is the
+    /// only shape a non-selector policy ever takes, and it keeps a zero-source
+    /// legacy policy's PATHLESS identity byte-for-byte.
+    pub source_path: Option<String>,
+    /// The stable 6-hex member tag ([`member_tag6`]), `Some` **only** when the
+    /// policy fans out to MORE THAN ONE member. A one-member policy — every
+    /// non-selector policy, and a selector that matched exactly one PVC —
+    /// keeps `None`, so its Job names, labels and status stamps stay
+    /// byte-identical to every prior operator.
+    pub member6: Option<String>,
+}
+
+/// **Pure.** The verification members of `policy`, mirroring EXACTLY what the
+/// backup side mints.
+///
+/// The mirror is [`kopiur_api::expand::expand_sources`]: a policy that mixes a
+/// plain `pvc:` source with a `pvcSelector` source backs up **only the selector
+/// members** (`expand_sources` skips non-selector sources once any selector
+/// exists), so verification must too. Returning the union instead would derive
+/// a path the repository has no snapshot for and fail the whole policy.
+///
+/// Built on [`EffectiveSource::kopia_source_path`] + [`strategy_for`] — the
+/// same two functions `expand_sources` uses — and deliberately NOT on
+/// [`kopiur_api::expand::ExpandedMember::name`]: that name carries a 63-char
+/// bound that can error, and verification mints no child CRs, so it needs no
+/// name.
+///
+/// * no selector source ⇒ exactly one member, `source_path: None`,
+///   `member6: None` (the pre-#456 identity, verbatim);
+/// * a selector matching nothing ⇒ an EMPTY Vec, mirroring
+///   `SlotMintPlan::NothingMatched`. The caller warns, spawns nothing and
+///   stamps nothing — never a pathless run that false-passes.
+pub fn verify_members(
+    policy: &SnapshotPolicy,
+    matched: &BTreeMap<usize, Vec<kopiur_api::snapshot::PvcTargetRef>>,
+) -> Vec<VerifyMember> {
+    use kopiur_api::expand::{EffectiveSource, strategy_for};
+    if !policy.spec.sources.iter().any(|s| s.pvc_selector.is_some()) {
+        return vec![VerifyMember {
+            source_path: None,
+            member6: None,
+        }];
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut members: Vec<VerifyMember> = Vec::new();
+    for (index, source) in policy.spec.sources.iter().enumerate() {
+        if source.pvc_selector.is_none() {
+            continue;
+        }
+        let strategy = strategy_for(source);
+        for target in matched.get(&index).into_iter().flatten() {
+            let eff = EffectiveSource {
+                index,
+                pvc: Some(target.clone()),
+                nfs_path: None,
+                source_path_override: source.source_path_override.clone(),
+                read_only: kopiur_api::snapshot_policy::source_read_only(source),
+            };
+            let Some(path) = eff.kopia_source_path(strategy) else {
+                continue;
+            };
+            // Two selector sources landing on one path is a configuration error
+            // `expand_sources` REFUSES; verification only ever reads, so it
+            // degrades to verifying that one path once rather than parking the
+            // policy on a fault the backup side already reports.
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            members.push(VerifyMember {
+                member6: Some(member_tag6(&path)),
+                source_path: Some(path),
+            });
+        }
+    }
+    // A one-member fan-out is NOT a fan-out: drop the member dimension so the
+    // Job name, the labels and the stamp stay byte-identical to single-member.
+    if members.len() == 1 {
+        members[0].member6 = None;
+    }
+    members
+}
+
+/// Thin IO over [`verify_members`]: one `match_pvcs` LIST per **reconcile**
+/// (never per repository — `verify_step` runs once per repository and would
+/// otherwise multiply the LIST by the repository count).
+///
+/// The LIST is skipped entirely for a policy with no `pvcSelector` source:
+/// [`crate::expand::match_pvcs`] iterates sources and `continue`s past every
+/// non-selector one, so it performs no cluster IO there.
+pub async fn resolve_verify_members(
+    ctx: &Context,
+    policy: &SnapshotPolicy,
+) -> Result<Vec<VerifyMember>> {
+    let matched = crate::expand::match_pvcs(&ctx.client, policy).await?;
+    Ok(verify_members(policy, &matched))
+}
+
+/// **Pure.** The `status.verificationStamps` key one (repository, member) cell
+/// stamps, or `None` for the classic flat `status.lastVerified` write.
+///
+/// `#` is the member separator because it cannot occur in a repo key
+/// ([`kopiur_api::common::repo_key`] is `Kind/ns/name`), which makes
+/// [`parse_stamp_key`] total and unambiguous. A member-only key (a single-repo
+/// policy that fans out) is therefore `#<member6>` — an empty repo segment.
+pub fn stamp_key(repo_key: Option<&str>, member6: Option<&str>) -> Option<String> {
+    match (repo_key, member6) {
+        (None, None) => None,
+        (Some(r), None) => Some(r.to_string()),
+        (r, Some(m)) => Some(format!("{}#{m}", r.unwrap_or(""))),
+    }
+}
+
+/// **Pure and total.** Split a persisted stamp key into its
+/// `(repository segment, member tag)`. A key with no `#` is repo-only (the
+/// #368 shape); an empty repository segment is a single-repo fan-out.
+pub fn parse_stamp_key(key: &str) -> (&str, Option<&str>) {
+    match key.rsplit_once('#') {
+        Some((repo, member)) => (repo, Some(member)),
+        None => (key, None),
+    }
+}
+
+/// **Pure.** Whether a persisted `verificationStamps` key still describes a
+/// LIVE cell, i.e. must survive the prune.
+///
+/// `repo_keys` carries the empty string for a single-repo policy (the
+/// repo-agnostic segment its keys use). `member6s` is empty when the policy
+/// does not fan out.
+///
+/// This replaces the #368 prune, which kept a key only when it equalled a
+/// current repo key **exactly** — so it deleted every member-keyed stamp on the
+/// very next reconcile (and, for a single-repo policy, nulled the whole map
+/// every pass). With the stamps gone the fold could never advance
+/// `lastVerified`, and a due deep verify re-fired every slot forever.
+pub fn stamp_key_live(key: &str, repo_keys: &BTreeSet<&str>, member6s: &BTreeSet<&str>) -> bool {
+    let (repo, member) = parse_stamp_key(key);
+    repo_keys.contains(repo)
+        && match member {
+            Some(m) => member6s.contains(m),
+            // A bare repo key is live only while there is no member dimension:
+            // once the policy fans out, the pre-fan-out stamp described a
+            // PATHLESS run that false-passed and must not anchor anything.
+            None => member6s.is_empty(),
+        }
+}
+
 /// Decide which verification tier is due now, preferring deep (it subsumes quick).
 /// Returns the tier + its scheduled slot, or `None` if nothing is due. Pure given
 /// the policy's `verification`, the seed, the last-verified time, `now`, the
@@ -273,20 +452,31 @@ fn idle_requeue(
 ///
 /// `repo6` is the 6-hex per-repository tag ([`crate::naming::repo_tag6`]),
 /// present ONLY for a multi-repository policy: `<policy>-vfy-<q|d>-<r6>-<unix>`.
-/// The single-repo shape (`None`) stays byte-identical to every prior operator,
-/// so an in-flight slot's Job is still found by name across an upgrade (slot
-/// continuity — a renamed slot would double-spawn).
+/// `member6` is the 6-hex per-member tag ([`member_tag6`]), present ONLY when
+/// the policy fans out to more than one member (#456):
+/// `<policy>-vfy-<q|d>[-<r6>]-m<m6>-<unix>`. Both are spliced BETWEEN the tier
+/// and the unix slot, so the single-repo single-member shape (both `None`)
+/// stays byte-identical to every prior operator and an in-flight slot's Job is
+/// still found by name across an upgrade (slot continuity — a renamed slot
+/// would double-spawn).
+///
+/// `MAX` is **52, not 63**: the remaining 11 bytes of the 63-byte label budget
+/// are reserved for the `-<5-char>` pod-name suffix Kubernetes appends.
 fn verify_job_name(
     policy: &str,
     tier: VerifyTierKind,
     slot: DateTime<Utc>,
     repo6: Option<&str>,
+    member6: Option<&str>,
 ) -> String {
     const MAX: usize = 52;
-    let suffix = match repo6 {
-        None => format!("-vfy-{}-{}", tier.tag(), slot.timestamp()),
-        Some(r6) => format!("-vfy-{}-{r6}-{}", tier.tag(), slot.timestamp()),
-    };
+    let repo_seg = repo6.map(|r6| format!("-{r6}")).unwrap_or_default();
+    let member_seg = member6.map(|m6| format!("-m{m6}")).unwrap_or_default();
+    let suffix = format!(
+        "-vfy-{}{repo_seg}{member_seg}-{}",
+        tier.tag(),
+        slot.timestamp()
+    );
     let budget = MAX.saturating_sub(suffix.len());
     if policy.len() <= budget {
         format!("{policy}{suffix}")
@@ -322,27 +512,91 @@ pub struct VerifyTarget<'a> {
     /// Whether THIS repository holds a verifiable snapshot from this policy
     /// (#168 gate input).
     pub has_successful: bool,
+    /// The DERIVED kopia source path this cell verifies (#456), passed to the
+    /// identity kernel verbatim. `None` reproduces the pre-#456 identity: the
+    /// governing source's own `pvc`/`nfs`/`sourcePathOverride`, and a PATHLESS
+    /// identity for a zero-source legacy policy.
+    pub source_path: Option<&'a str>,
+    /// `Some(6-hex member tag)` ONLY when the policy fans out to more than one
+    /// member (#456). Orthogonal to [`Self::repo_key`]: the repo dimension
+    /// drives `repo_tag6`, the [`VERIFY_REPO_LABEL`] value and the projected
+    /// credentials prefix (members under one (policy, repository) SHARE that
+    /// Secret), while this drives only the `-m<6>` Job-name segment, the
+    /// [`VERIFY_MEMBER_LABEL`] value and the stamp key's member segment.
+    pub member6: Option<&'a str>,
+}
+
+/// What one (repository x member) verify cell asked of the reconciler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifyStepResult {
+    /// The requeue this cell wants, or `None` when `spec.verification` is
+    /// absent (no behavior change — the caller keeps its steady cadence).
+    pub requeue: Option<Duration>,
+    /// A **deep**-tier Job for this cell is in flight (just spawned, or still
+    /// running). The caller must not start another member's deep Job in the
+    /// same reconcile: deep members run SEQUENTIALLY because each provisions
+    /// its own `deep.capacity` of scratch, so a 4-PVC policy at `500Gi` would
+    /// otherwise ask the cluster for 2 TiB of ephemeral storage at once.
+    /// Correctness is never at stake (the scratch volume is per-Job — an
+    /// `Ephemeral` PVC or an `emptyDir`, never a shared one); this is a cost
+    /// guard.
+    pub deep_active: bool,
+}
+
+impl VerifyStepResult {
+    /// The "verification is not configured" answer.
+    fn unconfigured() -> Self {
+        Self {
+            requeue: None,
+            deep_active: false,
+        }
+    }
+    /// A requeue with no deep Job in flight.
+    fn requeue(d: Duration) -> Self {
+        Self {
+            requeue: Some(d),
+            deep_active: false,
+        }
+    }
 }
 
 /// The verification scheduling step, called by the `SnapshotPolicy` reconciler
 /// (after it has confirmed the policy is non-suspended and this target's
-/// repository is Ready) — once for the single-repo shape, once per READY
-/// repository for a multi-repo policy.
-/// Returns `Some(requeue)` when verification is configured (so the caller honors the
-/// verify cadence), or `None` when `spec.verification` is absent (no behavior change).
+/// repository is Ready) — once per (READY repository x verification member)
+/// cell.
+///
+/// `deep_hold` is the sequential-deep guard: `true` once another member's deep
+/// Job is in flight this reconcile, which defers this cell's deep tier (see
+/// [`VerifyStepResult::deep_active`]).
+///
+/// `has_discovered` is the #168 escape-hatch probe result, hoisted to
+/// per-TARGET by the caller so the LIST is not repeated per member.
 pub async fn verify_step(
     config: &SnapshotPolicy,
     ctx: &Context,
     target: &VerifyTarget<'_>,
     namespace: &str,
-) -> Result<Option<Duration>> {
+    has_discovered: bool,
+    deep_hold: bool,
+) -> Result<VerifyStepResult> {
     let Some(verification) = config.spec.verification.as_ref() else {
-        return Ok(None);
+        return Ok(VerifyStepResult::unconfigured());
     };
     let repo = target.repo;
     let has_successful = target.has_successful;
     let name = config.name_any();
-    let seed = config.uid().unwrap_or_else(|| name.clone());
+    // #456: a fanned-out policy seeds each member's cron spread by
+    // `<uid>|<path>`, so N members do not all fire in the same second (N
+    // concurrent quick verifies, or a stampede of deep ones). A one-member
+    // policy keeps the bare UID seed, so its slots are byte-identical.
+    let seed = match target.member6 {
+        None => config.uid().unwrap_or_else(|| name.clone()),
+        Some(_) => format!(
+            "{}|{}",
+            config.uid().unwrap_or_else(|| name.clone()),
+            target.source_path.unwrap_or_default()
+        ),
+    };
     let now = Utc::now();
     let last_verified = target.last_verified;
     let repo6 = target.repo_key.as_deref().map(crate::naming::repo_tag6);
@@ -356,18 +610,9 @@ pub async fn verify_step(
     // any backup, and the mover fails hard. Unlocked once this policy has a Succeeded
     // snapshot OR its repo already carries discovered (adopted) or replicated
     // snapshots (a replication DEST repo holding only copies is not empty). The
-    // discovered probe is a cheap labeled LIST (thin IO over the pure gate) — skipped
-    // entirely once a successful backup already unlocks the gate. Probed in the
-    // repository's OWN namespace (not the policy's — `RepositoryRef` allows a
-    // cross-namespace reference), or cluster-wide for a cluster-scoped repository
-    // (`repo_namespace == None`), which scatters its discovered rows across
-    // per-identity namespaces.
-    let has_discovered = if has_successful {
-        false
-    } else {
-        let scope = discovered_probe_scope(repo.repo_namespace.as_deref());
-        repo_has_discovered_snapshots(&ctx.client, &scope, &repo.owner_ref.uid).await?
-    };
+    // probe itself ([`repo_has_discovered_snapshots`]) is hoisted to per-target by
+    // the caller — it is a per-REPOSITORY fact, so repeating it per member would
+    // multiply the LIST by the member count for no new information.
     let unlocked = verification_unlocked(has_successful, has_discovered);
 
     let Some((tier, slot)) = due_tier(
@@ -385,7 +630,7 @@ pub async fn verify_step(
                  discovered snapshots); deferring until the first successful backup"
             );
         }
-        return Ok(Some(idle_requeue(
+        return Ok(VerifyStepResult::requeue(idle_requeue(
             verification,
             &seed,
             last_verified,
@@ -395,25 +640,55 @@ pub async fn verify_step(
         )));
     };
 
-    let job_name = verify_job_name(&name, tier, slot, repo6.as_deref());
+    // Sequential deep tier: another member's deep Job is already running this
+    // reconcile, so hold this one rather than provisioning a second scratch
+    // volume of `deep.capacity` alongside it. Re-evaluated on the prompt
+    // running cadence, so the held member starts as soon as the first finishes.
+    if tier == VerifyTierKind::Deep && deep_hold {
+        tracing::debug!(
+            policy = %name,
+            member = target.member6.unwrap_or("<single>"),
+            "deferring deep verification: another member's deep Job is in flight (deep \
+             members run sequentially so N members do not provision N scratch volumes)"
+        );
+        return Ok(VerifyStepResult {
+            requeue: Some(REQUEUE_RUNNING),
+            deep_active: true,
+        });
+    }
+
+    let job_name = verify_job_name(&name, tier, slot, repo6.as_deref(), target.member6);
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     match job_api.get_opt(&job_name).await? {
         Some(job) => match job_terminal_state(&job) {
             // Success: the mover stamped lastVerified; sleep until the next slot.
             // The terminal Job (its env carries the whole run spec) self-reaps
             // via its TTL — it is the slot-handled marker until then.
-            Some(true) => Ok(Some(
+            Some(true) => Ok(VerifyStepResult::requeue(
                 next_verify_wakeup(verification, &seed, Some(now), now, repo_defaults)
                     .min(REQUEUE_CAP),
             )),
             // Failure: the failed Job lingers to its TTL as the bounded-retry
             // backoff (and keeps the pod logs).
-            Some(false) => Ok(Some(REQUEUE_FAILED)),
-            None => Ok(Some(REQUEUE_RUNNING)),
+            Some(false) => Ok(VerifyStepResult::requeue(REQUEUE_FAILED)),
+            None => Ok(VerifyStepResult {
+                requeue: Some(REQUEUE_RUNNING),
+                deep_active: tier == VerifyTierKind::Deep,
+            }),
         },
         None => {
-            if has_active_verify_job(&job_api, &name, repo6.as_deref()).await? {
-                return Ok(Some(REQUEUE_RUNNING));
+            // The deep tier's single-flight is member-AGNOSTIC (`member6: None`
+            // below), which is what makes deep members sequential ACROSS
+            // reconciles and operator restarts, not just within one pass.
+            let flight_member = match tier {
+                VerifyTierKind::Quick => target.member6,
+                VerifyTierKind::Deep => None,
+            };
+            if has_active_verify_job(&job_api, &name, repo6.as_deref(), flight_member).await? {
+                return Ok(VerifyStepResult {
+                    requeue: Some(REQUEUE_RUNNING),
+                    deep_active: tier == VerifyTierKind::Deep,
+                });
             }
             spawn_verify_job(
                 config,
@@ -427,8 +702,19 @@ pub async fn verify_step(
                 slot,
             )
             .await?;
-            tracing::info!(policy = %name, ?tier, repo = target.repo_key.as_deref().unwrap_or("<single>"), slot = %slot.to_rfc3339(), "spawned verification Job");
-            Ok(Some(REQUEUE_RUNNING))
+            tracing::info!(
+                policy = %name,
+                ?tier,
+                repo = target.repo_key.as_deref().unwrap_or("<single>"),
+                member = target.member6.unwrap_or("<single>"),
+                source_path = target.source_path.unwrap_or("<identity-derived>"),
+                slot = %slot.to_rfc3339(),
+                "spawned verification Job"
+            );
+            Ok(VerifyStepResult {
+                requeue: Some(REQUEUE_RUNNING),
+                deep_active: tier == VerifyTierKind::Deep,
+            })
         }
     }
 }
@@ -455,11 +741,19 @@ async fn spawn_verify_job(
         verification,
         tier,
         target.repo_key.clone(),
-    );
+        target.source_path,
+        stamp_key(target.repo_key.as_deref(), target.member6),
+    )?;
 
     let mut labels = BTreeMap::new();
     labels.insert(COMPONENT_LABEL.to_string(), VERIFY_COMPONENT.to_string());
     labels.insert(VERIFY_INSTANCE_LABEL.to_string(), policy_name.to_string());
+    // #456 fan-out: label the member so the per-member single-flight can tell
+    // sibling members apart client-side. Stamped ONLY when the policy fans out,
+    // so a single-member Job's label set stays byte-identical.
+    if let Some(m6) = target.member6 {
+        labels.insert(VERIFY_MEMBER_LABEL.to_string(), m6.to_string());
+    }
     // Multi-repo: scope the single-flight selector per (policy, repository) so
     // the N per-repo verifies run concurrently while each repository still gets
     // at most one Job. Single-repo Jobs deliberately stay unlabeled, matching
@@ -614,9 +908,16 @@ async fn spawn_verify_job(
 /// so the deep tier restores the right snapshot.
 ///
 /// `repository_key` is `Some(normalized repo key)` for a multi-repo policy's
-/// per-repo run: the mover then stamps `status.verificationStamps[<key>]`
-/// (entry-keyed, clobber-free) instead of the flat `lastVerified`. `None` keeps
-/// the single-repo wire byte-identical.
+/// per-repo run (metadata + the old-wire stamp fallback). `stamp_key` is the
+/// `status.verificationStamps` key this run owns ([`stamp_key`]): the mover
+/// then stamps that entry (a map-key merge, so concurrent cells never clobber)
+/// instead of the flat `lastVerified`. `None` keeps the single-repo
+/// single-member wire byte-identical.
+///
+/// `source_path` is the member's DERIVED kopia source path (#456), used
+/// VERBATIM as the identity's path. Fallible: a policy whose CEL identity
+/// cannot be resolved now PARKS with `Error::Validation` instead of silently
+/// verifying a pathless sentinel that matches nothing and exits 0.
 #[allow(clippy::too_many_arguments)]
 pub fn build_verify_work_spec(
     config: &SnapshotPolicy,
@@ -626,7 +927,9 @@ pub fn build_verify_work_spec(
     verification: &Verification,
     tier: VerifyTierKind,
     repository_key: Option<String>,
-) -> MoverWorkSpec {
+    source_path: Option<&str>,
+    stamp_key: Option<String>,
+) -> Result<MoverWorkSpec> {
     let tier = match tier {
         // M3 (issue #216 category sweep): quick.parallel/fileParallelism/
         // fileQueueLength/maxErrors were dormant plumbing — the workspec and kopia
@@ -649,14 +952,18 @@ pub fn build_verify_work_spec(
             parallel: verification.deep.as_ref().and_then(|d| d.parallel),
         }),
     };
-    // The source identity (first source) so a deep restore targets the right path.
-    let identity = verify_identity(config, namespace, repo);
-    MoverWorkSpec {
+    // The member's identity, so BOTH tiers scope to the right kopia source: the
+    // deep tier restores that member's newest snapshot, and the quick tier's
+    // `--sources` filter actually matches manifests instead of falling through
+    // to a relative path and exiting 0 on zero of them (#456).
+    let identity = verify_identity_for(config, namespace, repo, source_path)?;
+    Ok(MoverWorkSpec {
         version: 1,
         operation: Operation::Verify(VerifyOp {
             tier,
             success_expr: verification.success_expr.clone(),
             repository_key,
+            stamp_key,
         }),
         identity,
         repository: backend_to_repository_connect(&repo.backend, repo.ca_bundle_pem.clone()),
@@ -677,7 +984,7 @@ pub fn build_verify_work_spec(
             .as_ref(),
         ),
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
-    }
+    })
 }
 
 /// Resolve the deep-verify scratch volume from the **effective** scratch config
@@ -786,20 +1093,15 @@ pub fn fold_verification(
     current: &[(kopiur_api::common::RepositoryRef, String)],
     existing: &[kopiur_api::snapshot_policy::RepoVerification],
     stamps: &BTreeMap<String, String>,
+    members: &[String],
     ns: &str,
 ) -> FoldedVerification {
     use kopiur_api::snapshot_policy::RepoVerification;
     let entries: Vec<RepoVerification> = current
         .iter()
-        .map(|(rref, key)| {
-            let prior = existing
-                .iter()
-                .find(|e| kopiur_api::common::repo_key(&e.repository, ns) == *key)
-                .and_then(|e| e.last_verified.as_deref());
-            RepoVerification {
-                repository: rref.clone(),
-                last_verified: later_rfc3339(prior, stamps.get(key).map(String::as_str)),
-            }
+        .map(|(rref, key)| RepoVerification {
+            repository: rref.clone(),
+            last_verified: repo_cell_min(existing, stamps, members, key, ns),
         })
         .collect();
     let flat = entries
@@ -809,6 +1111,42 @@ pub fn fold_verification(
         .and_then(|all| all.into_iter().min_by_key(|ts| rfc3339_or_min(ts)))
         .map(str::to_string);
     FoldedVerification { entries, flat }
+}
+
+/// **Pure.** One repository's folded `lastVerified`: the MIN over its member
+/// cells (#456), or its single repo-keyed stamp when the policy does not fan
+/// out.
+///
+/// The no-member arm keeps the #368 monotonic `max(prior entry, stamp)` so a
+/// re-read stale stamp is idempotent. The member arm deliberately does NOT
+/// carry the prior entry forward: a repository whose member set GREW is
+/// genuinely no longer fully verified, and pinning the old (higher) value would
+/// make a partially-verified repository look complete — the exact class of lie
+/// #456 was.
+fn repo_cell_min(
+    existing: &[kopiur_api::snapshot_policy::RepoVerification],
+    stamps: &BTreeMap<String, String>,
+    members: &[String],
+    key: &str,
+    ns: &str,
+) -> Option<String> {
+    if members.is_empty() {
+        let prior = existing
+            .iter()
+            .find(|e| kopiur_api::common::repo_key(&e.repository, ns) == key)
+            .and_then(|e| e.last_verified.as_deref());
+        return later_rfc3339(prior, stamps.get(key).map(String::as_str));
+    }
+    members
+        .iter()
+        .map(|m| {
+            stamp_key(Some(key), Some(m))
+                .and_then(|k| stamps.get(&k))
+                .map(String::as_str)
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|all| all.into_iter().min_by_key(|ts| rfc3339_or_min(ts)))
+        .map(str::to_string)
 }
 
 /// **Pure.** The later of two RFC3339 timestamps (an unparseable side loses to
@@ -835,42 +1173,46 @@ fn rfc3339_or_min(s: &str) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
-/// Resolve the recipe's source identity for the verify run (reuses the api kernel),
-/// falling back to a sentinel for the quick tier (which does not restore).
-fn verify_identity(
+/// Resolve the identity for ONE verify cell, reusing the SAME kernel entry point
+/// the #443 restore fan-out uses ([`crate::snapshot_policy::config_identity_for_path`]).
+///
+/// `path: Some(_)` is the member's derived kopia source path, fed in as a
+/// `sourcePathOverride` so the identity kernel uses it VERBATIM instead of
+/// re-deriving `/pvc/<name>` from the FIRST source's PVC name — which for a
+/// `pvcSelector` policy derived nothing at all, leaving the pathless
+/// `user@host:` filter behind #456.
+///
+/// `path: None` is the pre-#456 shape, byte-for-byte: the governing source's
+/// own `pvc`/`nfs`/`sourcePathOverride`, and a PATHLESS identity for a
+/// zero-source legacy policy (`config_identity_for_path`'s `/data` fallback
+/// only applies when the policy HAS sources, which is the same fallback the
+/// backup mover takes).
+///
+/// **Two documented behaviour changes** relative to the old `verify_identity`:
+///
+/// 1. A policy that has sources but derives no path resolves `/data` rather
+///    than `""` — the path the BACKUP actually recorded it under.
+/// 2. A failed identity resolution (a CEL `usernameExpr`/`hostnameExpr` that
+///    cannot render) now PROPAGATES as `Error::Validation` and parks the
+///    policy. It used to be masked as a `kopiur-verify@<ns>:` sentinel with an
+///    empty path, i.e. a run that verified nothing and reported success.
+fn verify_identity_for(
     config: &SnapshotPolicy,
     namespace: &str,
     repo: &ResolvedRepository,
-) -> ResolvedIdentity {
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    let source_path_override = first.and_then(|s| s.source_path_override.clone());
-    let inputs = kopiur_api::IdentityInputs {
-        object_name: &config.name_any(),
+    path: Option<&str>,
+) -> Result<ResolvedIdentity> {
+    let r = crate::snapshot_policy::config_identity_for_path(
+        config,
         namespace,
-        overrides: config.spec.identity.as_ref(),
-        defaults: repo.identity_defaults.as_ref(),
-        labels: config.metadata.labels.as_ref(),
-        annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
-    };
-    match kopiur_api::resolve_identity(&inputs) {
-        Ok(r) => ResolvedIdentity {
-            username: r.username,
-            hostname: r.hostname,
-            source_path: r.source_path.unwrap_or_default(),
-        },
-        // A malformed identity is already rejected at admission; fall back to a
-        // sentinel so the quick tier still runs (it doesn't use the path).
-        Err(_) => ResolvedIdentity {
-            username: "kopiur-verify".to_string(),
-            hostname: namespace.to_string(),
-            source_path: String::new(),
-        },
-    }
+        repo.identity_defaults.as_ref(),
+        path,
+    )?;
+    Ok(ResolvedIdentity {
+        username: r.username,
+        hostname: r.hostname,
+        source_path: r.source_path.unwrap_or_default(),
+    })
 }
 
 /// Whether the policy's resolved repository already carries **discovered**
@@ -903,16 +1245,65 @@ async fn repo_has_discovered_snapshots(
     Ok(!api.list(&lp).await?.items.is_empty())
 }
 
-/// Whether any non-terminal verify Job is owned by this policy (single-flight
-/// gate). `repo6` (a multi-repo policy's per-repo run) narrows the selector by
+/// **Pure.** Whether one existing verify Job holds the single-flight slot of
+/// the member identified by `member6`.
+///
+/// This is the client-side half of the #456 upgrade guard. The LIST selector
+/// deliberately omits [`VERIFY_MEMBER_LABEL`] (see its doc comment), so the
+/// filtering happens here:
+///
+/// * a Job with **no** member label blocks EVERY member. That is a Job minted
+///   by an operator that predates the label — for the deep tier, letting N
+///   fresh members start beside it would mean N+1 concurrent scratch restores;
+/// * while we are not fanning out (`member6: None`), any labelled Job blocks
+///   too. Conservative and transient (it happens only while a fan-out is
+///   collapsing to one member), and it never double-spawns;
+/// * otherwise only the SAME member blocks, so sibling quick members run
+///   concurrently.
+fn job_blocks_member(job: &Job, member6: Option<&str>) -> bool {
+    match (member6, job.labels().get(VERIFY_MEMBER_LABEL)) {
+        (_, None) | (None, Some(_)) => true,
+        (Some(mine), Some(theirs)) => mine == theirs,
+    }
+}
+
+/// Thin IO: the #168 escape-hatch probe for ONE repository — hoisted out of
+/// [`verify_step`] by the caller so a fanned-out policy runs it once per
+/// repository instead of once per (repository x member) cell. `false` without
+/// any LIST once a successful backup already unlocks the gate.
+///
+/// Probed in the repository's OWN namespace (not the policy's — `RepositoryRef`
+/// allows a cross-namespace reference), or cluster-wide for a cluster-scoped
+/// repository (`repo_namespace == None`), which scatters its discovered rows
+/// across per-identity namespaces.
+pub async fn has_discovered_snapshots(
+    ctx: &Context,
+    repo: &ResolvedRepository,
+    has_successful: bool,
+) -> Result<bool> {
+    if has_successful {
+        return Ok(false);
+    }
+    let scope = discovered_probe_scope(repo.repo_namespace.as_deref());
+    repo_has_discovered_snapshots(&ctx.client, &scope, &repo.owner_ref.uid).await
+}
+
+/// Whether any non-terminal verify Job holds this cell's single-flight slot.
+///
+/// `repo6` (a multi-repo policy's per-repo run) narrows the LIST by
 /// [`VERIFY_REPO_LABEL`] so the gate is per (policy, repository) — repo A's
 /// in-flight verify must not block repo B's. The single-repo shape (`None`)
 /// keeps the policy-wide selector, which also matches in-flight Jobs from
 /// older operators that predate the repo label.
+///
+/// `member6` narrows further, but **client-side only** ([`job_blocks_member`]):
+/// adding the member label to the LIST would make a legacy unlabelled Job
+/// invisible and spawn N new Jobs alongside it.
 async fn has_active_verify_job(
     job_api: &Api<Job>,
     policy_name: &str,
     repo6: Option<&str>,
+    member6: Option<&str>,
 ) -> Result<bool> {
     let mut selector =
         format!("{COMPONENT_LABEL}={VERIFY_COMPONENT},{VERIFY_INSTANCE_LABEL}={policy_name}");
@@ -922,7 +1313,10 @@ async fn has_active_verify_job(
     let jobs = job_api
         .list(&ListParams::default().labels(&selector))
         .await?;
-    Ok(jobs.items.iter().any(|j| job_terminal_state(j).is_none()))
+    Ok(jobs
+        .items
+        .iter()
+        .any(|j| job_terminal_state(j).is_none() && job_blocks_member(j, member6)))
 }
 
 #[cfg(test)]
@@ -1321,21 +1715,21 @@ mod tests {
         let slot = DateTime::parse_from_rfc3339("2026-06-09T04:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let n = verify_job_name("postgres-data", VerifyTierKind::Quick, slot, None);
+        let n = verify_job_name("postgres-data", VerifyTierKind::Quick, slot, None, None);
         assert!(n.len() <= 52);
         assert!(n.starts_with("postgres-data-vfy-q-"));
         assert_eq!(
             n,
-            verify_job_name("postgres-data", VerifyTierKind::Quick, slot, None)
+            verify_job_name("postgres-data", VerifyTierKind::Quick, slot, None, None)
         );
         // Quick vs deep differ.
         assert_ne!(
             n,
-            verify_job_name("postgres-data", VerifyTierKind::Deep, slot, None)
+            verify_job_name("postgres-data", VerifyTierKind::Deep, slot, None, None)
         );
         // Long names truncate+hash within budget.
         let long = "a-very-long-snapshot-policy-name-that-blows-the-dns-label-budget";
-        assert!(verify_job_name(long, VerifyTierKind::Deep, slot, None).len() <= 52);
+        assert!(verify_job_name(long, VerifyTierKind::Deep, slot, None, None).len() <= 52);
     }
 
     #[test]
@@ -1350,23 +1744,23 @@ mod tests {
             .with_timezone(&Utc);
         let unix = slot.timestamp();
         assert_eq!(
-            verify_job_name("pg", VerifyTierKind::Quick, slot, None),
+            verify_job_name("pg", VerifyTierKind::Quick, slot, None, None),
             format!("pg-vfy-q-{unix}"),
             "single-repo name is the exact legacy format"
         );
         let r6 = crate::naming::repo_tag6("Repository/backups/nas");
-        let multi = verify_job_name("pg", VerifyTierKind::Quick, slot, Some(&r6));
+        let multi = verify_job_name("pg", VerifyTierKind::Quick, slot, Some(&r6), None);
         assert_eq!(multi, format!("pg-vfy-q-{r6}-{unix}"));
         assert!(multi.len() <= 52);
         // Distinct repos → distinct per-slot names (concurrent Jobs coexist).
         let other = crate::naming::repo_tag6("ClusterRepository/offsite");
         assert_ne!(
             multi,
-            verify_job_name("pg", VerifyTierKind::Quick, slot, Some(&other))
+            verify_job_name("pg", VerifyTierKind::Quick, slot, Some(&other), None)
         );
         // Long policy names stay within budget with the tag present.
         let long = "a-very-long-snapshot-policy-name-that-blows-the-dns-label-budget";
-        assert!(verify_job_name(long, VerifyTierKind::Deep, slot, Some(&r6)).len() <= 52);
+        assert!(verify_job_name(long, VerifyTierKind::Deep, slot, Some(&r6), None).len() <= 52);
     }
 
     #[test]
@@ -1422,7 +1816,7 @@ mod tests {
             ),
         ]
         .into();
-        let folded = fold_verification(&keyed(&repos), &[], &stamps, "ns");
+        let folded = fold_verification(&keyed(&repos), &[], &stamps, &[], "ns");
         assert_eq!(folded.entries.len(), 2);
         assert_eq!(
             folded.entries[0].last_verified.as_deref(),
@@ -1448,7 +1842,7 @@ mod tests {
             repository: repos[0].clone(),
             last_verified: Some("2026-08-02T00:00:00+00:00".into()),
         }];
-        let folded = fold_verification(&keyed(&repos), &existing, &BTreeMap::new(), "ns");
+        let folded = fold_verification(&keyed(&repos), &existing, &BTreeMap::new(), &[], "ns");
         assert_eq!(folded.entries.len(), 2);
         assert!(folded.entries[1].last_verified.is_none());
         assert!(folded.flat.is_none(), "flat requires EVERY current repo");
@@ -1459,7 +1853,7 @@ mod tests {
             "2026-07-01T00:00:00+00:00".to_string(),
         )]
         .into();
-        let folded = fold_verification(&keyed(&repos), &existing, &stale, "ns");
+        let folded = fold_verification(&keyed(&repos), &existing, &stale, &[], "ns");
         assert_eq!(
             folded.entries[0].last_verified.as_deref(),
             Some("2026-08-02T00:00:00+00:00"),
@@ -1488,7 +1882,7 @@ mod tests {
             "2026-08-03T00:00:00+00:00".to_string(),
         )]
         .into();
-        let folded = fold_verification(&keyed(&current), &existing, &stamps, "ns");
+        let folded = fold_verification(&keyed(&current), &existing, &stamps, &[], "ns");
         assert_eq!(folded.entries.len(), 1);
         assert_eq!(folded.entries[0].repository.name, "nas");
         assert_eq!(
@@ -1584,8 +1978,18 @@ mod tests {
         v.verify_files_percent = Some(10);
         let policy = sample_policy(v.clone());
         let repo = sample_repo();
-        let ws =
-            build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Quick, None);
+        let ws = build_verify_work_spec(
+            &policy,
+            &repo,
+            "ns",
+            "pg",
+            &v,
+            VerifyTierKind::Quick,
+            None,
+            None,
+            None,
+        )
+        .expect("identity resolves");
         match &ws.operation {
             Operation::Verify(op) => {
                 assert_eq!(op.success_expr.as_deref(), Some("stats.errors == 0"));
@@ -1623,8 +2027,18 @@ mod tests {
         });
         let policy = sample_policy(v.clone());
         let repo = sample_repo();
-        let ws =
-            build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Quick, None);
+        let ws = build_verify_work_spec(
+            &policy,
+            &repo,
+            "ns",
+            "pg",
+            &v,
+            VerifyTierKind::Quick,
+            None,
+            None,
+            None,
+        )
+        .expect("identity resolves");
         match &ws.operation {
             Operation::Verify(op) => match &op.tier {
                 VerifyTier::Quick(q) => {
@@ -1652,7 +2066,18 @@ mod tests {
         let v = verification(None, Some("0 5 * * 0"));
         let policy = sample_policy(v.clone());
         let repo = sample_repo();
-        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Deep, None);
+        let ws = build_verify_work_spec(
+            &policy,
+            &repo,
+            "ns",
+            "pg",
+            &v,
+            VerifyTierKind::Deep,
+            None,
+            None,
+            None,
+        )
+        .expect("identity resolves");
         match &ws.operation {
             Operation::Verify(op) => match &op.tier {
                 VerifyTier::Deep(d) => {
@@ -1682,7 +2107,18 @@ mod tests {
         });
         let policy = sample_policy(v.clone());
         let repo = sample_repo();
-        let ws = build_verify_work_spec(&policy, &repo, "ns", "pg", &v, VerifyTierKind::Deep, None);
+        let ws = build_verify_work_spec(
+            &policy,
+            &repo,
+            "ns",
+            "pg",
+            &v,
+            VerifyTierKind::Deep,
+            None,
+            None,
+            None,
+        )
+        .expect("identity resolves");
         match &ws.operation {
             Operation::Verify(op) => match &op.tier {
                 VerifyTier::Deep(d) => {
@@ -1814,6 +2250,522 @@ mod tests {
         assert!(
             !st.ignored,
             "repo-supplied capacity should make the SC honored"
+        );
+    }
+
+    // --- #456: the (repository x member) verify fan-out -----------------------
+
+    /// A policy built the way the apiserver hands one over: a JSON value (what
+    /// a decoded CR body is) into the typed struct. Never `serde_yaml` straight
+    /// into a typed value — 0.9 mis-encodes externally-tagged enums.
+    fn selector_policy(sources: serde_json::Value) -> SnapshotPolicy {
+        policy_json(serde_json::json!({
+            "repository": { "name": "r" },
+            "sources": sources,
+            "verification": { "quick": { "schedule": { "cron": "*/5 * * * *" } } },
+        }))
+    }
+
+    /// See [`selector_policy`].
+    fn policy_json(spec: serde_json::Value) -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "ns" },
+            "spec": spec,
+        }))
+        .expect("typed SnapshotPolicy")
+    }
+
+    fn matched(
+        pairs: &[(usize, &[(&str, &str)])],
+    ) -> BTreeMap<usize, Vec<kopiur_api::snapshot::PvcTargetRef>> {
+        pairs
+            .iter()
+            .map(|(index, pvcs)| {
+                (
+                    *index,
+                    pvcs.iter()
+                        .map(|(ns, name)| kopiur_api::snapshot::PvcTargetRef {
+                            namespace: (*ns).to_string(),
+                            name: (*name).to_string(),
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn paths(members: &[VerifyMember]) -> Vec<String> {
+        members
+            .iter()
+            .map(|m| m.source_path.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn selector_policy_fans_out_one_member_per_matched_pvc_under_both_strategies() {
+        // THE #456 bug: one member with an EMPTY path. Every member must carry
+        // the DERIVED path its backup was written under, and under the strategy
+        // that source declares.
+        for (strategy, want) in [
+            ("PvcName", vec!["/pvc/data-a", "/pvc/data-b"]),
+            (
+                "PvcNamespacedName",
+                vec!["/pvc/ns/data-a", "/pvc/ns/data-b"],
+            ),
+        ] {
+            let policy = selector_policy(serde_json::json!([{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+                "sourcePathStrategy": strategy,
+            }]));
+            let members = verify_members(
+                &policy,
+                &matched(&[(0, &[("ns", "data-a"), ("ns", "data-b")])]),
+            );
+            assert_eq!(paths(&members), want, "strategy {strategy}");
+            assert!(
+                members.iter().all(|m| m.member6.is_some()),
+                "a 2-member fan-out must carry the member dimension"
+            );
+            assert_ne!(
+                members[0].member6, members[1].member6,
+                "distinct paths must get distinct member tags, or two members share one \
+                 Job name and one stamp"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_members_mirror_exactly_what_the_backup_side_mints() {
+        // The invariant the whole fix rests on: verification must derive the
+        // SAME set of kopia source paths `expand_sources` gives the backup. A
+        // mixed `pvc` + `pvcSelector` policy backs up ONLY the selector members
+        // — returning the union here would derive a path with no snapshots and
+        // fail the whole policy.
+        use kopiur_api::expand::{effective_source, expand_sources, strategy_for};
+        let policy = selector_policy(serde_json::json!([
+            { "pvc": { "name": "legacy" } },
+            {
+                "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+                "sourcePathStrategy": "PvcName",
+            },
+        ]));
+        let m = matched(&[(1, &[("ns", "data-a"), ("ns", "data-b")])]);
+        let backup: Vec<String> = expand_sources(&policy, "pg-1", &m)
+            .expect("expansion")
+            .expect("a selector policy expands")
+            .iter()
+            .map(|em| {
+                let eff = effective_source(&policy, Some(&em.source)).expect("effective");
+                eff.kopia_source_path(strategy_for(&policy.spec.sources[eff.index]))
+                    .expect("a PVC member always has a path")
+            })
+            .collect();
+        assert_eq!(
+            paths(&verify_members(&policy, &m)),
+            backup,
+            "the verify member paths must equal the backup member paths, exactly"
+        );
+        assert!(
+            !backup.iter().any(|p| p == "/pvc/legacy"),
+            "sanity: expand_sources skips the plain pvc source, so verification must too"
+        );
+    }
+
+    #[test]
+    fn a_selector_matching_nothing_yields_no_members_so_nothing_is_spawned_or_stamped() {
+        let policy = selector_policy(serde_json::json!([{
+            "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+        }]));
+        assert!(
+            verify_members(&policy, &matched(&[(0, &[])])).is_empty(),
+            "mirror SlotMintPlan::NothingMatched — never a pathless run that false-passes"
+        );
+        assert!(
+            verify_members(&policy, &BTreeMap::new()).is_empty(),
+            "an absent match entry is the same situation as an empty one"
+        );
+    }
+
+    #[test]
+    fn non_selector_and_one_member_policies_keep_the_pre_fix_shape() {
+        // A plain `pvc:`/`nfs:` policy: ONE member, no path of its own (the
+        // identity kernel derives it from the governing source exactly as
+        // before) and no member dimension.
+        for sources in [
+            serde_json::json!([{ "pvc": { "name": "data" } }]),
+            serde_json::json!([{ "nfs": { "server": "h", "path": "/export" } }]),
+            serde_json::json!([]),
+        ] {
+            let members = verify_members(&selector_policy(sources.clone()), &BTreeMap::new());
+            assert_eq!(members.len(), 1, "{sources}");
+            assert_eq!(members[0].source_path, None, "{sources}");
+            assert_eq!(members[0].member6, None, "{sources}");
+        }
+        // A selector matching exactly ONE PVC still needs the derived path (that
+        // is the bug), but is not a fan-out: no member dimension, so its Job
+        // name, labels and stamp stay byte-identical to a single-member policy.
+        let one = selector_policy(serde_json::json!([{
+            "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+        }]));
+        let members = verify_members(&one, &matched(&[(0, &[("ns", "only")])]));
+        assert_eq!(paths(&members), vec!["/pvc/only"]);
+        assert_eq!(members[0].member6, None);
+    }
+
+    #[test]
+    fn two_selector_sources_on_one_path_verify_it_once_instead_of_twice() {
+        // `expand_sources` REFUSES this (two backups would overwrite each
+        // other); verification only reads, so it degrades to one run rather
+        // than parking the policy on a fault the backup side already reports.
+        let policy = selector_policy(serde_json::json!([
+            { "pvcSelector": { "labelSelector": { "matchLabels": { "a": "1" } } } },
+            { "pvcSelector": { "labelSelector": { "matchLabels": { "b": "2" } } } },
+        ]));
+        let members = verify_members(
+            &policy,
+            &matched(&[(0, &[("ns", "shared")]), (1, &[("ns", "shared")])]),
+        );
+        assert_eq!(paths(&members), vec!["/pvc/shared"]);
+    }
+
+    // --- identity: the derived path reaches the wire, errors are not masked ---
+
+    #[test]
+    fn member_path_lands_verbatim_on_the_work_spec_identity() {
+        let policy = selector_policy(serde_json::json!([{
+            "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+        }]));
+        let v = policy.spec.verification.clone().expect("verification");
+        let ws = build_verify_work_spec(
+            &policy,
+            &sample_repo(),
+            "ns",
+            "pg",
+            &v,
+            VerifyTierKind::Quick,
+            None,
+            Some("/pvc/data-b"),
+            stamp_key(None, Some("abc123")),
+        )
+        .expect("identity resolves");
+        assert_eq!(
+            ws.identity.source_path, "/pvc/data-b",
+            "the member path must be used VERBATIM — a re-derived /pvc/<first source> or an \
+             empty path is #456"
+        );
+        assert_ne!(
+            ws.identity.source_spec(),
+            format!("{}@{}:", ws.identity.username, ws.identity.hostname),
+            "a pathless `user@host:` source spec is what kopia silently matched zero \
+             manifests for (quick verify exited 0 on a false pass)"
+        );
+        match &ws.operation {
+            Operation::Verify(op) => assert_eq!(op.stamp_key.as_deref(), Some("#abc123")),
+            other => panic!("expected a verify op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_zero_source_legacy_policy_keeps_its_pathless_identity_byte_for_byte() {
+        let policy = selector_policy(serde_json::json!([]));
+        let v = policy.spec.verification.clone().expect("verification");
+        let ws = build_verify_work_spec(
+            &policy,
+            &sample_repo(),
+            "ns",
+            "pg",
+            &v,
+            VerifyTierKind::Quick,
+            None,
+            None,
+            None,
+        )
+        .expect("identity resolves");
+        assert_eq!(
+            ws.identity.source_path, "",
+            "a zero-source legacy policy has no path at all; inventing /data would break \
+             a working verify on upgrade"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_cel_identity_parks_instead_of_verifying_a_sentinel() {
+        // Documented behaviour change: this used to be masked as
+        // `kopiur-verify@<ns>:` with an empty path — a run that verified
+        // nothing and reported success.
+        let policy = selector_policy(serde_json::json!([{ "pvc": { "name": "data" } }]));
+        let v = policy.spec.verification.clone().expect("verification");
+        // The CEL `*Expr` pair lives on the REPOSITORY's identityDefaults.
+        let mut repo = sample_repo();
+        repo.identity_defaults = Some(
+            serde_json::from_value(serde_json::json!({ "usernameExpr": "namespace +" }))
+                .expect("typed IdentityDefaults"),
+        );
+        let err = build_verify_work_spec(
+            &policy,
+            &repo,
+            "ns",
+            "pg",
+            &v,
+            VerifyTierKind::Quick,
+            None,
+            None,
+            None,
+        )
+        .expect_err("an unresolvable identity must propagate, not fall back to a sentinel");
+        assert!(
+            matches!(err, crate::error::Error::Validation(_)),
+            "expected a Validation error, got {err:?}"
+        );
+    }
+
+    // --- seeds, names and labels ---------------------------------------------
+
+    #[test]
+    fn member_seeds_spread_the_slots_so_members_do_not_all_fire_at_once() {
+        let spec = cron_spec("0 * * * *", Some("30m"));
+        let after = jitter_after();
+        let a = slot_for("uid|/pvc/data-a", &spec, after, None).expect("slot a");
+        let b = slot_for("uid|/pvc/data-b", &spec, after, None).expect("slot b");
+        assert_ne!(
+            a, b,
+            "two members must not share a jitter offset, or N quick verifies (or a \
+             stampede of deep ones) fire in the same second"
+        );
+        // And the one-member shape keeps the bare-UID seed, so its slots are
+        // byte-identical to a pre-#456 operator's.
+        assert_eq!(
+            slot_for("uid", &spec, after, None).expect("slot"),
+            slot_for("uid", &spec, after, None).expect("slot"),
+        );
+    }
+
+    #[test]
+    fn verify_job_name_gains_m6_only_when_fanning_out_and_stays_within_52() {
+        let slot = DateTime::parse_from_rfc3339("2026-06-09T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let unix = slot.timestamp();
+        let m6 = member_tag6("/pvc/data-a");
+        // Single-member: byte-identical legacy format (slot continuity).
+        assert_eq!(
+            verify_job_name("pg", VerifyTierKind::Quick, slot, None, None),
+            format!("pg-vfy-q-{unix}")
+        );
+        assert_eq!(
+            verify_job_name("pg", VerifyTierKind::Quick, slot, None, Some(&m6)),
+            format!("pg-vfy-q-m{m6}-{unix}")
+        );
+        let r6 = crate::naming::repo_tag6("Repository/backups/nas");
+        assert_eq!(
+            verify_job_name("pg", VerifyTierKind::Quick, slot, Some(&r6), Some(&m6)),
+            format!("pg-vfy-q-{r6}-m{m6}-{unix}")
+        );
+        // Sibling members never collide on a name.
+        assert_ne!(
+            verify_job_name("pg", VerifyTierKind::Quick, slot, Some(&r6), Some(&m6)),
+            verify_job_name(
+                "pg",
+                VerifyTierKind::Quick,
+                slot,
+                Some(&r6),
+                Some(&member_tag6("/pvc/data-b"))
+            )
+        );
+        // MAX is 52, NOT 63: the remaining budget is the pod-name suffix.
+        let long = "a-very-long-snapshot-policy-name-that-blows-the-dns-label-budget";
+        let n = verify_job_name(long, VerifyTierKind::Deep, slot, Some(&r6), Some(&m6));
+        assert!(n.len() <= 52, "{n} is {} bytes", n.len());
+    }
+
+    #[test]
+    fn verify_member_label_is_group_prefixed_and_distinct() {
+        assert!(VERIFY_MEMBER_LABEL.starts_with("kopiur.home-operations.com/"));
+        assert_ne!(VERIFY_MEMBER_LABEL, VERIFY_REPO_LABEL);
+        assert_ne!(VERIFY_MEMBER_LABEL, VERIFY_INSTANCE_LABEL);
+    }
+
+    // --- stamp keys -----------------------------------------------------------
+
+    #[test]
+    fn stamp_key_shapes_and_a_total_parser() {
+        assert_eq!(stamp_key(None, None), None, "flat lastVerified");
+        assert_eq!(
+            stamp_key(Some("Repository/ns/nas"), None).as_deref(),
+            Some("Repository/ns/nas"),
+            "#368 wire, unchanged"
+        );
+        assert_eq!(
+            stamp_key(None, Some("abc123")).as_deref(),
+            Some("#abc123"),
+            "single-repo fan-out: an EMPTY repo segment"
+        );
+        assert_eq!(
+            stamp_key(Some("Repository/ns/nas"), Some("abc123")).as_deref(),
+            Some("Repository/ns/nas#abc123")
+        );
+        // Total: every shape round-trips, and a garbage key never panics.
+        assert_eq!(
+            parse_stamp_key("Repository/ns/nas"),
+            ("Repository/ns/nas", None)
+        );
+        assert_eq!(parse_stamp_key("#abc123"), ("", Some("abc123")));
+        assert_eq!(
+            parse_stamp_key("Repository/ns/nas#abc123"),
+            ("Repository/ns/nas", Some("abc123"))
+        );
+        assert_eq!(parse_stamp_key(""), ("", None));
+        assert_eq!(parse_stamp_key("#"), ("", Some("")));
+        assert_eq!(parse_stamp_key("a#b#c"), ("a#b", Some("c")));
+    }
+
+    #[test]
+    fn the_prune_keeps_member_keys_and_drops_only_dead_cells() {
+        // The #368 prune kept a key only when it equalled a current REPO key
+        // exactly, so it deleted every member-keyed stamp on the next
+        // reconcile — `lastVerified` never advanced and a due deep verify
+        // re-fired every slot forever.
+        let repos: BTreeSet<&str> = ["Repository/ns/a", "Repository/ns/b"].into_iter().collect();
+        let members: BTreeSet<&str> = ["m1", "m2"].into_iter().collect();
+        for live in [
+            "Repository/ns/a#m1",
+            "Repository/ns/a#m2",
+            "Repository/ns/b#m1",
+        ] {
+            assert!(
+                stamp_key_live(live, &repos, &members),
+                "{live} must survive"
+            );
+        }
+        for dead in [
+            "Repository/ns/a",      // bare key, but the policy fans out now
+            "Repository/ns/c#m1",   // repository left the spec
+            "Repository/ns/a#gone", // PVC no longer matches
+        ] {
+            assert!(
+                !stamp_key_live(dead, &repos, &members),
+                "{dead} must be pruned"
+            );
+        }
+        // Single-repo fan-out: the repo segment is the empty string.
+        let single: BTreeSet<&str> = [""].into_iter().collect();
+        assert!(stamp_key_live("#m1", &single, &members));
+        assert!(!stamp_key_live("#m9", &single, &members));
+        // No member dimension: the bare repo key is the live shape, and a
+        // leftover member key is dead.
+        let none: BTreeSet<&str> = BTreeSet::new();
+        assert!(stamp_key_live("Repository/ns/a", &repos, &none));
+        assert!(!stamp_key_live("Repository/ns/a#m1", &repos, &none));
+    }
+
+    #[test]
+    fn fold_takes_the_min_over_members_so_a_partial_repo_is_never_fully_verified() {
+        let repos = [rref("Repository", Some("ns"), "a")];
+        let members = vec!["m1".to_string(), "m2".to_string()];
+        let mut stamps = BTreeMap::new();
+        stamps.insert(
+            "Repository/ns/a#m1".to_string(),
+            "2026-08-02T00:00:00+00:00".to_string(),
+        );
+        // Only ONE of two members has verified.
+        let folded = fold_verification(&keyed(&repos), &[], &stamps, &members, "ns");
+        assert_eq!(
+            folded.entries[0].last_verified, None,
+            "a repository whose members are only PARTLY verified must not look verified"
+        );
+        assert_eq!(folded.flat, None);
+        // Both members: the entry (and the flat field) is the MIN, i.e. the age
+        // of the STALEST member — "everything is verified as of T".
+        stamps.insert(
+            "Repository/ns/a#m2".to_string(),
+            "2026-08-05T00:00:00+00:00".to_string(),
+        );
+        let folded = fold_verification(&keyed(&repos), &[], &stamps, &members, "ns");
+        assert_eq!(
+            folded.entries[0].last_verified.as_deref(),
+            Some("2026-08-02T00:00:00+00:00")
+        );
+        assert_eq!(folded.flat.as_deref(), Some("2026-08-02T00:00:00+00:00"));
+    }
+
+    #[test]
+    fn fold_flat_is_the_min_over_every_repo_times_member_cell() {
+        let repos = [
+            rref("Repository", Some("ns"), "a"),
+            rref("ClusterRepository", None, "b"),
+        ];
+        let members = vec!["m1".to_string(), "m2".to_string()];
+        let stamps: BTreeMap<String, String> = [
+            ("Repository/ns/a#m1", "2026-08-09T00:00:00+00:00"),
+            ("Repository/ns/a#m2", "2026-08-08T00:00:00+00:00"),
+            ("ClusterRepository/b#m1", "2026-08-03T00:00:00+00:00"),
+            ("ClusterRepository/b#m2", "2026-08-07T00:00:00+00:00"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let folded = fold_verification(&keyed(&repos), &[], &stamps, &members, "ns");
+        assert_eq!(
+            folded.entries[0].last_verified.as_deref(),
+            Some("2026-08-08T00:00:00+00:00")
+        );
+        assert_eq!(
+            folded.entries[1].last_verified.as_deref(),
+            Some("2026-08-03T00:00:00+00:00")
+        );
+        assert_eq!(
+            folded.flat.as_deref(),
+            Some("2026-08-03T00:00:00+00:00"),
+            "the flat field is the MIN over all (repo x member) cells"
+        );
+    }
+
+    // --- single-flight across an upgrade -------------------------------------
+
+    fn verify_job(member6: Option<&str>) -> Job {
+        let mut labels = BTreeMap::new();
+        labels.insert(COMPONENT_LABEL.to_string(), VERIFY_COMPONENT.to_string());
+        labels.insert(VERIFY_INSTANCE_LABEL.to_string(), "pg".to_string());
+        if let Some(m6) = member6 {
+            labels.insert(VERIFY_MEMBER_LABEL.to_string(), m6.to_string());
+        }
+        Job {
+            metadata: kube::core::ObjectMeta {
+                name: Some("pg-vfy-d-1".into()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_legacy_unlabelled_verify_job_blocks_every_member() {
+        // THE upgrade hazard. An in-flight Job minted by an operator predating
+        // the member label carries neither VERIFY_MEMBER_LABEL nor
+        // VERIFY_REPO_LABEL. If the member label joined the LIST selector that
+        // Job would become invisible and we would spawn N fresh ones beside it
+        // — for the deep tier, N+1 concurrent scratch restores.
+        let legacy = verify_job(None);
+        assert!(job_blocks_member(&legacy, None));
+        assert!(job_blocks_member(&legacy, Some("m1")));
+        assert!(job_blocks_member(&legacy, Some("m2")));
+    }
+
+    #[test]
+    fn sibling_members_do_not_block_each_other_but_the_same_member_does() {
+        let m1 = verify_job(Some("m1"));
+        assert!(job_blocks_member(&m1, Some("m1")));
+        assert!(
+            !job_blocks_member(&m1, Some("m2")),
+            "quick members of one repository run concurrently"
+        );
+        assert!(
+            job_blocks_member(&m1, None),
+            "while NOT fanning out (and for the always-sequential deep tier, which \
+             passes None) any labelled Job holds the slot"
         );
     }
 }

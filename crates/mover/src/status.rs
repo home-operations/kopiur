@@ -591,26 +591,27 @@ impl StatusUpdate {
 
 /// `{ "status": ... }` body for a successful verification.
 ///
-/// `repository_key: None` (the classic single-repo flow): stamp the flat
-/// `lastVerified` and a `Verified=True` condition — byte-identical to every
-/// prior operator.
+/// `stamp_key: None` (the classic flat flow — one repository, one verification
+/// member): stamp the flat `lastVerified` and a `Verified=True` condition —
+/// byte-identical to every prior operator.
 ///
-/// `repository_key: Some(key)` (a multi-repository policy's per-repo verify,
-/// #368): stamp ONLY `verificationStamps[<key>]`. A JSON merge patch merges
-/// *map keys* but replaces *arrays*, so the entry-keyed map is what lets two
-/// concurrent per-repo verifies land without clobbering each other — writing
-/// the flat field or the `status.verification` Vec from here would lose one
-/// repo's result (and the flat field's multi-repo meaning is the controller's
-/// MIN across repos, which one mover cannot compute). No condition either:
-/// the conditions array is replace-on-merge, so concurrent per-repo writers
-/// must not touch it — the controller folds the stamps and owns conditions.
+/// `stamp_key: Some(key)` (one cell of a (repository x member) grid: #368's
+/// per-repository dimension, #456's per-member dimension, or both): stamp ONLY
+/// `verificationStamps[<key>]`. A JSON merge patch merges *map keys* but
+/// replaces *arrays*, so the entry-keyed map is what lets two concurrent cells
+/// land without clobbering each other — writing the flat field or the
+/// `status.verification` Vec from here would lose one cell's result (and the
+/// flat field's grid meaning is the controller's MIN across cells, which one
+/// mover cannot compute). No condition either: the conditions array is
+/// replace-on-merge, so concurrent writers must not touch it — the controller
+/// folds the stamps and owns conditions.
 pub fn verify_ok_body(
     tier: &str,
-    repository_key: Option<&str>,
+    stamp_key: Option<&str>,
     now: &chrono::DateTime<chrono::Utc>,
 ) -> serde_json::Value {
     let ts = now.to_rfc3339();
-    match repository_key {
+    match stamp_key {
         None => serde_json::json!({
             "status": {
                 "lastVerified": ts,
@@ -1862,6 +1863,34 @@ mod tests {
             "the conditions array is replace-on-merge; concurrent per-repo \
              writers must not touch it"
         );
+    }
+
+    #[test]
+    fn verify_ok_body_writes_the_member_keyed_stamp_for_a_fanned_out_policy() {
+        // #456: a `pvcSelector` policy verifies one cell per matched PVC. A
+        // single-repository fan-out's key has an EMPTY repository segment
+        // (`#<member6>`), and a multi-repo fan-out carries both dimensions.
+        let now = chrono::Utc::now();
+        for key in ["#a1b2c3", "Repository/backups/nas#a1b2c3"] {
+            let body = verify_ok_body("deep", Some(key), &now);
+            assert!(
+                body["status"]["verificationStamps"][key].is_string(),
+                "the member-keyed stamp must be the ONLY thing written: {body}"
+            );
+            assert!(
+                body["status"].get("lastVerified").is_none(),
+                "the flat field is the controller's MIN over every (repo x member) cell, \
+                 never a mover write — a fanned-out member that stamped it would claim the \
+                 whole policy was verified"
+            );
+            assert!(body["status"].get("conditions").is_none());
+        }
+        // Sibling members of ONE repository write DISJOINT keys, which is what
+        // makes the RFC 7396 map-key merge clobber-free for them too.
+        let a = verify_ok_body("quick", Some("#aaaaaa"), &now);
+        let b = verify_ok_body("quick", Some("#bbbbbb"), &now);
+        assert!(a["status"]["verificationStamps"]["#bbbbbb"].is_null());
+        assert!(b["status"]["verificationStamps"]["#aaaaaa"].is_null());
     }
 
     /// THE race the entry-keyed design exists for: two per-repo verify movers

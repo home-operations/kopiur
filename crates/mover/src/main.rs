@@ -2930,7 +2930,11 @@ async fn run_verify_flow(
         &spec.target_ref,
         &verify_ok_body(
             op.tier.kind_str(),
-            op.repository_key.as_deref(),
+            // #456: the (repository x member) stamp key. `repository_key` is
+            // the pre-#456 fallback, so a Job already in flight across the
+            // upgrade (its work spec rides its own env) still stamps the
+            // per-repository entry it was minted for.
+            op.stamp_key.as_deref().or(op.repository_key.as_deref()),
             &chrono::Utc::now(),
         ),
     )
