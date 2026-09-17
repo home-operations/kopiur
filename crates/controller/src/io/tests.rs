@@ -1825,9 +1825,40 @@ fn wi_rolebinding_name_truncates_long_sa_names_with_a_stable_hash() {
     assert_ne!(name, wi_rolebinding_name(&format!("{}b", "a".repeat(259))));
 }
 
+/// Sprig's `trunc <limit> | trimSuffix "-"` — the chart's own two steps,
+/// reproduced so the test computes what Helm computes rather than what we hope it
+/// does. `trunc` is a byte prefix; `trimSuffix "-"` removes exactly ONE dash.
+fn sprig_trunc_trim(s: &str, limit: usize) -> String {
+    let cut = &s[..s.len().min(limit)];
+    cut.strip_suffix('-').unwrap_or(cut).to_string()
+}
+
+/// `kopiur.moverBaseName`: the chart's shared mover stem.
+fn chart_mover_base(fullname: &str) -> String {
+    sprig_trunc_trim(fullname, MOVER_BASE_NAME_MAX)
+}
+
+/// A valid DNS-1123 subdomain of at most 63 bytes — what every mover
+/// ServiceAccount / Role / ClusterRole / RoleBinding name has to be.
+fn is_dns1123_subdomain_63(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && name
+            .bytes()
+            .next_back()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 #[test]
 fn snapshot_replication_mover_name_derives_from_the_generic_role() {
-    // The default chart wiring (`<fullname>-mover`) yields the exact name
+    // The default chart wiring (`<moverBaseName>-mover`) yields the exact name
     // `gen-rbac` ships and the chart's snapshotReplicationMoverName helper
     // renders, so the runtime binding always references an existing role.
     assert_eq!(
@@ -1839,67 +1870,208 @@ fn snapshot_replication_mover_name_derives_from_the_generic_role() {
         "myrelease-kopiur-snapshot-replication-mover"
     );
     // A custom role name without the conventional suffix still derives
-    // deterministically (and distinctly from the generic role).
+    // deterministically (and distinctly from the generic role) — the suffix is
+    // appended whole rather than shortened, because the suffix is the only thing
+    // separating two roles that must never share an identity.
     assert_eq!(
         snapshot_replication_mover_name("custom-role"),
-        "custom-role-snapshot-replication"
+        "custom-role-snapshot-replication-mover"
     );
 }
 
 #[test]
-fn stream_mover_name_derives_and_truncates_like_the_chart() {
-    // The default chart wiring (`<fullname>-mover`) yields the exact name
-    // `gen-rbac` ships and the chart's streamMoverName helper renders.
+fn stream_mover_name_derives_from_the_generic_role() {
     assert_eq!(stream_mover_name("kopiur-mover"), "kopiur-stream-mover");
     assert_eq!(
         stream_mover_name("myrelease-kopiur-mover"),
         "myrelease-kopiur-stream-mover"
     );
-    // A custom role name without the conventional suffix still derives
-    // deterministically (and distinctly from the generic role).
-    assert_eq!(stream_mover_name("custom-role"), "custom-role-stream");
+    assert_eq!(stream_mover_name("custom-role"), "custom-role-stream-mover");
+}
 
-    // THE regression this test exists for: a long release name. The chart caps
-    // its role name at 63; if the controller's roleRef is not capped the same
-    // way, the RoleBinding names a role that was never created and every stream
-    // backup in the namespace dies on a forbidden `pods/exec`.
-    let long = format!("{}-mover", "r".repeat(80));
-    let derived = stream_mover_name(&long);
-    assert_eq!(
-        derived.len(),
-        63,
-        "capped at the DNS-1123 label limit: {derived}"
-    );
-    // Sprig `trunc 63` is a plain byte prefix of the same pre-truncation string.
-    assert_eq!(derived, format!("{}-stream-mover", "r".repeat(80))[..63]);
+/// THE regression test for the stream mover's roleRef.
+///
+/// The controller only ever sees `KOPIUR_MOVER_CLUSTERROLE` — the chart's
+/// `kopiur.moverName` — and derives the two dedicated mover identities from it. If
+/// the derivation and the chart disagree at ANY `fullname` length, or if two of the
+/// three names collapse onto one, the failure is a silent privilege merge, not a
+/// 404: a RoleBinding whose `roleRef` resolves to the GENERIC mover role passes
+/// escalation prevention and applies cleanly, and the stream Job then runs on the
+/// ServiceAccount every ordinary mover Job uses. At `fullname` 62-63 the CHART
+/// itself used to render the `pods/exec` stream role and the generic mover role
+/// under one object name, so template file ordering decided whether every ordinary
+/// mover Job in every namespace inherited `pods/exec`.
+///
+/// So this sweeps the whole reachable band and asserts THREE properties, not one:
+///  1. the chart's name equals what the controller derives from the chart's mover
+///     name (both sides agree);
+///  2. all three names are pairwise distinct (privilege separation survives the
+///     cap);
+///  3. every emitted name is a valid ≤63-byte DNS-1123 subdomain.
+///
+/// The old version of this test fed `"r".repeat(80) + "-mover"` — an 86-byte base
+/// the chart can never emit — so it only ever exercised the unreachable case, and
+/// asserted that `trunc 63` was PRESENT in the template rather than that the two
+/// sides agreed.
+#[test]
+fn mover_identity_names_agree_with_the_chart_at_every_length() {
+    // `fullname` is itself `trunc 63`-capped by the chart, so 63 is the whole
+    // reachable range. The band that broke starts at 58; sweep from 50 for margin,
+    // and include adversarial shapes: a 36-byte cut landing on a dash (so
+    // `trimSuffix` fires), and names that already END in a mover suffix — the
+    // inputs a plain append-and-cap scheme collides on.
+    let mut fullnames: Vec<String> = (50..=63).map(|n| "r".repeat(n)).collect();
+    fullnames.push(format!("{}-{}", "a".repeat(35), "b".repeat(27))); // cut lands on '-'
+    fullnames.push(format!("{}-stream", "c".repeat(50))); // 57, ends "-stream"
+    fullnames.push(format!("{}-stream-mover", "d".repeat(50))); // 63, ends "-stream-mover"
+    fullnames.push(format!("{}-snapshot-replication-mover", "e".repeat(36))); // 63
+    fullnames.push("kopiur".to_string()); // the default release
+    fullnames.push("k".to_string()); // shortest plausible
 
-    // `trimSuffix "-"` drops a trailing separator left by the cut, so the cap can
-    // never emit an invalid name. A 62-byte stem puts the `-` of `-stream-mover`
-    // at byte 62, so the 63-byte cut ends exactly on the separator.
-    let stem = "s".repeat(62);
-    let cut = stream_mover_name(&format!("{stem}-mover"));
-    assert_eq!(
-        cut, stem,
-        "a cut landing on the separator must lose it, leaving a valid 62-byte name"
-    );
+    for fullname in &fullnames {
+        let base = chart_mover_base(fullname);
+        // The chart appends whole suffixes to the capped stem.
+        let chart_mover = format!("{base}-mover");
+        let chart_stream = format!("{base}-stream-mover");
+        let chart_srepl = format!("{base}-snapshot-replication-mover");
 
-    // And the SAME two steps must be in the template, or the lockstep this
-    // function claims is only a comment.
+        // (1) Both sides agree — the controller derives from the chart's mover name.
+        assert_eq!(
+            stream_mover_name(&chart_mover),
+            chart_stream,
+            "stream name diverged from the chart at fullname len {}",
+            fullname.len()
+        );
+        assert_eq!(
+            snapshot_replication_mover_name(&chart_mover),
+            chart_srepl,
+            "snapshot-replication name diverged from the chart at fullname len {}",
+            fullname.len()
+        );
+
+        // (2) Pairwise distinct: the stream role carries `pods/exec` and must never
+        // share an object name — or a minted ServiceAccount — with either sibling.
+        assert_ne!(
+            chart_stream,
+            chart_mover,
+            "the pods/exec stream role collided with the generic mover role at \
+             fullname len {}",
+            fullname.len()
+        );
+        assert_ne!(
+            chart_stream,
+            chart_srepl,
+            "the stream and snapshot-replication roles collided at fullname len {}",
+            fullname.len()
+        );
+        assert_ne!(
+            chart_srepl,
+            chart_mover,
+            "the snapshot-replication role collided with the generic mover role at \
+             fullname len {}",
+            fullname.len()
+        );
+
+        // (3) Every emitted name is applyable.
+        for name in [&chart_mover, &chart_stream, &chart_srepl] {
+            assert!(
+                is_dns1123_subdomain_63(name),
+                "not a valid <=63-byte DNS-1123 subdomain ({} bytes): {name}",
+                name.len()
+            );
+        }
+    }
+}
+
+/// The off-chart path: a hand-set `KOPIUR_MOVER_CLUSTERROLE` long enough that even
+/// the stem overflows a suffix's budget. Chart agreement is irrelevant there (that
+/// operator ships their own roles), but the three identities must still be pairwise
+/// distinct and applyable — a collision here would hand a stream Job the generic
+/// mover ServiceAccount just as surely as the chart-side one did.
+#[test]
+fn a_hand_set_mover_role_name_still_yields_three_distinct_identities() {
+    let mut bases: Vec<String> = (36..=63)
+        .map(|n| format!("{}-mover", "z".repeat(n)))
+        .collect();
+    // Adversarial: a base that ALREADY ends in one of the derived suffixes, which is
+    // what a plain truncate-and-append scheme collides on.
+    bases.push(format!("{}-stream-mover", "y".repeat(50)));
+    bases.push(format!("{}-snapshot-replication-mover", "x".repeat(36)));
+    bases.push("z".repeat(63)); // no `-mover` suffix at all
+    bases.push("acme-backup".to_string()); // short custom name
+
+    for base in &bases {
+        let stream = stream_mover_name(base);
+        let srepl = snapshot_replication_mover_name(base);
+        assert_ne!(stream, *base, "stream collided with the mover role: {base}");
+        assert_ne!(srepl, *base, "srepl collided with the mover role: {base}");
+        assert_ne!(stream, srepl, "stream collided with srepl: {base}");
+        for name in [&stream, &srepl] {
+            assert!(
+                is_dns1123_subdomain_63(name),
+                "not a valid <=63-byte DNS-1123 subdomain ({} bytes): {name}",
+                name.len()
+            );
+        }
+        // Deterministic across calls (server-side apply idempotence).
+        assert_eq!(stream, stream_mover_name(base));
+        assert_eq!(srepl, snapshot_replication_mover_name(base));
+    }
+}
+
+/// The scheme above is only real if the TEMPLATE implements it. Pin the three
+/// properties the Rust derivation depends on: one shared stem helper, capped at
+/// `MOVER_BASE_NAME_MAX`, and three names that append their suffix WHOLE with no
+/// further truncation (a `trunc 63` back on any of them re-introduces the
+/// collision this fixes).
+#[test]
+fn chart_helpers_cap_the_mover_stem_not_the_finished_name() {
     let tpl = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../deploy/helm/kopiur/templates/_helpers.tpl"
     ))
     .expect("the chart helpers template must be readable from the workspace");
-    let helper = tpl
-        .split(r#"define "kopiur.streamMoverName""#)
-        .nth(1)
-        .and_then(|rest| rest.split("{{- end }}").next())
-        .expect("kopiur.streamMoverName must exist in the chart");
+    let body = |name: &str| -> String {
+        tpl.split(&format!(r#"define "kopiur.{name}""#))
+            .nth(1)
+            .and_then(|rest| rest.split("{{- end }}").next())
+            .unwrap_or_else(|| panic!("kopiur.{name} must exist in the chart"))
+            .to_string()
+    };
+
+    let base = body("moverBaseName");
     assert!(
-        helper.contains("trunc 63") && helper.contains(r#"trimSuffix "-""#),
-        "kopiur.streamMoverName must apply `trunc 63 | trimSuffix \"-\"` to match \
-         stream_mover_name; got: {helper}"
+        base.contains(&format!("trunc {MOVER_BASE_NAME_MAX}")),
+        "kopiur.moverBaseName must cap the stem at {MOVER_BASE_NAME_MAX} (63 minus the \
+         longest mover suffix); got: {base}"
     );
+    assert!(
+        base.contains(r#"trimSuffix "-""#),
+        "kopiur.moverBaseName must drop a trailing dash left by the cut; got: {base}"
+    );
+
+    for (helper, suffix) in [
+        ("moverName", "-mover"),
+        ("streamMoverName", "-stream-mover"),
+        (
+            "snapshotReplicationMoverName",
+            "-snapshot-replication-mover",
+        ),
+    ] {
+        let h = body(helper);
+        assert!(
+            h.contains(&format!(
+                r#"printf "%s{suffix}" (include "kopiur.moverBaseName" .)"#
+            )),
+            "kopiur.{helper} must append `{suffix}` to the shared, pre-capped stem; got: {h}"
+        );
+        assert!(
+            !h.contains("trunc"),
+            "kopiur.{helper} must NOT truncate the finished name — that cuts the suffix \
+             away and collapses the pods/exec stream role onto the generic mover role; \
+             got: {h}"
+        );
+    }
 }
 
 #[test]

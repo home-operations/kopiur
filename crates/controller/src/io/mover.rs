@@ -306,18 +306,14 @@ fn wi_rolebinding_named(prefix: &str, wi_sa: &str) -> String {
 
 /// Derive the dedicated snapshot-replication mover role/ServiceAccount name
 /// from the configured generic mover role name (`ctx.mover_clusterrole`, the
-/// chart's `<fullname>-mover`). The default `kopiur-mover` yields
+/// chart's `<moverBaseName>-mover`). The default `kopiur-mover` yields
 /// `kopiur-snapshot-replication-mover` — the exact name `cargo xtask gen-rbac`
 /// ships and the Helm `kopiur.snapshotReplicationMoverName` helper renders, so
 /// the runtime RoleBinding always references the role the install actually
-/// carries. A custom role name without the `-mover` suffix gets a plain
-/// `-snapshot-replication` suffix (a deliberate, documented derivation — there
-/// is no separate config knob).
+/// carries. See [`derived_mover_name`] for the shared scheme (and for what a
+/// custom role name without the `-mover` suffix yields).
 pub fn snapshot_replication_mover_name(base: &str) -> String {
-    match base.strip_suffix("-mover") {
-        Some(stem) => format!("{stem}-snapshot-replication-mover"),
-        None => format!("{base}-snapshot-replication"),
-    }
+    derived_mover_name(base, SNAPSHOT_REPLICATION_MOVER_SUFFIX)
 }
 
 /// Resolve the identity the **snapshot-replication** mover Job runs as and
@@ -385,25 +381,81 @@ pub async fn ensure_snapshot_replication_mover_identity(
     })
 }
 
-/// Sprig's `trunc 63 | trimSuffix "-"`, in Rust.
+/// Distinguishing suffix of the dedicated stream-source mover identity, as the
+/// chart's `kopiur.streamMoverName` helper appends it.
+const STREAM_MOVER_SUFFIX: &str = "stream-mover";
+
+/// Distinguishing suffix of the dedicated snapshot-replication mover identity, as
+/// the chart's `kopiur.snapshotReplicationMoverName` helper appends it. The
+/// LONGEST suffix in the family, so it sets the chart's stem cap
+/// ([`MOVER_BASE_NAME_MAX`]).
+const SNAPSHOT_REPLICATION_MOVER_SUFFIX: &str = "snapshot-replication-mover";
+
+/// The 63-byte DNS-1123 label limit every generated mover name must fit.
+const DNS_LABEL_MAX: usize = 63;
+
+/// The chart's `kopiur.moverBaseName` cap: 63 minus the longest suffix any mover
+/// helper appends (`-snapshot-replication-mover`, 27 bytes). The chart caps the
+/// **stem** at this and then appends whole suffixes, so no suffix is ever
+/// truncated away and `kopiur.moverName` is exactly `<stem>-mover` — which is what
+/// lets [`derived_mover_name`] recover the stem losslessly from
+/// `KOPIUR_MOVER_CLUSTERROLE`.
+pub const MOVER_BASE_NAME_MAX: usize =
+    DNS_LABEL_MAX - (SNAPSHOT_REPLICATION_MOVER_SUFFIX.len() + 1);
+
+/// Sprig's `trunc <limit> | trimSuffix "-"`, in Rust.
 ///
-/// The chart caps every generated name at 63 for DNS-1123, then drops a trailing
-/// `-` so a cut that lands on a separator does not leave an invalid name. Any
-/// Rust-side name that must equal a chart-rendered one has to apply the SAME two
-/// steps, or the two agree only for short release names and diverge — silently —
-/// for long ones.
-///
-/// Byte-for-byte identical to sprig for the ASCII the chart can actually produce
-/// (Helm's `trunc` slices bytes). A multi-byte name is cut at the last char
-/// boundary at or below 63 instead of splitting a code point, because a Rust
-/// panic here would take down the reconcile and Kubernetes rejects non-ASCII
-/// names anyway. `trimSuffix` removes ONE trailing `-`, matching Go.
-fn trunc63_trim(name: &str) -> String {
-    let mut end = name.len().min(63);
+/// Helm's `trunc` slices BYTES, and `trimSuffix "-"` removes ONE trailing dash so
+/// a cut that lands on a separator does not leave an invalid name. A multi-byte
+/// name is cut at the last char boundary at or below `limit` instead of splitting
+/// a code point, because a Rust panic here would take down the reconcile and
+/// Kubernetes rejects non-ASCII names anyway.
+fn trunc_trim(name: &str, limit: usize) -> &str {
+    let mut end = name.len().min(limit);
     while end > 0 && !name.is_char_boundary(end) {
         end -= 1;
     }
-    name[..end].strip_suffix('-').unwrap_or(&name[..end]).into()
+    let cut = &name[..end];
+    cut.strip_suffix('-').unwrap_or(cut)
+}
+
+/// The shared naming scheme for every DEDICATED mover identity, derived from the
+/// generic mover role name (`KOPIUR_MOVER_CLUSTERROLE`, the chart's
+/// `<moverBaseName>-mover`) by swapping the `-mover` suffix for `suffix`.
+///
+/// **Why the cap lives on the STEM, not on the finished name.** The suffix is the
+/// only thing that separates the `pods/exec`-carrying stream role from the generic
+/// mover role. Capping the finished name (what this did before) truncates the
+/// suffix away at long release names, and then two roles that must never share an
+/// identity collapse onto one: at `fullname` 58-61 the controller derived the
+/// GENERIC mover name for a stream Job — no "role not found" breadcrumb, just the
+/// stream Job running on the ServiceAccount every ordinary mover Job uses — and at
+/// 62-63 the chart itself rendered the stream role and the generic mover role under
+/// ONE object name, so whichever template rendered last decided whether every
+/// ordinary mover Job in every namespace got `pods/exec`.
+///
+/// So the chart caps the stem at [`MOVER_BASE_NAME_MAX`] and appends whole
+/// suffixes. `<stem>-mover` then strips losslessly here, the stem is already short
+/// enough for every suffix, and chart and controller agree byte-for-byte at every
+/// `fullname` length — no truncation happens on this path at all.
+///
+/// The truncating branch is only reachable for a hand-set
+/// `KOPIUR_MOVER_CLUSTERROLE` long enough that even the stem overflows (there is no
+/// separate config knob per mover). It keeps the suffix whole and spends the
+/// reclaimed room on a stable FNV-1a hash of the stem — `<stem'>-<h8>-<suffix>` —
+/// so two long custom names stay distinct, the result stays under the label limit,
+/// and the length arithmetic makes it unable to collide with `base` itself. An
+/// operator on that path ships their own roles, so only mutual distinctness
+/// matters, not agreement with the chart.
+fn derived_mover_name(base: &str, suffix: &str) -> String {
+    let stem = base.strip_suffix("-mover").unwrap_or(base);
+    let budget = DNS_LABEL_MAX - (suffix.len() + 1);
+    if stem.len() <= budget {
+        return format!("{stem}-{suffix}");
+    }
+    let hash = crate::naming::short_hash(stem); // 8 hex chars, stable across toolchains
+    let keep = budget.saturating_sub(hash.len() + 1); // room for "-<hash>"
+    format!("{}-{hash}-{suffix}", trunc_trim(stem, keep))
 }
 
 /// The dedicated stream-source mover identity's name, derived from the generic
@@ -411,17 +463,13 @@ fn trunc63_trim(name: &str) -> String {
 ///
 /// Keep in lockstep with the chart's `kopiur.streamMoverName` helper: the
 /// controller derives the roleRef from `KOPIUR_MOVER_CLUSTERROLE`, so renaming
-/// either side alone leaves the RoleBinding pointing at a role that does not exist.
-/// That includes the chart's `trunc 63 | trimSuffix "-"` — without it a long
-/// release name yields a role the chart truncated and a roleRef the controller did
-/// not, so the RoleBinding points at a name that does not exist and every stream
-/// backup in that namespace fails on a forbidden `pods/exec`. Applied here via
-/// [`trunc63_trim`], and pinned against the template by a unit test.
+/// either side alone leaves the RoleBinding pointing at a role that does not
+/// exist — or, worse, at the GENERIC mover role, which resolves cleanly and hands
+/// the stream Job the ServiceAccount every ordinary mover Job runs as. See
+/// [`derived_mover_name`] for the scheme and why the cap sits on the stem; pinned
+/// against the template by a unit test that sweeps every `fullname` length.
 pub fn stream_mover_name(base: &str) -> String {
-    trunc63_trim(&match base.strip_suffix("-mover") {
-        Some(stem) => format!("{stem}-stream-mover"),
-        None => format!("{base}-stream"),
-    })
+    derived_mover_name(base, STREAM_MOVER_SUFFIX)
 }
 
 /// Resolve the identity a STREAM-SOURCE mover Job runs as and ensure its RBAC —
