@@ -569,3 +569,226 @@ async fn inherit_with_a_pinned_fallback_uid_proceeds_and_never_writes_the_hold()
     let _ = repos.delete(repo, &DeleteParams::default()).await;
     let _ = deploys.delete(workload, &DeleteParams::default()).await;
 }
+
+/// The storage class the `snapshot-stack` mise task installs (`csi: true` shards only —
+/// `reshape-core`, which runs this suite, is one). Mirrors `copy_methods.rs`.
+const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
+
+/// A CSI-provisioned, bound, seeded source PVC — the only kind `copyMethod: Snapshot` can
+/// stage. Deliberately NOT the shared static hostPath `e2e-src`, which has no provisioner.
+async fn csi_source_pvc(client: &Client, pvc: &str, seed_pod: &str) {
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = pvcs
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": { "name": pvc, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": CSI_STORAGE_CLASS,
+                    "resources": { "requests": { "storage": "64Mi" } },
+                },
+            })),
+        )
+        .await;
+    let _ = pods
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": { "name": seed_pod, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{
+                        "name": "seed", "image": kopiur_e2e::consts::BUSYBOX_IMAGE,
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["sh", "-c", "echo kopiur-464 > /data/marker.txt"],
+                        "volumeMounts": [{ "name": "d", "mountPath": "/data" }],
+                    }],
+                    "volumes": [{ "name": "d", "persistentVolumeClaim": { "claimName": pvc } }],
+                },
+            })),
+        )
+        .await;
+    wait_until(
+        &format!("CSI source PVC {pvc} Bound"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let bound = pvcs
+                .get_opt(pvc)
+                .await?
+                .and_then(|p| p.status.and_then(|s| s.phase))
+                .as_deref()
+                == Some("Bound");
+            Ok(bound.then_some(()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the CSI source PVC {pvc} must bind: {e}"));
+}
+
+/// #464 round 2 — the heal must SURVIVE the rest of the launch pass, on the copyMethod that
+/// actually reaches the writers that used to erase it.
+///
+/// `inherit_holds_when_the_workload_is_scaled_to_zero_then_heals_on_scale_up` covers the same
+/// hold/heal cycle, but on `copyMethod: Direct` (the base policy JSON's default), where
+/// `resolve_staging` returns `NotApplicable` and writes nothing. Under **`Snapshot`** (and
+/// `Clone`) it writes `SourceStaged` TWICE — once waiting on the VolumeSnapshot, once when
+/// the stage is ready — both LATER in the same pass than the heal. Those writers used to
+/// build their array from the reconcile-START copy, and a `conditions` merge patch REPLACES
+/// the array, so they wrote the `False` straight back; the next pass healed from a
+/// start-of-pass copy that said `False` again, forever. The Snapshot below therefore
+/// SUCCEEDS while `doctor` calls it "blocked … it will wait forever" — the exact false
+/// diagnosis this condition was added to remove, just narrowed to non-`Direct` copyMethods.
+///
+/// Requires the CSI snapshot stack, which the `reshape-core` shard (`csi: true`) installs.
+#[tokio::test]
+#[ignore = "requires the e2e harness + the CSI snapshot stack (mise run //crates/e2e:snapshot-stack)"]
+async fn the_inherit_heal_survives_a_staged_copymethod_launch_pass() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
+        return;
+    }
+    ensure_repo(&client, "moverdefaults").await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let deploys: Api<Deployment> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    let repo = "e2e-stghold-repo";
+    let policy = "e2e-stghold-policy";
+    let backup = "e2e-stghold-backup";
+    let workload = "e2e-stghold-wl";
+    let src = "e2e-stghold-src";
+
+    csi_source_pvc(&client, src, "e2e-stghold-seed").await;
+    create_idempotent(
+        &deploys,
+        &cr(inherit_workload_deployment(workload, 1, 4322)),
+        "create the inherit-source Deployment",
+    )
+    .await;
+    scale_workload(&client, workload, 1).await;
+
+    create_idempotent(
+        &repos,
+        &cr(repository_json(
+            repo,
+            "moverdefaults",
+            serde_json::json!({}),
+        )),
+        "create Repository",
+    )
+    .await;
+    wait_phase(&repos, repo, "Ready")
+        .await
+        .expect("Repository should bootstrap to Ready");
+
+    create_idempotent(
+        &policies,
+        &cr(snapshot_policy_json(
+            E2E_NAMESPACE,
+            policy,
+            "Repository",
+            repo,
+            serde_json::json!({
+                // The whole point of this sibling. `merge_spec` takes BARE spec fields, and
+                // the base JSON hardcodes `Direct` — asserted below, because a wrapper or a
+                // pruned field would silently re-run the Direct scenario and pass green.
+                "copyMethod": "Snapshot",
+                "sources": [ { "pvc": { "name": src } } ],
+                "mover": {
+                    "inheritSecurityContextFrom": {
+                        "workloadSelector": { "podSelector": { "matchLabels": { "app": workload } } }
+                    }
+                }
+            }),
+        )),
+        "create SnapshotPolicy with copyMethod: Snapshot and a workloadSelector inherit",
+    )
+    .await;
+    // Read it back: the overlay must have LANDED. (The e2e-overlay gotcha — a `{"spec": ...}`
+    // wrapper is dropped by serde AND pruned by the apiserver.)
+    let landed = policies.get(policy).await.expect("read the policy back");
+    assert_eq!(
+        landed.spec.copy_method,
+        kopiur_api::CopyMethod::Snapshot,
+        "the copyMethod overlay must land, or this test silently re-runs the Direct scenario"
+    );
+
+    scale_workload(&client, workload, 0).await;
+    create_idempotent(
+        &backups,
+        &cr(snapshot_json(
+            E2E_NAMESPACE,
+            backup,
+            policy,
+            serde_json::json!({}),
+        )),
+        "create Snapshot",
+    )
+    .await;
+
+    // (1) HELD, exactly as on the Direct path.
+    wait_security_context_resolved(&backups, backup, "False", "InheritSourceMissing").await;
+    assert!(
+        jobs.get_opt(backup)
+            .await
+            .expect("list mover Jobs")
+            .is_none(),
+        "a held run must not launch a mover Job"
+    );
+
+    // (2) Scale back up: the SAME Snapshot stages a CSI VolumeSnapshot and runs.
+    scale_workload(&client, workload, 1).await;
+    let job = wait_for_job(&jobs, backup).await;
+    assert_eq!(
+        job_container_sc(&job).and_then(|sc| sc.run_as_group),
+        Some(4322),
+        "the mover must carry the workload's INHERITED runAsGroup"
+    );
+    wait_phase(&backups, backup, "Succeeded")
+        .await
+        .expect("the previously-held staged Snapshot must complete once the workload is back");
+
+    // (3) THE ROUND-2 GUARD. The run staged (so both `SourceStaged` writers fired after the
+    //     heal) and finished — and the gate must read `True`. Before the fix this is `False`,
+    //     durably, on a Snapshot that Succeeded.
+    let done = backups.get(backup).await.expect("read the Snapshot back");
+    let staged_ready = done
+        .status
+        .as_ref()
+        .and_then(|s| s.staged.as_ref())
+        .and_then(|s| s.ready);
+    assert_eq!(
+        staged_ready,
+        Some(true),
+        "the run must actually have STAGED, or it never reached the clobbering writers: {:#?}",
+        done.status
+    );
+    let (status, reason, _) = security_context_resolved(&backups, backup)
+        .await
+        .expect("the condition must still be present, healed rather than removed");
+    assert_eq!(
+        (status.as_str(), reason.as_str()),
+        ("True", "InheritSourceResolved"),
+        "the heal must survive staging's status writes, or doctor reports a succeeded backup \
+         as blocked forever"
+    );
+
+    // Cleanup.
+    let _ = backups.delete(backup, &DeleteParams::default()).await;
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = repos.delete(repo, &DeleteParams::default()).await;
+    let _ = deploys.delete(workload, &DeleteParams::default()).await;
+}

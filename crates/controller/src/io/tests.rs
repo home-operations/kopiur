@@ -4413,7 +4413,11 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
     // (`io::heal_inherit_source_missing`, reason `InheritSourceResolved`) once
     // resolution succeeds, because the object that was parked is the object that
     // then goes `Running` — and `doctor` suppresses a stale gate only on a
-    // TERMINAL phase. Pinned by `inherit_source_heal_conditions_*`.
+    // TERMINAL phase. Pinned by `inherit_source_heal_conditions_*` for the flip itself, and
+    // by `snapshot::tests::the_inherit_heal_survives_the_rest_of_the_launch_pass` /
+    // `restore::tests::the_fanout_status_body_preserves_a_healed_inherit_hold` for the half
+    // that decides whether it STICKS: every conditions writer that can follow the heal in
+    // the same pass seeds from `io::live_conditions`, not the reconcile-start copy.
     (
         kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
         false,

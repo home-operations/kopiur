@@ -1377,7 +1377,12 @@ async fn drive_populator_fanout(
         .as_ref()
         .map(serde_json::to_value)
         .transpose()?;
-    let status = fanout_status(restore, &prev, &next, &gone);
+    // LIVE conditions base. This is the pass's only top-level status write, but
+    // `drive_one_claim` above already patched the same array from inside
+    // `run_restore_mover` (the `CredentialsAvailable` clear, the #464 inherit heal) — and a
+    // `conditions` patch REPLACES it. See `fanout_status`.
+    let base = io::live_conditions(api, name, restore).await;
+    let status = fanout_status(restore, &base, &prev, &next, &gone);
     io::patch_status_if_changed(api, name, current.as_ref(), status).await?;
 
     run_deferred_finalizers(ctx, namespace, name, finalizers).await?;
@@ -3487,12 +3492,17 @@ async fn run_restore_mover(
     // hold is actually standing, so a run that was never held stays byte-identical.
     //
     // Placed HERE, past the "clear any stale MoverPermitted/CredentialsAvailable" blocks
-    // above rather than at the resolve site, for the reason those blocks force: each rebuilds
-    // `conditions` from the RECONCILE-START copy, so a condition written before them is
-    // erased and then re-written next pass, forever (the same hazard documented at
-    // `report_restore_inherit_fallback`). The runs this placement skips are the ones those
-    // gates refuse — and they carry their own registered `Fail` row, so `doctor` still
-    // reports them as blocked, which they are.
+    // above rather than at the resolve site, because each of those still rebuilds
+    // `conditions` from the RECONCILE-START copy and a `conditions` patch REPLACES the array
+    // — a heal written before them would simply be erased. The runs this placement skips are
+    // the ones those gates refuse, and they carry their own registered `Fail` row, so
+    // `doctor` still reports them as blocked, which they are.
+    //
+    // Everything that can write `conditions` AFTER this point in the pass instead seeds from
+    // `io::live_conditions`, which is what makes the heal DURABLE: the direct path's
+    // `MoverOutcome` arms already did, and the populator's end-of-pass body now does too (see
+    // `plan::fanout_status`). Adding a later writer that seeds from the start-of-pass copy
+    // re-opens the bug.
     io::heal_inherit_source_missing(api, restore).await?;
     let creds_secrets = io::plain_creds(creds.names);
 
