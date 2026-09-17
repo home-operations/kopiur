@@ -1,6 +1,10 @@
 //! `kubectl kopiur restore` — the one-liner over the `Restore` CRD: exactly
 //! one source (snapshot / policy / raw identity) into exactly one target
 //! (created PVC / existing PVC / populator), with optional wait + log stream.
+//!
+//! `target.streamExec` (#451) is deliberately NOT here: piping one virtual file
+//! into a command in a running Pod needs a selector, a container and an argv,
+//! which is a manifest shape rather than a flag set. It is refused by name.
 
 use chrono::{DateTime, Utc};
 use kopiur_api::common::{CredentialProjection, FailurePolicy, ObjectRef, RepositoryRef};
@@ -65,12 +69,76 @@ fn restore_options_from_args(args: &RestoreArgs) -> Option<RestoreOptions> {
     })
 }
 
+/// **Pure.** Map the target flags onto exactly one [`RestoreTarget`].
+///
+/// Total, with no `_` arm and no `unreachable!`. clap's `target` ArgGroup is
+/// `required(true)` and mutually exclusive, so the refusing arm should be dead —
+/// but "should be" is not a type, and this is the CLI's user-facing entry point:
+/// a regression in the group wiring would turn a mistyped flag into a panicked
+/// binary with a backtrace instead of a sentence telling the user which flags
+/// exist. The refusal also carries the one target the CLI genuinely cannot build,
+/// `streamExec`, so a user looking for it is pointed at the manifest rather than
+/// left to conclude the feature is missing.
+///
+/// [`RestoreTarget`] has a fourth variant this function never produces. That gap
+/// is deliberate and pinned by `cli_builds_every_restore_target_it_supports`,
+/// which matches the enum exhaustively — so a fifth variant has to decide whether
+/// the CLI grows a flag for it or joins the manifest-only list.
+fn restore_target_from_args(args: &RestoreArgs) -> Result<RestoreTarget, CliError> {
+    match (&args.to_pvc, &args.create_pvc, args.populator) {
+        (Some(existing), None, false) => Ok(RestoreTarget::PvcRef(ObjectRef {
+            name: existing.clone(),
+            namespace: None,
+        })),
+        (None, Some(create), false) => Ok(RestoreTarget::Pvc(PvcTemplate {
+            name: create.clone(),
+            storage_class_name: args.storage_class.clone(),
+            capacity: args.size.clone(),
+            access_modes: args.access_modes.clone(),
+        })),
+        (None, None, true) => Ok(RestoreTarget::Populator(PopulatorTarget {})),
+        // Every remaining combination, spelled out rather than `_`: none given,
+        // or more than one.
+        (None, None, false)
+        | (Some(_), Some(_), _)
+        | (Some(_), None, true)
+        | (None, Some(_), true) => Err(CliError::UnresolvedRestoreTarget {
+            given: target_flags_given(args),
+        }),
+    }
+}
+
+/// The target flags actually present, for [`CliError::UnresolvedRestoreTarget`]'s
+/// message. Pure; `none` rather than an empty list so the sentence still reads.
+fn target_flags_given(args: &RestoreArgs) -> String {
+    let given: Vec<&str> = [
+        ("--to-pvc", args.to_pvc.is_some()),
+        ("--create-pvc", args.create_pvc.is_some()),
+        ("--populator", args.populator),
+    ]
+    .into_iter()
+    .filter_map(|(flag, present)| present.then_some(flag))
+    .collect();
+    if given.is_empty() {
+        "none".to_string()
+    } else {
+        given.join(", ")
+    }
+}
+
 /// Build the `Restore` CR from the parsed flags. Pure — `now` is injected so
 /// names are deterministic under test. The exactly-one-of invariants are
 /// enforced by clap groups; this maps each flag set 1:1 onto the
 /// externally-tagged enums (no field may be dropped — the restore-options bug
 /// class is regression-tested below).
-pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) -> Restore {
+///
+/// Fallible only through [`restore_target_from_args`]: with a well-formed flag
+/// set (which clap guarantees) it always succeeds.
+pub fn build_restore(
+    args: &RestoreArgs,
+    namespace: &str,
+    now: DateTime<Utc>,
+) -> Result<Restore, CliError> {
     let source = match (&args.from_snapshot, &args.from_policy, &args.identity) {
         (Some(snapshot), None, None) => RestoreSource::SnapshotRef(ObjectRef {
             name: snapshot.clone(),
@@ -96,20 +164,7 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
         _ => unreachable!("clap group enforces exactly one source"),
     };
 
-    let target = match (&args.to_pvc, &args.create_pvc, args.populator) {
-        (Some(existing), None, false) => RestoreTarget::PvcRef(ObjectRef {
-            name: existing.clone(),
-            namespace: None,
-        }),
-        (None, Some(create), false) => RestoreTarget::Pvc(PvcTemplate {
-            name: create.clone(),
-            storage_class_name: args.storage_class.clone(),
-            capacity: args.size.clone(),
-            access_modes: args.access_modes.clone(),
-        }),
-        (None, None, true) => RestoreTarget::Populator(PopulatorTarget {}),
-        _ => unreachable!("clap group enforces exactly one target"),
-    };
+    let target = restore_target_from_args(args)?;
 
     let repository = args.repository.as_ref().map(|name| RepositoryRef {
         kind: args.repository_kind.into(),
@@ -164,7 +219,7 @@ pub fn build_restore(args: &RestoreArgs, namespace: &str, now: DateTime<Utc>) ->
         },
     );
     restore.metadata.namespace = Some(namespace.to_string());
-    restore
+    Ok(restore)
 }
 
 /// Terminal-phase classification. Exhaustive over [`RestorePhase`].
@@ -316,7 +371,7 @@ pub async fn run(
     }
     let ns = ctx.namespace.as_str();
     let restores: Api<Restore> = Api::namespaced(ctx.client.clone(), ns);
-    let restore = build_restore(args, ns, now);
+    let restore = build_restore(args, ns, now)?;
     let name = restore.metadata.name.clone().expect("name set by builder");
     let created = restores
         .create(&PostParams::default(), &restore)
@@ -463,7 +518,7 @@ mod tests {
                 let mut flags: Vec<&str> = source_flags.to_vec();
                 flags.extend_from_slice(target_flags);
                 let args = parse(&flags);
-                let restore = build_restore(&args, "media", at());
+                let restore = build_restore(&args, "media", at()).expect("valid target flags");
                 assert_eq!(restore.spec.source.kind_str(), source_kind, "{flags:?}");
                 assert_eq!(restore.spec.target.kind_str(), target_kind, "{flags:?}");
                 // Round-trip through JSON (the cluster's encoding).
@@ -472,6 +527,81 @@ mod tests {
                 assert_eq!(reparsed.spec, restore.spec);
             }
         }
+    }
+
+    #[test]
+    fn cli_builds_every_restore_target_it_supports() {
+        // THE compile-time obligation. `RestoreTarget` is matched exhaustively
+        // here, so a fifth variant cannot land without deciding whether the CLI
+        // grows a flag for it or is documented as manifest-only. Without this,
+        // a new target silently becomes unreachable from `kubectl kopiur restore`
+        // and nothing says so.
+        let flags_for = |t: &RestoreTarget| -> Option<Vec<&'static str>> {
+            match t {
+                RestoreTarget::PvcRef(_) => Some(vec!["--to-pvc", "existing"]),
+                RestoreTarget::Pvc(_) => Some(vec!["--create-pvc", "fresh", "--size", "1Gi"]),
+                RestoreTarget::Populator(_) => Some(vec!["--populator"]),
+                // Manifest-only: piping a virtual file into a command in a running
+                // Pod needs a selector, a container and an argv, which is a YAML
+                // shape rather than a flag set. The refusal message names it.
+                RestoreTarget::StreamExec(_) => None,
+            }
+        };
+
+        // Each supported target's flags really do build that target.
+        for (target, expected) in [
+            (
+                RestoreTarget::PvcRef(ObjectRef {
+                    name: "existing".into(),
+                    namespace: None,
+                }),
+                "PvcRef",
+            ),
+            (
+                RestoreTarget::Pvc(PvcTemplate {
+                    name: "fresh".into(),
+                    storage_class_name: None,
+                    capacity: Some("1Gi".into()),
+                    access_modes: vec![],
+                }),
+                "Pvc",
+            ),
+            (RestoreTarget::Populator(PopulatorTarget {}), "Populator"),
+        ] {
+            let flags = flags_for(&target).expect("a supported target has flags");
+            let mut all = vec!["--from-snapshot", "snap1"];
+            all.extend_from_slice(&flags);
+            let built = restore_target_from_args(&parse(&all)).expect("supported target");
+            assert_eq!(built.kind_str(), expected, "{flags:?}");
+            assert_eq!(built.kind_str(), target.kind_str());
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_target_names_the_flags_and_the_manifest_only_one() {
+        // clap should make this unreachable; if its group wiring ever regresses,
+        // the CLI must print a sentence rather than panic with a backtrace.
+        let mut args = parse(&["--from-snapshot", "snap1", "--populator"]);
+        args.populator = false; // simulate the group letting "no target" through
+        let err = restore_target_from_args(&args).expect_err("no target is a refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("(none)"), "names what was seen: {msg}");
+        assert!(msg.contains("--to-pvc") && msg.contains("--create-pvc"));
+        // The one target the CLI genuinely cannot build is named, so a user after
+        // it is sent to the manifest instead of concluding it does not exist.
+        assert!(msg.contains("streamExec"), "{msg}");
+        assert!(msg.contains("docs/stream-sources.md"), "{msg}");
+
+        // More than one target is the same refusal, and lists both.
+        let mut two = parse(&["--from-snapshot", "snap1", "--to-pvc", "existing"]);
+        two.populator = true;
+        let msg = restore_target_from_args(&two)
+            .expect_err("two targets")
+            .to_string();
+        assert!(
+            msg.contains("--to-pvc, --populator"),
+            "lists every flag seen: {msg}"
+        );
     }
 
     #[test]
@@ -514,7 +644,7 @@ mod tests {
             "--to-pvc",
             "scratch",
         ]);
-        let restore = build_restore(&args, "media", at());
+        let restore = build_restore(&args, "media", at()).expect("valid target flags");
         match &restore.spec.source {
             RestoreSource::FromPolicy(p) => {
                 assert_eq!(p.source_path.as_deref(), Some("/pvc/postgres-data"));
@@ -523,7 +653,11 @@ mod tests {
         }
         // Absent ⇒ absent on the wire (the derivation applies).
         let bare = parse(&["--from-policy", "nightly", "--to-pvc", "scratch"]);
-        match &build_restore(&bare, "media", at()).spec.source {
+        match &build_restore(&bare, "media", at())
+            .expect("valid target flags")
+            .spec
+            .source
+        {
             RestoreSource::FromPolicy(p) => assert!(p.source_path.is_none()),
             other => panic!("expected fromPolicy, got {other:?}"),
         }
@@ -650,7 +784,9 @@ mod tests {
             args.on_missing_snapshot,
             Some(OnMissingSnapshotArg::Continue)
         );
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
+        let wire =
+            serde_json::to_value(build_restore(&args, "media", at()).expect("valid target flags"))
+                .unwrap();
         assert_eq!(wire["metadata"]["name"], "my-restore");
         let spec = &wire["spec"];
         assert_eq!(spec["source"]["fromPolicy"]["name"], "pol1");
@@ -707,7 +843,9 @@ mod tests {
             "--skip-existing",
             "true",
         ]);
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
+        let wire =
+            serde_json::to_value(build_restore(&args, "media", at()).expect("valid target flags"))
+                .unwrap();
         let opts = &wire["spec"]["options"];
         assert_eq!(opts["parallel"], 4);
         assert_eq!(opts["writeSparseFiles"], true);
@@ -726,7 +864,9 @@ mod tests {
     #[test]
     fn minimal_restore_has_no_optional_noise_on_the_wire() {
         let args = parse(&["--from-snapshot", "snap1", "--to-pvc", "data"]);
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
+        let wire =
+            serde_json::to_value(build_restore(&args, "media", at()).expect("valid target flags"))
+                .unwrap();
         assert_eq!(wire["metadata"]["name"], "restore-snap1-20260611030012");
         let spec = &wire["spec"];
         assert_eq!(spec["source"]["snapshotRef"]["name"], "snap1");
@@ -745,7 +885,9 @@ mod tests {
             "data",
             "--credential-projection",
         ]);
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
+        let wire =
+            serde_json::to_value(build_restore(&args, "media", at()).expect("valid target flags"))
+                .unwrap();
         assert_eq!(wire["spec"]["credentialProjection"]["enabled"], true);
     }
 
@@ -761,7 +903,9 @@ mod tests {
             "--to-pvc",
             "x",
         ]);
-        let wire = serde_json::to_value(build_restore(&args, "media", at())).unwrap();
+        let wire =
+            serde_json::to_value(build_restore(&args, "media", at()).expect("valid target flags"))
+                .unwrap();
         assert_eq!(wire["spec"]["source"]["identity"]["snapshotID"], "abc123");
         assert_eq!(wire["spec"]["source"]["identity"]["username"], "u");
         assert_eq!(wire["spec"]["source"]["identity"]["sourcePath"], "/p");
@@ -787,7 +931,7 @@ mod tests {
         // serialized directly; the CLI must emit the cluster's plain-mapping
         // encoding (via a JSON Value) so the output is kubectl-applyable.
         let args = parse(&["--from-snapshot", "snap1", "--to-pvc", "data"]);
-        let restore = build_restore(&args, "media", at());
+        let restore = build_restore(&args, "media", at()).expect("valid target flags");
         let value = serde_json::to_value(&restore).unwrap();
         let yaml = serde_yaml::to_string(&value).unwrap();
         assert!(yaml.contains("snapshotRef:"), "{yaml}");

@@ -448,17 +448,28 @@ pub struct StreamExec {
     /// spec, so anyone with `pods:get` in the namespace can read it.
     #[schemars(length(min = 1))]
     pub command: Vec<String>,
-    /// Go duration bounding the command (e.g. `2h`); absent uses
-    /// [`DEFAULT_STREAM_TIMEOUT`]. On expiry the command is abandoned and the run
-    /// fails, leaving no snapshot behind.
+    /// Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the
+    /// command is abandoned and the run fails, leaving no snapshot behind.
+    ///
+    /// The same bound applies whether this exec is a backup's producer or a
+    /// `streamExec` restore's consumer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_stream_timeout")]
     pub timeout: Option<String>,
 }
 
-/// Default bound on a stream producer/consumer command when `timeout` is unset.
-/// Generous enough for a large logical dump, finite so a wedged command cannot pin
-/// a mover Job forever.
-pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 3600;
+/// schemars default for [`StreamExec::timeout`] —
+/// [`DEFAULT_STREAM_TIMEOUT_SECS`](crate::consts::DEFAULT_STREAM_TIMEOUT_SECS)
+/// (`1h`) rendered as the Go duration string the field takes.
+///
+/// Context-free per api-conventions §4a: BOTH resolution sites (the backup Job
+/// build in `snapshot::build` and the restore Job build in `restore`) map an
+/// absent — or unparseable — `timeout` to exactly that constant, and the field
+/// means the same thing as a producer and as a consumer, so materializing `1h`
+/// server-side changes no behavior. A unit test pins `"1h"` to the constant.
+fn default_stream_timeout() -> Option<String> {
+    Some("1h".to_string())
+}
 
 /// The four mutually-exclusive forms a [`Source`] can take, resolved from its
 /// sibling `Option`s.
@@ -468,6 +479,14 @@ pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 3600;
 /// this enum EXHAUSTIVELY — so a fifth source form cannot compile until backup Job
 /// construction, validation, and identity resolution each account for it. Borrowed,
 /// so callers match without cloning.
+///
+/// Not to be confused with the private `expand::SourceShape`, a narrower classifier
+/// used only by [`restore_source_path`](crate::expand::restore_source_path): that one
+/// answers "can this source's kopia path be derived from the restore's target PVC?",
+/// keeps only the fields that decision needs, and tolerates a malformed stored object
+/// with an `Invalid` arm where this resolver returns a
+/// [`ValidationError`](crate::error::ValidationError). Adding a form here means adding
+/// an arm there.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SourceShape<'a> {
     /// One PVC named directly.
@@ -2206,6 +2225,47 @@ preflight:
         );
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["lastSuccessfulSnapshot"], "2026-06-09T02:00:00Z");
+    }
+
+    // --- stream source (spec.sources[].stream) -------------------------------
+
+    #[test]
+    fn stream_timeout_schema_default_is_the_shared_constant() {
+        // api-conventions §4a: a context-free default, safe to server-side
+        // materialize because BOTH resolution sites (the backup Job build and the
+        // restore Job build) map an absent/unparseable `timeout` to exactly
+        // DEFAULT_STREAM_TIMEOUT_SECS. Asserted on the REAL CRD, and on both CRDs
+        // that embed `StreamExec` — a producer and a consumer must not disagree
+        // about how long they are allowed to run.
+        let policy = serde_json::to_value(SnapshotPolicy::crd()).unwrap();
+        let src = &policy["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["sources"]["items"]["properties"]["stream"]["properties"]["workloadExec"]
+            ["properties"]["timeout"]["default"];
+        assert_eq!(src, &serde_json::json!("1h"));
+
+        let restore = serde_json::to_value(crate::Restore::crd()).unwrap();
+        let tgt = &restore["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["target"]["properties"]["streamExec"]["properties"]["workloadExec"]["properties"]
+            ["timeout"]["default"];
+        assert_eq!(
+            tgt, src,
+            "the producer and consumer timeout defaults come from one constant"
+        );
+    }
+
+    #[test]
+    fn stream_timeout_schema_default_matches_the_duration_constant() {
+        // The schema default is a Go duration STRING but the controller resolves an
+        // absent value to a seconds constant. If someone edits one and not the
+        // other, the materialized value stops matching the resolver and the
+        // default is no longer behavior-preserving — which §4a forbids.
+        let rendered = default_stream_timeout().expect("a default is emitted");
+        assert_eq!(
+            crate::duration::parse_go_duration(&rendered)
+                .expect("the emitted default must be a parseable Go duration")
+                .as_secs(),
+            crate::consts::DEFAULT_STREAM_TIMEOUT_SECS
+        );
     }
 
     // --- policy-deletion cascade (spec.deletion.onPolicyDelete) --------------

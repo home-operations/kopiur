@@ -2459,7 +2459,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector` ·
 | `command` | []string | **required**<br><sub>minItems 1</sub> | The argv to execute. NOT a shell line: element 0 is the program, so use `["sh", "-ec", "..."]` explicitly if you want shell semantics.<br>Reference credentials through the container's existing environment or mounted Secrets — never inline them here. This argv is copied into the mover Pod's spec, so anyone with `pods:get` in the namespace can read it. |
 | `podSelector` | core/v1 LabelSelector | **required** | Standard label selector identifying the workload Pod, resolved in the `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an empty selector matches every Pod in the namespace. |
 | `container` | string | — | Container to exec in; absent uses the Pod's default container. |
-| `timeout` | string | — | Go duration bounding the command (e.g. `2h`); absent uses `DEFAULT_STREAM_TIMEOUT`. On expiry the command is abandoned and the run fails, leaving no snapshot behind. |
+| `timeout` | string | `1h` | Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the command is abandoned and the run fails, leaving no snapshot behind.<br>The same bound applies whether this exec is a backup's producer or a `streamExec` restore's consumer. |
 
 #### `spec.staging` { #snapshotpolicy-spec-staging }
 
@@ -3129,7 +3129,7 @@ Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef` �
 | `command` | []string | **required**<br><sub>minItems 1</sub> | The argv to execute. NOT a shell line: element 0 is the program, so use `["sh", "-ec", "..."]` explicitly if you want shell semantics.<br>Reference credentials through the container's existing environment or mounted Secrets — never inline them here. This argv is copied into the mover Pod's spec, so anyone with `pods:get` in the namespace can read it. |
 | `podSelector` | core/v1 LabelSelector | **required** | Standard label selector identifying the workload Pod, resolved in the `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an empty selector matches every Pod in the namespace. |
 | `container` | string | — | Container to exec in; absent uses the Pod's default container. |
-| `timeout` | string | — | Go duration bounding the command (e.g. `2h`); absent uses `DEFAULT_STREAM_TIMEOUT`. On expiry the command is abandoned and the run fails, leaving no snapshot behind. |
+| `timeout` | string | `1h` | Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the command is abandoned and the run fails, leaving no snapshot behind.<br>The same bound applies whether this exec is a backup's producer or a `streamExec` restore's consumer. |
 
 #### `spec.credentialProjection` { #restore-spec-credentialprojection }
 

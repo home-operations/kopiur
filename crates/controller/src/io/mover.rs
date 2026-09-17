@@ -385,17 +385,43 @@ pub async fn ensure_snapshot_replication_mover_identity(
     })
 }
 
+/// Sprig's `trunc 63 | trimSuffix "-"`, in Rust.
+///
+/// The chart caps every generated name at 63 for DNS-1123, then drops a trailing
+/// `-` so a cut that lands on a separator does not leave an invalid name. Any
+/// Rust-side name that must equal a chart-rendered one has to apply the SAME two
+/// steps, or the two agree only for short release names and diverge — silently —
+/// for long ones.
+///
+/// Byte-for-byte identical to sprig for the ASCII the chart can actually produce
+/// (Helm's `trunc` slices bytes). A multi-byte name is cut at the last char
+/// boundary at or below 63 instead of splitting a code point, because a Rust
+/// panic here would take down the reconcile and Kubernetes rejects non-ASCII
+/// names anyway. `trimSuffix` removes ONE trailing `-`, matching Go.
+fn trunc63_trim(name: &str) -> String {
+    let mut end = name.len().min(63);
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].strip_suffix('-').unwrap_or(&name[..end]).into()
+}
+
 /// The dedicated stream-source mover identity's name, derived from the generic
 /// mover role name the same way [`snapshot_replication_mover_name`] is.
 ///
 /// Keep in lockstep with the chart's `kopiur.streamMoverName` helper: the
 /// controller derives the roleRef from `KOPIUR_MOVER_CLUSTERROLE`, so renaming
 /// either side alone leaves the RoleBinding pointing at a role that does not exist.
+/// That includes the chart's `trunc 63 | trimSuffix "-"` — without it a long
+/// release name yields a role the chart truncated and a roleRef the controller did
+/// not, so the RoleBinding points at a name that does not exist and every stream
+/// backup in that namespace fails on a forbidden `pods/exec`. Applied here via
+/// [`trunc63_trim`], and pinned against the template by a unit test.
 pub fn stream_mover_name(base: &str) -> String {
-    match base.strip_suffix("-mover") {
+    trunc63_trim(&match base.strip_suffix("-mover") {
         Some(stem) => format!("{stem}-stream-mover"),
         None => format!("{base}-stream"),
-    }
+    })
 }
 
 /// Resolve the identity a STREAM-SOURCE mover Job runs as and ensure its RBAC —

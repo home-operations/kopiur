@@ -832,7 +832,7 @@ async fn run_operation(
 async fn restore_stream(
     client: &KopiaClient,
     op: &RestoreOp,
-    consumer: &kopiur_mover::workspec::StreamConsumerSpec,
+    consumer: &kopiur_mover::workspec::StreamExecSpec,
 ) -> Result<StatusUpdate> {
     // Only a controller-resolved id is supported: the deferred `Resolve` path pins
     // its choice through the StatusReporter, which this path does not carry. The

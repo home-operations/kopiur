@@ -185,6 +185,27 @@ pub enum CliError {
         candidates: String,
     },
 
+    /// The `restore` flags did not map onto exactly one `RestoreTarget`.
+    ///
+    /// Two distinct causes share one variant because the fix is the same: clap's
+    /// `target` ArgGroup should make both impossible, so reaching this means
+    /// either the group config regressed or the requested target has no flag.
+    /// Notably `target.streamExec` is manifest-only — there is no flag for it —
+    /// so the message names it rather than leaving a user guessing.
+    #[error(
+        "no single restore target was resolved from the flags ({given}). \
+         `kubectl kopiur restore` supports --to-pvc (existing PVC), --create-pvc \
+         (operator-created PVC) and --populator (passive volume populator). \
+         A `target.streamExec` restore — piping one virtual file into a command in \
+         a running Pod — is not available from the CLI yet. \
+         Fix: pass exactly one of those three flags, or apply a `Restore` manifest \
+         with the target you want (see docs/stream-sources.md for streamExec)"
+    )]
+    UnresolvedRestoreTarget {
+        /// Which target flags were seen, for the message.
+        given: String,
+    },
+
     /// A migration input (VolSync object / restic Secret) can't be translated.
     #[error("{what}. Fix: {fix}")]
     MigrationInput {

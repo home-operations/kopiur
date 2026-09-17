@@ -78,7 +78,7 @@ pub(super) fn build_backup_run(
             (
                 path,
                 None,
-                Some(kopiur_mover::workspec::StreamProducerSpec {
+                Some(kopiur_mover::workspec::StreamExecSpec {
                     namespace: namespace.to_string(),
                     pod_selector: selector,
                     container: stream.workload_exec.container.clone(),
@@ -90,7 +90,7 @@ pub(super) fn build_backup_run(
                         .as_deref()
                         .and_then(kopiur_api::duration::parse_go_duration)
                         .map(|d| d.as_secs())
-                        .unwrap_or(kopiur_api::snapshot_policy::DEFAULT_STREAM_TIMEOUT_SECS),
+                        .unwrap_or(kopiur_api::consts::DEFAULT_STREAM_TIMEOUT_SECS),
                 }),
             )
         }

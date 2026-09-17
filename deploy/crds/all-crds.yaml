@@ -9180,10 +9180,13 @@ spec:
                                   type: object
                               type: object
                             timeout:
+                              default: 1h
                               description: |-
-                                Go duration bounding the command (e.g. `2h`); absent uses
-                                [`DEFAULT_STREAM_TIMEOUT`]. On expiry the command is abandoned and the run
-                                fails, leaving no snapshot behind.
+                                Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the
+                                command is abandoned and the run fails, leaving no snapshot behind.
+
+                                The same bound applies whether this exec is a backup's producer or a
+                                `streamExec` restore's consumer.
                               nullable: true
                               type: string
                           required:
@@ -12055,10 +12058,13 @@ spec:
                                 type: object
                             type: object
                           timeout:
+                            default: 1h
                             description: |-
-                              Go duration bounding the command (e.g. `2h`); absent uses
-                              [`DEFAULT_STREAM_TIMEOUT`]. On expiry the command is abandoned and the run
-                              fails, leaving no snapshot behind.
+                              Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the
+                              command is abandoned and the run fails, leaving no snapshot behind.
+
+                              The same bound applies whether this exec is a backup's producer or a
+                              `streamExec` restore's consumer.
                             nullable: true
                             type: string
                         required:

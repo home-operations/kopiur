@@ -410,6 +410,25 @@ fn populator_state_depends_on_target_variant() {
         })),
         PopulatorState::DirectTarget
     );
+    // `streamExec` is operator-driven too: the mover reads one virtual file and
+    // pipes it into a command, and nothing ever claims the Restore. Pinned here
+    // because the OTHER classification would be silently catastrophic — an
+    // `AwaitingClaim` streamExec restore would sit passive forever waiting for a
+    // `dataSourceRef` that can never arrive, since it writes no PVC to claim.
+    assert_eq!(
+        populator_state(&RestoreTarget::StreamExec(
+            kopiur_api::restore::StreamExecTarget {
+                file_name: "postgres.sql".into(),
+                workload_exec: kopiur_api::snapshot_policy::StreamExec {
+                    pod_selector: Default::default(),
+                    container: None,
+                    command: vec!["psql".into()],
+                    timeout: None,
+                },
+            }
+        )),
+        PopulatorState::DirectTarget
+    );
 }
 
 #[test]

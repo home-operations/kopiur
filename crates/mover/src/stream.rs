@@ -36,7 +36,7 @@ use kube::{Api, ResourceExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::{MoverError, Result};
-use crate::workspec::{StreamConsumerSpec, StreamProducerSpec};
+use crate::workspec::StreamExecSpec;
 use kopiur_kopia::StdinOutcome;
 
 /// Bytes of exec stderr kept for diagnostics. Bounded because the point of the cap
@@ -389,7 +389,7 @@ where
 /// tail.
 pub async fn feed_from_pod(
     client: &kube::Client,
-    spec: &StreamProducerSpec,
+    spec: &StreamExecSpec,
     stdin: &mut kopiur_kopia::StdinWriter<'_>,
     failure: &mut Option<String>,
 ) -> StdinOutcome {
@@ -522,7 +522,7 @@ pub async fn feed_from_pod(
 pub async fn restore_into_pod(
     client: &kube::Client,
     kopia: &kopiur_kopia::KopiaClient,
-    spec: &StreamConsumerSpec,
+    spec: &StreamExecSpec,
     object_id: &str,
 ) -> Result<()> {
     let timeout = Duration::from_secs(spec.timeout_seconds);

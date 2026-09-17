@@ -115,7 +115,7 @@ pub enum SnapshotInput<'a> {
     Filesystem,
     /// Exec a command in a workload pod and pipe its stdout into kopia; nothing is
     /// mounted and `source_path` is the VIRTUAL root the artifact is recorded under.
-    Stream(&'a StreamProducerSpec),
+    Stream(&'a StreamExecSpec),
 }
 
 /// THE resolver for how a backup run gets its bytes.
@@ -126,14 +126,24 @@ pub fn snapshot_input(op: &SnapshotOp) -> SnapshotInput<'_> {
     }
 }
 
-/// Produce a backup's bytes by exec'ing a command in a running workload pod.
+/// Exec a command in one running workload pod and pipe ONE of its standard
+/// streams, for a backup (the command's stdout IS the data) or a restore (the
+/// restored bytes go to the command's stdin).
+///
+/// ONE type for both directions, deliberately. The producer and consumer forms
+/// were byte-identical structs — same fields, same wire names — and two names for
+/// one shape is a drift surface: a field added to the producer and forgotten on
+/// the consumer compiles clean and silently loses the knob on restores. The ROLE
+/// is carried by the enum that borrows this spec, [`SnapshotInput::Stream`] vs
+/// [`RestoreOutput::Stream`], where a reconcile path must already match
+/// exhaustively; it does not need a second struct to restate it.
 ///
 /// The controller resolves the selector into this spec at plan time and the mover
-/// re-resolves the pod at exec time — the Job can start minutes after the Snapshot
-/// CR was written, by which point the pod may have been rescheduled.
+/// re-resolves the pod at exec time — the Job can start minutes after the CR was
+/// written, by which point the pod may have been rescheduled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StreamProducerSpec {
+pub struct StreamExecSpec {
     /// Namespace to resolve `pod_selector` in.
     pub namespace: String,
     /// Rendered label-selector query (`k=v,...`) identifying the workload pod.
@@ -141,31 +151,14 @@ pub struct StreamProducerSpec {
     /// Container to exec in; absent uses the pod's default container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
-    /// argv to run. Element 0 is the program; this is not a shell line.
+    /// argv to run. Element 0 is the program; this is not a shell line. As a
+    /// producer its stdout is captured; as a consumer it receives the restored
+    /// bytes on stdin.
     pub command: Vec<String>,
-    /// Name of the single virtual file the stdout is stored as.
+    /// The single virtual file inside the snapshot: the name the producer's stdout
+    /// is stored as, or the entry a consumer reads back.
     pub file_name: String,
-    /// Wall-clock bound on the producer, in seconds.
-    pub timeout_seconds: u64,
-}
-
-/// Consume a restored virtual file by feeding it to a command's stdin in a running
-/// pod — the mirror of [`StreamProducerSpec`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StreamConsumerSpec {
-    /// Namespace to resolve `pod_selector` in.
-    pub namespace: String,
-    /// Rendered label-selector query identifying the target pod.
-    pub pod_selector: String,
-    /// Container to exec in; absent uses the pod's default container.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container: Option<String>,
-    /// argv to run; it receives the restored bytes on stdin.
-    pub command: Vec<String>,
-    /// Which virtual file inside the snapshot to read back.
-    pub file_name: String,
-    /// Wall-clock bound on the consumer, in seconds.
+    /// Wall-clock bound on the command, in seconds.
     pub timeout_seconds: u64,
 }
 
@@ -176,7 +169,7 @@ pub enum RestoreOutput<'a> {
     /// Write the snapshot's files into the mounted `target_path`.
     Filesystem,
     /// Stream one virtual file into a command's stdin in a workload pod.
-    Stream(&'a StreamConsumerSpec),
+    Stream(&'a StreamExecSpec),
 }
 
 /// THE resolver for where a restore run puts its bytes.
@@ -202,7 +195,7 @@ pub struct SnapshotOp {
     /// exhaustively-matched [`SnapshotInput`]. `#[serde(default)]` so work-spec JSON
     /// written before this field existed still decodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stdin: Option<StreamProducerSpec>,
+    pub stdin: Option<StreamExecSpec>,
     /// Tags to attach to the snapshot (`key:value` pairs).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
@@ -557,7 +550,7 @@ pub struct RestoreOp {
     /// command's stdin instead of writing files to `target_path`. Read it through
     /// [`restore_output`]. `#[serde(default)]` so older work-spec JSON still decodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stdout: Option<StreamConsumerSpec>,
+    pub stdout: Option<StreamExecSpec>,
     /// Stable identity anchors for the referenced snapshot, used to self-heal a
     /// stale id (kopia rewrites the manifest id on pin) when a
     /// [`RestoreSelection::Snapshot`] restore reports the id not found. Empty ⇒ no

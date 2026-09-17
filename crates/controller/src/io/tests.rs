@@ -1847,6 +1847,62 @@ fn snapshot_replication_mover_name_derives_from_the_generic_role() {
 }
 
 #[test]
+fn stream_mover_name_derives_and_truncates_like_the_chart() {
+    // The default chart wiring (`<fullname>-mover`) yields the exact name
+    // `gen-rbac` ships and the chart's streamMoverName helper renders.
+    assert_eq!(stream_mover_name("kopiur-mover"), "kopiur-stream-mover");
+    assert_eq!(
+        stream_mover_name("myrelease-kopiur-mover"),
+        "myrelease-kopiur-stream-mover"
+    );
+    // A custom role name without the conventional suffix still derives
+    // deterministically (and distinctly from the generic role).
+    assert_eq!(stream_mover_name("custom-role"), "custom-role-stream");
+
+    // THE regression this test exists for: a long release name. The chart caps
+    // its role name at 63; if the controller's roleRef is not capped the same
+    // way, the RoleBinding names a role that was never created and every stream
+    // backup in the namespace dies on a forbidden `pods/exec`.
+    let long = format!("{}-mover", "r".repeat(80));
+    let derived = stream_mover_name(&long);
+    assert_eq!(
+        derived.len(),
+        63,
+        "capped at the DNS-1123 label limit: {derived}"
+    );
+    // Sprig `trunc 63` is a plain byte prefix of the same pre-truncation string.
+    assert_eq!(derived, format!("{}-stream-mover", "r".repeat(80))[..63]);
+
+    // `trimSuffix "-"` drops a trailing separator left by the cut, so the cap can
+    // never emit an invalid name. A 62-byte stem puts the `-` of `-stream-mover`
+    // at byte 62, so the 63-byte cut ends exactly on the separator.
+    let stem = "s".repeat(62);
+    let cut = stream_mover_name(&format!("{stem}-mover"));
+    assert_eq!(
+        cut, stem,
+        "a cut landing on the separator must lose it, leaving a valid 62-byte name"
+    );
+
+    // And the SAME two steps must be in the template, or the lockstep this
+    // function claims is only a comment.
+    let tpl = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/helm/kopiur/templates/_helpers.tpl"
+    ))
+    .expect("the chart helpers template must be readable from the workspace");
+    let helper = tpl
+        .split(r#"define "kopiur.streamMoverName""#)
+        .nth(1)
+        .and_then(|rest| rest.split("{{- end }}").next())
+        .expect("kopiur.streamMoverName must exist in the chart");
+    assert!(
+        helper.contains("trunc 63") && helper.contains(r#"trimSuffix "-""#),
+        "kopiur.streamMoverName must apply `trunc 63 | trimSuffix \"-\"` to match \
+         stream_mover_name; got: {helper}"
+    );
+}
+
+#[test]
 fn missing_wi_sa_message_is_actionable_per_cloud() {
     use kopiur_api::creds::WorkloadIdentityCloud;
     for (cloud, annotation) in [
@@ -3932,12 +3988,16 @@ const GATE_WRITERS: &[(&str, bool, &str, &str)] = &[
     ),
     // Same condition, different capability: a `stream` source needs `pods/exec` in
     // the workload namespace, which requires its own namespace opt-in annotation.
-    // Its own reason so an admin is pointed at the right annotation.
+    // Its own reason so an admin is pointed at the right annotation. BOTH sides
+    // stamp it — a `stream` backup source and a `streamExec` restore target each
+    // exec into a workload pod — so both are named here: a row crediting only the
+    // backup writer reads as "restores are not gated", and the next person to
+    // touch the restore gate has no reason to look at this table.
     (
         crate::consts::MOVER_PERMITTED_CONDITION,
         false,
         crate::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
-        "snapshot::reconcile_inner stream-exec gate (upsert_gate)",
+        "snapshot::reconcile_inner + restore::run_restore_mover stream-exec gate (upsert_gate)",
     ),
     // The `Error::MissingDependency` credential arm in `snapshot::reconcile_inner`
     // and `restore::run_restore_mover`, via

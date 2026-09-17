@@ -119,7 +119,7 @@ controller mints the same-named SA + RoleBinding per namespace, only for
 SnapshotPolicies that use a `stream` source.
 */}}
 {{- define "kopiur.streamMoverName" -}}
-{{- printf "%s-stream-mover" (include "kopiur.fullname" .) | trimSuffix "-" }}
+{{- printf "%s-stream-mover" (include "kopiur.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*

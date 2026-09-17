@@ -337,14 +337,23 @@ impl RestoreSourcePath {
     }
 }
 
-/// A total classification of one `SnapshotPolicy` source, for the restore-path
-/// derivation.
+/// A total classification of one `SnapshotPolicy` source, **for the restore-path
+/// derivation only**.
+///
+/// Deliberately a DIFFERENT type from the wire-form resolver
+/// [`snapshot_policy::SourceShape`](crate::snapshot_policy::SourceShape), which
+/// answers "which one of the mutually-exclusive keys is set?" and borrows each
+/// form's whole sub-object for the backup side. This one answers the narrower
+/// restore question "can this source's path be derived from the target PVC?",
+/// so it carries only the fields that decision needs and adds an `Invalid` arm
+/// the wire-form resolver reports as an error instead. Keep the two in step:
+/// every form added there needs an arm here.
 ///
 /// The point of the enum is that "not a selector" is not one thing: a plain
 /// `pvc:` source can match the restore target by NAME (and then contributes its
-/// own path, override included), while `nfs` and a malformed source contribute
-/// nothing at all. Matched exhaustively, so a fourth source shape has to decide
-/// what it means for a restore before it compiles.
+/// own path, override included), while `nfs`, `stream` and a malformed source
+/// contribute nothing at all. Matched exhaustively, so a fifth source shape has
+/// to decide what it means for a restore before it compiles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SourceShape<'a> {
     /// A plain `pvc:` source, with the PVC name it addresses (always in the
@@ -360,7 +369,14 @@ enum SourceShape<'a> {
     },
     /// An `nfs` export: never addressed by a PVC target.
     Nfs,
-    /// None of `pvc`/`pvcSelector`/`nfs` is set. Admission forbids it; a
+    /// A `stream` source: its bytes come from a command's stdout and its kopia
+    /// path is `/stream/<fileName>`, which no PVC target can derive. Never
+    /// addressed by a PVC target, exactly like [`SourceShape::Nfs`] — but named
+    /// rather than folded into [`SourceShape::Invalid`], because a stream source
+    /// is perfectly VALID and reporting it as malformed would send a future
+    /// reader hunting a spec bug that isn't there.
+    Stream,
+    /// None of `pvc`/`pvcSelector`/`nfs`/`stream` is set. Admission forbids it; a
     /// hand-patched object may carry it. Contributes nothing.
     Invalid,
 }
@@ -373,10 +389,11 @@ fn source_shape(source: &Source) -> SourceShape<'_> {
             source_path_override: source.source_path_override.as_deref(),
         };
     }
-    match (&source.pvc, &source.nfs) {
-        (Some(p), _) => SourceShape::Pvc { name: &p.name },
-        (None, Some(_)) => SourceShape::Nfs,
-        (None, None) => SourceShape::Invalid,
+    match (&source.pvc, &source.nfs, &source.stream) {
+        (Some(p), _, _) => SourceShape::Pvc { name: &p.name },
+        (None, Some(_), _) => SourceShape::Nfs,
+        (None, None, Some(_)) => SourceShape::Stream,
+        (None, None, None) => SourceShape::Invalid,
     }
 }
 
@@ -498,7 +515,10 @@ pub fn restore_source_path(
     if policy_ns == target.namespace
         && let Some(index) = shapes.iter().position(|s| match s {
             SourceShape::Pvc { name } => *name == target.name,
-            SourceShape::Selector { .. } | SourceShape::Nfs | SourceShape::Invalid => false,
+            SourceShape::Selector { .. }
+            | SourceShape::Nfs
+            | SourceShape::Stream
+            | SourceShape::Invalid => false,
         })
     {
         let source = &policy.spec.sources[index];
@@ -542,7 +562,10 @@ pub fn restore_source_path(
                 strategy,
                 source_path_override,
             } => (*strategy, *source_path_override),
-            SourceShape::Pvc { .. } | SourceShape::Nfs | SourceShape::Invalid => continue,
+            SourceShape::Pvc { .. }
+            | SourceShape::Nfs
+            | SourceShape::Stream
+            | SourceShape::Invalid => continue,
         };
         match agreed {
             None => agreed = Some((strategy, over)),

@@ -3666,7 +3666,7 @@ async fn run_restore_mover(
             // command's stdin, so `target_path` below is inert for it.
             stdout: match dispatch.destination {
                 RestoreDestination::Pvc(_) => None,
-                RestoreDestination::Stream(t) => Some(kopiur_mover::workspec::StreamConsumerSpec {
+                RestoreDestination::Stream(t) => Some(kopiur_mover::workspec::StreamExecSpec {
                     namespace: namespace.to_string(),
                     pod_selector: io::label_selector_to_string(&t.workload_exec.pod_selector),
                     container: t.workload_exec.container.clone(),
@@ -3678,7 +3678,7 @@ async fn run_restore_mover(
                         .as_deref()
                         .and_then(kopiur_api::duration::parse_go_duration)
                         .map(|d| d.as_secs())
-                        .unwrap_or(kopiur_api::snapshot_policy::DEFAULT_STREAM_TIMEOUT_SECS),
+                        .unwrap_or(kopiur_api::consts::DEFAULT_STREAM_TIMEOUT_SECS),
                 }),
             },
             source: selection.clone(),

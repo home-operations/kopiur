@@ -280,6 +280,16 @@ pub fn effective_failed_jobs_history_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(DEFAULT_FAILED_JOBS_HISTORY_LIMIT)
 }
 
+/// Default bound on a stream producer/consumer command (a `stream` source's
+/// `workloadExec.timeout`, or a `streamExec` restore target's) when `timeout` is
+/// unset. Generous enough for a large logical dump, finite so a wedged command
+/// cannot pin a mover Job forever. Both resolution sites (backup Job build and
+/// restore Job build) map absent-or-unparseable → exactly this value, which is
+/// what makes emitting it as a schema `default:` behavior-preserving. Part of the
+/// documented API contract (field-reference), so it lives here rather than in the
+/// controller.
+pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 3600;
+
 /// Default `spec.deletionProtection.threshold` (0 disables). 10 pending
 /// external destructive deletions is far above legitimate manual cleanup but
 /// far below a tooling-driven cascade (the motivating incident was ~600).

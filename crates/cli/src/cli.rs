@@ -437,9 +437,13 @@ pub struct DoctorArgs {
     pub failure_lookback: std::time::Duration,
 }
 
-/// Flags for `restore`: exactly one source, exactly one target (both enforced
-/// at parse time and mapped 1:1 onto the externally-tagged `RestoreSource`/
-/// `RestoreTarget` enums).
+/// Flags for `restore`: exactly one source, exactly one target (both enforced at
+/// parse time).
+///
+/// The source flags cover `RestoreSource` completely. The target flags cover
+/// three of `RestoreTarget`'s four variants — `streamExec` is manifest-only, and
+/// `cmd::restore::restore_target_from_args` refuses with a message that says so
+/// rather than pretending the mapping is total.
 #[derive(clap::Args, Debug)]
 #[command(
     group(clap::ArgGroup::new("source").required(true)),

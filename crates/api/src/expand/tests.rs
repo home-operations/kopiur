@@ -36,12 +36,8 @@ fn selector_source(strategy: Option<SourcePathStrategy>, namespaces: Vec<&str>) 
             },
             label_selector: None,
         }),
-        nfs: None,
-        stream: None,
-        read_only: None,
-        acknowledge_live_mutation: None,
-        source_path_override: None,
         source_path_strategy: strategy,
+        ..Default::default()
     }
 }
 
@@ -50,13 +46,7 @@ fn pvc_source(name: &str) -> Source {
         pvc: Some(PvcSource {
             name: name.to_string(),
         }),
-        pvc_selector: None,
-        nfs: None,
-        stream: None,
-        read_only: None,
-        acknowledge_live_mutation: None,
-        source_path_override: None,
-        source_path_strategy: None,
+        ..Default::default()
     }
 }
 
@@ -939,6 +929,90 @@ fn nfs_source(path: &str) -> Source {
 fn with_override(mut s: Source, over: &str) -> Source {
     s.source_path_override = Some(over.to_string());
     s
+}
+
+/// The compile-time obligation: every `expand::SourceShape` arm is named here, so
+/// a FIFTH wire-form source (added to `snapshot_policy::Source`, hence to
+/// `snapshot_policy::SourceShape`) cannot land without deciding what it means for
+/// a restore. Without this witness the restore classifier silently folds an
+/// unknown form into `Invalid` and `restore_source_path` answers for it by
+/// accident — which is exactly what a `stream` source did before it got its own
+/// arm.
+#[test]
+fn source_shape_classifies_every_wire_form() {
+    // Driven off the wire-form resolver, so the two classifiers cannot drift: each
+    // `snapshot_policy::SourceShape` variant must map to a named arm here.
+    let cases: Vec<(&str, Source)> = vec![
+        ("pvc", pvc_source("data")),
+        (
+            "pvcSelector",
+            selector_source(Some(SourcePathStrategy::PvcName), vec![]),
+        ),
+        ("nfs", nfs_source("/export/data")),
+        ("stream", stream_source("postgres.sql")),
+    ];
+    for (kind, source) in &cases {
+        // The wire-form resolver agrees this is a real, singular form...
+        let wire = crate::snapshot_policy::source_shape(source)
+            .unwrap_or_else(|e| panic!("{kind} is a valid source form: {e}"));
+        assert_eq!(wire.kind_str(), *kind);
+
+        // ...and the restore classifier gives it a NAMED arm, never `Invalid`.
+        let shape = source_shape(source);
+        let named = match shape {
+            SourceShape::Pvc { .. } => "pvc",
+            SourceShape::Selector { .. } => "pvcSelector",
+            SourceShape::Nfs => "nfs",
+            SourceShape::Stream => "stream",
+            SourceShape::Invalid => panic!(
+                "`{kind}` is a valid source form but the restore classifier calls it malformed; \
+                 give it its own `SourceShape` arm and decide what it means for a restore"
+            ),
+        };
+        assert_eq!(named, *kind, "the two classifiers must agree on the form");
+    }
+
+    // `Invalid` is reserved for a genuinely malformed stored object — nothing set.
+    assert_eq!(source_shape(&Source::default()), SourceShape::Invalid);
+    assert!(crate::snapshot_policy::source_shape(&Source::default()).is_err());
+}
+
+/// A `stream` source contributes nothing to a PVC restore's path derivation, and
+/// says so through its own arm rather than by being mistaken for malformed.
+///
+/// Behaviorally this is byte-identical to the pre-`Stream`-arm answer — which is
+/// the point: the variant is a clarity and exhaustiveness fix, not a semantic one,
+/// and this test is what proves the refactor changed no answer. A stream policy's
+/// only derivable path comes from rule (3) (`sources[0]`'s own path), which for a
+/// stream source is `/stream/<fileName>`.
+#[test]
+fn a_stream_source_is_never_addressed_by_a_pvc_target() {
+    // Rule (2) cannot match a stream source: there is no PVC name to compare.
+    let p = policy_with(vec![stream_source("postgres.sql")]);
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "postgres.sql")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/stream/postgres.sql".into())),
+        "a stream policy falls through to its own source path, not to a /pvc/ guess"
+    );
+
+    // Mixed with a plain `pvc:` source, the exact PVC match still wins and the
+    // stream source is simply skipped.
+    let mixed = policy_with(vec![stream_source("postgres.sql"), pvc_source("data")]);
+    assert_eq!(
+        restore_source_path(&mixed, None, &target("billing", "data")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/pvc/data".into()))
+    );
+
+    // Alongside a selector, a stream source neither supplies nor blocks the
+    // agreed derivation (rule 4) — it is skipped like an `nfs` source.
+    let with_selector = policy_with(vec![
+        stream_source("postgres.sql"),
+        selector_source(Some(SourcePathStrategy::PvcName), vec![]),
+    ]);
+    assert_eq!(
+        restore_source_path(&with_selector, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/pgdata".into())
+    );
 }
 
 #[test]

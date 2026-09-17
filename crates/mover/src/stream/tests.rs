@@ -267,7 +267,7 @@ fn the_exec_start_budget_is_short_and_fixed() {
     // And it is emphatically NOT the default dump budget.
     assert_ne!(
         EXEC_START_TIMEOUT,
-        Duration::from_secs(kopiur_api::snapshot_policy::DEFAULT_STREAM_TIMEOUT_SECS)
+        Duration::from_secs(kopiur_api::consts::DEFAULT_STREAM_TIMEOUT_SECS)
     );
 }
 

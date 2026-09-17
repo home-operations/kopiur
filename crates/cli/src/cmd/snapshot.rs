@@ -645,6 +645,69 @@ mod tests {
         .expect("single-repo policy fixture")
     }
 
+    /// A `stream`-source policy, as the API SERVER delivers it — schema defaults
+    /// (`readOnly`, `sourcePathStrategy`, `workloadExec.timeout`) materialized
+    /// onto the source, which a hand-built `Source` literal cannot reproduce.
+    fn stream_policy() -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "nightly", "namespace": "media" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "nas" },
+                "sources": [{
+                    "stream": {
+                        "fileName": "postgres.sql",
+                        "workloadExec": {
+                            "podSelector": { "matchLabels": { "app": "postgres" } },
+                            "command": ["sh", "-ec", "pg_dumpall"],
+                            "timeout": "1h",
+                        },
+                    },
+                    "readOnly": true,
+                    "sourcePathStrategy": "PvcName",
+                }],
+            }
+        }))
+        .expect("stream policy fixture")
+    }
+
+    #[test]
+    fn planned_cells_of_a_stream_policy_is_the_one_legacy_cell() {
+        // The byte-identical contract this module claims: `snapshot now` mints
+        // exactly what a `SnapshotSchedule` slot would, via the same `mint_cells`.
+        // A `stream` source carries no `pvcSelector`, so it must land on the same
+        // single unpinned cell a plain `pvc:` source does — no fan-out, no pin.
+        // Pinned with a stream fixture because the source shapes reach
+        // `expand_sources`/`mint_cells` through different arms, and a stream
+        // source that accidentally fanned out would mint N children against ONE
+        // kopia source path, where they would prune each other.
+        let cells = planned_cells(&stream_policy(), "nightly", "base", None, None).unwrap();
+        assert_eq!(cells.len(), 1, "a stream source never fans out");
+        assert_eq!(cells[0].name, "base");
+        assert!(
+            cells[0].source.is_none() && cells[0].repository.is_none(),
+            "the legacy cell is unpinned: {:?}",
+            cells[0]
+        );
+        // Byte-identical to the plain-`pvc:` answer, which is the contract.
+        assert_eq!(
+            cells,
+            planned_cells(&single_repo_policy(), "nightly", "base", None, None).unwrap()
+        );
+
+        // And the built Snapshot is the pre-fan-out shape: a bare policyRef, no
+        // per-source pin on the wire.
+        let snap = build_snapshot_for(&args(), "media", at(), Some(&cells[0]));
+        let wire = serde_json::to_value(&snap).unwrap();
+        assert_eq!(wire["metadata"]["name"], "base");
+        assert!(
+            wire["spec"]["source"].is_null(),
+            "a stream child carries no source pin: {}",
+            wire["spec"]
+        );
+    }
+
     #[test]
     fn planned_cells_single_repo_is_the_one_legacy_cell() {
         let cells = planned_cells(&single_repo_policy(), "nightly", "base", None, None).unwrap();
