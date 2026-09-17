@@ -4378,16 +4378,14 @@ fn policy_own_source_path(
             over.to_string(),
         ));
     }
+    // Mirrors step (3) of `restore_source_path`, including its zero-source legacy
+    // tolerance: no sources means no path to record, not an error.
+    let Some(first) = config.spec.sources.first() else {
+        return Ok(kopiur_api::expand::RestoreSourcePath::PolicySource(None));
+    };
     let eff = kopiur_api::expand::effective_source(config, None).map_err(|e| e.to_string())?;
-    // `sources[0]` exists whenever `effective_source(_, None)` succeeded.
-    let strategy = config
-        .spec
-        .sources
-        .first()
-        .map(kopiur_api::expand::strategy_for)
-        .unwrap_or(kopiur_api::snapshot_policy::SourcePathStrategy::PvcName);
     Ok(kopiur_api::expand::RestoreSourcePath::PolicySource(
-        eff.kopia_source_path(strategy),
+        eff.kopia_source_path(kopiur_api::expand::strategy_for(first)),
     ))
 }
 
