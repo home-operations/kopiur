@@ -103,8 +103,10 @@ preload() {
   docker save "$img" | docker exec -i "$NODE" ctr --namespace=k8s.io images import - >/dev/null 2>&1 \\
     && echo "   preloaded $img" || echo "   warn: could not preload $img (will pull in-cluster)"
 }
-preload minio/minio:latest
-preload minio/mc:latest
+# quay.io + immutable RELEASE tags: MinIO withdrew these from Docker Hub, where
+# they now 404. Lockstep with crates/e2e/src/consts.rs MINIO_IMAGE / MC_IMAGE.
+preload quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+preload quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
 # Backend servers for the SFTP/WebDAV e2e (mirror crates/e2e/src/consts.rs).
 # atmoz/sftp:debian (OpenSSH 9.x) — NOT :alpine (OpenSSH 10.2 hangs kopia's go-ssh).
 preload atmoz/sftp:debian
