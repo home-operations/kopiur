@@ -69,6 +69,14 @@ pub const EXEC_STDERR_BUF: usize = 64 * 1024;
 /// eventually appears points at the wrong knob.
 pub const EXEC_START_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long to wait for the exec `Status` AFTER the transfer has already failed.
+///
+/// Short and fixed on purpose. kube-rs closes our stdin because it received the
+/// `Status` frame, so by the time we are handling a broken sink the frame has
+/// either arrived or is not coming — waiting the consumer's whole timeout would
+/// add minutes to a failure that is already decided.
+pub const STATUS_AFTER_FAILURE: Duration = Duration::from_secs(5);
+
 /// Pick the one pod a stream source may exec into.
 ///
 /// Requires EXACTLY ONE `Running`, non-terminating match. Zero, several, or
@@ -239,21 +247,40 @@ pub fn consumer_failure_detail(
     file_name: &str,
     err: &kopiur_kopia::KopiaError,
     stderr_tail: &str,
+    verdict: &ExecVerdict,
 ) -> String {
     let base = object_read_failure_message(file_name, err);
     let tail = stderr_tail.trim();
     let sink = matches!(err, kopiur_kopia::KopiaError::OutputSink { .. });
-    match (sink, tail.is_empty()) {
-        (_, false) => format!("{base}. The command's own last words: {tail}"),
-        // A broken sink with nothing on stderr is still diagnosable: the command
-        // exited, and its exit status is the next place to look.
-        (true, true) => format!(
-            "{base}. The command exited before the transfer finished and printed \
-             nothing on stderr — check its exit status in the mover Job's logs, and \
-             that it reads its stdin to completion"
+    // The exec Status is the authoritative "why": kube-rs closed our stdin because
+    // it arrived. Exhaustive over `ExecVerdict` so a new verdict has to decide what
+    // it means here rather than silently reading as "no status".
+    let why = match verdict {
+        ExecVerdict::Failed(detail) => Some(format!("the command exited: {detail}")),
+        // Success beside a broken sink is a real shape, not a contradiction: the
+        // command finished (and closed its stdin) before we finished writing.
+        ExecVerdict::Success if sink => Some(
+            "the command exited SUCCESSFULLY before the transfer finished, so it \
+             stopped reading early — it must consume its stdin to completion"
+                .to_string(),
         ),
-        (false, true) => base,
+        ExecVerdict::Success | ExecVerdict::NoStatus => None,
+    };
+    let had_why = why.is_some();
+    let mut out = base;
+    if let Some(why) = why {
+        out = format!("{out}. {why}");
     }
+    if !tail.is_empty() {
+        out = format!("{out}. The command's own last words: {tail}");
+    } else if sink && !had_why {
+        out = format!(
+            "{out}. The command exited before the transfer finished and printed \
+             nothing on stderr, and the exec reported no status — check the mover \
+             Job's logs, and that the command reads its stdin to completion"
+        );
+    }
+    out
 }
 
 /// The kube client the stream paths exec through.
@@ -598,7 +625,7 @@ pub async fn restore_into_pod(
             detail: "the exec stream provided no stdin channel".to_string(),
         })?;
     let mut errs = attached.stderr();
-    let status_fut = attached.take_status();
+    let mut status_fut = attached.take_status();
 
     let mut stderr_tail = String::new();
     let shipped = {
@@ -643,16 +670,30 @@ pub async fn restore_into_pod(
             })?,
         }
     };
-    shipped.map_err(|e| MoverError::StreamExecFailed {
-        // A kopia-side timeout is translated to name the field the user set. Left
-        // as the raw `KopiaError::Timeout` it would quote kopia's argv and a
-        // seconds count with no hint which knob produced it — the same
-        // blames-the-wrong-knob failure the exec-start split exists to avoid.
-        //
-        // `stderr_tail` is carried in DELIBERATELY: on a broken sink it holds the
-        // only statement of why the consumer died, and it used to be dropped here.
-        detail: consumer_failure_detail(&spec.file_name, &e, &stderr_tail),
-    })?;
+    // On a SHIP failure the exec `Status` is the authoritative statement of what
+    // happened — kube-rs closes our stdin precisely BECAUSE it received one — so
+    // consult it before giving up. Returning here without it (which this path used
+    // to do) throws away the exit reason at the exact moment it is needed, leaving
+    // the operator with "broken pipe". Bounded by a short fixed budget, not the
+    // consumer's: the frame has already arrived if it is coming at all.
+    let ship_err = match shipped {
+        Ok(()) => None,
+        Err(e) => {
+            let verdict = match status_fut.take() {
+                Some(f) => match tokio::time::timeout(STATUS_AFTER_FAILURE, f).await {
+                    Ok(st) => verdict_of(st),
+                    Err(_) => ExecVerdict::NoStatus,
+                },
+                None => ExecVerdict::NoStatus,
+            };
+            Some((e, verdict))
+        }
+    };
+    if let Some((e, verdict)) = ship_err {
+        return Err(MoverError::StreamExecFailed {
+            detail: consumer_failure_detail(&spec.file_name, &e, &stderr_tail, &verdict),
+        });
+    }
 
     let verdict = match status_fut {
         Some(f) => match tokio::time::timeout(timeout, f).await {

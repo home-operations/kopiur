@@ -425,6 +425,7 @@ fn a_broken_sink_carries_the_consumers_last_words() {
         "dump.sql",
         &err,
         "sh: can't create /tmp/restored.sql: Read-only file system\n",
+        &super::ExecVerdict::NoStatus,
     );
     assert!(
         msg.contains("can't create /tmp/restored.sql"),
@@ -441,12 +442,20 @@ fn a_silent_broken_sink_still_points_somewhere() {
         args: "show kfile".into(),
         source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
     };
-    let msg = super::consumer_failure_detail("dump.sql", &err, "   \n  ");
+    let msg =
+        super::consumer_failure_detail("dump.sql", &err, "   \n  ", &super::ExecVerdict::NoStatus);
     assert!(
         msg.contains("exited before the transfer finished"),
         "explains the mechanism: {msg}"
     );
-    assert!(msg.contains("exit status"), "names the next place to look: {msg}");
+    assert!(
+        msg.contains("reported no status"),
+        "says the exec status was unavailable rather than staying silent: {msg}"
+    );
+    assert!(
+        msg.contains("mover Job's logs"),
+        "names the next place to look: {msg}"
+    );
 }
 
 /// A kopia-side TIMEOUT keeps naming the user's own field, and does not acquire
@@ -457,7 +466,7 @@ fn a_timeout_is_not_reframed_as_a_consumer_exit() {
         args: "show kfile".into(),
         seconds: 300,
     };
-    let msg = super::consumer_failure_detail("dump.sql", &err, "");
+    let msg = super::consumer_failure_detail("dump.sql", &err, "", &super::ExecVerdict::NoStatus);
     assert!(
         msg.contains("workloadExec.timeout"),
         "still names the field the user set: {msg}"
@@ -465,5 +474,43 @@ fn a_timeout_is_not_reframed_as_a_consumer_exit() {
     assert!(
         !msg.contains("exited before the transfer finished"),
         "must not claim the consumer exited: {msg}"
+    );
+}
+
+/// The exec verdict is the authoritative "why" and must reach the message.
+#[test]
+fn the_exec_verdict_explains_a_broken_sink() {
+    let err = kopiur_kopia::KopiaError::OutputSink {
+        args: "show kfile".into(),
+        source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+    };
+    let msg = super::consumer_failure_detail(
+        "dump.sql",
+        &err,
+        "",
+        &super::ExecVerdict::Failed("command terminated with exit code 2".into()),
+    );
+    assert!(
+        msg.contains("exit code 2"),
+        "carries the exec status: {msg}"
+    );
+    assert!(
+        !msg.contains("reported no status"),
+        "must not also claim there was no status: {msg}"
+    );
+}
+
+/// A command that SUCCEEDS while our write is still going is the "stopped reading
+/// early" shape, not a contradiction — and the message must say which.
+#[test]
+fn a_successful_command_beside_a_broken_sink_names_the_early_exit() {
+    let err = kopiur_kopia::KopiaError::OutputSink {
+        args: "show kfile".into(),
+        source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+    };
+    let msg = super::consumer_failure_detail("dump.sql", &err, "", &super::ExecVerdict::Success);
+    assert!(
+        msg.contains("stopped reading early") || msg.contains("consume its stdin"),
+        "names the real shape: {msg}"
     );
 }
