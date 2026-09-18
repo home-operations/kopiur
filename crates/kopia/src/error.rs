@@ -339,6 +339,25 @@ impl fmt::Display for KopiaErrorClass {
 /// ```
 #[derive(thiserror::Error, Debug)]
 pub enum KopiaError {
+    /// Writing kopia's OUTPUT to the consumer failed. kopia spawned and ran
+    /// fine; the sink — a `streamExec` restore's exec stdin — broke.
+    ///
+    /// Separate from [`KopiaError::Spawn`] because it used to BE `Spawn`, and
+    /// that misattribution actively cost debugging time: a `streamExec` restore
+    /// whose consumer pipe broke reported "failed to spawn kopia binary `kopia`:
+    /// broken pipe", sending the reader after a missing binary that was in fact
+    /// running. The three fallible halves of the streaming copy — the sink write,
+    /// the stderr read, and the child wait — are not interchangeable and must not
+    /// share one error.
+    #[error("streaming `{args}` into the consumer failed while writing kopia's output: {source}")]
+    OutputSink {
+        /// The kopia argv whose output was being streamed.
+        args: String,
+        /// Underlying I/O error from the SINK, not from kopia.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The kopia binary could not be spawned at all (missing binary, not
     /// executable, fork failure). Carries the OS error.
     #[error("failed to spawn kopia binary `{binary}`: {source}")]
@@ -469,6 +488,9 @@ impl KopiaError {
             // retrying the same pod won't help, treat as Unknown/non-retryable.
             KopiaError::Spawn { .. } => KopiaErrorClass::Unknown,
             KopiaError::Json { .. } | KopiaError::EmptyOutput { .. } => KopiaErrorClass::Unknown,
+            // The repository was never at fault — the consumer's pipe was. Re-running
+            // re-runs the same consumer command, so this is terminal for the operator.
+            KopiaError::OutputSink { .. } => KopiaErrorClass::Unknown,
             // Timeouts are usually a slow backend → worth a retry.
             KopiaError::Timeout { .. } => KopiaErrorClass::RepositoryUnavailable,
             // Both stdin-producer failures: the repository was never at fault —

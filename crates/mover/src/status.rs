@@ -152,6 +152,10 @@ impl From<&crate::error::MoverError> for FailureBlock {
                     // got to EOF, so there is no exit status of its own to report.
                     | KopiaError::StdinProducerFailed { .. }
                     | KopiaError::StdinProducerWroteNothing { .. }
+                    // The CONSUMER's pipe broke, not kopia's. kopia may still be
+                    // mid-stream when we give up on the sink, so whatever it exits
+                    // with describes the teardown, not the failure.
+                    | KopiaError::OutputSink { .. }
                     | KopiaError::Timeout { .. } => None,
                 },
                 Some(op.as_str().to_string()),

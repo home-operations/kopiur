@@ -1093,6 +1093,41 @@ pub const STDIN_FINALIZE_GRACE: Duration = Duration::from_secs(600);
 /// to it — best-effort and non-deterministic; with the controller's 120s
 /// `default_timeout`, a hung backend would leave one transient zombie per
 /// retry. Reaping inline makes cleanup a guarantee instead of a race.
+/// Which half of the streaming copy failed, so the error can name the right thing.
+///
+/// `tokio::join!`ing the sink write, kopia's stderr read and kopia's exit into one
+/// `io::Error` loses the only fact that matters for diagnosis: whose pipe broke. A
+/// `streamExec` restore whose consumer died reported "failed to spawn kopia binary
+/// `kopia`: broken pipe" — pointing at a binary that had spawned and was streaming.
+enum StreamHalves {
+    /// Writing kopia's stdout to the CONSUMER failed.
+    Sink(std::io::Error),
+    /// Reading kopia's stderr, or reaping kopia, failed.
+    Kopia(std::io::Error),
+}
+
+impl From<std::io::Error> for StreamHalves {
+    fn from(e: std::io::Error) -> Self {
+        // Only the `?`s inside the join arm produce this, and both are kopia-side.
+        StreamHalves::Kopia(e)
+    }
+}
+
+impl StreamHalves {
+    fn into_kopia_error(self, binary: &std::path::Path, args: &str) -> KopiaError {
+        match self {
+            StreamHalves::Sink(source) => KopiaError::OutputSink {
+                args: args.to_string(),
+                source,
+            },
+            StreamHalves::Kopia(source) => KopiaError::Spawn {
+                binary: binary.display().to_string(),
+                source,
+            },
+        }
+    }
+}
+
 /// Best-effort on error: nothing here can improve on the Timeout being
 /// returned, so a kill/wait failure is only logged.
 async fn kill_and_reap(child: &mut tokio::process::Child) {
@@ -2457,17 +2492,24 @@ impl KopiaClient {
             let mut buf = String::new();
             stderr_pipe.read_to_string(&mut buf).await.map(|_| buf)
         };
+        // The three halves are NOT interchangeable, so they do not share one error.
+        // `copied` is a write to the CONSUMER's sink; `err`/`status` are kopia's own
+        // stderr and exit. Collapsing them into one `io::Error` is what made a
+        // `streamExec` restore whose consumer pipe broke report "failed to spawn
+        // kopia binary `kopia`: broken pipe" — blaming a binary that had spawned
+        // and was streaming. `StreamHalves` keeps the attribution.
         let wait_with_io = async {
             let (copied, err, status) = tokio::join!(copy_out, read_err, child.wait());
-            Ok::<_, std::io::Error>((copied?, err?, status?))
+            match copied {
+                Ok(bytes) => Ok::<_, StreamHalves>((bytes, err?, status?)),
+                Err(source) => Err(StreamHalves::Sink(source)),
+            }
         };
 
+        let attribute = |h: StreamHalves| h.into_kopia_error(&self.binary, &display_args);
         let (bytes, stderr, status) = match budget.or(self.default_timeout) {
             Some(t) => match tokio::time::timeout(t, wait_with_io).await {
-                Ok(res) => res.map_err(|source| KopiaError::Spawn {
-                    binary: self.binary.display().to_string(),
-                    source,
-                })?,
+                Ok(res) => res.map_err(attribute)?,
                 Err(_) => {
                     kill_and_reap(&mut child).await;
                     return Err(KopiaError::Timeout {
@@ -2476,10 +2518,7 @@ impl KopiaClient {
                     });
                 }
             },
-            None => wait_with_io.await.map_err(|source| KopiaError::Spawn {
-                binary: self.binary.display().to_string(),
-                source,
-            })?,
+            None => wait_with_io.await.map_err(attribute)?,
         };
 
         if status.code() == Some(0) {
