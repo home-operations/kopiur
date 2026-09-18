@@ -224,6 +224,38 @@ pub fn object_read_failure_message(file_name: &str, err: &kopiur_kopia::KopiaErr
     }
 }
 
+/// [`object_read_failure_message`] plus whatever the CONSUMER said before it died.
+///
+/// A broken sink means the consumer's stdin closed under us, and kube-rs closes it
+/// for exactly one reason: the exec message loop `break`s on the server's `Status`
+/// frame, which arrives when the command has EXITED. So the interesting fact is
+/// never "broken pipe" — it is why the command exited, and the command already
+/// said so on its stderr.
+///
+/// That stderr was being captured and then thrown away on this path, which is how
+/// a `streamExec` restore came to report a bare transport error with the one line
+/// that explains it sitting unused in a local.
+pub fn consumer_failure_detail(
+    file_name: &str,
+    err: &kopiur_kopia::KopiaError,
+    stderr_tail: &str,
+) -> String {
+    let base = object_read_failure_message(file_name, err);
+    let tail = stderr_tail.trim();
+    let sink = matches!(err, kopiur_kopia::KopiaError::OutputSink { .. });
+    match (sink, tail.is_empty()) {
+        (_, false) => format!("{base}. The command's own last words: {tail}"),
+        // A broken sink with nothing on stderr is still diagnosable: the command
+        // exited, and its exit status is the next place to look.
+        (true, true) => format!(
+            "{base}. The command exited before the transfer finished and printed \
+             nothing on stderr — check its exit status in the mover Job's logs, and \
+             that it reads its stdin to completion"
+        ),
+        (false, true) => base,
+    }
+}
+
 /// The kube client the stream paths exec through.
 ///
 /// NOT [`kube::Client::try_default`]. That infers a [`kube::Config`] carrying
@@ -616,7 +648,10 @@ pub async fn restore_into_pod(
         // as the raw `KopiaError::Timeout` it would quote kopia's argv and a
         // seconds count with no hint which knob produced it — the same
         // blames-the-wrong-knob failure the exec-start split exists to avoid.
-        detail: object_read_failure_message(&spec.file_name, &e),
+        //
+        // `stderr_tail` is carried in DELIBERATELY: on a broken sink it holds the
+        // only statement of why the consumer died, and it used to be dropped here.
+        detail: consumer_failure_detail(&spec.file_name, &e, &stderr_tail),
     })?;
 
     let verdict = match status_fut {

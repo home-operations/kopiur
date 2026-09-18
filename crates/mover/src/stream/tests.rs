@@ -410,3 +410,60 @@ fn the_exec_client_config_carries_no_write_timeout() {
          established should fail fast"
     );
 }
+
+/// The consumer's stderr must reach the error on a broken sink.
+///
+/// Regression guard with a scar: a `streamExec` restore reported only a transport
+/// error while the command's own explanation sat captured-and-discarded in a local.
+#[test]
+fn a_broken_sink_carries_the_consumers_last_words() {
+    let err = kopiur_kopia::KopiaError::OutputSink {
+        args: "show kfile".into(),
+        source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+    };
+    let msg = super::consumer_failure_detail(
+        "dump.sql",
+        &err,
+        "sh: can't create /tmp/restored.sql: Read-only file system\n",
+    );
+    assert!(
+        msg.contains("can't create /tmp/restored.sql"),
+        "the consumer's stderr must survive: {msg}"
+    );
+    assert!(msg.contains("dump.sql"), "names the file: {msg}");
+}
+
+/// A broken sink with a SILENT consumer still says where to look next, rather
+/// than leaving the reader with a bare "broken pipe".
+#[test]
+fn a_silent_broken_sink_still_points_somewhere() {
+    let err = kopiur_kopia::KopiaError::OutputSink {
+        args: "show kfile".into(),
+        source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+    };
+    let msg = super::consumer_failure_detail("dump.sql", &err, "   \n  ");
+    assert!(
+        msg.contains("exited before the transfer finished"),
+        "explains the mechanism: {msg}"
+    );
+    assert!(msg.contains("exit status"), "names the next place to look: {msg}");
+}
+
+/// A kopia-side TIMEOUT keeps naming the user's own field, and does not acquire
+/// consumer-exit language it has not earned.
+#[test]
+fn a_timeout_is_not_reframed_as_a_consumer_exit() {
+    let err = kopiur_kopia::KopiaError::Timeout {
+        args: "show kfile".into(),
+        seconds: 300,
+    };
+    let msg = super::consumer_failure_detail("dump.sql", &err, "");
+    assert!(
+        msg.contains("workloadExec.timeout"),
+        "still names the field the user set: {msg}"
+    );
+    assert!(
+        !msg.contains("exited before the transfer finished"),
+        "must not claim the consumer exited: {msg}"
+    );
+}
