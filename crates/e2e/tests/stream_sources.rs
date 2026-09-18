@@ -43,6 +43,17 @@ const FAIL_REPO: &str = "e2e-stream-fail-repo";
 /// the leak test finds it. Deliberately unlike anything the operator prints itself.
 const SENTINEL: &str = "KOPIUR-STREAM-SENTINEL-8f3a1c9e-payload-line";
 
+/// One line of bulk filler (63 chars + newline = 64 bytes).
+const BULK_LINE: &str = "kopiur-stream-bulk-filler-line-0123456789abcdef0123456789abcdef";
+/// Enough lines to exceed the exec stdin's first burst by a wide margin (~4 MiB).
+///
+/// Load-bearing. A `streamExec` restore whose consumer is not wrapped to hold stdin
+/// open is SILENTLY TRUNCATED by Kubernetes exec — measured at 131,072 bytes of an
+/// 8 MiB payload, with the write reporting success. A single-line fixture fits in
+/// the first burst and passes anyway, so the payload must be big enough that a
+/// truncated restore cannot possibly satisfy the byte-count assertion below.
+const BULK_LINES: usize = 65_536;
+
 /// Opt the e2e namespace in to stream-exec movers. Without this the Snapshot parks
 /// at `MoverPermitted=False` — which is itself asserted by `gate_blocks_until_namespace_opts_in`.
 async fn annotate_namespace(client: &Client, ns: &str, on: bool) {
@@ -144,7 +155,18 @@ async fn stream_backup_and_restore_is_byte_identical() {
                 "stream-policy",
                 REPO,
                 "stream-db",
-                serde_json::json!(["sh", "-c", format!("printf '%s\\n' '{SENTINEL}'")]),
+                // The sentinel line PLUS ~4 MiB of filler. The bulk is the point: a
+                // one-line payload fits in the exec's first stdin burst and so
+                // survives even when the restore is truncating, which is exactly how
+                // the silent-truncation defect hid. See BULK_LINES.
+                serde_json::json!([
+                    "sh",
+                    "-c",
+                    format!(
+                        "printf '%s\\n' '{SENTINEL}'; i=0; while [ $i -lt {BULK_LINES} ]; \
+                         do printf '%s\\n' '{BULK_LINE}'; i=$((i+1)); done"
+                    )
+                ]),
                 "dump.sql",
             )),
         )
@@ -231,10 +253,31 @@ async fn stream_backup_and_restore_is_byte_identical() {
         }
     }
     let restored = String::from_utf8_lossy(&buf);
+    let expected_len = SENTINEL.len() + 1 + BULK_LINES * (BULK_LINE.len() + 1);
+
+    // BYTE COUNT FIRST, and it is the assertion that matters. A truncated restore
+    // still starts with the sentinel, so checking only the first line passes while
+    // the bulk is missing — which is precisely how the silent-truncation defect
+    // survived. Compare lengths before content so the failure says how much arrived.
     assert_eq!(
-        restored.trim(),
-        SENTINEL,
-        "the restored bytes must equal what the producer wrote"
+        buf.len(),
+        expected_len,
+        "restored {} of {expected_len} bytes — a short read here means the exec \
+         stdin truncated the stream, not that the content differs",
+        buf.len()
+    );
+    assert!(
+        restored.starts_with(SENTINEL),
+        "the restored stream must begin with the sentinel line"
+    );
+    assert_eq!(
+        restored.lines().count(),
+        1 + BULK_LINES,
+        "every produced line must arrive"
+    );
+    assert!(
+        restored.lines().skip(1).all(|l| l == BULK_LINE),
+        "every bulk line must arrive intact"
     );
 }
 

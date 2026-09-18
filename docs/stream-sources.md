@@ -276,6 +276,34 @@ temporary volume. Both halves must succeed again: a `psql` that died halfway lea
 a half-loaded database, and calling that a completed restore would be worse than
 failing.
 
+/// warning | A restore target must have `/bin/sh`
+
+Kubernetes `exec` **silently truncates** what you write to a command's stdin when the
+only process holding stdin open is the command itself — which is the shape of a
+directly-invoked `psql`. Measured against a real cluster: **131,072 bytes of an 8 MiB
+payload arrived, and the write reported success.** `kubectl exec -i` behaves exactly
+the same way, so this is the platform's behaviour rather than something Kopiur can
+sidestep in its own client.
+
+So Kopiur runs your restore command through a shell that stays alive holding stdin:
+
+```
+sh -c '"$@"; exit $?' kopiur-stream-consumer <your command...>
+```
+
+Your command's arguments are passed as positional parameters, never pasted into the
+script text, so an argument containing spaces or shell metacharacters is still one
+argument. The trailing `exit $?` propagates your command's exit code unchanged.
+
+The practical consequence: **the target container needs `/bin/sh`.** A distroless
+consumer image has none, and a `streamExec` restore into it fails with a message
+saying so. Failing loudly is deliberate — the alternative is restoring a fraction of
+your data and reporting success.
+
+Streamed *backups* are unaffected: they read the producer's stdout, which has no such
+behaviour.
+///
+
 /// danger | Point restores at a scratch database
 
 `streamExec` runs whatever you name against whatever the selector matches, and

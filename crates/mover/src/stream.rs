@@ -378,6 +378,46 @@ pub fn consumer_attach_params(container: Option<&str>) -> AttachParams {
     p
 }
 
+/// `$0` for the wrapper shell. Shows up in the target's process list, so it names
+/// itself rather than appearing as a mystery `sh`.
+pub const STREAM_WRAPPER_ARGV0: &str = "kopiur-stream-consumer";
+
+/// The consumer's argv, wrapped so a shell stays alive holding stdin open.
+///
+/// **This is a data-integrity fix, not a style choice.** Kubernetes `exec` stdin is
+/// SILENTLY TRUNCATED when the only process holding stdin is the reader itself —
+/// which is the shape of both a directly-invoked consumer (`psql …`, how users
+/// actually write this) and `sh -c 'cat > f'` (the shell EXECS INTO the command,
+/// replacing itself). Measured on kind with an 8 MiB payload: 131,072 bytes landed
+/// out of 8,388,608, while `write_all` returned **Ok**. `kubectl exec -i`
+/// reproduces it identically, so this is the platform's behaviour and not a client
+/// bug to route around.
+///
+/// Keeping a parent shell alive fixes it completely — the same 8 MiB arrives whole.
+/// The trailing `exit $?` does double duty: it propagates the consumer's exit code
+/// (verified 0→0, 7→7, 1→1, which matters because success is decided from the exec
+/// `Status`), and being a SECOND statement it defeats the shell's
+/// exec-the-last-command optimisation, which is what re-creates the broken shape.
+///
+/// argv rides as POSITIONAL PARAMETERS (`"$@"`), never interpolated into the script
+/// text, so an argument containing spaces or shell metacharacters is passed through
+/// as one argument and cannot be re-parsed as shell syntax. Verified: an argument of
+/// `two words; rm -rf /` arrives intact as `$1`.
+///
+/// The cost is that the target container must have `/bin/sh`. That is a real
+/// constraint (a distroless consumer has none) and it is documented; failing loudly
+/// there is strictly better than silently restoring a fraction of the data.
+pub fn stdin_holding_command(argv: &[String]) -> Vec<String> {
+    let mut out = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        r#""$@"; exit $?"#.to_string(),
+        STREAM_WRAPPER_ARGV0.to_string(),
+    ];
+    out.extend_from_slice(argv);
+    out
+}
+
 /// Drain `reader` to EOF, keeping only the LAST [`EXEC_STDERR_CAP`] bytes.
 ///
 /// # Why it must read to EOF
@@ -605,7 +645,10 @@ pub async fn restore_into_pod(
 
     let api: Api<Pod> = Api::namespaced(client.clone(), &spec.namespace);
     let params = consumer_attach_params(spec.container.as_deref());
-    let attach = api.exec(&pod_name, spec.command.clone(), &params);
+    // Wrapped, not raw: see `stdin_holding_command`. An unwrapped consumer silently
+    // truncates the restore. The producer side is NOT wrapped — it reads the pod's
+    // stdout, which is unaffected.
+    let attach = api.exec(&pod_name, stdin_holding_command(&spec.command), &params);
     let mut attached = tokio::time::timeout(EXEC_START_TIMEOUT, attach)
         .await
         .map_err(|_| MoverError::StreamExecFailed {
@@ -613,8 +656,13 @@ pub async fn restore_into_pod(
         })?
         .map_err(|e| MoverError::StreamExecFailed {
             detail: format!(
-                "could not exec into pod `{pod_name}`: {e}. Check that the kopiur mover \
-                 ServiceAccount is allowed `pods/exec` in namespace `{}`",
+                "could not exec into pod `{pod_name}`: {e}. Two things to check. \
+                 First, that the kopiur mover ServiceAccount is allowed `pods/exec` in \
+                 namespace `{}`. Second, that the target container has `/bin/sh`: a \
+                 streamExec restore runs the command through a shell that stays alive \
+                 holding stdin open, because Kubernetes exec SILENTLY TRUNCATES stdin \
+                 when the only process holding it is the command itself. A distroless \
+                 consumer image has no shell and cannot be restored into this way",
                 spec.namespace
             ),
         })?;

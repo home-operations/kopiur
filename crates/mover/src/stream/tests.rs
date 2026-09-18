@@ -514,3 +514,58 @@ fn a_successful_command_beside_a_broken_sink_names_the_early_exit() {
         "names the real shape: {msg}"
     );
 }
+
+/// The consumer's argv is wrapped so a shell stays alive holding stdin.
+///
+/// Not cosmetic: unwrapped, Kubernetes exec silently truncated an 8 MiB payload to
+/// 131,072 bytes while `write_all` returned Ok. See `stdin_holding_command`.
+#[test]
+fn the_consumer_command_is_wrapped_to_hold_stdin_open() {
+    let argv = vec!["psql".to_string(), "-d".to_string(), "mydb".to_string()];
+    let got = super::stdin_holding_command(&argv);
+    assert_eq!(got[0], "sh");
+    assert_eq!(got[1], "-c");
+    // TWO statements: the trailing `exit $?` both propagates the exit code and
+    // defeats the shell's exec-the-last-command optimisation, which is what
+    // re-creates the truncating shape.
+    assert_eq!(got[2], r#""$@"; exit $?"#);
+    assert!(
+        got[2].contains("; exit $?"),
+        "must stay two statements: {:?}",
+        got[2]
+    );
+    assert_eq!(got[3], super::STREAM_WRAPPER_ARGV0, "$0 names itself");
+    assert_eq!(&got[4..], &argv[..], "argv follows verbatim as $1..");
+}
+
+/// argv rides as positional parameters, never interpolated into the script, so an
+/// argument carrying shell metacharacters cannot be re-parsed as shell syntax.
+#[test]
+fn a_hostile_argument_cannot_become_shell_syntax() {
+    let argv = vec![
+        "psql".to_string(),
+        "-c".to_string(),
+        "SELECT 1; rm -rf /".to_string(),
+    ];
+    let got = super::stdin_holding_command(&argv);
+    // The script text is a fixed string — it never grows with user input.
+    assert_eq!(got[2], r#""$@"; exit $?"#);
+    assert!(
+        !got[2].contains("rm -rf"),
+        "user input must not reach the script text: {:?}",
+        got[2]
+    );
+    // And the hostile argument survives intact as ONE argument.
+    assert_eq!(got.last().unwrap(), "SELECT 1; rm -rf /");
+    assert_eq!(got.len(), 4 + argv.len(), "no splitting, no extra args");
+}
+
+/// An empty consumer argv is still a well-formed wrapper (admission rejects empty
+/// commands, so this pins the shape rather than endorsing the input).
+#[test]
+fn wrapping_an_empty_argv_is_still_well_formed() {
+    let got = super::stdin_holding_command(&[]);
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[0], "sh");
+    assert_eq!(got[3], super::STREAM_WRAPPER_ARGV0);
+}
