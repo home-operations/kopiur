@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.10](https://github.com/home-operations/kopiur/compare/0.10.9...0.10.10) (2026-09-19)
+
+
+### Continuous Integration
+
+* **github-action:** update github-actions ([#468](https://github.com/home-operations/kopiur/issues/468)) ([af27b2e](https://github.com/home-operations/kopiur/commit/af27b2efd26af79155ecbe6561eff669739c46ef))
+
+
+### Miscellaneous Chores
+
+* **mise:** update mise tools ([#463](https://github.com/home-operations/kopiur/issues/463)) ([69698aa](https://github.com/home-operations/kopiur/commit/69698aacc146ae9f364cec3c9928599673fe0e5b))
+* **mise:** update tool node (24.20.0 → v24.21.0) ([#457](https://github.com/home-operations/kopiur/issues/457)) ([fc67c05](https://github.com/home-operations/kopiur/commit/fc67c05180a069b2e5b040ad257959c241b3fa40))
+* **mise:** update tool oxfmt (0.66.0 → 0.68.0) ([#459](https://github.com/home-operations/kopiur/issues/459)) ([0614d12](https://github.com/home-operations/kopiur/commit/0614d12d1f2063e0ceea040aff4c3f19642d60fb))
+* **mise:** update tool rust (1.98.0 → 1.98.1) ([#447](https://github.com/home-operations/kopiur/issues/447)) ([3b2d33e](https://github.com/home-operations/kopiur/commit/3b2d33e2ba92339ea621ad90a92a57881798d7ca))
+
 ## [0.10.9](https://github.com/home-operations/kopiur/compare/0.10.8...0.10.9) (2026-09-19)
 
 
