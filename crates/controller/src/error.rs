@@ -91,6 +91,29 @@ pub enum Error {
     #[error("missing source PVC: {0}")]
     MissingSourcePvc(String),
 
+    /// A `mover.inheritSecurityContextFrom` naming a **live-pod** source
+    /// (`workloadSelector`/`pvcConsumer`) resolved NOTHING to inherit — no pod
+    /// matched the selector, the named container is absent, or the matched pod
+    /// sets neither a container nor a pod-level `securityContext` — and the
+    /// recipe pins no fallback identity to proceed on (issue #464).
+    ///
+    /// Permanent-*shaped*: nothing in kopiur scales a workload up, corrects a
+    /// label selector, or invents the UID the data expects, so it holds on the
+    /// slow structural cadence (300s) instead of hot-looping every 30s — the
+    /// precedent is [`Error::MissingRecordedIdentity`], whose hold is the same
+    /// shape one inherit mode over. The reconciler writes the
+    /// `SecurityContextResolved=False` gate condition + a transition-gated
+    /// Warning Event NAMING the selector before returning this, so the hold is
+    /// never silent and never generic (before #464 it propagated as a bare
+    /// [`Error::MissingDependency`] with no condition at all).
+    ///
+    /// Distinct from the `Fallback` path on purpose: when an explicit
+    /// `mover.securityContext` DOES pin a `runAsUser`, that context stands in
+    /// and the run PROCEEDS with an advisory `SecurityContextInherited=False`/
+    /// `InheritFallback` report — never this error.
+    #[error("mover securityContext could not be resolved: {0}")]
+    InheritSourceMissing(String),
+
     /// JSON (de)serialization of a spec/status/work-spec failed. Structural.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -198,6 +221,7 @@ impl Error {
             | Error::BlockedOnGrant(_)
             | Error::MissingRecordedIdentity(_)
             | Error::MissingSourcePvc(_)
+            | Error::InheritSourceMissing(_)
             | Error::Serialization(_)
             | Error::BuildJob(_)
             | Error::InvalidSchedule(_)
@@ -225,6 +249,7 @@ impl Error {
             | Error::BlockedOnGrant(_)
             | Error::MissingRecordedIdentity(_)
             | Error::MissingSourcePvc(_)
+            | Error::InheritSourceMissing(_)
             | Error::Serialization(_)
             | Error::BuildJob(_)
             | Error::InvalidSchedule(_)
@@ -443,6 +468,40 @@ mod tests {
         // hot-loop the reconciler. Two renders of the same error must be
         // byte-identical.
         let make = || Error::MissingSourcePvc("source PVC `app/data` does not exist".into());
+        assert_eq!(make().to_string(), make().to_string());
+    }
+
+    #[test]
+    fn inherit_source_missing_is_structural_not_a_hot_loop() {
+        // Issue #464: a `workloadSelector` that matches no pod (the workload is
+        // scaled to zero — precisely when a quiesced backup is most useful) used
+        // to surface as a generic MissingDependency (Transient) and re-check
+        // every 30s forever with no condition naming the selector. Nothing in
+        // kopiur can scale the workload up, so it holds on the slow structural
+        // cadence (300s), precedent `MissingRecordedIdentity`, behind the
+        // `SecurityContextResolved=False` gate + Warning Event the reconciler
+        // writes first.
+        let err = Error::InheritSourceMissing(
+            "mover.inheritSecurityContextFrom (workloadSelector `app=pg`) resolved no \
+             securityContext"
+                .into(),
+        );
+        assert_eq!(err.class(), ErrorClass::Structural);
+        assert!(!err.event_publish_futile());
+        assert!(
+            err.to_string()
+                .contains("mover securityContext could not be resolved")
+        );
+        assert!(err.to_string().contains("app=pg"));
+    }
+
+    #[test]
+    fn inherit_source_missing_message_is_byte_stable() {
+        // The condition/Event message rides a 300s requeue, so a volatile byte
+        // (timestamp, attempt counter) would re-write status every pass, bump
+        // resourceVersion, wake the primary watch and hot-loop the reconciler.
+        let make =
+            || Error::InheritSourceMissing("workloadSelector `app=pg` matched no pod".into());
         assert_eq!(make().to_string(), make().to_string());
     }
 

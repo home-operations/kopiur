@@ -545,7 +545,7 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `compliance` | [object](#repository-spec-parameters-blobretention-compliance) | — | `COMPLIANCE` — **nobody can shorten or remove the lock before it expires**, including the account root. An oversized period is an unfixable storage-cost commitment; there is no recovery path short of deleting the bucket after expiry. |
-| `disabled` | boolean | — | Actively disable retention (`--retention-mode=none`). Must be `true`.<br>A `bool` rather than a unit variant because an externally-tagged unit variant serializes as the bare string `"Disabled"`, mixing string and object forms in one `oneOf` and breaking the structural schema. Same shape, and same reason, as `crate::cluster_repository::AllowedNamespaces::All`.<br>This is distinct from omitting `blobRetention` entirely: absent means "leave the repository alone", so deleting the block from a manifest can never silently strip ransomware protection someone configured deliberately. |
+| `disabled` | boolean | — | Actively disable retention (`--retention-mode=none`). Must be `true`.<br>A `bool` rather than a unit variant because an externally-tagged unit variant serializes as the bare string `"Disabled"`, mixing string and object forms in one `oneOf` and breaking the structural schema. Same shape, and same reason, as `AllowedNamespaces::All`.<br>This is distinct from omitting `blobRetention` entirely: absent means "leave the repository alone", so deleting the block from a manifest can never silently strip ransomware protection someone configured deliberately. |
 | `governance` | [object](#repository-spec-parameters-blobretention-governance) | — | `GOVERNANCE` — locked against ordinary deletes, but a sufficiently privileged identity can still shorten or remove the lock. The safe default for most clusters. |
 
 ###### `spec.parameters.blobRetention.compliance` { #repository-spec-parameters-blobretention-compliance }
@@ -564,12 +564,12 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`). |
-| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
-| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`). |
-| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`). |
-| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this. |
-| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration. |
+| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`).<br>At least `10` — kopia refuses anything lower with "epoch advance on count too low". |
+| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>At least `1` — kopia refuses anything lower with "epoch advance on size too low", and 1 MiB is the smallest threshold the flag can express.<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
+| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`).<br>At least `1` — kopia refuses anything lower with "invalid epoch range compaction period". |
+| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`).<br>At least `1`. This floor is kopiur's own: kopia does not validate the field, so a non-positive value would ask it to run epoch cleanup with no workers. |
+| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.<br>Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`. When `refreshFrequency` is not declared, that second bound is measured against kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or declare a `refreshFrequency` of a third of it or less alongside it. |
+| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration.<br>At most `80m`: kopia requires `cleanupSafetyMargin &gt;= 3x` this value, and `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's `4h` default and `4h / 3` is a hard ceiling. |
 
 #### `spec.scheduleDefaults` { #repository-spec-scheduledefaults }
 
@@ -1021,7 +1021,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `advanceOnCount` | integer | **required** | Observed index-blob count that triggers an epoch advance. |
-| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance. |
+| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance, **rounded up**.<br>kopia reports this threshold in BYTES and it need not be a whole number of MiB, so the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a value the repository does not actually hold. Drift against `spec` is computed on the exact byte count, never on this rounded mirror. |
 | `checkpointFrequency` | integer | **required** | Observed epochs between full index checkpoints. |
 | `cleanupSafetyMargin` | string | **required** | Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis; not settable through `spec.parameters`. |
 | `deleteParallelism` | integer | **required** | Observed epoch-cleanup delete parallelism. |
@@ -1061,7 +1061,8 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`) observed at the last bootstrap. |
+| `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`): the freshest count available, from either the last bootstrap or the recount a maintenance run takes right after compacting. `indexBlobCountAt` says when. |
+| `indexBlobCountAt` | string | — | RFC3339 instant `indexBlobCount` was observed.<br>Distinct from `lastObservedAt` (the catalog scan's timestamp) and from `status.health.lastProbeAt` (the backend probe's): the index-blob count has its own writers, and this is what lets the reconciler decide whether a post-maintenance recount is fresher than the bootstrap's own count. Without it the two observations were incomparable, so the `IndexBlobHealth` warning could only ever quote the bootstrap figure — which is pre-compaction, and stayed pre-compaction until the next bootstrap ran (#458).<br>The two writers mean subtly different things, deliberately. A bootstrap stamps "when this count was FIRST seen at this value", reusing the previous stamp while the number is unchanged — that arm re-observes on every reconcile, and a stamp that always moved would make the status always-changed and the reconcile a hot loop. A post-maintenance recount always carries its own instant, because it is a distinct observation taken at a known time and its whole purpose is to be comparable. |
 | `lastObservedAt` | string | — | RFC 3339 timestamp these stats were last observed. |
 | `snapshotCount` | integer | — | Total snapshots present in the repository (across all identities). |
 | `totalSize` | string | — | Human-readable total on-disk size (e.g. `412Gi`). |
@@ -1613,7 +1614,7 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `compliance` | [object](#clusterrepository-spec-parameters-blobretention-compliance) | — | `COMPLIANCE` — **nobody can shorten or remove the lock before it expires**, including the account root. An oversized period is an unfixable storage-cost commitment; there is no recovery path short of deleting the bucket after expiry. |
-| `disabled` | boolean | — | Actively disable retention (`--retention-mode=none`). Must be `true`.<br>A `bool` rather than a unit variant because an externally-tagged unit variant serializes as the bare string `"Disabled"`, mixing string and object forms in one `oneOf` and breaking the structural schema. Same shape, and same reason, as `crate::cluster_repository::AllowedNamespaces::All`.<br>This is distinct from omitting `blobRetention` entirely: absent means "leave the repository alone", so deleting the block from a manifest can never silently strip ransomware protection someone configured deliberately. |
+| `disabled` | boolean | — | Actively disable retention (`--retention-mode=none`). Must be `true`.<br>A `bool` rather than a unit variant because an externally-tagged unit variant serializes as the bare string `"Disabled"`, mixing string and object forms in one `oneOf` and breaking the structural schema. Same shape, and same reason, as `AllowedNamespaces::All`.<br>This is distinct from omitting `blobRetention` entirely: absent means "leave the repository alone", so deleting the block from a manifest can never silently strip ransomware protection someone configured deliberately. |
 | `governance` | [object](#clusterrepository-spec-parameters-blobretention-governance) | — | `GOVERNANCE` — locked against ordinary deletes, but a sufficiently privileged identity can still shorten or remove the lock. The safe default for most clusters. |
 
 ###### `spec.parameters.blobRetention.compliance` { #clusterrepository-spec-parameters-blobretention-compliance }
@@ -1632,12 +1633,12 @@ Externally tagged — set **exactly one** of: `compliance` · `disabled` · `gov
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`). |
-| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
-| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`). |
-| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`). |
-| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this. |
-| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration. |
+| `advanceOnCount` | integer | — | Index blobs in an epoch that trigger an advance, once older than `minDuration` (kopia default `20`).<br>At least `10` — kopia refuses anything lower with "epoch advance on count too low". |
+| `advanceOnSizeMiB` | integer | — | Total index size in an epoch that triggers an advance, once older than `minDuration` (kopia default `10` MiB).<br>At least `1` — kopia refuses anything lower with "epoch advance on size too low", and 1 MiB is the smallest threshold the flag can express.<br>Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes — kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760 bytes — even though kopia's own log renders the result as "MB". That ambiguity is this field's main hazard; the API surface should not reproduce it. |
+| `checkpointFrequency` | integer | — | Epochs between full index checkpoints (kopia default `7`).<br>At least `1` — kopia refuses anything lower with "invalid epoch range compaction period". |
+| `deleteParallelism` | integer | — | Parallelism for epoch cleanup deletions (kopia default `4`).<br>At least `1`. This floor is kopiur's own: kopia does not validate the field, so a non-positive value would ask it to run epoch cleanup with no workers. |
+| `minDuration` | string | — | Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.<br>Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`. When `refreshFrequency` is not declared, that second bound is measured against kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or declare a `refreshFrequency` of a third of it or less alongside it. |
+| `refreshFrequency` | string | — | How often clients re-read epoch state (kopia default `20m`). Go-style duration.<br>At most `80m`: kopia requires `cleanupSafetyMargin &gt;= 3x` this value, and `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's `4h` default and `4h / 3` is a hard ceiling. |
 
 #### `spec.scheduleDefaults` { #clusterrepository-spec-scheduledefaults }
 
@@ -2091,7 +2092,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `advanceOnCount` | integer | **required** | Observed index-blob count that triggers an epoch advance. |
-| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance. |
+| `advanceOnSizeMiB` | integer | **required** | Observed total index size (MiB) that triggers an epoch advance, **rounded up**.<br>kopia reports this threshold in BYTES and it need not be a whole number of MiB, so the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a value the repository does not actually hold. Drift against `spec` is computed on the exact byte count, never on this rounded mirror. |
 | `checkpointFrequency` | integer | **required** | Observed epochs between full index checkpoints. |
 | `cleanupSafetyMargin` | string | **required** | Observed cleanup safety margin, as a Go-style duration. Reported for diagnosis; not settable through `spec.parameters`. |
 | `deleteParallelism` | integer | **required** | Observed epoch-cleanup delete parallelism. |
@@ -2131,7 +2132,8 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`) observed at the last bootstrap. |
+| `indexBlobCount` | integer | — | Number of content-index blobs (`kopia index list`): the freshest count available, from either the last bootstrap or the recount a maintenance run takes right after compacting. `indexBlobCountAt` says when. |
+| `indexBlobCountAt` | string | — | RFC3339 instant `indexBlobCount` was observed.<br>Distinct from `lastObservedAt` (the catalog scan's timestamp) and from `status.health.lastProbeAt` (the backend probe's): the index-blob count has its own writers, and this is what lets the reconciler decide whether a post-maintenance recount is fresher than the bootstrap's own count. Without it the two observations were incomparable, so the `IndexBlobHealth` warning could only ever quote the bootstrap figure — which is pre-compaction, and stayed pre-compaction until the next bootstrap ran (#458).<br>The two writers mean subtly different things, deliberately. A bootstrap stamps "when this count was FIRST seen at this value", reusing the previous stamp while the number is unchanged — that arm re-observes on every reconcile, and a stamp that always moved would make the status always-changed and the reconcile a hot loop. A post-maintenance recount always carries its own instant, because it is a distinct observation taken at a known time and its whole purpose is to be comparable. |
 | `lastObservedAt` | string | — | RFC 3339 timestamp these stats were last observed. |
 | `snapshotCount` | integer | — | Total snapshots present in the repository (across all identities). |
 | `totalSize` | string | — | Human-readable total on-disk size (e.g. `412Gi`). |
@@ -2404,17 +2406,18 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 #### `spec.sources[]` { #snapshotpolicy-spec-sources }
 
-Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
+Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector` · `stream`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `acknowledgeLiveMutation` | boolean | — | Acknowledges that `copyMethod: Direct` + `readOnly: false` lets the kubelet recursively `chgrp` the **live** volume to the mover's `fsGroup` and make it group-writable — permanently, while the workload is running. Required for that combination alone.<br>Ignored (not rejected) otherwise: it is an acknowledgement, never harmful to carry, and rejecting a stale one would make switching `copyMethod` between `Direct` and `Snapshot`/`Clone` a two-step edit in both directions. |
-| `nfs` | [object](#snapshotpolicy-spec-sources-nfs) | — | An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`. |
+| `nfs` | [object](#snapshotpolicy-spec-sources-nfs) | — | An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`/`stream`. |
 | `pvc` | [object](#snapshotpolicy-spec-sources-pvc) | — | Single PVC by name. Mutually exclusive with `pvcSelector`/`nfs`. |
 | `pvcSelector` | [object](#snapshotpolicy-spec-sources-pvcselector) | — | Label/namespace selector matching many PVCs. Mutually exclusive with `pvc`/`nfs`. |
 | `readOnly` | boolean | `true` | Mount the source read-only (default `true`; kopia only ever reads it).<br>Set `false` **only** to make `fsGroup` work on the source. The kubelet applies `fsGroup` by recursively `chgrp`-ing the volume and adding group-write — and it skips that walk entirely on a read-only mount, which is why a mover `fsGroup`/`fsGroupChangePolicy` otherwise has no effect here. Under `copyMethod: Snapshot`/`Clone` the walk rewrites the throwaway staged PVC and never touches your data. Under `copyMethod: Direct` it rewrites the LIVE volume, which requires `acknowledgeLiveMutation`.<br>Not supported on an `nfs` source: the kubelet does not apply `fsGroup` to in-tree NFS volumes at all, so a read-write mount would grant nothing. |
-| `sourcePathOverride` | string | —<br><sub>maxLength 4096</sub> | What kopia records as the source path (default `/pvc/&lt;name&gt;`, or the NFS export `path`). |
+| `sourcePathOverride` | string | —<br><sub>maxLength 4096</sub> | What kopia records as the source path (default `/pvc/&lt;name&gt;`, or the NFS export `path`).<br>On a `pvcSelector` source this is a footgun. It is ONE literal path, so it works only while the selector matches exactly one PVC; the moment a second PVC matches, both would land on that same kopia source, merging their histories into one stream where they also prune each other, so the BACKUP is refused at run time and no further snapshots are minted for that source.<br>Watch the failed schedule fire, not verification: the earlier snapshots remain at that path, so verification keeps passing while backups have stopped. (Verification only fails on a path that never received a backup.) Prefer `sourcePathStrategy`, which derives a distinct path per PVC, or put the override on its own `pvc:` source. |
 | `sourcePathStrategy` | enum: PvcName \| PvcNamespacedName | `PvcName` | How a selector-matched PVC's source path is derived. Only relevant for `pvcSelector` sources, where one recipe expands to many PVCs and each needs a distinct kopia source path. Defaults to `PvcName`. |
+| `stream` | [object](#snapshotpolicy-spec-sources-stream) | — | Capture a command's standard output as one virtual file — a logical backup (`pg_dumpall`, `mysqldump`, …) rather than a volume copy. Mutually exclusive with `pvc`/`pvcSelector`/`nfs`. No volume is mounted; the mover execs the command in a running workload Pod and streams its stdout straight into kopia. |
 
 ##### `spec.sources[].nfs` { #snapshotpolicy-spec-sources-nfs }
 
@@ -2441,6 +2444,22 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `matchNames` | []string | — | Exact namespace names to search; empty means the policy's own namespace. |
+
+##### `spec.sources[].stream` { #snapshotpolicy-spec-sources-stream }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `fileName` | string | **required**<br><sub>minLength 1; maxLength 255</sub> | Name of the single virtual file stored in the snapshot (e.g. `postgres.sql`).<br>Must be ONE file name: no `/`, and not `.` or `..`. kopia stores this string verbatim as the entry name and does not sanitize it, so a path-shaped value would make a later `kopia restore` write OUTSIDE its destination directory. |
+| `workloadExec` | [object](#snapshotpolicy-spec-sources-stream-workloadexec) | **required** | The producer: what to run, and where. Its stdout IS the backup data. |
+
+###### `spec.sources[].stream.workloadExec` { #snapshotpolicy-spec-sources-stream-workloadexec }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `command` | []string | **required**<br><sub>minItems 1</sub> | The argv to execute. NOT a shell line: element 0 is the program, so use `["sh", "-ec", "..."]` explicitly if you want shell semantics.<br>Reference credentials through the container's existing environment or mounted Secrets — never inline them here. This argv is copied into the mover Pod's spec, so anyone with `pods:get` in the namespace can read it. |
+| `podSelector` | core/v1 LabelSelector | **required** | Standard label selector identifying the workload Pod, resolved in the `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an empty selector matches every Pod in the namespace. |
+| `container` | string | — | Container to exec in; absent uses the Pod's default container. |
+| `timeout` | string | `1h` | Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the command is abandoned and the run fails, leaving no snapshot behind.<br>The same bound applies whether this exec is a backup's producer or a `streamExec` restore's consumer. |
 
 #### `spec.staging` { #snapshotpolicy-spec-staging }
 
@@ -2509,13 +2528,13 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `adoption` | [object](#snapshotpolicy-status-adoption) | — | Summary of automatic adoption of discovered snapshots into this recipe. |
 | `conditions` | [][object](#snapshotpolicy-status-conditions) | — | Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`). |
 | `lastSuccessfulSnapshot` | string | — | RFC3339 timestamp of the most recent successful child `Snapshot` from this recipe. |
-| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier). Single-repo: stamped directly by the verify mover. Multi-repo: computed by the controller as the MINIMUM `lastVerified` across the CURRENT repositories ("everything is verified as of T"), absent until every current repository has verified at least once. |
+| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier).<br>Verification runs once per (repository x source) cell: a `spec.repositories` fan-out adds the repository dimension, and a `pvcSelector` source adds one cell per matched PVC (each has its own kopia source path, so each needs its own verification).<br>* one repository AND a non-selector source (`pvc`/`nfs`): stamped   directly by the verify mover, exactly as before; * otherwise — a `spec.repositories` fan-out, or ANY `pvcSelector` source   (including one currently matching a single PVC): computed by the   controller as the MINIMUM across the CURRENT cells ("everything is   verified as of T"), and absent until EVERY current cell has verified at   least once — a partially verified policy must not display a reassuring   timestamp. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, for staleness detection. |
 | `repositorySummary` | string | — | Human-readable summary of the policy's repository target(s) for the `Repositories` print column: the comma-joined repository names (the one name for the single-repo shape), capped near a kubectl column width with a `+N` overflow marker. Written by the controller. |
 | `resolved` | [object](#snapshotpolicy-status-resolved) | — | What would be passed to kopia — pinned at admission. |
 | `retention` | [object](#snapshotpolicy-status-retention) | — | Summary of GFS retention pruning against this config's `Snapshot` CRs. |
 | `verification` | [][object](#snapshotpolicy-status-verification) | — | Per-repository verification records for a multi-repository policy (#368): one entry per CURRENT `spec.repositories` member, maintained by the controller (single writer — entries for repositories no longer in the spec are pruned). Empty (elided) for the single-repo shape, whose wire stays byte-identical. |
-| `verificationStamps` | map[string]string | — | Internal write channel for per-repository verification (#368): RFC3339 markers keyed by the normalized repository key (`repo_key`). Each verify mover merge-patches ONLY its own key — a JSON merge patch merges map keys, so two concurrent per-repo verifies can never clobber one another (a Vec would be replaced wholesale). The controller folds these into `verification` on its next pass and prunes keys for repositories no longer in the spec. Never written for the single-repo shape. |
+| `verificationStamps` | map[string]string | — | Internal write channel for per-cell verification: RFC3339 markers keyed by the (repository x source) cell a verify run covered.<br>Key shapes, where the repository segment is the normalized repository key (`repo_key`) and the member segment is a stable 12-hex tag over the matched PVC's derived kopia source path:<br>* `&lt;repository&gt;` — a `spec.repositories` fan-out with a single source; * `&lt;repository&gt;#&lt;member&gt;` — a fan-out over both dimensions; * `#&lt;member&gt;` — one repository, a `pvcSelector` source (the repository   segment is empty).<br>`#` is the separator because a repository key cannot contain one.<br>Each verify mover merge-patches ONLY its own key — a JSON merge patch merges map keys, so concurrent cells can never clobber one another (a Vec would be replaced wholesale). The controller folds these into `verification` and `lastVerified` on its next pass and prunes keys whose repository or matched PVC is gone. Not written when the policy targets one repository with a non-selector source, whose wire stays byte-identical; a `pvcSelector` source always uses this map, even while it matches a single PVC. |
 
 #### `status.adoption` { #snapshotpolicy-status-adoption }
 
@@ -2600,7 +2619,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `repository` | [object](#snapshotpolicy-status-verification-repository) | **required** | The repository this record covers, normalized (`normalized_repository_ref`) so it re-resolves from anywhere. |
-| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier) against THIS repository; absent until its first successful verify. |
+| `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier) against THIS repository; absent until its first successful verify.<br>When the policy's source is a `pvcSelector`, this is the MINIMUM across that repository's matched PVCs, and absent until every one of them has verified — a repository whose volumes are only partly verified must not look fully verified. |
 
 ##### `status.verification[].repository` { #snapshotpolicy-status-verification-repository }
 
@@ -2623,6 +2642,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `deletionPolicy` | enum: Delete \| Retain \| Orphan | — | Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted. Produced backups default to `Delete`; discovered snapshots are forced to `Retain`. |
 | `description` | string | —<br><sub>maxLength 1024</sub> | Free-form text recorded on the kopia snapshot manifest (`snapshot create --description`). Per-invocation by nature — scheduled/discovered `Snapshot`s never set this (no templated descriptions). |
 | `failurePolicy` | [object](#snapshot-spec-failurepolicy) | — | Mover Job retry and deadline limits for this run. |
+| `mover` | [object](#snapshot-spec-mover) | — | Per-run mover overrides for THIS snapshot's Job (resources, cache budgets, `securityContext`, `privilegedMode`, `ttlSecondsAfterFinished`).<br>Layered field-wise as `repository.moverDefaults &lt; policyRef's mover &lt; this mover` — the highest layer that sets a field wins, and a field you omit falls through, so a partial override here can only adjust what it names. This exists so an ad-hoc one-shot (`kubectl create` before a risky change, a debug run that needs more memory or a different UID) does not require editing the shared, GitOps-managed `SnapshotPolicy` that every scheduled run also uses.<br>Two deliberate exclusions:<br>* `mover.cache` here is **run-scoped only**. It sets this run's kopia cache   budgets (`--content-cache-size-mb`/`--metadata-cache-size-mb`) and, when   the cache is `Ephemeral`, that Job's cache-volume `capacity` and   `storageClassName` — a generic ephemeral volume bound to this pod and   GC'd with it. What it cannot touch is anything **shared**: `cache.mode`   is policy-owned (a per-run `mode: Persistent` never mints the shared   PVC), and under `mode: Persistent` the PVC's own `capacity`/   `storageClassName` come from the policy alone, because that claim is   named per-POLICY and every sibling `Snapshot` depends on it.<br>* `inheritSecurityContextFrom.snapshot` is restore-only and rejected here,   exactly as on `SnapshotPolicy`: a backup's identity comes from the live   workload; it is the run that *records* an identity.<br>An elevated mover assembled here is gated by the namespace's `privileged-movers` opt-in just like a policy-level one — the gate runs on the merged result. |
 | `onScheduleDelete` | enum: Retain \| Delete | — | What the deletion of a `SnapshotSchedule` does to the `Snapshot` CRs it produced (which Kubernetes GC cascade-deletes via their ownerReference). Default `Retain`: the CRs are removed but their kopia snapshots survive and the catalog rediscovers them as `origin: discovered`. `Delete` opts into the cascade: each Snapshot's own `deletionPolicy` applies.<br>Deliberately 2-variant (not reusing `DeletionPolicy`): an `Orphan` in cascade position would differ from `Retain` only in per-CR event/metric bookkeeping — an invalid state made unrepresentable. The guard's `Retain` is exactly `DeletionPolicy::Retain`'s semantics (CR removed, kopia snapshot stays, catalog rediscovers it), deliberately NOT the `Orphan` event storm (no per-CR "orphaned" event/metric for every produced Snapshot). |
 | `pin` | boolean | — | Exempt this snapshot from GFS retention. |
 | `policyRef` | [object](#snapshot-spec-policyref) | — | The `SnapshotPolicy` recipe to run; absent for `discovered` backups. |
@@ -2637,6 +2657,51 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector`.
 | `activeDeadlineSeconds` | integer | — | Mover `Job.spec.activeDeadlineSeconds` — wall-clock cap after which a running run is killed. |
 | `backoffLimit` | integer | — | Mover `Job.spec.backoffLimit` — retries before a failed run is marked failed. |
 | `podStartupDeadlineSeconds` | integer | — | Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s. |
+
+#### `spec.mover` { #snapshot-spec-mover }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `cache` | [object](#snapshot-spec-mover-cache) | — | Override the repository's `CacheDefaults` for this recipe's movers. |
+| `inheritSecurityContextFrom` | [union](#snapshot-spec-mover-inheritsecuritycontextfrom) | — | Copy the UID/GID security context from a live workload rather than hard-coding it.<br>Requires the workload to pin `runAsUser` (container or pod level): a UID that comes from the container image's `USER` line is invisible in the pod spec and cannot be inherited — the mover would silently run as its own image's UID instead.<br>May be combined with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback when no workload pod can be resolved. |
+| `podSecurityContext` | core/v1 PodSecurityContext | — | Pod security context for the mover (notably `fsGroup` for group-writable restore volumes). Same layering as `securityContext`: highest layer, merged field-wise, and combinable with `inheritSecurityContextFrom`. |
+| `privilegedMode` | boolean | — | Opt-in, namespace-gated privileged mode; preserves UID/GID on restore. |
+| `resources` | core/v1 ResourceRequirements | — | Resource requests/limits for the mover container. |
+| `securityContext` | core/v1 SecurityContext | — | Container security context for the mover; merged field-wise over the hardened base, `moverDefaults`, and any inherited context — this is the highest layer, so every field set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the workload's, fields you omit are inherited, and this context stands in alone when inheritance cannot resolve a pod. |
+| `ttlSecondsAfterFinished` | integer | — | Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC. |
+
+##### `spec.mover.cache` { #snapshot-spec-mover-cache }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
+| `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+##### `spec.mover.inheritSecurityContextFrom` { #snapshot-spec-mover-inheritsecuritycontextfrom }
+
+Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `workloadSelector`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `pvcConsumer` | [object](#snapshot-spec-mover-inheritsecuritycontextfrom-pvcconsumer) | — | Backup sources only: auto-derive the workload from the PVC this snapshot backs up. |
+| `snapshot` | object | — | Restores only: inherit the identity RECORDED on the backup itself (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) — uid/gid/fsGroup the backup mover actually ran as. Needs no live workload pod, so it works on a rebuilt cluster and with `target.populator`. Rejected at admission on SnapshotPolicy/Maintenance (backups read the live workload; maintenance has no snapshot). Write it as `snapshot: {}` (an empty sub-object) — a bare `snapshot:` is null and rejected. |
+| `workloadSelector` | [object](#snapshot-spec-mover-inheritsecuritycontextfrom-workloadselector) | — | Inherit from workload pod(s) matched by an explicit label selector (backup or restore). |
+
+###### `spec.mover.inheritSecurityContextFrom.pvcConsumer` { #snapshot-spec-mover-inheritsecuritycontextfrom-pvcconsumer }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `container` | string | — | Which container within the matched consumer pod to inherit from; absent uses the first/only. |
+
+###### `spec.mover.inheritSecurityContextFrom.workloadSelector` { #snapshot-spec-mover-inheritsecuritycontextfrom-workloadselector }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `podSelector` | core/v1 LabelSelector | **required** | Label selector matching the workload pod(s) to read context/hooks from. |
+| `container` | string | — | Which container within the matched pod; absent uses the first/only container. |
 
 #### `spec.policyRef` { #snapshot-spec-policyref }
 
@@ -2983,7 +3048,7 @@ Externally tagged — set **exactly one** of: `pvc`.
 
 **Validation rules** (enforced at admission):
 
-- exactly one of target.pvc, target.pvcRef, target.populator
+- exactly one of target.pvc, target.pvcRef, target.populator, target.streamExec
 
 #### `spec.source` { #restore-spec-source }
 
@@ -3025,13 +3090,14 @@ Externally tagged — set **exactly one** of: `fromPolicy` · `identity` · `sna
 
 #### `spec.target` { #restore-spec-target }
 
-Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef`.
+Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef` · `streamExec`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `populator` | object | — | Passive populator mode: the restore is claimed by a PVC's `spec.dataSourceRef`. |
 | `pvc` | [object](#restore-spec-target-pvc) | — | Operator creates the PVC. |
 | `pvcRef` | [object](#restore-spec-target-pvcref) | — | Write into an existing PVC. |
+| `streamExec` | [object](#restore-spec-target-streamexec) | — | Stream one virtual file out of the snapshot into a command's stdin in a running Pod — the companion of a `stream` backup source (e.g. feeding a `pg_dumpall` artifact back through `psql`). Writes no PVC. |
 
 ##### `spec.target.pvc` { #restore-spec-target-pvc }
 
@@ -3048,6 +3114,22 @@ Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef`.
 | --- | --- | --- | --- |
 | `name` | string | **required** | Name of the referenced object. |
 | `namespace` | string | — | Namespace of the referenced object; absent = same namespace as the referrer. |
+
+##### `spec.target.streamExec` { #restore-spec-target-streamexec }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `fileName` | string | **required**<br><sub>minLength 1; maxLength 255</sub> | Which virtual file inside the snapshot to read back — the `fileName` the backup's stream source used (e.g. `postgres.sql`). |
+| `workloadExec` | [object](#restore-spec-target-streamexec-workloadexec) | **required** | Where to send it: the command receives the file's bytes on stdin. |
+
+###### `spec.target.streamExec.workloadExec` { #restore-spec-target-streamexec-workloadexec }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `command` | []string | **required**<br><sub>minItems 1</sub> | The argv to execute. NOT a shell line: element 0 is the program, so use `["sh", "-ec", "..."]` explicitly if you want shell semantics.<br>Reference credentials through the container's existing environment or mounted Secrets — never inline them here. This argv is copied into the mover Pod's spec, so anyone with `pods:get` in the namespace can read it. |
+| `podSelector` | core/v1 LabelSelector | **required** | Standard label selector identifying the workload Pod, resolved in the `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an empty selector matches every Pod in the namespace. |
+| `container` | string | — | Container to exec in; absent uses the Pod's default container. |
+| `timeout` | string | `1h` | Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the command is abandoned and the run fails, leaving no snapshot behind.<br>The same bound applies whether this exec is a backup's producer or a `streamExec` restore's consumer. |
 
 #### `spec.credentialProjection` { #restore-spec-credentialprojection }
 
@@ -3366,6 +3448,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `full` | [object](#maintenance-status-full) | — | Last/next-run state for the full maintenance schedule. |
 | `manualRun` | [object](#maintenance-status-manualrun) | — | State of the most recent annotation-requested out-of-band run; absent until one is requested. |
 | `observedGeneration` | integer | — | The `metadata.generation` this status reflects, for staleness detection. |
+| `observedIndexBlobs` | [object](#maintenance-status-observedindexblobs) | — | Content-index blob count re-counted right after the most recent successful run. |
 | `ownership` | [object](#maintenance-status-ownership) | — | Current lease holder, if the lease has been claimed. |
 | `quick` | [object](#maintenance-status-quick) | — | Last/next-run state for the quick maintenance schedule. |
 
@@ -3385,7 +3468,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `consecutiveFailures` | integer | — | Count of back-to-back failed runs of this kind; resets on success. |
-| `lastContentReclaimedBytes` | integer | — | Bytes of storage reclaimed by the most recent run of this kind. |
+| `lastContentReclaimedBytes` | integer | — | Bytes of backend storage the most recent run of this kind actually freed: the blobs kopia deleted (unreferenced packs, superseded epoch indexes and expired logs), summed from the run history `kopia maintenance info` reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only marks contents deleted in the index and frees no storage until a later run removes the blobs. Absent when the run reclaimed nothing measurable — a quick run on an epoch-enabled repository only advances and compacts epochs, so there is no figure to report; `0` always means a measured zero, never "unknown". |
 | `lastHandledAt` | string | — | RFC3339 instant the controller last observed this kind's per-slot Job reach terminal success. |
 | `lastRunAt` | string | — | RFC3339 instant of the most recent run of this kind. |
 | `nextScheduledAt` | string | — | RFC3339 instant of the next scheduled run of this kind (cron + jitter, pinned). |
@@ -3399,6 +3482,13 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `phase` | enum: Running \| Succeeded \| Failed | — | Lifecycle of a manual run. Closed enum. |
 | `requestedAt` | string | — | The `run-requested` annotation value this status reflects (RFC3339). |
 
+#### `status.observedIndexBlobs` { #maintenance-status-observedindexblobs }
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `count` | integer | `0` | Number of content-index blobs (`kopia index list`) after the run. |
+| `observedAt` | string | `` | RFC3339 instant the recount was taken. What makes this observation comparable against the repository's own `storageStats.indexBlobCountAt`, so whichever is newer wins rather than whichever was written last. |
+
 #### `status.ownership` { #maintenance-status-ownership }
 
 | Field | Type | Default | Description |
@@ -3411,7 +3501,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `consecutiveFailures` | integer | — | Count of back-to-back failed runs of this kind; resets on success. |
-| `lastContentReclaimedBytes` | integer | — | Bytes of storage reclaimed by the most recent run of this kind. |
+| `lastContentReclaimedBytes` | integer | — | Bytes of backend storage the most recent run of this kind actually freed: the blobs kopia deleted (unreferenced packs, superseded epoch indexes and expired logs), summed from the run history `kopia maintenance info` reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only marks contents deleted in the index and frees no storage until a later run removes the blobs. Absent when the run reclaimed nothing measurable — a quick run on an epoch-enabled repository only advances and compacts epochs, so there is no figure to report; `0` always means a measured zero, never "unknown". |
 | `lastHandledAt` | string | — | RFC3339 instant the controller last observed this kind's per-slot Job reach terminal success. |
 | `lastRunAt` | string | — | RFC3339 instant of the most recent run of this kind. |
 | `nextScheduledAt` | string | — | RFC3339 instant of the next scheduled run of this kind (cron + jitter, pinned). |

@@ -615,8 +615,21 @@ pub struct MaintenanceCadence {
     pub interval: i64,
 }
 
-/// The `schedule` block: when maintenance next runs. The detailed per-task
-/// `runs` history is left as a raw value (its shape is large and unstable).
+/// The `schedule` block: when maintenance next runs, plus the per-task run
+/// history kopia keeps in the same blob.
+///
+/// `runs` is kopia's `map[TaskType][]RunInfo`
+/// (`repo/maintenance/maintenance_schedule.go`). It carries **no** `omitempty`,
+/// so a repository that has never run maintenance emits `"runs": null` rather
+/// than omitting the key — hence [`Self::runs`] must tolerate an explicit null,
+/// which `#[serde(default)]` alone does NOT (a default applies only to an
+/// ABSENT key). See the field for the deserializer that does.
+///
+/// kopia's `Schedule.ReportRun` **prepends** each new run and truncates the
+/// history to 50 entries per task. Never key a before/after comparison on index
+/// or length: at saturation `len(after) == len(before)`. Compare
+/// [`MaintenanceRun::start`] instead — that is what
+/// [`reclaimed_bytes_since`] does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MaintenanceSchedule {
@@ -626,6 +639,198 @@ pub struct MaintenanceSchedule {
     /// Next scheduled quick maintenance, if known.
     #[serde(default)]
     pub next_quick_maintenance: Option<DateTime<Utc>>,
+    /// Per-task run history, newest first, capped at 50 entries per task.
+    ///
+    /// The key is kopia's `TaskType` string (`full-delete-blobs`,
+    /// `snapshot-gc`, …) — see the `TASK_*` constants. A `BTreeMap` (not a
+    /// typed enum) on purpose: a newer kopia adding a task must not fail the
+    /// parse of a `maintenance info` the mover's lease decision depends on.
+    ///
+    /// `deserialize_with` is not decoration: `#[serde(default)]` alone rejects
+    /// the explicit `"runs": null` a fresh repository really emits (proven by
+    /// `null_runs_history_decodes_as_empty`), because a default only applies to
+    /// an ABSENT key.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub runs: BTreeMap<String, Vec<MaintenanceRun>>,
+}
+
+/// Deserialize an explicit JSON `null` as `T::default()` rather than an error.
+///
+/// Needed wherever kopia's Go struct field carries no `omitempty` but its value
+/// is a nil map/slice: `encoding/json` writes `null`, and serde's `default`
+/// covers only a MISSING key.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// kopia maintenance task: delete blobs no index references, in a **quick** run.
+/// The `deletedTotalSize` its [`TASK_DELETE_UNREFERENCED_PACKS_STATS`] extra
+/// reports is storage actually freed from the backend.
+pub const TASK_QUICK_DELETE_BLOBS: &str = "quick-delete-blobs";
+/// kopia maintenance task: the [`TASK_QUICK_DELETE_BLOBS`] twin in a **full** run.
+pub const TASK_FULL_DELETE_BLOBS: &str = "full-delete-blobs";
+/// kopia maintenance task: drop index blobs superseded by epoch compaction.
+pub const TASK_DELETE_SUPERSEDED_EPOCH_INDEXES: &str = "delete-superseded-epoch-indexes";
+/// kopia maintenance task: expire old repository log blobs per `logRetention`.
+pub const TASK_CLEANUP_LOGS: &str = "cleanup-logs";
+
+/// `extra[].kind` for [`DeleteUnreferencedPacksStats`].
+pub const TASK_DELETE_UNREFERENCED_PACKS_STATS: &str = "deleteUnreferencedPacksStats";
+/// `extra[].kind` for [`CleanupSupersededIndexesStats`].
+pub const KIND_CLEANUP_SUPERSEDED_INDEXES_STATS: &str = "cleanupSupersededIndexesStats";
+/// `extra[].kind` for [`CleanupLogsStats`].
+pub const KIND_CLEANUP_LOGS_STATS: &str = "cleanupLogsStats";
+
+/// One entry in a per-task maintenance run history (`schedule.runs[task][]`).
+///
+/// Mirrors kopia's `maintenance.RunInfo`. Two serialization details are
+/// load-bearing:
+///
+/// * `success` is `json:"success,omitempty"`, so a **failed** run serializes
+///   with the key *absent*. `#[serde(default)]` therefore decodes a failed run
+///   as `success: false` — the same value kopia meant.
+/// * `extra` is populated only on success, so a failed run contributes no
+///   statistics at all.
+///
+/// `start`/`end` carry no `omitempty` in kopia today, but are modelled as
+/// `Option` anyway: this history feeds a best-effort *metric*, and it must
+/// never be the reason a `maintenance info` — which the mover's lease decision
+/// depends on — fails to parse.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceRun {
+    /// When the run started. The only sound key for a before/after comparison
+    /// (see [`MaintenanceSchedule::runs`] on why index and length are not).
+    #[serde(default)]
+    pub start: Option<DateTime<Utc>>,
+    /// When the run finished.
+    #[serde(default)]
+    pub end: Option<DateTime<Utc>>,
+    /// Whether the run succeeded. Absent on the wire means `false`.
+    #[serde(default)]
+    pub success: bool,
+    /// kopia's failure text, empty on success.
+    #[serde(default)]
+    pub error: String,
+    /// Per-task statistics blocks; populated only on success.
+    #[serde(default)]
+    pub extra: Vec<MaintenanceRunExtra>,
+}
+
+impl MaintenanceRun {
+    /// The typed `data` of the first extra with `kind`, or `None` when this run
+    /// carries no such extra (or its `data` does not fit `T` — kopia emits an
+    /// explicit `"data": null` for the statless tasks).
+    fn stats<T: serde::de::DeserializeOwned>(&self, kind: &str) -> Option<T> {
+        self.extra
+            .iter()
+            .find(|e| e.kind == kind)
+            .and_then(|e| serde_json::from_value(e.data.clone()).ok())
+    }
+
+    /// Blobs deleted because no index referenced them — the one statistic that
+    /// reports storage genuinely freed from the backend.
+    pub fn delete_unreferenced_packs_stats(&self) -> Option<DeleteUnreferencedPacksStats> {
+        self.stats(TASK_DELETE_UNREFERENCED_PACKS_STATS)
+    }
+
+    /// Index blobs deleted after epoch compaction superseded them.
+    pub fn cleanup_superseded_indexes_stats(&self) -> Option<CleanupSupersededIndexesStats> {
+        self.stats(KIND_CLEANUP_SUPERSEDED_INDEXES_STATS)
+    }
+
+    /// Repository log blobs deleted per `logRetention`.
+    pub fn cleanup_logs_stats(&self) -> Option<CleanupLogsStats> {
+        self.stats(KIND_CLEANUP_LOGS_STATS)
+    }
+}
+
+/// One statistics block on a [`MaintenanceRun`] — kopia's
+/// `maintenancestats.Extra`, which is `{Kind string; Data json.RawMessage}`.
+///
+/// `data` is a **nested object** whose shape depends on `kind`, so this is
+/// deliberately *not* a `#[serde(tag = ...)]` enum: an unknown `kind` written
+/// by a newer kopia must still decode (and kopia emits `"data": null` for the
+/// tasks that have no statistics, which a tagged enum would also reject). Reach
+/// for the typed accessors on [`MaintenanceRun`] instead of matching on `kind`
+/// by hand.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceRunExtra {
+    /// kopia's statistics-kind discriminator, e.g. `deleteUnreferencedPacksStats`.
+    #[serde(default)]
+    pub kind: String,
+    /// The kind-specific payload; `null` for the statless tasks.
+    #[serde(default)]
+    pub data: serde_json::Value,
+}
+
+/// `deleteUnreferencedPacksStats` — the `quick-delete-blobs` /
+/// `full-delete-blobs` result. **This** is where reclaimed storage is reported:
+/// the task issues real blob deletes against the backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteUnreferencedPacksStats {
+    /// Pack blobs found unreferenced by any index.
+    #[serde(default)]
+    pub unreferenced_pack_count: i64,
+    /// Total bytes of those unreferenced pack blobs.
+    #[serde(default)]
+    pub unreferenced_total_size: i64,
+    /// Pack blobs actually deleted this run.
+    #[serde(default)]
+    pub deleted_pack_count: i64,
+    /// **Bytes actually freed from the backend** this run.
+    #[serde(default)]
+    pub deleted_total_size: i64,
+    /// Pack blobs held back by the run's safety margin (too recent to delete).
+    #[serde(default)]
+    pub retained_pack_count: i64,
+    /// Total bytes of the retained pack blobs.
+    #[serde(default)]
+    pub retained_total_size: i64,
+}
+
+/// `cleanupSupersededIndexesStats` — the `delete-superseded-epoch-indexes`
+/// result. Real blob deletes, so its `deletedTotalSize` is freed storage too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupSupersededIndexesStats {
+    /// Index blobs deleted this run.
+    #[serde(default)]
+    pub deleted_blob_count: i64,
+    /// Bytes freed by deleting them.
+    #[serde(default)]
+    pub deleted_total_size: i64,
+}
+
+/// `cleanupLogsStats` — the `cleanup-logs` result. Repository log blobs are real
+/// blobs, so `deletedBlobSize` is freed storage as well (a small figure, but a
+/// true one).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupLogsStats {
+    /// Log blobs eligible for deletion.
+    #[serde(default)]
+    pub to_delete_blob_count: i64,
+    /// Total bytes of the eligible log blobs.
+    #[serde(default)]
+    pub to_delete_blob_size: i64,
+    /// Log blobs actually deleted this run.
+    #[serde(default)]
+    pub deleted_blob_count: i64,
+    /// Bytes freed by deleting them.
+    #[serde(default)]
+    pub deleted_blob_size: i64,
+    /// Log blobs kept.
+    #[serde(default)]
+    pub retained_blob_count: i64,
+    /// Total bytes of the kept log blobs.
+    #[serde(default)]
+    pub retained_blob_size: i64,
 }
 
 /// Result of `kopia maintenance info --json`.
@@ -661,6 +866,98 @@ pub struct MaintenanceInfo {
     /// Schedule with next-run timestamps.
     #[serde(default)]
     pub schedule: Option<MaintenanceSchedule>,
+}
+
+/// The newest [`MaintenanceRun::start`] recorded for `task`, or `None` when the
+/// schedule has no successful-or-failed entry for it.
+fn newest_run_start(info: &MaintenanceInfo, task: &str) -> Option<DateTime<Utc>> {
+    info.schedule
+        .as_ref()?
+        .runs
+        .get(task)?
+        .iter()
+        .filter_map(|r| r.start)
+        .max()
+}
+
+/// The **successful** runs of `task` present in `after` but not in `before`.
+///
+/// Selected by `start` strictly newer than the newest `start` `before` had for
+/// that task — never by index or length, because kopia prepends and caps the
+/// history at 50 entries per task, so at saturation the two lists are the same
+/// length (see [`MaintenanceSchedule::runs`]). A run with no `start` cannot be
+/// proven new and is skipped.
+fn runs_since<'a>(
+    before: &'a MaintenanceInfo,
+    after: &'a MaintenanceInfo,
+    task: &'a str,
+) -> impl Iterator<Item = &'a MaintenanceRun> {
+    let floor = newest_run_start(before, task);
+    after
+        .schedule
+        .iter()
+        .filter_map(move |s| s.runs.get(task))
+        .flatten()
+        .filter(move |r| r.success && r.start.is_some_and(|start| floor.is_none_or(|f| start > f)))
+}
+
+/// Bytes of backend storage **actually freed** by the maintenance run that
+/// happened between two `kopia maintenance info` observations.
+///
+/// `kopia maintenance run` prints no machine-readable result, so the only way to
+/// learn what a run reclaimed is to diff the per-task run history it appends to
+/// the schedule blob. Returns `None` when no counted task produced a new
+/// successful run — the honest answer for an epoch-enabled repository's *quick*
+/// run, which kopia short-circuits into `compact-single-epoch` + `advance-epoch`
+/// only (`runQuickMaintenance`), neither of which deletes a blob. `Some(0)`
+/// means a counted task *did* run and freed nothing; `None` means unknown. They
+/// are never conflated.
+///
+/// # What is counted, and what deliberately is not
+///
+/// Counted, because each issues real blob deletes against the backend:
+///
+/// | task | statistic |
+/// |---|---|
+/// | `quick-delete-blobs`, `full-delete-blobs` | [`DeleteUnreferencedPacksStats::deleted_total_size`] |
+/// | `delete-superseded-epoch-indexes` | [`CleanupSupersededIndexesStats::deleted_total_size`] |
+/// | `cleanup-logs` | [`CleanupLogsStats::deleted_blob_size`] |
+///
+/// **Not** counted: `snapshotGCStats.deletedContentSize`, however tempting its
+/// name. `snapshot-gc` only *marks* contents deleted in the index
+/// (`snapshot/snapshotgc/gc.go`) and frees no storage at all — the blobs still
+/// occupy the bucket until a later `*-delete-blobs` removes them. Reporting it
+/// would show tens of gigabytes "reclaimed" while the bucket did not shrink by
+/// a byte. `rewriteContentsStats` is excluded for the mirror-image reason: it
+/// *writes* new packs and orphans the old ones, so its bytes are moved, not
+/// freed.
+pub fn reclaimed_bytes_since(before: &MaintenanceInfo, after: &MaintenanceInfo) -> Option<i64> {
+    let mut total = 0i64;
+    let mut measured = false;
+    // `saturating_add`, not `+=`: the summands come from kopia's `extra[].data`,
+    // which is an untyped JSON object this crate does not validate. A release
+    // build would WRAP an overflowing sum into a negative "reclaimed" figure —
+    // a number worse than no number at all on a backup operator.
+    let mut add = |bytes: i64| {
+        measured = true;
+        total = total.saturating_add(bytes);
+    };
+    for task in [TASK_QUICK_DELETE_BLOBS, TASK_FULL_DELETE_BLOBS] {
+        for run in runs_since(before, after, task) {
+            add(run
+                .delete_unreferenced_packs_stats()
+                .map_or(0, |s| s.deleted_total_size));
+        }
+    }
+    for run in runs_since(before, after, TASK_DELETE_SUPERSEDED_EPOCH_INDEXES) {
+        add(run
+            .cleanup_superseded_indexes_stats()
+            .map_or(0, |s| s.deleted_total_size));
+    }
+    for run in runs_since(before, after, TASK_CLEANUP_LOGS) {
+        add(run.cleanup_logs_stats().map_or(0, |s| s.deleted_blob_size));
+    }
+    measured.then_some(total)
 }
 
 /// One entry from `kopia index list --json` — a single content-index blob.

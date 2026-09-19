@@ -2317,7 +2317,7 @@ spec:
                           A `bool` rather than a unit variant because an externally-tagged unit variant
                           serializes as the bare string `"Disabled"`, mixing string and object forms in one
                           `oneOf` and breaking the structural schema. Same shape, and same reason, as
-                          [`crate::cluster_repository::AllowedNamespaces::All`].
+                          [`AllowedNamespaces::All`](crate::cluster_repository::AllowedNamespaces::All).
 
                           This is distinct from omitting `blobRetention` entirely: absent means "leave the
                           repository alone", so deleting the block from a manifest can never silently strip
@@ -2351,6 +2351,8 @@ spec:
                         description: |-
                           Index blobs in an epoch that trigger an advance, once older than `minDuration`
                           (kopia default `20`).
+
+                          At least `10` — kopia refuses anything lower with "epoch advance on count too low".
                         format: int64
                         nullable: true
                         type: integer
@@ -2358,6 +2360,9 @@ spec:
                         description: |-
                           Total index size in an epoch that triggers an advance, once older than `minDuration`
                           (kopia default `10` MiB).
+
+                          At least `1` — kopia refuses anything lower with "epoch advance on size too low",
+                          and 1 MiB is the smallest threshold the flag can express.
 
                           Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
                           (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
@@ -2368,12 +2373,20 @@ spec:
                         nullable: true
                         type: integer
                       checkpointFrequency:
-                        description: Epochs between full index checkpoints (kopia default `7`).
+                        description: |-
+                          Epochs between full index checkpoints (kopia default `7`).
+
+                          At least `1` — kopia refuses anything lower with "invalid epoch range compaction
+                          period".
                         format: int64
                         nullable: true
                         type: integer
                       deleteParallelism:
-                        description: Parallelism for epoch cleanup deletions (kopia default `4`).
+                        description: |-
+                          Parallelism for epoch cleanup deletions (kopia default `4`).
+
+                          At least `1`. This floor is kopiur's own: kopia does not validate the field, so a
+                          non-positive value would ask it to run epoch cleanup with no workers.
                         format: int64
                         nullable: true
                         type: integer
@@ -2381,10 +2394,20 @@ spec:
                         description: |-
                           Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
                           (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+
+                          Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`.
+                          When `refreshFrequency` is not declared, that second bound is measured against
+                          kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or
+                          declare a `refreshFrequency` of a third of it or less alongside it.
                         nullable: true
                         type: string
                       refreshFrequency:
-                        description: How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+                        description: |-
+                          How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+
+                          At most `80m`: kopia requires `cleanupSafetyMargin >= 3x` this value, and
+                          `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's
+                          `4h` default and `4h / 3` is a hard ceiling.
                         nullable: true
                         type: string
                     type: object
@@ -3690,7 +3713,13 @@ spec:
                         format: int64
                         type: integer
                       advanceOnSizeMiB:
-                        description: Observed total index size (MiB) that triggers an epoch advance.
+                        description: |-
+                          Observed total index size (MiB) that triggers an epoch advance, **rounded up**.
+
+                          kopia reports this threshold in BYTES and it need not be a whole number of MiB, so
+                          the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a
+                          value the repository does not actually hold. Drift against `spec` is computed on the
+                          exact byte count, never on this rounded mirror.
                         format: int64
                         type: integer
                       checkpointFrequency:
@@ -3849,10 +3878,35 @@ spec:
                 nullable: true
                 properties:
                   indexBlobCount:
-                    description: Number of content-index blobs (`kopia index list`) observed at the last bootstrap.
+                    description: |-
+                      Number of content-index blobs (`kopia index list`): the freshest count
+                      available, from either the last bootstrap or the recount a maintenance
+                      run takes right after compacting. `indexBlobCountAt` says when.
                     format: int64
                     nullable: true
                     type: integer
+                  indexBlobCountAt:
+                    description: |-
+                      RFC3339 instant `indexBlobCount` was observed.
+
+                      Distinct from `lastObservedAt` (the catalog scan's timestamp) and from
+                      `status.health.lastProbeAt` (the backend probe's): the index-blob count
+                      has its own writers, and this is what lets the reconciler decide whether
+                      a post-maintenance recount is fresher than the bootstrap's own count.
+                      Without it the two observations were incomparable, so the
+                      `IndexBlobHealth` warning could only ever quote the bootstrap figure —
+                      which is pre-compaction, and stayed pre-compaction until the next
+                      bootstrap ran (#458).
+
+                      The two writers mean subtly different things, deliberately. A bootstrap
+                      stamps "when this count was FIRST seen at this value", reusing the
+                      previous stamp while the number is unchanged — that arm re-observes on
+                      every reconcile, and a stamp that always moved would make the status
+                      always-changed and the reconcile a hot loop. A post-maintenance recount
+                      always carries its own instant, because it is a distinct observation
+                      taken at a known time and its whole purpose is to be comparable.
+                    nullable: true
+                    type: string
                   lastObservedAt:
                     description: RFC 3339 timestamp these stats were last observed.
                     nullable: true
@@ -6276,7 +6330,7 @@ spec:
                           A `bool` rather than a unit variant because an externally-tagged unit variant
                           serializes as the bare string `"Disabled"`, mixing string and object forms in one
                           `oneOf` and breaking the structural schema. Same shape, and same reason, as
-                          [`crate::cluster_repository::AllowedNamespaces::All`].
+                          [`AllowedNamespaces::All`](crate::cluster_repository::AllowedNamespaces::All).
 
                           This is distinct from omitting `blobRetention` entirely: absent means "leave the
                           repository alone", so deleting the block from a manifest can never silently strip
@@ -6310,6 +6364,8 @@ spec:
                         description: |-
                           Index blobs in an epoch that trigger an advance, once older than `minDuration`
                           (kopia default `20`).
+
+                          At least `10` — kopia refuses anything lower with "epoch advance on count too low".
                         format: int64
                         nullable: true
                         type: integer
@@ -6317,6 +6373,9 @@ spec:
                         description: |-
                           Total index size in an epoch that triggers an advance, once older than `minDuration`
                           (kopia default `10` MiB).
+
+                          At least `1` — kopia refuses anything lower with "epoch advance on size too low",
+                          and 1 MiB is the smallest threshold the flag can express.
 
                           Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
                           (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
@@ -6327,12 +6386,20 @@ spec:
                         nullable: true
                         type: integer
                       checkpointFrequency:
-                        description: Epochs between full index checkpoints (kopia default `7`).
+                        description: |-
+                          Epochs between full index checkpoints (kopia default `7`).
+
+                          At least `1` — kopia refuses anything lower with "invalid epoch range compaction
+                          period".
                         format: int64
                         nullable: true
                         type: integer
                       deleteParallelism:
-                        description: Parallelism for epoch cleanup deletions (kopia default `4`).
+                        description: |-
+                          Parallelism for epoch cleanup deletions (kopia default `4`).
+
+                          At least `1`. This floor is kopiur's own: kopia does not validate the field, so a
+                          non-positive value would ask it to run epoch cleanup with no workers.
                         format: int64
                         nullable: true
                         type: integer
@@ -6340,10 +6407,20 @@ spec:
                         description: |-
                           Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
                           (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+
+                          Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`.
+                          When `refreshFrequency` is not declared, that second bound is measured against
+                          kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or
+                          declare a `refreshFrequency` of a third of it or less alongside it.
                         nullable: true
                         type: string
                       refreshFrequency:
-                        description: How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+                        description: |-
+                          How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+
+                          At most `80m`: kopia requires `cleanupSafetyMargin >= 3x` this value, and
+                          `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's
+                          `4h` default and `4h / 3` is a hard ceiling.
                         nullable: true
                         type: string
                     type: object
@@ -7660,7 +7737,13 @@ spec:
                         format: int64
                         type: integer
                       advanceOnSizeMiB:
-                        description: Observed total index size (MiB) that triggers an epoch advance.
+                        description: |-
+                          Observed total index size (MiB) that triggers an epoch advance, **rounded up**.
+
+                          kopia reports this threshold in BYTES and it need not be a whole number of MiB, so
+                          the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a
+                          value the repository does not actually hold. Drift against `spec` is computed on the
+                          exact byte count, never on this rounded mirror.
                         format: int64
                         type: integer
                       checkpointFrequency:
@@ -7819,10 +7902,35 @@ spec:
                 nullable: true
                 properties:
                   indexBlobCount:
-                    description: Number of content-index blobs (`kopia index list`) observed at the last bootstrap.
+                    description: |-
+                      Number of content-index blobs (`kopia index list`): the freshest count
+                      available, from either the last bootstrap or the recount a maintenance
+                      run takes right after compacting. `indexBlobCountAt` says when.
                     format: int64
                     nullable: true
                     type: integer
+                  indexBlobCountAt:
+                    description: |-
+                      RFC3339 instant `indexBlobCount` was observed.
+
+                      Distinct from `lastObservedAt` (the catalog scan's timestamp) and from
+                      `status.health.lastProbeAt` (the backend probe's): the index-blob count
+                      has its own writers, and this is what lets the reconciler decide whether
+                      a post-maintenance recount is fresher than the bootstrap's own count.
+                      Without it the two observations were incomparable, so the
+                      `IndexBlobHealth` warning could only ever quote the bootstrap figure —
+                      which is pre-compaction, and stayed pre-compaction until the next
+                      bootstrap ran (#458).
+
+                      The two writers mean subtly different things, deliberately. A bootstrap
+                      stamps "when this count was FIRST seen at this value", reusing the
+                      previous stamp while the number is unchanged — that arm re-observes on
+                      every reconcile, and a stamp that always moved would make the status
+                      always-changed and the reconcile a hot loop. A post-maintenance recount
+                      always carries its own instant, because it is a distinct observation
+                      taken at a known time and its whole purpose is to be comparable.
+                    nullable: true
+                    type: string
                   lastObservedAt:
                     description: RFC 3339 timestamp these stats were last observed.
                     nullable: true
@@ -8868,7 +8976,9 @@ spec:
               sources:
                 description: What to back up (at least one source; webhook-enforced).
                 items:
-                  description: A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs` (webhook-enforced).
+                  description: |-
+                    A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs`, `stream`
+                    (webhook-enforced).
                   properties:
                     acknowledgeLiveMutation:
                       description: |-
@@ -8883,7 +8993,7 @@ spec:
                       nullable: true
                       type: boolean
                     nfs:
-                      description: An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`.
+                      description: An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`/`stream`.
                       nullable: true
                       properties:
                         path:
@@ -8970,7 +9080,21 @@ spec:
                       nullable: true
                       type: boolean
                     sourcePathOverride:
-                      description: What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
+                      description: |-
+                        What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
+
+                        On a `pvcSelector` source this is a footgun. It is ONE literal path, so
+                        it works only while the selector matches exactly one PVC; the moment a
+                        second PVC matches, both would land on that same kopia source, merging
+                        their histories into one stream where they also prune each other, so the
+                        BACKUP is refused at run time and no further snapshots are minted for
+                        that source.
+
+                        Watch the failed schedule fire, not verification: the earlier snapshots
+                        remain at that path, so verification keeps passing while backups have
+                        stopped. (Verification only fails on a path that never received a
+                        backup.) Prefer `sourcePathStrategy`, which derives a distinct path per
+                        PVC, or put the override on its own `pvc:` source.
                       maxLength: 4096
                       nullable: true
                       type: string
@@ -8985,10 +9109,98 @@ spec:
                       - PvcNamespacedName
                       nullable: true
                       type: string
+                    stream:
+                      description: |-
+                        Capture a command's standard output as one virtual file — a logical backup
+                        (`pg_dumpall`, `mysqldump`, …) rather than a volume copy. Mutually exclusive
+                        with `pvc`/`pvcSelector`/`nfs`. No volume is mounted; the mover execs the
+                        command in a running workload Pod and streams its stdout straight into kopia.
+                      nullable: true
+                      properties:
+                        fileName:
+                          description: |-
+                            Name of the single virtual file stored in the snapshot (e.g. `postgres.sql`).
+
+                            Must be ONE file name: no `/`, and not `.` or `..`. kopia stores this string
+                            verbatim as the entry name and does not sanitize it, so a path-shaped value
+                            would make a later `kopia restore` write OUTSIDE its destination directory.
+                          maxLength: 255
+                          minLength: 1
+                          type: string
+                        workloadExec:
+                          description: 'The producer: what to run, and where. Its stdout IS the backup data.'
+                          properties:
+                            command:
+                              description: |-
+                                The argv to execute. NOT a shell line: element 0 is the program, so use
+                                `["sh", "-ec", "..."]` explicitly if you want shell semantics.
+
+                                Reference credentials through the container's existing environment or mounted
+                                Secrets — never inline them here. This argv is copied into the mover Pod's
+                                spec, so anyone with `pods:get` in the namespace can read it.
+                              items:
+                                type: string
+                              minItems: 1
+                              type: array
+                            container:
+                              description: Container to exec in; absent uses the Pod's default container.
+                              nullable: true
+                              type: string
+                            podSelector:
+                              description: |-
+                                Standard label selector identifying the workload Pod, resolved in the
+                                `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an
+                                empty selector matches every Pod in the namespace.
+                              properties:
+                                matchExpressions:
+                                  description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                  items:
+                                    description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                                    properties:
+                                      key:
+                                        description: key is the label key that the selector applies to.
+                                        type: string
+                                      operator:
+                                        description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                                        type: string
+                                      values:
+                                        description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                                        items:
+                                          type: string
+                                        type: array
+                                    required:
+                                    - key
+                                    - operator
+                                    type: object
+                                  type: array
+                                matchLabels:
+                                  additionalProperties:
+                                    type: string
+                                  description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                  type: object
+                              type: object
+                            timeout:
+                              default: 1h
+                              description: |-
+                                Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the
+                                command is abandoned and the run fails, leaving no snapshot behind.
+
+                                The same bound applies whether this exec is a backup's producer or a
+                                `streamExec` restore's consumer.
+                              nullable: true
+                              type: string
+                          required:
+                          - command
+                          - podSelector
+                          type: object
+                      required:
+                      - fileName
+                      - workloadExec
+                      type: object
                   type: object
                   x-kubernetes-validations:
-                  - message: exactly one of pvc, pvcSelector, nfs
-                    rule: '(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) == 1'
+                  - message: exactly one of pvc, pvcSelector, nfs, stream
+                    rule: '(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) + (has(self.stream) ? 1 : 0) == 1'
                 maxItems: 100
                 type: array
               staging:
@@ -9308,10 +9520,20 @@ spec:
               lastVerified:
                 description: |-
                   RFC3339 timestamp of the most recent successful verification (any tier).
-                  Single-repo: stamped directly by the verify mover. Multi-repo: computed
-                  by the controller as the MINIMUM `lastVerified` across the CURRENT
-                  repositories ("everything is verified as of T"), absent until every
-                  current repository has verified at least once.
+
+                  Verification runs once per (repository x source) cell: a
+                  `spec.repositories` fan-out adds the repository dimension, and a
+                  `pvcSelector` source adds one cell per matched PVC (each has its own
+                  kopia source path, so each needs its own verification).
+
+                  * one repository AND a non-selector source (`pvc`/`nfs`): stamped
+                    directly by the verify mover, exactly as before;
+                  * otherwise — a `spec.repositories` fan-out, or ANY `pvcSelector` source
+                    (including one currently matching a single PVC): computed by the
+                    controller as the MINIMUM across the CURRENT cells ("everything is
+                    verified as of T"), and absent until EVERY current cell has verified at
+                    least once — a partially verified policy must not display a reassuring
+                    timestamp.
                 nullable: true
                 type: string
               observedGeneration:
@@ -9467,6 +9689,11 @@ spec:
                       description: |-
                         RFC3339 timestamp of the most recent successful verification (any tier)
                         against THIS repository; absent until its first successful verify.
+
+                        When the policy's source is a `pvcSelector`, this is the MINIMUM across
+                        that repository's matched PVCs, and absent until every one of them has
+                        verified — a repository whose volumes are only partly verified must not
+                        look fully verified.
                       nullable: true
                       type: string
                     repository:
@@ -9500,14 +9727,28 @@ spec:
                 additionalProperties:
                   type: string
                 description: |-
-                  Internal write channel for per-repository verification (#368): RFC3339
-                  markers keyed by the normalized repository key
-                  ([`repo_key`](crate::common::repo_key)). Each verify mover merge-patches
-                  ONLY its own key — a JSON merge patch merges map keys, so two concurrent
-                  per-repo verifies can never clobber one another (a Vec would be replaced
-                  wholesale). The controller folds these into `verification` on its next
-                  pass and prunes keys for repositories no longer in the spec. Never
-                  written for the single-repo shape.
+                  Internal write channel for per-cell verification: RFC3339 markers keyed
+                  by the (repository x source) cell a verify run covered.
+
+                  Key shapes, where the repository segment is the normalized repository
+                  key ([`repo_key`](crate::common::repo_key)) and the member segment is a
+                  stable 12-hex tag over the matched PVC's derived kopia source path:
+
+                  * `<repository>` — a `spec.repositories` fan-out with a single source;
+                  * `<repository>#<member>` — a fan-out over both dimensions;
+                  * `#<member>` — one repository, a `pvcSelector` source (the repository
+                    segment is empty).
+
+                  `#` is the separator because a repository key cannot contain one.
+
+                  Each verify mover merge-patches ONLY its own key — a JSON merge patch
+                  merges map keys, so concurrent cells can never clobber one another (a
+                  Vec would be replaced wholesale). The controller folds these into
+                  `verification` and `lastVerified` on its next pass and prunes keys whose
+                  repository or matched PVC is gone. Not written when the policy targets
+                  one repository with a non-selector source, whose wire stays
+                  byte-identical; a `pvcSelector` source always uses this map, even while
+                  it matches a single PVC.
                 type: object
             type: object
         required:
@@ -9594,6 +9835,438 @@ spec:
                     type: integer
                   podStartupDeadlineSeconds:
                     description: Seconds a non-starting (wedged) mover pod may sit before the run is failed; default 300s.
+                    format: int64
+                    nullable: true
+                    type: integer
+                type: object
+              mover:
+                description: |-
+                  Per-run mover overrides for THIS snapshot's Job (resources, cache budgets,
+                  `securityContext`, `privilegedMode`, `ttlSecondsAfterFinished`).
+
+                  Layered field-wise as `repository.moverDefaults < policyRef's mover <
+                  this mover` — the highest layer that sets a field wins, and a field you
+                  omit falls through, so a partial override here can only adjust what it
+                  names. This exists so an ad-hoc one-shot (`kubectl create` before a risky
+                  change, a debug run that needs more memory or a different UID) does not
+                  require editing the shared, GitOps-managed `SnapshotPolicy` that every
+                  scheduled run also uses.
+
+                  Two deliberate exclusions:
+
+                  * `mover.cache` here is **run-scoped only**. It sets this run's kopia cache
+                    budgets (`--content-cache-size-mb`/`--metadata-cache-size-mb`) and, when
+                    the cache is `Ephemeral`, that Job's cache-volume `capacity` and
+                    `storageClassName` — a generic ephemeral volume bound to this pod and
+                    GC'd with it. What it cannot touch is anything **shared**: `cache.mode`
+                    is policy-owned (a per-run `mode: Persistent` never mints the shared
+                    PVC), and under `mode: Persistent` the PVC's own `capacity`/
+                    `storageClassName` come from the policy alone, because that claim is
+                    named per-POLICY and every sibling `Snapshot` depends on it.
+
+                  * `inheritSecurityContextFrom.snapshot` is restore-only and rejected here,
+                    exactly as on `SnapshotPolicy`: a backup's identity comes from the live
+                    workload; it is the run that *records* an identity.
+
+                  An elevated mover assembled here is gated by the namespace's
+                  `privileged-movers` opt-in just like a policy-level one — the gate runs on
+                  the merged result.
+                nullable: true
+                properties:
+                  cache:
+                    description: Override the repository's [`CacheDefaults`] for this recipe's movers.
+                    nullable: true
+                    properties:
+                      capacity:
+                        description: Size of the PVC backing the mover's kopia cache (e.g. `10Gi`).
+                        nullable: true
+                        type: string
+                      contentCacheSizeMb:
+                        description: kopia content cache budget in MiB (`--content-cache-size-mb`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      metadataCacheSizeMb:
+                        description: kopia metadata cache budget in MiB (`--metadata-cache-size-mb`).
+                        format: int64
+                        nullable: true
+                        type: integer
+                      mode:
+                        description: How a mover's kopia cache volume is provisioned.
+                        enum:
+                        - Ephemeral
+                        - Persistent
+                        nullable: true
+                        type: string
+                      storageClassName:
+                        description: StorageClass for the cache PVC; absent uses the cluster default.
+                        nullable: true
+                        type: string
+                    type: object
+                  inheritSecurityContextFrom:
+                    description: |-
+                      Copy the UID/GID security context from a live workload rather than hard-coding it.
+
+                      Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
+                      from the container image's `USER` line is invisible in the pod spec and cannot be
+                      inherited — the mover would silently run as its own image's UID instead.
+
+                      May be combined with `securityContext`/`podSecurityContext`, which override it
+                      field-wise and act as the fallback when no workload pod can be resolved.
+                    nullable: true
+                    oneOf:
+                    - required:
+                      - workloadSelector
+                    - required:
+                      - pvcConsumer
+                    - required:
+                      - snapshot
+                    properties:
+                      pvcConsumer:
+                        description: 'Backup sources only: auto-derive the workload from the PVC this snapshot backs up.'
+                        properties:
+                          container:
+                            description: Which container within the matched consumer pod to inherit from; absent uses the first/only.
+                            nullable: true
+                            type: string
+                        type: object
+                      snapshot:
+                        description: |-
+                          Restores only: inherit the identity RECORDED on the backup itself
+                          (`Snapshot.status.recorded`, decoded from the `kopiur-meta` kopia tag) —
+                          uid/gid/fsGroup the backup mover actually ran as. Needs no live workload
+                          pod, so it works on a rebuilt cluster and with `target.populator`.
+                          Rejected at admission on SnapshotPolicy/Maintenance (backups read the
+                          live workload; maintenance has no snapshot). Write it as `snapshot: {}`
+                          (an empty sub-object) — a bare `snapshot:` is null and rejected.
+                        type: object
+                      workloadSelector:
+                        description: Inherit from workload pod(s) matched by an explicit label selector (backup or restore).
+                        properties:
+                          container:
+                            description: Which container within the matched pod; absent uses the first/only container.
+                            nullable: true
+                            type: string
+                          podSelector:
+                            description: Label selector matching the workload pod(s) to read context/hooks from.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                items:
+                                  description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector applies to.
+                                      type: string
+                                    operator:
+                                      description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                        required:
+                        - podSelector
+                        type: object
+                    type: object
+                  podSecurityContext:
+                    description: |-
+                      Pod security context for the mover (notably `fsGroup` for group-writable restore
+                      volumes). Same layering as `securityContext`: highest layer, merged field-wise, and
+                      combinable with `inheritSecurityContextFrom`.
+                    nullable: true
+                    properties:
+                      appArmorProfile:
+                        description: appArmorProfile is the AppArmor options to use by the containers in this pod. Note that this field cannot be set when spec.os.name is windows.
+                        properties:
+                          localhostProfile:
+                            description: localhostProfile indicates a profile loaded on the node that should be used. The profile must be preconfigured on the node to work. Must match the loaded name of the profile. Must be set if and only if type is "Localhost".
+                            type: string
+                          type:
+                            description: |-
+                              type indicates which kind of AppArmor profile will be applied. Valid options are:
+                                Localhost - a profile pre-loaded on the node.
+                                RuntimeDefault - the container runtime's default profile.
+                                Unconfined - no AppArmor enforcement.
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      fsGroup:
+                        description: |-
+                          A special supplemental group that applies to all containers in a pod. Some volume types allow the Kubelet to change the ownership of that volume to be owned by the pod:
+
+                          1. The owning GID will be the FSGroup 2. The setgid bit is set (new files created in the volume will be owned by FSGroup) 3. The permission bits are OR'd with rw-rw----
+
+                          If unset, the Kubelet will not modify the ownership and permissions of any volume. Note that this field cannot be set when spec.os.name is windows.
+                        format: int64
+                        type: integer
+                      fsGroupChangePolicy:
+                        description: 'fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are "OnRootMismatch" and "Always". If not specified, "Always" is used. Note that this field cannot be set when spec.os.name is windows.'
+                        type: string
+                      runAsGroup:
+                        description: The GID to run the entrypoint of the container process. Uses runtime default if unset. May also be set in SecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence for that container. Note that this field cannot be set when spec.os.name is windows.
+                        format: int64
+                        type: integer
+                      runAsNonRoot:
+                        description: Indicates that the container must run as a non-root user. If true, the Kubelet will validate the image at runtime to ensure that it does not run as UID 0 (root) and fail to start the container if it does. If unset or false, no such validation will be performed. May also be set in SecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence.
+                        type: boolean
+                      runAsUser:
+                        description: The UID to run the entrypoint of the container process. Defaults to user specified in image metadata if unspecified. May also be set in SecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence for that container. Note that this field cannot be set when spec.os.name is windows.
+                        format: int64
+                        type: integer
+                      seLinuxChangePolicy:
+                        description: |-
+                          seLinuxChangePolicy defines how the container's SELinux label is applied to all volumes used by the Pod. It has no effect on nodes that do not support SELinux or to volumes does not support SELinux. Valid values are "MountOption" and "Recursive".
+
+                          "Recursive" means relabeling of all files on all Pod volumes by the container runtime. This may be slow for large volumes, but allows mixing privileged and unprivileged Pods sharing the same volume on the same node.
+
+                          "MountOption" mounts all eligible Pod volumes with `-o context` mount option. This requires all Pods that share the same volume to use the same SELinux label. It is not possible to share the same volume among privileged and unprivileged Pods. Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their CSIDriver instance. Other volumes are always re-labelled recursively. "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
+
+                          If not specified and SELinuxMount feature gate is enabled, "MountOption" is used. If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes and "Recursive" for all other volumes.
+
+                          This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
+
+                          All Pods that use the same volume should use the same seLinuxChangePolicy, otherwise some pods can get stuck in ContainerCreating state. Note that this field cannot be set when spec.os.name is windows.
+                        type: string
+                      seLinuxOptions:
+                        description: The SELinux context to be applied to all containers. If unspecified, the container runtime will allocate a random SELinux context for each container.  May also be set in SecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence for that container. Note that this field cannot be set when spec.os.name is windows.
+                        properties:
+                          level:
+                            description: Level is SELinux level label that applies to the container.
+                            type: string
+                          role:
+                            description: Role is a SELinux role label that applies to the container.
+                            type: string
+                          type:
+                            description: Type is a SELinux type label that applies to the container.
+                            type: string
+                          user:
+                            description: User is a SELinux user label that applies to the container.
+                            type: string
+                        type: object
+                      seccompProfile:
+                        description: The seccomp options to use by the containers in this pod. Note that this field cannot be set when spec.os.name is windows.
+                        properties:
+                          localhostProfile:
+                            description: localhostProfile indicates a profile defined in a file on the node should be used. The profile must be preconfigured on the node to work. Must be a descending path, relative to the kubelet's configured seccomp profile location. Must be set if type is "Localhost". Must NOT be set for any other type.
+                            type: string
+                          type:
+                            description: |-
+                              type indicates which kind of seccomp profile will be applied. Valid options are:
+
+                              Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      supplementalGroups:
+                        description: A list of groups applied to the first process run in each container, in addition to the container's primary GID and fsGroup (if specified).  If the SupplementalGroupsPolicy feature is enabled, the supplementalGroupsPolicy field determines whether these are in addition to or instead of any group memberships defined in the container image. If unspecified, no additional groups are added, though group memberships defined in the container image may still be used, depending on the supplementalGroupsPolicy field. Note that this field cannot be set when spec.os.name is windows.
+                        items:
+                          format: int64
+                          type: integer
+                        type: array
+                      supplementalGroupsPolicy:
+                        description: Defines how supplemental groups of the first container processes are calculated. Valid values are "Merge" and "Strict". If not specified, "Merge" is used. (Alpha) Using the field requires the SupplementalGroupsPolicy feature gate to be enabled and the container runtime must implement support for this feature. Note that this field cannot be set when spec.os.name is windows.
+                        type: string
+                      sysctls:
+                        description: Sysctls hold a list of namespaced sysctls used for the pod. Pods with unsupported sysctls (by the container runtime) might fail to launch. Note that this field cannot be set when spec.os.name is windows.
+                        items:
+                          description: Sysctl defines a kernel parameter to be set
+                          properties:
+                            name:
+                              description: Name of a property to set
+                              type: string
+                            value:
+                              description: Value of a property to set
+                              type: string
+                          required:
+                          - name
+                          - value
+                          type: object
+                        type: array
+                      windowsOptions:
+                        description: The Windows specific settings applied to all containers. If unspecified, the options within a container's SecurityContext will be used. If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence. Note that this field cannot be set when spec.os.name is linux.
+                        properties:
+                          gmsaCredentialSpec:
+                            description: GMSACredentialSpec is where the GMSA admission webhook (https://github.com/kubernetes-sigs/windows-gmsa) inlines the contents of the GMSA credential spec named by the GMSACredentialSpecName field.
+                            type: string
+                          gmsaCredentialSpecName:
+                            description: GMSACredentialSpecName is the name of the GMSA credential spec to use.
+                            type: string
+                          hostProcess:
+                            description: HostProcess determines if a container should be run as a 'Host Process' container. All of a Pod's containers must have the same effective HostProcess value (it is not allowed to have a mix of HostProcess containers and non-HostProcess containers). In addition, if HostProcess is true then HostNetwork must also be set to true.
+                            type: boolean
+                          runAsUserName:
+                            description: The UserName in Windows to run the entrypoint of the container process. Defaults to the user specified in image metadata if unspecified. May also be set in PodSecurityContext. If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence.
+                            type: string
+                        type: object
+                    type: object
+                  privilegedMode:
+                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    nullable: true
+                    type: boolean
+                  resources:
+                    description: Resource requests/limits for the mover container.
+                    nullable: true
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
+
+                          This is an alpha field and requires enabling the DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: Name must match the name of one entry in pod.spec.resourceClaims of the Pod where this field is used. It makes that resource available inside a container.
+                              type: string
+                            request:
+                              description: Request is the name chosen for a request in the referenced claim. If empty, everything from the claim is made available, otherwise only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                      limits:
+                        additionalProperties:
+                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          x-kubernetes-int-or-string: true
+                        description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        type: object
+                      requests:
+                        additionalProperties:
+                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          x-kubernetes-int-or-string: true
+                        description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        type: object
+                    type: object
+                  securityContext:
+                    description: |-
+                      Container security context for the mover; merged field-wise over the hardened base,
+                      `moverDefaults`, and any inherited context — this is the highest layer, so every field
+                      set here wins. Combines with `inheritSecurityContextFrom`: fields you set override the
+                      workload's, fields you omit are inherited, and this context stands in alone when
+                      inheritance cannot resolve a pod.
+                    nullable: true
+                    properties:
+                      allowPrivilegeEscalation:
+                        description: 'AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows.'
+                        type: boolean
+                      appArmorProfile:
+                        description: appArmorProfile is the AppArmor options to use by this container. If set, this profile overrides the pod's appArmorProfile. Note that this field cannot be set when spec.os.name is windows.
+                        properties:
+                          localhostProfile:
+                            description: localhostProfile indicates a profile loaded on the node that should be used. The profile must be preconfigured on the node to work. Must match the loaded name of the profile. Must be set if and only if type is "Localhost".
+                            type: string
+                          type:
+                            description: |-
+                              type indicates which kind of AppArmor profile will be applied. Valid options are:
+                                Localhost - a profile pre-loaded on the node.
+                                RuntimeDefault - the container runtime's default profile.
+                                Unconfined - no AppArmor enforcement.
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      capabilities:
+                        description: The capabilities to add/drop when running containers. Defaults to the default set of capabilities granted by the container runtime. Note that this field cannot be set when spec.os.name is windows.
+                        properties:
+                          add:
+                            description: Added capabilities
+                            items:
+                              type: string
+                            type: array
+                          drop:
+                            description: Removed capabilities
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      privileged:
+                        description: Run container in privileged mode. Processes in privileged containers are essentially equivalent to root on the host. Defaults to false. Note that this field cannot be set when spec.os.name is windows.
+                        type: boolean
+                      procMount:
+                        description: procMount denotes the type of proc mount to use for the containers. The default value is Default which uses the container runtime defaults for readonly paths and masked paths. This requires the ProcMountType feature flag to be enabled. Note that this field cannot be set when spec.os.name is windows.
+                        type: string
+                      readOnlyRootFilesystem:
+                        description: Whether this container has a read-only root filesystem. Default is false. Note that this field cannot be set when spec.os.name is windows.
+                        type: boolean
+                      runAsGroup:
+                        description: The GID to run the entrypoint of the container process. Uses runtime default if unset. May also be set in PodSecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence. Note that this field cannot be set when spec.os.name is windows.
+                        format: int64
+                        type: integer
+                      runAsNonRoot:
+                        description: Indicates that the container must run as a non-root user. If true, the Kubelet will validate the image at runtime to ensure that it does not run as UID 0 (root) and fail to start the container if it does. If unset or false, no such validation will be performed. May also be set in PodSecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence.
+                        type: boolean
+                      runAsUser:
+                        description: The UID to run the entrypoint of the container process. Defaults to user specified in image metadata if unspecified. May also be set in PodSecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence. Note that this field cannot be set when spec.os.name is windows.
+                        format: int64
+                        type: integer
+                      seLinuxOptions:
+                        description: The SELinux context to be applied to the container. If unspecified, the container runtime will allocate a random SELinux context for each container.  May also be set in PodSecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence. Note that this field cannot be set when spec.os.name is windows.
+                        properties:
+                          level:
+                            description: Level is SELinux level label that applies to the container.
+                            type: string
+                          role:
+                            description: Role is a SELinux role label that applies to the container.
+                            type: string
+                          type:
+                            description: Type is a SELinux type label that applies to the container.
+                            type: string
+                          user:
+                            description: User is a SELinux user label that applies to the container.
+                            type: string
+                        type: object
+                      seccompProfile:
+                        description: The seccomp options to use by this container. If seccomp options are provided at both the pod & container level, the container options override the pod options. Note that this field cannot be set when spec.os.name is windows.
+                        properties:
+                          localhostProfile:
+                            description: localhostProfile indicates a profile defined in a file on the node should be used. The profile must be preconfigured on the node to work. Must be a descending path, relative to the kubelet's configured seccomp profile location. Must be set if type is "Localhost". Must NOT be set for any other type.
+                            type: string
+                          type:
+                            description: |-
+                              type indicates which kind of seccomp profile will be applied. Valid options are:
+
+                              Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      windowsOptions:
+                        description: The Windows specific settings applied to all containers. If unspecified, the options from the PodSecurityContext will be used. If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence. Note that this field cannot be set when spec.os.name is linux.
+                        properties:
+                          gmsaCredentialSpec:
+                            description: GMSACredentialSpec is where the GMSA admission webhook (https://github.com/kubernetes-sigs/windows-gmsa) inlines the contents of the GMSA credential spec named by the GMSACredentialSpecName field.
+                            type: string
+                          gmsaCredentialSpecName:
+                            description: GMSACredentialSpecName is the name of the GMSA credential spec to use.
+                            type: string
+                          hostProcess:
+                            description: HostProcess determines if a container should be run as a 'Host Process' container. All of a Pod's containers must have the same effective HostProcess value (it is not allowed to have a mix of HostProcess containers and non-HostProcess containers). In addition, if HostProcess is true then HostNetwork must also be set to true.
+                            type: boolean
+                          runAsUserName:
+                            description: The UserName in Windows to run the entrypoint of the container process. Defaults to the user specified in image metadata if unspecified. May also be set in PodSecurityContext. If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence.
+                            type: string
+                        type: object
+                    type: object
+                  ttlSecondsAfterFinished:
+                    description: Per-recipe override of `Job.spec.ttlSecondsAfterFinished` so finished Jobs self-GC.
                     format: int64
                     nullable: true
                     type: integer
@@ -11269,6 +11942,8 @@ spec:
                   - pvcRef
                 - required:
                   - populator
+                - required:
+                  - streamExec
                 properties:
                   populator:
                     description: 'Passive populator mode: the restore is claimed by a PVC''s `spec.dataSourceRef`.'
@@ -11319,14 +11994,97 @@ spec:
                     required:
                     - name
                     type: object
+                  streamExec:
+                    description: |-
+                      Stream one virtual file out of the snapshot into a command's stdin in a
+                      running Pod — the companion of a `stream` backup source (e.g. feeding a
+                      `pg_dumpall` artifact back through `psql`). Writes no PVC.
+                    properties:
+                      fileName:
+                        description: |-
+                          Which virtual file inside the snapshot to read back — the `fileName` the
+                          backup's stream source used (e.g. `postgres.sql`).
+                        maxLength: 255
+                        minLength: 1
+                        type: string
+                      workloadExec:
+                        description: 'Where to send it: the command receives the file''s bytes on stdin.'
+                        properties:
+                          command:
+                            description: |-
+                              The argv to execute. NOT a shell line: element 0 is the program, so use
+                              `["sh", "-ec", "..."]` explicitly if you want shell semantics.
+
+                              Reference credentials through the container's existing environment or mounted
+                              Secrets — never inline them here. This argv is copied into the mover Pod's
+                              spec, so anyone with `pods:get` in the namespace can read it.
+                            items:
+                              type: string
+                            minItems: 1
+                            type: array
+                          container:
+                            description: Container to exec in; absent uses the Pod's default container.
+                            nullable: true
+                            type: string
+                          podSelector:
+                            description: |-
+                              Standard label selector identifying the workload Pod, resolved in the
+                              `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an
+                              empty selector matches every Pod in the namespace.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                                items:
+                                  description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector applies to.
+                                      type: string
+                                    operator:
+                                      description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                          timeout:
+                            default: 1h
+                            description: |-
+                              Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the
+                              command is abandoned and the run fails, leaving no snapshot behind.
+
+                              The same bound applies whether this exec is a backup's producer or a
+                              `streamExec` restore's consumer.
+                            nullable: true
+                            type: string
+                        required:
+                        - command
+                        - podSelector
+                        type: object
+                    required:
+                    - fileName
+                    - workloadExec
+                    type: object
                 type: object
             required:
             - source
             - target
             type: object
             x-kubernetes-validations:
-            - message: exactly one of target.pvc, target.pvcRef, target.populator
-              rule: '[has(self.target.pvc), has(self.target.pvcRef), has(self.target.populator)].filter(x, x).size() == 1'
+            - message: exactly one of target.pvc, target.pvcRef, target.populator, target.streamExec
+              rule: '[has(self.target.pvc), has(self.target.pvcRef), has(self.target.populator), has(self.target.streamExec)].filter(x, x).size() == 1'
           status:
             description: Observed state of a Restore, written by the controller/mover.
             nullable: true
@@ -12404,7 +13162,16 @@ spec:
                     nullable: true
                     type: integer
                   lastContentReclaimedBytes:
-                    description: Bytes of storage reclaimed by the most recent run of this kind.
+                    description: |-
+                      Bytes of backend storage the most recent run of this kind actually freed:
+                      the blobs kopia deleted (unreferenced packs, superseded epoch indexes and
+                      expired logs), summed from the run history `kopia maintenance info`
+                      reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only
+                      marks contents deleted in the index and frees no storage until a later run
+                      removes the blobs. Absent when the run reclaimed nothing measurable — a
+                      quick run on an epoch-enabled repository only advances and compacts
+                      epochs, so there is no figure to report; `0` always means a measured zero,
+                      never "unknown".
                     format: int64
                     nullable: true
                     type: integer
@@ -12456,6 +13223,23 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              observedIndexBlobs:
+                description: Content-index blob count re-counted right after the most recent successful run.
+                nullable: true
+                properties:
+                  count:
+                    default: 0
+                    description: Number of content-index blobs (`kopia index list`) after the run.
+                    format: int64
+                    type: integer
+                  observedAt:
+                    default: ''
+                    description: |-
+                      RFC3339 instant the recount was taken. What makes this observation
+                      comparable against the repository's own `storageStats.indexBlobCountAt`,
+                      so whichever is newer wins rather than whichever was written last.
+                    type: string
+                type: object
               ownership:
                 description: Current lease holder, if the lease has been claimed.
                 nullable: true
@@ -12479,7 +13263,16 @@ spec:
                     nullable: true
                     type: integer
                   lastContentReclaimedBytes:
-                    description: Bytes of storage reclaimed by the most recent run of this kind.
+                    description: |-
+                      Bytes of backend storage the most recent run of this kind actually freed:
+                      the blobs kopia deleted (unreferenced packs, superseded epoch indexes and
+                      expired logs), summed from the run history `kopia maintenance info`
+                      reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only
+                      marks contents deleted in the index and frees no storage until a later run
+                      removes the blobs. Absent when the run reclaimed nothing measurable — a
+                      quick run on an epoch-enabled repository only advances and compacts
+                      epochs, so there is no figure to report; `0` always means a measured zero,
+                      never "unknown".
                     format: int64
                     nullable: true
                     type: integer

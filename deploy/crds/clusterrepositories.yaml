@@ -2370,7 +2370,7 @@ spec:
                           A `bool` rather than a unit variant because an externally-tagged unit variant
                           serializes as the bare string `"Disabled"`, mixing string and object forms in one
                           `oneOf` and breaking the structural schema. Same shape, and same reason, as
-                          [`crate::cluster_repository::AllowedNamespaces::All`].
+                          [`AllowedNamespaces::All`](crate::cluster_repository::AllowedNamespaces::All).
 
                           This is distinct from omitting `blobRetention` entirely: absent means "leave the
                           repository alone", so deleting the block from a manifest can never silently strip
@@ -2404,6 +2404,8 @@ spec:
                         description: |-
                           Index blobs in an epoch that trigger an advance, once older than `minDuration`
                           (kopia default `20`).
+
+                          At least `10` — kopia refuses anything lower with "epoch advance on count too low".
                         format: int64
                         nullable: true
                         type: integer
@@ -2411,6 +2413,9 @@ spec:
                         description: |-
                           Total index size in an epoch that triggers an advance, once older than `minDuration`
                           (kopia default `10` MiB).
+
+                          At least `1` — kopia refuses anything lower with "epoch advance on size too low",
+                          and 1 MiB is the smallest threshold the flag can express.
 
                           Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
                           (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
@@ -2421,12 +2426,20 @@ spec:
                         nullable: true
                         type: integer
                       checkpointFrequency:
-                        description: Epochs between full index checkpoints (kopia default `7`).
+                        description: |-
+                          Epochs between full index checkpoints (kopia default `7`).
+
+                          At least `1` — kopia refuses anything lower with "invalid epoch range compaction
+                          period".
                         format: int64
                         nullable: true
                         type: integer
                       deleteParallelism:
-                        description: Parallelism for epoch cleanup deletions (kopia default `4`).
+                        description: |-
+                          Parallelism for epoch cleanup deletions (kopia default `4`).
+
+                          At least `1`. This floor is kopiur's own: kopia does not validate the field, so a
+                          non-positive value would ask it to run epoch cleanup with no workers.
                         format: int64
                         nullable: true
                         type: integer
@@ -2434,10 +2447,20 @@ spec:
                         description: |-
                           Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
                           (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+
+                          Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`.
+                          When `refreshFrequency` is not declared, that second bound is measured against
+                          kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or
+                          declare a `refreshFrequency` of a third of it or less alongside it.
                         nullable: true
                         type: string
                       refreshFrequency:
-                        description: How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+                        description: |-
+                          How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+
+                          At most `80m`: kopia requires `cleanupSafetyMargin >= 3x` this value, and
+                          `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's
+                          `4h` default and `4h / 3` is a hard ceiling.
                         nullable: true
                         type: string
                     type: object
@@ -3754,7 +3777,13 @@ spec:
                         format: int64
                         type: integer
                       advanceOnSizeMiB:
-                        description: Observed total index size (MiB) that triggers an epoch advance.
+                        description: |-
+                          Observed total index size (MiB) that triggers an epoch advance, **rounded up**.
+
+                          kopia reports this threshold in BYTES and it need not be a whole number of MiB, so
+                          the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a
+                          value the repository does not actually hold. Drift against `spec` is computed on the
+                          exact byte count, never on this rounded mirror.
                         format: int64
                         type: integer
                       checkpointFrequency:
@@ -3913,10 +3942,35 @@ spec:
                 nullable: true
                 properties:
                   indexBlobCount:
-                    description: Number of content-index blobs (`kopia index list`) observed at the last bootstrap.
+                    description: |-
+                      Number of content-index blobs (`kopia index list`): the freshest count
+                      available, from either the last bootstrap or the recount a maintenance
+                      run takes right after compacting. `indexBlobCountAt` says when.
                     format: int64
                     nullable: true
                     type: integer
+                  indexBlobCountAt:
+                    description: |-
+                      RFC3339 instant `indexBlobCount` was observed.
+
+                      Distinct from `lastObservedAt` (the catalog scan's timestamp) and from
+                      `status.health.lastProbeAt` (the backend probe's): the index-blob count
+                      has its own writers, and this is what lets the reconciler decide whether
+                      a post-maintenance recount is fresher than the bootstrap's own count.
+                      Without it the two observations were incomparable, so the
+                      `IndexBlobHealth` warning could only ever quote the bootstrap figure —
+                      which is pre-compaction, and stayed pre-compaction until the next
+                      bootstrap ran (#458).
+
+                      The two writers mean subtly different things, deliberately. A bootstrap
+                      stamps "when this count was FIRST seen at this value", reusing the
+                      previous stamp while the number is unchanged — that arm re-observes on
+                      every reconcile, and a stamp that always moved would make the status
+                      always-changed and the reconcile a hot loop. A post-maintenance recount
+                      always carries its own instant, because it is a distinct observation
+                      taken at a known time and its whole purpose is to be comparable.
+                    nullable: true
+                    type: string
                   lastObservedAt:
                     description: RFC 3339 timestamp these stats were last observed.
                     nullable: true

@@ -87,9 +87,9 @@ $ kubectl -n kopiur-tryit get maintenance primary \
 2026-06-17T14:05:42Z    # illustrative
 ```
 
-/// note | `lastContentReclaimedBytes` reads `0` even on a successful run
+/// note | `lastContentReclaimedBytes` counts blobs kopia deleted, not the snapshot-GC figure
 
-`kopia maintenance run` does not emit a machine-readable reclaimed-bytes figure, so `status.full.lastContentReclaimedBytes` reads `0` today even though the run does reclaim space. The field exists and round-trips. Populating it precisely is a planned enhancement.
+`status.full.lastContentReclaimedBytes` sums bytes of backend storage the run actually freed: unreferenced packs, superseded epoch indexes, and expired logs, read from `kopia maintenance info --json` before and after the run. It deliberately excludes kopia's snapshot-GC figure, which only marks contents deleted in the index and frees no storage until a later run removes the blobs. The field is absent when the run reclaimed nothing measurable — a quick run on an epoch-enabled repository only advances and compacts epochs, so there is no figure to report. `0` always means a measured zero, never "nothing to report."
 
 ///
 
@@ -205,7 +205,7 @@ kopia stamps a maintenance owner when a repository is **created**. kopiur stamps
 
 kopia stores its content index as a set of **index blobs**. Each backup adds one, and **maintenance compacts them back down**. So in a healthy repository the count rises during the day and falls after the next full-maintenance run. If maintenance stops keeping up, most often because of a stale owner as described above, but also because of a disabled or failing `Maintenance`, the count climbs without bound. Once it gets high enough, kopia warns "Found too many index blobs (N)" and backup and restore performance degrades.
 
-kopiur observes the count on every bootstrap and surfaces it three ways, **without blocking the repository**. The repository stays `Ready`; this is a degradation warning, not an outage:
+kopiur observes the count at bootstrap and after each successful maintenance run — the newer of the two observations wins — and surfaces it three ways, **without blocking the repository**. The repository stays `Ready`; this is a degradation warning, not an outage:
 
 - a print column: `kubectl get repository` and `kubectl get clusterrepository` show an `IndexBlobs` column in wide output;
 - `status.storageStats.indexBlobCount`;
@@ -343,9 +343,9 @@ The running mover Jobs are labeled, so you can watch them directly:
 $ kubectl get jobs -n billing -l app.kubernetes.io/component=maintenance
 ```
 
-/// note | Reclaimed bytes currently reports 0
+/// note | `lastContentReclaimedBytes` counts blobs kopia deleted, not the snapshot-GC figure
 
-`kopia maintenance run` does not emit a machine-readable reclaimed-bytes figure, so `lastContentReclaimedBytes` reads `0` today even though the run does reclaim space. The field exists and round-trips. Populating it precisely is a planned enhancement.
+`lastContentReclaimedBytes` sums bytes of backend storage the run actually freed: unreferenced packs, superseded epoch indexes, and expired logs, read from `kopia maintenance info --json` before and after the run. It deliberately excludes kopia's snapshot-GC figure, which only marks contents deleted in the index and frees no storage until a later run removes the blobs. The field is absent when the run reclaimed nothing measurable — a quick run on an epoch-enabled repository only advances and compacts epochs, so there is no figure to report. `0` always means a measured zero, never "nothing to report."
 
 ///
 

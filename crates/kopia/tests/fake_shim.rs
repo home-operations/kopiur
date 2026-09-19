@@ -588,6 +588,84 @@ exit 0
     assert_eq!(n, want.len() as u64, "returned count matches the stream");
 }
 
+/// A sink whose every write fails with `BrokenPipe` — a `streamExec` restore whose
+/// consumer command died the instant it was exec'd.
+struct BrokenSink;
+
+impl tokio::io::AsyncWrite for BrokenSink {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A failing SINK is the consumer's fault, and must not be reported as a kopia
+/// spawn failure.
+///
+/// This is a regression guard with a real scar: the streaming runner used to
+/// `tokio::join!` the sink write, kopia's stderr read and kopia's exit into one
+/// `io::Error` and map the lot to [`KopiaError::Spawn`]. A `streamExec` restore
+/// whose consumer pipe broke therefore reported "failed to spawn kopia binary
+/// `kopia`: broken pipe" — sending the reader after a missing binary that had in
+/// fact spawned and was streaming happily. The shim below exits 0, so there is
+/// nothing wrong with kopia at all.
+#[tokio::test]
+async fn a_failing_sink_is_not_reported_as_a_kopia_spawn_failure() {
+    let s = shim(
+        r#"#!/bin/sh
+printf 'some object bytes'
+exit 0
+"#,
+    );
+    let client = client_for(&s);
+    let args = kopiur_kopia::SessionCmd::ShowObject {
+        oid: "kfile".into(),
+    }
+    .argv("ignored-bin");
+    let err = client
+        .run_raw_streaming(&args[1..], &mut BrokenSink)
+        .await
+        .expect_err("a broken sink must fail the stream");
+
+    match &err {
+        kopiur_kopia::KopiaError::OutputSink { args, source } => {
+            assert_eq!(source.kind(), std::io::ErrorKind::BrokenPipe);
+            assert!(args.contains("show"), "the argv is named: {args}");
+        }
+        other => panic!("expected OutputSink, got {other:?}"),
+    }
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("failed to spawn"),
+        "must not blame the spawn: {msg}"
+    );
+    assert!(
+        msg.contains("into the consumer"),
+        "must name the consumer: {msg}"
+    );
+    // Terminal for the operator: re-running re-runs the same consumer command.
+    assert_eq!(
+        err.class(),
+        kopiur_kopia::KopiaErrorClass::Unknown,
+        "a broken consumer is not a repository fault"
+    );
+}
+
 #[tokio::test]
 async fn run_raw_streaming_nonzero_exit_carries_stderr_tail() {
     let s = shim(

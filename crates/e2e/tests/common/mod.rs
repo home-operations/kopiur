@@ -1023,3 +1023,85 @@ pub async fn populate_claims(
         readers,
     }
 }
+
+// --- stream-source producer pods (#451) -------------------------------------
+
+/// A long-lived pod that plays the part of the database: it just sleeps, and a
+/// `stream` source (or a `streamExec` restore target) execs a command inside it.
+///
+/// Shared rather than inline in `stream_sources.rs` because more than one
+/// scenario needs one — and specifically because the multi-match scenario needs
+/// TWO pods carrying the SAME `app` label, which only works if both are built
+/// the same way. `labels.app` is the pod's own `name` by default; use
+/// [`ensure_producer_labeled`] to put several pods behind one selector.
+pub fn producer_pod(ns: &str, name: &str, app_label: &str) -> k8s_openapi::api::core::v1::Pod {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": { "name": name, "namespace": ns, "labels": { "app": app_label } },
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "db",
+                "image": consts::BUSYBOX_IMAGE,
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["sleep", "3600"],
+            }],
+        },
+    }))
+    .expect("producer pod")
+}
+
+/// Create (idempotently) a producer pod whose `app` label is its own name, and
+/// wait for it to reach `Running`.
+pub async fn ensure_producer(client: &Client, name: &str) {
+    ensure_producer_labeled(client, name, name).await;
+}
+
+/// [`ensure_producer`] with an explicit `app` label, so several pods can sit
+/// behind ONE selector — the multi-match refusal has no other way to be set up.
+pub async fn ensure_producer_labeled(client: &Client, name: &str, app_label: &str) {
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    if pods.get_opt(name).await.ok().flatten().is_none() {
+        let _ = pods
+            .create(
+                &PostParams::default(),
+                &producer_pod(E2E_NAMESPACE, name, app_label),
+            )
+            .await;
+    }
+    wait_until(
+        &format!("{name} Running"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(pods
+                .get_opt(name)
+                .await?
+                .and_then(|p| p.status.and_then(|s| s.phase))
+                .filter(|ph| ph == "Running")
+                .map(|_| ()))
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the producer pod {name} should reach Running: {e}"));
+}
+
+/// Delete a producer pod and wait until it is gone.
+///
+/// Load-bearing for the multi-match scenario: the e2e binary runs
+/// `--test-threads=1`, so a second same-labelled pod left behind would make every
+/// LATER scenario's selector match two pods and fail for the wrong reason.
+pub async fn drop_producer(client: &Client, name: &str) {
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = pods
+        .delete(name, &DeleteParams::default().grace_period(0))
+        .await;
+    let _ = wait_until(
+        &format!("{name} gone"),
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(pods.get_opt(name).await?.is_none().then_some(())) },
+    )
+    .await;
+}

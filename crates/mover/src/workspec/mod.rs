@@ -102,12 +102,100 @@ impl Operation {
     }
 }
 
+/// How a [`SnapshotOp`]'s bytes are produced. Resolved from
+/// [`SnapshotOp::stdin`] by [`snapshot_input`].
+///
+/// An enum rather than an `Option` check at each use site: the two inputs need
+/// completely different execution (walk a mounted path vs. exec a pod and pipe its
+/// stdout), and matching exhaustively is what stops a future third input from
+/// silently falling into the filesystem path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotInput<'a> {
+    /// Snapshot whatever is mounted at `source_path` (the PVC/NFS path).
+    Filesystem,
+    /// Exec a command in a workload pod and pipe its stdout into kopia; nothing is
+    /// mounted and `source_path` is the VIRTUAL root the artifact is recorded under.
+    Stream(&'a StreamExecSpec),
+}
+
+/// THE resolver for how a backup run gets its bytes.
+pub fn snapshot_input(op: &SnapshotOp) -> SnapshotInput<'_> {
+    match &op.stdin {
+        Some(spec) => SnapshotInput::Stream(spec),
+        None => SnapshotInput::Filesystem,
+    }
+}
+
+/// Exec a command in one running workload pod and pipe ONE of its standard
+/// streams, for a backup (the command's stdout IS the data) or a restore (the
+/// restored bytes go to the command's stdin).
+///
+/// ONE type for both directions, deliberately. The producer and consumer forms
+/// were byte-identical structs — same fields, same wire names — and two names for
+/// one shape is a drift surface: a field added to the producer and forgotten on
+/// the consumer compiles clean and silently loses the knob on restores. The ROLE
+/// is carried by the enum that borrows this spec, [`SnapshotInput::Stream`] vs
+/// [`RestoreOutput::Stream`], where a reconcile path must already match
+/// exhaustively; it does not need a second struct to restate it.
+///
+/// The controller resolves the selector into this spec at plan time and the mover
+/// re-resolves the pod at exec time — the Job can start minutes after the CR was
+/// written, by which point the pod may have been rescheduled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamExecSpec {
+    /// Namespace to resolve `pod_selector` in.
+    pub namespace: String,
+    /// Rendered label-selector query (`k=v,...`) identifying the workload pod.
+    pub pod_selector: String,
+    /// Container to exec in; absent uses the pod's default container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// argv to run. Element 0 is the program; this is not a shell line. As a
+    /// producer its stdout is captured; as a consumer it receives the restored
+    /// bytes on stdin.
+    pub command: Vec<String>,
+    /// The single virtual file inside the snapshot: the name the producer's stdout
+    /// is stored as, or the entry a consumer reads back.
+    pub file_name: String,
+    /// Wall-clock bound on the command, in seconds.
+    pub timeout_seconds: u64,
+}
+
+/// Where a [`RestoreOp`] writes. Resolved from [`RestoreOp::stdout`] by
+/// [`restore_output`]; exhaustive for the same reason as [`SnapshotInput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutput<'a> {
+    /// Write the snapshot's files into the mounted `target_path`.
+    Filesystem,
+    /// Stream one virtual file into a command's stdin in a workload pod.
+    Stream(&'a StreamExecSpec),
+}
+
+/// THE resolver for where a restore run puts its bytes.
+pub fn restore_output(op: &RestoreOp) -> RestoreOutput<'_> {
+    match &op.stdout {
+        Some(spec) => RestoreOutput::Stream(spec),
+        None => RestoreOutput::Filesystem,
+    }
+}
+
 /// Payload for a backup run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotOp {
     /// Absolute path inside the mover pod to snapshot (e.g. `/data`).
+    ///
+    /// With `stdin` set this is instead the VIRTUAL root kopia records the streamed
+    /// artifact under (e.g. `/stream/postgres.sql`); nothing is read from the pod's
+    /// filesystem.
     pub source_path: String,
+    /// Present ⇒ this run's bytes come from a command's stdout rather than from a
+    /// mounted path. Read it through [`snapshot_input`], which turns it into the
+    /// exhaustively-matched [`SnapshotInput`]. `#[serde(default)]` so work-spec JSON
+    /// written before this field existed still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<StreamExecSpec>,
     /// Tags to attach to the snapshot (`key:value` pairs).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
@@ -455,7 +543,14 @@ pub struct RestoreOp {
     /// Which snapshot to restore: a controller-resolved id, or an in-Job selector.
     pub source: RestoreSelection,
     /// Absolute path inside the mover pod to restore into (e.g. `/data`).
+    ///
+    /// Ignored when `stdout` is set: a stream restore writes to no filesystem at all.
     pub target_path: String,
+    /// Present ⇒ restore ONE virtual file out of the snapshot and pipe it into a
+    /// command's stdin instead of writing files to `target_path`. Read it through
+    /// [`restore_output`]. `#[serde(default)]` so older work-spec JSON still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<StreamExecSpec>,
     /// Stable identity anchors for the referenced snapshot, used to self-heal a
     /// stale id (kopia rewrites the manifest id on pin) when a
     /// [`RestoreSelection::Snapshot`] restore reports the id not found. Empty ⇒ no
@@ -521,6 +616,7 @@ impl RestoreOp {
     ///
     /// let op = RestoreOp {
     ///     source: RestoreSelection::Snapshot("k1".into()),
+    ///     stdout: None,
     ///     target_path: "/data".into(),
     ///     anchor: Default::default(),
     ///     ignore_permission_errors: Some(false),
@@ -1241,11 +1337,21 @@ pub fn epoch_drift(
             o.epoch_refresh_frequency_ns,
         ),
         epoch_advance_on_count: num_drift(desired.advance_on_count, o.advance_on_count),
-        // MiB on the flag, bytes in the report.
-        epoch_advance_on_size_mb: num_drift(
-            desired.advance_on_size_mb,
-            o.advance_on_total_size_bytes / MIB,
-        ),
+        // MiB on the flag, bytes in the report — so compare in BYTES, never in MiB (#458).
+        //
+        // kopia stores this threshold as `declared << 20`, so `desired * MIB` is bit-for-bit
+        // what a converged repository reports and the comparison converges exactly. The
+        // inverse (`observed / MIB`) truncates: a repository holding 10 MiB + 1 byte reads
+        // back as `10`, a declared `10` looks converged, and kopiur silently never corrects
+        // a threshold the user asked for.
+        //
+        // `saturating_mul`, not `*`: a declared value near i64::MAX would otherwise overflow
+        // (a debug-build panic in the mover, a wrapped negative in release). Saturation can
+        // only ever read as drift, which sends the value to kopia and surfaces its refusal
+        // as the Warning event — the honest outcome for a value no repository can hold.
+        epoch_advance_on_size_mb: desired
+            .advance_on_size_mb
+            .filter(|w| w.saturating_mul(MIB) != o.advance_on_total_size_bytes),
         epoch_checkpoint_frequency: num_drift(desired.checkpoint_frequency, o.checkpoint_frequency),
         epoch_delete_parallelism: num_drift(desired.delete_parallelism, o.delete_parallelism),
         // Epoch drift never touches retention; `parameters_drift` merges the two.
@@ -1253,6 +1359,21 @@ pub fn epoch_drift(
         retention_period: None,
     };
     (!args.is_empty()).then_some(args)
+}
+
+/// `bytes → MiB`, rounded UP — hand-rolled because `i64::div_ceil` is still unstable
+/// (`int_roundings`) and this crate builds on stable.
+///
+/// `saturating_add` keeps the `+ (MIB - 1)` bias from overflowing on a pathological
+/// observation. The negative branch is not decoration: Rust's integer division truncates
+/// toward zero, which for a negative value already IS the ceiling, so routing negatives
+/// through the biased form would round them the wrong way.
+fn bytes_to_mib_ceil(bytes: i64) -> i64 {
+    if bytes < 0 {
+        bytes / MIB
+    } else {
+        bytes.saturating_add(MIB - 1) / MIB
+    }
 }
 
 /// Mirror kopia's reported epoch parameters into the api crate's status type, rendering
@@ -1269,7 +1390,14 @@ pub fn observed_epoch(
         refresh_frequency: dur(o.epoch_refresh_frequency_ns),
         cleanup_safety_margin: dur(o.cleanup_safety_margin_ns),
         advance_on_count: o.advance_on_count,
-        advance_on_size_mb: o.advance_on_total_size_bytes / MIB,
+        // Rounded UP (#458). The mirror exists to be honest about what the repository holds,
+        // and kopia's byte threshold need not be a whole number of MiB (`set-parameters`
+        // only writes multiples, but a repository configured by hand or by a future kopia
+        // need not be). Rounding down would print exactly the declared value while the
+        // repository held something else — re-introducing, in `status`, the silent
+        // convergence that `epoch_drift` was just fixed to stop. Drift itself is computed on
+        // the exact byte count, never on this rounded mirror.
+        advance_on_size_mb: bytes_to_mib_ceil(o.advance_on_total_size_bytes),
         checkpoint_frequency: o.checkpoint_frequency,
         delete_parallelism: o.delete_parallelism,
     }
@@ -1648,6 +1776,23 @@ pub struct VerifyOp {
     /// single-repo flow, whose status write stays byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_key: Option<String>,
+    /// The `status.verificationStamps` key this run owns (#456). A verify run
+    /// is one cell of a (repository x member) grid: the repository dimension
+    /// comes from a multi-repository policy (#368) and the member dimension
+    /// from a `pvcSelector` policy fanning out one kopia source per matched PVC.
+    /// Shapes: `<repo key>` (repository only, the #368 wire),
+    /// `<repo key>#<member6>`, or `#<member6>` (a single-repository fan-out).
+    ///
+    /// A DISTINCT field from [`Self::repository_key`] rather than a
+    /// reinterpretation of it, because that one also drives the Job's
+    /// `repo_tag6` name segment, its `verify-repo` label value and the
+    /// projected-credentials prefix — and in-flight Jobs minted before #456
+    /// carry the old shape in their embedded work spec, so the mover falls back
+    /// to `repository_key` when this is absent.
+    ///
+    /// `None` = the classic flat `status.lastVerified` write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp_key: Option<String>,
 }
 
 /// Payload for a repository-replication run (ADR-0005 §13(d)). The mover connects
@@ -2311,6 +2456,7 @@ impl Default for MoverOptions {
 /// let spec = MoverWorkSpec {
 ///     version: 1,
 ///     operation: Operation::Snapshot(SnapshotOp {
+///         stdin: None,
 ///         source_path: "/data".into(),
 ///         tags: BTreeMap::new(),
 ///         policy: Default::default(),

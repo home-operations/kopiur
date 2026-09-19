@@ -1900,6 +1900,7 @@ fn backup_aggregate_rejects_discovered_delete() {
         deletion_policy: Some(DeletionPolicy::Delete),
         on_schedule_delete: None,
         pin: false,
+        mover: None,
     };
     let errs = validate_backup(&spec, Some(Origin::Discovered));
     assert_eq!(errs.len(), 1);
@@ -2017,6 +2018,7 @@ fn backup_aggregate_rejects_reserved_tags() {
         deletion_policy: None,
         on_schedule_delete: None,
         pin: false,
+        mover: None,
     };
     let errs = validate_backup(&spec, Some(Origin::Manual));
     assert!(
@@ -2078,6 +2080,7 @@ fn backup_aggregate_rejects_discovered_on_schedule_delete() {
         deletion_policy: None,
         on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
         pin: false,
+        mover: None,
     };
     let errs = validate_backup(&spec, Some(Origin::Discovered));
     assert!(errs.iter().any(|e| matches!(
@@ -2102,6 +2105,7 @@ fn backup_aggregate_with_unparseable_origin_skips_gated_rules_but_not_the_rest()
         deletion_policy: Some(DeletionPolicy::Delete),
         on_schedule_delete: Some(ScheduleDeletePolicy::Retain),
         pin: false,
+        mover: None,
     };
     assert!(validate_backup(&gated_only, None).is_empty());
 
@@ -4948,6 +4952,164 @@ fn staging_overrides_rejected_for_nfs_but_honored_for_pvc_selector_sources() {
 }
 
 #[test]
+fn a_source_path_override_on_a_selector_stays_admissible() {
+    // #456 review: refusing this combination parked a configuration that
+    // genuinely works. A pure validator cannot see how many PVCs the selector
+    // currently matches, and the two cases are not the same:
+    //
+    //  * ONE matched PVC: the override wins, there is no path COLLISION for
+    //    `expand_sources` to refuse, the backup is minted and real snapshots
+    //    exist at that path. A working single-volume policy with a custom path.
+    //  * TWO OR MORE: `expand_sources` refuses the RUN (its collision check),
+    //    so no further snapshot is minted. The signal there is the refused
+    //    backup, not verification: a policy that WAS working still has
+    //    snapshots at that path, so verification keeps passing (it fails only
+    //    where the path never received a backup).
+    //
+    // Refusing both would have parked the whole policy on upgrade —
+    // `reconcile_inner` validates first and returns on the first error, so
+    // retention pruning, adoption, status and the repository summary would stop
+    // too. The run-time refusal already catches the broken case, loudly, at the
+    // moment it becomes broken.
+    let source: Source = crate::testutil::from_yaml(
+        "pvcSelector: { labelSelector: { matchLabels: { app: pg } } }\nsourcePathOverride: /data\n",
+    );
+    assert!(
+        validate_source(&source).is_ok(),
+        "a selector + sourcePathOverride must stay admissible: it works for one matched PVC"
+    );
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         groupBy: None\n\
+         sources: [ { pvcSelector: { labelSelector: { matchLabels: { app: pg } } }, \
+                      sourcePathOverride: /data } ]\n",
+    );
+    assert!(
+        validate_backup_config(&spec).is_empty(),
+        "admission must not park such a policy: {:?}",
+        validate_backup_config(&spec)
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_one_pvc_selector_with_an_override_expands_to_that_override_path() {
+    // The working case, end to end on the pure kernel: ONE matched PVC, so no
+    // collision, and the member's kopia source path IS the override — which is
+    // what the backup writes and therefore what verification must check.
+    use crate::expand::{effective_source, expand_sources, strategy_for};
+    use crate::snapshot::PvcTargetRef;
+    let policy: crate::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "pg", "namespace": "apps" },
+        "spec": {
+            "repository": { "name": "r" },
+            "groupBy": "None",
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "app": "pg" } } },
+                "sourcePathOverride": "/data",
+            }],
+        },
+    }))
+    .expect("typed policy");
+    let matched = std::collections::BTreeMap::from([(
+        0usize,
+        vec![PvcTargetRef {
+            namespace: "apps".into(),
+            name: "only".into(),
+        }],
+    )]);
+    let members = expand_sources(&policy, "pg-1", &matched)
+        .expect("one matched PVC cannot collide with itself")
+        .expect("a selector policy expands");
+    assert_eq!(members.len(), 1);
+    let eff = effective_source(&policy, Some(&members[0].source)).expect("effective");
+    assert_eq!(
+        eff.kopia_source_path(strategy_for(&policy.spec.sources[eff.index]))
+            .as_deref(),
+        Some("/data"),
+        "the override wins over the strategy, so this is the path the backup writes"
+    );
+
+    // Add a SECOND matching PVC and the same expansion is refused — both would
+    // land on `/data`, merging two volumes' histories into one stream.
+    let matched = std::collections::BTreeMap::from([(
+        0usize,
+        vec![
+            PvcTargetRef {
+                namespace: "apps".into(),
+                name: "one".into(),
+            },
+            PvcTargetRef {
+                namespace: "apps".into(),
+                name: "two".into(),
+            },
+        ],
+    )]);
+    let err = expand_sources(&policy, "pg-1", &matched)
+        .expect_err("two members on one path must be refused at run time");
+    let msg = err.to_string();
+    assert!(msg.contains("/data"), "{msg}");
+    // The remedy must be the one that actually applies. `sourcePathStrategy` is
+    // NEVER consulted while an override is set (the override wins at
+    // `kopia_source_path`'s first branch), so "set sourcePathStrategy:
+    // PvcNamespacedName" — the message for a strategy-derived collision —
+    // would be a fix that changes nothing.
+    assert!(
+        msg.contains("sourcePathOverride"),
+        "the message must name the override as the cause: {msg}"
+    );
+    assert!(
+        msg.contains("Remove that `sourcePathOverride`"),
+        "and tell the user to remove it: {msg}"
+    );
+    assert!(
+        !msg.contains("Set `sourcePathStrategy: PvcNamespacedName` on that source"),
+        "the strategy remedy is inert while an override is set: {msg}"
+    );
+
+    // A collision with NO override still gets the strategy remedy, unchanged.
+    let strategy_policy: crate::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "pg", "namespace": "apps" },
+        "spec": {
+            "repository": { "name": "r" },
+            "groupBy": "None",
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "app": "pg" } } },
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .expect("typed policy");
+    let cross_ns = std::collections::BTreeMap::from([(
+        0usize,
+        vec![
+            PvcTargetRef {
+                namespace: "a".into(),
+                name: "data".into(),
+            },
+            PvcTargetRef {
+                namespace: "b".into(),
+                name: "data".into(),
+            },
+        ],
+    )]);
+    let msg = expand_sources(&strategy_policy, "pg-1", &cross_ns)
+        .expect_err("two same-named PVCs on PvcName collide")
+        .to_string();
+    assert!(
+        msg.contains("Set `sourcePathStrategy: PvcNamespacedName` on that source"),
+        "a strategy-derived collision keeps the strategy remedy: {msg}"
+    );
+    assert!(!msg.contains("sourcePathOverride"), "{msg}");
+}
+
+#[test]
 fn flipping_source_path_strategy_forks_a_selector_source() {
     // A `PvcName` -> `PvcNamespacedName` flip rewrites EVERY matched PVC's kopia
     // path at once (`/pvc/x` -> `/pvc/ns/x`), re-identifying the source and
@@ -5635,6 +5797,407 @@ fn cluster_repository_gets_the_identical_parameters_rules() {
         "{base}parameters:\n  epoch:\n    minDuration: 6h\n"
     ));
     assert!(validate_cluster_repository(&spec).is_empty());
+}
+
+// --- #458: kopia's own epoch floors ---------------------------------------
+//
+// Every floor here was verified against the pinned kopia 0.23.1 binary, not read off the
+// source: `kopia repository set-parameters --epoch-advance-on-count=5` really does exit
+// non-zero with "epoch advance on count too low", and because `set-parameters` MERGES the
+// flags into the repository's existing parameters before validating the whole set, that one
+// rejection also discards every other flag in the same call. That merge is why these are
+// admission errors and not warnings: the reporter on #458 declared advanceOnCount: 5 and
+// advanceOnSizeMiB: 2 alongside a legal minDuration, and lost the minDuration too.
+
+#[test]
+fn kopia_default_epoch_parameters_pass_admission() {
+    // The floors must never tax the values kopia itself ships with (refresh 20m,
+    // minDuration 24h, advanceOnCount 20, advanceOnSizeMiB 10, checkpointFrequency 7,
+    // deleteParallelism 4) — a floor that rejects kopia's own defaults is a broken floor.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 24h\n    refreshFrequency: 20m\n    \
+         advanceOnCount: 20\n    advanceOnSizeMiB: 10\n    checkpointFrequency: 7\n    \
+         deleteParallelism: 4\n"
+    ));
+    assert!(
+        validate_repository(&spec).is_empty(),
+        "{:?}",
+        validate_repository(&spec)
+    );
+}
+
+#[test]
+fn epoch_advance_on_count_below_kopias_floor_is_rejected() {
+    // The reporter's exact value. kopia: "epoch advance on count too low".
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnCount: 5\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "advanceOnCount: 5 must be rejected");
+    assert!(msg.contains("advanceOnCount"), "{msg}");
+    assert!(msg.contains("10"), "must name the floor: {msg}");
+    assert!(
+        msg.contains("epoch advance on count too low"),
+        "must quote kopia's own error text: {msg}"
+    );
+    assert!(
+        msg.contains("set-parameters"),
+        "must say the whole call is refused: {msg}"
+    );
+
+    // Exactly at the floor is fine.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnCount: 10\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+}
+
+#[test]
+fn epoch_advance_on_size_below_one_mib_is_rejected() {
+    // 2 MiB — the reporter's other value — is LEGAL; only sub-MiB is not, and since the
+    // field's unit is MiB the only sub-floor integers are 0 and negatives. Verified on
+    // 0.23.1: `--epoch-advance-on-size-mb=-1` errors "epoch advance on size too low",
+    // while `=0` is silently dropped by kopia's CLI as "no changes" — which is worse,
+    // because the user sees success and nothing happens.
+    for bad in ["0", "-1"] {
+        let spec = repo_yaml(&format!(
+            "{REPO_BASE}parameters:\n  epoch:\n    advanceOnSizeMiB: {bad}\n"
+        ));
+        let errs = validate_repository(&spec);
+        let msg = format!("{errs:?}");
+        assert!(!errs.is_empty(), "advanceOnSizeMiB: {bad} must be rejected");
+        assert!(msg.contains("advanceOnSizeMiB"), "{msg}");
+        assert!(
+            msg.contains("epoch advance on size too low"),
+            "must quote kopia: {msg}"
+        );
+    }
+
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnSizeMiB: 2\n"
+    ));
+    assert!(
+        validate_repository(&spec).is_empty(),
+        "2 MiB is above kopia's 1 MiB floor and must be accepted"
+    );
+}
+
+#[test]
+fn epoch_refresh_frequency_above_the_cleanup_safety_margin_is_rejected() {
+    // kopia requires cleanupSafetyMargin >= 3 x refreshFrequency, and kopiur has NO
+    // cleanupSafetyMargin field at all — so the margin is always kopia's 4h default and
+    // any refresh above 80m is guaranteed to fail. Verified: `--epoch-refresh-frequency=90m`
+    // errors "invalid cleanup safety margin, must be at least 3x epoch refresh frequency".
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: 90m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "refreshFrequency: 90m must be rejected");
+    assert!(msg.contains("refreshFrequency"), "{msg}");
+    assert!(msg.contains("80m"), "must name the ceiling: {msg}");
+    assert!(
+        msg.contains("cleanup safety margin"),
+        "must quote kopia: {msg}"
+    );
+
+    // 80m is exactly 4h/3 — the boundary is inclusive.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: 80m\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+}
+
+#[test]
+fn min_duration_must_clear_both_the_absolute_and_the_refresh_derived_floor() {
+    // (a) minDuration: 10m DECLARED ALONE fails on the live repository, even though 10m is
+    // exactly kopia's absolute floor: the repository's untouched refresh of 20m makes
+    // 20m x 3 = 60m > 10m, and kopia answers "epoch refresh period is too long, must be
+    // 1/3 of minimal epoch duration or shorter". Verified on 0.23.1. This is the single
+    // most confusing failure in the whole block, so the message has to spell out both fixes.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 10m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(
+        !errs.is_empty(),
+        "minDuration: 10m declared alone always fails on the live repository"
+    );
+    assert!(msg.contains("minDuration"), "{msg}");
+    assert!(msg.contains("60m"), "must name the derived floor: {msg}");
+    assert!(
+        msg.contains("refreshFrequency"),
+        "must offer the other fix — lower the refresh: {msg}"
+    );
+    assert!(
+        msg.contains("epoch refresh period is too long"),
+        "must quote kopia: {msg}"
+    );
+
+    // (b) 60m alone clears 3 x kopia's 20m default.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 60m\n"
+    ));
+    assert!(
+        validate_repository(&spec).is_empty(),
+        "minDuration: 60m alone is exactly 3 x kopia's 20m refresh default"
+    );
+
+    // (c) 10m becomes legal the moment a small enough refresh is declared WITH it —
+    // `--epoch-min-duration=10m --epoch-refresh-frequency=3m` genuinely succeeds.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 10m\n    refreshFrequency: 3m\n"
+    ));
+    assert!(
+        validate_repository(&spec).is_empty(),
+        "a declared refreshFrequency <= minDuration/3 makes 10m legal"
+    );
+
+    // (d) …but the ABSOLUTE 10m floor still bites: 5m + 1m satisfies the 3x rule and kopia
+    // still refuses with "minimum epoch duration too low: 5m0s".
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 5m\n    refreshFrequency: 1m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "5m is below kopia's absolute 10m floor");
+    assert!(
+        msg.contains("minimum epoch duration too low"),
+        "must quote kopia: {msg}"
+    );
+}
+
+#[test]
+fn epoch_checkpoint_frequency_and_delete_parallelism_floors() {
+    // checkpointFrequency is kopia's rule ("invalid epoch range compaction period", verified
+    // with `--epoch-checkpoint-frequency=-1`); deleteParallelism is KOPIUR's own — kopia's
+    // Validate() never looks at it — and the message must say so rather than imply kopia
+    // would catch it.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    checkpointFrequency: 0\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "checkpointFrequency: 0 must be rejected");
+    assert!(
+        msg.contains("invalid epoch range compaction period"),
+        "must quote kopia: {msg}"
+    );
+
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    deleteParallelism: 0\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty(), "deleteParallelism: 0 must be rejected");
+    assert!(
+        msg.contains("kopia does not validate"),
+        "must be honest that this floor is kopiur's own: {msg}"
+    );
+
+    // 1 is the floor for both.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    checkpointFrequency: 1\n    deleteParallelism: 1\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+}
+
+#[test]
+fn a_parsed_zero_refresh_frequency_is_rejected() {
+    // The #458 failure mode, surviving on the one epoch field that got a ceiling but no
+    // floor. `parse_go_duration` accepts "0s"/"0" as a real zero, and kopia's
+    // `setDurationParameter` is `if v == 0 { return }` — so the flag is dropped, `anyChange`
+    // stays false, and the command exits 0 with `no changes`. Verified on 0.23.1: the
+    // repository keeps its 20m and reports it.
+    //
+    // Downstream that is worse than a plain no-op: `EpochParametersSpec::from_api` renders
+    // "0s", `dur_drift` compares 0 against 1_200_000_000_000 forever, so the flag is
+    // re-sent on EVERY bootstrap while `status.parameters.epoch.refreshFrequency`
+    // permanently disagrees with spec and the user sees success.
+    for zero in ["0s", "0", "0m", "0h"] {
+        let spec = repo_yaml(&format!(
+            "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: {zero:?}\n"
+        ));
+        let errs = validate_repository(&spec);
+        let msg = format!("{errs:?}");
+        assert!(
+            !errs.is_empty(),
+            "refreshFrequency: {zero:?} must be rejected"
+        );
+        assert!(msg.contains("refreshFrequency"), "{msg}");
+        assert!(
+            msg.contains("no changes"),
+            "must say kopia drops it silently: {msg}"
+        );
+    }
+
+    // The smallest NON-zero value stays valid — the floor must not tax anyone.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: 1s\n"
+    ));
+    assert!(validate_repository(&spec).is_empty());
+
+    // And the sibling durations are already covered: minDuration: 0s falls to the 10m
+    // branch rather than needing a zero rule of its own. Asserted so a future refactor
+    // cannot quietly open that hole.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 0s\n"
+    ));
+    assert!(
+        !validate_repository(&spec).is_empty(),
+        "minDuration: 0s must still be rejected (by the 10m floor)"
+    );
+}
+
+#[test]
+fn the_derived_bounds_admit_that_they_assume_kopias_defaults() {
+    // Both derived bounds can reject a call the LIVE repository would accept, because a pure
+    // validator cannot read live state:
+    //
+    //  * the 80m ceiling assumes the 4h cleanupSafetyMargin default, but kopia's CLI exposes
+    //    `--epoch-cleanup-safety-margin` — raise it to 23h out of band and 90m is legal
+    //    (verified on 0.23.1);
+    //  * the minDuration bound assumes the 20m refresh default, but applying
+    //    `{minDuration: 60m, refreshFrequency: 5m}` and then dropping refreshFrequency from
+    //    spec leaves the live 5m in place, which makes minDuration: 30m legal.
+    //
+    // The bounds stay (they are right for every repository kopiur itself configured), so the
+    // MESSAGE has to own the assumption and point at where the live values are mirrored.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    refreshFrequency: 90m\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(
+        msg.contains("status.parameters.epoch.cleanupSafetyMargin"),
+        "must point at the mirrored live margin: {msg}"
+    );
+    assert!(
+        msg.contains("cannot read"),
+        "must own the assumption rather than state it as fact: {msg}"
+    );
+
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 30m\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(
+        msg.contains("status.parameters.epoch.refreshFrequency"),
+        "must point at the mirrored live refresh: {msg}"
+    );
+    assert!(msg.contains("cannot read"), "{msg}");
+}
+
+#[test]
+fn the_suggested_refresh_frequency_never_breaks_its_own_ceiling() {
+    // `minDuration / 3` is only the right suggestion while it stays under the 80m ceiling.
+    // With minDuration: 300m the naive third is 100m, which the ceiling rejects — advice
+    // that fails the very next admission is worse than no advice.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 300m\n    refreshFrequency: 200m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty());
+    assert!(
+        !msg.contains("100m or less"),
+        "must not suggest a refreshFrequency its own ceiling forbids: {msg}"
+    );
+    assert!(msg.contains("80m or less"), "capped at the ceiling: {msg}");
+}
+
+#[test]
+fn a_min_duration_below_the_absolute_floor_explains_both_rules() {
+    // `minDuration: 5m` alone violates BOTH bounds: the absolute 10m floor and the derived
+    // 60m one. Reporting the 60m figure while explaining only the 10m rule mismatches
+    // why-against-floor, and the old message withheld the fix that does work — 10m WITH a
+    // small refreshFrequency. "Lowering refreshFrequency cannot help" is only true with
+    // minDuration held fixed, which is not what the user is being asked to do.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 5m\n"
+    ));
+    let errs = validate_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert!(!errs.is_empty());
+    assert!(
+        msg.contains("minimum epoch duration too low"),
+        "the absolute rule: {msg}"
+    );
+    assert!(
+        msg.contains("3 x refreshFrequency"),
+        "…and the derived rule, since the reported floor is the derived one: {msg}"
+    );
+    assert!(
+        msg.contains("10m"),
+        "must offer the 10m + small-refresh route that actually works: {msg}"
+    );
+
+    // Below 10m WITH a refresh small enough to satisfy the 3x rule, only the absolute rule
+    // bites — and then the message must not drag in the derived one.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 5m\n    refreshFrequency: 1m\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(msg.contains("minimum epoch duration too low"), "{msg}");
+    assert!(
+        !msg.contains("3 x refreshFrequency"),
+        "the 3x rule is satisfied here and must not be blamed: {msg}"
+    );
+}
+
+#[test]
+fn the_zero_is_dropped_note_only_appears_for_a_zero() {
+    // The note is ~230 characters about what kopia does with a `0`. On `advanceOnCount: 5`
+    // it is simply not true of the value in hand, and it crowds out the part that is.
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnCount: 5\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(
+        !msg.contains("no changes"),
+        "a non-zero value must not carry the zero-is-dropped note: {msg}"
+    );
+
+    let spec = repo_yaml(&format!(
+        "{REPO_BASE}parameters:\n  epoch:\n    advanceOnCount: 0\n"
+    ));
+    let msg = format!("{:?}", validate_repository(&spec));
+    assert!(
+        msg.contains("no changes"),
+        "a zero must still explain that kopia drops it silently: {msg}"
+    );
+}
+
+#[test]
+fn cluster_repository_rejects_the_same_epoch_floors() {
+    // validate_repository_parameters is shared, but the two kinds have fully duplicated
+    // reconcilers and this is the classic way half an API surface ships inert.
+    let base = "backend: { filesystem: { path: /repo } }\n\
+                encryption: { passwordSecretRef: { name: s, namespace: kopiur-system, key: KOPIA_PASSWORD } }\n\
+                allowedNamespaces: { all: true }\n";
+    // The reporter's exact declaration, on the kind they actually used.
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}parameters:\n  epoch:\n    minDuration: 6h\n    advanceOnCount: 5\n    \
+         advanceOnSizeMiB: 2\n"
+    ));
+    let errs = validate_cluster_repository(&spec);
+    let msg = format!("{errs:?}");
+    assert_eq!(
+        errs.len(),
+        1,
+        "only advanceOnCount is out of range — advanceOnSizeMiB: 2 and minDuration: 6h are \
+         both legal: {msg}"
+    );
+    assert!(msg.contains("advanceOnCount"), "{msg}");
+
+    let spec: ClusterRepositorySpec = crate::testutil::from_yaml(&format!(
+        "{base}parameters:\n  epoch:\n    minDuration: 10m\n"
+    ));
+    assert!(
+        !validate_cluster_repository(&spec).is_empty(),
+        "the derived minDuration floor must apply to ClusterRepository too"
+    );
 }
 
 // --- #332: object-lock blob retention -------------------------------------------------
@@ -7647,4 +8210,477 @@ fn m1_admission_messages_are_well_formed() {
             "M1 message not well-formed: {e}"
         );
     }
+}
+
+// --- Snapshot.spec.mover (#464) ---
+
+#[test]
+fn snapshot_mover_rejects_requests_exceeding_limits() {
+    use crate::snapshot::SnapshotSpec;
+    let spec: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 resources:\n\
+         \x20   requests: { memory: 4Gi }\n\
+         \x20   limits: { memory: 1Gi }\n",
+    );
+    let errs = validate_backup(&spec, Some(Origin::Manual));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    match &errs[0] {
+        ValidationError::InvalidFieldValue { field, reason } => {
+            assert_eq!(field, "Snapshot mover resources.requests.memory");
+            assert!(reason.contains("exceeds limit"), "{reason}");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_mover_rejects_the_restore_only_snapshot_inherit() {
+    use crate::snapshot::SnapshotSpec;
+    let spec: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 inheritSecurityContextFrom: { snapshot: {} }\n",
+    );
+    let errs = validate_backup(&spec, Some(Origin::Manual));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    match &errs[0] {
+        ValidationError::InvalidFieldValue { field, reason } => {
+            assert_eq!(field, "snapshot.mover.inheritSecurityContextFrom.snapshot");
+            assert!(reason.contains("restore-only"), "{reason}");
+        }
+        other => panic!("expected InvalidFieldValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_mover_admits_pvc_consumer_and_a_plain_override() {
+    use crate::snapshot::SnapshotSpec;
+    // `pvcConsumer` is deliberately ADMITTED: `validate_backup` is client-free, so it
+    // cannot see whether the referenced policy has a source PVC to derive a consumer
+    // from. The controller resolves it and parks the run with a named reason when it
+    // cannot — better than an admission refusal built on missing information.
+    let consumer: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 inheritSecurityContextFrom: { pvcConsumer: {} }\n",
+    );
+    assert!(
+        validate_backup(&consumer, Some(Origin::Manual)).is_empty(),
+        "pvcConsumer must be admitted on a Snapshot"
+    );
+
+    let plain: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 resources: { requests: { memory: 2Gi } }\n\
+         \x20 securityContext: { runAsUser: 1000 }\n\
+         \x20 cache: { capacity: 20Gi }\n\
+         \x20 ttlSecondsAfterFinished: 60\n",
+    );
+    assert!(validate_backup(&plain, Some(Origin::Manual)).is_empty());
+    let m = plain.mover.as_ref().expect("mover decoded");
+    assert_eq!(
+        m.security_context.as_ref().and_then(|s| s.run_as_user),
+        Some(1000)
+    );
+    assert_eq!(
+        m.cache.as_ref().and_then(|c| c.capacity.as_deref()),
+        Some("20Gi")
+    );
+    assert_eq!(m.ttl_seconds_after_finished, Some(60));
+}
+
+#[test]
+fn effective_backup_mover_layers_snapshot_over_policy() {
+    use crate::snapshot::{SnapshotSpec, effective_backup_mover};
+    use crate::snapshot_policy::SnapshotPolicySpec;
+
+    let policy: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { pvc: { name: data } } ]\n\
+         mover:\n\
+         \x20 securityContext: { runAsUser: 1000 }\n\
+         \x20 cache: { capacity: 8Gi, contentCacheSizeMb: 4096 }\n\
+         \x20 ttlSecondsAfterFinished: 3600\n",
+    );
+    let snapshot: SnapshotSpec = crate::testutil::from_yaml(
+        "policyRef: { name: pg }\n\
+         mover:\n\
+         \x20 cache: { contentCacheSizeMb: 16384 }\n\
+         \x20 resources: { requests: { memory: 4Gi } }\n",
+    );
+
+    let merged = effective_backup_mover(&snapshot, &policy).expect("both layers present");
+    // Snapshot-set field wins…
+    assert_eq!(
+        merged.cache.as_ref().and_then(|c| c.content_cache_size_mb),
+        Some(16384)
+    );
+    // …snapshot-only field lands…
+    assert_eq!(
+        merged
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|r| r.get("memory"))
+            .map(|q| q.0.as_str()),
+        Some("4Gi")
+    );
+    // …and everything the snapshot omits falls through to the policy.
+    assert_eq!(
+        merged.cache.as_ref().and_then(|c| c.capacity.as_deref()),
+        Some("8Gi")
+    );
+    assert_eq!(
+        merged.security_context.as_ref().and_then(|s| s.run_as_user),
+        Some(1000)
+    );
+    assert_eq!(merged.ttl_seconds_after_finished, Some(3600));
+
+    // Either layer alone passes through verbatim; neither yields None (so a
+    // pre-feature Snapshot resolves exactly as before).
+    let bare: SnapshotSpec = crate::testutil::from_yaml("policyRef: { name: pg }\n");
+    assert_eq!(
+        effective_backup_mover(&bare, &policy).as_ref(),
+        policy.mover.as_ref()
+    );
+    let mut policy_no_mover = policy.clone();
+    policy_no_mover.mover = None;
+    assert_eq!(
+        effective_backup_mover(&snapshot, &policy_no_mover).as_ref(),
+        snapshot.mover.as_ref()
+    );
+    assert!(effective_backup_mover(&bare, &policy_no_mover).is_none());
+}
+
+// --- stream sources -------------------------------------------------------
+//
+// These go through the YAML→JSON→typed bridge (the API-server path) rather than
+// building `Source` literals, because the bug they guard only exists on that path:
+// `readOnly` and `sourcePathStrategy` carry SCHEMA DEFAULTS the API server
+// materializes onto every source before admission runs, so a hand-built literal
+// with `read_only: None` cannot reproduce what the cluster actually sends.
+
+/// The shape the API server delivers: the policy as written, plus the defaults it
+/// stamps in. Anything asserting "the user did not set this" must be tested here.
+fn stream_source_as_served(extra: &str) -> Source {
+    let yaml = format!(
+        r#"
+stream:
+  fileName: postgres.sql
+  workloadExec:
+    podSelector:
+      matchLabels: {{ app: postgres }}
+    container: postgres
+    command: ["sh", "-ec", "pg_dumpall"]
+# --- materialized by the API server from the CRD schema defaults ---
+readOnly: true
+sourcePathStrategy: PvcName
+{extra}
+"#
+    );
+    crate::testutil::from_yaml(&yaml)
+}
+
+/// The regression this file exists for: a stream policy written WITHOUT any
+/// PVC-only field must still be accepted after the API server has defaulted
+/// `readOnly: true` and `sourcePathStrategy: PvcName` onto it.
+///
+/// This failed against a real cluster — every valid stream policy was rejected with
+/// "readOnly does not apply to a stream source" for a field the user never wrote.
+#[test]
+fn a_stream_source_survives_the_api_servers_materialized_defaults() {
+    let source = stream_source_as_served("");
+    assert!(
+        validate_source(&source).is_ok(),
+        "materialized schema defaults must not be mistaken for user intent: {:?}",
+        validate_source(&source)
+    );
+}
+
+/// The value that would actually mean something is still refused.
+#[test]
+fn read_only_false_is_rejected_on_a_stream_source() {
+    let mut source = stream_source_as_served("");
+    source.read_only = Some(false);
+    let err = validate_source(&source).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("readOnly: false does not apply"), "{msg}");
+    assert!(msg.contains("nothing is mounted"), "{msg}");
+}
+
+/// A non-default path strategy is a real request, and meaningless here.
+#[test]
+fn a_non_default_source_path_strategy_is_rejected_on_a_stream_source() {
+    let mut source = stream_source_as_served("");
+    source.source_path_strategy =
+        Some(crate::snapshot_policy::SourcePathStrategy::PvcNamespacedName);
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("sourcePathStrategy"), "{err}");
+}
+
+/// `acknowledgeLiveMutation` has NO schema default, so its presence IS user intent.
+#[test]
+fn acknowledge_live_mutation_is_rejected_on_a_stream_source() {
+    let source = stream_source_as_served("acknowledgeLiveMutation: true");
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("acknowledgeLiveMutation"), "{err}");
+}
+
+/// A path-shaped `fileName` is a security problem, not a style one: kopia stores it
+/// verbatim as the entry name, so a restore would write outside its destination.
+#[test]
+fn a_path_shaped_file_name_is_rejected() {
+    for bad in ["../escape.sql", "sub/dir.sql", "/abs.sql", ".", "..", ""] {
+        let mut source = stream_source_as_served("");
+        source.stream.as_mut().unwrap().file_name = bad.to_string();
+        let err =
+            validate_source(&source).expect_err(&format!("`{bad}` must be rejected as a fileName"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("single file name") || msg.contains("not a usable file name"),
+            "`{bad}`: {msg}"
+        );
+    }
+}
+
+/// An empty selector matches every pod in the namespace — never what was meant.
+#[test]
+fn an_empty_pod_selector_is_rejected() {
+    let source: Source = crate::testutil::from_yaml(
+        r#"
+stream:
+  fileName: postgres.sql
+  workloadExec:
+    podSelector: {}
+    command: ["pg_dumpall"]
+readOnly: true
+"#,
+    );
+    let err = validate_source(&source).unwrap_err();
+    assert!(err.to_string().contains("matches EVERY pod"), "{err}");
+}
+
+/// A stream source cannot share a policy with other sources: expansion only fans out
+/// selector sources, so the others would be silently skipped.
+#[test]
+fn a_stream_source_must_be_its_policys_only_source() {
+    let spec: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - pvc: { name: data }
+  - stream:
+      fileName: postgres.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: postgres } }
+        command: ["pg_dumpall"]
+"#,
+    );
+    let errs = validate_backup_config(&spec);
+    assert!(
+        errs.iter().any(|e| e.to_string().contains("only source")),
+        "expected an only-source rejection, got {errs:?}"
+    );
+}
+
+/// A `stream` source's kopia path IS its identity, so renaming `fileName` forks
+/// it exactly as changing a PVC's `sourcePathOverride` forks that PVC (#451).
+///
+/// This was uncovered: `pvc_source_effective_path` returns `None` for a source
+/// with no `pvc`, so a `fileName` rename passed admission silently and the next
+/// backup started a fresh history under `/stream/<new>` while the old
+/// `/stream/<old>` aged out under retention — the same orphan-every-manifest
+/// outcome the guard exists to prevent, with no warning and no ack.
+#[test]
+fn source_path_fork_catches_a_renamed_stream_file() {
+    let mk = |file: &str, path_override: Option<&str>| -> SnapshotPolicySpec {
+        let mut s: SnapshotPolicySpec = crate::testutil::from_yaml(&format!(
+            r#"
+repository: {{ kind: Repository, name: r }}
+sources:
+  - stream:
+      fileName: {file}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: postgres }} }}
+        command: ["sh", "-ec", "pg_dumpall"]
+    readOnly: true
+    sourcePathStrategy: PvcName
+"#
+        ));
+        s.sources[0].source_path_override = path_override.map(String::from);
+        s
+    };
+
+    // `postgres.sql` → `pg.sql`: /stream/postgres.sql → /stream/pg.sql ⇒ fork.
+    let old = mk("postgres.sql", None);
+    let new = mk("pg.sql", None);
+    let err = detect_source_path_fork(&old, &new, true, false)
+        .expect("renaming a stream fileName must trip IdentityWouldFork");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/stream/postgres.sql");
+            assert_eq!(new, "/stream/pg.sql");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+
+    // The escape hatches behave exactly as they do for a PVC source.
+    assert!(
+        detect_source_path_fork(&old, &new, true, true).is_none(),
+        "the allow-identity-change ack must release it"
+    );
+    assert!(
+        detect_source_path_fork(&old, &new, false, false).is_none(),
+        "no history means nothing to orphan"
+    );
+    assert!(
+        detect_source_path_fork(&old, &mk("postgres.sql", None), true, false).is_none(),
+        "an unchanged fileName is not a fork"
+    );
+
+    // Adding a `sourcePathOverride` moves the recorded path too, so it forks.
+    assert!(
+        detect_source_path_fork(&old, &mk("postgres.sql", Some("/dumps/pg")), true, false)
+            .is_some(),
+        "overriding a stream source's path re-identifies it"
+    );
+    // ...and removing it forks back.
+    assert!(
+        detect_source_path_fork(&mk("postgres.sql", Some("/dumps/pg")), &old, true, false)
+            .is_some()
+    );
+}
+
+/// Keyed by POSITION, because a stream source has no PVC name to match across an
+/// edit. Two stream sources swapping places therefore fork — correctly: each
+/// index's recorded path changed, and index is what
+/// `Snapshot.spec.source.sourceIndex` pins.
+#[test]
+fn stream_source_forks_are_keyed_by_position() {
+    let two = |a: &str, b: &str| -> SnapshotPolicySpec {
+        crate::testutil::from_yaml(&format!(
+            r#"
+repository: {{ kind: Repository, name: r }}
+sources:
+  - stream:
+      fileName: {a}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: a }} }}
+        command: ["a"]
+  - stream:
+      fileName: {b}
+      workloadExec:
+        podSelector: {{ matchLabels: {{ app: b }} }}
+        command: ["b"]
+"#
+        ))
+    };
+    // Same set, different order ⇒ both indices' paths changed ⇒ fork.
+    assert!(
+        detect_source_path_fork(&two("a.sql", "b.sql"), &two("b.sql", "a.sql"), true, false)
+            .is_some()
+    );
+    // Identical ⇒ no fork.
+    assert!(
+        detect_source_path_fork(&two("a.sql", "b.sql"), &two("a.sql", "b.sql"), true, false)
+            .is_none()
+    );
+    // A source APPENDED at a new index has no old baseline, so it never forks —
+    // same rule the selector guard uses.
+    let one: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - stream:
+      fileName: a.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: a } }
+        command: ["a"]
+"#,
+    );
+    assert!(detect_source_path_fork(&one, &two("a.sql", "b.sql"), true, false).is_none());
+}
+
+/// A source that CHANGES KIND at a fixed index forks, and neither kind-specific
+/// arm could see it: the PVC arm keys on PVC name (absent from the stream side)
+/// and the stream arm keys on `fileName` (absent from the PVC side), so
+/// `stream → pvc` at index 0 rewrote `/stream/dump.sql` to `/pvc/data` — the
+/// orphan-every-manifest outcome the guard exists for — and passed admission
+/// silently. The index-keyed backstop catches it in both directions.
+#[test]
+fn source_path_fork_catches_a_source_that_changes_kind_at_one_index() {
+    let stream: SnapshotPolicySpec = crate::testutil::from_yaml(
+        r#"
+repository: { kind: Repository, name: r }
+sources:
+  - stream:
+      fileName: dump.sql
+      workloadExec:
+        podSelector: { matchLabels: { app: postgres } }
+        command: ["pg_dumpall"]
+"#,
+    );
+    let pvc: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: data } } ]\n",
+    );
+    let nfs: SnapshotPolicySpec = crate::testutil::from_yaml(
+        "repository: { kind: Repository, name: r }\n\
+         sources: [ { nfs: { server: nas, path: /export/db } } ]\n",
+    );
+
+    // stream → pvc, and back.
+    let err = detect_source_path_fork(&stream, &pvc, true, false)
+        .expect("stream -> pvc at index 0 re-identifies the source");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/stream/dump.sql");
+            assert_eq!(new, "/pvc/data");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+    assert!(detect_source_path_fork(&pvc, &stream, true, false).is_some());
+
+    // stream → nfs, pvc → nfs, and back: every kind pair at a fixed index.
+    for (a, b) in [(&stream, &nfs), (&nfs, &stream), (&pvc, &nfs), (&nfs, &pvc)] {
+        assert!(
+            detect_source_path_fork(a, b, true, false).is_some(),
+            "a kind change at index 0 always re-identifies the source"
+        );
+    }
+
+    // The escape hatches still apply, and an unchanged spec is never a fork.
+    assert!(detect_source_path_fork(&stream, &pvc, true, true).is_none());
+    assert!(detect_source_path_fork(&stream, &pvc, false, false).is_none());
+    for same in [&stream, &pvc, &nfs] {
+        assert!(detect_source_path_fork(same, same, true, false).is_none());
+    }
+}
+
+/// REORDERING two plain `pvc:` sources trips the backstop, deliberately. Index is
+/// what `Snapshot.spec.source.sourceIndex` pins, and for a selector-free policy
+/// only `sources[0]` is ever backed up — so the swap genuinely changes which
+/// volume the policy captures. It needs the `allow-identity-change` ack, which is
+/// exactly the confirmation such an edit deserves.
+#[test]
+fn reordering_plain_pvc_sources_needs_the_ack() {
+    let order = |a: &str, b: &str| -> SnapshotPolicySpec {
+        crate::testutil::from_yaml(&format!(
+            "repository: {{ kind: Repository, name: r }}\n\
+             sources: [ {{ pvc: {{ name: {a} }} }}, {{ pvc: {{ name: {b} }} }} ]\n"
+        ))
+    };
+    let err = detect_source_path_fork(&order("a", "b"), &order("b", "a"), true, false)
+        .expect("swapping sources[0] changes what the policy backs up");
+    match &err {
+        ValidationError::IdentityWouldFork { old, new } => {
+            assert_eq!(old, "/pvc/a");
+            assert_eq!(new, "/pvc/b");
+        }
+        other => panic!("expected IdentityWouldFork, got {other:?}"),
+    }
+    assert!(detect_source_path_fork(&order("a", "b"), &order("b", "a"), true, true).is_none());
+    assert!(detect_source_path_fork(&order("a", "b"), &order("a", "b"), true, false).is_none());
 }

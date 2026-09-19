@@ -410,6 +410,25 @@ fn populator_state_depends_on_target_variant() {
         })),
         PopulatorState::DirectTarget
     );
+    // `streamExec` is operator-driven too: the mover reads one virtual file and
+    // pipes it into a command, and nothing ever claims the Restore. Pinned here
+    // because the OTHER classification would be silently catastrophic — an
+    // `AwaitingClaim` streamExec restore would sit passive forever waiting for a
+    // `dataSourceRef` that can never arrive, since it writes no PVC to claim.
+    assert_eq!(
+        populator_state(&RestoreTarget::StreamExec(
+            kopiur_api::restore::StreamExecTarget {
+                file_name: "postgres.sql".into(),
+                workload_exec: kopiur_api::snapshot_policy::StreamExec {
+                    pod_selector: Default::default(),
+                    container: None,
+                    command: vec!["psql".into()],
+                    timeout: None,
+                },
+            }
+        )),
+        PopulatorState::DirectTarget
+    );
 }
 
 #[test]
@@ -728,8 +747,10 @@ fn condition_of(status: &serde_json::Value, type_: &str) -> Option<serde_json::V
 fn mirrored_status(
     claims: &std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus>,
 ) -> serde_json::Value {
+    let restore = restore_with_anchor(None);
     fanout_status(
-        &restore_with_anchor(None),
+        &restore,
+        &existing_conditions(&restore),
         &std::collections::BTreeMap::new(),
         claims,
         &[],
@@ -936,7 +957,7 @@ fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
     for (restore, top_level_present) in [(&legacy_pinned, true), (&bare, false)] {
         // Pinned, one claim ⇒ written (whatever stood there before).
         let one = claims_of(&[("data", pinned())]);
-        let s = fanout_status(restore, &none, &one, &[]);
+        let s = fanout_status(restore, &existing_conditions(restore), &none, &one, &[]);
         assert_eq!(
             s["resolved"]["resolution"],
             serde_json::json!("Snapshot"),
@@ -947,14 +968,14 @@ fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
         // Unpinned, one claim ⇒ `resolved` OMITTED — the adopted legacy pin (or
         // nothing) stays. `target` still names the prime being written.
         let one = claims_of(&[("data", unpinned())]);
-        let s = fanout_status(restore, &none, &one, &[]);
+        let s = fanout_status(restore, &existing_conditions(restore), &none, &one, &[]);
         assert!(
             s.get("resolved").is_none(),
             "top_level_present={top_level_present}: {s}"
         );
         assert_eq!(s["target"]["pvcPrime"], "prime-u1");
         // …and the same on the heartbeat, where `prev` is that same record.
-        let s = fanout_status(restore, &one, &one, &[]);
+        let s = fanout_status(restore, &existing_conditions(restore), &one, &one, &[]);
         assert!(s.get("resolved").is_none(), "{s}");
 
         // Unpinned, one claim, but the CLAIMANT CHANGED (a re-arm): the pin that
@@ -962,13 +983,20 @@ fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
         let mut fresh = unpinned();
         fresh.uid = Some("u-new".into());
         let rearmed = claims_of(&[("data", fresh)]);
-        let s = fanout_status(restore, &claims_of(&[("data", pinned())]), &rearmed, &[]);
+        let s = fanout_status(
+            restore,
+            &existing_conditions(restore),
+            &claims_of(&[("data", pinned())]),
+            &rearmed,
+            &[],
+        );
         assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
 
         // Unpinned survivor while a SIBLING's record is dropped: the dropped
         // claim's mirrored pin is stale — reset it.
         let s = fanout_status(
             restore,
+            &existing_conditions(restore),
             &claims_of(&[("data", unpinned()), ("logs", pinned())]),
             &claims_of(&[("data", unpinned())]),
             &["logs".to_string()],
@@ -979,10 +1007,16 @@ fn the_single_claim_mirror_writes_a_pin_but_never_nulls_an_unpinned_one() {
         let mut second = pinned();
         second.uid = Some("u2".into());
         let two = claims_of(&[("data", pinned()), ("logs", second)]);
-        let s = fanout_status(restore, &claims_of(&[("data", pinned())]), &two, &[]);
+        let s = fanout_status(
+            restore,
+            &existing_conditions(restore),
+            &claims_of(&[("data", pinned())]),
+            &two,
+            &[],
+        );
         assert_eq!(s["resolved"], serde_json::Value::Null, "{s}");
         assert_eq!(s["target"], serde_json::Value::Null, "{s}");
-        let s = fanout_status(restore, &two, &two, &[]);
+        let s = fanout_status(restore, &existing_conditions(restore), &two, &two, &[]);
         assert!(s.get("resolved").is_none(), "{s}");
     }
 }
@@ -1047,7 +1081,14 @@ fn several_claims_clear_the_mirror_and_report_the_aggregate() {
             Some(ResolutionOutcome::Snapshot),
         ),
     )]);
-    let status = fanout_status(&restore_with_anchor(None), &was_single, &two, &[]);
+    let anchored = restore_with_anchor(None);
+    let status = fanout_status(
+        &anchored,
+        &existing_conditions(&anchored),
+        &was_single,
+        &two,
+        &[],
+    );
     assert_eq!(
         status["resolved"],
         serde_json::Value::Null,
@@ -1056,7 +1097,7 @@ fn several_claims_clear_the_mirror_and_report_the_aggregate() {
     assert_eq!(status["target"], serde_json::Value::Null, "{status}");
     // Many→Many heartbeat: nothing to clear, so `resolved` is not named — a
     // `null` there is what erased an adopted legacy pin (finding 5).
-    let steady = fanout_status(&restore_with_anchor(None), &two, &two, &[]);
+    let steady = fanout_status(&anchored, &existing_conditions(&anchored), &two, &two, &[]);
     assert!(
         steady.get("resolved").is_none(),
         "the many-claim heartbeat must leave `resolved` alone: {steady}"
@@ -2288,6 +2329,7 @@ fn restore_flags_enable_file_deletion_regression() {
     // End-to-end through the mover's RestoreOp -> kopia client RestoreOptions ->
     // argv, proving the whole chain (not just this one hop).
     let op = RestoreOp {
+        stdout: None,
         source: RestoreSelection::Snapshot("s".into()),
         target_path: "/data".into(),
         anchor: Default::default(),
@@ -3653,5 +3695,287 @@ fn claim_wait_window_is_per_claim_only_and_opens_now_on_the_first_pass() {
     assert_eq!(
         effective_wait_anchor(&restore_with_anchor(Some("2025-06-01T00:00:00Z")), created),
         1_748_736_000
+    );
+}
+
+// --- stream restore: the `fromPolicy` identity derivation (#451) -------------
+//
+// `from_policy_identity(.., target: None)` is the arm a `target.streamExec`
+// restore takes. It had ZERO coverage in any tier: no unit test named it, and the
+// only e2e stream restore uses `source.snapshotRef`, which never reaches it.
+// These five tests pin the whole derivation, pure and hermetic.
+
+/// A policy whose single source streams `file_name` out of a command.
+fn stream_policy(file_name: &str) -> kopiur_api::SnapshotPolicy {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "pg", "namespace": "db" },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{
+                "stream": {
+                    "fileName": file_name,
+                    "workloadExec": {
+                        "podSelector": { "matchLabels": { "app": "postgres" } },
+                        "command": ["sh", "-ec", "pg_dumpall"],
+                    },
+                },
+                // Materialized by the API server from the CRD schema defaults.
+                "readOnly": true,
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .expect("a valid stream SnapshotPolicy")
+}
+
+/// A `pvcSelector` policy whose members ALL share one `sourcePathOverride` — the
+/// shape `restore_source_path` step (5) refuses, because no derivation can say
+/// which member a given path holds.
+fn flattened_selector_policy() -> kopiur_api::SnapshotPolicy {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "all-volumes", "namespace": "db" },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "backup": "yes" } } },
+                "sourcePathOverride": "/data",
+                "readOnly": true,
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .expect("a valid selector SnapshotPolicy")
+}
+
+/// (a) THE regression guard for the whole feature: a `streamExec` restore whose
+/// source is `fromPolicy` must resolve the identity the BACKUP recorded —
+/// `/stream/<fileName>` — and specifically not `/data` (what the old
+/// `config_identity_for_path` fallback produced) nor `/pvc/...` nor the pathless
+/// form (which matches every source and takes the newest of them).
+#[test]
+fn a_stream_from_policy_restore_resolves_the_stream_root_identity() {
+    let policy = stream_policy("postgres.sql");
+    let id = from_policy_identity(&policy, "db", None, None, None)
+        .expect("a stream policy resolves its own identity");
+    assert_eq!(id.source_path.as_deref(), Some("/stream/postgres.sql"));
+    assert_ne!(id.source_path.as_deref(), Some("/data"));
+    assert!(
+        !id.source_path
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("/pvc/"),
+        "a stream artifact must never resolve a volume path"
+    );
+    assert!(
+        id.source_path.is_some(),
+        "a pathless identity matches the newest snapshot of ANY source"
+    );
+    // The name half still comes from the policy, exactly as on the backup side.
+    assert_eq!(id.username, "pg");
+    assert_eq!(id.hostname, "db");
+}
+
+/// (b) An explicit `source.fromPolicy.sourcePath` wins over the derived stream
+/// root, exactly as it does on the per-PVC path.
+#[test]
+fn a_stream_from_policy_restore_honours_an_explicit_source_path() {
+    let policy = stream_policy("postgres.sql");
+    let id = from_policy_identity(&policy, "db", None, Some("/custom/dump"), None)
+        .expect("an explicit path is never second-guessed");
+    assert_eq!(id.source_path.as_deref(), Some("/custom/dump"));
+}
+
+/// (c) The data-integrity hole: `target.streamExec` + `source.fromPolicy` naming a
+/// `pvcSelector` policy with a SHARED `sourcePathOverride`. `kopia_source_path`
+/// returns that override at its first branch, so the resolved identity would match
+/// the newest snapshot of an ARBITRARY matched member and the mover would pipe
+/// that volume's bytes into the user's `psql` stdin. `policy_own_source_path`
+/// applied step (3) of `restore_source_path` without step (3)'s `!has_selector`
+/// precondition, so this resolved `/data` and looked fine.
+///
+/// It must fail closed with the what/why/fix text instead.
+#[test]
+fn a_stream_restore_of_a_non_stream_policy_fails_closed() {
+    let policy = flattened_selector_policy();
+    let err = from_policy_identity(&policy, "db", None, None, None)
+        .expect_err("a streamExec restore of a selector policy must be refused");
+    // Not the wrong answer the bug produced.
+    assert!(
+        !err.contains("/data") || err.contains("fails closed"),
+        "the refusal must not read as a resolved path: {err}"
+    );
+    // what / why / fix.
+    assert!(err.contains("streamExec"), "must name the target: {err}");
+    assert!(
+        err.contains("all-volumes"),
+        "must name the offending policy: {err}"
+    );
+    assert!(err.contains("not a `stream` source"), "must say why: {err}");
+    assert!(err.contains("Fix:"), "must say how to fix it: {err}");
+    // The same refusal for every OTHER source kind: a streamExec restore of a
+    // volume tree or an NFS export has no single file to read either, and each
+    // takes a different branch of `kopia_source_path` on the way to the guard.
+    for source in [
+        serde_json::json!({ "pvc": { "name": "data" }, "readOnly": true }),
+        serde_json::json!({ "nfs": { "server": "nas", "path": "/export/db" }, "readOnly": true }),
+    ] {
+        let policy: kopiur_api::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "vol", "namespace": "db" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "nas" },
+                "sources": [source],
+            },
+        }))
+        .unwrap();
+        let err = from_policy_identity(&policy, "db", None, None, None)
+            .expect_err("a streamExec restore of a non-stream policy must be refused");
+        assert!(err.contains("not a `stream` source"), "{err}");
+    }
+}
+
+/// (d) A zero-source legacy policy keeps the PATHLESS identity-only form. Admission
+/// forbids writing one, but a hand-patched object may carry it, and a working
+/// restore must not become a terminal error on upgrade — so this is deliberately
+/// NOT the fail-closed arm.
+#[test]
+fn a_stream_restore_of_a_zero_source_policy_stays_pathless() {
+    let mut policy = stream_policy("postgres.sql");
+    policy.spec.sources.clear();
+    let id = from_policy_identity(&policy, "db", None, None, None)
+        .expect("a zero-source policy is tolerated, not refused");
+    assert_eq!(id.source_path, None);
+}
+
+/// (e) The negative guard: a PVC target still routes through
+/// `restore_source_path`, so the stream-only `None` branch cannot silently widen.
+/// Same policy, same call, `Some(target)` — and the answer is the PER-PVC
+/// derivation, which for a flattened selector is the #443 ambiguity refusal, NOT
+/// `policy_own_source_path`'s stream-shape refusal.
+#[test]
+fn a_pvc_target_still_routes_through_the_per_pvc_derivation() {
+    let target = kopiur_api::snapshot::PvcTargetRef {
+        namespace: "db".into(),
+        name: "data-1".into(),
+    };
+    // A plain selector (no shared override) derives the member path per-PVC.
+    let plain: kopiur_api::SnapshotPolicy = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "SnapshotPolicy",
+        "metadata": { "name": "all-volumes", "namespace": "db" },
+        "spec": {
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{
+                "pvcSelector": { "labelSelector": { "matchLabels": { "backup": "yes" } } },
+                "readOnly": true,
+                "sourcePathStrategy": "PvcName",
+            }],
+        },
+    }))
+    .unwrap();
+    let id = from_policy_identity(&plain, "db", None, None, Some(&target))
+        .expect("a PVC target derives its own member path");
+    assert_eq!(id.source_path.as_deref(), Some("/pvc/data-1"));
+
+    // The flattened selector refuses through the #443 message, not the stream one.
+    let err = from_policy_identity(
+        &flattened_selector_policy(),
+        "db",
+        None,
+        None,
+        Some(&target),
+    )
+    .expect_err("a flattened selector is ambiguous for a PVC target");
+    assert!(
+        err.contains("sourcePathStrategy") || err.contains("sourcePathOverride"),
+        "expected the #443 ambiguity refusal, got: {err}"
+    );
+    assert!(
+        !err.contains("streamExec"),
+        "a PVC target must not take the stream arm: {err}"
+    );
+
+    // And a STREAM policy with a PVC target does NOT get the stream root — it goes
+    // through `restore_source_path`, which sees a non-PVC, non-selector source and
+    // falls back to the policy's own path. The two derivations stay separate.
+    let stream_with_pvc_target =
+        from_policy_identity(&stream_policy("x.sql"), "db", None, None, Some(&target))
+            .expect("the per-PVC derivation is total for a single-source policy");
+    assert_eq!(
+        stream_with_pvc_target.source_path.as_deref(),
+        Some("/stream/x.sql"),
+        "a single-source policy's step-(3) fallback is its own path, stream included"
+    );
+}
+
+// --- #464 round 2: the inherit heal must survive the fan-out's end-of-pass write ----------
+
+/// The populator twin of `snapshot::tests::the_inherit_heal_survives_the_rest_of_the_launch_pass`.
+///
+/// On the fan-out path the #464 heal is written deep inside `drive_one_claim` (via
+/// `run_restore_mover`), and [`fanout_status`] then builds the pass's ONE top-level body.
+/// Seeded from `restore.status` — the reconcile-start copy, which is what it used before
+/// this fix — that body replaces the conditions array and writes the hold back onto a
+/// populator that is restoring successfully; the next pass heals and clobbers it again from
+/// its own start-of-pass copy, so `doctor` reports a working restore as blocked forever.
+#[test]
+fn the_fanout_status_body_preserves_a_healed_inherit_hold() {
+    let restore = restore_with_anchor(None);
+    let healed = crate::io::inherit_source_heal_conditions(
+        &crate::io::upsert_gate(
+            &[],
+            &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+            "HELD: workloadSelector `app=pg` matched no pod",
+            Some(1),
+        ),
+        Some(1),
+    )
+    .expect("a standing hold heals");
+
+    let claims = claims_of(&[(
+        "data",
+        mirror_record(
+            kopiur_api::RestoreClaimPhase::Populating,
+            crate::consts::POPULATING_PRIME_PVC_REASON,
+            "populator: restoring into the prime PVC",
+            None,
+        ),
+    )]);
+    let none = std::collections::BTreeMap::new();
+    let live_based = fanout_status(&restore, &healed, &none, &claims, &[]);
+    let row = |body: &serde_json::Value| -> serde_json::Value {
+        body["conditions"]
+            .as_array()
+            .expect("conditions written")
+            .iter()
+            .find(|c| c["type"] == kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    assert_eq!(
+        row(&live_based)["status"],
+        "True",
+        "a LIVE base must carry the heal through the fan-out body: {live_based:#}"
+    );
+
+    // The pre-fix shape: the same body over the reconcile-start copy DROPS the healed row
+    // entirely (this fixture carries no conditions), so the fan-out patch replaces the array
+    // with one that has no record of the resolution at all.
+    let stale_based = fanout_status(
+        &restore,
+        &existing_conditions(&restore),
+        &none,
+        &claims,
+        &[],
+    );
+    assert_eq!(
+        row(&stale_based),
+        serde_json::Value::Null,
+        "pinning the defect: a stale base erases the heal from the fan-out body"
     );
 }

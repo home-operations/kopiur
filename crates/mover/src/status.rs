@@ -146,6 +146,16 @@ impl From<&crate::error::MoverError> for FailureBlock {
                     KopiaError::Spawn { .. }
                     | KopiaError::Json { .. }
                     | KopiaError::EmptyOutput { .. }
+                    // kopia was killed on purpose, so its exit code says nothing
+                    // about the failure — the producer's does, and it is in the
+                    // message. Same for a producer that wrote nothing: kopia never
+                    // got to EOF, so there is no exit status of its own to report.
+                    | KopiaError::StdinProducerFailed { .. }
+                    | KopiaError::StdinProducerWroteNothing { .. }
+                    // The CONSUMER's pipe broke, not kopia's. kopia may still be
+                    // mid-stream when we give up on the sink, so whatever it exits
+                    // with describes the teardown, not the failure.
+                    | KopiaError::OutputSink { .. }
                     | KopiaError::Timeout { .. } => None,
                 },
                 Some(op.as_str().to_string()),
@@ -164,6 +174,10 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::RestoreNoSnapshot { .. }
             | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::ScratchNotWritable { .. }
+            // A failed dump command / unresolvable pod is the user's config, not a
+            // transient fault: re-running the same Job re-runs the same command.
+            | MoverError::StreamPodResolve { .. }
+            | MoverError::StreamExecFailed { .. }
             | MoverError::SuccessExprFalse { .. }
             | MoverError::SuccessExprEval { .. }
             | MoverError::KubeClient { .. }
@@ -591,26 +605,27 @@ impl StatusUpdate {
 
 /// `{ "status": ... }` body for a successful verification.
 ///
-/// `repository_key: None` (the classic single-repo flow): stamp the flat
-/// `lastVerified` and a `Verified=True` condition — byte-identical to every
-/// prior operator.
+/// `stamp_key: None` (the classic flat flow — one repository, one verification
+/// member): stamp the flat `lastVerified` and a `Verified=True` condition —
+/// byte-identical to every prior operator.
 ///
-/// `repository_key: Some(key)` (a multi-repository policy's per-repo verify,
-/// #368): stamp ONLY `verificationStamps[<key>]`. A JSON merge patch merges
-/// *map keys* but replaces *arrays*, so the entry-keyed map is what lets two
-/// concurrent per-repo verifies land without clobbering each other — writing
-/// the flat field or the `status.verification` Vec from here would lose one
-/// repo's result (and the flat field's multi-repo meaning is the controller's
-/// MIN across repos, which one mover cannot compute). No condition either:
-/// the conditions array is replace-on-merge, so concurrent per-repo writers
-/// must not touch it — the controller folds the stamps and owns conditions.
+/// `stamp_key: Some(key)` (one cell of a (repository x member) grid: #368's
+/// per-repository dimension, #456's per-member dimension, or both): stamp ONLY
+/// `verificationStamps[<key>]`. A JSON merge patch merges *map keys* but
+/// replaces *arrays*, so the entry-keyed map is what lets two concurrent cells
+/// land without clobbering each other — writing the flat field or the
+/// `status.verification` Vec from here would lose one cell's result (and the
+/// flat field's grid meaning is the controller's MIN across cells, which one
+/// mover cannot compute). No condition either: the conditions array is
+/// replace-on-merge, so concurrent writers must not touch it — the controller
+/// folds the stamps and owns conditions.
 pub fn verify_ok_body(
     tier: &str,
-    repository_key: Option<&str>,
+    stamp_key: Option<&str>,
     now: &chrono::DateTime<chrono::Utc>,
 ) -> serde_json::Value {
     let ts = now.to_rfc3339();
-    match repository_key {
+    match stamp_key {
         None => serde_json::json!({
             "status": {
                 "lastVerified": ts,
@@ -632,20 +647,44 @@ pub fn verify_ok_body(
     }
 }
 
-/// `{ "status": ... }` body for a failed verification: a `Verified=False` condition.
-pub fn verify_failed_body(message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "status": {
-            "conditions": [{
-                "type": "Verified",
-                "status": "False",
-                "reason": "VerificationFailed",
-                "message": message,
-                "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
-                "observedGeneration": 0,
-            }],
-        }
-    })
+/// The `{ "status": ... }` body for a failed verification, or `None` when this
+/// run must not write one.
+///
+/// `stamp_key` is the SAME discriminator [`verify_ok_body`] takes, and for the
+/// same reason:
+///
+/// * `None` (the classic flat flow — one repository, one verification member):
+///   there is exactly ONE verify mover per policy, so it owns the conditions
+///   array and reports `Verified=False` — byte-identical to every prior
+///   operator.
+/// * `Some(_)` (one cell of a (repository x member) grid): write NOTHING. A
+///   JSON merge patch REPLACES arrays, and #456's fan-out means N concurrent
+///   movers per policy; a bare `conditions` array from each of them clobbers
+///   its siblings and erases the controller's own `Ready` row. The success path
+///   already omits the array for exactly this reason, so the failure path must
+///   too — a writer that cannot write safely must not write.
+///
+/// A failed cell is NOT silent: its Job is `Failed` (pod logs retained to its
+/// TTL, and `verify_step` reads the terminal state), its stamp is never
+/// written, so the controller's fold cannot advance `lastVerified` for the
+/// repository — which is what `kopiur_snapshot_verified` staleness alerting
+/// watches — and the mover logs the classified error before exiting non-zero.
+pub fn verify_failed_body(stamp_key: Option<&str>, message: &str) -> Option<serde_json::Value> {
+    match stamp_key {
+        Some(_) => None,
+        None => Some(serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Verified",
+                    "status": "False",
+                    "reason": "VerificationFailed",
+                    "message": message,
+                    "lastTransitionTime": chrono::Utc::now().to_rfc3339(),
+                    "observedGeneration": 0,
+                }],
+            }
+        })),
+    }
 }
 
 /// `{ "status": ... }` body for a successful replication: stamp `lastReplicated`,
@@ -762,27 +801,87 @@ pub fn snapshot_replicate_failed_body(
     serde_json::json!({ "status": status })
 }
 
+/// What a successful maintenance run measured about the repository, for
+/// [`maintenance_ran_body`]. A sub-object rather than positional `Option<i64>`
+/// arguments so the two figures — which are both nullable integers — cannot be
+/// silently transposed at a call site.
+///
+/// Every field is best-effort: `kopia maintenance run` emits no machine-readable
+/// result, so each figure comes from a follow-up kopia call that must never turn
+/// a successful run into a failed Job. `None` is therefore "not measured", and is
+/// written as an omitted key, never as `0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceObservations {
+    /// Bytes of backend storage the run actually freed, from the
+    /// `kopia maintenance info` run-history delta
+    /// ([`kopiur_kopia::reclaimed_bytes_since`]).
+    pub reclaimed_bytes: Option<i64>,
+    /// Content-index blob count re-counted after the run (`kopia index list`).
+    ///
+    /// The repository reconcilers adopt this when it is newer than their own
+    /// bootstrap observation, so the `IndexBlobHealth` warning stops quoting a
+    /// pre-compaction number (#458).
+    pub index_blob_count: Option<i64>,
+}
+
 /// `{ "status": ... }` body for a successful maintenance run. A full run also
-/// advances the quick clock (full subsumes quick). `lastContentReclaimedBytes`
-/// is `0`: `kopia maintenance run` emits no JSON, so the precise figure needs a
-/// `maintenance info` delta (tracked separately; the field round-trips).
+/// advances the quick clock (full subsumes quick).
+///
+/// `lastContentReclaimedBytes` is stamped on **only the mode that actually
+/// ran**, and is written on EVERY successful run — as a number when the run was
+/// measured, and as an explicit `null` when it was not.
+///
+/// The `null` matters as much as the number. This is a merge patch, so an
+/// omitted key leaves whatever was there before; a bumped `lastRunAt` beside the
+/// PREVIOUS run's byte figure reads as "this run reclaimed 3.9 GB" for a run
+/// whose figure is unknown, which is the exact class of lie #458 was filed
+/// about. `null` removes the key instead, so an unmeasured run reports nothing
+/// rather than someone else's number. Two paths reach it: a post-run
+/// `maintenance info` that failed or timed out, and — permanently — a quick run
+/// on a repository using the epoch index manager, which deletes no blobs.
+///
+/// The same reasoning covers the other direction: on a full run the subsumed
+/// quick block also carries an explicit `null`, because its `lastRunAt` is being
+/// bumped by a run that was not a quick run.
+///
+/// The field was previously hardcoded to `0`, which reported "reclaimed
+/// nothing" for a run that freed gigabytes. `0` now means a measured zero, and
+/// absent means unmeasured; they are never conflated.
 pub fn maintenance_ran_body(
     op: &MaintenanceOp,
     now: &chrono::DateTime<chrono::Utc>,
+    obs: &MaintenanceObservations,
 ) -> serde_json::Value {
     let ts = now.to_rfc3339();
-    let run = serde_json::json!({ "lastRunAt": ts, "lastContentReclaimedBytes": 0 });
+    // The block for the mode that ran: it owns the measured figures. The key is
+    // ALWAYS present — `null` when unmeasured, so the merge patch CLEARS a
+    // previous run's figure rather than leaving it beside the new `lastRunAt`.
+    let ran = serde_json::json!({
+        "lastRunAt": ts,
+        "lastContentReclaimedBytes": obs.reclaimed_bytes,
+    });
     let mut status = serde_json::json!({
         "ownership": { "owner": op.owner, "claimedAt": ts },
         "conditions": [lease_condition_body("True", "LeaseClaimed", "maintenance lease claimed", now)],
     });
+    // The recount is mode-independent — it describes the repository, not this
+    // run's kind — so it sits at the top of the status rather than inside the
+    // per-mode block, and carries its own timestamp so the repository
+    // reconcilers can tell it apart from their own (older) bootstrap
+    // observation. Omitted entirely when the recount did not complete: a `0`
+    // here would read as a perfectly healthy index.
+    if let Some(count) = obs.index_blob_count {
+        status["observedIndexBlobs"] = serde_json::json!({ "count": count, "observedAt": ts });
+    }
     match op.mode {
         MaintenanceMode::Quick => {
-            status["quick"] = run;
+            status["quick"] = ran;
         }
         MaintenanceMode::Full => {
-            status["quick"] = run.clone();
-            status["full"] = run;
+            // Clock-only for quick, plus the explicit clear described above.
+            status["quick"] =
+                serde_json::json!({ "lastRunAt": ts, "lastContentReclaimedBytes": null });
+            status["full"] = ran;
         }
     }
     serde_json::json!({ "status": status })
@@ -1718,8 +1817,16 @@ mod tests {
     #[test]
     fn quick_run_advances_only_quick_clock() {
         let now = chrono::Utc::now();
-        let body = maintenance_ran_body(&maint_op(MaintenanceMode::Quick), &now);
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Quick),
+            &now,
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(4096),
+                index_blob_count: None,
+            },
+        );
         assert!(body["status"]["quick"]["lastRunAt"].is_string());
+        assert_eq!(body["status"]["quick"]["lastContentReclaimedBytes"], 4096);
         assert!(
             body["status"]["full"].is_null(),
             "a quick run must not stamp the full clock"
@@ -1730,7 +1837,11 @@ mod tests {
     #[test]
     fn full_run_subsumes_quick_clock() {
         let now = chrono::Utc::now();
-        let body = maintenance_ran_body(&maint_op(MaintenanceMode::Full), &now);
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Full),
+            &now,
+            &MaintenanceObservations::default(),
+        );
         // Full subsumes quick: both clocks advance so quick isn't immediately due.
         assert!(body["status"]["full"]["lastRunAt"].is_string());
         assert!(body["status"]["quick"]["lastRunAt"].is_string());
@@ -1738,6 +1849,139 @@ mod tests {
             body["status"]["full"]["lastRunAt"],
             body["status"]["quick"]["lastRunAt"]
         );
+    }
+
+    /// #458: the reclaimed figure belongs to the mode that RAN. A full run must
+    /// not stamp it on `quick` — `crates/controller/src/maintenance/mod.rs` reads
+    /// `full.lastContentReclaimedBytes` for the gauge, and an operator reading
+    /// `quick` must not be shown a full run's bytes.
+    #[test]
+    fn full_run_stamps_reclaimed_bytes_only_on_full() {
+        let now = chrono::Utc::now();
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Full),
+            &now,
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(3_900_000_000),
+                index_blob_count: None,
+            },
+        );
+        assert_eq!(
+            body["status"]["full"]["lastContentReclaimedBytes"],
+            3_900_000_000i64
+        );
+        // Explicit null, not the figure and not a leftover: the merge-patch
+        // removes the key, so the subsumed quick clock carries no byte figure
+        // that a quick run did not measure.
+        assert!(
+            body["status"]["quick"]["lastContentReclaimedBytes"].is_null(),
+            "a full run must clear, never stamp, quick's reclaimed figure"
+        );
+        assert!(
+            body["status"]["quick"]
+                .as_object()
+                .expect("quick is an object")
+                .contains_key("lastContentReclaimedBytes"),
+            "the clear must be an EXPLICIT null (merge-patch key removal), not an omission"
+        );
+    }
+
+    /// An unmeasurable run (a quick run on an epoch repository, or a failed or
+    /// timed-out post-run `maintenance info`) must CLEAR the figure — not report
+    /// `0`, and not leave the previous run's number standing. An omitted key in
+    /// a merge patch is a no-op, so only an EXPLICIT null actually removes it:
+    /// the same treatment `full_run_stamps_reclaimed_bytes_only_on_full` pins
+    /// for the subsumed quick clock. Without it, a bumped `lastRunAt` sits
+    /// beside a stale byte figure — the #458 lie in a new costume.
+    #[test]
+    fn unmeasured_run_clears_reclaimed_bytes_rather_than_leaving_a_stale_figure() {
+        let now = chrono::Utc::now();
+        for mode in [MaintenanceMode::Quick, MaintenanceMode::Full] {
+            let body =
+                maintenance_ran_body(&maint_op(mode), &now, &MaintenanceObservations::default());
+            let ran = match mode {
+                MaintenanceMode::Quick => &body["status"]["quick"],
+                MaintenanceMode::Full => &body["status"]["full"],
+            };
+            assert!(
+                ran["lastContentReclaimedBytes"].is_null(),
+                "{mode:?}: an unmeasured run must not claim a figure"
+            );
+            assert!(
+                ran.as_object()
+                    .expect("run block")
+                    .contains_key("lastContentReclaimedBytes"),
+                "{mode:?}: the clear must be an EXPLICIT null (merge-patch key removal), not \
+                 an omission — an omitted key leaves the previous run's figure standing"
+            );
+            assert!(
+                ran["lastRunAt"].is_string(),
+                "{mode:?}: the clock still advances"
+            );
+        }
+    }
+
+    /// #458: the post-run index-blob recount rides the same body, at the TOP of
+    /// the status (it describes the repository, not the run's kind) and with its
+    /// own timestamp so the repository reconcilers can compare it against their
+    /// bootstrap observation.
+    #[test]
+    fn ran_body_carries_the_index_blob_recount_with_its_own_timestamp() {
+        let now = ts();
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Full),
+            &now,
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(1),
+                index_blob_count: Some(312),
+            },
+        );
+        assert_eq!(body["status"]["observedIndexBlobs"]["count"], 312);
+        assert_eq!(
+            body["status"]["observedIndexBlobs"]["observedAt"],
+            now.to_rfc3339()
+        );
+        // It is NOT nested under the per-mode blocks: a quick and a full run
+        // observe the same repository.
+        assert!(body["status"]["full"].get("observedIndexBlobs").is_none());
+        assert!(body["status"]["quick"].get("observedIndexBlobs").is_none());
+    }
+
+    /// A recount that timed out or failed must leave the key absent — `0` would
+    /// read as a perfectly healthy index and silently clear a real warning.
+    #[test]
+    fn unmeasured_recount_omits_observed_index_blobs() {
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Quick),
+            &ts(),
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(0),
+                index_blob_count: None,
+            },
+        );
+        assert!(
+            body["status"]
+                .as_object()
+                .expect("status")
+                .get("observedIndexBlobs")
+                .is_none(),
+            "an unmeasured recount must not publish a zero count"
+        );
+    }
+
+    /// A measured zero is a real observation and must be reported as `0`, which
+    /// is exactly why `None` may not also be written as `0`.
+    #[test]
+    fn measured_zero_is_reported() {
+        let body = maintenance_ran_body(
+            &maint_op(MaintenanceMode::Quick),
+            &chrono::Utc::now(),
+            &MaintenanceObservations {
+                reclaimed_bytes: Some(0),
+                index_blob_count: None,
+            },
+        );
+        assert_eq!(body["status"]["quick"]["lastContentReclaimedBytes"], 0);
     }
 
     #[test]
@@ -1861,6 +2105,115 @@ mod tests {
             body["status"].get("conditions").is_none(),
             "the conditions array is replace-on-merge; concurrent per-repo \
              writers must not touch it"
+        );
+    }
+
+    #[test]
+    fn verify_ok_body_writes_the_member_keyed_stamp_for_a_fanned_out_policy() {
+        // #456: a `pvcSelector` policy verifies one cell per matched PVC. A
+        // single-repository fan-out's key has an EMPTY repository segment
+        // (`#<member6>`), and a multi-repo fan-out carries both dimensions.
+        let now = chrono::Utc::now();
+        for key in ["#a1b2c3", "Repository/backups/nas#a1b2c3"] {
+            let body = verify_ok_body("deep", Some(key), &now);
+            assert!(
+                body["status"]["verificationStamps"][key].is_string(),
+                "the member-keyed stamp must be the ONLY thing written: {body}"
+            );
+            assert!(
+                body["status"].get("lastVerified").is_none(),
+                "the flat field is the controller's MIN over every (repo x member) cell, \
+                 never a mover write — a fanned-out member that stamped it would claim the \
+                 whole policy was verified"
+            );
+            assert!(body["status"].get("conditions").is_none());
+        }
+        // Sibling members of ONE repository write DISJOINT keys, which is what
+        // makes the RFC 7396 map-key merge clobber-free for them too.
+        let a = verify_ok_body("quick", Some("#aaaaaa"), &now);
+        let b = verify_ok_body("quick", Some("#bbbbbb"), &now);
+        assert!(a["status"]["verificationStamps"]["#bbbbbb"].is_null());
+        assert!(b["status"]["verificationStamps"]["#aaaaaa"].is_null());
+    }
+
+    #[test]
+    fn verify_failed_body_is_written_only_by_the_run_that_owns_the_conditions_array() {
+        // The classic flat flow: ONE verify mover per policy, so it owns the
+        // array and reports the failure — byte-identical to every prior
+        // operator.
+        let flat = verify_failed_body(None, "deep verify found no snapshot")
+            .expect("the flat flow reports Verified=False");
+        assert_eq!(flat["status"]["conditions"][0]["type"], "Verified");
+        assert_eq!(flat["status"]["conditions"][0]["status"], "False");
+        assert_eq!(
+            flat["status"]["conditions"][0]["reason"],
+            "VerificationFailed"
+        );
+        // Every KEYED shape — #368's per-repository dimension, #456's
+        // per-member dimension, or both — writes nothing. N of these run
+        // CONCURRENTLY on one policy, and a merge-patched `conditions` array
+        // replaces the array wholesale, so each one would erase its siblings'
+        // rows and the controller's own. `verify_ok_body` already omits the
+        // array for exactly this reason (asserted just above); the failure path
+        // must agree or the fan-out reintroduced the clobber.
+        for key in [
+            "Repository/backups/nas",
+            "#a1b2c3",
+            "Repository/backups/nas#a1b2c3",
+        ] {
+            assert!(
+                verify_failed_body(Some(key), "boom").is_none(),
+                "a fan-out cell must not write the replace-on-merge conditions array: {key}"
+            );
+        }
+    }
+
+    /// The concrete damage the keyed arm avoids: with N members failing, a bare
+    /// `conditions` array from each mover REPLACES what the controller wrote,
+    /// so the policy's `Ready` row disappears on a merge patch.
+    #[test]
+    fn a_fanned_out_failure_cannot_erase_the_controllers_ready_row() {
+        fn merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+            // RFC 7396: object keys merge, arrays are REPLACED.
+            match (target.as_object_mut(), patch.as_object()) {
+                (Some(t), Some(p)) => {
+                    for (k, v) in p {
+                        match (
+                            v.is_null(),
+                            v.is_object() && t.get(k).is_some_and(|c| c.is_object()),
+                        ) {
+                            (true, _) => {
+                                t.remove(k);
+                            }
+                            (false, true) => {
+                                merge(t.get_mut(k).expect("checked present just above"), v)
+                            }
+                            (false, false) => {
+                                t.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                _ => *target = patch.clone(),
+            }
+        }
+        // What the controller wrote this reconcile.
+        let mut stored = serde_json::json!({
+            "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
+        });
+        // Two sibling members of one fanned-out policy both fail.
+        for key in ["#aaaaaa", "#bbbbbb"] {
+            if let Some(body) = verify_failed_body(Some(key), "boom") {
+                merge(&mut stored, &body);
+            }
+        }
+        assert_eq!(
+            stored["status"]["conditions"][0]["type"], "Ready",
+            "the controller's Ready row must survive N concurrent member failures: {stored}"
+        );
+        assert_eq!(
+            stored["status"]["conditions"].as_array().map(Vec::len),
+            Some(1)
         );
     }
 

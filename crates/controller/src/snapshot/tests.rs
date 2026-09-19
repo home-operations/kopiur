@@ -403,6 +403,7 @@ fn backup_with_policy_ref(pinned_repo: Option<kopiur_api::common::RepositoryRef>
             deletion_policy: None,
             on_schedule_delete: None,
             pin: false,
+            mover: None,
             description: None,
         },
     );
@@ -595,6 +596,7 @@ fn dummy_backup() -> Snapshot {
             deletion_policy: None,
             on_schedule_delete: None,
             pin: false,
+            mover: None,
             description: None,
         },
     )
@@ -4371,6 +4373,7 @@ fn sample_backup_work_spec() -> kopiur_mover::workspec::MoverWorkSpec {
     MoverWorkSpec {
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {
+            stdin: None,
             source_path: "/data".into(),
             tags: BTreeMap::new(),
             policy: Default::default(),
@@ -4749,4 +4752,390 @@ fn the_in_flight_heal_needs_the_pinned_repository() {
             .is_none()
     );
     assert!(in_flight_heal_target(&backup).is_none());
+}
+
+// --- Snapshot.spec.mover: per-run override over the policy's (#464) --------
+
+/// A `Snapshot` carrying a per-run `mover`, decoded the cluster's way.
+fn backup_with_mover(mover_json: serde_json::Value) -> Snapshot {
+    let mut backup = dummy_backup();
+    backup.spec.mover = Some(serde_json::from_value(mover_json).expect("valid MoverSpec JSON"));
+    backup
+}
+
+#[test]
+fn build_backup_run_lets_a_snapshot_mover_cache_win_the_per_run_budgets() {
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let mut cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "data".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    // The shared recipe's budgets.
+    cfg.spec.mover = Some(
+        serde_json::from_value(serde_json::json!({
+            "cache": { "capacity": "8Gi", "contentCacheSizeMb": 4096, "metadataCacheSizeMb": 512 },
+        }))
+        .expect("valid MoverSpec"),
+    );
+    let repo = resolved_s3_repo();
+
+    // No per-run override → the recipe's budgets, exactly as before this feature.
+    let (ws, ..) = build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "pg").unwrap();
+    assert_eq!(ws.cache.content_cache_size_mb, Some(4096));
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(512));
+
+    // A one-shot raising only `contentCacheSizeMb` wins that field and inherits the
+    // rest — the whole point of a partial per-run override on a GitOps-managed recipe.
+    let backup = backup_with_mover(serde_json::json!({
+        "cache": { "contentCacheSizeMb": 16384 },
+    }));
+    let (ws, ..) = build_backup_run(&backup, &cfg, &repo, "ns", "pg").unwrap();
+    assert_eq!(ws.cache.content_cache_size_mb, Some(16384));
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(512));
+}
+
+/// A `SnapshotPolicy` with one PVC source and the given `mover` JSON.
+fn policy_with_mover(mover_json: serde_json::Value) -> SnapshotPolicy {
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let mut cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "data".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    cfg.spec.mover = Some(serde_json::from_value(mover_json).expect("valid MoverSpec JSON"));
+    cfg
+}
+
+#[test]
+fn a_snapshot_mover_cache_never_changes_the_policy_owned_persistent_cache_pvc() {
+    use kopiur_api::common::CacheVolumeMode;
+    // A PERSISTENT cache: one controller-owned PVC named per-policy and shared by
+    // every child Snapshot of this policy.
+    let cfg = policy_with_mover(serde_json::json!({
+        "cache": {
+            "capacity": "8Gi",
+            "storageClassName": "fast",
+            "mode": "Persistent",
+            "contentCacheSizeMb": 4096,
+        },
+    }));
+    let repo = resolved_s3_repo();
+
+    // An ad-hoc Snapshot that tries to resize AND re-class the shared cache.
+    let hostile = backup_with_mover(serde_json::json!({
+        "cache": { "capacity": "500Gi", "storageClassName": "slow", "mode": "Ephemeral" },
+    }));
+
+    // Under `Persistent` the volume spec is derived from the POLICY alone.
+    // `policy_cache_spec` takes no `Snapshot` at all — the absent parameter is the
+    // guarantee — and `cache_volume_spec` hands exactly that through, so nothing the
+    // Snapshot said can reach `ensure_cache_pvc`.
+    let pvc_spec = super::cache_volume_spec(&repo, &cfg, hostile.spec.mover.as_ref())
+        .expect("policy sets a cache");
+    assert_eq!(pvc_spec, super::policy_cache_spec(&repo, &cfg).unwrap());
+    assert_eq!(pvc_spec.capacity.as_deref(), Some("8Gi"));
+    assert_eq!(pvc_spec.storage_class_name.as_deref(), Some("fast"));
+    assert_eq!(pvc_spec.mode, Some(CacheVolumeMode::Persistent));
+
+    // Meanwhile the MERGED view — what this run's Job-scoped BUDGETS use — does honor
+    // the override. The two deliberately diverge under `Persistent`, which is exactly
+    // why the PVC path must not use the merged one.
+    let merged = kopiur_api::snapshot::effective_backup_mover(&hostile.spec, &cfg.spec)
+        .and_then(|m| m.cache)
+        .expect("merged cache");
+    assert_eq!(merged.capacity.as_deref(), Some("500Gi"));
+    assert_ne!(
+        pvc_spec, merged,
+        "the persistent cache PVC's spec must NOT track a per-run mover.cache override"
+    );
+
+    // And the per-run BUDGETS still flow through (the override left them unset, so the
+    // policy's survive) — the override changed the volume knobs without dropping them.
+    let (ws, ..) = build_backup_run(&hostile, &cfg, &repo, "ns", "pg").unwrap();
+    assert_eq!(ws.cache.content_cache_size_mb, Some(4096));
+}
+
+#[test]
+fn a_snapshot_mover_cache_does_size_and_class_an_ephemeral_cache_volume() {
+    use kopiur_api::common::CacheVolumeMode;
+    let repo = resolved_s3_repo();
+
+    // (a) Policy mode EPHEMERAL: the volume is bound to THIS Job's pod and auto-GC'd
+    //     with it, so there is no sibling-shared state and the per-run size/class win.
+    let cfg = policy_with_mover(serde_json::json!({
+        "cache": { "capacity": "8Gi", "storageClassName": "fast", "mode": "Ephemeral" },
+    }));
+    let run = backup_with_mover(serde_json::json!({
+        "cache": { "capacity": "500Gi", "storageClassName": "slow" },
+    }));
+    let spec =
+        super::cache_volume_spec(&repo, &cfg, run.spec.mover.as_ref()).expect("a cache is set");
+    assert_eq!(spec.capacity.as_deref(), Some("500Gi"));
+    assert_eq!(spec.storage_class_name.as_deref(), Some("slow"));
+    assert_eq!(spec.mode, Some(CacheVolumeMode::Ephemeral));
+
+    // (b) Policy sets NO cache at all: the mode defaults to Ephemeral, so a per-run
+    //     `capacity` must upgrade the run off an `emptyDir` rather than be dropped.
+    let mut bare = cfg.clone();
+    bare.spec.mover = None;
+    let spec = super::cache_volume_spec(&repo, &bare, run.spec.mover.as_ref())
+        .expect("the per-run layer alone sets a cache");
+    assert_eq!(spec.capacity.as_deref(), Some("500Gi"));
+    assert_eq!(spec.mode, Some(CacheVolumeMode::Ephemeral));
+
+    // (c) A per-run `mode: Persistent` must NOT mint the policy-named shared PVC.
+    //     The mode is policy-owned, so it stays Ephemeral.
+    let escalate = backup_with_mover(serde_json::json!({
+        "cache": { "capacity": "500Gi", "mode": "Persistent" },
+    }));
+    let spec = super::cache_volume_spec(&repo, &cfg, escalate.spec.mover.as_ref())
+        .expect("a cache is set");
+    assert_eq!(
+        spec.mode,
+        Some(CacheVolumeMode::Ephemeral),
+        "a per-run `mode: Persistent` must never promote the run onto the shared PVC"
+    );
+
+    // (d) Nothing anywhere is still an emptyDir.
+    assert_eq!(
+        super::cache_volume_spec(&repo, &bare, None),
+        None,
+        "no cache on any layer must stay `None` (emptyDir)"
+    );
+}
+
+/// The Ephemeral spec really does reach the mounted volume, and gets there without a
+/// single API call: the mock client below fails EVERY request, so this also proves the
+/// ephemeral path never touches `ensure_cache_pvc` (which is what would let a per-run
+/// size escape its Job).
+#[tokio::test]
+async fn an_ephemeral_per_run_capacity_reaches_the_mover_volume_with_no_api_call() {
+    use http::{Request, Response, StatusCode};
+    use kopiur_mover::jobs::CacheVolume;
+    use kube::client::Body;
+
+    let svc = tower::service_fn(move |_req: Request<Body>| async move {
+        Ok::<_, std::convert::Infallible>(
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    br#"{"kind":"Status","apiVersion":"v1","status":"Failure","code":500}"#
+                        .to_vec(),
+                ))
+                .unwrap(),
+        )
+    });
+    let client = kube::Client::new(svc, "ns");
+
+    let repo = resolved_s3_repo();
+    let cfg = policy_with_mover(serde_json::json!({
+        "cache": { "capacity": "8Gi", "storageClassName": "fast", "mode": "Ephemeral" },
+    }));
+    let run = backup_with_mover(serde_json::json!({
+        "cache": { "capacity": "500Gi", "storageClassName": "slow" },
+    }));
+
+    let volume = crate::cache::resolve_cache_volume(
+        &client,
+        "ns",
+        Default::default(),
+        "kopiur-cache-pg-ns-abc123",
+        super::cache_volume_spec(&repo, &cfg, run.spec.mover.as_ref()).as_ref(),
+    )
+    .await
+    .expect("the ephemeral path provisions nothing, so it cannot fail on the client");
+
+    assert_eq!(
+        volume,
+        CacheVolume::Ephemeral {
+            capacity: "500Gi".into(),
+            storage_class: Some("slow".into()),
+        },
+        "the per-run capacity/class must reach the mover's cache volume"
+    );
+}
+
+#[test]
+fn recorded_meta_reports_a_snapshot_level_security_context_as_the_identity_source() {
+    use crate::io::InheritOutcome;
+    use kopiur_api::RecordedSrc;
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let mut cfg = config_with_source(
+        "pg",
+        Source {
+            pvc: Some(PvcSource {
+                name: "data".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    cfg.spec.mover = Some(
+        serde_json::from_value(serde_json::json!({
+            "securityContext": { "runAsUser": 1000 },
+        }))
+        .expect("valid MoverSpec"),
+    );
+    let backup = backup_with_mover(serde_json::json!({
+        "securityContext": { "runAsUser": 2000 },
+    }));
+
+    // The merged recipe mover is what the reconciler threads into `recorded_meta`, so
+    // the `kopiur-meta` tag records the UID this run actually ran as — 2000, not the
+    // policy's 1000.
+    let recipe = kopiur_api::snapshot::effective_backup_mover(&backup.spec, &cfg.spec);
+    let resolved = kopiur_api::common::resolve_mover(
+        None,
+        recipe.as_ref().and_then(|m| m.security_context.as_ref()),
+        recipe
+            .as_ref()
+            .and_then(|m| m.pod_security_context.as_ref()),
+        None,
+        None,
+        None,
+    );
+    let recorded =
+        super::build::recorded_meta(&resolved, &InheritOutcome::NotRequested, recipe.as_ref());
+    assert_eq!(recorded.uid, Some(2000));
+    assert_eq!(recorded.src, RecordedSrc::Explicit);
+}
+
+// --- #464 round 2: the inherit heal must SURVIVE the rest of the launch pass -------------
+
+/// The condition-writers-clobber guard for the #464 heal. Round 1 got the heal WRITTEN
+/// (`io::tests::inherit_source_heal_conditions_clears_a_standing_hold_in_place` covers
+/// that); this covers the half that actually decides whether `doctor` lies: the healed
+/// `True` surviving every writer that follows it in the SAME reconcile.
+///
+/// A `conditions` merge patch REPLACES the array, so each later writer's BASE is the whole
+/// question. Fed the LIVE array — what [`io::live_conditions`] now returns at each of those
+/// sites — the heal survives. Fed the reconcile-START copy, as round 1's staging arms were,
+/// the SAME writer resurrects `SecurityContextResolved=False` onto a Snapshot that is about
+/// to go `Running`; and because the next pass builds from its own start-of-pass copy, the
+/// heal is clobbered again, forever. That is not a cosmetic status wobble: `doctor`
+/// suppresses a stale gate only on a TERMINAL phase, so it reports a healthy
+/// `copyMethod: Snapshot` backup as "blocked … it will wait forever".
+#[test]
+fn the_inherit_heal_survives_the_rest_of_the_launch_pass() {
+    let observed = Some(7);
+    let held = io::upsert_gate(
+        &[],
+        &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+        "HELD: workloadSelector `app=pg` matched no pod",
+        observed,
+    );
+    let healed =
+        io::inherit_source_heal_conditions(&held, observed).expect("a standing hold heals");
+    let resolved = |c: &[Condition]| -> (String, String) {
+        let row = c
+            .iter()
+            .find(|c| c.type_ == kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION)
+            .expect("the gate row must still be present, healed rather than removed");
+        (row.status.clone(), row.reason.clone())
+    };
+
+    // Every writer that can follow the heal in the same launch pass, in the order
+    // `reconcile_inner` runs them, each seeded from what the previous one produced — which
+    // is exactly what a live re-read hands it.
+    let waiting = staged_conditions(
+        &healed,
+        false,
+        crate::consts::STAGING_WAITING_REASON,
+        "waiting for the VolumeSnapshot to become readyToUse",
+        observed,
+    );
+    let ready = staged_conditions(
+        &waiting,
+        true,
+        SOURCE_STAGED_REASON,
+        "staged source ready (Snapshot): pvc `staged`",
+        observed,
+    );
+    let after_colocation = io::upsert_condition(
+        &ready,
+        crate::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+        true,
+        crate::consts::SOURCE_PVC_FOUND_REASON,
+        "source PVC `ns/data` found; the backup can launch",
+        observed,
+    );
+    assert_eq!(
+        resolved(&after_colocation),
+        (
+            "True".to_string(),
+            kopiur_api::consts::INHERIT_SOURCE_RESOLVED_REASON.to_string()
+        ),
+        "the heal must survive staging + the colocation gate clear: {after_colocation:#?}"
+    );
+
+    // The round-1 shape, pinned as the defect: the SAME staging writer seeded from the
+    // reconcile-START copy (`held`) instead of the live array. It does not merely fail to
+    // heal — it writes the hold BACK.
+    let clobbered = staged_conditions(
+        &held,
+        true,
+        SOURCE_STAGED_REASON,
+        "staged source ready (Snapshot): pvc `staged`",
+        observed,
+    );
+    assert_eq!(
+        resolved(&clobbered),
+        (
+            "False".to_string(),
+            kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON.to_string()
+        ),
+        "a stale-seeded staging write resurrects the hold — the bug this fix removes"
+    );
+}
+
+/// The same guard for the OTHER clobber shape on the Snapshot side: the missing-source-PVC
+/// park, which writes phase `Pending` (NON-terminal, so `doctor` does not suppress it) plus
+/// its own gate. It must report the block it actually found and nothing else.
+#[test]
+fn the_missing_source_pvc_park_does_not_resurrect_the_inherit_hold() {
+    let observed = Some(3);
+    let healed = io::inherit_source_heal_conditions(
+        &io::upsert_gate(
+            &[],
+            &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+            "HELD",
+            observed,
+        ),
+        observed,
+    )
+    .expect("a standing hold heals");
+    let backup: Snapshot = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Snapshot",
+        "metadata": { "name": "b", "namespace": "ns", "generation": 3 },
+        "spec": { "snapshotPolicyRef": { "name": "p" } },
+    }))
+    .expect("Snapshot fixture");
+    let status = snapshot_ready_status_with_condition_on(
+        &backup,
+        &healed,
+        SnapshotPhase::Pending,
+        crate::consts::SOURCE_PVC_MISSING_REASON,
+        "source PVC `ns/data` does not exist",
+        crate::consts::SOURCE_PVC_AVAILABLE_CONDITION,
+        false,
+    );
+    let conds = status["conditions"].as_array().expect("conditions written");
+    let row = conds
+        .iter()
+        .find(|c| c["type"] == kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION)
+        .expect("the healed gate row must survive the park");
+    assert_eq!(
+        row["status"], "True",
+        "the park must not re-report a block that has cleared: {status:#}"
+    );
 }

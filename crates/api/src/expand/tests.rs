@@ -36,11 +36,8 @@ fn selector_source(strategy: Option<SourcePathStrategy>, namespaces: Vec<&str>) 
             },
             label_selector: None,
         }),
-        nfs: None,
-        read_only: None,
-        acknowledge_live_mutation: None,
-        source_path_override: None,
         source_path_strategy: strategy,
+        ..Default::default()
     }
 }
 
@@ -49,12 +46,7 @@ fn pvc_source(name: &str) -> Source {
         pvc: Some(PvcSource {
             name: name.to_string(),
         }),
-        pvc_selector: None,
-        nfs: None,
-        read_only: None,
-        acknowledge_live_mutation: None,
-        source_path_override: None,
-        source_path_strategy: None,
+        ..Default::default()
     }
 }
 
@@ -930,16 +922,176 @@ fn nfs_source(path: &str) -> Source {
             server: "nas.lan".into(),
             path: path.to_string(),
         }),
-        read_only: None,
-        acknowledge_live_mutation: None,
-        source_path_override: None,
-        source_path_strategy: None,
+        ..Default::default()
     }
 }
 
 fn with_override(mut s: Source, over: &str) -> Source {
     s.source_path_override = Some(over.to_string());
     s
+}
+
+/// A behavioral witness that the two classifiers AGREE on every wire form.
+///
+/// It is NOT what makes a fifth form impossible to land silently — this test's inputs
+/// are a hardcoded list of four literals, so a fifth `snapshot_policy::SourceShape`
+/// variant would simply be absent from `cases` and never checked. The earlier version
+/// of this doc claimed otherwise, which is exactly the kind of overclaim that lets the
+/// gap it describes reopen.
+///
+/// **The real obligation lives in the code**: `expand::source_shape` is a `match` over
+/// `snapshot_policy::source_shape(source)`, so a fifth variant there makes that `match`
+/// non-exhaustive and the crate stops compiling until someone decides what the new form
+/// means for a restore. Before that coupling, a fifth `Source` FIELD folded into
+/// `SourceShape::Invalid` and `restore_source_path` answered for it by accident — which
+/// is exactly what a `stream` source did before it got its own arm.
+///
+/// What this test still earns its keep for: the two classifiers could agree
+/// STRUCTURALLY and still disagree on WHICH arm a form maps to (a copy-paste in the
+/// coupled `match` sending `nfs` to `Stream`, say). Nothing in the type system catches
+/// that; this does.
+#[test]
+fn source_shape_classifies_every_wire_form() {
+    let cases: Vec<(&str, Source)> = vec![
+        ("pvc", pvc_source("data")),
+        (
+            "pvcSelector",
+            selector_source(Some(SourcePathStrategy::PvcName), vec![]),
+        ),
+        ("nfs", nfs_source("/export/data")),
+        ("stream", stream_source("postgres.sql")),
+    ];
+    for (kind, source) in &cases {
+        // The wire-form resolver agrees this is a real, singular form...
+        let wire = crate::snapshot_policy::source_shape(source)
+            .unwrap_or_else(|e| panic!("{kind} is a valid source form: {e}"));
+        assert_eq!(wire.kind_str(), *kind);
+
+        // ...and the restore classifier gives it a NAMED arm, never `Invalid`.
+        let shape = source_shape(source);
+        let named = match shape {
+            SourceShape::Pvc { .. } => "pvc",
+            SourceShape::Selector { .. } => "pvcSelector",
+            SourceShape::Nfs => "nfs",
+            SourceShape::Stream => "stream",
+            SourceShape::Invalid => panic!(
+                "`{kind}` is a valid source form but the restore classifier calls it malformed; \
+                 give it its own `SourceShape` arm and decide what it means for a restore"
+            ),
+        };
+        assert_eq!(named, *kind, "the two classifiers must agree on the form");
+    }
+
+    // `Invalid` is reserved for a genuinely malformed stored object: nothing set…
+    assert_eq!(source_shape(&Source::default()), SourceShape::Invalid);
+    assert!(crate::snapshot_policy::source_shape(&Source::default()).is_err());
+
+    // …or SEVERAL set. The pre-coupling classifier picked a winner by field order
+    // (`pvcSelector` first, then `pvc`), so a multi-set source resolved a path as
+    // though it were well-formed. Both classifiers now call it malformed.
+    let mut multi = pvc_source("data");
+    multi.nfs = Some(crate::NfsVolume {
+        server: "nfs.example".into(),
+        path: "/export/data".into(),
+    });
+    assert_eq!(source_shape(&multi), SourceShape::Invalid);
+    assert!(crate::snapshot_policy::source_shape(&multi).is_err());
+
+    let mut selector_and_pvc = selector_source(Some(SourcePathStrategy::PvcName), vec![]);
+    selector_and_pvc.pvc = Some(crate::snapshot_policy::PvcSource {
+        name: "data".into(),
+    });
+    assert_eq!(source_shape(&selector_and_pvc), SourceShape::Invalid);
+}
+
+/// A MALFORMED governing source can no longer resolve a restore path by accident —
+/// the #451 bug reached through the classifier instead of through a `stream` source.
+///
+/// Both halves used to answer, wrongly and silently:
+/// * nothing set ⇒ rule (3) handed `effective_source` an all-`None` source, whose
+///   `kopia_source_path` is `None` — the PATHLESS identity `user@host:`, which kopia
+///   reads as a relative filesystem path and matches against every member of the
+///   repository.
+/// * `pvc` beside `pvcSelector` ⇒ the old field-order precedence called it a selector
+///   and derived a per-target path; with the fields the other way round it returned
+///   `sources[0]`'s own `/pvc/<name>` — a REAL path holding another volume's data,
+///   under a green `Completed`.
+#[test]
+fn a_malformed_governing_source_fails_the_restore_path_closed() {
+    let malformed = |p: &SnapshotPolicy| {
+        let err = restore_source_path(p, None, &target("billing", "pgdata")).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidFieldValue { field, reason }
+                if field == "spec.source.fromPolicy.sourcePath"
+                    && reason.contains("exactly one of")),
+            "got {err:?}"
+        );
+    };
+
+    // Nothing set.
+    malformed(&policy_with(vec![Source::default()]));
+
+    // Several set.
+    let mut multi = pvc_source("data");
+    multi.nfs = Some(crate::NfsVolume {
+        server: "nfs.example".into(),
+        path: "/export/data".into(),
+    });
+    malformed(&policy_with(vec![multi]));
+
+    // An explicit override still wins outright: rule (1) runs before any
+    // classification, so a user who names the path is never blocked by a policy
+    // they may not be able to edit.
+    let p = policy_with(vec![Source::default()]);
+    assert_eq!(
+        restore_source_path(&p, Some("/pvc/pgdata"), &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::Override("/pvc/pgdata".into())
+    );
+
+    // A zero-source legacy policy is NOT a malformed governing source: it has no
+    // source at all, and keeps its documented tolerance.
+    assert_eq!(
+        restore_source_path(&policy_with(vec![]), None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::PolicySource(None)
+    );
+}
+
+/// A `stream` source contributes nothing to a PVC restore's path derivation, and
+/// says so through its own arm rather than by being mistaken for malformed.
+///
+/// Behaviorally this is byte-identical to the pre-`Stream`-arm answer — which is
+/// the point: the variant is a clarity and exhaustiveness fix, not a semantic one,
+/// and this test is what proves the refactor changed no answer. A stream policy's
+/// only derivable path comes from rule (3) (`sources[0]`'s own path), which for a
+/// stream source is `/stream/<fileName>`.
+#[test]
+fn a_stream_source_is_never_addressed_by_a_pvc_target() {
+    // Rule (2) cannot match a stream source: there is no PVC name to compare.
+    let p = policy_with(vec![stream_source("postgres.sql")]);
+    assert_eq!(
+        restore_source_path(&p, None, &target("billing", "postgres.sql")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/stream/postgres.sql".into())),
+        "a stream policy falls through to its own source path, not to a /pvc/ guess"
+    );
+
+    // Mixed with a plain `pvc:` source, the exact PVC match still wins and the
+    // stream source is simply skipped.
+    let mixed = policy_with(vec![stream_source("postgres.sql"), pvc_source("data")]);
+    assert_eq!(
+        restore_source_path(&mixed, None, &target("billing", "data")).unwrap(),
+        RestoreSourcePath::PolicySource(Some("/pvc/data".into()))
+    );
+
+    // Alongside a selector, a stream source neither supplies nor blocks the
+    // agreed derivation (rule 4) — it is skipped like an `nfs` source.
+    let with_selector = policy_with(vec![
+        stream_source("postgres.sql"),
+        selector_source(Some(SourcePathStrategy::PvcName), vec![]),
+    ]);
+    assert_eq!(
+        restore_source_path(&with_selector, None, &target("billing", "pgdata")).unwrap(),
+        RestoreSourcePath::DerivedFromTarget("/pvc/pgdata".into())
+    );
 }
 
 #[test]
@@ -1259,4 +1411,196 @@ fn populate_job_name_is_capped_and_injective_per_claimant() {
     // A clip must not leave a trailing dash before the marker.
     let dashy = format!("{}-", "r".repeat(60));
     assert!(!populate_job_name(&dashy, "uid").contains("--populate-"));
+}
+
+// --- the ONE identity-path derivation (#451) --------------------------------
+//
+// Five identity sites (`config_identity`, `config_identity_for_path`,
+// `resolve_config_identity`, `verify_identity`, the webhook's
+// `resolve_policy_identity`) used to each re-derive the kopia source path from
+// `sources.first()`'s `pvc`/`nfs` by hand. A `stream` source has NEITHER, so
+// every one of them resolved a pathless-or-`/data` identity while the BACKUP
+// side recorded `/stream/<fileName>` — silently making a streamed snapshot
+// unrestorable via `fromPolicy`, unverifiable, unadoptable, and invisible to the
+// collision guard. They all route through [`identity_source_path`] now.
+
+/// A `stream` source as the API SERVER delivers it — the schema defaults
+/// (`readOnly`, `sourcePathStrategy`) materialized onto it, which is what a
+/// hand-built `Source` literal cannot reproduce.
+fn stream_source(file_name: &str) -> Source {
+    crate::testutil::from_yaml(&format!(
+        r#"
+stream:
+  fileName: {file_name}
+  workloadExec:
+    podSelector:
+      matchLabels: {{ app: postgres }}
+    command: ["sh", "-ec", "pg_dumpall"]
+readOnly: true
+sourcePathStrategy: PvcName
+"#
+    ))
+}
+
+/// A hand-written PVC pin against a `stream` (or `nfs`) source is REFUSED, so an
+/// `EffectiveSource` can never carry both a `pvc` target and a `stream` producer.
+///
+/// That combination had two different kopia paths and its two consumers picked
+/// different ones: `kopia_source_path` checks `pvc` first, so `identity_source_path`
+/// — hence the mover's `--override-source`, hence the RECORDED manifest — answered
+/// `/pvc/<name>`, while `snapshot::build`'s stream arm derives `/stream/<fileName>`
+/// for the work spec. Verification and every `fromPolicy` restore look under the
+/// stream path and find nothing, so the policy's quick verify fails TERMINALLY on a
+/// policy whose snapshots are real.
+///
+/// Nothing upstream rejects the input (`validate::snapshot` does not look at
+/// `Snapshot.spec.source`; the webhook's pin refusals cover other shapes), which is
+/// why the refusal lives in the derivation itself.
+#[test]
+fn a_pvc_pin_is_refused_against_a_source_that_has_no_pvc() {
+    let pin = |index: u32| SnapshotSourceRef {
+        source_index: index,
+        target: SnapshotSourceTarget::Pvc(target("billing", "data")),
+        group: None,
+    };
+
+    for (kind, source) in [
+        ("stream", stream_source("postgres.sql")),
+        ("nfs", nfs_source("/export/data")),
+    ] {
+        let policy = policy_with(vec![source]);
+        let err = effective_source(&policy, Some(&pin(0)))
+            .expect_err("a PVC pin onto a non-PVC source is refused");
+        assert!(
+            matches!(&err, ValidationError::InvalidFieldValue { field, reason }
+                if field == "spec.source.target.pvc"
+                    && reason.contains(kind)
+                    && reason.contains("billing/data")),
+            "{kind}: got {err:?}"
+        );
+    }
+
+    // Both PVC-shaped forms still accept a pin, unchanged: the selector fan-out
+    // member (the ordinary case) and a plain `pvc:` source pinned explicitly.
+    let selector = policy_with(vec![selector_source(
+        Some(SourcePathStrategy::PvcName),
+        vec![],
+    )]);
+    let eff = effective_source(&selector, Some(&pin(0))).expect("a fan-out member resolves");
+    assert_eq!(
+        eff.kopia_source_path(SourcePathStrategy::PvcName)
+            .as_deref(),
+        Some("/pvc/data")
+    );
+    assert!(
+        eff.stream.is_none(),
+        "a PVC-pinned run carries no stream producer"
+    );
+
+    let plain = policy_with(vec![pvc_source("other")]);
+    let eff = effective_source(&plain, Some(&pin(0))).expect("a pinned plain pvc source resolves");
+    assert_eq!(
+        eff.kopia_source_path(SourcePathStrategy::PvcName)
+            .as_deref(),
+        Some("/pvc/data")
+    );
+
+    // And the UNPINNED stream path is untouched — the refusal is pin-only.
+    let stream_policy = policy_with(vec![stream_source("postgres.sql")]);
+    let eff = effective_source(&stream_policy, None).expect("an unpinned stream source resolves");
+    assert!(eff.pvc.is_none());
+    assert_eq!(
+        eff.kopia_source_path(SourcePathStrategy::PvcName)
+            .as_deref(),
+        Some("/stream/postgres.sql")
+    );
+}
+
+/// The load-bearing assertion: the ONE derivation every identity site now calls
+/// yields the stream root, and specifically NOT `/data`, NOT `/pvc/...`, and NOT
+/// the pathless form. A sixth site cannot drift because [`IdentityInputs`] no
+/// longer accepts the raw `pvc`/`nfs` pieces to re-derive from — it takes only
+/// this function's answer.
+#[test]
+fn identity_source_path_of_a_stream_policy_is_the_stream_root() {
+    let policy = policy_with(vec![stream_source("postgres.sql")]);
+    let path = identity_source_path(&policy, None).expect("a stream policy derives a path");
+    assert_eq!(path.as_deref(), Some("/stream/postgres.sql"));
+    // The three wrong answers the five sites used to give.
+    assert_ne!(path.as_deref(), Some("/data"));
+    assert_ne!(path.as_deref(), Some("/pvc/app"));
+    assert!(path.is_some(), "a pathless identity matches every source");
+}
+
+/// `sourcePathOverride` still wins over the stream root, exactly as it does for a
+/// PVC or NFS source.
+#[test]
+fn identity_source_path_honours_an_override_on_a_stream_source() {
+    let mut source = stream_source("postgres.sql");
+    source.source_path_override = Some("/custom/dump".to_string());
+    let policy = policy_with(vec![source]);
+    assert_eq!(
+        identity_source_path(&policy, None).unwrap().as_deref(),
+        Some("/custom/dump")
+    );
+}
+
+/// The non-stream shapes are byte-identical to what the five sites derived by
+/// hand — this function replaces them, it does not change them.
+#[test]
+fn identity_source_path_reproduces_the_pvc_nfs_and_selector_answers() {
+    // A plain `pvc:` source: `/pvc/<name>`.
+    assert_eq!(
+        identity_source_path(&policy_with(vec![pvc_source("data")]), None)
+            .unwrap()
+            .as_deref(),
+        Some("/pvc/data")
+    );
+    // An NFS source: the export path.
+    let mut nfs = pvc_source("ignored");
+    nfs.pvc = None;
+    nfs.nfs = Some(crate::backend::NfsVolume {
+        server: "nas".into(),
+        path: "/mnt/eros/Media".into(),
+    });
+    assert_eq!(
+        identity_source_path(&policy_with(vec![nfs]), None)
+            .unwrap()
+            .as_deref(),
+        Some("/mnt/eros/Media")
+    );
+    // A selector source with no pin: pathless, as before. (The backup side always
+    // passes a per-member pin; the restore side fails closed via
+    // `restore_source_path` rather than relying on this.)
+    assert_eq!(
+        identity_source_path(&policy_with(vec![selector_source(None, vec![])]), None).unwrap(),
+        None
+    );
+    // A zero-source legacy policy: pathless, NOT an error — a working restore must
+    // not become a terminal failure on upgrade.
+    assert_eq!(
+        identity_source_path(&policy_with(vec![]), None).unwrap(),
+        None
+    );
+}
+
+/// A fanned-out child still resolves its OWN member path through the same
+/// function, so the selector fan-out keeps the #346 per-member identity.
+#[test]
+fn identity_source_path_honours_a_fanout_pin() {
+    let policy = policy_with(vec![selector_source(
+        Some(SourcePathStrategy::PvcNamespacedName),
+        vec![],
+    )]);
+    let pin = SnapshotSourceRef {
+        source_index: 0,
+        target: SnapshotSourceTarget::Pvc(target("media", "data-1")),
+        group: None,
+    };
+    assert_eq!(
+        identity_source_path(&policy, Some(&pin))
+            .unwrap()
+            .as_deref(),
+        Some("/pvc/media/data-1")
+    );
 }

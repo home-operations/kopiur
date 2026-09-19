@@ -1171,16 +1171,114 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // the credential Secret(s) the mover loads via envFrom are present. Either
     // problem surfaces as a clear `CredentialsAvailable=False` condition + Warning
     // Event and a requeue, instead of launching a Job that hangs (ADR §4.12).
-    let mover_identity = match io::ensure_mover_identity(
-        &ctx.client,
-        &namespace,
-        &[&repo.backend],
-        ctx.mover_service_account.as_deref(),
-        ctx.mover_role_kind.as_str(),
-        &ctx.mover_clusterrole,
-    )
-    .await
-    {
+    // Does this run exec into a workload pod? A stream source needs `pods/exec`,
+    // which lives on a DEDICATED role + ServiceAccount so the verb never reaches the
+    // SA every ordinary mover Job in the namespace runs as.
+    let uses_stream = work_spec_uses_stream(&work_spec);
+
+    // Stream-exec gate: the namespace must opt in. Anyone able to write a
+    // SnapshotPolicy here could otherwise run arbitrary commands in any pod in the
+    // namespace without holding `pods/exec` themselves — a verb Kubernetes separates
+    // from ordinary write access deliberately.
+    // EXHAUSTIVE over the three-state opt-in: "not annotated" and "we are not
+    // allowed to look" are different refusals with different fixes, and a `bool`
+    // collapsed them into a message that told a namespaced-install admin to
+    // annotate a namespace the operator will never be able to read.
+    let stream_refusal = match uses_stream {
+        false => None,
+        true => io::stream_exec_refusal(
+            io::namespace_stream_exec_opt_in(&ctx.client, &namespace).await?,
+            "SnapshotPolicy",
+            &config.name_any(),
+            &namespace,
+            &io::stream_mover_name(&ctx.mover_clusterrole),
+        ),
+    };
+    if let Some(msg) = stream_refusal {
+        // The reconcile-start copy is the CORRECT base here, and deliberately so:
+        // this refusal is the FIRST conditions writer of its pass on the launch
+        // path. Every earlier conditions write in `reconcile_inner` RETURNS before
+        // reaching it (the CA-bundle gate, the read-only-repository `Failed`, the
+        // repository-not-Ready park, both preflight arms), the one write that does
+        // continue touches only `preflightSince`, and `pool_gate`'s `Admit` arm
+        // writes nothing at all — it hands the slot heal back as a `bool` for
+        // `fold_slot_heal` to apply in the pass's LAST write. So there is nothing
+        // in this array yet for a live re-read to recover, and none is taken.
+        //
+        // This also sits BEFORE `resolve_mover_security_contexts`, so the #464
+        // inherit heal provably has not run and cannot be ordered ahead of it —
+        // see `io::tests::WORK_GATE_PARKS`, which records that classification and
+        // the narrow residual it leaves (an opt-in annotation revoked between a
+        // held pass and the next one).
+        let existing = backup
+            .status
+            .as_ref()
+            .map(|s| s.conditions.clone())
+            .unwrap_or_default();
+        let conditions = io::upsert_gate(
+            &existing,
+            &kopiur_api::gates::STREAM_EXEC_GATE,
+            &msg,
+            backup.meta().generation,
+        );
+        // Guarded like the privileged-mover refusal: the message is stable, so
+        // only a real transition should emit the Event/metric.
+        let current = serde_json::to_value(&backup.status).ok();
+        let wrote = io::patch_status_if_changed(
+            &api,
+            &name,
+            current.as_ref(),
+            serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+        )
+        .await?;
+        if wrote {
+            ctx.metrics.inc_backup_refused(
+                &namespace,
+                &name,
+                kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+            );
+            io::publish_warning_event(
+                ctx,
+                backup,
+                kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+                crate::consts::ALLOW_STREAM_EXEC_ACTION,
+                &msg,
+            )
+            .await;
+        }
+        // Aligned with the privileged gate (#451): a permission refusal is
+        // `BlockedOnGrant`, NOT a green `Action::requeue`. The old return said
+        // "reconciled fine, come back in 30s", which hot-looped the refusal on
+        // the fast cadence and gave the error policy nothing to classify — while
+        // the identically-shaped privileged refusal two hundred lines below
+        // already returned `BlockedOnGrant` and got the slow structural cadence.
+        // The blocker is an annotation an admin adds out-of-band and the
+        // Namespace watch re-enqueues the moment it lands, so any requeue is
+        // only a watch-desync backstop.
+        return Err(Error::BlockedOnGrant(msg));
+    }
+
+    let identity_result = if uses_stream {
+        io::ensure_stream_mover_identity(
+            &ctx.client,
+            &namespace,
+            &[&repo.backend],
+            &ctx.mover_clusterrole,
+            ctx.mover_role_kind.as_str(),
+        )
+        .await
+    } else {
+        io::ensure_mover_identity(
+            &ctx.client,
+            &namespace,
+            &[&repo.backend],
+            ctx.mover_service_account.as_deref(),
+            ctx.mover_role_kind.as_str(),
+            &ctx.mover_clusterrole,
+        )
+        .await
+    };
+    let mover_identity = match identity_result {
         Ok(identity) => identity,
         Err(Error::MissingDependency(msg)) => {
             let existing = backup
@@ -1217,18 +1315,69 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         jobs::MountSource::Pvc { claim_name } => Some(claim_name.as_str()),
         jobs::MountSource::Nfs { .. } => None,
     });
-    let mover_security = io::resolve_mover_security_contexts(
+    // THE recipe mover for this run: `Snapshot.spec.mover` merged field-wise OVER the
+    // policy's (#464), so an ad-hoc one-shot can adjust resources/cache budgets/
+    // securityContext/TTL without editing the shared, GitOps-managed SnapshotPolicy.
+    // Computed ONCE and threaded through every consumer below — the inherit resolution,
+    // the privileged gate, `resolve_mover`, the recorded `kopiur-meta` identity and the
+    // inherit-outcome report — so none of them can disagree about what this run asked
+    // for. The repository's `moverDefaults` still enters UNDERNEATH it inside
+    // `resolve_mover`, giving the full ladder
+    // `hardened ⊂ moverDefaults ⊂ inherited ⊂ policy.mover ⊂ snapshot.mover`.
+    let recipe_mover = kopiur_api::snapshot::effective_backup_mover(&backup.spec, &config.spec);
+    let mover_security = match io::resolve_mover_security_contexts(
         &ctx.client,
         &namespace,
-        config.spec.mover.as_ref(),
+        recipe_mover.as_ref(),
         source_pvc,
         // `inheritSecurityContextFrom.snapshot` is restore-only (admission-rejected
-        // on SnapshotPolicy), so a backup never has a recorded source to pass.
+        // on SnapshotPolicy AND on Snapshot), so a backup never has a recorded source
+        // to pass.
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(s) => s,
+        // A live-pod inherit that resolved NOTHING and has no pinned fallback identity
+        // (#464): the workload is scaled to zero — precisely when a quiesced backup is
+        // most useful — or the selector matches nothing. Park it behind the registered
+        // `SecurityContextResolved=False` gate with a message naming the selector, then
+        // requeue on the slow structural cadence. A bare `?` here surfaced a generic,
+        // condition-less `MissingDependency` that re-checked every 30s forever.
+        Err(Error::InheritSourceMissing(msg)) => {
+            io::park_on_inherit_source_missing(&api, backup, ctx, &msg).await?;
+            return Err(Error::InheritSourceMissing(msg));
+        }
+        Err(e) => return Err(e),
+    };
+    // The hold's healing half (#464), the instant the resolve that parks it SUCCEEDS.
+    //
+    // A run parked on `SecurityContextResolved=False` is the SAME object that proceeds once
+    // the workload is back, so the gate must clear or `doctor` keeps reporting "blocked …
+    // will wait forever" — it suppresses a stale gate only on a TERMINAL phase, and this one
+    // parks at `Pending`. Writes nothing at all unless a hold is actually standing, so a run
+    // that was never held stays byte-identical.
+    //
+    // Placed HERE, not after the credentials/privileged blocks below, because `doctor`
+    // (`first_gate`) returns on the FIRST registered `Fail` row it meets in an array
+    // `upsert_condition_status` only ever APPENDS to — so a stale `SecurityContextResolved=
+    // False` written earliest in the object's life outranks every later gate FOREVER, and
+    // three of the paths this used to sit behind (the repository-not-Ready park, the
+    // Maintenance-cache preflight, and `pool_gate`'s `Parked` arm) carry no registered row
+    // at all while leaving the object non-terminal. Healing late meant the GitOps bring-up
+    // case — workload scaled to zero, then up, with the credential Secret still missing —
+    // diagnosed "scale the workload up" for a workload that was already up.
+    //
+    // What makes that safe is that EVERY conditions writer after this point seeds from a live
+    // re-read (`io::live_conditions`/`live_conditions_and_status`/
+    // `clear_work_condition_if_stale`), not from the reconcile-start copy, because a
+    // `conditions` patch REPLACES the array. Adding a later writer that seeds from the
+    // start-of-pass copy re-opens the bug, and
+    // `io::tests::the_inherit_heal_precedes_every_non_terminal_gate_it_could_shadow`
+    // pins the ordering half.
+    io::heal_inherit_source_missing(&api, backup).await?;
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
-    let privileged_mode = config.spec.mover.as_ref().and_then(|m| m.privileged_mode);
+    let privileged_mode = recipe_mover.as_ref().and_then(|m| m.privileged_mode);
 
     // Field-wise merge the repository's moverDefaults under the recipe's effective
     // contexts/resources/cache: `hardened ⊂ moverDefaults ⊂ recipe` (ADR-0004 §1/§2).
@@ -1239,16 +1388,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         repo.mover_defaults.as_ref(),
         effective_sc.as_ref(),
         effective_pod_sc.as_ref(),
-        config
-            .spec
-            .mover
-            .as_ref()
-            .and_then(|m| m.resources.as_ref()),
-        config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
+        recipe_mover.as_ref().and_then(|m| m.resources.as_ref()),
+        recipe_mover.as_ref().and_then(|m| m.cache.as_ref()),
         // Recipe `mover.ttlSecondsAfterFinished` wins over the repo default (§12).
-        config
-            .spec
-            .mover
+        recipe_mover
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
@@ -1261,7 +1404,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     let recorded = recorded_meta(
         &resolved_mover,
         &mover_security.outcome,
-        config.spec.mover.as_ref(),
+        recipe_mover.as_ref(),
     );
     match &mut work_spec.operation {
         Operation::Snapshot(op) => {
@@ -1305,13 +1448,52 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .mover_service_account
             .as_deref()
             .unwrap_or(config::DEFAULT_MOVER_NAME);
+        // Name the object that actually CARRIES the elevation. The gate above is on
+        // the merged mover — correct, so a per-run override cannot bypass the opt-in
+        // — but the merge has four authored layers, and telling an operator to edit
+        // the policy when the elevation is in their one-shot `Snapshot.spec.mover`
+        // (#464) sends them to a spec with nothing elevated in it. They then reach
+        // for the only other fix on offer: annotating the namespace, which
+        // permanently grants every future backup there the right to run privileged.
+        let policy_name = config.name_any();
+        let layer = io::attribute_elevation(
+            backup
+                .spec
+                .mover
+                .as_ref()
+                .is_some_and(|m| m.requires_privilege()),
+            config
+                .spec
+                .mover
+                .as_ref()
+                .is_some_and(|m| m.requires_privilege()),
+            io::mover_defaults_require_privilege(repo.mover_defaults.as_ref()),
+        );
+        let (carrier_kind, carrier_name, carrier_field) = match layer {
+            io::ElevationLayer::Invocation => ("Snapshot", name.as_str(), "spec.mover"),
+            io::ElevationLayer::Recipe => ("SnapshotPolicy", policy_name.as_str(), "spec.mover"),
+            io::ElevationLayer::RepositoryDefaults => (
+                io::repo_kind_str(repo_ref.kind),
+                repo_ref.name.as_str(),
+                "spec.moverDefaults",
+            ),
+            // Nothing is elevated on its own: the context was inherited from a
+            // workload pod, or assembled from layers that are each benign. The
+            // recipe is where `inheritSecurityContextFrom` is pinned or dropped.
+            io::ElevationLayer::Composed => (
+                "SnapshotPolicy",
+                policy_name.as_str(),
+                "spec.mover (including any securityContext it inherits from a workload)",
+            ),
+        };
         let msg =
-            io::privileged_mover_message("SnapshotPolicy", &config.name_any(), &namespace, sa);
-        let existing = backup
-            .status
-            .as_ref()
-            .map(|s| s.conditions.clone())
-            .unwrap_or_default();
+            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, &namespace, sa);
+        // LIVE base for the array AND the no-op comparison: the #464 inherit heal
+        // wrote to this same array moments ago and a `conditions` patch REPLACES
+        // it, so the reconcile-start copy would resurrect the hold onto a run
+        // whose REAL block is this refusal — and `doctor` would then name the
+        // resurrected row instead of the one it is being refused for.
+        let (existing, current) = io::live_conditions_and_status(&api, &name, backup).await;
         let conditions = io::upsert_gate(
             &existing,
             &kopiur_api::gates::PRIVILEGED_MOVER_GATE,
@@ -1322,7 +1504,6 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         // transition, not on every 30 s transient retry while the namespace
         // opt-in is still absent (the message is stable, so a repeat is a
         // true no-op).
-        let current = serde_json::to_value(&backup.status).ok();
         let wrote = io::patch_status_if_changed(
             &api,
             &name,
@@ -1353,21 +1534,16 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         return Err(Error::BlockedOnGrant(msg));
     }
     // Permitted: clear any stale `MoverPermitted=False` from a prior reconcile.
-    if let Some(conds) = backup.status.as_ref().map(|s| s.conditions.as_slice())
-        && conds
-            .iter()
-            .any(|c| c.type_ == MOVER_PERMITTED_CONDITION && c.status != "True")
-    {
-        let conditions = io::upsert_condition(
-            conds,
-            MOVER_PERMITTED_CONDITION,
-            true,
-            "Permitted",
-            "the mover is permitted in this namespace",
-            backup.meta().generation,
-        );
-        io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
-    }
+    // Live-based (see `io::clear_work_condition_if_stale`) — the #464 heal ran
+    // above and this patch replaces the array it wrote.
+    io::clear_work_condition_if_stale(
+        &api,
+        backup,
+        MOVER_PERMITTED_CONDITION,
+        "Permitted",
+        "the mover is permitted in this namespace",
+    )
+    .await?;
 
     // SecurityContext-compatibility (positive-only, best-effort): confirm `True` only when the
     // RESOLVED mover provably can read the source. Every inherit mode goes through the same
@@ -1402,7 +1578,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         backup,
         &mover_security,
         &resolved_mover,
-        config.spec.mover.as_ref(),
+        // The MERGED recipe mover, not the policy's: the "explicit context" this
+        // verdict is computed against must be what THIS run actually asked for, or a
+        // Snapshot that overrides `securityContext` gets an inherit verdict derived
+        // from the policy's context instead of its own.
+        recipe_mover.as_ref(),
         ctx,
     )
     .await;
@@ -1433,11 +1613,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     {
         Ok(c) => c,
         Err(Error::MissingDependency(msg)) => {
-            let existing = backup
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
+            // LIVE base, for the reason the privileged refusal above states: the
+            // #464 heal already wrote this array in this pass, and seeding from
+            // the reconcile-start copy would put a stale
+            // `SecurityContextResolved=False` back at index 0 — where `doctor`
+            // reports it INSTEAD of the missing Secret that is the actual
+            // blocker. That false diagnosis is the bug this ordering removes.
+            let existing = io::live_conditions(&api, &name, backup).await;
             let conditions = io::upsert_gate(
                 &existing,
                 &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
@@ -1462,32 +1644,19 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // Creds are present (or were just projected): clear any stale
     // `CredentialsAvailable=False` from a prior reconcile so a fixed problem stops
     // showing on the object.
-    if let Some(conds) = backup.status.as_ref().map(|s| s.conditions.as_slice())
-        && conds
-            .iter()
-            .any(|c| c.type_ == CREDENTIALS_AVAILABLE_CONDITION && c.status != "True")
-    {
-        let (reason, note) = if creds.projected > 0 {
-            (
-                CREDENTIALS_PROJECTED_REASON,
-                "credential Secret(s) projected into the mover namespace",
-            )
-        } else {
-            (
-                "Available",
-                "credentials Secret(s) present in the mover namespace",
-            )
-        };
-        let conditions = io::upsert_condition(
-            conds,
-            CREDENTIALS_AVAILABLE_CONDITION,
-            true,
-            reason,
-            note,
-            backup.meta().generation,
-        );
-        io::patch_status(&api, &name, serde_json::json!({ "conditions": conditions })).await?;
-    }
+    let (reason, note) = if creds.projected > 0 {
+        (
+            CREDENTIALS_PROJECTED_REASON,
+            "credential Secret(s) projected into the mover namespace",
+        )
+    } else {
+        (
+            "Available",
+            "credentials Secret(s) present in the mover namespace",
+        )
+    };
+    io::clear_work_condition_if_stale(&api, backup, CREDENTIALS_AVAILABLE_CONDITION, reason, note)
+        .await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     // ADR §4.8: beforeSnapshot hooks (quiesce/flush) run to completion BEFORE the
@@ -1570,14 +1739,12 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     mount.read_only,
                 );
             }
-            let existing = backup
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
-            let conditions = io::upsert_condition(
-                &existing,
-                SOURCE_STAGED_CONDITION,
+            // LIVE conditions base, not `backup`: staging runs LATE in the launch pass
+            // and this patch REPLACES the array, so the reconcile-start copy would ERASE
+            // the `CredentialsAvailable` clear and the #464 inherit heal written above it,
+            // resurrecting the very values they cleared — see `staged_conditions`.
+            let conditions = staged_conditions(
+                &io::live_conditions(&api, &name, backup).await,
                 true,
                 SOURCE_STAGED_REASON,
                 &format!(
@@ -1620,14 +1787,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // transient) `status.error` as diagnostic context; that is NOT a
             // failure — see `StagingOutcome::Failed` for the deadline that is
             // (issue #198).
-            let existing = backup
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
-            let conditions = io::upsert_condition(
-                &existing,
-                SOURCE_STAGED_CONDITION,
+            // LIVE conditions base — same reason as the `Ready` arm above, and it matters
+            // MORE here: this arm returns `Err`, so the run does not reach the
+            // Job-creation patch that would otherwise re-fold a clobbered heal.
+            let conditions = staged_conditions(
+                &io::live_conditions(&api, &name, backup).await,
                 false,
                 reason,
                 &msg,
@@ -1754,11 +1918,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         &namespace,
         io::owner_ref_for(&config, "SnapshotPolicy")?,
         &cache_pvc,
-        crate::cache::effective_cache(
-            &repo,
-            config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
-        )
-        .as_ref(),
+        cache_volume_spec(&repo, &config, recipe_mover.as_ref()).as_ref(),
     )
     .await?;
     // RWO Multi-Attach avoidance: pin the mover to the node the source PVC is
@@ -2275,11 +2435,15 @@ async fn clear_source_pvc_gate_if_parked(
     pvc_ns: &str,
     pvc_name: &str,
 ) -> Result<()> {
-    let existing = backup
-        .status
-        .as_ref()
-        .map(|s| s.conditions.clone())
-        .unwrap_or_default();
+    // Cheap pre-check on the reconcile-start copy FIRST: the overwhelming majority of runs
+    // never touched this gate, and they must not pay a live GET to learn that.
+    if !source_pvc_gate_clear_needed(&existing_conditions(backup)) {
+        return Ok(());
+    }
+    // A run that DID park reaches here after the #464 inherit heal (and the
+    // `CredentialsAvailable` clear) wrote to the same array, which this patch REPLACES — so
+    // re-read live and re-check against THAT, the `fold_slot_heal` discipline.
+    let existing = io::live_conditions(api, name, backup).await;
     if !source_pvc_gate_clear_needed(&existing) {
         return Ok(());
     }
@@ -2316,11 +2480,12 @@ async fn handle_missing_source_pvc(
     pvc_name: &str,
 ) -> Result<Action> {
     let msg = source_pvc_missing_message(pvc_ns, pvc_name);
-    let existing = backup
-        .status
-        .as_ref()
-        .map(|s| s.conditions.clone())
-        .unwrap_or_default();
+    // LIVE base: this park runs after the #464 inherit heal in the same pass, and the
+    // reconcile-start copy would resurrect the hold onto a run whose REAL block is the
+    // missing PVC. It also makes the two derivations below read the freshest array — the
+    // deadline anchor and the Event transition both live IN the condition, so a start-of-pass
+    // copy that predates this pass's own stamp would re-anchor the deadline and re-Event.
+    let existing = io::live_conditions(api, name, backup).await;
     let newly_missing = should_publish_source_pvc_missing_event(&existing);
     // Anchor BEFORE this pass's write: a first sighting has no anchor (this
     // write stamps it), so it can never expire on the same pass it was seen.
@@ -2335,8 +2500,9 @@ async fn handle_missing_source_pvc(
     } else {
         SnapshotPhase::Pending
     };
-    let status = snapshot_ready_status_with_condition(
+    let status = snapshot_ready_status_with_condition_on(
         backup,
+        &existing,
         phase,
         crate::consts::SOURCE_PVC_MISSING_REASON,
         &msg,
@@ -4744,6 +4910,82 @@ async fn assess_backup_security_context(
     }
     // Undecidable / likely-incompatible from securityContext alone → stay silent on the
     // reconcile path (no false alarms). The mover verifies it for real at runtime.
+}
+
+/// The **policy-owned** slice of the effective cache config: the repository's
+/// `moverDefaults.cache` overlaid by the `SnapshotPolicy`'s `mover.cache`, and
+/// nothing else.
+///
+/// Deliberately takes the `SnapshotPolicy` and NOT the `Snapshot`. Two things about a
+/// backup's cache must stay policy-owned, and this function is what makes that
+/// structural rather than a comment someone can delete:
+///
+/// 1. The cache **mode**. `mode: Persistent` means "mint/reuse the PVC named after
+///    this policy"; letting a per-run value pick the mode would let one ad-hoc
+///    Snapshot create — or coerce away from — shared storage.
+/// 2. The **persistent PVC's own spec** (`capacity`/`storageClassName`). The claim is
+///    named per-POLICY (`kopiur_api::expand::cache_pvc_name(&config.name_any(), …)`)
+///    and is shared by every child `Snapshot` of that policy, so honoring a per-run
+///    size or class there would resize/re-class storage its siblings depend on (#464).
+///
+/// The absent parameter is the guarantee: a future caller cannot thread the per-run
+/// layer into either decision by accident, because there is nowhere to put it.
+///
+/// Everything else about the cache IS run-scoped and does take the per-run layer — the
+/// kopia budgets (`build.rs`'s `cache_tuning`) and, via [`cache_volume_spec`], the size
+/// and class of an **ephemeral** cache volume, which lives and dies with this one Job.
+fn policy_cache_spec(
+    repo: &io::ResolvedRepository,
+    config: &SnapshotPolicy,
+) -> Option<kopiur_api::common::CacheDefaults> {
+    crate::cache::effective_cache(
+        repo,
+        config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
+    )
+}
+
+/// The cache config governing this run's cache **volume**, splitting the decision by
+/// who owns what (#464):
+///
+/// - The **mode** comes from [`policy_cache_spec`] alone, defaulting to `Ephemeral`.
+/// - `Persistent` → the policy's spec, verbatim. The per-run layer never reaches
+///   `ensure_cache_pvc`, so an ad-hoc Snapshot cannot resize or re-class the
+///   policy-named, sibling-shared PVC.
+/// - `Ephemeral` → the MERGED `capacity`/`storageClassName` (policy ⊂ snapshot), with
+///   `mode` pinned back to `Ephemeral`. A generic ephemeral volume is bound to this
+///   Job's pod and auto-GC'd with it, so there is no shared state for a per-run size or
+///   class to corrupt — and a per-run `capacity` against a policy that set none
+///   correctly upgrades the run off an `emptyDir` instead of being silently dropped.
+///   Re-pinning `mode` is what stops a per-run `mode: Persistent` from minting the
+///   shared PVC through this path.
+///
+/// Pure, so the whole split is unit-testable; the async provisioning in
+/// [`crate::cache::resolve_cache_volume`] is thin IO over it, deciding nothing this
+/// function has not already decided.
+fn cache_volume_spec(
+    repo: &io::ResolvedRepository,
+    config: &SnapshotPolicy,
+    run_mover: Option<&kopiur_api::common::MoverSpec>,
+) -> Option<kopiur_api::common::CacheDefaults> {
+    use kopiur_api::common::{CacheDefaults, CacheVolumeMode};
+    let policy = policy_cache_spec(repo, config);
+    // Exhaustive over the mode (no `_ =>`): a new provisioning mode must decide here
+    // whether it is shared — and therefore policy-owned — or per-run.
+    match policy
+        .as_ref()
+        .map(CacheDefaults::effective_mode)
+        .unwrap_or_default()
+    {
+        CacheVolumeMode::Persistent => policy,
+        CacheVolumeMode::Ephemeral => {
+            crate::cache::effective_cache(repo, run_mover.and_then(|m| m.cache.as_ref())).map(|c| {
+                CacheDefaults {
+                    mode: Some(CacheVolumeMode::Ephemeral),
+                    ..c
+                }
+            })
+        }
+    }
 }
 
 /// Report what `mover.inheritSecurityContextFrom` actually achieved, when it achieved

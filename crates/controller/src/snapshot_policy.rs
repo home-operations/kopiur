@@ -405,6 +405,53 @@ fn multi_repo_has_success(backups: &[Snapshot], repo_key: &str) -> bool {
     })
 }
 
+/// **Pure.** The kopia source path a child `Snapshot` actually backed up,
+/// derived exactly the way the backup side derived it
+/// ([`kopiur_api::expand::effective_source`] + `strategy_for`). `None` when it
+/// cannot be derived — a child minted against an older recipe shape, which must
+/// never be mistaken for a match.
+fn child_kopia_source_path(policy: &SnapshotPolicy, child: &Snapshot) -> Option<String> {
+    let eff = kopiur_api::expand::effective_source(policy, child.spec.source.as_ref()).ok()?;
+    let strategy = kopiur_api::expand::strategy_for(policy.spec.sources.get(eff.index)?);
+    eff.kopia_source_path(strategy)
+}
+
+/// **Pure.** Whether a SUCCEEDED child of this policy already covers
+/// `member_path` — the PER-MEMBER #168 verification gate (#456).
+///
+/// Per member, not per policy: a PVC that joins the selector LATER has no
+/// snapshot of its own, and unlocking it because a SIBLING succeeded reopens
+/// exactly the #456 false pass — its quick verify would filter on a path with
+/// no manifests, match zero and exit 0.
+///
+/// `repo_key` narrows to one repository for a multi-repo policy (a child counts
+/// only for the repository its `spec.repository` pin names, same rule as
+/// [`multi_repo_has_success`]).
+fn member_has_success(
+    policy: &SnapshotPolicy,
+    backups: &[Snapshot],
+    repo_key: Option<&str>,
+    member_path: &str,
+) -> bool {
+    backups.iter().any(|b| {
+        if retention_view(b).is_none() {
+            return false;
+        }
+        if let Some(key) = repo_key {
+            let ns = b.namespace().unwrap_or_default();
+            let pinned_here = b
+                .spec
+                .repository
+                .as_ref()
+                .is_some_and(|pin| kopiur_api::common::repo_key(pin, &ns) == key);
+            if !pinned_here {
+                return false;
+            }
+        }
+        child_kopia_source_path(policy, b).as_deref() == Some(member_path)
+    })
+}
+
 /// The terminal ordering key for a Snapshot: `status.timing.endTime`, falling
 /// back to `metadata.creationTimestamp`.
 fn snapshot_end_or_creation(b: &Snapshot) -> Option<DateTime<Utc>> {
@@ -1152,7 +1199,26 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // `status.verification` Vec (multi only; the controller is the vec's single
     // writer — see `verification::fold_verification`). `None` for the classic
     // single-repo shape, whose flat `lastVerified` the mover stamps directly.
-    let folded = fold_multi_verification(config, is_multi, &repo_targets, &namespace);
+    // #456: the verification member grid. ONE `match_pvcs` LIST per RECONCILE
+    // (never per repository — `verify_step` runs once per repository and would
+    // otherwise multiply it by the repository count), and only for a policy
+    // that actually configures verification. A `pvcSelector` policy fans out to
+    // one cell per matched PVC, each verifying its OWN kopia source path; every
+    // other shape yields exactly one member with no member dimension.
+    let verify_members = match config.spec.verification.is_some() {
+        true => crate::verification::resolve_verify_members(ctx, config).await?,
+        false => Vec::new(),
+    };
+    if config.spec.verification.is_some() && verify_members.is_empty() {
+        tracing::warn!(
+            policy = %name,
+            "verification is configured but this policy's pvcSelector matched no \
+             PersistentVolumeClaim: nothing to verify, so no verify Job is spawned and no \
+             lastVerified is stamped. Check the selector's labels."
+        );
+    }
+    let folded =
+        fold_multi_verification(config, is_multi, &repo_targets, &verify_members, &namespace);
 
     // Final status: Ready when every repository is (Reconciling + the
     // registered `RepositoriesReady` gate otherwise), the observedGeneration,
@@ -1204,7 +1270,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         conditions,
         last_successful.as_deref(),
         &repo_targets,
-        folded.as_ref(),
+        &folded,
     )?;
     io::patch_status_if_changed(&api, &name, current.as_ref(), status).await?;
 
@@ -1213,9 +1279,16 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // stamps `status.lastVerified` on a successful quick/deep verify (single-repo);
     // for multi the folded MIN across current repos is the honest fleet-wide age.
     // No-op until a first verify lands.
-    let flat_verified = match folded.as_ref() {
-        Some(f) => f.folded.flat.clone(),
-        None => config.status.as_ref().and_then(|s| s.last_verified.clone()),
+    // `Flat` reads the value the mover stamped directly; `Undecided` made no
+    // decision, so the gauge keeps reporting the last real verification and
+    // AGES — which is exactly what staleness alerting fires on. Clearing it
+    // instead would delete the series and make "nothing is being verified"
+    // unalertable (review S1).
+    let flat_verified = match &folded {
+        VerifyFold::Grid(f) => f.folded.flat.clone(),
+        VerifyFold::Flat | VerifyFold::Undecided => {
+            config.status.as_ref().and_then(|s| s.last_verified.clone())
+        }
     };
     if let Some(ts) = flat_verified.as_deref().and_then(rfc3339_unix_secs) {
         ctx.metrics.set_snapshot_verified(&namespace, &name, ts);
@@ -1233,10 +1306,13 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         config,
         ctx,
         &namespace,
-        &ready,
-        folded.as_ref(),
-        &backups,
-        has_successful_snapshot,
+        &VerifySteps {
+            ready: &ready,
+            folded: folded.grid(),
+            members: &verify_members,
+            backups: &backups,
+            has_successful_snapshot,
+        },
     )
     .await?;
     let base = match verify_requeue {
@@ -1259,35 +1335,126 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     Ok(Action::requeue(requeue))
 }
 
-/// The multi-repo verification fold inputs + result: the CURRENT repo set as
-/// `(normalized ref, key)` pairs and the folded per-repo state. `None` for the
-/// single-repo shape. Extracted so `reconcile_inner` only gains a call
-/// (complexity ratchet).
+/// What this reconcile is entitled to SAY about verification status.
+///
+/// The three arms were ONE `Option` before, and collapsing the middle one into
+/// `None` was a data-integrity bug with two faces (review F2 + S1): a
+/// `pvcSelector` that matched nothing produced no members, which read as "this
+/// policy has no member dimension", so [`final_status_body`] nulled
+/// `verificationStamps` WHOLESALE while never naming `lastVerified` — and
+/// RFC 7386 treats an omitted key as a no-op. The claim survived; the evidence
+/// under it did not. One relabelled app, or one reconcile of watch lag, and
+/// every member's stamp was gone: `verify_cell_anchor` then found nothing,
+/// `tier_after(None)` anchored a year in the past, `due_tier` preferred DEEP
+/// for EVERY member, and a 4-PVC policy at `deep.capacity: 500Gi` ran four
+/// sequential full scratch restores for volumes verified yesterday.
+enum VerifyFold {
+    /// No verification grid: one repository, and no member dimension. The
+    /// mover stamps the flat `status.lastVerified` directly and the multi-only
+    /// surfaces can be retired (a multi→single spec edit).
+    Flat,
+    /// `spec.verification` IS configured and the policy's `pvcSelector`
+    /// matched NO `PersistentVolumeClaim`: the reconcile has no verification
+    /// observation to fold and **makes no verification status decision at
+    /// all** — no `lastVerified`, no `verification`, no stamp prune.
+    ///
+    /// The residual error is deliberate and is the safe one: a member that was
+    /// genuinely removed keeps an inert stamp until the selector matches
+    /// something again, at which point `stamp_key_live` prunes it as usual. An
+    /// orphan stamp can never make a missing member look verified — the fold
+    /// only ever LOOKS UP the keys of CURRENT members, so an extra key is read
+    /// by nobody — whereas deleting a live one costs hours of backend egress
+    /// and erases the `kopiur_snapshot_verified` series that staleness
+    /// alerting fires on. A frozen `lastVerified` also keeps AGEING, so it
+    /// trips that same alert; a cleared one is silent. Nothing is quietly
+    /// claimed here either: the caller logs a `WARN` naming the selector.
+    Undecided,
+    /// The (repository x member) grid: a repository dimension, a member
+    /// dimension, or both.
+    Grid(MultiVerification),
+}
+
+impl VerifyFold {
+    /// The grid, when this pass has one. [`VerifyFold::Undecided`] is
+    /// deliberately NOT a grid: every consumer that folds or prunes must see
+    /// "no decision", not "an empty grid".
+    fn grid(&self) -> Option<&MultiVerification> {
+        match self {
+            VerifyFold::Grid(mv) => Some(mv),
+            VerifyFold::Flat | VerifyFold::Undecided => None,
+        }
+    }
+}
+
+/// The entry-keyed verification fold inputs + result: the CURRENT stamp grid
+/// (repositories x members) and the folded state. Extracted so
+/// `reconcile_inner` only gains a call (complexity ratchet).
 struct MultiVerification {
-    /// `(normalized ref, normalized repo key)` per current repo, spec order.
+    /// `(normalized ref, stamp-key repository segment)` per current repo, spec
+    /// order. A single-repository policy carries exactly one pair whose segment
+    /// is the EMPTY string — the repo-agnostic segment its `#<member_tag>` stamp
+    /// keys use.
     current_repos: Vec<(RepositoryRef, String)>,
+    /// The current member tags (#456), empty when the policy does not fan out.
+    members: Vec<String>,
+    /// Whether to publish the per-repo `status.verification` Vec. `true` only
+    /// for a genuinely multi-repository policy: a single-repo fan-out has no
+    /// per-repository dimension to surface, and inventing a one-entry Vec for
+    /// it would change a status wire nobody asked to change.
+    publish_entries: bool,
     folded: crate::verification::FoldedVerification,
 }
 
-/// See [`MultiVerification`].
+/// See [`VerifyFold`] and [`MultiVerification`].
 fn fold_multi_verification(
     config: &SnapshotPolicy,
     is_multi: bool,
     repo_targets: &[&RepositoryRef],
+    verify_members: &[crate::verification::VerifyMember],
     namespace: &str,
-) -> Option<MultiVerification> {
-    if !is_multi {
-        return None;
+) -> VerifyFold {
+    // Configured, but nothing matched: make NO verification status decision
+    // this pass. Checked BEFORE everything else because it is invisible
+    // downstream — an empty member list is indistinguishable from "no member
+    // dimension" in the single-repo branch, and in the multi-repo branch it
+    // makes `member_keys` empty so the prune deletes every `#<tag>` stamp
+    // there is. `run_verify_steps` already has this guard; `final_status_body`
+    // runs FIRST and did not. See [`VerifyFold::Undecided`].
+    if config.spec.verification.is_some() && verify_members.is_empty() {
+        return VerifyFold::Undecided;
     }
-    let current_repos: Vec<(RepositoryRef, String)> = repo_targets
+    let members: Vec<String> = verify_members
         .iter()
-        .map(|r| {
-            (
-                kopiur_api::common::normalized_repository_ref(r, namespace),
-                kopiur_api::common::repo_key(r, namespace),
-            )
-        })
+        .filter_map(|m| m.member_tag.clone())
         .collect();
+    // Stamps-map mode: a repository dimension, a member dimension, or both.
+    if !is_multi && members.is_empty() {
+        return VerifyFold::Flat;
+    }
+    let current_repos: Vec<(RepositoryRef, String)> = match is_multi {
+        true => repo_targets
+            .iter()
+            .map(|r| {
+                (
+                    kopiur_api::common::normalized_repository_ref(r, namespace),
+                    kopiur_api::common::repo_key(r, namespace),
+                )
+            })
+            .collect(),
+        false => repo_targets
+            .iter()
+            .take(1)
+            .map(|r| {
+                (
+                    kopiur_api::common::normalized_repository_ref(r, namespace),
+                    String::new(),
+                )
+            })
+            .collect(),
+    };
+    if current_repos.is_empty() {
+        return VerifyFold::Flat;
+    }
     let existing_entries = config
         .status
         .as_ref()
@@ -1302,10 +1469,13 @@ fn fold_multi_verification(
         &current_repos,
         &existing_entries,
         &stamps,
+        &members,
         namespace,
     );
-    Some(MultiVerification {
+    VerifyFold::Grid(MultiVerification {
         current_repos,
+        members,
+        publish_entries: is_multi,
         folded,
     })
 }
@@ -1394,13 +1564,18 @@ fn select_scratch_state(
 /// its multi-only surfaces (`verification`, `verificationStamps`) nulled once.
 /// Every conditional is keyed off the PRIOR status so the steady-state body
 /// compares equal and the guarded write stays a no-op.
+///
+/// [`VerifyFold::Undecided`] names none of those keys: a merge patch that does
+/// not mention a key leaves it exactly as it was, which is the whole point —
+/// see that variant for why preserving a possibly-orphaned stamp is the safe
+/// error and deleting a live one is not.
 fn final_status_body(
     config: &SnapshotPolicy,
     generation: Option<i64>,
     conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
     last_successful: Option<&str>,
     repo_targets: &[&RepositoryRef],
-    folded: Option<&MultiVerification>,
+    folded: &VerifyFold,
 ) -> Result<serde_json::Value> {
     let names: Vec<&str> = repo_targets.iter().map(|r| r.name.as_str()).collect();
     let mut status = serde_json::json!({
@@ -1413,23 +1588,38 @@ fn final_status_body(
     }
     let prior = config.status.as_ref();
     match folded {
-        Some(mv) => {
-            status["verification"] = serde_json::to_value(&mv.folded.entries)?;
+        VerifyFold::Grid(mv) => {
+            if mv.publish_entries {
+                status["verification"] = serde_json::to_value(&mv.folded.entries)?;
+            } else if prior.is_some_and(|s| !s.verification.is_empty()) {
+                // multi -> single-repo-with-fan-out edit: the per-repo Vec has
+                // no meaning here, and would otherwise linger forever.
+                status["verification"] = serde_json::Value::Null;
+            }
             let prior_flat = prior.is_some_and(|s| s.last_verified.is_some());
             match (&mv.folded.flat, prior_flat) {
                 (Some(ts), _) => status["lastVerified"] = serde_json::json!(ts),
-                // Regressed to unknown (a current repo has never verified)
-                // while a prior value exists: clear it once, then stay silent.
+                // Regressed to unknown while a prior value exists: clear it
+                // once, then stay silent. This is also what clears the #456
+                // false-pass timestamp on a selector policy's FIRST fan-out
+                // reconcile — the pre-fix flat `lastVerified` was stamped by a
+                // pathless quick verify that matched zero manifests and exited
+                // 0, so it is not proof of anything and must not anchor the
+                // catch-up.
                 (None, true) => status["lastVerified"] = serde_json::Value::Null,
                 (None, false) => {}
             }
-            let current_keys: std::collections::BTreeSet<&str> =
+            let repo_keys: std::collections::BTreeSet<&str> =
                 mv.current_repos.iter().map(|(_, k)| k.as_str()).collect();
+            let member_keys: std::collections::BTreeSet<&str> =
+                mv.members.iter().map(String::as_str).collect();
             let stale: serde_json::Map<String, serde_json::Value> = prior
                 .map(|s| {
                     s.verification_stamps
                         .keys()
-                        .filter(|k| !current_keys.contains(k.as_str()))
+                        .filter(|k| {
+                            !crate::verification::stamp_key_live(k, &repo_keys, &member_keys)
+                        })
                         .map(|k| (k.clone(), serde_json::Value::Null))
                         .collect()
                 })
@@ -1438,7 +1628,7 @@ fn final_status_body(
                 status["verificationStamps"] = serde_json::Value::Object(stale);
             }
         }
-        None => {
+        VerifyFold::Flat => {
             // multi→single edit: the multi-only surfaces would otherwise
             // linger forever. Null them exactly once (conditional on the prior
             // status actually carrying them).
@@ -1449,70 +1639,243 @@ fn final_status_body(
                 status["verificationStamps"] = serde_json::Value::Null;
             }
         }
+        // Name NOTHING verification-related. This pass observed no cell, so it
+        // has nothing to say. Falling into the `Flat` arm instead — which is
+        // what an empty member set used to do — deleted a working policy's
+        // whole stamp map on a one-reconcile selector blip (S1) while leaving
+        // its `lastVerified` claim standing over the hole (F2).
+        VerifyFold::Undecided => {}
     }
     Ok(status)
 }
 
-/// The per-target verification scheduling loop (thin orchestration over
-/// [`crate::verification::verify_step`]): the single-repo shape runs exactly
-/// one step with the flat `lastVerified` anchor (byte-identical behavior); a
-/// multi-repo policy runs one step per READY repository, each anchored on its
-/// own folded entry and gated on ITS OWN #168 input. Returns the minimum
-/// requested requeue.
-async fn run_verify_steps(
+/// **Pure.** One (repository x member) verify cell's last-verified anchor.
+///
+/// * a fan-out member anchors on ITS OWN stamp, so member B's recent verify
+///   never defers member A's due slot (the same per-repository reasoning #368
+///   applied one dimension up);
+/// * a multi-repo, single-member cell anchors on its folded per-repo entry;
+/// * the classic single-repo single-member cell anchors on the flat
+///   `status.lastVerified` — byte-identical behavior.
+fn verify_cell_anchor(
     config: &SnapshotPolicy,
-    ctx: &Context,
-    namespace: &str,
-    ready: &[&PolicyRepoTarget],
     folded: Option<&MultiVerification>,
-    backups: &[Snapshot],
-    has_successful_snapshot: bool,
-) -> Result<Option<std::time::Duration>> {
+    stamps: &std::collections::BTreeMap<String, String>,
+    stamp_key: Option<&str>,
+    is_fanout: bool,
+    repo_key: Option<&str>,
+    namespace: &str,
+) -> Option<DateTime<Utc>> {
     let parse_ts = |s: &str| {
         DateTime::parse_from_rfc3339(s)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     };
+    if is_fanout {
+        return stamp_key
+            .and_then(|k| stamps.get(k))
+            .map(String::as_str)
+            .and_then(parse_ts);
+    }
+    match (folded, repo_key) {
+        (Some(mv), Some(key)) => mv
+            .folded
+            .entries
+            .iter()
+            .find(|e| kopiur_api::common::repo_key(&e.repository, namespace) == key)
+            .and_then(|e| e.last_verified.as_deref())
+            .and_then(parse_ts),
+        _ => config
+            .status
+            .as_ref()
+            .and_then(|s| s.last_verified.as_deref())
+            .and_then(parse_ts),
+    }
+}
+
+/// The verification scheduling loop over the (READY repository x member) grid
+/// (thin orchestration over [`crate::verification::verify_step`]).
+///
+/// The classic shape — a single repository and a single member — runs exactly
+/// one step with the flat `lastVerified` anchor (byte-identical behavior). A
+/// multi-repo policy adds a repository dimension (#368) and a `pvcSelector`
+/// policy adds a member dimension (#456); both together are the full grid.
+///
+/// Two hoists, both because this function runs ONCE per reconcile while
+/// `verify_step` runs once per cell: `match_pvcs` (the caller's
+/// `verify_members`) and the #168 discovered-snapshot probe (per repository —
+/// it is a per-repository fact).
+///
+/// Concurrency: quick members of one repository run CONCURRENTLY (independent
+/// short reads), while deep members run SEQUENTIALLY (`deep_hold`) — each deep
+/// member provisions its own `deep.capacity` of scratch, so a 4-PVC policy at
+/// `500Gi` would otherwise ask for 2 TiB of ephemeral storage at once.
+///
+/// Returns the minimum requested requeue.
+struct VerifySteps<'a> {
+    /// The READY repository targets, in spec order.
+    ready: &'a [&'a PolicyRepoTarget],
+    /// The entry-keyed fold, `None` for the classic flat shape.
+    folded: Option<&'a MultiVerification>,
+    /// The verification members (#456) — one per matched PVC for a selector
+    /// policy, exactly one otherwise, EMPTY when a selector matched nothing.
+    members: &'a [crate::verification::VerifyMember],
+    /// This policy's child Snapshots (the #168 gate's per-repository input).
+    backups: &'a [Snapshot],
+    /// Whether this policy has any successful backup (the single-repo #168 input).
+    has_successful_snapshot: bool,
+}
+
+/// The per-repository inputs [`verify_verify_cells`] needs, grouped so its
+/// signature stays readable.
+struct VerifyCellInputs<'a> {
+    /// This policy's child Snapshots (the per-member success input).
+    backups: &'a [Snapshot],
+    /// `Some(normalized repo key)` for a multi-repository policy.
+    repo_key: Option<&'a str>,
+    /// Whether this repository holds ANY successful backup from the policy —
+    /// the input a path-less (non-selector) member keeps using.
+    repo_has_successful: bool,
+}
+
+/// One `(has_successful, identity key)` pair per verification member, under ONE
+/// repository. Fallible: the identity resolves through
+/// [`config_identity_for_path`], so an unresolvable CEL expression parks the
+/// policy here rather than silently gating it forever (a gated cell never
+/// reaches the work-spec build that would otherwise surface it).
+///
+/// **The `source_path` argument is load-bearing.** It must be the MEMBER's own
+/// derived path, not `None`: the identity key is compared against what the
+/// catalog recorded for a discovered/replicated row, and the catalog records
+/// the per-member path. Passing `None` here would resolve a different address
+/// for every selector member, the #168 escape hatch would never match, and it
+/// would be silently dead forever (fail-closed, so nothing would notice).
+/// Guarded by `verification::tests::the_member_path_is_what_makes_the_discovered_unlock_match`.
+fn verify_verify_cells(
+    config: &SnapshotPolicy,
+    namespace: &str,
+    target: &PolicyRepoTarget,
+    verify_members: &[crate::verification::VerifyMember],
+    inputs: VerifyCellInputs<'_>,
+) -> Result<Vec<(bool, crate::verification::IdentityKey)>> {
+    verify_members
+        .iter()
+        .map(|m| {
+            let has_successful = match m.source_path.as_deref() {
+                Some(path) => member_has_success(config, inputs.backups, inputs.repo_key, path),
+                None => inputs.repo_has_successful,
+            };
+            let identity = config_identity_for_path(
+                config,
+                namespace,
+                target.repo.identity_defaults.as_ref(),
+                m.source_path.as_deref(),
+            )?;
+            Ok((has_successful, crate::verification::identity_key(&identity)))
+        })
+        .collect()
+}
+
+/// See [`VerifySteps`].
+async fn run_verify_steps(
+    config: &SnapshotPolicy,
+    ctx: &Context,
+    namespace: &str,
+    steps: &VerifySteps<'_>,
+) -> Result<Option<std::time::Duration>> {
+    let VerifySteps {
+        ready,
+        folded,
+        members: verify_members,
+        backups,
+        has_successful_snapshot,
+    } = *steps;
+    if config.spec.verification.is_none() {
+        return Ok(None);
+    }
+    // A `pvcSelector` that matched nothing: spawn nothing, stamp nothing (the
+    // caller warned). Mirrors `SlotMintPlan::NothingMatched` on the backup side
+    // — emphatically NOT a pathless run, which is what #456 was.
+    if verify_members.is_empty() {
+        return Ok(None);
+    }
+    let is_multi = kopiur_api::is_multi_repo(&config.spec);
+    let stamps = config
+        .status
+        .as_ref()
+        .map(|s| s.verification_stamps.clone())
+        .unwrap_or_default();
     let mut min_requeue: Option<std::time::Duration> = None;
-    match folded {
-        None => {
-            if let Some(t) = ready.first() {
-                let vt = crate::verification::VerifyTarget {
-                    rref: &t.rref,
-                    repo: &t.repo,
-                    repo_key: None,
-                    last_verified: config
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.last_verified.as_deref())
-                        .and_then(parse_ts),
-                    has_successful: has_successful_snapshot,
-                };
-                min_requeue = crate::verification::verify_step(config, ctx, &vt, namespace).await?;
-            }
-        }
-        Some(mv) => {
-            for t in ready {
-                let key = kopiur_api::common::repo_key(&t.rref, namespace);
-                let last = mv
-                    .folded
-                    .entries
-                    .iter()
-                    .find(|e| kopiur_api::common::repo_key(&e.repository, namespace) == key)
-                    .and_then(|e| e.last_verified.as_deref())
-                    .and_then(parse_ts);
-                let vt = crate::verification::VerifyTarget {
-                    rref: &t.rref,
-                    repo: &t.repo,
-                    has_successful: multi_repo_has_success(backups, &key),
-                    repo_key: Some(key),
-                    last_verified: last,
-                };
-                if let Some(rq) =
-                    crate::verification::verify_step(config, ctx, &vt, namespace).await?
-                {
-                    min_requeue = Some(min_requeue.map_or(rq, |c| c.min(rq)));
-                }
+    let mut deep_hold = false;
+    for t in ready {
+        let repo_key = is_multi.then(|| kopiur_api::common::repo_key(&t.rref, namespace));
+        let repo_has_successful = match repo_key.as_deref() {
+            Some(key) => multi_repo_has_success(backups, key),
+            None => has_successful_snapshot,
+        };
+        // #456: the #168 gate is per (repository x member). A member has a
+        // verifiable snapshot when a Succeeded child of this policy covers ITS
+        // path, or when the repository holds a discovered/replicated row AT ITS
+        // IDENTITY. A path-less (non-selector) member keeps the per-policy /
+        // per-repository success input, byte-identically.
+        let cells = verify_verify_cells(
+            config,
+            namespace,
+            t,
+            verify_members,
+            VerifyCellInputs {
+                backups,
+                repo_key: repo_key.as_deref(),
+                repo_has_successful,
+            },
+        )?;
+        // The identities of this repository's adopted/replicated rows, read ONCE
+        // per repository and only for the identities still GATED. Narrowed by
+        // identity rather than a bare "this repository holds SOME foreign row":
+        // that unlocked a brand-new policy on a SHARED repository (the ordinary
+        // shape there) for an identity with no manifest, which, now that a
+        // quick verify covering nothing is terminal, meant a FAILED verify Job
+        // every slot until its first own backup.
+        let discovered = crate::verification::discovered_identity_index(
+            ctx,
+            &t.repo,
+            &crate::verification::probe_identities(&cells),
+        )
+        .await?;
+        for (member, (has_successful, identity)) in verify_members.iter().zip(cells.iter()) {
+            let has_successful = *has_successful;
+            let has_discovered = discovered.contains(identity);
+            let key =
+                crate::verification::stamp_key(repo_key.as_deref(), member.member_tag.as_deref());
+            let vt = crate::verification::VerifyTarget {
+                rref: &t.rref,
+                repo: &t.repo,
+                repo_key: repo_key.clone(),
+                last_verified: verify_cell_anchor(
+                    config,
+                    folded,
+                    &stamps,
+                    key.as_deref(),
+                    member.member_tag.is_some(),
+                    repo_key.as_deref(),
+                    namespace,
+                ),
+                has_successful,
+                source_path: member.source_path.as_deref(),
+                member_tag: member.member_tag.as_deref(),
+            };
+            let out = crate::verification::verify_step(
+                config,
+                ctx,
+                &vt,
+                namespace,
+                has_discovered,
+                deep_hold,
+            )
+            .await?;
+            deep_hold |= out.deep_active;
+            if let Some(rq) = out.requeue {
+                min_requeue = Some(min_requeue.map_or(rq, |c: std::time::Duration| c.min(rq)));
             }
         }
     }
@@ -2155,10 +2518,11 @@ pub fn config_identity(
     namespace: &str,
     defaults: Option<&kopiur_api::IdentityDefaults>,
 ) -> Result<kopiur_api::common::ResolvedIdentity> {
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    let source_path_override = first.and_then(|s| s.source_path_override.clone());
+    // THE shared derivation (#451) — the same call the backup side makes, so a
+    // `stream` source resolves `/stream/<fileName>` here instead of the pathless
+    // identity the old inline `pvc`/`nfs` derivation produced.
+    let source_path = kopiur_api::expand::identity_source_path(config, None)
+        .map_err(|e| Error::Validation(e.to_string()))?;
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
         namespace,
@@ -2166,9 +2530,7 @@ pub fn config_identity(
         defaults,
         labels: config.metadata.labels.as_ref(),
         annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: source_path.as_deref(),
     };
     kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))
 }
@@ -2215,14 +2577,13 @@ pub fn config_identity_for_path(
     defaults: Option<&kopiur_api::IdentityDefaults>,
     source_path: Option<&str>,
 ) -> Result<kopiur_api::common::ResolvedIdentity> {
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    // The caller's derived path wins; without one, the governing source's own
-    // `sourcePathOverride` still applies exactly as `config_identity` applies it.
-    let source_path_override = match source_path {
+    // The caller's derived path wins; without one, fall back to THE shared
+    // derivation (#451) — which is exactly what `config_identity` resolves, and
+    // which yields `/stream/<fileName>` for a stream source.
+    let resolved_path = match source_path {
         Some(p) => Some(p.to_string()),
-        None => first.and_then(|s| s.source_path_override.clone()),
+        None => kopiur_api::expand::identity_source_path(config, None)
+            .map_err(|e| Error::Validation(e.to_string()))?,
     };
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
@@ -2231,9 +2592,7 @@ pub fn config_identity_for_path(
         defaults,
         labels: config.metadata.labels.as_ref(),
         annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: resolved_path.as_deref(),
     };
     let mut resolved =
         kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))?;
@@ -2291,10 +2650,9 @@ fn resolve_config_identity(
     defaults: Option<&kopiur_api::IdentityDefaults>,
 ) -> Result<kopiur_api::snapshot_policy::ResolvedPolicy> {
     use kopiur_api::snapshot_policy::{ResolvedPolicy, ResolvedPolicySource};
-    let first = config.spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    let source_path_override = first.and_then(|s| s.source_path_override.clone());
+    // THE shared derivation (#451).
+    let source_path = kopiur_api::expand::identity_source_path(config, None)
+        .map_err(|e| Error::Validation(e.to_string()))?;
     let inputs = kopiur_api::IdentityInputs {
         object_name: &config.name_any(),
         namespace,
@@ -2302,23 +2660,22 @@ fn resolve_config_identity(
         defaults,
         labels: config.metadata.labels.as_ref(),
         annotations: config.metadata.annotations.as_ref(),
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: source_path.as_deref(),
     };
     let identity =
         kopiur_api::resolve_identity(&inputs).map_err(|e| Error::Validation(e.to_string()))?;
+    // Per-source `status.resolved.sources[]` rows, also through the shared
+    // derivation (#451): the mirror a human reads must show the path kopia
+    // actually records, `/stream/<fileName>` included — the old inline
+    // `override → /pvc/<name> → nfs.path` chain left a stream source's row blank.
     let sources = config
         .spec
         .sources
         .iter()
-        .map(|s| ResolvedPolicySource {
+        .enumerate()
+        .map(|(index, s)| ResolvedPolicySource {
             pvc: s.pvc.as_ref().map(|p| format!("{namespace}/{}", p.name)),
-            source_path: s
-                .source_path_override
-                .clone()
-                .or_else(|| s.pvc.as_ref().map(|p| format!("/pvc/{}", p.name)))
-                .or_else(|| s.nfs.as_ref().map(|n| n.path.clone())),
+            source_path: kopiur_api::expand::source_kopia_path(s, index, namespace),
         })
         .collect();
     Ok(ResolvedPolicy {
@@ -2360,6 +2717,7 @@ mod tests {
                 deletion_policy: None,
                 on_schedule_delete: None,
                 pin: false,
+                mover: None,
                 description: None,
             },
         );
@@ -2694,6 +3052,7 @@ mod tests {
                     deletion_policy: None,
                     on_schedule_delete: None,
                     pin: false,
+                    mover: None,
                     description: None,
                 },
             );
@@ -2974,6 +3333,7 @@ mod tests {
                 deletion_policy: None,
                 on_schedule_delete: None,
                 pin: false,
+                mover: None,
                 description: None,
             },
         );
@@ -3331,6 +3691,80 @@ mod tests {
         assert!(!multi_repo_has_success(&rows, "Repository/apps/repo-c"));
     }
 
+    #[test]
+    fn member_has_success_gates_each_member_on_its_own_backup() {
+        // #456: a PVC that joins the selector LATER must stay gated until ITS
+        // OWN first backup succeeds. Unlocking it because a sibling succeeded
+        // reopens the false pass — quick verify on a path with no manifests
+        // matches zero and exits 0.
+        let policy: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "apps" },
+            "spec": {
+                "repository": { "name": "r" },
+                "sources": [{
+                    "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+                    "sourcePathStrategy": "PvcName",
+                }],
+            },
+        }))
+        .expect("typed policy");
+        let member = |b: Snapshot, pvc: &str| {
+            let mut b = b;
+            b.metadata.namespace = Some("apps".into());
+            b.spec.source = Some(
+                serde_json::from_value(serde_json::json!({
+                    "sourceIndex": 0,
+                    "target": { "pvc": { "namespace": "apps", "name": pvc } },
+                }))
+                .expect("typed source pin"),
+            );
+            b
+        };
+        let rows = vec![
+            member(succeeded_backup("a1", at(2026, 5, 1)), "data-a"),
+            member(failed_backup("b1", at(2026, 5, 1)), "data-b"),
+        ];
+        assert!(member_has_success(&policy, &rows, None, "/pvc/data-a"));
+        assert!(
+            !member_has_success(&policy, &rows, None, "/pvc/data-b"),
+            "a FAILED run is not a verifiable snapshot"
+        );
+        assert!(
+            !member_has_success(&policy, &rows, None, "/pvc/data-c"),
+            "a member with no child of its own must stay gated even though a sibling \
+             succeeded — that is the #456 false pass"
+        );
+        // Multi-repo: a child counts only for the repository it is pinned to.
+        let pinned = vec![pin(
+            member(succeeded_backup("a1", at(2026, 5, 1)), "data-a"),
+            "repo-a",
+        )];
+        assert!(member_has_success(
+            &policy,
+            &pinned,
+            Some("Repository/apps/repo-a"),
+            "/pvc/data-a"
+        ));
+        assert!(!member_has_success(
+            &policy,
+            &pinned,
+            Some("Repository/apps/repo-b"),
+            "/pvc/data-a"
+        ));
+        // A child from an older recipe shape (no source pin) derives no path
+        // under a selector source, so it never false-matches a member.
+        let legacy = vec![member_less(succeeded_backup("old", at(2026, 5, 1)))];
+        assert!(!member_has_success(&policy, &legacy, None, "/pvc/data-a"));
+    }
+
+    /// A child with no `spec.source` pin, namespaced like the rest.
+    fn member_less(mut b: Snapshot) -> Snapshot {
+        b.metadata.namespace = Some("apps".into());
+        b
+    }
+
     // --- #382 M3: store-served enumeration data-safety boundaries -----------
 
     /// C1: with a store-served population, an externally-deleted-but-still-
@@ -3552,6 +3986,382 @@ mod tests {
         assert!(
             !requests.iter().any(|r| r.starts_with("POST ")),
             "no adopted-row create may fire for a vanished candidate: {requests:?}"
+        );
+    }
+
+    // --- every identity site derives a stream policy's path (#451) ---------------
+    //
+    // Five sites re-derived the kopia source path inline from `sources.first()`'s
+    // `pvc`/`nfs`. A `stream` source has NEITHER, so each resolved a pathless (or
+    // `/data`) identity while the backup side recorded `/stream/<fileName>`. All the
+    // consequences were silent: `fromPolicy` restores reported SnapshotNotFound,
+    // quick verification verified a path with no manifests and exited 0, the
+    // collision webhook collapsed every stream policy onto one identity, and
+    // `adoption::identities_match` compares source paths field-by-field so a
+    // discovered stream snapshot could never be adopted.
+    //
+    // These tests pin the three sites that live in this file. The other two are
+    // pinned in `verification.rs` and `crates/webhook/src/identity_collision.rs`;
+    // the shared derivation itself in `kopiur_api::expand`.
+
+    /// A policy whose single source streams `postgres.sql` out of a command, as the
+    /// API server delivers it (schema defaults materialized).
+    fn stream_config() -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "db" },
+            "spec": {
+                "repository": { "kind": "Repository", "name": "nas" },
+                "sources": [{
+                    "stream": {
+                        "fileName": "postgres.sql",
+                        "workloadExec": {
+                            "podSelector": { "matchLabels": { "app": "postgres" } },
+                            "command": ["sh", "-ec", "pg_dumpall"],
+                        },
+                    },
+                    "readOnly": true,
+                    "sourcePathStrategy": "PvcName",
+                }],
+            },
+        }))
+        .expect("a valid stream SnapshotPolicy")
+    }
+
+    #[test]
+    fn config_identity_of_a_stream_policy_is_the_stream_root() {
+        let id = config_identity(&stream_config(), "db", None).expect("resolves");
+        assert_eq!(id.source_path.as_deref(), Some("/stream/postgres.sql"));
+        assert_eq!(
+            kopiur_api::identity_string(&id),
+            "pg@db:/stream/postgres.sql"
+        );
+    }
+
+    #[test]
+    fn config_identity_for_path_of_a_stream_policy_needs_no_caller_path() {
+        // `None` is what a stream restore passes — there is no per-PVC path to derive.
+        // It must NOT fall through to the `/data` fallback.
+        let id = config_identity_for_path(&stream_config(), "db", None, None).expect("resolves");
+        assert_eq!(id.source_path.as_deref(), Some("/stream/postgres.sql"));
+        assert_ne!(id.source_path.as_deref(), Some("/data"));
+    }
+
+    #[test]
+    fn resolved_status_mirrors_a_stream_policys_source_path() {
+        let resolved = resolve_config_identity(&stream_config(), "db", None).expect("resolves");
+        assert_eq!(
+            resolved
+                .identity
+                .as_ref()
+                .and_then(|i| i.source_path.as_deref()),
+            Some("/stream/postgres.sql")
+        );
+        // The per-source row a human reads in `status.resolved.sources[]` — blank
+        // before this, because the old chain only knew `override → pvc → nfs`.
+        assert_eq!(resolved.sources.len(), 1);
+        assert_eq!(
+            resolved.sources[0].source_path.as_deref(),
+            Some("/stream/postgres.sql")
+        );
+        assert_eq!(resolved.sources[0].pvc, None);
+    }
+
+    /// A discovered `/stream/...` snapshot is adoptable only because the policy side
+    /// now resolves the same path: `adoption::identities_match` compares
+    /// `source_path` field-by-field, so a pathless policy identity could never match
+    /// a kopia row (kopia rows always carry a path).
+    #[test]
+    fn a_stream_policys_identity_matches_a_discovered_stream_row() {
+        let policy_id = config_identity(&stream_config(), "db", None).expect("resolves");
+        let discovered = kopiur_api::common::ResolvedIdentity {
+            username: "pg".into(),
+            hostname: "db".into(),
+            source_path: Some("/stream/postgres.sql".into()),
+        };
+        assert_eq!(policy_id.username, discovered.username);
+        assert_eq!(policy_id.hostname, discovered.hostname);
+        assert_eq!(
+            policy_id.source_path, discovered.source_path,
+            "an unadoptable stream snapshot is exactly a source_path mismatch here"
+        );
+    }
+
+    // --- F2 / S1: the verification status decision -----------------------------
+
+    /// A `SnapshotPolicy` the way the apiserver hands one over — a decoded JSON
+    /// body into the typed struct, never `serde_yaml` straight into a typed
+    /// value (0.9 mis-encodes externally-tagged enums).
+    fn verify_policy(sources: serde_json::Value, status: serde_json::Value) -> SnapshotPolicy {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "ns", "generation": 4 },
+            "spec": {
+                "repository": { "name": "r" },
+                "sources": sources,
+                "verification": { "quick": { "schedule": { "cron": "*/5 * * * *" } } },
+            },
+            "status": status,
+        }))
+        .expect("typed SnapshotPolicy")
+    }
+
+    fn selector_sources() -> serde_json::Value {
+        serde_json::json!([{
+            "pvcSelector": { "labelSelector": { "matchLabels": { "app": "web" } } },
+        }])
+    }
+
+    /// A policy that verified three PVCs cleanly and holds their stamps.
+    fn a_verified_three_pvc_policy() -> SnapshotPolicy {
+        verify_policy(
+            selector_sources(),
+            serde_json::json!({
+                "lastVerified": "2026-09-16T02:00:00+00:00",
+                "verificationStamps": {
+                    "#aaaaaaaaaaaa": "2026-09-16T02:00:00+00:00",
+                    "#bbbbbbbbbbbb": "2026-09-16T02:05:00+00:00",
+                    "#cccccccccccc": "2026-09-16T02:10:00+00:00",
+                },
+            }),
+        )
+    }
+
+    fn rref(name: &str) -> RepositoryRef {
+        RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::Repository,
+            name: name.into(),
+            namespace: Some("ns".into()),
+        }
+    }
+
+    fn member(tag: &str, path: &str) -> crate::verification::VerifyMember {
+        crate::verification::VerifyMember {
+            source_path: Some(path.into()),
+            member_tag: Some(tag.into()),
+        }
+    }
+
+    fn body_of(policy: &SnapshotPolicy, folded: &VerifyFold) -> serde_json::Value {
+        let r = rref("r");
+        final_status_body(policy, Some(4), Vec::new(), None, &[&r], folded).expect("status body")
+    }
+
+    /// The distinction F2 and S1 both turn on. "Verification is configured and
+    /// the selector matched nothing" is NOT "this policy has no member
+    /// dimension", and collapsing the two into one `None` is what let a
+    /// one-reconcile label blip destroy weeks of stamps.
+    #[test]
+    fn the_fold_distinguishes_no_member_dimension_from_a_selector_that_matched_nothing() {
+        let policy = a_verified_three_pvc_policy();
+        let r = rref("r");
+        // Configured + matched nothing, single-repo AND multi-repo: both are
+        // Undecided. The multi-repo branch used to fold with an empty member
+        // set, which made `member_keys` empty and pruned every `#<tag>` stamp.
+        for is_multi in [false, true] {
+            assert!(
+                matches!(
+                    fold_multi_verification(&policy, is_multi, &[&r], &[], "ns"),
+                    VerifyFold::Undecided
+                ),
+                "is_multi={is_multi}"
+            );
+        }
+        // No member dimension and one repository: the classic flat shape.
+        let flat_policy = verify_policy(
+            serde_json::json!([{ "pvc": { "name": "data" } }]),
+            serde_json::json!({}),
+        );
+        let one_flat_member = [crate::verification::VerifyMember {
+            source_path: None,
+            member_tag: None,
+        }];
+        assert!(matches!(
+            fold_multi_verification(&flat_policy, false, &[&r], &one_flat_member, "ns"),
+            VerifyFold::Flat
+        ));
+        // And a live grid is still a grid.
+        assert!(matches!(
+            fold_multi_verification(
+                &policy,
+                false,
+                &[&r],
+                &[member("aaaaaaaaaaaa", "/pvc/a")],
+                "ns"
+            ),
+            VerifyFold::Grid(_)
+        ));
+    }
+
+    /// S1: the stamps are the EVIDENCE. A pass that observed nothing must not
+    /// delete them — `tier_after(None)` anchors a year in the past, so the next
+    /// pass would prefer DEEP for every member and run N full scratch restores
+    /// at `deep.capacity` each for volumes verified yesterday.
+    ///
+    /// F2: and it must not leave a `lastVerified` claim standing over deleted
+    /// evidence either. Naming NOTHING keeps claim and evidence consistent, and
+    /// the frozen timestamp keeps ageing into the staleness alert.
+    #[test]
+    fn a_selector_that_matched_nothing_makes_no_verification_status_decision() {
+        let policy = a_verified_three_pvc_policy();
+        let nas = rref("nas");
+        let offsite = rref("offsite");
+        // Both dimensions, driven through the REAL fold — the single-repo
+        // branch destroyed the map wholesale, the multi-repo branch destroyed
+        // it one `null` key at a time.
+        for targets in [vec![&nas], vec![&nas, &offsite]] {
+            let is_multi = targets.len() > 1;
+            let folded = fold_multi_verification(&policy, is_multi, &targets, &[], "ns");
+            let body = final_status_body(&policy, Some(4), Vec::new(), None, &targets, &folded)
+                .expect("status body");
+            for key in ["verificationStamps", "lastVerified", "verification"] {
+                assert!(
+                    body.get(key).is_none(),
+                    "an observation-free pass must not name {key} at all (is_multi={is_multi}): \
+                     {body}"
+                );
+            }
+            // The rest of the status write is untouched — this is not a bail-out.
+            assert_eq!(body["observedGeneration"], 4);
+            assert!(body.get("repositorySummary").is_some());
+        }
+    }
+
+    /// The other half of the distinction: a genuine multi→single spec edit still
+    /// retires the multi-only surfaces exactly once, so an `Undecided` arm that
+    /// swallowed this case would leave them forever.
+    #[test]
+    fn the_flat_arm_still_retires_the_multi_only_surfaces_once() {
+        let policy = a_verified_three_pvc_policy();
+        let body = body_of(&policy, &VerifyFold::Flat);
+        assert!(body["verificationStamps"].is_null(), "{body}");
+        // ... and stays silent when there is nothing to retire.
+        let fresh = verify_policy(selector_sources(), serde_json::json!({}));
+        let body = body_of(&fresh, &VerifyFold::Flat);
+        assert!(body.get("verificationStamps").is_none());
+        assert!(body.get("verification").is_none());
+    }
+
+    /// The grid arm keeps pruning dead cells — the `Undecided` fix must not make
+    /// a genuinely removed member's stamp immortal. As soon as the selector
+    /// matches ANYTHING again, `stamp_key_live` reaps the orphans.
+    #[test]
+    fn the_grid_arm_still_prunes_the_stamp_of_a_member_that_is_really_gone() {
+        let policy = a_verified_three_pvc_policy();
+        let folded = fold_multi_verification(
+            &policy,
+            false,
+            &[&rref("r")],
+            // `#bbbbbbbbbbbb` and `#cccccccccccc` are no longer matched.
+            &[member("aaaaaaaaaaaa", "/pvc/a")],
+            "ns",
+        );
+        assert!(matches!(folded, VerifyFold::Grid(_)));
+        let body = body_of(&policy, &folded);
+        let stale = &body["verificationStamps"];
+        assert!(
+            stale["#bbbbbbbbbbbb"].is_null() && stale["#cccccccccccc"].is_null(),
+            "{body}"
+        );
+        assert!(
+            stale.get("#aaaaaaaaaaaa").is_none(),
+            "the LIVE member's stamp must survive the prune: {body}"
+        );
+        // One member with a stamp = the whole (1 x 1) grid is verified, so the
+        // flat field is that stamp.
+        assert_eq!(body["lastVerified"], "2026-09-16T02:00:00+00:00", "{body}");
+    }
+
+    /// A member with no stamp yet leaves the fold incomplete, and the flat claim
+    /// is cleared rather than inherited from the members that HAVE verified.
+    #[test]
+    fn a_grid_with_an_unverified_member_clears_the_flat_claim_once() {
+        let policy = a_verified_three_pvc_policy();
+        let folded = fold_multi_verification(
+            &policy,
+            false,
+            &[&rref("r")],
+            &[
+                member("aaaaaaaaaaaa", "/pvc/a"),
+                member("dddddddddddd", "/pvc/d"),
+            ],
+            "ns",
+        );
+        let body = body_of(&policy, &folded);
+        assert!(
+            body["lastVerified"].is_null(),
+            "a partially verified policy must not display a reassuring timestamp: {body}"
+        );
+    }
+
+    // --- verify_cell_anchor ----------------------------------------------------
+
+    #[test]
+    fn a_fan_out_member_anchors_on_its_own_stamp_never_a_siblings_or_the_flat_field() {
+        let policy = a_verified_three_pvc_policy();
+        let stamps: BTreeMap<String, String> = [
+            ("#aaaaaaaaaaaa", "2026-09-16T02:00:00+00:00"),
+            ("#bbbbbbbbbbbb", "2026-09-16T02:05:00+00:00"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let anchor = |key: Option<&str>| {
+            verify_cell_anchor(&policy, None, &stamps, key, true, None, "ns")
+                .map(|t| t.to_rfc3339())
+        };
+        assert_eq!(
+            anchor(Some("#aaaaaaaaaaaa")).as_deref(),
+            Some("2026-09-16T02:00:00+00:00")
+        );
+        assert_eq!(
+            anchor(Some("#bbbbbbbbbbbb")).as_deref(),
+            Some("2026-09-16T02:05:00+00:00"),
+            "a sibling's recent verify must never defer this member's due slot"
+        );
+        // A member with no stamp is UNVERIFIED — it must not inherit the flat
+        // field, which is what deferred the first real verification by a whole
+        // deep period before #456.
+        assert_eq!(
+            anchor(Some("#dddddddddddd")),
+            None,
+            "an unstamped member has no anchor, even though status.lastVerified is set"
+        );
+    }
+
+    #[test]
+    fn a_non_fan_out_cell_anchors_on_its_repo_entry_and_the_classic_shape_on_the_flat_field() {
+        let policy = a_verified_three_pvc_policy();
+        let stamps = BTreeMap::new();
+        // Multi-repo, single member: the folded per-repo entry, so a fresh repo
+        // B is immediately due without repo A's recent verify deferring it.
+        let folded = fold_multi_verification(
+            &policy,
+            true,
+            &[&rref("nas"), &rref("offsite")],
+            &[crate::verification::VerifyMember {
+                source_path: None,
+                member_tag: None,
+            }],
+            "ns",
+        );
+        let VerifyFold::Grid(mv) = &folded else {
+            panic!("a multi-repo policy folds to a grid, got a non-grid fold");
+        };
+        let key = kopiur_api::common::repo_key(&rref("nas"), "ns");
+        assert_eq!(
+            verify_cell_anchor(&policy, Some(mv), &stamps, None, false, Some(&key), "ns"),
+            None,
+            "no stamp for this repository yet, so no anchor — NOT the flat field"
+        );
+        // The classic single-repo, single-member cell: the flat field, verbatim.
+        assert_eq!(
+            verify_cell_anchor(&policy, None, &stamps, None, false, None, "ns")
+                .map(|t| t.to_rfc3339())
+                .as_deref(),
+            Some("2026-09-16T02:00:00+00:00")
         );
     }
 }

@@ -32,7 +32,8 @@ pub use kopiur_api::consts::{
     SCHEDULE_FANOUT_CAPPED_CONDITION, SCHEDULE_LABEL, SCHEDULE_RUNNABLE_CONDITION,
     SKIP_SNAPSHOT_CLEANUP_ANNOTATION, SLOT_ACQUIRED_REASON, SNAPSHOT_CLEANUP_FINALIZER,
     SNAPSHOT_ID_LABEL, SOURCE_PVC_AVAILABLE_CONDITION, SOURCE_PVC_MISSING_REASON,
-    STALLED_CONDITION, WAITING_FOR_SLOT_REASON,
+    STALLED_CONDITION, STREAM_EXEC_ANNOTATION, STREAM_EXEC_NOT_PERMITTED_REASON,
+    WAITING_FOR_SLOT_REASON,
 };
 
 /// `reason` when a backup is held in `Pending` (then `Failed` after the timeout)
@@ -115,6 +116,28 @@ pub const VERIFY_SLOT_ANNOTATION: &str = "kopiur.home-operations.com/verify-slot
 /// older operator (which lack this label) still hold the gate across an
 /// upgrade.
 pub const VERIFY_REPO_LABEL: &str = "kopiur.home-operations.com/verify-repo";
+
+/// Label tying a verification Job to the ONE selector-expanded member (one
+/// matched PVC's derived kopia source path) it verifies (#456 fan-out). Value:
+/// the stable 12-hex member tag ([`crate::verification::member_tag`]) over that
+/// DERIVED source path — label-safe where the raw `/pvc/<name>` path (slashes)
+/// is not.
+///
+/// Stamped on every member of a `pvcSelector` policy — including a selector
+/// that currently matches exactly ONE PVC, which is deliberately NOT collapsed
+/// to the flat shape (see [`crate::verification::VerifyMember::member_tag`]).
+/// Absent only for a non-selector source (`pvc:`/`nfs:`), whose Job names,
+/// labels and status stamps therefore stay byte-identical to every prior
+/// operator.
+///
+/// Deliberately **not** part of the single-flight LIST selector. An in-flight
+/// verify Job minted by an OLDER operator carries neither this label nor
+/// [`VERIFY_REPO_LABEL`], so narrowing the LIST by it would stop seeing that
+/// Job and spawn N fresh ones beside it — for the deep tier, N+1 concurrent
+/// scratch restores. The gate therefore LISTs without it and filters
+/// client-side (`verification::job_blocks_cell`), where an unlabelled
+/// non-terminal Job still holds every cell's slot.
+pub const VERIFY_MEMBER_LABEL: &str = "kopiur.home-operations.com/verify-member";
 
 /// `COMPONENT_LABEL` value for replication mover Jobs (ADR-0005 §13(d)).
 pub const REPLICATION_COMPONENT: &str = "replication";
@@ -446,6 +469,9 @@ pub const KOPIA_UI_FLAG: &str = "features.kopiaUi.enabled";
 
 /// Event `action` (remediation hint) for a refused privileged mover.
 pub const ALLOW_PRIVILEGED_MOVER_ACTION: &str = "AnnotateNamespaceForPrivilegedMovers";
+
+/// Event `action` (remediation hint) for a refused stream-source mover.
+pub const ALLOW_STREAM_EXEC_ACTION: &str = "AnnotateNamespaceForStreamExec";
 /// `Snapshot` condition for CSI source staging (`copyMethod: Snapshot`/`Clone`,
 /// ADR §3.3): `True` once the staged VolumeSnapshot/PVC is ready for the mover;
 /// `False` while waiting (reason [`STAGING_WAITING_REASON`]) or on a preflight
@@ -568,6 +594,13 @@ pub const RECORDED_APPLIED_REASON: &str = "RecordedApplied";
 /// Event `action` (remediation hint) when recorded-identity inherit cannot proceed or
 /// contributed nothing: pin `mover.securityContext` explicitly (or drop the inherit).
 pub const SET_EXPLICIT_MOVER_CONTEXT_ACTION: &str = "SetExplicitMoverSecurityContext";
+/// Event `action` (remediation hint) for the `SecurityContextResolved=False` hold
+/// ([`kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON`], #464): a live-pod
+/// inherit resolved nothing and no fallback identity is pinned. Names BOTH ways
+/// out, because which one applies is the user's call — bring the workload back up
+/// (or fix the selector), or pin `mover.securityContext.runAsUser` so the run
+/// proceeds on an explicit identity while the workload is down.
+pub const SCALE_WORKLOAD_OR_PIN_MOVER_UID_ACTION: &str = "ScaleWorkloadOrPinMoverRunAsUser";
 /// `Restore` condition reporting whether the *future* consumer of the restore target PVC
 /// will be able to read what the mover writes (a securityContext-only heuristic; no runtime
 /// layer exists for restore since the consumer may not exist yet). Same tri-state semantics

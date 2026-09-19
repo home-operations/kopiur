@@ -49,6 +49,21 @@ const MOVER_CLUSTERROLE_NAME: &str = "kopiur-mover";
 /// ServiceAccount the controller mints per namespace for snapshot-replication
 /// Jobs alone (`io::ensure_snapshot_replication_mover_identity`).
 const SNAPSHOT_REPLICATION_MOVER_NAME: &str = "kopiur-snapshot-replication-mover";
+/// The dedicated stream-source mover role.
+///
+/// A `stream` source execs a command in a running workload pod, which needs
+/// `pods/exec` — a verb the generic `kopiur-mover` role must NEVER hold: every
+/// mover Job in the namespace runs as that SA, so granting it there would let any
+/// backup Job run arbitrary commands in any pod in the namespace. Same separation,
+/// and same reasoning, as the snapshot-replication role above: the verbs live on
+/// this role, bound only to the dedicated `kopiur-stream-mover` ServiceAccount the
+/// controller mints for stream Jobs (`io::ensure_stream_mover_identity`).
+///
+/// `resourceNames` cannot narrow this further: the pod name is not known until the
+/// selector resolves at run time, and RBAC has no label-selector form. The scope
+/// bound is therefore the NAMESPACE (the RoleBinding is namespace-local), which is
+/// why the feature additionally requires a cluster-admin namespace opt-in.
+const STREAM_MOVER_NAME: &str = "kopiur-stream-mover";
 /// Name of the leader-election Role + RoleBinding the cluster artifact pairs
 /// with its ClusterRole (the Lease is namespace-local; see [`leader_election_rules`]).
 const LEADER_ROLE_NAME: &str = "kopiur-leader-election";
@@ -401,6 +416,21 @@ fn snapshot_replication_mover_rules() -> Vec<PolicyRule> {
     ]
 }
 
+/// Rules for the dedicated stream-source mover.
+///
+/// The generic mover rules PLUS the two the exec needs:
+/// - `pods` get/list: resolve the selector to exactly one running pod.
+/// - `pods/exec` create/get: open the exec websocket.
+///
+/// **Deliberately NOT a widening of the generic mover role** — see
+/// [`STREAM_MOVER_NAME`].
+fn stream_mover_rules(cluster: bool) -> Vec<PolicyRule> {
+    let mut rules = mover_rules(cluster);
+    rules.push(rule(&[""], &["pods".into()], &["get", "list"]));
+    rules.push(rule(&[""], &["pods/exec".into()], &["create", "get"]));
+    rules
+}
+
 /// Splice `apiVersion`/`kind` into a serialized k8s-openapi object and render
 /// it as a YAML document body (no leading header).
 fn render<T: Serialize + Resource>(obj: &T) -> Result<String> {
@@ -624,7 +654,18 @@ fn mover_cluster_artifact() -> Result<Artifact> {
         rules: Some(snapshot_replication_mover_rules()),
         ..Default::default()
     };
-    let content = document(&[render(&clusterrole)?, render(&srepl_clusterrole)?]);
+    // The dedicated stream-source mover role ships alongside for the same reason:
+    // `pods/exec` must never reach the SA every ordinary mover Job runs as.
+    let stream_clusterrole = ClusterRole {
+        metadata: metadata(STREAM_MOVER_NAME, None),
+        rules: Some(stream_mover_rules(true)),
+        ..Default::default()
+    };
+    let content = document(&[
+        render(&clusterrole)?,
+        render(&srepl_clusterrole)?,
+        render(&stream_clusterrole)?,
+    ]);
     Ok(Artifact::new(
         "rbac/mover-clusterrole.yaml".to_string(),
         content,
@@ -648,7 +689,11 @@ fn mover_namespaced_artifact() -> Result<Artifact> {
         metadata: metadata(SNAPSHOT_REPLICATION_MOVER_NAME, Some(DEFAULT_NAMESPACE)),
         rules: Some(snapshot_replication_mover_rules()),
     };
-    let content = document(&[render(&role)?, render(&srepl_role)?]);
+    let stream_role = Role {
+        metadata: metadata(STREAM_MOVER_NAME, Some(DEFAULT_NAMESPACE)),
+        rules: Some(stream_mover_rules(false)),
+    };
+    let content = document(&[render(&role)?, render(&srepl_role)?, render(&stream_role)?]);
     Ok(Artifact::new("rbac/mover-role.yaml".to_string(), content))
 }
 

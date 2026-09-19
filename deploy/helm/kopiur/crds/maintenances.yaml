@@ -618,7 +618,16 @@ spec:
                     nullable: true
                     type: integer
                   lastContentReclaimedBytes:
-                    description: Bytes of storage reclaimed by the most recent run of this kind.
+                    description: |-
+                      Bytes of backend storage the most recent run of this kind actually freed:
+                      the blobs kopia deleted (unreferenced packs, superseded epoch indexes and
+                      expired logs), summed from the run history `kopia maintenance info`
+                      reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only
+                      marks contents deleted in the index and frees no storage until a later run
+                      removes the blobs. Absent when the run reclaimed nothing measurable — a
+                      quick run on an epoch-enabled repository only advances and compacts
+                      epochs, so there is no figure to report; `0` always means a measured zero,
+                      never "unknown".
                     format: int64
                     nullable: true
                     type: integer
@@ -670,6 +679,23 @@ spec:
                 format: int64
                 nullable: true
                 type: integer
+              observedIndexBlobs:
+                description: Content-index blob count re-counted right after the most recent successful run.
+                nullable: true
+                properties:
+                  count:
+                    default: 0
+                    description: Number of content-index blobs (`kopia index list`) after the run.
+                    format: int64
+                    type: integer
+                  observedAt:
+                    default: ''
+                    description: |-
+                      RFC3339 instant the recount was taken. What makes this observation
+                      comparable against the repository's own `storageStats.indexBlobCountAt`,
+                      so whichever is newer wins rather than whichever was written last.
+                    type: string
+                type: object
               ownership:
                 description: Current lease holder, if the lease has been claimed.
                 nullable: true
@@ -693,7 +719,16 @@ spec:
                     nullable: true
                     type: integer
                   lastContentReclaimedBytes:
-                    description: Bytes of storage reclaimed by the most recent run of this kind.
+                    description: |-
+                      Bytes of backend storage the most recent run of this kind actually freed:
+                      the blobs kopia deleted (unreferenced packs, superseded epoch indexes and
+                      expired logs), summed from the run history `kopia maintenance info`
+                      reports. It deliberately EXCLUDES kopia's snapshot-GC figure, which only
+                      marks contents deleted in the index and frees no storage until a later run
+                      removes the blobs. Absent when the run reclaimed nothing measurable — a
+                      quick run on an epoch-enabled repository only advances and compacts
+                      epochs, so there is no figure to report; `0` always means a measured zero,
+                      never "unknown".
                     format: int64
                     nullable: true
                     type: integer

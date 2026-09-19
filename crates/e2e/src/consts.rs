@@ -58,6 +58,8 @@ pub const HOSTPATH_REPOS_ROOT: &str = "/kopiur-e2e/repos";
 /// that reuse them). The mise `e2e-node-seed` task creates `HOSTPATH_REPOS_ROOT/<s>`
 /// at 0777 for each — keep the two lists in lockstep.
 pub const REPO_SUBPATHS: &[&str] = &[
+    "stream",
+    "stream-fail",
     "moverdefaults",
     "scc-shadow",
     "recmeta",
@@ -105,6 +107,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // #346 multi-PVC fan-out + VolumeGroupSnapshot group staging.
     "multipvc-fanout",
     "multipvc-group",
+    // #456 verification fan-out (crates/e2e/tests/verification_fanout.rs): the
+    // scenario asserts a stamp PER MEMBER and that the flat `lastVerified` is
+    // their MIN, so no other scenario's verify traffic may write into this repo.
+    "vfyfanout",
     // #443: the populator fan-out scenario needs its own repo so no other
     // scenario's snapshots land under the same identity and confuse a
     // per-member path assertion.
@@ -353,9 +359,21 @@ pub const MINIO_PASS: &str = "minioadmin123";
 /// via the backend's `tls.disableTls`).
 pub const MINIO_ENDPOINT: &str = "minio.kopiur-e2e.svc.cluster.local:9000";
 /// Container image for MinIO (preloaded into the node by `e2e-cluster-up`).
-pub const MINIO_IMAGE: &str = "minio/minio:latest";
-/// Container image for the `mc` client used to create buckets.
-pub const MC_IMAGE: &str = "minio/mc:latest";
+///
+/// **quay.io, pinned to an immutable RELEASE tag — not Docker Hub, not `latest`.**
+/// MinIO withdrew their images from Docker Hub: `docker.io/minio/minio` now 404s
+/// on the Hub API and an in-cluster pull fails with "pull access denied,
+/// repository does not exist or may require authorization". That took out every
+/// S3-backed e2e shard at once, and only after a 420s readiness timeout per
+/// attempt, because the preload helper is best-effort and the pods fall back to
+/// an in-cluster pull that also fails. quay.io/minio is the upstream's own
+/// remaining public registry.
+///
+/// Keep in lockstep with the `preload` lines in `crates/e2e/mise.toml`.
+pub const MINIO_IMAGE: &str = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z";
+/// Container image for the `mc` client used to create buckets. Same registry and
+/// pinning rationale as [`MINIO_IMAGE`].
+pub const MC_IMAGE: &str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z";
 /// Buckets the bucket-creator Pod ensures (idempotent `mc mb --ignore-existing`).
 pub const BUCKETS: &[&str] = &[
     "kopiur",

@@ -203,6 +203,14 @@ jobs:
           - shard: hooks-retention
             bins: "hooks retention policy_knobs adoption"
             backends: true
+          # Streamed command sources: the mover execs into a workload pod and pipes
+          # stdout into kopia. Its own shard because the scenarios mutate the
+          # NAMESPACE annotation that gates stream-exec (on, then off, then on
+          # again) — a binary sharing the cluster could see a Snapshot parked or
+          # released by someone else's edit rather than its own.
+          - shard: stream-sources
+            bins: "stream_sources"
+            backends: false
           - shard: reshape-async
             bins: "verification replication"
             backends: false
@@ -257,8 +265,12 @@ jobs:
           # external-snapshotter 8.2, but still default-OFF) — a stack shape no
           # other shard uses, and one that would drag every CSI shard along if it
           # regressed.
+          # `verification_fanout` (#456) rides this shard rather than
+          # `reshape-async`: it needs TWO labelled source PVCs a `pvcSelector`
+          # can fan out over, and `reshape-async` provisions exactly one
+          # hostPath source PVC per namespace.
           - shard: multi-pvc
-            bins: "multi_pvc_group"
+            bins: "multi_pvc_group verification_fanout"
             backends: false
             csi: true
           # #443 populator fan-out: ONE populator Restore fills EVERY claiming

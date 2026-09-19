@@ -339,6 +339,25 @@ impl fmt::Display for KopiaErrorClass {
 /// ```
 #[derive(thiserror::Error, Debug)]
 pub enum KopiaError {
+    /// Writing kopia's OUTPUT to the consumer failed. kopia spawned and ran
+    /// fine; the sink — a `streamExec` restore's exec stdin — broke.
+    ///
+    /// Separate from [`KopiaError::Spawn`] because it used to BE `Spawn`, and
+    /// that misattribution actively cost debugging time: a `streamExec` restore
+    /// whose consumer pipe broke reported "failed to spawn kopia binary `kopia`:
+    /// broken pipe", sending the reader after a missing binary that was in fact
+    /// running. The three fallible halves of the streaming copy — the sink write,
+    /// the stderr read, and the child wait — are not interchangeable and must not
+    /// share one error.
+    #[error("streaming `{args}` into the consumer failed while writing kopia's output: {source}")]
+    OutputSink {
+        /// The kopia argv whose output was being streamed.
+        args: String,
+        /// Underlying I/O error from the SINK, not from kopia.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The kopia binary could not be spawned at all (missing binary, not
     /// executable, fork failure). Carries the OS error.
     #[error("failed to spawn kopia binary `{binary}`: {source}")]
@@ -387,6 +406,51 @@ pub enum KopiaError {
         source: serde_json::Error,
     },
 
+    /// The process feeding kopia's stdin did not finish successfully, so the
+    /// snapshot was deliberately aborted before kopia wrote any manifest.
+    ///
+    /// Distinct from [`KopiaError::NonZeroExit`]: kopia itself was fine — it was
+    /// killed on purpose. Surfacing that difference is what tells an operator
+    /// "your dump command failed" rather than "the backup tool failed".
+    #[error(
+        "the snapshot was aborted because its stdin producer failed: {detail}{}",
+        if stderr_tail.is_empty() { String::new() } else { format!(" (kopia stderr: {stderr_tail})") }
+    )]
+    StdinProducerFailed {
+        /// What went wrong with the producer, already free of any streamed data.
+        detail: String,
+        /// Bounded tail of kopia's own stderr, for context.
+        stderr_tail: String,
+    },
+
+    /// The stdin producer exited **successfully** having written ZERO bytes, so
+    /// the snapshot was aborted before any manifest was written.
+    ///
+    /// Deliberately a failure rather than an empty snapshot. A producer's exit
+    /// status cannot be trusted to catch this on its own: `pg_dump` exits 0
+    /// against an instance it cannot see any databases in, `mysqldump` exits 0
+    /// when its credentials grant nothing, and a `sh -c 'a | b'` pipeline reports
+    /// only `b`'s status. Committing the result would put a zero-byte "restore
+    /// point" into the repository that retention keeps and a restore would
+    /// cheerfully write over a live database with.
+    #[error(
+        "the snapshot was aborted because its stdin producer exited successfully but wrote no \
+         data at all — an empty dump is not a backup, so nothing was committed. Check that the \
+         command in `workloadExec.command` actually writes to stdout (a `pg_dump`/`mysqldump` \
+         can exit 0 and emit nothing when its credentials see no databases, and a `sh -c 'a | b'` \
+         pipeline reports only the LAST program's status — add `set -o pipefail`). Args: \
+         {args}{}",
+        if stderr_tail.is_empty() { String::new() } else { format!(" (kopia stderr: {stderr_tail})") }
+    )]
+    StdinProducerWroteNothing {
+        /// The kopia argv, for correlation with the Job log.
+        args: String,
+        /// Bounded tail of kopia's own stderr. NEVER the producer's stdout — that
+        /// is the user's data and this crate offers no path by which it could
+        /// reach an error message.
+        stderr_tail: String,
+    },
+
     /// We expected a JSON object/array on stdout but found none (kopia printed
     /// only progress / nothing) even though it exited **0**.
     ///
@@ -424,8 +488,33 @@ impl KopiaError {
             // retrying the same pod won't help, treat as Unknown/non-retryable.
             KopiaError::Spawn { .. } => KopiaErrorClass::Unknown,
             KopiaError::Json { .. } | KopiaError::EmptyOutput { .. } => KopiaErrorClass::Unknown,
+            // The repository was never at fault — the consumer's pipe was. Re-running
+            // re-runs the same consumer command, so this is terminal for the operator.
+            KopiaError::OutputSink { .. } => KopiaErrorClass::Unknown,
             // Timeouts are usually a slow backend → worth a retry.
             KopiaError::Timeout { .. } => KopiaErrorClass::RepositoryUnavailable,
+            // Both stdin-producer failures: the repository was never at fault —
+            // the user's dump command was. Re-running the same command would
+            // reproduce the same failure, or the same empty output, so the fix
+            // is in the workload or the policy, never in another attempt.
+            //
+            // They share ONE arm deliberately. These two comments used to sit on
+            // separate arms and drifted: one kept the honest scope below while
+            // the other went on claiming outright that the failure is not
+            // retried. Same class, same reasoning, one arm — so the claim cannot
+            // rot on only one half again.
+            //
+            // NOTE what this class does and does NOT do. It makes the failure
+            // TERMINAL for the operator: `MoverError::retry_recommended()` is
+            // false, so `status.failure.retryRecommended` says so and the
+            // controller does not treat the run as retryable. It does NOT stop
+            // the Kubernetes Job from retrying — the mover exits non-zero and the
+            // Job's own `backoffLimit` (default 2) may schedule replacement pods
+            // that re-exec the producer's command. Preventing that needs the Job
+            // DELETED, the way the wedged-pod path in `controller::snapshot`
+            // does; nothing reads `retryRecommended` today. Tracked separately.
+            KopiaError::StdinProducerFailed { .. }
+            | KopiaError::StdinProducerWroteNothing { .. } => KopiaErrorClass::Unknown,
         }
     }
 
@@ -436,6 +525,14 @@ impl KopiaError {
             // An exit-0-with-no-JSON keeps its stderr too, so `status.failure`
             // shows kopia's own words instead of a bare "class Unknown".
             KopiaError::EmptyOutput { stderr_tail, .. } if !stderr_tail.is_empty() => {
+                Some(stderr_tail.as_str())
+            }
+            // Bounded kopia stderr only. The producer's own diagnostics ride in
+            // `detail`, and its STDOUT — the backup data — is never captured at all.
+            KopiaError::StdinProducerFailed { stderr_tail, .. }
+            | KopiaError::StdinProducerWroteNothing { stderr_tail, .. }
+                if !stderr_tail.is_empty() =>
+            {
                 Some(stderr_tail.as_str())
             }
             _ => None,

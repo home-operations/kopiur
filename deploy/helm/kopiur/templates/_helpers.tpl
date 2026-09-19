@@ -89,25 +89,68 @@ Controller component name.
 {{- end }}
 
 {{/*
+The shared stem every mover identity is built from.
+
+Capped at 63 minus the LONGEST suffix any mover helper appends
+(`-snapshot-replication-mover`, 27 bytes), so appending a suffix can never push a
+name past the 63-byte DNS-1123 limit and therefore never truncates the suffix
+AWAY. That property is load-bearing for security, not cosmetics: the suffix is
+the only thing separating the `pods/exec`-carrying stream role from the generic
+mover role, and with the cap applied AFTER the suffix (as it was) a `fullname` of
+62-63 bytes rendered BOTH roles under one object name — whichever template
+rendered last won, so every ordinary mover Job could silently inherit
+`pods/exec`. Because the cap now lands on the stem, `kopiur.moverName` is exactly
+`<stem>-mover`, so the controller recovers the stem losslessly from
+`KOPIUR_MOVER_CLUSTERROLE` (`io::derived_mover_name`) and the two sides cannot
+diverge at any length.
+
+`trimSuffix "-"` drops a separator the cut may have landed on, so the stem is
+always a valid DNS-1123 label prefix. Pinned against the Rust derivation by
+`crates/controller/src/io/tests.rs::mover_identity_names_agree_with_the_chart_at_every_length`.
+*/}}
+{{- define "kopiur.moverBaseName" -}}
+{{- include "kopiur.fullname" . | trunc 36 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Mover identity. The controller mints — in each mover Job's (workload) namespace — a
 least-privilege ServiceAccount of this name bound to the mover Role/ClusterRole of
 the same name. Both names are passed to the controller via env so the
 runtime-minted objects match the chart-shipped role.
+
+MUST stay exactly `<moverBaseName>-mover`: the controller derives the two dedicated
+mover identities below by stripping that suffix off `KOPIUR_MOVER_CLUSTERROLE`.
 */}}
 {{- define "kopiur.moverName" -}}
-{{- printf "%s-mover" (include "kopiur.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- printf "%s-mover" (include "kopiur.moverBaseName" .) }}
 {{- end }}
 
 {{/*
 Dedicated snapshot-replication mover identity (issue #368). The controller
 DERIVES this name from KOPIUR_MOVER_CLUSTERROLE by replacing the `-mover`
 suffix (`io::snapshot_replication_mover_name`), so this helper MUST stay
-`<fullname>-snapshot-replication-mover` — renaming either side alone breaks the
-runtime RoleBinding's roleRef. The controller mints the same-named SA +
+`<moverBaseName>-snapshot-replication-mover` — renaming either side alone breaks
+the runtime RoleBinding's roleRef. The controller mints the same-named SA +
 RoleBinding per namespace, only for snapshot-replication mover Jobs.
 */}}
 {{- define "kopiur.snapshotReplicationMoverName" -}}
-{{- printf "%s-snapshot-replication-mover" (include "kopiur.fullname" .) | trimSuffix "-" }}
+{{- printf "%s-snapshot-replication-mover" (include "kopiur.moverBaseName" .) }}
+{{- end }}
+
+{{/*
+Dedicated stream-source mover identity. The controller DERIVES this name from
+KOPIUR_MOVER_CLUSTERROLE by replacing the `-mover` suffix
+(`io::stream_mover_name`), so this helper MUST stay
+`<moverBaseName>-stream-mover` — renaming either side alone breaks the runtime
+RoleBinding's roleRef. The controller mints the same-named SA + RoleBinding per
+namespace, only for SnapshotPolicies that use a `stream` source.
+
+This role carries `pods/exec`. It must NEVER render under the same object name as
+`kopiur.moverName`; the shared, suffix-preserving `kopiur.moverBaseName` cap is
+what guarantees that at every `fullname` length.
+*/}}
+{{- define "kopiur.streamMoverName" -}}
+{{- printf "%s-stream-mover" (include "kopiur.moverBaseName" .) }}
 {{- end }}
 
 {{/*

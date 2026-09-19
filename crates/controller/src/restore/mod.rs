@@ -303,15 +303,19 @@ async fn drive_direct_target(
     // policy carried the SAME cross-volume hazard as the populator: a pathless
     // identity matches the newest snapshot of ANY member. Exhaustive over
     // `RestoreTarget`.
-    let source_target = match &restore.spec.target {
-        RestoreTarget::Pvc(t) => kopiur_api::snapshot::PvcTargetRef {
+    // `None` for a stream target: it fills no volume, so there is nothing to
+    // derive a per-PVC path from — the identity is the policy's own
+    // `/stream/<fileName>` (see `from_policy_identity`).
+    let source_target: Option<kopiur_api::snapshot::PvcTargetRef> = match &restore.spec.target {
+        RestoreTarget::Pvc(t) => Some(kopiur_api::snapshot::PvcTargetRef {
             namespace: namespace.to_string(),
             name: t.name.clone(),
-        },
-        RestoreTarget::PvcRef(r) => kopiur_api::snapshot::PvcTargetRef {
+        }),
+        RestoreTarget::PvcRef(r) => Some(kopiur_api::snapshot::PvcTargetRef {
             namespace: r.namespace.clone().unwrap_or_else(|| namespace.to_string()),
             name: r.name.clone(),
-        },
+        }),
+        RestoreTarget::StreamExec(_) => None,
         RestoreTarget::Populator(_) => {
             return Err(Error::Invariant(
                 "DirectTarget restore reached with a populator target (should route to \
@@ -357,7 +361,7 @@ async fn drive_direct_target(
                 restore,
                 namespace,
                 wait_window.anchor(),
-                &source_target,
+                source_target.as_ref(),
                 &mut cache,
             )
             .await?
@@ -507,7 +511,7 @@ async fn drive_direct_target(
         namespace,
         name,
         selection.as_ref(),
-        &source_target,
+        source_target.as_ref(),
     )
     .await
 }
@@ -1377,7 +1381,12 @@ async fn drive_populator_fanout(
         .as_ref()
         .map(serde_json::to_value)
         .transpose()?;
-    let status = fanout_status(restore, &prev, &next, &gone);
+    // LIVE conditions base. This is the pass's only top-level status write, but
+    // `drive_one_claim` above already patched the same array from inside
+    // `run_restore_mover` (the `CredentialsAvailable` clear, the #464 inherit heal) — and a
+    // `conditions` patch REPLACES it. See `fanout_status`.
+    let base = io::live_conditions(api, name, restore).await;
+    let status = fanout_status(restore, &base, &prev, &next, &gone);
     io::patch_status_if_changed(api, name, current.as_ref(), status).await?;
 
     run_deferred_finalizers(ctx, namespace, name, finalizers).await?;
@@ -2045,11 +2054,13 @@ async fn claim_populate(
     let mut mover_in_flight = false;
     let mut record = if let Some(selection) = selection.as_ref() {
         let dispatch = RestoreDispatch {
-            target_pvc: &cc.prime_name,
-            source_target: kopiur_api::snapshot::PvcTargetRef {
+            // The populator always writes into the prime PVC it just provisioned;
+            // `target.streamExec` never routes here (it is a DirectTarget).
+            destination: RestoreDestination::Pvc(&cc.prime_name),
+            source_target: Some(kopiur_api::snapshot::PvcTargetRef {
                 namespace: namespace.to_string(),
                 name: cc.consumer_name.clone(),
-            },
+            }),
             claim_key: Some(&cc.consumer_name),
             job_reuse: cc.job_reuse,
         };
@@ -2227,25 +2238,33 @@ async fn resolve_claim_source(
         name: cc.consumer_name.clone(),
     };
     let window = claim_wait_window(cc.prev, chrono::Utc::now().timestamp());
-    let outcome =
-        match resolve_snapshot(ctx, restore, namespace, window.anchor(), &target, cache).await? {
-            SourceResolution::Resolved(outcome) => outcome,
-            // Fail CLOSED: the policy names no single volume for this claim, so
-            // restoring anything would be a guess — quite possibly with another
-            // volume's data. Scoped to THIS claim; siblings are unaffected.
-            SourceResolution::Ambiguous(msg) => {
-                return Ok(ClaimResolution::Parked(Box::new(ClaimOutcome {
-                    record: cc.record(
-                        RestoreClaimPhase::Failed,
-                        ClaimReason::SourcePathAmbiguous,
-                        msg,
-                    ),
-                    requeue: 300,
-                    event: None,
-                    after_patch: None,
-                })));
-            }
-        };
+    let outcome = match resolve_snapshot(
+        ctx,
+        restore,
+        namespace,
+        window.anchor(),
+        Some(&target),
+        cache,
+    )
+    .await?
+    {
+        SourceResolution::Resolved(outcome) => outcome,
+        // Fail CLOSED: the policy names no single volume for this claim, so
+        // restoring anything would be a guess — quite possibly with another
+        // volume's data. Scoped to THIS claim; siblings are unaffected.
+        SourceResolution::Ambiguous(msg) => {
+            return Ok(ClaimResolution::Parked(Box::new(ClaimOutcome {
+                record: cc.record(
+                    RestoreClaimPhase::Failed,
+                    ClaimReason::SourcePathAmbiguous,
+                    msg,
+                ),
+                requeue: 300,
+                event: None,
+                after_patch: None,
+            })));
+        }
+    };
     match outcome {
         Some(ResolveOutcome::Pinned(res)) => {
             *source_path = res
@@ -2690,21 +2709,34 @@ async fn drive_direct_restore(
     namespace: &str,
     name: &str,
     selection: Option<&RestoreSelection>,
-    source_target: &kopiur_api::snapshot::PvcTargetRef,
+    source_target: Option<&kopiur_api::snapshot::PvcTargetRef>,
 ) -> Result<Action> {
-    // Resolve the target PVC for the restore Job. DirectTarget is only reached for
-    // an explicit PVC target (populator routes to AwaitingClaim in the reconcile
-    // dispatch). Exhaustive over RestoreTarget so a new variant must be considered.
-    let target_pvc = match &restore.spec.target {
-        RestoreTarget::PvcRef(r) => r.name.clone(),
+    // Resolve where this restore's bytes go. DirectTarget is only reached for an
+    // explicit PVC or stream target (populator routes to AwaitingClaim in the
+    // reconcile dispatch). ONE exhaustive match over `RestoreTarget`, so a new
+    // variant cannot compile until it decides what it writes into.
+    //
+    // `DirectDestination` exists purely to OWN the PVC name: `RestoreDestination`
+    // borrows, and that borrow has to outlive the awaits between here and the
+    // dispatch below. Resolving in two matches — one producing `Option<String>`,
+    // one re-matching the target against it — is what the borrow used to force,
+    // and it cost the type-safety property: a future non-PVC variant yielding
+    // `None` compiled clean and produced a runtime `Invariant` error instead of a
+    // compile error. Owning the intermediate collapses the second match to a
+    // total, unreachable-free conversion.
+    let direct: DirectDestination<'_> = match &restore.spec.target {
+        RestoreTarget::PvcRef(r) => DirectDestination::Pvc(r.name.clone()),
         // `target.pvc` means the operator CREATES the PVC (ADR §3.6) — without
         // this the mover Job references a claim nobody made and sits Pending
         // forever (FailedScheduling: persistentvolumeclaim not found). This also
         // provisions the empty volume for the deploy-or-restore (no-snapshot) case.
         RestoreTarget::Pvc(t) => {
             ensure_restore_target_pvc(ctx, namespace, t).await?;
-            t.name.clone()
+            DirectDestination::Pvc(t.name.clone())
         }
+        // A stream target creates nothing: the mover reads one virtual file out of
+        // the snapshot and pipes it into a command's stdin.
+        RestoreTarget::StreamExec(t) => DirectDestination::Stream(t),
         RestoreTarget::Populator(_) => {
             return Err(Error::Invariant(
                 "DirectTarget restore reached with a populator target (should route to \
@@ -2713,6 +2745,7 @@ async fn drive_direct_restore(
             ));
         }
     };
+    let destination = direct.borrowed();
 
     let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
 
@@ -2751,8 +2784,8 @@ async fn drive_direct_restore(
     // The Job is named after the Restore and writes into the explicit target PVC;
     // the helper creates/tracks it, the phase writes stay here.
     let dispatch = RestoreDispatch {
-        target_pvc: &target_pvc,
-        source_target: source_target.clone(),
+        destination,
+        source_target: source_target.cloned(),
         // A direct restore keeps the classic top-level status shape: it is the
         // only writer, so there is nothing to key by claim.
         claim_key: None,
@@ -2843,11 +2876,19 @@ async fn drive_direct_restore(
         }
         MoverOutcome::Wedged { message } => {
             if phase != Some(&RestorePhase::Failed) {
+                // Live conditions base, like the three arms above: this write
+                // follows the SAME pass's launch-time condition patches (the
+                // #464 inherit heal, `SecurityContextInherited`, the
+                // `MoverPermitted` clear), and `restore_ready_status` rebuilds
+                // the whole array from its argument.
+                let Some(live) = io::live_conditions_source(api, name, restore).await else {
+                    return Ok(Action::requeue(std::time::Duration::from_secs(120)));
+                };
                 io::patch_status(
                     api,
                     name,
                     restore_ready_status(
-                        restore,
+                        &live,
                         RestorePhase::Failed,
                         MOVER_POD_WEDGED_REASON,
                         &message,
@@ -2862,23 +2903,34 @@ async fn drive_direct_restore(
 
 /// What ONE restore mover dispatch is filling, and how it reports.
 ///
-/// A struct rather than four more positional parameters because
-/// `target_pvc` and `source_target` are DIFFERENT PVCs on the populator path
+/// A struct rather than four more positional parameters because the WRITTEN
+/// destination and `source_target` are DIFFERENT PVCs on the populator path
 /// (the prime is written; the CLAIMANT is what the per-PVC kopia source path is
 /// derived from, #443) and swapping them silently restores the wrong volume.
 struct RestoreDispatch<'a> {
-    /// The PVC the mover WRITES into, mounted read-write at `/restore`: the
-    /// direct target, or a populator prime.
-    target_pvc: &'a str,
-    /// The PVC whose DATA this is. Same as `target_pvc` for a direct restore;
-    /// the claiming PVC (never the prime) for a populator. The per-PVC source
-    /// path and the recorded-identity catalog row are both keyed off it.
-    source_target: kopiur_api::snapshot::PvcTargetRef,
+    /// Where the mover puts the bytes: a PVC mounted read-write at `/restore`
+    /// (the direct target, or a populator prime), or a command's stdin.
+    destination: RestoreDestination<'a>,
+    /// The PVC whose DATA this is. Same as the destination PVC for a direct
+    /// restore; the claiming PVC (never the prime) for a populator. The per-PVC
+    /// source path and the recorded-identity catalog row are both keyed off it.
+    /// `None` for a stream destination, which fills no volume and therefore has
+    /// no per-PVC derivation — its path is the policy's own `/stream/<fileName>`.
+    source_target: Option<kopiur_api::snapshot::PvcTargetRef>,
     /// The `status.claims.<key>` the mover nests its status writes under;
     /// `None` keeps the classic top-level shape (direct restores).
     claim_key: Option<&'a str>,
     /// Whether this Job's name is re-used across runs.
     job_reuse: JobNameReuse,
+}
+
+impl<'a> RestoreDispatch<'a> {
+    /// The PVC this dispatch WRITES into, or `None` for a stream destination.
+    /// Reads at each call site as "this step needs a PVC" rather than
+    /// re-matching the destination enum.
+    fn pvc(&self) -> Option<&'a str> {
+        self.destination.pvc()
+    }
 }
 
 /// Observed state of a restore mover Job, returned by [`run_restore_mover`].
@@ -3064,6 +3116,59 @@ async fn reserve_restore_slot(
     .await
 }
 
+/// Where a direct restore writes: a mounted PVC, or a command's stdin in a
+/// running Pod. Borrowed and exhaustive, so a new [`RestoreTarget`] variant must
+/// decide how the mover Job is shaped before it compiles.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RestoreDestination<'a> {
+    /// The classic path: the mover mounts this PVC read-write at `/restore` and
+    /// kopia writes the snapshot's files into it.
+    Pvc(&'a str),
+    /// The stream path: the mover reads ONE virtual file out of the snapshot and
+    /// pipes it into a command's stdin. No volume is mounted, so none of the
+    /// PVC-shaped machinery (colocation, target-PVC securityContext assessment)
+    /// applies.
+    Stream(&'a kopiur_api::restore::StreamExecTarget),
+}
+
+/// [`RestoreDestination`] with the PVC name OWNED.
+///
+/// `RestoreDestination::Pvc` borrows a `&str`, which cannot be produced inside
+/// the same `match` that awaits `ensure_restore_target_pvc` and then outlive it.
+/// This carries the `String` so `drive_direct_restore` resolves its target in ONE
+/// exhaustive match over [`kopiur_api::restore::RestoreTarget`] and converts once,
+/// instead of matching twice with a `_` in the target position — which is how the
+/// "a new variant cannot compile until every handler accounts for it" property
+/// gets lost in practice.
+pub(super) enum DirectDestination<'a> {
+    /// The PVC the mover writes into, owned.
+    Pvc(String),
+    /// The stream consumer, borrowed from the `Restore` spec (which outlives us).
+    Stream(&'a kopiur_api::restore::StreamExecTarget),
+}
+
+impl<'a> DirectDestination<'a> {
+    /// The borrowing form. Total and exhaustive — no unreachable arm to get wrong.
+    pub(super) fn borrowed(&'a self) -> RestoreDestination<'a> {
+        match self {
+            DirectDestination::Pvc(name) => RestoreDestination::Pvc(name),
+            DirectDestination::Stream(t) => RestoreDestination::Stream(t),
+        }
+    }
+}
+
+impl<'a> RestoreDestination<'a> {
+    /// The target PVC name, or `None` for a stream destination. Used by the
+    /// PVC-only steps so each reads as "this step needs a PVC" rather than
+    /// re-matching the enum.
+    fn pvc(&self) -> Option<&'a str> {
+        match self {
+            RestoreDestination::Pvc(name) => Some(name),
+            RestoreDestination::Stream(_) => None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_restore_mover(
     ctx: &Context,
@@ -3075,7 +3180,6 @@ async fn run_restore_mover(
     dispatch: &RestoreDispatch<'_>,
 ) -> Result<MoverOutcome> {
     use k8s_openapi::api::batch::v1::Job;
-    let target_pvc = dispatch.target_pvc;
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     if let Some(job) = job_api.get_opt(job_name).await? {
         // A Job being DELETED is not THIS run's outcome — but only where the Job name is
@@ -3156,16 +3260,85 @@ async fn run_restore_mover(
     // it loads via envFrom — verifying the user-managed ones are present, or (with
     // `spec.credentialProjection`) projecting the repository's Secret(s) here owned
     // by this Restore. A problem surfaces as a clear condition + Event (ADR §4.12).
-    let mover_identity = match io::ensure_mover_identity(
-        &ctx.client,
-        namespace,
-        &[&repo.backend],
-        ctx.mover_service_account.as_deref(),
-        ctx.mover_role_kind.as_str(),
-        &ctx.mover_clusterrole,
-    )
-    .await
-    {
+    // A stream destination execs into a workload pod, so it needs the dedicated
+    // exec-capable identity AND the namespace opt-in — same reasoning, same
+    // annotation, as the backup side.
+    let uses_stream = matches!(dispatch.destination, RestoreDestination::Stream(_));
+    // EXHAUSTIVE over the three-state opt-in — see the SnapshotPolicy gate for
+    // why "not annotated" and "not allowed to look" must not be one `bool`.
+    let stream_refusal = match uses_stream {
+        false => None,
+        true => io::stream_exec_refusal(
+            io::namespace_stream_exec_opt_in(&ctx.client, namespace).await?,
+            "Restore",
+            name,
+            namespace,
+            &io::stream_mover_name(&ctx.mover_clusterrole),
+        ),
+    };
+    if let Some(msg) = stream_refusal {
+        let existing = restore
+            .status
+            .as_ref()
+            .map(|s| s.conditions.clone())
+            .unwrap_or_default();
+        let conditions = io::upsert_gate(
+            &existing,
+            &kopiur_api::gates::STREAM_EXEC_GATE,
+            &msg,
+            restore.metadata.generation,
+        );
+        // Guarded like the privileged gate: the message is stable across retries,
+        // so only a real transition should emit the Event.
+        let current = serde_json::to_value(&restore.status).ok();
+        let wrote = io::patch_status_if_changed(
+            api,
+            name,
+            current.as_ref(),
+            serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+        )
+        .await?;
+        if wrote {
+            io::publish_warning_event(
+                ctx,
+                restore,
+                kopiur_api::consts::STREAM_EXEC_NOT_PERMITTED_REASON,
+                crate::consts::ALLOW_STREAM_EXEC_ACTION,
+                &msg,
+            )
+            .await;
+        }
+        // `BlockedOnGrant`, NOT `Ok(MoverOutcome::Running { created: false })`
+        // (#451). That `Ok` was actively harmful, not merely imprecise: the
+        // caller treats a `Running` outcome as "the mover is progressing" and
+        // OVERWRITES the `Pending` phase this gate just wrote with `Restoring`,
+        // so a permission refusal was reported to the user as a restore in
+        // flight — indefinitely, since no Job exists to ever finish. The
+        // identically-shaped privileged gate below already returned
+        // `BlockedOnGrant`; this is the same error for the same reason.
+        return Err(Error::BlockedOnGrant(msg));
+    }
+    let identity_result = if uses_stream {
+        io::ensure_stream_mover_identity(
+            &ctx.client,
+            namespace,
+            &[&repo.backend],
+            &ctx.mover_clusterrole,
+            ctx.mover_role_kind.as_str(),
+        )
+        .await
+    } else {
+        io::ensure_mover_identity(
+            &ctx.client,
+            namespace,
+            &[&repo.backend],
+            ctx.mover_service_account.as_deref(),
+            ctx.mover_role_kind.as_str(),
+            &ctx.mover_clusterrole,
+        )
+        .await
+    };
+    let mover_identity = match identity_result {
         Ok(identity) => identity,
         Err(Error::MissingDependency(msg)) => {
             let existing = restore
@@ -3217,7 +3390,7 @@ async fn run_restore_mover(
         restore,
         namespace,
         dispatch_pinned_id,
-        &dispatch.source_target,
+        dispatch.source_target.as_ref(),
     )
     .await
     {
@@ -3250,8 +3423,30 @@ async fn run_restore_mover(
             report_missing_recorded_identity(restore, api, &msg, ctx).await?;
             return Err(Error::MissingRecordedIdentity(msg));
         }
+        // The LIVE-pod inherit hold (#464): `workloadSelector`/`pvcConsumer` resolved no
+        // securityContext at all AND the recipe pins no fallback identity. Its own
+        // registered gate (`SecurityContextResolved=False`, naming the selector) and the
+        // same slow structural requeue — distinct from the advisory
+        // `SecurityContextInherited` report above, which only ever describes a run that
+        // PROCEEDED.
+        Err(Error::InheritSourceMissing(msg)) => {
+            io::park_on_inherit_source_missing(api, restore, ctx, &msg).await?;
+            return Err(Error::InheritSourceMissing(msg));
+        }
         Err(e) => return Err(e),
     };
+    // The hold's healing half (#464), the instant the resolve that parks it SUCCEEDS.
+    // Mirrors the Snapshot side, for the same reason and with the same safety argument:
+    // `doctor` (`first_gate`) returns on the FIRST registered `Fail` row of an append-only
+    // array, so a stale `SecurityContextResolved=False` written earliest outranks every
+    // later gate forever — including the readiness gate's `Held` arm, which parks
+    // non-terminally with no registered row of its own and returns long before the old heal
+    // site. Every conditions writer past this point seeds from a live re-read (the
+    // `MoverOutcome` arms, the inherit/compat reporters, the clears below, and the
+    // populator's `plan::fanout_status`), which is what makes the heal durable.
+    // `io::tests::the_inherit_heal_precedes_every_non_terminal_gate_it_could_shadow`
+    // pins the ordering half.
+    io::heal_inherit_source_missing(api, restore).await?;
     let (effective_sc, effective_pod_sc) = mover_security.contexts.clone();
     let privileged_mode = restore.spec.mover.as_ref().and_then(|m| m.privileged_mode);
 
@@ -3291,12 +3486,42 @@ async fn run_restore_mover(
             .mover_service_account
             .as_deref()
             .unwrap_or(config::DEFAULT_MOVER_NAME);
-        let msg = io::privileged_mover_message("Restore", name, namespace, sa);
-        let existing = restore
-            .status
-            .as_ref()
-            .map(|s| s.conditions.clone())
-            .unwrap_or_default();
+        // Name the layer that actually carries the elevation, not always the
+        // `Restore` — the gate runs on the MERGED mover, and an elevation authored
+        // in the repository's `moverDefaults` sent the operator to a `Restore`
+        // spec with nothing elevated in it (mirrors the Snapshot gate, #464).
+        let repo_ref = repo.repository_ref();
+        let layer = io::attribute_elevation(
+            // A Restore has no per-run layer above its own spec.
+            false,
+            restore
+                .spec
+                .mover
+                .as_ref()
+                .is_some_and(|m| m.requires_privilege()),
+            io::mover_defaults_require_privilege(repo.mover_defaults.as_ref()),
+        );
+        let (carrier_kind, carrier_name, carrier_field) = match layer {
+            io::ElevationLayer::Invocation | io::ElevationLayer::Recipe => {
+                ("Restore", name, "spec.mover")
+            }
+            io::ElevationLayer::RepositoryDefaults => (
+                io::repo_kind_str(repo_ref.kind),
+                repo_ref.name.as_str(),
+                "spec.moverDefaults",
+            ),
+            io::ElevationLayer::Composed => (
+                "Restore",
+                name,
+                "spec.mover (including any securityContext it inherits from a workload)",
+            ),
+        };
+        let msg =
+            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, namespace, sa);
+        // LIVE base: the #464 heal wrote this same array moments ago and a
+        // `conditions` patch REPLACES it, so the reconcile-start copy would
+        // resurrect the hold and `doctor` would name it instead of this refusal.
+        let existing = io::live_conditions(api, name, restore).await;
         let conditions = io::upsert_gate(
             &existing,
             &kopiur_api::gates::PRIVILEGED_MOVER_GATE,
@@ -3323,21 +3548,16 @@ async fn run_restore_mover(
         return Err(Error::BlockedOnGrant(msg));
     }
     // Permitted: clear any stale `MoverPermitted=False` from a prior reconcile.
-    if let Some(conds) = restore.status.as_ref().map(|s| s.conditions.as_slice())
-        && conds
-            .iter()
-            .any(|c| c.type_ == MOVER_PERMITTED_CONDITION && c.status != "True")
-    {
-        let conditions = io::upsert_condition(
-            conds,
-            MOVER_PERMITTED_CONDITION,
-            true,
-            "Permitted",
-            "the mover is permitted in this namespace",
-            restore.metadata.generation,
-        );
-        io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
-    }
+    // Live-based (see `io::clear_work_condition_if_stale`) — the #464 heal ran
+    // above and this patch replaces the array it wrote.
+    io::clear_work_condition_if_stale(
+        api,
+        restore,
+        MOVER_PERMITTED_CONDITION,
+        "Permitted",
+        "the mover is permitted in this namespace",
+    )
+    .await?;
 
     // A restore that falls back to its explicit context is NOT tracking the workload it named —
     // report it, exactly as a backup does.
@@ -3382,15 +3602,20 @@ async fn run_restore_mover(
     // consumer of the target PVC can read what the mover writes (matching UID / shared fsGroup
     // on the fresh volume). Never writes `False` — restore has no certain signal, so the
     // advisory negative lives in the admission warning. Never fatal.
-    assess_restore_security_context(
-        namespace,
-        restore,
-        target_pvc,
-        &resolved_mover.security_context,
-        resolved_mover.pod_security_context.as_ref(),
-        ctx,
-    )
-    .await;
+    // PVC-only: the assessment compares the mover's identity against the FUTURE
+    // consumer of the target volume. A stream destination writes no volume, so
+    // there is no consumer and nothing to assess.
+    if let Some(target_pvc) = dispatch.pvc() {
+        assess_restore_security_context(
+            namespace,
+            restore,
+            target_pvc,
+            &resolved_mover.security_context,
+            resolved_mover.pod_security_context.as_ref(),
+            ctx,
+        )
+        .await;
+    }
 
     let owner = io::owner_ref_for(restore, "Restore")?;
     let repo_ref = restore.spec.repository.as_ref();
@@ -3416,11 +3641,10 @@ async fn run_restore_mover(
     {
         Ok(c) => c,
         Err(Error::MissingDependency(msg)) => {
-            let existing = restore
-                .status
-                .as_ref()
-                .map(|s| s.conditions.clone())
-                .unwrap_or_default();
+            // LIVE base: same reason as the privileged refusal above — a stale
+            // `SecurityContextResolved=False` resurrected at index 0 is the row
+            // `doctor` would report INSTEAD of the missing Secret.
+            let existing = io::live_conditions(api, name, restore).await;
             let conditions = io::upsert_gate(
                 &existing,
                 &kopiur_api::gates::MISSING_CREDENTIALS_GATE,
@@ -3443,32 +3667,19 @@ async fn run_restore_mover(
             .inc_secrets_projected(namespace, creds.projected);
     }
     // Creds present (or projected): clear any stale `CredentialsAvailable=False`.
-    if let Some(conds) = restore.status.as_ref().map(|s| s.conditions.as_slice())
-        && conds
-            .iter()
-            .any(|c| c.type_ == CREDENTIALS_AVAILABLE_CONDITION && c.status != "True")
-    {
-        let (reason, note) = if creds.projected > 0 {
-            (
-                CREDENTIALS_PROJECTED_REASON,
-                "credential Secret(s) projected into the mover namespace",
-            )
-        } else {
-            (
-                "Available",
-                "credentials Secret(s) present in the mover namespace",
-            )
-        };
-        let conditions = io::upsert_condition(
-            conds,
-            CREDENTIALS_AVAILABLE_CONDITION,
-            true,
-            reason,
-            note,
-            restore.metadata.generation,
-        );
-        io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
-    }
+    let (reason, note) = if creds.projected > 0 {
+        (
+            CREDENTIALS_PROJECTED_REASON,
+            "credential Secret(s) projected into the mover namespace",
+        )
+    } else {
+        (
+            "Available",
+            "credentials Secret(s) present in the mover namespace",
+        )
+    };
+    io::clear_work_condition_if_stale(api, restore, CREDENTIALS_AVAILABLE_CONDITION, reason, note)
+        .await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     let identity = MoverIdentity {
@@ -3496,6 +3707,26 @@ async fn run_restore_mover(
     let work_spec = MoverWorkSpec {
         version: 2,
         operation: Operation::Restore(RestoreOp {
+            // A stream destination replaces the filesystem write entirely: the
+            // mover reads ONE virtual file out of the snapshot and pipes it into a
+            // command's stdin, so `target_path` below is inert for it.
+            stdout: match dispatch.destination {
+                RestoreDestination::Pvc(_) => None,
+                RestoreDestination::Stream(t) => Some(kopiur_mover::workspec::StreamExecSpec {
+                    namespace: namespace.to_string(),
+                    pod_selector: io::label_selector_to_string(&t.workload_exec.pod_selector),
+                    container: t.workload_exec.container.clone(),
+                    command: t.workload_exec.command.clone(),
+                    file_name: t.file_name.clone(),
+                    timeout_seconds: t
+                        .workload_exec
+                        .timeout
+                        .as_deref()
+                        .and_then(kopiur_api::duration::parse_go_duration)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(kopiur_api::consts::DEFAULT_STREAM_TIMEOUT_SECS),
+                }),
+            },
             source: selection.clone(),
             target_path: target_path.clone(),
             anchor,
@@ -3560,25 +3791,36 @@ async fn run_restore_mover(
         // MissingDependency retry, never the Snapshot-side terminal machinery
         // (Restore's parking precedent, `waitTimeout`/`onMissing`, is about
         // snapshots, not PVCs).
-        let decision = match io::resolve_source_colocation(
-            &ctx.client,
-            namespace,
-            target_pvc,
-            resolved_mover.source_colocation,
-        )
-        .await?
-        {
-            io::ColocationOutcome::Resolved(decision) => decision,
-            io::ColocationOutcome::SourcePvcAbsent {
-                namespace: pvc_ns,
-                name: pvc_name,
-            } => return Err(restore_target_pvc_race_error(&pvc_ns, &pvc_name)),
-        };
-        io::apply_colocation(
-            decision,
-            resolved_mover.affinity.clone(),
-            resolved_mover.tolerations.clone(),
-        )?
+        // Colocation places the mover next to the PVC it writes. A stream
+        // destination has no PVC to be near, so there is nothing to colocate on —
+        // yield the recipe's own affinity/tolerations unchanged.
+        match dispatch.pvc() {
+            None => (
+                resolved_mover.affinity.clone(),
+                resolved_mover.tolerations.clone(),
+            ),
+            Some(target_pvc) => {
+                let decision = match io::resolve_source_colocation(
+                    &ctx.client,
+                    namespace,
+                    target_pvc,
+                    resolved_mover.source_colocation,
+                )
+                .await?
+                {
+                    io::ColocationOutcome::Resolved(decision) => decision,
+                    io::ColocationOutcome::SourcePvcAbsent {
+                        namespace: pvc_ns,
+                        name: pvc_name,
+                    } => return Err(restore_target_pvc_race_error(&pvc_ns, &pvc_name)),
+                };
+                io::apply_colocation(
+                    decision,
+                    resolved_mover.affinity.clone(),
+                    resolved_mover.tolerations.clone(),
+                )?
+            }
+        }
     };
     let inputs = MoverJobInputs {
         name: job_name,
@@ -3623,7 +3865,11 @@ async fn run_restore_mover(
             labels
         },
         // Restore writes INTO the target PVC, mounted read-write at /restore.
-        source_volume: Some(VolumeMountSpec::pvc(target_pvc, target_path, false)),
+        // A stream destination mounts nothing — the bytes go straight from kopia
+        // into an exec stdin, never touching a filesystem.
+        source_volume: dispatch
+            .pvc()
+            .map(|pvc| VolumeMountSpec::pvc(pvc, target_path, false)),
         repo_volume,
         creds_secrets,
         result_configmap: None,
@@ -3809,7 +4055,7 @@ async fn snapshot_recorded_source(
     restore: &Restore,
     namespace: &str,
     pinned_id: Option<&str>,
-    target: &kopiur_api::snapshot::PvcTargetRef,
+    target: Option<&kopiur_api::snapshot::PvcTargetRef>,
 ) -> Result<Option<io::SnapshotRecordedSource>> {
     if !snapshot_inherit_active(restore) {
         return Ok(None);
@@ -4190,6 +4436,90 @@ async fn ensure_restore_target_pvc(
     }
 }
 
+/// The policy's OWN kopia source path, for a restore whose target is not a PVC
+/// (today: `target.streamExec`).
+///
+/// The per-PVC derivation in [`kopiur_api::expand::restore_source_path`] answers
+/// "which member of a selector policy fills THIS volume" — a question a stream
+/// restore does not ask, because it fills no volume. A stream policy is
+/// admission-restricted to a single `stream` source, so its effective source is
+/// unambiguous and [`kopiur_api::expand::identity_source_path`] yields
+/// `/stream/<fileName>` — exactly what the backup side recorded. An explicit
+/// `source.fromPolicy.sourcePath` still wins, as it does on the per-PVC path.
+///
+/// # Why this FAILS CLOSED for a non-stream policy
+///
+/// It would be easy to mirror step (3) of `restore_source_path` unconditionally
+/// and hand back whatever `sources[0]` produces. That is wrong, and in one
+/// reachable configuration it is a data-integrity bug: `target.streamExec` with
+/// `source.fromPolicy` naming a `pvcSelector` policy that carries a SHARED
+/// `sourcePathOverride`. `kopia_source_path` returns that override before it ever
+/// looks at a PVC, the resolved identity then matches the newest snapshot of ANY
+/// matched member, and the mover pipes an arbitrary volume's bytes into the
+/// user's `psql`/`mysql` stdin. That is precisely the configuration
+/// `restore_source_path` step (5) refuses — step (3)'s body is only sound behind
+/// step (3)'s `!has_selector` precondition.
+///
+/// Nothing upstream prevents the pair: `validate_restore` checks only `fileName`
+/// and `workloadExec` on a `StreamExec` target, and cross-CR validation is not
+/// available at admission at all. So the guard lives here, and it is a shape
+/// check on the EFFECTIVE SOURCE rather than a selector check — a streamExec
+/// restore of a PVC/NFS policy has no single file to read either, and answering
+/// it with a volume's root path would be just as wrong.
+///
+/// Returns the ready-to-surface message (not an [`Error`]) for the same reason
+/// [`from_policy_identity`] does: it is a DOMAIN outcome about the spec pair.
+fn policy_own_source_path(
+    config: &kopiur_api::SnapshotPolicy,
+    source_path_override: Option<&str>,
+) -> std::result::Result<kopiur_api::expand::RestoreSourcePath, String> {
+    if let Some(over) = source_path_override {
+        return Ok(kopiur_api::expand::RestoreSourcePath::Override(
+            over.to_string(),
+        ));
+    }
+    // Zero-source legacy tolerance, exactly as `restore_source_path` step (3) has
+    // it: admission forbids a zero-source policy, but a hand-patched object may
+    // carry one, and a working restore must not become a terminal error on
+    // upgrade. The pathless identity is the honest answer — there is no source to
+    // be wrong about.
+    if config.spec.sources.is_empty() {
+        return Ok(kopiur_api::expand::RestoreSourcePath::PolicySource(None));
+    }
+    let eff = kopiur_api::expand::effective_source(config, None).map_err(|e| e.to_string())?;
+    if eff.stream.is_none() {
+        return Err(stream_restore_needs_a_stream_policy_message(
+            config, eff.index,
+        ));
+    }
+    // THE shared derivation (#451) — the same call the backup side makes.
+    Ok(kopiur_api::expand::RestoreSourcePath::PolicySource(
+        kopiur_api::expand::identity_source_path(config, None).map_err(|e| e.to_string())?,
+    ))
+}
+
+/// The what/why/fix text for a `streamExec` restore pointed at a policy whose
+/// governing source is not a `stream` source. Pure so the exact wording is
+/// unit-asserted.
+fn stream_restore_needs_a_stream_policy_message(
+    config: &kopiur_api::SnapshotPolicy,
+    index: usize,
+) -> String {
+    format!(
+        "this Restore's target is `streamExec`, which reads ONE virtual file out of a snapshot \
+         and pipes it into a command's stdin — but `source.fromPolicy` names SnapshotPolicy \
+         `{}`, whose governing source #{index} is not a `stream` source, so it recorded a volume \
+         tree rather than a file and there is no single kopia source path to read. Resolving one \
+         anyway would match the newest snapshot of whatever that policy backed up (for a \
+         `pvcSelector` policy sharing one `sourcePathOverride`, an arbitrary member volume) and \
+         feed it to the command, so kopiur fails closed. Fix: point `source.fromPolicy` at a \
+         SnapshotPolicy whose source is `stream`, use `source.snapshotRef` to name the snapshot \
+         directly, or set `source.fromPolicy.sourcePath` to the exact kopia source path the file \
+         lives under.",
+        config.name_any(),
+    )
+}
+
 /// The kopia identity a `fromPolicy` restore of `target` must read under — the
 /// #443 cross-volume fix, in one place so the resolution path and the
 /// recorded-identity catalog search can never disagree.
@@ -4205,15 +4535,27 @@ async fn ensure_restore_target_pvc(
 /// [`Error`]: it is a DOMAIN outcome (a valid `Restore` plus a valid
 /// `SnapshotPolicy` that together name no single volume), reported on the
 /// affected claim's own record rather than as a reconcile failure.
+///
+/// `target: None` is a restore that fills no volume (`target.streamExec`); it
+/// routes to [`policy_own_source_path`], which fails closed the same way for a
+/// policy that recorded a volume tree rather than a file.
 fn from_policy_identity(
     config: &kopiur_api::SnapshotPolicy,
     config_namespace: &str,
     defaults: Option<&kopiur_api::IdentityDefaults>,
     source_path_override: Option<&str>,
-    target: &kopiur_api::snapshot::PvcTargetRef,
+    target: Option<&kopiur_api::snapshot::PvcTargetRef>,
 ) -> std::result::Result<kopiur_api::common::ResolvedIdentity, String> {
-    let path =
-        restore_source_path(config, source_path_override, target).map_err(|e| e.to_string())?;
+    let path = match target {
+        Some(target) => {
+            restore_source_path(config, source_path_override, target).map_err(|e| e.to_string())?
+        }
+        // No target PVC means a stream restore: it fills no volume, so there is
+        // nothing to derive a per-PVC path from. The identity is the policy's OWN
+        // path (`/stream/<fileName>` for a stream source), with an explicit
+        // `sourcePath` override honoured exactly as `restore_source_path` does.
+        None => policy_own_source_path(config, source_path_override)?,
+    };
     crate::snapshot_policy::config_identity_for_path(
         config,
         config_namespace,
@@ -4240,7 +4582,7 @@ async fn resolve_snapshot(
     restore: &Restore,
     namespace: &str,
     wait_anchor: i64,
-    target: &kopiur_api::snapshot::PvcTargetRef,
+    target: Option<&kopiur_api::snapshot::PvcTargetRef>,
     cache: &mut PassCache,
 ) -> Result<SourceResolution> {
     use kopiur_api::common::{ObjectRef, ResolvedIdentity};

@@ -1,0 +1,275 @@
+{
+  "owner": "perf3ct@desktop",
+  "quick": { "enabled": true, "interval": 3600000000000 },
+  "full": { "enabled": true, "interval": 86400000000000 },
+  "logRetention": { "maxTotalSize": 1073741824, "maxCount": 10000, "maxAge": 2592000000000000 },
+  "extendObjectLocks": false,
+  "listParallelism": 0,
+  "schedule": {
+    "nextFullMaintenance": "2026-09-18T12:02:50.332645398-07:00",
+    "nextQuickMaintenance": "2026-09-17T13:02:50.332645478-07:00",
+    "runs": {
+      "advance-epoch": [
+        {
+          "start": "2026-09-17T12:02:50.382565437-07:00",
+          "end": "2026-09-17T12:02:50.382570627-07:00",
+          "success": true,
+          "extra": [
+            { "kind": "advanceEpochStats", "data": { "currentEpoch": 0, "wasAdvanced": false } }
+          ]
+        },
+        {
+          "start": "2026-09-17T12:02:45.022976457-07:00",
+          "end": "2026-09-17T12:02:45.022982907-07:00",
+          "success": true,
+          "extra": [
+            { "kind": "advanceEpochStats", "data": { "currentEpoch": 0, "wasAdvanced": false } }
+          ]
+        }
+      ],
+      "cleanup-epoch-markers": [
+        {
+          "start": "2026-09-17T12:02:50.384942916-07:00",
+          "end": "2026-09-17T12:02:50.384963516-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "cleanupMarkersStats",
+              "data": { "deletedEpochMarkerBlobCount": 0, "deletedWatermarkBlobCount": 0 }
+            }
+          ]
+        },
+        {
+          "start": "2026-09-17T12:02:45.02698741-07:00",
+          "end": "2026-09-17T12:02:45.027059251-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "cleanupMarkersStats",
+              "data": { "deletedEpochMarkerBlobCount": 0, "deletedWatermarkBlobCount": 0 }
+            }
+          ]
+        }
+      ],
+      "cleanup-logs": [
+        {
+          "start": "2026-09-17T12:02:50.388875848-07:00",
+          "end": "2026-09-17T12:02:50.388967909-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "cleanupLogsStats",
+              "data": {
+                "toDeleteBlobCount": 0,
+                "toDeleteBlobSize": 0,
+                "deletedBlobCount": 0,
+                "deletedBlobSize": 0,
+                "retainedBlobCount": 4,
+                "retainedBlobSize": 5730
+              }
+            }
+          ]
+        },
+        {
+          "start": "2026-09-17T12:02:45.033310602-07:00",
+          "end": "2026-09-17T12:02:45.033472093-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "cleanupLogsStats",
+              "data": {
+                "toDeleteBlobCount": 0,
+                "toDeleteBlobSize": 0,
+                "deletedBlobCount": 0,
+                "deletedBlobSize": 0,
+                "retainedBlobCount": 1,
+                "retainedBlobSize": 888
+              }
+            }
+          ]
+        }
+      ],
+      "compact-single-epoch": [
+        {
+          "start": "2026-09-17T12:02:50.381208655-07:00",
+          "end": "2026-09-17T12:02:50.381221856-07:00",
+          "success": true,
+          "extra": [{ "kind": "compactSingleEpochStats", "data": null }]
+        },
+        {
+          "start": "2026-09-17T12:02:45.021452225-07:00",
+          "end": "2026-09-17T12:02:45.021482375-07:00",
+          "success": true,
+          "extra": [{ "kind": "compactSingleEpochStats", "data": null }]
+        }
+      ],
+      "delete-superseded-epoch-indexes": [
+        {
+          "start": "2026-09-17T12:02:50.386271687-07:00",
+          "end": "2026-09-17T12:02:50.387550427-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "cleanupSupersededIndexesStats",
+              "data": {
+                "maxReplacementTime": "2026-09-17T08:02:50.367331592-07:00",
+                "deletedBlobCount": 0,
+                "deletedTotalSize": 0
+              }
+            }
+          ]
+        },
+        {
+          "start": "2026-09-17T12:02:45.02944641-07:00",
+          "end": "2026-09-17T12:02:45.030908762-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "cleanupSupersededIndexesStats",
+              "data": {
+                "maxReplacementTime": "2026-09-17T08:02:45.004295048-07:00",
+                "deletedBlobCount": 0,
+                "deletedTotalSize": 0
+              }
+            }
+          ]
+        }
+      ],
+      "full-delete-blobs": [
+        {
+          "start": "2026-09-17T12:02:50.377591896-07:00",
+          "end": "2026-09-17T12:02:50.379751623-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "deleteUnreferencedPacksStats",
+              "data": {
+                "unreferencedPackCount": 6,
+                "unreferencedTotalSize": 14022073,
+                "deletedPackCount": 6,
+                "deletedTotalSize": 14022073,
+                "retainedPackCount": 0,
+                "retainedTotalSize": 0
+              }
+            }
+          ]
+        }
+      ],
+      "full-drop-deleted-content": [
+        {
+          "start": "2026-09-17T12:02:50.374631352-07:00",
+          "end": "2026-09-17T12:02:50.376195234-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "compactIndexesStats",
+              "data": { "droppedContentsDeletedBefore": "2026-09-17T12:02:50.374617561-07:00" }
+            }
+          ]
+        }
+      ],
+      "full-rewrite-contents": [
+        {
+          "start": "2026-09-17T12:02:50.34507425-07:00",
+          "end": "2026-09-17T12:02:50.373125039-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "rewriteContentsStats",
+              "data": {
+                "toRewriteContentCount": 13,
+                "toRewriteContentSize": 14002959,
+                "rewrittenContentCount": 13,
+                "rewrittenContentSize": 14002959,
+                "retainedContentCount": 0,
+                "retainedContentSize": 0
+              }
+            }
+          ]
+        },
+        {
+          "start": "2026-09-17T12:02:45.019713681-07:00",
+          "end": "2026-09-17T12:02:45.019964003-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "rewriteContentsStats",
+              "data": {
+                "toRewriteContentCount": 0,
+                "toRewriteContentSize": 0,
+                "rewrittenContentCount": 0,
+                "rewrittenContentSize": 0,
+                "retainedContentCount": 5,
+                "retainedContentSize": 1836
+              }
+            }
+          ]
+        }
+      ],
+      "generate-epoch-range-index": [
+        {
+          "start": "2026-09-17T12:02:50.383746116-07:00",
+          "end": "2026-09-17T12:02:50.383759886-07:00",
+          "success": true,
+          "extra": [{ "kind": "generateRangeCheckpointStats", "data": null }]
+        },
+        {
+          "start": "2026-09-17T12:02:45.025451627-07:00",
+          "end": "2026-09-17T12:02:45.025463948-07:00",
+          "success": true,
+          "extra": [{ "kind": "generateRangeCheckpointStats", "data": null }]
+        }
+      ],
+      "snapshot-gc": [
+        {
+          "start": "2026-09-17T12:02:50.334602804-07:00",
+          "end": "2026-09-17T12:02:50.343583458-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "snapshotGCStats",
+              "data": {
+                "unreferencedContentCount": 4,
+                "unreferencedContentSize": 6000529,
+                "deletedContentCount": 4,
+                "deletedContentSize": 6000529,
+                "unreferencedRecentContentCount": 0,
+                "unreferencedRecentContentSize": 0,
+                "inUseContentCount": 5,
+                "inUseContentSize": 8000577,
+                "inUseSystemContentCount": 4,
+                "inUseSystemContentSize": 1853,
+                "recoveredContentCount": 0,
+                "recoveredContentSize": 0
+              }
+            }
+          ]
+        },
+        {
+          "start": "2026-09-17T12:02:45.015317805-07:00",
+          "end": "2026-09-17T12:02:45.017767004-07:00",
+          "success": true,
+          "extra": [
+            {
+              "kind": "snapshotGCStats",
+              "data": {
+                "unreferencedContentCount": 0,
+                "unreferencedContentSize": 0,
+                "deletedContentCount": 0,
+                "deletedContentSize": 0,
+                "unreferencedRecentContentCount": 0,
+                "unreferencedRecentContentSize": 0,
+                "inUseContentCount": 7,
+                "inUseContentSize": 9000770,
+                "inUseSystemContentCount": 2,
+                "inUseSystemContentSize": 1178,
+                "recoveredContentCount": 0,
+                "recoveredContentSize": 0
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

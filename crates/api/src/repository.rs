@@ -225,7 +225,7 @@ pub enum BlobRetention {
     /// A `bool` rather than a unit variant because an externally-tagged unit variant
     /// serializes as the bare string `"Disabled"`, mixing string and object forms in one
     /// `oneOf` and breaking the structural schema. Same shape, and same reason, as
-    /// [`crate::cluster_repository::AllowedNamespaces::All`].
+    /// [`AllowedNamespaces::All`](crate::cluster_repository::AllowedNamespaces::All).
     ///
     /// This is distinct from omitting `blobRetention` entirely: absent means "leave the
     /// repository alone", so deleting the block from a manifest can never silently strip
@@ -279,22 +279,49 @@ pub struct RetentionWindow {
 /// `cleanupSafetyMargin` is deliberately **observable but not settable**: its job is to stop
 /// kopia deleting index blobs a concurrent writer still needs, and there is no safe generic
 /// advice for lowering it.
+///
+/// **Every field here has an admission floor** (#458), because `kopia repository
+/// set-parameters` merges the flags it is given into the repository's existing parameters and
+/// then validates the whole resulting set — so ONE out-of-range value refuses the entire
+/// call and discards every other parameter in the same apply. The floors:
+///
+/// - `minDuration`: at least `10m`, and at least 3x `refreshFrequency` (kopia's untouched
+///   `20m` default when none is declared — which is why `minDuration: 10m` alone is
+///   rejected, and `60m` is the smallest value that stands on its own).
+/// - `refreshFrequency`: at most `80m`, because kopia needs `cleanupSafetyMargin` to be at
+///   least 3x it and the margin is stuck at kopia's `4h` default (kopiur cannot set it).
+/// - `advanceOnCount`: at least `10`. `advanceOnSizeMiB`: at least `1`.
+/// - `checkpointFrequency`: at least `1`. `deleteParallelism`: at least `1`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EpochParameters {
     /// Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
     /// (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
+    ///
+    /// Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`.
+    /// When `refreshFrequency` is not declared, that second bound is measured against
+    /// kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or
+    /// declare a `refreshFrequency` of a third of it or less alongside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_duration: Option<String>,
     /// How often clients re-read epoch state (kopia default `20m`). Go-style duration.
+    ///
+    /// At most `80m`: kopia requires `cleanupSafetyMargin >= 3x` this value, and
+    /// `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's
+    /// `4h` default and `4h / 3` is a hard ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_frequency: Option<String>,
     /// Index blobs in an epoch that trigger an advance, once older than `minDuration`
     /// (kopia default `20`).
+    ///
+    /// At least `10` — kopia refuses anything lower with "epoch advance on count too low".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advance_on_count: Option<i64>,
     /// Total index size in an epoch that triggers an advance, once older than `minDuration`
     /// (kopia default `10` MiB).
+    ///
+    /// At least `1` — kopia refuses anything lower with "epoch advance on size too low",
+    /// and 1 MiB is the smallest threshold the flag can express.
     ///
     /// Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
     /// (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
@@ -308,9 +335,15 @@ pub struct EpochParameters {
     )]
     pub advance_on_size_mb: Option<i64>,
     /// Epochs between full index checkpoints (kopia default `7`).
+    ///
+    /// At least `1` — kopia refuses anything lower with "invalid epoch range compaction
+    /// period".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_frequency: Option<i64>,
     /// Parallelism for epoch cleanup deletions (kopia default `4`).
+    ///
+    /// At least `1`. This floor is kopiur's own: kopia does not validate the field, so a
+    /// non-positive value would ask it to run epoch cleanup with no workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_parallelism: Option<i64>,
 }
@@ -340,7 +373,12 @@ pub struct ObservedEpochParameters {
     pub cleanup_safety_margin: String,
     /// Observed index-blob count that triggers an epoch advance.
     pub advance_on_count: i64,
-    /// Observed total index size (MiB) that triggers an epoch advance.
+    /// Observed total index size (MiB) that triggers an epoch advance, **rounded up**.
+    ///
+    /// kopia reports this threshold in BYTES and it need not be a whole number of MiB, so
+    /// the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a
+    /// value the repository does not actually hold. Drift against `spec` is computed on the
+    /// exact byte count, never on this rounded mirror.
     #[serde(rename = "advanceOnSizeMiB")]
     pub advance_on_size_mb: i64,
     /// Observed epochs between full index checkpoints.
@@ -792,9 +830,31 @@ pub struct StorageStats {
     /// RFC 3339 timestamp these stats were last observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observed_at: Option<String>,
-    /// Number of content-index blobs (`kopia index list`) observed at the last bootstrap.
+    /// Number of content-index blobs (`kopia index list`): the freshest count
+    /// available, from either the last bootstrap or the recount a maintenance
+    /// run takes right after compacting. `indexBlobCountAt` says when.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_blob_count: Option<i64>,
+    /// RFC3339 instant `indexBlobCount` was observed.
+    ///
+    /// Distinct from `lastObservedAt` (the catalog scan's timestamp) and from
+    /// `status.health.lastProbeAt` (the backend probe's): the index-blob count
+    /// has its own writers, and this is what lets the reconciler decide whether
+    /// a post-maintenance recount is fresher than the bootstrap's own count.
+    /// Without it the two observations were incomparable, so the
+    /// `IndexBlobHealth` warning could only ever quote the bootstrap figure —
+    /// which is pre-compaction, and stayed pre-compaction until the next
+    /// bootstrap ran (#458).
+    ///
+    /// The two writers mean subtly different things, deliberately. A bootstrap
+    /// stamps "when this count was FIRST seen at this value", reusing the
+    /// previous stamp while the number is unchanged — that arm re-observes on
+    /// every reconcile, and a stamp that always moved would make the status
+    /// always-changed and the reconcile a hot loop. A post-maintenance recount
+    /// always carries its own instant, because it is a distinct observation
+    /// taken at a known time and its whole purpose is to be comparable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_blob_count_at: Option<String>,
 }
 
 /// Status of catalog materialization for `origin: discovered` `Snapshot` CRs.
@@ -1261,12 +1321,47 @@ health:
             total_size_bytes: Some(442_000_000),
             last_observed_at: None,
             index_blob_count: Some(1448),
+            index_blob_count_at: Some("2026-06-01T03:00:00Z".into()),
         };
         let json = serde_json::to_value(&stats).unwrap();
         assert_eq!(json["indexBlobCount"], 1448);
+        assert_eq!(json["indexBlobCountAt"], "2026-06-01T03:00:00Z");
         assert_eq!(json["totalSizeBytes"], 442_000_000_i64);
         let back: StorageStats = serde_json::from_value(json).unwrap();
         assert_eq!(back, stats);
+    }
+
+    /// #458: the count's own timestamp, parsed the cluster's way. It must be
+    /// separate from `lastObservedAt` (the catalog scan's), because the two have
+    /// different writers and the reconciler compares only this one against a
+    /// post-maintenance recount. A pre-upgrade status carrying a count and NO
+    /// stamp must still decode.
+    #[test]
+    fn storage_stats_index_blob_count_at_is_distinct_and_optional() {
+        let stats: StorageStats = from_yaml(
+            "snapshotCount: 3\nlastObservedAt: 2026-06-01T00:00:00Z\n\
+             indexBlobCount: 4200\nindexBlobCountAt: 2026-06-02T09:30:00Z\n",
+        );
+        assert_eq!(stats.index_blob_count, Some(4200));
+        assert_eq!(
+            stats.index_blob_count_at.as_deref(),
+            Some("2026-06-02T09:30:00Z")
+        );
+        assert_eq!(
+            stats.last_observed_at.as_deref(),
+            Some("2026-06-01T00:00:00Z")
+        );
+
+        let legacy: StorageStats = from_yaml("indexBlobCount: 4200\n");
+        assert_eq!(legacy.index_blob_count, Some(4200));
+        assert!(legacy.index_blob_count_at.is_none());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("indexBlobCountAt")
+                .is_none(),
+            "an absent stamp must stay elided"
+        );
     }
 
     #[test]
