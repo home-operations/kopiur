@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.10.9](https://github.com/home-operations/kopiur/compare/0.10.8...0.10.9) (2026-09-19)
+
+
+### Bug Fixes
+
+* **rust:** update crate reqwest (0.13.4 → 0.13.5) ([#453](https://github.com/home-operations/kopiur/issues/453)) ([fadb44d](https://github.com/home-operations/kopiur/commit/fadb44d6dd036a2fe899d00ddce4fca8cb68ad98))
+* streamed command sources, epoch parameters, per-PVC verification, per-run mover overrides ([#436](https://github.com/home-operations/kopiur/issues/436) [#451](https://github.com/home-operations/kopiur/issues/451) [#456](https://github.com/home-operations/kopiur/issues/456) [#458](https://github.com/home-operations/kopiur/issues/458) [#461](https://github.com/home-operations/kopiur/issues/461) [#464](https://github.com/home-operations/kopiur/issues/464)) ([#467](https://github.com/home-operations/kopiur/issues/467)) ([0e4bf7b](https://github.com/home-operations/kopiur/commit/0e4bf7b4427c61880c5498a41b5f22b99d4734a9))
+
+
+### Miscellaneous Chores
+
+* **mise:** update tool aqua:taiki-e/cargo-llvm-cov (0.9.0 → 0.9.1) ([#455](https://github.com/home-operations/kopiur/issues/455)) ([882faef](https://github.com/home-operations/kopiur/commit/882faeffa1f599319645f375be6b39d0b69a17e8))
+
 ## [0.10.8](https://github.com/home-operations/kopiur/compare/0.10.7...0.10.8) (2026-09-08)
 
 
