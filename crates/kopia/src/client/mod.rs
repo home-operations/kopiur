@@ -2220,6 +2220,26 @@ impl KopiaClient {
         self.run_ok(&snapshot_migrate_args(opts)).await.map(|_| ())
     }
 
+    /// Delete many snapshot manifests in ONE kopia invocation
+    /// (`kopia snapshot delete <id>... --delete`): one repository open and one
+    /// index load for the whole set, instead of one per id (issue #477).
+    ///
+    /// **All-or-nothing** (verified against a real kopia 0.23.1 repository):
+    /// kopia's CLI loop stops at the first failing id, and its write session
+    /// flushes only when every id succeeded. On any error NOTHING was deleted,
+    /// even the ids kopia already logged as "Deleting snapshot …".
+    ///
+    /// So unlike [`Self::snapshot_delete`], a `no snapshots matched` failure is
+    /// NOT remapped to success. Here it means one id was absent and the whole
+    /// call committed nothing. Pass only ids a fresh listing shows present, and
+    /// keep the call small enough for one argv (callers chunk).
+    pub async fn snapshot_delete_many(&self, ids: &[String]) -> Result<(), KopiaError> {
+        let mut args = vec!["snapshot".to_string(), "delete".to_string()];
+        args.extend(ids.iter().cloned());
+        args.push("--delete".into());
+        self.run_ok(&args).await.map(|_| ())
+    }
+
     /// Delete a single snapshot by manifest id. kopia's `snapshot delete`
     /// requires `--delete` to actually remove (otherwise it dry-runs) and does
     /// not support `--json`; success is signaled by exit code 0.

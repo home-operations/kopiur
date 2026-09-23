@@ -209,6 +209,14 @@ impl KopiaErrorClass {
             KopiaErrorClass::NotFound
         } else if s.contains("error connecting to repository")
             || s.contains("unable to open repository")
+            // kopia's other open-failure phrasing, and the index/blob download
+            // failures behind it: a remote backend dropping connections while
+            // the index loads (issue #477). AFTER the AuthFailure/NotFound arms,
+            // so a failed open with a specific cause (bad password, not
+            // initialized) keeps its specific class.
+            || s.contains("failed to open repository")
+            || s.contains("error loading indexes")
+            || s.contains("unexpected eof")
             || s.contains("connection refused")
             || s.contains("dial tcp")
             || s.contains("no route to host")
@@ -577,6 +585,35 @@ mod tests {
         assert_eq!(
             KopiaErrorClass::classify("something totally unexpected"),
             KopiaErrorClass::Unknown
+        );
+    }
+
+    /// Issue #477, verbatim: a remote backend dropping connections while the
+    /// index loads. The repository failed to OPEN, a transient backend fault,
+    /// so it must be retryable. As `Unknown` the batch-delete fallback would
+    /// re-open the same struggling repository once per member.
+    #[test]
+    fn classify_index_load_failures_as_repository_unavailable() {
+        let issue_477 = "failed to open repository: unable to create shared content manager: \
+             error loading indexes: error downloading indexes: error loading index blob \
+             xn45_abc: getContent: unable to complete GetBlob(xn45_abc,0,-1) despite 10 \
+             retries: unexpected EOF";
+        assert_eq!(
+            KopiaErrorClass::classify(issue_477),
+            KopiaErrorClass::RepositoryUnavailable
+        );
+        assert_eq!(
+            KopiaErrorClass::classify("error reading blob: unexpected EOF"),
+            KopiaErrorClass::RepositoryUnavailable
+        );
+        // The earlier arms still win on a failed open with a specific cause.
+        assert_eq!(
+            KopiaErrorClass::classify("failed to open repository: invalid repository password"),
+            KopiaErrorClass::AuthFailure
+        );
+        assert_eq!(
+            KopiaErrorClass::classify("failed to open repository: repository not initialized"),
+            KopiaErrorClass::NotFound
         );
     }
 

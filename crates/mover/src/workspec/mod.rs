@@ -678,10 +678,11 @@ pub struct SnapshotDeleteOp {
 }
 
 /// Payload for a per-repository batch snapshot-delete run (mass-deletion
-/// protection): one mover Job deletes MANY manifest ids over one connect,
-/// instead of one Job per `Snapshot` CR. Nothing emits this yet (a later
-/// milestone wires the controller dispatcher); this type landing is an
-/// upgrade-safe no-op.
+/// protection): one mover Job deletes MANY manifest ids, instead of one Job
+/// per `Snapshot` CR. The controller's per-repository batch dispatcher emits
+/// it. The mover plans the whole batch against one `snapshot list` and deletes
+/// it with one bulk `kopia snapshot delete` (see
+/// [`crate::batch_delete::plan_batch_delete`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotDeleteBatchOp {

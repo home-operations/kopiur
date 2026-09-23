@@ -394,6 +394,38 @@ async fn snapshot_lists_are_complete_only_by_default() {
     );
 }
 
+#[tokio::test]
+async fn snapshot_delete_many_is_one_invocation_with_every_id() {
+    let s = argv_gate_shim("snapshot delete a b c --delete");
+    let client = client_for(&s);
+    client
+        .snapshot_delete_many(&["a".into(), "b".into(), "c".into()])
+        .await
+        .unwrap();
+}
+
+/// A multi-id delete with one absent id commits NOTHING (kopia's write session
+/// only flushes on success — verified against a real 0.23.1 repository), yet
+/// its stderr carries the very `no snapshots matched` text the single-id
+/// [`KopiaClient::snapshot_delete`] treats as "already gone". The bulk call
+/// must surface it, or a batch would report success having deleted nothing.
+#[tokio::test]
+async fn snapshot_delete_many_never_swallows_no_snapshots_matched() {
+    let s = shim(
+        r#"#!/bin/sh
+echo "Deleting snapshot a of u@h:/d at 2026-09-17 18:00:00 UTC..." 1>&2
+echo "error deleting snapshots by root ID b: no snapshots matched b" 1>&2
+exit 1
+"#,
+    );
+    let client = client_for(&s);
+    let err = client
+        .snapshot_delete_many(&["a".into(), "b".into()])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, KopiaError::NonZeroExit { .. }));
+}
+
 // --- New verb / backend coverage. The shims gate exit 0 on the expected argv,
 // so these double as wiring assertions against the real kopia 0.23 flag names. ---
 

@@ -28,6 +28,7 @@ use kopiur_kopia::{
 };
 use tracing::{error, info, warn};
 
+use kopiur_mover::batch_delete::{BatchDeletePlan, anchor_self_heal_allowed, plan_batch_delete};
 use kopiur_mover::bootstrap::{
     BootstrapInitAction, BootstrapResult, CreateGrant, MAX_RETURNED_SNAPSHOTS,
     RESULT_CONFIGMAP_KEY, SeedOutcome, bootstrap_init_action,
@@ -1201,18 +1202,11 @@ async fn resolve_live_id(client: &KopiaClient, anchor: &SnapshotAnchor) -> Optio
     .map(|e| e.id.clone())
 }
 
-/// Whether [`delete_one`]'s stale-id self-heal may attempt re-resolution.
-/// Gated on the anchor's `start_time` alone — see [`delete_one`]'s doc for why
-/// a path(+identity)-only match is unsafe for a DELETE decision. Pulled out so
-/// the gate is unit-testable without spawning kopia.
-fn anchor_self_heal_allowed(anchor: &SnapshotAnchor) -> bool {
-    anchor.start_time.is_some()
-}
-
 /// Delete one snapshot by id, self-healing a stale recorded id via its stable
-/// anchor. Shared by the legacy single [`Operation::SnapshotDelete`] arm and
-/// the [`Operation::SnapshotDeleteBatch`] loop ([`delete_batch`]), so the
-/// self-heal logic — and its safety gate — lives in exactly one place.
+/// anchor, for the legacy single [`Operation::SnapshotDelete`] arm only. The
+/// [`Operation::SnapshotDeleteBatch`] path ([`delete_batch`]) plans its own
+/// self-heal against one listing ([`plan_batch_delete`]) behind the SAME gate,
+/// [`anchor_self_heal_allowed`], so the data-loss rule lives in one place.
 ///
 /// kopia's [`KopiaClient::snapshot_delete`] is idempotent (a "no snapshots
 /// matched" miss is tolerated), so a delete-by-id call against a STALE id
@@ -1261,29 +1255,128 @@ async fn delete_one(
     Ok(())
 }
 
-/// Delete every [`SnapshotDeleteBatchOp`] member independently: attempt-all-
-/// then-fail, never short-circuited by an earlier member's failure. kopia's
-/// delete is idempotent, so every retry of the WHOLE batch monotonically
-/// shrinks the truly-remaining set — a transient repo blip mid-batch
-/// converges on the next Job retry instead of wedging on the first failure.
-/// Pulled out of [`run_operation`] so the attempt-all-then-fail ordering is
-/// unit-testable against a fake kopia binary without a full work spec /
-/// reporter.
+/// Most manifest ids one `kopia snapshot delete` invocation carries. Each
+/// chunk is its own all-or-nothing kopia transaction; 500 × a 32-char id is
+/// far below any argv limit. A batch is at most a few hundred members, so this
+/// is almost always one call.
+const SNAPSHOT_DELETE_CHUNK: usize = 500;
+
+/// Delete a [`SnapshotDeleteBatchOp`] with ONE repository listing and one
+/// bulk `kopia snapshot delete` per [`SNAPSHOT_DELETE_CHUNK`] (issue #477: one
+/// process per member re-opened the repository and reloaded its full index
+/// every time). [`plan_batch_delete`] partitions the members against the
+/// listing first, because one absent id aborts kopia's all-or-nothing
+/// multi-id delete.
+///
+/// attempt-all-then-fail is preserved: every chunk is attempted, and the
+/// result counts failed MEMBERS. kopia's delete is idempotent and every retry
+/// re-plans against a fresh listing, so a retry of the whole batch
+/// monotonically shrinks what is left. A listing failure fails the Job
+/// outright, and the controller's backoff retries it. Fanning out one more
+/// repository open per member against a repository that just failed to open
+/// is the thundering herd this replaces.
 async fn delete_batch(client: &KopiaClient, op: &SnapshotDeleteBatchOp) -> Result<StatusUpdate> {
-    let mut failed = 0usize;
-    for item in &op.items {
-        if let Err(e) = delete_one(client, &item.snapshot_id, &item.anchor).await {
-            warn!(id = %item.snapshot_id, error = %e, "batch member delete failed; continuing");
-            failed += 1;
-        }
+    let listing = client
+        .snapshot_list_all_with_incomplete()
+        .await
+        .map_err(|source| MoverError::Kopia {
+            op: KopiaOp::BatchDeleteSnapshotList,
+            source,
+        })?;
+    let plan = plan_batch_delete(&op.items, &listing);
+    log_batch_plan(op, &plan);
+    let mut failed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (ids, members) in plan
+        .ids
+        .chunks(SNAPSHOT_DELETE_CHUNK)
+        .zip(plan.members_of.chunks(SNAPSHOT_DELETE_CHUNK))
+    {
+        failed.extend(delete_chunk(client, ids, members).await);
     }
-    if failed > 0 {
+    if !failed.is_empty() {
         return Err(MoverError::BatchDeleteIncomplete {
-            failed,
+            failed: failed.len(),
             total: op.items.len(),
         });
     }
     Ok(StatusUpdate::succeeded(chrono::Utc::now()))
+}
+
+/// Delete one chunk in a single kopia call and return the members it failed.
+/// kopia committed nothing on a failed call, so:
+/// - a RETRYABLE failure (the backend is struggling) fails the whole chunk,
+///   leaving the retry to the controller's backoff instead of hammering the
+///   repository once per id;
+/// - any other failure (typically an id deleted between the listing and the
+///   delete) retries each id alone with the idempotent single delete.
+async fn delete_chunk(client: &KopiaClient, ids: &[String], members: &[Vec<usize>]) -> Vec<usize> {
+    let err = match client.snapshot_delete_many(ids).await {
+        Ok(()) => {
+            info!(deleted = ids.len(), "batch snapshot delete committed");
+            return Vec::new();
+        }
+        Err(e) => e,
+    };
+    if err.class().is_retryable() {
+        warn!(
+            ids = ids.len(),
+            error = %err,
+            "bulk snapshot delete failed with a retryable error; nothing was deleted. \
+             Failing the batch for a backoff retry instead of re-opening the repository per id",
+        );
+        return members.iter().flatten().copied().collect();
+    }
+    warn!(
+        ids = ids.len(),
+        error = %err,
+        "bulk snapshot delete failed; nothing was deleted. Retrying each id alone",
+    );
+    delete_each(client, ids, members).await
+}
+
+/// The non-retryable fallback: each id alone through the idempotent single
+/// delete (an id that vanished since the listing is success), attempting every
+/// id and returning the members whose delete really failed.
+async fn delete_each(client: &KopiaClient, ids: &[String], members: &[Vec<usize>]) -> Vec<usize> {
+    let mut failed = Vec::new();
+    for (id, served) in ids.iter().zip(members) {
+        if let Err(e) = client.snapshot_delete(id).await {
+            warn!(id = %id, error = %e, "batch member delete failed; continuing");
+            failed.extend(served);
+        }
+    }
+    failed
+}
+
+/// The operator-facing log of a batch plan: what is already gone, which
+/// stale ids were healed, and where the self-heal's data-loss gate held.
+fn log_batch_plan(op: &SnapshotDeleteBatchOp, plan: &BatchDeletePlan) {
+    info!(
+        members = op.items.len(),
+        to_delete = plan.ids.len(),
+        already_absent = plan.already_absent.len(),
+        "planned batch snapshot delete",
+    );
+    for h in &plan.healed {
+        warn!(
+            recorded = %h.recorded,
+            live = %h.live,
+            "recorded snapshot id was stale (kopia rewrites the id on pin); \
+             deleting the live manifest re-resolved from the snapshot's identity \
+             to avoid orphaning it",
+        );
+    }
+    for &m in &plan.already_absent {
+        let item = &op.items[m];
+        if !anchor_self_heal_allowed(&item.anchor) && !item.anchor.source_path.is_empty() {
+            info!(
+                snapshot_id = %item.snapshot_id,
+                "anchor has no start_time; skipping the stale-id self-heal to avoid \
+                 deleting an unrelated snapshot that happens to share the source path \
+                 (data-loss gate)",
+            );
+        }
+    }
 }
 
 /// Capture the start-time anchor for a pin op BEFORE the (un)pin runs. The work
@@ -4990,73 +5083,215 @@ esac
                 .expect("delete_one self-heals the live manifest and succeeds");
         }
 
-        #[tokio::test]
-        async fn delete_batch_attempts_every_member_even_after_an_earlier_failure() {
-            // attempt-all-then-fail: the first member's delete fails (a
-            // non-idempotent error, not the "already absent" no-op), but the
-            // second must still be attempted — proven by a marker file the
-            // shim only touches on the second member's argv.
-            let marker_dir = tempfile::tempdir().unwrap();
-            let marker = marker_dir.path().join("good-id-deleted");
-            let s = shim(&format!(
+        /// A kopia shim that appends every invocation's argv to a log, lists
+        /// `listed` ids as complete snapshots, and runs `delete_arm` (a `case`
+        /// arm body) for any `snapshot delete`.
+        fn logging_shim(log: &std::path::Path, listed: &[&str], delete_arms: &str) -> Shim {
+            let entries = listed
+                .iter()
+                .map(|id| {
+                    format!(
+                        r#"{{"id":"{id}","source":{{"host":"prod","userName":"mydb","path":"/pvc/{id}"}},"startTime":"2026-06-19T05:54:19Z","endTime":"2026-06-19T05:54:19Z"}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            shim(&format!(
                 r#"#!/bin/sh
+echo "$*" >> "{log}"
 case "$*" in
-  *"snapshot delete bad-id"*) echo "error deleting snapshots: access denied" 1>&2; exit 1 ;;
-  *"snapshot delete good-id"*) touch "{marker}"; exit 0 ;;
-  *) exit 0 ;;
+  "snapshot list"*) echo '[{entries}]'; exit 0 ;;
+{delete_arms}
+  *) echo "unexpected argv: $*" 1>&2; exit 9 ;;
 esac
 "#,
-                marker = marker.display()
-            ));
-            let client = client_for(&s);
-            let op = SnapshotDeleteBatchOp {
-                items: vec![
-                    SnapshotDeleteItem {
-                        snapshot_id: "bad-id".into(),
+                log = log.display(),
+            ))
+        }
+
+        /// The kopia subcommands a shim saw, trailing common flags stripped.
+        fn invocations(log: &std::path::Path) -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| {
+                    l.split(" --no-")
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        fn batch(ids: &[&str]) -> SnapshotDeleteBatchOp {
+            SnapshotDeleteBatchOp {
+                items: ids
+                    .iter()
+                    .map(|id| SnapshotDeleteItem {
+                        snapshot_id: (*id).into(),
                         anchor: SnapshotAnchor::default(),
-                    },
-                    SnapshotDeleteItem {
-                        snapshot_id: "good-id".into(),
-                        anchor: SnapshotAnchor::default(),
-                    },
-                ],
-            };
-            let err = delete_batch(&client, &op)
-                .await
-                .expect_err("one member failed, so the batch is incomplete");
-            match err {
-                MoverError::BatchDeleteIncomplete { failed, total } => {
-                    assert_eq!(failed, 1);
-                    assert_eq!(total, 2);
-                }
-                other => panic!("expected BatchDeleteIncomplete, got {other:?}"),
+                    })
+                    .collect(),
             }
-            assert!(
-                marker.exists(),
-                "the second member must still be attempted after the first failed"
+        }
+
+        /// Issue #477: the whole batch costs ONE listing and ONE delete
+        /// process (one repository open each), however many members it has.
+        /// An already-absent member never reaches the argv, because one absent
+        /// id aborts kopia's all-or-nothing multi-id delete.
+        #[tokio::test]
+        async fn delete_batch_opens_the_repository_once_for_the_whole_batch() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(
+                &log,
+                &["a", "b", "c"],
+                r#"  "snapshot delete a b c --delete"*) exit 0 ;;"#,
+            );
+            let update = delete_batch(&client_for(&s), &batch(&["a", "gone", "b", "c"]))
+                .await
+                .expect("every present member deleted; the absent one was already done");
+            assert_eq!(update.phase.as_deref(), Some("Succeeded"));
+            assert_eq!(
+                invocations(&log),
+                [
+                    "snapshot list --json --all",
+                    "snapshot delete a b c --delete"
+                ]
             );
         }
 
         #[tokio::test]
-        async fn delete_batch_reports_success_when_every_member_succeeds() {
-            let s = shim("#!/bin/sh\nexit 0\n");
-            let client = client_for(&s);
-            let op = SnapshotDeleteBatchOp {
-                items: vec![
-                    SnapshotDeleteItem {
-                        snapshot_id: "a".into(),
-                        anchor: SnapshotAnchor::default(),
-                    },
-                    SnapshotDeleteItem {
-                        snapshot_id: "b".into(),
-                        anchor: SnapshotAnchor::default(),
-                    },
-                ],
-            };
-            let update = delete_batch(&client, &op)
+        async fn delete_batch_with_nothing_present_deletes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(&log, &[], "");
+            delete_batch(&client_for(&s), &batch(&["gone"]))
                 .await
-                .expect("every member succeeds");
-            assert_eq!(update.phase.as_deref(), Some("Succeeded"));
+                .expect("an already-absent member is success");
+            assert_eq!(invocations(&log), ["snapshot list --json --all"]);
+        }
+
+        #[tokio::test]
+        async fn delete_batch_self_heals_a_stale_id_in_the_same_bulk_call() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(
+                &log,
+                &["a", "live"],
+                r#"  "snapshot delete a live --delete"*) exit 0 ;;"#,
+            );
+            let mut op = batch(&["a", "stale"]);
+            op.items[1].anchor = anchor_with_start_time("/pvc/live", "2026-06-19T05:54:19Z");
+            op.items[1].anchor.username = Some("mydb".into());
+            op.items[1].anchor.hostname = Some("prod".into());
+            delete_batch(&client_for(&s), &op).await.expect("healed");
+            assert_eq!(
+                invocations(&log),
+                [
+                    "snapshot list --json --all",
+                    "snapshot delete a live --delete"
+                ]
+            );
+        }
+
+        /// A listing that cannot open the repository fails the Job WITHOUT
+        /// fanning out one more repository open per member.
+        #[tokio::test]
+        async fn delete_batch_list_failure_deletes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = shim(&format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\necho 'failed to open repository: unexpected EOF' 1>&2\nexit 1\n",
+                log.display()
+            ));
+            let err = delete_batch(&client_for(&s), &batch(&["a", "b"]))
+                .await
+                .expect_err("the list failed");
+            assert!(
+                matches!(
+                    err,
+                    MoverError::Kopia {
+                        op: KopiaOp::BatchDeleteSnapshotList,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            assert_eq!(invocations(&log).len(), 1, "only the failed list ran");
+        }
+
+        /// A RETRYABLE bulk failure (the backend dropping connections, #477)
+        /// marks the chunk failed with no per-id fan-out, which would re-open
+        /// the struggling repository once per member.
+        #[tokio::test]
+        async fn delete_batch_retryable_bulk_failure_does_not_fan_out() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(
+                &log,
+                &["a", "b"],
+                r#"  "snapshot delete"*) echo "failed to open repository: error loading indexes: unexpected EOF" 1>&2; exit 1 ;;"#,
+            );
+            let err = delete_batch(&client_for(&s), &batch(&["a", "b"]))
+                .await
+                .expect_err("the bulk delete failed");
+            assert!(
+                matches!(
+                    err,
+                    MoverError::BatchDeleteIncomplete {
+                        failed: 2,
+                        total: 2
+                    }
+                ),
+                "{err:?}"
+            );
+            assert_eq!(
+                invocations(&log),
+                ["snapshot list --json --all", "snapshot delete a b --delete"]
+            );
+        }
+
+        /// A NON-retryable bulk failure (e.g. an id removed between the list
+        /// and the delete) committed nothing, so every id is retried alone with
+        /// the idempotent single delete. attempt-all-then-fail holds: a later
+        /// member is still attempted after an earlier one fails.
+        #[tokio::test]
+        async fn delete_batch_non_retryable_bulk_failure_falls_back_per_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(
+                &log,
+                &["bad", "vanished", "good"],
+                r#"  "snapshot delete bad vanished good --delete"*) echo "error deleting snapshots by root ID vanished: no snapshots matched vanished" 1>&2; exit 1 ;;
+  "snapshot delete bad --delete"*) echo "error deleting snapshots: access denied" 1>&2; exit 1 ;;
+  "snapshot delete vanished --delete"*) echo "no snapshots matched vanished" 1>&2; exit 1 ;;
+  "snapshot delete good --delete"*) exit 0 ;;"#,
+            );
+            let err = delete_batch(&client_for(&s), &batch(&["bad", "vanished", "good"]))
+                .await
+                .expect_err("one member really failed");
+            assert!(
+                matches!(
+                    err,
+                    MoverError::BatchDeleteIncomplete {
+                        failed: 1,
+                        total: 3
+                    }
+                ),
+                "{err:?}"
+            );
+            assert_eq!(
+                invocations(&log),
+                [
+                    "snapshot list --json --all",
+                    "snapshot delete bad vanished good --delete",
+                    "snapshot delete bad --delete",
+                    "snapshot delete vanished --delete",
+                    "snapshot delete good --delete",
+                ]
+            );
         }
     }
 

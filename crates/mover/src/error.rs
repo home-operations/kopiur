@@ -32,6 +32,9 @@ pub enum KopiaOp {
     SnapshotDelete,
     /// `snapshot pin`/`unpin` reconciliation.
     SnapshotPin,
+    /// The one `snapshot list --all` a `SnapshotDeleteBatch` Job partitions its
+    /// members against before its bulk delete.
+    BatchDeleteSnapshotList,
     /// `repository connect` for a maintenance run.
     MaintenanceConnect,
     /// `maintenance info` (lease holder read).
@@ -113,6 +116,7 @@ impl KopiaOp {
             KopiaOp::SnapshotRestore => "snapshot restore",
             KopiaOp::SnapshotDelete => "snapshot delete",
             KopiaOp::SnapshotPin => "snapshot pin",
+            KopiaOp::BatchDeleteSnapshotList => "batch delete snapshot list",
             KopiaOp::MaintenanceConnect => "maintenance connect",
             KopiaOp::MaintenanceInfo => "maintenance info",
             KopiaOp::MaintenanceSetOwner => "maintenance set-owner",
@@ -668,6 +672,7 @@ mod tests {
             KopiaOp::SnapshotRestore,
             KopiaOp::SnapshotDelete,
             KopiaOp::SnapshotPin,
+            KopiaOp::BatchDeleteSnapshotList,
             KopiaOp::MaintenanceConnect,
             KopiaOp::MaintenanceInfo,
             KopiaOp::MaintenanceSetOwner,

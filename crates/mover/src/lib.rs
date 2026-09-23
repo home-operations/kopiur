@@ -1,6 +1,7 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+pub mod batch_delete;
 pub mod bootstrap;
 pub mod cli;
 pub mod credentials;
