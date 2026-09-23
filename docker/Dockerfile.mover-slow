@@ -26,7 +26,7 @@ ARG MOVER_IMAGE=kopiur/mover:e2e
 # Same digest-pinned busybox the harness already preloads onto the kind node
 # (crates/e2e/src/consts.rs::BUSYBOX_IMAGE / the `node-seed` mise task), so this
 # build reuses a layer the e2e host has anyway. Pinned by digest — no `:latest`.
-ARG BUSYBOX_IMAGE=busybox@sha256:cac8f90bbee42dc962a6b38bb1a235948d070385bb9d996bba15a6db8d364008
+ARG BUSYBOX_IMAGE=busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
 
 FROM ${BUSYBOX_IMAGE} AS busybox
 
