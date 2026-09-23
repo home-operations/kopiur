@@ -97,6 +97,16 @@ pub fn matcher_matches(m: &IdentityMatcherSpec, t: &IdentityTriple) -> bool {
             .is_none_or(|p| component_glob_matches(p, &t.2))
 }
 
+/// The complete snapshots of a listing. Every key-set kernel below reads
+/// through this, so an incomplete checkpoint is never a replicable identity,
+/// an expected key, or a copy correspondence — even if a caller hands in a raw
+/// [`KopiaClient::snapshot_list_all_with_incomplete`] listing.
+///
+/// [`KopiaClient::snapshot_list_all_with_incomplete`]: kopiur_kopia::KopiaClient::snapshot_list_all_with_incomplete
+fn complete(entries: &[SnapshotListEntry]) -> impl Iterator<Item = &SnapshotListEntry> {
+    entries.iter().filter(|e| e.incomplete_reason().is_none())
+}
+
 /// Select the identities a replication run covers: an identity is selected
 /// when it matches ANY include matcher (an empty include list includes every
 /// identity) and NO exclude matcher (exclude always wins). Pure over the
@@ -106,8 +116,7 @@ pub fn select_identities(
     exclude: &[IdentityMatcherSpec],
     entries: &[SnapshotListEntry],
 ) -> BTreeSet<IdentityTriple> {
-    entries
-        .iter()
+    complete(entries)
         .map(entry_triple)
         .filter(|t| {
             let included = include.is_empty() || include.iter().any(|m| matcher_matches(m, t));
@@ -120,17 +129,15 @@ pub fn select_identities(
 /// identities. When `latest_only`, only the NEWEST startTime per identity is
 /// kept — mirroring what `snapshot migrate --latest-only` copies.
 ///
-/// Incomplete checkpoint snapshots never appear here: kopia's `snapshot list
-/// --json` omits them unless `--incomplete` is passed, and
-/// [`kopiur_kopia::KopiaClient::snapshot_list_all`] never passes it — so the
-/// listing itself is the complete-only set.
+/// Incomplete checkpoints are excluded (see [`complete`]). kopia's JSON
+/// listing DOES emit them without `--incomplete` — that flag filters only the
+/// text output — and a checkpoint never arrives via migrate (issue #477).
 pub fn expected_keys(
     entries: &[SnapshotListEntry],
     selected: &BTreeSet<IdentityTriple>,
     latest_only: bool,
 ) -> BTreeSet<SnapKey> {
-    let mut all: BTreeSet<SnapKey> = entries
-        .iter()
+    let mut all: BTreeSet<SnapKey> = complete(entries)
         .filter(|e| selected.contains(&entry_triple(e)))
         .map(|e| (entry_triple(e), e.start_time))
         .collect();
@@ -152,9 +159,24 @@ pub fn expected_keys(
 /// row is never deleted merely because the selection was narrowed while its
 /// snapshot still exists on the source.
 pub fn all_keys(entries: &[SnapshotListEntry]) -> BTreeSet<SnapKey> {
+    complete(entries)
+        .map(|e| (entry_triple(e), e.start_time))
+        .collect()
+}
+
+/// The INCOMPLETE manifests (kopia checkpoints an interrupted `snapshot
+/// create` left behind) of `selected` identities in a raw source listing —
+/// what the run deliberately did not replicate, for the `incompleteSkipped`
+/// stat and the operator warning. `kopia snapshot migrate` never lands a
+/// checkpoint as a complete snapshot, so counting one as expected would fail
+/// the post-verify on every run forever (issue #477).
+pub fn incomplete_skipped<'a>(
+    entries: &'a [SnapshotListEntry],
+    selected: &BTreeSet<IdentityTriple>,
+) -> Vec<&'a SnapshotListEntry> {
     entries
         .iter()
-        .map(|e| (entry_triple(e), e.start_time))
+        .filter(|e| e.incomplete_reason().is_some() && selected.contains(&entry_triple(e)))
         .collect()
 }
 
@@ -163,8 +185,7 @@ pub fn dest_keys(
     entries: &[SnapshotListEntry],
     selected: &BTreeSet<IdentityTriple>,
 ) -> BTreeSet<SnapKey> {
-    entries
-        .iter()
+    complete(entries)
         .filter(|e| selected.contains(&entry_triple(e)))
         .map(|e| (entry_triple(e), e.start_time))
         .collect()
@@ -513,12 +534,10 @@ pub fn correspondence_set(
     selected: &BTreeSet<IdentityTriple>,
     dest_after: &[SnapshotListEntry],
 ) -> Vec<CopyCorrespondence> {
-    let source_ids: BTreeMap<SnapKey, &str> = source
-        .iter()
+    let source_ids: BTreeMap<SnapKey, &str> = complete(source)
         .map(|e| ((entry_triple(e), e.start_time), e.id.as_str()))
         .collect();
-    dest_after
-        .iter()
+    complete(dest_after)
         .filter(|e| selected.contains(&entry_triple(e)))
         .filter_map(|e| {
             let src = source_ids.get(&(entry_triple(e), e.start_time))?;

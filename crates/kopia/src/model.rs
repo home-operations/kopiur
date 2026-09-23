@@ -102,6 +102,10 @@ pub struct DirSummary {
     /// this is how an otherwise-silent *incomplete* snapshot is detected.
     #[serde(default)]
     pub errors: Vec<EntryError>,
+    /// kopia's `IncompleteReason` mirrored into the root summary (`checkpoint`,
+    /// `canceled`, …). See [`SnapshotListEntry::incomplete_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
 }
 
 /// One `{path, error}` entry from a snapshot's `rootEntry.summ.errors`. Kopia records the
@@ -366,6 +370,41 @@ pub struct SnapshotListEntry {
     /// (these types also ride the mover result wire).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
+    /// kopia's `IncompleteReason`: set (`checkpoint`, `canceled`, …) on a
+    /// manifest an interrupted `snapshot create` left behind. kopia's JSON
+    /// listing emits these even WITHOUT `--incomplete` (that flag only filters
+    /// the text output) — read it through [`Self::incomplete_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
+}
+
+impl SnapshotListEntry {
+    /// Why this manifest is NOT a complete snapshot, or `None` for a complete
+    /// one. Reads the top-level marker, falling back to `rootEntry.summ`
+    /// (kopia writes both); an empty string is kopia's `omitempty` "complete".
+    /// Deliberately an open string, not an enum: ANY reason means incomplete,
+    /// so a reason kopia adds later can never be mistaken for complete.
+    pub fn incomplete_reason(&self) -> Option<&str> {
+        let summ = self
+            .root_entry
+            .as_ref()
+            .and_then(|r| r.summary.as_ref())
+            .and_then(|s| s.incomplete.as_deref());
+        [self.incomplete.as_deref(), summ]
+            .into_iter()
+            .flatten()
+            .find(|r| !r.is_empty())
+    }
+}
+
+/// Split a raw `snapshot list --json` result into `(complete, incomplete)`,
+/// preserving order. See [`SnapshotListEntry::incomplete_reason`].
+pub fn partition_incomplete(
+    entries: Vec<SnapshotListEntry>,
+) -> (Vec<SnapshotListEntry>, Vec<SnapshotListEntry>) {
+    entries
+        .into_iter()
+        .partition(|e| e.incomplete_reason().is_none())
 }
 
 /// One entry of a kopia directory manifest (`kopia show <dir-object-id>`).

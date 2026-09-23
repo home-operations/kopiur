@@ -364,6 +364,36 @@ exit 1
     assert!(matches!(err, KopiaError::NonZeroExit { .. }));
 }
 
+// --- #477: incomplete (checkpoint / canceled) manifests -------------------
+
+/// One complete and one checkpoint entry, the shape kopia 0.23 emits from
+/// `snapshot list --json` without `--incomplete` (see fixtures_parse.rs).
+const LIST_WITH_CHECKPOINT: &str = r#"[
+ {"id":"done","source":{"host":"h","userName":"u","path":"/d"},"startTime":"2026-09-17T18:00:00Z","endTime":"2026-09-17T18:01:00Z"},
+ {"id":"ckpt","source":{"host":"h","userName":"u","path":"/d"},"startTime":"2026-09-17T18:55:54Z","endTime":"2026-09-17T19:00:00Z","incomplete":"checkpoint","rootEntry":{"summ":{"incomplete":"checkpoint"}}}
+]"#;
+
+fn list_shim() -> Shim {
+    shim(&format!(
+        "#!/bin/sh\ncat <<'EOF'\n{LIST_WITH_CHECKPOINT}\nEOF\n"
+    ))
+}
+
+#[tokio::test]
+async fn snapshot_lists_are_complete_only_by_default() {
+    let s = list_shim();
+    let client = client_for(&s);
+    let ids =
+        |v: Vec<kopiur_kopia::SnapshotListEntry>| v.into_iter().map(|e| e.id).collect::<Vec<_>>();
+    assert_eq!(ids(client.snapshot_list(None).await.unwrap()), ["done"]);
+    assert_eq!(ids(client.snapshot_list_all().await.unwrap()), ["done"]);
+    assert_eq!(
+        ids(client.snapshot_list_all_with_incomplete().await.unwrap()),
+        ["done", "ckpt"],
+        "the presence listing keeps every manifest id"
+    );
+}
+
 // --- New verb / backend coverage. The shims gate exit 0 on the expected argv,
 // so these double as wiring assertions against the real kopia 0.23 flag names. ---
 

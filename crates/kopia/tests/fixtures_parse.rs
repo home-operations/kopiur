@@ -9,6 +9,13 @@ use kopiur_kopia::{
 
 const SNAPSHOT_CREATE: &str = include_str!("fixtures/snapshot_create.json");
 const SNAPSHOT_LIST: &str = include_str!("fixtures/snapshot_list.json");
+/// `kopia snapshot list --json` captured from a REAL kopia 0.23.1 filesystem
+/// repository holding one complete snapshot and one INCOMPLETE manifest (a
+/// `snapshot create` interrupted with SIGINT, which kopia records with
+/// `"incomplete":"canceled"` both top-level and under `rootEntry.summ`). It
+/// proves JSON mode emits incomplete manifests WITHOUT `--incomplete` — the
+/// text-mode-only filter that issue #477 was bitten by.
+const SNAPSHOT_LIST_INCOMPLETE: &str = include_str!("fixtures/snapshot_list_incomplete.json");
 const REPOSITORY_STATUS: &str = include_str!("fixtures/repository_status.json");
 const MAINTENANCE_INFO: &str = include_str!("fixtures/maintenance_info.json");
 /// `kopia maintenance info --json` captured from a REAL kopia 0.23.1 filesystem
@@ -62,6 +69,52 @@ fn parse_snapshot_list() {
     // GFS retention reasons.
     assert!(e.retention_reason.contains(&"latest-1".to_string()));
     assert!(e.retention_reason.contains(&"daily-1".to_string()));
+}
+
+#[test]
+fn snapshot_list_json_carries_incomplete_manifests() {
+    let entries: Vec<SnapshotListEntry> = serde_json::from_str(SNAPSHOT_LIST_INCOMPLETE).unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "JSON mode lists the incomplete manifest too"
+    );
+    let complete = entries
+        .iter()
+        .find(|e| e.source.path.ends_with("/src"))
+        .unwrap();
+    let canceled = entries
+        .iter()
+        .find(|e| e.source.path.ends_with("/src4"))
+        .unwrap();
+    assert_eq!(complete.incomplete_reason(), None);
+    assert_eq!(canceled.incomplete_reason(), Some("canceled"));
+    let summ = canceled
+        .root_entry
+        .as_ref()
+        .and_then(|r| r.summary.as_ref())
+        .unwrap();
+    assert_eq!(summ.incomplete.as_deref(), Some("canceled"));
+}
+
+/// The issue #477 shape: a periodic checkpoint left by an interrupted upload.
+/// Either marker alone (top-level or `rootEntry.summ`) is enough, and an empty
+/// string is kopia's "complete" (`omitempty`), never a reason.
+#[test]
+fn incomplete_reason_reads_either_marker() {
+    let base: serde_json::Value =
+        serde_json::from_str::<Vec<serde_json::Value>>(SNAPSHOT_LIST).unwrap()[0].clone();
+    let with = |patch: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = base.clone();
+        patch(&mut v);
+        serde_json::from_value::<SnapshotListEntry>(v).unwrap()
+    };
+    let top = with(&|v| v["incomplete"] = "checkpoint".into());
+    assert_eq!(top.incomplete_reason(), Some("checkpoint"));
+    let summ_only = with(&|v| v["rootEntry"]["summ"]["incomplete"] = "checkpoint".into());
+    assert_eq!(summ_only.incomplete_reason(), Some("checkpoint"));
+    let empty = with(&|v| v["incomplete"] = "".into());
+    assert_eq!(empty.incomplete_reason(), None);
 }
 
 #[test]

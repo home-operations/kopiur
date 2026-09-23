@@ -43,7 +43,8 @@ use kopiur_mover::status::{
     MaintenanceObservations, SnapshotReplicationRunStats, StatusReporter, StatusUpdate,
     lease_blocked_body, maintenance_failed_body, maintenance_failed_body_from_mover,
     maintenance_ran_body, replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
-    snapshot_replicate_ok_body, split_api_version, verify_failed_body, verify_ok_body,
+    snapshot_replicate_ok_body, snapshot_replicate_success_message, split_api_version,
+    verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
@@ -3751,9 +3752,41 @@ struct SreplRunData {
     stats: SnapshotReplicationRunStats,
 }
 
+/// Name (up to 10) incomplete source manifests the run skipped, with the fix.
+/// A `warn!`, not a failure: the skip is correct, but the checkpoint is an
+/// interrupted upload an operator usually wants to clean up.
+fn warn_incomplete_skipped(skipped: &[&kopiur_kopia::SnapshotListEntry]) {
+    if skipped.is_empty() {
+        return;
+    }
+    let sample = skipped
+        .iter()
+        .take(10)
+        .map(|e| {
+            format!(
+                "{}@{} ({}, id {})",
+                e.source.identity(),
+                e.start_time.to_rfc3339(),
+                e.incomplete_reason().unwrap_or_default(),
+                e.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        count = skipped.len(),
+        %sample,
+        "skipping incomplete source snapshot manifest(s): kopia cannot replicate a checkpoint, so \
+         they are excluded from the copy and the post-verify. They are usually left by an \
+         interrupted `kopia snapshot create`; once confirmed abandoned, remove each with \
+         `kopia snapshot delete <id> --delete` against the source repository"
+    );
+}
+
 /// Steps 5–7 of the replicate flow: enumerate the source (`snapshot list
-/// --all` — foreign identities too; incomplete checkpoints never appear,
-/// kopia's list omits them without `--incomplete`), select identities, run the
+/// --all` — foreign identities too; incomplete checkpoints ARE listed — kopia's
+/// `--incomplete` filters only text output — so the kernels exclude them and
+/// the run reports them as `incompleteSkipped`), select identities, run the
 /// migrate (`--all` when unfiltered, else one `--sources` per selected
 /// triple), then the mandatory post-verify (kopia exits 0 even when a
 /// per-source migration failed, so the dest listing is the real success
@@ -3768,7 +3801,9 @@ async fn srepl_migrate_and_verify(
 ) -> Result<Option<SreplRunData>> {
     use kopiur_mover::error::KopiaOp as Op;
 
-    let source_list = match source_client.snapshot_list_all().await {
+    // Unfiltered on purpose: the kernels skip incomplete manifests themselves,
+    // and the run reports what it skipped (issue #477).
+    let source_list = match source_client.snapshot_list_all_with_incomplete().await {
         Ok(l) => l,
         Err(e) => {
             srepl_terminal_kopia(&spec.target_ref, Op::SourceSnapshotList, e).await?;
@@ -3776,6 +3811,8 @@ async fn srepl_migrate_and_verify(
         }
     };
     let selected = srepl::select_identities(&op.include, &op.exclude, &source_list);
+    let incomplete_skipped = srepl::incomplete_skipped(&source_list, &selected);
+    warn_incomplete_skipped(&incomplete_skipped);
     if selected.is_empty() {
         let stats = SnapshotReplicationRunStats::default();
         patch_snapshot_replicate_status(
@@ -3837,6 +3874,7 @@ async fn srepl_migrate_and_verify(
         already_present: expected.intersection(&dest_before_keys).count(),
         failed: missing.len(),
         pruned: 0,
+        incomplete_skipped: incomplete_skipped.len(),
     };
     let expected_len = expected.len();
     Ok(Some(SreplRunData {
@@ -4011,18 +4049,7 @@ async fn run_snapshot_replicate_flow(
             &chrono::Utc::now(),
             stats,
             "ReplicationSucceeded",
-            &format!(
-                "replicated {} snapshot(s) across {} identit{} ({} already present, {} pruned)",
-                stats.snapshots_copied,
-                stats.identities_selected,
-                if stats.identities_selected == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                stats.already_present,
-                stats.pruned,
-            ),
+            &snapshot_replicate_success_message(stats),
         ),
     )
     .await;

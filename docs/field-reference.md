@@ -4078,6 +4078,7 @@ Externally tagged — set **exactly one** of: `mirrorSource` · `none` · `reten
 | `alreadyPresent` | integer | —<br><sub>min 0</sub> | Selected snapshots that were already present at the destination (skipped). |
 | `failed` | integer | —<br><sub>min 0</sub> | Selected snapshots that failed to copy (kopia migrate exits 0 on per-source failures; the mover's post-verify counts them here). |
 | `identitiesSelected` | integer | —<br><sub>min 0</sub> | Source identities the selector matched this run. |
+| `incompleteSkipped` | integer | —<br><sub>min 0</sub> | Incomplete source manifests of selected identities — checkpoints an interrupted `kopia snapshot create` left behind — that this run did not replicate. kopia can never migrate a checkpoint as a complete snapshot, so they are skipped rather than failing the post-verify. Non-zero usually means an abandoned manual backup worth cleaning up with `kopia snapshot delete &lt;id&gt; --delete` (the mover log names the ids). |
 | `pruned` | integer | —<br><sub>min 0</sub> | Copies pruned this run per `spec.pruning`. |
 | `snapshotsCopied` | integer | —<br><sub>min 0</sub> | Snapshots newly copied to the destination this run. |
 

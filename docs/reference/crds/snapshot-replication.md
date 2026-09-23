@@ -31,7 +31,7 @@ Which snapshots to copy. Leaving it out copies every identity's full history, wh
 | `identities.include` / `identities.exclude` | Lists of matchers over the kopia identity triple. Each matcher sets any of `username` / `hostname` / `sourcePath` (at least one required, webhook-enforced); every **set** component must match. Components match with anchored globs: `*` = any run of characters, `?` = exactly one. A snapshot is selected when it matches any `include` (empty = everything) and no `exclude`; exclude wins. |
 | `latestOnly` | `true` = copy only each selected identity's most recent snapshot (a cheap seed); default `false` = full history. |
 
-Matching zero identities is a successful no-op, not an error. Source snapshots that are incomplete, meaning interrupted, are never copied.
+Matching zero identities is a successful no-op, not an error. Source snapshots that are incomplete, meaning checkpoints left by an interrupted `kopia snapshot create`, are never copied and never count as missing. They are reported in `status.lastRun.incompleteSkipped`.
 
 ### `migrate`
 
@@ -111,5 +111,5 @@ The phase is `Pending` while the replication is suspended, or while the request 
 | --- | --- |
 | `observedGeneration` | The `metadata.generation` last reconciled, for staleness detection and kstatus. |
 | `lastReplicated` | RFC 3339 timestamp of the most recent successful run, behind the `LAST` print column. |
-| `lastRun` | Counters from the most recent run: `identitiesSelected`, `snapshotsCopied`, `alreadyPresent` (idempotent skips), `failed`, `pruned`. |
+| `lastRun` | Counters from the most recent run: `identitiesSelected`, `snapshotsCopied`, `alreadyPresent` (idempotent skips), `failed`, `pruned`, `incompleteSkipped` (interrupted-upload checkpoints on the source that were not copied). |
 | `conditions` | Standard `Ready`/`Reconciling`/`Stalled` for `kubectl wait`, plus gates like `WaitingForSourceRepository` / `WaitingForDestinationRepository` / `DestinationReadOnly` and the `IdentityOverlap` runtime guard. |

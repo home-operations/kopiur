@@ -743,6 +743,36 @@ pub struct SnapshotReplicationRunStats {
     pub failed: usize,
     /// How many dest-side copy CRs this run's pruning deleted.
     pub pruned: usize,
+    /// How many INCOMPLETE source manifests (checkpoints an interrupted
+    /// `kopia snapshot create` left behind) of selected identities this run
+    /// deliberately did not replicate (issue #477).
+    pub incomplete_skipped: usize,
+}
+
+/// The `Ready=True` message for a successful snapshot replication. Skipped
+/// incomplete source manifests are named here (not only in the mover log) so
+/// `kubectl describe` shows an abandoned checkpoint worth cleaning up (#477).
+pub fn snapshot_replicate_success_message(stats: &SnapshotReplicationRunStats) -> String {
+    let mut msg = format!(
+        "replicated {} snapshot(s) across {} identit{} ({} already present, {} pruned)",
+        stats.snapshots_copied,
+        stats.identities_selected,
+        if stats.identities_selected == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        stats.already_present,
+        stats.pruned,
+    );
+    if stats.incomplete_skipped > 0 {
+        msg.push_str(&format!(
+            "; skipped {} incomplete source snapshot(s) (interrupted-upload checkpoints kopia \
+             cannot replicate; the mover log names their ids)",
+            stats.incomplete_skipped
+        ));
+    }
+    msg
 }
 
 /// `{ "status": ... }` body for a successful snapshot replication: phase
@@ -1985,6 +2015,32 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_replicate_success_message_surfaces_skipped_checkpoints() {
+        let mut stats = SnapshotReplicationRunStats {
+            identities_selected: 1,
+            snapshots_copied: 2,
+            already_present: 3,
+            pruned: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot_replicate_success_message(&stats),
+            "replicated 2 snapshot(s) across 1 identity (3 already present, 4 pruned)"
+        );
+        stats.identities_selected = 2;
+        stats.incomplete_skipped = 1;
+        let msg = snapshot_replicate_success_message(&stats);
+        assert!(
+            msg.starts_with("replicated 2 snapshot(s) across 2 identities"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("skipped 1 incomplete source snapshot(s)"),
+            "a skipped checkpoint must be visible on Ready, not only in the log: {msg}"
+        );
+    }
+
+    #[test]
     fn snapshot_replicate_ok_body_carries_last_run_and_ready_true() {
         let stats = SnapshotReplicationRunStats {
             identities_selected: 3,
@@ -1992,6 +2048,7 @@ mod tests {
             already_present: 2,
             failed: 0,
             pruned: 1,
+            incomplete_skipped: 1,
         };
         let body = snapshot_replicate_ok_body(
             "S3",
@@ -2008,6 +2065,7 @@ mod tests {
         assert_eq!(body["status"]["lastRun"]["alreadyPresent"], 2);
         assert_eq!(body["status"]["lastRun"]["failed"], 0);
         assert_eq!(body["status"]["lastRun"]["pruned"], 1);
+        assert_eq!(body["status"]["lastRun"]["incompleteSkipped"], 1);
         let cond = &body["status"]["conditions"][0];
         assert_eq!(cond["type"], "Ready");
         assert_eq!(cond["status"], "True");
@@ -2060,6 +2118,7 @@ mod tests {
             already_present: 0,
             failed: 3,
             pruned: 0,
+            incomplete_skipped: 0,
         };
         let body = snapshot_replicate_failed_body("3 missing", Some(&stats));
         assert_eq!(body["status"]["lastRun"]["failed"], 3);
