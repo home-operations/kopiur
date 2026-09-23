@@ -61,22 +61,22 @@ prometheus = "0.14"
 # export is runtime/env-gated; these add no behavior unless an endpoint is set.
 # NOTE: tracing-opentelemetry versions OFFSET the monorepo by +1 (0.33 ↔ otel
 # 0.32) — bump it in lockstep or the graph splits into two otel versions.
-opentelemetry = { version = "0.32", features = ["metrics", "trace", "logs"] }
-opentelemetry_sdk = { version = "0.32", features = [
+opentelemetry = { version = "0.33", features = ["metrics", "trace", "logs"] }
+opentelemetry_sdk = { version = "0.33", features = [
     "rt-tokio",
     "metrics",
     "trace",
     "logs",
     "experimental_metrics_custom_reader",
 ] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "grpc-tonic",
     "trace",
     "metrics",
     "logs",
 ] }
-opentelemetry-prometheus = "0.32"
-opentelemetry-appender-tracing = "0.32"
+opentelemetry-prometheus = "0.33"
+opentelemetry-appender-tracing = "0.33"
 tracing-opentelemetry = "0.33"
 url = "2"
 # HTTP client for SnapshotPolicy `httpRequest` hooks (ADR §4.8). rustls-only,
