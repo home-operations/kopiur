@@ -132,6 +132,8 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "massdel-nooverlap",
     "massdel-throttle",
     "massdel-outage",
+    // #477: a raised spec.concurrency.maxConcurrentDeleteJobs lets batches overlap.
+    "massdel-cap2",
     // Final-review flagship counterexample (mass_deletion.rs scenario 9): a held
     // external wave must not be swept into a concurrent breaker-exempt prune's batch.
     "massdel-heldprune",

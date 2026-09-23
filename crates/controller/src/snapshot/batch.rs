@@ -10,7 +10,6 @@
 //! decision surface is unit-tested without a cluster.
 
 use std::collections::{BTreeSet, HashSet};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -287,12 +286,56 @@ pub fn newest_pending_deletion(pending: &[PendingMember]) -> Option<chrono::Date
         .max()
 }
 
-/// Cap on members in a single batch delete Job (a huge batch has to be
-/// broken into waves for throttling and Job-size sanity).
-pub const MAX_BATCH_MEMBERS: usize = 200;
+/// Cap on members in a single batch delete Job. The mover deletes a batch in
+/// one bulk kopia call (one repository open), so a bigger batch is cheap; the
+/// binding limit for realistic source paths is [`BATCH_ITEMS_BYTE_BUDGET`].
+pub const MAX_BATCH_MEMBERS: usize = 1000;
+/// Serialized-size budget for one batch's members (the work spec's `items`):
+/// 80 KiB. The work spec rides a pod env var, and the Job builder refuses one
+/// over [`kopiur_mover::jobs::MAX_WORK_SPEC_BYTES`] (100 KiB, under Linux's
+/// 128 KiB `MAX_ARG_STRLEN`). The rest is headroom for the connect spec and
+/// envelope. With long source paths this binds well before
+/// [`MAX_BATCH_MEMBERS`].
+pub const BATCH_ITEMS_BYTE_BUDGET: usize = 80 * 1024;
+// At least 16 KiB of the work-spec cap must stay free for the connect spec and
+// envelope around the items: checked at compile time.
+const _: () =
+    assert!(BATCH_ITEMS_BYTE_BUDGET + 16 * 1024 <= kopiur_mover::jobs::MAX_WORK_SPEC_BYTES);
+
+/// The serialized size of one member as a work-spec item, plus its separator.
+pub fn delete_item_bytes(m: &PendingMember) -> usize {
+    let item = kopiur_mover::workspec::SnapshotDeleteItem {
+        snapshot_id: m.snapshot_id.clone(),
+        anchor: m.anchor.clone(),
+    };
+    serde_json::to_vec(&item).map_or(usize::MAX, |v| v.len() + 1)
+}
+
 /// How long a burst of pending deletions is allowed to accumulate before it
 /// fires (bounded latency vs. bounded batching — small bursts still coalesce).
 pub const BATCH_QUIET_WINDOW: Duration = Duration::from_secs(10);
+
+/// `activeDeadlineSeconds` of a snapshot-delete batch Job: 30 minutes. Batches
+/// are single-flight per repository (`spec.concurrency.maxConcurrentDeleteJobs`,
+/// default 1), so a Job that hangs blocks every later wave for its repository
+/// until it ends. The blanket 48h mover deadline
+/// ([`kopiur_mover::jobs::DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS`]) would make that
+/// two days. A healthy batch is one listing plus one bulk `kopia snapshot
+/// delete` and finishes in seconds to minutes. A Job that hits this deadline
+/// fails, and its members re-fire in a fresh wave after the failed-Job backoff.
+pub const BATCH_DELETE_DEADLINE_SECONDS: i64 = 30 * 60;
+
+/// The [`JobLimits`](kopiur_mover::jobs::JobLimits) of a snapshot-delete batch
+/// Job: the short [`BATCH_DELETE_DEADLINE_SECONDS`], and NO
+/// `ttlSecondsAfterFinished` because reaping is explicit (the dispatcher and
+/// sweep own it), so a member reconcile can always observe the terminal Job.
+pub fn batch_job_limits() -> kopiur_mover::jobs::JobLimits {
+    kopiur_mover::jobs::JobLimits {
+        active_deadline_seconds: Some(BATCH_DELETE_DEADLINE_SECONDS),
+        ttl_seconds_after_finished: None,
+        ..kopiur_mover::jobs::JobLimits::default()
+    }
+}
 
 /// Everything the FIRE-eligibility filter ([`fire_eligible`]) needs, all pure.
 ///
@@ -459,8 +502,10 @@ pub fn empty_schedule_list_proves_synced(item_count: Option<usize>) -> bool {
 /// `covered` by a non-FAILED batch Job ([`covered_uids`] — LIVE or SUCCEEDED). THE
 /// NO-OVERLAP INVARIANT: a member rides at most one non-terminal-failed batch — this
 /// prevents double-enrollment (an anchor-heal double-delete hazard for a LIVE job, a
-/// wasteful re-delete / oldest-first stall for a SUCCEEDED-but-draining one) and
-/// gives the throttle real parallelism (wave 2 takes the NEXT [`MAX_BATCH_MEMBERS`]).
+/// wasteful re-delete / oldest-first stall for a SUCCEEDED-but-draining one). The
+/// NEXT wave takes the next [`MAX_BATCH_MEMBERS`], but only once the repository's
+/// delete-Job cap admits it (`spec.concurrency.maxConcurrentDeleteJobs`, default
+/// 1: waves run one at a time; see [`crate::pool::DeleteAdmissionLedger`]).
 pub fn fireable_members(
     pending: Vec<PendingMember>,
     covered_uids: &HashSet<String>,
@@ -519,6 +564,24 @@ fn oldest_first_truncated(fireable: &[PendingMember], max: usize) -> Vec<Pending
             .then_with(|| a.uid.cmp(&b.uid))
     });
     sorted.truncate(max);
+    within_byte_budget(sorted)
+}
+
+/// The longest oldest-first prefix whose serialized items fit
+/// [`BATCH_ITEMS_BYTE_BUDGET`], and always at least one member: an oversized
+/// member fires alone (and the Job builder names the problem) rather than
+/// wedging the whole queue behind it. A prefix of an already-deterministic
+/// order, so the wave (and its Job name) is stable across reconciles.
+fn within_byte_budget(mut sorted: Vec<PendingMember>) -> Vec<PendingMember> {
+    let mut used = 0usize;
+    let fit = sorted
+        .iter()
+        .take_while(|m| {
+            used = used.saturating_add(delete_item_bytes(m));
+            used <= BATCH_ITEMS_BYTE_BUDGET
+        })
+        .count();
+    sorted.truncate(fit.max(1));
     sorted
 }
 
@@ -541,31 +604,6 @@ pub fn batch_job_name(repo: &RepositoryRef, members: &[PendingMember]) -> String
     uids.sort_unstable();
     let full = format!("snapdel-{}-{}", repo_label(repo), uids.join("-"));
     crate::naming::capped_name(&full)
-}
-
-/// Whether a new batch Job may launch given how many are already live.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThrottleVerdict {
-    /// Under the cap: launch the new batch Job.
-    Proceed,
-    /// At/over the cap: wait for a live Job to finish first.
-    Wait,
-}
-
-/// `cap` bounds concurrent live batch delete Jobs cluster-wide
-/// (`Context::max_concurrent_delete_jobs`). `None` (the default,
-/// `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` unset or `0`) means UNCAPPED: batching
-/// (one Job per repository per accumulation window, not one per `Snapshot`)
-/// is the primary defense against overwhelming the backend, so an
-/// operator-wide concurrency cap is only an opt-in backstop — always
-/// `Proceed` when it's off, so a slow/failing repository can never
-/// head-of-line-block every other repository's deletions behind it.
-pub fn throttle_verdict(live_batch_jobs: usize, cap: Option<NonZeroUsize>) -> ThrottleVerdict {
-    match cap {
-        None => ThrottleVerdict::Proceed,
-        Some(cap) if live_batch_jobs >= cap.get() => ThrottleVerdict::Wait,
-        Some(_) => ThrottleVerdict::Proceed,
-    }
 }
 
 /// Requeue mapping for the deletion path (single source of truth): an enum ->
@@ -1846,6 +1884,95 @@ mod tests {
         }
     }
 
+    // --- batch byte budget (#477) ---------------------------------------------
+
+    fn long_path_member(uid: &str, secs: i64, path_len: usize) -> PendingMember {
+        let mut m = member(uid, secs);
+        m.anchor = SnapshotAnchor {
+            source_path: format!("/{}", "p".repeat(path_len)),
+            start_time: Some("2026-06-19T05:54:19Z".into()),
+            username: Some("ns-name".into()),
+            hostname: Some("cluster".into()),
+        };
+        m
+    }
+
+    fn items_bytes(members: &[PendingMember]) -> usize {
+        members.iter().map(delete_item_bytes).sum()
+    }
+
+    /// A batch's serialized members must fit the work-spec env var (the Job
+    /// builder refuses over `MAX_WORK_SPEC_BYTES`). Long source paths made even
+    /// the old 200-member cap too big, a Job that could never be built.
+    #[test]
+    fn a_fired_batch_fits_the_work_spec_byte_budget() {
+        let fireable: Vec<_> = (0..MAX_BATCH_MEMBERS as i64)
+            .map(|i| long_path_member(&format!("u{i:05}"), i, 1000))
+            .collect();
+        let BatchFire::Fire(fired) = batch_fire_decision(
+            &fireable,
+            chrono::Utc::now(),
+            BATCH_QUIET_WINDOW,
+            MAX_BATCH_MEMBERS,
+        ) else {
+            panic!("a full batch fires");
+        };
+        assert!(!fired.is_empty());
+        assert!(
+            fired.len() < fireable.len(),
+            "the byte budget must bind here"
+        );
+        assert!(items_bytes(&fired) <= BATCH_ITEMS_BYTE_BUDGET);
+        // Oldest first, and the same prefix whatever the input order, so the
+        // deterministic Job name (409 dedup) cannot flap between reconciles.
+        let mut reversed = fireable.clone();
+        reversed.reverse();
+        let BatchFire::Fire(again) = batch_fire_decision(
+            &reversed,
+            chrono::Utc::now(),
+            BATCH_QUIET_WINDOW,
+            MAX_BATCH_MEMBERS,
+        ) else {
+            panic!("fires");
+        };
+        assert_eq!(fired, again);
+        assert_eq!(fired[0].uid, "u00000");
+    }
+
+    #[test]
+    fn a_single_oversized_member_still_fires_alone() {
+        let fireable = vec![
+            long_path_member("big", 1, BATCH_ITEMS_BYTE_BUDGET),
+            member("small", 2),
+        ];
+        let BatchFire::Fire(fired) =
+            batch_fire_decision(&fireable, chrono::Utc::now(), BATCH_QUIET_WINDOW, 10)
+        else {
+            panic!("fires");
+        };
+        assert_eq!(fired.len(), 1, "never an empty wave");
+        assert_eq!(fired[0].uid, "big");
+    }
+
+    // --- batch_job_limits ------------------------------------------------------
+
+    /// #477: with delete batches single-flight per repository, one wedged Job
+    /// blocks every later wave for that repository until it ends. The blanket
+    /// 48h mover deadline would make that two days, so batch Jobs carry their
+    /// own short one. A bulk delete finishes in seconds.
+    #[test]
+    fn batch_jobs_carry_a_short_deadline_and_no_ttl() {
+        let limits = batch_job_limits();
+        assert_eq!(
+            limits.active_deadline_seconds,
+            Some(BATCH_DELETE_DEADLINE_SECONDS)
+        );
+        assert_eq!(
+            limits.ttl_seconds_after_finished, None,
+            "reaping is explicit"
+        );
+    }
+
     // --- batch_job_name -------------------------------------------------
 
     #[test]
@@ -1865,23 +1992,6 @@ mod tests {
         let a = vec![member("uid-a", 1), member("uid-b", 2)];
         let b = vec![member("uid-a", 1), member("uid-c", 2)];
         assert_ne!(batch_job_name(&r, &a), batch_job_name(&r, &b));
-    }
-
-    // --- throttle_verdict -------------------------------------------------
-
-    #[test]
-    fn throttle_verdict_below_and_at_cap() {
-        let cap = NonZeroUsize::new(3);
-        assert_eq!(throttle_verdict(2, cap), ThrottleVerdict::Proceed);
-        assert_eq!(throttle_verdict(3, cap), ThrottleVerdict::Wait);
-    }
-
-    #[test]
-    fn throttle_verdict_uncapped_always_proceeds() {
-        // `None` (the default) means uncapped: no live count, however large,
-        // ever throttles — batching itself is the primary protection.
-        assert_eq!(throttle_verdict(0, None), ThrottleVerdict::Proceed);
-        assert_eq!(throttle_verdict(1_000_000, None), ThrottleVerdict::Proceed);
     }
 
     // --- deletion_requeue -------------------------------------------------

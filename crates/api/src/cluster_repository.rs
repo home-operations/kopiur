@@ -528,7 +528,8 @@ deletionProtection:
         assert_eq!(
             spec.concurrency,
             Some(ConcurrencySpec {
-                max_concurrent_jobs: Some(4)
+                max_concurrent_jobs: Some(4),
+                max_concurrent_delete_jobs: None,
             })
         );
         assert_eq!(

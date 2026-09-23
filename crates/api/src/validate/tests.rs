@@ -8684,3 +8684,36 @@ fn reordering_plain_pvc_sources_needs_the_ack() {
     assert!(detect_source_path_fork(&order("a", "b"), &order("b", "a"), true, true).is_none());
     assert!(detect_source_path_fork(&order("a", "b"), &order("a", "b"), true, false).is_none());
 }
+
+/// #477: a delete-Job cap of 0 would never delete anything, and there is no
+/// "unlimited" spelling (unlimited is the herd #477 describes). Omit the
+/// field for the default of 1.
+#[test]
+fn repository_concurrency_rejects_a_zero_delete_job_cap() {
+    use crate::common::ConcurrencySpec;
+    let zero = ConcurrencySpec {
+        max_concurrent_delete_jobs: Some(0),
+        ..Default::default()
+    };
+    let errs = validate_repository_concurrency(Some(&zero), "ClusterRepository");
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    let msg = errs[0].to_string();
+    assert!(
+        msg.contains("ClusterRepository spec.concurrency.maxConcurrentDeleteJobs"),
+        "{msg}"
+    );
+    assert!(msg.contains("at least 1"), "{msg}");
+
+    let two = ConcurrencySpec {
+        max_concurrent_delete_jobs: Some(2),
+        ..Default::default()
+    };
+    assert!(validate_repository_concurrency(Some(&two), "Repository").is_empty());
+    assert!(validate_repository_concurrency(None, "Repository").is_empty());
+    // maxConcurrentJobs keeps its own meaning: 0 is "unlimited", not an error.
+    let pool_zero = ConcurrencySpec {
+        max_concurrent_jobs: Some(0),
+        ..Default::default()
+    };
+    assert!(validate_repository_concurrency(Some(&pool_zero), "Repository").is_empty());
+}

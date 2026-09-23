@@ -2142,7 +2142,7 @@ impl KopiaClient {
     /// List COMPLETE snapshots, optionally filtered by source identity. With no
     /// filter this lists all snapshots in the repository.
     ///
-    /// **Incomplete manifests are dropped** (see [`complete_only`]): kopia's JSON
+    /// **Incomplete manifests are dropped**: kopia's JSON
     /// listing emits the checkpoints an interrupted `snapshot create` leaves
     /// behind even without `--incomplete`, and no caller of a "snapshot list"
     /// means a partial upload (issue #477). Use

@@ -533,6 +533,16 @@ A run that arrives at a full pool is parked **before its Job is created**. It sh
 
 A cluster-wide backstop, the Helm value [`maxConcurrentJobs`](install.md#runtime-tuning), bounds the same pool across every repository, for operators whose constraint is the node pool rather than any one backend. A run must satisfy both.
 
+Snapshot deletions have their own, separate limit, `maxConcurrentDeleteJobs`. It is how many batch-delete Jobs may run against this repository at once, and **absent means `1`**: one batch at a time, the next starting when the current one finishes. Each batch already deletes up to 1,000 snapshots in one kopia call, and kopia serializes deletes on the repository's index, so more parallel batches only multiply index downloads against the same backend. Raise it only for a fast local backend with a very large deletion backlog. It must be at least `1`; there is no unlimited value.
+
+```yaml
+spec:
+    concurrency:
+        maxConcurrentDeleteJobs: 1 # absent = 1 (the default); must be >= 1
+```
+
+See [Backups → how a deletion actually runs](backups.md#how-a-deletion-actually-runs--batched-not-one-job-per-snapshot).
+
 ### A tuned repository, end to end
 
 Concurrency, `scheduleDefaults` and `moverDefaults.podLabels` are the three settings you reach for once a repository has real load on it. Applied together:

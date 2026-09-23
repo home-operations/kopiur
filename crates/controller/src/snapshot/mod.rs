@@ -4032,30 +4032,88 @@ async fn fire_batch(
         BatchFire::Accumulate { retry_in } => Ok(Action::requeue(deletion_requeue(
             DeletionRequeue::Accumulating(retry_in),
         ))),
-        BatchFire::Fire(members) => match throttle_verdict(
-            throttle_live_count(ctx).await?,
-            ctx.max_concurrent_delete_jobs,
-        ) {
-            ThrottleVerdict::Wait => Ok(Action::requeue(deletion_requeue(
-                DeletionRequeue::Throttled,
-            ))),
-            ThrottleVerdict::Proceed => {
-                launch_batch_job(
-                    backup, ctx, api, namespace, name, job_ns, repo_ref, repo, &members,
-                )
-                .await
+        BatchFire::Fire(members) => {
+            let job_name = batch_job_name(repo_ref, &members);
+            match admit_batch(ctx, job_ns, repo_ref, repo, views, &job_name).await? {
+                crate::pool::DeleteVerdict::Park {
+                    repo_live,
+                    global_live,
+                } => {
+                    tracing::debug!(
+                        backup = %name,
+                        repo_live,
+                        global_live,
+                        "delete batch parked: the repository's (or the cluster's) delete-Job \
+                         cap is reached; the next wave fires when a running batch finishes"
+                    );
+                    Ok(Action::requeue(deletion_requeue(
+                        DeletionRequeue::Throttled,
+                    )))
+                }
+                // `_reservation` (not `_`) keeps the slot reserved until the
+                // create below has returned and the next LIST can see the Job.
+                crate::pool::DeleteVerdict::Admit(_reservation) => {
+                    launch_batch_job(
+                        backup, ctx, api, namespace, name, job_ns, repo_ref, repo, &members,
+                    )
+                    .await
+                }
             }
-        },
+        }
     }
 }
 
-/// Count the LIVE batch delete Jobs across the whole watch scope — the throttle's
-/// cluster-wide concurrency input. Skipped entirely (returns 0) when UNCAPPED (the
-/// default), so a normal install never pays for the extra LIST.
-async fn throttle_live_count(ctx: &Context) -> Result<usize> {
-    if ctx.max_concurrent_delete_jobs.is_none() {
-        return Ok(0);
+/// Admit or park a delete-batch wave (issue #477). Delete batches are capped
+/// PER REPOSITORY (`spec.concurrency.maxConcurrentDeleteJobs`, default 1: one
+/// batch at a time) and, when `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` is set, across
+/// the cluster. Decided under [`crate::pool::DeleteAdmissionLedger`]'s lock, so
+/// concurrently reconciling members cannot each LIST "nothing running" and each
+/// launch a batch, which is how #477 got ~33 Jobs on one repository.
+///
+/// `views` is this repository's quorum LIST from the same reconcile. The
+/// cluster-wide LIST runs only when the global cap is set, so the default
+/// install pays nothing extra.
+async fn admit_batch(
+    ctx: &Context,
+    job_ns: &str,
+    repo_ref: &RepositoryRef,
+    repo: &ResolvedRepository,
+    views: &[BatchJobView],
+    job_name: &str,
+) -> Result<crate::pool::DeleteVerdict> {
+    let mut observed = crate::pool::ObservedPool {
+        repo_live: views
+            .iter()
+            .filter(|v| v.state == BatchJobState::Live)
+            .count(),
+        global_live: 0,
+        seen: views
+            .iter()
+            .map(|v| crate::pool::job_key(job_ns, &v.name))
+            .collect(),
+    };
+    if ctx.max_concurrent_delete_jobs.is_some() {
+        let (live, seen) = cluster_batch_jobs(ctx).await?;
+        observed.global_live = live;
+        observed.seen.extend(seen);
     }
+    let caps = crate::pool::DeleteCaps {
+        repo: kopiur_api::consts::effective_max_concurrent_delete_jobs(repo.concurrency.as_ref()),
+        global: ctx.max_concurrent_delete_jobs,
+    };
+    Ok(ctx.delete_admissions.admit(
+        &repo_label(repo_ref),
+        &crate::pool::job_key(job_ns, job_name),
+        &observed,
+        caps,
+    ))
+}
+
+/// Every batch delete Job in the watch scope: how many are LIVE, and the
+/// `namespace/name` key of each (live or not) for the ledger's sweep. A quorum
+/// read (no `resourceVersion`): the ledger relies on the next LIST seeing a
+/// just-created Job.
+async fn cluster_batch_jobs(ctx: &Context) -> Result<(usize, std::collections::BTreeSet<String>)> {
     let selector =
         format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{OP_LABEL}={OP_SNAPSHOT_DELETE_BATCH}");
     let job_api: Api<Job> = crate::controllers::scoped_api(&ctx.client, &ctx.watch_scope);
@@ -4063,10 +4121,15 @@ async fn throttle_live_count(ctx: &Context) -> Result<usize> {
         .list(&ListParams::default().labels(&selector))
         .await?
         .items;
-    Ok(jobs
+    let live = jobs
         .iter()
         .filter(|j| job_terminal_state(j).is_none())
-        .count())
+        .count();
+    let seen = jobs
+        .iter()
+        .map(|j| crate::pool::job_key(&j.namespace().unwrap_or_default(), &j.name_any()))
+        .collect();
+    Ok((live, seen))
 }
 
 /// Build (§2) and CREATE the batch delete Job for `members`, then move THIS CR to
@@ -4214,12 +4277,7 @@ async fn build_batch_job(
         None,
         None,
     );
-    let limits = JobLimits {
-        // NO TTL — reaping is EXPLICIT (the dispatcher + sweep own it), so a member
-        // reconcile can always observe the terminal Job.
-        ttl_seconds_after_finished: None,
-        ..JobLimits::default()
-    };
+    let limits = batch_job_limits();
     let mover_identity = io::ensure_mover_identity(
         &ctx.client,
         job_ns,

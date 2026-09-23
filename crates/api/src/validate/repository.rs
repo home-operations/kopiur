@@ -718,6 +718,28 @@ pub fn validate_repository_health(
     Ok(())
 }
 
+/// `spec.concurrency` rules shared by `Repository` and `ClusterRepository`
+/// (`context` names the kind for the message). `maxConcurrentDeleteJobs` must be
+/// at least 1: 0 would never delete anything, and there is deliberately no
+/// "unlimited" spelling. `maxConcurrentJobs` keeps its own contract (0 means
+/// unlimited), so it is not checked here.
+pub fn validate_repository_concurrency(
+    concurrency: Option<&crate::common::ConcurrencySpec>,
+    context: &str,
+) -> Vec<ValidationError> {
+    concurrency
+        .and_then(|c| c.max_concurrent_delete_jobs)
+        .and_then(|n| {
+            super::require_min(
+                &format!("{context} spec.concurrency.maxConcurrentDeleteJobs"),
+                i64::from(n),
+                super::NumericBound::Count,
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
 /// Whether a [`Retention`] selects **no** snapshots — every bucket unset or `0`. The
 /// controller only prunes when `spec.retention` is `Some` ([`crate::retention::select_kept`]
 /// over the buckets), so a `Some(keeps-nothing)` retention prunes *every* `Snapshot`
@@ -949,6 +971,10 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
     if let Err(e) = validate_repository_health(spec.health.as_ref(), "Repository") {
         errs.push(e);
     }
+    errs.extend(validate_repository_concurrency(
+        spec.concurrency.as_ref(),
+        "Repository",
+    ));
     if let Some(b) = &spec.bootstrap
         && let Some(fp) = &b.failure_policy
         && let Err(e) = validate_failure_policy(fp, "Repository spec.bootstrap")
@@ -1688,6 +1714,10 @@ pub fn validate_cluster_repository(spec: &ClusterRepositorySpec) -> Vec<Validati
     if let Err(e) = validate_repository_health(spec.health.as_ref(), "ClusterRepository") {
         errs.push(e);
     }
+    errs.extend(validate_repository_concurrency(
+        spec.concurrency.as_ref(),
+        "ClusterRepository",
+    ));
     if let Some(b) = &spec.bootstrap
         && let Some(fp) = &b.failure_policy
         && let Err(e) = validate_failure_policy(fp, "ClusterRepository spec.bootstrap")

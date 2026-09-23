@@ -1173,6 +1173,46 @@ health:
         assert_eq!(crate::consts::effective_max_concurrent_jobs(None), None);
     }
 
+    /// #477: delete-batch Jobs are capped per repository. Absent means ONE
+    /// (single-flight), never unlimited: parallel bulk deletes on one repository
+    /// only multiply index loads and write contention. No schema `default:`, so
+    /// stored repositories carry no diff noise, and the resolver owns the 1.
+    #[test]
+    fn concurrency_max_concurrent_delete_jobs_defaults_to_one() {
+        use crate::common::ConcurrencySpec;
+        use crate::consts::effective_max_concurrent_delete_jobs;
+
+        let head = "backend: { filesystem: { path: /repo } }\n\
+                    encryption: { passwordSecretRef: { name: s } }\n";
+        let spec: RepositorySpec = from_yaml(&format!(
+            "{head}concurrency:\n  maxConcurrentDeleteJobs: 3\n"
+        ));
+        assert_eq!(
+            spec.concurrency.and_then(|c| c.max_concurrent_delete_jobs),
+            Some(3)
+        );
+        assert_eq!(
+            effective_max_concurrent_delete_jobs(spec.concurrency.as_ref()).get(),
+            3
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["concurrency"]["maxConcurrentDeleteJobs"], 3);
+
+        assert_eq!(effective_max_concurrent_delete_jobs(None).get(), 1);
+        assert_eq!(
+            effective_max_concurrent_delete_jobs(Some(&ConcurrencySpec::default())).get(),
+            1
+        );
+
+        let crd = serde_json::to_value(Repository::crd()).unwrap();
+        let field = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["concurrency"]["properties"]["maxConcurrentDeleteJobs"];
+        assert!(!field.is_null(), "the field must exist in the schema");
+        assert!(field.get("default").is_none(), "no schema default: {field}");
+        // The apiserver enforces the floor too, not only the webhook.
+        assert_eq!(field["minimum"], 1.0, "{field}");
+    }
+
     #[test]
     fn concurrency_round_trips_and_zero_is_unlimited() {
         use crate::common::ConcurrencySpec;
@@ -1186,7 +1226,8 @@ health:
         assert_eq!(
             spec.concurrency,
             Some(ConcurrencySpec {
-                max_concurrent_jobs: Some(2)
+                max_concurrent_jobs: Some(2),
+                max_concurrent_delete_jobs: None,
             })
         );
         assert_eq!(
@@ -1216,7 +1257,8 @@ health:
         assert_eq!(
             empty.concurrency,
             Some(ConcurrencySpec {
-                max_concurrent_jobs: None
+                max_concurrent_jobs: None,
+                max_concurrent_delete_jobs: None,
             })
         );
         assert_eq!(
