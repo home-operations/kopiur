@@ -44,8 +44,8 @@ use kopiur_mover::status::{
     MaintenanceObservations, SnapshotReplicationRunStats, StatusReporter, StatusUpdate,
     lease_blocked_body, maintenance_failed_body, maintenance_failed_body_from_mover,
     maintenance_ran_body, replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
-    snapshot_replicate_ok_body, snapshot_replicate_success_message, split_api_version,
-    verify_failed_body, verify_ok_body,
+    snapshot_replicate_no_match_message, snapshot_replicate_ok_body,
+    snapshot_replicate_success_message, split_api_version, verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
@@ -3904,10 +3904,14 @@ async fn srepl_migrate_and_verify(
         }
     };
     let selected = srepl::select_identities(&op.include, &op.exclude, &source_list);
-    let incomplete_skipped = srepl::incomplete_skipped(&source_list, &selected);
+    let incomplete_skipped = srepl::incomplete_skipped(&op.include, &op.exclude, &source_list);
     warn_incomplete_skipped(&incomplete_skipped);
     if selected.is_empty() {
-        let stats = SnapshotReplicationRunStats::default();
+        let stats = SnapshotReplicationRunStats {
+            incomplete_skipped: incomplete_skipped.len(),
+            ..Default::default()
+        };
+        let message = snapshot_replicate_no_match_message(&stats);
         patch_snapshot_replicate_status(
             &spec.target_ref,
             &snapshot_replicate_ok_body(
@@ -3915,11 +3919,11 @@ async fn srepl_migrate_and_verify(
                 &chrono::Utc::now(),
                 &stats,
                 "NoIdentitiesMatched",
-                "no source identities matched the selection; nothing to replicate",
+                &message,
             ),
         )
         .await;
-        info!("no source identities matched the selection; nothing to replicate");
+        info!("{message}");
         return Ok(None);
     }
     let dest_before = match dest_client.snapshot_list_all().await {

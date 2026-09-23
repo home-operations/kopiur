@@ -118,11 +118,20 @@ pub fn select_identities(
 ) -> BTreeSet<IdentityTriple> {
     complete(entries)
         .map(entry_triple)
-        .filter(|t| {
-            let included = include.is_empty() || include.iter().any(|m| matcher_matches(m, t));
-            included && !exclude.iter().any(|m| matcher_matches(m, t))
-        })
+        .filter(|t| identity_matches(include, exclude, t))
         .collect()
+}
+
+/// The run's identity rule, shared by [`select_identities`] and
+/// [`incomplete_skipped`]: ANY include matcher (an empty include list includes
+/// every identity) and NO exclude matcher (exclude always wins).
+fn identity_matches(
+    include: &[IdentityMatcherSpec],
+    exclude: &[IdentityMatcherSpec],
+    t: &IdentityTriple,
+) -> bool {
+    let included = include.is_empty() || include.iter().any(|m| matcher_matches(m, t));
+    included && !exclude.iter().any(|m| matcher_matches(m, t))
 }
 
 /// The `(triple, startTime)` keys of `entries` restricted to `selected`
@@ -165,18 +174,27 @@ pub fn all_keys(entries: &[SnapshotListEntry]) -> BTreeSet<SnapKey> {
 }
 
 /// The INCOMPLETE manifests (kopia checkpoints an interrupted `snapshot
-/// create` left behind) of `selected` identities in a raw source listing —
-/// what the run deliberately did not replicate, for the `incompleteSkipped`
-/// stat and the operator warning. `kopia snapshot migrate` never lands a
-/// checkpoint as a complete snapshot, so counting one as expected would fail
-/// the post-verify on every run forever (issue #477).
+/// create` left behind) in a raw source listing whose identity the run's
+/// include/exclude matchers cover — what the run deliberately did not
+/// replicate, for the `incompleteSkipped` stat and the operator warning.
+/// `kopia snapshot migrate` never lands a checkpoint as a complete snapshot,
+/// so counting one as expected would fail the post-verify on every run
+/// forever (issue #477).
+///
+/// Scoped by the MATCHERS, not by [`select_identities`]: selection only sees
+/// complete snapshots, so an identity whose only manifest is a checkpoint (an
+/// interrupted first backup) is never selected. Deriving this from the
+/// selection would hide exactly that case, and a checkpoint-only source would
+/// replicate "nothing" in silence.
 pub fn incomplete_skipped<'a>(
+    include: &[IdentityMatcherSpec],
+    exclude: &[IdentityMatcherSpec],
     entries: &'a [SnapshotListEntry],
-    selected: &BTreeSet<IdentityTriple>,
 ) -> Vec<&'a SnapshotListEntry> {
     entries
         .iter()
-        .filter(|e| e.incomplete_reason().is_some() && selected.contains(&entry_triple(e)))
+        .filter(|e| e.incomplete_reason().is_some())
+        .filter(|e| identity_matches(include, exclude, &entry_triple(e)))
         .collect()
 }
 

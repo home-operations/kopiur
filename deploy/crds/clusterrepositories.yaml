@@ -3998,7 +3998,10 @@ spec:
                     nullable: true
                     type: string
                   snapshotCount:
-                    description: Total snapshots present in the repository (across all identities).
+                    description: |-
+                      Total COMPLETE snapshots present in the repository (across all
+                      identities). Incomplete checkpoints an interrupted `kopia snapshot
+                      create` left behind are not snapshots and are not counted.
                     format: int64
                     nullable: true
                     type: integer

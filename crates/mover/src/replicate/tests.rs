@@ -231,7 +231,7 @@ fn checkpoints_never_select_identities_or_correspond() {
 }
 
 #[test]
-fn incomplete_skipped_reports_only_selected_identities() {
+fn incomplete_skipped_reports_only_matched_identities() {
     let mut source = three_entries();
     source.push(checkpoint(
         "c1",
@@ -247,11 +247,35 @@ fn incomplete_skipped_reports_only_selected_identities() {
         "/x",
         "2026-09-17T18:55:54Z",
     ));
-    let selected = select_identities(&[matcher(Some("mydb"), None, None)], &[], &source);
-    let skipped = incomplete_skipped(&source, &selected);
+    let include = [matcher(Some("mydb"), None, None)];
+    let skipped = incomplete_skipped(&include, &[], &source);
     assert_eq!(
         skipped.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
         ["c1"]
+    );
+    // exclude wins, exactly as for selection.
+    let excluded = incomplete_skipped(&include, &[matcher(None, Some("prod"), None)], &source);
+    assert!(excluded.is_empty());
+}
+
+/// Review finding on #477: an identity whose ONLY manifest is a checkpoint (an
+/// interrupted FIRST backup) is never selected, since there is nothing to copy.
+/// It must still be reported, or a checkpoint-only source replicates "nothing"
+/// in total silence, the exact case an operator most needs to hear about.
+#[test]
+fn a_checkpoint_only_identity_is_still_reported() {
+    let source = vec![checkpoint(
+        "only",
+        "u",
+        "h",
+        "/first-backup",
+        "2026-09-17T18:00:00Z",
+    )];
+    assert!(select_identities(&[], &[], &source).is_empty());
+    let skipped = incomplete_skipped(&[], &[], &source);
+    assert_eq!(
+        skipped.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["only"]
     );
 }
 

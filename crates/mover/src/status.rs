@@ -765,6 +765,21 @@ pub fn snapshot_replicate_success_message(stats: &SnapshotReplicationRunStats) -
         stats.already_present,
         stats.pruned,
     );
+    push_incomplete_skipped(&mut msg, stats);
+    msg
+}
+
+/// The `Ready=True` message when no source identity matched the selection.
+/// Still names skipped incomplete manifests: a source holding ONLY checkpoints
+/// (an interrupted first backup) selects nothing, and saying just "nothing to
+/// replicate" would hide the abandoned upload (#477).
+pub fn snapshot_replicate_no_match_message(stats: &SnapshotReplicationRunStats) -> String {
+    let mut msg = "no source identities matched the selection; nothing to replicate".to_string();
+    push_incomplete_skipped(&mut msg, stats);
+    msg
+}
+
+fn push_incomplete_skipped(msg: &mut String, stats: &SnapshotReplicationRunStats) {
     if stats.incomplete_skipped > 0 {
         msg.push_str(&format!(
             "; skipped {} incomplete source snapshot(s) (interrupted-upload checkpoints kopia \
@@ -772,7 +787,6 @@ pub fn snapshot_replicate_success_message(stats: &SnapshotReplicationRunStats) -
             stats.incomplete_skipped
         ));
     }
-    msg
 }
 
 /// `{ "status": ... }` body for a successful snapshot replication: phase
@@ -2012,6 +2026,23 @@ mod tests {
             },
         );
         assert_eq!(body["status"]["quick"]["lastContentReclaimedBytes"], 0);
+    }
+
+    /// A source holding only checkpoints selects no identity. The run must
+    /// still say it skipped them, not a bare "nothing to replicate".
+    #[test]
+    fn snapshot_replicate_no_match_message_surfaces_skipped_checkpoints() {
+        let mut stats = SnapshotReplicationRunStats::default();
+        assert_eq!(
+            snapshot_replicate_no_match_message(&stats),
+            "no source identities matched the selection; nothing to replicate"
+        );
+        stats.incomplete_skipped = 2;
+        let msg = snapshot_replicate_no_match_message(&stats);
+        assert!(
+            msg.contains("skipped 2 incomplete source snapshot(s)"),
+            "{msg}"
+        );
     }
 
     #[test]

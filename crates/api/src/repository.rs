@@ -814,7 +814,9 @@ pub struct RepositoryHealthStatus {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageStats {
-    /// Total snapshots present in the repository (across all identities).
+    /// Total COMPLETE snapshots present in the repository (across all
+    /// identities). Incomplete checkpoints an interrupted `kopia snapshot
+    /// create` left behind are not snapshots and are not counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_count: Option<i64>,
     /// Human-readable total on-disk size (e.g. `412Gi`).
