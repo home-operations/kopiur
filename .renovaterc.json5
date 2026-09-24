@@ -1,17 +1,4 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["local>home-operations/renovate-config"],
-  packageRules: [
-    {
-      description: "Auto-merge non-major updates, but only after every CI check passes",
-      matchUpdateTypes: ["minor", "patch", "digest", "lockFileMaintenance"],
-      automerge: true,
-    },
-    {
-      description: "zer0ver: 0.x minors can break at any time, don't automerge them",
-      matchUpdateTypes: ["minor"],
-      matchCurrentVersion: "/^v?0\\./",
-      automerge: false,
-    },
-  ],
 }
