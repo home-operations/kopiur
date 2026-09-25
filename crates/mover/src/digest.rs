@@ -451,7 +451,13 @@ mod tests {
 
         let mut d = good;
         let mut bytes = STANDARD.decode(&d.hashes).unwrap();
-        let chunks: Vec<Vec<u8>> = bytes.chunks_exact(8).rev().map(<[u8]>::to_vec).collect();
+        let chunks: Vec<Vec<u8>> = bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .rev()
+            .map(|c| c.to_vec())
+            .collect();
         bytes = chunks.concat();
         d.hashes = STANDARD.encode(bytes);
         assert_eq!(d.decode(), Err(DigestError::Unsorted));
