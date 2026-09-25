@@ -1581,6 +1581,46 @@ fn coverage_detail(coverage: &ListingCoverage) -> String {
     }
 }
 
+/// The operator-facing fix for a [`ListingCoverage::Partial`] scan. Pure;
+/// exhaustive so a new reason cannot ship without its remedy.
+fn partial_remedy(reason: &PartialReason) -> String {
+    match reason {
+        PartialReason::MoverTooOld => {
+            "the bootstrap mover predates the snapshot-membership digest; \
+             run a mover image matching the controller version (Helm `mover.image`)"
+                .to_string()
+        }
+        PartialReason::OverDigestBudget => {
+            "the repository holds more snapshots than the membership \
+             digest can carry (~86k); bound discovered rows with `spec.catalog.retain` \
+             (`perIdentity` / `maxAgeDays`), which applies to existing rows regardless"
+                .to_string()
+        }
+        PartialReason::Invalid(why) => format!(
+            "the mover's membership digest was rejected ({why}); nothing was expired on its \
+             word, and the next scan retries with a fresh digest — if this repeats, report \
+             it as a kopiur bug"
+        ),
+    }
+}
+
+/// ONE warning per `Partial` scan (issue #476): the state that used to leak
+/// discovered rows silently. `Complete`/`Capped` are healthy and say nothing
+/// here (the summary line carries the coverage).
+fn warn_if_partial(repo_name: &str, coverage: &ListingCoverage) {
+    match coverage {
+        ListingCoverage::Complete | ListingCoverage::Capped { .. } => {}
+        ListingCoverage::Partial { reason } => tracing::warn!(
+            repo = repo_name,
+            coverage = %coverage_detail(coverage),
+            fix = %partial_remedy(reason),
+            "catalog listing was capped and snapshot membership is unknown, so discovered \
+             Snapshots whose kopia snapshots were deleted repository-side are NOT expired this \
+             scan (status.catalog.coverage: Partial; catalog.retain still bounds rows)"
+        ),
+    }
+}
+
 /// The per-scan summary logging: one info line when the scan changed anything,
 /// and ONE aggregated warn for decode/write degradations — counts only, never
 /// per-entry lines (a foreign writer controls the tag values and must not be
@@ -1592,6 +1632,7 @@ fn log_scan_summary(
     backfill_failed: i64,
     coverage: &ListingCoverage,
 ) {
+    warn_if_partial(repo_name, coverage);
     let changed = outcome.created > 0
         || outcome.expired > 0
         || outcome.expire_failed > 0
@@ -1964,6 +2005,22 @@ fn discovered_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_remedy_names_a_cause_specific_fix() {
+        let old = partial_remedy(&PartialReason::MoverTooOld);
+        assert!(old.contains("mover image"), "{old}");
+        let big = partial_remedy(&PartialReason::OverDigestBudget);
+        assert!(big.contains("catalog.retain"), "{big}");
+        let bad = partial_remedy(&PartialReason::Invalid(
+            "digest hashes are not sorted".into(),
+        ));
+        assert!(
+            bad.contains("digest hashes are not sorted"),
+            "the cause is quoted: {bad}"
+        );
+        assert!(bad.contains("retries"), "{bad}");
+    }
     use kopiur_kopia::SnapshotStats;
 
     fn entry(id: &str, identity: (&str, &str, &str), end: DateTime<Utc>) -> SnapshotListEntry {

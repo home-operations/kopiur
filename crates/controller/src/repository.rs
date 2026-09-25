@@ -675,6 +675,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                     total,
                     &catalog::ListingCoverage::Complete,
                     0,
+                    None,
                 )
                 .await?;
             }
@@ -2479,13 +2480,6 @@ async fn finalize_bootstrap(
     if let Some(w) = index_blob_event {
         io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
     }
-    if result.snapshots_truncated {
-        tracing::warn!(
-            repo = %name,
-            snapshot_count = result.snapshot_count.unwrap_or(0),
-            "catalog larger than the materialization cap; not all snapshots were materialized"
-        );
-    }
 
     // Materialize/expire discovered Snapshots from the snapshots the Job
     // returned — once per result: after the first scan stamps `lastRefreshAt`,
@@ -2524,6 +2518,7 @@ async fn finalize_bootstrap(
             snapshot_count,
             &catalog::coverage_for(&result),
             result.foreign_suffix_dropped,
+            result.logical_bytes,
         )
         .await?;
     }
@@ -3130,6 +3125,10 @@ async fn run_catalog_scan(
     total_snapshot_count: i64,
     coverage: &catalog::ListingCoverage,
     foreign_prefilter_dropped: i64,
+    // Logical bytes over the FULL listing, from the mover (#476): the capped
+    // `listing` would under-count sources outside the window. `None` for the
+    // in-process path (its listing is already complete) or an older mover.
+    logical_bytes: Option<i64>,
 ) -> Result<()> {
     let owner_ref = io::owner_ref_for(repo, "Repository")?;
     let cluster = repo
@@ -3157,7 +3156,7 @@ async fn run_catalog_scan(
     // Logical bytes under management is recorded directly from kopia's data, both as
     // the metric gauge and as `storageStats.totalSizeBytes` (the integer form of the
     // human `total_size`), which backup preflight reads as `repository.sizeBytes`.
-    let size_bytes = logical_bytes_under_management(listing);
+    let size_bytes = logical_bytes.unwrap_or_else(|| logical_bytes_under_management(listing));
     ctx.metrics
         .set_repo_size_bytes(namespace, repo_name, size_bytes);
 
@@ -3166,6 +3165,7 @@ async fn run_catalog_scan(
         "discoveredBackupCount": outcome.discovered,
         "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
         "foreignSnapshotCount": foreign_total,
+        "coverage": outcome.coverage,
     });
     // Retire a pending `catalog-scan-requested-at` token: ANY completed scan (not
     // just one the token itself triggered) honors it, since the request was for

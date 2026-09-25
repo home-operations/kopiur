@@ -661,6 +661,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                     total,
                     &catalog::ListingCoverage::Complete,
                     0,
+                    None,
                 )
                 .await?;
             }
@@ -755,6 +756,9 @@ async fn run_cluster_catalog_scan(
     // which never prefilters). Added to `outcome.foreign` — never double-counted,
     // since a mover-dropped entry never reaches this scan's listing at all.
     foreign_prefilter_dropped: i64,
+    // Logical bytes over the FULL listing, from the mover (#476) — see the
+    // `Repository` twin (`run_catalog_scan`). `None` = compute from `listing`.
+    logical_bytes: Option<i64>,
 ) -> Result<()> {
     let repo_uid = repo
         .uid()
@@ -797,13 +801,15 @@ async fn run_cluster_catalog_scan(
 
     // Cluster-scoped: the metric namespace label is empty, matching the
     // phase/catalog gauges in `record_cluster_repository_status_metrics`.
-    let size_bytes = crate::repository::logical_bytes_under_management(listing);
+    let size_bytes =
+        logical_bytes.unwrap_or_else(|| crate::repository::logical_bytes_under_management(listing));
     ctx.metrics.set_repo_size_bytes("", name, size_bytes);
 
     let mut catalog_patch = serde_json::json!({
         "discoveredBackupCount": outcome.discovered,
         "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
         "foreignSnapshotCount": foreign_total,
+        "coverage": outcome.coverage,
     });
     // Retire a pending `catalog-scan-requested-at` token: ANY completed scan (not
     // just one the token itself triggered) honors it — see the `Repository` twin
@@ -2245,13 +2251,6 @@ async fn finalize_cluster_bootstrap(
     if let Some(w) = index_blob_event {
         io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
     }
-    if result.snapshots_truncated {
-        tracing::warn!(
-            repo = %name,
-            snapshot_count = result.snapshot_count,
-            "catalog larger than the materialization cap; not all snapshots were materialized"
-        );
-    }
 
     // Materialize/expire discovered Snapshots from the snapshots the Job
     // returned — once per result: after the first scan stamps `lastRefreshAt`,
@@ -2282,6 +2281,7 @@ async fn finalize_cluster_bootstrap(
             snapshot_count,
             &catalog::coverage_for(&result),
             result.foreign_suffix_dropped,
+            result.logical_bytes,
         )
         .await?;
     }
