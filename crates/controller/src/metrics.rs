@@ -102,7 +102,6 @@ pub struct Metrics {
     repo_snapshot_count: Gauge<i64>,
     repo_discovered_backups: Gauge<i64>,
     repo_foreign_snapshots: Gauge<i64>,
-    repo_catalog_coverage: Gauge<i64>,
     repo_maintenance_configured: Gauge<i64>,
 
     // Restore + maintenance.
@@ -682,14 +681,6 @@ impl Metrics {
                  (multi-cluster shared repository; identityDefaults.cluster).",
             )
             .build();
-        let repo_catalog_coverage = m
-            .i64_gauge("kopiur_repo_catalog_coverage")
-            .with_description(
-                "1 on the state (complete/capped/partial) matching status.catalog.coverage as \
-                 of the last catalog scan, 0 on the others (#476). partial = rows whose \
-                 snapshots were deleted repository-side are NOT expired.",
-            )
-            .build();
         let repo_maintenance_configured = m
             .i64_gauge("kopiur_repository_maintenance_configured")
             .with_description(
@@ -742,7 +733,6 @@ impl Metrics {
             repo_snapshot_count,
             repo_discovered_backups,
             repo_foreign_snapshots,
-            repo_catalog_coverage,
             repo_maintenance_configured,
             restore_duration_seconds,
             leader_is_leader,
@@ -833,6 +823,55 @@ impl Metrics {
     /// keeps discovered snapshots out of PromQL `by (policy)` groupings.
     pub fn register_resource_observers(&self, stores: ResourceStores) {
         let m = self.provider.meter();
+
+        // Catalog coverage per repository (#476): 1 on the state matching
+        // `status.catalog.coverage` as of the last scan. Store-backed like the
+        // phase gauge — the series exists iff the CR does, so a `state="partial"`
+        // alert resolves when its repository is deleted — and only the ACTIVE
+        // state is emitted. Never scanned, or a state this build does not know
+        // (`Unknown`, a newer operator's write), emits nothing rather than
+        // minting an unbounded label.
+        {
+            let repositories = stores.repositories.clone();
+            let cluster_repositories = stores.cluster_repositories.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_repo_catalog_coverage")
+                .with_description(
+                    "1 on the state (complete/capped/partial) matching status.catalog.coverage \
+                     as of the last catalog scan (#476); only the active state is emitted. \
+                     partial = rows whose snapshots were deleted repository-side are NOT \
+                     expired.",
+                )
+                .with_callback(move |o| {
+                    let repos = repositories.state().into_iter().map(|r| {
+                        (
+                            r.namespace().unwrap_or_default(),
+                            r.name_any(),
+                            catalog_coverage(r.status.as_ref().and_then(|s| s.catalog.as_ref())),
+                        )
+                    });
+                    let crepos = cluster_repositories.state().into_iter().map(|r| {
+                        (
+                            String::new(),
+                            r.name_any(),
+                            catalog_coverage(r.status.as_ref().and_then(|s| s.catalog.as_ref())),
+                        )
+                    });
+                    for (ns, name, state) in repos.chain(crepos) {
+                        if let Some(state) = state {
+                            o.observe(
+                                1,
+                                &[
+                                    KeyValue::new("namespace", ns),
+                                    KeyValue::new("name", name),
+                                    KeyValue::new("state", state),
+                                ],
+                            );
+                        }
+                    }
+                })
+                .build();
+        }
 
         // Per-resource lifecycle phase across all four store-backed kinds. One series
         // per CR, valued 1 at its active phase.
@@ -1703,37 +1742,6 @@ impl Metrics {
         }
     }
 
-    /// Set the catalog-coverage gauge from `status.catalog.coverage`: 1 on the
-    /// active state, 0 on every other canonical state (iterating
-    /// [`CatalogCoverage::ALL`], so a state the repository left never stays
-    /// stuck at 1). An `Unknown` value (a newer operator's state) mints no new
-    /// label — every canonical state reads 0. `ns` is empty for a
-    /// `ClusterRepository`, as with [`Self::set_repo_catalog`].
-    pub fn set_repo_catalog_coverage(&self, ns: &str, name: &str, coverage: &CatalogCoverage) {
-        self.record_repo_catalog_coverage(ns, name, Some(coverage));
-    }
-
-    /// Zero every canonical state of the catalog-coverage gauge for a
-    /// repository (on its deletion). A sync gauge cannot drop a series, so this
-    /// is the strongest reset available: no `state="partial"} == 1` outlives
-    /// the repository.
-    pub fn clear_repo_catalog_coverage(&self, ns: &str, name: &str) {
-        self.record_repo_catalog_coverage(ns, name, None);
-    }
-
-    fn record_repo_catalog_coverage(&self, ns: &str, name: &str, active: Option<&CatalogCoverage>) {
-        for state in CatalogCoverage::ALL {
-            self.repo_catalog_coverage.record(
-                i64::from(active == Some(state)),
-                &[
-                    KeyValue::new("namespace", ns.to_string()),
-                    KeyValue::new("name", name.to_string()),
-                    KeyValue::new("state", state.label().to_lowercase()),
-                ],
-            );
-        }
-    }
-
     /// Set the maintenance-configured gauge for a repository: 1 if a `Maintenance`
     /// CR references it, 0 otherwise. `kind` is `Repository`/`ClusterRepository`;
     /// `ns` is empty for a cluster-scoped `ClusterRepository`.
@@ -1862,6 +1870,20 @@ fn deletion_held(backup: &Snapshot) -> bool {
 /// "unknown"/"unknown" bucket when unpinned — never a per-repo guess, and
 /// never every-repo double-counting. Pure so the label mapping is
 /// unit-tested off-OTel.
+/// The lowercase `state` label for a repository's catalog coverage, or `None`
+/// when there is nothing to emit: never scanned, or a value this build does not
+/// recognize (an exhaustive match, so a new canonical state must be labeled here).
+fn catalog_coverage(
+    catalog: Option<&kopiur_api::repository::CatalogStatus>,
+) -> Option<&'static str> {
+    match catalog?.coverage.as_ref()? {
+        CatalogCoverage::Complete => Some("complete"),
+        CatalogCoverage::Capped => Some("capped"),
+        CatalogCoverage::Partial => Some("partial"),
+        CatalogCoverage::Unknown(_) => None,
+    }
+}
+
 fn repo_gauge_attrs(pinned: Option<&RepositoryRef>) -> [KeyValue; 2] {
     let (kind, name) = match pinned {
         Some(r) => (
@@ -2707,56 +2729,92 @@ mod tests {
         assert_eq!(got, want, "{text}");
     }
 
+    fn coverage_stores(repos: Vec<Repository>, crepos: Vec<ClusterRepository>) -> ResourceStores {
+        let (snaps, _, _, restores) = empty_stores();
+        ResourceStores {
+            snapshots: snaps.0,
+            repositories: make_store(repos).0,
+            cluster_repositories: make_store(crepos).0,
+            restores: restores.0,
+        }
+    }
+
     #[test]
-    fn repo_catalog_coverage_sets_the_active_state_to_one_and_the_rest_to_zero() {
-        use kopiur_api::repository::CatalogCoverage;
+    fn repo_catalog_coverage_emits_only_the_active_state_from_the_store() {
         let m = Metrics::new();
-        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Partial);
-        let text = String::from_utf8(m.gather()).unwrap();
-        // Lowercase state labels, one series per canonical state.
-        expect_states(
-            &text,
-            &[("complete", "0"), ("capped", "0"), ("partial", "1")],
+        let text = gather_with(
+            &m,
+            coverage_stores(
+                vec![repository_cr_with_status(
+                    "apps",
+                    "nas",
+                    serde_json::json!({ "phase": "Ready", "catalog": { "coverage": "Partial" } }),
+                )],
+                vec![],
+            ),
         );
+        // Lowercase state label, value 1, and no 0-valued series for the other
+        // states (the store-backed convention, same as kopiur_resource_phase).
+        expect_states(&text, &[("partial", "1")]);
         assert!(text.contains("namespace=\"apps\""), "{text}");
-
-        // A later Complete scan flips the gauge — no stale `partial == 1` left
-        // for the `state="partial"` alert to keep firing on.
-        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Complete);
-        let text = String::from_utf8(m.gather()).unwrap();
-        expect_states(
-            &text,
-            &[("complete", "1"), ("capped", "0"), ("partial", "0")],
-        );
     }
 
     #[test]
-    fn repo_catalog_coverage_unknown_zeroes_every_canonical_state() {
-        use kopiur_api::repository::CatalogCoverage;
+    fn repo_catalog_coverage_series_exists_iff_the_repository_does() {
+        // No stale `state="partial"} 1` can outlive a deleted repository: the
+        // series is derived from the store on every scrape.
         let m = Metrics::new();
-        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Capped);
-        // A value from a newer operator mints no unbounded label: every
-        // canonical state reads 0.
-        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Unknown("Sampled".into()));
-        let text = String::from_utf8(m.gather()).unwrap();
-        expect_states(
-            &text,
-            &[("complete", "0"), ("capped", "0"), ("partial", "0")],
-        );
-        assert!(!text.contains("sampled"), "{text}");
+        let text = gather_with(&m, coverage_stores(vec![], vec![]));
+        expect_states(&text, &[]);
     }
 
     #[test]
-    fn clearing_repo_catalog_coverage_leaves_no_state_at_one() {
-        use kopiur_api::repository::CatalogCoverage;
+    fn repo_catalog_coverage_covers_cluster_repositories_with_an_empty_namespace() {
         let m = Metrics::new();
-        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Partial);
-        m.clear_repo_catalog_coverage("apps", "nas");
-        let text = String::from_utf8(m.gather()).unwrap();
-        expect_states(
-            &text,
-            &[("complete", "0"), ("capped", "0"), ("partial", "0")],
+        let text = gather_with(
+            &m,
+            coverage_stores(
+                vec![],
+                vec![cluster_repository_cr_with_status(
+                    "nas",
+                    serde_json::json!({ "phase": "Ready", "catalog": { "coverage": "Capped" } }),
+                )],
+            ),
         );
+        expect_states(&text, &[("capped", "1")]);
+        assert!(text.contains("namespace=\"\""), "{text}");
+    }
+
+    #[test]
+    fn repo_catalog_coverage_is_absent_when_unscanned_or_unknown() {
+        // Never scanned (no coverage) and a newer operator's value both emit
+        // nothing — an Unknown string must not mint an unbounded label.
+        let m = Metrics::new();
+        let text = gather_with(
+            &m,
+            coverage_stores(
+                vec![
+                    repository_cr_with_status(
+                        "apps",
+                        "nas",
+                        serde_json::json!({ "phase": "Ready" }),
+                    ),
+                    repository_cr_with_status(
+                        "apps",
+                        "nas2",
+                        serde_json::json!({ "phase": "Ready", "catalog": { "coverage": "Sampled" } }),
+                    ),
+                ],
+                vec![],
+            ),
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with("kopiur_repo_catalog_coverage{")),
+            "{text}"
+        );
+        assert!(!text.to_lowercase().contains("sampled"), "{text}");
     }
 
     #[test]
