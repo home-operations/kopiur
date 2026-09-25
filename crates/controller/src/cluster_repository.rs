@@ -653,7 +653,16 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             ) {
                 let listing = client.snapshot_list(None).await?;
                 let total = listing.len() as i64;
-                run_cluster_catalog_scan(ctx, repo, &name, &listing, total, false, 0).await?;
+                run_cluster_catalog_scan(
+                    ctx,
+                    repo,
+                    &name,
+                    &listing,
+                    total,
+                    &catalog::ListingCoverage::Complete,
+                    0,
+                )
+                .await?;
             }
 
             // Ensure the managed Maintenance for this ClusterRepository (ADR §3.7).
@@ -740,7 +749,7 @@ async fn run_cluster_catalog_scan(
     name: &str,
     listing: &[SnapshotListEntry],
     total_snapshot_count: i64,
-    listing_truncated: bool,
+    coverage: &catalog::ListingCoverage,
     // Entries the mover's foreign-suffix prefilter already dropped before this
     // scan ever saw its `listing` (0 for the in-process bare-filesystem path,
     // which never prefilters). Added to `outcome.foreign` — never double-counted,
@@ -773,7 +782,7 @@ async fn run_cluster_catalog_scan(
         cluster,
         repo.spec.catalog.as_ref(),
         listing,
-        listing_truncated,
+        coverage,
     )
     .await?;
     let foreign_total = outcome.foreign + foreign_prefilter_dropped;
@@ -2271,7 +2280,7 @@ async fn finalize_cluster_bootstrap(
             name,
             &result.snapshots,
             snapshot_count,
-            result.snapshots_truncated,
+            &catalog::coverage_for(&result),
             result.foreign_suffix_dropped,
         )
         .await?;

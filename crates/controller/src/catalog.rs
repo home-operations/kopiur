@@ -22,11 +22,29 @@
 //! - **Bounds** (`spec.catalog.retain`): the most-recent `perIdentity` rows per
 //!   `username@hostname:path`, nothing older than `maxAgeDays`. Rows beyond the
 //!   bounds are **expired — the CR is deleted, the kopia snapshot is untouched**
-//!   (discovered rows are forced `deletionPolicy: Retain`, §4.5).
-//! - **Absence expiry**: a row whose snapshot no longer appears in a *complete*
-//!   listing was deleted repository-side (an external writer pruned it) — the
-//!   stale row is expired. Skipped when the listing was truncated (absence is
-//!   unknowable from a partial list).
+//!   (discovered rows are forced `deletionPolicy: Retain`, §4.5). The bounds apply
+//!   to EXISTING rows too, including rows outside the listing window (ranked by
+//!   their own recorded identity and end time), so `retain` really does bound the
+//!   etcd footprint on a large repository.
+//! - **Absence expiry** (issue #476): a row whose snapshot was deleted
+//!   repository-side (an external writer pruned it) is expired. The bootstrap
+//!   mover caps the entries it returns (the *window*), so "absent from the window"
+//!   alone proves nothing; [`ListingCoverage`] ([`coverage_for`]) says what the
+//!   scan can prove:
+//!   - `Complete` — the listing is every snapshot: absent means gone.
+//!   - `Capped` — the window was capped, but the mover shipped a membership
+//!     digest over the FULL listing: a row whose id the digest does not contain
+//!     is gone and expires (the digest's error is one-sided — it can only keep a
+//!     row, never wrongly expire one); a row it does contain is kept, subject to
+//!     `retain`.
+//!   - `Partial` — capped with no usable digest (an old mover, a repository past
+//!     the digest's ceiling, or a digest that failed validation): absence is
+//!     unknowable, so out-of-window rows are kept unless `retain`, produced, or
+//!     foreign-ignored rules expire them.
+//!
+//!   Rows outside the window only ever take the `perIdentity` slots the window
+//!   left free for their identity, so they never displace a row the window saw
+//!   (an old mover's window is not newest-first).
 //!
 //! ## Identity-aware placement (multi-cluster shared repo)
 //!
@@ -38,8 +56,12 @@
 //! ([`decide_cluster_placement`]/[`decide_namespace_placement`], pure). Entries decided
 //! `ForeignIgnored` are fed to `plan_catalog` exactly like `produced_ids` — filtered in
 //! the same `eligible` chain spot, so they never consume a `retain.perIdentity` slot,
-//! and any PRE-EXISTING discovered row for one expires via the ordinary absence
-//! mechanics once it's no longer eligible. Without a cluster identity, every hostname
+//! and any PRE-EXISTING discovered row for one expires. The same pass also classifies
+//! the recorded hostname of every row OUTSIDE the listing window
+//! ([`PlacementPass::row_foreign_ignored_ids`], with its row-only candidate namespaces
+//! included in the scan's cached `Namespace` GETs), so a foreign row the capped
+//! window cannot see expires exactly as it would under a complete listing — whatever
+//! the [`ListingCoverage`]. Without a cluster identity, every hostname
 //! classifies `Bare` and this pass is byte-identical to the pre-M4 per-entry placement
 //! (proven by fixture tests). `spec.catalog.foreignSnapshots` (M3:
 //! [`ForeignSnapshots`]/[`CatalogBounds::effective_foreign_snapshots`]) decides what
@@ -108,6 +130,8 @@ use kopiur_api::common::{CatalogBounds, CatalogRetain, ForeignSnapshots, Reposit
 use kopiur_api::snapshot::repository_ref_for;
 use kopiur_api::{HostClass, Snapshot, classify_hostname, validate};
 use kopiur_kopia::{SnapshotListEntry, SnapshotSource};
+use kopiur_mover::bootstrap::BootstrapResult;
+use kopiur_mover::digest::DecodedDigest;
 
 use crate::consts::{ORIGIN_LABEL, REPOSITORY_UID_LABEL, SNAPSHOT_ID_LABEL};
 use crate::context::Context;
@@ -123,7 +147,119 @@ pub fn catalog_dedup_key(repo_uid: &str, snapshot_id: &str) -> (String, String) 
 /// The kopia identity a snapshot was taken under, as the canonical
 /// `username@hostname:path` string `catalog.retain.perIdentity` groups by.
 pub fn identity_key(source: &SnapshotSource) -> String {
-    format!("{}@{}:{}", source.user_name, source.host, source.path)
+    identity_key_parts(&source.user_name, &source.host, &source.path)
+}
+
+/// The one formatter behind [`identity_key`] AND a materialized row's identity
+/// ([`rows_for`]), so a listing entry and the row it produced can never key into
+/// different `perIdentity` buckets.
+pub fn identity_key_parts(user: &str, host: &str, path: &str) -> String {
+    format!("{user}@{host}:{path}")
+}
+
+/// How much of the repository one catalog scan's listing speaks for (issue #476).
+///
+/// The bootstrap mover caps the entries it ships back (the materialization
+/// *window*), so a row whose snapshot is missing from the window may be either
+/// deleted repository-side or merely out of the window. This says which of the
+/// two the planner can tell apart; [`plan_catalog`] matches it exhaustively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListingCoverage {
+    /// The listing holds every snapshot: absent from it means gone.
+    Complete,
+    /// The window was capped, but `present` is a membership set over every
+    /// listed id: `!present.contains(id)` proves the snapshot is gone (a `true`
+    /// may rarely be a false positive, which only keeps a row one scan longer).
+    Capped {
+        /// Membership over the full post-prefilter listing.
+        present: DecodedDigest,
+    },
+    /// The window was capped and membership is unknown: a row absent from the
+    /// window may still exist, so absence expiry is off (retain still bounds it).
+    Partial {
+        /// Why membership is unknown — surfaced in the scan's coverage log.
+        reason: PartialReason,
+    },
+}
+
+/// Why a truncated listing's membership is unknown ([`ListingCoverage::Partial`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartialReason {
+    /// The mover predates the membership digest (fix: upgrade the mover image).
+    MoverTooOld,
+    /// The repository holds more snapshots than the digest can carry
+    /// (fix: tighten `catalog.retain` or prune the repository).
+    OverDigestBudget,
+    /// The digest was present but failed validation; carries why.
+    Invalid(String),
+}
+
+impl ListingCoverage {
+    /// The `status.catalog.coverage` value for this coverage.
+    pub fn as_status(&self) -> kopiur_api::repository::CatalogCoverage {
+        use kopiur_api::repository::CatalogCoverage;
+        match self {
+            ListingCoverage::Complete => CatalogCoverage::Complete,
+            ListingCoverage::Capped { .. } => CatalogCoverage::Capped,
+            ListingCoverage::Partial { .. } => CatalogCoverage::Partial,
+        }
+    }
+}
+
+/// What a bootstrap Job's catalog listing speaks for. Pure.
+///
+/// - Not truncated → [`ListingCoverage::Complete`].
+/// - Truncated with no digest → [`ListingCoverage::Partial`]: a current mover
+///   always ships the digest unless the listing exceeded its budget, and old
+///   movers never set `logicalBytes` either, so `logicalBytes` present means
+///   [`PartialReason::OverDigestBudget`], absent means [`PartialReason::MoverTooOld`].
+/// - Truncated with a digest → [`ListingCoverage::Capped`] only when it decodes
+///   AND agrees with the rest of the result: its id count equals the listing's
+///   (`snapshotCount - foreignSuffixDropped`) and it contains every returned
+///   entry. Anything else is [`PartialReason::Invalid`] — a digest that is wrong
+///   could answer "absent" for a present snapshot, the one unsafe direction.
+pub fn coverage_for(result: &BootstrapResult) -> ListingCoverage {
+    if !result.snapshots_truncated {
+        return ListingCoverage::Complete;
+    }
+    let Some(listed) = result.listed_ids.as_ref() else {
+        let reason = match result.logical_bytes {
+            Some(_) => PartialReason::OverDigestBudget,
+            None => PartialReason::MoverTooOld,
+        };
+        return ListingCoverage::Partial { reason };
+    };
+    match verified_digest(listed, result) {
+        Ok(present) => ListingCoverage::Capped { present },
+        Err(why) => ListingCoverage::Partial {
+            reason: PartialReason::Invalid(why),
+        },
+    }
+}
+
+/// Decode `listed` and cross-check it against the rest of `result`
+/// ([`coverage_for`]). The error is the human-readable reason.
+fn verified_digest(
+    listed: &kopiur_mover::digest::ListedIds,
+    result: &BootstrapResult,
+) -> std::result::Result<DecodedDigest, String> {
+    let decoded = listed.decode().map_err(|e| e.to_string())?;
+    let expected = result.snapshot_count.unwrap_or(-1) - result.foreign_suffix_dropped;
+    let held = i64::try_from(decoded.len()).unwrap_or(i64::MAX);
+    if held != expected {
+        return Err(format!(
+            "digest holds {held} ids but the listing reported {expected} \
+             (snapshotCount {:?} - foreignSuffixDropped {})",
+            result.snapshot_count, result.foreign_suffix_dropped
+        ));
+    }
+    if let Some(missing) = result.snapshots.iter().find(|e| !decoded.contains(&e.id)) {
+        return Err(format!(
+            "digest does not contain returned snapshot {}",
+            missing.id
+        ));
+    }
+    Ok(decoded)
 }
 
 /// `true` when a catalog scan is due: never scanned, an unparseable stamp
@@ -451,6 +587,15 @@ pub struct CatalogRow {
     /// The snapshot's end time (from `status.timing.endTime`), used for
     /// per-identity ordering. Rows written before timing was recorded sort oldest.
     pub end_time: Option<DateTime<Utc>>,
+    /// The row's `username@hostname:path` ([`identity_key_parts`], from
+    /// `status.snapshot.identity`), so a row outside the listing window can be
+    /// ranked against its identity's `perIdentity` slots. `None` when the row
+    /// records no source path (it is then unranked).
+    pub identity: Option<String>,
+    /// The identity hostname (`status.snapshot.identity.hostname`), so the
+    /// placement pass can classify a row outside the listing window exactly as
+    /// it would classify its entry. `None` when the row carries no identity.
+    pub host: Option<String>,
 }
 
 /// What a scan decided: entries to materialize and rows to expire.
@@ -470,78 +615,238 @@ pub struct CatalogPlan<'a> {
 /// `produced_ids`: a `ForeignIgnored`-decided entry is never eligible, so it never
 /// consumes a `retain.perIdentity` slot, and — because it still appears in `listing`
 /// (only `eligible` excludes it, not `listing`/`listed`) — any PRE-EXISTING discovered
-/// row for it expires via the ordinary absence-expiry rule below, on the exact same
-/// terms as any other row (safe under truncation once the entry is physically seen).
+/// row for it expires, on the exact same terms as any other row.
+///
+/// `row_foreign_ignored_ids` ([`PlacementPass::row_foreign_ignored_ids`]) is the same
+/// decision for rows OUTSIDE the listing window, classified from the row's own
+/// recorded hostname — so under `Capped`/`Partial` coverage a foreign row the window
+/// cannot see expires exactly as it would under a complete listing.
+///
+/// The keep-set is built in two steps:
+///
+/// 1. **Window**: exactly as always — the most-recent `perIdentity` eligible listing
+///    entries per identity ([`window_keep`]).
+/// 2. **Out-of-window rows** (a row whose id is not in the FULL `listing`): kept only
+///    when [`coverage`](ListingCoverage) cannot prove the snapshot gone, it is not
+///    produced/foreign-ignored, it is within `maxAgeDays` by its own end time, and
+///    its identity still has a `perIdentity` slot the window left free
+///    ([`out_of_window_candidates`], [`fill_row_slots`]). They can never displace a
+///    window keep.
+///
+/// Every row whose id is not kept expires.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_catalog<'a>(
     rows: &[CatalogRow],
     produced_ids: &BTreeSet<String>,
     foreign_ignored_ids: &BTreeSet<String>,
+    row_foreign_ignored_ids: &BTreeSet<String>,
     listing: &'a [SnapshotListEntry],
-    listing_truncated: bool,
+    coverage: &ListingCoverage,
     retain: Option<&CatalogRetain>,
     now: DateTime<Utc>,
 ) -> CatalogPlan<'a> {
-    // Eligible = in the listing, not produced by this repository CR, not decided
-    // ForeignIgnored by the placement pass, within the age bound.
-    let max_age = retain
-        .and_then(|r| r.max_age_days)
-        .filter(|d| *d >= 1)
-        .map(|d| chrono::Duration::days(d));
-    let eligible = listing
-        .iter()
-        .filter(|e| !produced_ids.contains(&e.id))
-        .filter(|e| !foreign_ignored_ids.contains(&e.id))
-        .filter(|e| max_age.is_none_or(|a| e.end_time + a > now));
+    let bounds = RetainBounds::new(retain, now);
+    let window = window_keep(listing, produced_ids, foreign_ignored_ids, &bounds);
 
-    // Keep-set: the most-recent `perIdentity` eligible entries per identity.
-    let per_identity = retain
-        .and_then(|r| r.per_identity)
-        .filter(|n| *n >= 0)
-        .map(|n| n as usize);
-    let mut by_identity: BTreeMap<String, Vec<&SnapshotListEntry>> = BTreeMap::new();
-    for e in eligible {
-        by_identity
-            .entry(identity_key(&e.source))
-            .or_default()
-            .push(e);
+    let mut keep: BTreeMap<&str, Kept<'a>> = BTreeMap::new();
+    for e in window.values().flatten() {
+        keep.insert(e.id.as_str(), Kept::Entry(e));
     }
-    let mut keep: BTreeMap<&str, &SnapshotListEntry> = BTreeMap::new();
-    for entries in by_identity.values_mut() {
-        entries.sort_by_key(|e| std::cmp::Reverse(e.end_time));
-        let cap = per_identity.unwrap_or(entries.len());
-        for e in entries.iter().take(cap) {
-            keep.insert(e.id.as_str(), e);
-        }
+
+    let listed: BTreeSet<&str> = listing.iter().map(|e| e.id.as_str()).collect();
+    let row_filter = RowFilter {
+        produced_ids,
+        foreign_ignored_ids,
+        row_foreign_ignored_ids,
+        coverage,
+        bounds: &bounds,
+    };
+    let candidates = out_of_window_candidates(rows, &listed, &row_filter);
+    for id in fill_row_slots(candidates, &window, bounds.per_identity) {
+        keep.insert(id, Kept::Row);
     }
 
     let have: BTreeSet<&str> = rows.iter().map(|r| r.snapshot_id.as_str()).collect();
-    let listed: BTreeSet<&str> = listing.iter().map(|e| e.id.as_str()).collect();
-
     let mut create: Vec<&SnapshotListEntry> = keep
         .values()
-        .filter(|e| !have.contains(e.id.as_str()))
-        .copied()
+        .filter_map(|k| match k {
+            Kept::Entry(e) => (!have.contains(e.id.as_str())).then_some(*e),
+            Kept::Row => None,
+        })
         .collect();
     // Newest-first creation order so a creation interrupted mid-batch has
     // materialized the most useful rows first.
     create.sort_by_key(|e| std::cmp::Reverse(e.end_time));
 
+    // Every row whose id is not kept: in the listing but outside the window
+    // keep-set (aged out, over the cap, produced, foreign-ignored), or out of the
+    // window and either proven gone or beyond retain. All duplicate rows of a
+    // kept id survive together.
     let expire = rows
         .iter()
-        .filter(|r| {
-            if keep.contains_key(r.snapshot_id.as_str()) {
-                return false;
-            }
-            // In the listing but outside the keep-set: aged out, over the
-            // per-identity cap, or shadowing a produced snapshot — expire (safe
-            // even under truncation; we saw the entry). Absent from the listing:
-            // deleted repository-side — expire only when the listing is complete.
-            listed.contains(r.snapshot_id.as_str()) || !listing_truncated
-        })
+        .filter(|r| !keep.contains_key(r.snapshot_id.as_str()))
         .map(|r| (r.namespace.clone(), r.name.clone()))
         .collect();
 
     CatalogPlan { create, expire }
+}
+
+/// Why a snapshot id is in [`plan_catalog`]'s keep-set. Only a listing entry can
+/// be materialized, so `create` draws from [`Kept::Entry`] alone.
+enum Kept<'a> {
+    /// An eligible listing entry inside the window keep-set.
+    Entry(&'a SnapshotListEntry),
+    /// An existing row outside the window that could not be expired.
+    Row,
+}
+
+/// `spec.catalog.retain`, resolved once per plan.
+struct RetainBounds {
+    /// `maxAgeDays` (only values ≥ 1 bound anything).
+    max_age: Option<chrono::Duration>,
+    /// `perIdentity` (negative values are ignored; `None` = unlimited).
+    per_identity: Option<usize>,
+    /// The plan's clock.
+    now: DateTime<Utc>,
+}
+
+impl RetainBounds {
+    fn new(retain: Option<&CatalogRetain>, now: DateTime<Utc>) -> Self {
+        RetainBounds {
+            max_age: retain
+                .and_then(|r| r.max_age_days)
+                .filter(|d| *d >= 1)
+                .map(chrono::Duration::days),
+            per_identity: retain
+                .and_then(|r| r.per_identity)
+                .filter(|n| *n >= 0)
+                .map(|n| n as usize),
+            now,
+        }
+    }
+
+    /// Within `maxAgeDays` of `now` (strictly, as the window filter always was).
+    fn within_age(&self, end_time: DateTime<Utc>) -> bool {
+        self.max_age.is_none_or(|a| end_time + a > self.now)
+    }
+}
+
+/// Step 1 of [`plan_catalog`]: the most-recent `perIdentity` eligible listing
+/// entries per identity (eligible = not produced, not foreign-ignored, within
+/// `maxAgeDays`). Keyed by [`identity_key`], so [`fill_row_slots`] can see how
+/// many slots each identity already used.
+fn window_keep<'a>(
+    listing: &'a [SnapshotListEntry],
+    produced_ids: &BTreeSet<String>,
+    foreign_ignored_ids: &BTreeSet<String>,
+    bounds: &RetainBounds,
+) -> BTreeMap<String, Vec<&'a SnapshotListEntry>> {
+    let mut by_identity: BTreeMap<String, Vec<&SnapshotListEntry>> = BTreeMap::new();
+    for e in listing
+        .iter()
+        .filter(|e| !produced_ids.contains(&e.id))
+        .filter(|e| !foreign_ignored_ids.contains(&e.id))
+        .filter(|e| bounds.within_age(e.end_time))
+    {
+        by_identity
+            .entry(identity_key(&e.source))
+            .or_default()
+            .push(e);
+    }
+    for entries in by_identity.values_mut() {
+        entries.sort_by_key(|e| std::cmp::Reverse(e.end_time));
+        entries.truncate(bounds.per_identity.unwrap_or(entries.len()));
+    }
+    by_identity
+}
+
+/// What an out-of-window row must pass to stay a keep candidate.
+struct RowFilter<'p> {
+    produced_ids: &'p BTreeSet<String>,
+    foreign_ignored_ids: &'p BTreeSet<String>,
+    row_foreign_ignored_ids: &'p BTreeSet<String>,
+    coverage: &'p ListingCoverage,
+    bounds: &'p RetainBounds,
+}
+
+impl RowFilter<'_> {
+    fn admits(&self, row: &CatalogRow) -> bool {
+        let id = row.snapshot_id.as_str();
+        !self.produced_ids.contains(id)
+            && !self.foreign_ignored_ids.contains(id)
+            && !self.row_foreign_ignored_ids.contains(id)
+            // No recorded end time: its age cannot be proven, so it passes.
+            && row.end_time.is_none_or(|t| self.bounds.within_age(t))
+            && presence_unrefuted(self.coverage, id)
+    }
+}
+
+/// `true` unless `coverage` PROVES the snapshot `id` is gone from the repository.
+/// Only ever asked about ids absent from the listing window.
+fn presence_unrefuted(coverage: &ListingCoverage, id: &str) -> bool {
+    match coverage {
+        // Absent from a complete listing = deleted repository-side.
+        ListingCoverage::Complete => false,
+        // `false` is exact; a rare false-positive `true` only keeps a row.
+        ListingCoverage::Capped { present } => present.contains(id),
+        // Membership unknown: cannot prove it gone.
+        ListingCoverage::Partial { .. } => true,
+    }
+}
+
+/// Rows whose id is not in the full listing, collapsed to ONE row per snapshot id
+/// (the newest `end_time`, so duplicates share a single slot), filtered through
+/// [`RowFilter::admits`].
+fn out_of_window_candidates<'r>(
+    rows: &'r [CatalogRow],
+    listed: &BTreeSet<&str>,
+    filter: &RowFilter<'_>,
+) -> Vec<&'r CatalogRow> {
+    let mut newest: BTreeMap<&str, &CatalogRow> = BTreeMap::new();
+    for r in rows
+        .iter()
+        .filter(|r| !listed.contains(r.snapshot_id.as_str()))
+    {
+        let slot = newest.entry(r.snapshot_id.as_str()).or_insert(r);
+        if r.end_time > slot.end_time {
+            *slot = r;
+        }
+    }
+    newest.into_values().filter(|r| filter.admits(r)).collect()
+}
+
+/// Step 2 of [`plan_catalog`]: candidate rows take only the `perIdentity` slots
+/// the window left for their identity, newest end time first (ties by id). A row
+/// with no identity cannot be ranked, so it is kept without consuming a slot.
+fn fill_row_slots<'r>(
+    candidates: Vec<&'r CatalogRow>,
+    window: &BTreeMap<String, Vec<&SnapshotListEntry>>,
+    per_identity: Option<usize>,
+) -> Vec<&'r str> {
+    let mut by_identity: BTreeMap<Option<&str>, Vec<&CatalogRow>> = BTreeMap::new();
+    for r in candidates {
+        by_identity
+            .entry(r.identity.as_deref())
+            .or_default()
+            .push(r);
+    }
+    let mut kept = Vec::new();
+    for (identity, mut rows) in by_identity {
+        let free = match identity {
+            None => usize::MAX,
+            Some(key) => {
+                let used = window.get(key).map_or(0, Vec::len);
+                per_identity.map_or(usize::MAX, |n| n.saturating_sub(used))
+            }
+        };
+        rows.sort_by(|a, b| {
+            b.end_time
+                .cmp(&a.end_time)
+                .then_with(|| a.snapshot_id.cmp(&b.snapshot_id))
+        });
+        kept.extend(rows.into_iter().take(free).map(|r| r.snapshot_id.as_str()));
+    }
+    kept
 }
 
 /// Extract this repository's discovered rows from a `Snapshot` LIST (rows carry
@@ -565,11 +870,23 @@ pub fn rows_for(repo_uid: &str, snapshots: &[Snapshot]) -> Vec<CatalogRow> {
                 .and_then(|t| t.end_time.as_deref())
                 .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
                 .map(|t| t.with_timezone(&Utc));
+            let recorded = s
+                .status
+                .as_ref()
+                .and_then(|st| st.snapshot.as_ref())
+                .map(|i| &i.identity);
+            let identity = recorded.and_then(|i| {
+                i.source_path
+                    .as_deref()
+                    .map(|path| identity_key_parts(&i.username, &i.hostname, path))
+            });
             Some(CatalogRow {
                 namespace: s.namespace().unwrap_or_default(),
                 name: s.name_any(),
                 snapshot_id: id,
                 end_time,
+                identity,
+                host: recorded.map(|i| i.hostname.clone()),
             })
         })
         .collect()
@@ -809,17 +1126,36 @@ pub fn decide_namespace_placement(class: HostClass<'_>, namespace: &str) -> Plac
 /// under `cluster`. Thin helper so [`scan`] knows exactly which (cached) `Namespace`
 /// GETs to perform; [`plan_placements`] then takes the resolved answers as a plain
 /// map, so it stays pure and unit-testable with a stub. Pure.
+///
+/// Also covers the hostnames of `rows` OUTSIDE the listing window
+/// ([`out_of_window_row_hosts`]), which [`plan_placements`] classifies too.
 pub fn candidate_namespaces<'a>(
     listing: &'a [SnapshotListEntry],
+    rows: &'a [CatalogRow],
     cluster: Option<&str>,
 ) -> BTreeSet<&'a str> {
     listing
         .iter()
-        .filter_map(|e| match classify_hostname(&e.source.host, cluster) {
+        .map(|e| e.source.host.as_str())
+        .chain(out_of_window_row_hosts(listing, rows).map(|(_, host)| host))
+        .filter_map(|host| match classify_hostname(host, cluster) {
             HostClass::Bare { namespace } | HostClass::OwnCluster { namespace } => Some(namespace),
             HostClass::ForeignCluster { .. } => None,
         })
         .collect()
+}
+
+/// `(snapshot id, recorded hostname)` of every row whose id is NOT in `listing`
+/// (the window) and that records a hostname. Pure.
+pub fn out_of_window_row_hosts<'a>(
+    listing: &[SnapshotListEntry],
+    rows: &'a [CatalogRow],
+) -> impl Iterator<Item = (&'a str, &'a str)> {
+    let listed: BTreeSet<&str> = listing.iter().map(|e| e.id.as_str()).collect();
+    rows.iter().filter_map(move |r| {
+        let host = r.host.as_deref()?;
+        (!listed.contains(r.snapshot_id.as_str())).then_some((r.snapshot_id.as_str(), host))
+    })
 }
 
 /// Outcome of the identity-aware placement pass ([`plan_placements`]) over a FULL
@@ -845,6 +1181,58 @@ pub struct PlacementPass {
     /// Keyed by the [`HostClass::ForeignCluster`] suffix, or the full hostname for a
     /// bare host treated as foreign (it carries no suffix).
     pub foreign_suffix_counts: BTreeMap<String, i64>,
+    /// Snapshot ids of discovered rows OUTSIDE the listing window whose recorded
+    /// hostname decided [`PlacementDecision::ForeignIgnored`] — the same decision
+    /// their entry would get, so under `Capped`/`Partial` coverage such a row
+    /// expires exactly as it would under a complete listing. Fed to
+    /// [`plan_catalog`]; never counted in `foreign_count` (rows are not listing
+    /// snapshots).
+    pub row_foreign_ignored_ids: BTreeSet<String>,
+}
+
+/// The placement inputs that do not vary per hostname.
+struct PlacementRules<'p> {
+    cluster: Option<&'p str>,
+    cluster_mode: bool,
+    foreign: ForeignSnapshots,
+    placement: &'p Placement<'p>,
+    ns_allowed: &'p BTreeMap<String, bool>,
+}
+
+impl PlacementRules<'_> {
+    /// Classify + decide one hostname. Pure.
+    fn decide(&self, host: &str) -> PlacementDecision {
+        let class = classify_hostname(host, self.cluster);
+        match self.placement {
+            Placement::Namespace(ns) => decide_namespace_placement(class, ns),
+            Placement::Cluster { fallback, .. } => {
+                // The tenancy gate itself (`allowedNamespaces`) was already applied by
+                // the caller when it resolved `ns_allowed`; this pure pass just reads
+                // the answer for the candidate namespace `class` names.
+                let candidate_allowed = match class {
+                    HostClass::Bare { namespace } | HostClass::OwnCluster { namespace } => {
+                        self.ns_allowed.get(namespace).copied().unwrap_or(false)
+                    }
+                    HostClass::ForeignCluster { .. } => false,
+                };
+                decide_cluster_placement(
+                    class,
+                    candidate_allowed,
+                    self.cluster_mode,
+                    self.foreign,
+                    *fallback,
+                )
+            }
+        }
+    }
+
+    /// The foreign-cluster suffix `host` carries, if any.
+    fn foreign_suffix(&self, host: &str) -> Option<String> {
+        match classify_hostname(host, self.cluster) {
+            HostClass::ForeignCluster { suffix } => Some(suffix.to_string()),
+            HostClass::Bare { .. } | HostClass::OwnCluster { .. } => None,
+        }
+    }
 }
 
 /// Run the identity-aware placement pass over a FULL kopia `listing`, BEFORE
@@ -852,14 +1240,25 @@ pub struct PlacementPass {
 /// answer for every [`candidate_namespaces`] entry, ALREADY resolved by the caller
 /// (a cached `Namespace` GET + [`validate::validate_consumer_against_cluster_repo`]
 /// for [`scan`]; a stub in tests) — no IO happens here.
+///
+/// `rows` outside the listing window are classified from their recorded hostname
+/// with the same decision functions ([`PlacementPass::row_foreign_ignored_ids`]);
+/// they add no entry to `decisions` (only listing entries are ever created).
 pub fn plan_placements(
     listing: &[SnapshotListEntry],
+    rows: &[CatalogRow],
     cluster: Option<&str>,
     foreign: ForeignSnapshots,
     placement: &Placement<'_>,
     ns_allowed: &BTreeMap<String, bool>,
 ) -> PlacementPass {
-    let cluster_mode = cluster.is_some_and(|c| !c.is_empty());
+    let rules = PlacementRules {
+        cluster,
+        cluster_mode: cluster.is_some_and(|c| !c.is_empty()),
+        foreign,
+        placement,
+        ns_allowed,
+    };
 
     // Pass 1: one decision per DISTINCT hostname (a host's classification/decision
     // never varies across its entries within one scan).
@@ -870,31 +1269,16 @@ pub fn plan_placements(
         if decisions.contains_key(host) {
             continue;
         }
-        let class = classify_hostname(host, cluster);
-        foreign_suffix_by_host.insert(
-            host.to_string(),
-            match class {
-                HostClass::ForeignCluster { suffix } => Some(suffix.to_string()),
-                HostClass::Bare { .. } | HostClass::OwnCluster { .. } => None,
-            },
-        );
-        let decision = match placement {
-            Placement::Namespace(ns) => decide_namespace_placement(class, ns),
-            Placement::Cluster { fallback, .. } => {
-                // The tenancy gate itself (`allowedNamespaces`) was already applied by
-                // the caller when it resolved `ns_allowed`; this pure pass just reads
-                // the answer for the candidate namespace `class` names.
-                let candidate_allowed = match class {
-                    HostClass::Bare { namespace } | HostClass::OwnCluster { namespace } => {
-                        ns_allowed.get(namespace).copied().unwrap_or(false)
-                    }
-                    HostClass::ForeignCluster { .. } => false,
-                };
-                decide_cluster_placement(class, candidate_allowed, cluster_mode, foreign, *fallback)
-            }
-        };
-        decisions.insert(host.to_string(), decision);
+        foreign_suffix_by_host.insert(host.to_string(), rules.foreign_suffix(host));
+        decisions.insert(host.to_string(), rules.decide(host));
     }
+    let row_foreign_ignored_ids = out_of_window_row_hosts(listing, rows)
+        .filter(|(_, host)| match decisions.get(*host) {
+            Some(decided) => *decided == PlacementDecision::ForeignIgnored,
+            None => rules.decide(host) == PlacementDecision::ForeignIgnored,
+        })
+        .map(|(id, _)| id.to_string())
+        .collect();
 
     // Pass 2: per-ENTRY accounting (a host with N entries contributes N to
     // `foreign_count`/the suffix breakdown — `status.catalog.foreignSnapshotCount`
@@ -930,12 +1314,20 @@ pub fn plan_placements(
         foreign_ignored_ids,
         foreign_count,
         foreign_suffix_counts,
+        row_foreign_ignored_ids,
     }
 }
 
 /// What a [`scan`] did, for the caller's status patch / metrics / events.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScanOutcome {
+    /// How much of the repository this scan's listing spoke for (the
+    /// `status.catalog.coverage` value, as of this scan).
+    pub coverage: kopiur_api::repository::CatalogCoverage,
+    /// Planned expiries whose delete failed (never 404s, which are done). A
+    /// non-zero count makes [`scan`] return [`Error::CatalogExpiryIncomplete`]
+    /// after every delete was attempted; carried here for the summary log.
+    pub expire_failed: i64,
     /// Discovered rows created this scan.
     pub created: i64,
     /// Discovered rows expired (CR deleted; kopia snapshot untouched).
@@ -989,7 +1381,7 @@ pub async fn scan(
     cluster: Option<&str>,
     catalog: Option<&CatalogBounds>,
     listing: &[SnapshotListEntry],
-    listing_truncated: bool,
+    coverage: &ListingCoverage,
 ) -> Result<ScanOutcome> {
     let repo_name = match owner {
         ScanOwner::Repository { name, .. } | ScanOwner::ClusterRepository { name } => name,
@@ -1012,14 +1404,15 @@ pub async fn scan(
     let rows = rows_for(repo_uid, &all_snapshots);
     let produced_ids = produced_ids_for(owner, repo_uid, &all_snapshots);
 
-    // Identity-aware placement pass over the FULL listing, BEFORE plan_catalog (see
-    // the module docs): thin IO here (one cached `Namespace` GET per distinct
-    // candidate namespace, only for the `Cluster` placement kind), then the pure
-    // decision in `plan_placements`.
+    // Identity-aware placement pass over the FULL listing (plus the hostnames of
+    // rows outside the listing window), BEFORE plan_catalog (see the module docs):
+    // thin IO here (one cached `Namespace` GET per distinct candidate namespace,
+    // only for the `Cluster` placement kind), then the pure decision in
+    // `plan_placements`.
     let foreign = CatalogBounds::effective_foreign_snapshots(catalog);
     let mut ns_allowed: BTreeMap<String, bool> = BTreeMap::new();
     if let Placement::Cluster { allowed, .. } = &placement {
-        for candidate in candidate_namespaces(listing, cluster) {
+        for candidate in candidate_namespaces(listing, &rows, cluster) {
             let ns_api: Api<Namespace> = Api::all(ctx.client.clone());
             let labels = ns_api
                 .get_opt(candidate)
@@ -1037,22 +1430,32 @@ pub async fn scan(
             ns_allowed.insert(candidate.to_string(), ok);
         }
     }
-    let pass = plan_placements(listing, cluster, foreign, &placement, &ns_allowed);
+    let pass = plan_placements(listing, &rows, cluster, foreign, &placement, &ns_allowed);
 
     let retain = catalog.and_then(|c| c.retain.as_ref());
     let plan = plan_catalog(
         &rows,
         &produced_ids,
         &pass.foreign_ignored_ids,
+        &pass.row_foreign_ignored_ids,
         listing,
-        listing_truncated,
+        coverage,
         retain,
         Utc::now(),
     );
 
     let mut outcome = ScanOutcome {
+        coverage: coverage.as_status(),
+        expire_failed: 0,
+        created: 0,
+        expired: 0,
+        discovered: 0,
+        unplaced_hosts: BTreeSet::new(),
         foreign: pass.foreign_count,
-        ..Default::default()
+        meta_unsupported: 0,
+        meta_malformed: 0,
+        create_failed: 0,
+        backfilled: 0,
     };
 
     create_discovered_rows(
@@ -1068,18 +1471,114 @@ pub async fn scan(
     let backfill_failed =
         backfill_recorded_meta(ctx, repo_name, listing, &all_snapshots, &mut outcome).await;
 
-    for (ns, name) in &plan.expire {
-        let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
-        match api.delete(name, &DeleteParams::default()).await {
-            Ok(_) => outcome.expired += 1,
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-            Err(e) => return Err(Error::Kube(e)),
+    let tally = expire_rows(ctx, &plan.expire).await;
+    outcome.expired = tally.expired;
+    outcome.expire_failed = tally.failed;
+
+    outcome.discovered = (rows.len() as i64 - outcome.expired).max(0) + outcome.created;
+    log_scan_summary(repo_name, &outcome, &pass, backfill_failed, coverage);
+    // Only after every delete was attempted: a failure fails the scan so
+    // `lastRefreshAt` is not stamped and the retry re-scans the remainder.
+    tally.check(plan.expire.len() as i64)?;
+    Ok(outcome)
+}
+
+/// How many expiry deletes may be in flight at once. Bounded so the first scan
+/// after an upgrade (which may reclaim tens of thousands of stale rows, #476)
+/// is fast without flooding the apiserver.
+const EXPIRY_CONCURRENCY: usize = 16;
+
+/// Delete every planned expiry with bounded concurrency. Never aborts on the
+/// first error: every delete is attempted and the failures are counted.
+async fn expire_rows(ctx: &Context, expire: &[(String, String)]) -> ExpiryTally {
+    use futures::StreamExt;
+    // Materialize owned futures first: a lazy `map` closure held across the
+    // `.await` below trips rustc's higher-ranked `Send` inference for the
+    // reconciler future ("FnOnce is not general enough").
+    let deletes: Vec<_> = expire
+        .iter()
+        .map(|(ns, name)| {
+            let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
+            let name = name.clone();
+            async move {
+                let params = DeleteParams::default();
+                classify_expiry_delete(api.delete(&name, &params).await)
+            }
+        })
+        .collect();
+    let results: Vec<ExpiryDelete> = futures::stream::iter(deletes)
+        .buffer_unordered(EXPIRY_CONCURRENCY)
+        .collect()
+        .await;
+    let mut tally = ExpiryTally::default();
+    for r in results {
+        tally.record(r);
+    }
+    tally
+}
+
+/// What one expiry delete amounted to.
+#[derive(Debug, PartialEq, Eq)]
+enum ExpiryDelete {
+    /// The CR was deleted.
+    Deleted,
+    /// 404: already gone — the goal state, not a failure.
+    AlreadyGone,
+    /// Anything else; carries the error for the aggregated message.
+    Failed(String),
+}
+
+/// Classify one expiry delete's result. Pure.
+fn classify_expiry_delete<T>(res: std::result::Result<T, kube::Error>) -> ExpiryDelete {
+    match res {
+        Ok(_) => ExpiryDelete::Deleted,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => ExpiryDelete::AlreadyGone,
+        Err(e) => ExpiryDelete::Failed(e.to_string()),
+    }
+}
+
+/// Aggregate of one scan's expiry deletes.
+#[derive(Debug, Default)]
+struct ExpiryTally {
+    expired: i64,
+    failed: i64,
+    first_error: Option<String>,
+}
+
+impl ExpiryTally {
+    fn record(&mut self, d: ExpiryDelete) {
+        match d {
+            ExpiryDelete::Deleted => self.expired += 1,
+            ExpiryDelete::AlreadyGone => {}
+            ExpiryDelete::Failed(e) => {
+                self.failed += 1;
+                self.first_error.get_or_insert(e);
+            }
         }
     }
 
-    outcome.discovered = (rows.len() as i64 - outcome.expired).max(0) + outcome.created;
-    log_scan_summary(repo_name, &outcome, &pass, backfill_failed);
-    Ok(outcome)
+    /// `Err` when any delete failed (after all were attempted), so the caller
+    /// does not mark the scan refreshed and the retry finishes the reclaim.
+    fn check(self, attempted: i64) -> Result<()> {
+        if self.failed == 0 {
+            return Ok(());
+        }
+        Err(Error::CatalogExpiryIncomplete {
+            failed: self.failed,
+            attempted,
+            first_error: self.first_error.unwrap_or_default(),
+        })
+    }
+}
+
+/// The coverage as a log value: the variant, plus why when membership was
+/// unknown (a digest can be large, so `Capped` never prints it).
+fn coverage_detail(coverage: &ListingCoverage) -> String {
+    match coverage {
+        ListingCoverage::Complete => "Complete".to_string(),
+        ListingCoverage::Capped { present } => format!("Capped ({} ids)", present.len()),
+        ListingCoverage::Partial { reason } => format!("Partial ({reason:?})"),
+    }
 }
 
 /// The per-scan summary logging: one info line when the scan changed anything,
@@ -1091,9 +1590,11 @@ fn log_scan_summary(
     outcome: &ScanOutcome,
     pass: &PlacementPass,
     backfill_failed: i64,
+    coverage: &ListingCoverage,
 ) {
     let changed = outcome.created > 0
         || outcome.expired > 0
+        || outcome.expire_failed > 0
         || outcome.foreign > 0
         || outcome.backfilled > 0
         || outcome.create_failed > 0;
@@ -1104,13 +1605,27 @@ fn log_scan_summary(
         top.truncate(5);
         tracing::info!(
             repo = repo_name,
+            coverage = %coverage_detail(coverage),
             created = outcome.created,
             expired = outcome.expired,
+            expire_failed = outcome.expire_failed,
             discovered = outcome.discovered,
             foreign = outcome.foreign,
             backfilled = outcome.backfilled,
             foreign_top_suffixes = ?top,
             "catalog scan reconciled discovered Snapshot CRs"
+        );
+    }
+    if outcome.expire_failed > 0 {
+        tracing::warn!(
+            repo = repo_name,
+            expired = outcome.expired,
+            expire_failed = outcome.expire_failed,
+            coverage = %coverage_detail(coverage),
+            "catalog scan could not delete every stale discovered Snapshot CR (the rest \
+             were deleted); the scan is not marked refreshed and retries the remainder \
+             automatically — if this persists, check the API server's health and the \
+             operator's RBAC to delete snapshots.kopiur.home-operations.com"
         );
     }
     if outcome.meta_unsupported > 0 || outcome.meta_malformed > 0 || outcome.create_failed > 0 {
@@ -1353,6 +1868,35 @@ async fn materialize_discovered(
     entry: &SnapshotListEntry,
     recorded: Option<&kopiur_api::RecordedSnapshotMeta>,
 ) -> Result<()> {
+    let backup = discovered_snapshot(owner, namespace, repo_name, repo_uid, entry, recorded);
+    let cr_name = backup.name_any();
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    // Create the CR; the discovered status is then PATCHed onto the subresource.
+    match io::apply(&api, &cr_name, &backup).await {
+        Ok(_) => {}
+        Err(Error::Kube(kube::Error::Api(ae))) if ae.code == 409 => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    io::patch_status(
+        &api,
+        &cr_name,
+        serde_json::to_value(backup.status.unwrap_or_default())?,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The `origin: discovered` `Snapshot` CR (spec, labels, status) that
+/// [`materialize_discovered`] writes for `entry`. Pure, so the row [`rows_for`]
+/// later reads back from it can be tested against the entry it came from.
+fn discovered_snapshot(
+    owner: &OwnerReference,
+    namespace: &str,
+    repo_name: &str,
+    repo_uid: &str,
+    entry: &SnapshotListEntry,
+    recorded: Option<&kopiur_api::RecordedSnapshotMeta>,
+) -> Snapshot {
     use kopiur_api::common::{DeletionPolicy, ResolvedIdentity};
     use kopiur_api::snapshot::{
         SnapshotInfo, SnapshotSpec, SnapshotStats, SnapshotStatus, SnapshotTiming,
@@ -1414,21 +1958,7 @@ async fn materialize_discovered(
         recorded: recorded.cloned(),
         ..Default::default()
     });
-
-    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
-    // Create the CR; the discovered status is then PATCHed onto the subresource.
-    match io::apply(&api, &cr_name, &backup).await {
-        Ok(_) => {}
-        Err(Error::Kube(kube::Error::Api(ae))) if ae.code == 409 => return Ok(()),
-        Err(e) => return Err(e),
-    }
-    io::patch_status(
-        &api,
-        &cr_name,
-        serde_json::to_value(backup.status.unwrap_or_default())?,
-    )
-    .await?;
-    Ok(())
+    backup
 }
 
 #[cfg(test)]
@@ -1461,6 +1991,41 @@ mod tests {
             name: name.into(),
             snapshot_id: id.into(),
             end_time: end,
+            identity: None,
+            host: None,
+        }
+    }
+
+    /// A row that records its identity, like every row `materialize_discovered`
+    /// writes.
+    fn id_row(
+        name: &str,
+        id: &str,
+        identity: (&str, &str, &str),
+        end: Option<DateTime<Utc>>,
+    ) -> CatalogRow {
+        CatalogRow {
+            identity: Some(identity_key_parts(identity.0, identity.1, identity.2)),
+            host: Some(identity.1.into()),
+            ..row(name, id, end)
+        }
+    }
+
+    /// Membership unknown (an old mover's truncated result).
+    fn partial() -> ListingCoverage {
+        ListingCoverage::Partial {
+            reason: PartialReason::MoverTooOld,
+        }
+    }
+
+    /// `Capped` coverage whose digest holds exactly `ids`.
+    fn capped<'a>(ids: impl IntoIterator<Item = &'a str>) -> ListingCoverage {
+        use kopiur_mover::digest::{DIGEST_BUDGET_BYTES, SnapshotIdDigest};
+        ListingCoverage::Capped {
+            present: SnapshotIdDigest::build(ids, 0x5eed, DIGEST_BUDGET_BYTES)
+                .unwrap()
+                .decode()
+                .unwrap(),
         }
     }
 
@@ -1596,8 +2161,9 @@ mod tests {
             &rows,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             None,
             Utc::now(),
         );
@@ -1632,8 +2198,9 @@ mod tests {
             &rows,
             &produced,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             Some(&retain),
             Utc::now(),
         );
@@ -1662,8 +2229,9 @@ mod tests {
             &[],
             &produced,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             None,
             Utc::now(),
         );
@@ -1680,8 +2248,9 @@ mod tests {
             &rows,
             &produced,
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             None,
             Utc::now(),
         );
@@ -1707,8 +2276,9 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             Some(&retain),
             Utc::now(),
         );
@@ -1728,8 +2298,9 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             Some(&retain),
             Utc::now(),
         );
@@ -1758,8 +2329,9 @@ mod tests {
             &rows,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             Some(&retain),
             Utc::now(),
         );
@@ -1785,8 +2357,9 @@ mod tests {
             &rows,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             Some(&retain),
             Utc::now(),
         );
@@ -1804,8 +2377,9 @@ mod tests {
             &rows,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             None,
             Utc::now(),
         );
@@ -1815,8 +2389,9 @@ mod tests {
             &rows,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            true,
+            &partial(),
             None,
             Utc::now(),
         );
@@ -1841,12 +2416,746 @@ mod tests {
             &rows,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            true,
+            &partial(),
             Some(&retain),
             Utc::now(),
         );
         assert_eq!(expired(&plan), vec!["r-a1"]);
+    }
+
+    // --- #476: absence expiry past the materialization window ---------------
+
+    /// Issue #476. The mover caps the entries it returns, so on a repository
+    /// larger than the window EVERY scan is truncated. Rows for snapshots a
+    /// peer cluster deleted are absent from the window AND from the repository
+    /// — before the fix they could never expire and piled up without bound.
+    /// With the membership digest the planner can tell "deleted" from "out of
+    /// the window": deleted rows expire, still-present ones are kept.
+    #[test]
+    fn issue_476_capped_listing_expires_rows_whose_snapshots_are_gone() {
+        // A window of 3 entries (the mover returned only these).
+        let listing = vec![
+            entry("w1", ("u", "h", "/a"), t(10)),
+            entry("w2", ("u", "h", "/b"), t(20)),
+            entry("w3", ("u", "h", "/c"), t(30)),
+        ];
+        // Pre-existing discovered rows for snapshots OUTSIDE the window.
+        let rows = vec![
+            // Deleted repository-side (by the peer's GFS retention).
+            id_row("r-gone1", "gone1", ("peer", "h", "/x"), Some(t(900))),
+            id_row("r-gone2", "gone2", ("peer", "h", "/y"), Some(t(800))),
+            // Still in the repository, just not in the window.
+            id_row("r-kept", "kept", ("peer", "h", "/z"), Some(t(700))),
+        ];
+        // The digest covers the window ids plus the present-but-out-of-window id.
+        let coverage = capped(["w1", "w2", "w3", "kept"]);
+        let plan = plan_catalog(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            &coverage,
+            None,
+            Utc::now(),
+        );
+        let mut gone = expired(&plan);
+        gone.sort_unstable();
+        assert_eq!(
+            gone,
+            vec!["r-gone1", "r-gone2"],
+            "rows whose snapshots are gone must expire even though the listing was capped"
+        );
+        let mut created = ids(&plan);
+        created.sort_unstable();
+        assert_eq!(created, vec!["w1", "w2", "w3"]);
+    }
+
+    /// Plan both ways and return `(sorted creates, sorted expires)`.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_ids(
+        rows: &[CatalogRow],
+        produced: &BTreeSet<String>,
+        foreign: &BTreeSet<String>,
+        row_foreign: &BTreeSet<String>,
+        listing: &[SnapshotListEntry],
+        coverage: &ListingCoverage,
+        retain: Option<&CatalogRetain>,
+        now: DateTime<Utc>,
+    ) -> (Vec<String>, Vec<String>) {
+        let plan = plan_catalog(
+            rows,
+            produced,
+            foreign,
+            row_foreign,
+            listing,
+            coverage,
+            retain,
+            now,
+        );
+        let mut c: Vec<String> = ids(&plan).into_iter().map(String::from).collect();
+        let mut e: Vec<String> = expired(&plan).into_iter().map(String::from).collect();
+        c.sort_unstable();
+        e.sort_unstable();
+        (c, e)
+    }
+
+    /// A `Capped` digest holding exactly the listing's ids says nothing the
+    /// listing doesn't: the plan must be identical to `Complete`'s, over every
+    /// shape of fixture the existing tests use (rows in/out of the listing,
+    /// produced, foreign-ignored, perIdentity, maxAgeDays).
+    #[test]
+    fn capped_with_a_digest_of_exactly_the_listing_plans_like_complete() {
+        let old = Utc::now() - chrono::Duration::days(120);
+        let listing = vec![
+            entry("a1", ("u", "a", "/p"), t(30)),
+            entry("a2", ("u", "a", "/p"), t(20)),
+            entry("a3", ("u", "a", "/p"), t(10)),
+            entry("b1", ("u", "b", "/p"), t(40)),
+            entry("ours", ("app", "ns", "/data"), t(5)),
+            entry("foreign", ("u", "billing.west", "/p"), t(3)),
+            entry("old", ("u", "h", "/p"), old),
+        ];
+        let rows = [
+            id_row("r-a1", "a1", ("u", "a", "/p"), Some(t(30))),
+            row("r-a2", "a2", Some(t(20))),
+            row("r-ours", "ours", Some(t(5))),
+            row("r-foreign", "foreign", Some(t(3))),
+            row("r-old", "old", Some(old)),
+            id_row("r-gone", "gone", ("u", "a", "/p"), Some(t(1))),
+            row("r-gone-bare", "gone-bare", None),
+        ];
+        let produced: BTreeSet<String> = ["ours".to_string()].into();
+        let foreign: BTreeSet<String> = ["foreign".to_string()].into();
+        let retains = [
+            None,
+            Some(CatalogRetain {
+                per_identity: Some(1),
+                max_age_days: None,
+            }),
+            Some(CatalogRetain {
+                per_identity: Some(2),
+                max_age_days: Some(90),
+            }),
+            Some(CatalogRetain {
+                per_identity: Some(0),
+                max_age_days: None,
+            }),
+        ];
+        let coverage = capped(listing.iter().map(|e| e.id.as_str()));
+        let now = Utc::now();
+        for retain in &retains {
+            for rows in [&rows[..], &[]] {
+                let complete = plan_ids(
+                    rows,
+                    &produced,
+                    &foreign,
+                    &BTreeSet::new(),
+                    &listing,
+                    &ListingCoverage::Complete,
+                    retain.as_ref(),
+                    now,
+                );
+                let as_capped = plan_ids(
+                    rows,
+                    &produced,
+                    &foreign,
+                    &BTreeSet::new(),
+                    &listing,
+                    &coverage,
+                    retain.as_ref(),
+                    now,
+                );
+                assert_eq!(complete, as_capped, "retain={retain:?}");
+            }
+        }
+    }
+
+    /// Partial (membership unknown) still cannot prove a row's snapshot gone,
+    /// but `retain` is about the CR count, not presence: an out-of-window row
+    /// beyond `maxAgeDays` or beyond its identity's `perIdentity` slots expires
+    /// whether or not its snapshot still exists. That is what makes `retain`
+    /// actually bound the etcd footprint on a large repository (#476).
+    #[test]
+    fn partial_coverage_lets_retain_bound_out_of_window_rows() {
+        let listing = vec![entry("a-win", ("u", "a", "/p"), t(5))];
+        let rows = vec![
+            // Identity a: the window already fills its single slot.
+            id_row("r-a-win", "a-win", ("u", "a", "/p"), Some(t(5))),
+            id_row("r-a-out", "a-out", ("u", "a", "/p"), Some(t(50))),
+            // Identity b: nothing in the window → one slot, newest wins.
+            id_row("r-b-new", "b-new", ("u", "b", "/p"), Some(t(10))),
+            id_row("r-b-old", "b-old", ("u", "b", "/p"), Some(t(20))),
+            // Beyond maxAgeDays by the row's own end time.
+            id_row(
+                "r-c-aged",
+                "c-aged",
+                ("u", "c", "/p"),
+                Some(Utc::now() - chrono::Duration::days(120)),
+            ),
+            // No identity and no end time: cannot be ranked or aged → kept.
+            row("r-bare", "bare", None),
+            // Shadowing a produced snapshot → expired.
+            id_row("r-ours", "ours", ("u", "d", "/p"), Some(t(3))),
+            // Its host decided ForeignIgnored → expired.
+            id_row("r-foreign", "frgn", ("u", "ghost", "/p"), Some(t(3))),
+        ];
+        let retain = CatalogRetain {
+            per_identity: Some(1),
+            max_age_days: Some(90),
+        };
+        let (created, gone) = plan_ids(
+            &rows,
+            &["ours".to_string()].into(),
+            &BTreeSet::new(),
+            &["frgn".to_string()].into(),
+            &listing,
+            &partial(),
+            Some(&retain),
+            Utc::now(),
+        );
+        assert!(created.is_empty(), "{created:?}");
+        assert_eq!(
+            gone,
+            vec!["r-a-out", "r-b-old", "r-c-aged", "r-foreign", "r-ours"]
+        );
+
+        // Without retain, Partial keeps every out-of-window row it cannot
+        // disprove (today's truncated behavior), still dropping produced/foreign.
+        let (_, gone) = plan_ids(
+            &rows,
+            &["ours".to_string()].into(),
+            &BTreeSet::new(),
+            &["frgn".to_string()].into(),
+            &listing,
+            &partial(),
+            None,
+            Utc::now(),
+        );
+        assert_eq!(gone, vec!["r-foreign", "r-ours"]);
+    }
+
+    /// Two CRs can carry one snapshot id (e.g. a row left in an old namespace).
+    /// They collapse to ONE candidate, so they share a single `perIdentity` slot
+    /// and survive or expire together — never one consuming the other's slot.
+    #[test]
+    fn duplicate_rows_for_one_out_of_window_id_share_a_slot() {
+        let listing = vec![entry("w", ("u", "other", "/p"), t(1))];
+        let mut dup = id_row("r-d1-b", "d1", ("u", "a", "/p"), Some(t(10)));
+        dup.namespace = "ns-b".into();
+        let rows = vec![
+            id_row("r-d1-a", "d1", ("u", "a", "/p"), Some(t(10))),
+            dup,
+            id_row("r-d0", "d0", ("u", "a", "/p"), Some(t(20))),
+        ];
+        let retain = CatalogRetain {
+            per_identity: Some(1),
+            max_age_days: None,
+        };
+        for coverage in [capped(["w", "d0", "d1"]), partial()] {
+            let (_, gone) = plan_ids(
+                &rows,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &listing,
+                &coverage,
+                Some(&retain),
+                Utc::now(),
+            );
+            assert_eq!(gone, vec!["r-d0"], "{coverage:?}");
+        }
+    }
+
+    /// An old mover truncates WITHOUT sorting, so its window can hold an
+    /// identity's OLDER snapshot while a newer one sits outside it. The window
+    /// entry was seen; the out-of-window row was not — it may only take slots
+    /// the window left over, never displace the window's keep.
+    #[test]
+    fn old_mover_unsorted_window_is_never_displaced_by_an_out_of_window_row() {
+        let listing = vec![entry("a-old", ("u", "a", "/p"), t(100))];
+        let rows = vec![
+            id_row("r-a-old", "a-old", ("u", "a", "/p"), Some(t(100))),
+            id_row("r-a-new", "a-new", ("u", "a", "/p"), Some(t(5))),
+        ];
+        let retain = CatalogRetain {
+            per_identity: Some(1),
+            max_age_days: None,
+        };
+        let (created, gone) = plan_ids(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            &partial(),
+            Some(&retain),
+            Utc::now(),
+        );
+        assert!(created.is_empty());
+        assert_eq!(gone, vec!["r-a-new"]);
+    }
+
+    /// Under `Capped`, presence is decided per row: present rows are kept
+    /// (subject to retain), absent ones expire — identity or not.
+    #[test]
+    fn capped_presence_is_per_row_and_retain_still_applies() {
+        let listing = vec![entry("w", ("u", "a", "/p"), t(1))];
+        let rows = vec![
+            row("r-bare-present", "bare-present", None),
+            row("r-bare-gone", "bare-gone", None),
+            id_row(
+                "r-aged-present",
+                "aged-present",
+                ("u", "b", "/p"),
+                Some(Utc::now() - chrono::Duration::days(120)),
+            ),
+            id_row("r-foreign", "frgn", ("u", "ghost", "/p"), Some(t(3))),
+        ];
+        let retain = CatalogRetain {
+            per_identity: None,
+            max_age_days: Some(90),
+        };
+        let (_, gone) = plan_ids(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &["frgn".to_string()].into(),
+            &listing,
+            &capped(["w", "bare-present", "aged-present", "frgn"]),
+            Some(&retain),
+            Utc::now(),
+        );
+        assert_eq!(gone, vec!["r-aged-present", "r-bare-gone", "r-foreign"]);
+    }
+
+    // --- expiry IO bookkeeping -----------------------------------------------
+
+    fn api_err(code: u16) -> kube::Error {
+        kube::Error::Api(Box::new(kube::core::Status {
+            code,
+            message: format!("status {code}"),
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn expiry_deletes_classify_404_as_done_and_everything_else_as_failed() {
+        assert_eq!(classify_expiry_delete(Ok(())), ExpiryDelete::Deleted);
+        assert_eq!(
+            classify_expiry_delete::<()>(Err(api_err(404))),
+            ExpiryDelete::AlreadyGone
+        );
+        assert!(matches!(
+            classify_expiry_delete::<()>(Err(api_err(500))),
+            ExpiryDelete::Failed(_)
+        ));
+        assert!(matches!(
+            classify_expiry_delete::<()>(Err(api_err(403))),
+            ExpiryDelete::Failed(_)
+        ));
+    }
+
+    /// Every delete is attempted and counted; failures never abort the rest,
+    /// and any failure turns the scan into a retryable error AFTER the loop, so
+    /// `lastRefreshAt` is not stamped and the retry finishes the job.
+    #[test]
+    fn expiry_tally_attempts_all_and_errors_only_after_counting() {
+        let mut tally = ExpiryTally::default();
+        for d in [
+            ExpiryDelete::Deleted,
+            ExpiryDelete::Failed("boom 1".into()),
+            ExpiryDelete::AlreadyGone,
+            ExpiryDelete::Deleted,
+            ExpiryDelete::Failed("boom 2".into()),
+        ] {
+            tally.record(d);
+        }
+        assert_eq!(tally.expired, 2);
+        assert_eq!(tally.failed, 2);
+        let err = tally.check(5).expect_err("failures must fail the scan");
+        assert_eq!(err.class(), crate::error::ErrorClass::Transient);
+        let Error::CatalogExpiryIncomplete {
+            failed,
+            attempted,
+            first_error,
+        } = err
+        else {
+            panic!("unexpected error {err:?}");
+        };
+        assert_eq!((failed, attempted), (2, 5));
+        assert_eq!(first_error, "boom 1");
+
+        let mut clean = ExpiryTally::default();
+        clean.record(ExpiryDelete::Deleted);
+        clean.record(ExpiryDelete::AlreadyGone);
+        assert!(clean.check(2).is_ok());
+    }
+
+    // --- row identity parity --------------------------------------------------
+
+    /// A row read back from the CR `materialize_discovered` writes must key into
+    /// the SAME `perIdentity` bucket as the listing entry it came from — or an
+    /// out-of-window row would be ranked against the wrong identity's slots.
+    #[test]
+    fn a_materialized_rows_identity_matches_its_entrys_identity_key() {
+        let owner = OwnerReference {
+            api_version: "kopiur.home-operations.com/v1alpha1".into(),
+            kind: "Repository".into(),
+            name: "repo".into(),
+            uid: "uid-1".into(),
+            ..Default::default()
+        };
+        for source in [
+            ("app", "billing", "/pvc/data"),
+            ("shared", "db.east", "/stream/postgres.sql"),
+            ("user@x", "host", "/path with spaces:and:colons"),
+        ] {
+            let e = entry("0123456789abcdef0123", source, t(10));
+            let cr = discovered_snapshot(&owner, "ns", "repo", "uid-1", &e, None);
+            let rows = rows_for("uid-1", &[cr]);
+            assert_eq!(rows.len(), 1, "{source:?}");
+            assert_eq!(
+                rows[0].identity.as_deref(),
+                Some(identity_key(&e.source).as_str()),
+                "{source:?}"
+            );
+            assert_eq!(rows[0].host.as_deref(), Some(source.1));
+            assert_eq!(rows[0].end_time, Some(e.end_time));
+        }
+    }
+
+    /// A row without a recorded source path cannot be ranked (its identity is
+    /// unknown), but its hostname still classifies for placement.
+    #[test]
+    fn a_row_without_a_source_path_has_no_identity() {
+        let owner = OwnerReference::default();
+        let e = entry("abc", ("u", "h", "/p"), t(10));
+        let mut cr = discovered_snapshot(&owner, "ns", "repo", "uid-1", &e, None);
+        if let Some(info) = cr.status.as_mut().and_then(|s| s.snapshot.as_mut()) {
+            info.identity.source_path = None;
+        }
+        let rows = rows_for("uid-1", &[cr]);
+        assert_eq!(rows[0].identity, None);
+        assert_eq!(rows[0].host.as_deref(), Some("h"));
+    }
+
+    // --- placement of rows outside the listing window -------------------------
+
+    /// Cluster mode on, `foreignSnapshots: Ignore`, a bare host whose namespace
+    /// is disallowed: its entry would be `ForeignIgnored`, so its row expires
+    /// under a complete listing. The same row OUTSIDE a capped window — still
+    /// present in the repository — must expire the same way, classified from
+    /// the row's own hostname.
+    #[test]
+    fn an_out_of_window_bare_foreign_row_expires_under_capped_like_complete() {
+        let allowed = AllowedNamespaces::List(vec!["billing".into()]);
+        let placement = Placement::Cluster {
+            allowed: &allowed,
+            fallback: None,
+        };
+        let mut ns_allowed = BTreeMap::new();
+        ns_allowed.insert("billing".to_string(), true);
+        ns_allowed.insert("ghost".to_string(), false);
+        let ghost_row = id_row("r-ghost", "ghostid", ("u", "ghost", "/p"), Some(t(9)));
+        let own_row = id_row("r-own", "ownid", ("u", "billing.east", "/p"), Some(t(8)));
+        let rows = vec![ghost_row, own_row];
+        let window = vec![entry("w", ("u", "billing.east", "/q"), t(1))];
+
+        // The row-only namespace needs a tenancy answer too.
+        assert_eq!(
+            candidate_namespaces(&window, &rows, Some("east")),
+            ["billing", "ghost"].into()
+        );
+
+        let pass = plan_placements(
+            &window,
+            &rows,
+            Some("east"),
+            ForeignSnapshots::Ignore,
+            &placement,
+            &ns_allowed,
+        );
+        assert_eq!(pass.row_foreign_ignored_ids, ["ghostid".to_string()].into());
+        assert!(pass.foreign_ignored_ids.is_empty());
+        assert_eq!(
+            pass.foreign_count, 0,
+            "rows are not counted as listing snapshots"
+        );
+
+        let (_, gone) = plan_ids(
+            &rows,
+            &BTreeSet::new(),
+            &pass.foreign_ignored_ids,
+            &pass.row_foreign_ignored_ids,
+            &window,
+            &capped(["w", "ghostid", "ownid"]),
+            None,
+            Utc::now(),
+        );
+        assert_eq!(gone, vec!["r-ghost"]);
+
+        // The complete-listing twin: both entries visible, same verdict.
+        let full = vec![
+            window[0].clone(),
+            entry("ghostid", ("u", "ghost", "/p"), t(9)),
+            entry("ownid", ("u", "billing.east", "/p"), t(8)),
+        ];
+        let pass = plan_placements(
+            &full,
+            &rows,
+            Some("east"),
+            ForeignSnapshots::Ignore,
+            &placement,
+            &ns_allowed,
+        );
+        assert!(
+            pass.row_foreign_ignored_ids.is_empty(),
+            "in-window rows are decided by their entries"
+        );
+        let (_, gone_complete) = plan_ids(
+            &rows,
+            &BTreeSet::new(),
+            &pass.foreign_ignored_ids,
+            &pass.row_foreign_ignored_ids,
+            &full,
+            &ListingCoverage::Complete,
+            None,
+            Utc::now(),
+        );
+        assert_eq!(gone_complete, gone);
+    }
+
+    #[test]
+    fn namespace_placement_ignores_out_of_window_foreign_suffixed_rows_and_skips_hostless_ones() {
+        let rows = vec![
+            id_row("r-west", "westid", ("u", "prod.west", "/p"), Some(t(9))),
+            id_row("r-east", "eastid", ("u", "prod.east", "/p"), Some(t(9))),
+            row("r-nohost", "nohost", Some(t(9))),
+        ];
+        let pass = plan_placements(
+            &[],
+            &rows,
+            Some("east"),
+            ForeignSnapshots::Ignore,
+            &Placement::Namespace("prod"),
+            &BTreeMap::new(),
+        );
+        assert_eq!(pass.row_foreign_ignored_ids, ["westid".to_string()].into());
+        assert!(
+            pass.decisions.is_empty(),
+            "rows never add creation decisions"
+        );
+    }
+
+    // --- coverage_for: what a bootstrap result's listing speaks for ----------
+
+    mod coverage {
+        use super::*;
+        use kopiur_mover::digest::{DIGEST_BUDGET_BYTES, DigestAlgo, ListedIds, SnapshotIdDigest};
+
+        fn window(ids: &[&str]) -> Vec<SnapshotListEntry> {
+            ids.iter()
+                .map(|id| entry(id, ("u", "h", "/p"), t(5)))
+                .collect()
+        }
+
+        fn digest(ids: &[&str]) -> SnapshotIdDigest {
+            SnapshotIdDigest::build(ids.iter().copied(), 42, DIGEST_BUDGET_BYTES).unwrap()
+        }
+
+        fn result(
+            count: Option<i64>,
+            returned: &[&str],
+            truncated: bool,
+            dropped: i64,
+            listed: Option<ListedIds>,
+            logical_bytes: Option<i64>,
+        ) -> BootstrapResult {
+            BootstrapResult::ready(
+                false,
+                None,
+                count,
+                window(returned),
+                truncated,
+                dropped,
+                None,
+            )
+            .with_catalog_membership(listed, logical_bytes)
+        }
+
+        const ALL: [&str; 5] = ["a", "b", "c", "d", "e"];
+
+        fn is_invalid(c: &ListingCoverage) -> bool {
+            matches!(
+                c,
+                ListingCoverage::Partial {
+                    reason: PartialReason::Invalid(_)
+                }
+            )
+        }
+
+        #[test]
+        fn an_untruncated_listing_is_complete_digest_or_not() {
+            let r = result(Some(2), &["a", "b"], false, 0, None, None);
+            assert_eq!(coverage_for(&r), ListingCoverage::Complete);
+            let r = result(
+                Some(2),
+                &["a", "b"],
+                false,
+                0,
+                Some(ListedIds::Invalid("junk".into())),
+                Some(1),
+            );
+            assert_eq!(coverage_for(&r), ListingCoverage::Complete);
+        }
+
+        #[test]
+        fn truncated_without_a_digest_is_partial_with_the_right_reason() {
+            // Old movers never set logicalBytes (nor the digest).
+            let r = result(Some(5), &["a"], true, 0, None, None);
+            assert_eq!(
+                coverage_for(&r),
+                ListingCoverage::Partial {
+                    reason: PartialReason::MoverTooOld
+                }
+            );
+            // A new mover always ships the digest unless it exceeded the budget.
+            let r = result(Some(5), &["a"], true, 0, None, Some(10));
+            assert_eq!(
+                coverage_for(&r),
+                ListingCoverage::Partial {
+                    reason: PartialReason::OverDigestBudget
+                }
+            );
+        }
+
+        #[test]
+        fn a_valid_digest_over_a_truncated_window_is_capped() {
+            let r = result(
+                Some(5),
+                &["a", "b"],
+                true,
+                0,
+                Some(ListedIds::Digest(digest(&ALL))),
+                Some(1),
+            );
+            let c = coverage_for(&r);
+            let ListingCoverage::Capped { present } = &c else {
+                panic!("expected Capped, got {c:?}");
+            };
+            assert!(ALL.iter().all(|id| present.contains(id)));
+            assert!(!present.contains("gone"));
+            assert_eq!(
+                c.as_status(),
+                kopiur_api::repository::CatalogCoverage::Capped
+            );
+        }
+
+        #[test]
+        fn a_size_trimmed_sub_cap_result_is_capped() {
+            // The result-size budget trimmed the window to a handful of entries
+            // (well under the cap) but still flagged it truncated.
+            let r = result(
+                Some(5),
+                &["a"],
+                true,
+                0,
+                Some(ListedIds::Digest(digest(&ALL))),
+                Some(1),
+            );
+            assert!(matches!(coverage_for(&r), ListingCoverage::Capped { .. }));
+        }
+
+        #[test]
+        fn the_count_cross_check_accounts_for_the_foreign_prefilter() {
+            // 7 in the repository, 2 dropped by the mover's foreign prefilter,
+            // the digest covers the 5 that remained.
+            let r = result(
+                Some(7),
+                &["a", "b"],
+                true,
+                2,
+                Some(ListedIds::Digest(digest(&ALL))),
+                Some(1),
+            );
+            assert!(matches!(coverage_for(&r), ListingCoverage::Capped { .. }));
+        }
+
+        #[test]
+        fn every_untrustworthy_digest_is_partial_invalid() {
+            let with = |count: Option<i64>, returned: &[&str], d: ListedIds| {
+                coverage_for(&result(count, returned, true, 0, Some(d), Some(1)))
+            };
+            let good = digest(&ALL);
+
+            // Count mismatch against the listing's own count.
+            assert!(is_invalid(&with(
+                Some(6),
+                &["a"],
+                ListedIds::Digest(good.clone())
+            )));
+            // snapshot_count missing on a listing run can't be cross-checked.
+            assert!(is_invalid(&with(
+                None,
+                &["a"],
+                ListedIds::Digest(good.clone())
+            )));
+            // A returned entry the digest doesn't contain.
+            assert!(is_invalid(&with(
+                Some(5),
+                &["a", "zzz"],
+                ListedIds::Digest(good.clone())
+            )));
+            // Bad width.
+            let mut d = good.clone();
+            d.width = 5;
+            assert!(is_invalid(&with(Some(5), &["a"], ListedIds::Digest(d))));
+            // Unknown algorithm.
+            let mut d = good.clone();
+            d.algo = DigestAlgo::Unknown("xxh3-v9".into());
+            assert!(is_invalid(&with(Some(5), &["a"], ListedIds::Digest(d))));
+            // Garbage in the field.
+            assert!(is_invalid(&with(
+                Some(5),
+                &["a"],
+                ListedIds::Invalid("not a digest".into())
+            )));
+        }
+
+        #[test]
+        fn an_unsorted_digest_is_partial_invalid() {
+            // Two single-id digests at width 6 encode to 8 base64 chars with no
+            // padding, so concatenating them is a valid 2-id encoding — in one
+            // of the two orders it is unsorted.
+            let one = |id: &str| SnapshotIdDigest::build([id], 42, 8).unwrap();
+            let (x, y) = (one("a"), one("b"));
+            assert_eq!(x.width, 6);
+            let orders = [
+                format!("{}{}", x.hashes, y.hashes),
+                format!("{}{}", y.hashes, x.hashes),
+            ];
+            let unsorted = orders
+                .into_iter()
+                .map(|hashes| SnapshotIdDigest {
+                    count: 2,
+                    hashes,
+                    ..x.clone()
+                })
+                .find(|d| d.decode().is_err())
+                .expect("one of the two orders is unsorted");
+            let c = coverage_for(&result(
+                Some(2),
+                &["a"],
+                true,
+                0,
+                Some(ListedIds::Digest(unsorted)),
+                Some(1),
+            ));
+            assert!(is_invalid(&c), "{c:?}");
+        }
     }
 
     #[test]
@@ -3075,6 +4384,7 @@ mod tests {
         };
         let pass = plan_placements(
             &listing,
+            &[],
             Some("east"),
             ForeignSnapshots::Ignore,
             &placement,
@@ -3119,6 +4429,7 @@ mod tests {
         // Empty ns_allowed map: the Namespace placement kind must never consult it.
         let pass = plan_placements(
             &listing,
+            &[],
             Some("east"),
             ForeignSnapshots::Ignore,
             &placement,
@@ -3149,6 +4460,7 @@ mod tests {
         let placement = Placement::Namespace("prod");
         let pass = plan_placements(
             &listing,
+            &[],
             Some("east"),
             ForeignSnapshots::Ignore,
             &placement,
@@ -3187,8 +4499,9 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &foreign_ignored,
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             None,
             Utc::now(),
         );
@@ -3204,8 +4517,9 @@ mod tests {
             &rows,
             &BTreeSet::new(),
             &foreign_ignored,
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             None,
             Utc::now(),
         );
@@ -3226,8 +4540,9 @@ mod tests {
             &rows,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            true,
+            &partial(),
             None,
             Utc::now(),
         );
@@ -3255,8 +4570,9 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &foreign_ignored,
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             Some(&retain),
             Utc::now(),
         );
@@ -3282,8 +4598,9 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             Some(&retain),
             Utc::now(),
         );
@@ -3325,8 +4642,9 @@ mod tests {
             &[],
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             Some(&CatalogRetain {
                 per_identity: Some(1),
                 max_age_days: None,
@@ -3351,8 +4669,9 @@ mod tests {
             &existing,
             &BTreeSet::new(),
             &BTreeSet::new(),
+            &BTreeSet::new(),
             &listing,
-            false,
+            &ListingCoverage::Complete,
             None,
             Utc::now(),
         );

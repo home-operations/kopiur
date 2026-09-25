@@ -666,7 +666,15 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 let listing = client.snapshot_list(None).await?;
                 let total = listing.len() as i64;
                 run_catalog_scan(
-                    ctx, repo, &namespace, &name, &repo_uid, &listing, total, false, 0,
+                    ctx,
+                    repo,
+                    &namespace,
+                    &name,
+                    &repo_uid,
+                    &listing,
+                    total,
+                    &catalog::ListingCoverage::Complete,
+                    0,
                 )
                 .await?;
             }
@@ -2514,7 +2522,7 @@ async fn finalize_bootstrap(
             repo_uid,
             &result.snapshots,
             snapshot_count,
-            result.snapshots_truncated,
+            &catalog::coverage_for(&result),
             result.foreign_suffix_dropped,
         )
         .await?;
@@ -3106,7 +3114,7 @@ fn bootstrap_condition(
 /// the bare-path filesystem backend, or carried back from the bootstrap Job for
 /// everything else. `total_snapshot_count` is the authoritative repository-wide
 /// count (may exceed `listing.len()` when the Job capped the returned entries —
-/// `listing_truncated`, see `BootstrapResult::snapshots_truncated`).
+/// `coverage`, see [`catalog::coverage_for`]).
 /// `foreign_prefilter_dropped` is the count the mover's foreign-suffix prefilter
 /// already dropped before this scan ever saw `listing` (`0` when the repository has
 /// no cluster identity, or `catalog.foreignSnapshots` isn't `Ignore` — the prefilter
@@ -3120,7 +3128,7 @@ async fn run_catalog_scan(
     repo_uid: &str,
     listing: &[SnapshotListEntry],
     total_snapshot_count: i64,
-    listing_truncated: bool,
+    coverage: &catalog::ListingCoverage,
     foreign_prefilter_dropped: i64,
 ) -> Result<()> {
     let owner_ref = io::owner_ref_for(repo, "Repository")?;
@@ -3141,7 +3149,7 @@ async fn run_catalog_scan(
         cluster,
         repo.spec.catalog.as_ref(),
         listing,
-        listing_truncated,
+        coverage,
     )
     .await?;
     let foreign_total = outcome.foreign + foreign_prefilter_dropped;

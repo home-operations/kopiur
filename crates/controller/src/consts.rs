@@ -784,6 +784,9 @@ pub const KUBE_API_ERROR_REASON: &str = "KubeApiError";
 /// `action` for a failed Kubernetes API call: check API-server health and the
 /// controller's RBAC.
 pub const CHECK_API_SERVER_ACTION: &str = "CheckApiServer";
+/// Event `reason` when a catalog scan could not delete every stale discovered
+/// `Snapshot` CR it planned to expire (issue #476); the scan retries.
+pub const CATALOG_EXPIRY_INCOMPLETE_REASON: &str = "CatalogExpiryIncomplete";
 /// Event `reason` when defensive re-validation rejected the object's spec.
 pub const INVALID_SPEC_REASON: &str = "InvalidSpec";
 /// `action` for a spec that failed validation: the user must fix the spec.
