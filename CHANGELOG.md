@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.10.10](https://github.com/home-operations/kopiur/compare/0.10.9...0.10.10) (2026-09-25)
+
+
+### Bug Fixes
+
+* batch snapshot deletes and checkpoint-poisoned replication ([#477](https://github.com/home-operations/kopiur/issues/477)) ([#481](https://github.com/home-operations/kopiur/issues/481)) ([183337c](https://github.com/home-operations/kopiur/commit/183337cb1a6e574a59b3b024ee484fe911975d5c))
+* **container:** update image busybox (cac8f90 → fd7dc98) ([#479](https://github.com/home-operations/kopiur/issues/479)) ([945a106](https://github.com/home-operations/kopiur/commit/945a106a6571f6d7490c70baacb4116a47f3579c))
+* **container:** update image busybox (dc2d74b → cac8f90) ([#478](https://github.com/home-operations/kopiur/issues/478)) ([8531656](https://github.com/home-operations/kopiur/commit/85316560199f7580fc7ff90aa746c51ef8bb53f3))
+* **e2e:** move MinIO/mc to the pgsty fork; preload digest refs via crictl ([#485](https://github.com/home-operations/kopiur/issues/485)) ([a4f0233](https://github.com/home-operations/kopiur/commit/a4f0233d308284fb9cacbe85e6017642c57e1127))
+* **rust:** update crate clap (4.6.6 → 4.6.7) ([#465](https://github.com/home-operations/kopiur/issues/465)) ([fcddd45](https://github.com/home-operations/kopiur/commit/fcddd45a9e504c5ad906b46688fafc96024eadc3))
+* **rust:** update crate rand (0.10.2 → 0.10.3) ([#473](https://github.com/home-operations/kopiur/issues/473)) ([026c0f4](https://github.com/home-operations/kopiur/commit/026c0f4f41cf83b7eba01ed5e91cb87933bba2b3))
+* **rust:** update crate thiserror (2.0.20 → 2.0.21) ([#482](https://github.com/home-operations/kopiur/issues/482)) ([1457622](https://github.com/home-operations/kopiur/commit/1457622d822d296bcf36f463c2df50830277ce8f))
+
+
+### Continuous Integration
+
+* **github-action:** update github-actions ([#468](https://github.com/home-operations/kopiur/issues/468)) ([af27b2e](https://github.com/home-operations/kopiur/commit/af27b2efd26af79155ecbe6561eff669739c46ef))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action codecov/codecov-action (v7.1.0 → v7.1.1) ([#472](https://github.com/home-operations/kopiur/issues/472)) ([5a3f76b](https://github.com/home-operations/kopiur/commit/5a3f76b7621bf297d8dbb409a47f3981d519f618))
+* **mise:** update mise tools ([#463](https://github.com/home-operations/kopiur/issues/463)) ([69698aa](https://github.com/home-operations/kopiur/commit/69698aacc146ae9f364cec3c9928599673fe0e5b))
+* **mise:** update tool aqua:astral-sh/uv (0.12.15 → 0.12.16) ([#474](https://github.com/home-operations/kopiur/issues/474)) ([8a45270](https://github.com/home-operations/kopiur/commit/8a45270d1ab8cc690fd52b7d15c60427f1e6875e))
+* **mise:** update tool aqua:astral-sh/uv (0.12.16 → 0.12.17) ([#475](https://github.com/home-operations/kopiur/issues/475)) ([b94926b](https://github.com/home-operations/kopiur/commit/b94926b302a8f0402334c900ba320cb26d46fbc6))
+* **mise:** update tool node (24.20.0 → v24.21.0) ([#457](https://github.com/home-operations/kopiur/issues/457)) ([fc67c05](https://github.com/home-operations/kopiur/commit/fc67c05180a069b2e5b040ad257959c241b3fa40))
+* **mise:** update tool oxfmt (0.66.0 → 0.68.0) ([#459](https://github.com/home-operations/kopiur/issues/459)) ([0614d12](https://github.com/home-operations/kopiur/commit/0614d12d1f2063e0ceea040aff4c3f19642d60fb))
+* **mise:** update tool rust (1.98.0 → 1.98.1) ([#447](https://github.com/home-operations/kopiur/issues/447)) ([3b2d33e](https://github.com/home-operations/kopiur/commit/3b2d33e2ba92339ea621ad90a92a57881798d7ca))
+* **renovate:** inherit the automerge rules from the shared preset ([#483](https://github.com/home-operations/kopiur/issues/483)) ([5b9feb6](https://github.com/home-operations/kopiur/commit/5b9feb645bde890ef3ac1302ba0eacef72a226ec))
+
 ## [0.10.9](https://github.com/home-operations/kopiur/compare/0.10.8...0.10.9) (2026-09-19)
 
 
