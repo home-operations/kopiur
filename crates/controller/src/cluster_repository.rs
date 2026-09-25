@@ -1551,7 +1551,7 @@ async fn bootstrap_cluster_via_mover(
         }
         crate::repo_seed::SeedArming::Armed(armed) => Some(armed),
     };
-    let work_spec = cluster_bootstrap_work_spec(
+    let mut work_spec = cluster_bootstrap_work_spec(
         backend,
         name,
         &job_ns,
@@ -1576,6 +1576,8 @@ async fn bootstrap_cluster_via_mover(
         ca_bundle_pem,
         seed.as_ref().map(|s| s.op.clone()),
     );
+    // #476 e2e hook: an internal annotation may SHRINK the catalog window.
+    crate::repository::apply_catalog_window_override(&mut work_spec, repo.annotations());
     // Preflight the credential Secret(s) the bootstrap mover loads via `envFrom`, in the
     // namespace it will actually run in. Without this the Job launches against a Secret
     // that isn't there, its pod wedges in `CreateContainerConfigError` until the bootstrap

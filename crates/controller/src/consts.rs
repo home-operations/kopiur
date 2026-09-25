@@ -214,6 +214,15 @@ pub const REVERIFY_REQUESTED_ANNOTATION: &str = "kopiur.home-operations.com/reve
 pub const CATALOG_SCAN_REQUESTED_ANNOTATION: &str =
     "kopiur.home-operations.com/catalog-scan-requested-at";
 
+/// INTERNAL, test-only annotation on a `Repository`/`ClusterRepository`: shrink
+/// the bootstrap mover's catalog materialization window below
+/// `MAX_RETURNED_SNAPSHOTS` (issue #476's e2e guard needs a capped window
+/// without seeding 1,000+ real snapshots). It can only SHRINK the window — any
+/// value outside `1..=MAX_RETURNED_SNAPSHOTS`, or unparseable, is ignored — so
+/// setting it can never enlarge the result `ConfigMap`. Undocumented on purpose.
+pub const INTERNAL_CATALOG_WINDOW_ANNOTATION: &str =
+    "kopiur.home-operations.com/internal-catalog-window";
+
 /// Normal Event reason on a `SnapshotPolicy` when auto-adoption re-attached one
 /// or more discovered snapshots into it (M6). The note names the count, the
 /// resolved identity, that the rows are now GFS-governed, and both opt-outs.

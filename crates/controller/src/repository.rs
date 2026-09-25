@@ -1543,7 +1543,7 @@ async fn bootstrap_via_mover(
         }
         repo_seed::SeedArming::Armed(armed) => Some(armed),
     };
-    let work_spec = bootstrap_work_spec(
+    let mut work_spec = bootstrap_work_spec(
         backend,
         name,
         namespace,
@@ -1571,6 +1571,8 @@ async fn bootstrap_via_mover(
         ca_bundle_pem,
         seed.as_ref().map(|s| s.op.clone()),
     );
+    // #476 e2e hook: an internal annotation may SHRINK the catalog window.
+    crate::repository::apply_catalog_window_override(&mut work_spec, repo.annotations());
     // Resolve the bootstrap Job's run identity in the Repository's namespace:
     // the user's workload-identity SA (preflighted + bound to the mover role),
     // or the minted mover SA + RoleBinding (ADR §4.12). A SEEDING bootstrap
@@ -1914,6 +1916,39 @@ pub(crate) fn blob_retention_for(
     parameters
         .and_then(|p| p.blob_retention.as_ref())
         .and_then(kopiur_mover::workspec::BlobRetentionSpec::from_api)
+}
+
+/// The [`crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION`] override, if it
+/// names a window in `1..=MAX_RETURNED_SNAPSHOTS`. Anything else is ignored, so
+/// the annotation can only ever shrink the window. Pure.
+pub(crate) fn catalog_window_override(
+    annotations: &std::collections::BTreeMap<String, String>,
+) -> Option<u32> {
+    let max = u32::try_from(kopiur_mover::bootstrap::MAX_RETURNED_SNAPSHOTS).unwrap_or(u32::MAX);
+    annotations
+        .get(crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION)?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (1..=max).contains(n))
+}
+
+/// Apply [`catalog_window_override`] to a bootstrap work spec (a no-op for any
+/// other operation). Applied at the launch sites rather than threaded through
+/// the work-spec builders, which never see the CR's metadata.
+pub(crate) fn apply_catalog_window_override(
+    spec: &mut MoverWorkSpec,
+    annotations: &std::collections::BTreeMap<String, String>,
+) {
+    let Operation::BootstrapRepository(op) = &mut spec.operation else {
+        // The bootstrap work-spec builders only ever produce this variant.
+        debug_assert!(
+            false,
+            "catalog window override applied to a non-bootstrap op"
+        );
+        return;
+    };
+    op.max_returned_snapshots = catalog_window_override(annotations);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3450,6 +3485,24 @@ mod tests {
         ];
         assert_eq!(logical_bytes_under_management(&listing), 190);
         assert_eq!(logical_bytes_under_management(&[]), 0);
+    }
+
+    #[test]
+    fn catalog_window_override_only_ever_shrinks_the_window() {
+        let ann = |v: &str| {
+            std::collections::BTreeMap::from([(
+                crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION.to_string(),
+                v.to_string(),
+            )])
+        };
+        assert_eq!(catalog_window_override(&ann("2")), Some(2));
+        assert_eq!(catalog_window_override(&ann(" 7 ")), Some(7));
+        let max = kopiur_mover::bootstrap::MAX_RETURNED_SNAPSHOTS.to_string();
+        assert_eq!(catalog_window_override(&ann(&max)), Some(1000));
+        for bad in ["0", "1001", "99999999", "-3", "two", ""] {
+            assert_eq!(catalog_window_override(&ann(bad)), None, "{bad:?}");
+        }
+        assert_eq!(catalog_window_override(&Default::default()), None);
     }
 
     #[test]
