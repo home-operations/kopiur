@@ -993,6 +993,7 @@ mod tests {
         let mut ns_repo = repo_cr("backups", "nas");
         ns_repo.spec.concurrency = Some(ConcurrencySpec {
             max_concurrent_jobs: Some(3),
+            max_concurrent_delete_jobs: None,
         });
         let resolved =
             resolved_from_namespaced(ns_repo, "backups".into(), None).expect("projection succeeds");
@@ -1005,6 +1006,7 @@ mod tests {
         let mut cluster = cluster_repo_cr("shared");
         cluster.spec.concurrency = Some(ConcurrencySpec {
             max_concurrent_jobs: Some(3),
+            max_concurrent_delete_jobs: None,
         });
         let resolved = resolved_from_cluster(cluster, None).expect("projection succeeds");
         assert_eq!(
@@ -1039,6 +1041,7 @@ mod tests {
         use kopiur_api::common::ConcurrencySpec;
         let zero = Some(ConcurrencySpec {
             max_concurrent_jobs: Some(0),
+            max_concurrent_delete_jobs: None,
         });
 
         let mut ns_repo = repo_cr("backups", "nas");

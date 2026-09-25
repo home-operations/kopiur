@@ -324,16 +324,16 @@ pub fn effective_mass_deletion_threshold(p: Option<&crate::common::DeletionProte
 /// // No block at all, no field, and an explicit 0 are the same state: uncapped.
 /// assert_eq!(effective_max_concurrent_jobs(None), None);
 /// assert_eq!(
-///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: None })),
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: None, max_concurrent_delete_jobs: None })),
 ///     None,
 /// );
 /// assert_eq!(
-///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(0) })),
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(0), max_concurrent_delete_jobs: None })),
 ///     None,
 /// );
 /// // A positive value caps the pool.
 /// assert_eq!(
-///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(3) }))
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(3), max_concurrent_delete_jobs: None }))
 ///         .map(|n| n.get()),
 ///     Some(3),
 /// );
@@ -343,6 +343,35 @@ pub fn effective_max_concurrent_jobs(
 ) -> Option<std::num::NonZeroUsize> {
     spec.and_then(|c| c.max_concurrent_jobs)
         .and_then(|n| std::num::NonZeroUsize::new(n as usize))
+}
+
+/// The per-repository snapshot-delete batch default when
+/// `concurrency.maxConcurrentDeleteJobs` is absent: one batch at a time
+/// (single-flight). See [`effective_max_concurrent_delete_jobs`].
+pub const DEFAULT_MAX_CONCURRENT_DELETE_JOBS: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN;
+
+/// The effective per-repository cap on live snapshot-delete batch Jobs:
+/// `concurrency.maxConcurrentDeleteJobs` when set, else
+/// [`DEFAULT_MAX_CONCURRENT_DELETE_JOBS`] (1). Unlike
+/// [`effective_max_concurrent_jobs`] there is NO uncapped state: parallel bulk
+/// deletes against one repository only multiply index loads (issue #477). An
+/// explicit `0` is refused at admission; should one reach the controller anyway
+/// it also resolves to the default rather than to "delete nothing, forever".
+///
+/// ```
+/// use kopiur_api::common::ConcurrencySpec;
+/// use kopiur_api::consts::effective_max_concurrent_delete_jobs;
+///
+/// assert_eq!(effective_max_concurrent_delete_jobs(None).get(), 1);
+/// let two = ConcurrencySpec { max_concurrent_delete_jobs: Some(2), ..Default::default() };
+/// assert_eq!(effective_max_concurrent_delete_jobs(Some(&two)).get(), 2);
+/// ```
+pub fn effective_max_concurrent_delete_jobs(
+    spec: Option<&crate::common::ConcurrencySpec>,
+) -> std::num::NonZeroUsize {
+    spec.and_then(|c| c.max_concurrent_delete_jobs)
+        .and_then(|n| std::num::NonZeroUsize::new(n as usize))
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_DELETE_JOBS)
 }
 
 /// Pool-membership label stamped on every mover `Job` that counts toward its
@@ -775,6 +804,7 @@ mod tests {
         let cap = |n: Option<u32>| {
             effective_max_concurrent_jobs(Some(&ConcurrencySpec {
                 max_concurrent_jobs: n,
+                max_concurrent_delete_jobs: None,
             }))
             .map(|v| v.get())
         };

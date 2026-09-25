@@ -112,6 +112,16 @@ itself is the primary defense, and a global cap is an opt-in backstop, not
 Kopiur's answer to head-of-line blocking one repository's slow deletes behind
 every other repository's.
 
+> **Amended by #477.** Two assumptions above did not hold. "Connects once"
+> was true, but the mover still ran one `kopia snapshot delete` process, one
+> repository open, per member. And nothing enforced one batch per repository:
+> each finalizer reconcile could fire the NEXT wave while earlier ones ran, so
+> a 4,000-snapshot prune became ~33 concurrent Jobs on one repository. Now the
+> mover deletes a batch in one bulk kopia call, and batches are capped per
+> repository (`spec.concurrency.maxConcurrentDeleteJobs`, default 1) through a
+> race-free admission ledger, with a 30-minute Job deadline so a wedged batch
+> cannot stall its repository. The code is the source of truth.
+
 Full rationale for each of the five design choices above:
 [design rationale → Mass-deletion protection](../dev/design-rationale.md#mass-deletion-protection-cascade-guard--breaker--batching).
 

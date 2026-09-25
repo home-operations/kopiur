@@ -2139,8 +2139,14 @@ impl KopiaClient {
         }
     }
 
-    /// List snapshots, optionally filtered by source identity. With no filter
-    /// this lists all snapshots in the repository.
+    /// List COMPLETE snapshots, optionally filtered by source identity. With no
+    /// filter this lists all snapshots in the repository.
+    ///
+    /// **Incomplete manifests are dropped**: kopia's JSON
+    /// listing emits the checkpoints an interrupted `snapshot create` leaves
+    /// behind even without `--incomplete`, and no caller of a "snapshot list"
+    /// means a partial upload (issue #477). Use
+    /// [`Self::snapshot_list_all_with_incomplete`] for manifest-id presence.
     pub async fn snapshot_list(
         &self,
         filter: Option<&SnapshotSource>,
@@ -2150,7 +2156,7 @@ impl KopiaClient {
             // kopia accepts the identity string as a positional source filter.
             args.push(src.identity());
         }
-        self.run_json(&args, "snapshot list").await
+        Ok(complete_only(self.run_json(&args, "snapshot list").await?))
     }
 
     /// List EVERY snapshot in the repository regardless of owning identity
@@ -2172,7 +2178,23 @@ impl KopiaClient {
     /// change without the flag name changing with it. The behavior above is
     /// pinned by the `sync_to_seeds_*` integration test, which asserts a
     /// foreign-identity-only repository lists its snapshots BOTH ways.
+    ///
+    /// Complete snapshots only, like [`Self::snapshot_list`].
     pub async fn snapshot_list_all(&self) -> Result<Vec<SnapshotListEntry>, KopiaError> {
+        Ok(complete_only(
+            self.snapshot_list_all_with_incomplete().await?,
+        ))
+    }
+
+    /// [`Self::snapshot_list_all`] WITHOUT dropping incomplete manifests: every
+    /// manifest id in the repository, checkpoints included (tell them apart with
+    /// [`SnapshotListEntry::incomplete_reason`] / [`crate::partition_incomplete`]).
+    /// For manifest-id PRESENCE checks — e.g. "is this id still there to
+    /// delete?" — and for callers that report what they skipped. Never pick a
+    /// snapshot to restore, verify or replicate from this listing.
+    pub async fn snapshot_list_all_with_incomplete(
+        &self,
+    ) -> Result<Vec<SnapshotListEntry>, KopiaError> {
         self.run_json(&snapshot_list_all_args(), "snapshot list --all")
             .await
     }
@@ -2196,6 +2218,26 @@ impl KopiaClient {
     /// every expected `(identity, startTime)` pair is present.
     pub async fn snapshot_migrate(&self, opts: &SnapshotMigrateOptions) -> Result<(), KopiaError> {
         self.run_ok(&snapshot_migrate_args(opts)).await.map(|_| ())
+    }
+
+    /// Delete many snapshot manifests in ONE kopia invocation
+    /// (`kopia snapshot delete <id>... --delete`): one repository open and one
+    /// index load for the whole set, instead of one per id (issue #477).
+    ///
+    /// **All-or-nothing** (verified against a real kopia 0.23.1 repository):
+    /// kopia's CLI loop stops at the first failing id, and its write session
+    /// flushes only when every id succeeded. On any error NOTHING was deleted,
+    /// even the ids kopia already logged as "Deleting snapshot …".
+    ///
+    /// So unlike [`Self::snapshot_delete`], a `no snapshots matched` failure is
+    /// NOT remapped to success. Here it means one id was absent and the whole
+    /// call committed nothing. Pass only ids a fresh listing shows present, and
+    /// keep the call small enough for one argv (callers chunk).
+    pub async fn snapshot_delete_many(&self, ids: &[String]) -> Result<(), KopiaError> {
+        let mut args = vec!["snapshot".to_string(), "delete".to_string()];
+        args.extend(ids.iter().cloned());
+        args.push("--delete".into());
+        self.run_ok(&args).await.map(|_| ())
     }
 
     /// Delete a single snapshot by manifest id. kopia's `snapshot delete`
@@ -2761,6 +2803,20 @@ fn connect_args(spec: &ConnectSpec, cache: CacheTuning, opts: ConnectOptions) ->
 
 /// Build the args for `kopia snapshot list --json --all`. Pure so the
 /// every-identity list argv is unit-testable without spawning kopia.
+/// Drop incomplete manifests from a raw listing, logging what was dropped.
+fn complete_only(entries: Vec<SnapshotListEntry>) -> Vec<SnapshotListEntry> {
+    let (complete, incomplete) = crate::partition_incomplete(entries);
+    for e in &incomplete {
+        tracing::debug!(
+            id = %e.id,
+            source = %e.source.identity(),
+            reason = e.incomplete_reason().unwrap_or_default(),
+            "skipping incomplete snapshot manifest"
+        );
+    }
+    complete
+}
+
 fn snapshot_list_all_args() -> Vec<String> {
     vec![
         "snapshot".into(),

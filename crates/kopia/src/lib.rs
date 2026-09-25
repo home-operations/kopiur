@@ -25,8 +25,8 @@ pub use model::{
     DeleteUnreferencedPacksStats, DirEntry, DirManifest, DirSummary, DirSummaryLite, EntryError,
     IndexBlobEntry, MaintenanceCadence, MaintenanceInfo, MaintenanceRun, MaintenanceRunExtra,
     MaintenanceSchedule, RepositoryStatus, RootEntry, SnapshotCreateOutcome, SnapshotCreateResult,
-    SnapshotListEntry, SnapshotSource, SnapshotStats, StorageInfo, reclaimed_bytes_since,
-    user_tags,
+    SnapshotListEntry, SnapshotSource, SnapshotStats, StorageInfo, partition_incomplete,
+    reclaimed_bytes_since, user_tags,
 };
 pub use selection::{filter_as_of, pick_offset};
 pub use session::SessionCmd;

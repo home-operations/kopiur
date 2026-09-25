@@ -164,15 +164,15 @@ streamingLists: true
 # type: integer
 # minimum: 0
 # @schema
-# -- 0 = uncapped (default); set to bound concurrent snapshot-delete batch
-# Jobs across repositories (mass-deletion protection). Batching itself is the
-# primary protection — one Job per repository per accumulation window, not
-# one per Snapshot — so this cap is an opt-in backstop for a
-# resource-constrained cluster, not a load-bearing safety mechanism: a small
-# cap risks head-of-line-blocking every OTHER repository's deletions behind
-# one slow/failing one. It does NOT bound how many Snapshots one batch Job
-# deletes, nor does it gate whether a deletion is allowed at all — that's
-# deletionProtection.threshold on the Repository/ClusterRepository.
+# -- 0 = no cluster-wide cap (default); set to bound concurrent snapshot-delete
+# batch Jobs across ALL repositories. Each repository is already capped on its
+# own by spec.concurrency.maxConcurrentDeleteJobs (default 1: one batch at a
+# time, each deleting hundreds of Snapshots in one kopia call), so this is an
+# opt-in backstop for a resource-constrained cluster, not a load-bearing safety
+# mechanism: a small cap risks head-of-line-blocking every OTHER repository's
+# deletions behind one slow/failing one. It does NOT bound how many Snapshots
+# one batch Job deletes, nor does it gate whether a deletion is allowed at all —
+# that's deletionProtection.threshold on the Repository/ClusterRepository.
 maxConcurrentDeleteJobs: 0
 # @schema
 # type: integer

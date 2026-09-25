@@ -860,7 +860,7 @@ pub struct ConcurrencySpec {
     /// Excluded from the pool entirely: maintenance (already single-flight per
     /// repository), verification, pin, and snapshot-delete batch Jobs. These are
     /// operator-driven housekeeping that must not be starved by a saturated
-    /// backup pool.
+    /// backup pool. Delete batches have their own cap, `maxConcurrentDeleteJobs`.
     ///
     /// Absent or `0` means unlimited — the default, and today's behavior.
     ///
@@ -870,6 +870,26 @@ pub struct ConcurrencySpec {
     /// diff noise for a value that changes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrent_jobs: Option<u32>,
+
+    /// Ceiling on how many snapshot-delete batch Jobs may run against this
+    /// repository at once. **Absent means 1**: one batch at a time, and the next
+    /// batch starts when the current one finishes.
+    ///
+    /// A batch Job deletes hundreds of snapshots in a single kopia call. kopia
+    /// serializes manifest deletes on the repository's index anyway, so running
+    /// several batches in parallel adds no throughput. Each extra Job only loads
+    /// the full index again against the same backend (issue #477). Raise it only
+    /// for a fast local backend with a very large deletion backlog.
+    ///
+    /// Must be at least 1. There is no "unlimited" value. Omit the field for the
+    /// default. The controller-wide `maxConcurrentDeleteJobs` Helm value still
+    /// caps delete Jobs across ALL repositories on top of this.
+    ///
+    /// No schema `default:` is emitted (api-conventions §4a); the controller
+    /// resolves absent to 1, so stored repositories carry no diff noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_concurrent_delete_jobs: Option<u32>,
 }
 
 /// Repository access mode; `ReadOnly` serves restores only (no backups, no maintenance).

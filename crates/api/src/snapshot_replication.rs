@@ -462,6 +462,14 @@ pub struct SnapshotReplicationRunStats {
     /// Copies pruned this run per `spec.pruning`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pruned: Option<u32>,
+    /// Incomplete source manifests of selected identities — checkpoints an
+    /// interrupted `kopia snapshot create` left behind — that this run did not
+    /// replicate. kopia can never migrate a checkpoint as a complete snapshot,
+    /// so they are skipped rather than failing the post-verify. Non-zero
+    /// usually means an abandoned manual backup worth cleaning up with
+    /// `kopia snapshot delete <id> --delete` (the mover log names the ids).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_skipped: Option<u32>,
 }
 
 /// Observed state of a `SnapshotReplication`.
@@ -680,12 +688,13 @@ schedule: { cron: "0 6 * * 0" }
     #[test]
     fn status_roundtrips_with_run_stats() {
         let status: SnapshotReplicationStatus = from_yaml(
-            "phase: Succeeded\nobservedGeneration: 3\nlastReplicated: 2026-08-01T06:00:00Z\nlastRun:\n  identitiesSelected: 4\n  snapshotsCopied: 12\n  alreadyPresent: 88\n  failed: 0\n  pruned: 2\n",
+            "phase: Succeeded\nobservedGeneration: 3\nlastReplicated: 2026-08-01T06:00:00Z\nlastRun:\n  identitiesSelected: 4\n  snapshotsCopied: 12\n  alreadyPresent: 88\n  failed: 0\n  pruned: 2\n  incompleteSkipped: 1\n",
         );
         assert_eq!(status.phase, Some(SnapshotReplicationPhase::Succeeded));
         let run = status.last_run.expect("lastRun set");
         assert_eq!(run.identities_selected, Some(4));
         assert_eq!(run.snapshots_copied, Some(12));
+        assert_eq!(run.incomplete_skipped, Some(1));
         assert_eq!(run.already_present, Some(88));
         assert_eq!(run.failed, Some(0));
         assert_eq!(run.pruned, Some(2));

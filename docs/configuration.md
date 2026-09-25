@@ -179,11 +179,12 @@ This is the operator itself. The settings worth knowing:
   entirely. Leaving it at `0` costs nothing: with no cap set anywhere the
   operator performs no extra API calls at all.
 - **`maxConcurrentDeleteJobs`**: cluster-wide cap on concurrent `snapdel-*`
-  batch-delete Jobs, default `0` which means uncapped. This is a *separate* pool from
-  `maxConcurrentJobs`, because a deletion reduces repository load and is already batched
-  one Job per repository. Queuing it behind backups would grow the backlog it
-  exists to drain. It does not gate whether a deletion is *allowed*; that is
-  `deletionProtection.threshold` on the repository.
+  batch-delete Jobs, default `0` which means no cluster-wide cap. Each repository is
+  already limited on its own by `spec.concurrency.maxConcurrentDeleteJobs` (default
+  one batch at a time). This is a *separate* pool from `maxConcurrentJobs`, because a
+  deletion reduces repository load, and queuing it behind backups would grow the
+  backlog it exists to drain. It does not gate whether a deletion is *allowed*; that
+  is `deletionProtection.threshold` on the repository.
 - **`extraVolumes` / `extraVolumeMounts`**: the way to make a **filesystem
   backend** reachable in-process, through hostPath, NFS or a PVC, so the controller can
   run its short idempotent kopia ops. The e2e harness uses a hostPath here.

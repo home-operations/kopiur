@@ -167,6 +167,118 @@ fn exclude_alone_subtracts_from_the_implicit_all() {
     assert!(!selected.contains(&t("mydb", "staging", "/pvc/mydb")));
 }
 
+// --- #477: incomplete checkpoints ---------------------------------------------
+
+/// `entry` marked with kopia's `IncompleteReason`, as `snapshot list --json`
+/// emits an interrupted upload's checkpoint even without `--incomplete`.
+fn checkpoint(id: &str, user: &str, host: &str, path: &str, start: &str) -> SnapshotListEntry {
+    let mut e = entry(id, user, host, path, start, start);
+    e.incomplete = Some("checkpoint".into());
+    e
+}
+
+/// Issue #477 verbatim: a stray source checkpoint can never be migrated, so if
+/// it counted as expected the post-verify failed forever ("1 of 1261 expected
+/// snapshot(s) did not arrive"). It must be neither expected nor missing.
+#[test]
+fn source_checkpoint_is_never_expected_or_missing() {
+    let mut source = three_entries();
+    source.push(checkpoint(
+        "ckpt",
+        "mydb",
+        "prod",
+        "/pvc/mydb",
+        "2026-09-17T18:55:54Z",
+    ));
+    let selected = select_identities(&[], &[], &source);
+    let dest: Vec<_> = three_entries();
+    assert!(missing_after_migrate(&source, &selected, &dest, false).is_empty());
+    assert_eq!(expected_keys(&source, &selected, false).len(), 3);
+    // latest_only must pick the newest COMPLETE snapshot, not the checkpoint.
+    let latest = expected_keys(&source, &selected, true);
+    assert!(!latest.contains(&(t("mydb", "prod", "/pvc/mydb"), ts("2026-09-17T18:55:54Z"))));
+    assert!(
+        !all_keys(&source).contains(&(t("mydb", "prod", "/pvc/mydb"), ts("2026-09-17T18:55:54Z")))
+    );
+}
+
+/// An identity whose ONLY manifest is a checkpoint is not a replicable
+/// identity, and a checkpoint an interrupted migrate left on the DESTINATION
+/// never becomes a copy-CR correspondence.
+#[test]
+fn checkpoints_never_select_identities_or_correspond() {
+    let ckpt_only = vec![checkpoint(
+        "c",
+        "u",
+        "h",
+        "/only-ckpt",
+        "2026-09-17T18:00:00Z",
+    )];
+    assert!(select_identities(&[], &[], &ckpt_only).is_empty());
+
+    let source = three_entries();
+    let selected = select_identities(&[], &[], &source);
+    let mut dest_ckpt = entry(
+        "d-ckpt",
+        "mydb",
+        "prod",
+        "/pvc/mydb",
+        "2026-08-01T02:00:00Z",
+        "2026-08-01T02:05:00Z",
+    );
+    dest_ckpt.incomplete = Some("checkpoint".into());
+    assert!(correspondence_set(&source, &selected, &[dest_ckpt]).is_empty());
+}
+
+#[test]
+fn incomplete_skipped_reports_only_matched_identities() {
+    let mut source = three_entries();
+    source.push(checkpoint(
+        "c1",
+        "mydb",
+        "prod",
+        "/pvc/mydb",
+        "2026-09-17T18:55:54Z",
+    ));
+    source.push(checkpoint(
+        "c2",
+        "nobody",
+        "else",
+        "/x",
+        "2026-09-17T18:55:54Z",
+    ));
+    let include = [matcher(Some("mydb"), None, None)];
+    let skipped = incomplete_skipped(&include, &[], &source);
+    assert_eq!(
+        skipped.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["c1"]
+    );
+    // exclude wins, exactly as for selection.
+    let excluded = incomplete_skipped(&include, &[matcher(None, Some("prod"), None)], &source);
+    assert!(excluded.is_empty());
+}
+
+/// Review finding on #477: an identity whose ONLY manifest is a checkpoint (an
+/// interrupted FIRST backup) is never selected, since there is nothing to copy.
+/// It must still be reported, or a checkpoint-only source replicates "nothing"
+/// in total silence, the exact case an operator most needs to hear about.
+#[test]
+fn a_checkpoint_only_identity_is_still_reported() {
+    let source = vec![checkpoint(
+        "only",
+        "u",
+        "h",
+        "/first-backup",
+        "2026-09-17T18:00:00Z",
+    )];
+    assert!(select_identities(&[], &[], &source).is_empty());
+    let skipped = incomplete_skipped(&[], &[], &source);
+    assert_eq!(
+        skipped.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["only"]
+    );
+}
+
 // --- expected_keys / missing_after_migrate -----------------------------------
 
 #[test]

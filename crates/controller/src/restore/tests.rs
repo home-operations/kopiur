@@ -2868,6 +2868,7 @@ fn pooled_repo(cap: Option<u32>) -> crate::io::ResolvedRepository {
         deletion_protection: None,
         concurrency: cap.map(|c| kopiur_api::common::ConcurrencySpec {
             max_concurrent_jobs: Some(c),
+            max_concurrent_delete_jobs: None,
         }),
         mass_deletion_ack: None,
         catalog: None,

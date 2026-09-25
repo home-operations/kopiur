@@ -858,7 +858,9 @@ pub const OP_SNAPSHOT_DELETE_BATCH: &str = "snapshot-delete-batch";
 /// `Snapshot` UIDs it targets — the dispatcher's single source of truth for
 /// "which Snapshots does this Job cover" (single-flight / no-overlap checks).
 /// An annotation, not a label: an arbitrary-length UID list can exceed a
-/// label-value's 63-char limit for anything but a tiny batch.
+/// label-value's 63-char limit for anything but a tiny batch. Its size is bounded
+/// by the batch itself (`crate::snapshot::MAX_BATCH_MEMBERS` × a 36-char UID ≈ 36
+/// KiB at 1000), far under the 256 KiB per-object annotation limit.
 pub const DELETE_MEMBERS_ANNOTATION: &str = "kopiur.home-operations.com/delete-members";
 /// Label on a batch-delete Job carrying the target repository's hash
 /// (`crate::snapshot::repo_label`), so the dispatcher can LIST live batch Jobs
