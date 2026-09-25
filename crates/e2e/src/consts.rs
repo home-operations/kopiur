@@ -476,6 +476,10 @@ pub const BUCKETS: &[&str] = &[
     "kopiur-mc-d2",
     "kopiur-mc-e",
     "kopiur-mc-f",
+    // #476 stale-discovered-row expiry past a capped catalog window
+    // (crates/e2e/tests/catalog_window.rs): its own bucket so the peer seeder's
+    // snapshot counts are exact.
+    "kopiur-catalog-window",
     // ClusterRepository cross-namespace adoption (M8, crates/e2e/tests/adoption.rs,
     // `cluster_repository_adoption_cross_namespace`): a foreign-seeded snapshot whose
     // identity hostname places its discovered row in the WORKLOAD namespace while the

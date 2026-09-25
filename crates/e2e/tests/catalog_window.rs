@@ -175,6 +175,20 @@ async fn stale_discovered_rows_expire_beyond_the_materialization_window() {
     let name = "e2e-catalog-window";
     let bucket = "kopiur-catalog-window";
 
+    // A previous attempt (nextest retries) may have left the CR behind; start
+    // clean so a retry is a real retry, not an instant 409. The repository is
+    // created fresh in the bucket below, so the bucket is emptied too.
+    let _ = crepos.delete(name, &DeleteParams::default()).await;
+    wait_until(
+        &format!("{name} gone"),
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(crepos.get_opt(name).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("leftover ClusterRepository should be deleted");
+    run_seeder(&client, "e2e-cw-wipe", &[SeedStep::WipeBucket { bucket }]).await;
+
     // A plain shared repository: no cluster identity, discovered rows land in
     // the namespace named by the snapshot hostname (the #476 topology: the
     // reporter's peer rows were bare-hostname, `foreign=0`).
