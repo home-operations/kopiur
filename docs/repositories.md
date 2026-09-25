@@ -363,7 +363,8 @@ How it behaves, all of it automatic with nothing to install:
 - **Discovered means "not produced through this Repository CR".** Snapshots Kopiur itself takes via your `SnapshotPolicy`s already have their own `Snapshot` CRs and are never duplicated as discovered rows.
 - **Discovered rows are forced `deletionPolicy: Retain`.** Deleting a discovered `Snapshot` CR deletes only the CR. Kopiur **never** deletes a kopia snapshot it didn't create. And because the row mirrors repository state, it reappears on the next refresh; to keep rows away permanently, bound them with `catalog.retain` below.
 - **An initial scan always runs**, on first bootstrap and again on any spec change, so adopting a repository surfaces its existing history immediately.
-- **Repeated re-scanning is opt-in.** Set `catalog.periodicRefresh: true` to keep re-scanning every `catalog.refreshInterval`, default **1h**, minimum `30s`. That way snapshots written out-of-band *after* adoption keep appearing, and rows whose snapshot was pruned repository-side are expired. It is **off by default**, because for object-store and volume-backed repositories each re-scan re-runs the self-cleaning bootstrap Job. Leaving it off means the repository bootstraps once and isn't re-run on a timer. When it is on, the interval is the *only* thing that drives re-scans: a Job removed early by its `ttlSecondsAfterFinished` does **not** trigger an extra scan, so `refreshInterval: 24h` gives one scan a day regardless of the Job TTL.
+- **Repeated re-scanning is opt-in.** Set `catalog.periodicRefresh: true` to keep re-scanning every `catalog.refreshInterval`, default **1h**, minimum `30s`. That way snapshots written out-of-band *after* adoption keep appearing, and rows whose snapshot was deleted repository-side, for example pruned by another cluster's GFS retention, are expired. It is **off by default**, because for object-store and volume-backed repositories each re-scan re-runs the self-cleaning bootstrap Job. Leaving it off means the repository bootstraps once and isn't re-run on a timer. When it is on, the interval is the *only* thing that drives re-scans: a Job removed early by its `ttlSecondsAfterFinished` does **not** trigger an extra scan, so `refreshInterval: 24h` gives one scan a day regardless of the Job TTL.
+- **You can ask for one scan at any time**, without turning on `periodicRefresh`, by stamping a fresh timestamp on the `catalog-scan-requested-at` annotation. See [Keeping the row count bounded](#keeping-the-row-count-bounded--the-window-coverage-and-retain) below.
 - **The row carries the real data**: the kopia snapshot ID, the foreign `username@hostname:path` identity, the snapshot's timing and logical size.
 
 The settings, all under `spec.catalog`:
@@ -381,6 +382,49 @@ spec:
 ```
 
 `retain` bounds the **CR rows, never the data**. A row expired by `perIdentity` or `maxAgeDays` is just a deleted CR: the kopia snapshot stays in the repository and remains restorable via [`Restore.source.identity`](restores.md#restoring-a-snapshot-kopiur-didnt-create).
+
+### Keeping the row count bounded — the window, coverage, and `retain`
+
+Three things decide how many discovered rows exist after a scan. Knowing which one is in play tells you which knob to turn.
+
+**1. The materialization window.** One scan materializes at most **1,000** snapshots, and fewer if the scan's result would exceed the size budget of the ConfigMap it travels back in (long source paths use it up faster). The window is filled **newest-first, round-robin across identities** (`username@hostname:path`), so every identity gets its most recent snapshots in before any one identity gets its older ones. Snapshots outside the window are not materialized on that scan. Nothing is lost: they stay in the repository and remain restorable by identity.
+
+**2. Stale-row expiry.** A discovered row whose kopia snapshot no longer exists, for example because the cluster that owns it pruned it under its own GFS retention, is expired on the next scan. This works on repositories of any realistic size, including ones far larger than the window: alongside the window, the scan returns a compact list of **every** snapshot ID in the repository, so Kopiur can tell "outside the window" (keep the row) apart from "deleted from the repository" (expire the row).
+
+**3. `catalog.retain`.** `perIdentity` and `maxAgeDays` bound the rows that **already exist**, not only the snapshots a scan lists. Tightening `retain` therefore reclaims a backlog on the next scan. This is the knob to reach for when a repository's history is simply larger than you want mirrored into etcd.
+
+**`status.catalog.coverage`** tells you, as of `status.catalog.lastRefreshAt`, which of those guarantees the last scan could give:
+
+| `coverage` | What the last scan saw | Stale rows expired? |
+| ---------- | ---------------------- | ------------------- |
+| `Complete` | The listing covered every snapshot in the repository. | Yes. |
+| `Capped`   | The repository is larger than the window, so only the newest window was materialized, but every snapshot ID was still known. | Yes. |
+| `Partial`  | The window was capped **and** the full list of snapshot IDs was not available: typically a mover image older than the controller, or a repository beyond the ID-list ceiling of roughly 86,000 snapshots. | **No.** Rows whose snapshots were deleted repository-side stay until coverage recovers. `retain` still bounds rows. |
+
+```console
+$ kubectl get repository <name> -n <ns> -o jsonpath='{.status.catalog.coverage}{"  "}{.status.catalog.lastRefreshAt}{"\n"}'
+```
+
+`kubectl kopiur status` shows the coverage next to the discovered count whenever it isn't `Complete`, for example `7836 (partial)`. A `Partial` scan also logs one WARN line on the controller naming the cause, and the `kopiur_repo_catalog_coverage` gauge exposes the state to alerting (see [Observability](dev/observability.md)). On `Partial`, make sure the mover image matches the controller version; if the repository really is beyond the ceiling, bound the rows with `retain`.
+
+**Triggering a scan on demand.** With `periodicRefresh` off, the default, a scan only runs on a spec change or on request. To request one, for example to reclaim a backlog right after upgrading or after tightening `retain`, stamp a fresh timestamp on the annotation:
+
+```console
+# Repository
+$ kubectl annotate repository <name> -n <ns> \
+    kopiur.home-operations.com/catalog-scan-requested-at=$(date -u +%FT%TZ) --overwrite
+# ClusterRepository (cluster-scoped, so no -n)
+$ kubectl annotate clusterrepository <name> \
+    kopiur.home-operations.com/catalog-scan-requested-at=$(date -u +%FT%TZ) --overwrite
+```
+
+The value is an opaque token: any new value requests exactly one scan. The request is done when `status.catalog.scanRequestHonored` equals the annotation value.
+
+/// note | Deleting discovered rows never deletes kopia data
+
+A scan may delete many discovered `Snapshot` CRs at once, for example the first scan after upgrading a large shared repository, or the first scan after tightening `retain`. That only removes Kubernetes objects. Discovered rows are forced to `deletionPolicy: Retain`, so no `kopia snapshot delete` ever runs for them, and every snapshot stays restorable by identity.
+
+///
 
 /// note | Where a ClusterRepository puts discovered Snapshots
 

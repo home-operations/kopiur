@@ -826,6 +826,24 @@ pub struct BootstrapResult {
     /// default).
     #[serde(default)]
     pub foreign_suffix_dropped: i64,
+    /// Membership set over EVERY listed snapshot id — after the foreign-suffix
+    /// prefilter, BEFORE the materialization cap (issue #476). Written on every
+    /// `scan_catalog` run, so the controller can tell an id that fell outside
+    /// the capped `snapshots` window from one deleted repository-side, and keep
+    /// absence expiry on for repositories larger than the window. `None` when
+    /// the catalog wasn't scanned, the listing exceeded the digest's ceiling
+    /// ([`crate::digest::DIGEST_WIDTHS`]), or the mover predates the field —
+    /// the controller then treats a truncated result as membership-unknown.
+    /// Never trimmed by [`enforce_result_size_budget`]: it reserves its budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed_ids: Option<crate::digest::ListedIds>,
+    /// Logical bytes under management over the FULL post-prefilter listing
+    /// (the newest snapshot's size per source), so `storageStats.totalSizeBytes`
+    /// does not under-count sources outside the capped window. `None` when the
+    /// catalog wasn't scanned or the mover predates the field; the controller
+    /// then falls back to computing it from `snapshots`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_bytes: Option<i64>,
     /// Count of content-index blobs (`kopia index list`), when it could be read.
     /// Best-effort: `None` if the query failed (the controller then leaves the
     /// prior `status.storageStats.indexBlobCount` untouched). The controller
@@ -890,6 +908,8 @@ impl BootstrapResult {
             snapshots,
             snapshots_truncated,
             foreign_suffix_dropped,
+            listed_ids: None,
+            logical_bytes: None,
             index_blob_count,
             epoch: None,
             epoch_error: None,
@@ -909,6 +929,19 @@ impl BootstrapResult {
     ) -> Self {
         self.epoch = epoch;
         self.epoch_error = epoch_error;
+        self
+    }
+
+    /// Attach the catalog membership digest and full-listing logical bytes
+    /// (issue #476). A sibling of [`BootstrapResult::with_epoch`] for the same
+    /// reason: the positional list of [`BootstrapResult::ready`] is full.
+    pub fn with_catalog_membership(
+        mut self,
+        listed_ids: Option<crate::digest::ListedIds>,
+        logical_bytes: Option<i64>,
+    ) -> Self {
+        self.listed_ids = listed_ids;
+        self.logical_bytes = logical_bytes;
         self
     }
 
@@ -952,6 +985,8 @@ impl BootstrapResult {
             snapshots: Vec::new(),
             snapshots_truncated: false,
             foreign_suffix_dropped: 0,
+            listed_ids: None,
+            logical_bytes: None,
             index_blob_count: None,
             epoch: None,
             epoch_error: None,

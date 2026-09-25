@@ -19,7 +19,7 @@ nightly  media      Repository/nas  false      9h ago         -
 IN FLIGHT: 0 snapshot(s), 0 restore(s)
 ```
 
-`DISCOVERED` is the repository's `status.catalog.discoveredBackupCount`: how many `Snapshot` objects the last catalog scan materialized from snapshots already in the repository. It shows `-` when the repository has never been scanned.
+`DISCOVERED` is the repository's `status.catalog.discoveredBackupCount`: how many `Snapshot` objects the last catalog scan materialized from snapshots already in the repository. It shows `-` when the repository has never been scanned. When the last scan's `status.catalog.coverage` isn't `Complete`, the coverage follows the count, for example `7836 (partial)`; see [The catalog → keeping the row count bounded](../repositories.md#keeping-the-row-count-bounded--the-window-coverage-and-retain).
 
 That column is plain inventory rather than a warning. A repository shared by several apps, or one re-seeded from a replica, legitimately carries a non-zero count. `CLUSTER` and `FOREIGN` are the multi-cluster pair: this cluster's identity suffix, and how many snapshots the last scan attributed to another cluster.
 
