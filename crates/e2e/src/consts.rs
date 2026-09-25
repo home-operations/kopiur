@@ -360,20 +360,21 @@ pub const MINIO_PASS: &str = "minioadmin123";
 pub const MINIO_ENDPOINT: &str = "minio.kopiur-e2e.svc.cluster.local:9000";
 /// Container image for MinIO (preloaded into the node by `e2e-cluster-up`).
 ///
-/// **quay.io, pinned to an immutable RELEASE tag — not Docker Hub, not `latest`.**
-/// MinIO withdrew their images from Docker Hub: `docker.io/minio/minio` now 404s
-/// on the Hub API and an in-cluster pull fails with "pull access denied,
-/// repository does not exist or may require authorization". That took out every
+/// **The `pgsty` community fork on Docker Hub, pinned by tag AND digest.**
+/// Upstream MinIO has now pulled its public images twice: first from Docker Hub
+/// (`docker.io/minio/minio` 404s), then from quay.io (`quay.io/minio/*` answers
+/// 401 to anonymous pulls since 2026-09-24). Each time it took out every
 /// S3-backed e2e shard at once, and only after a 420s readiness timeout per
 /// attempt, because the preload helper is best-effort and the pods fall back to
-/// an in-cluster pull that also fails. quay.io/minio is the upstream's own
-/// remaining public registry.
+/// an in-cluster pull that also fails. `pgsty/minio` is a drop-in rebuild (same
+/// `minio` entrypoint, `/usr/bin/sh` present); the digest pins the exact bytes
+/// so a re-tag on a third-party repo cannot change what the suite runs.
 ///
 /// Keep in lockstep with the `preload` lines in `crates/e2e/mise.toml`.
-pub const MINIO_IMAGE: &str = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z";
+pub const MINIO_IMAGE: &str = "docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372";
 /// Container image for the `mc` client used to create buckets. Same registry and
 /// pinning rationale as [`MINIO_IMAGE`].
-pub const MC_IMAGE: &str = "quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z";
+pub const MC_IMAGE: &str = "docker.io/pgsty/mc:RELEASE.2026-09-13T00-00-00Z@sha256:aa5cc1401b3e1ab482d215d5717e9e69b4f14970a3656f330ed20a549fe19020";
 /// Buckets the bucket-creator Pod ensures (idempotent `mc mb --ignore-existing`).
 pub const BUCKETS: &[&str] = &[
     "kopiur",
