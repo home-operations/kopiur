@@ -629,9 +629,10 @@ pub struct CatalogPlan<'a> {
 /// 2. **Out-of-window rows** (a row whose id is not in the FULL `listing`): kept only
 ///    when [`coverage`](ListingCoverage) cannot prove the snapshot gone, it is not
 ///    produced/foreign-ignored, it is within `maxAgeDays` by its own end time, and
-///    its identity still has a `perIdentity` slot the window left free
-///    ([`out_of_window_candidates`], [`fill_row_slots`]). They can never displace a
-///    window keep.
+///    — under `Capped` only — its identity still has a `perIdentity` slot the
+///    window left free ([`out_of_window_candidates`], [`fill_row_slots`],
+///    [`row_rank_cap`]). They can never displace a window keep, and under
+///    `Partial` they are never ranked at all.
 ///
 /// Every row whose id is not kept expires.
 #[allow(clippy::too_many_arguments)]
@@ -662,7 +663,7 @@ pub fn plan_catalog<'a>(
         bounds: &bounds,
     };
     let candidates = out_of_window_candidates(rows, &listed, &row_filter);
-    for id in fill_row_slots(candidates, &window, bounds.per_identity) {
+    for id in fill_row_slots(candidates, &window, row_rank_cap(coverage, &bounds)) {
         keep.insert(id, Kept::Row);
     }
 
@@ -813,6 +814,26 @@ fn out_of_window_candidates<'r>(
         }
     }
     newest.into_values().filter(|r| filter.admits(r)).collect()
+}
+
+/// The `perIdentity` cap out-of-window rows are ranked against, per coverage.
+///
+/// Ranking a row against its identity's window keeps is only sound when the
+/// window IS that identity's newest-first prefix — then "the slots the window
+/// left free" really are the next-newest snapshots. That holds for `Capped`
+/// (only a mover that orders its window fairly ships a digest).
+///
+/// Under `Partial` it does not: an old mover's window is kopia's oldest-first
+/// per-source slice, and absent rows can't be refuted, so ranking would expire
+/// rows for NEWER, still-present snapshots while keeping older ones (#476
+/// review). There `perIdentity` stops at the window; `maxAgeDays`, decided from
+/// each row's own end time, still bounds out-of-window rows.
+fn row_rank_cap(coverage: &ListingCoverage, bounds: &RetainBounds) -> Option<usize> {
+    match coverage {
+        // No out-of-window row is ever a candidate under Complete.
+        ListingCoverage::Complete | ListingCoverage::Capped { .. } => bounds.per_identity,
+        ListingCoverage::Partial { .. } => None,
+    }
 }
 
 /// Step 2 of [`plan_catalog`]: candidate rows take only the `perIdentity` slots
@@ -2631,12 +2652,14 @@ mod tests {
     }
 
     /// Partial (membership unknown) still cannot prove a row's snapshot gone,
-    /// but `retain` is about the CR count, not presence: an out-of-window row
-    /// beyond `maxAgeDays` or beyond its identity's `perIdentity` slots expires
-    /// whether or not its snapshot still exists. That is what makes `retain`
-    /// actually bound the etcd footprint on a large repository (#476).
+    /// but `maxAgeDays` is decided from the row's own end time, so an
+    /// out-of-window row beyond it expires whether or not its snapshot still
+    /// exists — as do produced-shadowing and foreign-ignored rows. `perIdentity`
+    /// deliberately does NOT reach out-of-window rows under Partial (see
+    /// `row_rank_cap`): the window can't be trusted as each identity's newest
+    /// prefix, so ranking against it could expire newer, present snapshots.
     #[test]
-    fn partial_coverage_lets_retain_bound_out_of_window_rows() {
+    fn partial_coverage_bounds_out_of_window_rows_by_age_produced_and_foreign() {
         let listing = vec![entry("a-win", ("u", "a", "/p"), t(5))];
         let rows = vec![
             // Identity a: the window already fills its single slot.
@@ -2674,10 +2697,7 @@ mod tests {
             Utc::now(),
         );
         assert!(created.is_empty(), "{created:?}");
-        assert_eq!(
-            gone,
-            vec!["r-a-out", "r-b-old", "r-c-aged", "r-foreign", "r-ours"]
-        );
+        assert_eq!(gone, vec!["r-c-aged", "r-foreign", "r-ours"]);
 
         // Without retain, Partial keeps every out-of-window row it cannot
         // disprove (today's truncated behavior), still dropping produced/foreign.
@@ -2711,19 +2731,29 @@ mod tests {
             per_identity: Some(1),
             max_age_days: None,
         };
-        for coverage in [capped(["w", "d0", "d1"]), partial()] {
-            let (_, gone) = plan_ids(
-                &rows,
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                &listing,
-                &coverage,
-                Some(&retain),
-                Utc::now(),
-            );
-            assert_eq!(gone, vec!["r-d0"], "{coverage:?}");
-        }
+        let (_, gone) = plan_ids(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            &capped(["w", "d0", "d1"]),
+            Some(&retain),
+            Utc::now(),
+        );
+        assert_eq!(gone, vec!["r-d0"], "the duplicates share one slot");
+        // Under Partial, perIdentity does not rank out-of-window rows at all.
+        let (_, gone) = plan_ids(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            &partial(),
+            Some(&retain),
+            Utc::now(),
+        );
+        assert!(gone.is_empty(), "{gone:?}");
     }
 
     /// An old mover truncates WITHOUT sorting, so its window can hold an
@@ -2731,11 +2761,18 @@ mod tests {
     /// entry was seen; the out-of-window row was not — it may only take slots
     /// the window left over, never displace the window's keep.
     #[test]
-    fn old_mover_unsorted_window_is_never_displaced_by_an_out_of_window_row() {
+    fn partial_never_expires_an_out_of_window_row_by_per_identity() {
+        // An OLD mover's window is kopia's oldest-first-per-source slice, so the
+        // window can hold an identity's OLDEST snapshot while its newest ones sit
+        // outside. Ranking out-of-window rows against that window would expire
+        // `r-a-new` — a row whose snapshot is newer AND (for all we know) still
+        // present. Under Partial neither the window order nor presence can be
+        // trusted, so `perIdentity` does not reach out-of-window rows; both stay.
         let listing = vec![entry("a-old", ("u", "a", "/p"), t(100))];
         let rows = vec![
             id_row("r-a-old", "a-old", ("u", "a", "/p"), Some(t(100))),
             id_row("r-a-new", "a-new", ("u", "a", "/p"), Some(t(5))),
+            id_row("r-a-newer", "a-newer", ("u", "a", "/p"), Some(t(1))),
         ];
         let retain = CatalogRetain {
             per_identity: Some(1),
@@ -2752,7 +2789,42 @@ mod tests {
             Utc::now(),
         );
         assert!(created.is_empty());
-        assert_eq!(gone, vec!["r-a-new"]);
+        assert!(
+            gone.is_empty(),
+            "nothing present may expire by rank under Partial: {gone:?}"
+        );
+    }
+
+    #[test]
+    fn partial_still_bounds_out_of_window_rows_by_max_age() {
+        // maxAgeDays is decided from the row's OWN end time — sound under any
+        // coverage, so it keeps bounding a Partial repository's rows.
+        let listing = vec![entry("w", ("u", "a", "/p"), t(1))];
+        let rows = vec![
+            id_row("r-w", "w", ("u", "a", "/p"), Some(t(1))),
+            id_row(
+                "r-ancient",
+                "ancient",
+                ("u", "a", "/p"),
+                Some(Utc::now() - chrono::Duration::days(400)),
+            ),
+            id_row("r-recent", "recent", ("u", "a", "/p"), Some(t(30))),
+        ];
+        let retain = CatalogRetain {
+            per_identity: None,
+            max_age_days: Some(90),
+        };
+        let (_, gone) = plan_ids(
+            &rows,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &listing,
+            &partial(),
+            Some(&retain),
+            Utc::now(),
+        );
+        assert_eq!(gone, vec!["r-ancient"]);
     }
 
     /// Under `Capped`, presence is decided per row: present rows are kept

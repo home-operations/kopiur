@@ -897,7 +897,7 @@ pub struct CatalogStatus {
     /// snapshots were deleted repository-side still expire. `Partial`: the
     /// window was capped AND membership was unknown (a mover older than the
     /// controller, or a repository beyond the membership digest's ceiling), so
-    /// such stale rows are kept; `catalog.retain` still bounds rows.
+    /// such stale rows are kept; `catalog.retain.maxAgeDays` still bounds them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<CatalogCoverage>,
 }
@@ -920,7 +920,8 @@ pub enum CatalogCoverage {
     /// so rows whose snapshots were deleted repository-side still expire.
     Capped,
     /// The window was capped and membership was unknown: rows whose snapshots
-    /// were deleted repository-side are NOT expired (retain still applies).
+    /// were deleted repository-side are NOT expired (`retain.maxAgeDays` still
+    /// applies to rows outside the window; `perIdentity` only to the window).
     Partial,
     /// A value this build does not recognize (newer operator). Decode-compat
     /// only — hidden from the CRD schema, never produced by this build.

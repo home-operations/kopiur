@@ -391,7 +391,7 @@ Three things decide how many discovered rows exist after a scan. Knowing which o
 
 **2. Stale-row expiry.** A discovered row whose kopia snapshot no longer exists, for example because the cluster that owns it pruned it under its own GFS retention, is expired on the next scan. This works on repositories of any realistic size, including ones far larger than the window: alongside the window, the scan returns a compact list of **every** snapshot ID in the repository, so Kopiur can tell "outside the window" (keep the row) apart from "deleted from the repository" (expire the row).
 
-**3. `catalog.retain`.** `perIdentity` and `maxAgeDays` bound the rows that **already exist**, not only the snapshots a scan lists. Tightening `retain` therefore reclaims a backlog on the next scan. This is the knob to reach for when a repository's history is simply larger than you want mirrored into etcd.
+**3. `catalog.retain`.** `perIdentity` and `maxAgeDays` bound the rows that **already exist**, not only the snapshots a scan lists (under `Partial` coverage, only `maxAgeDays` reaches rows outside the window — see below). Tightening `retain` therefore reclaims a backlog on the next scan. This is the knob to reach for when a repository's history is simply larger than you want mirrored into etcd.
 
 **`status.catalog.coverage`** tells you, as of `status.catalog.lastRefreshAt`, which of those guarantees the last scan could give:
 
@@ -399,13 +399,13 @@ Three things decide how many discovered rows exist after a scan. Knowing which o
 | ---------- | ---------------------- | ------------------- |
 | `Complete` | The listing covered every snapshot in the repository. | Yes. |
 | `Capped`   | The repository is larger than the window, so only the newest window was materialized, but every snapshot ID was still known. | Yes. |
-| `Partial`  | The window was capped **and** the full list of snapshot IDs was not available: typically a mover image older than the controller, or a repository beyond the ID-list ceiling of roughly 86,000 snapshots. | **No.** Rows whose snapshots were deleted repository-side stay until coverage recovers. `retain` still bounds rows. |
+| `Partial`  | The window was capped **and** the full list of snapshot IDs was not available: typically a mover image older than the controller, or a repository beyond the ID-list ceiling of roughly 86,000 snapshots. | **No.** Rows whose snapshots were deleted repository-side stay until coverage recovers. For rows outside the window only `maxAgeDays` applies; `perIdentity` still caps the window itself. |
 
 ```console
 $ kubectl get repository <name> -n <ns> -o jsonpath='{.status.catalog.coverage}{"  "}{.status.catalog.lastRefreshAt}{"\n"}'
 ```
 
-`kubectl kopiur status` shows the coverage next to the discovered count whenever it isn't `Complete`, for example `7836 (partial)`. A `Partial` scan also logs one WARN line on the controller naming the cause, and the `kopiur_repo_catalog_coverage` gauge exposes the state to alerting (see [Observability](dev/observability.md)). On `Partial`, make sure the mover image matches the controller version; if the repository really is beyond the ceiling, bound the rows with `retain`.
+`kubectl kopiur status` shows the coverage next to the discovered count whenever it isn't `Complete`, for example `7836 (partial)`. A `Partial` scan also logs one WARN line on the controller naming the cause, and the `kopiur_repo_catalog_coverage` gauge exposes the state to alerting (see [Observability](dev/observability.md)). On `Partial`, make sure the mover image matches the controller version; if the repository really is beyond the ceiling, bound the rows with `retain.maxAgeDays`. Under `Partial`, `perIdentity` is deliberately not applied to rows outside the window: kopiur cannot tell which of those snapshots still exist, so ranking them could delete the rows for your newest snapshots while keeping stale ones.
 
 **Triggering a scan on demand.** With `periodicRefresh` off, the default, a scan only runs on a spec change or on request. To request one, for example to reclaim a backlog right after upgrading or after tightening `retain`, stamp a fresh timestamp on the annotation:
 
