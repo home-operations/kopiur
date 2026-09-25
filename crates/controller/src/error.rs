@@ -127,8 +127,11 @@ pub enum Error {
 
     /// A catalog scan attempted EVERY planned discovered-row expiry, but some
     /// deletes failed (issue #476). Transient: the scan is deliberately not
-    /// marked refreshed (`status.catalog.lastRefreshAt` is not stamped), so the
-    /// normal retry re-scans and re-attempts the remainder. Expiry is monotonic
+    /// marked refreshed (`status.catalog.lastRefreshAt` is not stamped), and the
+    /// failed scan stamps a fresh `catalog-scan-requested-at` token
+    /// (`catalog::request_rescan_after_failed_scan`) — the generation arm is
+    /// already spent by then, so that token is what actually re-arms the scan
+    /// with `periodicRefresh` off. Expiry is monotonic
     /// — each retry only has fewer rows left — so a large first reclaim after an
     /// upgrade converges even if the apiserver throttles part of it.
     #[error(

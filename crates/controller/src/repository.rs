@@ -653,7 +653,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             // repo's status is byte-stable between refreshes (no self-triggered
             // reconcile hot-loop).
             let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-            if catalog::scan_due(
+            let scan_outcome = if catalog::scan_due(
                 repo.metadata.generation,
                 repo.status.as_ref().and_then(|s| s.observed_generation),
                 last_refresh_at(repo),
@@ -663,22 +663,39 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 scan_requested_honored(repo),
                 chrono::Utc::now(),
             ) {
-                let listing = client.snapshot_list(None).await?;
-                let total = listing.len() as i64;
-                run_catalog_scan(
-                    ctx,
-                    repo,
-                    &namespace,
-                    &name,
-                    &repo_uid,
-                    &listing,
-                    total,
-                    &catalog::ListingCoverage::Complete,
-                    0,
-                    None,
-                )
-                .await?;
-            }
+                match client.snapshot_list(None).await {
+                    Ok(listing) => {
+                        let total = listing.len() as i64;
+                        run_catalog_scan(
+                            ctx,
+                            repo,
+                            &namespace,
+                            &name,
+                            &repo_uid,
+                            &listing,
+                            total,
+                            &catalog::ListingCoverage::Complete,
+                            0,
+                            None,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        // A failed listing spends the generation arm too; ask
+                        // for a retry exactly as a failed scan does.
+                        catalog::request_rescan_after_failed_scan(
+                            ctx,
+                            &repository_ref(repo),
+                            scan_requested_token(repo),
+                            scan_requested_honored(repo),
+                        )
+                        .await;
+                        Err(e.into())
+                    }
+                }
+            } else {
+                Ok(())
+            };
 
             // Now that the repo is Ready, ensure its managed Maintenance exists
             // (default-on) and surface the MaintenanceConfigured condition. Built
@@ -689,6 +706,10 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             // §11: a ReadOnly repository runs no maintenance (it serves restores
             // only). Skip the projection so no managed Maintenance is created.
             ensure_repo_maintenance(ctx, repo, &namespace, &name, &api, &conditions).await;
+            // Surfaced only now, so a failed scan (e.g. `CatalogExpiryIncomplete`
+            // while reclaiming a large post-#476 backlog) doesn't also block the
+            // maintenance projection — the same order as the mover path.
+            scan_outcome?;
         }
         other => {
             // Object-store backends run connect/create/status/catalog in a
@@ -3168,7 +3189,20 @@ async fn run_catalog_scan(
         listing,
         coverage,
     )
-    .await?;
+    .await;
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            catalog::request_rescan_after_failed_scan(
+                ctx,
+                &repository_ref(repo),
+                scan_requested_token(repo),
+                scan_requested_honored(repo),
+            )
+            .await;
+            return Err(e);
+        }
+    };
     let foreign_total = outcome.foreign + foreign_prefilter_dropped;
 
     // Logical bytes under management is recorded directly from kopia's data, both as

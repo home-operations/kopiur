@@ -641,7 +641,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             // `catalog.fallbackNamespace`, else it is skipped with a Warning Event
             // (`crate::catalog::decide_cluster_placement` + `crate::catalog::scan`).
             let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-            if catalog::scan_due(
+            let scan_outcome = if catalog::scan_due(
                 repo.metadata.generation,
                 repo.status.as_ref().and_then(|s| s.observed_generation),
                 cluster_last_refresh_at(repo),
@@ -651,26 +651,47 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 cluster_scan_requested_honored(repo),
                 chrono::Utc::now(),
             ) {
-                let listing = client.snapshot_list(None).await?;
-                let total = listing.len() as i64;
-                run_cluster_catalog_scan(
-                    ctx,
-                    repo,
-                    &name,
-                    &listing,
-                    total,
-                    &catalog::ListingCoverage::Complete,
-                    0,
-                    None,
-                )
-                .await?;
-            }
+                match client.snapshot_list(None).await {
+                    Ok(listing) => {
+                        let total = listing.len() as i64;
+                        run_cluster_catalog_scan(
+                            ctx,
+                            repo,
+                            &name,
+                            &listing,
+                            total,
+                            &catalog::ListingCoverage::Complete,
+                            0,
+                            None,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        // A failed listing spends the generation arm too; ask
+                        // for a retry exactly as a failed scan does.
+                        catalog::request_rescan_after_failed_scan(
+                            ctx,
+                            &cluster_repository_ref(repo),
+                            cluster_scan_requested_token(repo),
+                            cluster_scan_requested_honored(repo),
+                        )
+                        .await;
+                        Err(e.into())
+                    }
+                }
+            } else {
+                Ok(())
+            };
 
             // Ensure the managed Maintenance for this ClusterRepository (ADR §3.7).
             // Cluster-scoped, so the metric namespace label is empty and
             // ref-matching ignores namespace. The (namespaced) Maintenance lands in
             // spec.maintenance.namespace, else the operator's own namespace.
             ensure_cluster_maintenance(ctx, repo, &name, &api, &cluster_conditions(repo)).await;
+            // Surfaced only now, so a failed scan (e.g. `CatalogExpiryIncomplete`
+            // while reclaiming a large post-#476 backlog) doesn't also block the
+            // maintenance projection — the same order as the mover path.
+            scan_outcome?;
         }
         other => {
             // Object-store backends bootstrap via a short-lived mover Job (ADR
@@ -788,7 +809,20 @@ async fn run_cluster_catalog_scan(
         listing,
         coverage,
     )
-    .await?;
+    .await;
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            catalog::request_rescan_after_failed_scan(
+                ctx,
+                &cluster_repository_ref(repo),
+                cluster_scan_requested_token(repo),
+                cluster_scan_requested_honored(repo),
+            )
+            .await;
+            return Err(e);
+        }
+    };
     let foreign_total = outcome.foreign + foreign_prefilter_dropped;
 
     if !outcome.unplaced_hosts.is_empty() {

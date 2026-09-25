@@ -312,6 +312,26 @@ pub fn scan_requested_pending(token: Option<&str>, honored: Option<&str>) -> boo
     Some(token) != honored
 }
 
+/// The scan-request token to stamp after a catalog scan FAILED, or `None` when
+/// one is already pending (#476 review).
+///
+/// A scan runs after the reconcile has already written `observedGeneration`, so a
+/// failed scan (e.g. `CatalogExpiryIncomplete` mid-reclaim, or a LIST error)
+/// would otherwise never be retried: [`scan_due`]'s generation arm is spent, and
+/// with `periodicRefresh` off (the default) nothing else fires until the next spec
+/// edit. Stamping a fresh `catalog-scan-requested-at` token reuses the on-demand
+/// path — [`scan_requested_pending`] re-arms `scan_due`, and on the Job path
+/// [`scan_requested_due`] relaunches the bootstrap under its existing rate limit —
+/// and the next successful scan retires it via `scanRequestHonored` as usual. A
+/// still-pending token already does all of that, so it is left untouched. Pure.
+pub fn rescan_token_after_failed_scan(
+    token: Option<&str>,
+    honored: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    (!scan_requested_pending(token, honored)).then(|| now.to_rfc3339())
+}
+
 /// Whether a pending scan-request token should be allowed to LAUNCH a new
 /// bootstrap/scan attempt NOW — [`scan_requested_pending`] plus a rate limit on
 /// top. Used only by [`bootstrap_recycle_due`]/[`bootstrap_create_due`] (which
@@ -1384,6 +1404,34 @@ pub struct ScanOutcome {
     pub backfilled: i64,
 }
 
+/// After a FAILED [`scan`]: stamp a fresh scan-request token on the repository
+/// (unless one is already pending) so the scan is actually retried — see
+/// [`rescan_token_after_failed_scan`] for why nothing else would. Best-effort:
+/// a failed stamp is logged, never allowed to replace the scan's own error,
+/// which the caller returns regardless.
+pub async fn request_rescan_after_failed_scan(
+    ctx: &Context,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    token: Option<&str>,
+    honored: Option<&str>,
+) {
+    let Some(fresh) = rescan_token_after_failed_scan(token, honored, Utc::now()) else {
+        return;
+    };
+    let default_ns = repo_ref.namespace.clone().unwrap_or_default();
+    if let Err(e) =
+        crate::io::request_catalog_scan(&ctx.client, repo_ref, &default_ns, &fresh).await
+    {
+        tracing::warn!(
+            repo = %repo_ref.name,
+            error = %e,
+            "catalog scan failed and the retry request could not be recorded; the scan \
+             will re-run on the next spec change, periodic refresh, or on-demand \
+             catalog-scan-requested-at annotation"
+        );
+    }
+}
+
 /// The rows whose recorded hosts the placement pass must classify. Under
 /// `Complete` no out-of-window row is ever a keep candidate (absent from a
 /// complete listing = gone), so classifying their hosts would only add Namespace
@@ -2046,6 +2094,30 @@ fn discovered_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_scan_requests_a_rescan_unless_one_is_already_pending() {
+        let now = DateTime::parse_from_rfc3339("2026-09-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // No token, or the last one already honored: stamp a fresh one, so the
+        // retry does not depend on a generation change or periodicRefresh.
+        assert_eq!(
+            rescan_token_after_failed_scan(None, None, now).as_deref(),
+            Some("2026-09-25T12:00:00+00:00")
+        );
+        assert!(rescan_token_after_failed_scan(Some("t1"), Some("t1"), now).is_some());
+        // A token is still pending: it already re-arms the scan; re-stamping
+        // would only churn the annotation (and reset nothing useful).
+        assert_eq!(
+            rescan_token_after_failed_scan(Some("t2"), Some("t1"), now),
+            None
+        );
+        assert_eq!(rescan_token_after_failed_scan(Some("t2"), None, now), None);
+        // The fresh token is itself pending, so scan_due fires on the retry.
+        let tok = rescan_token_after_failed_scan(None, None, now).unwrap();
+        assert!(scan_requested_pending(Some(&tok), None));
+    }
 
     #[test]
     fn partial_remedy_names_a_cause_specific_fix() {
