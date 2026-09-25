@@ -1908,6 +1908,7 @@ fn cluster_bootstrap_work_spec(
             // pre-#380. Admission refuses `spec.seed` on a ReadOnly repository,
             // so this and `read_only` are never both set.
             seed,
+            max_returned_snapshots: None,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),

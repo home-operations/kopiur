@@ -867,6 +867,13 @@ pub struct BootstrapRepositoryOp {
     /// #380 exists to prevent. Absent on old work specs (serde default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<SeedOpSpec>,
+    /// **Test-only** override of [`crate::bootstrap::MAX_RETURNED_SNAPSHOTS`]
+    /// (issue #476), so e2e can exercise a capped catalog window with a handful
+    /// of snapshots instead of a thousand. Set ONLY by the controller's hidden
+    /// e2e env; `None` (every production work spec, and every old one) keeps
+    /// the default cap. The mover clamps it to at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_returned_snapshots: Option<u32>,
 }
 
 impl BootstrapRepositoryOp {

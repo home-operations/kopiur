@@ -2005,6 +2005,7 @@ fn bootstrap_work_spec(
             // every write, so the seed could never complete), and the caller's
             // `seed_armed` is the only source of this value.
             seed,
+            max_returned_snapshots: None,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
