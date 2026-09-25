@@ -3578,6 +3578,14 @@ spec:
                 description: Catalog-materialization status (how many discovered `Snapshot`s, last refresh).
                 nullable: true
                 properties:
+                  coverage:
+                    description: How much of the repository a catalog scan could see.
+                    enum:
+                    - Complete
+                    - Capped
+                    - Partial
+                    nullable: true
+                    type: string
                   discoveredBackupCount:
                     description: How many `Snapshot` CRs were materialized from the catalog scan.
                     format: int64
