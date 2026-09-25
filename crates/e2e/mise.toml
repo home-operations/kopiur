@@ -97,16 +97,29 @@ NODE=kopiur-e2e-control-plane
 # kind load chokes on docker's manifest-list store, so import the saved tarball
 # straight into the node's containerd k8s.io namespace. Best-effort: pods fall
 # back to an in-cluster pull (IfNotPresent) if this fails.
+#
+# Digest-pinned refs (`name[:tag]@sha256:…`) are pulled through the node's own CRI
+# with crictl instead: `docker pull` by digest stores no repo tag, so the saved
+# tarball imports NAMELESS and kubelet never matches it — the preload "succeeded"
+# while every pod still pulled in-cluster. crictl registers the exact reference
+# kubelet resolves; `crictl inspecti` proves it before we claim success.
 preload() {
   img="$1"
+  case "$img" in
+    *@sha256:*)
+      for attempt in 1 2 3; do docker exec "$NODE" crictl pull "$img" >/dev/null 2>&1 && break; echo "   (retry $attempt) $img"; sleep 3; done
+      docker exec "$NODE" crictl inspecti "$img" >/dev/null 2>&1 \\
+        && echo "   preloaded $img" || echo "   warn: could not preload $img (will pull in-cluster)"
+      return ;;
+  esac
   for attempt in 1 2 3; do docker pull "$img" >/dev/null 2>&1 && break; echo "   (retry $attempt) $img"; sleep 3; done
   docker save "$img" | docker exec -i "$NODE" ctr --namespace=k8s.io images import - >/dev/null 2>&1 \\
     && echo "   preloaded $img" || echo "   warn: could not preload $img (will pull in-cluster)"
 }
-# quay.io + immutable RELEASE tags: MinIO withdrew these from Docker Hub, where
-# they now 404. Lockstep with crates/e2e/src/consts.rs MINIO_IMAGE / MC_IMAGE.
-preload quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-preload quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+# pgsty fork, tag + digest pinned: upstream MinIO withdrew Docker Hub (404) and
+# then quay.io (401). Lockstep with crates/e2e/src/consts.rs MINIO_IMAGE / MC_IMAGE.
+preload docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+preload docker.io/pgsty/mc:RELEASE.2026-09-13T00-00-00Z@sha256:aa5cc1401b3e1ab482d215d5717e9e69b4f14970a3656f330ed20a549fe19020
 # Backend servers for the SFTP/WebDAV e2e (mirror crates/e2e/src/consts.rs).
 # atmoz/sftp:debian (OpenSSH 9.x) — NOT :alpine (OpenSSH 10.2 hangs kopia's go-ssh).
 preload atmoz/sftp:debian
