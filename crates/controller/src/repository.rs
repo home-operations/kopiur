@@ -1934,12 +1934,23 @@ pub(crate) fn catalog_window_override(
     annotations: &std::collections::BTreeMap<String, String>,
 ) -> Option<u32> {
     let max = u32::try_from(kopiur_mover::bootstrap::MAX_RETURNED_SNAPSHOTS).unwrap_or(u32::MAX);
-    annotations
-        .get(crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION)?
+    let raw = annotations.get(crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION)?;
+    let window = raw
         .trim()
         .parse::<u32>()
         .ok()
-        .filter(|n| (1..=max).contains(n))
+        .filter(|n| (1..=max).contains(n));
+    if window.is_none() {
+        // Ignoring is the safe direction (full window), but say so: a typo'd
+        // e2e setup would otherwise silently exercise the uncapped path.
+        tracing::debug!(
+            value = %raw,
+            max,
+            "ignoring {} (not an integer in 1..=max)",
+            crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION
+        );
+    }
+    window
 }
 
 /// Apply [`catalog_window_override`] to a bootstrap work spec (a no-op for any
@@ -2496,7 +2507,7 @@ async fn finalize_bootstrap(
     // scan-request token un-honored, so `bootstrap_recycle_due`'s token arm
     // recycles the Job for a full run — the launch-side `probe_only` gating
     // makes this arm unreachable in practice; this is its belt.
-    if let Some(snapshot_count) = result.snapshot_count
+    let scan_outcome = if let Some(snapshot_count) = result.snapshot_count
         && catalog::scan_due(
             repo.metadata.generation,
             repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -2506,8 +2517,7 @@ async fn finalize_bootstrap(
             scan_requested_token(repo),
             scan_requested_honored(repo),
             chrono::Utc::now(),
-        )
-    {
+        ) {
         run_catalog_scan(
             ctx,
             repo,
@@ -2520,8 +2530,10 @@ async fn finalize_bootstrap(
             result.foreign_suffix_dropped,
             result.logical_bytes,
         )
-        .await?;
-    }
+        .await
+    } else {
+        Ok(())
+    };
 
     // Ensure the managed Maintenance for this repo (ADR §3.7). Build on the
     // conditions we just patched (which include `Bootstrapped`), NOT the stale
@@ -2529,6 +2541,12 @@ async fn finalize_bootstrap(
     // condition we set above (both writes replace the whole conditions array).
     // §11: a ReadOnly repository runs no maintenance — skip the projection.
     ensure_repo_maintenance(ctx, repo, namespace, name, api, &conditions).await;
+
+    // A failed scan (e.g. `CatalogExpiryIncomplete` while reclaiming a large
+    // post-#476 backlog) must not also block the maintenance projection above:
+    // surface it only now. It still returns before a probe Job is deleted, so
+    // the unconsumed result stays readable for the retry.
+    scan_outcome?;
 
     // A probe consumes its Job exactly once: delete it so the steady state has no
     // lingering finished Job to re-read (no churn) and the next probe is a fresh

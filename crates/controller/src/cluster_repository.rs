@@ -2261,7 +2261,7 @@ async fn finalize_cluster_bootstrap(
     let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
     // `snapshot_count: None` = the listing DID NOT RUN (a probe-only result,
     // #414): never scan over it — see the Repository twin.
-    if let Some(snapshot_count) = result.snapshot_count
+    let scan_outcome = if let Some(snapshot_count) = result.snapshot_count
         && catalog::scan_due(
             repo.metadata.generation,
             repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -2271,8 +2271,7 @@ async fn finalize_cluster_bootstrap(
             cluster_scan_requested_token(repo),
             cluster_scan_requested_honored(repo),
             chrono::Utc::now(),
-        )
-    {
+        ) {
         run_cluster_catalog_scan(
             ctx,
             repo,
@@ -2283,13 +2282,21 @@ async fn finalize_cluster_bootstrap(
             result.foreign_suffix_dropped,
             result.logical_bytes,
         )
-        .await?;
-    }
+        .await
+    } else {
+        Ok(())
+    };
 
     // Ensure the managed Maintenance for this ClusterRepository (§3.7). Build on
     // the conditions we just patched (including `Bootstrapped`), not the stale
     // cached object, so this patch doesn't drop the `Bootstrapped` set above.
     ensure_cluster_maintenance(ctx, repo, name, api, &conditions).await;
+
+    // A failed scan (e.g. `CatalogExpiryIncomplete` while reclaiming a large
+    // post-#476 backlog) must not also block the maintenance projection above:
+    // surface it only now. It still returns before a probe Job is deleted, so
+    // the unconsumed result stays readable for the retry.
+    scan_outcome?;
 
     // A probe consumes its Job exactly once (no lingering finished Job → no churn;
     // the next probe is a fresh connect). Requeue on the probe cadence.

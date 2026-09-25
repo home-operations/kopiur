@@ -1384,6 +1384,17 @@ pub struct ScanOutcome {
     pub backfilled: i64,
 }
 
+/// The rows whose recorded hosts the placement pass must classify. Under
+/// `Complete` no out-of-window row is ever a keep candidate (absent from a
+/// complete listing = gone), so classifying their hosts would only add Namespace
+/// GETs — and new ways for the scan to fail — for no decision.
+fn placement_rows<'r>(coverage: &ListingCoverage, rows: &'r [CatalogRow]) -> &'r [CatalogRow] {
+    match coverage {
+        ListingCoverage::Complete => &[],
+        ListingCoverage::Capped { .. } | ListingCoverage::Partial { .. } => rows,
+    }
+}
+
 /// Run a catalog scan: LIST the relevant `Snapshot` CRs, run the identity-aware
 /// placement pass ([`plan_placements`]), [`plan_catalog`], then create/expire rows.
 /// The caller supplies the kopia listing (in-process for bare-path filesystem, from
@@ -1407,6 +1418,9 @@ pub async fn scan(
     let repo_name = match owner {
         ScanOwner::Repository { name, .. } | ScanOwner::ClusterRepository { name } => name,
     };
+    // Before any IO, so a scan that then fails (a LIST/GET/create error) still
+    // surfaces the Partial state it was asked to act on.
+    warn_if_partial(repo_name, coverage);
 
     // One install-scope-wide LIST serves both sides of the plan: this repository's
     // discovered rows (by the dedup labels — always controller-stamped) AND the
@@ -1433,7 +1447,7 @@ pub async fn scan(
     let foreign = CatalogBounds::effective_foreign_snapshots(catalog);
     let mut ns_allowed: BTreeMap<String, bool> = BTreeMap::new();
     if let Placement::Cluster { allowed, .. } = &placement {
-        for candidate in candidate_namespaces(listing, &rows, cluster) {
+        for candidate in candidate_namespaces(listing, placement_rows(coverage, &rows), cluster) {
             let ns_api: Api<Namespace> = Api::all(ctx.client.clone());
             let labels = ns_api
                 .get_opt(candidate)
@@ -1451,7 +1465,14 @@ pub async fn scan(
             ns_allowed.insert(candidate.to_string(), ok);
         }
     }
-    let pass = plan_placements(listing, &rows, cluster, foreign, &placement, &ns_allowed);
+    let pass = plan_placements(
+        listing,
+        placement_rows(coverage, &rows),
+        cluster,
+        foreign,
+        &placement,
+        &ns_allowed,
+    );
 
     let retain = catalog.and_then(|c| c.retain.as_ref());
     let plan = plan_catalog(
@@ -1653,7 +1674,6 @@ fn log_scan_summary(
     backfill_failed: i64,
     coverage: &ListingCoverage,
 ) {
-    warn_if_partial(repo_name, coverage);
     let changed = outcome.created > 0
         || outcome.expired > 0
         || outcome.expire_failed > 0

@@ -1865,11 +1865,6 @@ fn deletion_held(backup: &Snapshot) -> bool {
     })
 }
 
-/// `repo_kind`/`repo_name` attributes for the deletion-observability gauges:
-/// the pinned repository's kind/name, or the single conservative
-/// "unknown"/"unknown" bucket when unpinned — never a per-repo guess, and
-/// never every-repo double-counting. Pure so the label mapping is
-/// unit-tested off-OTel.
 /// The lowercase `state` label for a repository's catalog coverage, or `None`
 /// when there is nothing to emit: never scanned, or a value this build does not
 /// recognize (an exhaustive match, so a new canonical state must be labeled here).
@@ -1884,6 +1879,11 @@ fn catalog_coverage(
     }
 }
 
+/// `repo_kind`/`repo_name` attributes for the deletion-observability gauges:
+/// the pinned repository's kind/name, or the single conservative
+/// "unknown"/"unknown" bucket when unpinned — never a per-repo guess, and
+/// never every-repo double-counting. Pure so the label mapping is
+/// unit-tested off-OTel.
 fn repo_gauge_attrs(pinned: Option<&RepositoryRef>) -> [KeyValue; 2] {
     let (kind, name) = match pinned {
         Some(r) => (

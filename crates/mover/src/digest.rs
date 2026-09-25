@@ -130,6 +130,9 @@ pub enum DigestError {
     /// Prefixes are not in ascending order, so binary search would lie.
     #[error("digest hashes are not sorted")]
     Unsorted,
+    /// `listedIds` was present but was not a digest at all ([`ListedIds::Invalid`]).
+    #[error("listedIds is not a well-formed digest: {0}")]
+    Malformed(String),
 }
 
 /// The salted hash of one id, big-endian so byte order == numeric order.
@@ -273,9 +276,7 @@ impl ListedIds {
     pub fn decode(&self) -> Result<DecodedDigest, DigestError> {
         match self {
             ListedIds::Digest(d) => d.decode(),
-            ListedIds::Invalid(reason) => Err(DigestError::Base64(format!(
-                "listedIds is not a digest: {reason}"
-            ))),
+            ListedIds::Invalid(reason) => Err(DigestError::Malformed(reason.clone())),
         }
     }
 }
@@ -403,7 +404,10 @@ mod tests {
     fn a_malformed_value_decodes_as_invalid_not_a_parse_error() {
         let back: ListedIds = serde_json::from_value(serde_json::json!({"algo": 7})).unwrap();
         assert!(matches!(back, ListedIds::Invalid(_)), "{back:?}");
-        assert!(back.decode().is_err());
+        assert!(
+            matches!(back.decode(), Err(DigestError::Malformed(_))),
+            "an invalid listedIds names itself, not a base64 fault"
+        );
         let back: ListedIds = serde_json::from_value(serde_json::json!("nonsense")).unwrap();
         assert!(matches!(back, ListedIds::Invalid(_)));
     }
