@@ -25,6 +25,7 @@ use kube::ResourceExt;
 use kube::runtime::reflector::Store;
 
 use kopiur_api::common::{RepositoryKind, RepositoryRef};
+use kopiur_api::repository::CatalogCoverage;
 use kopiur_api::{
     ClusterRepository, PhaseLabel, Repository, Restore, Snapshot, SnapshotPhase, SnapshotStats,
 };
@@ -101,6 +102,7 @@ pub struct Metrics {
     repo_snapshot_count: Gauge<i64>,
     repo_discovered_backups: Gauge<i64>,
     repo_foreign_snapshots: Gauge<i64>,
+    repo_catalog_coverage: Gauge<i64>,
     repo_maintenance_configured: Gauge<i64>,
 
     // Restore + maintenance.
@@ -680,6 +682,14 @@ impl Metrics {
                  (multi-cluster shared repository; identityDefaults.cluster).",
             )
             .build();
+        let repo_catalog_coverage = m
+            .i64_gauge("kopiur_repo_catalog_coverage")
+            .with_description(
+                "1 on the state (complete/capped/partial) matching status.catalog.coverage as \
+                 of the last catalog scan, 0 on the others (#476). partial = rows whose \
+                 snapshots were deleted repository-side are NOT expired.",
+            )
+            .build();
         let repo_maintenance_configured = m
             .i64_gauge("kopiur_repository_maintenance_configured")
             .with_description(
@@ -732,6 +742,7 @@ impl Metrics {
             repo_snapshot_count,
             repo_discovered_backups,
             repo_foreign_snapshots,
+            repo_catalog_coverage,
             repo_maintenance_configured,
             restore_duration_seconds,
             leader_is_leader,
@@ -1692,6 +1703,37 @@ impl Metrics {
         }
     }
 
+    /// Set the catalog-coverage gauge from `status.catalog.coverage`: 1 on the
+    /// active state, 0 on every other canonical state (iterating
+    /// [`CatalogCoverage::ALL`], so a state the repository left never stays
+    /// stuck at 1). An `Unknown` value (a newer operator's state) mints no new
+    /// label — every canonical state reads 0. `ns` is empty for a
+    /// `ClusterRepository`, as with [`Self::set_repo_catalog`].
+    pub fn set_repo_catalog_coverage(&self, ns: &str, name: &str, coverage: &CatalogCoverage) {
+        self.record_repo_catalog_coverage(ns, name, Some(coverage));
+    }
+
+    /// Zero every canonical state of the catalog-coverage gauge for a
+    /// repository (on its deletion). A sync gauge cannot drop a series, so this
+    /// is the strongest reset available: no `state="partial"} == 1` outlives
+    /// the repository.
+    pub fn clear_repo_catalog_coverage(&self, ns: &str, name: &str) {
+        self.record_repo_catalog_coverage(ns, name, None);
+    }
+
+    fn record_repo_catalog_coverage(&self, ns: &str, name: &str, active: Option<&CatalogCoverage>) {
+        for state in CatalogCoverage::ALL {
+            self.repo_catalog_coverage.record(
+                i64::from(active == Some(state)),
+                &[
+                    KeyValue::new("namespace", ns.to_string()),
+                    KeyValue::new("name", name.to_string()),
+                    KeyValue::new("state", state.label().to_lowercase()),
+                ],
+            );
+        }
+    }
+
     /// Set the maintenance-configured gauge for a repository: 1 if a `Maintenance`
     /// CR references it, 0 otherwise. `kind` is `Repository`/`ClusterRepository`;
     /// `ns` is empty for a cluster-scoped `ClusterRepository`.
@@ -2633,6 +2675,87 @@ mod tests {
                 .any(|l| l.starts_with("kopiur_repo_foreign_snapshots{")
                     && l.contains("name=\"nas\"")),
             "{text}"
+        );
+    }
+
+    /// Every `kopiur_repo_catalog_coverage` line for `name="nas"`, as
+    /// `state -> value`.
+    fn coverage_series(text: &str) -> std::collections::BTreeMap<String, String> {
+        text.lines()
+            .filter(|l| {
+                l.starts_with("kopiur_repo_catalog_coverage{") && l.contains("name=\"nas\"")
+            })
+            .map(|l| {
+                let state = l
+                    .split("state=\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or_else(|| panic!("no state label: {l}"))
+                    .to_string();
+                let value = l.trim_end().rsplit(' ').next().unwrap().to_string();
+                (state, value)
+            })
+            .collect()
+    }
+
+    fn expect_states(text: &str, want: &[(&str, &str)]) {
+        let got = coverage_series(text);
+        let want: std::collections::BTreeMap<String, String> = want
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(got, want, "{text}");
+    }
+
+    #[test]
+    fn repo_catalog_coverage_sets_the_active_state_to_one_and_the_rest_to_zero() {
+        use kopiur_api::repository::CatalogCoverage;
+        let m = Metrics::new();
+        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Partial);
+        let text = String::from_utf8(m.gather()).unwrap();
+        // Lowercase state labels, one series per canonical state.
+        expect_states(
+            &text,
+            &[("complete", "0"), ("capped", "0"), ("partial", "1")],
+        );
+        assert!(text.contains("namespace=\"apps\""), "{text}");
+
+        // A later Complete scan flips the gauge — no stale `partial == 1` left
+        // for the `state="partial"` alert to keep firing on.
+        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Complete);
+        let text = String::from_utf8(m.gather()).unwrap();
+        expect_states(
+            &text,
+            &[("complete", "1"), ("capped", "0"), ("partial", "0")],
+        );
+    }
+
+    #[test]
+    fn repo_catalog_coverage_unknown_zeroes_every_canonical_state() {
+        use kopiur_api::repository::CatalogCoverage;
+        let m = Metrics::new();
+        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Capped);
+        // A value from a newer operator mints no unbounded label: every
+        // canonical state reads 0.
+        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Unknown("Sampled".into()));
+        let text = String::from_utf8(m.gather()).unwrap();
+        expect_states(
+            &text,
+            &[("complete", "0"), ("capped", "0"), ("partial", "0")],
+        );
+        assert!(!text.contains("sampled"), "{text}");
+    }
+
+    #[test]
+    fn clearing_repo_catalog_coverage_leaves_no_state_at_one() {
+        use kopiur_api::repository::CatalogCoverage;
+        let m = Metrics::new();
+        m.set_repo_catalog_coverage("apps", "nas", &CatalogCoverage::Partial);
+        m.clear_repo_catalog_coverage("apps", "nas");
+        let text = String::from_utf8(m.gather()).unwrap();
+        expect_states(
+            &text,
+            &[("complete", "0"), ("capped", "0"), ("partial", "0")],
         );
     }
 
