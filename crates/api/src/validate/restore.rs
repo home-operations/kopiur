@@ -60,9 +60,8 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
             return Err(ValidationError::InvalidFieldValue {
                 field: "restore.policy.waitTimeout".to_string(),
                 reason: format!(
-                    "{wt:?} is not a valid Go-style duration; use a positive number with an \
-                     s/m/h suffix (e.g. 90s, 5m, 1h) — how long the restore waits for the \
-                     source snapshot to appear before applying onMissingSnapshot"
+                    "{wt:?} is not a valid duration. Fix: use a Go-style duration like 90s, 5m, \
+                     or 1h"
                 ),
             });
         };
@@ -84,10 +83,8 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
                 field: "restore.policy.waitTimeout".to_string(),
                 reason: format!(
                     "{wt:?} ({}s) must be shorter than failurePolicy.activeDeadlineSeconds \
-                     ({deadline}s): the wait for the source snapshot is polled inside the \
-                     restore Job, so a waitTimeout at or beyond the deadline would let the \
-                     Job be killed before onMissingSnapshot applies. Lower waitTimeout or \
-                     raise activeDeadlineSeconds.",
+                     ({deadline}s), or the restore Job is killed before onMissingSnapshot \
+                     applies. Fix: lower waitTimeout or raise activeDeadlineSeconds",
                     wait.as_secs()
                 ),
             });
@@ -119,12 +116,9 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
                     | Some(InheritSecurityContextFrom::PvcConsumer(_)) => {
                         return Err(ValidationError::InvalidFieldValue {
                             field: "restore.mover.inheritSecurityContextFrom".to_string(),
-                            reason: "is not allowed with target.populator: no workload pod \
-                                     exists at provision time to inherit a security context \
-                                     from. Set mover.securityContext explicitly, use \
-                                     inheritSecurityContextFrom: { snapshot: {} } (the \
-                                     backup's recorded identity — needs no live pod), or rely \
-                                     on the repository's moverDefaults instead"
+                            reason: "is not allowed with target.populator (no workload pod \
+                                     exists yet). Fix: use inheritSecurityContextFrom: \
+                                     { snapshot: {} }, or set mover.securityContext explicitly"
                                 .to_string(),
                         });
                     }
@@ -165,8 +159,8 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
         forbid_pvc_consumer(
             m,
             "restore",
-            "Use inheritSecurityContextFrom.workloadSelector (the pod that will read the restored \
-             data), or an explicit mover.securityContext, instead.",
+            "Fix: use inheritSecurityContextFrom.workloadSelector, or set \
+             mover.securityContext explicitly",
         )?;
         validate_mover(m, "Restore mover")?;
     }
@@ -183,8 +177,7 @@ fn validate_as_of(field: &str, as_of: Option<&str>) -> ValidationResult {
         return Err(ValidationError::InvalidFieldValue {
             field: field.to_string(),
             reason: format!(
-                "{s:?} is not an RFC3339 timestamp; use e.g. 2026-05-01T00:00:00Z \
-                 (the newest snapshot at or before this instant is restored)"
+                "{s:?} is not an RFC3339 timestamp. Fix: use e.g. 2026-05-01T00:00:00Z"
             ),
         });
     }

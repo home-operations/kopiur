@@ -454,8 +454,8 @@ async fn handle_manual_run(
             .await?;
             Ok(ManualRunVerdict::Continue(Some(RunStall::new(
                 "ManualRunOutcomeLost",
-                "the requested replication Job disappeared before its outcome was observed \
-                 (TTL-reaped?); re-annotate to run again",
+                "the requested replication Job was gone before its result was read. Fix: \
+                 re-annotate to run it again",
             ))))
         }
         None => {
@@ -526,7 +526,7 @@ async fn handle_manual_run(
             tracing::info!(
                 replication = %name,
                 requested = %request.raw,
-                "spawned REQUESTED replication Job"
+                "spawned requested replication Job"
             );
             Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)))
         }

@@ -56,8 +56,8 @@ pub enum TenancyDenial {
     /// A `Selector` gate could not be evaluated because the namespace's labels
     /// were unresolvable (fail-closed).
     #[error(
-        "ClusterRepository {repo_name:?} gates namespace {consumer_namespace:?} by a label \
-         selector, but the namespace's labels could not be resolved; denying (fail-closed)"
+        "ClusterRepository {repo_name:?} selects namespaces by label, but the labels of \
+         namespace {consumer_namespace:?} could not be read; denying"
     )]
     SelectorLabelsUnresolved {
         /// The consumer CR's namespace.
@@ -68,8 +68,8 @@ pub enum TenancyDenial {
 
     /// The webhook has no Kubernetes client to resolve the gate (fail-closed).
     #[error(
-        "cannot verify ClusterRepository {repo_name:?} tenancy for namespace \
-         {consumer_namespace:?}: the webhook has no Kubernetes client; denying (fail-closed)"
+        "cannot check ClusterRepository {repo_name:?} access for namespace \
+         {consumer_namespace:?}: the webhook has no Kubernetes client; denying"
     )]
     NoClient {
         /// The consumer CR's namespace.
@@ -80,8 +80,8 @@ pub enum TenancyDenial {
 
     /// The referenced `ClusterRepository` could not be fetched (fail-closed).
     #[error(
-        "cannot resolve ClusterRepository {repo_name:?} referenced from namespace \
-         {consumer_namespace:?}: {source}; denying (fail-closed)"
+        "cannot read ClusterRepository {repo_name:?} (referenced from namespace \
+         {consumer_namespace:?}): {source}; denying"
     )]
     RepoUnresolvable {
         /// The consumer CR's namespace.
@@ -96,8 +96,8 @@ pub enum TenancyDenial {
     /// The consumer namespace's labels could not be fetched for a `Selector`
     /// gate (fail-closed).
     #[error(
-        "cannot resolve labels of namespace {consumer_namespace:?} to evaluate ClusterRepository \
-         {repo_name:?} selector: {source}; denying (fail-closed)"
+        "cannot read the labels of namespace {consumer_namespace:?} for ClusterRepository \
+         {repo_name:?}: {source}; denying"
     )]
     NamespaceLabelsUnresolvable {
         /// The consumer CR's namespace.
@@ -111,8 +111,8 @@ pub enum TenancyDenial {
 
     /// The admission request carried no consumer namespace at all (fail-closed).
     #[error(
-        "consumer namespace was not provided in the admission request; cannot evaluate \
-         ClusterRepository tenancy (fail-closed)"
+        "the admission request has no namespace, so ClusterRepository access cannot be \
+         checked; denying"
     )]
     NoConsumerNamespace,
 }
@@ -346,7 +346,7 @@ mod tests {
                     denial,
                     TenancyDenial::SelectorLabelsUnresolved { .. }
                 ));
-                assert!(denial.to_string().contains("fail-closed"));
+                assert!(denial.to_string().contains("denying"));
             }
             TenancyDecision::Allow => unreachable!(),
         }
@@ -383,7 +383,7 @@ mod tests {
         ];
         for d in denials {
             let msg = d.to_string();
-            assert!(msg.contains("fail-closed"), "{msg}");
+            assert!(msg.contains("denying"), "{msg}");
         }
     }
 

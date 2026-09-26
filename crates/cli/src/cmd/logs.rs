@@ -104,14 +104,14 @@ pub fn restore_recorded_tails(status: Option<&kopiur_api::RestoreStatus>) -> Vec
 /// One section per [`RecordedTail`], headed by its claim when scoped. Pure.
 pub fn gone_fallback(kind: &str, name: &str, tails: &[RecordedTail]) -> String {
     let mut out = format!(
-        "the mover Job (and its pods) for {kind} {name} no longer exist — \
-         completed Jobs are garbage-collected. Showing the tail recorded in status:\n"
+        "the mover Job for {kind} {name} no longer exists (finished Jobs are \
+         garbage-collected). Showing the log tail saved in status:\n"
     );
     let any_recorded = tails
         .iter()
         .any(|t| t.log_tail.is_some() || t.failure.is_some());
     if !any_recorded {
-        out.push_str("(no logTail recorded — the run may never have started)\n");
+        out.push_str("(no logTail recorded; the run may never have started)\n");
         return out;
     }
     for t in tails {
@@ -456,7 +456,7 @@ pub async fn stream_target_logs_when_ready(ctx: &KubeCtx, target: LogsTarget, na
                 failures += 1;
                 if failures == QUIET_FAILURES {
                     eprintln!(
-                        "warning: still unable to stream mover logs from pod {pod} ({e}); retrying"
+                        "warning: cannot stream mover logs from pod {pod} yet ({e}); retrying"
                     );
                 }
                 tokio::time::sleep(POLL).await;
@@ -580,8 +580,8 @@ mod tests {
         let text = gone_fallback("restore", "app", &tails);
         assert_eq!(
             text,
-            "the mover Job (and its pods) for restore app no longer exist — completed Jobs \
-             are garbage-collected. Showing the tail recorded in status:\n\
+            "the mover Job for restore app no longer exists (finished Jobs are \
+             garbage-collected). Showing the log tail saved in status:\n\
              === claim cache ===\n(no logTail recorded for this claim)\n\
              === claim data ===\n--- log tail ---\ndata: restored 12 files\n\
              === claim logs ===\nfailure (PermissionDenied): cannot write /data\n\

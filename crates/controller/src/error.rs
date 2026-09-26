@@ -31,7 +31,7 @@ pub const TERMINAL_HEARTBEAT: Duration = Duration::from_secs(1800);
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A `kube::Client` API call failed (GET/PATCH/CREATE/DELETE). Transient.
-    #[error("kube api error: {0}")]
+    #[error("Kubernetes API error: {0}")]
     Kube(#[from] kube::Error),
 
     /// A kopia subprocess invocation failed. Transient (repo may be offline).
@@ -62,7 +62,7 @@ pub enum Error {
     /// is watched, so the grant re-enqueues the blocked CR the moment it lands —
     /// the requeue is only a watch-desync backstop, so it runs on the slow
     /// structural cadence instead of hot-looping every 30s until a human acts.
-    #[error("blocked on an out-of-band grant: {0}")]
+    #[error("waiting for a grant on another object: {0}")]
     BlockedOnGrant(String),
 
     /// A restore's `inheritSecurityContextFrom.snapshot` cannot resolve a
@@ -153,7 +153,7 @@ pub enum Error {
     /// ([`crate::webhook_tls::CertError`]). Transient like [`Error::WebhookSetup`]
     /// (the periodic reconcile retries; admission stays untrusted, the controller
     /// never crashes), but typed so the `rcgen` source chain stays inspectable.
-    #[error("webhook TLS setup failed: could not mint or resolve the CA/serving certificate: {0}")]
+    #[error("webhook TLS setup failed: could not create the CA or serving certificate: {0}")]
     WebhookCert(#[from] crate::webhook_tls::CertError),
 }
 
@@ -360,8 +360,7 @@ where
         ctx.metrics.record_failure_event_dropped("transport");
         tracing::debug!(
             kind = kind,
-            "skipping failure Event: kube transport error — the publish would ride the same \
-             dead connection"
+            "skipping failure Event: the API connection is down"
         );
     } else {
         let event = crate::io::reconcile_failure_event(err, crate::io::operator_uid());
@@ -425,7 +424,7 @@ mod tests {
         // now delivers the grant immediately; the requeue is a slow backstop.
         let err = Error::BlockedOnGrant("namespace `app` has not opted in".into());
         assert_eq!(err.class(), ErrorClass::Structural);
-        assert!(err.to_string().contains("out-of-band grant"));
+        assert!(err.to_string().contains("waiting for a grant"));
         assert!(err.to_string().contains("namespace `app` has not opted in"));
     }
 
@@ -523,7 +522,7 @@ mod tests {
             rcgen::Error::CouldNotParseCertificate,
         ));
         assert_eq!(err.class(), ErrorClass::Transient);
-        assert!(err.to_string().contains("could not mint"));
+        assert!(err.to_string().contains("could not create the CA"));
         assert!(
             std::error::Error::source(&err).is_some(),
             "the CertError source chain must stay inspectable"

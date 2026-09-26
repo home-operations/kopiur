@@ -452,7 +452,7 @@ fn s3_tls_ca_bundle_plus_disable_tls_is_rejected() {
         Err(ValidationError::MutuallyExclusive { a, b, context }) => {
             assert_eq!(a, "tls.caBundleRef");
             assert_eq!(b, "tls.disableTls");
-            assert!(context.contains("no TLS handshake"), "{context}");
+            assert!(context.contains("CA bundle is never used"), "{context}");
         }
         other => panic!("caBundleRef + disableTls must be rejected, got {other:?}"),
     }
@@ -611,7 +611,10 @@ fn replication_auth_same_kind_static_wi_mix_is_rejected() {
     // ambient chain and are rejected with the why in the message.
     for (src, dst) in [(&static_side, &wi_side), (&wi_side, &static_side)] {
         let err = validate_replication_auth(src, dst, AuthPairKind::Replication).unwrap_err();
-        assert!(err.to_string().contains("ambient"), "{err}");
+        assert!(
+            err.to_string().contains("cannot mix workloadIdentity"),
+            "{err}"
+        );
     }
     // Same-kind, same auth style on both sides is fine.
     assert!(
@@ -685,7 +688,7 @@ fn replication_destination_secret_in_another_namespace_is_rejected() {
     // What/why/fix: names the Secret, both namespaces, and why envFrom can't reach it.
     assert!(msg.contains("r2-creds"), "{msg}");
     assert!(msg.contains("other-ns") && msg.contains("team-a"), "{msg}");
-    assert!(msg.contains("envFrom"), "{msg}");
+    assert!(msg.contains("can only read Secrets there"), "{msg}");
 }
 
 #[test]
@@ -1392,7 +1395,7 @@ fn snapshot_inherit_is_forbidden_on_snapshot_policy() {
         .map(|e| e.to_string())
         .unwrap_or_else(|| panic!("expected the snapshot-inherit rejection, got: {errs:?}"));
     // What/why/fix: a backup reads the LIVE workload; `snapshot` is restore-only.
-    assert!(msg.contains("live workload"), "{msg}");
+    assert!(msg.contains("workloadSelector"), "{msg}");
     assert!(msg.contains("restore-only"), "{msg}");
 }
 
@@ -1771,7 +1774,7 @@ fn policy_repositories_well_formed_multi_repo_is_accepted() {
     // that points at per-child/per-operation repository selection.
     let msg = ValidationError::PolicySingleRepositoryRequired.to_string();
     assert!(msg.contains("spec.repositories"), "{msg}");
-    assert!(msg.contains("spec.repository pin"), "{msg}");
+    assert!(msg.contains("spec.repository"), "{msg}");
 }
 
 #[test]
@@ -1945,9 +1948,8 @@ fn snapshot_tags_reject_colon_keys_citing_the_first_colon_split() {
     // What (the key), why (kopia's first-colon split + the duplicate-key create
     // failure it can trip), fix (colon-free key).
     assert!(msg.contains("env:prod"), "{msg}");
-    assert!(msg.contains("first colon"), "{msg}");
-    assert!(msg.contains("duplicate"), "{msg}");
-    assert!(msg.contains("colon-free"), "{msg}");
+    assert!(msg.contains("contains a colon"), "{msg}");
+    assert!(msg.contains("without `:`"), "{msg}");
 }
 
 #[test]
@@ -2045,7 +2047,7 @@ fn discovered_and_adopted_on_schedule_delete_is_rejected_for_either_variant() {
             let msg = err.to_string();
             assert!(msg.contains(origin.label_value()), "{msg}");
             assert!(msg.contains("onScheduleDelete"), "{msg}");
-            assert!(msg.contains("Remove spec.onScheduleDelete"), "{msg}");
+            assert!(msg.contains("Fix: remove spec.onScheduleDelete"), "{msg}");
         }
         // Absent is fine.
         assert!(validate_backup_on_schedule_delete(origin, None).is_ok());
@@ -3291,10 +3293,7 @@ fn foreign_snapshots_requires_a_cluster_identity_on_both_kinds() {
         ValidationError::ForeignSnapshotsRequiresCluster
     ));
     let msg = errs[0].to_string();
-    assert!(
-        msg.contains("requires a cluster identity (`identityDefaults.cluster`)"),
-        "{msg}"
-    );
+    assert!(msg.contains("needs identityDefaults.cluster"), "{msg}");
 
     // Empty-string cluster behaves like unset (matches classify_hostname's own rule).
     let errs = validate_foreign_snapshots_cluster_coupling(
@@ -4339,7 +4338,7 @@ fn backup_config_validates_verification() {
         .unwrap_or_else(|| panic!("expected a quick.schedule rejection, got: {errs:?}"));
     assert!(
         quick_err.contains("verification.quick.schedule.cron")
-            && quick_err.contains("Move your cron/jitter/timezone fields under `schedule:`"),
+            && quick_err.contains("move your cron/jitter/timezone fields under `schedule:`"),
         "message must name the move actionably, got: {quick_err:?}"
     );
 
@@ -5063,11 +5062,11 @@ fn a_one_pvc_selector_with_an_override_expands_to_that_override_path() {
         "the message must name the override as the cause: {msg}"
     );
     assert!(
-        msg.contains("Remove that `sourcePathOverride`"),
+        msg.contains("remove that `sourcePathOverride`"),
         "and tell the user to remove it: {msg}"
     );
     assert!(
-        !msg.contains("Set `sourcePathStrategy: PvcNamespacedName` on that source"),
+        !msg.contains("set `sourcePathStrategy: PvcNamespacedName` on that source"),
         "the strategy remedy is inert while an override is set: {msg}"
     );
 
@@ -5103,7 +5102,7 @@ fn a_one_pvc_selector_with_an_override_expands_to_that_override_path() {
         .expect_err("two same-named PVCs on PvcName collide")
         .to_string();
     assert!(
-        msg.contains("Set `sourcePathStrategy: PvcNamespacedName` on that source"),
+        msg.contains("set `sourcePathStrategy: PvcNamespacedName` on that source"),
         "a strategy-derived collision keeps the strategy remedy: {msg}"
     );
     assert!(!msg.contains("sourcePathOverride"), "{msg}");
@@ -5421,7 +5420,7 @@ fn replication_validator_surfaces_the_inherit_rejection() {
         .map(|e| e.to_string())
         .unwrap();
     assert!(
-        msg.contains("never reads a workload's files") && msg.contains("mover.securityContext"),
+        msg.contains("there is no workload") && msg.contains("mover.securityContext"),
         "the message must explain the why and name the remedy, got: {msg}"
     );
 }
@@ -5762,7 +5761,7 @@ fn a_read_only_repository_cannot_declare_epoch_parameters() {
     let msg = format!("{errs:?}");
     assert!(!errs.is_empty(), "ReadOnly + parameters must be rejected");
     assert!(msg.contains("ReadOnly"), "{msg}");
-    assert!(msg.contains("set-parameters"), "must say WHY: {msg}");
+    assert!(msg.contains("mode: ReadWrite"), "must name the fix: {msg}");
 
     // ReadOnly WITHOUT parameters stays valid — this must not tax a plain consumer repo.
     let spec = repo_yaml(&format!("{REPO_BASE}mode: ReadOnly\n"));
@@ -5838,11 +5837,11 @@ fn epoch_advance_on_count_below_kopias_floor_is_rejected() {
     assert!(msg.contains("advanceOnCount"), "{msg}");
     assert!(msg.contains("10"), "must name the floor: {msg}");
     assert!(
-        msg.contains("epoch advance on count too low"),
-        "must quote kopia's own error text: {msg}"
+        msg.contains("kopia rejects lower values"),
+        "must say kopia enforces it: {msg}"
     );
     assert!(
-        msg.contains("set-parameters"),
+        msg.contains("every parameter in the same apply"),
         "must say the whole call is refused: {msg}"
     );
 
@@ -5868,10 +5867,7 @@ fn epoch_advance_on_size_below_one_mib_is_rejected() {
         let msg = format!("{errs:?}");
         assert!(!errs.is_empty(), "advanceOnSizeMiB: {bad} must be rejected");
         assert!(msg.contains("advanceOnSizeMiB"), "{msg}");
-        assert!(
-            msg.contains("epoch advance on size too low"),
-            "must quote kopia: {msg}"
-        );
+        assert!(msg.contains("kopia rejects lower values"), "{msg}");
     }
 
     let spec = repo_yaml(&format!(
@@ -5932,8 +5928,8 @@ fn min_duration_must_clear_both_the_absolute_and_the_refresh_derived_floor() {
         "must offer the other fix — lower the refresh: {msg}"
     );
     assert!(
-        msg.contains("epoch refresh period is too long"),
-        "must quote kopia: {msg}"
+        msg.contains("3 x refreshFrequency"),
+        "must name kopia's rule: {msg}"
     );
 
     // (b) 60m alone clears 3 x kopia's 20m default.
@@ -5963,10 +5959,7 @@ fn min_duration_must_clear_both_the_absolute_and_the_refresh_derived_floor() {
     let errs = validate_repository(&spec);
     let msg = format!("{errs:?}");
     assert!(!errs.is_empty(), "5m is below kopia's absolute 10m floor");
-    assert!(
-        msg.contains("minimum epoch duration too low"),
-        "must quote kopia: {msg}"
-    );
+    assert!(msg.contains("kopia's minimum is 10m"), "{msg}");
 }
 
 #[test]
@@ -5981,10 +5974,7 @@ fn epoch_checkpoint_frequency_and_delete_parallelism_floors() {
     let errs = validate_repository(&spec);
     let msg = format!("{errs:?}");
     assert!(!errs.is_empty(), "checkpointFrequency: 0 must be rejected");
-    assert!(
-        msg.contains("invalid epoch range compaction period"),
-        "must quote kopia: {msg}"
-    );
+    assert!(msg.contains("kopia rejects lower values"), "{msg}");
 
     let spec = repo_yaml(&format!(
         "{REPO_BASE}parameters:\n  epoch:\n    deleteParallelism: 0\n"
@@ -5992,10 +5982,7 @@ fn epoch_checkpoint_frequency_and_delete_parallelism_floors() {
     let errs = validate_repository(&spec);
     let msg = format!("{errs:?}");
     assert!(!errs.is_empty(), "deleteParallelism: 0 must be rejected");
-    assert!(
-        msg.contains("kopia does not validate"),
-        "must be honest that this floor is kopiur's own: {msg}"
-    );
+    assert!(msg.contains("no workers"), "must say why: {msg}");
 
     // 1 is the floor for both.
     let spec = repo_yaml(&format!(
@@ -6028,7 +6015,7 @@ fn a_parsed_zero_refresh_frequency_is_rejected() {
         );
         assert!(msg.contains("refreshFrequency"), "{msg}");
         assert!(
-            msg.contains("no changes"),
+            msg.contains("silently ignores"),
             "must say kopia drops it silently: {msg}"
         );
     }
@@ -6074,7 +6061,7 @@ fn the_derived_bounds_admit_that_they_assume_kopias_defaults() {
         "must point at the mirrored live margin: {msg}"
     );
     assert!(
-        msg.contains("cannot read"),
+        msg.contains("assumed"),
         "must own the assumption rather than state it as fact: {msg}"
     );
 
@@ -6086,7 +6073,7 @@ fn the_derived_bounds_admit_that_they_assume_kopias_defaults() {
         msg.contains("status.parameters.epoch.refreshFrequency"),
         "must point at the mirrored live refresh: {msg}"
     );
-    assert!(msg.contains("cannot read"), "{msg}");
+    assert!(msg.contains("default"), "{msg}");
 }
 
 #[test]
@@ -6121,7 +6108,7 @@ fn a_min_duration_below_the_absolute_floor_explains_both_rules() {
     let msg = format!("{errs:?}");
     assert!(!errs.is_empty());
     assert!(
-        msg.contains("minimum epoch duration too low"),
+        msg.contains("kopia's minimum is 10m"),
         "the absolute rule: {msg}"
     );
     assert!(
@@ -6139,7 +6126,7 @@ fn a_min_duration_below_the_absolute_floor_explains_both_rules() {
         "{REPO_BASE}parameters:\n  epoch:\n    minDuration: 5m\n    refreshFrequency: 1m\n"
     ));
     let msg = format!("{:?}", validate_repository(&spec));
-    assert!(msg.contains("minimum epoch duration too low"), "{msg}");
+    assert!(msg.contains("kopia's minimum is 10m"), "{msg}");
     assert!(
         !msg.contains("3 x refreshFrequency"),
         "the 3x rule is satisfied here and must not be blamed: {msg}"
@@ -6155,7 +6142,7 @@ fn the_zero_is_dropped_note_only_appears_for_a_zero() {
     ));
     let msg = format!("{:?}", validate_repository(&spec));
     assert!(
-        !msg.contains("no changes"),
+        !msg.contains("silently ignore"),
         "a non-zero value must not carry the zero-is-dropped note: {msg}"
     );
 
@@ -6164,7 +6151,7 @@ fn the_zero_is_dropped_note_only_appears_for_a_zero() {
     ));
     let msg = format!("{:?}", validate_repository(&spec));
     assert!(
-        msg.contains("no changes"),
+        msg.contains("silently ignore 0"),
         "a zero must still explain that kopia drops it silently: {msg}"
     );
 }
@@ -6261,8 +6248,8 @@ fn a_retention_period_below_kopias_one_day_floor_is_rejected() {
             "{period} is under 24h and must be rejected"
         );
         assert!(
-            format!("{errs:?}").contains("1-day"),
-            "must quote kopia's own wording so the two are searchable together: {errs:?}"
+            format!("{errs:?}").contains("minimum of 1 day"),
+            "must name kopia's floor: {errs:?}"
         );
     }
     // Exactly the floor is allowed.
@@ -6344,8 +6331,8 @@ fn blob_retention_is_rejected_on_backends_without_object_lock() {
             "{name} cannot object-lock and must be rejected"
         );
         assert!(
-            format!("{errs:?}").contains("unsupported put-blob option"),
-            "the message must carry kopia's verbatim error so a user can grep for it: {errs:?}"
+            format!("{errs:?}").contains("does not support object lock"),
+            "the message must say why: {errs:?}"
         );
         // ...but the same backend WITHOUT blobRetention stays perfectly valid.
         let spec = repo_yaml(&format!("{backend}{enc}"));
@@ -6368,7 +6355,7 @@ fn a_read_only_repository_cannot_declare_blob_retention() {
         !errs.is_empty(),
         "ReadOnly + blobRetention must be rejected"
     );
-    assert!(msg.contains("set-parameters"), "must say WHY: {msg}");
+    assert!(msg.contains("mode: ReadWrite"), "must name the fix: {msg}");
 }
 
 #[test]
@@ -6382,7 +6369,7 @@ fn cluster_repository_gets_the_identical_blob_retention_rules() {
         "{base}parameters:\n  blobRetention:\n    governance:\n      period: 1h\n"
     ));
     assert!(
-        format!("{:?}", validate_cluster_repository(&spec)).contains("1-day"),
+        format!("{:?}", validate_cluster_repository(&spec)).contains("minimum of 1 day"),
         "ClusterRepository must enforce the retention floor too"
     );
 
@@ -6628,11 +6615,8 @@ fn srepl_mover_inherit_is_rejected_with_the_adapted_message() {
                 field,
                 "SnapshotReplication spec.mover.inheritSecurityContextFrom"
             );
-            assert!(reason.contains("snapshot manifests"), "{reason}");
-            assert!(
-                reason.contains("never reads a workload's files"),
-                "{reason}"
-            );
+            assert!(reason.contains("snapshot-replication mover"), "{reason}");
+            assert!(reason.contains("there is no workload"), "{reason}");
         }
         other => panic!("expected the inherit rejection, got {other:?}"),
     }
@@ -7093,7 +7077,7 @@ fn blob_seed_with_explicit_create_format_knobs_is_rejected() {
         !msg.contains("create.hash"),
         "unset knobs must not be named: {msg}"
     );
-    assert!(msg.contains("migrate mode"), "{msg}");
+    assert!(msg.contains("spec.seed.from.repository"), "{msg}");
 
     // `create.enabled` alone stays legal: a seed-armed bootstrap never falls
     // back to `create`, so the flag keeps its ordinary meaning afterwards.
@@ -7196,7 +7180,7 @@ seed:
         .unwrap_or_else(|| panic!("{errs:?}"));
     let msg = e.to_string();
     assert!(msg.contains("\"/repo\""), "{msg}");
-    assert!(msg.contains("does not move any data"), "{msg}");
+    assert!(msg.contains("not where the data lives"), "{msg}");
 }
 
 #[test]
@@ -7223,7 +7207,7 @@ fn a_cluster_repository_seed_secret_must_not_pin_a_namespace() {
         .unwrap_or_else(|| panic!("{errs:?}"));
     let msg = e.to_string();
     assert!(msg.contains("\"elsewhere\""), "{msg}");
-    assert!(msg.contains("operator's own"), "{msg}");
+    assert!(msg.contains("operator's namespace"), "{msg}");
     // The fix text must name the field that actually decides the namespace: the
     // bootstrap Job runs where `encryption.passwordSecretRef` resolves, which is
     // the operator's namespace ONLY when that ref pins none. Telling the user
@@ -7267,7 +7251,7 @@ fn a_namespaced_seed_secret_must_be_co_resident() {
         }
     );
     let msg = err.to_string();
-    assert!(msg.contains("envFrom"), "{msg}");
+    assert!(msg.contains("can only read Secrets there"), "{msg}");
     assert!(msg.contains("\"backups\""), "{msg}");
 
     // Migrate mode carries no backend Secret, so the rule is a no-op there.
@@ -7474,7 +7458,7 @@ fn a_blob_seed_mixing_workload_identity_with_static_keys_is_rejected() {
         "{reason}"
     );
     let msg = e.to_string();
-    assert!(msg.contains("the seeding mover's environment"), "{msg}");
+    assert!(msg.contains("the seeding mover would"), "{msg}");
     assert!(
         !msg.contains("replication") && !msg.contains("destination"),
         "a repository bootstrap must not blame a replication mover or a \
@@ -7518,11 +7502,11 @@ seed:
         "seed.from.backend auth.workloadIdentity.serviceAccountName"
     );
     assert!(
-        reason.contains("this repository federates as \"repo-sa\"")
-            && reason.contains("the seed source as \"seed-sa\""),
+        reason.contains("this repository uses \"repo-sa\"")
+            && reason.contains("the seed source uses \"seed-sa\""),
         "{reason}"
     );
-    assert!(reason.contains("the seeding mover is one pod"), "{reason}");
+    assert!(reason.contains("the seeding mover runs as one"), "{reason}");
 }
 
 #[test]
@@ -7730,8 +7714,8 @@ fn jitter_bounds_accepts_up_to_24h_and_rejects_beyond() {
         assert_eq!(field, "spec.schedule.jitter");
         // What / why / fix, all three present.
         assert!(reason.contains("exceeds the 24h maximum"), "{reason}");
-        assert!(reason.contains("per-slot spread"), "{reason}");
-        assert!(reason.contains("move the offset into the cron"), "{reason}");
+        assert!(reason.contains("smaller than the cron period"), "{reason}");
+        assert!(reason.contains("offset in the cron expression"), "{reason}");
     }
 }
 
@@ -7809,7 +7793,7 @@ fn schedule_negative_starting_deadline_is_admission_only() {
         };
         assert_eq!(field, "spec.schedule.startingDeadlineSeconds");
         assert!(reason.contains("must be >= 0"), "{reason}");
-        assert!(reason.contains("SkipExpired forever"), "{reason}");
+        assert!(reason.contains("never runs"), "{reason}");
         // Ratchet pin: a stored schedule with a negative deadline must still
         // reconcile (visibly skipping) rather than stop dead.
         assert!(
@@ -8408,7 +8392,7 @@ fn read_only_false_is_rejected_on_a_stream_source() {
     let err = validate_source(&source).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("readOnly: false does not apply"), "{msg}");
-    assert!(msg.contains("nothing is mounted"), "{msg}");
+    assert!(msg.contains("mounts no volume"), "{msg}");
 }
 
 /// A non-default path strategy is a real request, and meaningless here.
@@ -8460,7 +8444,7 @@ readOnly: true
 "#,
     );
     let err = validate_source(&source).unwrap_err();
-    assert!(err.to_string().contains("matches EVERY pod"), "{err}");
+    assert!(err.to_string().contains("matches every pod"), "{err}");
 }
 
 /// A stream source cannot share a policy with other sources: expansion only fans out

@@ -316,11 +316,7 @@ impl RunStall {
 pub fn idle_report(stall: Option<&RunStall>) -> (bool, &'static str, &str) {
     match stall {
         Some(s) => (false, s.reason, s.message.as_str()),
-        None => (
-            true,
-            "Idle",
-            "replication is reconciled; waiting for the next scheduled slot",
-        ),
+        None => (true, "Idle", "idle; waiting for the next scheduled run"),
     }
 }
 
@@ -337,8 +333,8 @@ pub fn suspended_report(pending_request: bool) -> (&'static str, &'static str) {
     if pending_request {
         (
             "SuspendedWithPendingRun",
-            "run requested; replication is suspended (spec.suspend) — the run starts when it \
-             is resumed",
+            "run requested, but replication is suspended (spec.suspend); it runs once \
+             resumed",
         )
     } else {
         ("Suspended", "replication is suspended (spec.suspend)")
@@ -470,7 +466,7 @@ where
                     repository = %pinned.name,
                     repo_live,
                     global_live,
-                    "parking replication behind the source repository's mover-Job pool"
+                    "replication waiting for a mover slot on the source repository"
                 );
             }
             Ok(ReplicationPoolGate::Parked(Action::requeue(
@@ -539,8 +535,7 @@ pub async fn heal_replication_slot_condition<K>(
         tracing::debug!(
             replication = %name,
             error = %e,
-            "could not clear RepositorySlotAvailable after admission; retried while the run \
-             is in flight, else cleared at the next run's spawn"
+            "could not clear RepositorySlotAvailable; will retry"
         );
     }
 }
@@ -627,7 +622,7 @@ pub async fn observe_and_count_runs(
                 replication = %cr_name,
                 job = %job_name,
                 error = %e,
-                "could not stamp the run-counted marker; the run outcome metric is deferred to the next reconcile"
+                "could not mark the run as counted; will retry the run metric next reconcile"
             ),
         }
     }
@@ -1007,7 +1002,7 @@ mod tests {
         let (ready, reason, message) = idle_report(None);
         assert!(ready);
         assert_eq!(reason, "Idle");
-        assert!(message.contains("waiting for the next scheduled slot"));
+        assert!(message.contains("waiting for the next scheduled run"));
 
         // A stall from a requested run REPLACES it — one Ready writer per
         // reconcile, so the actionable half must be the one that lands.

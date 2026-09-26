@@ -98,26 +98,23 @@ const BANNER_HEADER: &str = "\
 /// of the restic path is thinking it moves data.
 const BANNER_RESTIC: &str = "\
 #
-# restic-mover sources: CONFIG TRANSLATION ONLY
+# restic sources: config only
 #
-# A VolSync restic repository is NOT a kopia repository. NO backup data is
-# migrated; the kopiur repository referenced below starts EMPTY and fills as
-# kopiur takes its own snapshots. Keep VolSync (and its repository) until
-# kopiur's retention coverage is sufficient for your recovery needs.";
+# No backup data is migrated: a restic repository is not a kopia repository,
+# so the kopiur repository below starts empty. Keep VolSync until kopiur has
+# enough snapshots for your recovery needs.";
 
 /// The kopia (fork) paragraph: the opposite story — data preserved, Secret
 /// referenced in place, identity continuity.
 const BANNER_KOPIA: &str = "\
 #
-# kopia-mover sources: REPOSITORY ADOPTED IN PLACE
+# kopia sources: existing repository reused
 #
-# The fork's repository IS a kopia repository: the Repository below connects
-# to it as-is and ALL existing snapshots are preserved. Translated policies
-# pin the fork's snapshot identity (username@hostname:/data), so history
-# continues seamlessly. KEEP the referenced VolSync Secret(s) — kopiur reads
-# the password (and matching credentials) from them IN PLACE. kopiur takes
-# over repository maintenance on its first run; retire the fork's
-# KopiaMaintenance objects and ReplicationSources once kopiur is green.";
+# The Repository below connects to the existing kopia repository, so all
+# snapshots are kept and history continues under the same identity. Keep the
+# referenced VolSync Secret(s): kopiur reads the password from them. kopiur
+# takes over maintenance, so retire the fork's KopiaMaintenance objects and
+# ReplicationSources once kopiur is healthy.";
 
 /// Banner footer shared by every run.
 const BANNER_FOOTER: &str = "\
@@ -237,8 +234,8 @@ fn emit_repository_objects(
             field: format!("secret/{restic_secret_name}.GOOGLE_APPLICATION_CREDENTIALS"),
             disposition: translate::Disposition::Unmappable {
                 reason: format!(
-                    "restic stores a file PATH; kopiur needs the service-account JSON CONTENT \
-                     under {creds_name}.KOPIA_GCS_CREDENTIALS — add it yourself before applying"
+                    "restic stores a file path, but kopiur needs the service-account JSON \
+                     itself in {creds_name}.KOPIA_GCS_CREDENTIALS; add it before applying"
                 ),
             },
         });
@@ -258,8 +255,8 @@ fn emit_repository_objects(
         field: format!("secret/{restic_secret_name}.RESTIC_PASSWORD"),
         disposition: translate::Disposition::Unmappable {
             reason: format!(
-                "a kopia repository needs its OWN new password; {password_name} carries a \
-                 REPLACE_ME placeholder you must set before applying"
+                "kopia needs a new password; set the REPLACE_ME placeholder in \
+                 {password_name} before applying"
             ),
         },
     });
@@ -312,10 +309,7 @@ fn emit_kopia_repository_objects(
         })?;
     if !data.contains_key("KOPIA_PASSWORD") {
         return Err(CliError::MigrationInput {
-            what: format!(
-                "kopia Secret {namespace}/{secret_name} has no KOPIA_PASSWORD key; the fork \
-                 requires it and kopiur references it in place"
-            ),
+            what: format!("kopia Secret {namespace}/{secret_name} has no KOPIA_PASSWORD key"),
             fix: "fix the Secret, or pass --repository to skip secret resolution".into(),
         });
     }
@@ -338,8 +332,8 @@ fn emit_kopia_repository_objects(
             field: format!("secret/{secret_name}.KOPIA_REPOSITORY"),
             disposition: translate::Disposition::Mapped {
                 to: format!(
-                    "Repository/{repo_name}.spec.backend (adopted in place; no create \
-                             block — the repository must already exist)"
+                    "Repository/{repo_name}.spec.backend (existing repository reused; no \
+                     create block)"
                 ),
             },
         },
@@ -347,8 +341,8 @@ fn emit_kopia_repository_objects(
             field: format!("secret/{secret_name}.KOPIA_PASSWORD"),
             disposition: translate::Disposition::Mapped {
                 to: format!(
-                    "Repository/{repo_name}.spec.encryption.passwordSecretRef — referenced IN \
-                     PLACE; KEEP Secret {secret_name:?} when decommissioning VolSync"
+                    "Repository/{repo_name}.spec.encryption.passwordSecretRef (referenced in \
+                     place; keep Secret {secret_name:?} when removing VolSync)"
                 ),
             },
         },
@@ -395,8 +389,8 @@ fn check_cross_mover_collision(
     if emitted_repos.contains_key(&(other_mover, namespace.to_string(), secret_name.to_string())) {
         return Err(CliError::MigrationInput {
             what: format!(
-                "Secret {secret_name:?} is referenced by BOTH a restic and a kopia VolSync \
-                 object; their derived Repositories would both be named {secret_name}-kopiur"
+                "Secret {secret_name:?} is used by both a restic and a kopia VolSync object, \
+                 so both derived Repositories would be named {secret_name}-kopiur"
             ),
             fix: "migrate the two movers in separate runs using --name, or pass --repository"
                 .into(),
@@ -502,34 +496,28 @@ fn validate_args(global: &GlobalArgs, args: &MigrateVolsyncArgs) -> Result<(), C
     if offline && args.apply {
         return Err(CliError::MigrationInput {
             what: "--apply cannot be combined with offline input (-f/--filename)".into(),
-            fix: "drop --apply and `kubectl apply -f` the emitted manifests yourself, or run \
-                  against the cluster"
-                .into(),
+            fix: "drop --apply and `kubectl apply -f` the output yourself".into(),
         });
     }
     // R2: --out-dir writes files for review; it does not apply.
     if args.out_dir.is_some() && args.apply {
         return Err(CliError::MigrationInput {
             what: "--apply cannot be combined with --out-dir".into(),
-            fix: "--out-dir writes manifests to disk for review; drop one of the two".into(),
+            fix: "drop one of the two".into(),
         });
     }
     // R3: offline --resolve-secrets needs a Secret source.
     if offline && args.resolve_secrets && !secrets_files && !args.from_cluster_secrets {
         return Err(CliError::MigrationInput {
             what: "offline --resolve-secrets has no Secret source".into(),
-            fix: "pass --secrets <file/dir> for plaintext Secrets, --from-cluster-secrets to \
-                  fetch them live, or --repository to skip secret resolution"
-                .into(),
+            fix: "pass --secrets <file/dir>, --from-cluster-secrets, or --repository".into(),
         });
     }
     // R4: secret-source flags are meaningless without offline input.
     if !offline && (secrets_files || args.from_cluster_secrets) {
         return Err(CliError::MigrationInput {
             what: "--secrets/--from-cluster-secrets only apply to offline input".into(),
-            fix: "add -f/--filename to read VolSync objects from disk, or drop these flags \
-                  (a cluster --resolve-secrets run already reads Secrets live)"
-                .into(),
+            fix: "add -f/--filename, or drop these flags".into(),
         });
     }
     // R6: stdin can only be read once.
@@ -679,12 +667,9 @@ pub async fn run(global: &GlobalArgs, args: &MigrateVolsyncArgs) -> Result<CmdOu
             };
             return Err(CliError::MigrationInput {
                 what: format!(
-                    "ReplicationSource {ns}/{name} uses --resolve-secrets but its {field} field \
-                     is empty/missing"
+                    "ReplicationSource {ns}/{name} has no {field}, which --resolve-secrets needs"
                 ),
-                fix: "set the mover's repository to the repository Secret name, or pass \
-                      --repository to point at an existing kopiur Repository"
-                    .into(),
+                fix: "set it to the repository Secret name, or pass --repository".into(),
             });
         }
         match mover_kind {
@@ -843,8 +828,8 @@ pub async fn run(global: &GlobalArgs, args: &MigrateVolsyncArgs) -> Result<CmdOu
                     if dest_secret.is_empty() {
                         return Err(CliError::MigrationInput {
                             what: format!(
-                                "ReplicationDestination {ns}/{name} uses --resolve-secrets but its \
-                                 spec.kopia.repository field is empty/missing"
+                                "ReplicationDestination {ns}/{name} has no \
+                                 spec.kopia.repository, which --resolve-secrets needs"
                             ),
                             fix: "set spec.kopia.repository, or pass --repository".into(),
                         });
@@ -914,8 +899,8 @@ pub async fn run(global: &GlobalArgs, args: &MigrateVolsyncArgs) -> Result<CmdOu
                 field: field.into(),
                 disposition: translate::Disposition::Unmappable {
                     reason: format!(
-                        "could not pair Secret {dest_secret:?} with exactly one translated source \
-                         policy; edit fromPolicy.name before applying"
+                        "could not match Secret {dest_secret:?} to exactly one translated \
+                         policy; set fromPolicy.name before applying"
                     ),
                 },
             });
@@ -942,15 +927,14 @@ pub async fn run(global: &GlobalArgs, args: &MigrateVolsyncArgs) -> Result<CmdOu
     // --- report on stderr ---
     if saw_restic {
         eprintln!(
-            "restic sources: CONFIG TRANSLATION ONLY — no backup data is migrated; the kopiur \
-             repository starts empty. Keep VolSync until kopiur's retention coverage suffices."
+            "restic sources: config only, no backup data is migrated. The kopiur repository \
+             starts empty; keep VolSync until kopiur has enough snapshots."
         );
     }
     if saw_kopia {
         eprintln!(
-            "kopia sources: REPOSITORY ADOPTED IN PLACE — all existing snapshots are preserved \
-             and the snapshot identity is pinned so history continues. KEEP the referenced \
-             VolSync Secret(s); retire the fork's KopiaMaintenance objects."
+            "kopia sources: existing repository reused; all snapshots and history are kept. \
+             Keep the referenced VolSync Secret(s); retire the fork's KopiaMaintenance objects."
         );
     }
     eprintln!();
@@ -976,11 +960,9 @@ pub async fn run(global: &GlobalArgs, args: &MigrateVolsyncArgs) -> Result<CmdOu
         let ctx = ctx.as_ref().expect("client present for --apply");
         if has_placeholder(&flat) {
             return Err(CliError::MigrationInput {
-                what: "the translated manifests still contain REPLACE_ME placeholders \
-                       (kopia password and/or an unpaired restore policy)"
-                    .into(),
-                fix: "run without --apply, edit the placeholders in the emitted YAML, then \
-                      `kubectl apply -f` it yourself"
+                what: "the translated manifests still contain REPLACE_ME placeholders".into(),
+                fix: "run without --apply, fill in the placeholders, then `kubectl apply -f` \
+                      the output"
                     .into(),
             });
         }
@@ -1072,29 +1054,29 @@ mod tests {
         )
         .unwrap();
         assert!(yaml.starts_with("# ===="), "{yaml}");
-        assert!(yaml.contains("CONFIG TRANSLATION ONLY"), "{yaml}");
-        assert!(yaml.contains("NO backup data is"), "{yaml}");
-        assert!(!yaml.contains("ADOPTED IN PLACE"), "{yaml}");
+        assert!(yaml.contains("restic sources: config only"), "{yaml}");
+        assert!(yaml.contains("No backup data is migrated"), "{yaml}");
+        assert!(!yaml.contains("existing repository reused"), "{yaml}");
         assert!(yaml.contains("---\nkind: SnapshotPolicy"), "{yaml}");
     }
 
     #[test]
     fn kopia_banner_says_adopted_not_empty() {
         let banner = compose_banner(false, true);
-        assert!(banner.contains("REPOSITORY ADOPTED IN PLACE"), "{banner}");
+        assert!(banner.contains("existing repository reused"), "{banner}");
         assert!(
-            banner.contains("KEEP the referenced VolSync Secret"),
+            banner.contains("Keep the\n# referenced VolSync Secret"),
             "{banner}"
         );
         assert!(banner.contains("KopiaMaintenance"), "{banner}");
-        assert!(!banner.contains("starts EMPTY"), "{banner}");
+        assert!(!banner.contains("starts empty"), "{banner}");
     }
 
     #[test]
     fn mixed_banner_carries_both_paragraphs() {
         let banner = compose_banner(true, true);
-        assert!(banner.contains("CONFIG TRANSLATION ONLY"), "{banner}");
-        assert!(banner.contains("REPOSITORY ADOPTED IN PLACE"), "{banner}");
+        assert!(banner.contains("restic sources: config only"), "{banner}");
+        assert!(banner.contains("existing repository reused"), "{banner}");
     }
 
     #[test]
@@ -1198,7 +1180,7 @@ mod tests {
         // The accounting tells the user to KEEP the referenced Secret.
         assert!(notes.iter().any(|n| matches!(
             &n.disposition,
-            translate::Disposition::Mapped { to } if to.contains("KEEP Secret")
+            translate::Disposition::Mapped { to } if to.contains("keep Secret")
         )));
         // The emitted Repository spec parses as the REAL kopiur type.
         let typed: kopiur_api::RepositorySpec =
@@ -1257,7 +1239,7 @@ mod tests {
         let err =
             check_cross_mover_collision(&emitted, MoverKind::Kopia, "media", "shared").unwrap_err();
         assert!(
-            err.to_string().contains("BOTH a restic and a kopia"),
+            err.to_string().contains("both a restic and a kopia"),
             "{err}"
         );
         // Same mover re-using the Secret is fine (that is the dedup hit path).

@@ -37,8 +37,8 @@ $ kubectl kopiur doctor -n media
   ok    webhook admission (live dry-run probe)
   ok    repositories ready
   FAIL  credential secrets present: Repository/nas: secret media/kopia-creds not found
-        why: movers load credentials via namespace-local envFrom; a missing Secret fails every run against that repository
-        fix: create the Secret in the named namespace (or enable credentialProjection where supported)
+        why: every run against that repository fails without it
+        fix: create the Secret in the named namespace (or enable credentialProjection)
   ok    no blocked or stuck work
   ok    no recent failed snapshots/restores
   ok    recent warning events
@@ -59,8 +59,8 @@ Those are reported **immediately, whatever the object's age**, and the FAIL line
 ```console
 $ kubectl kopiur doctor -n media
   FAIL  no blocked or stuck work: snapshot media/nightly-1759: blocked on MoverPermitted=False (PrivilegedMoverNotPermitted): the mover for SnapshotPolicy media/nightly needs elevated privileges; run: kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=true
-        why: a structural gate never self-heals — the operator has parked the object until a human makes an out-of-band change, so it will wait forever however new it is
-        fix: the condition message above is the operator's own diagnosis and carries the exact command to run; apply it and the object proceeds on its own
+        why: this block never self-heals; the object waits until someone acts
+        fix: run the command in the condition message above (the operator's own diagnosis); the object then continues on its own
 ```
 
 `--stuck-threshold`, default `1h`, governs only the **age**-based verdict, meaning an in-flight Snapshot or Restore that is not blocked but is slow. A Snapshot being deleted is measured from its `deletionTimestamp` rather than its creation, so a routine retention prune of month-old snapshots is never reported as stuck. Only a finalizer that is genuinely wedged is.

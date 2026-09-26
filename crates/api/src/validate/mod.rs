@@ -64,9 +64,8 @@ fn validate_pvc_selector(selector: &crate::snapshot_policy::PvcSelector) -> Vali
     {
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.sources[].pvcSelector.namespaceSelector".to_string(),
-            reason: "a backup's mover Pod can only mount PersistentVolumeClaims in its own \
-                     namespace, so a selector cannot reach PVCs in another one. Use one \
-                     SnapshotPolicy per namespace (each may point at the same repository)"
+            reason: "a backup can only read PVCs in its own namespace. Fix: use one \
+                     SnapshotPolicy per namespace (they can share a repository)"
                 .to_string(),
         });
     }
@@ -100,9 +99,8 @@ fn validate_pvc_selector(selector: &crate::snapshot_policy::PvcSelector) -> Vali
                             e.key
                         ),
                         reason: format!(
-                            "`{other}` is not a label-selector operator (expected In, NotIn, \
-                             Exists or DoesNotExist). An unrecognized operator would be dropped, \
-                             WIDENING the selector so PVCs you meant to exclude get backed up"
+                            "`{other}` is not a label-selector operator. Fix: use In, NotIn, \
+                             Exists or DoesNotExist"
                         ),
                     });
                 }
@@ -156,13 +154,10 @@ pub fn validate_source(source: &Source) -> ValidationResult {
             if !crate::snapshot_policy::source_read_only(source) {
                 return Err(ValidationError::InvalidFieldValue {
                     field: "spec.sources[].readOnly".to_string(),
-                    reason: "readOnly: false is not supported on an nfs source: the kubelet \
-                             does not apply fsGroup to in-tree NFS volumes, so a read-write \
-                             mount grants the mover no additional readability and only \
-                             exposes the export to writes. Remove readOnly (NFS is read \
-                             directly), and grant access with mover.podSecurityContext \
-                             supplementalGroups / mover.securityContext runAsUser matching \
-                             the export's ownership, or with a server-side ID remap"
+                    reason: "readOnly: false is not supported on an nfs source (fsGroup does \
+                             not apply to NFS). Fix: remove readOnly, and grant access with \
+                             mover.podSecurityContext supplementalGroups or \
+                             mover.securityContext runAsUser matching the export's owner"
                         .to_string(),
                 });
             }
@@ -192,18 +187,16 @@ fn validate_stream_source(source: &Source, stream: &StreamSource) -> ValidationR
     if source.read_only == Some(false) {
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.sources[].readOnly".to_string(),
-            reason: "readOnly: false does not apply to a stream source: nothing is mounted — \
-                     the mover execs a command and pipes its stdout into kopia, so there is no \
-                     volume to make writable. Remove readOnly"
+            reason: "readOnly: false does not apply to a stream source, which mounts no \
+                     volume. Fix: remove readOnly"
                 .to_string(),
         });
     }
     if source.acknowledge_live_mutation.is_some() {
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.sources[].acknowledgeLiveMutation".to_string(),
-            reason: "acknowledgeLiveMutation does not apply to a stream source: it \
-                     acknowledges the kubelet rewriting a mounted volume's ownership, and a \
-                     stream source mounts no volume. Remove acknowledgeLiveMutation"
+            reason: "acknowledgeLiveMutation does not apply to a stream source, which mounts \
+                     no volume. Fix: remove acknowledgeLiveMutation"
                 .to_string(),
         });
     }
@@ -215,9 +208,9 @@ fn validate_stream_source(source: &Source, stream: &StreamSource) -> ValidationR
     {
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.sources[].sourcePathStrategy".to_string(),
-            reason: "sourcePathStrategy derives a kopia path from a matched PVC's name and \
-                     applies only to a pvcSelector source. A stream source records \
-                     /stream/<fileName>; set sourcePathOverride to change it"
+            reason: "sourcePathStrategy only applies to a pvcSelector source. Fix: remove it; \
+                     to change a stream source's path (/stream/<fileName>), set \
+                     sourcePathOverride"
                 .to_string(),
         });
     }
@@ -242,10 +235,8 @@ pub fn validate_stream_file_name(field: &str, name: &str) -> ValidationResult {
         return Err(ValidationError::InvalidFieldValue {
             field: field.to_string(),
             reason: format!(
-                "`{name}` is not a usable file name. Give ONE file name (e.g. `postgres.sql`): \
-                 no `/`, not `.` or `..`, no control characters, not empty. kopia stores this \
-                 value verbatim as the entry name inside the snapshot, so a path-shaped value \
-                 would make a later restore write outside its destination directory"
+                "`{name}` is not a usable file name. Fix: give a single file name (e.g. \
+                 `postgres.sql`): not empty, no `/`, not `.` or `..`, no control characters"
             ),
         });
     }
@@ -259,8 +250,8 @@ pub fn validate_stream_exec(field: &str, exec: &StreamExec) -> ValidationResult 
     if exec.command.is_empty() {
         return Err(ValidationError::InvalidFieldValue {
             field: format!("{field}.command"),
-            reason: "give the argv to run, e.g. [\"sh\", \"-ec\", \"pg_dumpall -U postgres\"]. \
-                     This is exec'd directly, not through a shell, so element 0 is the program"
+            reason: "is empty. Fix: give the command to run, e.g. [\"sh\", \"-ec\", \
+                     \"pg_dumpall -U postgres\"] (it runs without a shell)"
                 .to_string(),
         });
     }
@@ -284,8 +275,8 @@ pub fn validate_stream_exec(field: &str, exec: &StreamExec) -> ValidationResult 
     if selector_empty {
         return Err(ValidationError::InvalidFieldValue {
             field: format!("{field}.podSelector"),
-            reason: "the podSelector is empty, which matches EVERY pod in the namespace. Set \
-                     matchLabels/matchExpressions identifying the one workload pod to exec into"
+            reason: "is empty, so it matches every pod in the namespace. Fix: set \
+                     matchLabels/matchExpressions for the one pod to run the command in"
                 .to_string(),
         });
     }
@@ -344,10 +335,7 @@ pub fn validate_access_modes(field: &str, modes: &[PvcAccessMode]) -> Vec<Valida
             errs.push(ValidationError::InvalidFieldValue {
                 field: format!("{field}[{i}]"),
                 reason: format!(
-                    "{value:?} is not a Kubernetes access mode (valid: {}). No PVC can be \
-                     provisioned from it — if this value was stored before kopiur enforced \
-                     the schema, it was already broken then; edit the resource to one of the \
-                     valid modes.",
+                    "{value:?} is not a Kubernetes access mode. Fix: use one of: {}",
                     PvcAccessMode::CANONICAL.join(", ")
                 ),
             });
@@ -369,10 +357,8 @@ pub fn validate_access_modes(field: &str, modes: &[PvcAccessMode]) -> Vec<Valida
     {
         errs.push(ValidationError::InvalidFieldValue {
             field: field.to_string(),
-            reason: "ReadWriteOncePod may not be combined with other access modes — the \
-                     apiserver rejects such a PVC at create time, so the run would wedge in \
-                     a retry loop instead of failing here. Use ReadWriteOncePod alone, or \
-                     drop it."
+            reason: "ReadWriteOncePod cannot be combined with other access modes. Fix: use \
+                     ReadWriteOncePod alone, or drop it"
                 .to_string(),
         });
     }
@@ -416,8 +402,7 @@ impl NumericBound {
         match self {
             NumericBound::Count => "0 would do no work; set a positive count",
             NumericBound::RatePerSecond => {
-                "kopia treats an ABSENT field, not 0, as \"no limit\"; 0 would stall the transfer, \
-                 so omit the field to run uncapped"
+                "0 would stall the transfer; omit the field for no limit"
             }
             NumericBound::Megabytes => {
                 "0 would cap the upload at nothing; omit the field to leave it uncapped"
@@ -533,9 +518,8 @@ pub fn validate_resources(resources: &ResourceRequirements, context: &str) -> Va
         return Err(ValidationError::InvalidFieldValue {
             field: format!("{context} resources.requests.{key}"),
             reason: format!(
-                "request `{req}` exceeds limit `{lim}`; the API server rejects a pod whose \
-                 requests exceed its limits, so the mover Job would never create a pod (it hangs \
-                 instead of failing). Lower the request or raise the limit."
+                "request `{req}` exceeds limit `{lim}`, so the mover pod can never start. Fix: \
+                 lower the request or raise the limit"
             ),
         });
     }
@@ -564,9 +548,7 @@ pub fn validate_failure_policy(fp: &FailurePolicy, context: &str) -> ValidationR
         return Err(ValidationError::InvalidFieldValue {
             field: format!("{context} failurePolicy.podStartupDeadlineSeconds"),
             reason: crate::message::Diagnostic::new(format!("must be at least 1 second (got {g})"))
-                .because(
-                    "it bounds how long a non-starting mover pod is tolerated before the run fails",
-                )
+                .because("it is how long a mover pod may take to start before the run fails")
                 .to_string(),
         });
     }
@@ -637,13 +619,10 @@ pub fn schedule_cr_growth_warning(cron: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "schedule fires ~{fires}×/hour: each fire creates one Snapshot CR per source, and \
-         they accumulate up to the SnapshotPolicy retention window (CR count ≈ fires × \
-         retained snapshots). A sub-hourly schedule with a wide or absent retention can \
-         produce thousands of Snapshot CRs, each re-reconciled for its whole retention \
-         window. If unintended, use a coarser schedule, bound SnapshotPolicy.spec.retention, \
-         or set the Snapshot deletionPolicy to Retain/Orphan. See docs/backups.md \
-         ('How many Snapshot CRs will I have?')."
+        "schedule fires ~{fires}×/hour and each fire creates a Snapshot CR per source, kept \
+         for the SnapshotPolicy retention window — this can add up to thousands of CRs. If \
+         unintended, use a coarser schedule or bound SnapshotPolicy.spec.retention. See \
+         docs/backups.md ('How many Snapshot CRs will I have?')."
     ))
 }
 
@@ -691,7 +670,7 @@ pub fn validate_jitter(field: &str, jitter: Option<&str>) -> ValidationResult {
         return Err(ValidationError::InvalidFieldValue {
             field: field.to_string(),
             reason: format!(
-                "{j:?} is not a valid duration. Use a Go-style duration like 30s, 5m, or 1h"
+                "{j:?} is not a valid duration. Fix: use a Go-style duration like 30s, 5m, or 1h"
             ),
         });
     }
@@ -744,9 +723,8 @@ pub fn validate_jitter_bounds(field: &str, jitter: &str) -> ValidationResult {
         return Err(ValidationError::InvalidFieldValue {
             field: field.to_string(),
             reason: format!(
-                "jitter of {jitter} exceeds the 24h maximum — jitter is a per-slot spread \
-                 within a cron period, not a schedule offset; use a window smaller than the \
-                 cron period (e.g. 10m), or move the offset into the cron expression"
+                "jitter of {jitter} exceeds the 24h maximum. Fix: use a window smaller than \
+                 the cron period (e.g. 10m); put a fixed offset in the cron expression instead"
             ),
         });
     }
@@ -789,10 +767,8 @@ pub fn validate_pod_metadata(defaults: &crate::common::MoverDefaults) -> Vec<Val
                 errs.push(ValidationError::InvalidFieldValue {
                     field: format!("{field}[{key:?}]"),
                     reason: format!(
-                        "{key:?} is reserved by kopiur — the operator stamps this key on every \
-                         mover pod and its own value wins the merge, so the value here would be \
-                         silently dropped. Use a key outside `{KOPIUR_KEY_PREFIX}` (and not \
-                         `app.kubernetes.io/managed-by`)"
+                        "{key:?} is reserved by kopiur and would be overwritten. Fix: use a key \
+                         outside `{KOPIUR_KEY_PREFIX}` (and not `app.kubernetes.io/managed-by`)"
                     ),
                 });
             }
@@ -851,9 +827,8 @@ pub fn validate_server(server: &ServerSpec, mode: RepositoryMode) -> Vec<Validat
     if server.read_only == Some(false) && !mode.allows_writes() {
         errs.push(ValidationError::InvalidFieldValue {
             field: "server.readOnly".to_string(),
-            reason: "a Repository with spec.mode: ReadOnly cannot serve a read-write UI; remove \
-                     server.readOnly (the ReadOnly mode forces the UI read-only) or set the \
-                     repository's spec.mode: ReadWrite"
+            reason: "a Repository with spec.mode: ReadOnly cannot serve a read-write UI. Fix: \
+                     remove server.readOnly, or set spec.mode: ReadWrite"
                 .to_string(),
         });
     }
@@ -881,8 +856,7 @@ pub(crate) fn forbid_pvc_consumer(
         return Err(ValidationError::InvalidFieldValue {
             field: format!("{field_prefix}.mover.inheritSecurityContextFrom.pvcConsumer"),
             reason: format!(
-                "is only valid for a backup source — there is no source PVC here to derive a \
-                 workload from. {instead}"
+                "is only valid for a backup source (there is no source PVC here). {instead}"
             ),
         });
     }

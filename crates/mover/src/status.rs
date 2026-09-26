@@ -782,8 +782,8 @@ pub fn snapshot_replicate_no_match_message(stats: &SnapshotReplicationRunStats) 
 fn push_incomplete_skipped(msg: &mut String, stats: &SnapshotReplicationRunStats) {
     if stats.incomplete_skipped > 0 {
         msg.push_str(&format!(
-            "; skipped {} incomplete source snapshot(s) (interrupted-upload checkpoints kopia \
-             cannot replicate; the mover log names their ids)",
+            "; skipped {} incomplete source snapshot(s) left by interrupted backups (ids in \
+             the mover log)",
             stats.incomplete_skipped
         ));
     }
@@ -2476,7 +2476,7 @@ mod tests {
                 .expect_err("403 is a real error");
             let msg = err.to_string();
             assert!(
-                msg.starts_with("failed to read the status of Restore test-ns/plex"),
+                msg.starts_with("could not read the status of Restore test-ns/plex"),
                 "the message must name the read: {msg}"
             );
             assert!(

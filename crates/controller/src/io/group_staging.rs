@@ -215,10 +215,7 @@ pub fn vgs_wait_outcome(
     if !deadline.is_some_and(|d| now >= d) {
         let mut msg = format!("waiting for VolumeGroupSnapshot `{ns}/{name}` to become readyToUse");
         if let Some(err) = &obs.error {
-            msg.push_str(&format!(
-                "; it reported a possibly-transient error (the snapshot-controller \
-                 retries automatically): {err}"
-            ));
+            msg.push_str(&format!("; last error (retried automatically): {err}"));
         }
         match deadline {
             Some(d) => msg.push_str(&format!(
@@ -234,22 +231,19 @@ pub fn vgs_wait_outcome(
         Some(err) => VgsWait::Failed {
             reason: crate::consts::REASON_VGS_FAILED,
             message: format!(
-                "VolumeGroupSnapshot `{ns}/{name}` did not become readyToUse within {waited} \
-                 (spec.staging.timeout; default 10m) and last reported: {err}; check the \
-                 VolumeGroupSnapshotClass `{class}` / CSI driver, or set `groupBy: None` to \
-                 capture each PVC independently. Every member Snapshot of this group is \
-                 terminal — the next scheduled run retries"
+                "VolumeGroupSnapshot `{ns}/{name}` was not readyToUse within {waited} \
+                 (spec.staging.timeout, default 10m); last error: {err}. Fix: check \
+                 VolumeGroupSnapshotClass `{class}` and the CSI driver, or set `groupBy: None`. \
+                 The next scheduled run retries"
             ),
         },
         None => VgsWait::Failed {
             reason: crate::consts::REASON_GROUP_STAGING_TIMEOUT,
             message: format!(
-                "VolumeGroupSnapshot `{ns}/{name}` did not become readyToUse within {waited} \
-                 (spec.staging.timeout; default 10m) and reported no error — the CSI driver or \
-                 snapshot-controller is stuck or very slow. Check both, raise \
-                 spec.staging.timeout, or set `groupBy: None` to capture each PVC \
-                 independently. Every member Snapshot of this group is terminal — the next \
-                 scheduled run retries"
+                "VolumeGroupSnapshot `{ns}/{name}` was not readyToUse within {waited} \
+                 (spec.staging.timeout, default 10m) and reported no error. Fix: check the CSI \
+                 driver and snapshot-controller, raise spec.staging.timeout, or set \
+                 `groupBy: None`. The next scheduled run retries"
             ),
         },
     }
@@ -290,10 +284,9 @@ pub fn member_wait_outcome(
     };
     if !deadline.is_some_and(|d| now >= d) {
         let mut msg = format!(
-            "VolumeGroupSnapshot `{ns}/{name}` is readyToUse, but the member snapshot for \
-             PersistentVolumeClaim `{pvc_namespace}/{pvc_name}` is not visible yet — the \
-             snapshot-controller publishes member VolumeSnapshots and their content bindings \
-             asynchronously, so they can lag the group's readiness; waiting for it"
+            "VolumeGroupSnapshot `{ns}/{name}` is readyToUse, but the member snapshot for PVC \
+             `{pvc_namespace}/{pvc_name}` is not visible yet (members appear asynchronously); \
+             waiting"
         );
         match deadline {
             Some(d) => msg.push_str(&format!(
@@ -310,13 +303,11 @@ pub fn member_wait_outcome(
     GroupStage::Failed {
         reason: crate::consts::REASON_GROUP_MEMBER_MISSING,
         message: format!(
-            "VolumeGroupSnapshot `{ns}/{name}` became readyToUse but captured no member for \
-             PersistentVolumeClaim `{pvc_namespace}/{pvc_name}` within the staging deadline. Its \
-             labels most likely stopped matching the pvcSelector between expansion and capture \
-             (the snapshot-controller re-evaluates the selector when it creates the group), or \
-             the CSI driver excluded it. Check `kubectl -n {ns} get volumegroupsnapshot {name} -o \
-             yaml`, or set `groupBy: None`. This Snapshot is terminal — the next scheduled run \
-             retries."
+            "VolumeGroupSnapshot `{ns}/{name}` captured no member for PVC \
+             `{pvc_namespace}/{pvc_name}` before the staging deadline; its labels probably \
+             stopped matching the pvcSelector, or the CSI driver excluded it. Check `kubectl -n \
+             {ns} get volumegroupsnapshot {name} -o yaml`, or set `groupBy: None`. The next \
+             scheduled run retries."
         ),
     }
 }
@@ -654,7 +645,7 @@ pub async fn cleanup_group_if_unused(client: &kube::Client, ns: &str, group: &st
     let all = match snaps.list(&ListParams::default()).await {
         Ok(list) => list.items,
         Err(e) => {
-            tracing::warn!(group = %group, error = %e, "could not list group members; leaving the VolumeGroupSnapshot in place (the sweep is the backstop)");
+            tracing::warn!(group = %group, error = %e, "could not list group members; leaving the VolumeGroupSnapshot in place");
             return Ok(false);
         }
     };
@@ -681,7 +672,7 @@ pub async fn cleanup_group_if_unused(client: &kube::Client, ns: &str, group: &st
         .await
     {
         Ok(_) => {
-            tracing::info!(group = %group, namespace = %ns, "reaped shared VolumeGroupSnapshot (all members terminal)");
+            tracing::info!(group = %group, namespace = %ns, "deleted shared VolumeGroupSnapshot (all members finished)");
             Ok(true)
         }
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(false),
@@ -802,7 +793,9 @@ pub async fn resolve_group_stage(
         return Ok(GroupStage::Failed {
             reason: crate::consts::REASON_GROUP_MEMBER_MISSING,
             message: format!(
-                "this Snapshot pins the VolumeGroupSnapshot `{ns}/{name}`, but SnapshotPolicy                  `{}` source #{source_index} no longer has a pvcSelector with a labelSelector —                  the recipe was edited mid-run. Delete this Snapshot and let the schedule                  re-fire.",
+                "this Snapshot uses VolumeGroupSnapshot `{ns}/{name}`, but SnapshotPolicy `{}` source \
+                 #{source_index} no longer has a pvcSelector with a labelSelector (the policy \
+                 changed mid-run). Delete this Snapshot and let the schedule re-run.",
                 policy.name_any(),
             ),
         });
@@ -815,7 +808,9 @@ pub async fn resolve_group_stage(
         return Ok(GroupStage::Failed {
             reason: crate::consts::REASON_NO_GROUP_CLASS,
             message: format!(
-                "PersistentVolumeClaim `{pvc_namespace}/{pvc_name}` has no StorageClass, so its                  CSI driver is unknown and no VolumeGroupSnapshotClass can be matched. Set                  `copyMethod: Direct`, or `groupBy: None`."
+                "PVC `{pvc_namespace}/{pvc_name}` has no StorageClass, so no \
+                 VolumeGroupSnapshotClass can be matched. Fix: set `copyMethod: Direct`, or \
+                 `groupBy: None`."
             ),
         });
     };
@@ -823,7 +818,9 @@ pub async fn resolve_group_stage(
         return Ok(GroupStage::Failed {
             reason: crate::consts::REASON_NO_GROUP_CLASS,
             message: format!(
-                "`groupBy: VolumeGroupSnapshot` needs the {GROUP_SNAPSHOT_GROUP} API group, which                  this cluster does not serve. Install external-snapshotter 8.2+ (group snapshots                  are Beta from Kubernetes 1.32), or set `groupBy: None` to capture each PVC                  independently."
+                "`groupBy: VolumeGroupSnapshot` needs the {GROUP_SNAPSHOT_GROUP} API group, which \
+                 this cluster does not serve. Fix: install external-snapshotter 8.2+, or set \
+                 `groupBy: None`."
             ),
         });
     };
@@ -834,7 +831,8 @@ pub async fn resolve_group_stage(
             return Ok(GroupStage::Failed {
                 reason: crate::consts::REASON_NO_GROUP_CLASS,
                 message: format!(
-                    "no VolumeGroupSnapshotClass exists for CSI driver `{driver}`. Create one, or                      set `groupBy: None` to capture each PVC independently (many drivers support                      per-volume snapshots but not group snapshots)."
+                    "no VolumeGroupSnapshotClass exists for CSI driver `{driver}`. Fix: create one, \
+                     or set `groupBy: None` (many drivers support only per-volume snapshots)."
                 ),
             });
         }
@@ -842,7 +840,8 @@ pub async fn resolve_group_stage(
             return Ok(GroupStage::Failed {
                 reason: crate::consts::REASON_NO_GROUP_CLASS,
                 message: format!(
-                    "multiple VolumeGroupSnapshotClasses match driver `{driver}` ({}) and none is                      the unique default; annotate one as the default class",
+                    "multiple VolumeGroupSnapshotClasses match driver `{driver}` ({}) and none is \
+                     the default. Fix: annotate one {DEFAULT_GROUP_CLASS_ANNOTATION}=true",
                     candidates.join(", ")
                 ),
             });

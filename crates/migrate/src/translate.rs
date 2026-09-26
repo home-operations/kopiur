@@ -101,10 +101,9 @@ pub(crate) fn map_access_modes(
         t.unmappable(
             field,
             &format!(
-                "{bad:?} is not a Kubernetes access mode (valid: {}); kopiur's CRD schema \
-                 would reject it at apply time, so it is not carried over. The emitted \
-                 Restore omits accessModes (the created PVC defaults to ReadWriteOnce) — \
-                 fix the VolSync value and re-run, or set target.pvc.accessModes by hand.",
+                "{bad:?} is not a Kubernetes access mode (valid: {}), so accessModes was \
+                 dropped and the new PVC defaults to ReadWriteOnce. Fix the VolSync value \
+                 and re-run, or set target.pvc.accessModes by hand.",
                 kopiur_api::common::PvcAccessMode::CANONICAL.join(", ")
             ),
         );
@@ -124,7 +123,7 @@ pub fn translate_source(
     let restic = spec
         .restic
         .as_ref()
-        .ok_or_else(|| format!("ReplicationSource {namespace}/{name} has no spec.restic block (a non-restic mover); kopiur migration covers restic sources only"))?;
+        .ok_or_else(|| format!("ReplicationSource {namespace}/{name} has no spec.restic block (non-restic mover); only restic sources are supported here"))?;
     let mut t = Translation::default();
 
     // --- SnapshotPolicy ---
@@ -154,9 +153,8 @@ pub fn translate_source(
             t.unmappable(
                 "spec.restic.copyMethod",
                 &format!(
-                    "unknown VolSync copyMethod {other:?}; translated to an explicit \
-                     SnapshotPolicy.spec.copyMethod: Direct — review whether this source \
-                     actually wants CSI staging (Snapshot/Clone) instead"
+                    "unknown VolSync copyMethod {other:?}; set to an explicit copyMethod: Direct. \
+                     Change it to Snapshot or Clone if this source needs CSI staging"
                 ),
             );
             "Direct"
@@ -173,7 +171,7 @@ pub fn translate_source(
         None => {
             t.mapped(
                 "spec.restic.copyMethod (absent; VolSync default is a live read)",
-                "SnapshotPolicy.spec.copyMethod: Direct (pinned explicitly)",
+                "SnapshotPolicy.spec.copyMethod: Direct (set explicitly)",
             );
         }
         // Unknown value — already recorded as Unmappable above.
@@ -210,8 +208,8 @@ pub fn translate_source(
             t.unmappable(
                 "spec.restic.retain.within",
                 &format!(
-                    "kopia has no keep-within ({within:?}); approximate with keepHourly/keepDaily \
-                     counts covering the same window"
+                    "kopia has no keep-within ({within:?}); use keepHourly/keepDaily counts that \
+                     cover the same window"
                 ),
             );
         }
@@ -259,8 +257,8 @@ pub fn translate_source(
     if restic.prune_interval_days.is_some() {
         t.ignored(
             "spec.restic.pruneIntervalDays",
-            "kopiur maintenance is default-managed per repository (quick 6h / full daily); \
-             tune the repository's spec.maintenance instead",
+            "kopiur runs maintenance per repository (quick every 6h, full daily); tune the \
+             Repository's spec.maintenance instead",
         );
     }
     if restic.unlock.is_some() {
@@ -272,7 +270,7 @@ pub fn translate_source(
     if restic.mover_service_account.is_some() {
         t.unmappable(
             "spec.restic.moverServiceAccount",
-            "kopiur mints a least-privilege per-namespace mover ServiceAccount itself",
+            "kopiur creates its own least-privilege mover ServiceAccount per namespace",
         );
     }
     if restic.custom_ca.is_some() {
@@ -286,7 +284,7 @@ pub fn translate_source(
             "spec.restic.storageClassName",
             &format!(
                 "kopiur stages Snapshot/Clone copies with the source PVC's StorageClass; \
-                 there is no per-policy staging-class override (was {class:?})"
+                 there is no per-policy override (was {class:?})"
             ),
         );
     }
@@ -299,8 +297,7 @@ pub fn translate_source(
     if restic.cache_access_modes.is_some() {
         t.unmappable(
             "spec.restic.cacheAccessModes",
-            "kopiur's mover cache has no access-mode override (it is a per-run \
-             ephemeral or controller-owned persistent volume)",
+            "the kopiur mover cache has no access-mode setting",
         );
     }
 
@@ -392,8 +389,7 @@ pub fn translate_destination(
                 if present {
                     t.ignored(
                         &format!("spec.restic.{field}"),
-                        "destinationPVC takes precedence; the restore writes into the \
-                         existing PVC and provisions nothing",
+                        "destinationPVC wins; the restore writes into that existing PVC",
                     );
                 }
             }
@@ -420,7 +416,7 @@ pub fn translate_destination(
         (None, None) => {
             return Err(format!(
                 "ReplicationDestination {namespace}/{name} has neither destinationPVC nor \
-                 capacity; kopiur needs an explicit restore target"
+                 capacity; set one so kopiur knows where to restore"
             ));
         }
     };
@@ -429,8 +425,8 @@ pub fn translate_destination(
         t.ignored(
             "spec.restic.copyMethod",
             &format!(
-                "kopiur restores write directly into the target PVC; VolSync's destination \
-                 copyMethod ({method:?}) has no role"
+                "kopiur restores write straight into the target PVC, so copyMethod \
+                 ({method:?}) is not needed"
             ),
         );
     }
@@ -445,8 +441,7 @@ pub fn translate_destination(
     if spec.trigger.is_some() {
         t.ignored(
             "spec.trigger",
-            "kopiur Restores are one-shot objects; create one per restore instead of a \
-             recurring destination trigger",
+            "a kopiur Restore runs once; create a new Restore each time you restore",
         );
     }
 
@@ -580,8 +575,8 @@ pub fn backend_from_restic_repository(
     } else {
         let scheme = url.split(':').next().unwrap_or(url);
         Err(format!(
-            "RESTIC_REPOSITORY {url:?}: scheme {scheme:?} is not translatable (kopiur supports \
-             s3/b2/azure/gcs/filesystem here); author the kopiur Repository by hand"
+            "RESTIC_REPOSITORY {url:?}: scheme {scheme:?} is not translatable (supported: \
+             s3/b2/azure/gcs/filesystem); write the kopiur Repository by hand"
         ))
     }
 }

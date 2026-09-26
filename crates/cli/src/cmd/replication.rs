@@ -134,7 +134,7 @@ pub fn failure_detail<K: ReplicationTarget>(obj: &K, name: &str, requested_at: &
         .unwrap_or_default();
     format!(
         "{} {name} requested run ({requested_at}) failed{condition_msg}\n\
-         the mover Job's logs are at `kubectl get jobs -l {}={name}`\n",
+         Find its Jobs with `kubectl get jobs -l {}={name}`\n",
         K::KIND,
         K::INSTANCE_LABEL,
     )
@@ -201,8 +201,8 @@ async fn detect_kind(ctx: &KubeCtx, name: &str) -> Result<ReplicationKindArg, Cl
         (false, true) => Ok(ReplicationKindArg::Snapshot),
         (true, true) => Err(CliError::AmbiguousTarget {
             what: format!(
-                "both a RepositoryReplication and a SnapshotReplication are named {name} in \
-                 namespace {ns}; pass --kind repository or --kind snapshot"
+                "a RepositoryReplication and a SnapshotReplication are both named {name} in \
+                 namespace {ns} (use --kind repository or --kind snapshot)"
             ),
             candidates: format!(
                 "{}/{name}, {}/{name}",
@@ -256,9 +256,8 @@ async fn run_kind<K: ReplicationTarget>(
         format!("{} {name} requested run", K::KIND),
         format!(
             "watch it with `kubectl get {} {name} -n {ns} -o jsonpath='{{.status.manualRun}}'`, \
-             or raise --timeout. A phase of Pending means the replication is suspended, or \
-             the request is waiting behind an in-flight run — `kubectl kopiur resume` it if \
-             suspended, or wait for the in-flight run to finish",
+             or raise --timeout. Pending means it is suspended (`kubectl kopiur resume` it) \
+             or waiting for a running replication to finish",
             K::PLURAL
         ),
         timeout,

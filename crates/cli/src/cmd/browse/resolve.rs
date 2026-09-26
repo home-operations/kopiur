@@ -237,9 +237,7 @@ pub async fn resolve_ca_bundle(
         return Err(CliError::CaBundleUnresolvable {
             repository: repo.name.clone(),
             detail: "tls.caBundleRef is set but names no ConfigMap".to_string(),
-            fix: "set tls.caBundleRef.configMapName on the repository, or remove the \
-                  caBundleRef block"
-                .to_string(),
+            fix: "set tls.caBundleRef.configMapName, or remove caBundleRef".to_string(),
         });
     };
     let ns = match &repo.namespace {
@@ -264,10 +262,7 @@ pub async fn resolve_ca_bundle(
         .ok_or_else(|| CliError::CaBundleUnresolvable {
             repository: repo.name.clone(),
             detail: format!("ConfigMap {ns}/{cm_name} not found"),
-            fix: format!(
-                "create it with the PEM CA bundle under key {key:?} (a ClusterRepository's \
-                 bundle lives in the operator's namespace; a Repository's in its own)"
-            ),
+            fix: format!("create it with the PEM CA bundle under key {key:?}"),
         })?;
     // Text under `data`, bytes under `binaryData` — accept both, like the
     // controller, so `kubectl create configmap --from-file` works either way.
@@ -293,8 +288,8 @@ pub async fn resolve_ca_bundle(
         return Err(CliError::CaBundleUnresolvable {
             repository: repo.name.clone(),
             detail: format!("ConfigMap {ns}/{cm_name} has no key {key:?} (found: {available:?})"),
-            fix: "add the PEM CA bundle under that key, or set tls.caBundleRef.key to one \
-                  of the existing keys"
+            fix: "add the PEM CA bundle under that key, or set tls.caBundleRef.key to an \
+                  existing key"
                 .to_string(),
         });
     };
@@ -305,9 +300,7 @@ pub async fn resolve_ca_bundle(
                 "ConfigMap {ns}/{cm_name} key {key:?} is not a PEM certificate bundle \
                  (no \"BEGIN CERTIFICATE\" block)"
             ),
-            fix: "store the CA chain PEM-encoded — kopia passes it to the TLS verifier \
-                  verbatim"
-                .to_string(),
+            fix: "store the CA chain PEM-encoded".to_string(),
         });
     }
     Ok(Some(pem))
@@ -334,9 +327,7 @@ async fn operator_namespace_for_ca(
             repository: repository.to_string(),
             configmap: configmap.to_string(),
             why: format!("no Deployment matches {selector} in any namespace"),
-            fix: "is the kopiur operator installed? The CA bundle is read from the \
-                  namespace the controller Deployment runs in"
-                .to_string(),
+            fix: "check that the kopiur operator is installed".to_string(),
         }),
         [only] => {
             only.metadata
@@ -353,8 +344,7 @@ async fn operator_namespace_for_ca(
             repository: repository.to_string(),
             configmap: configmap.to_string(),
             why: format!(
-                "{} Deployments match {selector}: {} — refusing to guess which install's \
-                 namespace to trust",
+                "{} Deployments match {selector}: {}, so the operator namespace is ambiguous",
                 many.len(),
                 many.iter()
                     .map(|d| format!(
@@ -365,8 +355,7 @@ async fn operator_namespace_for_ca(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            fix: "remove the impostor/stale Deployment (only one kopiur controller should \
-                  exist), or scope your kubeconfig to the real one"
+            fix: "remove the extra or stale controller Deployment (there should be only one)"
                 .to_string(),
         }),
     }

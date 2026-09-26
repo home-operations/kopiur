@@ -182,8 +182,8 @@ pub enum MoverError {
 
     /// No work spec was provided at all.
     #[error(
-        "no work spec: pass a path as the first arg, or set {} (inline JSON, how the \
-         controller passes it) or {} (a file path)",
+        "no work spec. Fix: set {} (inline JSON) or {} (a file path), or pass a path as the \
+         first arg",
         crate::env::WORK_SPEC,
         crate::env::WORK_SPEC_PATH
     )]
@@ -191,8 +191,8 @@ pub enum MoverError {
 
     /// The work-spec file could not be read.
     #[error(
-        "failed to read the work spec at {}: {source} — check the path (for a \
-         controller-created Job the spec is inline in the {} env instead)",
+        "could not read the work spec at {}: {source}. Fix: check the path, or set {} to \
+         pass it inline",
         .path.display(),
         crate::env::WORK_SPEC
     )]
@@ -206,8 +206,8 @@ pub enum MoverError {
 
     /// The work-spec file is not valid `MoverWorkSpec` JSON.
     #[error(
-        "failed to parse the work spec at {}: {source}. The controller and mover image versions \
-         may be skewed — redeploy so both run the same kopiur version",
+        "could not parse the work spec at {}: {source}. The controller and mover versions \
+         likely differ. Fix: run the same kopiur version for both",
         .path.display()
     )]
     WorkSpecParse {
@@ -227,8 +227,8 @@ pub enum MoverError {
 
     /// The server work-spec file could not be read.
     #[error(
-        "failed to read the server spec at {}: {source}. The controller mounts it via the \
-         server work-spec ConfigMap — check the Deployment's volume mount and {}",
+        "could not read the server spec at {}: {source}. Fix: check the Deployment's \
+         ConfigMap volume mount and {}",
         .path.display(),
         crate::env::SERVER_SPEC_PATH
     )]
@@ -242,8 +242,8 @@ pub enum MoverError {
 
     /// The server work-spec file is not valid `ServerWorkSpec` JSON.
     #[error(
-        "failed to parse the server spec at {}: {source}. The controller and mover image versions \
-         may be skewed — redeploy so both run the same kopiur version",
+        "could not parse the server spec at {}: {source}. The controller and mover versions \
+         likely differ. Fix: run the same kopiur version for both",
         .path.display()
     )]
     ServerSpecParse {
@@ -256,8 +256,8 @@ pub enum MoverError {
 
     /// The credential staging directory could not be created.
     #[error(
-        "failed to create the credential staging dir {}: {source}. The kopia-cache emptyDir must \
-         be mounted and writable by the mover's UID",
+        "could not create the credential dir {}: {source}. Fix: make sure the kopia-cache \
+         emptyDir is mounted and writable by the mover's UID",
         .path.display()
     )]
     CredentialStagingDir {
@@ -271,7 +271,7 @@ pub enum MoverError {
     /// A file-based backend credential (SFTP key, GCS JSON, rclone.conf) could
     /// not be written from its environment variable.
     #[error(
-        "failed to write the credential file {} (from ${env_key}): {source}. Check the \
+        "could not write the credential file {} (from ${env_key}): {source}. Fix: check the \
          credentials Secret key and that the kopia-cache emptyDir is writable",
         .path.display()
     )]
@@ -288,8 +288,8 @@ pub enum MoverError {
     /// The browse-session readiness marker could not be written, so the
     /// session pod would never turn Ready and the CLI would hang waiting.
     #[error(
-        "failed to write the browse-session readiness marker {}: {source}. The kopia-cache \
-         emptyDir must be mounted at /var/cache/kopia and writable by the mover's UID",
+        "could not write the browse-session ready marker {}: {source}. Fix: mount the \
+         kopia-cache emptyDir at /var/cache/kopia, writable by the mover's UID",
         .path.display()
     )]
     ReadyMarkerWrite {
@@ -306,9 +306,8 @@ pub enum MoverError {
     /// it into a failure rather than a false pass), and the deep tier when
     /// there is no snapshot to scratch-restore.
     #[error(
-        "verification found no snapshot for source path {source_path:?}: the \
-         repository has no snapshot for this identity yet. Run a backup first (the operator \
-         normally schedules verification only after the first successful backup)"
+        "verification found no snapshot for source path {source_path:?}: the repository has \
+         no snapshot for this identity yet. Run a backup first"
     )]
     VerifyNoSnapshot {
         /// The identity source path the lookup keyed on.
@@ -320,8 +319,8 @@ pub enum MoverError {
     /// Restore never retries); the fix is to create the snapshot, widen
     /// `source.asOf`/`offset`, or choose `Continue` to come up empty.
     #[error(
-        "no snapshot matched the restore source ({identity}) within the wait window; create the \
-         snapshot, widen source.asOf/offset, or set onMissingSnapshot: Continue to come up empty"
+        "no snapshot matched the restore source ({identity}) within the wait window. Fix: \
+         create the snapshot, widen source.asOf/offset, or set onMissingSnapshot: Continue"
     )]
     RestoreNoSnapshot {
         /// The kopia identity the listing keyed on (`user@host:path`).
@@ -343,10 +342,9 @@ pub enum MoverError {
     /// preflight probe before kopia runs (the non-root mover cannot create a dir
     /// under root-owned `/` unless a writable volume is mounted at the path).
     #[error(
-        "deep verify scratch path {} is not writable by the mover (uid {uid}): {source}. The \
-         controller must mount a writable volume there — set verification.deep.capacity (or \
-         moverDefaults.scratch.capacity), optionally with a storageClassName, to provision a \
-         sized ephemeral PVC, or leave them unset for an emptyDir",
+        "deep verify scratch path {} is not writable (uid {uid}): {source}. Fix: set \
+         verification.deep.capacity (or moverDefaults.scratch.capacity) for a sized volume, or \
+         leave both unset to use an emptyDir",
         .path.display()
     )]
     ScratchNotWritable {
@@ -397,8 +395,8 @@ pub enum MoverError {
     /// A kube client could not be built (the side-channel status PATCHes need
     /// in-cluster ServiceAccount credentials).
     #[error(
-        "failed to build a kube client: {source}. In-cluster ServiceAccount credentials are \
-         required for status PATCHes"
+        "could not build a kube client: {source}. Fix: run with in-cluster ServiceAccount \
+         credentials"
     )]
     KubeClient {
         /// The underlying kube error (boxed: `kube::Error` is large and this
@@ -408,7 +406,7 @@ pub enum MoverError {
     },
 
     /// A CR status PATCH failed.
-    #[error("failed to PATCH the status of {kind} {namespace}/{name}: {source}")]
+    #[error("could not update the status of {kind} {namespace}/{name}: {source}")]
     StatusPatch {
         /// The target CR kind.
         kind: String,
@@ -427,10 +425,8 @@ pub enum MoverError {
     /// the rejected call was a GET, which sent the reporter debugging the wrong
     /// request.
     #[error(
-        "failed to read the status of {kind} {namespace}/{name} (GET on the /status \
-         subresource): {source}. The mover reads status.resolved to reuse the snapshot a \
-         prior attempt pinned instead of re-resolving from the repository. Fix: grant `get` \
-         on the CRD's /status subresource in the kopiur-mover role (shipped by default)"
+        "could not read the status of {kind} {namespace}/{name} (GET on /status): {source}. \
+         Fix: grant `get` on the CRD's /status subresource in the kopiur-mover role"
     )]
     StatusRead {
         /// The target CR kind.
@@ -445,7 +441,7 @@ pub enum MoverError {
     },
 
     /// The bootstrap result could not be serialized.
-    #[error("failed to serialize the bootstrap result: {source}")]
+    #[error("could not serialize the bootstrap result: {source}")]
     ResultSerialize {
         /// The underlying JSON error.
         #[source]
@@ -454,9 +450,8 @@ pub enum MoverError {
 
     /// The bootstrap result could not be written into the work-spec ConfigMap.
     #[error(
-        "failed to write the bootstrap result into ConfigMap {namespace}/{configmap}: {source}. \
-         The controller cannot read the outcome — check the mover Role's ConfigMap patch \
-         permission"
+        "could not write the bootstrap result to ConfigMap {namespace}/{configmap}: {source}. \
+         Fix: grant the mover Role `patch` on ConfigMaps"
     )]
     ResultConfigMapPatch {
         /// The ConfigMap name.
@@ -472,9 +467,9 @@ pub enum MoverError {
     /// controller injects it via a `secretKeyRef` under the dedicated name so
     /// it can never collide with the source's `KOPIA_PASSWORD`.
     #[error(
-        "the replication destination's kopia password is missing: ${env_key} is unset. The \
-         controller injects it from the destination repository's encryption Secret — check the \
-         mover Job's env and that the destination Secret (or its projected copy) exists"
+        "the replication destination's kopia password is missing (${env_key} is unset). Fix: \
+         check that the destination repository's encryption Secret (or its projected copy) \
+         exists"
     )]
     DestPasswordMissing {
         /// The env var that should carry the destination password
@@ -489,12 +484,10 @@ pub enum MoverError {
     /// silently reusing this one would surface as a confusing `AuthFailure`
     /// against the source.
     #[error(
-        "the seed source repository's kopia password is missing: ${env_key} is unset, so \
-         `spec.seed`'s source repository cannot be opened. The controller injects it from the \
-         SOURCE repository's encryption Secret. Fix: check the source repository CR exists and \
-         is readable and its encryption Secret (or its projected copy) is present; a \
-         cross-namespace source also needs spec.seed.credentialProjection and the operator's \
-         features.credentialProjection install flag"
+        "the `spec.seed` source repository's kopia password is missing (${env_key} is unset). \
+         Fix: check the source repository exists and its encryption Secret (or projected copy) \
+         is present; a cross-namespace source also needs spec.seed.credentialProjection and \
+         the features.credentialProjection install flag"
     )]
     SeedPasswordMissing {
         /// The env var that should carry the seed source's password
@@ -508,12 +501,10 @@ pub enum MoverError {
     /// code 0 does not mean every selected snapshot arrived — the post-verify
     /// is the real success gate.
     #[error(
-        "snapshot replication is incomplete: {missing} of {expected} expected snapshot(s) did \
-         not arrive on the destination. `kopia snapshot migrate` exits 0 even when a per-source \
-         migration fails, so the post-verify is the real success gate — see the mover pod logs \
-         for kopia's per-source errors. Missing (up to {sample_cap} shown): {sample}. Retried \
-         automatically; migrate is idempotent by (identity, startTime), so it copies only what \
-         is still missing",
+        "snapshot replication is incomplete: {missing} of {expected} snapshot(s) did not \
+         arrive on the destination (kopia's per-source errors are in the mover pod logs). \
+         Missing (up to {sample_cap} shown): {sample}. Retried automatically; only missing \
+         snapshots are copied",
         sample_cap = MISSING_SAMPLE_CAP
     )]
     MigrateIncomplete {
@@ -529,10 +520,9 @@ pub enum MoverError {
     /// this run. The reconciliation is SSA-idempotent and re-runs over the full
     /// correspondence set every run, so a retry converges.
     #[error(
-        "snapshot replication copied data but {failed} of {total} destination-side copy \
-         Snapshot CR(s) could not be reconciled; see the mover pod logs for the per-CR kube \
-         errors. The reconciliation is idempotent (server-side apply over the full \
-         correspondence set), so the next run re-attempts only what is still missing"
+        "snapshot replication copied data but {failed} of {total} destination Snapshot CR(s) \
+         could not be created or updated (errors are in the mover pod logs). The next run \
+         retries them"
     )]
     CopyCrSyncIncomplete {
         /// How many copy-CR reconciliations failed.
@@ -544,9 +534,9 @@ pub enum MoverError {
     /// A copy-CR LIST (the reconciliation's or pruning's candidate read)
     /// failed, so the whole wave could not even start.
     #[error(
-        "snapshot replication could not list Snapshot CRs for {context}: {source}. Check the \
-         dedicated snapshot-replication mover Role (get/list/create/patch/delete on snapshots \
-         + snapshots/status patch) and the apiserver's availability; the run will be retried"
+        "snapshot replication could not list Snapshot CRs for {context}: {source}. Fix: check \
+         the snapshot-replication mover Role grants get/list/create/patch/delete on snapshots \
+         and patch on snapshots/status. The run will be retried"
     )]
     ReplicationCrList {
         /// Which wave needed the LIST ("copy-CR reconciliation" / "pruning").
@@ -559,9 +549,8 @@ pub enum MoverError {
     /// Some prune deletes (retention/mirrorSource) failed this run. Pruning
     /// re-selects from live state every run, so a retry converges.
     #[error(
-        "snapshot replication pruning completed incompletely: {failed} of {total} copy \
-         Snapshot CR delete(s) failed; see the mover pod logs for the per-CR kube errors. \
-         Pruning re-selects from live state each run, so the next run re-attempts what remains"
+        "snapshot replication pruning: {failed} of {total} Snapshot CR delete(s) failed \
+         (errors are in the mover pod logs). The next run retries them"
     )]
     PruneIncomplete {
         /// How many prune deletes failed.
@@ -584,10 +573,8 @@ pub enum MoverError {
     /// `warn!` per failing member); this variant just names how many failed,
     /// since the batch has no per-item CR status to carry a breakdown.
     #[error(
-        "batch snapshot delete completed incompletely: {failed} of {total} member deletes \
-         failed; see the mover pod logs for the per-item kopia errors. Deletes are idempotent, \
-         so retrying (the Job, or the next scheduled batch) only re-attempts what is still \
-         outstanding"
+        "batch snapshot delete: {failed} of {total} member deletes failed (errors are in the \
+         mover pod logs). A retry only re-attempts the ones still outstanding"
     )]
     BatchDeleteIncomplete {
         /// How many of the batch's members failed to delete.
@@ -895,8 +882,8 @@ mod tests {
         let msg = err.to_string();
         // what: how many of the batch failed
         assert!(msg.contains("2 of 5 member deletes failed"), "{msg}");
-        // fix: retrying only re-attempts what's outstanding (idempotent deletes)
-        assert!(msg.contains("idempotent"), "{msg}");
+        // fix: a retry only re-attempts what is outstanding
+        assert!(msg.contains("still outstanding"), "{msg}");
         assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
     }
 
@@ -910,7 +897,7 @@ mod tests {
         assert!(msg.contains("$KOPIUR_SEED_KOPIA_PASSWORD"), "{msg}");
         // why: it belongs to the SOURCE repository, not this one
         assert!(
-            msg.contains("SOURCE repository's encryption Secret"),
+            msg.contains("source repository exists and its encryption Secret"),
             "{msg}"
         );
         // fix: the cross-namespace case needs projection AND the install flag
@@ -947,12 +934,11 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("3 of 12"), "{msg}");
-        // why: kopia exits 0 on per-source failures — the caveat that makes
-        // the post-verify mandatory must be stated to the reader.
-        assert!(msg.contains("exits 0"), "{msg}");
-        // sample list is present, retry guidance names the idempotency key.
+        // why: the per-source errors live in the mover pod logs.
+        assert!(msg.contains("mover pod logs"), "{msg}");
+        // sample list is present, plus the retry guidance.
         assert!(msg.contains("a@h:/p@2026-08-01T00:00:00Z"), "{msg}");
-        assert!(msg.contains("(identity, startTime)"), "{msg}");
+        assert!(msg.contains("Retried automatically"), "{msg}");
         assert_eq!(err.kopia_class(), KopiaErrorClass::Unknown);
     }
 
@@ -964,7 +950,7 @@ mod tests {
         };
         let msg = sync.to_string();
         assert!(msg.contains("2 of 40"), "{msg}");
-        assert!(msg.contains("idempotent"), "{msg}");
+        assert!(msg.contains("next run retries"), "{msg}");
 
         let prune = MoverError::PruneIncomplete {
             failed: 1,
@@ -972,7 +958,7 @@ mod tests {
         };
         let msg = prune.to_string();
         assert!(msg.contains("1 of 5"), "{msg}");
-        assert!(msg.contains("re-selects from live state"), "{msg}");
+        assert!(msg.contains("next run retries"), "{msg}");
     }
 
     #[test]

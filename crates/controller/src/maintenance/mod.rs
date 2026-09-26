@@ -137,9 +137,8 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
             maint,
             "False",
             crate::consts::WAITING_FOR_REPOSITORY_REASON,
-            "target repository is not ready for maintenance: it has never bootstrapped, its \
-             backend is confirmed unreachable or the repository vanished, or it is in a terminal \
-             or unknown phase; deferring maintenance",
+            "waiting for the repository: it is not bootstrapped, unreachable, gone, or failed; \
+             maintenance runs once it is healthy",
         )
         .await?;
         return Ok(Action::requeue(REQUEUE_NOT_READY));
@@ -474,8 +473,8 @@ async fn handle_manual_run(
                 maint,
                 "False",
                 "ManualRunOutcomeLost",
-                "the manual maintenance Job disappeared before its outcome was observed \
-                 (TTL-reaped?); re-annotate to run again",
+                "the manual maintenance Job was deleted before its result was read; \
+                 re-annotate to run again",
             )
             .await?;
             Ok(None)
@@ -507,7 +506,7 @@ async fn handle_manual_run(
                 },
             )
             .await?;
-            tracing::info!(maint = %name, ?mode, requested = %requested.to_rfc3339(), "spawned MANUAL maintenance Job");
+            tracing::info!(maint = %name, ?mode, requested = %requested.to_rfc3339(), "spawned manual maintenance Job");
             Ok(Some(Action::requeue(REQUEUE_RUNNING)))
         }
     }
@@ -1108,16 +1107,14 @@ async fn set_ready_if_changed(
             io::ReadyOutcome::Stalled,
             "MaintenanceYielding",
             format!(
-                "maintenance Jobs are yielding without running ({holder}); repository \
-                 GC/compaction is not happening. Fix: set \
-                 spec.ownership.takeoverPolicy=Force once so the operator claims kopia's \
-                 maintenance ownership, then revert it"
+                "maintenance is not running because another owner holds it ({holder}). Fix: \
+                 set spec.ownership.takeoverPolicy=Force once to take ownership, then revert it"
             ),
         ),
         None => (
             io::ReadyOutcome::Ready,
             "Reconciled",
-            "maintenance is reconciled; the target repository accepts maintenance".to_string(),
+            "maintenance is reconciled".to_string(),
         ),
     };
     // Transition guard (G6): only write when Ready does not already reflect

@@ -1120,8 +1120,8 @@ fn log_scan_summary(
             meta_malformed = outcome.meta_malformed,
             create_failed = outcome.create_failed,
             backfill_failed,
-            "catalog scan degraded some entries (kopiur-meta undecodable and/or \
-             apiserver-rejected rows); affected rows carry no status.recorded"
+            "catalog scan could not fully record some snapshots (unreadable kopiur-meta or \
+             rejected by the API server); those rows have no status.recorded"
         );
     }
 }
@@ -1177,8 +1177,8 @@ async fn create_discovered_rows(
                         entry = %entry.id,
                         code = ae.code,
                         reason = %ae.message,
-                        "skipping a discovered entry the apiserver rejected; the scan \
-                         continues (first rejection logged; total in the scan summary)"
+                        "API server rejected a discovered snapshot; skipping it (only the first is \
+                         logged; see the scan summary for the total)"
                     );
                 }
             }
@@ -1249,8 +1249,8 @@ async fn backfill_recorded_meta(
                             snapshot = %cr.name_any(),
                             namespace = %ns,
                             error = %e,
-                            "recorded-metadata backfill patch failed; skipping \
-                             (first failure logged; total in the scan summary)"
+                            "could not backfill recorded metadata; skipping (only the first failure is \
+                             logged; see the scan summary for the total)"
                         );
                     }
                 }

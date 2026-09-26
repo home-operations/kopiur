@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "no Kubernetes client available; ClusterRepository tenancy checks will fail closed"
+                "no Kubernetes client; ClusterRepository access checks will deny"
             );
             None
         }
@@ -60,9 +60,9 @@ async fn main() -> anyhow::Result<()> {
         _ => {
             tracing::warn!(
                 %addr,
-                "KOPIUR_WEBHOOK_TLS_CERT/KEY not set: serving admission webhook over PLAIN HTTP. \
-                 This is only safe behind a TLS-terminating mesh or for local testing — the \
-                 Kubernetes API server requires HTTPS for real webhook registration."
+                "KOPIUR_WEBHOOK_TLS_CERT/KEY not set: serving admission webhook over plain HTTP; \
+                 the API server requires HTTPS, so this only works behind a TLS-terminating mesh \
+                 or for local testing"
             );
             serve_http(addr, router).await
         }
@@ -73,8 +73,8 @@ async fn serve_http(addr: SocketAddr, router: axum::Router) -> anyhow::Result<()
     use anyhow::Context as _;
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
         format!(
-            "binding the webhook server to {addr}; if this host has IPv6 disabled a `[::]` bind \
-             fails — set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (via webhook.extraEnv)",
+            "could not bind the webhook server to {addr}. Fix: if IPv6 is disabled, set \
+             KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (via webhook.extraEnv)",
             addr.port()
         )
     })?;
@@ -122,9 +122,8 @@ async fn serve_tls(
         .await
         .with_context(|| {
             format!(
-                "binding the webhook TLS server to {addr}; if this host has IPv6 disabled a \
-                 `[::]` bind fails — set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (via \
-                 webhook.extraEnv)",
+                "could not bind the webhook TLS server to {addr}. Fix: if IPv6 is disabled, \
+                 set KOPIUR_WEBHOOK_ADDR=0.0.0.0:{} (via webhook.extraEnv)",
                 addr.port()
             )
         })?;

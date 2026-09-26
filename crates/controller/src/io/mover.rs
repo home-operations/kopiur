@@ -163,7 +163,7 @@ pub async fn legacy_bootstrap_cleared(
             tracing::info!(
                 repository = %repo_name,
                 job = %legacy_job,
-                "reaping the pre-rename bootstrap Job (foreground) before creating its discovery successor"
+                "deleting the legacy bootstrap Job before creating the discovery Job"
             );
             delete_mover_run_with(client, namespace, &legacy_job, &DeleteParams::foreground())
                 .await?;
@@ -173,7 +173,7 @@ pub async fn legacy_bootstrap_cleared(
             tracing::debug!(
                 repository = %repo_name,
                 job = %legacy_job,
-                "waiting for the pre-rename bootstrap Job to finish terminating"
+                "waiting for the legacy bootstrap Job to be deleted"
             );
             Ok(false)
         }
@@ -601,9 +601,8 @@ pub async fn namespace_stream_exec_opt_in(
         Err(kube::Error::Api(e)) if e.code == 403 => {
             tracing::warn!(
                 namespace = ns,
-                "cannot read namespace to check the stream-exec opt-in (operator lacks \
-                 namespaces:get); REFUSING the stream mover — `pods/exec` is too large a \
-                 grant to hand out on an unverifiable inference"
+                "cannot read namespace to check the stream-exec opt-in (no namespaces:get); \
+                 refusing the stream mover"
             );
             Ok(StreamExecOptIn::Undeterminable)
         }
@@ -656,12 +655,10 @@ pub fn stream_exec_refusal(
 /// opted in (what / why / how-to-fix). Pure so the exact text is unit-asserted.
 pub fn stream_exec_not_allowed_message(kind: &str, name: &str, ns: &str, mover_sa: &str) -> String {
     format!(
-        "{kind} `{name}` uses a `stream` source, which execs a command inside a running pod in \
-         namespace `{ns}`, but that namespace has not opted in. Anyone able to write a {kind} in \
-         `{ns}` could otherwise run arbitrary commands in any pod there without holding \
-         `pods/exec` themselves, and the minted `{mover_sa}` ServiceAccount would carry that \
-         permission for the whole namespace. Fix: a cluster admin runs `kubectl annotate \
-         namespace {ns} {STREAM_EXEC_ANNOTATION}=true`, or use a PVC source instead."
+        "{kind} `{name}` uses a `stream` source, which runs commands in pods in namespace \
+         `{ns}`, but the namespace has not opted in (the `{mover_sa}` ServiceAccount would get \
+         `pods/exec` there). Fix: a cluster admin runs `kubectl annotate namespace {ns} \
+         {STREAM_EXEC_ANNOTATION}=true`, or use a PVC source."
     )
 }
 
@@ -674,16 +671,10 @@ pub fn stream_exec_not_allowed_message(kind: &str, name: &str, ns: &str, mover_s
 /// a cluster-scoped install that is getting a 403 has something else denying it.
 pub fn stream_exec_opt_in_unreadable_message(kind: &str, name: &str, ns: &str) -> String {
     format!(
-        "{kind} `{name}` uses a `stream` source, but kopiur cannot read Namespace `{ns}` to \
-         check the `{STREAM_EXEC_ANNOTATION}` opt-in (the API server returned 403), so it \
-         refuses to mint the `pods/exec` permission the stream mover needs. Unlike the \
-         elevated-mover check, this one fails CLOSED on purpose: `pods/exec` in `{ns}` is \
-         arbitrary code execution in every pod there, carried on a ServiceAccount that \
-         outlives the Job, and kopiur cannot verify from a 403 alone that handing it out is \
-         safe. Fix: grant the kopiur operator ServiceAccount `get` on the cluster-scoped \
-         `namespaces` resource (a namespaced-scope install has no such rule by default), or \
-         deploy kopiur cluster-scoped — stream sources require the opt-in to be readable. \
-         Otherwise use a PVC source, which needs neither."
+        "{kind} `{name}` uses a `stream` source, but kopiur cannot read Namespace `{ns}` \
+         (403) to check the `{STREAM_EXEC_ANNOTATION}` opt-in, so it refuses to grant \
+         `pods/exec`. Fix: give the operator ServiceAccount `get` on `namespaces`, install \
+         kopiur cluster-scoped, or use a PVC source."
     )
 }
 
@@ -723,10 +714,9 @@ pub fn missing_workload_identity_sa_message(
         WorkloadIdentityCloud::Gcs => "iam.gke.io/gcp-service-account",
     };
     format!(
-        "backend auth.workloadIdentity names ServiceAccount `{sa}`, but it does not exist in \
-         namespace `{ns}` where {consumer} runs — Kopiur never creates it (its cloud-federation \
-         annotations are your contract with the cloud's identity webhook). Fix: create \
-         ServiceAccount `{sa}` in `{ns}` with the federation binding ({annotation})."
+        "workload-identity ServiceAccount `{sa}` does not exist in namespace `{ns}` where \
+         {consumer} runs; kopiur never creates it. Fix: create ServiceAccount `{sa}` in `{ns}` \
+         with the federation binding ({annotation})."
     )
 }
 
@@ -907,7 +897,7 @@ pub async fn namespace_allows_privileged_movers(client: &kube::Client, ns: &str)
         Err(kube::Error::Api(e)) if e.code == 403 => {
             tracing::warn!(
                 namespace = ns,
-                "cannot read namespace to check the privileged-movers opt-in (operator lacks \
+                "cannot read namespace to check the privileged-movers opt-in (no \
                  namespaces:get); allowing the privileged mover"
             );
             Ok(true)
@@ -1000,12 +990,12 @@ pub fn privileged_mover_message(
     mover_sa: &str,
 ) -> String {
     format!(
-        "the mover for this run is privileged (e.g. `runAsUser: 0`, `privileged: true`, \
-         added capabilities, or `privilegedMode`), but namespace `{ns}` has not opted in — a \
-         tenant with access to `{ns}` could reuse the minted `{mover_sa}` ServiceAccount at \
-         that privilege. The elevation comes from {kind} `{name}` `{field}`. Fix: remove the \
-         elevated securityContext/privilegedMode there; or, to allow it for EVERY mover in \
-         namespace `{ns}` from now on, a cluster admin runs `kubectl annotate namespace {ns} \
+        "the mover is privileged (e.g. `runAsUser: 0`, `privileged: true`, added capabilities, \
+         or `privilegedMode`), but namespace `{ns}` has not opted in; anyone with access to \
+         `{ns}` could reuse the `{mover_sa}` ServiceAccount at that privilege. The elevation \
+         comes from {kind} `{name}` `{field}`. Fix: remove the elevated \
+         securityContext/privilegedMode there, or, to allow it for every mover in namespace \
+         `{ns}`, a cluster admin runs `kubectl annotate namespace {ns} \
          {PRIVILEGED_MOVERS_ANNOTATION}=true`."
     )
 }
@@ -1218,9 +1208,8 @@ pub async fn resolve_inherited_security_context(
     let query = label_selector_to_string(&selector.pod_selector);
     if query.is_empty() {
         return Err(Error::MissingDependency(format!(
-            "mover.inheritSecurityContextFrom.podSelector is empty in namespace `{ns}` — set \
-             matchLabels/matchExpressions identifying the workload pod whose securityContext the \
-             mover should inherit (UID/GID match)"
+            "mover.inheritSecurityContextFrom.podSelector is empty in namespace `{ns}`. Fix: \
+             set matchLabels or matchExpressions to select the workload pod to inherit from"
         )));
     }
     let api: Api<Pod> = Api::namespaced(client.clone(), ns);
@@ -1243,12 +1232,10 @@ pub fn inherited_security_context_from_pods(
 ) -> Result<InheritSource> {
     if pods.is_empty() {
         return Err(Error::MissingDependency(format!(
-            "no pod matches mover.inheritSecurityContextFrom (`{query}`) in namespace `{ns}` — \
-             inheriting reads a LIVE pod's securityContext, so the workload must be running for \
-             its UID/GID to be read. Scale it up, or fix podSelector.matchLabels. To keep backups \
-             running while it is down, set mover.securityContext.runAsUser: an explicit context \
-             that pins an identity is used as the fallback (and this run proceeds) instead of \
-             being held here."
+            "no pod matches mover.inheritSecurityContextFrom (`{query}`) in namespace `{ns}`; \
+             the workload must be running to inherit its UID/GID. Scale it up, or fix \
+             podSelector.matchLabels. To keep backups running while it is down, set \
+             mover.securityContext.runAsUser as a fallback."
         )));
     }
     // Prefer a Running pod; otherwise take the first match.
@@ -1291,7 +1278,7 @@ fn extract_inherited_contexts(
         Some(name) => Some(containers.iter().find(|c| c.name == name).ok_or_else(|| {
             Error::MissingDependency(format!(
                 "pod `{}` (matched by mover.inheritSecurityContextFrom in `{ns}`) has no \
-                 container `{name}` — fix `inheritSecurityContextFrom.container`",
+                 container `{name}`. Fix: correct `inheritSecurityContextFrom.container`",
                 pod.name_any()
             ))
         })?),
@@ -1303,11 +1290,9 @@ fn extract_inherited_contexts(
     let pod_sc = pod.spec.as_ref().and_then(|s| s.security_context.clone());
     if container_sc.is_none() && pod_sc.is_none() {
         return Err(Error::MissingDependency(format!(
-            "pod `{}` (mover.inheritSecurityContextFrom, `{ns}`) sets no securityContext at all \
-             — neither a container nor a pod-level one — so there is nothing to inherit. Its UID \
-             comes from its container image, which Kopiur cannot read from the pod spec. Set \
-             runAsUser on the workload, or set mover.securityContext.runAsUser to that image's \
-             UID (it merges with, and overrides, inherited values).",
+            "pod `{}` (mover.inheritSecurityContextFrom, `{ns}`) sets no securityContext, so \
+             there is nothing to inherit; its UID comes from its container image. Set runAsUser \
+              on the workload, or set mover.securityContext.runAsUser to that UID.",
             pod.name_any()
         )));
     }
@@ -1331,9 +1316,9 @@ pub async fn resolve_pvc_consumer_security_context(
 ) -> Result<(InheritSource, Vec<Pod>)> {
     let claim = source_pvc.ok_or_else(|| {
         Error::MissingDependency(
-            "mover.inheritSecurityContextFrom.pvcConsumer is only valid for a backup whose source \
-             is a single PVC — this run has no source PVC to derive the workload from; use \
-             workloadSelector or an explicit mover.securityContext instead"
+            "mover.inheritSecurityContextFrom.pvcConsumer needs a backup with a single PVC \
+             source, and this run has none. Fix: use workloadSelector or set \
+             mover.securityContext"
                 .to_string(),
         )
     })?;
@@ -1370,12 +1355,10 @@ pub fn pvc_consumer_security_context_from_pods(
     });
     let pod = consumers.first().ok_or_else(|| {
         Error::MissingDependency(format!(
-            "no running workload pod mounts the backup source PVC `{claim}` in namespace `{ns}` \
-             — mover.inheritSecurityContextFrom.pvcConsumer derives the mover's UID/GID from the \
-             pod that consumes this PVC, so that pod must be running. Scale the workload up. To \
-             keep backups running while it is down, set mover.securityContext.runAsUser: an \
-             explicit context that pins an identity is used as the fallback (and this run \
-             proceeds) instead of being held here."
+            "no running workload pod mounts the backup source PVC `{claim}` in namespace \
+             `{ns}`, so pvcConsumer has no UID/GID to inherit. Scale the workload up. To \
+             keep backups running while it is down, set mover.securityContext.runAsUser as a \
+             fallback."
         ))
     })?;
     // Pass the claim: with no explicit `container`, prefer the one that actually MOUNTS the
@@ -1461,7 +1444,7 @@ pub(crate) fn live_inherit_source_label(
         InheritSecurityContextFrom::WorkloadSelector(sel) => {
             let query = label_selector_to_string(&sel.pod_selector);
             Some(if query.is_empty() {
-                "workloadSelector with an EMPTY podSelector".to_string()
+                "workloadSelector with an empty podSelector".to_string()
             } else {
                 format!("workloadSelector `{query}`")
             })
@@ -1493,10 +1476,9 @@ pub(crate) fn live_inherit_source_label(
 /// status on every pass, wake the primary watch and hot-loop the reconciler.
 pub fn inherit_source_missing_message(source: &str, cause: &str) -> String {
     format!(
-        "mover.inheritSecurityContextFrom ({source}) resolved no securityContext to inherit, \
-         and this recipe pins no fallback identity — so the run is HELD rather than run as the \
-         wrong UID. {} The run stays `Pending` and re-checks every few minutes; it starts by \
-         itself once that is fixed, with no re-apply.",
+        "mover.inheritSecurityContextFrom ({source}) found nothing to inherit and no fallback \
+         UID is set, so the run is held rather than run as the wrong UID. {} The run stays \
+         `Pending`, re-checks every few minutes, and starts once this is fixed.",
         end_sentence(cause)
     )
 }
@@ -1531,13 +1513,15 @@ pub(crate) fn conditions_from_status(status: Option<&serde_json::Value>) -> Vec<
     };
     items
         .iter()
-        .filter_map(|item| match serde_json::from_value::<Condition>(item.clone()) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "conditions: skipping an unparseable status condition");
-                None
-            }
-        })
+        .filter_map(
+            |item| match serde_json::from_value::<Condition>(item.clone()) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping an unparseable status condition");
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -1705,7 +1689,7 @@ pub(crate) fn inherit_source_heal_conditions(
         kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
         true,
         kopiur_api::consts::INHERIT_SOURCE_RESOLVED_REASON,
-        "the mover securityContext resolved; the inherit hold has cleared",
+        "mover securityContext resolved",
         generation,
     ))
 }
@@ -1816,11 +1800,9 @@ pub async fn resolve_mover_security_contexts(
                 // variant unreachable on their kinds — so reaching this arm without a
                 // source is an operator bug, reported actionably instead of panicking.
                 return Err(Error::Invariant(format!(
-                    "mover.inheritSecurityContextFrom.snapshot reached a reconciler that \
-                     resolved no recorded-identity source in namespace `{ns}` — this variant \
-                     is restore-only (admission rejects it on SnapshotPolicy/Maintenance/\
-                     RepositoryReplication). This is a kopiur bug; please report it. As a \
-                     workaround, set mover.securityContext explicitly."
+                    "mover.inheritSecurityContextFrom.snapshot is restore-only but reached a \
+                     non-restore reconciler in namespace `{ns}`. This is a kopiur bug; please \
+                     report it. Workaround: set mover.securityContext."
                 )));
             };
             match &source.meta {
@@ -1832,11 +1814,9 @@ pub async fn resolve_mover_security_contexts(
                 // reconciler turns the propagated error into the
                 // `MissingRecordedIdentity` condition + slow requeue.
                 None => Err(Error::MissingDependency(format!(
-                    "Snapshot `{}` carries no recorded identity (`status.recorded`) — it \
-                     predates the kopiur-meta feature or was written by a foreign tool; the \
-                     catalog scan backfills it when the kopia snapshot carries the tag. Set \
-                     mover.securityContext explicitly, or use \
-                     inheritSecurityContextFrom.workloadSelector.",
+                    "Snapshot `{}` carries no recorded identity (`status.recorded`); it is older \
+                     than this feature or was not made by kopiur. Fix: set \
+                     mover.securityContext, or use inheritSecurityContextFrom.workloadSelector.",
                     source.snapshot
                 ))),
             }

@@ -83,10 +83,9 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     {
         errs.push(ValidationError::InvalidFieldValue {
             field: "spec.groupBy".to_string(),
-            reason: "`copyMethod: Clone` clones each PVC independently and has no group \
-                     equivalent, so it cannot honor `groupBy: VolumeGroupSnapshot` (the \
-                     default). Use `copyMethod: Snapshot` for a consistency group, or set \
-                     `groupBy: None` to accept independent clones"
+            reason: "`copyMethod: Clone` cannot do `groupBy: VolumeGroupSnapshot` (the \
+                     default). Fix: use `copyMethod: Snapshot` for a consistency group, or set \
+                     `groupBy: None`"
                 .to_string(),
         });
     }
@@ -130,13 +129,10 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
         {
             errs.push(ValidationError::InvalidFieldValue {
                 field: format!("spec.sources[{i}].readOnly"),
-                reason: "copyMethod: Direct with readOnly: false mounts the LIVE source volume \
-                         read-write, so the kubelet will recursively chgrp its contents to the \
-                         mover's fsGroup (65532 by default) and make them group-writable — \
-                         permanently, while the workload is running. Prefer copyMethod: \
-                         Snapshot/Clone, which applies fsGroup to a throwaway staged copy and \
-                         never touches your data. If you do mean to rewrite the live volume, \
-                         set acknowledgeLiveMutation: true on this source"
+                reason: "copyMethod: Direct with readOnly: false lets the kubelet permanently \
+                         change ownership of the live volume to the mover's fsGroup. Fix: use \
+                         copyMethod: Snapshot/Clone, or set acknowledgeLiveMutation: true on \
+                         this source if you mean it"
                     .to_string(),
             });
         }
@@ -150,9 +146,8 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     if spec.volume_snapshot_class_name.is_some() && spec.sources.iter().any(|s| s.nfs.is_some()) {
         errs.push(ValidationError::InvalidFieldValue {
             field: "spec.volumeSnapshotClassName".to_string(),
-            reason: "an NFS source cannot be CSI-snapshotted, so volumeSnapshotClassName is \
-                     meaningless with it; remove volumeSnapshotClassName (NFS is read directly), \
-                     or use a PVC source for copyMethod: Snapshot/Clone"
+            reason: "does not apply to an NFS source, which cannot be CSI-snapshotted. Fix: \
+                     remove volumeSnapshotClassName"
                 .to_string(),
         });
     }
@@ -161,9 +156,8 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     {
         errs.push(ValidationError::InvalidFieldValue {
             field: "spec.volumeSnapshotClassName".to_string(),
-            reason: "a stream source captures a command's stdout and mounts no volume, so \
-                     volumeSnapshotClassName is meaningless with it; remove \
-                     volumeSnapshotClassName, or use a PVC source for copyMethod: Snapshot/Clone"
+            reason: "does not apply to a stream source, which mounts no volume. Fix: remove \
+                     volumeSnapshotClassName"
                 .to_string(),
         });
     }
@@ -179,9 +173,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             field: format!("spec.sources[{i}].stream"),
             reason: format!(
                 "a stream source must be the only source in its SnapshotPolicy, but this one \
-                 has {}. A stream source produces exactly one artifact per Snapshot and is \
-                 never expanded, so the other sources would not be backed up. Move the stream \
-                 source into its own SnapshotPolicy",
+                 has {}. Fix: move the stream source into its own SnapshotPolicy",
                 spec.sources.len()
             ),
         });
@@ -192,8 +184,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
         if let Err(e) = forbid_snapshot_inherit(
             m,
             "snapshotPolicy",
-            "a backup mover's identity is read from the live workload \
-             (pvcConsumer/workloadSelector), not from a snapshot; `snapshot` is restore-only",
+            "is restore-only. Fix: use pvcConsumer or workloadSelector for a backup",
         ) {
             errs.push(e);
         }
@@ -221,9 +212,9 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     {
         errs.push(ValidationError::InvalidFieldValue {
             field: "spec.retention".to_string(),
-            reason: "keeps no snapshots — every keep* bucket is unset or 0, so GFS retention \
-                     would prune every Snapshot immediately (data loss). Set at least one bucket \
-                     (e.g. keepLatest: 1), or omit spec.retention entirely to disable pruning."
+            reason: "keeps no snapshots (every keep* is unset or 0), so every Snapshot would be \
+                     pruned. Fix: set at least one (e.g. keepLatest: 1), or omit spec.retention \
+                     to disable pruning"
                 .to_string(),
         });
     }
@@ -239,9 +230,9 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             match &q.schedule {
                 None => errs.push(ValidationError::InvalidFieldValue {
                     field: "spec.verification.quick.schedule".to_string(),
-                    reason: "the flat `verification.quick.cron` shape moved to \
-                             `verification.quick.schedule.cron` (matching `deep.schedule`). \
-                             Move your cron/jitter/timezone fields under `schedule:`."
+                    reason: "`verification.quick.cron` moved to \
+                             `verification.quick.schedule.cron`. Fix: move your \
+                             cron/jitter/timezone fields under `schedule:`"
                         .to_string(),
                 }),
                 Some(s) => {
@@ -331,8 +322,8 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
             errs.push(ValidationError::InvalidFieldValue {
                 field: "spec.preflight.timeout".to_string(),
                 reason: format!(
-                    "{t:?} is not a valid duration. Use a Go-style duration like 10m or 1h; omit \
-                     for the default (10m), or 0 to hold indefinitely"
+                    "{t:?} is not a valid duration. Fix: use a Go-style duration like 10m or 1h; \
+                     omit for the default (10m), or 0 to wait forever"
                 ),
             });
         }
@@ -397,8 +388,8 @@ fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
         errs.push(ValidationError::InvalidFieldValue {
             field: "spec.staging.timeout".to_string(),
             reason: format!(
-                "{t:?} is not a valid duration. Use a Go-style duration like 10m or 1h; omit \
-                 for the default (10m), or 0 to wait for the VolumeSnapshot indefinitely"
+                "{t:?} is not a valid duration. Fix: use a Go-style duration like 10m or 1h; \
+                 omit for the default (10m), or 0 to wait forever"
             ),
         });
     }
@@ -416,11 +407,9 @@ fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
     {
         errs.push(ValidationError::InvalidFieldValue {
             field: format!("spec.sources[{i}].readOnly"),
-            reason: "readOnly: false cannot be honored when spec.staging.accessModes is \
-                     [ReadOnlyMany]: the staged PVC is read-only, so mounting it read-write \
-                     fails at the kubelet and the backup never starts. Drop ReadOnlyMany (a \
-                     read-write staged PVC is what lets the kubelet apply fsGroup), or drop \
-                     readOnly: false"
+            reason: "readOnly: false cannot work when spec.staging.accessModes is \
+                     [ReadOnlyMany], so the backup would never start. Fix: drop ReadOnlyMany, \
+                     or drop readOnly: false"
                 .to_string(),
         });
     }
@@ -441,9 +430,8 @@ fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
     match spec.copy_method {
         CopyMethod::Direct => errs.push(ValidationError::InvalidFieldValue {
             field: overrides.clone(),
-            reason: "copyMethod: Direct mounts the live source PVC — there is no staged PVC \
-                     to override. Remove the staged-PVC override(s), or use copyMethod: \
-                     Snapshot/Clone."
+            reason: "copyMethod: Direct has no staged PVC to override. Fix: remove the \
+                     override(s), or use copyMethod: Snapshot/Clone"
                 .to_string(),
         }),
         CopyMethod::Snapshot | CopyMethod::Clone => {}
@@ -451,18 +439,16 @@ fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
     if spec.sources.iter().any(|s| s.nfs.is_some()) {
         errs.push(ValidationError::InvalidFieldValue {
             field: overrides.clone(),
-            reason: "an NFS source is read directly and never staged, so a staged-PVC \
-                     override is meaningless with it; remove the override(s) or use a PVC \
-                     source for copyMethod: Snapshot/Clone"
+            reason: "an NFS source is never staged, so there is no staged PVC to override. \
+                     Fix: remove the override(s)"
                 .to_string(),
         });
     }
     if spec.sources.iter().any(|s| s.stream.is_some()) {
         errs.push(ValidationError::InvalidFieldValue {
             field: overrides.clone(),
-            reason: "a stream source captures a command's stdout and mounts no volume, so \
-                     there is no staged PVC to override; remove the override(s) or use a PVC \
-                     source for copyMethod: Snapshot/Clone"
+            reason: "a stream source mounts no volume, so there is no staged PVC to override. \
+                     Fix: remove the override(s)"
                 .to_string(),
         });
     }
@@ -487,9 +473,7 @@ fn validate_hook(list: &str, index: usize, hook: &Hook) -> ValidationResult {
             return Err(ValidationError::InvalidFieldValue {
                 field: field(leaf),
                 reason: format!(
-                    "{t:?} is not a valid Go-style duration; use a positive number with an \
-                     s/m/h suffix (e.g. 90s, 2m) — how long the hook may run before it is \
-                     treated as failed"
+                    "{t:?} is not a valid duration. Fix: use a Go-style duration like 90s or 2m"
                 ),
             });
         }
@@ -567,9 +551,8 @@ fn header_name_error(name: &str, list: &str, i: usize, j: usize) -> Option<Valid
         return Some(ValidationError::InvalidFieldValue {
             field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
             reason: format!(
-                "{name:?} is not a valid HTTP header name — names are case-insensitive \
-                 RFC 7230 tokens (letters, digits, and !#$%&'*+-.^_`|~); remove \
-                 spaces and other separators"
+                "{name:?} is not a valid HTTP header name. Fix: use only letters, digits, and \
+                 !#$%&'*+-.^_`|~ (no spaces)"
             ),
         });
     }
@@ -577,8 +560,7 @@ fn header_name_error(name: &str, list: &str, i: usize, j: usize) -> Option<Valid
         return Some(ValidationError::InvalidFieldValue {
             field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
             reason: format!(
-                "header name is {} bytes — HTTP header names are limited to \
-                 {MAX_HEADER_NAME_LEN} bytes; use a shorter name",
+                "header name is {} bytes; the maximum is {MAX_HEADER_NAME_LEN}",
                 name.len()
             ),
         });
@@ -620,8 +602,8 @@ fn validate_http_hook_headers(
         if !is_valid_header_value(&header.value) {
             return Some(ValidationError::InvalidFieldValue {
                 field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].value"),
-                reason: "control characters (including CR/LF) are not allowed in header \
-                         values — put multi-line payloads in `body`, not a header"
+                reason: "header values cannot contain control characters (including CR/LF). \
+                         Fix: put multi-line data in `body`"
                     .into(),
             });
         }
@@ -630,8 +612,8 @@ fn validate_http_hook_headers(
             return Some(ValidationError::InvalidFieldValue {
                 field: format!("spec.hooks.{list}[{i}].httpRequest.headers[{j}].name"),
                 reason: format!(
-                    "duplicate header {:?} — each header may be set once; combine values \
-                     into a single comma-separated header if the endpoint expects repeats",
+                    "duplicate header {:?}. Fix: set it once, with comma-separated values if \
+                     needed",
                     header.name
                 ),
             });
@@ -645,8 +627,8 @@ fn validate_http_hook_headers(
     {
         return Some(ValidationError::InvalidFieldValue {
             field: format!("spec.hooks.{list}[{i}].httpRequest.headers"),
-            reason: "an explicit Authorization header conflicts with credentials in the \
-                     URL (user:pass@…) — use one auth source, not both"
+            reason: "an Authorization header conflicts with credentials in the URL \
+                     (user:pass@…). Fix: use one or the other"
                 .into(),
         });
     }
@@ -692,8 +674,7 @@ pub fn validate_backup(spec: &SnapshotSpec, origin: Option<Origin>) -> Vec<Valid
         if let Err(e) = forbid_snapshot_inherit(
             m,
             "snapshot",
-            "a backup mover's identity is read from the live workload \
-             (pvcConsumer/workloadSelector), not from a snapshot; `snapshot` is restore-only",
+            "is restore-only. Fix: use pvcConsumer or workloadSelector for a backup",
         ) {
             errs.push(e);
         }
@@ -732,31 +713,24 @@ pub fn snapshot_tag_error(key: &str, value: &str) -> Option<String> {
     }
     if key.contains(':') {
         return Some(format!(
-            "tag key {key:?} contains a colon — kopia splits each `--tags` arg on the first \
-             colon, so the text after it becomes the value and can collide with the reserved \
-             `kopiur:config` tag, failing snapshot create with a duplicate-tag error. Use a \
-             colon-free key."
+            "tag key {key:?} contains a colon. Fix: use a key without `:`"
         ));
     }
     if key.starts_with("kopiur") {
         return Some(format!(
-            "tag key {key:?} uses the reserved `kopiur` prefix — kopiur writes its own tags \
-             there (`kopiur:config`, `kopiur-meta`) and a user tag under that prefix would \
-             collide with or spoof them. Pick a key that does not start with `kopiur`."
+            "tag key {key:?} uses the reserved `kopiur` prefix. Fix: use a key that does not \
+             start with `kopiur`"
         ));
     }
     if key.len() > MAX_SNAPSHOT_TAG_KEY_LEN {
         return Some(format!(
-            "tag key is {} bytes; keys are limited to {MAX_SNAPSHOT_TAG_KEY_LEN} bytes — use a \
-             shorter key",
+            "tag key is {} bytes; the maximum is {MAX_SNAPSHOT_TAG_KEY_LEN}",
             key.len()
         ));
     }
     if value.len() > MAX_SNAPSHOT_TAG_VALUE_LEN {
         return Some(format!(
-            "tag value is {} bytes; values are limited to {MAX_SNAPSHOT_TAG_VALUE_LEN} bytes — \
-             every tag is stored on the kopia manifest and read back by every catalog scan, so \
-             unbounded values inflate the repository and the scan wire. Use a shorter value.",
+            "tag value is {} bytes; the maximum is {MAX_SNAPSHOT_TAG_VALUE_LEN}",
             value.len()
         ));
     }
@@ -777,9 +751,7 @@ pub fn validate_snapshot_tags(
         errs.push(ValidationError::InvalidFieldValue {
             field: "spec.tags".to_string(),
             reason: format!(
-                "{} tags; at most {MAX_SNAPSHOT_TAGS} user tags are allowed per Snapshot — \
-                 every tag is stored on the kopia manifest and read back by every catalog \
-                 scan. Remove tags until at most {MAX_SNAPSHOT_TAGS} remain.",
+                "{} tags; at most {MAX_SNAPSHOT_TAGS} are allowed per Snapshot",
                 tags.len()
             ),
         });

@@ -66,9 +66,8 @@ fn parse_webhook_addr(value: &str) -> Result<SocketAddr, String> {
     };
     value.parse::<SocketAddr>().map_err(|_| {
         format!(
-            "KOPIUR_WEBHOOK_ADDR='{value}' is not a valid socket address; use host:port, e.g. \
-             [::]:8443 (IPv6/dual-stack, the default), 0.0.0.0:8443 (IPv4-only, for hosts with \
-             IPv6 disabled); unset it to use the default [::]:8443"
+            "KOPIUR_WEBHOOK_ADDR='{value}' is not a valid address. Fix: use host:port, e.g. \
+             0.0.0.0:8443 for IPv4-only hosts, or unset it for the default [::]:8443"
         )
     })
 }
@@ -119,10 +118,10 @@ mod tests {
             .expect_err("garbage KOPIUR_WEBHOOK_ADDR must not silently fall back");
         let msg = err.to_string();
         assert!(msg.contains("KOPIUR_WEBHOOK_ADDR='not-an-addr'"), "{msg}");
-        assert!(msg.contains("is not a valid socket address"), "{msg}");
+        assert!(msg.contains("is not a valid address"), "{msg}");
         assert!(msg.contains("0.0.0.0:8443"), "{msg}");
         assert!(msg.contains("[::]:8443"), "{msg}");
-        assert!(msg.contains("unset it to use the default"), "{msg}");
+        assert!(msg.contains("unset it for the default"), "{msg}");
     }
 
     #[test]

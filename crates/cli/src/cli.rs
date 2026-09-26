@@ -119,9 +119,8 @@ pub struct BrowseCommonArgs {
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub session_ttl: Option<std::time::Duration>,
 
-    /// Read with a LOCAL kopia binary instead of an in-cluster session pod.
-    /// The repository credentials are fetched to this machine (needs `get
-    /// secrets` RBAC) and the backend must be reachable from here.
+    /// Read with a local kopia binary instead of an in-cluster session pod.
+    /// Needs `get secrets` RBAC and a backend reachable from this machine.
     #[arg(long)]
     pub local: bool,
 
@@ -191,8 +190,7 @@ pub struct BrowseArgs {
 /// `kubectl kopiur session …`
 #[derive(clap::Subcommand, Debug)]
 pub enum SessionCommand {
-    /// End the warm browse session holding a repository open (deletes its
-    /// Job). A no-op when no session exists.
+    /// End a repository's warm browse session (deletes its Job).
     End(SessionEndArgs),
 }
 
@@ -223,8 +221,7 @@ pub struct SessionEndArgs {
 /// `kubectl kopiur maintenance …`
 #[derive(clap::Subcommand, Debug)]
 pub enum MaintenanceCommand {
-    /// Trigger an out-of-band maintenance run (annotation-based; the operator
-    /// runs it through the same lease/single-flight path as the cron slots).
+    /// Run maintenance now, outside its schedule.
     Run(MaintenanceRunArgs),
 }
 
@@ -237,8 +234,7 @@ pub struct MaintenanceRunArgs {
     #[arg(value_name = "NAME", group = "which")]
     pub name: Option<String>,
 
-    /// Find the Maintenance covering this Repository/ClusterRepository
-    /// (the operator default-manages one per repository).
+    /// Find the Maintenance for this Repository/ClusterRepository.
     #[arg(long, value_name = "NAME", group = "which")]
     pub repository: Option<String>,
 
@@ -252,7 +248,7 @@ pub struct MaintenanceRunArgs {
     )]
     pub repository_kind: RepositoryKindArg,
 
-    /// Run a FULL maintenance (compaction + reclamation) instead of quick.
+    /// Run full maintenance (compaction and space reclaim) instead of quick.
     #[arg(long)]
     pub full: bool,
 
@@ -268,8 +264,7 @@ pub struct MaintenanceRunArgs {
 /// `kubectl kopiur replication …`
 #[derive(clap::Subcommand, Debug)]
 pub enum ReplicationCommand {
-    /// Trigger an out-of-band replication run (annotation-based; the operator
-    /// runs it through the same gates and single-flight path as the cron slots).
+    /// Run a replication now, outside its schedule.
     Run(ReplicationRunArgs),
 }
 
@@ -293,8 +288,8 @@ pub struct ReplicationRunArgs {
     #[arg(value_name = "NAME")]
     pub name: String,
 
-    /// Which replication kind NAME is. Omit to detect it: exactly one of the
-    /// two must exist under that name in the namespace.
+    /// Which replication kind NAME is. Omit to detect it (works when only one
+    /// kind has that name).
     #[arg(long, value_enum, value_name = "KIND")]
     pub kind: Option<ReplicationKindArg>,
 
@@ -311,10 +306,9 @@ pub struct ReplicationRunArgs {
 #[derive(clap::Subcommand, Debug)]
 pub enum MigrateCommand {
     /// Translate VolSync ReplicationSources/Destinations into kopiur
-    /// SnapshotPolicy/SnapshotSchedule/Restore manifests. restic sources are
-    /// CONFIG ONLY (no backup data moves; the kopiur repository starts empty);
-    /// kopia sources (perfectra1n/volsync fork) ADOPT the existing kopia
-    /// repository in place — snapshots and identity continue seamlessly.
+    /// SnapshotPolicy/SnapshotSchedule/Restore manifests. restic sources move
+    /// config only (the kopiur repository starts empty); kopia sources
+    /// (perfectra1n/volsync fork) reuse the existing repository and its snapshots.
     Volsync(MigrateVolsyncArgs),
 }
 
@@ -326,7 +320,7 @@ pub struct MigrateVolsyncArgs {
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Point the translated policies at this EXISTING kopiur repository.
+    /// Point the translated policies at this existing kopiur repository.
     #[arg(long, value_name = "NAME", group = "repo_source")]
     pub repository: Option<String>,
 
@@ -340,11 +334,9 @@ pub struct MigrateVolsyncArgs {
     )]
     pub repository_kind: RepositoryKindArg,
 
-    /// Read each repository Secret and EMIT a kopiur Repository derived from
-    /// it. restic: + credential Secrets, with a REPLACE_ME kopia password you
-    /// must set. kopia (fork): the existing repository is ADOPTED — its Secret
-    /// (password + matching credentials) is referenced in place, no
-    /// placeholder.
+    /// Read each repository Secret and emit a kopiur Repository from it.
+    /// restic: also emits credential Secrets with a REPLACE_ME kopia password
+    /// you must set. kopia (fork): reuses the existing repository and Secret.
     #[arg(long, group = "repo_source")]
     pub resolve_secrets: bool,
 
@@ -352,32 +344,28 @@ pub struct MigrateVolsyncArgs {
     #[arg(long)]
     pub include_destinations: bool,
 
-    /// Exit 1 (emitting nothing) when any field is unmappable. Incompatible
-    /// with --resolve-secrets (its password placeholder is unmappable by
-    /// design).
+    /// Exit 1 without output if any field cannot be translated. Not allowed
+    /// with --resolve-secrets.
     #[arg(long, conflicts_with = "resolve_secrets")]
     pub strict: bool,
 
-    /// Server-side-apply the translated objects (refused while any REPLACE_ME
-    /// placeholder remains).
+    /// Apply the translated objects (refused while any REPLACE_ME remains).
     #[arg(long)]
     pub apply: bool,
 
     // --- offline / GitOps mode ---
-    /// Read VolSync objects from these YAML files (or directories, or `-` for
-    /// stdin) instead of the cluster. Repeatable; any value engages offline
-    /// mode (no kubeconfig required). Mirrors `kubectl -f`.
+    /// Read VolSync objects from these YAML files, directories, or `-` (stdin)
+    /// instead of the cluster. Repeatable; no kubeconfig needed.
     #[arg(short = 'f', long = "filename", value_name = "PATH")]
     pub filename: Vec<PathBuf>,
 
-    /// Resolve repository Secrets from these plaintext Secret YAML files (or
-    /// directories, or `-`) in offline mode. Repeatable. Only meaningful with
-    /// --resolve-secrets and offline input (-f).
+    /// Read repository Secrets from these plaintext Secret YAML files,
+    /// directories, or `-`. Repeatable. Use with --resolve-secrets and -f.
     #[arg(long, value_name = "PATH", requires = "resolve_secrets")]
     pub secrets: Vec<PathBuf>,
 
-    /// In offline mode, still fetch referenced Secrets from the LIVE cluster
-    /// (needs a kubeconfig). Alternative to --secrets.
+    /// With -f, still fetch referenced Secrets from the cluster (needs a
+    /// kubeconfig). Alternative to --secrets.
     #[arg(long, requires = "resolve_secrets", conflicts_with = "secrets")]
     pub from_cluster_secrets: bool,
 
@@ -420,19 +408,13 @@ pub struct StatusArgs {
 pub struct DoctorArgs {
     /// Treat a Snapshot/Restore Pending/Running longer than this as stuck.
     ///
-    /// Only the AGE-based verdict uses this: an object parked on a structural
-    /// gate (a missing namespace opt-in, a missing credential Secret, a held
-    /// mass-deletion breaker) never self-heals and is reported immediately,
-    /// however young it is.
+    /// Objects blocked on something that needs a person (a missing Secret, a
+    /// held mass-deletion breaker) are reported right away, whatever their age.
     #[arg(long, value_name = "DURATION", default_value = "1h", value_parser = parse_duration)]
     pub stuck_threshold: std::time::Duration,
 
-    /// How far back a terminal `Failed` Snapshot/Restore counts as a CURRENT
-    /// problem (doctor fails) rather than retained history (doctor warns).
-    ///
-    /// `failedJobsHistoryLimit` keeps Failed CRs around by design, so an
-    /// unbounded window would leave doctor permanently red on a healthy
-    /// install that failed once last month.
+    /// How far back a `Failed` Snapshot/Restore counts as a current problem
+    /// (doctor fails). Older failures only warn.
     #[arg(long, value_name = "DURATION", default_value = "24h", value_parser = parse_duration)]
     pub failure_lookback: std::time::Duration,
 }
@@ -455,13 +437,13 @@ pub struct RestoreArgs {
     #[arg(long, value_name = "SNAPSHOT", group = "source")]
     pub from_snapshot: Option<String>,
 
-    /// Resolve the snapshot via this SnapshotPolicy's identity
-    /// (deploy-or-restore; works even with no Snapshot CR present).
+    /// Restore the latest snapshot of this SnapshotPolicy (works even with no
+    /// Snapshot CR present).
     #[arg(long, value_name = "POLICY", group = "source")]
     pub from_policy: Option<String>,
 
-    /// Restore a raw kopia identity (user@host[:path]) — for foreign writers
-    /// or snapshots aged out of the catalog. Requires --repository.
+    /// Restore from a raw kopia identity (user@host[:path]), e.g. snapshots
+    /// not written by kopiur. Requires --repository.
     #[arg(
         long,
         value_name = "USER@HOST[:PATH]",
@@ -489,8 +471,8 @@ pub struct RestoreArgs {
     pub offset: Option<i64>,
 
     /// The kopia source path to read (--from-policy only), e.g. /pvc/<member>.
-    /// Overrides the per-PVC derivation: needed to restore a pvcSelector
-    /// policy's member into a differently-named PVC, or cross-namespace.
+    /// Needed to restore a pvcSelector member into a differently-named PVC or
+    /// another namespace.
     // `requires` alone is satisfied by ANY member of the `source` group in clap
     // (`--from-snapshot … --source-path` parsed), so the other sources are
     // named as explicit conflicts too.
@@ -532,17 +514,15 @@ pub struct RestoreArgs {
     pub repository_namespace: Option<String>,
 
     // --- target (exactly one) ---
-    /// Write into this EXISTING PVC.
+    /// Write into this existing PVC.
     #[arg(long, value_name = "PVC", group = "target")]
     pub to_pvc: Option<String>,
 
-    /// Have the operator CREATE this PVC as the target. Requires --size (the
-    /// webhook refuses a created PVC without an explicit capacity).
+    /// Have the operator create this PVC as the target. Requires --size.
     #[arg(long, value_name = "NAME", group = "target", requires = "size")]
     pub create_pvc: Option<String>,
 
-    /// Passive populator mode: the restore is claimed later by a PVC's
-    /// `spec.dataSourceRef`.
+    /// Populator mode: a PVC claims the restore later via `spec.dataSourceRef`.
     #[arg(long, group = "target")]
     pub populator: bool,
 
@@ -618,10 +598,8 @@ pub struct RestoreArgs {
     pub skip_existing: Option<bool>,
 
     // --- credential projection ---
-    /// Project the repository's credential Secret(s) into this restore's mover
-    /// Job namespace. Requires the owning ClusterRepository's
-    /// `credentialProjection.allowed` gate (namespaced Repositories have no
-    /// gate). Off by default.
+    /// Copy the repository's credential Secret(s) into this restore's
+    /// namespace. For a ClusterRepository, needs `credentialProjection.allowed`.
     #[arg(long)]
     pub credential_projection: bool,
 
@@ -644,8 +622,8 @@ pub struct RestoreArgs {
     #[arg(long, value_name = "SECS")]
     pub active_deadline_seconds: Option<i64>,
 
-    /// Seconds a wedged mover pod (CreateContainerConfigError / ImagePullBackOff /
-    /// Unschedulable) may sit before the run is failed (failurePolicy.podStartupDeadlineSeconds).
+    /// Seconds a mover pod may fail to start (e.g. ImagePullBackOff) before
+    /// the run fails (failurePolicy.podStartupDeadlineSeconds).
     #[arg(long, value_name = "SECS")]
     pub pod_startup_deadline_seconds: Option<i64>,
 
@@ -754,8 +732,8 @@ pub struct SnapshotNowArgs {
     #[arg(long = "tag", value_name = "KEY=VALUE", value_parser = parse_key_val)]
     pub tags: Vec<(String, String)>,
 
-    /// Lifecycle of the kopia snapshot when this Snapshot CR is deleted
-    /// (default: the operator's origin-aware default, delete).
+    /// What happens to the kopia snapshot when this Snapshot CR is deleted
+    /// (default: delete).
     #[arg(long, value_enum, value_name = "POLICY")]
     pub deletion_policy: Option<DeletionPolicyArg>,
 
@@ -776,14 +754,13 @@ pub struct SnapshotNowArgs {
     #[arg(long, value_name = "SECS")]
     pub active_deadline_seconds: Option<i64>,
 
-    /// Seconds a wedged mover pod (CreateContainerConfigError / ImagePullBackOff /
-    /// Unschedulable) may sit before the run is failed (failurePolicy.podStartupDeadlineSeconds).
+    /// Seconds a mover pod may fail to start (e.g. ImagePullBackOff) before
+    /// the run fails (failurePolicy.podStartupDeadlineSeconds).
     #[arg(long, value_name = "SECS")]
     pub pod_startup_deadline_seconds: Option<i64>,
 
-    /// For a multi-repository policy: back up into this ONE repository (by
-    /// name) instead of fanning out to all of them. Refused if the name is not
-    /// one of the policy's repositories.
+    /// For a multi-repository policy: back up into only this repository
+    /// instead of all of them.
     #[arg(long, value_name = "NAME")]
     pub repository: Option<String>,
 
@@ -803,7 +780,7 @@ pub struct SnapshotNowArgs {
 /// `--deletion-policy` values; mirrors `kopiur_api::DeletionPolicy`.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeletionPolicyArg {
-    /// Deleting the CR deletes the kopia snapshot (finalizer-driven).
+    /// Deleting the CR deletes the kopia snapshot.
     Delete,
     /// Deleting the CR keeps the kopia snapshot.
     Retain,
@@ -942,11 +919,11 @@ pub enum OriginFilter {
     Scheduled,
     /// Created manually (kubectl / this plugin / automation).
     Manual,
-    /// Materialized from a repository catalog scan.
+    /// Found by scanning the repository.
     Discovered,
     /// A discovered snapshot re-attached to a live SnapshotPolicy.
     Adopted,
-    /// A dest-side copy minted by a SnapshotReplication run.
+    /// A copy created by a SnapshotReplication.
     Replicated,
 }
 

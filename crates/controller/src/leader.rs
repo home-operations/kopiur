@@ -393,11 +393,10 @@ pub async fn acquire(
                 tracing::error!(
                     lease = %cfg.lease_name,
                     namespace = %cfg.namespace,
-                    "leader election is enabled but the operator cannot access the Lease (403): \
-                     the ServiceAccount needs get/create/update on coordination.k8s.io leases \
-                     (upgrade the chart, which grants this when controller.leaderElection.enabled \
-                     is true, or disable leader election). RUNNING WITHOUT LEADER ELECTION — safe \
-                     at one replica; at more than one, every replica reconciles concurrently"
+                    "cannot access the leader-election Lease (403); running without leader \
+                     election, which is only safe with one replica. Fix: give the ServiceAccount \
+                     get/create/update on coordination.k8s.io leases (upgrade the chart), or \
+                     disable leader election"
                 );
                 return Acquired::Degraded;
             }
@@ -723,9 +722,8 @@ pub async fn reconfirm(
         let remaining = give_up_at.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Reconfirmed::Lost(format!(
-                "ran out of margin before the Lease could be re-reached ({last_error}); past \
-                 this point a standby may legitimately claim it, so continuing to reconcile \
-                 could not be proven exclusive"
+                "could not reach the Lease before the safety margin ran out ({last_error}); a \
+                 standby may now hold it"
             ));
         }
 
@@ -742,7 +740,7 @@ pub async fn reconfirm(
                 Some(h) if h == identity => {}
                 other => {
                     return Ok(Some(Reconfirmed::Lost(format!(
-                        "the Lease now names {}; it left our hands while we were out of contact",
+                        "the Lease is now held by {}",
                         other.unwrap_or("<nobody>")
                     ))));
                 }
@@ -814,8 +812,7 @@ pub async fn release(client: &Client, cfg: &LeaderElection, identity: &str) {
         Err(_elapsed) => tracing::warn!(
             lease = %cfg.lease_name,
             timeout_secs = RELEASE_TIMEOUT.as_secs(),
-            "releasing the leader lease timed out; leaving it to age out (the successor waits \
-             out the lease duration instead of taking over immediately)"
+            "releasing the leader lease timed out; the next leader takes over once it expires"
         ),
     }
 }

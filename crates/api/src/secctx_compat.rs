@@ -523,17 +523,17 @@ impl MoverReadCompat {
                 "mover UID {mover_uid_render} matches the workload's UID; it can read the source"
             ),
             MoverReadCompat::Unknown { why } => format!(
-                "cannot determine source readability from securityContext alone ({}); the mover \
-                 verifies it at runtime",
+                "cannot tell from securityContext whether the mover can read the source ({}); \
+                 the mover checks at runtime",
                 why.as_str()
             ),
             MoverReadCompat::LikelyIncompatible {
                 mover_uid,
                 workload_uids,
             } => format!(
-                "mover UID {mover_uid} shares no UID or group with the workload writer UID(s) {} \
-                 — the backup may fail with permission denied or silently skip unreadable files; \
-                 set mover.inheritSecurityContextFrom.pvcConsumer, or a matching runAsUser/fsGroup",
+                "mover UID {mover_uid} shares no UID or group with the workload UID(s) {}, so \
+                 the backup may fail or skip unreadable files. Fix: set \
+                 mover.inheritSecurityContextFrom.pvcConsumer, or a matching runAsUser/fsGroup",
                 render_uid_list(workload_uids)
             ),
         }

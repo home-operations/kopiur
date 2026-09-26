@@ -804,12 +804,12 @@ async fn delete_batch_job_victims(client: &kube::Client, victims: Vec<&Job>) -> 
             Ok(_) => {
                 deleted += 1;
                 tracing::info!(job = %name, namespace = %ns,
-                    "reaped leaked terminal batch delete Job (members all drained)");
+                    "deleted leftover finished batch delete Job");
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
             Err(e) => {
                 tracing::warn!(job = %name, namespace = %ns, error = %e,
-                    "leaked batch delete Job reap failed (skipped)");
+                    "could not delete leftover batch delete Job (skipped)");
             }
         }
     }
@@ -860,16 +860,14 @@ async fn delete_secret_victims(
             Ok(DeleteOutcome::Deleted) => {
                 deleted += 1;
                 tracing::info!(secret = %name, namespace = %ns, kind,
-                    "reaped projected credentials Secret");
+                    "deleted projected credentials Secret");
             }
             Ok(DeleteOutcome::Spared) => {}
             Ok(DeleteOutcome::Forbidden) => {
                 tracing::warn!(secret = %name, namespace = %ns, kind,
                     flag = crate::consts::CREDENTIAL_PROJECTION_FLAG,
-                    "projected credentials Secret delete forbidden: the operator \
-                     lacks the `secrets` delete verb (the credentialProjection flag was \
-                     likely disabled after projection was used). Re-enable the flag or \
-                     delete the copies by hand (skipped)");
+                    "not allowed to delete projected credentials Secret (credentialProjection \
+                     was likely turned off). Fix: re-enable it or delete the copies by hand");
             }
             Err(e) => {
                 tracing::warn!(secret = %name, namespace = %ns, kind, error = %e,
@@ -926,7 +924,7 @@ pub fn spawn_sweep(
                         );
                         tracing::info!(
                             deleted = outcome.terminal_creds_secrets,
-                            "reaped projected credential Secrets of finished Snapshots"
+                            "deleted projected credential Secrets of finished Snapshots"
                         );
                     }
                     // Leak backstop only — NOT metered (the dispatcher owns the
@@ -935,7 +933,7 @@ pub fn spawn_sweep(
                     if outcome.batch_jobs > 0 {
                         tracing::info!(
                             deleted = outcome.batch_jobs,
-                            "reaped leaked terminal batch delete Jobs (dispatcher backstop)"
+                            "deleted leftover finished batch delete Jobs"
                         );
                     }
                     // A leaked group is invisible otherwise: it has no

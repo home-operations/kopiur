@@ -595,18 +595,16 @@ $ kubectl describe snapshot nightly-abc12 -n billing
 ...
 Conditions:
   Type          Status  Reason               Message
-  DeletionHeld  True    MassDeletionBreaker  this snapshot's deletion is HELD by the mass-deletion
-                                              breaker: 23 pending external destructive deletions for
-                                              Repository `nas-primary` are at/above its threshold of
-                                              10. No kopia data has been deleted and this Snapshot
-                                              keeps its finalizer. To APPROVE this wave (releases
-                                              every currently-held deletion for the repository), run:
-                                              kubectl -n billing annotate repository/nas-primary
+  DeletionHeld  True    MassDeletionBreaker  deletion held: 23 pending deletions for Repository
+                                              `nas-primary` reached the threshold of 10, so nothing
+                                              was deleted. Fix: to approve all held deletions for
+                                              the repository, run: kubectl -n billing annotate
+                                              repository/nas-primary
                                               kopiur.home-operations.com/allow-mass-deletion=
-                                              "2026-07-16T18:04:11Z" --overwrite. To release THIS
-                                              Snapshot alone WITHOUT deleting its kopia snapshot,
-                                              annotate it kopiur.home-operations.com/skip-snapshot-
-                                              cleanup: "true".
+                                              "2026-07-16T18:04:11Z" --overwrite. To remove only
+                                              this Snapshot without deleting its kopia snapshot,
+                                              annotate it `kopiur.home-operations.com/skip-snapshot-
+                                              cleanup: "true"`.
 ```
 
 ### Releasing the wave — copy the value, don't generate it

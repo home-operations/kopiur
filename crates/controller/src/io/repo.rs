@@ -411,9 +411,8 @@ pub async fn resolve_backend_ca(
     // silently skip TLS trust the user asked for.
     let Some(cm_name) = key_ref.config_map_name.as_deref() else {
         return Err(Error::Validation(
-            "tls.caBundleRef is set but names no ConfigMap: set \
-             tls.caBundleRef.configMapName to the ConfigMap holding the PEM CA \
-             bundle, or remove the caBundleRef block"
+            "tls.caBundleRef is set but names no ConfigMap. Fix: set \
+             tls.caBundleRef.configMapName, or remove the caBundleRef block"
                 .to_string(),
         ));
     };
@@ -421,10 +420,10 @@ pub async fn resolve_backend_ca(
         Some(ns) => ns.to_string(),
         None => {
             return Err(Error::Invariant(format!(
-                "cannot resolve tls.caBundleRef ConfigMap {cm_name:?}: a \
+                "cannot find tls.caBundleRef ConfigMap {cm_name:?}: a \
                  ClusterRepository's CA bundle lives in the operator's namespace, \
-                 but KOPIUR_NAMESPACE is unset (running out-of-cluster?) — set \
-                 KOPIUR_NAMESPACE or move the repository to a namespaced Repository"
+                 but KOPIUR_NAMESPACE is unset. Fix: set KOPIUR_NAMESPACE, or use a \
+                 namespaced Repository"
             )));
         }
     };
@@ -432,9 +431,8 @@ pub async fn resolve_backend_ca(
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), &ns);
     let cm = api.get_opt(cm_name).await?.ok_or_else(|| {
         Error::MissingCaBundle(format!(
-            "tls.caBundleRef ConfigMap {ns}/{cm_name} not found: create it with the \
-             PEM CA bundle under key {key:?} (for a ClusterRepository it must live \
-             in the operator's namespace; for a Repository, in the repository's)"
+            "tls.caBundleRef ConfigMap {ns}/{cm_name} not found. Fix: create it with \
+             the PEM CA bundle under key {key:?}"
         ))
     })?;
     // ConfigMaps carry text under `data` and bytes under `binaryData`; a PEM
@@ -461,23 +459,22 @@ pub async fn resolve_backend_ca(
             .collect();
         return Err(Error::MissingCaBundle(format!(
             "tls.caBundleRef ConfigMap {ns}/{cm_name} has no key {key:?} (found: \
-             {available:?}): add the PEM CA bundle under that key, or set \
-             tls.caBundleRef.key to one of the existing keys"
+             {available:?}). Fix: add the PEM CA bundle under that key, or set \
+             tls.caBundleRef.key"
         )));
     };
     if !pem.contains("BEGIN CERTIFICATE") {
         return Err(Error::Validation(format!(
             "tls.caBundleRef ConfigMap {ns}/{cm_name} key {key:?} is not a PEM \
-             certificate bundle (no \"BEGIN CERTIFICATE\" block): store the CA \
-             chain PEM-encoded — kopia passes it to the S3 TLS verifier verbatim"
+             certificate bundle (no \"BEGIN CERTIFICATE\" block). Fix: store the CA \
+             chain PEM-encoded"
         )));
     }
     if pem.len() > MAX_CA_BUNDLE_BYTES {
         return Err(Error::Validation(format!(
             "tls.caBundleRef ConfigMap {ns}/{cm_name} key {key:?} is {} bytes, \
-             over the {MAX_CA_BUNDLE_BYTES}-byte limit: the bundle rides the mover \
-             work spec (a Job env var), so trim it to the CA chain this endpoint \
-             actually needs",
+             over the {MAX_CA_BUNDLE_BYTES}-byte limit. Fix: keep only the CA chain \
+             this endpoint needs",
             pem.len()
         )));
     }
@@ -806,7 +803,7 @@ pub async fn namespace_is_terminating(client: &kube::Client, namespace: &str) ->
         Err(kube::Error::Api(e)) if e.code == 403 => {
             tracing::debug!(
                 namespace,
-                "cannot read Namespace (namespaced-scope install); assuming not terminating"
+                "cannot read Namespace (namespaced install); assuming not terminating"
             );
             return Ok(false);
         }

@@ -1455,7 +1455,7 @@ fn maintenance_condition_covers_every_coverage_state() {
     assert!(status);
     assert_eq!(reason, MAINTENANCE_CONFIGURED_REASON);
     assert!(!warn);
-    assert!(msg.contains("externally-authored"), "{msg}");
+    assert!(msg.contains("user-created Maintenance"), "{msg}");
 
     // A deliberate opt-out keeps its message — which is now provably true, since
     // `maintenance_action` only reaches this state with `enabled == false`.
@@ -1478,7 +1478,7 @@ fn maintenance_condition_covers_every_coverage_state() {
     assert!(!status);
     assert_eq!(reason, MAINTENANCE_APPLY_FAILED_REASON);
     assert!(warn, "a failed apply is a real problem: warn");
-    assert!(msg.contains("ENABLED"), "{msg}");
+    assert!(msg.contains("maintenance is enabled"), "{msg}");
     assert!(msg.contains("kopiur-system"), "{msg}");
     assert!(msg.contains("RBAC"), "{msg}");
     assert!(
@@ -2236,7 +2236,7 @@ fn privileged_mover_message_is_actionable() {
             < msg.find("kubectl annotate").expect("annotate named"),
         "the spec-edit fix must be offered before the namespace-wide grant: {msg}"
     );
-    assert!(msg.contains("EVERY mover in namespace"), "{msg}");
+    assert!(msg.contains("every mover in namespace"), "{msg}");
 }
 
 #[test]
@@ -3455,19 +3455,19 @@ mod reconcile_failure_events {
                 Error::Kube(kube_error()),
                 KUBE_API_ERROR_REASON,
                 CHECK_API_SERVER_ACTION,
-                "retries automatically",
+                "retried automatically",
             ),
             (
                 Error::Validation("spec.retention.daily must be >= 1".into()),
                 INVALID_SPEC_REASON,
                 FIX_SPEC_ACTION,
-                "fix the field",
+                "Fix the field",
             ),
             (
                 Error::MissingDependency("Repository apps/nas".into()),
                 MISSING_DEPENDENCY_REASON,
                 CHECK_REFERENCES_ACTION,
-                "create it, or fix the reference",
+                "Create it, or fix the reference",
             ),
             (
                 Error::BlockedOnGrant(
@@ -3499,7 +3499,7 @@ mod reconcile_failure_events {
                 Error::WebhookSetup("no such webhook configuration".into()),
                 WEBHOOK_SETUP_FAILED_REASON,
                 CHECK_WEBHOOK_CONFIGURATION_ACTION,
-                "Admission stays untrusted",
+                "until TLS setup succeeds",
             ),
             (
                 Error::WebhookCert(crate::webhook_tls::CertError::Generate(
@@ -3507,7 +3507,7 @@ mod reconcile_failure_events {
                 )),
                 WEBHOOK_SETUP_FAILED_REASON,
                 CHECK_WEBHOOK_CONFIGURATION_ACTION,
-                "Admission stays untrusted",
+                "until TLS setup succeeds",
             ),
         ];
         for (err, reason, action, note_phrase) in cases {
@@ -3752,12 +3752,11 @@ fn inherit_source_missing_message_is_exactly_this_text() {
     );
     assert_eq!(
         msg,
-        "mover.inheritSecurityContextFrom (workloadSelector `app=postgres,tier=db`) resolved no \
-         securityContext to inherit, and this recipe pins no fallback identity — so the run is \
-         HELD rather than run as the wrong UID. no pod matches \
-         mover.inheritSecurityContextFrom (`app=postgres,tier=db`) in namespace `billing`. The \
-         run stays `Pending` and re-checks every few minutes; it starts by itself once that is \
-         fixed, with no re-apply."
+        "mover.inheritSecurityContextFrom (workloadSelector `app=postgres,tier=db`) found \
+         nothing to inherit and no fallback UID is set, so the run is held rather than run as \
+         the wrong UID. no pod matches mover.inheritSecurityContextFrom (`app=postgres,tier=db`) \
+         in namespace `billing`. The run stays `Pending`, re-checks every few minutes, and \
+         starts once this is fixed."
     );
     // Byte-stable across renders: the message rides a 300s requeue, so a volatile byte would
     // re-write status every pass, wake the primary watch and hot-loop the reconciler.
@@ -3787,9 +3786,8 @@ fn the_hold_message_never_runs_a_cause_into_the_next_sentence() {
         inherited_security_context_from_pods(&[pod], Some("nope"), "billing", "app=x")
             .unwrap_err()
             .to_string(),
-        "mover.inheritSecurityContextFrom.podSelector is empty in namespace `billing` — set \
-         matchLabels/matchExpressions identifying the workload pod whose securityContext the \
-         mover should inherit (UID/GID match)"
+        "mover.inheritSecurityContextFrom.podSelector is empty in namespace `billing`. Fix: \
+         set matchLabels or matchExpressions to select the workload pod to inherit from"
             .to_string(),
     ];
     for cause in &unpunctuated {
@@ -3811,7 +3809,7 @@ fn the_hold_message_never_runs_a_cause_into_the_next_sentence() {
     // workload up" — the workload is fine there, only the selector is empty. That ordering is
     // now the resolver cause's, which is why the wrapper adds no levers of its own.
     let empty = &unpunctuated[1];
-    let msg = inherit_source_missing_message("workloadSelector with an EMPTY podSelector", empty);
+    let msg = inherit_source_missing_message("workloadSelector with an empty podSelector", empty);
     let fix_at = msg.find("set matchLabels").expect("selector fix is named");
     assert!(
         !msg[..fix_at].contains("workload back up") && !msg[..fix_at].contains("Scale it up"),
@@ -3863,7 +3861,7 @@ fn the_hold_message_carries_the_resolver_cause_for_every_unresolvable_shape() {
     for (cause, diagnosis, fix) in &cases {
         let msg = inherit_source_missing_message("workloadSelector `app=x`", cause);
         assert!(msg.contains("app=x"), "the selector must be named: {msg}");
-        assert!(msg.contains("HELD"), "the run is held, say so: {msg}");
+        assert!(msg.contains("held"), "the run is held, say so: {msg}");
         assert!(
             msg.contains("re-checks every few minutes"),
             "the park/re-check contract is the wrapper's job: {msg}"
@@ -3915,7 +3913,7 @@ fn only_live_pod_inherit_modes_earn_the_dedicated_hold() {
     });
     assert_eq!(
         live_inherit_source_label(Some(&empty), None).as_deref(),
-        Some("workloadSelector with an EMPTY podSelector")
+        Some("workloadSelector with an empty podSelector")
     );
 
     // `pvcConsumer` names the claim whose consumer was hunted.
@@ -5393,8 +5391,8 @@ fn an_unreadable_namespace_refuses_the_stream_mover() {
     assert!(msg.contains("SnapshotPolicy `pg`"), "{msg}");
     assert!(msg.contains("cannot read Namespace `db`"), "{msg}");
     assert!(msg.contains("403"), "{msg}");
-    // why — and that the fail-closed choice is stated, not implied
-    assert!(msg.contains("fails CLOSED"), "{msg}");
+    // why — and that it refuses
+    assert!(msg.contains("refuses"), "{msg}");
     assert!(msg.contains("pods/exec"), "{msg}");
     // fix — BOTH options a namespaced-install admin needs
     assert!(

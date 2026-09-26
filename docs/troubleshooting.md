@@ -106,7 +106,7 @@ A `Snapshot` will not spawn a mover Job while its referenced `Repository` or `Cl
 ```console
 $ kubectl get snapshots <name> -n <ns> \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}'
-# → "waiting for repository `nas` to become `Ready` before launching the backup…"
+# → "waiting for repository `nas` to be `Ready` (backend unreachable)…"
 $ kubectl get repository <repo> -n <ns>   # fix the backend; watch PHASE return to Ready
 ```
 
@@ -254,7 +254,7 @@ This is a registered structural gate, so `kubectl kopiur doctor` also reports it
 | `no running workload pod mounts the backup source PVC` | `pvcConsumer` is set but no pod outside kopiur currently mounts the source PVC, so there is no consumer to derive the identity from. | Scale up the workload that mounts the PVC, or switch to `workloadSelector` or an explicit `mover.securityContext`. |
 | `has no container` | `inheritSecurityContextFrom…container` names a container the pod doesn't have. | Fix the `container` name, or omit it to take the pod's first container. |
 | `sets no securityContext … to inherit` | The matched pod sets **neither** a container nor a pod-level `securityContext`. | Set one on the workload, or use an explicit `mover.securityContext` or `mover.podSecurityContext` instead. |
-| `pvcConsumer … is only valid for a backup source` | `pvcConsumer` was set on a `Restore` or `Maintenance`, which admission rejects. | Use `workloadSelector` on a Restore, or an explicit `mover.securityContext`. |
+| `pvcConsumer needs a backup with a single PVC source` | `pvcConsumer` was set on a `Restore` or `Maintenance`, which admission rejects. | Use `workloadSelector` on a Restore, or an explicit `mover.securityContext`. |
 
 The last row is the one exception that is *not* this hold: `pvcConsumer` with no backup source PVC is a spec error rather than an absent workload, so it stays an ordinary transient `MissingDependency`. The restore-only `snapshot` mode has its own hold, `SecurityContextInherited=False` / `MissingRecordedIdentity`.
 
@@ -299,8 +299,7 @@ At `kubectl apply` time the webhook may attach a **non-blocking warning**. The a
 
 ```
 Warning: securityContext: the mover's UID likely cannot read the source PVC `app-data`
-(no shared UID or group with the workload that mounts it) — the backup may fail with
-permission denied or silently skip unreadable files.
+(no shared UID or group with its workload), so the backup may fail or skip files. Fix: ...
 ```
 
 It fires only when the recipe **explicitly pins** a `runAsUser` that shares no UID or group with the workload mounting `source.pvc`. It is **best-effort**: the webhook cannot see file modes, so the data may be world-readable, and it cannot see `moverDefaults`. It therefore stays silent when the UID is image-determined. The authoritative checks come later, from the `SecurityContextCompatible` condition at reconcile and from kopia's own output at runtime, both below. A `Restore` gets the same kind of warning about its *target* PVC's future consumer. The fix is always the same: match the mover to the workload with `inheritSecurityContextFrom.pvcConsumer: {}`, or a matching `runAsUser` and `fsGroup`.
@@ -309,9 +308,9 @@ It fires only when the recipe **explicitly pins** a `runAsUser` that shares no U
 
 | Symptom (at `kubectl apply`) | Cause | Fix |
 | --- | --- | --- |
-| `… is not a valid kopia identity component … (kopia parses username@hostname:path on the first @ and first :)` | A `spec.identity.username` or `hostname`, or an `identityDefaults` CEL expression's result, is empty or contains `@`, `:`, whitespace, or a control character. | Use a value that round-trips through kopia's `username@hostname:path` form, so no `@`, `:` or whitespace. Dots, dashes, slashes, and unicode letters are fine. |
+| `… is not a valid kopia identity component: …` | A `spec.identity.username` or `hostname`, or an `identityDefaults` CEL expression's result, is empty or contains `@`, `:`, whitespace, or a control character. | Use a value that round-trips through kopia's `username@hostname:path` form, so no `@`, `:` or whitespace. Dots, dashes, slashes, and unicode letters are fine. |
 | `… is not a valid kopia source path …` | A `sourcePathOverride` is empty or contains a newline or control character. | Set a non-empty path without control characters. Spaces and `:` are allowed. |
-| `this edit changes the policy's resolved kopia identity from … to …, but the policy already has snapshot history` | You edited `identity`, or a source's `sourcePathOverride`, on a `SnapshotPolicy` that has already produced snapshots. The change would orphan the old kopia history. | If unintentional, revert the identity. If you really mean to re-identify, set `kopiur.home-operations.com/allow-identity-change` to any non-empty value on the policy. See [Backups → identity](backups.md#identity--what-kopia-records-usernamehostnamepath). |
+| `this edit changes the policy's kopia identity (… → …) but it already has snapshots` | You edited `identity`, or a source's `sourcePathOverride`, on a `SnapshotPolicy` that has already produced snapshots. The change would orphan the old kopia history. | If unintentional, revert the identity. If you really mean to re-identify, set `kopiur.home-operations.com/allow-identity-change` to any non-empty value on the policy. See [Backups → identity](backups.md#identity--what-kopia-records-usernamehostnamepath). |
 
 ## Backup runs but `Failed`
 
@@ -353,9 +352,9 @@ $ kubectl get snapshot <name> -n <ns> -o jsonpath='{.status.stats.filesFailed}'
 42
 $ kubectl get snapshot <name> -n <ns> \
     -o jsonpath='{.status.conditions[?(@.type=="SecurityContextCompatible")].message}'
-the backup completed but 42 source entries could not be read and were EXCLUDED from the
-snapshot — it is INCOMPLETE. This is usually a UID/GID mismatch: match the mover to the
-workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching runAsUser…
+backup completed but 42 source entries could not be read and were skipped, so the
+snapshot is incomplete (usually a UID/GID mismatch). Fix: match the mover to the workload
+with mover.inheritSecurityContextFrom.pvcConsumer or runAsUser…
 ```
 
 This is the **certain** signal. It comes from kopia's own output, not a heuristic. The fix is the same as for a permission mismatch: match the mover to the workload with `inheritSecurityContextFrom.pvcConsumer: {}`, or a matching `runAsUser` and `fsGroup`, then re-run. See [Security context → Catching permission mismatches early](security-context.md#catching-permission-mismatches-early).
@@ -407,7 +406,7 @@ Kopiur avoids this by default: it pins an RWO source or destination mover to the
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | Multi-Attach despite default `Auto` | `sourceColocation.mode: Disabled` is set, or co-location couldn't find the node (no running consumer pod; trimmed RBAC missing `persistentvolumes`/`volumeattachments` read). | Leave or restore `mode: Auto`; make sure the workload pod is running; grant the RBAC (see [Repositories → `sourceColocation`](repositories.md#sourcecolocation-avoid-the-rwo-multi-attach-error)). |
-| Backup `Failed`: *"is ReadWriteOncePod and is currently held by a running pod"* | A `ReadWriteOncePod` volume can't be co-mounted by a second pod **at all**, even on the same node. | Use `copyMethod: Snapshot` (no downtime), scale the workload down for the backup window, or set `mode: Disabled` and manage placement yourself. See [PVC access modes & RWOP](access-modes.md). |
+| Backup `Failed`: *"is ReadWriteOncePod and held by a running pod"* | A `ReadWriteOncePod` volume can't be co-mounted by a second pod **at all**, even on the same node. | Use `copyMethod: Snapshot` (no downtime), scale the workload down for the backup window, or set `mode: Disabled` and manage placement yourself. See [PVC access modes & RWOP](access-modes.md). |
 | Backup `Failed` (mode `Required`): *"could not determine which node it is attached to"* | `mode: Required` refuses to guess when no consumer pod, PV `nodeAffinity` or `VolumeAttachment` reveals the node. | Start the workload that uses the PVC, switch to `ReadWriteMany`, or relax to `mode: Auto` or `Disabled`. |
 
 See [Repositories → `sourceColocation`](repositories.md#sourcecolocation-avoid-the-rwo-multi-attach-error) for the full behavior.

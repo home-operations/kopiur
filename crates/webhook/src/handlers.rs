@@ -343,9 +343,9 @@ async fn handle_snapshot(
         None => with_warnings(
             resp,
             vec![format!(
-                "unrecognized {} marker on this Snapshot: kopiur cannot classify its origin, \
-                 so it will be held inert (never run, never deleted by the operator); fix or \
-                 remove the label/status value, or upgrade the operator",
+                "unrecognized {} value on this Snapshot, so kopiur will leave it alone (never \
+                 run or delete it). Fix: correct or remove the label/status value, or upgrade \
+                 the operator",
                 api::consts::ORIGIN_LABEL
             )],
         ),
@@ -397,11 +397,9 @@ async fn handle_snapshot(
                     ValidationError::InvalidFieldValue {
                         field: "spec.source".to_string(),
                         reason: format!(
-                            "SnapshotPolicy `{}` uses a pvcSelector, which expands to one Snapshot \
-                             per matched PersistentVolumeClaim — so a Snapshot against it must carry \
-                             `spec.source` naming the PVC it covers, and this one does not. Fix: run \
-                             `kubectl kopiur snapshot now --policy {}`, or let a SnapshotSchedule \
-                             fire it; both expand the selector for you.",
+                            "SnapshotPolicy `{}` uses a pvcSelector, so a Snapshot for it needs \
+                             `spec.source` naming its PVC. Fix: run `kubectl kopiur snapshot now \
+                             --policy {}`, or let a SnapshotSchedule create it",
                             policy_ref.name, policy_ref.name,
                         ),
                     },
@@ -1016,10 +1014,8 @@ async fn handle_snapshot_replication(
     Ok(with_warnings(
         resp,
         vec![format!(
-            "spec.selection overlaps {}: this replication will copy snapshots into kopia \
-             identities the destination's own SnapshotPolicies also write directly, \
-             interleaving replicated copies with directly-written snapshots in those \
-             identities' histories. If unintended, exclude them via \
+            "spec.selection overlaps {} that the destination also writes directly, so \
+             replicated copies will mix with them. If unintended, exclude them via \
              spec.selection.identities.exclude",
             api::error::describe_overlapping_identities(&overlapping)
         )],
@@ -1733,7 +1729,7 @@ mod tests {
         let resp = dispatch(&req, None).await;
         assert!(!resp.allowed, "caBundleRef + disableTls must be rejected");
         assert!(
-            resp.result.message.contains("mutually exclusive"),
+            resp.result.message.contains("cannot both be set"),
             "{:?}",
             resp.result.message
         );
@@ -1883,7 +1879,7 @@ mod tests {
         assert!(
             resp.result
                 .message
-                .contains("competing kopia lineage sharing the old one's GFS retention timeline"),
+                .contains("new snapshots start a separate history"),
             "{:?}",
             resp.result.message
         );
@@ -2417,7 +2413,7 @@ mod tests {
             "{:?}",
             resp.result.message
         );
-        assert!(resp.result.message.contains("fail-closed"));
+        assert!(resp.result.message.contains("denying"));
 
         let dest_cluster = snapshot_replication_spec(json!({
             "destinationRef": { "kind": "ClusterRepository", "name": "offsite" },
@@ -2447,7 +2443,7 @@ mod tests {
         let resp = dispatch(&req, Some(&client)).await;
         assert!(!resp.allowed, "{:?}", resp.result.message);
         let msg = resp.result.message;
-        assert!(msg.contains("same Filesystem storage target"), "{msg:?}");
+        assert!(msg.contains("same Filesystem storage"), "{msg:?}");
         assert!(msg.contains("Repository src"), "{msg:?}");
         assert!(msg.contains("Repository dst"), "{msg:?}");
     }
@@ -2482,7 +2478,7 @@ mod tests {
         assert!(!resp.allowed, "{:?}", resp.result.message);
         let msg = resp.result.message;
         assert!(msg.contains("both mount at \"/repo\""), "{msg:?}");
-        assert!(msg.contains("distinct backend.path"), "{msg:?}");
+        assert!(msg.contains("different backend.path"), "{msg:?}");
 
         // Distinct paths: admitted (all other checks pass).
         let client = mock_path_client(vec![
@@ -2753,7 +2749,7 @@ mod tests {
         let resp = dispatch(&req, Some(&client)).await;
         assert!(!resp.allowed, "unpinned multi-repo child must be refused");
         let msg = resp.result.message;
-        assert!(msg.contains("must pin exactly one member"), "{msg:?}");
+        assert!(msg.contains("has no spec.repository"), "{msg:?}");
         assert!(msg.contains("kubectl kopiur snapshot now"), "{msg:?}");
     }
 
@@ -2785,7 +2781,7 @@ mod tests {
         assert!(!resp.allowed, "non-member pin must be refused");
         let msg = resp.result.message;
         assert!(msg.contains("Repository/billing/zzz"), "{msg:?}");
-        assert!(msg.contains("does not list that repository"), "{msg:?}");
+        assert!(msg.contains("does not list it"), "{msg:?}");
         assert!(
             msg.contains("Repository/billing/a") && msg.contains("ClusterRepository/b"),
             "the valid set must be named: {msg:?}"
@@ -2874,7 +2870,10 @@ mod tests {
             "selection-free multi-repo restore must be refused"
         );
         let msg = resp.result.message;
-        assert!(msg.contains("must say which one to read"), "{msg:?}");
+        assert!(
+            msg.contains("set restore spec.repository to one of"),
+            "{msg:?}"
+        );
         assert!(
             msg.contains("Repository/billing/a") && msg.contains("ClusterRepository/b"),
             "the valid set must be named: {msg:?}"
@@ -2966,7 +2965,7 @@ mod tests {
             "{:?}",
             resp.result.message
         );
-        assert!(resp.result.message.contains("fail-closed"));
+        assert!(resp.result.message.contains("denying"));
     }
 
     #[tokio::test]
@@ -3106,11 +3105,7 @@ mod tests {
             "policyRef": { "name": "pg" },
             "schedule": { "cron": "0 2 * * *", "startingDeadlineSeconds": -1 },
         });
-        assert_denied_containing(
-            admission_request("SnapshotSchedule", spec),
-            "SkipExpired forever",
-        )
-        .await;
+        assert_denied_containing(admission_request("SnapshotSchedule", spec), "never runs").await;
     }
 
     #[tokio::test]

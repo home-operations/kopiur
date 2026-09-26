@@ -88,13 +88,12 @@ impl ReplicationSourceSpec {
         match (&self.restic, &self.kopia) {
             (Some(r), None) => Ok(MoverBlock::Restic(r)),
             (None, Some(k)) => Ok(MoverBlock::Kopia(k)),
-            (Some(_), Some(_)) => Err(
-                "has BOTH spec.restic and spec.kopia blocks; VolSync allows one mover per object"
-                    .into(),
-            ),
+            (Some(_), Some(_)) => {
+                Err("has both spec.restic and spec.kopia; VolSync allows only one".into())
+            }
             (None, None) => Err(
-                "has neither spec.restic nor spec.kopia (a different mover, e.g. rsync/rclone); \
-                 kopiur migration covers restic and fork-kopia sources only"
+                "has neither spec.restic nor spec.kopia; only restic and kopia sources can be \
+                 migrated"
                     .into(),
             ),
         }
@@ -133,12 +132,12 @@ impl ReplicationDestinationSpec {
             (Some(r), None) => Ok(DestMoverBlock::Restic(r)),
             (None, Some(k)) => Ok(DestMoverBlock::Kopia(k)),
             (Some(_), Some(_)) => Err(
-                "has BOTH spec.restic and spec.kopia blocks; VolSync allows one mover per object"
+                "has both spec.restic and spec.kopia; VolSync allows only one"
                     .into(),
             ),
             (None, None) => Err(
-                "has neither spec.restic nor spec.kopia (a different mover, e.g. rsync/rclone); \
-                 kopiur migration covers restic and fork-kopia destinations only"
+                "has neither spec.restic nor spec.kopia; only restic and kopia destinations can be \
+                 migrated"
                     .into(),
             ),
         }

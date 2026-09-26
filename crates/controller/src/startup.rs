@@ -66,11 +66,8 @@ async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
             };
             tracing::warn!(
                 error = %why,
-                "apiserver version probe failed; keeping the configured streamingLists value \
-                 (fail open — a transport failure is not evidence about the server's version, \
-                 and downgrading ~50 watchers to paged lists is most expensive exactly when the \
-                 control plane is already struggling). Set streamingLists: false if your \
-                 apiserver predates 1.32."
+                "could not read the API server version; keeping the configured streamingLists \
+                 value. Fix: set streamingLists: false if your API server is older than 1.32"
             );
             return configured;
         }
@@ -80,8 +77,8 @@ async fn effective_streaming_lists(client: &Client, configured: bool) -> bool {
         tracing::warn!(
             server_major = %major,
             server_minor = %minor,
-            "streamingLists is on but the apiserver predates WatchList (beta in 1.32); \
-             using paged lists instead. Set streamingLists: false to silence this."
+            "streamingLists is on but the API server is older than 1.32; using paged \
+             lists. Set streamingLists: false to silence this."
         );
     }
     supported
@@ -175,8 +172,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "could not raise the RLIMIT_NOFILE soft limit; continuing with the inherited \
-                 limit (fd headroom stays at the container runtime's default)"
+                "could not raise the RLIMIT_NOFILE soft limit; keeping the inherited limit"
             );
         }
     }
@@ -468,8 +464,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
                         tracing::warn!(
                             attempts,
                             last_error = %last_error,
-                            "leader lease renewal failed; re-confirming our hold within the \
-                             remaining margin instead of restarting outright"
+                            "leader lease renewal failed; re-checking whether we still hold it"
                         );
                         // NOT `acquire`. The reconcilers are still running, so
                         // standing by behind a peer — which is what acquire does
@@ -494,9 +489,8 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
                                 );
                             }
                             leader::Reconfirmed::Lost(why) => anyhow::bail!(
-                                "leader lease renewal failed after {attempts} attempt(s) \
-                                 ({last_error}), and our hold could not be re-confirmed: \
-                                 {why} — exiting to re-elect"
+                                "leader lease lost after {attempts} failed renewal(s) \
+                                 ({last_error}): {why}; exiting to re-elect"
                             ),
                         }
                     }
@@ -595,8 +589,7 @@ fn webhook_tls_config(config: &config::ControllerConfig) -> Option<webhook_tls::
         Some(ns) => ns.clone(),
         None => {
             tracing::warn!(
-                "{} is set but {} is unset; cannot place the webhook TLS Secret — skipping \
-                 self-managed webhook TLS",
+                "{} is set but {} is unset; skipping self-managed webhook TLS",
                 config::WEBHOOK_TLS_MANAGED_ENV,
                 config::OPERATOR_NAMESPACE_ENV
             );
@@ -608,7 +601,7 @@ fn webhook_tls_config(config: &config::ControllerConfig) -> Option<webhook_tls::
         config.webhook_mutating_config.clone(),
     ) else {
         tracing::warn!(
-            "self-managed webhook TLS requested but {}/{} are unset — skipping",
+            "self-managed webhook TLS requested but {}/{} are unset; skipping",
             config::WEBHOOK_VALIDATING_CONFIG_ENV,
             config::WEBHOOK_MUTATING_CONFIG_ENV
         );

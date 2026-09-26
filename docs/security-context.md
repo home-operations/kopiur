@@ -290,7 +290,7 @@ There are two different questions, and they get two different conditions. `Secur
 ```console
 $ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextResolved")]}'
 {"type":"SecurityContextResolved","status":"False","reason":"InheritSourceMissing",
- "message":"mover.inheritSecurityContextFrom (workloadSelector `app=postgres`) resolved no securityContext to inherit, and this recipe pins no fallback identity — so the run is HELD instead of running as the wrong UID. ..."}
+ "message":"mover.inheritSecurityContextFrom (workloadSelector `app=postgres`) found nothing to inherit and no fallback UID is set, so the run is held rather than run as the wrong UID. ..."}
 ```
 
 Holding is deliberate: a backup taken as the wrong UID is worse than a backup that did not run. This is a **registered structural gate**, so [`kubectl kopiur doctor`](cli/operations.md) reports it as a blocked run rather than passing a cluster whose backups are quietly parked. One Warning Event fires per transition, not per reconcile.

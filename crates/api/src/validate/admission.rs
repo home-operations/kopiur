@@ -57,9 +57,8 @@ fn validate_starting_deadline_seconds(seconds: Option<i64>) -> ValidationResult 
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.schedule.startingDeadlineSeconds".to_string(),
             reason: format!(
-                "{s} must be >= 0 — a negative deadline marks every slot expired the instant \
-                 it fires (SkipExpired forever), so the schedule never runs. Omit the field for \
-                 no deadline, or use 0 to fire only exactly on time"
+                "{s} must be >= 0, or the schedule never runs. Fix: omit the field for no \
+                 deadline, or use 0 to fire only exactly on time"
             ),
         });
     }

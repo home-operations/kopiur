@@ -180,8 +180,7 @@ pub fn render(report: &DoctorReport) -> String {
 /// The fix line for every "this plugin is older than the server" verdict, so
 /// the three skew paths (an undecodable list, an unknown phase, an unregistered
 /// gate reason) tell the user the same thing.
-const UPGRADE_PLUGIN_FIX: &str = "upgrade the plugin to the operator's version (kubectl krew upgrade kopiur, or reinstall \
-     kubectl-kopiur from the operator's release) and re-run doctor";
+const UPGRADE_PLUGIN_FIX: &str = "upgrade the plugin to the operator's version (`kubectl krew upgrade kopiur`) and re-run doctor";
 
 /// Map a kube error on a check into an outcome.
 ///
@@ -196,15 +195,13 @@ fn warn_for(verb: &str, resource: &str, e: &kube::Error) -> Outcome {
     match e {
         kube::Error::SerdeError(se) => Outcome::Fail {
             what: format!("cannot decode the {resource} this cluster serves: {se}"),
-            why: "the server is writing a shape this plugin does not understand (an operator \
-                  newer than the plugin, or a partially-completed upgrade), so NONE of the \
-                  objects of that kind could be examined — this check saw an empty cluster"
+            why: "the operator is newer than this plugin (or mid-upgrade), so none of these \
+                  objects could be checked"
                 .into(),
             fix: UPGRADE_PLUGIN_FIX.into(),
         },
         kube::Error::Api(ae) if ae.code == 403 => Outcome::Warn(format!(
-            "cannot {verb} {resource} (RBAC); grant `{verb}` on `{resource}` or run \
-             with a more privileged kubeconfig to enable this check"
+            "cannot {verb} {resource} (RBAC); grant `{verb}` on `{resource}` to run this check"
         )),
         other => Outcome::Warn(format!("cannot {verb} {resource}: {other}")),
     }
@@ -280,8 +277,7 @@ async fn check_crds(ctx: &KubeCtx) -> Outcome {
                     return Outcome::Fail {
                         what: format!("CRD {name} does not serve {}", kopiur_api::VERSION),
                         why: "this plugin (and the operator) speak v1alpha1 only".into(),
-                        fix: "upgrade/reinstall the kopiur CRDs (helm upgrade, or apply deploy/crds/)"
-                            .into(),
+                        fix: "upgrade the kopiur CRDs (helm upgrade, or apply deploy/crds/)".into(),
                     };
                 }
                 let stale = missing_spec_fields(&expected, &crd);
@@ -291,14 +287,11 @@ async fn check_crds(ctx: &KubeCtx) -> Outcome {
                             "CRD {name} schema is stale: missing spec field(s) {}",
                             stale.join(", ")
                         ),
-                        why: "Helm never upgrades the chart's crds/ directory, so the live CRD \
-                              predates this schema — the apiserver PRUNES these fields from every \
-                              applied object (e.g. a multi-repository SnapshotPolicy loses \
-                              spec.repositories, and admission then refuses the neither-repository \
-                              shape)"
+                        why: "Helm does not upgrade CRDs, so the API server drops these fields \
+                              from every object you apply"
                             .into(),
-                        fix: "apply the current CRDs: kubectl apply --server-side -f deploy/crds/ \
-                              (or your GitOps CRD-upgrade path, e.g. Flux CreateReplace)"
+                        fix: "kubectl apply --server-side -f deploy/crds/ (or your GitOps CRD \
+                              upgrade path)"
                             .into(),
                     };
                 }
@@ -382,8 +375,7 @@ async fn check_deployment(ctx: &KubeCtx, component: &str, required: bool) -> (Ou
 async fn check_webhook_admission(ctx: &KubeCtx, webhook_installed: bool) -> Outcome {
     if !webhook_installed {
         return Outcome::Warn(
-            "webhook not installed; admission-time validation is off (the controller still \
-             validates defensively)"
+            "webhook not installed; specs are only checked by the controller, not at apply time"
                 .into(),
         );
     }
@@ -416,19 +408,19 @@ async fn check_webhook_admission(ctx: &KubeCtx, webhook_installed: bool) -> Outc
         }
         Err(kube::Error::Api(ae)) if ae.message.contains("denied the request") => {
             Outcome::Warn(format!(
-                "the probe was denied by a NON-kopiur webhook, so kopiur's own validation \
-                 could not be confirmed: {}",
+                "a non-kopiur webhook denied the probe, so kopiur's webhook could not be \
+                 checked: {}",
                 ae.message
             ))
         }
         // Admitted: the webhook did NOT intercept an invalid object.
         Ok(_) => Outcome::Fail {
             what: "an invalid SnapshotPolicy passed admission (dry-run)".into(),
-            why: "the validating webhook is not intercepting kopiur objects — bad specs will \
-                  land and fail later at reconcile time"
+            why: "the webhook is not checking kopiur objects, so bad specs fail later instead \
+                  of at apply time"
                 .into(),
-            fix: "check the ValidatingWebhookConfiguration, the webhook Service endpoints, and \
-                  the webhook pod logs"
+            fix: "check the ValidatingWebhookConfiguration, the webhook Service, and the \
+                  webhook pod logs"
                 .into(),
         },
         // Webhook wired but unreachable: the failurePolicy surfaces as an error.
@@ -439,14 +431,14 @@ async fn check_webhook_admission(ctx: &KubeCtx, webhook_installed: bool) -> Outc
                     "admission requests error instead of validating: {}",
                     ae.message
                 ),
-                fix: "check the webhook Service/EndpointSlices, the CA bundle, and the webhook \
-                      pod (kubectl -n <ns> logs deploy/<release>-webhook)"
+                fix: "check the webhook Service, the CA bundle, and the webhook pod logs \
+                      (kubectl -n <ns> logs deploy/<release>-webhook)"
                     .into(),
             }
         }
         Err(kube::Error::Api(ae)) if ae.code == 403 => Outcome::Warn(
-            "cannot dry-run create snapshotpolicies (RBAC); grant `create` (dryRun) to enable \
-             the admission probe"
+            "cannot dry-run create snapshotpolicies (RBAC); grant `create` to run the \
+             admission probe"
                 .into(),
         ),
         Err(e) => Outcome::Warn(format!("admission probe inconclusive: {e}")),
@@ -596,12 +588,9 @@ fn check_repos_ready(repos: &[RepoSummary]) -> Outcome {
         fails.extend(warns);
         return Outcome::Fail {
             what: format!("repositories not Ready or blocked: {}", fails.join("; ")),
-            why: "backups/restores against an unready repository cannot run, and a repository \
-                  holding a structural gate (a tripped mass-deletion breaker) blocks the work \
-                  waiting on it until a human acts"
-                .into(),
-            fix: "the condition message above is the operator's diagnosis and carries the exact \
-                  command where one applies; `kubectl describe` the repository for events"
+            why: "backups and restores cannot run against an unready or blocked repository".into(),
+            fix: "follow the condition message above; `kubectl describe` the repository for \
+                  events"
                 .into(),
         };
     }
@@ -620,8 +609,7 @@ async fn check_credentials(ctx: &KubeCtx, repos: &[RepoSummary]) -> Outcome {
         for cred in mover_creds_secret_refs(&repo.backend, &repo.encryption, default_ns) {
             let Some(ns) = cred.namespace.clone().or(default_ns.map(str::to_string)) else {
                 missing.push(format!(
-                    "{:?}/{}: secret {:?} has no resolvable namespace (a ClusterRepository \
-                     reference must pin one)",
+                    "{:?}/{}: secret {:?} has no namespace (a ClusterRepository must set one)",
                     repo.kind, repo.name, cred.name
                 ));
                 continue;
@@ -650,12 +638,8 @@ async fn check_credentials(ctx: &KubeCtx, repos: &[RepoSummary]) -> Outcome {
     } else {
         Outcome::Fail {
             what: format!("missing credential Secret(s): {}", missing.join("; ")),
-            why: "movers load credentials via namespace-local envFrom; a missing Secret \
-                  fails every run against that repository"
-                .into(),
-            fix: "create the Secret in the named namespace (or enable credentialProjection \
-                  where supported)"
-                .into(),
+            why: "every run against that repository fails without it".into(),
+            fix: "create the Secret in the named namespace (or enable credentialProjection)".into(),
         }
     }
 }
@@ -784,13 +768,9 @@ fn evaluate_snapshot_replications(
                 "snapshot replications unhealthy: {}",
                 join_capped(&fails, 5)
             ),
-            why: "a replication whose repositories are missing/unready cannot copy, and a \
-                  Failed one stopped copying at its last run — the off-site copy is stale \
-                  until this is fixed"
-                .into(),
-            fix: "the message above is the operator's diagnosis; `kubectl describe \
-                  snapshotreplication <name>` for events, and fix the named repository or \
-                  ref first where one is named"
+            why: "the replication cannot copy, so the off-site copy is going stale".into(),
+            fix: "fix the named repository or ref; `kubectl describe snapshotreplication \
+                  <name>` for events"
                 .into(),
         };
     }
@@ -873,8 +853,8 @@ fn describe_gate(gate: &StructuralGate, cond: &Condition) -> String {
 /// One line about a gate whose `reason` this build has no row for.
 fn describe_unregistered_gate(cond: &Condition) -> String {
     format!(
-        "blocked on {}={} with reason `{}`, which this plugin does not know (the operator is \
-         newer than the plugin): {}",
+        "blocked on {}={} with unknown reason `{}` (the operator is newer than the \
+         plugin): {}",
         cond.type_, cond.status, cond.reason, cond.message
     )
 }
@@ -971,16 +951,15 @@ impl StuckKind {
     fn why(&self) -> &'static str {
         match self {
             Self::Blocked { .. } => {
-                "a structural gate never self-heals — the operator has parked the object until a \
-                 human makes an out-of-band change, so it will wait forever however new it is"
+                "this block never self-heals; the object waits until someone acts"
             }
             Self::Overdue => {
-                "a Snapshot/Restore should reach a terminal phase; a long Pending/Running usually \
-                 means an unschedulable mover pod, a missing PVC, or an unreachable backend"
+                "a long Pending/Running usually means an unschedulable mover pod, a missing \
+                 PVC, or an unreachable backend"
             }
             Self::UnknownPhase { .. } | Self::UnregisteredGate { .. } => {
-                "the operator wrote a phase/reason this plugin does not know, so this plugin \
-                 cannot tell whether that work is progressing"
+                "this plugin does not know the phase/reason, so it cannot tell if the work \
+                 is progressing"
             }
         }
     }
@@ -989,13 +968,12 @@ impl StuckKind {
     fn fix(&self) -> &'static str {
         match self {
             Self::Blocked { .. } => {
-                "the condition message above is the operator's own diagnosis and carries the \
-                 exact command to run; apply it and the object proceeds on its own"
+                "run the command in the condition message above (the operator's own \
+                 diagnosis); the object then continues on its own"
             }
             Self::Overdue => {
-                "kubectl kopiur logs snapshot|restore <name> and `kubectl describe` the object \
-                 for its conditions/events; if this is a legitimately long run (e.g. a large \
-                 initial backup), raise --stuck-threshold"
+                "check `kubectl kopiur logs snapshot|restore <name>` and `kubectl describe`; \
+                 for a legitimately long run, raise --stuck-threshold"
             }
             Self::UnknownPhase { .. } | Self::UnregisteredGate { .. } => UPGRADE_PLUGIN_FIX,
         }
@@ -1446,12 +1424,9 @@ fn failures_outcome(
                 "{recent_count} failed in the last {lookback_label}: {}{older_note}",
                 join_capped(&lines, 10)
             ),
-            why: "a Failed Snapshot/Restore means a backup or restore did NOT happen; a failure \
-                  inside the lookback window is a current problem, not retained history"
-                .into(),
-            fix: "kubectl kopiur logs snapshot|restore <name> for the mover output, and \
-                  `kubectl describe` the object for its failure conditions; widen or narrow the \
-                  window with --failure-lookback"
+            why: "a Failed Snapshot/Restore means the backup or restore did not happen".into(),
+            fix: "check `kubectl kopiur logs snapshot|restore <name>` and `kubectl describe`; \
+                  change the window with --failure-lookback"
                 .into(),
         };
     }
@@ -2668,7 +2643,7 @@ mod tests {
         ));
         assert!(what.contains("snapshot media/nightly-1"), "{what}");
         assert!(what.contains("kopia could not connect"), "{what}");
-        assert!(why.contains("did NOT happen"), "{why}");
+        assert!(why.contains("did not happen"), "{why}");
         assert!(fix.contains("kubectl kopiur logs"), "{fix}");
     }
 

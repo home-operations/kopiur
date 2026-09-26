@@ -62,7 +62,7 @@ impl OtlpConfig {
             Ok(opt) => Ok(opt),
             Err(e) if TelemetryError::strict_mode() => Err(e),
             Err(e) => {
-                tracing::error!(error = %e, "OTLP disabled (misconfiguration); continuing with local telemetry");
+                tracing::error!(error = %e, "OTLP config is invalid; OTLP export is off, local logs and metrics still work");
                 Ok(None)
             }
         }
@@ -161,7 +161,7 @@ impl MetricsProvider {
     /// [`init_tracing`], which fails fast before this is reached.
     pub fn new(service_name: &str) -> Self {
         Self::try_new(service_name).unwrap_or_else(|e| {
-            tracing::error!(error = %e, "metrics provider degraded to no-op; /metrics will be empty until fixed");
+            tracing::error!(error = %e, "metrics setup failed; /metrics will be empty");
             Self::degraded(service_name)
         })
     }
@@ -210,7 +210,7 @@ impl MetricsProvider {
                 }
                 Err(e) if TelemetryError::strict_mode() => return Err(e),
                 Err(e) => {
-                    tracing::error!(error = %e, "OTLP metrics export disabled; Prometheus pull still active")
+                    tracing::error!(error = %e, "OTLP metrics export is off; /metrics still works")
                 }
             }
         }
@@ -359,9 +359,7 @@ pub fn init_tracing(service_name: &str) -> Result<TelemetryGuard, TelemetryError
         Ok(o) => o,
         Err(e) if TelemetryError::strict_mode() => return Err(e),
         Err(e) => {
-            deferred.push(format!(
-                "OTLP disabled (misconfiguration); continuing with local telemetry: {e}"
-            ));
+            deferred.push(format!("OTLP config is invalid; OTLP export is off: {e}"));
             None
         }
     };
@@ -415,8 +413,7 @@ pub fn init_tracing(service_name: &str) -> Result<TelemetryGuard, TelemetryError
         // No subscriber is installed, so `tracing::*` would go nowhere — write
         // straight to stderr and fail fast: a backup operator must not run blind.
         eprintln!(
-            "kopiur-telemetry: FATAL: could not install the tracing subscriber for \
-             {service_name}: {e}"
+            "kopiur-telemetry: could not install the tracing subscriber for {service_name}: {e}"
         );
         return Err(TelemetryError::SubscriberInit {
             source: Box::new(e),

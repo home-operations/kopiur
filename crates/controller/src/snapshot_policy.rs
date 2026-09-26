@@ -347,8 +347,8 @@ fn executable_prunes(
 /// status write stays a no-op while the outage persists.
 fn policy_repo_gate_message(not_ready_keys: &[String]) -> String {
     format!(
-        "repository(ies) not Ready: {} — backups, retention, adoption and verification \
-         against them are deferred until they recover (the ready subset keeps processing)",
+        "repository(ies) not Ready: {}. Work against them waits until they recover; \
+         Ready repositories keep going.",
         not_ready_keys.join(", ")
     )
 }
@@ -667,7 +667,7 @@ async fn execute_stamp_and_delete(
         io::annotate_then_delete_snapshot(backup_api, cr_name, PrunedBy::PolicyCascade).await?;
         ctx.metrics
             .inc_policy_cascade_children_deleted(namespace, PolicyCascadeMode::Retain);
-        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: stamped pruned-by then deleted (Retain mode)");
+        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: deleted Snapshot CR, kept its kopia snapshot (Retain)");
     }
     Ok(())
 }
@@ -683,7 +683,7 @@ async fn execute_stamp_only(
 ) -> Result<()> {
     for cr_name in names {
         io::stamp_pruned_by(backup_api, cr_name, PrunedBy::PolicyCascade).await?;
-        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: reclassified an in-flight terminating child (stamp only)");
+        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: marked a Snapshot that was already being deleted");
     }
     Ok(())
 }
@@ -700,7 +700,7 @@ async fn execute_delete_only(
         io::delete_snapshot(backup_api, cr_name).await?;
         ctx.metrics
             .inc_policy_cascade_children_deleted(namespace, PolicyCascadeMode::Delete);
-        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: bare deleted (Delete mode, external classification)");
+        tracing::info!(namespace, snapshot = %cr_name, "policy cascade: deleted Snapshot CR (Delete)");
     }
     Ok(())
 }
@@ -1135,7 +1135,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         }
         for cr_name in &to_stamp_only {
             io::stamp_pruned_by(&backup_api, cr_name, PrunedBy::Retention).await?;
-            tracing::info!(config = %name, backup = %cr_name, "reclassified an in-flight retention prune (pruned-by stamp only)");
+            tracing::info!(config = %name, backup = %cr_name, "marked a Snapshot already being deleted as a retention prune");
         }
         // `active` = live snapshots that survive GFS (all selected are being
         // removed one way or another, so subtract the full selected set — the
@@ -1212,9 +1212,8 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     if config.spec.verification.is_some() && verify_members.is_empty() {
         tracing::warn!(
             policy = %name,
-            "verification is configured but this policy's pvcSelector matched no \
-             PersistentVolumeClaim: nothing to verify, so no verify Job is spawned and no \
-             lastVerified is stamped. Check the selector's labels."
+            "verification is set but the pvcSelector matched no PersistentVolumeClaim, so \
+             nothing is verified. Fix: check the selector's labels."
         );
     }
     let folded =
@@ -2019,8 +2018,8 @@ async fn adoption_pass_for_target(
             crate::consts::ADOPTION_SCAN_REQUESTED_REASON,
             crate::consts::AWAIT_CATALOG_SCAN_ACTION,
             &format!(
-                "requested an on-demand catalog scan on repository {} so newly-recreated \
-                 snapshots matching identity {identity_str} materialize for adoption",
+                "requested a catalog scan on repository {} to find snapshots matching identity \
+                 {identity_str} for adoption",
                 t.rref.name
             ),
         )
@@ -2193,7 +2192,7 @@ async fn run_adoption(
             policy = %name,
             skipped = plan_skipped,
             identity = %identity_str,
-            "adoption withheld by the retention gate (inv. 8)"
+            "adoption skipped: retention would prune these snapshots"
         );
         if skipped_changed {
             io::publish_normal_event(
@@ -2390,8 +2389,7 @@ async fn adopt_one(
                     policy = %config.name_any(),
                     adopted = %cr_name,
                     discovered = %candidate.name,
-                    "adopted-row name is occupied by an object that is not this candidate's \
-                     adopted row (label mismatch); skipping to avoid overwriting a stranger's status"
+                    "a different Snapshot already uses the adopted name; skipping"
                 );
                 return Ok(());
             }

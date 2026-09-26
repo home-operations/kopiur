@@ -240,7 +240,7 @@ retention:
 Set only the buckets you care about and omit the rest. There is deliberately **no** `successfulJobsHistoryLimit`: successful retention is GFS, full stop. Failed runs are bounded separately by `failedJobsHistoryLimit` on the `SnapshotSchedule`.
 
 /// warning | A `retention:` block that keeps nothing is rejected
-If you set `retention:` but leave every bucket unset or `0`, GFS would prune **every** snapshot the moment it runs, which is silent data loss. The admission webhook rejects that, saying *"keeps no snapshots … set at least one bucket"*. To disable pruning entirely, **omit `retention` altogether**, because absent means don't prune. An empty-but-present block is the trap, so it's blocked.
+If you set `retention:` but leave every bucket unset or `0`, GFS would prune **every** snapshot the moment it runs, which is silent data loss. The admission webhook rejects that, saying *"keeps no snapshots … set at least one"*. To disable pruning entirely, **omit `retention` altogether**, because absent means don't prune. An empty-but-present block is the trap, so it's blocked.
 ///
 
 /// note | GFS is the only pruning mechanism: kopia's own retention is pinned off

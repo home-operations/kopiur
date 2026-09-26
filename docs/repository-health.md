@@ -30,7 +30,7 @@ A `Snapshot` will **not** spawn a mover Job while its repository is not `Ready`.
 ```console
 $ kubectl get snapshot <name> -n <ns> \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}'
-# → "waiting for repository `nas` to become `Ready` before launching the backup…"
+# → "waiting for repository `nas` to be `Ready` (backend unreachable)…"
 ```
 
 This is the same gate `Maintenance`, `SnapshotPolicy`, and `RepositoryReplication` already applied. `Snapshot` and `Restore` were the write paths that skipped it, and both are gated now.

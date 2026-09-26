@@ -36,8 +36,7 @@ pub struct CredsContext<'a> {
 pub fn missing_creds_message(secret: &str, job_ns: &str, ctx: &CredsContext) -> String {
     let mut msg = format!(
         "credentials Secret `{secret}` does not exist in namespace `{job_ns}`, where the mover \
-         Job runs and loads it via envFrom — envFrom is namespace-local and cannot read a Secret \
-         from another namespace."
+         Job runs (envFrom cannot read a Secret from another namespace)."
     );
     match ctx.repo_secret_namespace {
         // Cross-namespace mismatch (typically a ClusterRepository whose Secret is
@@ -45,9 +44,8 @@ pub fn missing_creds_message(secret: &str, job_ns: &str, ctx: &CredsContext) -> 
         Some(src) if src != job_ns => {
             msg.push_str(&format!(
                 " The {kind} `{name}` keeps that Secret in namespace `{src}`. Fix: create a \
-                 Secret `{secret}` in `{job_ns}` with the same keys (e.g. `KOPIA_PASSWORD`, plus \
-                 backend keys like `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), or use a \
-                 namespaced Repository whose secret lives in `{job_ns}`.",
+                 Secret `{secret}` in `{job_ns}` with the same keys (e.g. `KOPIA_PASSWORD` and \
+                 backend keys), or use a namespaced Repository in `{job_ns}`.",
                 kind = ctx.repo_kind,
                 name = ctx.repo_name,
             ));
@@ -55,9 +53,8 @@ pub fn missing_creds_message(secret: &str, job_ns: &str, ctx: &CredsContext) -> 
         // Same-namespace reference: the Secret simply isn't there yet.
         _ => {
             msg.push_str(&format!(
-                " The {kind} `{name}` references it from namespace `{job_ns}`. Fix: create a \
-                 Secret `{secret}` in `{job_ns}` with the repository credentials (e.g. \
-                 `KOPIA_PASSWORD`, plus any backend keys).",
+                " Fix: create a Secret `{secret}` in `{job_ns}` for {kind} `{name}` with the \
+                 repository credentials (e.g. `KOPIA_PASSWORD` and any backend keys).",
                 kind = ctx.repo_kind,
                 name = ctx.repo_name,
             ));
@@ -336,15 +333,12 @@ fn projection_name_conflict_message(
 ) -> String {
     let holder = match existing {
         Some(r) => format!("it is controlled by {} `{}`", r.kind, r.name),
-        None => "it carries no kopiur controller ownerReference, so it is \
-                 not managed by kopiur (likely user-created)"
-            .to_string(),
+        None => "it is not managed by kopiur (likely user-created)".to_string(),
     };
     format!(
-        "credential projection blocked for {kind} `{name}`: target Secret `{proj_name}` in \
-         namespace `{job_ns}` already exists and {holder}, and overwriting it would hand one \
-         consumer another owner's (or the user's) Secret. Fix: rename one of the colliding \
-         resources, or delete the conflicting Secret if it is stale.",
+        "credential projection blocked for {kind} `{name}`: Secret `{proj_name}` in namespace \
+         `{job_ns}` already exists and {holder}. Fix: rename one of the colliding resources, or \
+         delete the Secret if it is stale.",
         kind = ctx.repo_kind,
         name = ctx.repo_name,
     )
@@ -437,21 +431,20 @@ async fn reap_quietly(
         Ok(signal) => signal,
         Err(e) => {
             tracing::warn!(secret = %name, namespace = %job_ns, what, error = %e,
-                "projected credentials copy cleanup failed (skipped; retried next run)");
+                "could not delete projected credentials copy; retrying next run");
             return ReapSignal::Errored;
         }
     };
     match signal {
         ReapSignal::Deleted => {
             tracing::info!(secret = %name, namespace = %job_ns, what,
-                "reaped projected credentials copy");
+                "deleted projected credentials copy");
         }
         ReapSignal::Forbidden => {
             tracing::warn!(secret = %name, namespace = %job_ns, what,
                 flag = crate::consts::CREDENTIAL_PROJECTION_FLAG,
-                "cannot reap projected credentials copy: the operator lacks the \
-                 `secrets` delete verb. Upgrade the Helm release so the credentialProjection \
-                 grant includes delete, or remove the Secret by hand");
+                "cannot delete projected credentials copy: the operator lacks `secrets` \
+                 delete. Upgrade the Helm release, or delete the Secret by hand");
         }
         ReapSignal::Absent | ReapSignal::Kept | ReapSignal::Errored => {}
     }
@@ -886,9 +879,9 @@ fn projection_denied_message(
     let (why, fix) = match reason {
         ProjectionDenyReason::ConsumerNotOptedIn => (
             "the consumer has not opted in to credential projection",
-            "set `spec.credentialProjection.enabled: true` on this SnapshotPolicy/Restore (owner \
-             must also set `credentialProjection.allowed: true`), or create the Secret in the \
-             mover namespace yourself",
+            "set `spec.credentialProjection.enabled: true` on this SnapshotPolicy/Restore (the \
+             repository must also set `credentialProjection.allowed: true`), or create the \
+             Secret in the mover namespace yourself",
         ),
         ProjectionDenyReason::OwnerNotAllowed => (
             "the ClusterRepository owner has not allowed credential projection",
@@ -897,8 +890,8 @@ fn projection_denied_message(
         ),
     };
     format!(
-        "cross-namespace credential projection denied for `{secret}`: it lives in `{src_ns}` but \
-         the mover Job runs in `{job_ns}`, and {why}. Source: {kind} `{name}`. Fix: {fix}.",
+        "cannot copy Secret `{secret}` from `{src_ns}` to the mover namespace `{job_ns}`: {why} \
+         ({kind} `{name}`). Fix: {fix}.",
         kind = ctx.repo_kind,
         name = ctx.repo_name,
     )
@@ -910,9 +903,8 @@ fn projection_denied_message(
 fn projection_unresolved_ns_message(secret: &str, ctx: &CredsContext) -> String {
     format!(
         "credential Secret `{secret}` for {kind} `{name}` has no resolvable source namespace, so \
-         projection cannot read it to copy into the mover Job's namespace. Fix: set an explicit \
-         `namespace` on the Secret reference (a {kind} reference must pin one), or disable \
-         `spec.credentialProjection` and manage the Secret in each mover namespace yourself.",
+         it cannot be copied. Fix: set an explicit `namespace` on the Secret reference, or \
+         disable `spec.credentialProjection` and create the Secret in each mover namespace.",
         kind = ctx.repo_kind,
         name = ctx.repo_name,
     )
@@ -927,10 +919,9 @@ fn projection_source_missing_message(
     ctx: &CredsContext,
 ) -> String {
     format!(
-        "credential Secret `{secret}` not found in source namespace `{src_ns}`, so {kind} \
-         `{name}` cannot project it into `{job_ns}` where the mover Job runs. Fix: create Secret \
-         `{secret}` in `{src_ns}` with the repository credentials (e.g. `KOPIA_PASSWORD`, plus \
-         backend keys like `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`).",
+        "credential Secret `{secret}` for {kind} `{name}` not found in `{src_ns}`, so it cannot \
+         be copied to `{job_ns}`. Fix: create Secret `{secret}` in `{src_ns}` with the \
+         repository credentials (e.g. `KOPIA_PASSWORD` and backend keys).",
         kind = ctx.repo_kind,
         name = ctx.repo_name,
     )
@@ -945,11 +936,9 @@ fn map_projection_apply_error(e: Error, proj_name: &str, job_ns: &str) -> Error 
         && resp.code == 403
     {
         return Error::MissingDependency(format!(
-            "the operator is not permitted to write the projected credentials Secret \
-             `{proj_name}` in namespace `{job_ns}` (HTTP 403). Credential projection needs \
-             cluster-wide `secrets` create/patch RBAC. Fix: set `{flag}: true` \
-             in the Helm chart (grants the operator ClusterRole those verbs), or disable \
-             `spec.credentialProjection` on the repository and manage the Secret in `{job_ns}`.",
+            "the operator may not write the projected credentials Secret `{proj_name}` in \
+             namespace `{job_ns}` (HTTP 403). Fix: set `{flag}: true` in the Helm chart, or \
+             disable `spec.credentialProjection` and create the Secret in `{job_ns}` yourself.",
             flag = crate::consts::CREDENTIAL_PROJECTION_FLAG,
         ));
     }

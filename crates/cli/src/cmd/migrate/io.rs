@@ -77,7 +77,7 @@ impl SecretSource {
             // panic, to honor degrade-not-crash.
             SecretSource::None => Err(CliError::MigrationInput {
                 what: "internal: secret resolution attempted with --repository set".into(),
-                fix: "this is a kubectl-kopiur bug — please report it".into(),
+                fix: "this is a bug; please report it at https://github.com/home-operations/kopiur/issues".into(),
             }),
         }
     }

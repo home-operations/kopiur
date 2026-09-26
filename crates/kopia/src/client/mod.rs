@@ -1246,9 +1246,7 @@ impl AbortReason {
     fn into_error(self, args: String, stderr: &str) -> KopiaError {
         match self {
             AbortReason::ProducerFailed => KopiaError::StdinProducerFailed {
-                detail: "the stdin producer did not complete successfully; the kopia \
-                         snapshot was aborted before any manifest was written"
-                    .to_string(),
+                detail: "the stdin producer failed, so nothing was saved".to_string(),
                 stderr_tail: tail_lines(stderr),
             },
             AbortReason::WroteNothing => KopiaError::StdinProducerWroteNothing {

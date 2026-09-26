@@ -187,7 +187,7 @@ $ kubectl apply -f deploy/examples/tryit/volsync-source.yaml
 
 ```console
 $ kubectl kopiur migrate volsync -n media --resolve-secrets
-kopia sources: REPOSITORY ADOPTED IN PLACE — all existing snapshots are preserved and the snapshot identity is pinned so history continues. KEEP the referenced VolSync Secret(s); retire the fork's KopiaMaintenance objects.
+kopia sources: existing repository reused; all snapshots and history are kept. Keep the referenced VolSync Secret(s); retire the fork's KopiaMaintenance objects.
 
   mapped      spec.sourcePVC -> SnapshotPolicy.spec.sources[0].pvc.name
   mapped      spec.kopia.retain -> SnapshotPolicy.spec.retention

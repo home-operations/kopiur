@@ -144,9 +144,8 @@ That is the on-demand [run-requested](../replication.md#run-it-now) path. It sta
       Type:     Seeded
       Status:   False
       Reason:   Seeding
-      Message:  copying this repository's initial contents from S3; it does not become
-                Ready until the copy finishes (phase Initializing, or Degraded while
-                an earlier attempt is being retried)...
+      Message:  copying initial contents from S3; phase stays Initializing (Degraded
+                while retrying) until done...
     ```
 
     A first seed transfers the whole repository, so hours is normal. The phase is `Initializing` while the copy runs. It flips to `Degraded` if an attempt fails and is being retried. `Pending` means the run is parked because a migrate seed's source is not usable yet. The seeding Job's own logs are the progress view:

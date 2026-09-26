@@ -47,7 +47,7 @@ fn an_error_is_never_fatal_on_sight() {
     );
     match vgs_wait_outcome(&o, "ns", "g", "cls", Some(TEN_MIN), t(1)) {
         VgsWait::Waiting(msg) => {
-            assert!(msg.contains("possibly-transient"), "{msg}");
+            assert!(msg.contains("retried automatically"), "{msg}");
             assert!(
                 msg.contains("conflict"),
                 "the error is still surfaced: {msg}"

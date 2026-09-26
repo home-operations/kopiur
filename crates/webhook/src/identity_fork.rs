@@ -148,11 +148,10 @@ fn removed_repo_warning(
         return None;
     }
     Some(format!(
-        "this edit removes repository(ies) {} from a policy that already has snapshot \
-         history: their kopia snapshots remain in those repositories but this recipe no \
-         longer covers them (no new backups, retention, or verification there), and any \
-         existing Snapshot CR pinned to a removed repository becomes terminal. If \
-         unintended, restore the entry under spec.repositories",
+        "this edit removes repository(ies) {} from a policy with snapshot history: their \
+         snapshots stay there but get no new backups, retention, or verification, and \
+         Snapshot CRs pinned to them will fail. If unintended, restore the entry under \
+         spec.repositories",
         removed.into_iter().collect::<Vec<_>>().join(", ")
     ))
 }

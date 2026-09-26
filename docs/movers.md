@@ -155,10 +155,9 @@ When the Secret is missing, the `Snapshot` does **not** silently hang. The Secre
 $ kubectl get snapshots my-backup -n media \
     -o jsonpath='{.status.conditions[?(@.type=="CredentialsAvailable")].message}'
 credentials Secret `kopia-rustfs-creds` does not exist in namespace `media`,
-where the mover Job runs and loads it via envFrom — Kubernetes envFrom is
-namespace-local and cannot read a Secret from another namespace. The referenced
-ClusterRepository `rustfs-primary` keeps that Secret in namespace `kopiur-system`...
-Fix: create a Secret named `kopia-rustfs-creds` in namespace `media`...
+where the mover Job runs (envFrom cannot read a Secret from another namespace).
+The ClusterRepository `rustfs-primary` keeps that Secret in namespace
+`kopiur-system`. Fix: create a Secret `kopia-rustfs-creds` in `media`...
 ```
 
 Place the Secret and the condition clears to `CredentialsAvailable=True` on the next reconcile. The backup then proceeds.
@@ -177,11 +176,11 @@ What the gate checks is the **merged** mover, so any layer of the ladder can tri
 $ kubectl get snapshots my-backup -n media \
     -o jsonpath='{.status.conditions[?(@.type=="MoverPermitted")]}'
 {"type":"MoverPermitted","status":"False","reason":"PrivilegedMoverNotPermitted",
- "message":"the mover for this run is privileged ... namespace `media` has not
- opted in ... The elevation comes from Snapshot `my-backup` `spec.mover`. Fix:
- remove the elevated securityContext/privilegedMode there; or, to allow it for
- EVERY mover in namespace `media` from now on, a cluster admin runs `kubectl
- annotate namespace media kopiur.home-operations.com/privileged-movers=true`."}
+ "message":"the mover is privileged ... namespace `media` has not opted in ...
+ The elevation comes from Snapshot `my-backup` `spec.mover`. Fix: remove the
+ elevated securityContext/privilegedMode there, or, to allow it for every mover
+ in namespace `media`, a cluster admin runs `kubectl annotate namespace media
+ kopiur.home-operations.com/privileged-movers=true`."}
 ```
 
 A cluster admin opts the namespace in by applying the annotated `Namespace`:

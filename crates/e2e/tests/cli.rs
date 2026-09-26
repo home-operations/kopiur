@@ -1597,7 +1597,7 @@ async fn cli_migrate_volsync() {
     ]);
     assert!(out.success, "migrate --apply failed: {}", out.stderr);
     assert!(
-        out.stdout.contains("CONFIG TRANSLATION ONLY"),
+        out.stdout.contains("restic sources: config only"),
         "{}",
         out.stdout
     );
@@ -1863,7 +1863,7 @@ async fn cli_migrate_volsync_kopia() {
     ]);
     assert!(out.success, "kopia migrate --apply failed: {}", out.stderr);
     assert!(
-        out.stdout.contains("REPOSITORY ADOPTED IN PLACE"),
+        out.stdout.contains("existing repository reused"),
         "{}",
         out.stdout
     );
@@ -1873,7 +1873,7 @@ async fn cli_migrate_volsync_kopia() {
         out.stdout
     );
     assert!(
-        out.stderr.contains("referenced IN PLACE") && out.stderr.contains("KEEP Secret"),
+        out.stderr.contains("referenced in place") && out.stderr.contains("keep Secret"),
         "accounting must carry the keep-the-secret warning: {}",
         out.stderr
     );

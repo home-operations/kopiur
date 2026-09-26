@@ -253,7 +253,7 @@ fn referent_missing_message_says_what_why_and_how() {
     assert!(msg.contains("waitTimeout"), "{msg}");
     assert!(msg.contains("status.waitStartedAt"), "{msg}");
     // HOW to clear it.
-    assert!(msg.contains("Create the SnapshotPolicy"), "{msg}");
+    assert!(msg.contains("create the SnapshotPolicy"), "{msg}");
     // A cluster-scoped referent must not be given an invented namespace.
     let cluster = referent_missing_restore_message("ClusterRepository", None, "offsite");
     assert!(cluster.contains("ClusterRepository `offsite`"), "{cluster}");
@@ -1851,7 +1851,7 @@ fn target_already_bound_messages_say_what_why_fix() {
     assert!(msg.contains("PersistentVolume `pvc-abc`"), "{msg}");
     // The fix: re-create the CLAIM (deleting the Restore just re-triggers this no-op).
     assert!(msg.contains("delete the PVC"), "{msg}");
-    // Never claim a restore ran.
+    // Say plainly that no restore ran.
     assert!(msg.contains("no restore ran"), "{msg}");
     // A claim bound without an observed volumeName still reads sensibly.
     assert!(
@@ -1871,7 +1871,7 @@ fn target_already_bound_messages_say_what_why_fix() {
     );
     assert!(kept.contains("pv-xyz"), "{kept}");
     assert!(kept.contains("Retain"), "{kept}");
-    assert!(kept.contains("KEPT"), "{kept}");
+    assert!(kept.contains("kept"), "{kept}");
 }
 
 /// A LOST rebind is not an already-bound no-op: a prime WAS provisioned, a restore DID run,
@@ -1888,7 +1888,7 @@ fn lost_rebind_message_never_claims_nothing_ran() {
         "a lost rebind DID run a restore: {msg}"
     );
     assert!(
-        msg.contains("restored data is NOT in the claim"),
+        msg.contains("restored data is not in the claim"),
         "must say where the data actually is: {msg}"
     );
 }
@@ -1902,7 +1902,7 @@ fn populate_hijacked_message_points_at_the_provisioner() {
     assert!(msg.contains("`plex-config`"), "{msg}");
     assert!(msg.contains("pv-empty"), "{msg}");
     assert!(msg.contains("AnyVolumeDataSource"), "{msg}");
-    assert!(msg.contains("terminal"), "{msg}");
+    assert!(msg.contains("create a new Restore"), "{msg}");
     assert!(
         populate_hijacked_message("plex-config", None).contains("another PersistentVolume"),
         "an unnamed volume must not render as an empty backtick pair"
@@ -2094,10 +2094,9 @@ fn a_direct_source_path_ambiguity_says_to_create_a_new_restore() {
     let ambiguity = "SnapshotPolicy `cfg`'s selector sources do not yield a per-PVC path.";
     let msg = direct_source_path_ambiguous_message(ambiguity);
     assert!(msg.starts_with(ambiguity), "{msg}");
-    assert!(msg.contains("create a NEW Restore"), "{msg}");
+    assert!(msg.contains("create a new Restore"), "{msg}");
     assert!(msg.contains("source.fromPolicy.sourcePath"), "{msg}");
-    assert!(msg.contains("terminal"), "{msg}");
-    assert!(msg.contains("spec edit is not re-read"), "{msg}");
+    assert!(msg.contains("spec edits are not re-read"), "{msg}");
 }
 
 #[test]
@@ -2119,7 +2118,7 @@ fn wait_park_report_names_the_blocker_and_picks_the_cadence() {
         "the message must name the real blocker and the fix: {msg}"
     );
     assert!(
-        msg.contains("has NOT started"),
+        msg.contains("has not started"),
         "it must say the window has not started, not imply a snapshot wait: {msg}"
     );
     assert!(
@@ -2804,10 +2803,10 @@ fn recorded_verdict_root_uid_makes_the_elevation_visible() {
     // name ROOT, the snapshot it came from, and the forgeability of the record.
     let v = recorded_inherit_verdict("app/pg-b1", Some(0), RecordedSrc::Explicit, Some(0), None);
     assert!(v.ok, "{}", v.message);
-    assert!(v.message.contains("ROOT (uid 0)"), "{}", v.message);
+    assert!(v.message.contains("root (uid 0)"), "{}", v.message);
     assert!(v.message.contains("app/pg-b1"), "{}", v.message);
     assert!(v.message.contains("forge"), "{}", v.message);
-    assert!(v.message.contains("privileged-movers"), "{}", v.message);
+    assert!(v.message.contains("privileged movers"), "{}", v.message);
 }
 
 #[test]
@@ -2820,7 +2819,7 @@ fn absent_restore_target_pvc_stays_a_transient_race() {
     assert!(matches!(&err, Error::MissingDependency(_)), "{err:?}");
     assert_eq!(err.class(), crate::error::ErrorClass::Transient);
     assert!(err.to_string().contains("app/restored-data"));
-    assert!(err.to_string().contains("race"));
+    assert!(err.to_string().contains("retrying"));
 }
 
 // --- the restore's repository mover-Job pool reservation ----------------------
@@ -3185,7 +3184,10 @@ fn claims_summary_names_the_counts_the_stragglers_and_the_failures() {
     assert!(message.contains("in flight: c"), "{message}");
     assert!(message.contains("failed: d (MoverJobFailed)"), "{message}");
     // The fix a human acts on: siblings keep going, re-create the failed claim.
-    assert!(message.contains("re-create that claiming PVC"), "{message}");
+    assert!(
+        message.contains("re-create the failed claiming PVC"),
+        "{message}"
+    );
 
     // The healthy states carry the reasons the pre-#443 single-claim path used,
     // so `kubectl describe` reads the same for a one-PVC populator.
@@ -3218,7 +3220,7 @@ fn claims_summary_names_the_counts_the_stragglers_and_the_failures() {
     let (reason, message) = claims_summary(&ClaimsAggregate::NoClaims);
     assert_eq!(reason, crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON);
     assert!(message.contains("dataSourceRef"), "{message}");
-    assert!(message.contains("has NOT started"), "{message}");
+    assert!(message.contains("has not started"), "{message}");
 }
 
 #[test]

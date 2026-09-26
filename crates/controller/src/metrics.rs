@@ -356,11 +356,10 @@ impl Metrics {
         let failure_events_dropped = m
             .u64_counter("kopiur_controller_failure_events_dropped")
             .with_description(
-                "Reconcile-failure Warning Events dropped instead of published, by cause: \
-                 transport = the kube client's connection is down so a publish is futile; \
-                 saturated = too many in-flight publishes (best-effort, never queued); \
-                 timeout = the publish stalled past its deadline. A burst here is the \
-                 /metrics-visible signature of an apiserver outage.",
+                "Reconcile-failure Warning Events dropped instead of published, by cause \
+                 (transport = API server unreachable; saturated = too many in-flight \
+                 publishes; timeout = publish timed out). A burst usually means an API \
+                 server outage.",
             )
             .build();
         let reconcile_duration = m
@@ -373,27 +372,17 @@ impl Metrics {
         let kube_client_requests = m
             .u64_counter("kopiur_kube_client_requests")
             .with_description(
-                "Every HTTP request the controller's kube clients send to the apiserver, by \
-                 verb (get|list|watch|create|update|patch|apply|delete|deletecollection|other), \
-                 group ('' = the core group, matching apiserver_request_total so the two join), \
-                 kind (the resource plural, plus '/subresource' for subresource requests, or \
-                 'other' for non-resource paths), and client (main = watches + reconcilers, \
-                 exec = workloadExec attaches, election = the leader Lease). Counted at send \
-                 time via a tower layer under ClientBuilder, so Controller-internal trigger \
-                 streams are covered too. This is the controller's self-reported apiserver \
-                 footprint — the signal issue #382 had to reconstruct server-side.",
+                "HTTP requests the controller sends to the API server, by verb, group \
+                 ('' = core, as in apiserver_request_total), kind (resource plural, plus \
+                 '/subresource', or 'other'), and client (main = watches and reconcilers, \
+                 exec = workloadExec, election = the leader Lease).",
             )
             .build();
         let watcher_restarts = m
             .u64_counter("kopiur_watcher_restarts")
             .with_description(
-                "Watch-stream errors on the streams kopiur drives itself (the referent \
-                 metadata trigger streams and the shared Maintenance informer), by the \
-                 watched kind. Each error makes the watcher back off and restart its watch; \
-                 a sustained rate means watch churn (and re-LIST load) that is otherwise \
-                 invisible below the default log level. Controller-internal trigger streams \
-                 (primary reflectors, .owns(), .watches()) expose no error hook and are NOT \
-                 counted here — kopiur_kube_client_requests_total covers their traffic.",
+                "Watch errors on kopiur's own watch streams, by watched kind. Each error \
+                 restarts the watch; a sustained rate means watch churn and extra LIST load.",
             )
             .build();
 
@@ -425,33 +414,30 @@ impl Metrics {
         let leader_is_leader = m
             .i64_gauge("kopiur_leader_is_leader")
             .with_description(
-                "1 if this replica currently holds the election Lease, 0 otherwise. Also the \
-                 flag to filter dashboards by: the store-backed resource gauges are \
-                 leader-only, so a standby's /metrics legitimately omits them.",
+                "1 if this replica holds the leader Lease, 0 otherwise. Resource gauges are \
+                 reported only by the leader.",
             )
             .build();
         let leader_transitions = m
             .u64_counter("kopiur_leader_transitions")
             .with_description(
-                "Total times this replica acquired the election Lease. A healthy single-leader \
-                 deployment increments this once per process start; a climbing rate is \
-                 election flapping.",
+                "Times this replica became leader. Normally once per process start; a \
+                 climbing rate means leadership is flapping.",
             )
             .build();
         let leader_renew_failures = m
             .u64_counter("kopiur_leader_renew_failures")
             .with_description(
-                "Failed Lease renew attempts by reason (stalled|transport|conflict). These are \
-                 retried inside the renew window and are NOT by themselves leadership loss — \
-                 a sustained nonzero rate is the early warning that used to be invisible.",
+                "Failed leader Lease renew attempts, by reason (stalled|transport|conflict). \
+                 They are retried and do not by themselves lose leadership; a sustained rate \
+                 is an early warning.",
             )
             .build();
         let leader_renew_duration = m
             .f64_histogram("kopiur_leader_renew_duration_seconds")
             .with_description(
-                "Wall time of one Lease renew attempt, successful or not. Healthy is single-digit \
-                 milliseconds; a p99 approaching the renew deadline means the election is one \
-                 hiccup away from abdicating.",
+                "Duration of one leader Lease renew attempt. Healthy is a few milliseconds; \
+                 a p99 near the renew deadline means leadership is at risk.",
             )
             .with_boundaries(vec![0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
             .build();
@@ -466,11 +452,8 @@ impl Metrics {
         let snapshots_completed = m
             .u64_counter("kopiur_snapshots_completed")
             .with_description(
-                "Total Snapshot runs that reached a terminal phase, by result \
-                 (succeeded|failed), namespace, and policy. Incremented once per terminal \
-                 transition (the controller's finalize paths), so unlike the observable \
-                 kopiur_resource_phase gauge it survives the CR's deletion and answers \
-                 time-windowed 'backups completed in this period' in PromQL (issue #175).",
+                "Finished Snapshot runs, by result (succeeded|failed), namespace, and policy. \
+                 Unlike kopiur_resource_phase, it survives the Snapshot's deletion.",
             )
             .build();
         let snapshot_deletion_failures = m
@@ -486,122 +469,90 @@ impl Metrics {
         let snapshot_deletions = m
             .u64_counter("kopiur_snapshot_deletions")
             .with_description(
-                "Total Snapshot finalizer resolutions, by outcome (deleted|retained|orphaned| \
-                 cascade_retained|policy_cascade_retained) and namespace. Distinct from \
-                 kopiur_snapshot_deletion_failures_total, which counts kopia delete-call \
-                 FAILURES during finalizer handling, not resolutions — never sum the two.",
+                "Snapshot finalizer outcomes, by outcome (deleted|retained|orphaned| \
+                 cascade_retained|policy_cascade_retained) and namespace. Failed kopia \
+                 deletes are counted in kopiur_snapshot_deletion_failures_total instead.",
             )
             .build();
         let snapshots_cascade_retained = m
             .u64_counter("kopiur_snapshots_cascade_retained")
             .with_description(
-                "Total Snapshots retained specifically by the schedule-deletion cascade guard \
-                 (onScheduleDelete: Retain when the owning SnapshotSchedule is gone/replaced). \
-                 A narrower, always-alongside view of \
-                 kopiur_snapshot_deletions{outcome=\"cascade_retained\"} — both are bumped \
-                 together by inc_snapshot_cascade_retained so the two series can't drift apart.",
+                "Snapshots kept because their SnapshotSchedule was deleted or replaced with \
+                 onScheduleDelete: Retain. Same count as \
+                 kopiur_snapshot_deletions{outcome=\"cascade_retained\"}.",
             )
             .build();
         let snapshots_policy_cascade_retained = m
             .u64_counter("kopiur_snapshots_policy_cascade_retained")
             .with_description(
-                "Total Snapshots retained specifically by the policy-deletion cascade \
-                 (pruned-by: policy-cascade with the Snapshot's own effective deletionPolicy: \
-                 Delete, when the owning SnapshotPolicy is gone and onPolicyDelete: Retain). A \
-                 narrower, always-alongside view of \
-                 kopiur_snapshot_deletions{outcome=\"policy_cascade_retained\"} — both are \
-                 bumped together by inc_snapshot_policy_cascade_retained so the two series can't \
-                 drift apart.",
+                "Snapshots kept because their SnapshotPolicy was deleted with \
+                 onPolicyDelete: Retain. Same count as \
+                 kopiur_snapshot_deletions{outcome=\"policy_cascade_retained\"}.",
             )
             .build();
         let policy_cascade_children_deleted = m
             .u64_counter("kopiur_policy_cascade_children_deleted")
             .with_description(
-                "Total Snapshot children acted on by a SnapshotPolicy deletion-cascade \
-                 finalizer, by mode: retain = stamped pruned-by: policy-cascade then \
-                 deleted (the kopia snapshot itself is never touched); delete = a bare \
-                 unstamped delete, classifying as an ordinary external deletion subject \
-                 to the per-repository mass-deletion breaker. A terminating child merely \
-                 reclassified by a stamp-only pass is NOT counted here — its eventual \
-                 resolution is already covered by kopiur_snapshots_policy_cascade_retained.",
+                "Snapshot CRs deleted because their SnapshotPolicy was deleted, by mode \
+                 (retain = kopia snapshot kept; delete = kopia snapshot deleted, subject to \
+                 the mass-deletion breaker).",
             )
             .build();
         let replication_runs = m
             .u64_counter("kopiur_replication_runs")
             .with_description(
-                "Total replication runs that reached a terminal mover-Job outcome, by kind \
-                 (RepositoryReplication|SnapshotReplication), trigger (cron|manual) and \
-                 outcome (succeeded|failed). Counted ONCE per run: the reconcile's \
-                 Job-outcome arms are reached zero-to-many times for one run, so the \
-                 increment is keyed on a durable run-counted marker stamped on the Job \
-                 itself. A run still in flight is not counted at all.",
+                "Finished replication runs, by kind (RepositoryReplication|SnapshotReplication), \
+                 trigger (cron|manual) and outcome (succeeded|failed). Counted once per run.",
             )
             .build();
         let snapshot_delete_batch_jobs = m
             .u64_counter("kopiur_snapshot_delete_batch_jobs")
-            .with_description(
-                "Total mass-deletion batch-delete mover Jobs, by outcome (succeeded|failed).",
-            )
+            .with_description("Batch-delete mover Jobs, by outcome (succeeded|failed).")
             .build();
         let snapshot_delete_batch_members = m
             .u64_counter("kopiur_snapshot_delete_batch_members")
             .with_description(
-                "Total Snapshots resolved by a batch-delete Job, by member outcome \
-                 (deleted|failed). A single Job's members are counted independently — one \
-                 member's failure does not stop the others (kopiur_snapshot_delete_batch_jobs \
-                 records the whole-Job outcome separately).",
+                "Snapshots handled by a batch-delete Job, by outcome (deleted|failed). Each \
+                 Snapshot is counted on its own.",
             )
             .build();
         let work_spec_cms_swept = m
             .u64_counter("kopiur_work_spec_cms_swept")
-            .with_description(
-                "Total orphaned mover work-spec ConfigMaps deleted by the periodic sweep \
-                 (ConfigMaps whose mover Job was already TTL-reaped).",
-            )
+            .with_description("Orphaned mover work-spec ConfigMaps deleted by the periodic sweep.")
             .build();
         let projected_secrets_swept = m
             .u64_counter("kopiur_projected_secrets_swept")
             .with_description(
-                "Total legacy per-run projected credential Secrets deleted by the periodic \
-                 sweep (pre-stable-naming copies whose mover Job is gone).",
+                "Legacy per-run projected credential Secrets deleted by the periodic sweep.",
             )
             .build();
         let creds_secrets_reaped = m
             .u64_counter("kopiur_creds_secrets_reaped")
             .with_description(
-                "Total projected credential Secrets reaped once no mover Job could still \
-                 load them, by mechanism: `by=terminal` is the consuming CR's reconciler \
-                 (the fast path), `by=sweep` is the periodic backstop. Do NOT sum them — a \
-                 steady non-zero `by=sweep` rate means the reconciler's reap is not firing.",
+                "Projected credential Secrets deleted once no mover Job needs them, by `by` \
+                 (terminal = the owning CR's reconciler, sweep = the periodic sweep). A steady \
+                 `by=sweep` rate means the reconciler cleanup is not working.",
             )
             .build();
         let projected_secrets_live = m
             .i64_gauge("kopiur_projected_secrets_live")
             .with_description(
-                "Projected credential Secrets currently alive, observed each sweep pass. \
-                 The population, not a delta: a counter of projections rises identically \
-                 whether or not copies are ever reclaimed, which is why the per-run leak \
-                 (#240) ran unseen. Alert on deriv() > 0 over a day.",
+                "Projected credential Secrets that currently exist, sampled each sweep. \
+                 Alert on deriv() > 0 over a day (a leak).",
             )
             .build();
         let group_snapshots_live = m
             .i64_gauge("kopiur_volume_group_snapshots_live")
             .with_description(
-                "Shared CSI VolumeGroupSnapshots currently alive, observed each sweep pass. \
-                 These carry NO ownerReferences by design (a member Snapshot can be pruned \
-                 while its siblings still restore from the group), so ownerRef GC can never \
-                 reclaim one — kopiur's own reap is the only mechanism. The population is \
-                 therefore the signal: alert on deriv() > 0 over a day.",
+                "Shared CSI VolumeGroupSnapshots that currently exist, sampled each sweep. \
+                 Alert on deriv() > 0 over a day (a leak).",
             )
             .build();
         let snapshots_adopted = m
             .u64_counter("kopiur_snapshots_adopted")
             .with_description(
-                "Total discovered Snapshots auto-adopted into an identity-matching \
-                 SnapshotPolicy (status.origin flipped to Adopted), by namespace and policy. \
-                 Adopted rows are then GFS-governed and eventually pruned by the policy's \
-                 spec.retention — opt out with spec.adoption: Ignore on the policy or \
-                 spec.catalog.adoption: Ignore on the repository.",
+                "Discovered Snapshots adopted by a matching SnapshotPolicy, by namespace and \
+                 policy. Adopted Snapshots are pruned by the policy's retention.",
             )
             .build();
         let schedule_backups_created = m
@@ -611,51 +562,39 @@ impl Metrics {
         let secrets_projected = m
             .u64_counter("kopiur_secrets_projected")
             .with_description(
-                "Total credential Secrets projected into a mover Job's namespace \
-                 (opt-in spec.credentialProjection).",
+                "Credential Secrets copied into a mover Job's namespace \
+                 (spec.credentialProjection).",
             )
             .build();
         let backups_refused = m
             .u64_counter("kopiur_snapshot_refusals")
             .with_description(
-                "Total backups refused by policy (e.g. a ReadOnly repository, a privileged \
-                 mover without the namespace opt-in), labeled by reason. Refusals are \
-                 deliberate decisions, not reconcile errors, so they are not in \
-                 kopiur_controller_reconcile_errors.",
+                "Backups refused by policy (e.g. a ReadOnly repository), by reason. Not \
+                 counted as reconcile errors.",
             )
             .build();
         let health_probe_failures = m
             .u64_counter("kopiur_repository_health_probe_failures")
             .with_description(
-                "Total backend health-probe alerts raised (after the consecutive-failure \
-                 debounce), labeled by kind and outcome (vanished = backend reachable but the \
-                 repository is absent; unreachable = backend/mount/auth failure; timed_out = \
-                 the probe Job was killed by its bootstrap deadline — the backend may be \
-                 reachable but slow). These are alerts, and kopiur never auto-recreates.",
+                "Backend health-probe alerts, by kind and outcome (vanished = backend reachable \
+                 but repository missing; unreachable = backend, mount or auth failure; \
+                 timed_out = probe Job hit its deadline).",
             )
             .build();
         let breaker_trips = m
             .u64_counter("kopiur_repository_breaker_trips")
             .with_description(
-                "Total repository circuit-breaker openings: the backend health probe exceeded \
-                 spec.health.probe.failureThreshold under onFailure: Degrade, moving the \
-                 repository to Degraded (backups and replication pause until a connect \
-                 succeeds; maintenance also pauses for unreachable/vanished but keeps running \
-                 for timed_out, where index compaction is often the cure; recovery is \
-                 automatic). Labeled by kind (Repository/ClusterRepository), namespace, name, \
-                 and probe_kind (vanished/unreachable/timed_out — matching the \
-                 health-probe-failure outcome label).",
+                "Times a repository went Degraded after exceeding \
+                 spec.health.probe.failureThreshold, by kind, namespace, name, and probe_kind \
+                 (vanished|unreachable|timed_out). Backups and replication pause until it \
+                 recovers.",
             )
             .build();
         let repository_seeds = m
             .u64_counter("kopiur_repository_seed")
             .with_description(
-                "Total spec.seed outcomes on a repository bootstrap (issue #380), labeled by mode \
-                 (blob = kopia repository sync-to from a mirror backend; migrate = kopia snapshot \
-                 migrate from another repository CR) and outcome (seeded = data was copied in; \
-                 already_initialized = the standing no-op on a repository that was already \
-                 initialized; failed = the seeding bootstrap failed, and the repository is NOT \
-                 Ready).",
+                "spec.seed outcomes, by mode (blob = copy from a mirror backend; migrate = \
+                 copy from another repository) and outcome (seeded|already_initialized|failed).",
             )
             .build();
 
@@ -676,15 +615,15 @@ impl Metrics {
         let repo_foreign_snapshots = m
             .i64_gauge("kopiur_repo_foreign_snapshots")
             .with_description(
-                "Snapshots in the repository catalog classified as another cluster's \
-                 (multi-cluster shared repository; identityDefaults.cluster).",
+                "Snapshots in the repository that belong to another cluster \
+                 (identityDefaults.cluster).",
             )
             .build();
         let repo_maintenance_configured = m
             .i64_gauge("kopiur_repository_maintenance_configured")
             .with_description(
-                "1 if a Maintenance CR references the repository, 0 otherwise (unmaintained \
-                 repositories never reclaim storage).",
+                "1 if a Maintenance CR covers the repository, 0 otherwise. Without \
+                 maintenance, storage is never reclaimed.",
             )
             .build();
 
@@ -833,9 +772,8 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_resource_phase")
                 .with_description(
-                    "1 for a resource's active lifecycle phase (labeled kind/namespace/name/phase, \
-                     plus policy on Snapshot series). Store-backed: the series exists only while \
-                     the CR does, and only the active phase is emitted — never a 0-valued series.",
+                    "1 for a resource's current phase, by kind, namespace, name, phase (and policy \
+                     for Snapshots). Only the current phase is reported, never a 0.",
                 )
                 .with_callback(move |o| {
                     for s in snapshots.state() {
@@ -932,8 +870,7 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshot_files")
                 .with_description(
-                    "File count of a Snapshot (new+modified+unchanged), only when at least one \
-                     category is recorded — an unmeasured count is absent, never a bogus 0.",
+                    "File count of a Snapshot (new+modified+unchanged). Absent when unknown.",
                 )
                 .with_callback(move |o| {
                     for s in snapshots.state() {
@@ -981,8 +918,7 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshot_last_success_timestamp_seconds")
                 .with_description(
-                    "Unix timestamp of a successful Snapshot, from the mover-recorded \
-                     status.timing.endTime (only while phase == Succeeded).",
+                    "Unix timestamp of a Succeeded Snapshot, from status.timing.endTime.",
                 )
                 .with_callback(move |o| {
                     for s in snapshots.state() {
@@ -1073,8 +1009,8 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshotpolicy_last_backup_success")
                 .with_description(
-                    "1 if a policy's most recent terminal backup succeeded, 0 if it failed, \
-                     per (namespace, policy). Absent for a policy with no terminal backup yet.",
+                    "1 if a policy's latest finished backup succeeded, 0 if it failed, per \
+                     (namespace, policy). Absent until a backup finishes.",
                 )
                 .with_callback(move |o| {
                     for h in policy_backup_health(&snapshots.state()) {
@@ -1107,12 +1043,9 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshot_deletions_pending_external")
                 .with_description(
-                    "Snapshots being deleted (deletionTimestamp set) that still carry the \
-                     cleanup finalizer, by resolved repository (repo_kind/repo_name; unpinned \
-                     → repo_kind=repo_name=\"unknown\"). A coarser, cheaper approximation of \
-                     the mass-deletion breaker's own count: unlike the breaker this includes \
-                     operator prunes and does not re-run plan_deletion, so it may read higher \
-                     than the threshold-relevant count.",
+                    "Snapshots being deleted that still carry the cleanup finalizer, by \
+                     repo_kind and repo_name (\"unknown\" if unresolved). Includes operator \
+                     prunes, so it can read higher than the mass-deletion breaker's count.",
                 )
                 .with_callback(move |o| {
                     for s in snapshots.state() {
@@ -1129,10 +1062,8 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshot_deletions_held")
                 .with_description(
-                    "Snapshots currently HELD by the mass-deletion breaker (DeletionHeld=True \
-                     condition), by resolved repository (repo_kind/repo_name; unpinned → \
-                     repo_kind=repo_name=\"unknown\"). A subset of \
-                     kopiur_snapshot_deletions_pending_external.",
+                    "Snapshots held by the mass-deletion breaker (DeletionHeld=True), by \
+                     repo_kind and repo_name (\"unknown\" if unresolved).",
                 )
                 .with_callback(move |o| {
                     for s in snapshots.state() {
@@ -1159,11 +1090,8 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshot_consecutive_failures")
                 .with_description(
-                    "Consecutive Failed backups since the latest Succeeded one, per \
-                     SnapshotPolicy (labels namespace/name, name = the policy name). \
-                     Store-backed: the series exists iff the policy currently has at \
-                     least one Snapshot CR (spec.policyRef attribution), and is \
-                     re-derived from those CRs each collection.",
+                    "Failed backups since the latest Succeeded one, per SnapshotPolicy \
+                     (namespace, name). Absent while the policy has no Snapshot CRs.",
                 )
                 .with_callback(move |o| {
                     for p in policy_snapshot_counts(&snapshots.state()) {
@@ -1177,12 +1105,8 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshots_live")
                 .with_description(
-                    "Snapshot CRs currently alive per SnapshotPolicy (labels \
-                     namespace/name, name = the policy name). Bounded by GFS retention \
-                     when `spec.retention` is set; a policy WITHOUT it never prunes (a \
-                     deliberate safe default) and this is the only thing that will tell \
-                     you so. Store-backed: the series exists iff the policy currently \
-                     has at least one Snapshot CR (spec.policyRef attribution).",
+                    "Snapshot CRs per SnapshotPolicy (namespace, name). A policy without \
+                     `spec.retention` never prunes, so this keeps growing.",
                 )
                 .with_callback(move |o| {
                     for p in policy_snapshot_counts(&snapshots.state()) {
@@ -1200,11 +1124,8 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshot_gated")
                 .with_description(
-                    "Snapshots parked behind a not-Ready repository (deferrals, not \
-                     refusals): phase Pending with Ready reason RepositoryNotReady, \
-                     counted per (namespace, policy); the policy label is omitted for \
-                     Snapshots without a policyRef. Store-backed: the series drains \
-                     to absence as the parked Snapshots launch or disappear.",
+                    "Pending Snapshots waiting for their repository to become Ready \
+                     (RepositoryNotReady), per namespace and policy.",
                 )
                 .with_callback(move |o| {
                     for g in gated_snapshot_counts(&snapshots.state()) {
@@ -1234,12 +1155,9 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_snapshot_waiting_for_slot")
                 .with_description(
-                    "1 for each Snapshot queued behind its repository's mover-Job concurrency \
-                     cap (RepositorySlotAvailable=False), labeled \
-                     repository_kind/repository/namespace/name from the park-time \
-                     status.resolved.repository pin (unpinned → the \"unknown\" bucket). \
-                     Store-backed: the series exists only while the run is queued, so \
-                     `sum by (repository)` is the live queue depth and drains to absence.",
+                    "1 for each Snapshot waiting for a mover slot on its repository \
+                     (RepositorySlotAvailable=False), by repository_kind, repository, \
+                     namespace and name. `sum by (repository)` is the queue depth.",
                 )
                 .with_callback(move |o| {
                     for s in snapshots.state() {
@@ -1266,13 +1184,9 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_repository_consecutive_backend_failures")
                 .with_description(
-                    "Consecutive failed backend connects (health probe, strict \
-                     retries, and result-less bootstrap failures since #415) from \
-                     status.health.consecutiveProbeFailures, per repository \
-                     (kind/namespace/name; namespace is empty for a \
-                     ClusterRepository). Emitted whenever health status exists — a 0 \
-                     after recovery is informative — and absent when no probe or \
-                     failure fold has ever run; the series dies with the CR.",
+                    "Consecutive failed backend connects, from \
+                     status.health.consecutiveProbeFailures, per repository (kind, namespace, \
+                     name; namespace is empty for a ClusterRepository).",
                 )
                 .with_callback(move |o| {
                     for r in repositories.state() {
@@ -1314,11 +1228,9 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_repository_breaker_open_since_timestamp_seconds")
                 .with_description(
-                    "Unix timestamp of status.health.firstFailureAt, emitted ONLY \
-                     while the repository circuit breaker is open (phase Degraded \
-                     with BackendReachable=False), per repository (kind/namespace/ \
-                     name; namespace is empty for a ClusterRepository). The series \
-                     disappears when the breaker closes.",
+                    "Unix timestamp of status.health.firstFailureAt while a repository is \
+                     Degraded with BackendReachable=False, per repository (kind, namespace, \
+                     name; namespace is empty for a ClusterRepository).",
                 )
                 .with_callback(move |o| {
                     for r in repositories.state() {
@@ -1370,14 +1282,9 @@ impl Metrics {
             let _ = m
                 .i64_observable_gauge("kopiur_repository_breaker_open")
                 .with_description(
-                    "1 while the repository circuit breaker is open (phase Degraded with \
-                     BackendReachable=False), per repository (kind/namespace/name; namespace \
-                     is empty for a ClusterRepository), labeled by reason: unreachable or \
-                     vanished = hard outage (backups, replication and maintenance paused); \
-                     timed_out = the connect keeps exceeding the bootstrap deadline (backups/ \
-                     replication paused, maintenance still runs, the deadline escalates \
-                     automatically — usually self-healing). The series disappears when the \
-                     breaker closes.",
+                    "1 while a repository is Degraded with BackendReachable=False, per repository \
+                     (kind, namespace, name) and reason (unreachable|vanished|timed_out). \
+                     Backups and replication pause; maintenance still runs for timed_out.",
                 )
                 .with_callback(move |o| {
                     for r in repositories.state() {
