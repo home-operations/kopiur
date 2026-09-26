@@ -423,6 +423,10 @@ tests:
       ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
       ui.auth.impersonateExtraKeys: [scopes, oid]
       ui.auth.allowedGroups: [platform, sre]
+    # Pinned so the mover tag assertion below proves "derived from appVersion"
+    # without being edited on every release-please bump.
+    chart:
+      appVersion: 9.9.9-test
     template: ui-deployment.tpl
     asserts:
       - contains:
@@ -485,7 +489,7 @@ tests:
           path: spec.template.spec.containers[0].env
           content:
             name: KOPIUR_MOVER_IMAGE
-            value: ghcr.io/home-operations/kopiur-mover:0.10.8
+            value: ghcr.io/home-operations/kopiur-mover:9.9.9-test
 
   - it: runs locked down, on its own ServiceAccount, probing the ops port
     set:
