@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.11](https://github.com/home-operations/kopiur/compare/0.10.10...0.10.11) (2026-09-26)
+
+
+### Miscellaneous Chores
+
+* **mise:** update tool aqua:astral-sh/uv (0.12.17 → 0.12.18) ([#487](https://github.com/home-operations/kopiur/issues/487)) ([31f8d1f](https://github.com/home-operations/kopiur/commit/31f8d1f0114450953d1fda753c93c95b39014e91))
+
 ## [0.10.10](https://github.com/home-operations/kopiur/compare/0.10.9...0.10.10) (2026-09-25)
 
 
