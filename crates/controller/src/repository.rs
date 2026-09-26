@@ -653,7 +653,7 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             // repo's status is byte-stable between refreshes (no self-triggered
             // reconcile hot-loop).
             let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-            if catalog::scan_due(
+            let scan_outcome = if catalog::scan_due(
                 repo.metadata.generation,
                 repo.status.as_ref().and_then(|s| s.observed_generation),
                 last_refresh_at(repo),
@@ -663,13 +663,39 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                 scan_requested_honored(repo),
                 chrono::Utc::now(),
             ) {
-                let listing = client.snapshot_list(None).await?;
-                let total = listing.len() as i64;
-                run_catalog_scan(
-                    ctx, repo, &namespace, &name, &repo_uid, &listing, total, false, 0,
-                )
-                .await?;
-            }
+                match client.snapshot_list(None).await {
+                    Ok(listing) => {
+                        let total = listing.len() as i64;
+                        run_catalog_scan(
+                            ctx,
+                            repo,
+                            &namespace,
+                            &name,
+                            &repo_uid,
+                            &listing,
+                            total,
+                            &catalog::ListingCoverage::Complete,
+                            0,
+                            None,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        // A failed listing spends the generation arm too; ask
+                        // for a retry exactly as a failed scan does.
+                        catalog::request_rescan_after_failed_scan(
+                            ctx,
+                            &repository_ref(repo),
+                            scan_requested_token(repo),
+                            scan_requested_honored(repo),
+                        )
+                        .await;
+                        Err(e.into())
+                    }
+                }
+            } else {
+                Ok(())
+            };
 
             // Now that the repo is Ready, ensure its managed Maintenance exists
             // (default-on) and surface the MaintenanceConfigured condition. Built
@@ -680,6 +706,10 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
             // §11: a ReadOnly repository runs no maintenance (it serves restores
             // only). Skip the projection so no managed Maintenance is created.
             ensure_repo_maintenance(ctx, repo, &namespace, &name, &api, &conditions).await;
+            // Surfaced only now, so a failed scan (e.g. `CatalogExpiryIncomplete`
+            // while reclaiming a large post-#476 backlog) doesn't also block the
+            // maintenance projection — the same order as the mover path.
+            scan_outcome?;
         }
         other => {
             // Object-store backends run connect/create/status/catalog in a
@@ -1543,7 +1573,7 @@ async fn bootstrap_via_mover(
         }
         repo_seed::SeedArming::Armed(armed) => Some(armed),
     };
-    let work_spec = bootstrap_work_spec(
+    let mut work_spec = bootstrap_work_spec(
         backend,
         name,
         namespace,
@@ -1571,6 +1601,8 @@ async fn bootstrap_via_mover(
         ca_bundle_pem,
         seed.as_ref().map(|s| s.op.clone()),
     );
+    // #476 e2e hook: an internal annotation may SHRINK the catalog window.
+    crate::repository::apply_catalog_window_override(&mut work_spec, repo.annotations());
     // Resolve the bootstrap Job's run identity in the Repository's namespace:
     // the user's workload-identity SA (preflighted + bound to the mover role),
     // or the minted mover SA + RoleBinding (ADR §4.12). A SEEDING bootstrap
@@ -1916,6 +1948,50 @@ pub(crate) fn blob_retention_for(
         .and_then(kopiur_mover::workspec::BlobRetentionSpec::from_api)
 }
 
+/// The [`crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION`] override, if it
+/// names a window in `1..=MAX_RETURNED_SNAPSHOTS`. Anything else is ignored, so
+/// the annotation can only ever shrink the window. Pure.
+pub(crate) fn catalog_window_override(
+    annotations: &std::collections::BTreeMap<String, String>,
+) -> Option<u32> {
+    let max = u32::try_from(kopiur_mover::bootstrap::MAX_RETURNED_SNAPSHOTS).unwrap_or(u32::MAX);
+    let raw = annotations.get(crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION)?;
+    let window = raw
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|n| (1..=max).contains(n));
+    if window.is_none() {
+        // Ignoring is the safe direction (full window), but say so: a typo'd
+        // e2e setup would otherwise silently exercise the uncapped path.
+        tracing::debug!(
+            value = %raw,
+            max,
+            "ignoring {} (not an integer in 1..=max)",
+            crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION
+        );
+    }
+    window
+}
+
+/// Apply [`catalog_window_override`] to a bootstrap work spec (a no-op for any
+/// other operation). Applied at the launch sites rather than threaded through
+/// the work-spec builders, which never see the CR's metadata.
+pub(crate) fn apply_catalog_window_override(
+    spec: &mut MoverWorkSpec,
+    annotations: &std::collections::BTreeMap<String, String>,
+) {
+    let Operation::BootstrapRepository(op) = &mut spec.operation else {
+        // The bootstrap work-spec builders only ever produce this variant.
+        debug_assert!(
+            false,
+            "catalog window override applied to a non-bootstrap op"
+        );
+        return;
+    };
+    op.max_returned_snapshots = catalog_window_override(annotations);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bootstrap_work_spec(
     backend: &Backend,
@@ -2005,6 +2081,7 @@ fn bootstrap_work_spec(
             // every write, so the seed could never complete), and the caller's
             // `seed_armed` is the only source of this value.
             seed,
+            max_returned_snapshots: None,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
@@ -2435,13 +2512,6 @@ async fn finalize_bootstrap(
     if let Some(w) = index_blob_event {
         io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
     }
-    if result.snapshots_truncated {
-        tracing::warn!(
-            repo = %name,
-            snapshot_count = result.snapshot_count.unwrap_or(0),
-            "catalog larger than the materialization cap; not all snapshots were materialized"
-        );
-    }
 
     // Materialize/expire discovered Snapshots from the snapshots the Job
     // returned — once per result: after the first scan stamps `lastRefreshAt`,
@@ -2458,7 +2528,7 @@ async fn finalize_bootstrap(
     // scan-request token un-honored, so `bootstrap_recycle_due`'s token arm
     // recycles the Job for a full run — the launch-side `probe_only` gating
     // makes this arm unreachable in practice; this is its belt.
-    if let Some(snapshot_count) = result.snapshot_count
+    let scan_outcome = if let Some(snapshot_count) = result.snapshot_count
         && catalog::scan_due(
             repo.metadata.generation,
             repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -2468,8 +2538,7 @@ async fn finalize_bootstrap(
             scan_requested_token(repo),
             scan_requested_honored(repo),
             chrono::Utc::now(),
-        )
-    {
+        ) {
         run_catalog_scan(
             ctx,
             repo,
@@ -2478,11 +2547,14 @@ async fn finalize_bootstrap(
             repo_uid,
             &result.snapshots,
             snapshot_count,
-            result.snapshots_truncated,
+            &catalog::coverage_for(&result),
             result.foreign_suffix_dropped,
+            result.logical_bytes,
         )
-        .await?;
-    }
+        .await
+    } else {
+        Ok(())
+    };
 
     // Ensure the managed Maintenance for this repo (ADR §3.7). Build on the
     // conditions we just patched (which include `Bootstrapped`), NOT the stale
@@ -2490,6 +2562,12 @@ async fn finalize_bootstrap(
     // condition we set above (both writes replace the whole conditions array).
     // §11: a ReadOnly repository runs no maintenance — skip the projection.
     ensure_repo_maintenance(ctx, repo, namespace, name, api, &conditions).await;
+
+    // A failed scan (e.g. `CatalogExpiryIncomplete` while reclaiming a large
+    // post-#476 backlog) must not also block the maintenance projection above:
+    // surface it only now. It still returns before a probe Job is deleted, so
+    // the unconsumed result stays readable for the retry.
+    scan_outcome?;
 
     // A probe consumes its Job exactly once: delete it so the steady state has no
     // lingering finished Job to re-read (no churn) and the next probe is a fresh
@@ -3070,7 +3148,7 @@ fn bootstrap_condition(
 /// the bare-path filesystem backend, or carried back from the bootstrap Job for
 /// everything else. `total_snapshot_count` is the authoritative repository-wide
 /// count (may exceed `listing.len()` when the Job capped the returned entries —
-/// `listing_truncated`, see `BootstrapResult::snapshots_truncated`).
+/// `coverage`, see [`catalog::coverage_for`]).
 /// `foreign_prefilter_dropped` is the count the mover's foreign-suffix prefilter
 /// already dropped before this scan ever saw `listing` (`0` when the repository has
 /// no cluster identity, or `catalog.foreignSnapshots` isn't `Ignore` — the prefilter
@@ -3084,8 +3162,12 @@ async fn run_catalog_scan(
     repo_uid: &str,
     listing: &[SnapshotListEntry],
     total_snapshot_count: i64,
-    listing_truncated: bool,
+    coverage: &catalog::ListingCoverage,
     foreign_prefilter_dropped: i64,
+    // Logical bytes over the FULL listing, from the mover (#476): the capped
+    // `listing` would under-count sources outside the window. `None` for the
+    // in-process path (its listing is already complete) or an older mover.
+    logical_bytes: Option<i64>,
 ) -> Result<()> {
     let owner_ref = io::owner_ref_for(repo, "Repository")?;
     let cluster = repo
@@ -3105,15 +3187,28 @@ async fn run_catalog_scan(
         cluster,
         repo.spec.catalog.as_ref(),
         listing,
-        listing_truncated,
+        coverage,
     )
-    .await?;
+    .await;
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            catalog::request_rescan_after_failed_scan(
+                ctx,
+                &repository_ref(repo),
+                scan_requested_token(repo),
+                scan_requested_honored(repo),
+            )
+            .await;
+            return Err(e);
+        }
+    };
     let foreign_total = outcome.foreign + foreign_prefilter_dropped;
 
     // Logical bytes under management is recorded directly from kopia's data, both as
     // the metric gauge and as `storageStats.totalSizeBytes` (the integer form of the
     // human `total_size`), which backup preflight reads as `repository.sizeBytes`.
-    let size_bytes = logical_bytes_under_management(listing);
+    let size_bytes = logical_bytes.unwrap_or_else(|| logical_bytes_under_management(listing));
     ctx.metrics
         .set_repo_size_bytes(namespace, repo_name, size_bytes);
 
@@ -3122,6 +3217,7 @@ async fn run_catalog_scan(
         "discoveredBackupCount": outcome.discovered,
         "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
         "foreignSnapshotCount": foreign_total,
+        "coverage": outcome.coverage,
     });
     // Retire a pending `catalog-scan-requested-at` token: ANY completed scan (not
     // just one the token itself triggered) honors it, since the request was for
@@ -3449,6 +3545,24 @@ mod tests {
         ];
         assert_eq!(logical_bytes_under_management(&listing), 190);
         assert_eq!(logical_bytes_under_management(&[]), 0);
+    }
+
+    #[test]
+    fn catalog_window_override_only_ever_shrinks_the_window() {
+        let ann = |v: &str| {
+            std::collections::BTreeMap::from([(
+                crate::consts::INTERNAL_CATALOG_WINDOW_ANNOTATION.to_string(),
+                v.to_string(),
+            )])
+        };
+        assert_eq!(catalog_window_override(&ann("2")), Some(2));
+        assert_eq!(catalog_window_override(&ann(" 7 ")), Some(7));
+        let max = kopiur_mover::bootstrap::MAX_RETURNED_SNAPSHOTS.to_string();
+        assert_eq!(catalog_window_override(&ann(&max)), Some(1000));
+        for bad in ["0", "1001", "99999999", "-3", "two", ""] {
+            assert_eq!(catalog_window_override(&ann(bad)), None, "{bad:?}");
+        }
+        assert_eq!(catalog_window_override(&Default::default()), None);
     }
 
     #[test]

@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 kopiur-api = { workspace = true }
 kopiur-kopia = { workspace = true }
+base64 = { workspace = true }
 kopiur-telemetry = { workspace = true }
 # `ws` adds the websocket transport `Api::exec` needs: a stream source execs a
 # command in a workload pod and pipes its stdout into kopia (crates/mover/src/stream.rs).

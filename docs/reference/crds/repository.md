@@ -116,6 +116,7 @@ Repository-wide storage figures.
 
 - `snapshotCount` is the total number of snapshots in the repository, across all identities, from the last catalog scan.
 - `totalSize` is the total on-disk size in human-readable form, such as `412Gi`, from the last catalog scan.
+- `totalSizeBytes` is logical bytes under management: the sum, over every snapshot source in the repository, of that source's newest snapshot's logical size. It is computed over the full listing, not just the snapshots the catalog materialized, so it counts sources whose snapshots fall outside the materialization window too. It is exposed to backup preflight as `repository.sizeBytes`, and is repository size, not backend free space.
 - `lastObservedAt` is the RFC 3339 timestamp when the catalog-scan figures above were last seen.
 - `indexBlobCount` is the number of content-index blobs. Unlike the fields above, this is **not** only a catalog-scan figure: it is observed at bootstrap and re-observed after each successful maintenance run, and the newer observation wins — so it can reflect a post-maintenance compaction that happened well after the last catalog scan. Kopia compacts these during maintenance. A count that climbs without limit means maintenance is not keeping up, and crossing `spec.health.indexBlobWarnThreshold` raises the `IndexBlobHealth` warning. It is also the `IndexBlobs` print column.
 - `indexBlobCountAt` is the RFC 3339 timestamp `indexBlobCount` was observed. It is distinct from `lastObservedAt`: a bootstrap observation keeps its stamp while the count is unchanged, while a post-maintenance recount always carries its own fresh instant, which is what lets the reconciler tell the two kinds of observation apart.
@@ -130,7 +131,11 @@ The kopia repository parameters actually **seen** at the last bootstrap. This is
 
 ### `catalog`
 
-Catalog status. `discoveredBackupCount` is how many `Snapshot` objects the scan created, and `lastRefreshAt` is the RFC 3339 timestamp of the last catalog refresh.
+Catalog status. `discoveredBackupCount` is how many `Snapshot` objects the scan created, and `lastRefreshAt` is the RFC 3339 timestamp of the last catalog refresh. The other fields are all as of `lastRefreshAt`:
+
+- `coverage` is how much of the repository the last scan could account for. `Complete` means the listing covered every snapshot. `Capped` means only the newest window of up to 1,000 snapshots was materialized, but every snapshot ID was still known, so rows whose snapshots were deleted repository-side are still expired. `Partial` means the window was capped **and** the full list of snapshot IDs was unavailable, typically a mover image older than the controller or a repository beyond roughly 86,000 snapshots. Under `Partial`, rows whose snapshots were deleted repository-side are **not** expired; `catalog.retain` still bounds rows. See [The catalog → keeping the row count bounded](../../repositories.md#keeping-the-row-count-bounded--the-window-coverage-and-retain).
+- `foreignSnapshotCount` is how many snapshots the listing classified as another cluster's, per `catalog.foreignSnapshots`.
+- `scanRequestHonored` is the value of the `kopiur.home-operations.com/catalog-scan-requested-at` annotation the last completed scan honored. When it equals the live annotation, the requested scan has run.
 
 ### `server`
 

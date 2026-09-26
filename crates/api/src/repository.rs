@@ -891,6 +891,61 @@ pub struct CatalogStatus {
     /// token for retirement (that's `scanRequestHonored`, by equality).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_request_attempt_at: Option<String>,
+    /// How much of the repository the last catalog scan could see, as of
+    /// `lastRefreshAt`. `Complete`: the listing covered every snapshot.
+    /// `Capped`: only the newest window was materialized, but rows whose
+    /// snapshots were deleted repository-side still expire. `Partial`: the
+    /// window was capped AND membership was unknown (a mover older than the
+    /// controller, or a repository beyond the membership digest's ceiling), so
+    /// such stale rows are kept; `catalog.retain.maxAgeDays` still bounds them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CatalogCoverage>,
+}
+
+/// How much of the repository a catalog scan could see (issue #476). See
+/// [`CatalogStatus::coverage`].
+///
+/// ```
+/// use kopiur_api::repository::CatalogCoverage;
+///
+/// assert_eq!(serde_json::to_value(CatalogCoverage::Partial).unwrap(), "Partial");
+/// let c: CatalogCoverage = serde_json::from_value(serde_json::json!("Sampled")).unwrap();
+/// assert_eq!(c, CatalogCoverage::Unknown("Sampled".into()));
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogCoverage {
+    /// The listing held every snapshot: stale rows expire, retain applies.
+    Complete,
+    /// The materialized window was capped, but the scan knew every listed id,
+    /// so rows whose snapshots were deleted repository-side still expire.
+    Capped,
+    /// The window was capped and membership was unknown: rows whose snapshots
+    /// were deleted repository-side are NOT expired (`retain.maxAgeDays` still
+    /// applies to rows outside the window; `perIdentity` only to the window).
+    Partial,
+    /// A value this build does not recognize (newer operator). Decode-compat
+    /// only — hidden from the CRD schema, never produced by this build.
+    Unknown(String),
+}
+
+crate::common::phase_serde!(
+    CatalogCoverage,
+    "How much of the repository a catalog scan could see."
+);
+
+impl crate::common::PhaseLabel for CatalogCoverage {
+    const ALL: &'static [Self] = &[Self::Complete, Self::Capped, Self::Partial];
+    fn label(&self) -> &str {
+        match self {
+            Self::Complete => "Complete",
+            Self::Capped => "Capped",
+            Self::Partial => "Partial",
+            Self::Unknown(s) => s,
+        }
+    }
+    fn unknown(raw: String) -> Self {
+        Self::Unknown(raw)
+    }
 }
 
 #[cfg(test)]
@@ -1428,6 +1483,39 @@ health:
                 .get("foreignSnapshotCount")
                 .is_none(),
             "absent foreignSnapshotCount must be elided"
+        );
+    }
+
+    #[test]
+    fn catalog_status_coverage_roundtrips_and_tolerates_unknown() {
+        use crate::common::PhaseLabel;
+        let status: CatalogStatus = from_yaml("coverage: Capped\n");
+        assert_eq!(status.coverage, Some(CatalogCoverage::Capped));
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["coverage"], "Capped");
+        assert_eq!(
+            serde_json::from_value::<CatalogStatus>(json).unwrap(),
+            status
+        );
+
+        // A value from a newer operator decodes instead of poisoning the watch.
+        let newer: CatalogStatus = from_yaml("coverage: Sampled\n");
+        assert_eq!(
+            newer.coverage,
+            Some(CatalogCoverage::Unknown("Sampled".into()))
+        );
+        assert_eq!(serde_json::to_value(&newer).unwrap()["coverage"], "Sampled");
+
+        assert_eq!(
+            CatalogCoverage::canonical(),
+            vec!["Complete", "Capped", "Partial"]
+        );
+        let bare: CatalogStatus = from_yaml("{}\n");
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("coverage")
+                .is_none()
         );
     }
 

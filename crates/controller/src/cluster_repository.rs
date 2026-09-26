@@ -641,7 +641,7 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
             // `catalog.fallbackNamespace`, else it is skipped with a Warning Event
             // (`crate::catalog::decide_cluster_placement` + `crate::catalog::scan`).
             let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
-            if catalog::scan_due(
+            let scan_outcome = if catalog::scan_due(
                 repo.metadata.generation,
                 repo.status.as_ref().and_then(|s| s.observed_generation),
                 cluster_last_refresh_at(repo),
@@ -651,16 +651,47 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
                 cluster_scan_requested_honored(repo),
                 chrono::Utc::now(),
             ) {
-                let listing = client.snapshot_list(None).await?;
-                let total = listing.len() as i64;
-                run_cluster_catalog_scan(ctx, repo, &name, &listing, total, false, 0).await?;
-            }
+                match client.snapshot_list(None).await {
+                    Ok(listing) => {
+                        let total = listing.len() as i64;
+                        run_cluster_catalog_scan(
+                            ctx,
+                            repo,
+                            &name,
+                            &listing,
+                            total,
+                            &catalog::ListingCoverage::Complete,
+                            0,
+                            None,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        // A failed listing spends the generation arm too; ask
+                        // for a retry exactly as a failed scan does.
+                        catalog::request_rescan_after_failed_scan(
+                            ctx,
+                            &cluster_repository_ref(repo),
+                            cluster_scan_requested_token(repo),
+                            cluster_scan_requested_honored(repo),
+                        )
+                        .await;
+                        Err(e.into())
+                    }
+                }
+            } else {
+                Ok(())
+            };
 
             // Ensure the managed Maintenance for this ClusterRepository (ADR §3.7).
             // Cluster-scoped, so the metric namespace label is empty and
             // ref-matching ignores namespace. The (namespaced) Maintenance lands in
             // spec.maintenance.namespace, else the operator's own namespace.
             ensure_cluster_maintenance(ctx, repo, &name, &api, &cluster_conditions(repo)).await;
+            // Surfaced only now, so a failed scan (e.g. `CatalogExpiryIncomplete`
+            // while reclaiming a large post-#476 backlog) doesn't also block the
+            // maintenance projection — the same order as the mover path.
+            scan_outcome?;
         }
         other => {
             // Object-store backends bootstrap via a short-lived mover Job (ADR
@@ -740,12 +771,15 @@ async fn run_cluster_catalog_scan(
     name: &str,
     listing: &[SnapshotListEntry],
     total_snapshot_count: i64,
-    listing_truncated: bool,
+    coverage: &catalog::ListingCoverage,
     // Entries the mover's foreign-suffix prefilter already dropped before this
     // scan ever saw its `listing` (0 for the in-process bare-filesystem path,
     // which never prefilters). Added to `outcome.foreign` — never double-counted,
     // since a mover-dropped entry never reaches this scan's listing at all.
     foreign_prefilter_dropped: i64,
+    // Logical bytes over the FULL listing, from the mover (#476) — see the
+    // `Repository` twin (`run_catalog_scan`). `None` = compute from `listing`.
+    logical_bytes: Option<i64>,
 ) -> Result<()> {
     let repo_uid = repo
         .uid()
@@ -773,9 +807,22 @@ async fn run_cluster_catalog_scan(
         cluster,
         repo.spec.catalog.as_ref(),
         listing,
-        listing_truncated,
+        coverage,
     )
-    .await?;
+    .await;
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err(e) => {
+            catalog::request_rescan_after_failed_scan(
+                ctx,
+                &cluster_repository_ref(repo),
+                cluster_scan_requested_token(repo),
+                cluster_scan_requested_honored(repo),
+            )
+            .await;
+            return Err(e);
+        }
+    };
     let foreign_total = outcome.foreign + foreign_prefilter_dropped;
 
     if !outcome.unplaced_hosts.is_empty() {
@@ -788,13 +835,15 @@ async fn run_cluster_catalog_scan(
 
     // Cluster-scoped: the metric namespace label is empty, matching the
     // phase/catalog gauges in `record_cluster_repository_status_metrics`.
-    let size_bytes = crate::repository::logical_bytes_under_management(listing);
+    let size_bytes =
+        logical_bytes.unwrap_or_else(|| crate::repository::logical_bytes_under_management(listing));
     ctx.metrics.set_repo_size_bytes("", name, size_bytes);
 
     let mut catalog_patch = serde_json::json!({
         "discoveredBackupCount": outcome.discovered,
         "lastRefreshAt": chrono::Utc::now().to_rfc3339(),
         "foreignSnapshotCount": foreign_total,
+        "coverage": outcome.coverage,
     });
     // Retire a pending `catalog-scan-requested-at` token: ANY completed scan (not
     // just one the token itself triggered) honors it — see the `Repository` twin
@@ -1551,7 +1600,7 @@ async fn bootstrap_cluster_via_mover(
         }
         crate::repo_seed::SeedArming::Armed(armed) => Some(armed),
     };
-    let work_spec = cluster_bootstrap_work_spec(
+    let mut work_spec = cluster_bootstrap_work_spec(
         backend,
         name,
         &job_ns,
@@ -1576,6 +1625,8 @@ async fn bootstrap_cluster_via_mover(
         ca_bundle_pem,
         seed.as_ref().map(|s| s.op.clone()),
     );
+    // #476 e2e hook: an internal annotation may SHRINK the catalog window.
+    crate::repository::apply_catalog_window_override(&mut work_spec, repo.annotations());
     // Preflight the credential Secret(s) the bootstrap mover loads via `envFrom`, in the
     // namespace it will actually run in. Without this the Job launches against a Secret
     // that isn't there, its pod wedges in `CreateContainerConfigError` until the bootstrap
@@ -1908,6 +1959,7 @@ fn cluster_bootstrap_work_spec(
             // pre-#380. Admission refuses `spec.seed` on a ReadOnly repository,
             // so this and `read_only` are never both set.
             seed,
+            max_returned_snapshots: None,
         }),
         identity: ResolvedIdentity {
             username: "kopiur-bootstrap".to_string(),
@@ -2233,13 +2285,6 @@ async fn finalize_cluster_bootstrap(
     if let Some(w) = index_blob_event {
         io::publish_warning_event(ctx, repo, w.reason, w.action, &w.message).await;
     }
-    if result.snapshots_truncated {
-        tracing::warn!(
-            repo = %name,
-            snapshot_count = result.snapshot_count,
-            "catalog larger than the materialization cap; not all snapshots were materialized"
-        );
-    }
 
     // Materialize/expire discovered Snapshots from the snapshots the Job
     // returned — once per result: after the first scan stamps `lastRefreshAt`,
@@ -2250,7 +2295,7 @@ async fn finalize_cluster_bootstrap(
     let interval = CatalogBounds::effective_refresh_interval(repo.spec.catalog.as_ref());
     // `snapshot_count: None` = the listing DID NOT RUN (a probe-only result,
     // #414): never scan over it — see the Repository twin.
-    if let Some(snapshot_count) = result.snapshot_count
+    let scan_outcome = if let Some(snapshot_count) = result.snapshot_count
         && catalog::scan_due(
             repo.metadata.generation,
             repo.status.as_ref().and_then(|s| s.observed_generation),
@@ -2260,24 +2305,32 @@ async fn finalize_cluster_bootstrap(
             cluster_scan_requested_token(repo),
             cluster_scan_requested_honored(repo),
             chrono::Utc::now(),
-        )
-    {
+        ) {
         run_cluster_catalog_scan(
             ctx,
             repo,
             name,
             &result.snapshots,
             snapshot_count,
-            result.snapshots_truncated,
+            &catalog::coverage_for(&result),
             result.foreign_suffix_dropped,
+            result.logical_bytes,
         )
-        .await?;
-    }
+        .await
+    } else {
+        Ok(())
+    };
 
     // Ensure the managed Maintenance for this ClusterRepository (§3.7). Build on
     // the conditions we just patched (including `Bootstrapped`), not the stale
     // cached object, so this patch doesn't drop the `Bootstrapped` set above.
     ensure_cluster_maintenance(ctx, repo, name, api, &conditions).await;
+
+    // A failed scan (e.g. `CatalogExpiryIncomplete` while reclaiming a large
+    // post-#476 backlog) must not also block the maintenance projection above:
+    // surface it only now. It still returns before a probe Job is deleted, so
+    // the unconsumed result stays readable for the retry.
+    scan_outcome?;
 
     // A probe consumes its Job exactly once (no lingering finished Job → no churn;
     // the next probe is a fresh connect). Requeue on the probe cadence.

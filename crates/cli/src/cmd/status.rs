@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kopiur_api::common::{PhaseLabel, RepositoryKind};
 use kopiur_api::consts::{MAINTENANCE_CONFIGURED_CONDITION, READY_CONDITION, STALLED_CONDITION};
+use kopiur_api::repository::CatalogCoverage;
 use kopiur_api::{
     ClusterRepository, Repository, Restore, RestorePhase, Snapshot, SnapshotPhase, SnapshotPolicy,
     SnapshotReplication, SnapshotReplicationRunStats, SnapshotSchedule,
@@ -74,6 +75,11 @@ pub struct RepoRow {
     /// non-zero count is normal for a shared or re-seeded repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discovered: Option<i64>,
+    /// `status.catalog.coverage` — how much of the repository the last catalog
+    /// scan could see (`Complete`/`Capped`/`Partial`); absent when never
+    /// scanned or reported by an operator that predates #476.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CatalogCoverage>,
     /// The `Ready` condition message when the repo is NOT Ready.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
@@ -372,6 +378,7 @@ fn repo_row(
     cluster: Option<String>,
     foreign_snapshots: Option<i64>,
     discovered: Option<i64>,
+    coverage: Option<CatalogCoverage>,
 ) -> RepoRow {
     let phase = phase.unwrap_or_else(|| EMPTY_CELL.into());
     let maintenance = condition(conditions, MAINTENANCE_CONFIGURED_CONDITION)
@@ -401,7 +408,25 @@ fn repo_row(
         cluster,
         foreign_snapshots,
         discovered,
+        coverage,
         problem,
+    }
+}
+
+/// The DISCOVERED cell: the catalog count, followed by the scan's coverage when
+/// it is anything but `Complete` (e.g. `7836 (partial)`), so a capped or
+/// partial catalog is visible at a glance. `-` when never scanned. Pure.
+fn discovered_cell(discovered: Option<i64>, coverage: Option<&CatalogCoverage>) -> String {
+    let Some(count) = discovered else {
+        return EMPTY_CELL.into();
+    };
+    match coverage {
+        None | Some(CatalogCoverage::Complete) => count.to_string(),
+        Some(
+            c @ (CatalogCoverage::Capped | CatalogCoverage::Partial | CatalogCoverage::Unknown(_)),
+        ) => {
+            format!("{count} ({})", c.label().to_lowercase())
+        }
     }
 }
 
@@ -477,6 +502,9 @@ async fn gather(
             status
                 .and_then(|s| s.catalog.as_ref())
                 .and_then(|c| c.discovered_backup_count),
+            status
+                .and_then(|s| s.catalog.as_ref())
+                .and_then(|c| c.coverage.clone()),
         ));
     }
     {
@@ -526,6 +554,9 @@ async fn gather(
                 status
                     .and_then(|s| s.catalog.as_ref())
                     .and_then(|c| c.discovered_backup_count),
+                status
+                    .and_then(|s| s.catalog.as_ref())
+                    .and_then(|c| c.coverage.clone()),
             ));
         }
     }
@@ -760,9 +791,7 @@ pub fn render(report: &StatusReport, now: DateTime<Utc>) -> String {
                 r.foreign_snapshots
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| EMPTY_CELL.into()),
-                r.discovered
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| EMPTY_CELL.into()),
+                discovered_cell(r.discovered, r.coverage.as_ref()),
             ]);
         }
         out.push_str(&t.render());
@@ -961,6 +990,7 @@ mod tests {
                     cluster: None,
                     foreign_snapshots: None,
                     discovered: None,
+                    coverage: None,
                     problem: None,
                 },
                 RepoRow {
@@ -975,6 +1005,7 @@ mod tests {
                     cluster: Some("east".into()),
                     foreign_snapshots: Some(3),
                     discovered: Some(17),
+                    coverage: None,
                     problem: Some("credentials rejected; fix the Secret".into()),
                 },
             ],
@@ -1084,6 +1115,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn discovered_cell_appends_non_complete_coverage() {
+        use kopiur_api::repository::CatalogCoverage;
+        // Never scanned: the empty cell, regardless of coverage.
+        assert_eq!(discovered_cell(None, None), EMPTY_CELL);
+        // No coverage recorded (pre-#476 operator) or Complete: count only.
+        assert_eq!(discovered_cell(Some(7836), None), "7836");
+        assert_eq!(
+            discovered_cell(Some(7836), Some(&CatalogCoverage::Complete)),
+            "7836"
+        );
+        // A capped / partial scan says so after the count.
+        assert_eq!(
+            discovered_cell(Some(7836), Some(&CatalogCoverage::Partial)),
+            "7836 (partial)"
+        );
+        assert_eq!(
+            discovered_cell(Some(1000), Some(&CatalogCoverage::Capped)),
+            "1000 (capped)"
+        );
+        // A value from a newer operator surfaces lowercased, never hidden.
+        assert_eq!(
+            discovered_cell(Some(5), Some(&CatalogCoverage::Unknown("Sampled".into()))),
+            "5 (sampled)"
+        );
+    }
+
+    #[test]
+    fn render_shows_partial_coverage_in_the_discovered_column() {
+        let mut report = sample();
+        report.repositories[1].coverage = Some(kopiur_api::repository::CatalogCoverage::Partial);
+        let text = render(&report, now());
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("ClusterRepository") && l.ends_with("17 (partial)")),
+            "{text}"
+        );
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["repositories"][1]["coverage"], "Partial");
+        assert!(v["repositories"][0].get("coverage").is_none());
+    }
+
     /// `CatalogStatus` is shared by both repository kinds, so one accessor
     /// chain serves `Repository` and `ClusterRepository` alike — this pins the
     /// field path `gather` reads.
@@ -1159,6 +1232,7 @@ mod tests {
             None,
             None,
             ns_discovered,
+            None,
         );
         assert_eq!(row.discovered, Some(4));
     }

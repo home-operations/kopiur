@@ -583,6 +583,22 @@ You expected a recreated, or brand-new, `SnapshotPolicy` to pick up matching `or
 
 If every row above checks out and adoption still didn't fire, the discovered `Snapshot` may simply not exist yet. Confirm it with `kubectl get snapshots -n <ns> -l kopiur.home-operations.com/origin=discovered` before assuming adoption is broken.
 
+## Discovered Snapshot count keeps growing
+
+The number of `origin: discovered` `Snapshot` CRs climbs scan after scan and never comes down, often into the tens of thousands on a repository shared by several clusters. Most of the rows point at snapshots that no longer exist in the repository, typically because the cluster that owns them pruned them under its own GFS retention. Before this was fixed, the catalog-scan log line showed `expired=0` on every scan while `created=N` kept ticking up.
+
+**What should happen.** On each scan, a discovered row whose kopia snapshot has been deleted from the repository is expired, on repositories of any realistic size. `catalog.retain` (`perIdentity`, `maxAgeDays`) bounds the rows that remain. See [The catalog → keeping the row count bounded](repositories.md#keeping-the-row-count-bounded--the-window-coverage-and-retain).
+
+| Check | How |
+| ----- | --- |
+| **A scan has actually run recently.** With `catalog.periodicRefresh` off, the default, scans only run on a spec change or on request, so stale rows sit until the next one. | `kubectl get repository <name> -n <ns> -o jsonpath='{.status.catalog.lastRefreshAt}{"\n"}'` (for a `ClusterRepository`, `kubectl get clusterrepository <name>` with no `-n`). If it is old, request a scan: `kubectl annotate repository <name> -n <ns> kopiur.home-operations.com/catalog-scan-requested-at=$(date -u +%FT%TZ) --overwrite`. |
+| **The last scan could see every snapshot ID.** `status.catalog.coverage` says what the last scan could account for. `Complete` and `Capped` both expire stale rows. `Partial` does **not**. | `kubectl get repository <name> -n <ns> -o jsonpath='{.status.catalog.coverage}{"\n"}'`, or look for `(partial)` next to the discovered count in `kubectl kopiur status`. On `Partial` the controller also logs one WARN line per scan naming the cause. |
+| **The mover image matches the controller.** The commonest cause of `Partial` is a mover image older than the controller, which does not return the full list of snapshot IDs. | Compare the controller's image tag with the image the repository's bootstrap Job pods run (`kubectl get jobs -n <ns> -o wide` shows it). A stale `mover.image.tag` or `mover.image.digest` pin in your Helm values is the usual culprit; see [Configuration](configuration.md). Align them, then request a scan as above. |
+| **The repository isn't beyond the ID-list ceiling.** Past roughly 86,000 snapshots the full ID list no longer fits, and coverage stays `Partial`. | `kubectl get repository <name> -n <ns> -o jsonpath='{.status.storageStats.snapshotCount}{"\n"}'`. If it is that large, bound the rows with `catalog.retain` instead: `retain` applies to existing rows even under `Partial`. |
+| **`retain` is set if you want fewer rows than the repository holds.** A healthy scan keeps a row for every snapshot still in the repository that falls inside the materialization window. `retain` is what caps it below that. | Set `spec.catalog.retain.perIdentity` and/or `maxAgeDays`. The next scan reclaims existing rows over the limit, so request one with the annotation above rather than waiting. |
+
+The first scan after upgrading, or after tightening `retain`, can delete a large backlog of discovered rows in one go, with bounded concurrency. That is expected, and it only removes Kubernetes objects: discovered rows are forced to `deletionPolicy: Retain`, so no kopia data is deleted and every snapshot stays restorable [by identity](restores.md#restoring-a-snapshot-kopiur-didnt-create).
+
 ## CRDs or CRs disappeared after upgrading to 0.6.0
 
 Upgrading **from 0.5.x to 0.6.0** moves the CRDs into Helm's `crds/` directory. On that one crossing Helm prunes the old release-owned CRDs and cascade-deletes every `kopiur.home-operations.com` object. This is expected, not a bug in the operator.
