@@ -95,9 +95,10 @@ pub enum MoverJobKind {
 /// - **Verification** and **Pin** are cheap metadata operations; a pin is a
 ///   single manifest rewrite, and both are operator/housekeeping-driven rather
 ///   than user-scheduled load.
-/// - **SnapshotDeleteBatch** is already single-flighted per repository by its
-///   own dispatcher, and it *reduces* repository load; holding a delete behind
-///   backups grows the backlog it exists to drain.
+/// - **SnapshotDeleteBatch** has its own per-repository cap
+///   (`spec.concurrency.maxConcurrentDeleteJobs`, default 1, enforced by
+///   [`DeleteAdmissionLedger`]), and it *reduces* repository load; holding a
+///   delete behind backups grows the backlog it exists to drain.
 /// - **Discovery** (bootstrap / catalog re-scan) is what makes a repository
 ///   `Ready` in the first place. Gating it on a pool that only fills once the
 ///   repository IS ready would deadlock a fresh repository.
@@ -284,7 +285,8 @@ fn job_is_suspended(job: &Job) -> bool {
 /// **Costs nothing when uncapped.** Both caps `None` returns an empty
 /// [`ObservedPool`] without touching the apiserver — the default install must
 /// not pay a LIST per reconcile for a feature it does not use. This mirrors the
-/// batch-delete throttle's `throttle_live_count`.
+/// batch-delete dispatcher's cluster-wide LIST, which runs only when
+/// `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` is set.
 ///
 /// ONE LIST serves both numbers: an exists-selector on [`REPO_POOL_LABEL`]
 /// (plus the managed-by label, so a foreign Job that happens to carry the key
@@ -615,6 +617,92 @@ impl AdmissionLedger {
     #[cfg(test)]
     pub(crate) fn outstanding_for_test(&self) -> Reservations {
         lock_reservations(&self.inner).clone()
+    }
+}
+
+/// The caps a snapshot-delete batch is admitted against (issue #477).
+///
+/// Unlike [`PoolCaps`], the per-repository cap is NEVER absent: delete batches
+/// are single-flight per repository by default
+/// ([`kopiur_api::consts::effective_max_concurrent_delete_jobs`]), because
+/// parallel bulk deletes against one repository only multiply index loads and
+/// write contention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteCaps {
+    /// `spec.concurrency.maxConcurrentDeleteJobs`, default 1.
+    pub repo: NonZeroUsize,
+    /// The cluster-wide `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` backstop (`None` =
+    /// uncapped), counted across EVERY repository.
+    pub global: Option<NonZeroUsize>,
+}
+
+/// [`DeleteAdmissionLedger::admit`]'s answer.
+#[derive(Debug)]
+pub enum DeleteVerdict {
+    /// Create the batch Job now. Hold the guard until the create returns.
+    Admit(AdmissionGuard),
+    /// Hold this wave. Carries the effective counts (observed plus other waves'
+    /// reservations) the decision was taken against.
+    Park {
+        /// Effective live delete batches against THIS repository.
+        repo_live: usize,
+        /// Effective live delete batches across every repository.
+        global_live: usize,
+    },
+}
+
+/// The [`AdmissionLedger`] pattern for snapshot-delete batch Jobs: observe →
+/// decide → reserve under ONE lock, so concurrently reconciling members of one
+/// repository cannot all LIST "no batch running" and each launch one (the ~33
+/// concurrent Jobs of issue #477).
+///
+/// A separate ledger rather than a [`PoolClass`]: delete batches are not in the
+/// mover pool (see [`counts_toward_repo_pool`]) and have their own caps, so
+/// sharing reservations would let a deletion wave occupy a backup slot. It
+/// reuses the pool's reservation primitives and inherits their contracts (the
+/// guard releases on every exit, observed Jobs sweep their reservation, and a
+/// failover starts empty but can only over-admit, never under-admit).
+///
+/// One difference: a reservation never counts against the Job it was taken
+/// for. Two reconciles of the SAME wave derive the same deterministic Job
+/// name, and the second must fall through to the create's `409` dedup rather
+/// than park behind its own sibling.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteAdmissionLedger {
+    inner: Arc<Mutex<Reservations>>,
+}
+
+impl DeleteAdmissionLedger {
+    /// Decide and reserve atomically. `repo_key` is the repository's
+    /// [`repo_label`] value and `job_key` the [`job_key`] of the batch Job this
+    /// wave would create. `observed` counts LIVE delete batch Jobs, and its
+    /// `seen` names every batch Job the LIST returned.
+    pub fn admit(
+        &self,
+        repo_key: &str,
+        job_key: &str,
+        observed: &ObservedPool,
+        caps: DeleteCaps,
+    ) -> DeleteVerdict {
+        let mut held = lock_reservations(&self.inner);
+        sweep_observed(&mut held, &observed.seen);
+        let others = |pool: &BTreeSet<String>| pool.iter().filter(|k| *k != job_key).count();
+        let repo_live = observed.repo_live + held.get(repo_key).map_or(0, others);
+        let global_live = observed.global_live + held.values().map(others).sum::<usize>();
+        let at_repo_cap = repo_live >= caps.repo.get();
+        let at_global_cap = caps.global.is_some_and(|c| global_live >= c.get());
+        if at_repo_cap || at_global_cap {
+            return DeleteVerdict::Park {
+                repo_live,
+                global_live,
+            };
+        }
+        DeleteVerdict::Admit(insert_reservation(
+            &mut held,
+            &self.inner,
+            repo_key,
+            job_key,
+        ))
     }
 }
 
@@ -2239,6 +2327,147 @@ mod tests {
         assert_eq!(
             slot_acquired_message("Repository", "backups/nas"),
             slot_acquired_message("Repository", "backups/nas"),
+        );
+    }
+
+    // --- #477: snapshot-delete batch admission -------------------------------
+
+    fn delete_caps(repo: usize, global: Option<usize>) -> DeleteCaps {
+        DeleteCaps {
+            repo: std::num::NonZeroUsize::new(repo).unwrap(),
+            global: global.and_then(std::num::NonZeroUsize::new),
+        }
+    }
+
+    fn observed(repo_live: usize, global_live: usize, seen: &[&str]) -> ObservedPool {
+        ObservedPool {
+            repo_live,
+            global_live,
+            seen: seen.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// Single-flight: a live batch for the repository parks the next wave.
+    #[test]
+    fn delete_admission_parks_while_a_batch_is_live() {
+        let ledger = DeleteAdmissionLedger::default();
+        let v = ledger.admit(
+            "repo",
+            "ns/wave-2",
+            &observed(1, 1, &["ns/wave-1"]),
+            delete_caps(1, None),
+        );
+        assert!(
+            matches!(v, DeleteVerdict::Park { repo_live: 1, .. }),
+            "{v:?}"
+        );
+        let v = ledger.admit(
+            "repo",
+            "ns/wave-1",
+            &observed(0, 0, &[]),
+            delete_caps(1, None),
+        );
+        assert!(matches!(v, DeleteVerdict::Admit(_)), "{v:?}");
+    }
+
+    /// The LIST-then-create race #477's throttle had: two concurrent member
+    /// reconciles both LIST an empty repository. The first admission's
+    /// reservation parks the second (a DIFFERENT wave) until the guard drops.
+    #[test]
+    fn concurrent_delete_admissions_for_one_repository_admit_one() {
+        let ledger = DeleteAdmissionLedger::default();
+        let empty = observed(0, 0, &[]);
+        let first = ledger.admit("repo", "ns/wave-a", &empty, delete_caps(1, None));
+        let DeleteVerdict::Admit(guard) = first else {
+            panic!("the first admission must pass: {first:?}");
+        };
+        let second = ledger.admit("repo", "ns/wave-b", &empty, delete_caps(1, None));
+        assert!(
+            matches!(second, DeleteVerdict::Park { repo_live: 1, .. }),
+            "{second:?}"
+        );
+        // Another repository is unaffected by this one's reservation.
+        assert!(matches!(
+            ledger.admit("other", "ns/wave-c", &empty, delete_caps(1, None)),
+            DeleteVerdict::Admit(_)
+        ));
+        drop(guard);
+        assert!(matches!(
+            ledger.admit("repo", "ns/wave-b", &empty, delete_caps(1, None)),
+            DeleteVerdict::Admit(_)
+        ));
+    }
+
+    /// Two reconciles of the SAME wave compute the same Job name. A
+    /// reservation never counts against its own Job, so the second falls
+    /// through to the create's 409 dedup instead of parking needlessly.
+    #[test]
+    fn a_reservation_never_parks_its_own_job() {
+        let ledger = DeleteAdmissionLedger::default();
+        let empty = observed(0, 0, &[]);
+        let _first = ledger.admit("repo", "ns/wave-a", &empty, delete_caps(1, None));
+        assert!(matches!(
+            ledger.admit("repo", "ns/wave-a", &empty, delete_caps(1, None)),
+            DeleteVerdict::Admit(_)
+        ));
+    }
+
+    #[test]
+    fn delete_admission_honors_a_raised_repository_cap() {
+        let ledger = DeleteAdmissionLedger::default();
+        let v = ledger.admit(
+            "repo",
+            "ns/w2",
+            &observed(1, 1, &["ns/w1"]),
+            delete_caps(2, None),
+        );
+        assert!(matches!(v, DeleteVerdict::Admit(_)), "{v:?}");
+        let v = ledger.admit(
+            "repo",
+            "ns/w3",
+            &observed(1, 1, &["ns/w1"]),
+            delete_caps(2, None),
+        );
+        assert!(
+            matches!(v, DeleteVerdict::Park { repo_live: 2, .. }),
+            "{v:?}"
+        );
+    }
+
+    /// The cluster-wide backstop counts every repository's batches, reserved
+    /// ones included (the old throttle's bare LIST could over-admit it).
+    #[test]
+    fn delete_admission_global_cap_spans_repositories() {
+        let ledger = DeleteAdmissionLedger::default();
+        let empty = observed(0, 0, &[]);
+        let _a = ledger.admit("repo-a", "ns/a", &empty, delete_caps(1, Some(1)));
+        let v = ledger.admit("repo-b", "ns/b", &empty, delete_caps(1, Some(1)));
+        assert!(
+            matches!(v, DeleteVerdict::Park { global_live: 1, .. }),
+            "{v:?}"
+        );
+    }
+
+    /// Once the LIST can see a reserved Job, observed truth supersedes the
+    /// promise (no double count), exactly like the mover pool.
+    #[test]
+    fn delete_admission_sweeps_reservations_the_list_can_see() {
+        let ledger = DeleteAdmissionLedger::default();
+        let DeleteVerdict::Admit(guard) =
+            ledger.admit("repo", "ns/w1", &observed(0, 0, &[]), delete_caps(2, None))
+        else {
+            panic!("first admits");
+        };
+        std::mem::forget(guard); // a guard somehow held past the Job's creation
+        let v = ledger.admit(
+            "repo",
+            "ns/w2",
+            &observed(1, 1, &["ns/w1"]),
+            delete_caps(2, None),
+        );
+        assert!(
+            matches!(v, DeleteVerdict::Admit(_)),
+            "w1 counted once, not twice: {v:?}"
         );
     }
 }

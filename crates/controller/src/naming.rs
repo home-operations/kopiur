@@ -29,6 +29,19 @@ pub fn short_hash(s: &str) -> String {
     format!("{:08x}", (fnv1a(s) & 0xffff_ffff))
 }
 
+/// The FULL 64-bit FNV-1a as 16 stable hex chars, for tags that must
+/// disambiguate far more than a handful of siblings.
+///
+/// [`short_hash`] keeps the low 32 bits, which is ample for the ≤8 values
+/// [`repo_tag6`] separates but NOT for a truncated tag over hundreds of
+/// members: birthday collisions grow with the square of the population, so a
+/// 24-bit tag over the 400-member verification fan-out cap collides about once
+/// in 200 policies. Callers take a prefix of this instead and state the bit
+/// budget they are buying — see [`crate::verification::member_tag`].
+pub fn wide_hash(s: &str) -> String {
+    format!("{:016x}", fnv1a(s))
+}
+
 /// The stable 6-hex per-repository tag used by multi-repo verify Job names
 /// (`<policy>-vfy-<q|d>-<r6>-<unix>`) and the [`crate::consts::VERIFY_REPO_LABEL`]
 /// value: [`short_hash`] over the normalized repo key
@@ -134,6 +147,26 @@ mod tests {
         // Same reasoning: maintenance/verify/replication Job names embed this
         // hash when the CR name exceeds the budget. Pin a literal.
         assert_eq!(short_hash("postgres-data"), "5a5d7a49");
+    }
+
+    // --- wide_hash ------------------------------------------------------------
+
+    #[test]
+    fn wide_hash_is_pinned_and_agrees_with_short_hash_on_the_low_word() {
+        // It names on-cluster objects and keys persisted status stamps, so the
+        // exact FNV-1a output is load-bearing: an algorithm change would rename
+        // every verify Job and orphan every member stamp on upgrade.
+        assert_eq!(wide_hash("/pvc/data-a"), "87e3ae7d6b672648");
+        assert_eq!(wide_hash("/pvc/data-a").len(), 16);
+        // Same hash, two renderings: the low 32 bits ARE `short_hash`.
+        for s in ["/pvc/data-a", "postgres-data", ""] {
+            assert!(
+                wide_hash(s).ends_with(&short_hash(s)),
+                "{s}: {} vs {}",
+                wide_hash(s),
+                short_hash(s)
+            );
+        }
     }
 
     // --- repo_tag6 ------------------------------------------------------------

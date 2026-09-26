@@ -10,6 +10,7 @@ use kopiur_api::{PopulatorTarget, RestoreSource, RestoreTarget};
 use kopiur_ops::actions::restore::RestoreRequest;
 use kopiur_ops::actions::snapshot::SnapshotNowRequest;
 
+use crate::error::CliError;
 use crate::output::OutputFormat;
 
 /// `kubectl kopiur` — operate the kopiur backup operator from the command line.
@@ -452,9 +453,13 @@ pub struct DoctorArgs {
     pub failure_lookback: std::time::Duration,
 }
 
-/// Flags for `restore`: exactly one source, exactly one target (both enforced
-/// at parse time and mapped 1:1 onto the externally-tagged `RestoreSource`/
-/// `RestoreTarget` enums).
+/// Flags for `restore`: exactly one source, exactly one target (both enforced at
+/// parse time).
+///
+/// The source flags cover `RestoreSource` completely. The target flags cover
+/// three of `RestoreTarget`'s four variants — `streamExec` is manifest-only, and
+/// `cmd::restore::restore_target_from_args` refuses with a message that says so
+/// rather than pretending the mapping is total.
 #[derive(clap::Args, Debug)]
 #[command(
     group(clap::ArgGroup::new("source").required(true)),
@@ -678,16 +683,15 @@ pub struct RestoreArgs {
     pub timeout: Option<std::time::Duration>,
 }
 
-impl From<&RestoreArgs> for RestoreRequest {
-    /// Total, because PARSE TIME already enforced the exactly-one-of
-    /// invariant: clap's `source` and `target` `ArgGroup`s are `required(true)`
-    /// and mutually exclusive, so exactly one member of each is present here.
-    ///
-    /// A `TryFrom` would be the fallible-looking spelling, but its error type
-    /// could only be uninhabited — which `clippy::infallible_try_from` denies,
-    /// rightly: a conversion that cannot fail should say so. Callers written
-    /// against `TryFrom` still work — `std`'s blanket impl gives them one.
-    fn from(args: &RestoreArgs) -> Self {
+impl TryFrom<&RestoreArgs> for RestoreRequest {
+    type Error = CliError;
+
+    /// Fallible only through [`restore_target_from_args`]. The SOURCE arm stays
+    /// total-by-parse: clap's `source` `ArgGroup` is `required(true)` and
+    /// mutually exclusive, and every [`RestoreSource`] has a flag. The TARGET
+    /// arm does not get that luxury — `RestoreTarget::StreamExec` (#451) has no
+    /// flag, so the target mapping refuses by name instead of `unreachable!`.
+    fn try_from(args: &RestoreArgs) -> Result<Self, Self::Error> {
         let source = match (&args.from_snapshot, &args.from_policy, &args.identity) {
             (Some(snapshot), None, None) => RestoreSource::SnapshotRef(ObjectRef {
                 name: snapshot.clone(),
@@ -713,20 +717,7 @@ impl From<&RestoreArgs> for RestoreRequest {
             _ => unreachable!("clap group enforces exactly one source"),
         };
 
-        let target = match (&args.to_pvc, &args.create_pvc, args.populator) {
-            (Some(existing), None, false) => RestoreTarget::PvcRef(ObjectRef {
-                name: existing.clone(),
-                namespace: None,
-            }),
-            (None, Some(create), false) => RestoreTarget::Pvc(PvcTemplate {
-                name: create.clone(),
-                storage_class_name: args.storage_class.clone(),
-                capacity: args.size.clone(),
-                access_modes: args.access_modes.clone(),
-            }),
-            (None, None, true) => RestoreTarget::Populator(PopulatorTarget {}),
-            _ => unreachable!("clap group enforces exactly one target"),
-        };
+        let target = restore_target_from_args(args)?;
 
         let repository = args.repository.as_ref().map(|name| RepositoryRef {
             kind: args.repository_kind.into(),
@@ -743,7 +734,7 @@ impl From<&RestoreArgs> for RestoreRequest {
             None
         };
 
-        RestoreRequest {
+        Ok(RestoreRequest {
             source,
             target,
             repository,
@@ -756,7 +747,64 @@ impl From<&RestoreArgs> for RestoreRequest {
                 args.pod_startup_deadline_seconds,
             ),
             name: args.name.clone(),
-        }
+        })
+    }
+}
+
+/// **Pure.** Map the target flags onto exactly one [`RestoreTarget`].
+///
+/// Total, with no `_` arm and no `unreachable!`. clap's `target` ArgGroup is
+/// `required(true)` and mutually exclusive, so the refusing arm should be dead —
+/// but "should be" is not a type, and this is the CLI's user-facing entry point:
+/// a regression in the group wiring would turn a mistyped flag into a panicked
+/// binary with a backtrace instead of a sentence telling the user which flags
+/// exist. The refusal also carries the one target the CLI genuinely cannot build,
+/// `streamExec`, so a user looking for it is pointed at the manifest rather than
+/// left to conclude the feature is missing.
+///
+/// [`RestoreTarget`] has a fourth variant this function never produces. That gap
+/// is deliberate and pinned by `cli_builds_every_restore_target_it_supports`,
+/// which matches the enum exhaustively — so a fifth variant has to decide whether
+/// the CLI grows a flag for it or joins the manifest-only list.
+fn restore_target_from_args(args: &RestoreArgs) -> Result<RestoreTarget, CliError> {
+    match (&args.to_pvc, &args.create_pvc, args.populator) {
+        (Some(existing), None, false) => Ok(RestoreTarget::PvcRef(ObjectRef {
+            name: existing.clone(),
+            namespace: None,
+        })),
+        (None, Some(create), false) => Ok(RestoreTarget::Pvc(PvcTemplate {
+            name: create.clone(),
+            storage_class_name: args.storage_class.clone(),
+            capacity: args.size.clone(),
+            access_modes: args.access_modes.clone(),
+        })),
+        (None, None, true) => Ok(RestoreTarget::Populator(PopulatorTarget {})),
+        // Every remaining combination, spelled out rather than `_`: none given,
+        // or more than one.
+        (None, None, false)
+        | (Some(_), Some(_), _)
+        | (Some(_), None, true)
+        | (None, Some(_), true) => Err(CliError::UnresolvedRestoreTarget {
+            given: target_flags_given(args),
+        }),
+    }
+}
+
+/// The target flags actually present, for [`CliError::UnresolvedRestoreTarget`]'s
+/// message. Pure; `none` rather than an empty list so the sentence still reads.
+fn target_flags_given(args: &RestoreArgs) -> String {
+    let given: Vec<&str> = [
+        ("--to-pvc", args.to_pvc.is_some()),
+        ("--create-pvc", args.create_pvc.is_some()),
+        ("--populator", args.populator),
+    ]
+    .into_iter()
+    .filter_map(|(flag, present)| present.then_some(flag))
+    .collect();
+    if given.is_empty() {
+        "none".to_string()
+    } else {
+        given.join(", ")
     }
 }
 
@@ -1517,7 +1565,7 @@ mod tests {
             for (target_flags, target_kind) in targets {
                 let flags: Vec<&str> = source_flags.iter().chain(target_flags).copied().collect();
                 let args = restore_args(&flags);
-                let req = RestoreRequest::from(&args);
+                let req = RestoreRequest::try_from(&args).expect("valid target flags");
                 assert_eq!(req.source.kind_str(), source_kind, "{flags:?}");
                 assert_eq!(req.target.kind_str(), target_kind, "{flags:?}");
                 // The source's and target's own flags survive the conversion.
@@ -1570,6 +1618,9 @@ mod tests {
                 assert_eq!(t.capacity.as_deref(), Some("1Gi"));
             }
             RestoreTarget::Populator(_) => {}
+            // No flag builds it (see `cli_builds_every_restore_target_it_supports`),
+            // so a conversion that produced one is itself the bug.
+            RestoreTarget::StreamExec(t) => panic!("the CLI never builds streamExec: {t:?}"),
         }
     }
 
@@ -1589,7 +1640,7 @@ mod tests {
             "--to-pvc",
             "data",
         ]);
-        let req = RestoreRequest::from(&args);
+        let req = RestoreRequest::try_from(&args).expect("valid target flags");
         let RestoreSource::Identity(identity) = &req.source else {
             panic!("expected identity, got {:?}", req.source);
         };
@@ -1597,6 +1648,81 @@ mod tests {
         // The selectors it excludes stay absent.
         assert!(identity.as_of.is_none());
         assert!(identity.offset.is_none());
+    }
+
+    #[test]
+    fn cli_builds_every_restore_target_it_supports() {
+        // THE compile-time obligation. `RestoreTarget` is matched exhaustively
+        // here, so a fifth variant cannot land without deciding whether the CLI
+        // grows a flag for it or is documented as manifest-only. Without this,
+        // a new target silently becomes unreachable from `kubectl kopiur restore`
+        // and nothing says so.
+        let flags_for = |t: &RestoreTarget| -> Option<Vec<&'static str>> {
+            match t {
+                RestoreTarget::PvcRef(_) => Some(vec!["--to-pvc", "existing"]),
+                RestoreTarget::Pvc(_) => Some(vec!["--create-pvc", "fresh", "--size", "1Gi"]),
+                RestoreTarget::Populator(_) => Some(vec!["--populator"]),
+                // Manifest-only: piping a virtual file into a command in a running
+                // Pod needs a selector, a container and an argv, which is a YAML
+                // shape rather than a flag set. The refusal message names it.
+                RestoreTarget::StreamExec(_) => None,
+            }
+        };
+
+        // Each supported target's flags really do build that target.
+        for (target, expected) in [
+            (
+                RestoreTarget::PvcRef(ObjectRef {
+                    name: "existing".into(),
+                    namespace: None,
+                }),
+                "PvcRef",
+            ),
+            (
+                RestoreTarget::Pvc(PvcTemplate {
+                    name: "fresh".into(),
+                    storage_class_name: None,
+                    capacity: Some("1Gi".into()),
+                    access_modes: vec![],
+                }),
+                "Pvc",
+            ),
+            (RestoreTarget::Populator(PopulatorTarget {}), "Populator"),
+        ] {
+            let flags = flags_for(&target).expect("a supported target has flags");
+            let mut all = vec!["--from-snapshot", "snap1"];
+            all.extend_from_slice(&flags);
+            let built = restore_target_from_args(&restore_args(&all)).expect("supported target");
+            assert_eq!(built.kind_str(), expected, "{flags:?}");
+            assert_eq!(built.kind_str(), target.kind_str());
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_target_names_the_flags_and_the_manifest_only_one() {
+        // clap should make this unreachable; if its group wiring ever regresses,
+        // the CLI must print a sentence rather than panic with a backtrace.
+        let mut args = restore_args(&["--from-snapshot", "snap1", "--populator"]);
+        args.populator = false; // simulate the group letting "no target" through
+        let err = RestoreRequest::try_from(&args).expect_err("no target is a refusal");
+        let msg = err.to_string();
+        assert!(msg.contains("(none)"), "names what was seen: {msg}");
+        assert!(msg.contains("--to-pvc") && msg.contains("--create-pvc"));
+        // The one target the CLI genuinely cannot build is named, so a user after
+        // it is sent to the manifest instead of concluding it does not exist.
+        assert!(msg.contains("streamExec"), "{msg}");
+        assert!(msg.contains("docs/stream-sources.md"), "{msg}");
+
+        // More than one target is the same refusal, and lists both.
+        let mut two = restore_args(&["--from-snapshot", "snap1", "--to-pvc", "existing"]);
+        two.populator = true;
+        let msg = restore_target_from_args(&two)
+            .expect_err("two targets")
+            .to_string();
+        assert!(
+            msg.contains("--to-pvc, --populator"),
+            "lists every flag seen: {msg}"
+        );
     }
 
     /// A `restore` invocation with EVERY flag set, for the two "no flag
@@ -1675,7 +1801,7 @@ mod tests {
     /// must land on the request.
     #[test]
     fn restore_args_conversion_drops_no_flag() {
-        let req = RestoreRequest::from(&all_flags_restore_args());
+        let req = RestoreRequest::try_from(&all_flags_restore_args()).expect("valid target flags");
 
         let RestoreSource::FromPolicy(source) = &req.source else {
             panic!("expected fromPolicy, got {:?}", req.source);
@@ -1728,7 +1854,7 @@ mod tests {
     /// test so its assert count doesn't compound the one above's.
     #[test]
     fn restore_args_conversion_drops_no_option_flag() {
-        let req = RestoreRequest::from(&all_flags_restore_args());
+        let req = RestoreRequest::try_from(&all_flags_restore_args()).expect("valid target flags");
         let options = req.options.as_ref().expect("options set");
         assert!(options.enable_file_deletion);
         assert_eq!(options.ignore_permission_errors, Some(false));
@@ -1750,7 +1876,7 @@ mod tests {
     #[test]
     fn a_bare_restore_converts_to_an_empty_request() {
         let args = restore_args(&["--from-snapshot", "snap1", "--to-pvc", "data"]);
-        let req = RestoreRequest::from(&args);
+        let req = RestoreRequest::try_from(&args).expect("valid target flags");
         assert!(req.repository.is_none());
         assert!(req.options.is_none());
         assert!(req.policy.is_none());

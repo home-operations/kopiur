@@ -17,7 +17,7 @@ A feature is configured in **two places**: the CRD field that turns it on, such 
 ## The two flags
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:316:333"
+--8<-- "deploy/helm/kopiur/values.yaml:337:354"
 ```
 
 | CRD field you set… | …needs this Helm flag | Grants the operator `secrets` |
@@ -27,6 +27,14 @@ A feature is configured in **two places**: the CRD field that turns it on, such 
 | `spec.server` on a `Repository` / `ClusterRepository` (the kopia web-UI) | `features.kopiaUi.enabled` | `create`, `patch`, `delete` |
 
 Both default to `false`. With both off, the operator's `secrets` access is read-only, which is exactly what a plain backup deployment needs.
+
+/// info | Not on this page: the stream-source grants
+
+[`stream` sources and `streamExec` restore targets](stream-sources.md) are also gated, but on a different axis, so neither flag above turns them on.
+
+They need `pods/exec` in the **workload's** namespace — arbitrary code execution in every pod there — which no `secrets` flag covers. That grant is authorized per namespace by a cluster admin, with the `kopiur.home-operations.com/stream-exec-movers=true` annotation, and it fails **closed**: unlike the elevated-mover opt-in, Kopiur refuses when it cannot read the Namespace to check, because a `403` on `namespaces get` is indistinguishable from a deny an admin added on purpose. Under `installScope: namespaced` there is no `namespaces` read at all, so add the one supplementary `ClusterRole` with `rbacNamespaceReadForStreamSources: true`. See [Streamed command sources](stream-sources.md#if-kopiur-is-installed-namespace-scoped), [RBAC](rbac.md) and [Permissions → troubleshooting](permissions.md#troubleshooting).
+
+///
 
 ### Why each feature needs it
 
@@ -116,3 +124,4 @@ After you grant the flag, the operator re-reconciles and the condition clears on
 - [Movers, RBAC & credentials](movers.md) covers the full credential-projection model.
 - [Web UI (kopia server)](server.md) is the `spec.server` feature guide.
 - [Helm chart values](configuration.md#feature-permissions) is where these flags live.
+- [Streamed command sources](stream-sources.md) is the other gated capability, authorized by a namespace annotation rather than by a `secrets` flag.

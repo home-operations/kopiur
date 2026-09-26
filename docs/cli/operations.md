@@ -58,7 +58,7 @@ Those are reported **immediately, whatever the object's age**, and the FAIL line
 
 ```console
 $ kubectl kopiur doctor -n media
-  FAIL  no blocked or stuck work: snapshot media/nightly-1759: blocked on MoverPermitted=False (PrivilegedMoverNotPermitted): the mover for SnapshotPolicy media/nightly needs elevated privileges; run: kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=allow
+  FAIL  no blocked or stuck work: snapshot media/nightly-1759: blocked on MoverPermitted=False (PrivilegedMoverNotPermitted): the mover for SnapshotPolicy media/nightly needs elevated privileges; run: kubectl annotate namespace media kopiur.home-operations.com/privileged-movers=true
         why: a structural gate never self-heals — the operator has parked the object until a human makes an out-of-band change, so it will wait forever however new it is
         fix: the condition message above is the operator's own diagnosis and carries the exact command to run; apply it and the object proceeds on its own
 ```

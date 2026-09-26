@@ -2,6 +2,10 @@
 //! one source (snapshot / policy / raw identity) into exactly one target
 //! (created PVC / existing PVC / populator), with optional wait + log stream.
 //!
+//! `target.streamExec` (#451) is deliberately NOT here: piping one virtual file
+//! into a command in a running Pod needs a selector, a container and an argv,
+//! which is a manifest shape rather than a flag set. It is refused by name.
+//!
 //! The CR-building and terminal-phase classification live in
 //! [`kopiur_ops::actions::restore`], shared with the web UI; the clap flags are
 //! mapped onto its `RestoreRequest` by the conversion in [`crate::cli`]. What
@@ -35,9 +39,9 @@ pub async fn run(
     }
     let ns = ctx.namespace.as_str();
     let restores: Api<Restore> = Api::namespaced(ctx.client.clone(), ns);
-    // Total: clap's `source`/`target` ArgGroups already refused every other
-    // shape (see the conversion in `crate::cli`).
-    let req = RestoreRequest::from(args);
+    // clap's `source`/`target` ArgGroups already refused every other shape; the
+    // conversion still refuses by name rather than panicking (see `crate::cli`).
+    let req = RestoreRequest::try_from(args)?;
     let restore = build_restore(&req, ns, now);
     let name = restore.metadata.name.clone().expect("name set by builder");
     let created = create_restore(ctx, ns, restore).await?;
@@ -278,7 +282,7 @@ mod tests {
         // serialized directly; the CLI must emit the cluster's plain-mapping
         // encoding (via a JSON Value) so the output is kubectl-applyable.
         let args = parse(&["--from-snapshot", "snap1", "--to-pvc", "data"]);
-        let req = RestoreRequest::from(&args);
+        let req = RestoreRequest::try_from(&args).expect("valid target flags");
         let restore = build_restore(&req, "media", at());
         let value = serde_json::to_value(&restore).unwrap();
         let yaml = serde_yaml::to_string(&value).unwrap();

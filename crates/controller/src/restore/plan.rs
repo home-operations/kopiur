@@ -74,7 +74,11 @@ pub fn restore_job_duration_seconds(job: &k8s_openapi::api::batch::v1::Job) -> O
 pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
     match target {
         RestoreTarget::Populator(_) => PopulatorState::AwaitingClaim,
-        RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => PopulatorState::DirectTarget,
+        // `streamExec` is operator-driven like pvc/pvcRef — the mover reads one
+        // virtual file and pipes it into a command. Nothing claims it.
+        RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) | RestoreTarget::StreamExec(_) => {
+            PopulatorState::DirectTarget
+        }
     }
 }
 
@@ -1433,8 +1437,18 @@ pub fn pass_is_all_quiet(
 /// array wholesale and erase the sibling written moments earlier (the
 /// condition-writers-clobber class). Per-claim detail lives under `claims.<pvc>`
 /// via [`claim_merge_body`], which never names a mover-owned key.
+///
+/// `base` is the conditions array to build on, and the caller MUST pass the LIVE one
+/// ([`io::live_conditions`]): this body is the LAST write of the pass, but by the time it is
+/// built `run_restore_mover` has already written into the same array from inside
+/// `drive_one_claim` — the `CredentialsAvailable` clear and the #464 inherit heal. Seeded
+/// from `restore.status` instead, this patch replaces the array and resurrects the values
+/// those writers had just cleared, on every pass, forever. A parameter rather than a live
+/// re-read in here so the function stays pure (and so the generations below keep coming from
+/// the OBSERVED object, not from a live copy whose spec this pass never reconciled).
 pub fn fanout_status(
     restore: &Restore,
+    base: &[Condition],
     prev: &std::collections::BTreeMap<String, RestoreClaimStatus>,
     next: &std::collections::BTreeMap<String, RestoreClaimStatus>,
     gone: &[String],
@@ -1442,7 +1456,7 @@ pub fn fanout_status(
     let mirror = claims_mirror(next);
     let (reason, message) = mirrored_report(&mirror, next);
     let mut conditions = io::upsert_condition(
-        &existing_conditions(restore),
+        base,
         "AwaitingClaim",
         false,
         crate::consts::CLAIMS_OBSERVED_REASON,

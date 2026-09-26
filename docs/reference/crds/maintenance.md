@@ -90,7 +90,7 @@ Run status per kind:
 | `nextScheduledAt` | RFC 3339 instant of the next scheduled run, with cron and jitter already applied. |
 | `lastHandledAt` | RFC 3339 instant the controller last saw this kind's per-slot Job succeed. It is set whether the run maintained the repository or only yielded the lease, so a yielded slot never re-fires endlessly. |
 | `consecutiveFailures` | How many runs of this kind failed back to back. It resets on success. |
-| `lastContentReclaimedBytes` | Bytes of storage reclaimed by the most recent run of this kind. |
+| `lastContentReclaimedBytes` | Bytes of storage the run actually freed (blobs kopia deleted), excluding kopia's snapshot-GC figure which frees nothing until a later run. Absent means nothing measurable to report; `0` means a measured zero. |
 
 ### `manualRun`
 

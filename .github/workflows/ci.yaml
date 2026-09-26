@@ -100,7 +100,7 @@ jobs:
           path: lcov.info
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         continue-on-error: true
         with:
           files: lcov.info
@@ -203,6 +203,14 @@ jobs:
           - shard: hooks-retention
             bins: "hooks retention policy_knobs adoption"
             backends: true
+          # Streamed command sources: the mover execs into a workload pod and pipes
+          # stdout into kopia. Its own shard because the scenarios mutate the
+          # NAMESPACE annotation that gates stream-exec (on, then off, then on
+          # again) — a binary sharing the cluster could see a Snapshot parked or
+          # released by someone else's edit rather than its own.
+          - shard: stream-sources
+            bins: "stream_sources"
+            backends: false
           - shard: reshape-async
             bins: "verification replication"
             backends: false
@@ -257,8 +265,12 @@ jobs:
           # external-snapshotter 8.2, but still default-OFF) — a stack shape no
           # other shard uses, and one that would drag every CSI shard along if it
           # regressed.
+          # `verification_fanout` (#456) rides this shard rather than
+          # `reshape-async`: it needs TWO labelled source PVCs a `pvcSelector`
+          # can fan out over, and `reshape-async` provisions exactly one
+          # hostPath source PVC per namespace.
           - shard: multi-pvc
-            bins: "multi_pvc_group"
+            bins: "multi_pvc_group verification_fanout"
             backends: false
             csi: true
           # #443 populator fan-out: ONE populator Restore fills EVERY claiming
@@ -978,7 +990,7 @@ jobs:
           echo "zizmor=$(mise config get tools.zizmor)" >> "$GITHUB_OUTPUT"
 
       - name: Lint workflows
-        uses: home-operations/.github/actions/workflow-lint@69cad1e407df8070dd9cfc3314551e473544014e # workflow-lint-v1.0.3
+        uses: home-operations/.github/actions/workflow-lint@1d6eebfd2066f2aa84939e573e56f60d8d2ed85f # workflow-lint-v1.0.4
         with:
           actionlint-version: ${{ steps.tools.outputs.actionlint }}
           zizmor-version: ${{ steps.tools.outputs.zizmor }}

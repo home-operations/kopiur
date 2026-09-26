@@ -645,6 +645,21 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
                  explicitly, or drop inheritSecurityContextFrom.snapshot."
             ),
         ),
+        // A live-pod `inheritSecurityContextFrom` resolved nothing and no
+        // fallback identity is pinned (#464). Same reason as the structural gate
+        // (`INHERIT_SOURCE_MISSING_GATE`) both reconcilers write for it, so the
+        // Event and the condition read as one signal. The resolver's message
+        // already names the selector and the three levers, so the note only adds
+        // the park/re-check contract.
+        Error::InheritSourceMissing(_) => (
+            kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON,
+            crate::consts::SCALE_WORKLOAD_OR_PIN_MOVER_UID_ACTION,
+            format!(
+                "{err}. The run is parked (re-checked every few minutes) and starts by itself \
+                 once the workload is readable again or an explicit \
+                 mover.securityContext.runAsUser is set — no re-apply needed."
+            ),
+        ),
         // The DIRECT source PVC is gone. Same reason as the structural gate
         // (`SOURCE_PVC_MISSING_GATE`) the snapshot reconciler writes for it, so
         // the Event and the condition read as one signal; the note names the

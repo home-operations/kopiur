@@ -292,6 +292,16 @@ pub fn effective_failed_jobs_history_limit(limit: Option<u32>) -> u32 {
     limit.unwrap_or(DEFAULT_FAILED_JOBS_HISTORY_LIMIT)
 }
 
+/// Default bound on a stream producer/consumer command (a `stream` source's
+/// `workloadExec.timeout`, or a `streamExec` restore target's) when `timeout` is
+/// unset. Generous enough for a large logical dump, finite so a wedged command
+/// cannot pin a mover Job forever. Both resolution sites (backup Job build and
+/// restore Job build) map absent-or-unparseable → exactly this value, which is
+/// what makes emitting it as a schema `default:` behavior-preserving. Part of the
+/// documented API contract (field-reference), so it lives here rather than in the
+/// controller.
+pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 3600;
+
 /// Default `spec.deletionProtection.threshold` (0 disables). 10 pending
 /// external destructive deletions is far above legitimate manual cleanup but
 /// far below a tooling-driven cascade (the motivating incident was ~600).
@@ -326,16 +336,16 @@ pub fn effective_mass_deletion_threshold(p: Option<&crate::common::DeletionProte
 /// // No block at all, no field, and an explicit 0 are the same state: uncapped.
 /// assert_eq!(effective_max_concurrent_jobs(None), None);
 /// assert_eq!(
-///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: None })),
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: None, max_concurrent_delete_jobs: None })),
 ///     None,
 /// );
 /// assert_eq!(
-///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(0) })),
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(0), max_concurrent_delete_jobs: None })),
 ///     None,
 /// );
 /// // A positive value caps the pool.
 /// assert_eq!(
-///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(3) }))
+///     effective_max_concurrent_jobs(Some(&ConcurrencySpec { max_concurrent_jobs: Some(3), max_concurrent_delete_jobs: None }))
 ///         .map(|n| n.get()),
 ///     Some(3),
 /// );
@@ -345,6 +355,35 @@ pub fn effective_max_concurrent_jobs(
 ) -> Option<std::num::NonZeroUsize> {
     spec.and_then(|c| c.max_concurrent_jobs)
         .and_then(|n| std::num::NonZeroUsize::new(n as usize))
+}
+
+/// The per-repository snapshot-delete batch default when
+/// `concurrency.maxConcurrentDeleteJobs` is absent: one batch at a time
+/// (single-flight). See [`effective_max_concurrent_delete_jobs`].
+pub const DEFAULT_MAX_CONCURRENT_DELETE_JOBS: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN;
+
+/// The effective per-repository cap on live snapshot-delete batch Jobs:
+/// `concurrency.maxConcurrentDeleteJobs` when set, else
+/// [`DEFAULT_MAX_CONCURRENT_DELETE_JOBS`] (1). Unlike
+/// [`effective_max_concurrent_jobs`] there is NO uncapped state: parallel bulk
+/// deletes against one repository only multiply index loads (issue #477). An
+/// explicit `0` is refused at admission; should one reach the controller anyway
+/// it also resolves to the default rather than to "delete nothing, forever".
+///
+/// ```
+/// use kopiur_api::common::ConcurrencySpec;
+/// use kopiur_api::consts::effective_max_concurrent_delete_jobs;
+///
+/// assert_eq!(effective_max_concurrent_delete_jobs(None).get(), 1);
+/// let two = ConcurrencySpec { max_concurrent_delete_jobs: Some(2), ..Default::default() };
+/// assert_eq!(effective_max_concurrent_delete_jobs(Some(&two)).get(), 2);
+/// ```
+pub fn effective_max_concurrent_delete_jobs(
+    spec: Option<&crate::common::ConcurrencySpec>,
+) -> std::num::NonZeroUsize {
+    spec.and_then(|c| c.max_concurrent_delete_jobs)
+        .and_then(|n| std::num::NonZeroUsize::new(n as usize))
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_DELETE_JOBS)
 }
 
 /// Pool-membership label stamped on every mover `Job` that counts toward its
@@ -392,11 +431,25 @@ pub const MASS_DELETION_THRESHOLD_EXCEEDED_REASON: &str = "ThresholdExceeded";
 /// minted mover ServiceAccount at that privilege. Mirrors VolSync's
 /// `volsync.backube/privileged-movers`.
 pub const PRIVILEGED_MOVERS_ANNOTATION: &str = "kopiur.home-operations.com/privileged-movers";
+/// Namespace annotation a cluster admin sets to allow `stream` backup sources in
+/// that namespace.
+///
+/// Separate from [`PRIVILEGED_MOVERS_ANNOTATION`] because it gates a different
+/// capability: not an elevated container, but `pods/exec` — the ability to run
+/// commands inside OTHER pods in the namespace. Kubernetes separates that verb from
+/// ordinary write access deliberately, and without this gate anyone who can create a
+/// `SnapshotPolicy` in a namespace would effectively acquire it.
+pub const STREAM_EXEC_ANNOTATION: &str = "kopiur.home-operations.com/stream-exec-movers";
 /// `Snapshot`/`Restore` condition surfaced when a privileged mover is requested in a
 /// namespace that has not opted in — `False` carries the actionable message.
 pub const MOVER_PERMITTED_CONDITION: &str = "MoverPermitted";
 /// `reason`/Event reason for [`MOVER_PERMITTED_CONDITION`] = `False`.
 pub const PRIVILEGED_MOVER_NOT_PERMITTED_REASON: &str = "PrivilegedMoverNotPermitted";
+
+/// `reason`/Event reason for [`MOVER_PERMITTED_CONDITION`] = `False` when a
+/// `stream` source is used in a namespace that has not opted in to
+/// [`STREAM_EXEC_ANNOTATION`].
+pub const STREAM_EXEC_NOT_PERMITTED_REASON: &str = "StreamExecNotPermitted";
 
 /// `SnapshotSchedule` condition recording whether the schedule is able to fire
 /// its next slot. Set `False` (with [`BLOCKED_ON_UNREADABLE_RUN_REASON`]) when
@@ -481,6 +534,47 @@ pub const FANOUT_TOO_LARGE_REASON: &str = "FanoutTooLarge";
 pub const SOURCE_PVC_AVAILABLE_CONDITION: &str = "SourcePvcAvailable";
 /// `reason`/Event reason for [`SOURCE_PVC_AVAILABLE_CONDITION`] = `False`.
 pub const SOURCE_PVC_MISSING_REASON: &str = "SourcePvcMissing";
+
+/// `Snapshot`/`Restore` condition recording whether the mover's securityContext
+/// could be RESOLVED at all — the hold, as opposed to the advisory
+/// `SecurityContextInherited` report of what inheritance achieved on a run that
+/// still went ahead.
+///
+/// Set `False` (with [`INHERIT_SOURCE_MISSING_REASON`]) when
+/// `mover.inheritSecurityContextFrom` names a live-pod source that resolved
+/// NOTHING — no pod matched the selector, the named container is absent, or the
+/// matched pod sets neither a container nor a pod-level context — AND the recipe
+/// pins no fallback identity. The run parks at `phase: Pending` on the slow
+/// structural cadence rather than being backed up (or restored) as the wrong UID.
+///
+/// Deliberately its OWN condition rather than a reason on
+/// `SecurityContextInherited`: that condition is advisory and carries five
+/// unregistered reasons, and registering one of them would make
+/// `kubectl kopiur doctor` classify the other four as "the operator is newer than
+/// the plugin" (its `first_gate` reports a registered condition+status whose
+/// reason matches no row as UNREGISTERED). A separate condition keeps the hold
+/// visible to `doctor` and the advisory report advisory.
+/// Structural ([`crate::gates::INHERIT_SOURCE_MISSING_GATE`]).
+pub const SECURITY_CONTEXT_RESOLVED_CONDITION: &str = "SecurityContextResolved";
+/// `reason`/Event reason for [`SECURITY_CONTEXT_RESOLVED_CONDITION`] = `False`:
+/// a live-pod `mover.inheritSecurityContextFrom` resolved no securityContext and
+/// the recipe pins no fallback `runAsUser` to proceed on. Clears when the
+/// workload comes up, the selector is corrected, or an explicit
+/// `mover.securityContext.runAsUser` is set.
+pub const INHERIT_SOURCE_MISSING_REASON: &str = "InheritSourceMissing";
+/// `reason` for [`SECURITY_CONTEXT_RESOLVED_CONDITION`] = `True`: the hold above
+/// has CLEARED — the workload came back, the selector was corrected, or an
+/// explicit `runAsUser` was pinned — and the run is proceeding.
+///
+/// Written only when a non-`True` condition is already standing, so a run that
+/// was never held stays byte-identical and cannot hot-loop. Healing matters as
+/// much as holding: `kubectl kopiur doctor` suppresses a stale gate only on a
+/// TERMINAL phase, so a `Running` Snapshot still carrying the `False` would be
+/// reported as "blocked … will wait forever" for the whole mover run — the exact
+/// inverse of the false diagnosis this condition exists to prevent.
+/// [`crate::gates::StructuralGate::trips`] requires the blocked status, so a
+/// `True` matches no row and can never be read as an unregistered trip.
+pub const INHERIT_SOURCE_RESOLVED_REASON: &str = "InheritSourceResolved";
 
 /// Condition recording whether this run holds a slot in its repository's
 /// mover-Job pool (`spec.concurrency.maxConcurrentJobs`). `False` with
@@ -723,6 +817,7 @@ mod tests {
         let cap = |n: Option<u32>| {
             effective_max_concurrent_jobs(Some(&ConcurrencySpec {
                 max_concurrent_jobs: n,
+                max_concurrent_delete_jobs: None,
             }))
             .map(|v| v.get())
         };

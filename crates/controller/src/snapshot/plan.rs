@@ -1146,8 +1146,35 @@ pub(super) fn snapshot_ready_status_with_condition(
     condition_type: &str,
     condition_status: bool,
 ) -> serde_json::Value {
-    let seeded = io::upsert_condition(
+    snapshot_ready_status_with_condition_on(
+        backup,
         &existing_conditions(backup),
+        phase,
+        reason,
+        message,
+        condition_type,
+        condition_status,
+    )
+}
+
+/// [`snapshot_ready_status_with_condition`] over an EXPLICIT conditions base — for a writer
+/// that is NOT the first of its reconcile and so must seed from the LIVE array
+/// ([`io::live_conditions`]) rather than `backup.status`. Mirrors
+/// `restore::plan::restore_ready_status_on`, which exists for the same reason.
+///
+/// `backup` still supplies the generations: `observedGeneration` must name the spec THIS pass
+/// reconciled, which a live re-read can have already moved past.
+pub(super) fn snapshot_ready_status_with_condition_on(
+    backup: &Snapshot,
+    base: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+    phase: SnapshotPhase,
+    reason: &str,
+    message: &str,
+    condition_type: &str,
+    condition_status: bool,
+) -> serde_json::Value {
+    let seeded = io::upsert_condition(
+        base,
         condition_type,
         condition_status,
         reason,
@@ -1155,6 +1182,37 @@ pub(super) fn snapshot_ready_status_with_condition(
         backup.meta().generation,
     );
     snapshot_ready_status_over(backup, &phase, reason, message, &seeded)
+}
+
+/// The `SourceStaged` conditions array for one staging pass — the single place BOTH staging
+/// writers (`StagingOutcome::Ready` and `StagingOutcome::Waiting`) build their array, so the
+/// property that actually matters is unit-testable without a cluster.
+///
+/// `existing` MUST be the LIVE array ([`io::live_conditions`]), never
+/// `backup.status.conditions`. Staging runs LATE in the launch pass — after the
+/// `CredentialsAvailable` clear and after the #464 inherit heal — and a `conditions` merge
+/// patch REPLACES the array, so seeding it from the reconcile-START copy resurrects whatever
+/// those earlier writers had just cleared. That is not self-correcting: the next pass reads
+/// the resurrected value, heals it, and clobbers it again from its own start-of-pass copy,
+/// forever. Pinned by `the_inherit_heal_survives_the_rest_of_the_launch_pass`.
+///
+/// `generation` stays the OBSERVED generation (`backup.meta().generation`), not the live
+/// object's: the condition records the spec this pass reconciled.
+pub(super) fn staged_conditions(
+    existing: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+    met: bool,
+    reason: &str,
+    message: &str,
+    generation: Option<i64>,
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    io::upsert_condition(
+        existing,
+        crate::consts::SOURCE_STAGED_CONDITION,
+        met,
+        reason,
+        message,
+        generation,
+    )
 }
 
 /// The status body written when the repository-pool gate PARKS a run: phase
@@ -1207,7 +1265,7 @@ pub(super) fn park_status(
     status
 }
 
-fn existing_conditions(
+pub(super) fn existing_conditions(
     backup: &Snapshot,
 ) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
     backup

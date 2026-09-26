@@ -43,7 +43,13 @@ nas-primary-to-offsite   nas-primary   offsite-s3    0 6 * * *   Succeeded   2m 
 $ kubectl -n billing get snapshots -l kopiur.home-operations.com/origin=replicated
 ```
 
-`status.lastRun` carries the per-run counters: `identitiesSelected`, `snapshotsCopied`, `alreadyPresent`, `failed`, and `pruned`.
+`status.lastRun` carries the per-run counters: `identitiesSelected`, `snapshotsCopied`, `alreadyPresent`, `failed`, `pruned`, and `incompleteSkipped`.
+
+/// note | Incomplete source snapshots are skipped, not failed
+
+An interrupted `kopia snapshot create` (a killed pod, a cancelled manual run) leaves an **incomplete checkpoint** manifest in the source repository. kopia can never migrate a checkpoint as a real snapshot, so replication skips it rather than failing the run over it. The count is in `status.lastRun.incompleteSkipped`, the `Ready` message says so, and the mover log names each skipped id. Once you have confirmed the upload is abandoned, remove it from the source repository with `kopia snapshot delete <id> --delete`.
+
+///
 
 `kubectl kopiur status` and `kubectl kopiur doctor` render them too. `kubectl kopiur snapshots list` shows where a replicated row was copied from, in `status.copiedFrom`.
 

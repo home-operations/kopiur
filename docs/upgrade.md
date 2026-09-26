@@ -2,6 +2,26 @@
 
 This page covers upgrading the operator across releases. Most upgrades are a routine `helm upgrade`, or a Flux or Argo reconcile: bump the chart version, roll the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which moves the CustomResourceDefinitions (CRDs) between two Helm mechanisms and needs one deliberate step to avoid data loss. Read that section before you cross it.
 
+## Mover Role names: only if your release name is long (over ~30 characters)
+
+The three mover identities — `<release>-mover`, `<release>-stream-mover` and `<release>-snapshot-replication-mover` — are now all built from one **pre-capped stem** instead of each being truncated to 63 characters after its suffix was appended. Appending after the cap meant a long enough `fullname` cut the suffix off, and two roles that must never share an identity collapsed onto one name: the `pods/exec`-carrying stream role could land on the same object name as the generic mover role every ordinary backup Job runs as.
+
+**If the chart's `fullname` — your release name, or `fullnameOverride` — is 36 characters or shorter, nothing changes.** That covers the default `kopiur` and essentially every normal install; `helm template` before and after renders byte-identical names.
+
+Above 36 characters the three names change, because the stem is now capped at 36 so the longest suffix always fits. With a `fullname` of `platform-backups-production-cluster-kopiur` (42 characters), the mover role goes from `platform-backups-production-cluster-kopiur-mover` to `platform-backups-production-cluster-mover`, and the stream role from `platform-backups-production-cluster-kopiur-stream-mover` to `platform-backups-production-cluster-stream-mover` — one shared stem now backing all three names. Run `helm template` with your values and `diff` the `mover` names if you want the exact before/after.
+
+`helm upgrade` creates the new Role/ClusterRole and removes the old one, and the controller mints the matching per-namespace ServiceAccount and RoleBinding on the next reconcile. Nothing fails in between: in-flight mover Jobs keep referencing the ServiceAccount they were created with, which still exists.
+
+The **old** per-namespace ServiceAccounts and RoleBindings are left behind, because Kopiur never deletes minted mover RBAC (see [RBAC reference](rbac.md#the-stream-source-mover-kopiur-stream-mover)). Find and remove them per namespace:
+
+```sh
+kubectl get serviceaccount,rolebinding -A -l app.kubernetes.io/managed-by=kopiur
+kubectl delete rolebinding <old-name> -n <ns>
+kubectl delete serviceaccount <old-name> -n <ns>
+```
+
+Doing this matters most for an old `…-stream-mover` ServiceAccount, whose RoleBinding carries `create pods/exec`.
+
 ## Per-repository mover concurrency: what the first reconcile after the upgrade does
 
 The release that adds [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) needs **no action**. With no cap set anywhere, which is the default, the gate costs one branch, performs no extra API calls, and changes nothing about backups. The notes below matter only once you set a cap, and only across the upgrade itself.

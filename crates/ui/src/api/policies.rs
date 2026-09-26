@@ -146,6 +146,11 @@ fn describe_source(source: &kopiur_api::snapshot_policy::Source) -> String {
     if let Some(nfs) = &source.nfs {
         return format!("nfs://{}{}", nfs.server, nfs.path);
     }
+    if let Some(stream) = &source.stream {
+        // The kopia path a stream source records under (`/stream/<fileName>`),
+        // so the row reads the same as the identity it produces.
+        return format!("stream/{}", stream.file_name);
+    }
     // `Source` is a struct of optional shapes rather than an enum, so a source
     // that sets none of them is representable — and is exactly what a newer
     // operator's third source kind looks like to this build.
@@ -388,6 +393,28 @@ spec:
             sources_view(&selector),
             vec!["pvcSelector(backup=yes)", "nfs://10.0.0.1/exports/media"]
         );
+    }
+
+    #[test]
+    fn a_stream_source_is_named_not_shown_as_unrecognized() {
+        // `stream` (#451) arrived after this view was written; without its own
+        // arm it fell through to "(unrecognized source)" on a perfectly valid policy.
+        let dump: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: pg, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources:
+    - stream:
+        fileName: postgres.sql
+        workloadExec:
+          podSelector: { matchLabels: { app: postgres } }
+          command: ["sh", "-ec", "pg_dumpall"]
+"#,
+        );
+        assert_eq!(sources_view(&dump), vec!["stream/postgres.sql"]);
     }
 
     #[test]

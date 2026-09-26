@@ -180,21 +180,22 @@ pub const DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS: i64 = 3600;
 
 /// Cap on concurrently RUNNING `Snapshot`-delete BATCH mover Jobs across every
 /// repository the controller manages (the operator's own GFS-retention prunes
-/// included) — the throttle the batch dispatcher checks before firing a new
-/// one (`crate::snapshot::throttle_verdict`). Bounds how much delete traffic a
+/// included), checked with each repository's own cap before a new batch fires
+/// (`crate::pool::DeleteAdmissionLedger`). Bounds how much delete traffic a
 /// mass-deletion wave (or an incident's retroactive prune) can put on the
 /// backend at once; it does NOT bound how many `Snapshot`s one batch Job
 /// deletes (see `crate::snapshot::MAX_BATCH_MEMBERS`), nor does it gate
 /// whether a deletion is allowed at all — that is
 /// `Repository`/`ClusterRepository` `spec.deletionProtection.threshold`.
 ///
-/// `0` (or unset) means UNCAPPED — the default. Batching is the PRIMARY
-/// protection here: a mass-deletion wave already drains as one Job per
-/// repository per accumulation window (`crate::snapshot::BATCH_QUIET_WINDOW`),
-/// not one Job per `Snapshot`, so an operator-wide concurrency cap is an
-/// opt-in backstop for a resource-constrained cluster, not a load-bearing
-/// safety mechanism — a small default cap risks head-of-line blocking every
-/// OTHER repository's deletions behind one slow or failing one. Reachable via
+/// `0` (or unset) means no cluster-wide cap — the default. The PRIMARY
+/// protection is per repository: a mass-deletion wave drains as batch Jobs of
+/// up to `crate::snapshot::MAX_BATCH_MEMBERS` members, at most
+/// `spec.concurrency.maxConcurrentDeleteJobs` (default 1) of them live per
+/// repository at a time, each deleting its members in one bulk kopia call. This
+/// cluster-wide cap is an opt-in backstop for a resource-constrained cluster,
+/// not a load-bearing safety mechanism — a small value risks head-of-line
+/// blocking every OTHER repository's deletions behind one slow or failing one. Reachable via
 /// the chart's top-level `maxConcurrentDeleteJobs` value.
 pub const MAX_CONCURRENT_DELETE_JOBS_ENV: &str = "KOPIUR_MAX_CONCURRENT_DELETE_JOBS";
 

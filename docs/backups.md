@@ -132,7 +132,7 @@ Helm never upgrades the chart's `crds/` directory, so on an existing install the
 
 ### Sources — what to back up
 
-`sources` is a list. Each entry is **exactly one of** a single PVC, a label selector, or an inline NFS export. They are mutually exclusive, and the webhook rejects setting more than one on a source.
+`sources` is a list. Each entry is **exactly one of** a single PVC, a label selector, an inline NFS export, or a streamed command. They are mutually exclusive, and the webhook rejects setting more than one on a source.
 
 ```yaml
 sources:
@@ -159,6 +159,7 @@ Consequences worth knowing:
 - **A hand-written `Snapshot` with only a `policyRef` is rejected** against a selector policy. It does not say which PVC it covers, and the operator will not pick one of N on your behalf. Use `kubectl kopiur snapshot now` or a schedule; both expand for you.
 - **The selector only matches PVCs in the policy's own namespace.** `namespaceSelector` is refused, because a mover Pod can only mount PersistentVolumeClaims in its own namespace, and the mover Job runs in the `Snapshot`'s namespace, which is the policy's. Use one `SnapshotPolicy` per namespace; they can share a repository.
 - **Two selector sources may not match the same PVC.** Both would resolve to one kopia source path and one `Snapshot` name, so one of the two backups would silently overwrite the other. Narrow the selectors instead.
+- **`sourcePathOverride` on a selector source is a footgun.** It is one literal path, so it only works while the selector matches exactly one PVC. The moment a second PVC matches, both would land on that same kopia source, merging two volumes' histories into one stream where they also prune each other — so the **backup** is refused at run time and no further snapshots are minted for that source. Watch the failed schedule fire, not verification: the snapshots taken before the second PVC appeared are still at that path, so verification keeps passing while backups have quietly stopped. It is not rejected at admission, because a single-match policy with a custom path genuinely works and rejecting it would park the whole recipe. Prefer `sourcePathStrategy`, which derives a distinct path per PVC, or put the override on its own `pvc:` source.
 - **`sourcePathStrategy` is part of your data identity.** `PvcName` gives each PVC the kopia path `/pvc/<name>`; `PvcNamespacedName` qualifies it with the namespace. Changing the strategy later re-identifies every source, so it is guarded like any other identity change. See [Identity](#identity--what-kopia-records-usernamehostnamepath).
 - **`groupBy`** decides whether the captures are crash-consistent with each other. See [copy methods → multi-PVC and consistency groups](copy-methods.md#multi-pvc-and-consistency-groups).
 
@@ -172,6 +173,22 @@ sources:
 ```
 
 The operator mounts the export read-only into the backup mover and kopia snapshots it. By default kopia records the export `path` as the snapshot `sourcePath`; override it with `sourcePathOverride`. An NFS source works with **any** repository backend.
+
+Or capture a **command's stdout** as one virtual file, with nothing mounted at all — the logical-backup source for a database dump. See [Streamed command sources](stream-sources.md) and [example 45](https://github.com/home-operations/kopiur/blob/main/deploy/examples/45-stream-source-postgres.yaml):
+
+```yaml
+sources:
+    - stream:
+          fileName: postgres.sql # the one virtual file in the snapshot
+          workloadExec:
+              podSelector:
+                  matchLabels: { app: postgres }
+              command: ["sh", "-ec", "pg_dumpall -U postgres"]
+```
+
+The mover execs the command in the **workload's** container and pipes its stdout straight into kopia, so the dump uses the credentials already present there and the mover never sees repository credentials. The snapshot root is a virtual directory at `/stream/<fileName>` — deliberately distinct from a PVC source's `/pvc/<name>`, so a streamed artifact and a volume backup can never share a kopia identity. Exactly one **Running** pod must match `podSelector`; zero, several, or only not-running matches are each a named failure rather than an arbitrary pick.
+
+A stream source needs `pods/exec` in the workload namespace, which is a much larger grant than an ordinary backup, so it is gated behind its own namespace opt-in that **fails closed**. Restoring one is the mirror `streamExec` target, which pipes the file back into a command's stdin. Both are covered on the [Streamed command sources](stream-sources.md) page.
 
 #### `readOnly` — the source mount
 
@@ -443,9 +460,47 @@ You can set the scratch size and class **once** at the repository level via [`mo
 Verification only ever runs against a snapshot that actually exists. On a brand-new `SnapshotPolicy` the operator does **not** schedule a verify Job the moment `verification` is added. It waits until either:
 
 - this policy has produced its **first successful backup**, meaning a `Snapshot` that reached `Succeeded`, or
-- the resolved repository already carries **discovered** (adopted) snapshots. That is the escape hatch for an [adopted repository](scenarios/adopt-existing-repo.md), where a deep verify legitimately restores the latest repo snapshot for the identity even though this policy has never run a backup itself.
+- the resolved repository already carries a **discovered** (adopted) or **replicated** snapshot **at this policy's own kopia identity**. That is the escape hatch for an [adopted repository](scenarios/adopt-existing-repo.md), where a deep verify legitimately restores the latest repo snapshot for the identity even though this policy has never run a backup itself. The identity has to match: on a repository shared with other policies or other clusters, someone else's history says nothing about yours, and unlocking on it would just produce a failing verify Job every slot until your own first backup landed.
 
 While gated, `status.lastVerified` stays unset and no verify Job is created. The `SnapshotPolicy` keeps reconciling on a steady background cadence rather than the tight polling it uses once a verify Job is actually in flight, because there is nothing wrong to report, just nothing to verify yet. As soon as the gate opens, which typically means the first backup succeeds, the operator catches up and runs the first due verification promptly, without waiting for the next cron slot. Before this gate existed, a fresh policy with `verification` configured but no backup yet could spawn a verify Job that failed hard against an empty repository (GitHub #168).
+
+### verification with a `pvcSelector` — one run per matched volume
+
+A policy whose source is a [`pvcSelector`](#sources--what-to-back-up) backs up **one kopia source per matched PVC**, so verification checks **one per matched PVC** too. Each matched volume gets its own verify Job, carrying that volume's own kopia source path, and its own recorded result.
+
+You do not configure any of this. `verification` is written exactly as above; the fan-out follows the selector.
+
+Where it shows up:
+
+- **Verify Jobs.** One per matched PVC, named `<policy>-vfy-<q|d>-m<tag>-<slot>`, where `<tag>` identifies the volume. A `pvcSelector` policy uses this name even while the selector matches only **one** PVC; only a non-selector source (`pvc:` or `nfs:`) keeps the plain `<policy>-vfy-<q|d>-<slot>` name.
+- **`status.verificationStamps`.** Each member records its own timestamp under its own key. A `pvcSelector` policy always uses this map, again including the one-match case. Only a non-selector source keeps writing the flat `status.lastVerified` directly, with no stamp map.
+- **`status.lastVerified`.** The **oldest** member timestamp, so it reads as _"every volume in this policy is verified as of T"_. It stays unset until **every** member has verified at least once: a partially verified policy must not show a reassuring timestamp. The same rule applies one level up for a [multi-repository policy](#repositories--one-recipe-several-repositories-fan-out), where `status.verification[].lastVerified` is the oldest across that repository's volumes.
+- **A selector that currently matches nothing.** Nothing is verified and nothing is stamped, and the operator logs a warning naming the policy. It never runs a verification that covers no volume.
+- **The gate is per volume, and per identity.** The [gate above](#verification-scheduling--gated-until-there-is-something-to-verify) applies to each member individually: a PVC that joins the selector later stays unverified until **its own** first backup succeeds, because a sibling's success is no evidence about a volume the repository has never seen. The adopted-repository escape hatch is narrowed the same way: a discovered or replicated snapshot unlocks a member only when it carries **that member's** kopia identity, so a policy sharing a repository with other identities is not unlocked by their history.
+
+`quick` members of one repository run **concurrently** — they are short, read-only, metadata-heavy runs. `deep` members run **one at a time**, because each deep member provisions its own scratch volume of `deep.capacity`; four volumes at `capacity: 500Gi` would otherwise ask the cluster for 2 TiB of ephemeral storage at once. A held member starts as soon as the running one finishes, so a full deep drill of an N-volume policy simply takes N sequential restores. Only other `deep` runs hold a `deep` member back; a sibling's `quick` run never defers the drill.
+
+/// warning | A verification that covered nothing is a failure
+
+`kopia snapshot verify --sources <identity>` **exits 0 when its filter matches no snapshot at all**, so "the verify command succeeded" is not by itself evidence that anything was verified. The mover therefore fails the run, with `no snapshot ... for <identity>` naming the source path, whenever it cannot find a snapshot for the identity it just verified — for either tier.
+
+You can hit this without doing anything wrong. Changing a source's `sourcePathStrategy`, or its `sourcePathOverride`, re-addresses the kopia source: the existing snapshots stay under the **old** path and the new identity has none yet, so the first verification after such an edit fails until a backup runs under the new address. (The webhook rejects that edit outright on a policy that already has snapshots unless you acknowledge it — see [identity changes](#identity--what-kopia-records-usernamehostnamepath).) The same applies when the snapshots themselves are gone, for example after an external deletion.
+
+///
+
+/// warning | If you were already running verification on a `pvcSelector` policy
+
+Before this fan-out existed (GitHub #456), verification on a selector policy resolved an **empty** kopia source path. `deep` failed loudly with `deep verify found no snapshot to restore for source path ""`. `quick` failed **silently**: kopia matched zero snapshots, exited successfully, and the operator stamped `status.lastVerified` anyway. **Any `lastVerified` such a policy shows from before the upgrade is not evidence that anything was verified.**
+
+On the first reconcile after upgrading, the operator **clears that stale flat `status.lastVerified`** and starts recording per-member results, so the next scheduled slot performs a real verification of every matched volume. This applies to **every** `pvcSelector` policy, including one whose selector matches a single volume — that is precisely why such a policy is not kept on the flat field. Leaving the stale value in place would not merely display a proof that is not one: `status.lastVerified` is also the anchor the next due slot is measured from, so it would have **postponed the first real verification** by up to a full period of the coarsest tier you have configured — a month, for a monthly `deep` drill.
+
+///
+
+/// note | One smaller change that came with the fan-out
+
+A policy whose `identityDefaults.usernameExpr`/`hostnameExpr` cannot be evaluated now **parks** with a validation error on the `SnapshotPolicy` instead of quietly verifying under a `kopiur-verify@<namespace>` placeholder — which matched nothing and reported success. Fix the expression and the policy resumes.
+
+///
 
 `successExpr` is a CEL predicate returning a bool over the verify result. The environment is:
 
@@ -682,11 +737,13 @@ See [Adopt an existing repo → Delete a policy, then recreate it](scenarios/ado
 
 #### How a deletion actually runs — batched, not one Job per Snapshot
 
-Kopiur never spawns one mover Job per `Snapshot` being deleted. Deletions for the same repository are aggregated into ONE batch mover Job that connects once and deletes every member's kopia manifest. It is named `snapdel-*` and labeled `kopiur.home-operations.com/op=snapshot-delete-batch`. This is what keeps a legitimate bulk deletion, such as a GFS retention sweep, a namespace teardown, or an acknowledged mass-deletion wave, from hammering the backend with hundreds of concurrent connects.
+Kopiur never spawns one mover Job per `Snapshot` being deleted. Deletions for the same repository are aggregated into ONE batch mover Job. It is named `snapdel-*` and labeled `kopiur.home-operations.com/op=snapshot-delete-batch`. The Job lists the repository once, then deletes every member that is still present in **a single** `kopia snapshot delete` call, so the whole batch costs one repository open and one index load. Members whose snapshot is already gone count as done. This is what keeps a legitimate bulk deletion, such as a GFS retention sweep, a replication prune, a namespace teardown, or an acknowledged mass-deletion wave, from hammering the backend.
 
-Pending deletions for a repository accumulate for a short **quiet window** of about 10 seconds before the batch fires, so a burst arriving within that window rides one Job instead of several. A batch is also capped at 200 members per Job, so a very large wave fires across successive waves rather than one unbounded Job. A **single** deletion is simply a batch of one: it still waits out the quiet window, so expect up to about 10 seconds of added latency before an individual `Snapshot`'s finalizer clears, even outside any incident.
+Pending deletions for a repository accumulate for a short **quiet window** of about 10 seconds before the batch fires, so a burst arriving within that window rides one Job instead of several. A batch holds up to 1,000 members, and fewer when long source paths would make the Job's work spec too large, so a very large wave drains as a sequence of batches. A **single** deletion is simply a batch of one: it still waits out the quiet window, so expect up to about 10 seconds of added latency before an individual `Snapshot`'s finalizer clears, even outside any incident.
 
-An optional cluster-wide cap bounds how many batch Jobs may run at once across every repository. That is `KOPIUR_MAX_CONCURRENT_DELETE_JOBS`, or the Helm chart's top-level `maxConcurrentDeleteJobs` value, default **`0`, meaning uncapped**. Batching itself, not this cap, is the primary defense against overwhelming a backend, so leave it uncapped unless you have a specific reason to throttle concurrent deletes further.
+**One batch at a time per repository.** The next batch for a repository starts only when the running one finishes. kopia serializes manifest deletes on the repository's index anyway, so parallel batches against one backend add no throughput and only multiply index downloads. The limit is `spec.concurrency.maxConcurrentDeleteJobs` on the `Repository` or `ClusterRepository`, default `1`; see [Repositories → `concurrency`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once). A batch Job that runs longer than 30 minutes is failed, and its members fire again in a fresh batch, so one wedged Job cannot stall a repository's deletions for long.
+
+An optional cluster-wide cap additionally bounds how many batch Jobs may run at once across **every** repository. That is `KOPIUR_MAX_CONCURRENT_DELETE_JOBS`, or the Helm chart's top-level `maxConcurrentDeleteJobs` value, default **`0`, meaning no cluster-wide cap**. The per-repository limit is the primary defense, so leave this at `0` unless your cluster itself cannot host that many concurrent delete pods.
 
 /// note | Post-fire, `skip-snapshot-cleanup` only releases the CR: it can't pull a Snapshot out of an in-flight batch
 
@@ -736,6 +793,43 @@ spec:
     policyRef: { name: postgres-data }
     description: pre-upgrade snapshot before the v14→v15 migration
 ```
+
+### `mover` — override the recipe's mover for one run
+
+`Snapshot.spec.mover` is the same `MoverSpec` a [`SnapshotPolicy`](#mover--resources-cache-security-context) and a [`Restore`](restores.md#mover-cache--failure-policy) expose, and it exists for the case the recipe cannot serve: a **one-off** run that needs different mover settings than the nightly schedule. Without it, giving an ad-hoc pre-upgrade snapshot more memory or a different UID means editing the shared, GitOps-managed `SnapshotPolicy` that every scheduled run also uses — and remembering to edit it back.
+
+It merges **field by field** over the recipe's, which in turn merges over the repository's `moverDefaults`:
+
+```text
+Repository.moverDefaults  <  SnapshotPolicy.spec.mover  <  Snapshot.spec.mover
+```
+
+The highest layer that sets a field wins; a field you omit falls through. So a partial override adjusts only what it names, and it can only ever *tighten* the hardened base — it never drops `capabilities.drop: [ALL]` or the seccomp profile.
+
+```yaml
+--8<-- "deploy/examples/09-mover-permissions.yaml:snapshot-mover"
+```
+
+Every knob is available: `resources`, `cache`, `securityContext`, `podSecurityContext`, `inheritSecurityContextFrom`, `privilegedMode`, `ttlSecondsAfterFinished`. Three behaviors are worth knowing before you use it.
+
+/// warning | `mover.cache` here is run-scoped: it never touches a **persistent** cache PVC
+
+What a per-run `cache` affects is everything that lives and dies with this one Job: the kopia cache **budgets** (`contentCacheSizeMb`/`metadataCacheSizeMb`), and — when the cache is **`Ephemeral`** — that Job's cache-volume `capacity` and `storageClassName`. An ephemeral cache volume is bound to this run's pod and garbage-collected with it, so there is no shared storage for a per-run size or class to disturb. A per-run `capacity` against a policy that sets none does the obvious thing: it upgrades this run off an `emptyDir` onto a sized volume.
+
+Two things stay **policy-owned**, because they are shared:
+
+- **`cache.mode`.** A per-run `mode` is ignored, so an ad-hoc snapshot can never promote itself onto — or coerce the policy away from — the shared cache PVC.
+- **A `mode: Persistent` PVC's own `capacity`/`storageClassName`.** That cache lives in one controller-owned PVC named after the **`SnapshotPolicy`** and shared by every `Snapshot` that policy produces; letting one ad-hoc snapshot resize or re-class it would change storage every sibling run depends on. Under `Persistent`, the per-run volume knobs are dropped and the policy's are used.
+
+To change the persistent PVC, change the `SnapshotPolicy`.
+///
+
+/// warning | An elevated per-run mover still needs the namespace opt-in
+
+The privileged-mover gate runs on the **merged** result, so a `runAsUser: 0` / `privilegedMode: true` / added-capability context assembled here is refused with `MoverPermitted=False` exactly like a policy-level one, unless the namespace carries the `kopiur.home-operations.com/privileged-movers` annotation. A per-run override is a convenience, not an escape hatch. See [Movers → Privileged movers](movers.md#privileged-movers).
+///
+
+`inheritSecurityContextFrom` works here too, with the same backup-side rules: `pvcConsumer` and `workloadSelector` are valid, `snapshot: {}` is rejected at admission because it replays the identity *recorded on a backup* and a backup is what records one. Setting it on a `Snapshot` replaces the policy's inherit source outright rather than blending two selectors, and the policy's explicit `securityContext` still survives underneath as the inherit **fallback**.
 
 ### `failurePolicy` — retry & deadline for the mover Job
 
@@ -885,7 +979,7 @@ A repository has **one** budget, and backups, restores and the *source* side of 
 | | Repository bootstrap / catalog scan (`<name>-discovery`) |
 | | `kubectl kopiur browse` session pods |
 
-Each exclusion is a decision, not an oversight. Maintenance is the *cure* for an overloaded repository, so queuing it behind a full backup pool would make a struggling repository permanently unmaintainable. Deletions *reduce* load and are already batched one Job per repository. Bootstrap is what makes a repository `Ready` in the first place, so gating it on a pool that only fills once the repository is ready would deadlock a fresh one. A browse session is a human waiting at a terminal.
+Each exclusion is a decision, not an oversight. Maintenance is the *cure* for an overloaded repository, so queuing it behind a full backup pool would make a struggling repository permanently unmaintainable. Deletions *reduce* load and have their own per-repository limit, `maxConcurrentDeleteJobs` (default one batch at a time). Bootstrap is what makes a repository `Ready` in the first place, so gating it on a pool that only fills once the repository is ready would deadlock a fresh one. A browse session is a human waiting at a terminal.
 
 /// tip | Restores are never queued
 
@@ -988,4 +1082,5 @@ A `SnapshotPolicy` describes the work. A `SnapshotSchedule`, or you, turns it in
 - [Repositories & backends](repositories.md): where snapshots are stored.
 - [Restores](restores.md): reading a snapshot back.
 - [Movers, RBAC & credentials](movers.md): where backups actually run and what they need.
+- [Streamed command sources](stream-sources.md): the `stream` source form — capture `pg_dumpall`/`mysqldump` stdout with nothing mounted, and its `streamExec` restore.
 - [Examples](examples.md): [01 scheduled](examples.md#example-01--single-pvc-scheduled), [04 multi-PVC](examples.md#example-04--multi-pvc-selector), [06 manual](examples.md#example-06--manual-one-shot-backup).

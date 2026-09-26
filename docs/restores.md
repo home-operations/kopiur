@@ -7,7 +7,7 @@ A `Restore` reads a snapshot back into a PersistentVolumeClaim (PVC). It answers
 ```yaml
 spec:
     source: { <one of three>: ... } # FROM: which snapshot
-    target: { <one of three>: ... } # TO: pvc | pvcRef | populator: {}  (REQUIRED)
+    target: { <one of four>: ... } # TO: pvc | pvcRef | populator | streamExec  (REQUIRED)
     options: { ... } # HOW kopia writes (file deletion, permissions)
     policy: { ... } # what to do if the snapshot is missing
 ```
@@ -155,6 +155,8 @@ source:
 
 ## Where to restore _to_ — `target`
 
+Set exactly one of four keys. Three write a PersistentVolumeClaim; the fourth, `streamExec`, writes no volume at all.
+
 ### `pvc` — create a new PVC
 
 The operator creates the PVC and restores into it. This is the best choice for verification restores, where you restore alongside the original and compare:
@@ -188,6 +190,30 @@ Set `target.populator: {}` and the `Restore` becomes a **passive volume-populato
 target:
     populator: {} # explicit passive-populator mode
 ```
+
+### `streamExec` — pipe one file into a command
+
+The mirror of a [`stream` backup source](stream-sources.md): instead of writing files to a volume, the mover reads **one** virtual file out of the snapshot and pipes it into a command's stdin in a running Pod. This is how a `pg_dumpall` artifact is replayed through `psql`. See [Streamed command sources](stream-sources.md) and [example 46](https://github.com/home-operations/kopiur/blob/main/deploy/examples/46-restore-stream-exec.yaml):
+
+```yaml
+target:
+    streamExec:
+        fileName: postgres.sql # the fileName the backup's stream source used
+        workloadExec:
+            podSelector:
+                matchLabels: { app: postgres }
+            command: ["sh", "-ec", "psql -U postgres"]
+```
+
+No PVC is created, mounted, or written, so `options` that describe writing files to a filesystem are inert here. The command runs in the **workload's** container and uses the credentials already there. Exactly one **Running** pod must match `podSelector`, and the same [namespace opt-in](stream-sources.md#if-kopiur-is-installed-namespace-scoped) that gates a `stream` backup gates this too — it needs `pods/exec` in the workload namespace, and it fails **closed**, surfacing as `MoverPermitted=False` with reason `StreamExecNotPermitted`.
+
+/// warning | A partial load is possible, and the message says so
+
+The consumer is applying data as it arrives, so unlike a filesystem restore there is no staging volume to discard. If the command's `workloadExec.timeout` expires mid-stream, whatever it had already applied **stays applied**. The failure message names that field and says the load was partial. Size the timeout for the whole replay, and prefer a command that is transactional (`psql --single-transaction`) when the data allows it.
+
+///
+
+It is not available from `kubectl kopiur restore` — the flags map onto the three PVC targets — so write the `Restore` manifest. The CLI says as much if you reach for it.
 
 **One `Restore` serves every claim.** Every PVC whose `spec.dataSourceRef` names this `Restore` claims it, not just the first one. Kopiur drives each claim on its own. Each claim gets its own prime PVC, its own mover `Job`, its own [per-PVC source path](#sourcepath--which-volume-of-a-multi-pvc-policy-to-read), its own `waitTimeout` window, and its own record under `status.claims.<pvc>`:
 
@@ -302,6 +328,8 @@ A repository being initialized from a replica with [`spec.seed`](repositories.md
 ## Mover, cache & failure policy
 
 A restore writes data **into** a PVC, so the mover doing the writing has the same concerns a backup's mover does. `Restore.spec.mover` is the same `MoverSpec` a `SnapshotPolicy` exposes, and `Restore.spec.failurePolicy` mirrors `Snapshot.spec.failurePolicy`. See the full manifest in [example 12](examples.md#example-12--restore-mover-cache--failure-policy).
+
+A `Restore` **is** the invocation, so this block is already per-run — there is no recipe to override. The backup side reaches the same place in two steps: the recipe's [`SnapshotPolicy.spec.mover`](backups.md#mover--resources-cache-security-context), overridden for a single ad-hoc run by [`Snapshot.spec.mover`](backups.md#mover--override-the-recipes-mover-for-one-run).
 
 ```yaml
 spec:
@@ -469,6 +497,7 @@ The full `Restore` surface, with the examples that exercise each field. `source`
 | `target.pvc` | Create a new PVC and restore into it (`{ name, storageClassName?, capacity?, accessModes? }`). | The safe default: restore beside the original, verify, then cut over. ([03](examples.md#example-03--restore-by-picking-a-snapshot)) |
 | `target.pvcRef` | Restore into an **existing** PVC (`{ name }`). | In-place restore (scale the app down first). ([15](examples.md#example-15--in-place-mirror-restore)) |
 | `target.populator` | Explicit passive volume-populator source (`populator: {}`). | GitOps deploy-or-restore via a PVC `dataSourceRef`. ([05](examples.md#example-05--deploy-or-restore-gitops)) |
+| `target.streamExec` | Pipe ONE virtual file into a command's stdin in a running Pod (`{ fileName, workloadExec }`). Writes no PVC. | Replaying a logical dump (`psql` < `pg_dumpall`). ([stream sources](stream-sources.md)) |
 | `options.enableFileDeletion` | Delete target files not in the snapshot (exact **mirror**); wired to kopia's `--delete-extra`. Default `false` (additive). | A faithful in-place restore. Destructive, so use it deliberately. ([15](examples.md#example-15--in-place-mirror-restore)) |
 | `options.ignorePermissionErrors` | Complete and _report_ permission problems vs. fail hard. Default `true`. | `false` to fail-closed when exact permissions matter. |
 | `options.writeFilesAtomically` | Write via a temp file + rename. Default `true`. | Rarely changed. |
@@ -488,5 +517,6 @@ The full `Restore` surface, with the examples that exercise each field. `source`
 - [Backups & schedules](backups.md): producing the snapshots you restore.
 - [Repositories & backends](repositories.md): where the snapshots live.
 - [Permissions](permissions.md): choosing the mover's UID/GID and the privileged-movers opt-in (applies to restores too).
+- [Streamed command sources](stream-sources.md): the `streamExec` target and the `stream` backup source it reads back.
 - [Scenarios](scenarios/index.md): [02 recover lost data](scenarios/recover-lost-data.md), [07 point-in-time rollback](scenarios/point-in-time-rollback.md), [08 clone to another namespace](scenarios/clone-app-to-namespace.md), [10 DR from a replicated repository](scenarios/dr-with-replicated-repository.md).
 - [Examples](examples.md): [03 by Snapshot](examples.md#example-03--restore-by-picking-a-snapshot), [05 deploy-or-restore](examples.md#example-05--deploy-or-restore-gitops), [07 discovered](examples.md#example-07--restore-a-discovered-backup), [12 mover/cache/failure policy](examples.md#example-12--restore-mover-cache--failure-policy), [13 by identity](examples.md#example-13--restore-by-raw-kopia-identity), [14 point-in-time](examples.md#example-14--point-in-time--offset-restore), [15 in-place mirror](examples.md#example-15--in-place-mirror-restore), [16 cross-namespace](examples.md#example-16--cross-namespace-clone-restore), [17 shared-repo projection](examples.md#example-17--restore-from-a-shared-repo-projection).

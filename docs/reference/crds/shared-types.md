@@ -243,11 +243,12 @@ A `SnapshotSchedule` resolves the repository of the policy it **targets**, so a 
 
 Limits on the mover Jobs a repository runs, set on `Repository` or `ClusterRepository` `spec.concurrency`.
 
+- **`maxConcurrentDeleteJobs`** is the ceiling on this repository's in-flight snapshot-delete batch Jobs. Absent means **1**, one batch at a time; it must be at least `1`, and the webhook rejects `0`. There is no schema `default:`; the controller resolves absent to 1. See [Backups → how a deletion actually runs](../../backups.md#how-a-deletion-actually-runs--batched-not-one-job-per-snapshot).
 - **`maxConcurrentJobs`** is the ceiling on this repository's in-flight mover Jobs. Absent or `0` means **unlimited**, which is the default. The schema deliberately emits no `default:` for the field, because absent and `0` are the same state; a materialized default would stamp `{maxConcurrentJobs: 0}` onto every stored repository for no change in behavior.
 
 There is one pool per repository rather than one per kind of work. **Backups**, **restores**, and the **source** side of `RepositoryReplication` and `SnapshotReplication` all draw from it, because the repository's backend and the bandwidth to it are the shared resource.
 
-Outside the pool entirely: maintenance, which is already single-flight per repository and is the cure for an overloaded one; verification; pin; batched snapshot deletions; repository bootstrap and catalog scans; and `kubectl kopiur browse` session pods.
+Outside the pool entirely: maintenance, which is already single-flight per repository and is the cure for an overloaded one; verification; pin; batched snapshot deletions, which have their own `maxConcurrentDeleteJobs` limit; repository bootstrap and catalog scans; and `kubectl kopiur browse` session pods.
 
 Restores are **always admitted**, because a recovery in progress must not queue behind routine backups. A running restore still occupies a slot, so it displaces backups rather than adding to them. A `Job` that a queueing system has suspended with `spec.suspend: true` occupies no slot, so Kueue and Kopiur cannot deadlock each other.
 

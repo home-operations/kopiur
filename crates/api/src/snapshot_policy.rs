@@ -308,7 +308,8 @@ pub fn effective_on_policy_delete(
     deletion.map(|d| d.on_policy_delete).unwrap_or_default()
 }
 
-/// A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs` (webhook-enforced).
+/// A single backup source; exactly one of `pvc`, `pvcSelector`, `nfs`, `stream`
+/// (webhook-enforced).
 // The exactly-one-of rule is written as an integer sum of `has()` ternaries rather
 // than `[...].filter(x,x).size()==1`: the apiserver estimates per-item CEL cost ×
 // `maxItems`, and a list-construction + lambda `filter` blows the budget on the
@@ -316,11 +317,18 @@ pub fn effective_on_policy_delete(
 // `Default` is derived purely for construction ergonomics: `Source` is built as an
 // exhaustive struct literal in ~20 places, and every added field would otherwise have
 // to be spelled out at each one. An all-`None` `Source` is not a valid spec (the CEL
-// rule above demands exactly one of pvc/pvcSelector/nfs) and admission rejects it.
+// rule above demands exactly one of pvc/pvcSelector/nfs/stream) and admission rejects it.
+//
+// The forms stay sibling `Option`s rather than an externally-tagged enum because they
+// SHARE the `sourcePath*`/`readOnly` keys (see `crate::validate::validate_source`), which
+// an enum could only express with a `#[serde(flatten)]` kube's structural-schema rewriter
+// cannot represent. The type-safety thesis is upheld one layer up instead: [`source_shape`]
+// resolves this struct into the [`SourceShape`] enum, and every reconcile path matches on
+// THAT exhaustively — so a fifth form cannot compile until each handler accounts for it.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[schemars(extend("x-kubernetes-validations" = [{
-    "rule": "(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) == 1",
-    "message": "exactly one of pvc, pvcSelector, nfs"
+    "rule": "(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) + (has(self.stream) ? 1 : 0) == 1",
+    "message": "exactly one of pvc, pvcSelector, nfs, stream"
 }]))]
 #[serde(rename_all = "camelCase")]
 pub struct Source {
@@ -330,9 +338,15 @@ pub struct Source {
     /// Label/namespace selector matching many PVCs. Mutually exclusive with `pvc`/`nfs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pvc_selector: Option<PvcSelector>,
-    /// An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`.
+    /// An inline NFS export to back up directly. Mutually exclusive with `pvc`/`pvcSelector`/`stream`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfs: Option<NfsVolume>,
+    /// Capture a command's standard output as one virtual file — a logical backup
+    /// (`pg_dumpall`, `mysqldump`, …) rather than a volume copy. Mutually exclusive
+    /// with `pvc`/`pvcSelector`/`nfs`. No volume is mounted; the mover execs the
+    /// command in a running workload Pod and streams its stdout straight into kopia.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamSource>,
     /// Mount the source read-only (default `true`; kopia only ever reads it).
     ///
     /// Set `false` **only** to make `fsGroup` work on the source. The kubelet applies
@@ -359,6 +373,19 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledge_live_mutation: Option<bool>,
     /// What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
+    ///
+    /// On a `pvcSelector` source this is a footgun. It is ONE literal path, so
+    /// it works only while the selector matches exactly one PVC; the moment a
+    /// second PVC matches, both would land on that same kopia source, merging
+    /// their histories into one stream where they also prune each other, so the
+    /// BACKUP is refused at run time and no further snapshots are minted for
+    /// that source.
+    ///
+    /// Watch the failed schedule fire, not verification: the earlier snapshots
+    /// remain at that path, so verification keeps passing while backups have
+    /// stopped. (Verification only fails on a path that never received a
+    /// backup.) Prefer `sourcePathStrategy`, which derives a distinct path per
+    /// PVC, or put the override on its own `pvc:` source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 4096))]
     pub source_path_override: Option<String>,
@@ -366,6 +393,184 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(default = "default_source_path_strategy")]
     pub source_path_strategy: Option<SourcePathStrategy>,
+}
+
+/// The virtual directory a stream source's single file lives under, so a streamed
+/// artifact can never collide with a PVC source's `/pvc/<name>` namespace.
+pub const STREAM_SOURCE_ROOT: &str = "/stream";
+
+/// Capture a command's standard output as ONE virtual file inside a normal kopia
+/// snapshot — the logical-backup source (`pg_dumpall`, `mysqldump`, …).
+///
+/// Nothing is mounted: the mover execs `workloadExec.command` in a running workload
+/// Pod and pipes its stdout directly into `kopia snapshot create --stdin-file`. The
+/// snapshot root is a virtual directory at `/stream/<fileName>` (override with
+/// `sourcePathOverride`) containing exactly that one file.
+///
+/// The command runs in the WORKLOAD's container, so it uses the database credentials
+/// already present there; the mover never hands it repository credentials.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSource {
+    /// Name of the single virtual file stored in the snapshot (e.g. `postgres.sql`).
+    ///
+    /// Must be ONE file name: no `/`, and not `.` or `..`. kopia stores this string
+    /// verbatim as the entry name and does not sanitize it, so a path-shaped value
+    /// would make a later `kopia restore` write OUTSIDE its destination directory.
+    #[schemars(length(min = 1, max = 255))]
+    pub file_name: String,
+    /// The producer: what to run, and where. Its stdout IS the backup data.
+    pub workload_exec: StreamExec,
+}
+
+/// Exec a command in exactly one running workload Pod, streaming one of its
+/// standard streams. Used as the producer of a `stream` backup source and as the
+/// consumer of a `streamExec` restore target.
+///
+/// Exactly one RUNNING Pod must match `podSelector`: zero, several, or only
+/// not-running matches are named failures, never an arbitrary pick — a backup that
+/// silently dumped a different replica than intended is worse than one that stops.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamExec {
+    /// Standard label selector identifying the workload Pod, resolved in the
+    /// `SnapshotPolicy`'s (or `Restore`'s) own namespace. Must not be empty — an
+    /// empty selector matches every Pod in the namespace.
+    pub pod_selector: LabelSelector,
+    /// Container to exec in; absent uses the Pod's default container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// The argv to execute. NOT a shell line: element 0 is the program, so use
+    /// `["sh", "-ec", "..."]` explicitly if you want shell semantics.
+    ///
+    /// Reference credentials through the container's existing environment or mounted
+    /// Secrets — never inline them here. This argv is copied into the mover Pod's
+    /// spec, so anyone with `pods:get` in the namespace can read it.
+    #[schemars(length(min = 1))]
+    pub command: Vec<String>,
+    /// Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the
+    /// command is abandoned and the run fails, leaving no snapshot behind.
+    ///
+    /// The same bound applies whether this exec is a backup's producer or a
+    /// `streamExec` restore's consumer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_stream_timeout")]
+    pub timeout: Option<String>,
+}
+
+/// schemars default for [`StreamExec::timeout`] —
+/// [`DEFAULT_STREAM_TIMEOUT_SECS`](crate::consts::DEFAULT_STREAM_TIMEOUT_SECS)
+/// (`1h`) rendered as the Go duration string the field takes.
+///
+/// Context-free per api-conventions §4a: BOTH resolution sites (the backup Job
+/// build in `snapshot::build` and the restore Job build in `restore`) map an
+/// absent — or unparseable — `timeout` to exactly that constant, and the field
+/// means the same thing as a producer and as a consumer, so materializing `1h`
+/// server-side changes no behavior. A unit test pins `"1h"` to the constant.
+fn default_stream_timeout() -> Option<String> {
+    Some("1h".to_string())
+}
+
+/// The four mutually-exclusive forms a [`Source`] can take, resolved from its
+/// sibling `Option`s.
+///
+/// THE point of this type: `Source` must stay a struct of `Option`s on the wire (the
+/// forms share `sourcePath*`/`readOnly` keys), but every reconcile path matches on
+/// this enum EXHAUSTIVELY — so a fifth source form cannot compile until backup Job
+/// construction, validation, and identity resolution each account for it. Borrowed,
+/// so callers match without cloning.
+///
+/// Not to be confused with the private `expand::SourceShape`, a narrower classifier
+/// used only by [`restore_source_path`](crate::expand::restore_source_path): that one
+/// answers "can this source's kopia path be derived from the restore's target PVC?",
+/// keeps only the fields that decision needs, and tolerates a malformed stored object
+/// with an `Invalid` arm where this resolver returns a
+/// [`ValidationError`](crate::error::ValidationError). Adding a form here means adding
+/// an arm there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SourceShape<'a> {
+    /// One PVC named directly.
+    Pvc(&'a PvcSource),
+    /// A label/namespace selector matching many PVCs (fans out into child Snapshots).
+    PvcSelector(&'a PvcSelector),
+    /// An inline NFS export read directly.
+    Nfs(&'a NfsVolume),
+    /// A command whose stdout is captured as one virtual file.
+    Stream(&'a StreamSource),
+}
+
+impl SourceShape<'_> {
+    /// Stable discriminant string for status, metrics, and messages.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            SourceShape::Pvc(_) => "pvc",
+            SourceShape::PvcSelector(_) => "pvcSelector",
+            SourceShape::Nfs(_) => "nfs",
+            SourceShape::Stream(_) => "stream",
+        }
+    }
+}
+
+/// THE exactly-one-of resolver for a [`Source`]'s form.
+///
+/// Never panics: a stored CR can carry an invalid shape (none set, or several — e.g. a
+/// write that raced an old CRD schema), so those come back as a
+/// [`ValidationError`](crate::error::ValidationError) for the caller's error path rather
+/// than as an `unwrap` in a reconciler. Mirrors
+/// [`policy_repositories`](crate::snapshot_policy::policy_repositories).
+///
+/// ```
+/// use kopiur_api::snapshot_policy::{Source, SourceShape, PvcSource, source_shape};
+///
+/// let s = Source { pvc: Some(PvcSource { name: "data".into() }), ..Default::default() };
+/// assert!(matches!(source_shape(&s), Ok(SourceShape::Pvc(p)) if p.name == "data"));
+///
+/// // Nothing set is a named error, never a silent default.
+/// assert!(source_shape(&Source::default()).is_err());
+/// ```
+pub fn source_shape(source: &Source) -> Result<SourceShape<'_>, crate::error::ValidationError> {
+    let set: Vec<&'static str> = [
+        ("pvc", source.pvc.is_some()),
+        ("pvcSelector", source.pvc_selector.is_some()),
+        ("nfs", source.nfs.is_some()),
+        ("stream", source.stream.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+
+    match set.as_slice() {
+        [] => Err(crate::error::ValidationError::MissingRequiredField {
+            field: "source.pvc, source.pvcSelector, source.nfs, or source.stream".to_string(),
+        }),
+        [first, second, ..] => Err(crate::error::ValidationError::MutuallyExclusive {
+            a: (*first).to_string(),
+            b: (*second).to_string(),
+            context: "snapshot source".to_string(),
+        }),
+        // Exactly one is set; return the one that is. The `expect`s cannot fire —
+        // each arm is reached only when its own `is_some()` put the name in `set`.
+        ["pvc"] => Ok(SourceShape::Pvc(source.pvc.as_ref().expect("pvc is set"))),
+        ["pvcSelector"] => Ok(SourceShape::PvcSelector(
+            source.pvc_selector.as_ref().expect("pvcSelector is set"),
+        )),
+        ["nfs"] => Ok(SourceShape::Nfs(source.nfs.as_ref().expect("nfs is set"))),
+        ["stream"] => Ok(SourceShape::Stream(
+            source.stream.as_ref().expect("stream is set"),
+        )),
+        // Unreachable: `set` is built from exactly the four names above.
+        [other] => Err(crate::error::ValidationError::InvalidFieldValue {
+            field: "spec.sources[]".to_string(),
+            reason: format!("unknown source form `{other}`"),
+        }),
+    }
+}
+
+/// The kopia source path a stream source records by default: `/stream/<fileName>`.
+/// Deliberately distinct from a PVC source's `/pvc/<name>` so a streamed artifact and
+/// a volume backup can never share a kopia identity.
+pub fn stream_source_path(stream: &StreamSource) -> String {
+    format!("{STREAM_SOURCE_ROOT}/{}", stream.file_name)
 }
 
 /// A single backup source addressed by PVC name.
@@ -873,10 +1078,20 @@ pub struct SnapshotPolicyStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_successful_snapshot: Option<String>,
     /// RFC3339 timestamp of the most recent successful verification (any tier).
-    /// Single-repo: stamped directly by the verify mover. Multi-repo: computed
-    /// by the controller as the MINIMUM `lastVerified` across the CURRENT
-    /// repositories ("everything is verified as of T"), absent until every
-    /// current repository has verified at least once.
+    ///
+    /// Verification runs once per (repository x source) cell: a
+    /// `spec.repositories` fan-out adds the repository dimension, and a
+    /// `pvcSelector` source adds one cell per matched PVC (each has its own
+    /// kopia source path, so each needs its own verification).
+    ///
+    /// * one repository AND a non-selector source (`pvc`/`nfs`): stamped
+    ///   directly by the verify mover, exactly as before;
+    /// * otherwise — a `spec.repositories` fan-out, or ANY `pvcSelector` source
+    ///   (including one currently matching a single PVC): computed by the
+    ///   controller as the MINIMUM across the CURRENT cells ("everything is
+    ///   verified as of T"), and absent until EVERY current cell has verified at
+    ///   least once — a partially verified policy must not display a reassuring
+    ///   timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verified: Option<String>,
     /// Per-repository verification records for a multi-repository policy
@@ -886,14 +1101,28 @@ pub struct SnapshotPolicyStatus {
     /// wire stays byte-identical.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification: Vec<RepoVerification>,
-    /// Internal write channel for per-repository verification (#368): RFC3339
-    /// markers keyed by the normalized repository key
-    /// ([`repo_key`](crate::common::repo_key)). Each verify mover merge-patches
-    /// ONLY its own key — a JSON merge patch merges map keys, so two concurrent
-    /// per-repo verifies can never clobber one another (a Vec would be replaced
-    /// wholesale). The controller folds these into `verification` on its next
-    /// pass and prunes keys for repositories no longer in the spec. Never
-    /// written for the single-repo shape.
+    /// Internal write channel for per-cell verification: RFC3339 markers keyed
+    /// by the (repository x source) cell a verify run covered.
+    ///
+    /// Key shapes, where the repository segment is the normalized repository
+    /// key ([`repo_key`](crate::common::repo_key)) and the member segment is a
+    /// stable 12-hex tag over the matched PVC's derived kopia source path:
+    ///
+    /// * `<repository>` — a `spec.repositories` fan-out with a single source;
+    /// * `<repository>#<member>` — a fan-out over both dimensions;
+    /// * `#<member>` — one repository, a `pvcSelector` source (the repository
+    ///   segment is empty).
+    ///
+    /// `#` is the separator because a repository key cannot contain one.
+    ///
+    /// Each verify mover merge-patches ONLY its own key — a JSON merge patch
+    /// merges map keys, so concurrent cells can never clobber one another (a
+    /// Vec would be replaced wholesale). The controller folds these into
+    /// `verification` and `lastVerified` on its next pass and prunes keys whose
+    /// repository or matched PVC is gone. Not written when the policy targets
+    /// one repository with a non-selector source, whose wire stays
+    /// byte-identical; a `pvcSelector` source always uses this map, even while
+    /// it matches a single PVC.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub verification_stamps: std::collections::BTreeMap<String, String>,
     /// Human-readable summary of the policy's repository target(s) for the
@@ -919,6 +1148,11 @@ pub struct RepoVerification {
     pub repository: RepositoryRef,
     /// RFC3339 timestamp of the most recent successful verification (any tier)
     /// against THIS repository; absent until its first successful verify.
+    ///
+    /// When the policy's source is a `pvcSelector`, this is the MINIMUM across
+    /// that repository's matched PVCs, and absent until every one of them has
+    /// verified — a repository whose volumes are only partly verified must not
+    /// look fully verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_verified: Option<String>,
 }
@@ -1683,23 +1917,98 @@ suspend: true
         assert!(bare_json.get("errorHandling").is_none());
     }
 
-    #[test]
-    fn source_schema_carries_exactly_one_of_validation() {
-        // §15: the Source sub-object schema carries the exactly-one-of(pvc/
-        // pvcSelector/nfs) rule, surviving kube's structural-schema rewriter even as a
-        // list-item sub-object.
+    /// The `sources[]` item schema's operator-authored CEL rule, as the API server
+    /// will see it. Shared by both guards below.
+    fn source_cel_rule() -> String {
         let crd = SnapshotPolicy::crd();
         let json = serde_json::to_value(&crd).expect("serialize CRD");
         let source = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
             ["properties"]["sources"]["items"];
         let rules = source["x-kubernetes-validations"]
             .as_array()
-            .expect("sources.items.x-kubernetes-validations present");
-        assert!(rules.iter().any(|r| {
-            r["rule"]
-                .as_str()
-                .is_some_and(|s| s.contains("pvcSelector") && s.contains("nfs"))
-        }));
+            .expect("sources.items.x-kubernetes-validations present")
+            .clone();
+        rules
+            .iter()
+            .find_map(|r| r["rule"].as_str().map(str::to_string))
+            .expect("a CEL rule is present on sources.items")
+    }
+
+    #[test]
+    fn source_schema_carries_exactly_one_of_validation() {
+        // §15: the Source sub-object schema carries the exactly-one-of(pvc/
+        // pvcSelector/nfs/stream) rule, surviving kube's structural-schema rewriter even
+        // as a list-item sub-object.
+        let rule = source_cel_rule();
+        assert!(rule.contains("pvcSelector") && rule.contains("nfs"));
+        assert!(
+            rule.contains("== 1"),
+            "it must be an exactly-one-of: {rule}"
+        );
+    }
+
+    /// The `sources[]` CEL rule must name EVERY [`SourceShape`] variant.
+    ///
+    /// The mirror of `restore::cel_guard_tests::restore_target_cel_rule_lists_every_variant`,
+    /// and it exists for the same reason that one does. `source_shape` being an exhaustive
+    /// enum does NOT keep this rule in step: the rule lives in the generated schema and is
+    /// enforced by the API SERVER, before the webhook or any reconciler runs. A form added
+    /// to [`Source`] (hence to [`SourceShape`]) but missing from the rule compiles, passes
+    /// clippy, passes every other test, and `cargo xtask gen-all` regenerates the CRD with
+    /// the stale rule intact — `gen-all --check` only detects DRIFT, which a developer
+    /// clears by regenerating. The first evidence is `kubectl apply` failing in a real
+    /// cluster with a message naming only the old forms. That is exactly how `streamExec`
+    /// failed on the Restore side, and this side had no guard at all.
+    ///
+    /// It also catches the reverse edit: dropping `(has(self.stream) ? 1 : 0)` from a rule
+    /// this branch TOUCHED — a plausible merge-conflict resolution — makes every stream
+    /// policy unapplyable cluster-wide, and nothing else here would notice.
+    ///
+    /// Driving the expectation off `kind_str()` over a one-value-per-variant array means a
+    /// new variant fails to COMPILE here, with an instruction, rather than in a cluster.
+    #[test]
+    fn source_cel_rule_lists_every_variant() {
+        let stream = StreamSource {
+            file_name: "dump.sql".into(),
+            workload_exec: StreamExec {
+                pod_selector: Default::default(),
+                container: None,
+                command: vec!["true".into()],
+                timeout: None,
+            },
+        };
+        let pvc = PvcSource {
+            name: "data".into(),
+        };
+        let selector = PvcSelector {
+            namespace_selector: None,
+            label_selector: None,
+        };
+        let nfs = NfsVolume {
+            server: "nfs.example".into(),
+            path: "/export/data".into(),
+        };
+        // One value per variant, so adding a variant makes this array fail to compile
+        // and forces the author to extend it.
+        let all = [
+            SourceShape::Pvc(&pvc),
+            SourceShape::PvcSelector(&selector),
+            SourceShape::Nfs(&nfs),
+            SourceShape::Stream(&stream),
+        ];
+
+        let rule = source_cel_rule();
+        for shape in &all {
+            // `kind_str` is already the camelCase wire key for this struct.
+            let wire = shape.kind_str();
+            assert!(
+                rule.contains(&format!("has(self.{wire})")),
+                "the Source CEL rule does not mention `{wire}`, so the API SERVER will \
+                 REJECT that source form before the webhook ever sees it. Add \
+                 `(has(self.{wire}) ? 1 : 0)` to the rule (and its message) in \
+                 snapshot_policy.rs, then re-run `cargo xtask gen-all`.\nrule: {rule}"
+            );
+        }
     }
 
     #[test]
@@ -1991,6 +2300,47 @@ preflight:
         );
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["lastSuccessfulSnapshot"], "2026-06-09T02:00:00Z");
+    }
+
+    // --- stream source (spec.sources[].stream) -------------------------------
+
+    #[test]
+    fn stream_timeout_schema_default_is_the_shared_constant() {
+        // api-conventions §4a: a context-free default, safe to server-side
+        // materialize because BOTH resolution sites (the backup Job build and the
+        // restore Job build) map an absent/unparseable `timeout` to exactly
+        // DEFAULT_STREAM_TIMEOUT_SECS. Asserted on the REAL CRD, and on both CRDs
+        // that embed `StreamExec` — a producer and a consumer must not disagree
+        // about how long they are allowed to run.
+        let policy = serde_json::to_value(SnapshotPolicy::crd()).unwrap();
+        let src = &policy["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["sources"]["items"]["properties"]["stream"]["properties"]["workloadExec"]
+            ["properties"]["timeout"]["default"];
+        assert_eq!(src, &serde_json::json!("1h"));
+
+        let restore = serde_json::to_value(crate::Restore::crd()).unwrap();
+        let tgt = &restore["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["target"]["properties"]["streamExec"]["properties"]["workloadExec"]["properties"]
+            ["timeout"]["default"];
+        assert_eq!(
+            tgt, src,
+            "the producer and consumer timeout defaults come from one constant"
+        );
+    }
+
+    #[test]
+    fn stream_timeout_schema_default_matches_the_duration_constant() {
+        // The schema default is a Go duration STRING but the controller resolves an
+        // absent value to a seconds constant. If someone edits one and not the
+        // other, the materialized value stops matching the resolver and the
+        // default is no longer behavior-preserving — which §4a forbids.
+        let rendered = default_stream_timeout().expect("a default is emitted");
+        assert_eq!(
+            crate::duration::parse_go_duration(&rendered)
+                .expect("the emitted default must be a parseable Go duration")
+                .as_secs(),
+            crate::consts::DEFAULT_STREAM_TIMEOUT_SECS
+        );
     }
 
     // --- policy-deletion cascade (spec.deletion.onPolicyDelete) --------------

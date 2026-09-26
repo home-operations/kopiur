@@ -688,6 +688,14 @@ async fn spawn_maintenance_job(
     // mover is hardened/gated exactly like backup/restore (and inherits moverDefaults,
     // closing the drift the ClusterRepository hardcoded-context bug caused).
     // No backup source PVC for maintenance — `pvcConsumer` is not valid here.
+    //
+    // A bare `?` on purpose (#464): an unresolvable live-pod `workloadSelector` now returns
+    // `Error::InheritSourceMissing`, so maintenance deliberately inherits its Structural
+    // cadence (300s, up from the old Transient 30s) and its selector-naming message, but NOT
+    // the `SecurityContextResolved` gate condition — that gate's scope is
+    // `GateScope::SnapshotOrRestore`, and broadening the registry to a third kind was judged
+    // not worth it for a mover that reads no user data. The Warning Event still names the
+    // selector, so the hold is not silent.
     let (effective_sc, effective_pod_sc) = io::resolve_mover_security_contexts(
         &ctx.client,
         namespace,
@@ -722,7 +730,35 @@ async fn spawn_maintenance_job(
             .mover_service_account
             .as_deref()
             .unwrap_or(config::DEFAULT_MOVER_NAME);
-        let msg = io::privileged_mover_message("Maintenance", cr_name, namespace, sa);
+        // Same attribution as the Snapshot/Restore gates: a `moverDefaults`
+        // elevation must not read as "edit this Maintenance".
+        let repo_ref = repo.repository_ref();
+        let layer = io::attribute_elevation(
+            false,
+            maint
+                .spec
+                .mover
+                .as_ref()
+                .is_some_and(|m| m.requires_privilege()),
+            io::mover_defaults_require_privilege(repo.mover_defaults.as_ref()),
+        );
+        let (carrier_kind, carrier_name, carrier_field) = match layer {
+            io::ElevationLayer::Invocation | io::ElevationLayer::Recipe => {
+                ("Maintenance", cr_name, "spec.mover")
+            }
+            io::ElevationLayer::RepositoryDefaults => (
+                io::repo_kind_str(repo_ref.kind),
+                repo_ref.name.as_str(),
+                "spec.moverDefaults",
+            ),
+            io::ElevationLayer::Composed => (
+                "Maintenance",
+                cr_name,
+                "spec.mover (including any securityContext it inherits from a workload)",
+            ),
+        };
+        let msg =
+            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, namespace, sa);
         tracing::warn!(maintenance = %cr_name, namespace = %namespace, "{msg}; skipping maintenance run");
         return Ok(());
     }

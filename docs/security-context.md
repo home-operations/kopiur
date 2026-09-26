@@ -148,7 +148,7 @@ spec:
       pvcConsumer: {} # optionally: pvcConsumer: { container: app }
 ```
 
-The controller lists pods in the source namespace, finds the one mounting this snapshot's source PVC while excluding Kopiur's own mover pods, prefers a **Running** one, and copies its container and pod `securityContext` onto the mover. If no workload pod currently mounts the PVC, for example because it is scaled to zero, the Backup is **held** with an actionable condition, so scale the workload up. If you would rather it kept running, give the mover an explicit `securityContext` that pins a `runAsUser`. That becomes the fallback, and the run proceeds on it with a `SecurityContextInherited=False` / `InheritFallback` condition instead of being held. See [Combining inherit with an explicit context](#combining-inherit-with-an-explicit-context).
+The controller lists pods in the source namespace, finds the one mounting this snapshot's source PVC while excluding Kopiur's own mover pods, prefers a **Running** one, and copies its container and pod `securityContext` onto the mover. If no workload pod currently mounts the PVC, for example because it is scaled to zero, the Backup is **held** with `SecurityContextResolved=False` / `InheritSourceMissing`, whose message names the PVC whose consumer was missing, so scale the workload up. If you would rather it kept running, give the mover an explicit `securityContext` that pins a `runAsUser`. That becomes the fallback, and the run proceeds on it with a `SecurityContextInherited=False` / `InheritFallback` condition instead of being held. See [Combining inherit with an explicit context](#combining-inherit-with-an-explicit-context).
 
 /// warning | Your workload must pin `runAsUser` for this to do anything
 
@@ -194,7 +194,7 @@ $ kubectl get pod app-7c9d8f5b6-h2k4p -n app --show-labels
 
 How it resolves: the controller lists pods matching the selector, prefers a **Running** one, picks the named container or the pod's first, and copies **that container's `securityContext` and the pod's pod-level `securityContext`** onto the mover. The matched workload must be **running** so its identity can be read.
 
-The Backup or Restore is held with an actionable `MissingDependency`-style condition, telling you exactly what to fix, if no pod matches, if the selector is empty, if the named container is absent, or if the pod sets *neither* a container nor a pod-level `securityContext`. The exception is when the recipe also sets a `mover.securityContext` pinning a `runAsUser`. That is then used as the fallback, reported as `InheritFallback`, and the run proceeds.
+The Backup or Restore is held with [`SecurityContextResolved=False` / `InheritSourceMissing`](#the-securitycontextresolved-condition) if no pod matches, if the selector is empty, if the named container is absent, or if the pod sets *neither* a container nor a pod-level `securityContext`. The condition message **names the selector that matched nothing** and lists the three ways out. The exception is when the recipe also sets a `mover.securityContext` pinning a `runAsUser`. That is then used as the fallback, reported as `InheritFallback`, and the run proceeds.
 
 Things to remember:
 
@@ -276,14 +276,37 @@ If that's not what you meant, leave `runAsUser` out and let inherit supply it. K
 
 ///
 
+#### The `SecurityContextResolved` condition
+
+There are two different questions, and they get two different conditions. `SecurityContextResolved` answers *"could the mover's identity be worked out at all?"* — it is the **hold**. `SecurityContextInherited`, below, answers *"did inheriting do what you think it did?"* on a run that went ahead anyway — it is **advisory**.
+
+`SecurityContextResolved` is written only when the answer is no, and only for the live-pod modes (`workloadSelector`, `pvcConsumer`):
+
+| `status` / `reason` | What happened | What to do |
+| --- | --- | --- |
+| `False` / `InheritSourceMissing` | A live-pod inherit resolved **nothing** — no pod matched the selector, the named container is absent, or the matched pod sets neither a container nor a pod-level `securityContext` — and the recipe pins no fallback `runAsUser`. The run is parked at `phase: Pending` and re-checked every few minutes. The message **names the selector** (or the source PVC) that found nothing, and quotes the resolver's own diagnosis and fix. | Bring the workload back up, correct the selector, or set `mover.securityContext.runAsUser`. The run starts by itself once one of those is true; no re-apply. |
+| `True` / `InheritSourceResolved` | A previously-held run resolved its mover identity and is proceeding. | Nothing. |
+
+```console
+$ kubectl get snapshot pg-backup -o jsonpath='{.status.conditions[?(@.type=="SecurityContextResolved")]}'
+{"type":"SecurityContextResolved","status":"False","reason":"InheritSourceMissing",
+ "message":"mover.inheritSecurityContextFrom (workloadSelector `app=postgres`) resolved no securityContext to inherit, and this recipe pins no fallback identity — so the run is HELD instead of running as the wrong UID. ..."}
+```
+
+Holding is deliberate: a backup taken as the wrong UID is worse than a backup that did not run. This is a **registered structural gate**, so [`kubectl kopiur doctor`](cli/operations.md) reports it as a blocked run rather than passing a cluster whose backups are quietly parked. One Warning Event fires per transition, not per reconcile.
+
+The condition is **written only when the answer is no, and cleared when it becomes yes**. A run that was never held never carries it at all, and a held run that recovers flips to `True` / `InheritSourceResolved` before its mover Job starts — otherwise `doctor`, which forgives a stale gate only on a *terminal* phase, would keep calling a `Running` backup blocked for the whole run.
+
+The restore-only `inheritSecurityContextFrom.snapshot` mode has its own hold, reported on `SecurityContextInherited` as `MissingRecordedIdentity` — see [`snapshot` — inherit the backup's recorded identity](#snapshot--inherit-the-backups-recorded-identity-restore).
+
 #### The `SecurityContextInherited` condition
 
-`SecurityContextCompatible` answers *"can the mover read the source?"*. `SecurityContextInherited` answers a different question: *"did inheriting do what you think it did?"*. It appears on every run that asks to inherit, and **not at all** on runs that don't.
+`SecurityContextCompatible` answers *"can the mover read the source?"*. `SecurityContextInherited` answers a different question: *"did inheriting do what you think it did?"*. It appears on every run that asks to inherit, and **not at all** on runs that don't. Every state below describes a run that **proceeded** — it is advisory and never blocks. A run that could not proceed carries [`SecurityContextResolved=False`](#the-securitycontextresolved-condition) instead.
 
 | `status` / `reason` | What happened | What to do |
 | --- | --- | --- |
 | `True` / `InheritApplied` | Inheritance resolved a workload and its values survived every layer. The message names the pod and the uid the mover runs as. | Nothing. |
-| `False` / `InheritFallback` | No workload pod resolved: scaled to zero, mid-rollout, or the selector matches nothing. Your explicit context stood in, so the run proceeded rather than being held. | Nothing, if that's the intent. Otherwise scale the workload up. |
+| `False` / `InheritFallback` | No workload pod resolved: scaled to zero, mid-rollout, or the selector matches nothing. Your explicit context stood in, so the run proceeded rather than being held with [`SecurityContextResolved=False`](#the-securitycontextresolved-condition). | Nothing, if that's the intent. Otherwise scale the workload up. |
 | `False` / `InheritPinnedNoUid` | A pod resolved, but it pins no `runAsUser` and no group beyond the mover's own defaults. Its identity is in its image, which Kopiur cannot read, so inheriting copied nothing. | Set `runAsUser` on the workload, or set `mover.securityContext.runAsUser`. |
 | `False` / `InheritOverridden` | Inheritance resolved a UID, but this recipe's explicit `runAsUser` overrode it. That is correct by design, but inherit is a no-op for that field and won't follow the workload. The message names the **exact field** that won, either `mover.securityContext.runAsUser` or `mover.podSecurityContext.runAsUser`. Only this recipe can displace an inherited UID; the repository's `moverDefaults` never can. | Remove the named `runAsUser` to track the workload, or drop `inheritSecurityContextFrom`. |
 
@@ -526,7 +549,7 @@ $ kubectl -n app get pod <mover-pod> \
 
 /// tip | Scale the workload to zero and inherit fails loudly
 
-Run `kubectl -n app scale deploy/app --replicas=0`, then re-create the Snapshot. With no Running pod to read, the Snapshot is held with an actionable condition telling you exactly that. Inherit selects a live pod; it does not read a stored value. Scale back up and it proceeds.
+Run `kubectl -n app scale deploy/app --replicas=0`, then re-create the Snapshot. With no Running pod to read, the Snapshot is held at `phase: Pending` with `SecurityContextResolved=False` / `InheritSourceMissing`, whose message names the selector that matched nothing. Inherit selects a live pod; it does not read a stored value. Scale back up and it proceeds on its own.
 
 That's the behavior when the recipe has **nothing else to go on**, as here. Add a `mover.securityContext` that pins a `runAsUser` and the same scale-to-zero instead *proceeds* on that context, reporting `SecurityContextInherited=False` / `InheritFallback`. See [Combining inherit with an explicit context](#combining-inherit-with-an-explicit-context). Holding is the default precisely because a wrong-UID backup is worse than a missing one. You opt out of it by writing the identity you want used instead.
 
@@ -541,6 +564,7 @@ That's the behavior when the recipe has **nothing else to go on**, as here. Add 
 | Default if unset | UID `65532` (reads world-readable / `65532`-owned only), pod `fsGroup: 65532` | UID `65532` (files land owned by `65532`), pod `fsGroup: 65532` |
 | Preserve original ownership | n/a (kopia records it) | needs root + `privilegedMode: true` |
 | Inherit from workload | `SnapshotPolicy.spec.mover.inheritSecurityContextFrom` (`pvcConsumer`/`workloadSelector`) | `Restore.spec.mover.inheritSecurityContextFrom` (`workloadSelector`, or `snapshot: {}`, the backup's recorded identity, no live pod) |
+| Override it for ONE run | `Snapshot.spec.mover`, merged field-wise over the policy's — see [Backups → `mover` for one run](backups.md#mover--override-the-recipes-mover-for-one-run) | a `Restore` **is** the invocation, so `Restore.spec.mover` is already per-run |
 | Elevated context | namespace `privileged-movers` opt-in | same opt-in |
 | Tolerate permission errors | fails on unreadable files | `spec.options.ignorePermissionErrors` (default `true`) reports instead of failing |
 

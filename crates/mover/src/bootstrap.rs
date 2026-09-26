@@ -1894,6 +1894,7 @@ mod tests {
             root_entry: None,
             retention_reason: vec![],
             tags: Default::default(),
+            incomplete: None,
         }
     }
 
@@ -1999,6 +2000,7 @@ mod tests {
                     max_time: None,
                     num_failed: 20,
                     errors,
+                    incomplete: None,
                 }),
             }),
             retention_reason: vec!["latest-1".into(), "daily-1".into(), "weekly-1".into()],
@@ -2012,6 +2014,7 @@ mod tests {
                 ),
                 ("tag:team".to_string(), "x".repeat(4096)),
             ]),
+            incomplete: None,
         }
     }
 

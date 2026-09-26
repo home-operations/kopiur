@@ -131,6 +131,19 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
                 }
             }
         }
+        // A stream target writes no PVC: it pipes ONE virtual file out of the
+        // snapshot into a command's stdin. Validate the same things the backup-side
+        // stream source validates, with the same words.
+        RestoreTarget::StreamExec(t) => {
+            crate::validate::validate_stream_file_name(
+                "restore.target.streamExec.fileName",
+                &t.file_name,
+            )?;
+            crate::validate::validate_stream_exec(
+                "restore.target.streamExec.workloadExec",
+                &t.workload_exec,
+            )?;
+        }
         RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => {}
     }
     // Access modes on a create-target PVC: canonical/unique/RWOP-sole. Fail-fast on

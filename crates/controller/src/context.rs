@@ -198,12 +198,12 @@ pub struct Context {
     pub watch_scope: crate::config::WatchScope,
     /// Cap on concurrently running Snapshot-delete BATCH mover Jobs, across
     /// every repository (`KOPIUR_MAX_CONCURRENT_DELETE_JOBS`). `None` (the
-    /// default) means UNCAPPED — batching (one Job per repository per
-    /// accumulation window) is the primary protection against overwhelming
-    /// the backend; a cap is an opt-in backstop for a resource-constrained
-    /// cluster, and a small default risks head-of-line-blocking every OTHER
-    /// repository's deletions behind one slow/failing one. Consulted by the
-    /// batch dispatcher's throttle (`crate::snapshot::throttle_verdict`).
+    /// default) means no cluster-wide cap. Each repository is already capped on
+    /// its own (`spec.concurrency.maxConcurrentDeleteJobs`, default 1), so this
+    /// is an opt-in backstop for a resource-constrained cluster; a small value
+    /// risks head-of-line-blocking every OTHER repository's deletions behind one
+    /// slow/failing one. Enforced with the per-repository cap by
+    /// [`delete_admissions`](Self::delete_admissions).
     pub max_concurrent_delete_jobs: Option<std::num::NonZeroUsize>,
     /// Cluster-wide cap on concurrently running POOLED mover Jobs — backups,
     /// restores and the source side of either replication — across every
@@ -225,6 +225,12 @@ pub struct Context {
     /// [`Context::new`]. Sound because only the LEADER reconciles; see
     /// [`crate::pool::AdmissionLedger`] for the failover semantics.
     pub pool_admissions: crate::pool::AdmissionLedger,
+    /// In-process record of snapshot-delete batch admissions granted but whose
+    /// Jobs a LIST cannot see yet, so concurrently reconciling members of one
+    /// repository cannot each launch a batch (issue #477). Separate from
+    /// [`pool_admissions`](Self::pool_admissions): delete batches are not in the
+    /// mover pool. See [`crate::pool::DeleteAdmissionLedger`].
+    pub delete_admissions: crate::pool::DeleteAdmissionLedger,
     /// Shared informer cache of all `Snapshot` CRs, reused from the `Snapshot`
     /// controller's own reflector (`Controller::store()`). `OnceLock` because
     /// the `Context` is built (in `startup::run`) BEFORE `spawn_all` mints the
@@ -344,6 +350,7 @@ impl Context {
             max_concurrent_delete_jobs,
             max_concurrent_jobs,
             pool_admissions: crate::pool::AdmissionLedger::default(),
+            delete_admissions: crate::pool::DeleteAdmissionLedger::default(),
             snapshot_store: Arc::new(OnceLock::new()),
             snapshot_synced: Arc::new(AtomicBool::new(false)),
             schedule_store: Arc::new(OnceLock::new()),

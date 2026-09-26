@@ -434,6 +434,7 @@ pub fn build_adopted_snapshot(
             // Adopted rows have no owning schedule.
             on_schedule_delete: None,
             pin: candidate.pinned,
+            mover: None,
             description: None,
         },
     );
@@ -1543,5 +1544,113 @@ mod tests {
         assert!(msg.contains("spec.pin"), "lever: pin a snapshot");
         assert!(msg.contains("spec.adoption: Ignore"), "lever: opt out");
         assert!(msg.contains("discovered"), "states where the rows remain");
+    }
+
+    // -- a DISCOVERED stream snapshot is adoptable (#451) ---------------------
+
+    /// The end-to-end consequence of the identity fix, asserted where it actually
+    /// bites: `identities_match` compares `source_path` FIELD-BY-FIELD (it must —
+    /// `identity_string` drops a `None` path, so `alice@host` would spuriously
+    /// match `alice@host:/data`, and kopia rows always carry a path). Five identity
+    /// sites used to resolve a stream policy to a PATHLESS identity, so
+    /// `policy.source_path == None` could never equal a discovered row's
+    /// `Some("/stream/postgres.sql")` — every discovered stream snapshot was
+    /// permanently unadoptable, silently, with `lastScanUnmatched` ticking up and
+    /// nothing saying why.
+    ///
+    /// The policy identity here is the one `snapshot_policy::config_identity` now
+    /// produces for a stream policy (pinned by
+    /// `config_identity_of_a_stream_policy_is_the_stream_root`).
+    #[test]
+    fn a_discovered_stream_snapshot_is_adopted_under_the_stream_root_identity() {
+        let stream_ident = identity("pg", "db", Some("/stream/postgres.sql"));
+        let rows = vec![discovered_row(
+            "repo-1",
+            "found",
+            "kstream1",
+            stream_ident.clone(),
+        )];
+        let candidates = adoption_candidates("repo-1", &rows);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].identity.source_path.as_deref(),
+            Some("/stream/postgres.sql")
+        );
+
+        let plan = adopt_plan(
+            &stream_ident,
+            None,
+            candidates.clone(),
+            &BTreeSet::new(),
+            false,
+            None,
+        );
+        assert_eq!(plan.adopt.len(), 1, "the stream row must be adopted");
+        assert_eq!(plan.adopt[0].snapshot_id, "kstream1");
+        assert_eq!(plan.identity_matched, 1);
+        assert_eq!(plan.unmatched, 0);
+
+        // THE pre-fix state, reproduced explicitly: a PATHLESS policy identity
+        // (what all five sites resolved for a stream policy) matches nothing.
+        let pathless = identity("pg", "db", None);
+        let blind = adopt_plan(
+            &pathless,
+            None,
+            candidates.clone(),
+            &BTreeSet::new(),
+            false,
+            None,
+        );
+        assert!(
+            blind.adopt.is_empty(),
+            "a pathless policy identity cannot adopt a path-bearing kopia row — \
+             this is the bug, kept here so the fix has a visible counterfactual"
+        );
+        assert_eq!(blind.identity_matched, 0);
+        assert_eq!(blind.unmatched, 1);
+
+        // And a `/data` policy identity (the other wrong answer, from
+        // `config_identity_for_path`'s fallback) is just as blind.
+        let wrong_path = identity("pg", "db", Some("/data"));
+        let wrong = adopt_plan(&wrong_path, None, candidates, &BTreeSet::new(), false, None);
+        assert!(wrong.adopt.is_empty());
+        assert_eq!(wrong.identity_matched, 0);
+    }
+
+    /// Two stream policies in the same namespace differing only in `fileName`
+    /// must each adopt only THEIR OWN artifact. Under the pre-fix pathless
+    /// identity both resolved `pg@db` and would have been indistinguishable; the
+    /// `/stream/<fileName>` path is the only thing separating them.
+    #[test]
+    fn stream_snapshots_are_adopted_by_file_not_just_by_name_and_host() {
+        let pg = identity("shared", "db", Some("/stream/postgres.sql"));
+        let my = identity("shared", "db", Some("/stream/mysql.sql"));
+        let rows = vec![
+            discovered_row("repo-1", "pg-row", "kpg", pg.clone()),
+            discovered_row("repo-1", "my-row", "kmy", my.clone()),
+        ];
+        let candidates = adoption_candidates("repo-1", &rows);
+        assert_eq!(candidates.len(), 2);
+
+        let plan = adopt_plan(&pg, None, candidates.clone(), &BTreeSet::new(), false, None);
+        assert_eq!(
+            plan.adopt
+                .iter()
+                .map(|c| c.snapshot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kpg"],
+            "the postgres policy must not adopt the mysql artifact"
+        );
+        assert_eq!(plan.identity_matched, 1);
+        assert_eq!(plan.unmatched, 1);
+
+        let plan = adopt_plan(&my, None, candidates, &BTreeSet::new(), false, None);
+        assert_eq!(
+            plan.adopt
+                .iter()
+                .map(|c| c.snapshot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["kmy"]
+        );
     }
 }

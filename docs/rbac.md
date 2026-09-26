@@ -2,13 +2,14 @@
 
 Everything Kopiur is allowed to do in your cluster, in one place. Use it for security review, for scoping a namespaced install, and for debugging `Forbidden` errors.
 
-Kopiur runs as **three principals**:
+Kopiur runs as **four principals**:
 
 | ServiceAccount | Who uses it | Bound to |
 | --- | --- | --- |
 | `kopiur-controller` | The controller Deployment **and** the admission webhook Deployment (they share one ServiceAccount) | `kopiur-controller` ClusterRole (cluster scope) or Role (namespaced scope) |
 | `kopiur-mover` | Every ordinary mover `Job` (snapshot, restore, bootstrap, maintenance, verify, replicate, pin, delete) | `kopiur-mover` ClusterRole/Role |
 | `kopiur-snapshot-replication-mover` | Only `SnapshotReplication` mover Jobs | `kopiur-snapshot-replication-mover` ClusterRole/Role |
+| `kopiur-stream-mover` | Only mover Jobs for a [`stream` source](stream-sources.md) or a `streamExec` restore target. **The only mover principal that holds `pods/exec`** | `kopiur-stream-mover` ClusterRole/Role |
 
 The authoritative definitions are **generated** by `cargo xtask gen-rbac` into `deploy/rbac/`, as `operator-clusterrole.yaml`, `operator-role.yaml`, `mover-clusterrole.yaml` and `mover-role.yaml`.
 
@@ -29,12 +30,14 @@ What each rule is **for**, grouped by purpose:
 | `batch` → `jobs` | get, list, watch, create, update, patch, delete | Create and track the mover Jobs; reap them per `failedJobsHistoryLimit`. |
 | `snapshot.storage.k8s.io` → `volumesnapshots`; `groupsnapshot.storage.k8s.io` → `volumegroupsnapshots` | get, list, watch, create, **patch**, delete | CSI snapshot / group-snapshot copy methods (`SnapshotPolicy.spec.copyMethod`). |
 | core → `serviceaccounts`; `rbac.authorization.k8s.io` → `rolebindings` | get, **list, watch** (SAs), create, update, patch | Mint the per-namespace mover ServiceAccount + RoleBinding on demand (see below). `list`/`watch` on ServiceAccounts re-reconciles a repository the moment its `auth.workloadIdentity` SA is created. |
-| core → `namespaces` | get, list, watch | Read the `kopiur.home-operations.com/privileged-movers` annotation (the elevated-mover opt-in) and drive `pvcSelector` namespace selection. *(Cluster scope only.)* |
+| core → `namespaces` | get, list, watch | Read the two per-namespace opt-in annotations — `kopiur.home-operations.com/privileged-movers` (elevated mover) and `kopiur.home-operations.com/stream-exec-movers` (the `pods/exec` grant, the one check that fails **closed** when this read is unavailable) — and drive `pvcSelector` namespace selection. *(Cluster scope only.)* |
 | `groupsnapshot.storage.k8s.io` → `volumegroupsnapshotclasses` | get, list, watch | Resolve the group-snapshot class for `groupBy: VolumeGroupSnapshot`, the same way `volumesnapshotclasses` is resolved for per-volume staging. *(Cluster scope only, which is why group staging needs `installScope: cluster`.)* |
 | `admissionregistration.k8s.io` → `validatingwebhookconfigurations`, `mutatingwebhookconfigurations` (names `kopiur-validating` / `kopiur-mutating` only) | get, patch | Inject the self-managed CA bundle into the webhook configurations (`webhook.tls.mode: self`). *(Cluster scope only.)* |
 | core → `secrets` (name `kopiur-webhook-tls` only) | update, patch | Rotate the self-managed webhook serving certificate. |
 
 † In a **namespaced install**, meaning `installScope: namespaced`, the Role drops three things: `clusterrepositories`, because it is a cluster-scoped kind, the webhook-configuration rule, and the `namespaces` rule. Dropping `namespaces` is also why the privileged-mover gate fails *open* there: the operator cannot read namespace annotations, and the install is already confined to admin-chosen namespaces.
+
+The [stream-exec gate](stream-sources.md#if-kopiur-is-installed-namespace-scoped) is the one exception that fails **closed** instead, because `pods/exec` in a namespace is a much larger grant than an elevated container — arbitrary code execution in every pod there, on a ServiceAccount that outlives the Job. A namespaced install therefore refuses `stream` sources until you add the one read back with `rbacNamespaceReadForStreamSources: true`, which emits a supplementary ClusterRole granting `get` on `namespaces` and nothing else. `pvc` and `nfs` sources need none of this.
 
 ## The mover (`kopiur-mover`)
 
@@ -60,6 +63,35 @@ That is exactly why it is a **separate** principal rather than a widening of `ko
 | core → `configmaps` | get, patch | Same result-reporting channel as the ordinary mover. |
 
 Like `kopiur-mover`, its ServiceAccount and RoleBinding are minted per namespace on demand, and it cannot read Secrets.
+
+### The stream-source mover (`kopiur-stream-mover`)
+
+A [`stream` source](stream-sources.md) backs up the **stdout of a command run inside a workload pod**, and a `streamExec` restore target pipes bytes back into one. Doing that needs `pods/exec` in the workload's namespace. This is the largest grant Kopiur mints, and the most important one to review:
+
+| API group → resources | Verbs | Why |
+| --- | --- | --- |
+| `kopiur.home-operations.com` → every CRD's `/status` | get, patch | Same result-reporting channel as the ordinary mover. |
+| core → `configmaps` | get, patch | Same result-reporting channel as the ordinary mover. |
+| core → `pods` | get, list | Resolve `stream.workloadExec.podSelector` to one Running pod in the namespace. |
+| core → `pods/exec` | **create**, get | Run the dump or restore command inside that pod. |
+
+`create` on `pods/exec` in a namespace is **arbitrary code execution in every pod in that namespace**, as whatever UID those containers run as. Three things bound it:
+
+1. **It is a separate principal.** `pods/exec` never reaches `kopiur-mover`, the ServiceAccount every ordinary backup Job in the namespace runs as. That separation is the whole design, and it survives long release names because all the mover names are built from one pre-capped stem (`kopiur.moverBaseName` in the chart) rather than truncated after the suffix is appended.
+2. **It is bound per namespace**, through a namespaced RoleBinding the controller mints in the workload namespace — never a ClusterRoleBinding. `resourceNames` genuinely cannot narrow it further: the pod name is not known until the selector resolves at run time, and RBAC has no label-selector form.
+3. **A cluster admin must opt the namespace in**, with `kubectl annotate namespace <ns> kopiur.home-operations.com/stream-exec-movers=true`. Without it, `Snapshot`s and `Restore`s for stream work sit in `Pending` with `MoverPermitted=False` / `StreamExecNotPermitted`. This check [fails **closed**](stream-sources.md#if-kopiur-is-installed-namespace-scoped), including when the Namespace cannot be read.
+
+/// warning | Withdrawing the annotation does not revoke the grant
+
+The ServiceAccount and RoleBinding are minted on demand and carry **no owner reference**, so nothing deletes them: removing the annotation (or the last stream policy) stops new stream Jobs, but the `<release>-stream-mover` ServiceAccount and its RoleBinding stay in that namespace, and anyone who can create a Pod there can set `serviceAccountName` to it. Revoking is an explicit, two-command step:
+
+```sh
+kubectl delete rolebinding  kopiur-stream-mover -n <ns>
+kubectl delete serviceaccount kopiur-stream-mover -n <ns>
+```
+
+Substitute your release's prefix if `fullnameOverride`/the release name is not `kopiur`, and delete the RoleBinding **first** — it is the object that carries the privilege. See [Streamed command sources → Revoking the opt-in](stream-sources.md#revoking-the-opt-in).
+///
 
 ### The runtime-minted per-namespace mover identity
 

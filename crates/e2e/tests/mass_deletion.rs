@@ -30,7 +30,9 @@
 //! 5. `single_snapshot_delete_still_releases` — one manual delete makes exactly one
 //!    batch Job whose members are exactly that CR's UID; the CR drains, kopia -1.
 //! 6. `concurrent_batches_do_not_overlap` — two disjoint delete waves make two
-//!    disjoint batch Jobs (uncapped default allows concurrency); all drain, kopia -5.
+//!    disjoint batch Jobs, and with the DEFAULT `maxConcurrentDeleteJobs` (1) the
+//!    second never starts while the first runs (#477: single-flight per repository,
+//!    held open with the slow-mover fixture); all drain, kopia -5.
 //! 7. `throttle_caps_concurrent_batch_jobs` — with `KOPIUR_MAX_CONCURRENT_DELETE_JOBS=1`
 //!    on the operator Deployment, at most one live batch Job exists at any instant;
 //!    both waves still drain. Restores the env (rollout wait) even on failure.
@@ -38,6 +40,10 @@
 //!    flipped read-only), the batch Job fails, is reaped, and refires (≥2 distinct Job
 //!    generations) while NO finalizer releases; restoring writability drains all + the
 //!    kopia snapshots are really deleted. Fail-safe under outage + convergence after.
+//!
+//! 10. `raised_delete_cap_allows_overlapping_batches` — `spec.concurrency
+//!     .maxConcurrentDeleteJobs: 2` lets the second wave run WHILE the first does,
+//!     and never more than two; the field really raises the per-repository cap.
 //!
 //! Scenarios 1-3 assert OUTCOMES (CRs drained, kopia counts, conditions/events); 5-8
 //! additionally assert the batch Job wire shape (op label, `delete-members`).
@@ -76,6 +82,7 @@ use kopiur_api::consts::{
     REPOSITORY_UID_LABEL, SCHEDULE_LABEL, SNAPSHOT_CLEANUP_FINALIZER,
 };
 use kopiur_api::{Repository, Snapshot, SnapshotPolicy, SnapshotSchedule};
+use kopiur_e2e::slow_mover::{MoverOp, SlowMover, with_slow_mover_config};
 use kopiur_e2e::{
     E2E_NAMESPACE, Need, World, builders, consts as e2e_consts, default_timeout, poll_interval,
     wait, wait_until,
@@ -260,13 +267,6 @@ async fn find_batch_with_members(
         },
     )
     .await
-}
-
-/// Panicking wrapper over [`find_batch_with_members`].
-async fn wait_batch_with_members(jobs: &Api<Job>, target: &BTreeSet<String>) -> Job {
-    find_batch_with_members(jobs, target)
-        .await
-        .expect("a batch Job with the target member set should appear")
 }
 
 /// A `Snapshot`'s `metadata.uid` (once created). Panics if absent — every persisted
@@ -1599,21 +1599,19 @@ async fn single_snapshot_delete_still_releases() {
     let _ = repos.delete(REPO, &DeleteParams::default()).await;
 }
 
-// --- Scenario 6: concurrent batches do not overlap (uncapped default) ----------
+// --- Scenario 6: batches do not overlap, and are single-flight by default ------
 
 const NOOVERLAP_SUBPATH: &str = "massdel-nooverlap";
 
 /// Two disjoint delete waves make two disjoint batch Jobs — the no-overlap invariant
-/// under the default (uncapped) concurrency. FIVE manual `Succeeded` snapshots (repo
-/// threshold left DEFAULT 10 — five deletes stay below it, so nothing is held).
-/// Delete 3 → a batch Job with EXACTLY those 3 UIDs. While it is (ideally) live,
-/// delete the other 2 → a SECOND batch Job with EXACTLY those 2 UIDs, sharing NO
-/// member with the first. All 5 drain; kopia -5.
-///
-/// Timing note (brief §6): a filesystem batch delete can complete before the second
-/// wave is issued, so simultaneous LIVENESS is best-effort (logged). The HARD,
-/// timing-robust assertions are the per-wave member sets, their DISJOINTNESS (the
-/// no-overlap invariant), the two being SEPARATE Jobs, and total drain.
+/// — AND, under the default `spec.concurrency.maxConcurrentDeleteJobs` (1), the
+/// second wave's Job is not created while the first is live (#477: ~33 concurrent
+/// batches once ran against one repository). FIVE manual `Succeeded` snapshots
+/// (repo threshold left DEFAULT 10 — five deletes stay below it, so nothing is held).
+/// Delete 3 → a batch Job with EXACTLY those 3 UIDs, held LIVE by the slow-mover
+/// fixture (batch deletes only). Delete the other 2 → a SECOND batch Job with
+/// EXACTLY those 2 UIDs, sharing NO member with the first, which appears only after
+/// the first went terminal. All 5 drain; kopia -5.
 #[tokio::test]
 #[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
 async fn concurrent_batches_do_not_overlap() {
@@ -1693,24 +1691,56 @@ async fn concurrent_batches_do_not_overlap() {
         "five snapshots must exist before, got {kopia_before}"
     );
 
-    // Wave 1: delete 3 → the batch Job with exactly those 3.
-    delete_and_settle(&backups, a_names).await;
-    let batch_a = wait_batch_with_members(&jobs, &set_a).await;
-    let a_live_at_capture = batch_job_state(&batch_a) == BatchJobState::Live;
+    // Hold every batch Job open long enough that wave 2 is deleted while wave 1's
+    // Job is provably live. Only batch deletes crawl.
+    let config = SlowMover::new(Duration::from_secs(25)).ops(&[MoverOp::SnapshotDeleteBatch]);
+    let (batch_a, batch_b) = with_slow_mover_config(&world, config, || async {
+        // Wave 1: delete 3 → the batch Job with exactly those 3, live (sleeping).
+        delete_snapshots_and_settle(&backups, a_names).await?;
+        let batch_a = find_batch_with_members(&jobs, &set_a).await?;
+        anyhow::ensure!(
+            batch_job_state(&batch_a) == BatchJobState::Live,
+            "wave-1's batch Job must still be live (slow mover) when wave 2 is deleted"
+        );
+        // Wave 2 while wave 1 runs. Sample fast: a second live batch for this
+        // repository would persist for the whole 25s sleep, so 1s polls cannot miss it.
+        delete_snapshots_and_settle(&backups, b_names).await?;
+        let mine: BTreeSet<String> = set_a.union(&set_b).cloned().collect();
+        let deadline = Instant::now() + default_timeout();
+        let batch_b = loop {
+            let js = my_batch_jobs(&jobs, &mine).await;
+            let live = js
+                .iter()
+                .filter(|j| batch_job_state(j) == BatchJobState::Live)
+                .count();
+            anyhow::ensure!(
+                live <= 1,
+                "single-flight violated: {live} live batch Jobs for one repository (#477)"
+            );
+            if let Some(b) = js.iter().find(|j| batch_members(j) == set_b) {
+                // Gone counts as terminal: the dispatcher reaps a succeeded batch
+                // Job once its members drained, which can precede wave 2's Job.
+                let a_live = jobs
+                    .get_opt(&batch_a.name_any())
+                    .await?
+                    .is_some_and(|j| batch_job_state(&j) == BatchJobState::Live);
+                anyhow::ensure!(
+                    !a_live,
+                    "wave-2's batch Job was created while wave-1's was still live"
+                );
+                break b.clone();
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "wave-2's batch Job never appeared"
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        Ok((batch_a, batch_b))
+    })
+    .await
+    .expect("single-flight delete waves under the slow mover");
 
-    // Wave 2: delete the other 2 → a SECOND, disjoint batch Job.
-    delete_and_settle(&backups, b_names).await;
-    let batch_b = wait_batch_with_members(&jobs, &set_b).await;
-    // Best-effort overlap observation: was wave-1's Job still live when wave-2's appeared?
-    let a_live_when_b_appeared = jobs
-        .get_opt(&batch_a.name_any())
-        .await
-        .ok()
-        .flatten()
-        .map(|j| batch_job_state(&j) == BatchJobState::Live)
-        .unwrap_or(false);
-
-    // HARD (timing-robust) assertions.
     assert_eq!(
         batch_members(&batch_a),
         set_a,
@@ -1724,22 +1754,157 @@ async fn concurrent_batches_do_not_overlap() {
     assert_ne!(
         batch_a.name_any(),
         batch_b.name_any(),
-        "the two waves must be SEPARATE batch Jobs (concurrency, not one merged Job)"
+        "the two waves must be SEPARATE batch Jobs, not one merged Job"
     );
     assert!(
         batch_members(&batch_b).is_disjoint(&batch_members(&batch_a)),
         "NO-OVERLAP: wave-2's batch must not re-enroll any wave-1 member"
-    );
-    eprintln!(
-        "[scenario6] no-overlap proven; wave-1 live when captured={a_live_at_capture}, \
-         wave-1 live when wave-2 appeared={a_live_when_b_appeared} \
-         (true = simultaneous concurrency observed; false = disjointness-only)"
     );
 
     // All 5 drain; kopia -5.
     wait_all_drained(&backups, &NAMES, Duration::from_secs(300)).await;
     let kopia_after =
         observed_snapshot_count(&client, "e2e-massdel-noov-verify-2", NOOVERLAP_SUBPATH).await;
+    assert_eq!(
+        kopia_after,
+        kopia_before - 5,
+        "both waves must delete all 5 kopia snapshots; before={kopia_before} after={kopia_after}"
+    );
+
+    let _ = policies.delete(POLICY, &DeleteParams::default()).await;
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 10: a raised per-repository delete cap allows overlap ------------
+
+const CAP2_SUBPATH: &str = "massdel-cap2";
+
+/// The other half of scenario 6: `spec.concurrency.maxConcurrentDeleteJobs: 2`
+/// really raises the per-repository cap. With batch Jobs held open by the slow
+/// mover, the second wave's Job runs WHILE the first does (two live at once is
+/// observed), and never more than two. All 5 drain; kopia -5.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn raised_delete_cap_allows_overlapping_batches() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, CAP2_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-massdel-cap2-repo";
+    const POLICY: &str = "e2e-massdel-cap2-pol";
+    const NAMES: [&str; 5] = [
+        "e2e-massdel-cap2-1",
+        "e2e-massdel-cap2-2",
+        "e2e-massdel-cap2-3",
+        "e2e-massdel-cap2-4",
+        "e2e-massdel-cap2-5",
+    ];
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                CAP2_SUBPATH,
+                serde_json::json!({
+                    "maintenance": { "enabled": false },
+                    "concurrency": { "maxConcurrentDeleteJobs": 2 },
+                }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    // The field must have LANDED (a dropped/pruned overlay would silently test the
+    // default and fail for the wrong reason).
+    assert_eq!(
+        repos
+            .get(REPO)
+            .await
+            .expect("get Repository")
+            .spec
+            .concurrency
+            .and_then(|c| c.max_concurrent_delete_jobs),
+        Some(2),
+        "spec.concurrency.maxConcurrentDeleteJobs must be stored on the Repository"
+    );
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+
+    let mine = seed_manual_snapshots(&backups, POLICY, &NAMES).await;
+    let kopia_before =
+        observed_snapshot_count(&client, "e2e-massdel-cap2-verify-1", CAP2_SUBPATH).await;
+    assert_eq!(
+        kopia_before, 5,
+        "five snapshots must exist before, got {kopia_before}"
+    );
+
+    let config = SlowMover::new(Duration::from_secs(25)).ops(&[MoverOp::SnapshotDeleteBatch]);
+    let max_live = with_slow_mover_config(&world, config, || async {
+        delete_snapshots_and_settle(&backups, &NAMES[..3]).await?;
+        let mut first: BTreeSet<String> = BTreeSet::new();
+        for n in &NAMES[..3] {
+            first.insert(snapshot_uid(&backups, n).await);
+        }
+        find_batch_with_members(&jobs, &first).await?;
+        delete_snapshots_and_settle(&backups, &NAMES[3..]).await?;
+        let mut max_live = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(360);
+        loop {
+            let js = my_batch_jobs(&jobs, &mine).await;
+            let live = js
+                .iter()
+                .filter(|j| batch_job_state(j) == BatchJobState::Live)
+                .count();
+            anyhow::ensure!(live <= 2, "cap=2 violated: {live} live batch Jobs");
+            max_live = max_live.max(live);
+            let mut remaining = 0usize;
+            for n in NAMES {
+                if backups.get_opt(n).await?.is_some() {
+                    remaining += 1;
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the waves did not drain in time");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Ok(max_live)
+    })
+    .await
+    .expect("overlapping delete waves under the slow mover");
+    assert_eq!(
+        max_live, 2,
+        "with maxConcurrentDeleteJobs: 2 the second wave must run while the first does"
+    );
+
+    let kopia_after =
+        observed_snapshot_count(&client, "e2e-massdel-cap2-verify-2", CAP2_SUBPATH).await;
     assert_eq!(
         kopia_after,
         kopia_before - 5,

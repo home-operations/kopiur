@@ -171,13 +171,17 @@ For the full mover `securityContext` surface, covering the hardened default, set
 
 The gate applies to **every** kind that runs a mover: a `SnapshotPolicy`'s `spec.mover`, a `Restore`'s `spec.mover`, and a `Maintenance`'s `spec.mover` alike. It also applies to a context **inherited** from a workload pod through `inheritSecurityContextFrom`, because the resolved context is what gets checked, so an inherited-root mover is gated too. If `spec.mover` requests privilege and the namespace has **not** opted in, the `Snapshot`, `Restore` or `Maintenance` is refused with a clear condition. "Requests privilege" means any of `runAsUser: 0`, `privileged: true`, `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot: false`, or `privilegedMode: true`.
 
+What the gate checks is the **merged** mover, so any layer of the ladder can trip it: `Repository.spec.moverDefaults`, the recipe's `spec.mover`, an inherited workload context, or a per-run [`Snapshot.spec.mover`](backups.md#mover--override-the-recipes-mover-for-one-run). The condition names the layer that actually carries the elevation, so a one-shot `Snapshot` that asks for root does not send you to edit a `SnapshotPolicy` containing nothing elevated:
+
 ```console
 $ kubectl get snapshots my-backup -n media \
     -o jsonpath='{.status.conditions[?(@.type=="MoverPermitted")]}'
 {"type":"MoverPermitted","status":"False","reason":"PrivilegedMoverNotPermitted",
- "message":"SnapshotPolicy `my-config` requests a privileged mover ... namespace
- `media` has not opted in ... kubectl annotate namespace media
- kopiur.home-operations.com/privileged-movers=true ..."}
+ "message":"the mover for this run is privileged ... namespace `media` has not
+ opted in ... The elevation comes from Snapshot `my-backup` `spec.mover`. Fix:
+ remove the elevated securityContext/privilegedMode there; or, to allow it for
+ EVERY mover in namespace `media` from now on, a cluster admin runs `kubectl
+ annotate namespace media kopiur.home-operations.com/privileged-movers=true`."}
 ```
 
 A cluster admin opts the namespace in by applying the annotated `Namespace`:

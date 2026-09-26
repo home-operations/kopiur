@@ -263,4 +263,68 @@ mod tests {
             "an fsGroup alone must not make the mover's UID knowable"
         );
     }
+
+    /// #464 documented behaviour change. A `Snapshot`'s `spec.mover` is merged OVER the
+    /// policy's before the warning is computed, so the judged identity is the RUN's, not
+    /// the recipe's. Two consequences worth pinning:
+    ///
+    /// 1. A snapshot-level `runAsUser` replaces the policy's — the warning is about the
+    ///    UID that will actually read the source.
+    /// 2. A snapshot that ADDS an `inheritSecurityContextFrom` on top of a policy that
+    ///    pinned a UID now SILENCES the warning the policy alone used to emit. That is
+    ///    correct, not a regression: every inherit mode resolves against a live workload
+    ///    (or a recorded identity) at reconcile time, and judging it from the explicit
+    ///    context alone would warn about a mismatch the operator will not produce. The
+    ///    reconcile-time condition remains the authoritative check.
+    #[test]
+    fn a_snapshot_level_mover_decides_the_admission_warning_identity() {
+        use api::common::{InheritSecurityContextFrom, PvcConsumerInherit};
+
+        let policy_mover = MoverSpec {
+            security_context: Some(SecurityContext {
+                run_as_user: Some(1000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // (1) The snapshot's UID wins.
+        let override_uid = MoverSpec {
+            security_context: Some(SecurityContext {
+                run_as_user: Some(2000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let merged = override_uid.merge_over(Some(&policy_mover));
+        assert_eq!(
+            pinned_mover_identity(Some(&merged)).and_then(|i| i.uid),
+            Some(2000)
+        );
+        // …and the policy alone would have been judged as 1000, so the merge is what
+        // moved the verdict.
+        assert_eq!(
+            pinned_mover_identity(Some(&policy_mover)).and_then(|i| i.uid),
+            Some(1000)
+        );
+
+        // (2) Adding an inherit silences the warning the policy alone emitted.
+        let adds_inherit = MoverSpec {
+            inherit_security_context_from: Some(InheritSecurityContextFrom::PvcConsumer(
+                PvcConsumerInherit::default(),
+            )),
+            ..Default::default()
+        };
+        let merged = adds_inherit.merge_over(Some(&policy_mover));
+        assert_eq!(
+            merged.security_context.as_ref().and_then(|s| s.run_as_user),
+            Some(1000),
+            "the policy's UID still falls through as the inherit FALLBACK"
+        );
+        assert!(
+            pinned_mover_identity(Some(&merged)).is_none(),
+            "an inherit on the merged mover makes the real identity reconcile-time-only, \
+             so admission must stay silent"
+        );
+    }
 }

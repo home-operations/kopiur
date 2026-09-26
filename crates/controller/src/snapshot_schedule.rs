@@ -1983,6 +1983,7 @@ fn scheduled_backup_spec(
         // Always explicit for produced Snapshots (the cascade guard's input).
         on_schedule_delete: Some(on_schedule_delete),
         pin: false,
+        mover: None,
         // Scheduled backups never carry a templated description (out of
         // scope for M4 — description is per-invocation only).
         description: None,
@@ -3610,6 +3611,7 @@ mod tests {
                     deletion_policy: None,
                     on_schedule_delete: None,
                     pin: false,
+                    mover: None,
                     description: None,
                 },
             );
@@ -3689,6 +3691,7 @@ mod tests {
                     deletion_policy: None,
                     on_schedule_delete: None,
                     pin: false,
+                    mover: None,
                     description: None,
                 },
             );
@@ -3749,6 +3752,7 @@ mod tests {
                     deletion_policy: None,
                     on_schedule_delete: None,
                     pin: false,
+                    mover: None,
                     description: None,
                 },
             );
@@ -3899,6 +3903,7 @@ mod tests {
                 deletion_policy: None,
                 on_schedule_delete: None,
                 pin: false,
+                mover: None,
                 description: None,
             },
         );

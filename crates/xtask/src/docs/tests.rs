@@ -100,21 +100,61 @@ fn oneof_variants_detects_externally_tagged_unions() {
 
 #[test]
 fn cel_exclusive_variants_detects_the_source_shape() {
-    let mut source = obj(&["pvc", "pvcSelector", "nfs", "sourcePathOverride"]);
+    let mut source = obj(&["pvc", "pvcSelector", "nfs", "stream", "sourcePathOverride"]);
     source.x_kubernetes_validations = Some(vec![ValidationRule {
         rule: "(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + \
-               (has(self.nfs) ? 1 : 0) == 1"
+               (has(self.nfs) ? 1 : 0) + (has(self.stream) ? 1 : 0) == 1"
             .into(),
         message: Some("set exactly one source".into()),
         ..Default::default()
     }]);
     assert_eq!(
         cel_exclusive_variants(&source),
-        Some(vec!["nfs".into(), "pvc".into(), "pvcSelector".into()])
+        Some(vec![
+            "nfs".into(),
+            "pvc".into(),
+            "pvcSelector".into(),
+            "stream".into()
+        ])
     );
     // union_intro surfaces it; collect_validations then hides that same rule.
     assert!(union_intro(&source).unwrap().contains("exactly one"));
     assert!(collect_validations(&source).is_empty());
+}
+
+#[test]
+fn cel_exclusive_variants_parses_the_real_source_rule() {
+    // The fixture above is hand-written, so it proves the PARSER and nothing about
+    // the SHIPPED rule. This one reads the rule off the real `SnapshotPolicy::crd()`
+    // and asserts the generator sees every source form — so adding a fifth form to
+    // `Source` without extending the CEL rule (or writing it in a shape the parser
+    // cannot read) fails here instead of silently dropping the form from the
+    // published field reference's "set exactly one of" line.
+    use kube::CustomResourceExt;
+    let crd = serde_json::to_value(kopiur_api::SnapshotPolicy::crd()).unwrap();
+    let source: k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps =
+        serde_json::from_value(
+            crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+                ["properties"]["sources"]["items"]
+                .clone(),
+        )
+        .expect("the sources item schema");
+
+    let variants = cel_exclusive_variants(&source)
+        .expect("the shipped `sources[]` schema must carry a parseable exactly-one-of rule");
+    assert_eq!(
+        variants,
+        vec!["nfs", "pvc", "pvcSelector", "stream"],
+        "every wire-form source must appear in the generated union intro"
+    );
+    // And each named variant is a real property on the node, not just a token in
+    // the rule text — that is what makes the rendered intro trustworthy.
+    let props = source.properties.as_ref().expect("source properties");
+    for v in &variants {
+        assert!(props.contains_key(v), "`{v}` must be a real property");
+    }
+    let intro = union_intro(&source).expect("a union intro");
+    assert!(intro.contains("`stream`"), "got: {intro}");
 }
 
 #[test]

@@ -112,12 +112,13 @@ Every field is optional and Kopiur adds no defaults of its own. Leaving a field 
 
 ### `storageStats`
 
-Repository-wide storage figures from the last catalog scan.
+Repository-wide storage figures.
 
-- `snapshotCount` is the total number of snapshots in the repository, across all identities.
-- `totalSize` is the total on-disk size in human-readable form, such as `412Gi`.
-- `lastObservedAt` is the RFC 3339 timestamp when these figures were last seen.
-- `indexBlobCount` is the number of content-index blobs seen at the last bootstrap. Kopia compacts these during maintenance. A count that climbs without limit means maintenance is not keeping up, and crossing `spec.health.indexBlobWarnThreshold` raises the `IndexBlobHealth` warning. It is also the `IndexBlobs` print column.
+- `snapshotCount` is the total number of snapshots in the repository, across all identities, from the last catalog scan.
+- `totalSize` is the total on-disk size in human-readable form, such as `412Gi`, from the last catalog scan.
+- `lastObservedAt` is the RFC 3339 timestamp when the catalog-scan figures above were last seen.
+- `indexBlobCount` is the number of content-index blobs. Unlike the fields above, this is **not** only a catalog-scan figure: it is observed at bootstrap and re-observed after each successful maintenance run, and the newer observation wins — so it can reflect a post-maintenance compaction that happened well after the last catalog scan. Kopia compacts these during maintenance. A count that climbs without limit means maintenance is not keeping up, and crossing `spec.health.indexBlobWarnThreshold` raises the `IndexBlobHealth` warning. It is also the `IndexBlobs` print column.
+- `indexBlobCountAt` is the RFC 3339 timestamp `indexBlobCount` was observed. It is distinct from `lastObservedAt`: a bootstrap observation keeps its stamp while the count is unchanged, while a post-maintenance recount always carries its own fresh instant, which is what lets the reconciler tell the two kinds of observation apart.
 
 ### `parameters`
 

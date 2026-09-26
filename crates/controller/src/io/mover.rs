@@ -9,7 +9,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector, OwnerReference};
 use kube::api::{DeleteParams, ListParams, PostParams};
 use kube::core::ObjectMeta;
 use kube::{Api, ResourceExt};
@@ -17,7 +17,7 @@ use kube::{Api, ResourceExt};
 use kopiur_api::common::{InheritSecurityContextFrom, MoverSpec, PodSelector};
 use kopiur_api::secctx_compat::{is_managed_by_kopiur, pod_mounts_claim};
 
-use crate::consts::PRIVILEGED_MOVERS_ANNOTATION;
+use crate::consts::{PRIVILEGED_MOVERS_ANNOTATION, STREAM_EXEC_ANNOTATION};
 use crate::error::{Error, Result};
 
 /// Apply a mover run's objects (server-side): the `Job` (which carries the
@@ -248,6 +248,20 @@ pub fn build_mover_rolebinding(
 /// `FailedCreate`s with `serviceaccount ... not found` and never schedules a pod).
 /// The objects are kopiur-managed and shared across all mover Jobs in the
 /// namespace (no owner reference, so deleting one Snapshot does not revoke them).
+///
+/// **Nothing reaps these**, deliberately: they are shared per-namespace
+/// infrastructure, the operator holds no `delete` on `serviceaccounts` or
+/// `rolebindings` (see `deploy/rbac/operator-clusterrole.yaml` — granting it would
+/// be cluster-wide SA deletion), and a reap keyed on "no consumer remains" would
+/// flap against a GitOps prune-then-apply cycle. For the generic and
+/// snapshot-replication movers the residue is inert: the SA holds only status-patch
+/// verbs.
+///
+/// For the STREAM mover it is not inert — the residue IS the `pods/exec` privilege,
+/// and it outlives both the policy and the namespace opt-in annotation. Withdrawing
+/// that opt-in stops new stream Jobs; it does not take the grant back. That is a
+/// documented, explicit two-command revoke (`docs/stream-sources.md`
+/// "Revoking the opt-in", `docs/rbac.md`), NOT something this function undoes.
 pub async fn ensure_mover_rbac(
     client: &kube::Client,
     ns: &str,
@@ -306,18 +320,14 @@ fn wi_rolebinding_named(prefix: &str, wi_sa: &str) -> String {
 
 /// Derive the dedicated snapshot-replication mover role/ServiceAccount name
 /// from the configured generic mover role name (`ctx.mover_clusterrole`, the
-/// chart's `<fullname>-mover`). The default `kopiur-mover` yields
+/// chart's `<moverBaseName>-mover`). The default `kopiur-mover` yields
 /// `kopiur-snapshot-replication-mover` — the exact name `cargo xtask gen-rbac`
 /// ships and the Helm `kopiur.snapshotReplicationMoverName` helper renders, so
 /// the runtime RoleBinding always references the role the install actually
-/// carries. A custom role name without the `-mover` suffix gets a plain
-/// `-snapshot-replication` suffix (a deliberate, documented derivation — there
-/// is no separate config knob).
+/// carries. See [`derived_mover_name`] for the shared scheme (and for what a
+/// custom role name without the `-mover` suffix yields).
 pub fn snapshot_replication_mover_name(base: &str) -> String {
-    match base.strip_suffix("-mover") {
-        Some(stem) => format!("{stem}-snapshot-replication-mover"),
-        None => format!("{base}-snapshot-replication"),
-    }
+    derived_mover_name(base, SNAPSHOT_REPLICATION_MOVER_SUFFIX)
 }
 
 /// Resolve the identity the **snapshot-replication** mover Job runs as and
@@ -383,6 +393,298 @@ pub async fn ensure_snapshot_replication_mover_identity(
         service_account: Some(sa_name),
         azure_workload_identity: azure,
     })
+}
+
+/// Distinguishing suffix of the dedicated stream-source mover identity, as the
+/// chart's `kopiur.streamMoverName` helper appends it.
+const STREAM_MOVER_SUFFIX: &str = "stream-mover";
+
+/// Distinguishing suffix of the dedicated snapshot-replication mover identity, as
+/// the chart's `kopiur.snapshotReplicationMoverName` helper appends it. The
+/// LONGEST suffix in the family, so it sets the chart's stem cap
+/// ([`MOVER_BASE_NAME_MAX`]).
+const SNAPSHOT_REPLICATION_MOVER_SUFFIX: &str = "snapshot-replication-mover";
+
+/// The 63-byte DNS-1123 label limit every generated mover name must fit.
+const DNS_LABEL_MAX: usize = 63;
+
+/// The chart's `kopiur.moverBaseName` cap: 63 minus the longest suffix any mover
+/// helper appends (`-snapshot-replication-mover`, 27 bytes). The chart caps the
+/// **stem** at this and then appends whole suffixes, so no suffix is ever
+/// truncated away and `kopiur.moverName` is exactly `<stem>-mover` — which is what
+/// lets [`derived_mover_name`] recover the stem losslessly from
+/// `KOPIUR_MOVER_CLUSTERROLE`.
+pub const MOVER_BASE_NAME_MAX: usize =
+    DNS_LABEL_MAX - (SNAPSHOT_REPLICATION_MOVER_SUFFIX.len() + 1);
+
+/// Sprig's `trunc <limit> | trimSuffix "-"`, in Rust.
+///
+/// Helm's `trunc` slices BYTES, and `trimSuffix "-"` removes ONE trailing dash so
+/// a cut that lands on a separator does not leave an invalid name. A multi-byte
+/// name is cut at the last char boundary at or below `limit` instead of splitting
+/// a code point, because a Rust panic here would take down the reconcile and
+/// Kubernetes rejects non-ASCII names anyway.
+fn trunc_trim(name: &str, limit: usize) -> &str {
+    let mut end = name.len().min(limit);
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &name[..end];
+    cut.strip_suffix('-').unwrap_or(cut)
+}
+
+/// The shared naming scheme for every DEDICATED mover identity, derived from the
+/// generic mover role name (`KOPIUR_MOVER_CLUSTERROLE`, the chart's
+/// `<moverBaseName>-mover`) by swapping the `-mover` suffix for `suffix`.
+///
+/// **Why the cap lives on the STEM, not on the finished name.** The suffix is the
+/// only thing that separates the `pods/exec`-carrying stream role from the generic
+/// mover role. Capping the finished name (what this did before) truncates the
+/// suffix away at long release names, and then two roles that must never share an
+/// identity collapse onto one: at `fullname` 58-61 the controller derived the
+/// GENERIC mover name for a stream Job — no "role not found" breadcrumb, just the
+/// stream Job running on the ServiceAccount every ordinary mover Job uses — and at
+/// 62-63 the chart itself rendered the stream role and the generic mover role under
+/// ONE object name, so whichever template rendered last decided whether every
+/// ordinary mover Job in every namespace got `pods/exec`.
+///
+/// So the chart caps the stem at [`MOVER_BASE_NAME_MAX`] and appends whole
+/// suffixes. `<stem>-mover` then strips losslessly here, the stem is already short
+/// enough for every suffix, and chart and controller agree byte-for-byte at every
+/// `fullname` length — no truncation happens on this path at all.
+///
+/// The truncating branch is only reachable for a hand-set
+/// `KOPIUR_MOVER_CLUSTERROLE` long enough that even the stem overflows (there is no
+/// separate config knob per mover). It keeps the suffix whole and spends the
+/// reclaimed room on a stable FNV-1a hash of the stem — `<stem'>-<h8>-<suffix>` —
+/// so two long custom names stay distinct, the result stays under the label limit,
+/// and the length arithmetic makes it unable to collide with `base` itself. An
+/// operator on that path ships their own roles, so only mutual distinctness
+/// matters, not agreement with the chart.
+fn derived_mover_name(base: &str, suffix: &str) -> String {
+    let stem = base.strip_suffix("-mover").unwrap_or(base);
+    let budget = DNS_LABEL_MAX - (suffix.len() + 1);
+    if stem.len() <= budget {
+        return format!("{stem}-{suffix}");
+    }
+    let hash = crate::naming::short_hash(stem); // 8 hex chars, stable across toolchains
+    let keep = budget.saturating_sub(hash.len() + 1); // room for "-<hash>"
+    format!("{}-{hash}-{suffix}", trunc_trim(stem, keep))
+}
+
+/// The dedicated stream-source mover identity's name, derived from the generic
+/// mover role name the same way [`snapshot_replication_mover_name`] is.
+///
+/// Keep in lockstep with the chart's `kopiur.streamMoverName` helper: the
+/// controller derives the roleRef from `KOPIUR_MOVER_CLUSTERROLE`, so renaming
+/// either side alone leaves the RoleBinding pointing at a role that does not
+/// exist — or, worse, at the GENERIC mover role, which resolves cleanly and hands
+/// the stream Job the ServiceAccount every ordinary mover Job runs as. See
+/// [`derived_mover_name`] for the scheme and why the cap sits on the stem; pinned
+/// against the template by a unit test that sweeps every `fullname` length.
+pub fn stream_mover_name(base: &str) -> String {
+    derived_mover_name(base, STREAM_MOVER_SUFFIX)
+}
+
+/// Resolve the identity a STREAM-SOURCE mover Job runs as and ensure its RBAC —
+/// the dedicated-SA sibling of [`ensure_mover_identity`].
+///
+/// This mover holds `pods/exec` in the workload namespace, which the generic
+/// `kopiur-mover` role must never hold: every ordinary mover Job in the namespace
+/// runs as that SA, so granting it there would let any backup Job run arbitrary
+/// commands in any pod in the namespace. So a stream Job runs as its own
+/// `…-stream-mover` ServiceAccount bound to the equally dedicated role, minted here
+/// per namespace exactly like the generic and snapshot-replication pairs.
+///
+/// Workload-identity backends still win the SA choice (the cloud federation names
+/// the SA the pod must run as); the dedicated role is then bound to the user's SA
+/// under a distinct `kopiur-stream-mover-wi-<sa>` binding name — RoleBinding
+/// `roleRef` is immutable, so reusing the generic `kopiur-mover-wi-<sa>` binding
+/// would 422 whenever both movers share one WI ServiceAccount.
+pub async fn ensure_stream_mover_identity(
+    client: &kube::Client,
+    ns: &str,
+    backends: &[&kopiur_api::backend::Backend],
+    mover_role_base: &str,
+    role_kind: &str,
+) -> Result<MoverRunIdentity> {
+    use kopiur_api::creds::{WorkloadIdentityCloud, backend_workload_identity};
+    let dedicated = stream_mover_name(mover_role_base);
+    let wi: Vec<_> = backends
+        .iter()
+        .filter_map(|b| backend_workload_identity(b))
+        .collect();
+    let Some((first, first_cloud)) = wi.first() else {
+        ensure_mover_rbac(client, ns, &dedicated, role_kind, &dedicated).await?;
+        return Ok(MoverRunIdentity {
+            service_account: Some(dedicated),
+            azure_workload_identity: false,
+        });
+    };
+    let sa_name = first.service_account_name.clone();
+    let azure = wi
+        .iter()
+        .any(|(_, cloud)| *cloud == WorkloadIdentityCloud::Azure);
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), ns);
+    if sa_api
+        .get_opt(&sa_name)
+        .await
+        .map_err(Error::Kube)?
+        .is_none()
+    {
+        return Err(Error::MissingDependency(
+            missing_workload_identity_sa_message(&sa_name, ns, *first_cloud, WI_CONSUMER_MOVER),
+        ));
+    }
+    let mut rb = build_mover_rolebinding(ns, &sa_name, role_kind, &dedicated);
+    rb.metadata.name = Some(wi_rolebinding_named("kopiur-stream-mover-wi-", &sa_name));
+    let rb_name = rb.metadata.name.clone().unwrap_or_default();
+    let rb_api: Api<RoleBinding> = Api::namespaced(client.clone(), ns);
+    apply(&rb_api, &rb_name, &rb).await?;
+    Ok(MoverRunIdentity {
+        service_account: Some(sa_name),
+        azure_workload_identity: azure,
+    })
+}
+
+/// The stream-exec opt-in state of a namespace — and, when it cannot be
+/// determined, the fact that it could not be.
+///
+/// A three-state enum rather than a `bool`, because "not opted in" and "we are
+/// not allowed to look" are different refusals with different fixes, and
+/// collapsing them produced a message telling a namespaced-install admin to
+/// annotate a namespace the operator will never be able to read. Matched
+/// exhaustively at both call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamExecOptIn {
+    /// The namespace carries `<annotation>=true`.
+    Allowed,
+    /// The namespace is readable and has NOT opted in.
+    NotAnnotated,
+    /// The operator cannot read Namespaces at all (403). Refused — see
+    /// [`namespace_stream_exec_opt_in`] for why this one fails CLOSED.
+    Undeterminable,
+}
+
+/// The stream-source opt-in state of `ns`.
+///
+/// The guard exists because a stream source is an RBAC escalation: anyone who can
+/// write a `SnapshotPolicy` in `ns` could otherwise cause arbitrary commands to run
+/// in any pod in `ns`, without themselves holding `pods/exec`. Kubernetes separates
+/// that verb deliberately; this keeps that separation meaningful.
+///
+/// # A DELIBERATE divergence from [`namespace_allows_privileged_movers`]
+///
+/// That check fails **OPEN** on a 403, and the reasoning is sound for what it
+/// guards: a namespaced install cannot read Namespaces, it is already confined to
+/// admin-selected namespaces, and the thing being granted is an elevated
+/// *container* inside a Job the operator already runs there.
+///
+/// `pods/exec` in a namespace is a materially larger grant than an elevated
+/// container. It is arbitrary code execution in EVERY pod in the namespace,
+/// including pods the operator has nothing to do with, and it is minted onto a
+/// long-lived ServiceAccount that outlives the Job. Failing open would hand that
+/// out on the strength of an inference ("we cannot read Namespaces, so this must
+/// be a namespaced install") that the operator cannot actually verify — a 403 on
+/// `namespaces get` can equally be a misconfigured cluster-scoped install, or an
+/// admission/authorization layer the admin added on purpose. So this one fails
+/// CLOSED, and [`stream_exec_opt_in_unreadable_message`] tells the admin exactly
+/// which of the two grants to make.
+pub async fn namespace_stream_exec_opt_in(
+    client: &kube::Client,
+    ns: &str,
+) -> Result<StreamExecOptIn> {
+    use k8s_openapi::api::core::v1::Namespace;
+    let api: Api<Namespace> = Api::all(client.clone());
+    match api.get(ns).await {
+        Ok(namespace) => Ok(stream_exec_opt_in_of(&namespace)),
+        Err(kube::Error::Api(e)) if e.code == 403 => {
+            tracing::warn!(
+                namespace = ns,
+                "cannot read namespace to check the stream-exec opt-in (operator lacks \
+                 namespaces:get); REFUSING the stream mover — `pods/exec` is too large a \
+                 grant to hand out on an unverifiable inference"
+            );
+            Ok(StreamExecOptIn::Undeterminable)
+        }
+        Err(e) => Err(Error::Kube(e)),
+    }
+}
+
+/// The opt-in a READABLE Namespace declares. Pure, so the annotation parsing is
+/// unit-tested without a cluster (thin IO over a tested pure fn).
+///
+/// Only the exact string `"true"` opts in: `"True"`, `"1"` and `"yes"` do not.
+/// Deliberately strict — this annotation gates `pods/exec`, and an admin who
+/// typo'd it should see the refusal rather than accidentally grant it.
+pub fn stream_exec_opt_in_of(ns: &k8s_openapi::api::core::v1::Namespace) -> StreamExecOptIn {
+    if ns
+        .annotations()
+        .get(STREAM_EXEC_ANNOTATION)
+        .is_some_and(|v| v == "true")
+    {
+        StreamExecOptIn::Allowed
+    } else {
+        StreamExecOptIn::NotAnnotated
+    }
+}
+
+/// The refusal message for an opt-in state, or `None` when the stream mover may
+/// run. **Pure** and EXHAUSTIVE, so a new opt-in state cannot compile until it
+/// decides whether it permits `pods/exec` — and so both the `SnapshotPolicy` and
+/// the `Restore` gate reach that decision through the same function rather than
+/// two hand-written matches that can disagree.
+pub fn stream_exec_refusal(
+    state: StreamExecOptIn,
+    kind: &str,
+    name: &str,
+    ns: &str,
+    mover_sa: &str,
+) -> Option<String> {
+    match state {
+        StreamExecOptIn::Allowed => None,
+        StreamExecOptIn::NotAnnotated => {
+            Some(stream_exec_not_allowed_message(kind, name, ns, mover_sa))
+        }
+        StreamExecOptIn::Undeterminable => {
+            Some(stream_exec_opt_in_unreadable_message(kind, name, ns))
+        }
+    }
+}
+
+/// The actionable message for a stream source refused in a namespace that has not
+/// opted in (what / why / how-to-fix). Pure so the exact text is unit-asserted.
+pub fn stream_exec_not_allowed_message(kind: &str, name: &str, ns: &str, mover_sa: &str) -> String {
+    format!(
+        "{kind} `{name}` uses a `stream` source, which execs a command inside a running pod in \
+         namespace `{ns}`, but that namespace has not opted in. Anyone able to write a {kind} in \
+         `{ns}` could otherwise run arbitrary commands in any pod there without holding \
+         `pods/exec` themselves, and the minted `{mover_sa}` ServiceAccount would carry that \
+         permission for the whole namespace. Fix: a cluster admin runs `kubectl annotate \
+         namespace {ns} {STREAM_EXEC_ANNOTATION}=true`, or use a PVC source instead."
+    )
+}
+
+/// The actionable message for a stream source refused because the operator cannot
+/// read the Namespace to check the opt-in at all. Pure so the exact text is
+/// unit-asserted.
+///
+/// Names BOTH fixes, because the admin's situation decides which one applies: a
+/// namespaced-scope install needs the cluster-scoped `namespaces get` added, while
+/// a cluster-scoped install that is getting a 403 has something else denying it.
+pub fn stream_exec_opt_in_unreadable_message(kind: &str, name: &str, ns: &str) -> String {
+    format!(
+        "{kind} `{name}` uses a `stream` source, but kopiur cannot read Namespace `{ns}` to \
+         check the `{STREAM_EXEC_ANNOTATION}` opt-in (the API server returned 403), so it \
+         refuses to mint the `pods/exec` permission the stream mover needs. Unlike the \
+         elevated-mover check, this one fails CLOSED on purpose: `pods/exec` in `{ns}` is \
+         arbitrary code execution in every pod there, carried on a ServiceAccount that \
+         outlives the Job, and kopiur cannot verify from a 403 alone that handing it out is \
+         safe. Fix: grant the kopiur operator ServiceAccount `get` on the cluster-scoped \
+         `namespaces` resource (a namespaced-scope install has no such rule by default), or \
+         deploy kopiur cluster-scoped — stream sources require the opt-in to be readable. \
+         Otherwise use a PVC source, which needs neither."
+    )
 }
 
 /// 8-hex-char content hash for name truncation (same idiom as the
@@ -614,18 +916,97 @@ pub async fn namespace_allows_privileged_movers(client: &kube::Client, ns: &str)
     }
 }
 
+/// Which authored layer of the mover ladder
+/// (`moverDefaults ⊂ inherited ⊂ recipe.mover ⊂ invocation.mover`) made the mover
+/// elevated, so the privileged-mover refusal names the object that actually carries
+/// the elevation.
+///
+/// #464 is why this exists. Once a per-run `Snapshot.spec.mover` became the common
+/// source of elevation, a refusal that always named the `SnapshotPolicy` sent the
+/// operator to a spec containing nothing elevated — so they reached for the only
+/// other fix the message offered, `kubectl annotate namespace … privileged-movers`,
+/// permanently granting EVERY future backup in that namespace the right to run
+/// privileged in order to unblock one ad-hoc run.
+///
+/// An enum with an exhaustive `match` at the call site rather than a `&str`, so a
+/// future layer cannot be added without every refusal deciding what it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElevationLayer {
+    /// The invocation's own `spec.mover` — a per-run `Snapshot.spec.mover` (#464).
+    Invocation,
+    /// The recipe's `spec.mover` (`SnapshotPolicy`, `Restore`, `Maintenance`).
+    Recipe,
+    /// The repository's `spec.moverDefaults`.
+    RepositoryDefaults,
+    /// No single authored layer is elevated on its own: the elevation was inherited
+    /// from a workload pod via `mover.inheritSecurityContextFrom`, or assembled
+    /// across layers that are each benign alone. The recipe is then where to pin
+    /// it, and the message says so without claiming the recipe carries it.
+    Composed,
+}
+
+/// Attribute a refused elevation to the most specific authored layer that is
+/// elevated **on its own**, invocation → recipe → repository defaults.
+///
+/// Pure, and advisory only: the gate still evaluates the MERGED mover, so this can
+/// never widen or narrow what is refused — it only decides which object the message
+/// tells the operator to edit.
+pub fn attribute_elevation(
+    invocation: bool,
+    recipe: bool,
+    repository_defaults: bool,
+) -> ElevationLayer {
+    if invocation {
+        ElevationLayer::Invocation
+    } else if recipe {
+        ElevationLayer::Recipe
+    } else if repository_defaults {
+        ElevationLayer::RepositoryDefaults
+    } else {
+        ElevationLayer::Composed
+    }
+}
+
+/// Whether a repository's `moverDefaults` is elevated **on its own** — the
+/// `RepositoryDefaults` input to [`attribute_elevation`]. `moverDefaults` carries no
+/// `privilegedMode` knob, so only the two security contexts can raise it.
+pub fn mover_defaults_require_privilege(
+    defaults: Option<&kopiur_api::common::MoverDefaults>,
+) -> bool {
+    defaults.is_some_and(|d| {
+        kopiur_api::common::requires_privilege_resolved(
+            d.security_context.as_ref(),
+            d.pod_security_context.as_ref(),
+            None,
+        )
+    })
+}
+
 /// The actionable message for a privileged mover refused in a namespace that has
 /// not opted in (what / why / how-to-fix). Pure so the exact text is unit-asserted.
-/// `kind` is the owning resource's kind (e.g. `SnapshotPolicy`, `Restore`) and `name`
-/// its name, so the message names the right object to fix.
-pub fn privileged_mover_message(kind: &str, name: &str, ns: &str, mover_sa: &str) -> String {
+///
+/// `kind`/`name` identify the object that CARRIES the elevation (see
+/// [`attribute_elevation`]) and `field` the spec path inside it — `spec.mover` on an
+/// invocation or recipe, `spec.moverDefaults` on a repository. Naming the merged
+/// result's recipe regardless would point the operator at a spec with nothing
+/// elevated in it, and the only other fix on offer is a permanent namespace-wide
+/// grant. The spec-edit fix is therefore stated FIRST, and the annotation is labelled
+/// for what it is.
+pub fn privileged_mover_message(
+    kind: &str,
+    name: &str,
+    field: &str,
+    ns: &str,
+    mover_sa: &str,
+) -> String {
     format!(
-        "{kind} `{name}` requests a privileged mover (e.g. `runAsUser: 0`, `privileged: true`, \
+        "the mover for this run is privileged (e.g. `runAsUser: 0`, `privileged: true`, \
          added capabilities, or `privilegedMode`), but namespace `{ns}` has not opted in — a \
-         tenant with access to `{ns}` could reuse the minted `{mover_sa}` ServiceAccount at that \
-         privilege. Fix: a cluster admin runs `kubectl annotate namespace {ns} \
-         {PRIVILEGED_MOVERS_ANNOTATION}=true`, or remove the elevated securityContext/\
-         privilegedMode from the {kind} `spec.mover`."
+         tenant with access to `{ns}` could reuse the minted `{mover_sa}` ServiceAccount at \
+         that privilege. The elevation comes from {kind} `{name}` `{field}`. Fix: remove the \
+         elevated securityContext/privilegedMode there; or, to allow it for EVERY mover in \
+         namespace `{ns}` from now on, a cluster admin runs `kubectl annotate namespace {ns} \
+         {PRIVILEGED_MOVERS_ANNOTATION}=true`."
     )
 }
 
@@ -1061,6 +1442,311 @@ pub async fn ensure_cache_pvc(
     }
 }
 
+/// How a **live-pod** `mover.inheritSecurityContextFrom` names its source, rendered for a
+/// human: the label selector that was queried, or the source PVC whose consumer was hunted.
+///
+/// `None` for the modes this hold does not cover — the restore-only `snapshot` variant (whose
+/// unresolvable case is the `MissingRecordedIdentity` hold, reported by the restore
+/// reconciler) and a `pvcConsumer` on a run that has no source PVC at all (a spec error, not
+/// an absent workload: telling that user to "scale the workload up" would be a wrong answer).
+/// A `None` therefore means "leave this error exactly as it propagates today".
+pub(crate) fn live_inherit_source_label(
+    inherit: Option<&InheritSecurityContextFrom>,
+    source_pvc: Option<&str>,
+) -> Option<String> {
+    // Exhaustive over the variants (the type-safety thesis): a new inherit mode must be
+    // classified here deliberately rather than silently inheriting the `snapshot` arm's
+    // leave-it-alone behavior.
+    match inherit? {
+        InheritSecurityContextFrom::WorkloadSelector(sel) => {
+            let query = label_selector_to_string(&sel.pod_selector);
+            Some(if query.is_empty() {
+                "workloadSelector with an EMPTY podSelector".to_string()
+            } else {
+                format!("workloadSelector `{query}`")
+            })
+        }
+        InheritSecurityContextFrom::PvcConsumer(_) => {
+            source_pvc.map(|claim| format!("pvcConsumer of source PVC `{claim}`"))
+        }
+        InheritSecurityContextFrom::Snapshot(_) => None,
+    }
+}
+
+/// The condition/Event message for the `SecurityContextResolved=False` hold (#464): what
+/// happened, why the run is HELD rather than proceeding, and how long it will wait.
+///
+/// `source` is [`live_inherit_source_label`]'s rendering, so the selector that matched
+/// nothing is always named — the reporter's point in #464 was that a warning naming the
+/// selector is worth more than any override.
+///
+/// **The REMEDIATION is `cause`'s job, not this wrapper's.** `cause` is the resolver's own
+/// actionable sentence, and those sentences already name the levers that apply to the case
+/// they diagnose — and they must keep doing so, because the same strings are the
+/// `MissingDependency` text on the *fallback* path, where no wrapper runs. Restating them
+/// here produced a ~1050-character message that said each lever twice, two of them nearly
+/// verbatim, and offered "bring the workload back up" for an empty `podSelector`, where the
+/// workload is fine. One owner: the cause. This wrapper contributes framing (what resolved
+/// nothing, why that HOLDS rather than proceeding) and the park/re-check contract.
+///
+/// Pure and byte-stable: it rides a 300s requeue, so a volatile byte here would re-write
+/// status on every pass, wake the primary watch and hot-loop the reconciler.
+pub fn inherit_source_missing_message(source: &str, cause: &str) -> String {
+    format!(
+        "mover.inheritSecurityContextFrom ({source}) resolved no securityContext to inherit, \
+         and this recipe pins no fallback identity — so the run is HELD rather than run as the \
+         wrong UID. {} The run stays `Pending` and re-checks every few minutes; it starts by \
+         itself once that is fixed, with no re-apply.",
+        end_sentence(cause)
+    )
+}
+
+/// `text` with a terminating `.` added when it does not already end in sentence punctuation.
+///
+/// The resolver causes are not uniform: two end in a full stop, but the empty-selector one
+/// ends `(UID/GID match)` and the missing-container one ends in a backticked field name. Both
+/// ran on into the next sentence of the composed hold message.
+fn end_sentence(text: &str) -> String {
+    let trimmed = text.trim_end();
+    if trimmed.ends_with(['.', '!', '?', ':']) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.")
+    }
+}
+
+/// The `status.conditions` array of a SERIALIZED custom resource, as typed conditions.
+///
+/// The gate park below is generic over `Snapshot`/`Restore` (one writer, two reconcilers), and
+/// neither `kube::Resource` nor any trait in this repo exposes `status.conditions` — so the
+/// live object is read back through JSON. A single unparseable entry is DROPPED with a warning
+/// rather than failing the whole extraction: returning an empty vec on one malformed condition
+/// would make the upsert REPLACE (and so erase) every healthy condition beside it.
+pub(crate) fn conditions_from_status(status: Option<&serde_json::Value>) -> Vec<Condition> {
+    let Some(items) = status
+        .and_then(|s| s.get("conditions"))
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| match serde_json::from_value::<Condition>(item.clone()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "conditions: skipping an unparseable status condition");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Park a `Snapshot`/`Restore` on the `SecurityContextResolved=False` hold (#464): write the
+/// registered gate condition at `phase: Pending` and fire ONE Warning Event per transition.
+///
+/// Generic over the two work kinds on purpose — the hold is identical on both, and two
+/// hand-written copies is exactly how a reason drifts on one side only.
+///
+/// Two properties are load-bearing, both learned the hard way elsewhere in this crate:
+///
+/// - the conditions array is built from a LIVE re-read ([`super::live_conditions_source`]),
+///   because a `conditions` merge patch REPLACES the array — a second writer in the same
+///   reconcile that builds from the stale in-memory copy silently erases the first one's
+///   condition;
+/// - the Event fires only when [`super::patch_status_if_changed`] reports a real write, so the
+///   300s structural requeue cannot re-fire an identical Warning forever.
+pub async fn park_on_inherit_source_missing<K>(
+    api: &Api<K>,
+    obj: &K,
+    ctx: &crate::context::Context,
+    message: &str,
+) -> Result<()>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+{
+    let name = obj.name_any();
+    let Some(live) = super::live_conditions_source(api, &name, obj).await else {
+        return Ok(()); // deleted mid-reconcile
+    };
+    let status = serde_json::to_value(&live)
+        .ok()
+        .and_then(|v| v.get("status").cloned());
+    let conditions = super::upsert_gate(
+        &conditions_from_status(status.as_ref()),
+        &kopiur_api::gates::INHERIT_SOURCE_MISSING_GATE,
+        message,
+        obj.meta().generation,
+    );
+    if super::patch_status_if_changed(
+        api,
+        &name,
+        status.as_ref(),
+        serde_json::json!({ "phase": "Pending", "conditions": conditions }),
+    )
+    .await?
+    {
+        super::publish_warning_event(
+            ctx,
+            obj,
+            kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON,
+            crate::consts::SCALE_WORKLOAD_OR_PIN_MOVER_UID_ACTION,
+            message,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// Clear a standing `<condition>=False` on a `Snapshot`/`Restore` whose blocker is
+/// now gone — the shared shape behind the `MoverPermitted` and
+/// `CredentialsAvailable` clears on both work kinds.
+///
+/// Two-stage on purpose, the [`crate::snapshot::clear_source_pvc_gate_if_parked`]
+/// discipline:
+/// 1. a cheap pre-check on the reconcile-start copy, so the overwhelming majority
+///    of runs (which never tripped the gate) pay no live GET and write nothing at
+///    all; then
+/// 2. a live re-read as the patch BASE and a re-check against it, because a
+///    `conditions` patch REPLACES the array and this clear is never the first
+///    conditions writer of its pass — the #464 inherit heal runs ahead of it, and
+///    seeding from the start-of-pass copy would resurrect the hold onto a run that
+///    has already resolved its securityContext. That resurrection is precisely what
+///    made `kubectl kopiur doctor` name a scaled-up workload as the blocker while
+///    the real one (a missing Secret) sat one slot later in the same array.
+///
+/// Returns without writing when the object vanished mid-reconcile.
+pub async fn clear_work_condition_if_stale<K>(
+    api: &Api<K>,
+    obj: &K,
+    condition: &str,
+    reason: &str,
+    message: &str,
+) -> Result<()>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+{
+    let stale = super::conditions_from_status(
+        serde_json::to_value(obj)
+            .ok()
+            .and_then(|v| v.get("status").cloned())
+            .as_ref(),
+    );
+    if !condition_is_not_true(&stale, condition) {
+        return Ok(());
+    }
+    let name = obj.name_any();
+    let Some(live) = super::live_conditions_source(api, &name, obj).await else {
+        return Ok(()); // deleted mid-reconcile
+    };
+    let existing = super::conditions_from_status(
+        serde_json::to_value(&live)
+            .ok()
+            .and_then(|v| v.get("status").cloned())
+            .as_ref(),
+    );
+    if !condition_is_not_true(&existing, condition) {
+        return Ok(());
+    }
+    let conditions = super::upsert_condition(
+        &existing,
+        condition,
+        true,
+        reason,
+        message,
+        obj.meta().generation,
+    );
+    super::patch_status(api, &name, serde_json::json!({ "conditions": conditions })).await?;
+    Ok(())
+}
+
+/// Whether `conditions` carries `condition` at a non-`True` status — i.e. a stale
+/// block worth clearing. Pure, so both stages of
+/// [`clear_work_condition_if_stale`] agree by construction.
+pub(crate) fn condition_is_not_true(conditions: &[Condition], condition: &str) -> bool {
+    conditions
+        .iter()
+        .any(|c| c.type_ == condition && c.status != "True")
+}
+
+/// The conditions array that CLEARS a standing `SecurityContextResolved=False`, or `None` when
+/// no hold is standing (so the caller writes nothing at all and the status stays byte-identical
+/// to a run that was never held — the property that keeps this off the hot-loop).
+///
+/// Pure, so the guard is unit-tested directly. Same shape as
+/// [`crate::snapshot::slot_heal_conditions`], which heals the pool gate for the same reason.
+///
+/// Healing is not cosmetic. `kubectl kopiur doctor` suppresses a stale gate only for a
+/// TERMINAL phase, and the hold parks at `Pending` — so the very Snapshot that was held is the
+/// one that later goes `Running`, and without this it would carry `SecurityContextResolved=
+/// False` for the whole mover run (minutes on a small PVC, hours on a large first backup) while
+/// `doctor` insisted it was "blocked … it will wait forever however new it is". That is the
+/// exact inverse of the false diagnosis this condition was introduced to avoid, in the same
+/// tool.
+pub(crate) fn inherit_source_heal_conditions(
+    existing: &[Condition],
+    generation: Option<i64>,
+) -> Option<Vec<Condition>> {
+    let held = existing.iter().any(|c| {
+        c.type_ == kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION && c.status != "True"
+    });
+    if !held {
+        return None;
+    }
+    Some(super::upsert_condition(
+        existing,
+        kopiur_api::consts::SECURITY_CONTEXT_RESOLVED_CONDITION,
+        true,
+        kopiur_api::consts::INHERIT_SOURCE_RESOLVED_REASON,
+        "the mover securityContext resolved; the inherit hold has cleared",
+        generation,
+    ))
+}
+
+/// Clear a standing `SecurityContextResolved=False` on a `Snapshot`/`Restore` that has now
+/// resolved its mover securityContext — the healing half of
+/// [`park_on_inherit_source_missing`], which makes that row a BOTH-polarity gate writer.
+///
+/// Generic over the two work kinds, like the park. Reads the LIVE conditions rather than the
+/// reconcile-start copy: the caller is never the first conditions writer of its reconcile
+/// (the privileged-mover and credentials clears run around it), and a `conditions` patch
+/// REPLACES the array.
+///
+/// Writes NOTHING when no hold is standing ([`inherit_source_heal_conditions`] returns `None`),
+/// which is the overwhelmingly common case — so the heal costs one cached read and cannot churn
+/// `resourceVersion` on a healthy run.
+pub async fn heal_inherit_source_missing<K>(api: &Api<K>, obj: &K) -> Result<()>
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+{
+    let name = obj.name_any();
+    let Some(live) = super::live_conditions_source(api, &name, obj).await else {
+        return Ok(()); // deleted mid-reconcile
+    };
+    let status = serde_json::to_value(&live)
+        .ok()
+        .and_then(|v| v.get("status").cloned());
+    let Some(conditions) = inherit_source_heal_conditions(
+        &conditions_from_status(status.as_ref()),
+        obj.meta().generation,
+    ) else {
+        return Ok(());
+    };
+    super::patch_status(api, &name, serde_json::json!({ "conditions": conditions })).await?;
+    Ok(())
+}
+
 /// The mover's **recipe-layer** container AND pod security contexts, plus how they were
 /// arrived at. Each context is `None` when unset (the Job builder then applies the hardened
 /// container default and no pod context). The result feeds BOTH the privileged-mover gate and
@@ -1186,6 +1872,30 @@ pub async fn resolve_mover_security_contexts(
                 outcome: InheritOutcome::Fallback { reason },
                 unfiltered_pods: None,
             });
+        }
+        // A LIVE-pod inherit that resolved nothing, with NO pinned fallback (#464): the
+        // workload is scaled to zero, the selector matches nothing, the named container is
+        // absent, or the matched pod sets no context at all. This is a hold a human must
+        // clear, not a transient blip, so it gets its own typed error — the reconcilers park
+        // it behind the registered `SecurityContextResolved=False` gate on the slow structural
+        // cadence, with a message that NAMES the selector. Before #464 it propagated as a bare
+        // `MissingDependency`: a fast, condition-less retry loop with a generic message.
+        //
+        // `live_inherit_source_label` returning `None` is what keeps the OTHER unresolvable
+        // modes exactly as they are: the restore-only `snapshot` variant stays a
+        // `MissingDependency` so the restore reconciler's `MissingRecordedIdentity` arm still
+        // catches it, and a `pvcConsumer` with no source PVC at all stays one too (a spec
+        // error, where "scale the workload up" would be the wrong advice).
+        Err(Error::MissingDependency(reason)) => {
+            return match live_inherit_source_label(
+                m.inherit_security_context_from.as_ref(),
+                source_pvc,
+            ) {
+                Some(source) => Err(Error::InheritSourceMissing(inherit_source_missing_message(
+                    &source, &reason,
+                ))),
+                None => Err(Error::MissingDependency(reason)),
+            };
         }
         // Everything else propagates, including `Error::Kube` (e.g. a 403 listing pods).
         // A workload that isn't running is workload state; a broken API call is an operator

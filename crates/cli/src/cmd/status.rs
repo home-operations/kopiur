@@ -323,6 +323,7 @@ mod tests {
                     already_present: Some(88),
                     failed: Some(0),
                     pruned: Some(2),
+                    incomplete_skipped: None,
                 }),
                 problem: Some("destination repository not Ready".into()),
             }],

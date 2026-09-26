@@ -1,0 +1,445 @@
+//! Real-kopia integration coverage for the stdin-fed snapshot path.
+//!
+//! Gated behind the `integration` feature and `#[ignore]` by default so the
+//! hermetic `cargo test` never invokes the real binary. Run with:
+//!
+//! ```text
+//! cargo test -p kopiur-kopia --features integration --test integration_stdin
+//! ```
+//!
+//! These are the tests that pin the CORRECTNESS CLAIM the whole stream-source
+//! feature rests on: a producer that fails leaves NO snapshot, even when it had
+//! already written every byte. If kopia ever changed so that it committed a
+//! manifest before stdin reached EOF, `abort_after_full_payload_leaves_no_snapshot`
+//! is what would catch it — and a silent regression there would mean shipping
+//! truncated database dumps as successful backups.
+
+#![cfg(unix)]
+
+use std::collections::BTreeMap;
+
+use kopiur_kopia::{
+    ConnectSpec, KopiaClient, SnapshotCreateOptions, SnapshotCreateOutcome, SnapshotSource,
+    StdinOutcome, StdinSnapshot, StdinWriter,
+};
+use tokio::io::AsyncWriteExt;
+
+fn isolated_client(config_dir: &std::path::Path) -> KopiaClient {
+    KopiaClient::builder()
+        .binary("kopia")
+        .env("KOPIA_PASSWORD", "test1234")
+        .env(
+            "KOPIA_CONFIG_PATH",
+            config_dir.join("repository.config").display().to_string(),
+        )
+        .env(
+            "KOPIA_CACHE_DIRECTORY",
+            config_dir.join("cache").display().to_string(),
+        )
+        .env(
+            "KOPIA_LOG_DIR",
+            config_dir.join("logs").display().to_string(),
+        )
+        .env("KOPIA_CHECK_FOR_UPDATES", "false")
+        .build()
+}
+
+async fn fresh_repo(repo: &std::path::Path, config: &std::path::Path) -> KopiaClient {
+    let client = isolated_client(config);
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo.to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("create repository");
+    client
+}
+
+/// Commit path: bytes in, one virtual file out, byte-identical on the way back.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn stdin_snapshot_roundtrips_byte_identical() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    // Deliberately larger than any pipe buffer, and not newline-structured, so a
+    // chunking or text-mangling bug shows up as a hash mismatch.
+    let payload: Vec<u8> = (0..(3 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
+    let expected = payload.clone();
+
+    let outcome = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                // A generous but BOUNDED budget; the point of the field is
+                // that `child.wait()` is never unbounded (#451).
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            async |stdin: &mut StdinWriter<'_>| {
+                stdin.write_all(&payload).await.expect("write payload");
+                Ok(StdinOutcome::Commit {
+                    bytes: payload.len() as u64,
+                })
+            },
+        )
+        .await
+        .expect("stdin snapshot should succeed");
+
+    let result = match outcome {
+        SnapshotCreateOutcome::Created(r) => *r,
+        SnapshotCreateOutcome::Unchanged => panic!("a stdin snapshot is never 'unchanged'"),
+    };
+    // One regular file inside a virtual directory — the shape the restore path relies on.
+    let root = result
+        .root_entry
+        .expect("a stdin snapshot always has a root entry");
+    assert_eq!(root.summary.as_ref().map(|s| s.files), Some(1));
+
+    let root_obj = root.obj.clone();
+    let mut got: Vec<u8> = Vec::new();
+    client
+        .show_to(&format!("{root_obj}/dump.sql"), None, &mut got)
+        .await
+        .expect("show the stored file");
+    assert_eq!(got.len(), expected.len(), "restored length differs");
+    assert!(
+        got == expected,
+        "restored bytes differ from what was streamed in"
+    );
+}
+
+/// THE load-bearing test. The producer writes the COMPLETE payload and only then
+/// reports failure. Because kopia's stdin is still open, aborting must leave no
+/// manifest at all — "all bytes delivered" must never be the commit point.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn abort_after_full_payload_leaves_no_snapshot() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    let before = client.snapshot_list_all().await.expect("list before").len();
+
+    let err = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                // A generous but BOUNDED budget; the point of the field is
+                // that `child.wait()` is never unbounded (#451).
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            async |stdin: &mut StdinWriter<'_>| {
+                stdin
+                    .write_all(b"a complete and perfectly valid looking dump\n")
+                    .await
+                    .expect("write payload");
+                // stdin is deliberately NOT closed: the runner owns it and closes it
+                // only AFTER killing kopia, which is what guarantees kopia never
+                // reaches EOF and never writes a manifest.
+                Ok(StdinOutcome::Abort)
+            },
+        )
+        .await
+        .expect_err("an aborted producer must fail the snapshot");
+
+    assert!(
+        matches!(err, kopiur_kopia::KopiaError::StdinProducerFailed { .. }),
+        "expected StdinProducerFailed, got {err:?}"
+    );
+
+    let after = client.snapshot_list_all().await.expect("list after");
+    assert_eq!(
+        after.len(),
+        before,
+        "aborting the producer must leave NO snapshot manifest behind, found {after:#?}"
+    );
+    assert!(
+        !after.iter().any(|e| e.source.path == "/stream/dump.sql"),
+        "no snapshot may exist for the aborted source"
+    );
+}
+
+/// A producer whose own error propagates: same guarantee, different arm of the
+/// runner (`Err` rather than `Ok(Abort)`).
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn producer_error_propagates_and_leaves_no_snapshot() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    let err = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                // A generous but BOUNDED budget; the point of the field is
+                // that `child.wait()` is never unbounded (#451).
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            async |stdin: &mut StdinWriter<'_>| {
+                stdin.write_all(b"partial").await.expect("write");
+                Err(kopiur_kopia::KopiaError::EmptyOutput {
+                    context: "synthetic producer failure".to_string(),
+                    stderr_tail: String::new(),
+                })
+            },
+        )
+        .await
+        .expect_err("the producer's own error must fail the snapshot");
+    assert!(matches!(err, kopiur_kopia::KopiaError::EmptyOutput { .. }));
+
+    let after = client.snapshot_list_all().await.expect("list after");
+    assert!(after.is_empty(), "no snapshot may exist, found {after:#?}");
+}
+
+/// `--stdin-file` must reach the argv, and the recorded identity must be the
+/// operator-resolved one rather than the mover pod's ambient user/host.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn stdin_snapshot_records_the_overridden_identity() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/postgres.sql",
+                stdin_file: "postgres.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("bundlecop@k7:/stream/postgres.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                // A generous but BOUNDED budget; the point of the field is
+                // that `child.wait()` is never unbounded (#451).
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            async |stdin: &mut StdinWriter<'_>| {
+                stdin.write_all(b"SELECT 1;\n").await.unwrap();
+                Ok(StdinOutcome::Commit { bytes: 10 })
+            },
+        )
+        .await
+        .expect("snapshot");
+
+    let listed = client
+        .snapshot_list(Some(&SnapshotSource {
+            user_name: "bundlecop".into(),
+            host: "k7".into(),
+            path: "/stream/postgres.sql".into(),
+        }))
+        .await
+        .expect("list by identity");
+    assert_eq!(
+        listed.len(),
+        1,
+        "expected exactly one snapshot: {listed:#?}"
+    );
+    assert_eq!(listed[0].source.user_name, "bundlecop");
+    assert_eq!(listed[0].source.host, "k7");
+}
+
+/// The empty-dump decision (#451), settled deliberately rather than left to
+/// chance: a producer that exits SUCCESSFULLY having written zero bytes is
+/// treated as a FAILURE and commits nothing.
+///
+/// This case is reachable without any bug in kopiur: `pg_dump` exits 0 against
+/// an instance whose credentials see no databases, `mysqldump` exits 0 when its
+/// grants are empty, and `sh -c 'pg_dumpall | gzip'` reports only `gzip`'s
+/// status, so a dead first stage looks like success. Committing the result would
+/// put a zero-byte "restore point" into the repository that retention keeps and
+/// a restore would cheerfully write over a live database with.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn a_producer_that_writes_nothing_commits_no_snapshot() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    let err = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            // Writes NOTHING and reports success — the shape a silently-failed
+            // dump command has.
+            async |_stdin: &mut StdinWriter<'_>| Ok(StdinOutcome::Commit { bytes: 0 }),
+        )
+        .await
+        .expect_err("a zero-byte dump must not be committed");
+
+    assert!(
+        matches!(
+            err,
+            kopiur_kopia::KopiaError::StdinProducerWroteNothing { .. }
+        ),
+        "expected StdinProducerWroteNothing, got {err:?}"
+    );
+    // The message has to tell the operator what to actually change.
+    let msg = err.to_string();
+    assert!(msg.contains("wrote no data"), "{msg}");
+    assert!(msg.contains("workloadExec.command"), "{msg}");
+    assert!(msg.contains("pipefail"), "{msg}");
+
+    // And the safety property holds exactly as it does for an explicit Abort:
+    // kopia was killed with stdin still open, so no manifest exists.
+    let after = client.snapshot_list_all().await.expect("list after");
+    assert!(
+        after.is_empty(),
+        "an empty dump must leave NO snapshot manifest, found {after:#?}"
+    );
+}
+
+/// `show_to` now wraps `run_raw_streaming` rather than a near-duplicate runner
+/// that skipped both the spawn retry and `default_timeout`. Pin that it still
+/// streams bytes out byte-for-byte AND that a bad object id fails rather than
+/// silently producing an empty sink.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn show_to_streams_bytes_and_fails_loudly_on_a_bad_object() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    let payload = b"BEGIN;\nSELECT 1;\nCOMMIT;\n".to_vec();
+    let expected = payload.clone();
+    let outcome = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/dump.sql",
+                stdin_file: "dump.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("tester@host:/stream/dump.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            async |stdin: &mut StdinWriter<'_>| {
+                stdin.write_all(&payload).await.expect("write");
+                Ok(StdinOutcome::Commit {
+                    bytes: payload.len() as u64,
+                })
+            },
+        )
+        .await
+        .expect("snapshot");
+    let root = match outcome {
+        SnapshotCreateOutcome::Created(r) => r.root_entry.expect("root entry").obj,
+        SnapshotCreateOutcome::Unchanged => panic!("never unchanged"),
+    };
+
+    let mut got: Vec<u8> = Vec::new();
+    client
+        .show_to(&format!("{root}/dump.sql"), None, &mut got)
+        .await
+        .expect("show the stored file");
+    assert_eq!(got, expected);
+
+    // A non-existent entry must be an error, not an empty success — a restore
+    // that pipes nothing into `psql` and reports Completed is the worst outcome.
+    let mut empty: Vec<u8> = Vec::new();
+    client
+        .show_to(&format!("{root}/not-there.sql"), None, &mut empty)
+        .await
+        .expect_err("a missing entry must fail");
+    assert!(empty.is_empty());
+}
+
+/// **The item-10 question, answered by reality rather than by reasoning**: does
+/// `kopia snapshot restore <id> <dir>` materialise a stdin-created snapshot's
+/// single virtual file on disk?
+///
+/// It decides whether DEEP verification (`verification.deep`, which
+/// scratch-restores the latest snapshot into an ephemeral volume and optionally
+/// evaluates a CEL `successExpr` over the result) can work at all for a stream
+/// policy. If the restore produced nothing, a deep verify would "pass" over an
+/// empty directory — a false green — and admission would have to reject
+/// `verification.deep` on a stream policy instead.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn a_stdin_snapshot_restores_its_virtual_file_to_a_directory() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let client = fresh_repo(repo_dir.path(), config_dir.path()).await;
+
+    let payload = b"-- pg_dumpall output\nCREATE DATABASE app;\n".to_vec();
+    let expected = payload.clone();
+    let outcome = client
+        .snapshot_create_stdin_outcome_with(
+            StdinSnapshot {
+                source_path: "/stream/postgres.sql",
+                stdin_file: "postgres.sql",
+                tags: &BTreeMap::new(),
+                override_source: Some("pg@db:/stream/postgres.sql"),
+                opts: &SnapshotCreateOptions::default(),
+                finalize_timeout: Some(std::time::Duration::from_secs(120)),
+            },
+            async |stdin: &mut StdinWriter<'_>| {
+                stdin.write_all(&payload).await.expect("write");
+                Ok(StdinOutcome::Commit {
+                    bytes: payload.len() as u64,
+                })
+            },
+        )
+        .await
+        .expect("snapshot");
+    let id = match outcome {
+        SnapshotCreateOutcome::Created(r) => r.id.clone(),
+        SnapshotCreateOutcome::Unchanged => panic!("never unchanged"),
+    };
+
+    let into = tempfile::tempdir().unwrap();
+    let target = into.path().join("restored");
+    client
+        .snapshot_restore_with(&id, &target.to_string_lossy(), &Default::default())
+        .await
+        .expect("restoring a stdin snapshot into a directory must succeed");
+
+    // The virtual directory's single entry lands as a real file named after
+    // `--stdin-file`, so a deep verify has something to look at.
+    let file = target.join("postgres.sql");
+    assert!(
+        file.is_file(),
+        "expected {} to exist; directory holds {:?}",
+        file.display(),
+        std::fs::read_dir(&target)
+            .map(|rd| rd
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("read the restored file"),
+        expected,
+        "the restored bytes must be what was streamed in"
+    );
+    // The mover's deep tier counts what the scratch-restore produced and exposes it
+    // to a CEL `successExpr` as `restored.files`. Exactly one file means a
+    // `restored.files > 0` expression is meaningful rather than vacuously false —
+    // which is what makes `verification.deep` usable on a stream policy at all.
+    let entries: Vec<_> = std::fs::read_dir(&target)
+        .expect("read the restore dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1, "expected exactly one restored entry");
+}

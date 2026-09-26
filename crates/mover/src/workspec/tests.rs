@@ -38,6 +38,7 @@ fn backup_roundtrip() {
     let spec = MoverWorkSpec {
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {
+            stdin: None,
             source_path: "/data".into(),
             tags,
             policy: Default::default(),
@@ -69,6 +70,7 @@ fn snapshot_op_create_knobs_roundtrip_wire_shape_and_map_to_kopia() {
     // names, and `create_options()` carries them into the kopia client's
     // `SnapshotCreateOptions` unchanged.
     let op = SnapshotOp {
+        stdin: None,
         source_path: "/data".into(),
         tags: BTreeMap::new(),
         policy: Default::default(),
@@ -117,6 +119,7 @@ fn restore_roundtrip() {
     let spec = MoverWorkSpec {
         version: 2,
         operation: Operation::Restore(RestoreOp {
+            stdout: None,
             source: RestoreSelection::Snapshot("abc123".into()),
             target_path: "/data".into(),
             anchor: SnapshotAnchor {
@@ -212,6 +215,7 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
     let spec = MoverWorkSpec {
         version: 2,
         operation: Operation::Restore(RestoreOp {
+            stdout: None,
             source: RestoreSelection::Resolve(RestoreSelector {
                 username: "restore".into(),
                 hostname: "prod".into(),
@@ -752,6 +756,7 @@ fn externally_tagged_operation_shape() {
     let spec = MoverWorkSpec {
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {
+            stdin: None,
             source_path: "/data".into(),
             tags: BTreeMap::new(),
             policy: Default::default(),
@@ -927,6 +932,7 @@ fn object_store_backends_convert_and_roundtrip() {
 fn restore_op_maps_options_and_defaults_absent() {
     // Options present → mapped onto the kopia client options.
     let op = RestoreOp {
+        stdout: None,
         source: RestoreSelection::Snapshot("s".into()),
         target_path: "/data".into(),
         anchor: SnapshotAnchor::default(),
@@ -1490,6 +1496,7 @@ fn verify_quick_roundtrip_and_wire_shape() {
             }),
             success_expr: Some("stats.files > 0 && stats.errors == 0".into()),
             repository_key: None,
+            stamp_key: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -1555,6 +1562,7 @@ fn verify_deep_roundtrip_and_wire_shape() {
             }),
             success_expr: None,
             repository_key: Some("Repository/backups/nas".into()),
+            stamp_key: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -1589,6 +1597,57 @@ fn verify_deep_roundtrip_and_wire_shape() {
     } else {
         panic!("expected verify op");
     }
+}
+
+// --- #456: the (repository x member) stamp key ---
+
+#[test]
+fn verify_stamp_key_roundtrips_in_every_shape_and_old_wire_json_still_decodes() {
+    // A NEW field, never a reinterpretation of `repositoryKey`: that one also
+    // drives the Job's repo_tag6 name segment, its verify-repo label value and
+    // the projected-credentials prefix.
+    for (repository_key, stamp_key) in [
+        (None, None),
+        (
+            Some("Repository/backups/nas"),
+            Some("Repository/backups/nas"),
+        ),
+        (None, Some("#a1b2c3")),
+        (
+            Some("Repository/backups/nas"),
+            Some("Repository/backups/nas#a1b2c3"),
+        ),
+    ] {
+        let op = VerifyOp {
+            tier: VerifyTier::Deep(DeepVerify {
+                scratch_path: "/scratch".into(),
+                snapshot_id: None,
+                parallel: None,
+            }),
+            success_expr: None,
+            repository_key: repository_key.map(str::to_string),
+            stamp_key: stamp_key.map(str::to_string),
+        };
+        let v: serde_json::Value = serde_json::to_value(&op).unwrap();
+        match stamp_key {
+            Some(k) => assert_eq!(v["stampKey"], k, "camelCased on the wire"),
+            None => assert!(
+                v.get("stampKey").is_none(),
+                "an absent stamp key must not appear on the wire (old-shape parity)"
+            ),
+        }
+        assert_eq!(serde_json::from_value::<VerifyOp>(v).unwrap(), op);
+    }
+
+    // A Job minted before #456 carries no `stampKey` at all; its embedded work
+    // spec must still decode on the upgraded mover.
+    let old = r#"{"tier":{"quick":{}},"repositoryKey":"Repository/backups/nas"}"#;
+    let parsed: VerifyOp = serde_json::from_str(old).unwrap();
+    assert_eq!(parsed.stamp_key, None);
+    assert_eq!(
+        parsed.repository_key.as_deref(),
+        Some("Repository/backups/nas")
+    );
 }
 
 // --- M3 (issue #216 category sweep): quick tuning knobs + deep restore parallelism ---
@@ -2287,6 +2346,74 @@ fn observed_epoch_renders_nanoseconds_back_to_go_durations() {
     assert_eq!(o.advance_on_size_mb, 10, "bytes → MiB");
     assert_eq!(o.checkpoint_frequency, 7);
     assert_eq!(o.delete_parallelism, 4);
+}
+
+#[test]
+fn epoch_drift_compares_the_size_threshold_byte_exactly() {
+    // #458. The old comparator divided the OBSERVED bytes by MiB and compared the quotient,
+    // which truncates: a repository sitting at 10 MiB + 1 byte reads back as "10" and a
+    // declared 10 looks converged, so kopiur never corrects it. Compare in bytes instead —
+    // `desired * MIB` is exactly what kopia stores (`v << 20`), so the comparison converges
+    // precisely and cannot hide a sub-MiB remainder.
+    let mut observed = observed_defaults();
+    observed.advance_on_total_size_bytes = 10 * 1_048_576 + 1;
+    let desired = EpochParametersSpec {
+        advance_on_size_mb: Some(10),
+        ..Default::default()
+    };
+    let args = epoch_drift(&desired, Some(&observed)).expect(
+        "10 MiB + 1 byte is NOT 10 MiB — the old `observed / MIB` truncation reported \
+         convergence here and left the repository uncorrected",
+    );
+    assert_eq!(args.epoch_advance_on_size_mb, Some(10));
+
+    // …and the exact multiple is still not drift, so the fix does not trade a hidden
+    // no-op for a re-apply on every bootstrap (which invalidates every other kopia
+    // client's cached format blob).
+    observed.advance_on_total_size_bytes = 10 * 1_048_576;
+    assert!(
+        epoch_drift(&desired, Some(&observed)).is_none(),
+        "an exact MiB multiple must stay converged"
+    );
+
+    // One byte BELOW is drift too — truncation hid this direction as well.
+    observed.advance_on_total_size_bytes = 10 * 1_048_576 - 1;
+    assert_eq!(
+        epoch_drift(&desired, Some(&observed))
+            .expect("10 MiB - 1 byte is drift")
+            .epoch_advance_on_size_mb,
+        Some(10)
+    );
+}
+
+#[test]
+fn observed_epoch_rounds_the_size_threshold_up() {
+    // The mirror's job is to be honest about what the repository holds. Rounding DOWN would
+    // print exactly the value the user declared while the repository held something else —
+    // the silent-convergence bug one layer up. Rounding up keeps a sub-MiB remainder
+    // visible as disagreement with `spec`.
+    let mut o = observed_defaults();
+    o.advance_on_total_size_bytes = 10 * 1_048_576 + 1;
+    assert_eq!(
+        observed_epoch(&o).advance_on_size_mb,
+        11,
+        "10 MiB + 1 byte must not mirror as a flat 10"
+    );
+
+    o.advance_on_total_size_bytes = 10 * 1_048_576;
+    assert_eq!(
+        observed_epoch(&o).advance_on_size_mb,
+        10,
+        "exact stays exact"
+    );
+
+    // A sub-MiB threshold kopia could only have been given by hand: 1 byte is not 0 MiB.
+    o.advance_on_total_size_bytes = 1;
+    assert_eq!(observed_epoch(&o).advance_on_size_mb, 1);
+
+    // And nothing observed is still nothing.
+    o.advance_on_total_size_bytes = 0;
+    assert_eq!(observed_epoch(&o).advance_on_size_mb, 0);
 }
 
 // --- #332: object-lock blob retention -------------------------------------------------

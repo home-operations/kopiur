@@ -1600,6 +1600,7 @@ mod tests {
                     deletion_policy: None,
                     on_schedule_delete: None,
                     pin: false,
+                    mover: None,
                     description: None,
                 },
             );
@@ -1629,6 +1630,7 @@ mod tests {
                     deletion_policy: None,
                     on_schedule_delete: None,
                     pin: false,
+                    mover: None,
                     description: None,
                 },
             );

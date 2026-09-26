@@ -58,6 +58,8 @@ pub const HOSTPATH_REPOS_ROOT: &str = "/kopiur-e2e/repos";
 /// that reuse them). The mise `e2e-node-seed` task creates `HOSTPATH_REPOS_ROOT/<s>`
 /// at 0777 for each — keep the two lists in lockstep.
 pub const REPO_SUBPATHS: &[&str] = &[
+    "stream",
+    "stream-fail",
     "moverdefaults",
     "scc-shadow",
     "recmeta",
@@ -105,6 +107,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // #346 multi-PVC fan-out + VolumeGroupSnapshot group staging.
     "multipvc-fanout",
     "multipvc-group",
+    // #456 verification fan-out (crates/e2e/tests/verification_fanout.rs): the
+    // scenario asserts a stamp PER MEMBER and that the flat `lastVerified` is
+    // their MIN, so no other scenario's verify traffic may write into this repo.
+    "vfyfanout",
     // #443: the populator fan-out scenario needs its own repo so no other
     // scenario's snapshots land under the same identity and confuse a
     // per-member path assertion.
@@ -126,6 +132,8 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "massdel-nooverlap",
     "massdel-throttle",
     "massdel-outage",
+    // #477: a raised spec.concurrency.maxConcurrentDeleteJobs lets batches overlap.
+    "massdel-cap2",
     // Final-review flagship counterexample (mass_deletion.rs scenario 9): a held
     // external wave must not be swept into a concurrent breaker-exempt prune's batch.
     "massdel-heldprune",
@@ -375,9 +383,22 @@ pub const MINIO_PASS: &str = "minioadmin123";
 /// via the backend's `tls.disableTls`).
 pub const MINIO_ENDPOINT: &str = "minio.kopiur-e2e.svc.cluster.local:9000";
 /// Container image for MinIO (preloaded into the node by `e2e-cluster-up`).
-pub const MINIO_IMAGE: &str = "minio/minio:latest";
-/// Container image for the `mc` client used to create buckets.
-pub const MC_IMAGE: &str = "minio/mc:latest";
+///
+/// **The `pgsty` community fork on Docker Hub, pinned by tag AND digest.**
+/// Upstream MinIO has now pulled its public images twice: first from Docker Hub
+/// (`docker.io/minio/minio` 404s), then from quay.io (`quay.io/minio/*` answers
+/// 401 to anonymous pulls since 2026-09-24). Each time it took out every
+/// S3-backed e2e shard at once, and only after a 420s readiness timeout per
+/// attempt, because the preload helper is best-effort and the pods fall back to
+/// an in-cluster pull that also fails. `pgsty/minio` is a drop-in rebuild (same
+/// `minio` entrypoint, `/usr/bin/sh` present); the digest pins the exact bytes
+/// so a re-tag on a third-party repo cannot change what the suite runs.
+///
+/// Keep in lockstep with the `preload` lines in `crates/e2e/mise.toml`.
+pub const MINIO_IMAGE: &str = "docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372";
+/// Container image for the `mc` client used to create buckets. Same registry and
+/// pinning rationale as [`MINIO_IMAGE`].
+pub const MC_IMAGE: &str = "docker.io/pgsty/mc:RELEASE.2026-09-13T00-00-00Z@sha256:aa5cc1401b3e1ab482d215d5717e9e69b4f14970a3656f330ed20a549fe19020";
 /// Buckets the bucket-creator Pod ensures (idempotent `mc mb --ignore-existing`).
 pub const BUCKETS: &[&str] = &[
     "kopiur",

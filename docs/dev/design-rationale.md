@@ -183,8 +183,11 @@ keeping Kopiur's own retention pruning unaffected:
 
   The deletion cap sits outside the mover pool entirely rather than sharing it, and
   that asymmetry is the same call made twice: a deletion **reduces** repository load
-  and is already single-flighted per repository, so queuing it behind a saturated
-  backup pool would grow the backlog it exists to drain. Maintenance is excluded for
+  and has its own per-repository cap (`spec.concurrency.maxConcurrentDeleteJobs`,
+  default 1, enforced by `pool::DeleteAdmissionLedger` since #477 — before that the
+  "single-flight" was assumed, not enforced, and one repository ran ~33 batches at
+  once), so queuing it behind a saturated backup pool would grow the backlog it
+  exists to drain. Maintenance is excluded for
   the identical reason — it is the cure for an overloaded repository. A cap that can
   starve its own remedy is not a throttle, it is a deadlock.
 - **The pending COUNT is inclusive; the fire SET is exclusive** — two intentionally

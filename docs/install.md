@@ -165,6 +165,8 @@ Choose **namespaced** as the explicit least-privilege opt-down for a single-team
 
 In namespaced scope the controller's watches are narrowed to the release namespace, to match the Role-only RBAC; the chart passes `--namespace={{ .Release.Namespace }}`. Cluster-scoped kinds are skipped entirely: `ClusterRepository` is not reconciled, and the [privileged-movers namespace opt-in](permissions.md) check fails **open**, because the operator is already confined to admin-chosen namespaces there.
 
+The [stream-source opt-in](stream-sources.md#if-kopiur-is-installed-namespace-scoped) fails **closed** there instead — `pods/exec` is a far larger grant than an elevated container — so `stream` sources are refused under a namespaced install until you set `rbacNamespaceReadForStreamSources: true`, which adds a supplementary ClusterRole granting `get` on `namespaces` alone. `pvc` and `nfs` sources are unaffected.
+
 /// warning | Features that need cluster RBAC are refused in namespaced scope
 
 Two features read or write cluster-scoped objects that a Role can never grant: PersistentVolumes, StorageClasses and VolumeSnapshotClasses. A namespaced install refuses them **up front with an actionable message** rather than retrying forever.
@@ -189,7 +191,7 @@ The chart's defaults are sized for a typical homelab to mid-size cluster. A hand
 | `workerThreads` | `KOPIUR_WORKER_THREADS` | `2` | Tokio worker threads. The controller is I/O-bound; raise only for a reconcile-heavy deployment. |
 | `streamingLists` | `KOPIUR_STREAMING_LISTS` | `true` | Stream cluster-wide re-lists via the WatchList API (lower apiserver + controller memory). Auto-downgrades to paged lists when the apiserver *answers* with a pre-1.32 version; a startup probe that fails to answer keeps the configured value, since a transport failure is not evidence about the server's version. |
 | `reconcileConcurrency` | `KOPIUR_RECONCILE_CONCURRENCY` | `8` | Per-controller cap on concurrent reconciles. Bounds API-server load and file descriptors during re-list storms and API-server outages. `0` = unbounded (not recommended). |
-| `maxConcurrentDeleteJobs` | `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` | `0` (uncapped) | Opt-in backstop on concurrent snapshot-delete batch Jobs; batching per repository is the primary protection. |
+| `maxConcurrentDeleteJobs` | `KOPIUR_MAX_CONCURRENT_DELETE_JOBS` | `0` (no cluster-wide cap) | Opt-in backstop on concurrent snapshot-delete batch Jobs across all repositories; each repository is already limited by `spec.concurrency.maxConcurrentDeleteJobs` (default 1). |
 | `maxConcurrentJobs` | `KOPIUR_MAX_CONCURRENT_JOBS` | `0` (uncapped) | Opt-in cluster-wide backstop on concurrent **pooled** mover Jobs (backups, restores, and the source side of either replication) across all repositories. The per-repository [`spec.concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) is the primary knob; a run must satisfy both. |
 | `leaderElection.flowSchema.enabled` | — | `true` | Give the controller's leader-election Lease its own API Priority and Fairness lane. See below. |
 

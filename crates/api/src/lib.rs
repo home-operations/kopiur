@@ -81,8 +81,9 @@ pub use snapshot::{
 };
 pub use snapshot_policy::{
     CopyMethod, DeepVerification, GroupBy, Hook, PolicyRepositories, SnapshotPolicy,
-    SnapshotPolicySpec, SnapshotPolicyStatus, SourcePathStrategy, StagingSpec, Verification,
-    is_multi_repo, policy_repositories, repository_refs, single_repository_ref,
+    SnapshotPolicySpec, SnapshotPolicyStatus, SourcePathStrategy, SourceShape, StagingSpec,
+    StreamExec, StreamSource, Verification, is_multi_repo, policy_repositories, repository_refs,
+    single_repository_ref, source_shape, stream_source_path,
 };
 pub use snapshot_replication::{
     IdentityMatcher, IdentitySelection, MigrateOptions, MirrorSourcePruning, NoPruning,

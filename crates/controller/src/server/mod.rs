@@ -80,6 +80,8 @@ pub const SERVER_CONFIG_DIR: &str = "/config";
 pub const SERVER_CONFIG_FILE: &str = "/config/repository.config";
 /// Writable kopia cache dir (emptyDir).
 pub const SERVER_CACHE_DIR: &str = "/cache";
+/// kopia log dir, under [`SERVER_CACHE_DIR`] so it needs no volume of its own.
+pub const SERVER_LOG_DIR: &str = "/cache/logs";
 
 /// The `Deployment`/`Service`/`ConfigMap` name for a repository's server.
 pub fn server_object_name(instance: &str) -> String {
@@ -380,13 +382,18 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
             value_from: None,
         },
         EnvVar {
-            name: "KOPIA_CONFIG_PATH".to_string(),
+            name: kopiur_kopia::env::CONFIG_PATH_ENV.to_string(),
             value: Some(SERVER_CONFIG_FILE.to_string()),
             value_from: None,
         },
         EnvVar {
-            name: "KOPIA_CACHE_DIRECTORY".to_string(),
+            name: kopiur_kopia::env::CACHE_DIRECTORY_ENV.to_string(),
             value: Some(SERVER_CACHE_DIR.to_string()),
+            value_from: None,
+        },
+        EnvVar {
+            name: kopiur_kopia::env::LOG_DIR_ENV.to_string(),
+            value: Some(SERVER_LOG_DIR.to_string()),
             value_from: None,
         },
         EnvVar {

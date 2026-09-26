@@ -264,6 +264,58 @@ fn deployment_password_auth_injects_server_password_env_from_secret() {
 }
 
 #[test]
+fn deployment_sets_kopia_config_cache_and_log_dir_env() {
+    // Regression (#461): the server Deployment set KOPIA_CONFIG_PATH and
+    // KOPIA_CACHE_DIRECTORY but never KOPIA_LOG_DIR, so kopia's file logs fell
+    // back to its unwritable default and spammed the container's stdout with
+    // write errors. All three must point under the writable `cache` emptyDir.
+    let dep = build_server_deployment(&inputs("ns", gen_auth()));
+    let spec = dep.spec.unwrap();
+    let pod_spec = spec.template.spec.unwrap();
+    let c = &pod_spec.containers[0];
+    let env = c.env.as_ref().unwrap();
+
+    let get = |name: &str| {
+        env.iter()
+            .find(|e| e.name == name)
+            .map(|e| e.value.clone().unwrap())
+            .unwrap_or_else(|| panic!("missing {name} env var"))
+    };
+    assert_eq!(get(kopiur_kopia::env::CONFIG_PATH_ENV), SERVER_CONFIG_FILE);
+    assert_eq!(
+        get(kopiur_kopia::env::CACHE_DIRECTORY_ENV),
+        SERVER_CACHE_DIR
+    );
+    assert_eq!(get(kopiur_kopia::env::LOG_DIR_ENV), SERVER_LOG_DIR);
+
+    // /cache/logs needs no volume of its own: it lives under the `cache`
+    // emptyDir already mounted at SERVER_CACHE_DIR.
+    assert!(
+        SERVER_LOG_DIR.starts_with(&format!("{SERVER_CACHE_DIR}/")),
+        "log dir must live under the cache mount"
+    );
+    let cache_mount = pod_spec
+        .volumes
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|v| v.name == "cache")
+        .expect("cache volume present");
+    assert!(
+        cache_mount.empty_dir.is_some(),
+        "cache volume must be an emptyDir"
+    );
+    let cache_vm = c
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|vm| vm.name == "cache")
+        .expect("cache volumeMount present");
+    assert_eq!(cache_vm.mount_path, SERVER_CACHE_DIR);
+}
+
+#[test]
 fn deployment_env_from_includes_every_creds_secret_in_order() {
     // Regression (#416): the server used to env-inject only the encryption
     // Secret, so a repo whose password and backend keys live in SEPARATE

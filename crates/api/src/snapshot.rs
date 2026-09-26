@@ -10,7 +10,7 @@
 //!   spec carries `repository` (the destination pin) and no `policyRef`.
 
 use crate::common::{
-    CredentialProjection, DeletionPolicy, FailurePolicy, PolicyRef, RepositoryRef,
+    CredentialProjection, DeletionPolicy, FailurePolicy, MoverSpec, PolicyRef, RepositoryRef,
     ResolvedIdentity, ScheduleDeletePolicy,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
@@ -100,6 +100,38 @@ pub struct SnapshotSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 1024))]
     pub description: Option<String>,
+    /// Per-run mover overrides for THIS snapshot's Job (resources, cache budgets,
+    /// `securityContext`, `privilegedMode`, `ttlSecondsAfterFinished`).
+    ///
+    /// Layered field-wise as `repository.moverDefaults < policyRef's mover <
+    /// this mover` — the highest layer that sets a field wins, and a field you
+    /// omit falls through, so a partial override here can only adjust what it
+    /// names. This exists so an ad-hoc one-shot (`kubectl create` before a risky
+    /// change, a debug run that needs more memory or a different UID) does not
+    /// require editing the shared, GitOps-managed `SnapshotPolicy` that every
+    /// scheduled run also uses.
+    ///
+    /// Two deliberate exclusions:
+    ///
+    /// * `mover.cache` here is **run-scoped only**. It sets this run's kopia cache
+    ///   budgets (`--content-cache-size-mb`/`--metadata-cache-size-mb`) and, when
+    ///   the cache is `Ephemeral`, that Job's cache-volume `capacity` and
+    ///   `storageClassName` — a generic ephemeral volume bound to this pod and
+    ///   GC'd with it. What it cannot touch is anything **shared**: `cache.mode`
+    ///   is policy-owned (a per-run `mode: Persistent` never mints the shared
+    ///   PVC), and under `mode: Persistent` the PVC's own `capacity`/
+    ///   `storageClassName` come from the policy alone, because that claim is
+    ///   named per-POLICY and every sibling `Snapshot` depends on it.
+    ///
+    /// * `inheritSecurityContextFrom.snapshot` is restore-only and rejected here,
+    ///   exactly as on `SnapshotPolicy`: a backup's identity comes from the live
+    ///   workload; it is the run that *records* an identity.
+    ///
+    /// An elevated mover assembled here is gated by the namespace's
+    /// `privileged-movers` opt-in just like a policy-level one — the gate runs on
+    /// the merged result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mover: Option<MoverSpec>,
 }
 
 /// Which source of the referenced `SnapshotPolicy` this `Snapshot` covers, and
@@ -824,6 +856,30 @@ pub fn repository_ref_for(snap: &Snapshot) -> Option<RepositoryRef> {
             namespace: None,
         })
     })
+}
+
+/// The mover configuration a backup run actually uses: `Snapshot.spec.mover`
+/// merged over the recipe's `SnapshotPolicy.spec.mover` (#464).
+///
+/// **Pure**, so the controller, the admission webhook and the CLI all read one
+/// answer — the layer order can never fork between them. The repository's
+/// `moverDefaults` is NOT folded in here: it enters underneath this result in
+/// [`resolve_mover`](crate::common::resolve_mover), which every consumer already
+/// calls, giving the full ladder
+/// `hardened ⊂ moverDefaults ⊂ inherited ⊂ policy.mover ⊂ snapshot.mover`.
+/// [`MoverSpec::merge_over`]'s context merge is associative, so pre-folding the
+/// top two layers here is identical to a flat merge of all five.
+///
+/// `None` only when neither layer sets a mover at all, so a Snapshot that carries
+/// none resolves byte-identically to the pre-feature behavior.
+pub fn effective_backup_mover(
+    snapshot: &SnapshotSpec,
+    policy: &crate::snapshot_policy::SnapshotPolicySpec,
+) -> Option<MoverSpec> {
+    match (snapshot.mover.as_ref(), policy.mover.as_ref()) {
+        (None, base) => base.cloned(),
+        (Some(over), base) => Some(over.merge_over(base)),
+    }
 }
 
 /// THE repository a policy-child `Snapshot` runs against, resolved from the

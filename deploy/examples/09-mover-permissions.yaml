@@ -4,7 +4,7 @@
 # data. By default movers run unprivileged as the image user (UID 65532) with a
 # hardened securityContext (runAsNonRoot, drop ALL caps, seccomp RuntimeDefault).
 #
-# WHERE to set the UID/GID — two layers:
+# WHERE to set the UID/GID — three layers, lowest first:
 #   * `Repository.spec.moverDefaults` — the SINGLE place to set PUID/PGID for the
 #     whole repository. Every mover it spawns (bootstrap, backup, restore,
 #     maintenance) inherits these. This is the new home of the old KOPIUR_PUID /
@@ -13,10 +13,14 @@
 #   * `SnapshotPolicy.spec.mover` / `Restore.spec.mover` — a per-recipe override.
 #     It MERGES field-wise over moverDefaults and the hardened base (it can only
 #     tighten — a partial override never drops drop:[ALL]/seccomp).
+#   * `Snapshot.spec.mover` — a PER-RUN override for one ad-hoc snapshot, merged
+#     over the policy's. Use it so a one-shot debug run does not require editing
+#     the shared, GitOps-managed SnapshotPolicy every scheduled run also uses.
 #
-# This example sets both: a repository-wide default (1000:1000 + fsGroup 1000) and
-# a per-recipe tweak, to show the layering. See the Permissions guide for how to
-# find the right numbers.
+# This example sets all three: a repository-wide default (1000:1000 + fsGroup
+# 1000), a per-recipe tweak, and a one-shot Snapshot that overrides the recipe,
+# to show the layering. See the Permissions guide for how to find the right
+# numbers.
 #
 # Field shapes verified against crates/api: `moverDefaults.{securityContext,
 # podSecurityContext}` and `spec.mover.securityContext` are standard core/v1
@@ -117,3 +121,56 @@ spec:
     #   runAsNonRoot: false
     # privilegedMode: true     # also preserves UID/GID ownership on RESTORE
 # --8<-- [end:mover]
+---
+# ── Per-RUN override on a one-shot Snapshot (MERGES over the policy) ───────────
+# An ad-hoc snapshot before a risky change, which needs more memory and a bigger
+# kopia content cache than the nightly schedule. Only the fields named here
+# change; runAsGroup, fsGroup, the cache capacity/class and the hardened base all
+# still come from the SnapshotPolicy and moverDefaults above.
+#
+# Precedence, lowest to highest:
+#   moverDefaults  <  SnapshotPolicy.spec.mover  <  Snapshot.spec.mover
+#
+# `mover.cache` here is RUN-SCOPED. It moves this run's kopia cache BUDGETS and,
+# when the cache is `Ephemeral`, this Job's cache-volume capacity/storageClassName
+# (an ephemeral volume is bound to this pod and GC'd with it). It cannot change
+# `cache.mode`, and under `mode: Persistent` the PVC's own capacity/class come from
+# the SnapshotPolicy alone — that claim is named per-POLICY and shared by every
+# sibling Snapshot, so a per-run override must not mutate state they depend on.
+#
+# It also does not escape the privileged-mover gate: an elevated context assembled
+# here still needs the namespace opt-in, because the gate runs on the MERGED result.
+# --8<-- [start:snapshot-mover]
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  # Server-named, so `kubectl create` (not apply) — a nameless object cannot be
+  # applied. The generated suffix lets you repeat the command for each ad-hoc run.
+  generateName: app-data-preupgrade-
+  namespace: app
+spec:
+  policyRef:
+    name: app-data
+  tags:
+    reason: pre-upgrade
+  # Per-RUN mover overrides, merged field-wise over the SnapshotPolicy's:
+  #   moverDefaults  <  SnapshotPolicy.spec.mover  <  Snapshot.spec.mover
+  mover:
+    # This app's archive directory is owned by a different UID than the rest of
+    # its data; override just that for this one run.
+    securityContext:
+      runAsUser: 1001
+    # More headroom for a one-off full re-read.
+    resources:
+      requests:
+        memory: 1Gi
+      limits:
+        memory: 4Gi
+    # Per-run kopia cache budgets (see the note above). A `capacity`/
+    # `storageClassName` here would also size THIS Job's cache volume, since this
+    # policy's cache is Ephemeral.
+    cache:
+      contentCacheSizeMb: 20000
+    # Keep this Job around longer than the 1h default so you can read its logs.
+    ttlSecondsAfterFinished: 21600
+# --8<-- [end:snapshot-mover]

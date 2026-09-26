@@ -51,10 +51,15 @@ pub fn resolve_policy_identity(
     annotations: Option<&BTreeMap<String, String>>,
     defaults: Option<&IdentityDefaults>,
 ) -> Option<api::common::ResolvedIdentity> {
-    let first = spec.sources.first();
-    let pvc_name = first.and_then(|s| s.pvc.as_ref().map(|p| p.name.clone()));
-    let nfs_source_path = first.and_then(|s| s.nfs.as_ref().map(|n| n.path.clone()));
-    let source_path_override = first.and_then(|s| s.source_path_override.clone());
+    // THE shared derivation (#451), in its spec-only form — the webhook admits a
+    // `SnapshotPolicySpec` it has no full object for. Before this, every `stream`
+    // policy in a namespace collapsed onto ONE pathless identity, so the guard
+    // both raised collisions that were not real (two stream policies backing up
+    // different files) and missed ones that were (a stream policy colliding with
+    // a PVC policy at the same `username@hostname`).
+    let source_path = api::expand::identity_source_path_in(&spec.sources, namespace, name, None)
+        .ok()
+        .flatten();
     let inputs = IdentityInputs {
         object_name: name,
         namespace,
@@ -62,9 +67,7 @@ pub fn resolve_policy_identity(
         defaults,
         labels,
         annotations,
-        pvc_name: pvc_name.as_deref(),
-        default_source_path: nfs_source_path.as_deref(),
-        source_path_override: source_path_override.as_deref(),
+        source_path: source_path.as_deref(),
     };
     api::resolve_identity(&inputs).ok()
 }
@@ -555,5 +558,65 @@ mod tests {
             defaults.expect("identityDefaults").cluster.as_deref(),
             Some("east")
         );
+    }
+
+    /// Site 5 of 5 (#451): the collision guard. Before the shared derivation,
+    /// EVERY stream policy in a namespace resolved the same pathless identity
+    /// `<name>@<namespace>` — so the guard both raised collisions that were not
+    /// real (two stream policies dumping different files) and, because a pathless
+    /// identity compares unequal to a path-bearing one, missed the real collision
+    /// between a stream policy and a PVC policy at the same `username@hostname`.
+    #[test]
+    fn a_stream_policy_resolves_its_stream_root_identity() {
+        let spec: SnapshotPolicySpec = serde_json::from_value(serde_json::json!({
+            "repository": { "kind": "Repository", "name": "nas" },
+            "sources": [{
+                "stream": {
+                    "fileName": "postgres.sql",
+                    "workloadExec": {
+                        "podSelector": { "matchLabels": { "app": "postgres" } },
+                        "command": ["sh", "-ec", "pg_dumpall"],
+                    },
+                },
+                // Materialized by the API server from the CRD schema defaults.
+                "readOnly": true,
+                "sourcePathStrategy": "PvcName",
+            }],
+        }))
+        .expect("a valid stream SnapshotPolicySpec");
+        assert_eq!(
+            policy_identity_string("pg", "db", &spec, None, None, None).as_deref(),
+            Some("pg@db:/stream/postgres.sql")
+        );
+    }
+
+    /// The consequence that made the collapse unsafe: two stream policies with the
+    /// SAME name shape but DIFFERENT files must resolve to different identities,
+    /// and a stream policy must not be indistinguishable from a volume policy.
+    #[test]
+    fn two_stream_policies_with_different_files_do_not_collide() {
+        let spec_for = |file: &str| -> SnapshotPolicySpec {
+            serde_json::from_value(serde_json::json!({
+                "repository": { "kind": "Repository", "name": "nas" },
+                "identity": { "username": "shared", "hostname": "db" },
+                "sources": [{
+                    "stream": {
+                        "fileName": file,
+                        "workloadExec": {
+                            "podSelector": { "matchLabels": { "app": "postgres" } },
+                            "command": ["sh", "-ec", "pg_dumpall"],
+                        },
+                    },
+                    "readOnly": true,
+                    "sourcePathStrategy": "PvcName",
+                }],
+            }))
+            .unwrap()
+        };
+        let a = policy_identity_string("a", "db", &spec_for("pg.sql"), None, None, None);
+        let b = policy_identity_string("b", "db", &spec_for("mysql.sql"), None, None, None);
+        assert_eq!(a.as_deref(), Some("shared@db:/stream/pg.sql"));
+        assert_eq!(b.as_deref(), Some("shared@db:/stream/mysql.sql"));
+        assert_ne!(a, b, "a pathless collapse made these one identity");
     }
 }

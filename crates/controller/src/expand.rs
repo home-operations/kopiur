@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 
 pub use kopiur_api::expand::{
     EffectiveSource, ExpandedMember, effective_source, expand_sources, fanout_child_name,
-    strategy_for,
+    identity_source_path, source_kopia_path, strategy_for,
 };
 
 /// Match every `pvcSelector` source of `policy` against live PVCs.

@@ -133,6 +133,7 @@ mod tests {
             root_entry: None,
             retention_reason: vec![],
             tags: Default::default(),
+            incomplete: None,
         }
     }
 

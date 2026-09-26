@@ -1,0 +1,78 @@
+[
+  {
+    "id": "6aa8bb06201863273b08f37977182fbd",
+    "source": { "host": "desktop", "userName": "perf3ct", "path": "/tmp/ckpt.2jsv/src" },
+    "description": "",
+    "startTime": "2026-09-23T17:29:51.218273078Z",
+    "endTime": "2026-09-23T17:29:51.675330149Z",
+    "stats": {
+      "totalSize": 1258291200,
+      "excludedTotalSize": 0,
+      "fileCount": 60,
+      "cachedFiles": 0,
+      "nonCachedFiles": 60,
+      "dirCount": 1,
+      "excludedFileCount": 0,
+      "excludedDirCount": 0,
+      "ignoredErrorCount": 0,
+      "errorCount": 0
+    },
+    "rootEntry": {
+      "name": "src",
+      "type": "d",
+      "mode": "0755",
+      "mtime": "2026-09-23T17:29:51.107335678Z",
+      "uid": 1000,
+      "gid": 100,
+      "obj": "kc7428ed762a2201b7cf02178b6fe7c5a",
+      "summ": {
+        "size": 1258291200,
+        "files": 60,
+        "symlinks": 0,
+        "dirs": 1,
+        "maxTime": "2026-09-23T17:29:51.13133583Z",
+        "numFailed": 0
+      }
+    },
+    "retentionReason": ["latest-1", "hourly-1", "daily-1", "weekly-1", "monthly-1", "annual-1"]
+  },
+  {
+    "id": "c45b2d11d2e39977d92f08e0b658cf96",
+    "source": { "host": "desktop", "userName": "perf3ct", "path": "/tmp/ckpt.2jsv/src4" },
+    "description": "",
+    "startTime": "2026-09-23T17:30:45.330377808Z",
+    "endTime": "2026-09-23T17:31:17.137962852Z",
+    "stats": {
+      "totalSize": 188743680,
+      "excludedTotalSize": 0,
+      "fileCount": 360,
+      "cachedFiles": 0,
+      "nonCachedFiles": 360,
+      "dirCount": 1,
+      "excludedFileCount": 0,
+      "excludedDirCount": 0,
+      "ignoredErrorCount": 0,
+      "errorCount": 0
+    },
+    "incomplete": "canceled",
+    "rootEntry": {
+      "name": "src4",
+      "type": "d",
+      "mode": "0755",
+      "mtime": "2026-09-23T17:30:45.249678773Z",
+      "uid": 1000,
+      "gid": 100,
+      "obj": "k4cd0cc8c166d71ea5023c4ab05871c4d",
+      "summ": {
+        "size": 188743680,
+        "files": 360,
+        "symlinks": 0,
+        "dirs": 1,
+        "maxTime": "2026-09-23T17:30:45.24767876Z",
+        "incomplete": "canceled",
+        "numFailed": 0
+      }
+    },
+    "retentionReason": ["incomplete"]
+  }
+]

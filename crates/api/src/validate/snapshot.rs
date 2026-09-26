@@ -156,6 +156,36 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
                 .to_string(),
         });
     }
+    // Same reasoning as the NFS arm above: a stream source has no PVC to snapshot.
+    if spec.volume_snapshot_class_name.is_some() && spec.sources.iter().any(|s| s.stream.is_some())
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.volumeSnapshotClassName".to_string(),
+            reason: "a stream source captures a command's stdout and mounts no volume, so \
+                     volumeSnapshotClassName is meaningless with it; remove \
+                     volumeSnapshotClassName, or use a PVC source for copyMethod: Snapshot/Clone"
+                .to_string(),
+        });
+    }
+    // A stream source must be its policy's ONLY source. Expansion fans out selector
+    // sources only (`expand_sources` returns None when no `pvcSelector` is present), so
+    // a non-selector policy runs `sources[0]` and nothing else — pairing a stream with
+    // another source would silently back up just one of them. Refuse instead of
+    // dropping a backup the user believes is configured.
+    if spec.sources.len() > 1
+        && let Some(i) = spec.sources.iter().position(|s| s.stream.is_some())
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: format!("spec.sources[{i}].stream"),
+            reason: format!(
+                "a stream source must be the only source in its SnapshotPolicy, but this one \
+                 has {}. A stream source produces exactly one artifact per Snapshot and is \
+                 never expanded, so the other sources would not be backed up. Move the stream \
+                 source into its own SnapshotPolicy",
+                spec.sources.len()
+            ),
+        });
+    }
     if let Some(m) = &spec.mover {
         // `inheritSecurityContextFrom.snapshot` replays a backup's RECORDED identity;
         // a backup has no recorded identity to replay — it is the run that records one.
@@ -427,6 +457,15 @@ fn validate_staging(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
                 .to_string(),
         });
     }
+    if spec.sources.iter().any(|s| s.stream.is_some()) {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: overrides.clone(),
+            reason: "a stream source captures a command's stdout and mounts no volume, so \
+                     there is no staged PVC to override; remove the override(s) or use a PVC \
+                     source for copyMethod: Snapshot/Clone"
+                .to_string(),
+        });
+    }
     // NOTE: `pvcSelector` sources used to be rejected here on the grounds that
     // they "are not CSI-staged". That was true only because the selector was
     // never implemented (#346). Each expanded member is now an ordinary
@@ -642,6 +681,34 @@ pub fn validate_backup(spec: &SnapshotSpec, origin: Option<Origin>) -> Vec<Valid
         errs.push(e);
     }
     errs.extend(validate_snapshot_tags(spec.tags.as_ref()));
+    if let Some(m) = &spec.mover {
+        // Same two rules the recipe layer gets, because this is the same layer one
+        // step up (#464): a per-run `mover` is merged OVER the policy's, so anything
+        // inadmissible there is inadmissible here.
+        //
+        // `inheritSecurityContextFrom.snapshot` replays the identity RECORDED on a
+        // backup; a backup has no recorded identity to replay — it is the run that
+        // records one.
+        if let Err(e) = forbid_snapshot_inherit(
+            m,
+            "snapshot",
+            "a backup mover's identity is read from the live workload \
+             (pvcConsumer/workloadSelector), not from a snapshot; `snapshot` is restore-only",
+        ) {
+            errs.push(e);
+        }
+        if let Err(e) = validate_mover(m, "Snapshot mover") {
+            errs.push(e);
+        }
+        // NOT rejected here: `inheritSecurityContextFrom.pvcConsumer`. Validators are
+        // spec-only and client-free, so this one cannot see the referenced
+        // `SnapshotPolicy`'s sources to know whether a source PVC exists to derive a
+        // consumer from. Refusing on that guess would reject the common, correct case
+        // (a one-shot against an ordinary `source.pvc` policy); admitting it lets the
+        // controller resolve it and, when it cannot, park the run on a condition that
+        // names the reason — which is strictly more informative than an admission
+        // error built on missing information.
+    }
     errs
 }
 

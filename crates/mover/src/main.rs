@@ -28,6 +28,7 @@ use kopiur_kopia::{
 };
 use tracing::{error, info, warn};
 
+use kopiur_mover::batch_delete::{BatchDeletePlan, anchor_self_heal_allowed, plan_batch_delete};
 use kopiur_mover::bootstrap::{
     BootstrapInitAction, BootstrapResult, CreateGrant, MAX_RETURNED_SNAPSHOTS,
     RESULT_CONFIGMAP_KEY, SeedOutcome, bootstrap_init_action,
@@ -40,10 +41,11 @@ use kopiur_mover::replicate as srepl;
 use kopiur_mover::resolve::{match_current_manifest, matches_source};
 use kopiur_mover::serve::ServerWorkSpec;
 use kopiur_mover::status::{
-    SnapshotReplicationRunStats, StatusReporter, StatusUpdate, lease_blocked_body,
-    maintenance_failed_body, maintenance_failed_body_from_mover, maintenance_ran_body,
-    replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
-    snapshot_replicate_ok_body, split_api_version, verify_failed_body, verify_ok_body,
+    MaintenanceObservations, SnapshotReplicationRunStats, StatusReporter, StatusUpdate,
+    lease_blocked_body, maintenance_failed_body, maintenance_failed_body_from_mover,
+    maintenance_ran_body, replicate_failed_body, replicate_ok_body, snapshot_replicate_failed_body,
+    snapshot_replicate_no_match_message, snapshot_replicate_ok_body,
+    snapshot_replicate_success_message, split_api_version, verify_failed_body, verify_ok_body,
 };
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
@@ -589,15 +591,75 @@ async fn run_operation(
             // real duration — kopia hashes the whole tree even when it decides
             // not to write a manifest, so this is not free and is worth showing.
             let started_at = chrono::Utc::now();
-            let outcome = client
-                .snapshot_create_outcome_with(
-                    &op.source_path,
-                    &op.tags,
-                    Some(&override_source),
-                    &op.create_options(),
-                )
-                .await
-                .map_err(kopia(KopiaOp::SnapshotCreate))?;
+            // Exhaustive: where the bytes come from decides the whole execution.
+            // A filesystem run walks the mounted path; a stream run execs a command
+            // in a workload pod and pipes its stdout in. A new input kind cannot
+            // compile until it is given one.
+            let outcome = match kopiur_mover::workspec::snapshot_input(op) {
+                kopiur_mover::workspec::SnapshotInput::Filesystem => client
+                    .snapshot_create_outcome_with(
+                        &op.source_path,
+                        &op.tags,
+                        Some(&override_source),
+                        &op.create_options(),
+                    )
+                    .await
+                    .map_err(kopia(KopiaOp::SnapshotCreate))?,
+                kopiur_mover::workspec::SnapshotInput::Stream(producer) => {
+                    // `exec_client`, not `try_default`: kube's inferred 295 s
+                    // `write_timeout` is a PER-WRITE connection timeout that would
+                    // tear down a long exec (#451).
+                    let kube_client = kopiur_mover::stream::exec_client().await?;
+                    // `failure` is how the producer's verdict escapes the closure:
+                    // the kopia runner only learns Commit/Abort, and the actionable
+                    // text has to reach the status. It holds ONLY the verdict and a
+                    // bounded stderr tail — never the dumped bytes.
+                    let mut failure: Option<String> = None;
+                    let res = client
+                        .snapshot_create_stdin_outcome_with(
+                            kopiur_kopia::StdinSnapshot {
+                                source_path: &op.source_path,
+                                stdin_file: &producer.file_name,
+                                tags: &op.tags,
+                                override_source: Some(&override_source),
+                                opts: &op.create_options(),
+                                // Bound kopia's FINALIZE phase (after stdin
+                                // closes), which no existing timeout owned: the
+                                // producer phase is already bounded inside
+                                // `feed_from_pod` by `workloadExec.timeout`.
+                                // Without this the mover Job could hang forever on
+                                // a kopia wedged writing a manifest (#451).
+                                finalize_timeout: Some(
+                                    std::time::Duration::from_secs(producer.timeout_seconds)
+                                        + kopiur_kopia::STDIN_FINALIZE_GRACE,
+                                ),
+                            },
+                            async |stdin: &mut kopiur_kopia::StdinWriter<'_>| {
+                                Ok(kopiur_mover::stream::feed_from_pod(
+                                    &kube_client,
+                                    producer,
+                                    stdin,
+                                    &mut failure,
+                                )
+                                .await)
+                            },
+                        )
+                        .await;
+                    match res {
+                        Ok(o) => o,
+                        Err(e) => {
+                            // A producer failure is the user's dump command, not
+                            // kopia: report it as such so the status names the right
+                            // thing to fix. kopia aborted before writing a manifest,
+                            // so nothing partial survives either way.
+                            return Err(match failure {
+                                Some(detail) => MoverError::StreamExecFailed { detail },
+                                None => kopia(KopiaOp::SnapshotCreate)(e),
+                            });
+                        }
+                    }
+                }
+            };
             // Exhaustive: a deduped run and a real one are BOTH successes but are
             // not interchangeable, and the difference is invisible in the happy
             // path. Matching here is what stops a run that owns no manifest from
@@ -647,6 +709,13 @@ async fn run_operation(
             Ok(StatusUpdate::succeeded_backup(&result, chrono::Utc::now()))
         }
         Operation::Restore(op) => {
+            // Where the bytes GO is decided first: a stream restore never touches a
+            // filesystem, so it does not share the mounted-target machinery below.
+            if let kopiur_mover::workspec::RestoreOutput::Stream(consumer) =
+                kopiur_mover::workspec::restore_output(op)
+            {
+                return restore_stream(client, op, consumer).await;
+            }
             // Exactly one source kind (externally tagged): a controller-resolved id,
             // or an in-Job selector to resolve here. Exhaustive — a new variant
             // can't compile until handled.
@@ -755,6 +824,163 @@ async fn run_operation(
 /// `NotFound`, re-resolve the live id from the snapshot's stable anchors
 /// ([`RestoreOp::anchor`]) and retry once. Returns the id actually restored (for
 /// `status.logTail`).
+/// Restore ONE virtual file out of a snapshot straight into a command's stdin.
+///
+/// Resolves the snapshot to its ROOT OBJECT id (not the manifest id — kopia's
+/// `<root>/<name>` sub-path form only accepts the former; a manifest id fails with
+/// "parent is not a directory") and streams `kopia show <root>/<fileName>` into the
+/// exec. Both halves must succeed: a `psql` that died halfway leaves a half-loaded
+/// database, and calling that a completed restore would be worse than failing.
+async fn restore_stream(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    consumer: &kopiur_mover::workspec::StreamExecSpec,
+) -> Result<StatusUpdate> {
+    // Only a controller-resolved id is supported: the deferred `Resolve` path pins
+    // its choice through the StatusReporter, which this path does not carry. The
+    // controller resolves a streamExec restore to a concrete snapshot before the Job.
+    let snapshot_id = match &op.source {
+        RestoreSelection::Snapshot(id) => id.clone(),
+        RestoreSelection::Resolve(sel) => {
+            let filter = SnapshotSource {
+                host: sel.hostname.clone(),
+                user_name: sel.username.clone(),
+                path: sel.source_path.clone().unwrap_or_default(),
+            };
+            let mut list = client
+                .snapshot_list(Some(&filter))
+                .await
+                .map_err(|source| MoverError::Kopia {
+                    op: KopiaOp::RestoreSnapshotList,
+                    source,
+                })?;
+            list.sort_by_key(|e| std::cmp::Reverse(e.end_time));
+            let cutoff = sel
+                .as_of
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            let candidates = filter_as_of(list, cutoff);
+            pick_offset(candidates, sel.offset)
+                .ok_or_else(|| MoverError::RestoreNoSnapshot {
+                    identity: filter.identity(),
+                })?
+                .id
+        }
+    };
+
+    // The sub-path form needs the ROOT ENTRY object id, so look the snapshot up.
+    let (snapshot_id, root_obj) =
+        stream_root_object(client, op, &snapshot_id, &consumer.file_name).await?;
+    let object_id = format!("{root_obj}/{}", consumer.file_name);
+
+    // The write-timeout case that matters most: on a stream RESTORE we are the
+    // writer, piping `kopia show` into the consumer's stdin, and a `psql` applying
+    // one enormous statement legitimately backpressures past kube's 295 s default.
+    let kube_client = kopiur_mover::stream::exec_client().await?;
+    kopiur_mover::stream::restore_into_pod(&kube_client, client, consumer, &object_id).await?;
+    Ok(StatusUpdate::completed(&snapshot_id, chrono::Utc::now()))
+}
+
+/// Resolve `snapshot_id` to its ROOT ENTRY object id, self-healing a stale id
+/// through the snapshot's stable anchor.
+///
+/// Two fixes over the naive lookup this replaces (#451):
+///
+/// 1. **The anchor self-heal.** kopia REWRITES a snapshot's manifest id when the
+///    snapshot is pinned (`UpdateSnapshot`), so the id the controller pinned into
+///    `status.resolved` can name a manifest that no longer exists. Every other
+///    id-consuming path in the mover already heals through
+///    [`RestoreOp::anchor`] (`restore_with_heal`, `delete_one`); the stream path
+///    did not, so a `streamExec` restore of a pinned snapshot failed with "could
+///    not be resolved to a root object" and no hint that pinning was the cause.
+///    The heal reuses [`resolve_live_id`], so it inherits the same
+///    path(+identity)(+start-time) safety: without a `start_time` disambiguator a
+///    path-only match must be UNIQUE, which is what stops it silently selecting
+///    the identity's next backup.
+/// 2. **The listing is scoped.** This used `snapshot_list_all()` — every snapshot
+///    in the repository, for every source, only to find one id. On a shared
+///    repository holding thousands of manifests that is a large listing decoded
+///    for nothing, and it makes the operation's cost depend on OTHER policies'
+///    history. `snapshot_list(Some(&source))` asks kopia for the one identity.
+///
+/// Returns the id actually resolved (which may differ from the one passed in) so
+/// the caller records the manifest it really read.
+async fn stream_root_object(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    snapshot_id: &str,
+    file_name: &str,
+) -> Result<(String, String)> {
+    // Scope the listing to the snapshot's own identity when the anchor carries
+    // one; fall back to the unscoped listing only when it does not (an anchor
+    // captured before identity was recorded), because a filter built from an
+    // EMPTY path/identity matches nothing rather than everything.
+    let listed = match anchor_source_filter(&op.anchor) {
+        Some(source) => client.snapshot_list(Some(&source)).await,
+        None => client.snapshot_list_all().await,
+    }
+    .map_err(|source| MoverError::Kopia {
+        op: KopiaOp::RestoreSnapshotList,
+        source,
+    })?;
+
+    if let Some(obj) = root_object_of(&listed, snapshot_id) {
+        return Ok((snapshot_id.to_string(), obj));
+    }
+
+    // Stale id: re-resolve the live manifest from the stable anchor.
+    if let Some(live) = resolve_live_id(client, &op.anchor).await
+        && live != snapshot_id
+        && let Some(obj) = root_object_of(&listed, &live)
+    {
+        warn!(
+            stale = %snapshot_id,
+            live = %live,
+            "stream restore snapshot id not found; healing to the live manifest \
+             re-resolved from the snapshot's identity (kopia rewrites the id on pin)",
+        );
+        return Ok((live, obj));
+    }
+
+    Err(MoverError::StreamExecFailed {
+        detail: format!(
+            "snapshot `{snapshot_id}` could not be resolved to a root object, so the file \
+             `{file_name}` inside it cannot be addressed. Nothing was piped into the \
+             command, so no partial load happened. The manifest is absent from the \
+             repository — it may have been deleted or expired by maintenance; re-resolve \
+             the restore against a snapshot that still exists"
+        ),
+    })
+}
+
+/// The root-entry object id of `snapshot_id` in `listed`, if present.
+fn root_object_of(listed: &[kopiur_kopia::SnapshotListEntry], snapshot_id: &str) -> Option<String> {
+    listed
+        .iter()
+        .find(|e| e.id == snapshot_id)
+        .and_then(|e| e.root_entry.as_ref())
+        .map(|r| r.obj.clone())
+}
+
+/// A kopia listing filter for an anchor's own identity, or `None` when the anchor
+/// does not carry a complete one.
+///
+/// Fail-OPEN to the unscoped listing on purpose: a `SnapshotSource` built from a
+/// partial anchor would filter on an EMPTY username/hostname and match nothing,
+/// turning a cost optimization into a restore that cannot find its snapshot.
+fn anchor_source_filter(anchor: &SnapshotAnchor) -> Option<SnapshotSource> {
+    if anchor.source_path.is_empty() {
+        return None;
+    }
+    let (user_name, host) = anchor.identity_filter()?;
+    Some(SnapshotSource {
+        user_name: user_name.to_string(),
+        host: host.to_string(),
+        path: anchor.source_path.clone(),
+    })
+}
+
 async fn restore_with_heal(
     client: &KopiaClient,
     op: &RestoreOp,
@@ -976,18 +1202,11 @@ async fn resolve_live_id(client: &KopiaClient, anchor: &SnapshotAnchor) -> Optio
     .map(|e| e.id.clone())
 }
 
-/// Whether [`delete_one`]'s stale-id self-heal may attempt re-resolution.
-/// Gated on the anchor's `start_time` alone — see [`delete_one`]'s doc for why
-/// a path(+identity)-only match is unsafe for a DELETE decision. Pulled out so
-/// the gate is unit-testable without spawning kopia.
-fn anchor_self_heal_allowed(anchor: &SnapshotAnchor) -> bool {
-    anchor.start_time.is_some()
-}
-
 /// Delete one snapshot by id, self-healing a stale recorded id via its stable
-/// anchor. Shared by the legacy single [`Operation::SnapshotDelete`] arm and
-/// the [`Operation::SnapshotDeleteBatch`] loop ([`delete_batch`]), so the
-/// self-heal logic — and its safety gate — lives in exactly one place.
+/// anchor, for the legacy single [`Operation::SnapshotDelete`] arm only. The
+/// [`Operation::SnapshotDeleteBatch`] path ([`delete_batch`]) plans its own
+/// self-heal against one listing ([`plan_batch_delete`]) behind the SAME gate,
+/// [`anchor_self_heal_allowed`], so the data-loss rule lives in one place.
 ///
 /// kopia's [`KopiaClient::snapshot_delete`] is idempotent (a "no snapshots
 /// matched" miss is tolerated), so a delete-by-id call against a STALE id
@@ -1036,29 +1255,128 @@ async fn delete_one(
     Ok(())
 }
 
-/// Delete every [`SnapshotDeleteBatchOp`] member independently: attempt-all-
-/// then-fail, never short-circuited by an earlier member's failure. kopia's
-/// delete is idempotent, so every retry of the WHOLE batch monotonically
-/// shrinks the truly-remaining set — a transient repo blip mid-batch
-/// converges on the next Job retry instead of wedging on the first failure.
-/// Pulled out of [`run_operation`] so the attempt-all-then-fail ordering is
-/// unit-testable against a fake kopia binary without a full work spec /
-/// reporter.
+/// Most manifest ids one `kopia snapshot delete` invocation carries. Each
+/// chunk is its own all-or-nothing kopia transaction; 500 × a 32-char id is
+/// far below any argv limit. A batch is at most a few hundred members, so this
+/// is almost always one call.
+const SNAPSHOT_DELETE_CHUNK: usize = 500;
+
+/// Delete a [`SnapshotDeleteBatchOp`] with ONE repository listing and one
+/// bulk `kopia snapshot delete` per [`SNAPSHOT_DELETE_CHUNK`] (issue #477: one
+/// process per member re-opened the repository and reloaded its full index
+/// every time). [`plan_batch_delete`] partitions the members against the
+/// listing first, because one absent id aborts kopia's all-or-nothing
+/// multi-id delete.
+///
+/// attempt-all-then-fail is preserved: every chunk is attempted, and the
+/// result counts failed MEMBERS. kopia's delete is idempotent and every retry
+/// re-plans against a fresh listing, so a retry of the whole batch
+/// monotonically shrinks what is left. A listing failure fails the Job
+/// outright, and the controller's backoff retries it. Fanning out one more
+/// repository open per member against a repository that just failed to open
+/// is the thundering herd this replaces.
 async fn delete_batch(client: &KopiaClient, op: &SnapshotDeleteBatchOp) -> Result<StatusUpdate> {
-    let mut failed = 0usize;
-    for item in &op.items {
-        if let Err(e) = delete_one(client, &item.snapshot_id, &item.anchor).await {
-            warn!(id = %item.snapshot_id, error = %e, "batch member delete failed; continuing");
-            failed += 1;
-        }
+    let listing = client
+        .snapshot_list_all_with_incomplete()
+        .await
+        .map_err(|source| MoverError::Kopia {
+            op: KopiaOp::BatchDeleteSnapshotList,
+            source,
+        })?;
+    let plan = plan_batch_delete(&op.items, &listing);
+    log_batch_plan(op, &plan);
+    let mut failed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (ids, members) in plan
+        .ids
+        .chunks(SNAPSHOT_DELETE_CHUNK)
+        .zip(plan.members_of.chunks(SNAPSHOT_DELETE_CHUNK))
+    {
+        failed.extend(delete_chunk(client, ids, members).await);
     }
-    if failed > 0 {
+    if !failed.is_empty() {
         return Err(MoverError::BatchDeleteIncomplete {
-            failed,
+            failed: failed.len(),
             total: op.items.len(),
         });
     }
     Ok(StatusUpdate::succeeded(chrono::Utc::now()))
+}
+
+/// Delete one chunk in a single kopia call and return the members it failed.
+/// kopia committed nothing on a failed call, so:
+/// - a RETRYABLE failure (the backend is struggling) fails the whole chunk,
+///   leaving the retry to the controller's backoff instead of hammering the
+///   repository once per id;
+/// - any other failure (typically an id deleted between the listing and the
+///   delete) retries each id alone with the idempotent single delete.
+async fn delete_chunk(client: &KopiaClient, ids: &[String], members: &[Vec<usize>]) -> Vec<usize> {
+    let err = match client.snapshot_delete_many(ids).await {
+        Ok(()) => {
+            info!(deleted = ids.len(), "batch snapshot delete committed");
+            return Vec::new();
+        }
+        Err(e) => e,
+    };
+    if err.class().is_retryable() {
+        warn!(
+            ids = ids.len(),
+            error = %err,
+            "bulk snapshot delete failed with a retryable error; nothing was deleted. \
+             Failing the batch for a backoff retry instead of re-opening the repository per id",
+        );
+        return members.iter().flatten().copied().collect();
+    }
+    warn!(
+        ids = ids.len(),
+        error = %err,
+        "bulk snapshot delete failed; nothing was deleted. Retrying each id alone",
+    );
+    delete_each(client, ids, members).await
+}
+
+/// The non-retryable fallback: each id alone through the idempotent single
+/// delete (an id that vanished since the listing is success), attempting every
+/// id and returning the members whose delete really failed.
+async fn delete_each(client: &KopiaClient, ids: &[String], members: &[Vec<usize>]) -> Vec<usize> {
+    let mut failed = Vec::new();
+    for (id, served) in ids.iter().zip(members) {
+        if let Err(e) = client.snapshot_delete(id).await {
+            warn!(id = %id, error = %e, "batch member delete failed; continuing");
+            failed.extend(served);
+        }
+    }
+    failed
+}
+
+/// The operator-facing log of a batch plan: what is already gone, which
+/// stale ids were healed, and where the self-heal's data-loss gate held.
+fn log_batch_plan(op: &SnapshotDeleteBatchOp, plan: &BatchDeletePlan) {
+    info!(
+        members = op.items.len(),
+        to_delete = plan.ids.len(),
+        already_absent = plan.already_absent.len(),
+        "planned batch snapshot delete",
+    );
+    for h in &plan.healed {
+        warn!(
+            recorded = %h.recorded,
+            live = %h.live,
+            "recorded snapshot id was stale (kopia rewrites the id on pin); \
+             deleting the live manifest re-resolved from the snapshot's identity \
+             to avoid orphaning it",
+        );
+    }
+    for &m in &plan.already_absent {
+        let item = &op.items[m];
+        if !anchor_self_heal_allowed(&item.anchor) && !item.anchor.source_path.is_empty() {
+            info!(
+                snapshot_id = %item.snapshot_id,
+                "anchor has no start_time; skipping the stale-id self-heal to avoid \
+                 deleting an unrelated snapshot that happens to share the source path \
+                 (data-loss gate)",
+            );
+        }
+    }
 }
 
 /// Capture the start-time anchor for a pin op BEFORE the (un)pin runs. The work
@@ -2589,6 +2907,99 @@ async fn write_result_configmap(
     Ok(())
 }
 
+/// How long EACH post-maintenance measurement may take before it is abandoned.
+///
+/// Both measurements are bounded, and neither bound is optional. Every kopia
+/// call here happens AFTER `maintenance run` already succeeded, and the success
+/// patch (`lastRunAt`, `ownership.claimedAt`, `LeaseOwned=True`) has not been
+/// sent yet — so a call that hangs does not merely lose a metric, it loses the
+/// record that maintenance ran at all: the Job sits until the
+/// `activeDeadlineSeconds` backstop, is killed `Failed`, and `backoffLimit`
+/// then re-runs the maintenance that had already completed. That is strictly
+/// worse than the stale figures this whole change exists to fix.
+///
+/// A `KopiaClient` bound cannot be relied on instead: the mover only sets
+/// `default_timeout` from `spec.options.operationTimeoutSecs`, which nothing in
+/// the repo populates, so in practice these calls are otherwise unbounded.
+///
+/// The bound is per measurement rather than shared so a slow (but completing)
+/// `maintenance info` cannot eat the recount's budget, and so each failure keeps
+/// its own actionable log line. `kopia index list` is normally milliseconds —
+/// but the repository this measurement is *for* is the unhealthy one with
+/// thousands of uncompacted index blobs, which is exactly where it is slowest
+/// and where a wedged object store stalls it.
+const MAINTENANCE_MEASURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Measure what a just-completed maintenance run did, for
+/// [`maintenance_ran_body`]. Best-effort by contract: every failure degrades to
+/// "not measured" (`None`) and is logged, never propagated — the run already
+/// succeeded, and a metric is not worth failing a Job over. Every call is
+/// bounded by [`MAINTENANCE_MEASURE_TIMEOUT`]; see there for why that is
+/// load-bearing rather than tidy.
+///
+/// `before` is the `maintenance info` the lease decision already read, so the
+/// only extra kopia call for the reclaimed figure is the post-run one.
+async fn measure_maintenance(
+    client: &KopiaClient,
+    before: &kopiur_kopia::MaintenanceInfo,
+) -> MaintenanceObservations {
+    let after =
+        match tokio::time::timeout(MAINTENANCE_MEASURE_TIMEOUT, client.maintenance_info()).await {
+            Ok(Ok(after)) => Some(after),
+            Ok(Err(e)) => {
+                warn!(
+                    class = %e.class(),
+                    "maintenance run succeeded but the post-run `maintenance info` failed; \
+                     reporting no reclaimed-bytes figure for this run"
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = MAINTENANCE_MEASURE_TIMEOUT.as_secs(),
+                    "maintenance run succeeded but the post-run `maintenance info` timed out; \
+                 reporting no reclaimed-bytes figure for this run"
+                );
+                None
+            }
+        };
+    MaintenanceObservations {
+        reclaimed_bytes: after
+            .as_ref()
+            .and_then(|after| kopiur_kopia::reclaimed_bytes_since(before, after)),
+        index_blob_count: recount_index_blobs(client).await,
+    }
+}
+
+/// Re-count the repository's content-index blobs after a successful maintenance
+/// run, so the repository's `IndexBlobHealth` condition stops quoting a
+/// pre-compaction number (#458).
+///
+/// Best-effort in both directions — a kopia error and a timeout both degrade to
+/// `None` ("not recounted"), which leaves the repository's existing bootstrap
+/// observation standing rather than overwriting it with a guess.
+async fn recount_index_blobs(client: &KopiaClient) -> Option<i64> {
+    match tokio::time::timeout(MAINTENANCE_MEASURE_TIMEOUT, client.index_blob_count()).await {
+        Ok(Ok(count)) => Some(count),
+        Ok(Err(e)) => {
+            warn!(
+                class = %e.class(),
+                "maintenance run succeeded but the post-run index-blob recount failed; \
+                 leaving the repository's previous count standing"
+            );
+            None
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = MAINTENANCE_MEASURE_TIMEOUT.as_secs(),
+                "maintenance run succeeded but the post-run index-blob recount timed out; \
+                 leaving the repository's previous count standing"
+            );
+            None
+        }
+    }
+}
+
 /// Drive a `Maintenance` run: connect, read the ownership lease, apply the
 /// takeover policy, run `kopia maintenance run` when we hold the lease, and PATCH
 /// the `Maintenance` `.status` directly (ADR §3.7). Returns an error (non-zero
@@ -2723,12 +3134,27 @@ async fn run_maintenance_flow(
                     source: e,
                 });
             }
+            // The run itself succeeded; everything below is MEASUREMENT and is
+            // strictly best-effort. `kopia maintenance run` prints nothing
+            // machine-readable, so the only way to learn what it reclaimed is to
+            // diff the per-task run history it appended to the schedule blob
+            // against the pre-run `info` read above for the lease decision (which
+            // makes "before" free). A failure here must never turn a successful
+            // maintenance run into a failed Job — it would make the operator
+            // retry work that already completed.
+            let observations = measure_maintenance(client, &info).await;
             patch_maintenance_status(
                 &spec.target_ref,
-                &maintenance_ran_body(op, &chrono::Utc::now()),
+                &maintenance_ran_body(op, &chrono::Utc::now(), &observations),
             )
             .await;
-            info!(?action, mode = ?op.mode, "maintenance run succeeded");
+            info!(
+                ?action,
+                mode = ?op.mode,
+                reclaimed_bytes = ?observations.reclaimed_bytes,
+                index_blobs = ?observations.index_blob_count,
+                "maintenance run succeeded"
+            );
             Ok(())
         }
     }
@@ -2745,6 +3171,33 @@ fn probe_scratch_writable(path: &str) -> std::io::Result<()> {
     let probe = std::path::Path::new(path).join(".kopiur-writable");
     std::fs::write(&probe, b"")?;
     std::fs::remove_file(&probe)
+}
+
+/// **Pure.** The quick tier's `successExpr` environment derived from the newest
+/// snapshot manifest for its identity: `(stats, snapshot id)`.
+///
+/// `kopia snapshot verify` reports no machine-readable file/byte counts of its
+/// own, so a healthy quick verify of a non-empty snapshot satisfies the common
+/// `stats.files > 0` predicate from the manifest instead of always failing on a
+/// hardcoded 0. `errors` is 0 — a passing verify found no integrity errors.
+/// Counts saturate rather than wrap, so an absurd manifest cannot make a
+/// predicate read a small number.
+///
+/// Deliberately takes the manifest that WAS found. "No manifest for this
+/// identity" is not an environment to report, it is a terminal verdict
+/// ([`MoverError::VerifyNoSnapshot`]): `kopia snapshot verify --sources` exits 0
+/// when its filter matches ZERO manifests, so reporting success there stamps
+/// `status.lastVerified` for a source path the repository holds no snapshot for
+/// — the #456 false pass.
+fn quick_coverage(entry: kopiur_kopia::SnapshotListEntry) -> (kopiur_api::VerifyStats, String) {
+    (
+        kopiur_api::VerifyStats {
+            files: i64::try_from(entry.stats.file_count).unwrap_or(i64::MAX),
+            bytes: i64::try_from(entry.stats.total_size).unwrap_or(i64::MAX),
+            errors: 0,
+        },
+        entry.id,
+    )
 }
 
 /// Drive a `Verify` run (ADR-0005 §4): connect, run the quick (`kopia snapshot
@@ -2769,7 +3222,7 @@ async fn run_verify_flow(
     // any other data flow.
     if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
         let e = e.into_mover_error(KopiaOp::VerifyConnect);
-        patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
+        patch_verify_failure(spec, op, &e.to_string()).await;
         error!(class = %e.kopia_class(), "could not open a capped connection to the repository being verified");
         return Err(e);
     }
@@ -2788,7 +3241,7 @@ async fn run_verify_flow(
             let mut opts = q.to_kopia();
             opts.sources = vec![spec.identity.source_spec()];
             if let Err(e) = client.snapshot_verify(&opts).await {
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
+                patch_verify_failure(spec, op, &e.to_string()).await;
                 error!(class = %e.class(), "snapshot verify failed");
                 return Err(MoverError::Kopia {
                     op: KopiaOp::SnapshotVerify,
@@ -2799,20 +3252,56 @@ async fn run_verify_flow(
             // its own, so derive the predicate environment from the snapshot manifest:
             // a healthy quick verify of a non-empty snapshot then satisfies the common
             // `stats.files > 0` predicate instead of always failing on a hardcoded 0.
-            // `errors` is 0 — a passing verify found no integrity errors. Best-effort:
-            // if the manifest can't be listed we fall back to 0/0/0 and the exit code
-            // remains the integrity verdict.
+            // `errors` is 0 — a passing verify found no integrity errors.
+            //
+            // The three arms are EXHAUSTIVE and mean three different things. The
+            // `_ =>` catch-all they replace (#456) conflated "this identity has no
+            // snapshot" with "the listing failed", and reported SUCCESS for both.
             match resolve_latest_snapshot(client, spec).await {
-                Ok(Some(entry)) => (
-                    kopiur_api::VerifyStats {
-                        files: i64::try_from(entry.stats.file_count).unwrap_or(i64::MAX),
-                        bytes: i64::try_from(entry.stats.total_size).unwrap_or(i64::MAX),
-                        errors: 0,
-                    },
-                    None,
-                    Some(entry.id),
-                ),
-                _ => (kopiur_api::VerifyStats::default(), None, None),
+                Ok(Some(entry)) => {
+                    let (stats, id) = quick_coverage(entry);
+                    (stats, None, Some(id))
+                }
+                // TERMINAL, exactly as the deep arm below already treats it —
+                // this is the #456 defect itself, not merely its trigger.
+                // `kopia snapshot verify --sources <spec>` exits 0 when the
+                // filter matches ZERO manifests, so falling through here
+                // stamped `status.lastVerified` for a source path the
+                // repository holds no snapshot for. A verification that covered
+                // NOTHING is a failure, and the mover is the only place that
+                // can know it: the controller's scheduling gate is an inference
+                // about coverage from Snapshot CRs, which a strategy/override
+                // change or an external deletion invalidates. Failing here
+                // demotes that gate to an optimisation.
+                Ok(None) => {
+                    let err = MoverError::VerifyNoSnapshot {
+                        source_path: spec.identity.source_path.clone(),
+                    };
+                    let msg = format!(
+                        "quick verification covered NO snapshot: the repository holds no \
+                         snapshot for {}. `kopia snapshot verify` exits 0 when its \
+                         --sources filter matches nothing, so this is reported as a \
+                         failure rather than a false pass. Run a backup for this source \
+                         first; if you just changed sourcePathStrategy or \
+                         sourcePathOverride, the previous snapshots live under the OLD \
+                         path and this identity is new.",
+                        spec.identity.source_spec()
+                    );
+                    patch_verify_failure(spec, op, &msg).await;
+                    error!(class = %err.kopia_class(), "{msg}");
+                    return Err(err);
+                }
+                // A LISTING failure is a different verdict from "no snapshot":
+                // the integrity verdict above may well be sound, but we cannot
+                // PROVE what was covered, so we must not claim success.
+                Err(e) => {
+                    patch_verify_failure(spec, op, &e.to_string()).await;
+                    error!(class = %e.class(), "could not list snapshots to confirm what the quick verify covered");
+                    return Err(MoverError::Kopia {
+                        op: KopiaOp::SnapshotVerify,
+                        source: e,
+                    });
+                }
             }
         }
         VerifyTier::Deep(d) => {
@@ -2826,16 +3315,11 @@ async fn run_verify_flow(
                         let err = MoverError::VerifyNoSnapshot {
                             source_path: spec.identity.source_path.clone(),
                         };
-                        patch_verify_status(
-                            &spec.target_ref,
-                            &verify_failed_body(&err.to_string()),
-                        )
-                        .await;
+                        patch_verify_failure(spec, op, &err.to_string()).await;
                         return Err(err);
                     }
                     Err(e) => {
-                        patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string()))
-                            .await;
+                        patch_verify_failure(spec, op, &e.to_string()).await;
                         return Err(MoverError::Kopia {
                             op: KopiaOp::DeepVerifySnapshotList,
                             source: e,
@@ -2854,7 +3338,7 @@ async fn run_verify_flow(
                     uid: kopiur_api::common::MOVER_NONROOT_ID,
                     source,
                 };
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&err.to_string())).await;
+                patch_verify_failure(spec, op, &err.to_string()).await;
                 error!(class = %err.kopia_class(), "deep verify scratch path not writable");
                 return Err(err);
             }
@@ -2869,7 +3353,7 @@ async fn run_verify_flow(
                 )
                 .await
             {
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&e.to_string())).await;
+                patch_verify_failure(spec, op, &e.to_string()).await;
                 error!(class = %e.class(), "deep verify scratch-restore failed");
                 return Err(MoverError::Kopia {
                     op: KopiaOp::DeepVerifyRestore,
@@ -2914,13 +3398,13 @@ async fn run_verify_flow(
             Ok(false) => {
                 let err = MoverError::SuccessExprFalse { expr: expr.clone() };
                 let msg = err.to_string();
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&msg)).await;
+                patch_verify_failure(spec, op, &msg).await;
                 warn!("{msg}");
                 return Err(err);
             }
             Err(e) => {
                 let err = MoverError::SuccessExprEval { source: e };
-                patch_verify_status(&spec.target_ref, &verify_failed_body(&err.to_string())).await;
+                patch_verify_failure(spec, op, &err.to_string()).await;
                 return Err(err);
             }
         }
@@ -2930,7 +3414,7 @@ async fn run_verify_flow(
         &spec.target_ref,
         &verify_ok_body(
             op.tier.kind_str(),
-            op.repository_key.as_deref(),
+            verify_stamp_key(op),
             &chrono::Utc::now(),
         ),
     )
@@ -2988,6 +3472,30 @@ fn count_files(dir: &str) -> Option<i64> {
 /// [`patch_maintenance_status`].
 async fn patch_verify_status(target: &workspec::TargetRef, body: &serde_json::Value) {
     patch_maintenance_status(target, body).await;
+}
+
+/// The (repository x member) `verificationStamps` key this verify run owns, or
+/// `None` for the classic flat flow (one repository, one verification member).
+///
+/// `repository_key` is the pre-#456 fallback, so a Job already in flight across
+/// the upgrade (its work spec rides its own env) still stamps the per-repository
+/// entry it was minted for. It is ALSO the discriminator for who may write the
+/// `status.conditions` array — see [`verify_failed_body`].
+fn verify_stamp_key(op: &VerifyOp) -> Option<&str> {
+    op.stamp_key.as_deref().or(op.repository_key.as_deref())
+}
+
+/// Report a failed verification on the `SnapshotPolicy`, from the one run that
+/// owns the conditions array.
+///
+/// A cell of #456's (repository x member) fan-out writes NOTHING here: N of
+/// them run concurrently on one policy and a merge-patched `conditions` array
+/// replaces its siblings' — and the controller's `Ready`. See
+/// [`verify_failed_body`] for what surfaces the failure instead.
+async fn patch_verify_failure(spec: &MoverWorkSpec, op: &VerifyOp, message: &str) {
+    if let Some(body) = verify_failed_body(verify_stamp_key(op), message) {
+        patch_verify_status(&spec.target_ref, &body).await;
+    }
 }
 
 /// Drive a `Replicate` run (ADR-0005 §13(d)): connect to the *source* repository,
@@ -3337,9 +3845,41 @@ struct SreplRunData {
     stats: SnapshotReplicationRunStats,
 }
 
+/// Name (up to 10) incomplete source manifests the run skipped, with the fix.
+/// A `warn!`, not a failure: the skip is correct, but the checkpoint is an
+/// interrupted upload an operator usually wants to clean up.
+fn warn_incomplete_skipped(skipped: &[&kopiur_kopia::SnapshotListEntry]) {
+    if skipped.is_empty() {
+        return;
+    }
+    let sample = skipped
+        .iter()
+        .take(10)
+        .map(|e| {
+            format!(
+                "{}@{} ({}, id {})",
+                e.source.identity(),
+                e.start_time.to_rfc3339(),
+                e.incomplete_reason().unwrap_or_default(),
+                e.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        count = skipped.len(),
+        %sample,
+        "skipping incomplete source snapshot manifest(s): kopia cannot replicate a checkpoint, so \
+         they are excluded from the copy and the post-verify. They are usually left by an \
+         interrupted `kopia snapshot create`; once confirmed abandoned, remove each with \
+         `kopia snapshot delete <id> --delete` against the source repository"
+    );
+}
+
 /// Steps 5–7 of the replicate flow: enumerate the source (`snapshot list
-/// --all` — foreign identities too; incomplete checkpoints never appear,
-/// kopia's list omits them without `--incomplete`), select identities, run the
+/// --all` — foreign identities too; incomplete checkpoints ARE listed — kopia's
+/// `--incomplete` filters only text output — so the kernels exclude them and
+/// the run reports them as `incompleteSkipped`), select identities, run the
 /// migrate (`--all` when unfiltered, else one `--sources` per selected
 /// triple), then the mandatory post-verify (kopia exits 0 even when a
 /// per-source migration failed, so the dest listing is the real success
@@ -3354,7 +3894,9 @@ async fn srepl_migrate_and_verify(
 ) -> Result<Option<SreplRunData>> {
     use kopiur_mover::error::KopiaOp as Op;
 
-    let source_list = match source_client.snapshot_list_all().await {
+    // Unfiltered on purpose: the kernels skip incomplete manifests themselves,
+    // and the run reports what it skipped (issue #477).
+    let source_list = match source_client.snapshot_list_all_with_incomplete().await {
         Ok(l) => l,
         Err(e) => {
             srepl_terminal_kopia(&spec.target_ref, Op::SourceSnapshotList, e).await?;
@@ -3362,8 +3904,14 @@ async fn srepl_migrate_and_verify(
         }
     };
     let selected = srepl::select_identities(&op.include, &op.exclude, &source_list);
+    let incomplete_skipped = srepl::incomplete_skipped(&op.include, &op.exclude, &source_list);
+    warn_incomplete_skipped(&incomplete_skipped);
     if selected.is_empty() {
-        let stats = SnapshotReplicationRunStats::default();
+        let stats = SnapshotReplicationRunStats {
+            incomplete_skipped: incomplete_skipped.len(),
+            ..Default::default()
+        };
+        let message = snapshot_replicate_no_match_message(&stats);
         patch_snapshot_replicate_status(
             &spec.target_ref,
             &snapshot_replicate_ok_body(
@@ -3371,11 +3919,11 @@ async fn srepl_migrate_and_verify(
                 &chrono::Utc::now(),
                 &stats,
                 "NoIdentitiesMatched",
-                "no source identities matched the selection; nothing to replicate",
+                &message,
             ),
         )
         .await;
-        info!("no source identities matched the selection; nothing to replicate");
+        info!("{message}");
         return Ok(None);
     }
     let dest_before = match dest_client.snapshot_list_all().await {
@@ -3423,6 +3971,7 @@ async fn srepl_migrate_and_verify(
         already_present: expected.intersection(&dest_before_keys).count(),
         failed: missing.len(),
         pruned: 0,
+        incomplete_skipped: incomplete_skipped.len(),
     };
     let expected_len = expected.len();
     Ok(Some(SreplRunData {
@@ -3597,18 +4146,7 @@ async fn run_snapshot_replicate_flow(
             &chrono::Utc::now(),
             stats,
             "ReplicationSucceeded",
-            &format!(
-                "replicated {} snapshot(s) across {} identit{} ({} already present, {} pruned)",
-                stats.snapshots_copied,
-                stats.identities_selected,
-                if stats.identities_selected == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                stats.already_present,
-                stats.pruned,
-            ),
+            &snapshot_replicate_success_message(stats),
         ),
     )
     .await;
@@ -3831,6 +4369,62 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #456: the quick tier's coverage verdict -----------------------------
+
+    /// A manifest entry with the given counts, for [`quick_coverage`].
+    fn manifest(id: &str, files: u64, bytes: u64) -> kopiur_kopia::SnapshotListEntry {
+        let mut e: kopiur_kopia::SnapshotListEntry = serde_json::from_value(serde_json::json!({
+            "id": id,
+            "source": { "host": "h", "userName": "u", "path": "/pvc/data" },
+            "startTime": "2026-08-01T00:00:00Z",
+            "endTime": "2026-08-01T00:01:00Z",
+        }))
+        .expect("typed manifest entry");
+        e.stats.file_count = files;
+        e.stats.total_size = bytes;
+        e
+    }
+
+    #[test]
+    fn quick_coverage_reports_the_manifest_counts_and_saturates() {
+        let (stats, id) = quick_coverage(manifest("k1", 42, 4096));
+        assert_eq!(id, "k1");
+        assert_eq!(stats.files, 42);
+        assert_eq!(stats.bytes, 4096);
+        assert_eq!(
+            stats.errors, 0,
+            "a passing quick verify found no integrity errors"
+        );
+        // Saturate, never wrap: a wrapped count could make `stats.files > 0`
+        // read false (or a byte budget read small) on an absurd manifest.
+        let (stats, _) = quick_coverage(manifest("k2", u64::MAX, u64::MAX));
+        assert_eq!(stats.files, i64::MAX);
+        assert_eq!(stats.bytes, i64::MAX);
+    }
+
+    #[test]
+    fn a_quick_verify_that_covered_no_snapshot_is_a_terminal_failure_not_a_pass() {
+        // #456's actual defect. `kopia snapshot verify --sources <spec>` exits 0
+        // when its filter matches ZERO manifests, so the quick arm's old `_ =>`
+        // catch-all stamped `status.lastVerified` for a source path the
+        // repository holds no snapshot for. The arm now returns this error; the
+        // guarantees it must keep are that it is TERMINAL (a retry cannot make
+        // a missing snapshot appear) and that it NAMES the path, since "which
+        // path?" is the whole diagnosis.
+        let err = MoverError::VerifyNoSnapshot {
+            source_path: "/pvc/data-b".into(),
+        };
+        assert!(
+            err.to_string().contains("/pvc/data-b"),
+            "the message must name the derived path: {err}"
+        );
+        assert!(
+            !err.retry_recommended(),
+            "a missing snapshot cannot be retried into existence, so a blind re-run \
+             must not be recommended"
+        );
+    }
 
     // --- #435: `bootstrap_declined` is three-way, not two-way ----------------
 
@@ -4493,73 +5087,283 @@ esac
                 .expect("delete_one self-heals the live manifest and succeeds");
         }
 
-        #[tokio::test]
-        async fn delete_batch_attempts_every_member_even_after_an_earlier_failure() {
-            // attempt-all-then-fail: the first member's delete fails (a
-            // non-idempotent error, not the "already absent" no-op), but the
-            // second must still be attempted — proven by a marker file the
-            // shim only touches on the second member's argv.
-            let marker_dir = tempfile::tempdir().unwrap();
-            let marker = marker_dir.path().join("good-id-deleted");
-            let s = shim(&format!(
+        /// A kopia shim that appends every invocation's argv to a log, lists
+        /// `listed` ids as complete snapshots, and runs `delete_arm` (a `case`
+        /// arm body) for any `snapshot delete`.
+        fn logging_shim(log: &std::path::Path, listed: &[&str], delete_arms: &str) -> Shim {
+            let entries = listed
+                .iter()
+                .map(|id| {
+                    format!(
+                        r#"{{"id":"{id}","source":{{"host":"prod","userName":"mydb","path":"/pvc/{id}"}},"startTime":"2026-06-19T05:54:19Z","endTime":"2026-06-19T05:54:19Z"}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            shim(&format!(
                 r#"#!/bin/sh
+echo "$*" >> "{log}"
 case "$*" in
-  *"snapshot delete bad-id"*) echo "error deleting snapshots: access denied" 1>&2; exit 1 ;;
-  *"snapshot delete good-id"*) touch "{marker}"; exit 0 ;;
-  *) exit 0 ;;
+  "snapshot list"*) echo '[{entries}]'; exit 0 ;;
+{delete_arms}
+  *) echo "unexpected argv: $*" 1>&2; exit 9 ;;
 esac
 "#,
-                marker = marker.display()
-            ));
-            let client = client_for(&s);
-            let op = SnapshotDeleteBatchOp {
-                items: vec![
-                    SnapshotDeleteItem {
-                        snapshot_id: "bad-id".into(),
+                log = log.display(),
+            ))
+        }
+
+        /// The kopia subcommands a shim saw, trailing common flags stripped.
+        fn invocations(log: &std::path::Path) -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| {
+                    l.split(" --no-")
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                })
+                .collect()
+        }
+
+        fn batch(ids: &[&str]) -> SnapshotDeleteBatchOp {
+            SnapshotDeleteBatchOp {
+                items: ids
+                    .iter()
+                    .map(|id| SnapshotDeleteItem {
+                        snapshot_id: (*id).into(),
                         anchor: SnapshotAnchor::default(),
-                    },
-                    SnapshotDeleteItem {
-                        snapshot_id: "good-id".into(),
-                        anchor: SnapshotAnchor::default(),
-                    },
-                ],
-            };
-            let err = delete_batch(&client, &op)
-                .await
-                .expect_err("one member failed, so the batch is incomplete");
-            match err {
-                MoverError::BatchDeleteIncomplete { failed, total } => {
-                    assert_eq!(failed, 1);
-                    assert_eq!(total, 2);
-                }
-                other => panic!("expected BatchDeleteIncomplete, got {other:?}"),
+                    })
+                    .collect(),
             }
-            assert!(
-                marker.exists(),
-                "the second member must still be attempted after the first failed"
+        }
+
+        /// Issue #477: the whole batch costs ONE listing and ONE delete
+        /// process (one repository open each), however many members it has.
+        /// An already-absent member never reaches the argv, because one absent
+        /// id aborts kopia's all-or-nothing multi-id delete.
+        #[tokio::test]
+        async fn delete_batch_opens_the_repository_once_for_the_whole_batch() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(
+                &log,
+                &["a", "b", "c"],
+                r#"  "snapshot delete a b c --delete"*) exit 0 ;;"#,
+            );
+            let update = delete_batch(&client_for(&s), &batch(&["a", "gone", "b", "c"]))
+                .await
+                .expect("every present member deleted; the absent one was already done");
+            assert_eq!(update.phase.as_deref(), Some("Succeeded"));
+            assert_eq!(
+                invocations(&log),
+                [
+                    "snapshot list --json --all",
+                    "snapshot delete a b c --delete"
+                ]
             );
         }
 
         #[tokio::test]
-        async fn delete_batch_reports_success_when_every_member_succeeds() {
-            let s = shim("#!/bin/sh\nexit 0\n");
-            let client = client_for(&s);
-            let op = SnapshotDeleteBatchOp {
-                items: vec![
-                    SnapshotDeleteItem {
-                        snapshot_id: "a".into(),
-                        anchor: SnapshotAnchor::default(),
-                    },
-                    SnapshotDeleteItem {
-                        snapshot_id: "b".into(),
-                        anchor: SnapshotAnchor::default(),
-                    },
-                ],
-            };
-            let update = delete_batch(&client, &op)
+        async fn delete_batch_with_nothing_present_deletes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(&log, &[], "");
+            delete_batch(&client_for(&s), &batch(&["gone"]))
                 .await
-                .expect("every member succeeds");
-            assert_eq!(update.phase.as_deref(), Some("Succeeded"));
+                .expect("an already-absent member is success");
+            assert_eq!(invocations(&log), ["snapshot list --json --all"]);
         }
+
+        #[tokio::test]
+        async fn delete_batch_self_heals_a_stale_id_in_the_same_bulk_call() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(
+                &log,
+                &["a", "live"],
+                r#"  "snapshot delete a live --delete"*) exit 0 ;;"#,
+            );
+            let mut op = batch(&["a", "stale"]);
+            op.items[1].anchor = anchor_with_start_time("/pvc/live", "2026-06-19T05:54:19Z");
+            op.items[1].anchor.username = Some("mydb".into());
+            op.items[1].anchor.hostname = Some("prod".into());
+            delete_batch(&client_for(&s), &op).await.expect("healed");
+            assert_eq!(
+                invocations(&log),
+                [
+                    "snapshot list --json --all",
+                    "snapshot delete a live --delete"
+                ]
+            );
+        }
+
+        /// A listing that cannot open the repository fails the Job WITHOUT
+        /// fanning out one more repository open per member.
+        #[tokio::test]
+        async fn delete_batch_list_failure_deletes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = shim(&format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\necho 'failed to open repository: unexpected EOF' 1>&2\nexit 1\n",
+                log.display()
+            ));
+            let err = delete_batch(&client_for(&s), &batch(&["a", "b"]))
+                .await
+                .expect_err("the list failed");
+            assert!(
+                matches!(
+                    err,
+                    MoverError::Kopia {
+                        op: KopiaOp::BatchDeleteSnapshotList,
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            assert_eq!(invocations(&log).len(), 1, "only the failed list ran");
+        }
+
+        /// A RETRYABLE bulk failure (the backend dropping connections, #477)
+        /// marks the chunk failed with no per-id fan-out, which would re-open
+        /// the struggling repository once per member.
+        #[tokio::test]
+        async fn delete_batch_retryable_bulk_failure_does_not_fan_out() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(
+                &log,
+                &["a", "b"],
+                r#"  "snapshot delete"*) echo "failed to open repository: error loading indexes: unexpected EOF" 1>&2; exit 1 ;;"#,
+            );
+            let err = delete_batch(&client_for(&s), &batch(&["a", "b"]))
+                .await
+                .expect_err("the bulk delete failed");
+            assert!(
+                matches!(
+                    err,
+                    MoverError::BatchDeleteIncomplete {
+                        failed: 2,
+                        total: 2
+                    }
+                ),
+                "{err:?}"
+            );
+            assert_eq!(
+                invocations(&log),
+                ["snapshot list --json --all", "snapshot delete a b --delete"]
+            );
+        }
+
+        /// A NON-retryable bulk failure (e.g. an id removed between the list
+        /// and the delete) committed nothing, so every id is retried alone with
+        /// the idempotent single delete. attempt-all-then-fail holds: a later
+        /// member is still attempted after an earlier one fails.
+        #[tokio::test]
+        async fn delete_batch_non_retryable_bulk_failure_falls_back_per_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let s = logging_shim(
+                &log,
+                &["bad", "vanished", "good"],
+                r#"  "snapshot delete bad vanished good --delete"*) echo "error deleting snapshots by root ID vanished: no snapshots matched vanished" 1>&2; exit 1 ;;
+  "snapshot delete bad --delete"*) echo "error deleting snapshots: access denied" 1>&2; exit 1 ;;
+  "snapshot delete vanished --delete"*) echo "no snapshots matched vanished" 1>&2; exit 1 ;;
+  "snapshot delete good --delete"*) exit 0 ;;"#,
+            );
+            let err = delete_batch(&client_for(&s), &batch(&["bad", "vanished", "good"]))
+                .await
+                .expect_err("one member really failed");
+            assert!(
+                matches!(
+                    err,
+                    MoverError::BatchDeleteIncomplete {
+                        failed: 1,
+                        total: 3
+                    }
+                ),
+                "{err:?}"
+            );
+            assert_eq!(
+                invocations(&log),
+                [
+                    "snapshot list --json --all",
+                    "snapshot delete bad vanished good --delete",
+                    "snapshot delete bad --delete",
+                    "snapshot delete vanished --delete",
+                    "snapshot delete good --delete",
+                ]
+            );
+        }
+    }
+
+    // --- #451: the stream restore's root-object resolution -------------------
+
+    fn stream_anchor(path: &str, start: Option<&str>) -> SnapshotAnchor {
+        SnapshotAnchor {
+            source_path: path.to_string(),
+            start_time: start.map(str::to_string),
+            username: Some("pg".to_string()),
+            hostname: Some("db".to_string()),
+        }
+    }
+
+    /// The listing MUST be scoped to the snapshot's own identity rather than
+    /// `snapshot_list_all()`: on a shared repository holding thousands of
+    /// manifests, resolving one root object used to decode every one of them, so
+    /// the cost of a stream restore depended on OTHER policies' history.
+    #[test]
+    fn a_complete_anchor_scopes_the_stream_listing() {
+        let filter = anchor_source_filter(&stream_anchor("/stream/postgres.sql", None))
+            .expect("a complete anchor yields a filter");
+        assert_eq!(filter.user_name, "pg");
+        assert_eq!(filter.host, "db");
+        assert_eq!(filter.path, "/stream/postgres.sql");
+    }
+
+    /// And it fails OPEN to the unscoped listing for an incomplete anchor. A
+    /// `SnapshotSource` built from a partial anchor would filter on an EMPTY
+    /// username/hostname and match NOTHING, turning a cost optimization into a
+    /// restore that cannot find a snapshot that is right there.
+    #[test]
+    fn an_incomplete_anchor_falls_back_to_the_unscoped_listing() {
+        // No path at all (a pre-feature work spec).
+        assert!(anchor_source_filter(&stream_anchor("", None)).is_none());
+        // Path but no recorded identity (an anchor captured before identity was).
+        let mut partial = stream_anchor("/stream/postgres.sql", None);
+        partial.username = None;
+        assert!(anchor_source_filter(&partial).is_none());
+        partial = stream_anchor("/stream/postgres.sql", None);
+        partial.hostname = None;
+        assert!(anchor_source_filter(&partial).is_none());
+    }
+
+    fn listed_entry(id: &str, obj: &str) -> kopiur_kopia::SnapshotListEntry {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "source": { "userName": "pg", "host": "db", "path": "/stream/postgres.sql" },
+            "startTime": "2024-01-01T00:00:00Z",
+            "endTime": "2024-01-01T00:01:00Z",
+            "rootEntry": { "name": "postgres.sql", "obj": obj, "type": "d" },
+        }))
+        .expect("a valid SnapshotListEntry")
+    }
+
+    /// The sub-path form (`<root>/<name>`) needs the ROOT ENTRY object id; a
+    /// manifest id fails with "parent is not a directory". Pin the extraction,
+    /// including the two misses that make the self-heal necessary.
+    #[test]
+    fn the_root_object_is_read_off_the_matching_entry_only() {
+        let listed = vec![listed_entry("kaaa", "k111"), listed_entry("kbbb", "k222")];
+        assert_eq!(root_object_of(&listed, "kbbb").as_deref(), Some("k222"));
+        // A STALE id — what kopia leaves behind after rewriting a manifest on pin
+        // — finds nothing, which is what drives the anchor self-heal.
+        assert_eq!(root_object_of(&listed, "kold"), None);
+        // An entry with no root entry cannot be addressed either.
+        let mut rootless = listed_entry("kccc", "k333");
+        rootless.root_entry = None;
+        assert_eq!(root_object_of(&[rootless], "kccc"), None);
     }
 }
