@@ -975,6 +975,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `coverage` | enum: Complete \| Capped \| Partial | — | How much of the repository a catalog scan could see. |
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
 | `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |
@@ -2047,6 +2048,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `coverage` | enum: Complete \| Capped \| Partial | — | How much of the repository a catalog scan could see. |
 | `discoveredBackupCount` | integer | — | How many `Snapshot` CRs were materialized from the catalog scan. |
 | `foreignSnapshotCount` | integer | — | Snapshots in the last complete listing classified as another cluster's (see `catalog.foreignSnapshots`); never materialized under `Ignore`. As of `catalog.lastRefreshAt` — enable `periodicRefresh` to keep it current. |
 | `lastRefreshAt` | string | — | RFC 3339 timestamp of the last catalog refresh. |

@@ -25,6 +25,7 @@ use kube::ResourceExt;
 use kube::runtime::reflector::Store;
 
 use kopiur_api::common::{RepositoryKind, RepositoryRef};
+use kopiur_api::repository::CatalogCoverage;
 use kopiur_api::{
     ClusterRepository, PhaseLabel, Repository, Restore, Snapshot, SnapshotPhase, SnapshotStats,
 };
@@ -822,6 +823,55 @@ impl Metrics {
     /// keeps discovered snapshots out of PromQL `by (policy)` groupings.
     pub fn register_resource_observers(&self, stores: ResourceStores) {
         let m = self.provider.meter();
+
+        // Catalog coverage per repository (#476): 1 on the state matching
+        // `status.catalog.coverage` as of the last scan. Store-backed like the
+        // phase gauge — the series exists iff the CR does, so a `state="partial"`
+        // alert resolves when its repository is deleted — and only the ACTIVE
+        // state is emitted. Never scanned, or a state this build does not know
+        // (`Unknown`, a newer operator's write), emits nothing rather than
+        // minting an unbounded label.
+        {
+            let repositories = stores.repositories.clone();
+            let cluster_repositories = stores.cluster_repositories.clone();
+            let _ = m
+                .i64_observable_gauge("kopiur_repo_catalog_coverage")
+                .with_description(
+                    "1 on the state (complete/capped/partial) matching status.catalog.coverage \
+                     as of the last catalog scan (#476); only the active state is emitted. \
+                     partial = rows whose snapshots were deleted repository-side are NOT \
+                     expired.",
+                )
+                .with_callback(move |o| {
+                    let repos = repositories.state().into_iter().map(|r| {
+                        (
+                            r.namespace().unwrap_or_default(),
+                            r.name_any(),
+                            catalog_coverage(r.status.as_ref().and_then(|s| s.catalog.as_ref())),
+                        )
+                    });
+                    let crepos = cluster_repositories.state().into_iter().map(|r| {
+                        (
+                            String::new(),
+                            r.name_any(),
+                            catalog_coverage(r.status.as_ref().and_then(|s| s.catalog.as_ref())),
+                        )
+                    });
+                    for (ns, name, state) in repos.chain(crepos) {
+                        if let Some(state) = state {
+                            o.observe(
+                                1,
+                                &[
+                                    KeyValue::new("namespace", ns),
+                                    KeyValue::new("name", name),
+                                    KeyValue::new("state", state),
+                                ],
+                            );
+                        }
+                    }
+                })
+                .build();
+        }
 
         // Per-resource lifecycle phase across all four store-backed kinds. One series
         // per CR, valued 1 at its active phase.
@@ -1815,6 +1865,20 @@ fn deletion_held(backup: &Snapshot) -> bool {
     })
 }
 
+/// The lowercase `state` label for a repository's catalog coverage, or `None`
+/// when there is nothing to emit: never scanned, or a value this build does not
+/// recognize (an exhaustive match, so a new canonical state must be labeled here).
+fn catalog_coverage(
+    catalog: Option<&kopiur_api::repository::CatalogStatus>,
+) -> Option<&'static str> {
+    match catalog?.coverage.as_ref()? {
+        CatalogCoverage::Complete => Some("complete"),
+        CatalogCoverage::Capped => Some("capped"),
+        CatalogCoverage::Partial => Some("partial"),
+        CatalogCoverage::Unknown(_) => None,
+    }
+}
+
 /// `repo_kind`/`repo_name` attributes for the deletion-observability gauges:
 /// the pinned repository's kind/name, or the single conservative
 /// "unknown"/"unknown" bucket when unpinned — never a per-repo guess, and
@@ -2634,6 +2698,123 @@ mod tests {
                     && l.contains("name=\"nas\"")),
             "{text}"
         );
+    }
+
+    /// Every `kopiur_repo_catalog_coverage` line for `name="nas"`, as
+    /// `state -> value`.
+    fn coverage_series(text: &str) -> std::collections::BTreeMap<String, String> {
+        text.lines()
+            .filter(|l| {
+                l.starts_with("kopiur_repo_catalog_coverage{") && l.contains("name=\"nas\"")
+            })
+            .map(|l| {
+                let state = l
+                    .split("state=\"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or_else(|| panic!("no state label: {l}"))
+                    .to_string();
+                let value = l.trim_end().rsplit(' ').next().unwrap().to_string();
+                (state, value)
+            })
+            .collect()
+    }
+
+    fn expect_states(text: &str, want: &[(&str, &str)]) {
+        let got = coverage_series(text);
+        let want: std::collections::BTreeMap<String, String> = want
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(got, want, "{text}");
+    }
+
+    fn coverage_stores(repos: Vec<Repository>, crepos: Vec<ClusterRepository>) -> ResourceStores {
+        let (snaps, _, _, restores) = empty_stores();
+        ResourceStores {
+            snapshots: snaps.0,
+            repositories: make_store(repos).0,
+            cluster_repositories: make_store(crepos).0,
+            restores: restores.0,
+        }
+    }
+
+    #[test]
+    fn repo_catalog_coverage_emits_only_the_active_state_from_the_store() {
+        let m = Metrics::new();
+        let text = gather_with(
+            &m,
+            coverage_stores(
+                vec![repository_cr_with_status(
+                    "apps",
+                    "nas",
+                    serde_json::json!({ "phase": "Ready", "catalog": { "coverage": "Partial" } }),
+                )],
+                vec![],
+            ),
+        );
+        // Lowercase state label, value 1, and no 0-valued series for the other
+        // states (the store-backed convention, same as kopiur_resource_phase).
+        expect_states(&text, &[("partial", "1")]);
+        assert!(text.contains("namespace=\"apps\""), "{text}");
+    }
+
+    #[test]
+    fn repo_catalog_coverage_series_exists_iff_the_repository_does() {
+        // No stale `state="partial"} 1` can outlive a deleted repository: the
+        // series is derived from the store on every scrape.
+        let m = Metrics::new();
+        let text = gather_with(&m, coverage_stores(vec![], vec![]));
+        expect_states(&text, &[]);
+    }
+
+    #[test]
+    fn repo_catalog_coverage_covers_cluster_repositories_with_an_empty_namespace() {
+        let m = Metrics::new();
+        let text = gather_with(
+            &m,
+            coverage_stores(
+                vec![],
+                vec![cluster_repository_cr_with_status(
+                    "nas",
+                    serde_json::json!({ "phase": "Ready", "catalog": { "coverage": "Capped" } }),
+                )],
+            ),
+        );
+        expect_states(&text, &[("capped", "1")]);
+        assert!(text.contains("namespace=\"\""), "{text}");
+    }
+
+    #[test]
+    fn repo_catalog_coverage_is_absent_when_unscanned_or_unknown() {
+        // Never scanned (no coverage) and a newer operator's value both emit
+        // nothing — an Unknown string must not mint an unbounded label.
+        let m = Metrics::new();
+        let text = gather_with(
+            &m,
+            coverage_stores(
+                vec![
+                    repository_cr_with_status(
+                        "apps",
+                        "nas",
+                        serde_json::json!({ "phase": "Ready" }),
+                    ),
+                    repository_cr_with_status(
+                        "apps",
+                        "nas2",
+                        serde_json::json!({ "phase": "Ready", "catalog": { "coverage": "Sampled" } }),
+                    ),
+                ],
+                vec![],
+            ),
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.starts_with("kopiur_repo_catalog_coverage{")),
+            "{text}"
+        );
+        assert!(!text.to_lowercase().contains("sampled"), "{text}");
     }
 
     #[test]

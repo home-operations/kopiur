@@ -18,6 +18,7 @@ use kopiur_kopia::{KopiaError, KopiaErrorClass, SnapshotListEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::digest::{DIGEST_BUDGET_BYTES, ListedIds, SnapshotIdDigest};
 use crate::status::{FailureBlock, failure_block_from_kopia};
 
 /// The `ConfigMap` data key the bootstrap result is written under (the mover
@@ -25,18 +26,37 @@ use crate::status::{FailureBlock, failure_block_from_kopia};
 /// drift, mirroring [`crate::env::WORK_SPEC_PATH`]).
 pub const RESULT_CONFIGMAP_KEY: &str = "result.json";
 
-/// Upper bound on snapshot entries returned for materialization. Bounds the
-/// `ConfigMap` size (etcd's ~1MB object limit). Applied AFTER
-/// [`apply_foreign_prefilter`] drops another cluster's entries (when the controller
-/// armed it), so a busy foreign peer's snapshots can no longer crowd this cluster's
-/// own out of the capped, returned listing — see [`prepare_catalog_entries`], which
-/// applies both in that order. A **bare** hostname's entries are NEVER dropped by
-/// the prefilter (classifying them needs a namespace lookup only the controller can
-/// do) and so still count against this cap. The snapshot *count* is reported
-/// exactly regardless (not affected by either the prefilter or the cap); only the
-/// per-entry list for materialization is capped, and the cap is surfaced via
-/// [`BootstrapResult::snapshots_truncated`] (never a silent truncation).
+/// Default upper bound on snapshot entries returned for materialization (the
+/// "window"). Bounds the result `ConfigMap` (etcd's ~1 MiB object limit); a
+/// hidden test hook (`BootstrapRepositoryOp::max_returned_snapshots`) can lower
+/// it. See [`prepare_catalog_entries`] for the full pipeline:
+///
+/// - It applies AFTER [`apply_foreign_prefilter`], so a busy foreign peer's
+///   snapshots cannot crowd this cluster's own out of the window. A **bare**
+///   hostname's entries are never prefiltered (classifying them needs a
+///   namespace lookup only the controller can do) and still count against it.
+/// - It applies to a FAIRLY ORDERED listing (newest first, round-robin across
+///   identities — see `order_for_window`), not to kopia's raw
+///   oldest-first-per-source order, so the window holds every identity's
+///   newest history (issue #476).
+/// - It caps only the per-entry window. The authoritative
+///   [`BootstrapResult::snapshot_count`], the membership digest
+///   ([`BootstrapResult::listed_ids`]) and [`BootstrapResult::logical_bytes`]
+///   all cover the FULL post-prefilter listing, so the controller can still
+///   expire rows whose snapshots vanished outside the window. The cap is
+///   surfaced via [`BootstrapResult::snapshots_truncated`] (never silent).
 pub const MAX_RETURNED_SNAPSHOTS: usize = 1000;
+
+/// The materialization window size for one bootstrap run: the work spec's
+/// test-only `max_returned_snapshots` override when set (clamped to at least 1
+/// — a zero window would return nothing yet still claim a membership digest),
+/// else [`MAX_RETURNED_SNAPSHOTS`]. Pure.
+pub fn window_cap(max_returned_snapshots: Option<u32>) -> usize {
+    match max_returned_snapshots {
+        Some(n) => usize::try_from(n).unwrap_or(usize::MAX).max(1),
+        None => MAX_RETURNED_SNAPSHOTS,
+    }
+}
 
 /// Drop listing entries whose hostname classifies
 /// [`kopiur_api::HostClass::ForeignCluster`] against `prefilter_cluster` — the
@@ -66,27 +86,147 @@ pub fn apply_foreign_prefilter(
     (kept, dropped)
 }
 
-/// Prepare a raw kopia listing for materialization: [`apply_foreign_prefilter`],
-/// THEN cap to [`MAX_RETURNED_SNAPSHOTS`] — that order means a busy foreign peer
-/// can no longer crowd this cluster's own snapshots out of the capped list. Returns
-/// `(entries, truncated, foreign_suffix_dropped)`. Pure; the sole caller is the
-/// mover's `run_bootstrap` (the kopia `snapshot list` IO happens before this, not
-/// within it).
+/// What [`prepare_catalog_entries`] hands back to `run_bootstrap`: the capped,
+/// slimmed materialization window plus everything the controller needs about
+/// the FULL post-prefilter listing that the window alone cannot tell it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCatalog {
+    /// The materialization window: fairly ordered (see
+    /// [`prepare_catalog_entries`]), capped, slimmed.
+    pub entries: Vec<SnapshotListEntry>,
+    /// `true` when the post-prefilter listing held more than `cap` entries.
+    pub truncated: bool,
+    /// Entries [`apply_foreign_prefilter`] dropped before anything else ran.
+    pub foreign_suffix_dropped: i64,
+    /// Membership digest over EVERY post-prefilter id (not just the window) —
+    /// `None` only when the listing is past the digest's ceiling.
+    pub listed_ids: Option<ListedIds>,
+    /// Logical bytes under management over the FULL post-prefilter listing.
+    pub logical_bytes: i64,
+}
+
+/// Prepare a raw kopia listing for materialization (pure; the kopia listing IO
+/// happens before this, in the mover's `run_bootstrap`):
+///
+/// 1. [`apply_foreign_prefilter`] — first, so a busy foreign peer can never
+///    crowd this cluster's own snapshots out of the window.
+/// 2. Over the FULL post-prefilter listing: the membership digest
+///    ([`SnapshotIdDigest::build`] with the caller's per-run `salt`, issue #476)
+///    and [`logical_bytes_under_management`]. Both must see what the cap drops.
+/// 3. Order the window fairly (see `order_for_window`), THEN truncate to
+///    `cap`. kopia lists grouped by source, OLDEST first within a source, so a
+///    bare truncation kept the oldest history of the first-listed identities
+///    and starved everything else (the second half of #476).
+/// 4. Slim each returned entry (see [`slim_catalog_entry`]).
 pub fn prepare_catalog_entries(
     listing: Vec<SnapshotListEntry>,
     prefilter_cluster: Option<&str>,
-) -> (Vec<SnapshotListEntry>, bool, i64) {
-    let (mut listing, dropped) = apply_foreign_prefilter(listing, prefilter_cluster);
-    let truncated = listing.len() > MAX_RETURNED_SNAPSHOTS;
+    cap: usize,
+    salt: u64,
+) -> PreparedCatalog {
+    let (listing, dropped) = apply_foreign_prefilter(listing, prefilter_cluster);
+    let listed_ids = SnapshotIdDigest::build(
+        listing.iter().map(|e| e.id.as_str()),
+        salt,
+        DIGEST_BUDGET_BYTES,
+    )
+    .map(ListedIds::Digest);
+    let logical_bytes = logical_bytes_under_management(&listing);
+    let mut listing = order_for_window(listing);
+    let truncated = listing.len() > cap;
     if truncated {
-        listing.truncate(MAX_RETURNED_SNAPSHOTS);
+        listing.truncate(cap);
     }
     // Slim each returned entry to only the fields the controller materializes.
     // The prefilter above needed `source.host`; nothing downstream needs the
     // heavy `rootEntry`/`retentionReason`, so drop them here — this is what
     // actually bounds the result ConfigMap size (see [`slim_catalog_entry`]).
-    let listing = listing.into_iter().map(slim_catalog_entry).collect();
-    (listing, truncated, dropped)
+    let entries = listing.into_iter().map(slim_catalog_entry).collect();
+    PreparedCatalog {
+        entries,
+        truncated,
+        foreign_suffix_dropped: dropped,
+        listed_ids,
+        logical_bytes,
+    }
+}
+
+/// Order a listing so that ANY prefix of it is a fair materialization window
+/// (issue #476). Pure and deterministic.
+///
+/// Each entry is ranked within its identity (`user@host:path`; rank 0 = that
+/// identity's newest by `end_time`, ties by `id`), then the whole listing is
+/// sorted by `(rank asc, end_time desc, id asc)`. So a prefix of length `k`:
+///
+/// - round-robins across identities — every identity's newest snapshot comes
+///   before any identity's second-newest, so a sparse identity is never
+///   starved by dense ones;
+/// - holds, for EACH identity, a newest-first prefix of that identity's own
+///   history — the controller relies on this to fill `retain.perIdentity`
+///   slots from out-of-window rows without ever displacing a window row.
+///
+/// This is what makes both the count cap and
+/// [`enforce_result_size_budget`]'s tail trim drop the highest ranks (oldest
+/// history of the busiest identities) first.
+fn order_for_window(listing: Vec<SnapshotListEntry>) -> Vec<SnapshotListEntry> {
+    use std::cmp::Reverse;
+    fn identity(e: &SnapshotListEntry) -> (&str, &str, &str) {
+        (&e.source.user_name, &e.source.host, &e.source.path)
+    }
+    let newest_first = |a: &SnapshotListEntry, b: &SnapshotListEntry| {
+        b.end_time.cmp(&a.end_time).then_with(|| a.id.cmp(&b.id))
+    };
+
+    // Group by identity, newest first within each, and read the rank off.
+    let mut by_identity: Vec<usize> = (0..listing.len()).collect();
+    by_identity.sort_by(|&a, &b| {
+        identity(&listing[a])
+            .cmp(&identity(&listing[b]))
+            .then_with(|| newest_first(&listing[a], &listing[b]))
+    });
+    let mut rank = vec![0usize; listing.len()];
+    for pair in by_identity.windows(2) {
+        let (prev, cur) = (pair[0], pair[1]);
+        if identity(&listing[prev]) == identity(&listing[cur]) {
+            rank[cur] = rank[prev] + 1;
+        }
+    }
+
+    let mut ranked: Vec<(usize, SnapshotListEntry)> = rank.into_iter().zip(listing).collect();
+    ranked.sort_by(|(ra, a), (rb, b)| {
+        (ra, Reverse(a.end_time), &a.id).cmp(&(rb, Reverse(b.end_time), &b.id))
+    });
+    ranked.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Logical bytes under management: the sum, over each distinct source PATH, of
+/// the newest (max `end_time`) snapshot's `stats.total_size`.
+///
+/// **Must match the controller's `repository::logical_bytes_under_management`
+/// exactly** (pinned by `crates/controller/tests/logical_bytes_parity.rs`): the
+/// controller prefers this value over its own when present, and falls back to
+/// its own over the window when not, so any drift would make
+/// `storageStats.totalSizeBytes` jump between mover versions. Same key
+/// (`source.path` alone — not the full identity), same tie-break (on an equal
+/// `end_time` the FIRST-listed entry wins), same per-entry saturation of an
+/// out-of-range `u64` to `i64::MAX`. The sum saturates too, where the
+/// controller's would overflow — unreachable (≈9.2 EB) and strictly safer.
+pub fn logical_bytes_under_management(listing: &[SnapshotListEntry]) -> i64 {
+    use std::collections::HashMap;
+    let mut newest: HashMap<&str, &SnapshotListEntry> = HashMap::new();
+    for e in listing {
+        let key = e.source.path.as_str();
+        match newest.get(key) {
+            Some(prev) if prev.end_time >= e.end_time => {}
+            _ => {
+                newest.insert(key, e);
+            }
+        }
+    }
+    newest
+        .values()
+        .map(|e| i64::try_from(e.stats.total_size).unwrap_or(i64::MAX))
+        .fold(0i64, i64::saturating_add)
 }
 
 /// Byte cap on the `description` a returned entry carries on the result wire —
@@ -165,12 +305,20 @@ fn normalize_meta_tags(tags: &BTreeMap<String, String>) -> BTreeMap<String, Stri
 pub const RESULT_SIZE_BUDGET_BYTES: usize = 900 * 1024;
 
 /// Backstop for the ConfigMap 1 MiB limit (issue #237): if the serialized `result`
-/// would still exceed `budget_bytes` (e.g. pathologically long identity paths, or a
-/// future field growth that [`slim_catalog_entry`] no longer covers), drop trailing
-/// `snapshots` entries — already newest-first from the cap — until it fits, flagging
-/// [`BootstrapResult::snapshots_truncated`] so the controller logs that not all were
-/// materialized. The authoritative `snapshot_count` is left untouched. Pure and
-/// deterministic; returns the (possibly trimmed) result.
+/// would still exceed `budget_bytes` (e.g. pathologically long identity paths, a
+/// large membership digest, or a future field growth that [`slim_catalog_entry`]
+/// no longer covers), drop trailing `snapshots` entries until it fits, flagging
+/// [`BootstrapResult::snapshots_truncated`]. Pure and deterministic; returns the
+/// (possibly trimmed) result.
+///
+/// It trims **only** `snapshots`. Because [`prepare_catalog_entries`] orders the
+/// window fairly (every identity's newest first), the tail it drops is the
+/// oldest history of the busiest identities, and what survives is still a
+/// prefix of the fair window. Everything describing the FULL listing is left
+/// untouched: `snapshot_count`, `logical_bytes`, and the membership digest
+/// [`BootstrapResult::listed_ids`] — the digest reserves its own budget
+/// ([`crate::digest::DIGEST_BUDGET_BYTES`], well under `budget_bytes`) and is
+/// never trimmed, since a partial digest would read as "absent" for listed ids.
 pub fn enforce_result_size_budget(
     mut result: BootstrapResult,
     budget_bytes: usize,
@@ -807,13 +955,18 @@ pub struct BootstrapResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_count: Option<i64>,
     /// Snapshot entries for the controller to materialize as discovered Snapshots.
-    /// Empty when `scanCatalog` was off, or capped to [`MAX_RETURNED_SNAPSHOTS`]
-    /// (after [`apply_foreign_prefilter`] ran, when armed).
+    /// Empty when `scanCatalog` was off. Otherwise the fair window from
+    /// [`prepare_catalog_entries`]: prefiltered, ordered newest-first round-robin
+    /// across identities, capped to [`MAX_RETURNED_SNAPSHOTS`], and possibly
+    /// tail-trimmed further by [`enforce_result_size_budget`]. Each identity's
+    /// share is a newest-first prefix of its history (new movers only — an old
+    /// mover's window is kopia's raw oldest-first order).
     #[serde(default)]
     pub snapshots: Vec<SnapshotListEntry>,
-    /// `true` if more than [`MAX_RETURNED_SNAPSHOTS`] existed (after prefiltering)
-    /// and the returned list was capped (so the controller can log that not all
-    /// were materialized).
+    /// `true` when `snapshots` is not the whole post-prefilter listing — it was
+    /// capped to [`MAX_RETURNED_SNAPSHOTS`] or trimmed by
+    /// [`enforce_result_size_budget`]. The controller then relies on
+    /// `listed_ids` to decide absence.
     #[serde(default)]
     pub snapshots_truncated: bool,
     /// Entries dropped by [`apply_foreign_prefilter`] BEFORE the
@@ -826,6 +979,24 @@ pub struct BootstrapResult {
     /// default).
     #[serde(default)]
     pub foreign_suffix_dropped: i64,
+    /// Membership set over EVERY listed snapshot id — after the foreign-suffix
+    /// prefilter, BEFORE the materialization cap (issue #476). Written on every
+    /// `scan_catalog` run, so the controller can tell an id that fell outside
+    /// the capped `snapshots` window from one deleted repository-side, and keep
+    /// absence expiry on for repositories larger than the window. `None` when
+    /// the catalog wasn't scanned, the listing exceeded the digest's ceiling
+    /// ([`crate::digest::DIGEST_WIDTHS`]), or the mover predates the field —
+    /// the controller then treats a truncated result as membership-unknown.
+    /// Never trimmed by [`enforce_result_size_budget`]: it reserves its budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed_ids: Option<crate::digest::ListedIds>,
+    /// Logical bytes under management over the FULL post-prefilter listing
+    /// (the newest snapshot's size per source), so `storageStats.totalSizeBytes`
+    /// does not under-count sources outside the capped window. `None` when the
+    /// catalog wasn't scanned or the mover predates the field; the controller
+    /// then falls back to computing it from `snapshots`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_bytes: Option<i64>,
     /// Count of content-index blobs (`kopia index list`), when it could be read.
     /// Best-effort: `None` if the query failed (the controller then leaves the
     /// prior `status.storageStats.indexBlobCount` untouched). The controller
@@ -890,6 +1061,8 @@ impl BootstrapResult {
             snapshots,
             snapshots_truncated,
             foreign_suffix_dropped,
+            listed_ids: None,
+            logical_bytes: None,
             index_blob_count,
             epoch: None,
             epoch_error: None,
@@ -909,6 +1082,19 @@ impl BootstrapResult {
     ) -> Self {
         self.epoch = epoch;
         self.epoch_error = epoch_error;
+        self
+    }
+
+    /// Attach the catalog membership digest and full-listing logical bytes
+    /// (issue #476). A sibling of [`BootstrapResult::with_epoch`] for the same
+    /// reason: the positional list of [`BootstrapResult::ready`] is full.
+    pub fn with_catalog_membership(
+        mut self,
+        listed_ids: Option<crate::digest::ListedIds>,
+        logical_bytes: Option<i64>,
+    ) -> Self {
+        self.listed_ids = listed_ids;
+        self.logical_bytes = logical_bytes;
         self
     }
 
@@ -952,6 +1138,8 @@ impl BootstrapResult {
             snapshots: Vec::new(),
             snapshots_truncated: false,
             foreign_suffix_dropped: 0,
+            listed_ids: None,
+            logical_bytes: None,
             index_blob_count: None,
             epoch: None,
             epoch_error: None,
@@ -1929,7 +2117,12 @@ mod tests {
             .map(|i| entry(&format!("own-{i}"), "checkout"))
             .collect();
         listing.extend((0..50).map(|i| entry(&format!("foreign-{i}"), "billing.west")));
-        let (kept, truncated, dropped) = prepare_catalog_entries(listing, Some("east"));
+        let PreparedCatalog {
+            entries: kept,
+            truncated,
+            foreign_suffix_dropped: dropped,
+            ..
+        } = prepare_catalog_entries(listing, Some("east"), MAX_RETURNED_SNAPSHOTS, 1);
         assert_eq!(dropped, 50);
         assert!(
             !truncated,
@@ -1943,7 +2136,12 @@ mod tests {
         let listing: Vec<SnapshotListEntry> = (0..(MAX_RETURNED_SNAPSHOTS + 10))
             .map(|i| entry(&format!("h{i}"), "checkout"))
             .collect();
-        let (kept, truncated, dropped) = prepare_catalog_entries(listing, None);
+        let PreparedCatalog {
+            entries: kept,
+            truncated,
+            foreign_suffix_dropped: dropped,
+            ..
+        } = prepare_catalog_entries(listing, None, MAX_RETURNED_SNAPSHOTS, 1);
         assert_eq!(dropped, 0);
         assert!(truncated);
         assert_eq!(kept.len(), MAX_RETURNED_SNAPSHOTS);
@@ -2093,7 +2291,11 @@ mod tests {
     #[test]
     fn prepare_catalog_entries_returns_slimmed_entries() {
         let listing = vec![fat_entry("a"), fat_entry("b")];
-        let (kept, truncated, _) = prepare_catalog_entries(listing, None);
+        let PreparedCatalog {
+            entries: kept,
+            truncated,
+            ..
+        } = prepare_catalog_entries(listing, None, MAX_RETURNED_SNAPSHOTS, 1);
         assert!(!truncated);
         assert!(
             kept.iter()
@@ -2126,7 +2328,7 @@ mod tests {
         );
 
         // Slimmed via the real prepare path, the same 1000 entries fit comfortably.
-        let (slim, _, _) = prepare_catalog_entries(raw, None);
+        let slim = prepare_catalog_entries(raw, None, MAX_RETURNED_SNAPSHOTS, 1).entries;
         let result = BootstrapResult::ready(
             false,
             Some("u".into()),
@@ -2172,6 +2374,371 @@ mod tests {
         assert_eq!(
             guarded, before,
             "an in-budget result must be left untouched"
+        );
+    }
+
+    // --- issue #476: fair window, membership digest, logical bytes ----------
+
+    /// A listing entry for `user@host:/pvc/<user>` that ended `secs` after a
+    /// fixed epoch, with a logical size.
+    fn at(id: &str, user: &str, host: &str, secs: i64, size: u64) -> SnapshotListEntry {
+        let t0 = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        SnapshotListEntry {
+            id: id.into(),
+            source: kopiur_kopia::SnapshotSource {
+                user_name: user.into(),
+                host: host.into(),
+                path: format!("/pvc/{user}"),
+            },
+            description: String::new(),
+            start_time: t0 + chrono::Duration::seconds(secs - 30),
+            end_time: t0 + chrono::Duration::seconds(secs),
+            stats: kopiur_kopia::SnapshotStats {
+                total_size: size,
+                ..Default::default()
+            },
+            root_entry: None,
+            retention_reason: vec![],
+            tags: Default::default(),
+            incomplete: None,
+        }
+    }
+
+    /// kopia's real `snapshot list --json` order: grouped by source (sorted),
+    /// ASCENDING end time within a source (`GroupBySource` + `SortByTime`).
+    fn kopia_order(mut v: Vec<SnapshotListEntry>) -> Vec<SnapshotListEntry> {
+        v.sort_by(|a, b| {
+            (
+                &a.source.user_name,
+                &a.source.host,
+                &a.source.path,
+                a.end_time,
+            )
+                .cmp(&(
+                    &b.source.user_name,
+                    &b.source.host,
+                    &b.source.path,
+                    b.end_time,
+                ))
+        });
+        v
+    }
+
+    /// `n` snapshots of one identity, one a minute starting at `start`.
+    fn history(user: &str, n: usize, start: i64) -> Vec<SnapshotListEntry> {
+        (0..n)
+            .map(|i| {
+                at(
+                    &format!("{user}-{i:05}"),
+                    user,
+                    "ns",
+                    start + 60 * i as i64,
+                    10,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn window_cap_defaults_and_clamps_the_test_override() {
+        assert_eq!(window_cap(None), MAX_RETURNED_SNAPSHOTS);
+        assert_eq!(window_cap(Some(2)), 2);
+        assert_eq!(window_cap(Some(0)), 1, "a zero window is clamped to one");
+    }
+
+    #[test]
+    fn capped_window_keeps_the_newest_history_not_the_oldest() {
+        // One identity, 1500 snapshots in kopia's oldest-first order: the old
+        // bare truncation kept ids 0..999 — the OLDEST — and never the newest.
+        let listing = kopia_order(history("app", 1500, 0));
+        let prepared = prepare_catalog_entries(listing, None, 1000, 1);
+        assert!(prepared.truncated);
+        assert_eq!(prepared.entries.len(), 1000);
+        let mut ids: Vec<&str> = prepared.entries.iter().map(|e| e.id.as_str()).collect();
+        ids.sort_unstable();
+        let expected: Vec<String> = (500..1500).map(|i| format!("app-{i:05}")).collect();
+        assert_eq!(ids, expected.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(
+            prepared.entries[0].id, "app-01499",
+            "window starts at the newest"
+        );
+    }
+
+    #[test]
+    fn capped_window_over_many_identities_keeps_each_ones_newest() {
+        // Five identities x 300, grouped oldest-first as kopia lists them. The
+        // old truncation returned identities a..c whole plus a third of d, and
+        // NOTHING of e. The fair window returns each identity's newest 200.
+        let mut all = Vec::new();
+        for (k, user) in ["a", "b", "c", "d", "e"].into_iter().enumerate() {
+            all.extend(history(user, 300, k as i64 * 7));
+        }
+        let prepared = prepare_catalog_entries(kopia_order(all), None, 1000, 1);
+        for user in ["a", "b", "c", "d", "e"] {
+            let floor = format!("{user}-00100");
+            let mine: Vec<&str> = prepared
+                .entries
+                .iter()
+                .filter(|e| e.source.user_name == user)
+                .map(|e| e.id.as_str())
+                .collect();
+            assert_eq!(mine.len(), 200, "{user}");
+            assert!(
+                mine.iter().all(|id| *id >= floor.as_str()),
+                "{user}: only the newest 200 (ids 100..299)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sparse_identity_is_never_starved_by_dense_ones() {
+        // 40 dense identities x 30 recent snapshots + one sparse identity whose
+        // two snapshots are far OLDER than everything else and listed last.
+        let mut all = Vec::new();
+        for d in 0..40 {
+            all.extend(history(&format!("dense{d:02}"), 30, 1_000_000));
+        }
+        all.push(at("sparse-old", "zzsparse", "ns", 5, 1));
+        all.push(at("sparse-new", "zzsparse", "ns", 10, 1));
+        let prepared = prepare_catalog_entries(kopia_order(all), None, 1000, 1);
+        assert!(prepared.truncated);
+        assert!(
+            prepared.entries.iter().any(|e| e.id == "sparse-new"),
+            "the sparse identity's newest snapshot must be in the window"
+        );
+    }
+
+    #[test]
+    fn every_identitys_window_share_is_a_newest_first_prefix_of_its_history() {
+        // Uneven identities, interleaved clocks, a range of caps.
+        let mut all = Vec::new();
+        for (k, n) in [3usize, 17, 1, 9, 40, 2].into_iter().enumerate() {
+            all.extend(history(&format!("u{k}"), n, (k as i64) * 13));
+        }
+        let full = kopia_order(all);
+        let identities: std::collections::BTreeSet<String> =
+            full.iter().map(|e| e.source.identity()).collect();
+        for cap in [1usize, 5, 17, 31, 72, 500] {
+            let prepared = prepare_catalog_entries(full.clone(), None, cap, 1);
+            assert_eq!(prepared.entries.len(), cap.min(full.len()));
+            for ident in &identities {
+                let mut hist: Vec<&SnapshotListEntry> = full
+                    .iter()
+                    .filter(|e| &e.source.identity() == ident)
+                    .collect();
+                hist.sort_by(|a, b| b.end_time.cmp(&a.end_time).then(a.id.cmp(&b.id)));
+                let got: Vec<&str> = prepared
+                    .entries
+                    .iter()
+                    .filter(|e| &e.source.identity() == ident)
+                    .map(|e| e.id.as_str())
+                    .collect();
+                let want: Vec<&str> = hist.iter().take(got.len()).map(|e| e.id.as_str()).collect();
+                assert_eq!(got, want, "cap {cap}, {ident}: newest-first prefix");
+            }
+        }
+    }
+
+    #[test]
+    fn the_digest_covers_the_whole_post_prefilter_listing_on_every_scan() {
+        let mut all = history("own", 30, 0);
+        all.push(at("foreign-1", "x", "billing.west", 5, 1));
+        let full = kopia_order(all);
+        let own_ids: Vec<String> = (0..30).map(|i| format!("own-{i:05}")).collect();
+
+        // Truncated: every listed id — in the window or not — is a member; the
+        // prefiltered foreign id is NOT (its row must still read as absent).
+        let prepared = prepare_catalog_entries(full.clone(), Some("east"), 4, 99);
+        let Some(ListedIds::Digest(d)) = &prepared.listed_ids else {
+            panic!("digest expected: {:?}", prepared.listed_ids)
+        };
+        assert_eq!(d.count, 30);
+        assert_eq!(d.salt, 99, "the caller's salt is used verbatim");
+        let dec = d.decode().expect("decodes");
+        assert!(own_ids.iter().all(|id| dec.contains(id)));
+        assert!(!dec.contains("foreign-1"));
+        assert_eq!(
+            prepared.listed_ids,
+            SnapshotIdDigest::build(own_ids.iter().map(String::as_str), 99, DIGEST_BUDGET_BYTES)
+                .map(ListedIds::Digest),
+            "pure: same ids + salt give the same digest"
+        );
+
+        // NOT truncated: the digest is still written (not only when capped).
+        let untruncated = prepare_catalog_entries(full, Some("east"), 1000, 7);
+        assert!(!untruncated.truncated);
+        assert!(matches!(untruncated.listed_ids, Some(ListedIds::Digest(ref d)) if d.count == 30));
+    }
+
+    #[test]
+    fn logical_bytes_count_sources_outside_the_window() {
+        // Two sources; the cap-1 window can only show one of them, but the
+        // logical bytes must be the full newest-per-source sum.
+        let listing = kopia_order(vec![
+            at("a1", "a", "ns", 10, 100),
+            at("a2", "a", "ns", 20, 150),
+            at("b1", "b", "ns", 5, 40),
+        ]);
+        let prepared = prepare_catalog_entries(listing, None, 1, 1);
+        assert_eq!(prepared.entries.len(), 1);
+        assert_eq!(prepared.logical_bytes, 150 + 40);
+    }
+
+    #[test]
+    fn logical_bytes_semantics_key_by_path_first_listed_wins_ties_and_saturate() {
+        // Keyed by PATH alone (like the controller): the same path under two
+        // users is one source.
+        let mut other_user = at("x", "b", "ns", 30, 7);
+        other_user.source.path = "/pvc/a".into();
+        let v = vec![at("a1", "a", "ns", 10, 100), other_user];
+        assert_eq!(logical_bytes_under_management(&v), 7);
+        // Equal end_time: the first-listed entry wins.
+        let v = vec![at("t1", "a", "ns", 10, 1), at("t2", "a", "ns", 10, 2)];
+        assert_eq!(logical_bytes_under_management(&v), 1);
+        // An out-of-range u64 saturates, and so does the sum.
+        let v = vec![
+            at("h1", "a", "ns", 10, u64::MAX),
+            at("h2", "b", "ns", 10, u64::MAX),
+        ];
+        assert_eq!(logical_bytes_under_management(&v), i64::MAX);
+        assert_eq!(logical_bytes_under_management(&[]), 0);
+    }
+
+    #[test]
+    fn size_trim_never_touches_the_digest_and_keeps_a_window_prefix() {
+        let listing: Vec<SnapshotListEntry> = (0..6)
+            .flat_map(|k| history(&format!("u{k}"), 40, k))
+            .map(|mut e| {
+                e.description = "d".repeat(200);
+                e
+            })
+            .collect();
+        let prepared = prepare_catalog_entries(kopia_order(listing), None, 200, 5);
+        let window = prepared.entries.clone();
+        let result = BootstrapResult::ready(
+            false,
+            Some("u".into()),
+            Some(240),
+            prepared.entries,
+            prepared.truncated,
+            0,
+            None,
+        )
+        .with_catalog_membership(prepared.listed_ids.clone(), Some(prepared.logical_bytes));
+        let before = serde_json::to_string(&result.listed_ids).unwrap();
+        let guarded = enforce_result_size_budget(result, 32 * 1024);
+        assert!(guarded.snapshots.len() < window.len(), "must have trimmed");
+        assert!(guarded.snapshots_truncated);
+        assert_eq!(
+            serde_json::to_string(&guarded.listed_ids).unwrap(),
+            before,
+            "the digest is byte-identical after trimming"
+        );
+        assert_eq!(guarded.logical_bytes, Some(prepared.logical_bytes));
+        assert_eq!(
+            guarded.snapshots[..],
+            window[..guarded.snapshots.len()],
+            "survivors are a prefix of the fair window"
+        );
+    }
+
+    /// A production-shaped listing entry: 32-hex manifest id, a cluster-suffixed
+    /// hostname, a canonical kopiur-meta tag plus user tags, and a ~100-byte
+    /// description.
+    fn realistic(i: usize) -> SnapshotListEntry {
+        let pvc = format!("postgres-data-{:03}", i % 97);
+        let mut e = at(
+            &format!(
+                "{:032x}",
+                (i as u128).wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835)
+            ),
+            &pvc,
+            &format!("database-namespace-{:02}.east", i % 13),
+            i as i64 * 60,
+            1_234_567_890,
+        );
+        e.description = format!(
+            "kopiur scheduled snapshot of pvc {pvc} by schedule nightly-{:02} (run {i:06})",
+            i % 7
+        );
+        e.tags = BTreeMap::from([
+            (
+                "tag:kopiur-meta".to_string(),
+                r#"{"schema":1,"src":"explicit","uid":1000,"gid":1000,"fsGroup":1000}"#.to_string(),
+            ),
+            ("tag:kopiur".to_string(), "config:nightly".to_string()),
+            ("tag:app".to_string(), "postgres".to_string()),
+        ]);
+        e
+    }
+
+    #[test]
+    fn a_realistic_capped_result_with_a_large_digest_fits_the_budget() {
+        // ~40k snapshots (the reporter's repository scaled up): a digest over
+        // all 40k plus a full 1000-entry window must be trimmed to fit, and
+        // the trim must fall on the window only.
+        let listing: Vec<SnapshotListEntry> = (0..40_000).map(realistic).collect();
+        let prepared = prepare_catalog_entries(
+            kopia_order(listing),
+            Some("east"),
+            MAX_RETURNED_SNAPSHOTS,
+            0x5eed,
+        );
+        assert_eq!(prepared.foreign_suffix_dropped, 0, "own-cluster hosts");
+        assert_eq!(prepared.entries.len(), MAX_RETURNED_SNAPSHOTS);
+        let Some(ListedIds::Digest(d)) = prepared.listed_ids.clone() else {
+            panic!("40k ids fit the digest budget")
+        };
+        assert_eq!(d.count, 40_000);
+        let result = BootstrapResult::ready(
+            false,
+            Some("u".into()),
+            Some(40_000),
+            prepared.entries,
+            prepared.truncated,
+            prepared.foreign_suffix_dropped,
+            Some(12),
+        )
+        .with_catalog_membership(prepared.listed_ids.clone(), Some(prepared.logical_bytes));
+        let guarded = enforce_result_size_budget(result, RESULT_SIZE_BUDGET_BYTES);
+        let size = serde_json::to_string(&guarded).unwrap().len();
+        assert!(size <= RESULT_SIZE_BUDGET_BYTES, "serialized {size} bytes");
+        assert!(guarded.snapshots_truncated);
+        assert!(
+            guarded.snapshots.len() < MAX_RETURNED_SNAPSHOTS,
+            "the digest's reservation forces the window to shorten"
+        );
+        assert!(!guarded.snapshots.is_empty(), "the window survives");
+        assert_eq!(guarded.listed_ids, prepared.listed_ids, "digest untouched");
+    }
+
+    #[test]
+    fn a_max_size_digest_alone_leaves_most_of_the_budget_for_entries() {
+        // The largest digest `build` will ever emit: the most ids the narrowest
+        // width fits in DIGEST_BUDGET_BYTES.
+        let n = DIGEST_BUDGET_BYTES / 4 * 3 / 4;
+        let ids: Vec<String> = (0..n).map(|i| format!("{i:032x}")).collect();
+        let d = SnapshotIdDigest::build(ids.iter().map(String::as_str), 1, DIGEST_BUDGET_BYTES)
+            .expect("at the ceiling, still fits");
+        assert_eq!(d.width, 4);
+        let result = BootstrapResult::ready(
+            false,
+            Some("u".into()),
+            Some(n as i64),
+            vec![],
+            true,
+            0,
+            Some(1),
+        )
+        .with_catalog_membership(Some(ListedIds::Digest(d)), Some(i64::MAX));
+        let size = serde_json::to_string(&result).unwrap().len();
+        assert!(
+            size <= DIGEST_BUDGET_BYTES + 1024,
+            "digest-only result is {size} bytes"
+        );
+        assert!(
+            RESULT_SIZE_BUDGET_BYTES - size >= 400 * 1024,
+            "at least 400 KiB stays free for the window ({size} used)"
         );
     }
 }

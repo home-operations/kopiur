@@ -697,6 +697,12 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
                  object's YAML."
             ),
         ),
+        // The message already carries what/why/fix; the scan retries on its own.
+        Error::CatalogExpiryIncomplete { .. } => (
+            crate::consts::CATALOG_EXPIRY_INCOMPLETE_REASON,
+            CHECK_API_SERVER_ACTION,
+            err.to_string(),
+        ),
         Error::WebhookSetup(_) | Error::WebhookCert(_) => (
             WEBHOOK_SETUP_FAILED_REASON,
             CHECK_WEBHOOK_CONFIGURATION_ACTION,
