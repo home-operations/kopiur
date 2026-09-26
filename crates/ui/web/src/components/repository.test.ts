@@ -5,6 +5,7 @@ import { EMPTY_CELL } from "../util/format";
 import {
   accessLabel,
   actionNamespace,
+  catalogCoverageNote,
   detailSearch,
   filterByHealth,
   isClusterScoped,
@@ -68,6 +69,23 @@ describe("repositoryPhaseLabel", () => {
   it("is the empty cell when the operator has written no phase at all", () => {
     expect(repositoryPhaseLabel(null)).toBe(EMPTY_CELL);
     expect(repositoryPhaseLabel(undefined)).toBe(EMPTY_CELL);
+  });
+});
+
+describe("catalogCoverageNote", () => {
+  it("adds nothing when the count is the whole repository, or coverage is unreported", () => {
+    expect(catalogCoverageNote("complete")).toBeNull();
+    expect(catalogCoverageNote(null)).toBeNull();
+    expect(catalogCoverageNote(undefined)).toBeNull();
+  });
+
+  it("says a capped or partial count is only the newest window", () => {
+    expect(catalogCoverageNote("capped")).toBe("newest window only");
+    expect(catalogCoverageNote("partial")).toContain("not expired");
+  });
+
+  it("renders a newer operator's coverage as the raw word it wrote", () => {
+    expect(catalogCoverageNote({ unknown: { raw: "Sampled" } })).toBe("Sampled");
   });
 });
 

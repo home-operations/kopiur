@@ -267,6 +267,31 @@ pub struct CatalogView {
     /// RFC3339 timestamp of the last catalog scan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh_at: Option<String>,
+    /// How much of the repository that scan could see; absent when an operator
+    /// that predates #476 wrote the status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CatalogCoverageView>,
+}
+
+/// View of `status.catalog.coverage` (#476): whether `discoveredBackupCount`
+/// is the whole repository or only the newest window of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum CatalogCoverageView {
+    /// The listing held every snapshot.
+    Complete,
+    /// Only the newest window was materialized; rows whose snapshots were
+    /// deleted repository-side still expire.
+    Capped,
+    /// Only the newest window was materialized AND membership was unknown, so
+    /// rows whose snapshots were deleted repository-side are kept.
+    Partial,
+    /// A coverage this build does not recognize.
+    Unknown {
+        /// The value exactly as the operator wrote it.
+        raw: String,
+    },
 }
 
 /// `Repository.status.health` — the periodic connectivity probe.

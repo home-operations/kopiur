@@ -14,6 +14,7 @@
 
 export type { ActionReceipt } from "./types/ActionReceipt";
 export type { Capabilities } from "./types/Capabilities";
+export type { CatalogCoverageView } from "./types/CatalogCoverageView";
 export type { CatalogView } from "./types/CatalogView";
 export type { ConditionView } from "./types/ConditionView";
 export type { DirEntryView } from "./types/DirEntryView";

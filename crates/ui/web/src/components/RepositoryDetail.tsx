@@ -14,6 +14,7 @@ import {
 import type { ReactNode } from "react";
 
 import type {
+  CatalogView,
   ConditionView,
   MaintenanceRow,
   RepositoryDetail as RepositoryDetailData,
@@ -25,7 +26,7 @@ import { Facts, type Fact } from "./Facts";
 import { Finding } from "./Finding";
 import { LastObserved } from "./RepositoryTable";
 import { gateSeverityLamp } from "./gates";
-import { accessLabel, repositoryVerdict } from "./repository";
+import { accessLabel, catalogCoverageNote, repositoryVerdict } from "./repository";
 import { NotReported } from "./NotReported";
 
 /**
@@ -160,7 +161,10 @@ export function RepositoryDetail({
             <Facts
               label="Catalog"
               facts={[
-                { term: "Discovered backups", value: count(detail.catalog.discoveredBackupCount) },
+                {
+                  term: "Discovered backups",
+                  value: discoveredWithCoverage(detail.catalog),
+                },
                 { term: "Foreign snapshots", value: count(detail.catalog.foreignSnapshotCount) },
                 {
                   term: "Last scan",
@@ -482,6 +486,13 @@ function Conditions({ conditions, now }: { conditions: readonly ConditionView[];
 /** A count, where zero is a measurement and absent is not one. */
 function count(value: number | null | undefined): string {
   return value === null || value === undefined ? EMPTY_CELL : String(value);
+}
+
+/** The discovered count, qualified when the scan saw only part of the repository. */
+function discoveredWithCoverage(catalog: CatalogView): string {
+  const base = count(catalog.discoveredBackupCount);
+  const note = catalogCoverageNote(catalog.coverage);
+  return note === null || base === EMPTY_CELL ? base : `${base} (${note})`;
 }
 
 /** An instant with a direction, or the empty cell. */

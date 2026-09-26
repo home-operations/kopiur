@@ -433,6 +433,7 @@ fn bootstrap_repository_roundtrip_and_wire_shape() {
             maintenance_owner_aliases: vec!["kopiur@kopiur-ns-repo-legacy".into()],
             read_only: true,
             seed: None,
+            max_returned_snapshots: None,
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -524,6 +525,7 @@ fn bootstrap_repository_new_wire_json_round_trips_to_old_shape_when_unset() {
         maintenance_owner_aliases: Vec::new(),
         read_only: false,
         seed: None,
+        max_returned_snapshots: None,
     };
     let v = serde_json::to_value(&op).unwrap();
     assert!(v.get("maintenanceOwnerAliases").is_none());
@@ -568,6 +570,7 @@ fn bootstrap_create_block_round_trips_and_defaults_off_for_old_work_specs() {
         maintenance_owner_aliases: Vec::new(),
         read_only: false,
         seed: None,
+        max_returned_snapshots: None,
     };
     let v = serde_json::to_value(&op).unwrap();
     // Externally tagged (CLAUDE.md rule 1): the variant is the key. The
@@ -2908,6 +2911,7 @@ fn a_seeding_bootstrap_op_round_trips_and_elides_its_defaults() {
         maintenance_owner_aliases: Vec::new(),
         read_only: false,
         seed: Some(blob_seed()),
+        max_returned_snapshots: None,
     };
     let v = serde_json::to_value(&op).unwrap();
     assert_eq!(
@@ -3034,4 +3038,30 @@ fn target_ref_claim_key_round_trips_camel_cased() {
     assert_eq!(v["claimKey"], "data-0");
     let back: TargetRef = serde_json::from_value(v).expect("round-trips");
     assert_eq!(back, scoped);
+}
+
+/// #476: the hidden `max_returned_snapshots` test hook is absent on every
+/// ordinary work spec (old and new), and round-trips when the controller's
+/// hidden e2e env arms it.
+#[test]
+fn bootstrap_max_returned_snapshots_hook_defaults_absent_and_round_trips() {
+    let old = r#"{"autoCreate":true,"scanCatalog":true}"#;
+    let parsed: BootstrapRepositoryOp = serde_json::from_str(old).unwrap();
+    assert_eq!(parsed.max_returned_snapshots, None);
+    let v = serde_json::to_value(&parsed).unwrap();
+    assert!(
+        v.get("maxReturnedSnapshots").is_none(),
+        "unset hook must not reach the wire"
+    );
+
+    let armed = BootstrapRepositoryOp {
+        max_returned_snapshots: Some(2),
+        ..parsed
+    };
+    let v = serde_json::to_value(&armed).unwrap();
+    assert_eq!(v["maxReturnedSnapshots"], 2);
+    assert_eq!(
+        serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
+        armed
+    );
 }

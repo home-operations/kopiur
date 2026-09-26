@@ -18,7 +18,7 @@
  * unknown rather than under healthy.
  */
 
-import type { RepositoryPhaseView, RepositorySummary } from "../api/types";
+import type { CatalogCoverageView, RepositoryPhaseView, RepositorySummary } from "../api/types";
 import { unknownVariant } from "../util/assertNever";
 import { EMPTY_CELL } from "../util/format";
 import { HEALTH_ORDER, type HealthKey, type Lamp, healthLamp } from "./health";
@@ -66,6 +66,33 @@ export function repositoryPhaseLabel(phase: RepositoryPhaseView | null | undefin
     }
   }
   return phase.unknown.raw;
+}
+
+/**
+ * `status.catalog.coverage` as a qualifier for the discovered-backup count
+ * (#476). A `complete` or unreported scan needs none — the count is the whole
+ * repository — so this returns `null` and the count stands alone. Otherwise the
+ * count is only the newest window, and saying so is the point of the field.
+ */
+export function catalogCoverageNote(
+  coverage: CatalogCoverageView | null | undefined,
+): string | null {
+  if (coverage === null || coverage === undefined) {
+    return null;
+  }
+  if (typeof coverage === "string") {
+    switch (coverage) {
+      case "complete":
+        return null;
+      case "capped":
+        return "newest window only";
+      case "partial":
+        return "newest window only; deleted snapshots are not expired";
+      default:
+        return unknownVariant(coverage, "CatalogCoverageView");
+    }
+  }
+  return coverage.unknown.raw;
 }
 
 /**

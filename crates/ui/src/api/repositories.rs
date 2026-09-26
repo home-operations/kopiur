@@ -18,14 +18,15 @@ use k8s_openapi::api::batch::v1::Job;
 use kopiur_api::cluster_repository::AllowedNamespaces;
 use kopiur_api::common::{RepositoryKind, RepositoryMode, repo_key};
 use kopiur_api::gates::GateScope;
+use kopiur_api::repository::CatalogCoverage;
 use kopiur_api::{
     ClusterRepository, Maintenance, Repository, RepositoryPhase, RepositoryReplication,
     SnapshotPolicy, SnapshotReplication,
 };
 use kopiur_ui_model::graph::GateHit;
 use kopiur_ui_model::views::{
-    CatalogView, HealthProbeView, PolicyRef, RepositoryDetail, RepositorySummary, SeedView,
-    ServerView, SessionInfo,
+    CatalogCoverageView, CatalogView, HealthProbeView, PolicyRef, RepositoryDetail,
+    RepositorySummary, SeedView, ServerView, SessionInfo,
 };
 
 use crate::AppState;
@@ -497,6 +498,18 @@ fn catalog_view(c: &kopiur_api::repository::CatalogStatus) -> CatalogView {
         discovered_backup_count: c.discovered_backup_count,
         foreign_snapshot_count: c.foreign_snapshot_count,
         last_refresh_at: c.last_refresh_at.clone(),
+        coverage: c.coverage.as_ref().map(catalog_coverage_view),
+    }
+}
+
+/// **Pure.** `status.catalog.coverage` onto the wire enum. Exhaustive; `Unknown`
+/// carries the operator's string verbatim.
+fn catalog_coverage_view(c: &CatalogCoverage) -> CatalogCoverageView {
+    match c {
+        CatalogCoverage::Complete => CatalogCoverageView::Complete,
+        CatalogCoverage::Capped => CatalogCoverageView::Capped,
+        CatalogCoverage::Partial => CatalogCoverageView::Partial,
+        CatalogCoverage::Unknown(raw) => CatalogCoverageView::Unknown { raw: raw.clone() },
     }
 }
 
@@ -593,6 +606,35 @@ status:
         )
     }
 
+    #[test]
+    fn catalog_view_carries_coverage_so_a_capped_count_is_not_read_as_complete() {
+        let status = |coverage: serde_json::Value| -> kopiur_api::repository::CatalogStatus {
+            serde_json::from_value(serde_json::json!({
+                "discoveredBackupCount": 1000,
+                "coverage": coverage,
+            }))
+            .expect("catalog status")
+        };
+        for (wire, view) in [
+            ("Complete", CatalogCoverageView::Complete),
+            ("Capped", CatalogCoverageView::Capped),
+            ("Partial", CatalogCoverageView::Partial),
+            (
+                "Sampled",
+                CatalogCoverageView::Unknown {
+                    raw: "Sampled".into(),
+                },
+            ),
+        ] {
+            let v = catalog_view(&status(serde_json::json!(wire)));
+            assert_eq!(v.discovered_backup_count, Some(1000));
+            assert_eq!(v.coverage, Some(view), "{wire}");
+        }
+        // An operator that predates #476 writes no coverage: absent, not guessed.
+        let legacy: kopiur_api::repository::CatalogStatus =
+            serde_json::from_value(serde_json::json!({ "discoveredBackupCount": 3 })).unwrap();
+        assert_eq!(catalog_view(&legacy).coverage, None);
+    }
     #[test]
     fn a_repository_row_carries_its_stats_and_health() {
         let row = view_repository(&nas());

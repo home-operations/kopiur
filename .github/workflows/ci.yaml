@@ -177,10 +177,10 @@ jobs:
             bins: "mass_deletion"
             backends: false
           # kubectl-kopiur plugin (the `run` task builds kopiur-cli before the suite)
-          # + multi-cluster shared-repository scenarios. Both S3-backed, both large,
-          # neither mutates the install.
+          # + multi-cluster shared-repository scenarios + the #476 catalog-window
+          # expiry guard. All S3-backed, none mutates the install.
           - shard: cli-multicluster
-            bins: "cli multi_cluster"
+            bins: "cli multi_cluster catalog_window"
             backends: true
           # Workload identity (auth.workloadIdentity): full S3 pipeline with NO
           # static keys via the anonymous-policy bucket + kopia's ambient chain,

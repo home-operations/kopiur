@@ -54,6 +54,18 @@ describe("RepositoryDetail with nothing reported yet", () => {
     expect(catalog).not.toHaveTextContent("0");
   });
 
+  it("qualifies a partial catalog count so it is not read as the whole repository", async () => {
+    renderWithRouter(
+      <RepositoryDetail
+        detail={{ ...bare, catalog: { discoveredBackupCount: 1000, coverage: "partial" } }}
+      />,
+    );
+    const catalog = await screen.findByRole("region", { name: "Catalog" });
+    expect(catalog).toHaveTextContent(
+      "1000 (newest window only; deleted snapshots are not expired)",
+    );
+  });
+
   it("says no probe has run, which is not the same as a passing probe", async () => {
     renderWithRouter(<RepositoryDetail detail={bare} />);
     expect(await screen.findByRole("region", { name: "Health probe" })).toHaveTextContent(

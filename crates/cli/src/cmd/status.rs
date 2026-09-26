@@ -6,6 +6,8 @@
 //! what stays here is how this command renders it.
 
 use chrono::{DateTime, Utc};
+use kopiur_api::common::PhaseLabel;
+use kopiur_api::repository::CatalogCoverage;
 use kopiur_ops::OpsError;
 use kopiur_ops::snapshots::resolve_repo_filter_for;
 use kopiur_ops::status::{StatusReport, build_report, gather};
@@ -14,6 +16,23 @@ use crate::cli::StatusArgs;
 use crate::context::KubeCtx;
 use crate::error::CliError;
 use crate::output::{EMPTY_CELL, OutputFormat, Table, human_age};
+
+/// The DISCOVERED cell: the catalog count, followed by the scan's coverage when
+/// it is anything but `Complete` (e.g. `7836 (partial)`), so a capped or
+/// partial catalog is visible at a glance. `-` when never scanned. Pure.
+fn discovered_cell(discovered: Option<i64>, coverage: Option<&CatalogCoverage>) -> String {
+    let Some(count) = discovered else {
+        return EMPTY_CELL.into();
+    };
+    match coverage {
+        None | Some(CatalogCoverage::Complete) => count.to_string(),
+        Some(
+            c @ (CatalogCoverage::Capped | CatalogCoverage::Partial | CatalogCoverage::Unknown(_)),
+        ) => {
+            format!("{count} ({})", c.label().to_lowercase())
+        }
+    }
+}
 
 /// Render the report as the human one-screen overview. Pure.
 pub fn render(report: &StatusReport, now: DateTime<Utc>) -> String {
@@ -50,9 +69,7 @@ pub fn render(report: &StatusReport, now: DateTime<Utc>) -> String {
                 r.foreign_snapshots
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| EMPTY_CELL.into()),
-                r.discovered
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| EMPTY_CELL.into()),
+                discovered_cell(r.discovered, r.coverage.as_ref()),
             ]);
         }
         out.push_str(&t.render());
@@ -274,6 +291,7 @@ mod tests {
                     cluster: None,
                     foreign_snapshots: None,
                     discovered: None,
+                    coverage: None,
                     problem: None,
                 },
                 RepoRow {
@@ -288,6 +306,7 @@ mod tests {
                     cluster: Some("east".into()),
                     foreign_snapshots: Some(3),
                     discovered: Some(17),
+                    coverage: None,
                     problem: Some("credentials rejected; fix the Secret".into()),
                 },
             ],
@@ -337,6 +356,47 @@ mod tests {
                 message: "terminal kopia failure".into(),
             }],
         }
+    }
+
+    #[test]
+    fn discovered_cell_appends_non_complete_coverage() {
+        // Never scanned: the empty cell, regardless of coverage.
+        assert_eq!(discovered_cell(None, None), EMPTY_CELL);
+        // No coverage recorded (pre-#476 operator) or Complete: count only.
+        assert_eq!(discovered_cell(Some(7836), None), "7836");
+        assert_eq!(
+            discovered_cell(Some(7836), Some(&CatalogCoverage::Complete)),
+            "7836"
+        );
+        // A capped / partial scan says so after the count.
+        assert_eq!(
+            discovered_cell(Some(7836), Some(&CatalogCoverage::Partial)),
+            "7836 (partial)"
+        );
+        assert_eq!(
+            discovered_cell(Some(1000), Some(&CatalogCoverage::Capped)),
+            "1000 (capped)"
+        );
+        // A value from a newer operator surfaces lowercased, never hidden.
+        assert_eq!(
+            discovered_cell(Some(5), Some(&CatalogCoverage::Unknown("Sampled".into()))),
+            "5 (sampled)"
+        );
+    }
+
+    #[test]
+    fn render_shows_partial_coverage_in_the_discovered_column() {
+        let mut report = sample();
+        report.repositories[1].coverage = Some(CatalogCoverage::Partial);
+        let text = render(&report, now());
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("ClusterRepository") && l.ends_with("17 (partial)")),
+            "{text}"
+        );
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["repositories"][1]["coverage"], "Partial");
+        assert!(v["repositories"][0].get("coverage").is_none());
     }
 
     #[test]

@@ -201,7 +201,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 73,
+            exported, 74,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -218,7 +218,8 @@ mod tests {
              the wire — the client had been reconstructing it from a \
              hand-maintained table, and the table said `repositories-ready` \
              was namespace-scoped when `list_repos` lists `ClusterRepository` \
-             cluster-wide"
+             cluster-wide; 73 -> 74 for `CatalogCoverageView` (#476), so the \
+             discovered-backup count says when it is only the newest window"
         );
     }
 }

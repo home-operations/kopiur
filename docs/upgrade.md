@@ -68,6 +68,17 @@ The same 24h cap applies to a `Repository` or `ClusterRepository`'s new `spec.sc
 
 ///
 
+## After 0.10.10: stale discovered Snapshots expire on large repositories (no action needed, expect one cleanup burst)
+
+Before this release, a repository holding more than 1,000 snapshots never expired a discovered `Snapshot` row whose kopia snapshot had been deleted repository-side, for example pruned by a peer cluster's GFS retention. The rows only accumulated, into the tens of thousands on a shared repository ([#476](https://github.com/home-operations/kopiur/issues/476)). Now each scan knows every snapshot ID in the repository, so stale rows expire at any realistic size, `catalog.retain` bounds existing rows as well as new ones, and `status.catalog.coverage` reports what the last scan could account for. See [The catalog → keeping the row count bounded](repositories.md#keeping-the-row-count-bounded--the-window-coverage-and-retain).
+
+There is nothing to apply beyond the normal upgrade, but these are worth knowing:
+
+- **The first scan after upgrading may delete a large backlog of discovered `Snapshot` CRs at once.** Deletion runs with bounded concurrency, so it is a one-time burst of API writes, not a stampede. It only removes Kubernetes objects: discovered rows are forced to `deletionPolicy: Retain`, so no kopia data is deleted and every snapshot stays restorable [by identity](restores.md#restoring-a-snapshot-kopiur-didnt-create).
+- **With `catalog.periodicRefresh` off, the default, that first scan waits for a spec change or a request.** To reclaim the backlog now, request a scan: `kubectl annotate repository <name> -n <ns> kopiur.home-operations.com/catalog-scan-requested-at=$(date -u +%FT%TZ) --overwrite`, or `kubectl annotate clusterrepository <name> …` with no `-n`.
+- **Upgrade the mover image together with the controller.** An older mover does not return the snapshot-ID list, so a repository over the 1,000-snapshot window reports `coverage: Partial` and its stale rows are not expired until the mover matches. This only matters if you pin `mover.image.tag` or `mover.image.digest` separately from the chart version.
+- **`storageStats.totalSizeBytes` may change on large repositories.** It is now computed over the full listing, the newest snapshot of every source, rather than over the snapshots that fit in the materialization window, so sources that previously fell outside the window are now counted. Backup preflight rules that read `repository.sizeBytes` see the new, more accurate figure.
+
 ## After 0.10.5: the `NoAdoptableHistory` warning no longer exists (no action needed)
 
 Versions after 0.10.5 remove the `NoAdoptableHistory` Warning Event outright. There is nothing to apply: no schema change, no flag, no RBAC. The operator simply stops emitting it.

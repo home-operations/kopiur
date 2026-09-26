@@ -9,6 +9,7 @@
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kopiur_api::common::{PhaseLabel, RepositoryKind};
 use kopiur_api::consts::{MAINTENANCE_CONFIGURED_CONDITION, READY_CONDITION, STALLED_CONDITION};
+use kopiur_api::repository::CatalogCoverage;
 use kopiur_api::{
     ClusterRepository, Repository, Restore, RestorePhase, Snapshot, SnapshotPhase, SnapshotPolicy,
     SnapshotReplication, SnapshotReplicationRunStats, SnapshotSchedule,
@@ -76,6 +77,11 @@ pub struct RepoRow {
     /// non-zero count is normal for a shared or re-seeded repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discovered: Option<i64>,
+    /// `status.catalog.coverage` — how much of the repository the last catalog
+    /// scan could see (`Complete`/`Capped`/`Partial`); absent when never
+    /// scanned or reported by an operator that predates #476.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CatalogCoverage>,
     /// The `Ready` condition message when the repo is NOT Ready.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
@@ -395,6 +401,7 @@ fn repo_row(
     cluster: Option<String>,
     foreign_snapshots: Option<i64>,
     discovered: Option<i64>,
+    coverage: Option<CatalogCoverage>,
 ) -> RepoRow {
     let phase = phase.unwrap_or_else(|| EMPTY_CELL.into());
     let maintenance = condition(conditions, MAINTENANCE_CONFIGURED_CONDITION)
@@ -424,6 +431,7 @@ fn repo_row(
         cluster,
         foreign_snapshots,
         discovered,
+        coverage,
         problem,
     }
 }
@@ -551,6 +559,9 @@ pub fn build_report(inputs: &StatusInputs, repo_filter: Option<&RepoFilter>) -> 
             status
                 .and_then(|s| s.catalog.as_ref())
                 .and_then(|c| c.discovered_backup_count),
+            status
+                .and_then(|s| s.catalog.as_ref())
+                .and_then(|c| c.coverage.clone()),
         ));
     }
     for repo in &inputs.cluster_repositories {
@@ -584,6 +595,9 @@ pub fn build_report(inputs: &StatusInputs, repo_filter: Option<&RepoFilter>) -> 
             status
                 .and_then(|s| s.catalog.as_ref())
                 .and_then(|c| c.discovered_backup_count),
+            status
+                .and_then(|s| s.catalog.as_ref())
+                .and_then(|c| c.coverage.clone()),
         ));
     }
 
@@ -987,6 +1001,7 @@ status:
             None,
             None,
             ns_discovered,
+            None,
         );
         assert_eq!(row.discovered, Some(4));
     }
