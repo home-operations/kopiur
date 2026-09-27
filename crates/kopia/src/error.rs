@@ -123,26 +123,25 @@ impl KopiaErrorClass {
             }
             KopiaErrorClass::AccessDenied => {
                 "the storage backend denied access; check the credentials Secret and that the \
-                 bucket/container/path exists and is reachable"
+                 bucket/container/path exists"
             }
             KopiaErrorClass::PermissionDenied => {
                 "repository path is not writable by the operator's UID; fix ownership/mode on the \
-                 backing PVC/NFS export"
+                 backing PVC or NFS export"
             }
             KopiaErrorClass::NotFound => {
-                "the requested repository path, snapshot, or target was not found; verify the \
-                 backend path/prefix and that the repository exists"
+                "the repository path, snapshot, or target was not found; check the backend \
+                 path/prefix"
             }
             KopiaErrorClass::Locked => {
                 "a repository lock is held by another writer; it usually clears on retry"
             }
             KopiaErrorClass::SourceError => {
-                "a source filesystem error occurred during upload; check the source volume and the \
-                 mover Job/pod logs"
+                "could not read the source volume during upload; check the volume and the mover \
+                 Job logs"
             }
             KopiaErrorClass::Unknown => {
-                "an unclassified repository backend error occurred; see the mover Job/pod logs and \
-                 status.failure for detail"
+                "unknown repository error; see the mover Job logs and status.failure"
             }
         }
     }
@@ -357,7 +356,7 @@ pub enum KopiaError {
     /// running. The three fallible halves of the streaming copy — the sink write,
     /// the stderr read, and the child wait — are not interchangeable and must not
     /// share one error.
-    #[error("streaming `{args}` into the consumer failed while writing kopia's output: {source}")]
+    #[error("could not stream kopia `{args}` output into the consumer: {source}")]
     OutputSink {
         /// The kopia argv whose output was being streamed.
         args: String,
@@ -421,7 +420,7 @@ pub enum KopiaError {
     /// killed on purpose. Surfacing that difference is what tells an operator
     /// "your dump command failed" rather than "the backup tool failed".
     #[error(
-        "the snapshot was aborted because its stdin producer failed: {detail}{}",
+        "snapshot aborted: {detail}{}",
         if stderr_tail.is_empty() { String::new() } else { format!(" (kopia stderr: {stderr_tail})") }
     )]
     StdinProducerFailed {
@@ -442,11 +441,9 @@ pub enum KopiaError {
     /// point" into the repository that retention keeps and a restore would
     /// cheerfully write over a live database with.
     #[error(
-        "the snapshot was aborted because its stdin producer exited successfully but wrote no \
-         data at all — an empty dump is not a backup, so nothing was committed. Check that the \
-         command in `workloadExec.command` actually writes to stdout (a `pg_dump`/`mysqldump` \
-         can exit 0 and emit nothing when its credentials see no databases, and a `sh -c 'a | b'` \
-         pipeline reports only the LAST program's status — add `set -o pipefail`). Args: \
+        "snapshot aborted: the stdin producer exited 0 but wrote no data, so nothing was saved. \
+         Fix: make sure `workloadExec.command` writes to stdout (a dump with no visible \
+         databases can print nothing); in a `sh -c` pipeline add `set -o pipefail`. Args: \
          {args}{}",
         if stderr_tail.is_empty() { String::new() } else { format!(" (kopia stderr: {stderr_tail})") }
     )]

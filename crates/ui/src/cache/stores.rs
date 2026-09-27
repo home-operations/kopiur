@@ -230,7 +230,7 @@ async fn supervise(
     health_tx: watch::Sender<CacheHealth>,
 ) {
     if initial_list_complete(&stores).await {
-        tracing::info!("kopiur-ui cache synced; all nine stores have completed initial list");
+        tracing::info!("kopiur-ui cache synced");
         // A send error means every receiver was dropped, i.e. the process is
         // shutting down. Nothing to report to.
         let _ = health_tx.send(CacheHealth::Synced);
@@ -242,10 +242,8 @@ async fn supervise(
     let kind = first_reflector_to_end(tasks).await;
     tracing::error!(
         kind,
-        "a kopiur-ui cache watch ended; that store is now frozen and will go stale, so the \
-         UI must stop serving from the cache. /readyz reports cache-watch-ended. This does \
-         not recover on its own — restart the pod, and check the apiserver's health and the \
-         UI ServiceAccount's list/watch RBAC for this kind."
+        "a kopiur-ui cache watch ended, so /readyz reports cache-watch-ended; restart the pod, \
+         and check the API server's health and the UI's list/watch RBAC for this kind"
     );
     let _ = health_tx.send(CacheHealth::WatchEnded { kind });
 }
@@ -274,8 +272,8 @@ async fn initial_list_complete(stores: &Stores) -> bool {
         Err(e) => {
             tracing::error!(
                 error = %e,
-                "a kopiur-ui cache writer was dropped before its first sync; the cache will \
-                 never become ready and the UI must not serve from it",
+                "a kopiur-ui cache store closed before its first sync; the cache will never \
+                 become ready",
             );
             false
         }
@@ -362,7 +360,7 @@ fn spawn<K: KopiurKind>(
         // the log below is the detail and readiness is the consequence.
         tracing::error!(
             kind = K::KIND,
-            "kopiur-ui cache watch ended; this kind's cache is now frozen and will go stale",
+            "kopiur-ui cache watch ended; this kind's cache will go stale",
         );
     });
     tasks.push(ReflectorTask {

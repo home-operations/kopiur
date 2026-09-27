@@ -146,7 +146,9 @@ pub(super) fn build_backup_run(
             // which is what #346 actually looked like to users.
             (None, None) if source.pvc_selector.is_some() => {
                 return Err(Error::Validation(format!(
-                    "SnapshotPolicy `{}` source #{} is a `pvcSelector`, which expands to one Snapshot                  per matched PVC — but this Snapshot carries no `spec.source` saying which PVC it                  covers, so there is nothing unambiguous to back up. Create it with `kubectl                  kopiur snapshot now --policy {0}` or let a SnapshotSchedule fire it; both expand                  the selector for you.",
+                    "SnapshotPolicy `{}` source #{} is a `pvcSelector`, but this Snapshot has no \
+                     `spec.source` naming a PVC. Fix: use `kubectl kopiur snapshot now --policy \
+                     {0}` or a SnapshotSchedule, which create one Snapshot per PVC.",
                     config.name_any(),
                     eff.index,
                 )));
@@ -403,9 +405,8 @@ pub(crate) use kopiur_mover::repo_meta::backend_to_repository_connect;
 /// (§11): what / why / how-to-fix. Pure so the text is unit-asserted.
 pub(super) fn readonly_backup_message(repo_name: &str) -> String {
     format!(
-        "refusing to create a backup: repository `{repo_name}` is `mode: ReadOnly` (ADR-0005 §11), \
-         which serves restores only. Set the repository's `spec.mode: ReadWrite` to allow backups, \
-         or target a different repository."
+        "refusing to back up: repository `{repo_name}` is `mode: ReadOnly`. Fix: set the \
+         repository's `spec.mode: ReadWrite`, or use a different repository."
     )
 }
 
@@ -413,8 +414,8 @@ pub(super) fn readonly_backup_message(repo_name: &str) -> String {
 /// (backend unreachable). Pure so the text is unit-asserted.
 pub(super) fn repository_not_ready_message(repo_name: &str) -> String {
     format!(
-        "waiting for repository `{repo_name}` to become `Ready` before launching the backup \
-         (its backend is unreachable); the backup proceeds once the repository reconnects."
+        "waiting for repository `{repo_name}` to be `Ready` (backend unreachable); the backup \
+         starts once it reconnects."
     )
 }
 
@@ -432,7 +433,7 @@ pub(super) fn tags_for(backup: &Snapshot, config: &SnapshotPolicy) -> BTreeMap<S
                 tracing::warn!(
                     backup = %backup.name_any(),
                     dropped = user.len() - tags.len(),
-                    "Snapshot.spec.tags exceeds the {} tag bound; the remainder is skipped",
+                    "Snapshot.spec.tags has more than {} tags; skipping the rest",
                     kopiur_api::validate::MAX_SNAPSHOT_TAGS
                 );
                 break;
@@ -444,7 +445,7 @@ pub(super) fn tags_for(backup: &Snapshot, config: &SnapshotPolicy) -> BTreeMap<S
                 Some(reason) => tracing::warn!(
                     backup = %backup.name_any(),
                     tag = %key,
-                    "skipping invalid Snapshot.spec.tags entry (stored pre-validation): {reason}"
+                    "skipping invalid Snapshot.spec.tags entry: {reason}"
                 ),
             }
         }
@@ -627,12 +628,10 @@ pub(super) fn job_limits(backup: &Snapshot) -> JobLimits {
 /// grace window — what failed, why, and how to fix it (the what/why/fix rule).
 pub(crate) fn wedged_pod_message(reason: &str, detail: &str, grace_seconds: i64) -> String {
     format!(
-        "mover pod stuck ({reason}) for over {grace_seconds}s and cannot start: {detail}. Usual \
-         causes: an invalid securityContext for the namespace's Pod Security policy (e.g. \
-         inherited root UID, no privileged-mover opt-in), an unavailable image, or an \
-         unschedulable source volume. Fix: correct the mover config (securityContext / \
-         inheritSecurityContextFrom / image) or the namespace policy, then re-run; tune the \
-         window with spec.failurePolicy.podStartupDeadlineSeconds."
+        "mover pod stuck ({reason}) for over {grace_seconds}s: {detail}. Common causes: a \
+         securityContext the namespace's Pod Security policy rejects, a missing image, or an \
+         unschedulable volume. Fix: correct the mover securityContext or image (or the \
+         namespace policy) and re-run; the wait is spec.failurePolicy.podStartupDeadlineSeconds."
     )
 }
 

@@ -201,8 +201,8 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
             repl,
             io::ReadyOutcome::Stalled,
             "DestinationReadOnly",
-            "destination repository is mode: ReadOnly and cannot take replicated \
-             snapshots; set its spec.mode to ReadWrite or point destinationRef elsewhere",
+            "destination repository is ReadOnly. Fix: set its spec.mode to ReadWrite, or \
+             point destinationRef at another repository",
             None,
             None,
         )
@@ -221,11 +221,9 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
             io::ReadyOutcome::Stalled,
             REPLICATION_IDENTITY_OVERLAP_REASON,
             &format!(
-                "pruning: mirrorSource, but a destination-side SnapshotPolicy writes the same \
-                 identities this replication selects ({}) — a source-side deletion would cascade \
-                 into identities the destination does not merely mirror. Fix: exclude those \
-                 identities in spec.selection, re-identify the destination policy, or switch \
-                 pruning off mirrorSource",
+                "pruning: mirrorSource would delete backups a destination SnapshotPolicy writes \
+                 to the same identities ({}). Fix: exclude them in spec.selection, change the \
+                 destination policy's identity, or turn off mirrorSource",
                 identity_sample(identities)
             ),
             None,
@@ -588,8 +586,8 @@ async fn handle_manual_run(
             .await?;
             Ok(ManualRunVerdict::Continue(Some(RunStall::new(
                 "ManualRunOutcomeLost",
-                "the requested snapshot-replication Job disappeared before its outcome was \
-                 observed (TTL-reaped?); re-annotate to run again",
+                "the requested snapshot-replication Job was gone before its result was read. \
+                 Fix: re-annotate to run it again",
             ))))
         }
         None => {
@@ -659,7 +657,7 @@ async fn handle_manual_run(
             tracing::info!(
                 replication = %name,
                 requested = %request.raw,
-                "spawned REQUESTED snapshot-replication Job"
+                "spawned requested snapshot-replication Job"
             );
             Ok(ManualRunVerdict::InFlight(Action::requeue(REQUEUE_RUNNING)))
         }
@@ -1077,7 +1075,7 @@ async fn reap_cross_namespace_duplicates(ctx: &Context, name: &str, dest_uid: &s
                 replication = %name,
                 snapshot = %format!("{ns}/{dup}"),
                 error = %e,
-                "cross-namespace duplicate reap failed (retried next idle pass)"
+                "could not delete cross-namespace duplicate (will retry)"
             ),
         }
     }
@@ -1347,11 +1345,7 @@ fn dest_password_ref(
     encryption: &Encryption,
 ) -> Result<(String, String)> {
     let name = resolved_names.first().cloned().ok_or_else(|| {
-        Error::Invariant(
-            "destination credential resolution yielded no Secret names — the encryption \
-             password Secret is mandatory, so this is a kopiur bug"
-                .into(),
-        )
+        Error::Invariant("no destination credential Secret was resolved (a kopiur bug)".into())
     })?;
     let key = encryption
         .password_secret_ref
@@ -1587,17 +1581,15 @@ fn overlap_condition_fields(v: &OverlapVerdict) -> (&'static str, &'static str, 
         OverlapVerdict::None => (
             "False",
             NO_IDENTITY_OVERLAP_REASON,
-            "no destination-side SnapshotPolicy identity is selected by this replication"
-                .to_string(),
+            "no destination SnapshotPolicy writes to the selected identities".to_string(),
         ),
         OverlapVerdict::Warn { identities } | OverlapVerdict::Stall { identities } => (
             "True",
             IDENTITY_OVERLAP_REASON,
             format!(
-                "a destination-side SnapshotPolicy writes directly under identities this \
-                 replication also selects ({}); replicated copies and direct backups will \
-                 interleave in one kopia identity's history. Narrow spec.selection or \
-                 re-identify the destination policy",
+                "a destination SnapshotPolicy also writes to identities this replication \
+                 copies ({}), so the two will mix in one history. Fix: narrow \
+                 spec.selection or change the destination policy's identity",
                 identity_sample(identities)
             ),
         ),

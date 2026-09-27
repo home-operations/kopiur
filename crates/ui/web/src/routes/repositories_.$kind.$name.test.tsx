@@ -268,7 +268,7 @@ describe("Repository detail", () => {
     await user.click(await screen.findByRole("button", { name: /Suspend/ }));
     // The confirmation says what suspending does before it is done.
     const confirm = screen.getByRole("group", { name: "Suspend" });
-    expect(confirm).toHaveTextContent("No new backup will be written here");
+    expect(confirm).toHaveTextContent("No new backups run here");
     await user.click(within(confirm).getByRole("button", { name: "Suspend this repository" }));
 
     expect(await screen.findByText(/is now suspended/)).toBeInTheDocument();

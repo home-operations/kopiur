@@ -391,7 +391,7 @@ async fn multi_repository_policy_backs_up_into_both_repos() {
         )
         .await
         .expect_err("an UNPINNED manual Snapshot against a multi-repo policy must be refused");
-    assert_admission_denied(&err, "must pin exactly one member", "unpinned manual mint");
+    assert_admission_denied(&err, "has no spec.repository", "unpinned manual mint");
 
     // A pin outside the member set ⇒ refused too (the typo guard).
     let err = backups
@@ -406,11 +406,7 @@ async fn multi_repository_policy_backs_up_into_both_repos() {
         )
         .await
         .expect_err("a NON-MEMBER pin must be refused");
-    assert_admission_denied(
-        &err,
-        "does not list that repository",
-        "non-member manual pin",
-    );
+    assert_admission_denied(&err, "does not list it", "non-member manual pin");
 
     // A member pin ⇒ admitted, and it really lands in that member's repo.
     const MANUAL: &str = "e2e-mr-manual-a";
@@ -964,7 +960,7 @@ async fn multi_repository_restore_from_policy_requires_selection() {
         );
     assert_admission_denied(
         &err,
-        "must say which one to read",
+        "set restore spec.repository to one of",
         "fromPolicy restore without spec.repository",
     );
     let msg = err.to_string();

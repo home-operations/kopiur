@@ -69,10 +69,9 @@ pub enum BuildJobError {
     Serialize(#[from] serde_json::Error),
     /// The serialized work spec exceeds what a pod env var can carry.
     #[error(
-        "the serialized work spec is {bytes} bytes, over the {MAX_WORK_SPEC_BYTES}-byte limit \
-         a pod environment variable can carry (Linux MAX_ARG_STRLEN is 128 KiB). The recipe \
-         is pathologically large — trim the policy (ignore rules, hooks, extra args) or split \
-         the source across policies"
+        "the work spec is {bytes} bytes, over the {MAX_WORK_SPEC_BYTES}-byte limit for a pod \
+         env var. Fix: trim the policy (ignore rules, hooks, extra args) or split the source \
+         across policies"
     )]
     TooLarge {
         /// Size of the serialized work spec.
@@ -1198,10 +1197,7 @@ mod tests {
         let err = build_job(&inputs(&ws, JobLimits::default())).unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, BuildJobError::TooLarge { .. }), "{msg}");
-        assert!(
-            msg.contains("MAX_ARG_STRLEN") || msg.contains("128 KiB"),
-            "{msg}"
-        );
+        assert!(msg.contains("byte limit for a pod env var"), "{msg}");
     }
 
     #[test]

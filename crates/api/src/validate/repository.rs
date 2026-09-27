@@ -177,12 +177,9 @@ pub fn validate_repository_parameters(
     if !mode.allows_writes() {
         errs.push(ValidationError::InvalidFieldValue {
             field: format!("{context} spec.parameters.epoch"),
-            reason: "a ReadOnly repository cannot apply repository parameters: \
-                     `kopia repository set-parameters` rewrites the repository-global format \
-                     blob and fails outright on a read-only connection. Remove \
-                     spec.parameters, or set mode: ReadWrite on the cluster that owns this \
-                     repository (in a multi-cluster layout, declare the parameters there — \
-                     they are a property of the repository, not of each consumer)"
+            reason: "a ReadOnly repository cannot apply repository parameters. Fix: remove \
+                     spec.parameters, or set them on the cluster that owns the repository \
+                     (mode: ReadWrite)"
                 .to_string(),
         });
     }
@@ -193,9 +190,9 @@ pub fn validate_repository_parameters(
             None => errs.push(ValidationError::InvalidFieldValue {
                 field,
                 reason: format!(
-                    "{raw:?} is not a valid duration. Use a Go-style duration with a single \
-                     unit, like 6h, 90m, or 30s; omit the field to leave kopia's current \
-                     value untouched"
+                    "{raw:?} is not a valid duration. Fix: use a Go-style duration with a \
+                     single unit, like 6h, 90m, or 30s; omit the field to keep kopia's current \
+                     value"
                 ),
             }),
             // kopia stores these as a Go `time.Duration` — an i64 NANOSECOND count, so it
@@ -208,9 +205,8 @@ pub fn validate_repository_parameters(
                 errs.push(ValidationError::InvalidFieldValue {
                     field,
                     reason: format!(
-                        "{raw:?} is too large: kopia stores epoch durations as a 64-bit \
-                         nanosecond count, so the maximum is roughly 292 years. Use a \
-                         realistic epoch duration (hours, e.g. 6h)"
+                        "{raw:?} is too large (the maximum is about 292 years). Fix: use a \
+                         realistic epoch duration, e.g. 6h"
                     ),
                 });
             }
@@ -275,30 +271,28 @@ fn epoch_floor_errors(
             "advanceOnCount",
             epoch.advance_on_count,
             KOPIA_MIN_ADVANCE_ON_COUNT,
-            "kopia refuses anything lower with \"epoch advance on count too low\"",
+            "kopia rejects lower values",
             true,
         ),
         (
             "advanceOnSizeMiB",
             epoch.advance_on_size_mb,
             KOPIA_MIN_ADVANCE_ON_SIZE_MIB,
-            "kopia refuses anything lower with \"epoch advance on size too low\" (it stores \
-             the value as `MiB << 20` bytes, so 1 is the smallest representable threshold)",
+            "kopia rejects lower values",
             true,
         ),
         (
             "checkpointFrequency",
             epoch.checkpoint_frequency,
             KOPIA_MIN_CHECKPOINT_FREQUENCY,
-            "kopia refuses anything lower with \"invalid epoch range compaction period\"",
+            "kopia rejects lower values",
             true,
         ),
         (
             "deleteParallelism",
             epoch.delete_parallelism,
             KOPIUR_MIN_DELETE_PARALLELISM,
-            "kopia does not validate this field at all — the floor is kopiur's own, because \
-             a non-positive parallelism asks kopia to run epoch cleanup with no workers",
+            "epoch cleanup would run with no workers",
             // kopia's own set-parameters merge-then-validate-whole-set behavior (why the
             // other three fields carry WHOLE_CALL_REFUSED) cannot apply here: kopia never
             // looks at this field, so violating this floor can never be what trips kopia's
@@ -321,7 +315,7 @@ fn epoch_floor_errors(
                 reason.push_str(ZERO_IS_DROPPED);
             }
             reason.push_str(&format!(
-                " Use {floor} or more, or omit the field to leave kopia's current value untouched"
+                " Fix: use {floor} or more, or omit the field to keep kopia's current value"
             ));
             errs.push(ValidationError::InvalidFieldValue {
                 field: field(name),
@@ -350,31 +344,20 @@ fn epoch_floor_errors(
         errs.push(ValidationError::InvalidFieldValue {
             field: field("refreshFrequency"),
             reason: format!(
-                "{refresh_raw:?} is zero, and kopia treats a zero duration as \"flag not \
-                 set\": `set-parameters` skips it, exits 0 and reports `no changes`, so the \
-                 repository silently keeps its existing refresh frequency. kopiur would then \
-                 read that as permanent drift and re-issue the flag on every bootstrap — \
-                 invalidating every other kopia client's cached format blob each time — \
-                 while `status.parameters.epoch.refreshFrequency` never agrees with `spec`. \
-                 Use a positive duration (1s or more), or omit the field to leave kopia's \
-                 current value untouched"
+                "{refresh_raw:?} is zero, which kopia silently ignores, so kopiur would \
+                 re-apply it forever. Fix: use 1s or more, or omit the field to keep kopia's \
+                 current value"
             ),
         });
     } else if declared_refresh.is_some_and(|r| r > MAX_EPOCH_REFRESH_FREQUENCY) {
         errs.push(ValidationError::InvalidFieldValue {
             field: field("refreshFrequency"),
             reason: format!(
-                "{refresh_raw:?} exceeds the maximum of 80m: kopia requires \
-                 `cleanupSafetyMargin >= 3 x refreshFrequency` and refuses the call with \
-                 \"invalid cleanup safety margin, must be at least 3x epoch refresh \
-                 frequency\". 80m is 4h/3, and kopiur ASSUMES the margin is kopia's 4h \
-                 default because a validator cannot read the live repository — kopiur has no \
-                 `cleanupSafetyMargin` field, but kopia's own CLI does \
-                 (`--epoch-cleanup-safety-margin`), so a repository whose margin was raised \
-                 out of band would in fact accept this. Check the live value at \
-                 `status.parameters.epoch.cleanupSafetyMargin`; if it is genuinely above 3x \
-                 this frequency, apply the change with kopia directly. {WHOLE_CALL_REFUSED} \
-                 Otherwise use 80m or less"
+                "{refresh_raw:?} exceeds the maximum of 80m: kopia requires a cleanup safety \
+                 margin (assumed to be the 4h default) of at least 3x refreshFrequency. \
+                 {WHOLE_CALL_REFUSED} Fix: use 80m or less; if \
+                 `status.parameters.epoch.cleanupSafetyMargin` is larger, apply the change \
+                 with kopia directly"
             ),
         });
     }
@@ -415,12 +398,11 @@ fn min_duration_floor_error(
     // still applies.
     let refresh = match (refresh_declared, declared_refresh) {
         (true, None) => None,
-        (true, Some(r)) => Some((r, "the refreshFrequency declared alongside it")),
+        (true, Some(r)) => Some((r, "the declared refreshFrequency")),
         (false, _) => Some((
             KOPIA_DEFAULT_EPOCH_REFRESH_FREQUENCY,
-            "kopia's 20m refreshFrequency default, which kopiur has to assume because a \
-             validator cannot read the live repository — check \
-             `status.parameters.epoch.refreshFrequency` for what this repository actually has",
+            "kopia's default refreshFrequency of 20m (the live value is in \
+             `status.parameters.epoch.refreshFrequency`)",
         )),
     };
     let derived = refresh.map(|(r, source)| (r.saturating_mul(3), source));
@@ -436,18 +418,12 @@ fn min_duration_floor_error(
     let derived_bites = derived.is_some_and(|(d, _)| min < d && d > KOPIA_MIN_EPOCH_DURATION);
     let mut why = Vec::new();
     if below_absolute {
-        why.push(
-            "kopia's absolute minimum is 10m — it refuses anything lower with \"minimum \
-             epoch duration too low\""
-                .to_string(),
-        );
+        why.push("kopia's minimum is 10m".to_string());
     }
     if derived_bites {
         let (_, source) = derived.expect("derived_bites implies a derived bound");
         why.push(format!(
-            "kopia requires `minDuration >= 3 x refreshFrequency`, refusing the call \
-             with \"epoch refresh period is too long, must be 1/3 of minimal epoch duration \
-             or shorter\" — and that 3x bound comes from {source}"
+            "kopia requires `minDuration >= 3 x refreshFrequency`, using {source}"
         ));
     }
 
@@ -456,19 +432,18 @@ fn min_duration_floor_error(
     // rule on the next apply.
     let fix = match (below_absolute, derived_bites) {
         (true, true) => format!(
-            "Use {} or more; or, since no refreshFrequency can rescue a value below kopia's \
-             10m floor, raise minDuration to 10m and declare a `refreshFrequency` of {} or \
-             less alongside it",
+            "Fix: use {} or more, or raise minDuration to 10m and set `refreshFrequency` to {} or \
+             less",
             render_minutes(floor),
             suggest_refresh(KOPIA_MIN_EPOCH_DURATION),
         ),
         (false, true) => format!(
-            "Use {} or more, or declare a `refreshFrequency` of {} or less alongside it",
+            "Fix: use {} or more, or set `refreshFrequency` to {} or less",
             render_minutes(floor),
             suggest_refresh(min),
         ),
         // Below 10m with the 3x rule already satisfied: raising minDuration is the only move.
-        (true, false) => format!("Use {} or more", render_minutes(floor)),
+        (true, false) => format!("Fix: use {} or more", render_minutes(floor)),
         (false, false) => unreachable!("min < floor implies at least one rule was broken"),
     };
     vec![ValidationError::InvalidFieldValue {
@@ -514,17 +489,13 @@ fn render_minutes(d: std::time::Duration) -> String {
 
 /// The sentence every epoch-floor message carries, and the whole reason #458 was a data
 /// problem rather than a cosmetic one.
-const WHOLE_CALL_REFUSED: &str = "`kopia repository set-parameters` merges the \
-     declared flags into the repository's existing parameters and validates the whole \
-     resulting set, so ONE out-of-range value refuses the entire call — every other \
-     parameter in the same apply is discarded with it.";
+const WHOLE_CALL_REFUSED: &str = "One out-of-range value makes kopia reject every \
+     parameter in the same apply.";
 
 /// Why `0` is rejected rather than tolerated as "leave it alone": kopia's CLI treats `0` on
 /// these integer flags as "flag not set" and prints `no changes`, which is the worst of both
 /// worlds — the user sees success and the repository is untouched. Verified on 0.23.1.
-const ZERO_IS_DROPPED: &str = "A `0` would not even reach kopia's parameter \
-     validation: its CLI treats 0 on these flags as \"not set\" and reports `no changes`, \
-     so it looks like it applied and does nothing.";
+const ZERO_IS_DROPPED: &str = "kopia would silently ignore 0.";
 
 /// kopia's `minEpochAdvanceOnCount`: "epoch advance on count too low" below this.
 const KOPIA_MIN_ADVANCE_ON_COUNT: i64 = 10;
@@ -580,11 +551,8 @@ fn validate_blob_retention(
     if !mode.allows_writes() {
         errs.push(ValidationError::InvalidFieldValue {
             field: field.clone(),
-            reason: "a ReadOnly repository cannot apply blob retention: \
-                     `kopia repository set-parameters` rewrites the repository-global format \
-                     blob and fails outright on a read-only connection. Declare \
-                     blobRetention on the cluster that owns this repository (mode: ReadWrite) \
-                     — object lock is a property of the repository, not of each consumer"
+            reason: "a ReadOnly repository cannot apply blob retention. Fix: set \
+                     blobRetention on the cluster that owns the repository (mode: ReadWrite)"
                 .to_string(),
         });
     }
@@ -604,12 +572,9 @@ fn validate_blob_retention(
         errs.push(ValidationError::InvalidFieldValue {
             field: field.clone(),
             reason: format!(
-                "the {} backend does not support object lock, so kopia cannot apply blob \
-                 retention to it — `kopia repository set-parameters` fails with \
-                 `blob-retention: unsupported put-blob option`, and would keep failing on \
-                 every reconcile. Remove spec.parameters.blobRetention, or use an S3, Azure, \
-                 or GCS repository whose bucket had object lock enabled AT CREATION (it \
-                 cannot be turned on later)",
+                "the {} backend does not support object lock. Fix: remove \
+                 spec.parameters.blobRetention, or use an S3, Azure, or GCS bucket created \
+                 with object lock enabled",
                 backend.kind_str()
             ),
         });
@@ -625,9 +590,8 @@ fn validate_blob_retention(
         None => errs.push(ValidationError::InvalidFieldValue {
             field: period_field,
             reason: format!(
-                "{:?} is not a valid duration. Kopiur accepts a Go-style duration with a \
-                 single unit of h, m, or s — write 30 days as 720h, not 30d. (kopia's own CLI \
-                 does accept `30d`; kopiur keeps one duration grammar across every CRD field.)",
+                "{:?} is not a valid duration. Fix: use a Go-style duration with a single \
+                 unit of h, m, or s — write 30 days as 720h, not 30d",
                 window.period
             ),
         }),
@@ -637,8 +601,7 @@ fn validate_blob_retention(
             errs.push(ValidationError::InvalidFieldValue {
                 field: period_field,
                 reason: format!(
-                    "{:?} is too large: kopia stores the retention period as a 64-bit \
-                     nanosecond count, so the maximum is roughly 292 years",
+                    "{:?} is too large (the maximum is about 292 years)",
                     window.period
                 ),
             });
@@ -647,8 +610,7 @@ fn validate_blob_retention(
             errs.push(ValidationError::InvalidFieldValue {
                 field: period_field,
                 reason: format!(
-                    "{:?} is below kopia's minimum: \"the minimum required is 1-day and there \
-                     is no maximum limit\". Use 24h or more",
+                    "{:?} is below kopia's minimum of 1 day. Fix: use 24h or more",
                     window.period
                 ),
             });
@@ -673,10 +635,7 @@ pub fn validate_repository_health(
     {
         return Err(ValidationError::InvalidFieldValue {
             field: format!("{context} health.indexBlobWarnThreshold"),
-            reason: format!(
-                "must be >= 0 (got {t}); 0 disables the index-blob warning, a positive \
-                 value is the count above which a Warning is raised"
-            ),
+            reason: format!("must be >= 0 (got {t}); 0 disables the warning"),
         });
     }
     if let Some(probe) = health.and_then(|h| h.probe.as_ref()) {
@@ -686,8 +645,8 @@ pub fn validate_repository_health(
                     return Err(ValidationError::InvalidFieldValue {
                         field: format!("{context} health.probe.interval"),
                         reason: format!(
-                            "{raw:?} is not a valid duration. Use a Go-style duration like 30s, \
-                             5m, or 1h; omit the field for the default (30m)"
+                            "{raw:?} is not a valid duration. Fix: use a Go-style duration like \
+                             30s, 5m, or 1h; omit the field for the default (30m)"
                         ),
                     });
                 }
@@ -695,8 +654,8 @@ pub fn validate_repository_health(
                     return Err(ValidationError::InvalidFieldValue {
                         field: format!("{context} health.probe.interval"),
                         reason: format!(
-                            "{raw:?} is shorter than the 30s minimum. Each probe runs a mover \
-                             Job; use 30s or more (default 30m)"
+                            "{raw:?} is shorter than the 30s minimum. Fix: use 30s or more \
+                             (default 30m)"
                         ),
                     });
                 }
@@ -709,8 +668,8 @@ pub fn validate_repository_health(
             return Err(ValidationError::InvalidFieldValue {
                 field: format!("{context} health.probe.failureThreshold"),
                 reason: format!(
-                    "must be >= 1 (got {t}); it is the number of consecutive failing probes \
-                     required before the warning is raised"
+                    "must be >= 1 (got {t}); it is how many failed probes in a row raise the \
+                     warning"
                 ),
             });
         }
@@ -1030,8 +989,8 @@ pub fn validate_repository(spec: &RepositorySpec) -> Vec<ValidationError> {
 /// repo `connect`/`create` fails with `permission denied`. Non-blocking (a user
 /// fixing it NAS-side via Mapall can ignore it). Kept short for the admission
 /// response (kube truncates very long warnings).
-pub const NFS_FSGROUP_WARNING: &str = "NFS filesystem repo: fsGroup is ignored on NFS — \
-     grant the mover write access via moverDefaults.podSecurityContext.supplementalGroups \
+pub const NFS_FSGROUP_WARNING: &str = "NFS filesystem repo: fsGroup is ignored on NFS. \
+     Fix: grant the mover write access via moverDefaults.podSecurityContext.supplementalGroups \
      (with a group-writable export), securityContext.runAsUser, or NAS-side Mapall";
 
 /// The actionable admission warning for an S3 backend pairing `tls.caBundleRef`
@@ -1046,9 +1005,8 @@ pub const NFS_FSGROUP_WARNING: &str = "NFS filesystem repo: fsGroup is ignored o
 /// `caBundleRef` never worked at all before this validation existed — no
 /// working CR can carry it.) Kept short for the admission response (kube
 /// truncates very long warnings).
-pub const S3_TLS_SKIP_VERIFY_WARNING: &str = "s3 tls: insecureSkipVerify wins at kopia — the \
-     referenced caBundleRef CA bundle is ignored while it is set; remove insecureSkipVerify \
-     once the CA bundle verifies the endpoint";
+pub const S3_TLS_SKIP_VERIFY_WARNING: &str = "s3 tls: caBundleRef is ignored while \
+     insecureSkipVerify is set; remove insecureSkipVerify once the CA bundle works";
 
 /// Whether `moverDefaults` configures an NFS-effective write identity — i.e. a
 /// `runAsUser` (container or pod) that owns the export, or a `supplementalGroups`
@@ -1113,16 +1071,16 @@ pub fn validate_catalog_bounds(
             None => errs.push(ValidationError::InvalidFieldValue {
                 field: "catalog.refreshInterval".to_string(),
                 reason: format!(
-                    "{raw:?} is not a valid duration. Use a Go-style duration like 30s, 5m, or \
-                     1h; omit the field for the default (1h)"
+                    "{raw:?} is not a valid duration. Fix: use a Go-style duration like 30s, \
+                     5m, or 1h; omit the field for the default (1h)"
                 ),
             }),
             Some(d) if d < crate::consts::MIN_CATALOG_REFRESH_INTERVAL => {
                 errs.push(ValidationError::InvalidFieldValue {
                     field: "catalog.refreshInterval".to_string(),
                     reason: format!(
-                        "{raw:?} is shorter than the 30s minimum. Each re-scan of an \
-                         object-store repository runs a mover Job; use 30s or more (default 1h)"
+                        "{raw:?} is shorter than the 30s minimum. Fix: use 30s or more \
+                         (default 1h)"
                     ),
                 });
             }
@@ -1136,9 +1094,8 @@ pub fn validate_catalog_bounds(
             errs.push(ValidationError::InvalidFieldValue {
                 field: "catalog.retain.perIdentity".to_string(),
                 reason: format!(
-                    "{n} is negative. Use a positive count of discovered Snapshot CRs to keep \
-                     per identity, 0 to disable discovered-Snapshot materialization, or omit \
-                     the field to materialize everything"
+                    "{n} is negative. Fix: use how many discovered Snapshots to keep per \
+                     identity, 0 to keep none, or omit the field to keep all"
                 ),
             });
         }
@@ -1148,9 +1105,8 @@ pub fn validate_catalog_bounds(
             errs.push(ValidationError::InvalidFieldValue {
                 field: "catalog.retain.maxAgeDays".to_string(),
                 reason: format!(
-                    "{d} is not a usable age bound. Use a positive number of days (snapshots \
-                     older than this get no discovered Snapshot CR), or omit the field for no \
-                     age bound"
+                    "{d} is not a valid age. Fix: use a positive number of days, or omit the \
+                     field for no limit"
                 ),
             });
         }
@@ -1158,9 +1114,8 @@ pub fn validate_catalog_bounds(
     if !cluster_scoped && catalog.fallback_namespace.is_some() {
         errs.push(ValidationError::InvalidFieldValue {
             field: "catalog.fallbackNamespace".to_string(),
-            reason: "only a ClusterRepository places discovered Snapshots across namespaces; a \
-                     namespaced Repository always materializes into its own namespace — remove \
-                     the field (or move the repository to a ClusterRepository)"
+            reason: "only applies to a ClusterRepository; a Repository always puts discovered \
+                     Snapshots in its own namespace. Fix: remove the field"
                 .to_string(),
         });
     }
@@ -1174,8 +1129,7 @@ pub fn validate_catalog_bounds(
         if catalog.fallback_namespace.is_none() {
             errs.push(ValidationError::InvalidFieldValue {
                 field: "catalog.foreignSnapshots".to_string(),
-                reason: "Fallback requires catalog.fallbackNamespace to be set (there is \
-                         nowhere to materialize a foreign snapshot otherwise); set \
+                reason: "Fallback requires catalog.fallbackNamespace. Fix: set \
                          fallbackNamespace, or use Ignore"
                     .to_string(),
             });
@@ -1183,9 +1137,8 @@ pub fn validate_catalog_bounds(
         if !cluster_scoped {
             errs.push(ValidationError::InvalidFieldValue {
                 field: "catalog.foreignSnapshots".to_string(),
-                reason: "Fallback is only meaningful on a ClusterRepository; a namespaced \
-                         Repository already materializes into its own namespace; use Ignore or \
-                         omit"
+                reason: "Fallback only applies to a ClusterRepository; a Repository always \
+                         uses its own namespace. Fix: use Ignore or omit"
                     .to_string(),
             });
         }
@@ -1252,10 +1205,8 @@ pub fn validate_repository_replication(spec: &RepositoryReplicationSpec) -> Vec<
         if let Err(e) = super::forbid_inherit(
             m,
             "RepositoryReplication spec",
-            "is not honored by a replication mover, which copies repository blobs and never \
-             reads a workload's files — there is no workload whose identity it could take. \
-             Remove it; set mover.securityContext explicitly if the destination backend needs \
-             a particular UID/GID (e.g. a filesystem repository on an NFS export).",
+            "does not apply to a replication mover (there is no workload). Fix: remove it; \
+             set mover.securityContext if the destination needs a particular UID/GID",
         ) {
             errs.push(e);
         }
@@ -1349,11 +1300,8 @@ pub fn validate_snapshot_replication(spec: &SnapshotReplicationSpec) -> Vec<Vali
         if let Err(e) = super::forbid_inherit(
             m,
             "SnapshotReplication spec",
-            "is not honored by a snapshot-replication mover, which copies snapshot manifests \
-             repository-to-repository and never reads a workload's files — there is no \
-             workload whose identity it could take. Remove it; set mover.securityContext \
-             explicitly if a filesystem-backed repository needs a particular UID/GID (e.g. \
-             an NFS export)",
+            "does not apply to a snapshot-replication mover (there is no workload). Fix: \
+             remove it; set mover.securityContext if a repository needs a particular UID/GID",
         ) {
             errs.push(e);
         }
@@ -1620,16 +1568,14 @@ pub fn validate_maintenance(spec: &MaintenanceSpec) -> Vec<ValidationError> {
         if let Err(e) = forbid_pvc_consumer(
             m,
             "maintenance",
-            "Use an explicit mover.securityContext instead.",
+            "Fix: set mover.securityContext explicitly",
         ) {
             errs.push(e);
         }
         if let Err(e) = forbid_snapshot_inherit(
             m,
             "maintenance",
-            "a maintenance mover operates on the repository, not on a snapshot's data, so \
-             there is no recorded identity to reproduce; `snapshot` is restore-only. Use an \
-             explicit mover.securityContext instead.",
+            "is restore-only. Fix: set mover.securityContext explicitly",
         ) {
             errs.push(e);
         }

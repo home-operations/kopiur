@@ -734,8 +734,7 @@ pub fn browsability(snap: &Snapshot) -> (bool, Option<String>) {
                 None
             } else {
                 Some(
-                    "This snapshot has no kopia manifest ID recorded yet, so there is nothing to \
-                     open. Wait for the operator to finish reconciling it."
+                    "This snapshot has no kopia manifest ID yet. Wait for the operator to finish with it."
                         .to_string(),
                 )
             }
@@ -748,28 +747,21 @@ pub fn browsability(snap: &Snapshot) -> (bool, Option<String>) {
                 .to_string(),
         ),
         Some(SnapshotPhase::Failed) => Some(
-            "This backup failed, so it wrote no snapshot to browse. Check the failure detail \
-             below, fix the cause, and run it again."
+            "This backup failed, so it wrote no snapshot to browse. Fix the cause below and run \
+             it again."
                 .to_string(),
         ),
-        Some(SnapshotPhase::Deleting) => Some(
-            "This snapshot is being deleted from the repository, so its contents are on their \
-             way out."
-                .to_string(),
-        ),
+        Some(SnapshotPhase::Deleting) => Some("This snapshot is being deleted.".to_string()),
         Some(SnapshotPhase::Unchanged) => Some(
-            "Nothing changed since the previous backup, so no new snapshot was written — browse \
-             the previous one instead."
+            "Nothing changed since the previous backup, so no snapshot was written. Browse the \
+             previous one."
                 .to_string(),
         ),
         Some(SnapshotPhase::Unknown(raw)) => Some(format!(
-            "This snapshot is in phase {raw}, which this version of the kopiur UI does not \
-             recognize. Upgrade kopiur-ui to the operator's version to browse it."
+            "This UI does not recognize phase {raw}. Upgrade kopiur-ui to the operator's \
+             version to browse it."
         )),
-        None => Some(
-            "The operator has not reported on this snapshot yet, so there is nothing to open."
-                .to_string(),
-        ),
+        None => Some("The operator has not reported on this snapshot yet.".to_string()),
     };
     (blocker.is_none(), blocker)
 }
@@ -1058,16 +1050,14 @@ fn plan_too_large(candidates: usize, cap: usize) -> ApiError {
         422,
         "plan-too-large",
         format!(
-            "This policy's retention population is {candidates} snapshots, which is more than \
-             this kopiur-ui will assemble into one plan (the cap is {cap})."
+            "This policy has {candidates} snapshots, more than the {cap} this UI will plan at \
+             once."
         ),
-        "A retention plan has to show each bucket WHOLE — the verdicts inside one are decided by \
-         all of its rows competing, so a truncated bucket would report keeps and prunes that are \
-         not what the operator will do. Refusing is the only honest answer that is not a lie.",
+        "A plan must show each bucket whole; a partial one would show the wrong keeps and \
+         prunes.",
         format!(
-            "browse the individual rows with /api/v1/snapshots?policy=<name>, which pages — or \
-             raise KOPIUR_UI_SNAPSHOT_LIST_CAP above {candidates} if this cluster really does \
-             need a plan this large"
+            "browse the rows with /api/v1/snapshots?policy=<name>, or raise \
+             KOPIUR_UI_SNAPSHOT_LIST_CAP above {candidates}"
         ),
     )
 }
@@ -1083,11 +1073,8 @@ fn no_governing_policy(snap: &Snapshot, namespace: &str, name: &str) -> ApiError
             422,
             "no-retention-policy",
             format!("Snapshot {namespace}/{name} is not governed by a SnapshotPolicy."),
-            "GFS retention is configured on a SnapshotPolicy, and this snapshot names none — a \
-             discovered or hand-written snapshot is bounded by the catalog or by whoever made \
-             it, not by a retention plan.",
-            "look at the repository's catalog settings instead, or set spec.policyRef if this \
-             snapshot should be governed by a policy",
+            "Retention comes from a SnapshotPolicy, and this snapshot names none.",
+            "check the repository's catalog settings, or set spec.policyRef",
         ),
         Some(policy_ref) => problem(
             422,
@@ -1096,11 +1083,9 @@ fn no_governing_policy(snap: &Snapshot, namespace: &str, name: &str) -> ApiError
                 "The SnapshotPolicy {} that governs {namespace}/{name} could not be read.",
                 policy_ref.name
             ),
-            "The plan is computed from the policy's retention rules, and this request cannot see \
-             them — the policy was deleted, or reading SnapshotPolicy in that namespace is not \
-             granted to you.",
-            "ask for `get` on snapshotpolicies in that namespace, or check whether the policy \
-             still exists",
+            "It was deleted, or you may not read SnapshotPolicies in that namespace.",
+            "ask for `get` on snapshotpolicies in that namespace, or check the policy still \
+             exists",
         ),
     }
 }
@@ -1126,15 +1111,10 @@ fn not_retention_governed(
             "not-retention-governed",
             format!(
                 "Snapshot {namespace}/{name} names SnapshotPolicy {policy_name}, but the \
-                 policy's own retention run does not select it yet."
+                 policy's retention does not select it yet."
             ),
-            "A prune enumerates its children by the kopiur config label, and this snapshot's \
-             label does not name this policy — the shape a discovered snapshot has while it is \
-             being adopted, after its spec reference is set and before the operator rewrites \
-             the label. Answering with a plan would report it competing for keep slots in a set \
-             the operator has never evaluated it in.",
-            "wait for the adoption to finish — the label follows within a reconcile — and open \
-             the plan again",
+            "Its kopiur config label does not name this policy yet; it is still being adopted.",
+            "wait for the adoption to finish, then open the plan again",
         );
     }
     let phase = snap
@@ -1147,11 +1127,8 @@ fn not_retention_governed(
         422,
         "not-retention-governed",
         format!("Snapshot {namespace}/{name} is {phase}, so GFS retention does not evaluate it."),
-        "Only a succeeded snapshot carrying a controller-written kopia manifest competes for a \
-         retention slot; a pending, running, failed, deduplicated or deleting row is bounded by \
-         something else and has no place in a bucket.",
-        "open the retention plan from a succeeded snapshot of the same policy to see which \
-         restore points it keeps",
+        "Only succeeded snapshots count toward retention.",
+        "open the retention plan from a succeeded snapshot of the same policy",
     )
 }
 
@@ -1191,10 +1168,9 @@ fn repository_namespace_required() -> ApiError {
         400,
         "repository-namespace-required",
         "Filtering by a namespaced Repository needs to know which namespace it is in.",
-        "The request named a repository but neither ?repositoryNamespace= nor ?namespace=, and \
-         two namespaces may each hold a repository with that name.",
-        "add ?repositoryNamespace=<namespace>, or filter with ?repositoryKind=cluster-repository \
-         if you meant the cluster-scoped one",
+        "Two namespaces may each hold a Repository with that name.",
+        "add ?repositoryNamespace=<namespace>, or ?repositoryKind=cluster-repository for a \
+         ClusterRepository",
     )
 }
 
@@ -1204,8 +1180,7 @@ fn bad_origin(value: &str) -> ApiError {
         400,
         "invalid-filter",
         format!("`{value}` is not a snapshot origin."),
-        "The origin filter takes the value the rows themselves carry, and this is not one of \
-         them.",
+        "It is not a value snapshots carry.",
         "use one of scheduled, manual, discovered, adopted or replicated",
     )
 }
@@ -1216,10 +1191,9 @@ fn bad_phase(value: &str) -> ApiError {
         400,
         "invalid-filter",
         format!("`{value}` is not a snapshot phase."),
-        "The phase filter takes the value the rows themselves carry, and this is not one of \
-         them.",
+        "It is not a value snapshots carry.",
         "use one of pending, running, succeeded, failed, deleting, discovered, unchanged, or \
-         unknown to find snapshots in a phase this UI build does not recognize",
+         unknown (a phase this UI does not recognize)",
     )
 }
 
@@ -1229,9 +1203,8 @@ fn snapshot_not_found(namespace: &str, name: &str) -> ApiError {
         404,
         "not-found",
         format!("There is no Snapshot called {name} in namespace {namespace}."),
-        "It was pruned by retention, deleted, or never existed — the SPA may be showing a link \
-         from a listing taken before the change.",
-        "reload the snapshots list to see what the cluster holds now",
+        "It was pruned by retention, deleted, or never existed.",
+        "reload the snapshots list",
     )
 }
 
@@ -2173,7 +2146,7 @@ spec:
             refusal.0.fix
         );
         assert!(
-            refusal.0.why.contains("WHOLE"),
+            refusal.0.why.contains("whole"),
             "the why must say why truncation is not on offer: {}",
             refusal.0.why
         );

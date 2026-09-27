@@ -361,7 +361,7 @@ pub use kopiur_telemetry::env::{LOG_PASSTHROUGH, OTEL_EXPORTER_OTLP_ENDPOINT, OT
 #[command(
     name = "kopiur-controller",
     version,
-    about = "Kopiur operator controller: per-CRD reconcilers, finalizers, and scheduling"
+    about = "Kopiur operator controller"
 )]
 pub struct ControllerArgs {
     /// Container image for mover Jobs (unset → the published default image).
@@ -376,17 +376,17 @@ pub struct ControllerArgs {
     #[arg(long, env = MOVER_PULL_POLICY_ENV)]
     pub mover_pull_policy: Option<String>,
 
-    /// ServiceAccount mover Job pods run as; the controller mints it plus a
-    /// RoleBinding in each Job's namespace. Unset → the namespace `default` SA
-    /// with no minting.
+    /// ServiceAccount mover Job pods run as; the controller creates it plus a
+    /// RoleBinding in each Job's namespace. Unset → the namespace's `default`
+    /// ServiceAccount.
     #[arg(long, env = MOVER_SERVICE_ACCOUNT_ENV)]
     pub mover_service_account: Option<String>,
 
-    /// Name of the mover ClusterRole/Role the minted RoleBinding references.
+    /// Name of the mover ClusterRole/Role the mover RoleBinding references.
     #[arg(long, env = MOVER_CLUSTERROLE_ENV, default_value = DEFAULT_MOVER_NAME)]
     pub mover_clusterrole: String,
 
-    /// roleRef.kind for the minted mover RoleBinding: ClusterRole or Role.
+    /// roleRef.kind for the mover RoleBinding: ClusterRole or Role.
     // Kept a raw string (not a ValueEnum) so an empty chart value keeps
     // meaning "default"; parsed to `RoleKind` in `resolve()`.
     #[arg(long, env = MOVER_ROLE_KIND_ENV)]
@@ -410,10 +410,9 @@ pub struct ControllerArgs {
     pub worker_threads: usize,
 
     /// Opt-in: stream cluster-wide list/resync via the WatchList API.
-    ///
-    /// Not `ArgAction::SetTrue`: that action cannot consume an env value, and
-    /// the chart sets `KOPIUR_STREAMING_LISTS=true`/`false`. `num_args = 0..=1`
-    /// keeps the bare `--streaming-lists` form working.
+    // Not `ArgAction::SetTrue`: that action cannot consume an env value, and
+    // the chart sets `KOPIUR_STREAMING_LISTS=true`/`false`. `num_args = 0..=1`
+    // keeps the bare `--streaming-lists` form working.
     #[arg(long, env = STREAMING_LISTS_ENV, action = ArgAction::Set,
           num_args = 0..=1, default_value_t = false, default_missing_value = "true",
           value_parser = parse_flag_bool)]
@@ -457,19 +456,18 @@ pub struct ControllerArgs {
     #[arg(long, env = LEASE_NAME_ENV)]
     pub lease_name: Option<String>,
 
-    /// Leader-election protocol timings, in seconds. Unset uses the client-go
-    /// defaults; any set that could split-brain is rejected at startup by
-    /// [`LeaseTimings::validate`]. Widen these only on a control plane where the
-    /// default 10s renew window is genuinely too tight.
+    /// Leader-election lease duration, in seconds. Unset uses the client-go
+    /// defaults; unsafe timing combinations are rejected at startup. Widen the
+    /// timings only if the default 10s renew window is too tight.
     #[arg(long, env = LEASE_DURATION_ENV)]
     pub lease_duration_seconds: Option<u64>,
-    /// See [`RENEW_DEADLINE_ENV`].
+    /// Leader-election renew deadline, in seconds.
     #[arg(long, env = RENEW_DEADLINE_ENV)]
     pub renew_deadline_seconds: Option<u64>,
-    /// See [`RENEW_PERIOD_ENV`].
+    /// Leader-election renew period, in seconds.
     #[arg(long, env = RENEW_PERIOD_ENV)]
     pub renew_period_seconds: Option<u64>,
-    /// See [`RETRY_PERIOD_ENV`].
+    /// Leader-election retry period, in seconds.
     #[arg(long, env = RETRY_PERIOD_ENV)]
     pub retry_period_seconds: Option<u64>,
 
@@ -479,51 +477,49 @@ pub struct ControllerArgs {
           value_parser = parse_sweep_interval)]
     pub work_spec_sweep_interval_secs: u64,
 
-    /// Minimum age (seconds) before the sweep may reap a work-spec ConfigMap.
+    /// Minimum age (seconds) before the sweep may delete a work-spec ConfigMap.
     #[arg(long, env = WORK_SPEC_SWEEP_MIN_AGE_ENV,
           default_value_t = DEFAULT_WORK_SPEC_SWEEP_MIN_AGE_SECS,
           value_parser = parse_sweep_min_age)]
     pub work_spec_sweep_min_age_secs: i64,
 
-    /// Cap on concurrently running Snapshot-delete BATCH mover Jobs, across
-    /// every repository. `0` (the default) means uncapped: batching (one Job
-    /// per repository per accumulation window) is the primary protection
-    /// against overwhelming the backend; this is an opt-in backstop for a
-    /// resource-constrained cluster. Raw `usize`, `0`-sentinel — resolved to
-    /// [`ControllerConfig::max_concurrent_delete_jobs`]`: Option<NonZeroUsize>`
-    /// in [`ControllerArgs::resolve`].
+    /// Cap on concurrently running Snapshot-delete mover Jobs across all
+    /// repositories. `0` (the default) means uncapped.
+    // Raw `usize`, `0`-sentinel — resolved to
+    // `ControllerConfig::max_concurrent_delete_jobs: Option<NonZeroUsize>` in
+    // `ControllerArgs::resolve`.
     #[arg(long, env = MAX_CONCURRENT_DELETE_JOBS_ENV,
           default_value_t = DEFAULT_MAX_CONCURRENT_DELETE_JOBS,
           value_parser = parse_max_concurrent_delete_jobs)]
     pub max_concurrent_delete_jobs: usize,
 
-    /// Cluster-wide cap on concurrently running pooled mover Jobs (backups,
-    /// restores, replication sources) across every repository — the backstop
-    /// under each repository's own `spec.concurrency.maxConcurrentJobs`. `0`
-    /// (the default) means uncapped; restores are always admitted. Raw `usize`,
-    /// `0`-sentinel — resolved to
-    /// [`ControllerConfig::max_concurrent_jobs`]`: Option<NonZeroUsize>` in
-    /// [`ControllerArgs::resolve`].
+    /// Cluster-wide cap on concurrently running mover Jobs (backups, restores,
+    /// replication), on top of each repository's
+    /// `spec.concurrency.maxConcurrentJobs`. `0` (the default) means uncapped;
+    /// restores are always admitted.
+    // Raw `usize`, `0`-sentinel — resolved to
+    // `ControllerConfig::max_concurrent_jobs: Option<NonZeroUsize>` in
+    // `ControllerArgs::resolve`.
     #[arg(long, env = MAX_CONCURRENT_JOBS_ENV,
           default_value_t = DEFAULT_MAX_CONCURRENT_JOBS,
           value_parser = parse_max_concurrent_jobs)]
     pub max_concurrent_jobs: usize,
 
     /// Per-controller cap on concurrently running reconciles. `0` means
-    /// unbounded (the pre-fix behavior; not recommended — see
-    /// [`RECONCILE_CONCURRENCY_ENV`]). Raw `u16`, `0`-sentinel — resolved to
-    /// [`ControllerConfig::reconcile_concurrency`]`: Option<NonZeroU16>` in
-    /// [`ControllerArgs::resolve`].
+    /// unbounded (not recommended).
+    // Raw `u16`, `0`-sentinel — resolved to
+    // `ControllerConfig::reconcile_concurrency: Option<NonZeroU16>` in
+    // `ControllerArgs::resolve`.
     #[arg(long, env = RECONCILE_CONCURRENCY_ENV,
           default_value_t = DEFAULT_RECONCILE_CONCURRENCY,
           value_parser = parse_reconcile_concurrency)]
     pub reconcile_concurrency: u16,
 
-    /// Seconds a Snapshot parked on a missing DIRECT source PVC waits before
-    /// flipping to terminal Failed. `0` disables the flip (park indefinitely).
-    /// Raw seconds, `0`-sentinel — resolved to
-    /// [`ControllerConfig::source_pvc_deadline`]`: Option<Duration>` in
-    /// [`ControllerArgs::resolve`].
+    /// Seconds a Snapshot waits for a missing source PVC before it is marked
+    /// Failed. `0` waits forever.
+    // Raw seconds, `0`-sentinel — resolved to
+    // `ControllerConfig::source_pvc_deadline: Option<Duration>` in
+    // `ControllerArgs::resolve`.
     #[arg(long, env = SOURCE_PVC_DEADLINE_ENV,
           default_value_t = crate::consts::DEFAULT_SOURCE_PVC_DEADLINE.as_secs(),
           value_parser = parse_source_pvc_deadline)]
@@ -534,12 +530,10 @@ pub struct ControllerArgs {
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "namespace")]
     pub cluster_scope: bool,
 
-    /// Namespaced install: watch ONLY this namespace (matches the chart's
-    /// Role-only RBAC) and skip cluster-scoped kinds (ClusterRepository,
-    /// Namespace referents). The chart stamps `--namespace={{ .Release.Namespace }}`
-    /// for `installScope: namespaced`. Deliberately separate from
-    /// --operator-namespace / KOPIUR_NAMESPACE (which only places managed
-    /// objects and the Lease).
+    /// Namespaced install: watch only this namespace and skip cluster-scoped
+    /// kinds (ClusterRepository). The chart sets it for
+    /// `installScope: namespaced`. Separate from --operator-namespace, which
+    /// only places managed objects and the Lease.
     #[arg(long)]
     pub namespace: Option<String>,
 }
@@ -620,25 +614,22 @@ impl LeaseTimings {
         let worst_case = self.renew_period + self.renew_deadline;
         if worst_case >= self.lease_duration {
             return Err(ConfigError::LeaseTimings(format!(
-                "renewPeriod ({:?}) + renewDeadline ({:?}) = {:?} must be strictly less than \
-                 leaseDuration ({:?}): a leader can sleep a full renew period and then spend a \
-                 full renew window before abdicating, and if that exceeds the lease duration a \
-                 standby may claim the Lease while this replica is still reconciling",
+                "renewPeriod ({:?}) + renewDeadline ({:?}) = {:?} must be less than \
+                 leaseDuration ({:?}), or a standby may take the Lease while this replica is \
+                 still reconciling",
                 self.renew_period, self.renew_deadline, worst_case, self.lease_duration
             )));
         }
         if self.retry_period >= self.renew_deadline {
             return Err(ConfigError::LeaseTimings(format!(
-                "retryPeriod ({:?}) must be less than renewDeadline ({:?}), or a renew window \
-                 fits only one attempt and a single slow call ends leadership",
+                "retryPeriod ({:?}) must be less than renewDeadline ({:?}) so a renew window \
+                 allows more than one attempt",
                 self.retry_period, self.renew_deadline
             )));
         }
         if self.renew_period.is_zero() || self.retry_period.is_zero() {
             return Err(ConfigError::LeaseTimings(
-                "renewPeriod and retryPeriod must be non-zero (a zero cadence busy-loops the \
-                 API server)"
-                    .to_string(),
+                "renewPeriod and retryPeriod must be non-zero".to_string(),
             ));
         }
         // Absolute ceiling, not just a relationship. `leaseDurationSeconds` is
@@ -650,9 +641,7 @@ impl LeaseTimings {
         // hours, which no deployment wants.
         if self.lease_duration > MAX_LEASE_DURATION {
             return Err(ConfigError::LeaseTimings(format!(
-                "leaseDuration ({:?}) exceeds the {:?} ceiling: a longer lease means a failover \
-                 waits that long before any replica may take over, and the value must stay \
-                 representable as the i32 `leaseDurationSeconds` the Lease publishes",
+                "leaseDuration ({:?}) exceeds the {:?} maximum",
                 self.lease_duration, MAX_LEASE_DURATION
             )));
         }
@@ -756,9 +745,8 @@ pub enum ConfigError {
     /// `KOPIUR_MOVER_ROLE_KIND`/`--mover-role-kind` is not one of the two
     /// values Kubernetes accepts as a RoleBinding `roleRef.kind`.
     #[error(
-        "KOPIUR_MOVER_ROLE_KIND='{value}' is not a valid mover RoleBinding roleRef.kind; use \
-         ClusterRole (cluster-scoped install) or Role (namespaced install); unset it to use the \
-         default ClusterRole"
+        "KOPIUR_MOVER_ROLE_KIND='{value}' is invalid; use ClusterRole (cluster-scoped \
+         install) or Role (namespaced install); unset it to use the default ClusterRole"
     )]
     InvalidRoleKind {
         /// The raw (unrecognized) value.
@@ -768,9 +756,8 @@ pub enum ConfigError {
     /// `KOPIUR_MOVER_PULL_POLICY`/`--mover-pull-policy` is not one of the
     /// three values Kubernetes accepts as an `imagePullPolicy`.
     #[error(
-        "KOPIUR_MOVER_PULL_POLICY='{value}' is not a valid imagePullPolicy for mover Jobs; use \
-         Always, IfNotPresent or Never; unset it to infer the policy (IfNotPresent when \
-         KOPIUR_MOVER_IMAGE is set, else the cluster default)"
+        "KOPIUR_MOVER_PULL_POLICY='{value}' is invalid; use Always, IfNotPresent or Never; \
+         unset it to infer the policy"
     )]
     InvalidPullPolicy {
         /// The raw (unrecognized) value.
@@ -781,9 +768,9 @@ pub enum ConfigError {
     /// must live somewhere, and guessing a namespace could split-brain two
     /// replicas onto different Leases.
     #[error(
-        "--leader-elect/KOPIUR_LEADER_ELECT is enabled but the operator namespace is unknown; \
-         set KOPIUR_NAMESPACE/--operator-namespace (the chart injects it via the downward API) \
-         so the election Lease has a home, or disable leader election"
+        "leader election is on but the operator namespace is unknown, so there is nowhere to \
+         create the Lease. Fix: set KOPIUR_NAMESPACE (--operator-namespace), or disable leader \
+         election"
     )]
     LeaderElectionNeedsNamespace,
 
@@ -982,8 +969,8 @@ fn parse_http_addr(value: &str) -> Result<SocketAddr, String> {
     value.parse::<SocketAddr>().map_err(|_| {
         format!(
             "KOPIUR_HTTP_ADDR='{value}' is not a valid socket address; use host:port, e.g. \
-             [::]:8081 (IPv6/dual-stack, the default), 0.0.0.0:8081 (IPv4-only, for hosts with \
-             IPv6 disabled); unset it to use the default [::]:8081"
+             [::]:8081 or 0.0.0.0:8081 (IPv4-only hosts); unset it to use the default \
+             [::]:8081"
         )
     })
 }
@@ -1029,7 +1016,7 @@ fn parse_max_concurrent_delete_jobs(value: &str) -> Result<usize, String> {
     value.parse::<usize>().map_err(|_| {
         format!(
             "KOPIUR_MAX_CONCURRENT_DELETE_JOBS='{value}' is not a valid job count; use a \
-             non-negative integer (0 = uncapped, the default); unset it to use the default \
+             non-negative integer (0 = uncapped); unset it to use the default \
              {DEFAULT_MAX_CONCURRENT_DELETE_JOBS}"
         )
     })
@@ -1049,8 +1036,8 @@ fn parse_max_concurrent_jobs(value: &str) -> Result<usize, String> {
     value.parse::<usize>().map_err(|_| {
         format!(
             "KOPIUR_MAX_CONCURRENT_JOBS='{value}' is not a valid job count; use a non-negative \
-             integer (0 = uncapped, the default) — this is the CLUSTER-WIDE backstop under each \
-             repository's spec.concurrency.maxConcurrentJobs; unset it to use the default \
+             integer (0 = uncapped); it is a cluster-wide cap on top of each repository's \
+             spec.concurrency.maxConcurrentJobs; unset it to use the default \
              {DEFAULT_MAX_CONCURRENT_JOBS}"
         )
     })
@@ -1066,9 +1053,9 @@ fn parse_reconcile_concurrency(value: &str) -> Result<u16, String> {
     }
     value.parse::<u16>().map_err(|_| {
         format!(
-            "KOPIUR_RECONCILE_CONCURRENCY='{value}' is not a valid per-controller reconcile \
-             cap; use an integer 0-65535 (0 = unbounded, not recommended), e.g. 8; unset it \
-             to use the default {DEFAULT_RECONCILE_CONCURRENCY}"
+            "KOPIUR_RECONCILE_CONCURRENCY='{value}' is not a valid reconcile cap; use an \
+             integer 0-65535, e.g. 8 (0 = unbounded); unset it to use the default \
+             {DEFAULT_RECONCILE_CONCURRENCY}"
         )
     })
 }
@@ -1084,7 +1071,7 @@ fn parse_source_pvc_deadline(value: &str) -> Result<u64, String> {
     value.parse::<u64>().map_err(|_| {
         format!(
             "{SOURCE_PVC_DEADLINE_ENV}='{value}' is not a valid deadline; use a number of \
-             seconds (0 = park indefinitely, never fail); unset it to use the default {}",
+             seconds (0 = wait forever); unset it to use the default {}",
             crate::consts::DEFAULT_SOURCE_PVC_DEADLINE.as_secs()
         )
     })
@@ -1647,7 +1634,7 @@ mod tests {
             .validate()
             .expect_err("zero margin must be rejected");
         assert!(
-            err.to_string().contains("strictly less than"),
+            err.to_string().contains("must be less than leaseDuration"),
             "the error must explain the margin: {err}"
         );
 
@@ -1688,7 +1675,7 @@ mod tests {
         let err = oversized
             .validate()
             .expect_err("an i32-overflowing lease duration must be rejected");
-        assert!(err.to_string().contains("ceiling"), "{err}");
+        assert!(err.to_string().contains("maximum"), "{err}");
 
         assert!(
             LeaseTimings {

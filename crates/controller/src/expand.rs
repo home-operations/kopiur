@@ -97,9 +97,9 @@ fn selector_namespaces(
         .unwrap_or_default();
     if !requested.is_empty() {
         return Err(Error::Validation(format!(
-            "SnapshotPolicy `{}`'s pvcSelector asks for namespace(s) {:?}, but a backup's mover \
-             Pod can only mount PersistentVolumeClaims in its own namespace (`{policy_ns}`). Use \
-             one SnapshotPolicy per namespace — each may point at the same repository.",
+            "SnapshotPolicy `{}` pvcSelector asks for namespace(s) {:?}, but a mover Pod can \
+             only mount PVCs in its own namespace (`{policy_ns}`). Fix: use one SnapshotPolicy \
+             per namespace; they can share a repository.",
             policy.name_any(),
             requested,
         )));

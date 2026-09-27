@@ -495,9 +495,9 @@ pub(crate) fn seed_success_fold(
             message: message.clone(),
             outcome: crate::metrics::SeedOutcomeLabel::Seeded,
             event: Some(format!(
-                "{message}. Re-apply your SnapshotPolicies to adopt this history — and review \
-                 their retention and defaultDeletionPolicy first: GFS prunes beyond-budget \
-                 restore points as soon as a policy adopts them."
+                "{message}. Re-apply your SnapshotPolicies to adopt this history, but check \
+                 their retention and defaultDeletionPolicy first: adopted snapshots are \
+                 pruned by retention right away."
             )),
         }
     } else {
@@ -505,8 +505,8 @@ pub(crate) fn seed_success_fold(
             status: serde_json::json!({ "seed": status }),
             reason: kopiur_api::consts::ALREADY_INITIALIZED_REASON,
             message: format!(
-                "spec.seed is a no-op: this repository was already initialized, so nothing was \
-                 copied from {}",
+                "spec.seed skipped: this repository already existed, so nothing was copied \
+                 from {}",
                 outcome.source
             ),
             outcome: crate::metrics::SeedOutcomeLabel::AlreadyInitialized,
@@ -610,10 +610,9 @@ pub(crate) fn seed_mode_of(outcome: &SeedOutcome) -> SeedMode {
 /// written while a seeding bootstrap Job is in flight.
 pub(crate) fn seeding_message(source_description: &str, deadline_secs: i64) -> String {
     format!(
-        "copying this repository's initial contents from {source_description}; not Ready until \
-         the copy finishes (phase Initializing, or Degraded while an earlier attempt is \
-         retried). The seeding Job's deadline is {deadline_secs}s \
-         (spec.seed.failurePolicy.activeDeadlineSeconds); watch the bootstrap Job's pod logs for \
+        "copying initial contents from {source_description}; phase stays Initializing \
+         (Degraded while retrying) until done. Deadline {deadline_secs}s \
+         (spec.seed.failurePolicy.activeDeadlineSeconds); see the bootstrap Job's logs for \
          progress."
     )
 }
@@ -622,10 +621,9 @@ pub(crate) fn seeding_message(source_description: &str, deadline_secs: i64) -> S
 /// missing or not `Ready`.
 pub(crate) fn waiting_for_seed_source_message(source_description: &str, why: &str) -> String {
     format!(
-        "spec.seed copies this repository's initial contents from {source_description}, but \
-         {why}. This repository stays Pending until the source is usable. Fix: bring the source \
-         repository up (check its own status/conditions), or point spec.seed.from.repository at \
-         one that is."
+        "spec.seed source {source_description} can't be used: {why}. This repository \
+         stays Pending until it can. Fix: get the source repository Ready, or point \
+         spec.seed.from.repository at one that is."
     )
 }
 
@@ -641,11 +639,9 @@ pub(crate) fn waiting_for_seed_source_message(source_description: &str, why: &st
 /// `SeedSourceNotFound` every two minutes forever.
 pub(crate) fn bare_path_seed_source_message(source_description: &str, path: &str) -> String {
     format!(
-        "spec.seed reads from {source_description}, whose backend is a BARE-PATH filesystem \
-         repository (path `{path}`, no `volume`) reachable only on the controller's filesystem \
-         — a seeding Job would mount nothing and find no repository. Fix: give the source \
-         Repository a `backend.filesystem.volume` (a PVC or inline NFS export), or seed from a \
-         network-reachable backend via spec.seed.from.backend."
+        "spec.seed source {source_description} is a filesystem repository with no \
+         `volume` (path `{path}`), which the seeding Job can't mount. Fix: give it a \
+         `backend.filesystem.volume`, or seed from spec.seed.from.backend."
     )
 }
 
@@ -712,11 +708,9 @@ pub(crate) fn migrate_source_backend_park(
 /// resolves to the SAME storage this repository is being created on.
 fn seed_source_same_storage_message(source_description: &str, local: &Backend) -> String {
     format!(
-        "spec.seed reads from {source_description}, which resolves to this repository's own \
-         {kind} storage (spec.backend) — the seed would read and write one location. Admission \
-         catches a self-reference only BY NAME; a second CR over one bucket/PVC has the same \
-         storage. Fix: point spec.seed.from.repository at the repository holding the surviving \
-         history, or drop spec.seed if this one already has it.",
+        "spec.seed source {source_description} uses the same {kind} storage as this \
+         repository. Fix: point spec.seed.from.repository at the repository holding the \
+         history, or remove spec.seed.",
         kind = local.kind_str()
     )
 }
@@ -725,11 +719,9 @@ fn seed_source_same_storage_message(source_description: &str, local: &Backend) -
 /// this repository's in-pod filesystem `path`.
 fn seed_mount_path_collision_message(source_description: &str, path: &str) -> String {
     format!(
-        "spec.seed reads from {source_description}, whose filesystem backend mounts at {path:?} \
-         — the same in-pod path as this repository's backend. One pod mounts BOTH, and two \
-         volumes cannot share one mountPath, so the Job is rejected. Fix: give one repository a \
-         distinct backend.filesystem.path (e.g. /seed-source); the path only sets where the \
-         volume mounts in kopiur's pods, so changing it moves no data."
+        "spec.seed source {source_description} mounts at {path:?}, the same mountPath \
+         as this repository. Fix: give one a different backend.filesystem.path (e.g. \
+         /seed-source); this moves no data."
     )
 }
 
@@ -759,31 +751,26 @@ fn seed_source_auth_conflict_message(
         backend_workload_identity(source_backend),
     ) {
         (Some((a, _)), Some((b, _))) => format!(
-            "this repository federates as ServiceAccount {:?} and the seed source as {:?}",
+            "this repository uses ServiceAccount {:?} and the source uses {:?}",
             a.service_account_name, b.service_account_name
         ),
         (Some((a, _)), None) => format!(
-            "this repository federates as ServiceAccount {:?}, the same-kind source uses a \
-             static credential Secret the pod would pick up as the wrong identity",
+            "this repository uses workload identity {:?} but the source uses a static \
+             credential Secret",
             a.service_account_name
         ),
         (None, Some((b, _))) => format!(
-            "the seed source federates as ServiceAccount {:?}, the same-kind local uses a \
-             static credential Secret the pod would pick up as the wrong identity",
+            "the source uses workload identity {:?} but this repository uses a static \
+             credential Secret",
             b.service_account_name
         ),
-        (None, None) => {
-            "the two backends' credentials cannot both be used from one pod".to_string()
-        }
+        (None, None) => "the two backends need different identities".to_string(),
     };
     format!(
-        "spec.seed copies this repository's initial contents from {source_description}, but the \
-         two backends' credentials cannot share one seeding pod: {detail}. A bootstrap Job runs \
-         as exactly ONE ServiceAccount, so kopiur will not launch a seed that fails part-way on \
-         a cloud auth error. Fix: put both backends' auth.workloadIdentity on the SAME \
-         ServiceAccount (access to both stores), or give both sides static credential Secrets in \
-         the bootstrap Job's namespace (a Repository's own; a ClusterRepository's operator \
-         namespace, unless encryption.passwordSecretRef.namespace pins another)."
+        "spec.seed from {source_description} can't run: the seeding pod runs as one \
+         ServiceAccount, but {detail}. Fix: use the same auth.workloadIdentity ServiceAccount on \
+         both, or give both static credential Secrets in the bootstrap Job's namespace (the \
+         operator's namespace for a ClusterRepository)."
     )
 }
 
@@ -886,7 +873,7 @@ async fn arm_blob_seed(
     }
     let Some(op) = seed_op_for(seed, ca_bundle_pem, None, resume) else {
         return Err(Error::Invariant(
-            "a blob seed resolved to no mover payload; this is a kopiur bug".into(),
+            "blob seed produced no mover payload (a kopiur bug)".into(),
         ));
     };
     Ok(SeedArming::Armed(Box::new(ArmedSeed {
@@ -985,9 +972,7 @@ async fn arm_migrate_seed(
     };
     let Some(op) = seed_op_for(seed, None, Some(&source_repo), resume) else {
         return Err(Error::Invariant(
-            "a migrate seed with a resolved source produced no mover payload; this is a kopiur \
-             bug"
-            .into(),
+            "migrate seed produced no mover payload (a kopiur bug)".into(),
         ));
     };
     let source_volume = seed_source_volume(&source.backend);
@@ -1033,11 +1018,7 @@ fn seed_source_volume(backend: &Backend) -> Option<VolumeMountSpec> {
 /// relies on.
 fn seed_password_env(resolved_names: &[String], source: &ResolvedRepository) -> Result<EnvVar> {
     let name = resolved_names.first().cloned().ok_or_else(|| {
-        Error::Invariant(
-            "seed source credential resolution yielded no Secret names — the encryption password \
-             Secret is mandatory, so this is a kopiur bug"
-                .into(),
-        )
+        Error::Invariant("no seed source credential Secret was resolved (a kopiur bug)".into())
     })?;
     let key = source
         .encryption
@@ -2036,7 +2017,7 @@ mod tests {
         // end — and a namespace instruction that is true for BOTH kinds (a
         // ClusterRepository's seeding Job does not run in "this namespace").
         for m in [&both, &one_sided, &other_side] {
-            assert!(m.contains("ONE ServiceAccount"), "{m}");
+            assert!(m.contains("one ServiceAccount"), "{m}");
             assert!(m.contains("auth.workloadIdentity"), "{m}");
             assert!(m.contains("static credential Secret"), "{m}");
             assert!(m.contains("ClusterRepository"), "{m}");
@@ -2055,9 +2036,12 @@ mod tests {
         assert!(one_sided.contains("kopiur-new"), "{one_sided}");
         assert!(other_side.contains("kopiur-old"), "{other_side}");
 
-        // Same storage: says WHY admission let it through, so the operator does
-        // not go looking for a webhook bug.
-        assert!(same_storage.contains("BY NAME"), "{same_storage}");
+        // Same storage: names the shared storage and the field to fix.
+        assert!(same_storage.contains("same S3 storage"), "{same_storage}");
+        assert!(
+            same_storage.contains("spec.seed.from.repository"),
+            "{same_storage}"
+        );
         assert!(same_storage.contains("S3"), "{same_storage}");
         // Collision: names the path AND that changing it moves no data.
         assert!(collision.contains("/repo"), "{collision}");

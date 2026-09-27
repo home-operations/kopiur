@@ -88,9 +88,8 @@ async fn report<K: ReplicationTarget>(
         format!("{} {name} requested run", K::KIND),
         format!(
             "watch it with `kubectl get {} {name} -n {ns} -o jsonpath='{{.status.manualRun}}'`, \
-             or raise --timeout. A phase of Pending means the replication is suspended, or \
-             the request is waiting behind an in-flight run — `kubectl kopiur resume` it if \
-             suspended, or wait for the in-flight run to finish",
+             or raise --timeout. Pending means it is suspended (`kubectl kopiur resume` it) \
+             or waiting for a running replication to finish",
             K::PLURAL
         ),
         timeout,

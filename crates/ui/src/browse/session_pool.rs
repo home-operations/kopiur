@@ -311,14 +311,9 @@ fn exec_busy(error: TryAcquireError, who: &str, limit: usize) -> ApiError {
             429,
             "too-many-requests",
             format!("Too many browse reads are already running for {who}."),
-            format!(
-                "kopiur-ui allows {limit} concurrent pods/exec calls there. Each one is a \
-                 websocket to the apiserver and a kopia process in the session pod, and a \
-                 file download holds its slot until the last byte."
-            ),
-            "wait for a listing or download in another tab to finish, then retry; raise \
-             KOPIUR_UI_MAX_EXEC_PER_IDENTITY or KOPIUR_UI_MAX_EXEC_GLOBAL if this is normal \
-             for your cluster",
+            format!("The limit is {limit} at a time; a download holds its slot until it ends."),
+            "wait for a listing or download in another tab to finish, then retry, or raise \
+             KOPIUR_UI_MAX_EXEC_PER_IDENTITY or KOPIUR_UI_MAX_EXEC_GLOBAL",
         ),
         TryAcquireError::Closed => pool_closed("browse execs"),
     }
@@ -331,9 +326,8 @@ fn pool_closed(what: &str) -> ApiError {
         500,
         "internal",
         format!("kopiur-ui's limit on {what} is no longer usable."),
-        "The semaphore guarding it was closed, which nothing in kopiur-ui does. This is a \
-         bug, not a problem with the request.",
-        "restart kopiur-ui and report this at \
+        "This is a kopiur-ui bug.",
+        "restart kopiur-ui and report it at \
          https://github.com/home-operations/kopiur/issues with the UI's logs",
     )
 }
@@ -434,8 +428,7 @@ where
     }
     tracing::info!(
         job,
-        "a read attached to a browse session that had just been replaced; deleting the \
-         session it started, because a GET must never leave a mover pod running"
+        "a read started a browse session that was just replaced; deleting it"
     );
     undo(job.to_string()).await;
     Err(refusal)

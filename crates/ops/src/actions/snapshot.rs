@@ -152,8 +152,8 @@ pub fn success_summary(snapshot: &Snapshot) -> String {
     if status.and_then(|s| s.phase.as_ref()) == Some(&SnapshotPhase::Unchanged) {
         let name = snapshot.metadata.name.as_deref().unwrap_or("?");
         return format!(
-            "snapshot {name}: no files changed since the previous snapshot, so no new \
-             snapshot was created (the previous one is still the restore point)\n"
+            "snapshot {name}: nothing changed since the previous snapshot, so no new \
+             one was created\n"
         );
     }
     let id = status

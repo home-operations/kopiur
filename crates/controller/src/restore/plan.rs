@@ -89,11 +89,8 @@ pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
 /// without this guard the reconcile just wedges on retried 403s while the
 /// consumer PVC sits Pending unexplained.
 pub fn populator_needs_cluster_scope_message() -> String {
-    "target.populator is unavailable in a namespaced install (installScope: namespaced): its \
-     volume-populator handshake reads StorageClasses and rebinds PersistentVolumes, which are \
-     cluster-scoped and cannot be granted by the install's Role RBAC. Fix: use target.pvc or \
-     target.pvcRef for a direct restore, or reinstall with installScope=cluster to use the \
-     populator."
+    "target.populator needs cluster-scoped access, which a namespaced install does not have. \
+     Fix: use target.pvc or target.pvcRef, or reinstall with installScope=cluster."
         .to_string()
 }
 /// Whether a `Restore` in `phase` has NOT yet launched its mover Job — the set the
@@ -122,8 +119,8 @@ pub(super) fn restore_awaiting_launch(phase: Option<&RestorePhase>) -> bool {
 /// text is unit-asserted.
 pub(super) fn repository_not_ready_restore_message(repo_name: &str) -> String {
     format!(
-        "waiting for repository `{repo_name}` to become `Ready` before launching the restore \
-         (its backend is unreachable); the restore proceeds once the repository reconnects."
+        "waiting for repository `{repo_name}` to be `Ready` (backend unreachable); the restore \
+         starts once it reconnects."
     )
 }
 
@@ -239,11 +236,9 @@ pub(super) fn target_already_bound_message(
         None => "a PersistentVolume".to_string(),
     };
     format!(
-        "populator: claiming PVC `{consumer_name}` is already bound to {volume}, so there is \
-         nothing to populate — the CSI volume-populator handover only applies to an UNBOUND \
-         claim. No prime PVC was provisioned and no restore ran; the live volume was untouched. \
-         Fix: to restore into this claim, delete the PVC and let it be re-created (keeping its \
-         dataSourceRef)."
+        "populator: claiming PVC `{consumer_name}` is already bound to {volume}, so no restore \
+         ran and the volume was untouched. Fix: to restore into it, delete the PVC and re-create \
+         it with the same dataSourceRef."
     )
 }
 
@@ -253,13 +248,10 @@ pub(super) fn target_already_bound_message(
 /// hide a full-size `Retain`ed volume the admin now owns. Pure.
 pub(super) fn lost_rebind_message(consumer_name: &str, kept_pv: &str) -> String {
     format!(
-        "populator: claiming PVC `{consumer_name}` bound to a DIFFERENT volume than this restore \
-         prepared, so the handover was lost and can never complete — a volume-populator only \
-         fills an UNBOUND claim, and something else (a provisioner ignoring dataSourceRef, or an \
-         earlier bind) got there first. The restored data is NOT in the claim: it is on \
-         PersistentVolume `{kept_pv}`, kept (forced reclaimPolicy: Retain). Fix: recover it from \
-         there, or delete the claiming PVC to let the restore re-run — then delete `{kept_pv}` \
-         when done."
+        "populator: claiming PVC `{consumer_name}` bound to a different volume first, so the \
+         restored data is not in the claim. It is on PersistentVolume `{kept_pv}` (kept with \
+         reclaimPolicy: Retain). Fix: recover it from there, or delete the claiming PVC to \
+         re-run the restore, then delete `{kept_pv}`."
     )
 }
 
@@ -274,14 +266,10 @@ pub(super) fn populate_hijacked_message(consumer_name: &str, bound_volume: Optio
         None => "another PersistentVolume".to_string(),
     };
     format!(
-        "populator: claiming PVC `{consumer_name}` was bound to {volume} while this restore was \
-         still writing its prime volume, so the restored data can never reach the claim — the \
-         app will come up on whatever that volume holds (empty, if a provisioner bound it \
-         ignoring the dataSourceRef). This cluster cannot complete the volume-populator \
-         handshake: check the StorageClass provisioner supports populators (AnyVolumeDataSource \
-         + a populator-aware external-provisioner). The in-flight restore was cancelled and its \
-         prime PVC left for inspection; a Failed Restore is terminal, so fix the provisioner and \
-         create a NEW Restore."
+        "populator: claiming PVC `{consumer_name}` was bound to {volume} mid-restore, so the \
+         restored data cannot reach it. The restore was cancelled and its prime PVC kept for \
+         inspection. Fix: make sure the StorageClass provisioner supports volume populators \
+         (AnyVolumeDataSource), then create a new Restore."
     )
 }
 
@@ -297,15 +285,14 @@ pub(super) fn reaped_populate_artifacts_note(
     kept_pv: Option<&str>,
 ) -> String {
     let mut note = format!(
-        "populator: reaped leftover populate artifacts ({}) for claiming PVC `{consumer_name}`: \
-         the claim is already bound, so they could never be handed over and the prime volume \
-         would otherwise hold a full copy of the restored data forever.",
+        "populator: deleted leftover {} for claiming PVC `{consumer_name}` (the claim is \
+         already bound).",
         artifacts.join(", ")
     );
     if let Some(pv) = kept_pv {
         note.push_str(&format!(
-            " PersistentVolume `{pv}` holds the restored data and was KEPT (forced \
-             reclaimPolicy: Retain) — delete it manually if you do not want it."
+            " PersistentVolume `{pv}` holds the restored data and was kept (reclaimPolicy: \
+             Retain); delete it by hand if you do not need it."
         ));
     }
     note
@@ -529,12 +516,9 @@ pub(super) fn referent_missing_restore_message(
         None => name.to_string(),
     };
     format!(
-        "waiting for {kind} `{target}` to exist: the repository this restore connects to is \
-         derived from it, so kopiur cannot verify the backend is reachable and will not launch \
-         the restore. The policy.waitTimeout window is NOT running meanwhile \
-         (status.waitStartedAt stays unstamped) — it opens once the {kind} exists and its \
-         repository is `Ready`. Create the {kind} (or repoint the Restore at one that exists) \
-         to proceed."
+        "waiting for {kind} `{target}` to exist: the restore's repository is derived from it. \
+         The waitTimeout clock (status.waitStartedAt) has not started yet. Fix: create the \
+         {kind}, or point the Restore at one that exists."
     )
 }
 
@@ -560,7 +544,7 @@ pub(super) fn cleared_referent_conditions(restore: &Restore) -> Option<Vec<Condi
         RESTORE_REFERENT_AVAILABLE_CONDITION,
         true,
         RESTORE_REFERENT_FOUND_REASON,
-        "the referent the restore derives its repository from now exists",
+        "the object the restore gets its repository from now exists",
         restore.metadata.generation,
     ))
 }
@@ -710,9 +694,8 @@ impl WaitWindow {
 /// rather than promising one the reconciler will not honor.
 pub fn direct_source_path_ambiguous_message(ambiguity: &str) -> String {
     format!(
-        "{ambiguity} This Restore is terminal (a direct-target Restore never retries, and a \
-         spec edit is not re-read): create a NEW Restore with source.fromPolicy.sourcePath \
-         set to the member to restore."
+        "{ambiguity} This Restore has failed and spec edits are not re-read: create a new \
+         Restore with source.fromPolicy.sourcePath set."
     )
 }
 
@@ -748,12 +731,9 @@ pub fn derived_source_path_hint(
         None => "the kopia source path was derived from the policy".to_string(),
     };
     Some(format!(
-        "Note: {path} (spec.source.fromPolicy.sourcePath is unset) — for a pvcSelector policy \
-         it is derived from the TARGET PVC's name, so restoring a member into a \
-         differently-named PVC (or cross-namespace) derives a path the repository has never \
-         seen. If the data you want was backed up under another member's path, set \
-         spec.source.fromPolicy.sourcePath explicitly (e.g. /pvc/<member>) on a new Restore, \
-         or `kubectl kopiur restore --from-policy <policy> --source-path /pvc/<member> ...`."
+        "Note: {path}, using the target PVC's name. If the data was backed up under another \
+         PVC, set spec.source.fromPolicy.sourcePath (e.g. /pvc/<member>) on a new Restore, or \
+         use `kubectl kopiur restore --from-policy <policy> --source-path /pvc/<member> ...`."
     ))
 }
 
@@ -802,18 +782,15 @@ pub(super) fn wait_park_report(
             crate::consts::WAITING_FOR_SNAPSHOT_REASON,
             format!(
                 "no snapshot matched the restore source yet; waiting up to waitTimeout \
-                 ({}) from when the wait window opened (status.waitStartedAt) for it to \
-                 appear before applying onMissingSnapshot",
+                 ({}) from status.waitStartedAt before applying onMissingSnapshot",
                 wait_timeout.unwrap_or_default()
             ),
             remaining.clamp(1, 15),
         ),
         WaitWindow::AwaitingClaim(_) => (
             crate::consts::AWAITING_PVC_DATA_SOURCE_REF_REASON,
-            "passive populator: no PersistentVolumeClaim claims this Restore yet \
-             (spec.dataSourceRef), so there is nothing to populate and the waitTimeout \
-             window has NOT started — it opens when a claim appears, and \
-             status.waitStartedAt records that instant. Create the claiming PVC to proceed."
+            "populator: no PVC references this Restore in spec.dataSourceRef yet, so the \
+             waitTimeout clock has not started. Fix: Create the claiming PVC."
                 .to_string(),
             30,
         ),
@@ -1043,10 +1020,8 @@ pub fn claims_summary(aggregate: &ClaimsAggregate) -> (&'static str, String) {
     let Some(tally) = aggregate.tally() else {
         return (
             AWAITING_PVC_DATA_SOURCE_REF_REASON,
-            "passive populator: no PersistentVolumeClaim claims this Restore yet \
-             (spec.dataSourceRef), so there is nothing to populate and the waitTimeout window \
-             has NOT started — it opens when a claim appears. Create the claiming PVC to \
-             proceed."
+            "populator: no PVC references this Restore in spec.dataSourceRef yet, so the \
+             waitTimeout clock has not started. Fix: Create the claiming PVC."
                 .to_string(),
         );
     };
@@ -1077,8 +1052,8 @@ pub fn claims_summary(aggregate: &ClaimsAggregate) -> (&'static str, String) {
             .collect();
         message.push_str(&format!("; failed: {}", failed.join(", ")));
         message.push_str(
-            ". A failed claim stalls the Restore while its siblings continue; fix the cause and \
-             re-create that claiming PVC to re-arm it.",
+            ". Other claims continue. Fix: resolve the cause, then re-create the failed claiming \
+             PVC to retry it.",
         );
     }
     let reason = match aggregate {
@@ -1460,8 +1435,7 @@ pub fn fanout_status(
         "AwaitingClaim",
         false,
         crate::consts::CLAIMS_OBSERVED_REASON,
-        "at least one PersistentVolumeClaim claims this Restore; status.claims carries the \
-         per-claim state",
+        "at least one PVC references this Restore; see status.claims for each claim",
         restore.metadata.generation,
     );
     if let Some((met, resolved_reason)) = mirrored_resolved_condition(&mirror) {

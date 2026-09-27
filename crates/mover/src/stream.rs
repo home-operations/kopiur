@@ -92,9 +92,8 @@ pub fn pick_stream_pod<'a>(
 ) -> std::result::Result<&'a Pod, String> {
     if pods.is_empty() {
         return Err(format!(
-            "no pod matches podSelector `{selector}` in namespace `{namespace}`. The workload \
-             must be running for a stream source to dump from it — scale it up, or fix the \
-             selector"
+            "no pod matches podSelector `{selector}` in namespace `{namespace}`. Fix: scale the \
+             workload up, or fix the selector"
         ));
     }
     let live: Vec<&Pod> = pods
@@ -104,16 +103,15 @@ pub fn pick_stream_pod<'a>(
     match live.as_slice() {
         [] => Err(format!(
             "podSelector `{selector}` matched {} pod(s) in namespace `{namespace}`, but none is \
-             Running and not terminating. A stream source needs a live container to exec into; \
-             wait for the workload to become ready, or fix the selector",
+             Running and not terminating. Fix: wait for the workload to become ready, or fix the \
+             selector",
             pods.len()
         )),
         [one] => Ok(one),
         many => Err(format!(
-            "podSelector `{selector}` matched {} RUNNING pods in namespace `{namespace}` ({}). A \
-             stream source must identify exactly one pod — dumping an arbitrary replica would \
-             make the backup's contents depend on scheduling. Narrow the selector (e.g. add a \
-             role/primary label) so it matches only the pod you mean to dump",
+            "podSelector `{selector}` matched {} running pods in namespace `{namespace}` ({}), \
+             but a stream source needs exactly one, not an arbitrary replica. Fix: narrow the \
+             selector (e.g. add a role/primary label)",
             many.len(),
             many.iter()
                 .map(|p| p.name_any())
@@ -174,8 +172,7 @@ pub fn producer_failure_message(
         }
         ExecVerdict::NoStatus => format!(
             "the exec connection to pod `{pod}` closed without reporting an exit status, so the \
-             dump cannot be assumed complete (a dropped connection is indistinguishable from a \
-             clean end-of-output on its own). The snapshot was discarded"
+             dump cannot be assumed complete. The snapshot was discarded"
         ),
     };
     if stderr_tail.trim().is_empty() {
@@ -188,9 +185,9 @@ pub fn producer_failure_message(
 /// Timeout message for a producer/consumer that overran its budget.
 pub fn timeout_message(pod: &str, command: &[String], timeout: Duration, field: &str) -> String {
     format!(
-        "the stream command {command:?} in pod `{pod}` did not finish within {}s. Raise \
-         `{field}.timeout`, or make the command faster. The snapshot was discarded, so no \
-         partial dump was kept",
+        "the stream command {command:?} in pod `{pod}` did not finish within {}s; the snapshot \
+         was discarded, so no partial dump was kept. Fix: raise `{field}.timeout`, or make the \
+         command faster",
         timeout.as_secs()
     )
 }
@@ -199,12 +196,10 @@ pub fn timeout_message(pod: &str, command: &[String], timeout: Duration, field: 
 /// exact wording is unit-asserted.
 pub fn exec_start_timeout_message(pod: &str, namespace: &str) -> String {
     format!(
-        "the exec into pod `{pod}` did not start within {}s, so nothing was streamed and no \
-         snapshot was written. This is the apiserver upgrade failing, not a slow command: check \
-         that the apiserver can reach the kubelet on `{namespace}/{pod}`'s node, that no \
-         NetworkPolicy or webhook is blocking `pods/exec`, and that the container is still \
-         running. It is NOT `workloadExec.timeout` — that budget covers the transfer and was \
-         not touched.",
+        "the exec into pod `{pod}` did not start within {}s, so no snapshot was written. This \
+         is not `workloadExec.timeout`, and raising it will not help. Fix: check that the API \
+         server can reach the kubelet on `{namespace}/{pod}`'s node, that no NetworkPolicy or \
+         webhook blocks `pods/exec`, and that the container is running",
         EXEC_START_TIMEOUT.as_secs()
     )
 }
@@ -221,14 +216,12 @@ pub fn exec_start_timeout_message(pod: &str, namespace: &str) -> String {
 pub fn object_read_failure_message(file_name: &str, err: &kopiur_kopia::KopiaError) -> String {
     match err {
         kopiur_kopia::KopiaError::Timeout { seconds, .. } => format!(
-            "reading `{file_name}` out of the snapshot did not finish within {seconds}s, so \
-             the restore was abandoned mid-stream and the command's input was cut short — \
-             whatever it had already applied is a PARTIAL load. The budget is \
-             `spec.target.streamExec.workloadExec.timeout`, which bounds the whole transfer \
-             including kopia's read. Raise it for a large artifact, or check whether the \
-             repository backend is stalling."
+            "reading `{file_name}` from the snapshot did not finish within {seconds}s, so the \
+             restore stopped mid-stream and the command may have applied a partial load. Fix: \
+             raise `spec.target.streamExec.workloadExec.timeout`, or check whether the \
+             repository backend is stalling"
         ),
-        other => format!("reading `{file_name}` out of the snapshot failed: {other}"),
+        other => format!("reading `{file_name}` from the snapshot failed: {other}"),
     }
 }
 
@@ -260,8 +253,8 @@ pub fn consumer_failure_detail(
         // Success beside a broken sink is a real shape, not a contradiction: the
         // command finished (and closed its stdin) before we finished writing.
         ExecVerdict::Success if sink => Some(
-            "the command exited SUCCESSFULLY before the transfer finished, so it \
-             stopped reading early — it must consume its stdin to completion"
+            "the command exited successfully before the transfer finished; it must read \
+             its stdin to the end"
                 .to_string(),
         ),
         ExecVerdict::Success | ExecVerdict::NoStatus => None,
@@ -272,12 +265,12 @@ pub fn consumer_failure_detail(
         out = format!("{out}. {why}");
     }
     if !tail.is_empty() {
-        out = format!("{out}. The command's own last words: {tail}");
+        out = format!("{out}. Command stderr: {tail}");
     } else if sink && !had_why {
         out = format!(
-            "{out}. The command exited before the transfer finished and printed \
-             nothing on stderr, and the exec reported no status — check the mover \
-             Job's logs, and that the command reads its stdin to completion"
+            "{out}. The command exited before the transfer finished, with no stderr and \
+             no exit status. Fix: check the mover Job's logs, and that the command reads its \
+             stdin to the end"
         );
     }
     out
@@ -526,8 +519,8 @@ pub async fn feed_from_pod(
         Ok(Ok(a)) => a,
         Ok(Err(e)) => {
             *failure = Some(format!(
-                "could not exec into pod `{pod_name}`: {e}. Check that the kopiur mover \
-                 ServiceAccount is allowed `pods/exec` in namespace `{}`",
+                "could not exec into pod `{pod_name}`: {e}. Fix: allow the kopiur mover \
+                 ServiceAccount `pods/exec` in namespace `{}`",
                 spec.namespace
             ));
             return StdinOutcome::Abort;
@@ -656,13 +649,9 @@ pub async fn restore_into_pod(
         })?
         .map_err(|e| MoverError::StreamExecFailed {
             detail: format!(
-                "could not exec into pod `{pod_name}`: {e}. Two things to check. \
-                 First, that the kopiur mover ServiceAccount is allowed `pods/exec` in \
-                 namespace `{}`. Second, that the target container has `/bin/sh`: a \
-                 streamExec restore runs the command through a shell that stays alive \
-                 holding stdin open, because Kubernetes exec SILENTLY TRUNCATES stdin \
-                 when the only process holding it is the command itself. A distroless \
-                 consumer image has no shell and cannot be restored into this way",
+                "could not exec into pod `{pod_name}`: {e}. Fix: allow the kopiur mover \
+                 ServiceAccount `pods/exec` in namespace `{}`, and make sure the target \
+                 container has `/bin/sh` (streamExec restores cannot use a distroless image)",
                 spec.namespace
             ),
         })?;

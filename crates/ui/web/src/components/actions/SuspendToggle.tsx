@@ -113,14 +113,11 @@ export function SuspendToggle({
         .
       </p>
       {suspended ? (
-        <p>
-          Work resumes at the next slot. Nothing is caught up retroactively — the windows missed
-          while it was suspended are simply gone.
-        </p>
+        <p>Work resumes at the next slot. Missed windows are not caught up.</p>
       ) : (
         <p>
-          While it is suspended, {consequence}. A window that comes and goes meanwhile is not made
-          up later. Data already written is untouched.
+          While it is suspended, {consequence}. Missed windows are not made up; existing data is
+          untouched.
         </p>
       )}
     </ActionPanel>

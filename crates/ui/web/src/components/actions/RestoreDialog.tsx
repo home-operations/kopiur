@@ -150,9 +150,8 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
     >
       <p>
         This creates a <span className="mono">Restore</span> in{" "}
-        <span className="mono">{namespace}</span>. The operator resolves the source, pins it, and
-        runs a mover Job — nothing is copied by pressing this button, and the restore&apos;s own
-        page is where the outcome appears.
+        <span className="mono">{namespace}</span>. The operator runs it in a mover Job; the
+        restore&apos;s page shows the outcome.
       </p>
 
       <fieldset className="action__choice">
@@ -186,8 +185,8 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
             setSourceKind("identity");
           }}
         >
-          A kopia identity — <span className="mono">user@host:/path</span> — which reaches snapshots
-          this operator never took.
+          A kopia identity — <span className="mono">user@host:/path</span> — including snapshots
+          this operator did not take.
         </Radio>
       </fieldset>
 
@@ -268,8 +267,8 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
           }}
         >
           An existing <span className="mono">PersistentVolumeClaim</span> in{" "}
-          <span className="mono">{namespace}</span>. Whatever is in it now is what the overwrite
-          setting below decides the fate of.
+          <span className="mono">{namespace}</span>. The overwrite setting below decides what
+          happens to its current files.
         </Radio>
         <Radio
           id={`${fieldId}-tgt-new`}
@@ -279,8 +278,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
             setTargetKind("pvc");
           }}
         >
-          A new claim the operator creates for this restore. Nothing exists in it yet, so nothing of
-          yours can be lost in it.
+          A new claim the operator creates for this restore, so nothing can be lost.
         </Radio>
       </fieldset>
 
@@ -316,9 +314,8 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
         <p className="action__note">
           This is <span className="mono">overwrite</span>, which becomes{" "}
           <span className="mono">spec.options.overwriteFiles</span> and then kopia&apos;s{" "}
-          <span className="mono">--[no-]overwrite-files</span>. Left unset it sends no flag at all
-          and kopia&apos;s own default — overwrite — applies, so there is no neutral answer and this
-          dialog always sends one.
+          <span className="mono">--[no-]overwrite-files</span>. Unset means kopia&apos;s default,
+          which overwrites, so this dialog always sends a choice.
         </p>
         <Radio
           id={`${fieldId}-ow-no`}
@@ -328,7 +325,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
             setOverwrite("no");
           }}
         >
-          Leave existing files alone. A file already at the target keeps the contents it has.
+          Leave existing files alone.
         </Radio>
         <Radio
           id={`${fieldId}-ow-yes`}
@@ -338,7 +335,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
             setOverwrite("yes");
           }}
         >
-          Overwrite them. Every file the snapshot carries replaces the one at the target, and{" "}
+          Overwrite them. Files from the snapshot replace the ones at the target, and{" "}
           <strong>what is there now is gone</strong>.
         </Radio>
       </fieldset>
@@ -346,8 +343,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
       {sourceKind === "snapshotRef" ? (
         <p className="action__note">
           A source path cannot be chosen for this source: the <span className="mono">Snapshot</span>{" "}
-          you named is already one kopia source, and the server refuses the combination rather than
-          ignoring it. Use a policy or identity source to pick a different path.
+          is already one kopia source. Use a policy or identity source to pick a path.
         </p>
       ) : (
         <Field
@@ -539,16 +535,16 @@ function blockedReason(
   repositoryName: string,
 ): string | undefined {
   if (source === undefined) {
-    return "The source is not complete — fill in every field it needs before this restore can be created.";
+    return "The source is not complete; fill in every field it needs.";
   }
   if (target === undefined) {
-    return "The target is not complete — a restore has to say which claim it writes into, and a new claim needs a size.";
+    return "The target is not complete; name the claim, and give a new claim a size.";
   }
   if (overwrite === "") {
-    return "Say what happens to files already at the target. There is no neutral answer: leaving overwrite unset lets kopia's own default overwrite them.";
+    return "Say what happens to files already at the target. There is no neutral answer: unset means kopia overwrites them.";
   }
   if (repositoryKind.length > 0 && repositoryName.trim().length === 0) {
-    return "A repository kind was chosen but not named. Name it, or go back to inferring the repository from the source.";
+    return "A repository kind was chosen but not named. Name it, or pick “Infer it from the source”.";
   }
   return undefined;
 }

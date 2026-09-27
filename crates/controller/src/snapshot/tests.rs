@@ -314,7 +314,7 @@ fn stuck_finalizer_hint_names_the_escape_hatch_and_keeps_the_original_message() 
     assert!(msg.contains(crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION));
     assert!(msg.contains("team-a/nightly-1"));
     // The user must know the kopia snapshot survives the escape hatch.
-    assert!(msg.contains("WITHOUT deleting the kopia snapshot"));
+    assert!(msg.contains("without deleting the kopia snapshot"));
 }
 
 #[test]
@@ -2592,7 +2592,7 @@ fn hold_message_carries_counts_repo_ack_command_and_escape_hatch() {
 fn schedule_cascade_retained_message_names_cr_and_opt_in() {
     let msg = schedule_cascade_retained_message("backups", "nightly-1");
     assert!(msg.contains("backups/nightly-1"), "cr name: {msg}");
-    assert!(msg.contains("RETAINED"), "states retained: {msg}");
+    assert!(msg.contains("was kept"), "states retained: {msg}");
     assert!(
         msg.contains("spec.deletion.onScheduleDelete: Delete"),
         "names the opt-in: {msg}"
@@ -2628,7 +2628,7 @@ fn policy_cascade_retained_message_names_cr_retained_state_and_opt_in() {
     let msg = policy_cascade_retained_message("backups", "nightly-1", true);
     assert!(msg.contains("backups/nightly-1"), "cr name: {msg}");
     assert!(
-        msg.contains("RETAINED in the repository"),
+        msg.contains("kept in the repository"),
         "states retained: {msg}"
     );
     assert!(
@@ -2651,7 +2651,7 @@ fn policy_cascade_retained_message_cancelled_mid_flight_names_no_completed_snaps
         msg.contains("never completed") && msg.contains("cancelled mid-flight"),
         "states not-completed: {msg}"
     );
-    assert!(!msg.contains("RETAINED in the repository"), "{msg}");
+    assert!(!msg.contains("kept in the repository"), "{msg}");
     assert!(
         msg.contains("rediscoverable/adoptable"),
         "still states rediscoverable: {msg}"

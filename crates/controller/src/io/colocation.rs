@@ -134,10 +134,10 @@ pub fn decide_colocation(
             AccessClass::Rwop => {
                 if facts.held_by_pod {
                     ColocationDecision::RwopHeld(format!(
-                        "PVC `{pvc}` is ReadWriteOncePod and is currently held by a running pod; a \
-                         second pod (the backup mover) cannot mount it even on the same node — \
-                         scale the workload down before backing it up, switch the PVC to \
-                         ReadWriteMany, or set moverDefaults.sourceColocation.mode=Disabled"
+                        "PVC `{pvc}` is ReadWriteOncePod and held by a running pod, so the mover \
+                         cannot mount it. Fix: scale the workload down before backing it up, \
+                         switch the PVC to ReadWriteMany, or set \
+                         moverDefaults.sourceColocation.mode=Disabled"
                     ))
                 } else {
                     // Nothing holds it → the mover is the sole pod; attach freely.
@@ -153,11 +153,10 @@ pub fn decide_colocation(
                 // attach it anywhere; under `Required` we refuse rather than guess.
                 None => match mode {
                     SourceColocationMode::Required => ColocationDecision::MissingNode(format!(
-                        "PVC `{pvc}` is ReadWriteOnce but the controller could not determine which \
-                         node it is attached to (no running consumer pod, no PV nodeAffinity, and \
-                         no attached VolumeAttachment); start the workload that uses it, switch the \
-                         PVC to ReadWriteMany, or set moverDefaults.sourceColocation.mode=Disabled \
-                         (sourceColocation.mode is Required)"
+                        "PVC `{pvc}` is ReadWriteOnce and kopiur could not determine which node \
+                         it is attached to (sourceColocation.mode is Required). Fix: start the \
+                         workload that uses it, switch the PVC to ReadWriteMany, or set \
+                         moverDefaults.sourceColocation.mode=Disabled"
                     )),
                     _ => ColocationDecision::Free,
                 },
@@ -250,8 +249,7 @@ pub async fn resolve_source_colocation(
         .await
         .map_err(|e| {
             Error::MissingDependency(format!(
-                "cannot read source PVC `{id}` to resolve its node for co-location \
-                 (RWO Multi-Attach avoidance): {e}"
+                "cannot read source PVC `{id}` to find its node: {e}"
             ))
         })? {
         Some(pvc) => pvc,
@@ -327,8 +325,8 @@ pub async fn resolve_source_colocation(
                 Err(kube::Error::Api(e)) if e.code == 403 => {
                     tracing::debug!(
                         pv = %pv_name,
-                        "cannot list VolumeAttachments (namespaced-scope install); relying on \
-                         the consuming-pod lookup for co-location"
+                        "cannot list VolumeAttachments (namespaced install); using the \
+                         consuming pod to find the node"
                     );
                 }
                 Err(e) => return Err(Error::Kube(e)),

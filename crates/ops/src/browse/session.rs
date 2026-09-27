@@ -602,8 +602,7 @@ async fn resolve_mover_image(ctx: &OpsCtx, image: &MoverImageSource) -> Result<S
     match list.items.as_slice() {
         [] => Err(OpsError::MoverImageUnresolvable {
             why: format!("no Deployment matches {selector} in any namespace"),
-            fix: "is the kopiur operator installed? Sessions run the operator's mover image, \
-                  so browsing needs a running install"
+            fix: "check that the kopiur operator is installed (browsing uses its mover image)"
                 .into(),
         }),
         [only] => mover_image_from_deployments(std::slice::from_ref(only)).ok_or_else(|| {
@@ -618,8 +617,7 @@ async fn resolve_mover_image(ctx: &OpsCtx, image: &MoverImageSource) -> Result<S
         }),
         many => Err(OpsError::MoverImageUnresolvable {
             why: format!(
-                "{} Deployments match {selector}: {} — refusing to guess which mover image \
-                 to trust",
+                "{} Deployments match {selector}: {}, so the mover image is ambiguous",
                 many.len(),
                 many.iter()
                     .map(|d| format!(
@@ -630,8 +628,7 @@ async fn resolve_mover_image(ctx: &OpsCtx, image: &MoverImageSource) -> Result<S
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            fix: "remove the impostor/stale Deployment (only one kopiur controller should \
-                  exist), or scope your kubeconfig to the real one"
+            fix: "remove the extra or stale controller Deployment (there should be only one)"
                 .into(),
         }),
     }

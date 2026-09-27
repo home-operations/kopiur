@@ -10,10 +10,9 @@ pub enum OpsError {
     /// A `pvcSelector` recipe matched no PersistentVolumeClaims, so there is
     /// nothing to snapshot.
     #[error(
-        "SnapshotPolicy {policy} uses a pvcSelector that currently matches no \
-         PersistentVolumeClaims in namespace {namespace}, so `snapshot now` has nothing to back \
-         up. Fix: check the selector's labels against `kubectl -n {namespace} get pvc \
-         --show-labels`"
+        "SnapshotPolicy {policy}: pvcSelector matches no PVCs in namespace {namespace}, \
+         so there is nothing to back up. Fix: compare the selector with \
+         `kubectl -n {namespace} get pvc --show-labels`"
     )]
     SelectorMatchedNothing {
         /// The recipe whose selector matched nothing.
@@ -26,7 +25,7 @@ pub enum OpsError {
     /// targets (multi-repo fan-out, #368) — refused rather than silently
     /// backing up into nothing.
     #[error(
-        "--repository {given} does not name a repository of SnapshotPolicy {policy}; \
+        "--repository {given} is not a repository of SnapshotPolicy {policy}; \
          valid: {valid}"
     )]
     UnknownPolicyRepository {
@@ -41,10 +40,8 @@ pub enum OpsError {
     /// The API server refused the request with 403.
     #[error(
         "forbidden: cannot {verb} {resource}{scope}: {source}. \
-         Your kubeconfig user lacks RBAC for this. \
-         Fix: ask a cluster admin to grant `{verb}` on `{resource}` \
-         (kopiur.home-operations.com) to your user, or run with a more \
-         privileged kubeconfig/--context"
+         Your user lacks RBAC for this. Fix: ask an admin to grant `{verb}` on \
+         `{resource}` (kopiur.home-operations.com), or use another --context"
     )]
     Forbidden {
         /// The verb that was refused (`get`, `list`, `patch`, …).
@@ -62,9 +59,9 @@ pub enum OpsError {
     /// not installed (or not this version).
     #[error(
         "the API server does not know the {kind} resource type: {source}. \
-         The kopiur CRDs are missing or outdated on this cluster. \
+         The kopiur CRDs are missing or outdated. \
          Fix: install kopiur (`helm install kopiur oci://ghcr.io/home-operations/charts/kopiur`) \
-         or apply the CRDs from deploy/crds/, then retry"
+         or apply deploy/crds/"
     )]
     KindNotInstalled {
         /// The kopiur kind that is missing.
@@ -77,8 +74,7 @@ pub enum OpsError {
     /// A named object was not found.
     #[error(
         "{kind} {name:?} not found{scope}. \
-         Fix: list what exists with `kubectl get {plural}{scope_flag}` and check \
-         the name (and --namespace/--context)"
+         Fix: check the name and namespace with `kubectl get {plural}{scope_flag}`"
     )]
     NotFound {
         /// The kopiur kind looked up.
@@ -96,8 +92,7 @@ pub enum OpsError {
     /// Any other Kubernetes API failure.
     #[error(
         "Kubernetes API request failed: cannot {verb} {resource}{scope}: {source}. \
-         Fix: check cluster/API-server health (`kubectl version`) and connectivity, \
-         then retry"
+         Fix: check the cluster is reachable (`kubectl version`), then retry"
     )]
     Api {
         /// The verb attempted.
@@ -113,11 +108,7 @@ pub enum OpsError {
 
     /// An admission webhook (kopiur's, or a cluster policy engine) rejected
     /// the object.
-    #[error(
-        "an admission webhook rejected this object: {message}. \
-         Fix: correct the flags/spec per the message above and retry \
-         (the message names the webhook that denied it)"
-    )]
+    #[error("an admission webhook rejected this object: {message}")]
     AdmissionDenied {
         /// The webhook's denial message (already actionable by project norm).
         message: String,
@@ -126,8 +117,7 @@ pub enum OpsError {
     /// A `--wait` deadline expired before the object reached a terminal state.
     #[error(
         "timed out after {after} waiting for {what}. \
-         The operation is still running in the cluster — waiting stopped, the work did not. \
-         Fix: {hint}"
+         It is still running in the cluster. Fix: {hint}"
     )]
     WaitTimeout {
         /// What was being waited on.
@@ -140,8 +130,7 @@ pub enum OpsError {
 
     /// The object being waited on was deleted mid-wait.
     #[error(
-        "{what} was deleted while waiting for it to finish. \
-         Something (a user, GitOps prune, or retention) removed the object. \
+        "{what} was deleted before it finished. \
          Fix: check `kubectl get events` for who deleted it, then re-run"
     )]
     GoneWhileWaiting {
@@ -150,10 +139,7 @@ pub enum OpsError {
     },
 
     /// A by-reference lookup matched more than one object.
-    #[error(
-        "{what}: {candidates}. \
-         Fix: name the one you mean explicitly (pass it as the positional NAME argument)"
-    )]
+    #[error("{what}: {candidates}. Fix: pass the one you mean as the NAME argument")]
     AmbiguousTarget {
         /// What was looked up and how many matched.
         what: String,
@@ -164,10 +150,9 @@ pub enum OpsError {
     /// A snapshot's repository lives in a different namespace than the
     /// session pod would.
     #[error(
-        "the snapshot's repository ({repo}) lives in namespace {repo_namespace}, but the \
-         browse session pod runs in the snapshot's namespace ({session_namespace}) — \
-         Kubernetes forbids cross-namespace owners, so the pod would be garbage-collected \
-         mid-read. Fix: browse a snapshot in the repository's namespace, or use --local"
+        "repository {repo} is in namespace {repo_namespace}, but the browse session \
+         runs in {session_namespace}, and Kubernetes forbids cross-namespace owners. \
+         Fix: browse a snapshot in the repository's namespace, or use --local"
     )]
     RepoOutsideSessionNamespace {
         /// `kind/name` of the repository.
@@ -191,11 +176,9 @@ pub enum OpsError {
     /// operator's namespace, which could not be discovered (zero or several
     /// controller Deployments matched the chart labels).
     #[error(
-        "cannot locate the operator namespace holding ClusterRepository {repository:?}'s \
-         tls.caBundleRef ConfigMap {configmap:?}: {why}. \
-         A ClusterRepository's CA bundle lives in the namespace the kopiur controller \
-         runs in (KOPIUR_NAMESPACE), which the CLI discovers from the controller \
-         Deployment. Fix: {fix}"
+        "cannot find the operator namespace for ClusterRepository {repository:?}'s \
+         tls.caBundleRef ConfigMap {configmap:?}: {why}. The bundle lives in the \
+         controller's namespace (KOPIUR_NAMESPACE). Fix: {fix}"
     )]
     OperatorNamespaceUnresolvable {
         /// The ClusterRepository whose CA bundle needs the namespace.
@@ -210,11 +193,7 @@ pub enum OpsError {
 
     /// A backend's `tls.caBundleRef` could not be resolved to PEM content
     /// (missing ConfigMap, missing key, or non-PEM data).
-    #[error(
-        "cannot resolve tls.caBundleRef for repository {repository:?}: {detail}. \
-         The CA bundle is inlined into the kopia connect so the backend's \
-         private-CA TLS endpoint is trusted. Fix: {fix}"
-    )]
+    #[error("cannot read tls.caBundleRef for repository {repository:?}: {detail}. Fix: {fix}")]
     CaBundleUnresolvable {
         /// The repository whose backend declares the caBundleRef.
         repository: String,
@@ -226,8 +205,8 @@ pub enum OpsError {
 
     /// A path component that must be a directory is something else.
     #[error(
-        "{path:?} is not a directory (kopia entry type {entry_type:?}); \
-         `ls` lists directories — use `cat`/`download` to read a file"
+        "{path:?} is not a directory (kopia entry type {entry_type:?}). \
+         Fix: use `cat`/`download` to read a file"
     )]
     NotADirectory {
         /// The offending path.
@@ -238,9 +217,8 @@ pub enum OpsError {
 
     /// (De)serializing an object for output failed — a kopiur bug, not a user error.
     #[error(
-        "failed to serialize {what} for output: {source}. \
-         This is a kubectl-kopiur bug — please report it at \
-         https://github.com/home-operations/kopiur/issues"
+        "failed to serialize {what} for output: {source}. This is a bug; \
+         please report it at https://github.com/home-operations/kopiur/issues"
     )]
     Serialization {
         /// What was being serialized.
@@ -254,11 +232,9 @@ pub enum OpsError {
     /// The Snapshot has no kopia snapshot id pinned in status, so there is
     /// nothing to read.
     #[error(
-        "Snapshot {name:?} cannot be browsed: {reason}. \
-         Browsing reads the kopia snapshot recorded in status.snapshot.kopiaSnapshotID, \
-         which only exists once a snapshot succeeded (or was discovered). \
-         Fix: wait for it to reach Succeeded, or pick another with \
-         `kubectl kopiur snapshots list`"
+        "Snapshot {name:?} cannot be browsed: {reason}. It has no \
+         status.snapshot.kopiaSnapshotID until it succeeds. Fix: wait for it to \
+         succeed, or pick another with `kubectl kopiur snapshots list`"
     )]
     SnapshotNotBrowsable {
         /// The Snapshot name.
@@ -270,11 +246,9 @@ pub enum OpsError {
     /// The Snapshot's repository cannot be derived (no pinned resolved ref, no
     /// owning repository).
     #[error(
-        "cannot determine which repository Snapshot {snapshot:?} lives in: it has \
-         neither a pinned status.resolved.repository nor a Repository/ClusterRepository \
-         ownerReference. \
-         Fix: this usually means the snapshot never ran — create a fresh one with \
-         `kubectl kopiur snapshot now`, or browse a discovered snapshot"
+        "cannot tell which repository Snapshot {snapshot:?} is in: it has no \
+         status.resolved.repository and no repository ownerReference, so it likely never \
+         ran. Fix: take a new one with `kubectl kopiur snapshot now`"
     )]
     RepositoryUnderivable {
         /// The Snapshot name.
@@ -284,11 +258,9 @@ pub enum OpsError {
     /// The repository's credential Secret lives outside the namespace the
     /// session pod would run in (a pod cannot `envFrom` across namespaces).
     #[error(
-        "the repository credential Secret {secret:?} lives in namespace \
-         {secret_namespace}, but the browse session pod runs in namespace \
-         {session_namespace}, and a pod cannot load a Secret from another namespace. \
-         Fix: browse a snapshot in namespace {secret_namespace}, copy the Secret \
-         into {session_namespace}, or read locally with --local"
+        "credential Secret {secret:?} is in namespace {secret_namespace}, but the \
+         browse session runs in {session_namespace}, and a pod cannot load a Secret \
+         from another namespace. Fix: copy the Secret into {session_namespace}, or use --local"
     )]
     CredsOutsideSessionNamespace {
         /// The credential Secret name.
@@ -302,10 +274,8 @@ pub enum OpsError {
     /// A ClusterRepository credential reference pins no namespace, so the
     /// Secret cannot be located.
     #[error(
-        "ClusterRepository {repository:?} references credential Secret {secret:?} \
-         without a namespace, so it cannot be located from a browse session. \
-         Cluster-scoped repositories must pin secretRef.namespace explicitly. \
-         Fix: set the namespace on the ClusterRepository's secret references"
+        "ClusterRepository {repository:?} references Secret {secret:?} without a \
+         namespace. Fix: set secretRef.namespace on the ClusterRepository"
     )]
     ClusterRepoSecretNamespaceMissing {
         /// The credential Secret name.
@@ -316,11 +286,8 @@ pub enum OpsError {
 
     /// The session pod failed before becoming ready.
     #[error(
-        "the browse session pod (Job {job} in namespace {namespace}) failed before \
-         becoming ready: {detail}. \
-         The session connects to the repository read-only; the pod logs above name \
-         the cause. Fix: check credentials and backend reachability \
-         (`kubectl kopiur doctor`), then retry"
+        "browse session pod (Job {namespace}/{job}) failed to start: {detail}. \
+         Fix: check credentials and backend access with `kubectl kopiur doctor`, then retry"
     )]
     SessionPodFailed {
         /// The session Job name.
@@ -333,11 +300,9 @@ pub enum OpsError {
 
     /// Waiting for the session pod to become ready timed out.
     #[error(
-        "timed out after {after} waiting for the browse session pod (Job {job}) to \
-         become ready. It may still be pulling its image or connecting to a slow \
-         backend. Fix: inspect it with \
-         `kubectl get pods -l batch.kubernetes.io/job-name={job}` (and its logs), \
-         then retry — a warm session answers instantly"
+        "timed out after {after} waiting for the browse session pod (Job {job}). \
+         Fix: check it with `kubectl get pods -l batch.kubernetes.io/job-name={job}`, \
+         then retry"
     )]
     SessionNotReady {
         /// The session Job name.
@@ -348,10 +313,9 @@ pub enum OpsError {
 
     /// An exec'd in-session kopia read failed.
     #[error(
-        "the in-session kopia read failed ({what}): {stderr}. \
-         The session is connected read-only, so this is a read/availability problem, \
-         never a mutation. Fix: retry; if it persists, end the session \
-         (`kubectl kopiur session end`) and start fresh"
+        "kopia read failed ({what}): {stderr}. Nothing was changed (the session is \
+         read-only). Fix: retry; if it keeps failing, run `kubectl kopiur session end` \
+         and try again"
     )]
     SessionExec {
         /// Which read failed.
@@ -363,9 +327,8 @@ pub enum OpsError {
     /// A user-supplied snapshot path is malformed or escapes the snapshot root.
     #[error(
         "invalid snapshot path {path:?}: {reason}. \
-         Paths are relative to the snapshot root (e.g. `sub/file.txt`); `..` and \
-         absolute paths are not allowed. \
-         Fix: pass a relative path — list the root first with `kubectl kopiur ls <snapshot>`"
+         Fix: pass a path relative to the snapshot root, like `sub/file.txt` \
+         (`kubectl kopiur ls <snapshot>` lists it)"
     )]
     InvalidPath {
         /// The offending path.
@@ -377,8 +340,7 @@ pub enum OpsError {
     /// A snapshot path does not exist.
     #[error(
         "path {path:?} does not exist in this snapshot. \
-         Fix: list the directory with `kubectl kopiur ls <snapshot> [dir]` and check \
-         the spelling (names are case-sensitive)"
+         Fix: check the name (case-sensitive) with `kubectl kopiur ls <snapshot> [dir]`"
     )]
     PathNotFound {
         /// The missing path.
@@ -387,8 +349,8 @@ pub enum OpsError {
 
     /// `cat`/`download` was pointed at a directory.
     #[error(
-        "{path:?} is a directory; cat/download read files. \
-         Fix: list it with `kubectl kopiur ls <snapshot> {path}`, then name a file inside it"
+        "{path:?} is a directory. \
+         Fix: list it with `kubectl kopiur ls <snapshot> {path}` and pick a file"
     )]
     IsADirectory {
         /// The directory path.
@@ -397,9 +359,8 @@ pub enum OpsError {
 
     /// `cat`/`download` was pointed at a non-regular-file entry (symlink, …).
     #[error(
-        "{path:?} is not a regular file (kopia entry type {entry_type:?}), so its \
-         bytes cannot be streamed. Fix: only regular files can be read; list the \
-         directory with `kubectl kopiur ls` to see entry types"
+        "{path:?} is not a regular file (kopia entry type {entry_type:?}). \
+         Only regular files can be read"
     )]
     NotAFile {
         /// The entry path.
@@ -410,9 +371,8 @@ pub enum OpsError {
 
     /// The kopia snapshot id pinned in status is gone from the repository.
     #[error(
-        "kopia snapshot {id} is not in the repository catalog (it may have been \
-         expired by retention or deleted out-of-band). \
-         Fix: pick a current snapshot with `kubectl kopiur snapshots list`"
+        "kopia snapshot {id} is no longer in the repository (expired by retention \
+         or deleted). Fix: pick another with `kubectl kopiur snapshots list`"
     )]
     SnapshotMissingInRepo {
         /// The kopia snapshot manifest id.
@@ -422,8 +382,8 @@ pub enum OpsError {
     /// kopia produced output the CLI could not interpret.
     #[error(
         "unexpected kopia output while reading {what}: {detail}. \
-         Fix: retry; if it persists this is likely a kopiur/kopia version mismatch — \
-         report it at https://github.com/home-operations/kopiur/issues"
+         Fix: retry; if it keeps failing (likely a version mismatch), report it at \
+         https://github.com/home-operations/kopiur/issues"
     )]
     UnexpectedKopiaOutput {
         /// What was being read.

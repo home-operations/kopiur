@@ -103,8 +103,7 @@ async fn affected_consumers(client: &Client, self_key: &str) -> Vec<String> {
             tracing::warn!(
                 repo = self_key,
                 %error,
-                "listing SnapshotPolicy consumers for the identityDefaults edit guard failed; \
-                 degrading to allow"
+                "could not list SnapshotPolicies for the identityDefaults check; allowing"
             );
             return Vec::new();
         }
@@ -173,7 +172,7 @@ pub async fn check_repository_identity_change(
     let Some(client) = client else {
         tracing::warn!(
             repo = self_key,
-            "no client available for the identityDefaults edit guard; degrading to allow"
+            "no Kubernetes client for the identityDefaults check; allowing"
         );
         return IdentityChangeOutcome::default();
     };

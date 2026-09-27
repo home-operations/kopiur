@@ -131,10 +131,9 @@ CSI **snapshots** of attached volumes are universally supported. CSI **clones** 
 If a running pod *does* hold the volume, Kopiur does not leave a mover stuck `Pending` forever. The backup **fails immediately** with an actionable message:
 
 ```text
-PVC `ns/data` is ReadWriteOncePod and is currently held by a running pod; a second
-pod (the backup mover) cannot mount it even on the same node — scale the workload
-down before backing it up, switch the PVC to ReadWriteMany, or set
-moverDefaults.sourceColocation.mode=Disabled
+PVC `ns/data` is ReadWriteOncePod and held by a running pod, so the mover cannot
+mount it. Fix: scale the workload down before backing it up, switch the PVC to
+ReadWriteMany, or set moverDefaults.sourceColocation.mode=Disabled
 ```
 
 Your options, best first:

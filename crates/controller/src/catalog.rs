@@ -1425,9 +1425,8 @@ pub async fn request_rescan_after_failed_scan(
         tracing::warn!(
             repo = %repo_ref.name,
             error = %e,
-            "catalog scan failed and the retry request could not be recorded; the scan \
-             will re-run on the next spec change, periodic refresh, or on-demand \
-             catalog-scan-requested-at annotation"
+            "catalog scan failed and could not schedule a retry; it will re-run on the next \
+             spec change, periodic refresh, or catalog-scan-requested-at annotation"
         );
     }
 }
@@ -1676,20 +1675,18 @@ fn coverage_detail(coverage: &ListingCoverage) -> String {
 fn partial_remedy(reason: &PartialReason) -> String {
     match reason {
         PartialReason::MoverTooOld => {
-            "the bootstrap mover predates the snapshot-membership digest; \
-             run a mover image matching the controller version (Helm `mover.image`)"
+            "the mover image is older than the controller; set Helm `mover.image` to \
+             the matching version"
                 .to_string()
         }
         PartialReason::OverDigestBudget => {
-            "the repository holds more snapshots than the membership \
-             digest can carry (~86k); bound discovered rows with `spec.catalog.retain` \
-             (`perIdentity` / `maxAgeDays`), which applies to existing rows regardless"
+            "the repository has too many snapshots to track (~86k); limit discovered \
+             Snapshots with `spec.catalog.retain` (`perIdentity` / `maxAgeDays`)"
                 .to_string()
         }
         PartialReason::Invalid(why) => format!(
-            "the mover's membership digest was rejected ({why}); nothing was expired on its \
-             word, and the next scan retries with a fresh digest — if this repeats, report \
-             it as a kopiur bug"
+            "the mover's snapshot list was invalid ({why}), so nothing was removed; the next \
+             scan retries. If this repeats, report it as a kopiur bug"
         ),
     }
 }
@@ -1704,9 +1701,8 @@ fn warn_if_partial(repo_name: &str, coverage: &ListingCoverage) {
             repo = repo_name,
             coverage = %coverage_detail(coverage),
             fix = %partial_remedy(reason),
-            "catalog listing was capped and snapshot membership is unknown, so discovered \
-             Snapshots whose kopia snapshots were deleted repository-side are NOT expired this \
-             scan (status.catalog.coverage: Partial; catalog.retain still bounds rows)"
+            "catalog coverage is Partial: discovered Snapshots whose kopia snapshots were \
+             deleted will not be removed this scan (spec.catalog.retain still applies)"
         ),
     }
 }
@@ -1752,10 +1748,9 @@ fn log_scan_summary(
             expired = outcome.expired,
             expire_failed = outcome.expire_failed,
             coverage = %coverage_detail(coverage),
-            "catalog scan could not delete every stale discovered Snapshot CR (the rest \
-             were deleted); the scan is not marked refreshed and retries the remainder \
-             automatically — if this persists, check the API server's health and the \
-             operator's RBAC to delete snapshots.kopiur.home-operations.com"
+            "catalog scan could not delete some stale discovered Snapshots; retrying. \
+             If this persists, check the API server and that the operator can delete \
+             snapshots.kopiur.home-operations.com"
         );
     }
     if outcome.meta_unsupported > 0 || outcome.meta_malformed > 0 || outcome.create_failed > 0 {
@@ -1765,8 +1760,8 @@ fn log_scan_summary(
             meta_malformed = outcome.meta_malformed,
             create_failed = outcome.create_failed,
             backfill_failed,
-            "catalog scan degraded some entries (kopiur-meta undecodable and/or \
-             apiserver-rejected rows); affected rows carry no status.recorded"
+            "catalog scan could not fully record some snapshots (unreadable kopiur-meta or \
+             rejected by the API server); those rows have no status.recorded"
         );
     }
 }
@@ -1822,8 +1817,8 @@ async fn create_discovered_rows(
                         entry = %entry.id,
                         code = ae.code,
                         reason = %ae.message,
-                        "skipping a discovered entry the apiserver rejected; the scan \
-                         continues (first rejection logged; total in the scan summary)"
+                        "API server rejected a discovered snapshot; skipping it (only the first is \
+                         logged; see the scan summary for the total)"
                     );
                 }
             }
@@ -1894,8 +1889,8 @@ async fn backfill_recorded_meta(
                             snapshot = %cr.name_any(),
                             namespace = %ns,
                             error = %e,
-                            "recorded-metadata backfill patch failed; skipping \
-                             (first failure logged; total in the scan summary)"
+                            "could not backfill recorded metadata; skipping (only the first failure is \
+                             logged; see the scan summary for the total)"
                         );
                     }
                 }

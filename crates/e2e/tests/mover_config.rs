@@ -420,7 +420,7 @@ async fn inherit_holds_when_the_workload_is_scaled_to_zero_then_heals_on_scale_u
         "the hold message must name the selector that matched nothing: {message}"
     );
     assert!(
-        message.contains("HELD"),
+        message.contains("held"),
         "the message must say the run is held, not merely that something failed: {message}"
     );
     wait_phase(&backups, backup, "Pending")

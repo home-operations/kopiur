@@ -52,8 +52,8 @@ pub async fn run(
     })?;
     if policy.spec.suspend {
         eprintln!(
-            "warning: SnapshotPolicy {} is suspended; the operator may not run this snapshot until it is resumed \
-             (kubectl kopiur resume policy {})",
+            "warning: SnapshotPolicy {} is suspended, so this snapshot may not run. \
+             Fix: kubectl kopiur resume policy {}",
             args.policy, args.policy
         );
     }
@@ -79,7 +79,7 @@ pub async fn run(
     let wait = args.wait || args.logs;
     let created_line = if fanned {
         format!(
-            "{} snapshots created ({}) — SnapshotPolicy {} expands a pvcSelector\n",
+            "{} snapshots created for SnapshotPolicy {}: {}\n",
             names.len(),
             names.join(", "),
             args.policy

@@ -83,7 +83,7 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
   const maintenanceReason = useCapabilityReason(maintenance?.namespace, "patchMaintenances");
   const noMaintenance =
     maintenance === null || maintenance === undefined
-      ? `No Maintenance resource governs ${summary.name}, so there is no run to request. A repository's spec.maintenance projects one by default.`
+      ? `No Maintenance resource governs ${summary.name}. Check that its spec.maintenance is not disabled.`
       : undefined;
 
   const resuming = summary.suspended;
@@ -99,15 +99,13 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
       confirmLabel: resuming ? "Resume this repository" : "Suspend this repository",
       prose: resuming ? (
         <p>
-          Resuming sets <span className="mono">spec.suspend: false</span>. Schedules that name this
-          repository start firing again on their next slot; nothing is caught up retroactively.
+          Resuming sets <span className="mono">spec.suspend: false</span>. Backups resume at the
+          next scheduled slot; missed ones are not made up.
         </p>
       ) : (
         <p>
-          Suspending sets <span className="mono">spec.suspend: true</span>. No new backup will be
-          written here until it is resumed — a schedule that fires meanwhile simply does not run,
-          and the missed window is not made up later. Snapshots already in the repository are
-          untouched.
+          Suspending sets <span className="mono">spec.suspend: true</span>. No new backups run here
+          until it is resumed, and missed ones are not made up. Existing snapshots are untouched.
         </p>
       ),
       running: suspend.isPending,
@@ -142,10 +140,8 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
             <span className="mono">
               {maintenance?.namespace ?? "?"}/{maintenance?.name ?? "?"}
             </span>
-            . The operator honors it on its next pass — the run itself happens in a mover Job, not
-            here. <strong>Quick</strong> compacts kopia&apos;s indexes and is cheap enough to run
-            often; <strong>full</strong> also drops content nothing references any more, and is slow
-            and heavy.
+            . <strong>Quick</strong> compacts kopia&apos;s indexes and is cheap;{" "}
+            <strong>full</strong> also reclaims unused space, and is slow.
           </p>
           <div className="controls__field">
             <label htmlFor="maintenance-mode">Mode</label>
@@ -191,11 +187,10 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
       confirmLabel: "Request a scan",
       prose: (
         <p>
-          A scan walks the kopia repository and adopts every snapshot it finds as a{" "}
-          <span className="mono">Snapshot</span> resource — including backups taken before kopiur or
-          by another cluster. Discovered snapshots are forced to{" "}
-          <span className="mono">deletionPolicy: Retain</span>, so nothing a scan finds can be
-          deleted by kopiur on your behalf. Repeated clicks collapse onto one honored scan.
+          A scan adds every snapshot in the kopia repository as a{" "}
+          <span className="mono">Snapshot</span> resource, including ones from another cluster.
+          Discovered snapshots use <span className="mono">deletionPolicy: Retain</span>, so kopiur
+          never deletes them.
         </p>
       ),
       running: scan.isPending,

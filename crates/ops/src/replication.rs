@@ -141,7 +141,7 @@ pub fn failure_detail<K: ReplicationTarget>(obj: &K, name: &str, requested_at: &
         .unwrap_or_default();
     format!(
         "{} {name} requested run ({requested_at}) failed{condition_msg}\n\
-         the mover Job's logs are at `kubectl get jobs -l {}={name}`\n",
+         Find its Jobs with `kubectl get jobs -l {}={name}`\n",
         K::KIND,
         K::INSTANCE_LABEL,
     )
@@ -180,8 +180,8 @@ pub async fn detect_kind(ctx: &OpsCtx, name: &str) -> Result<ReplicationKind, Op
         (false, true) => Ok(ReplicationKind::SnapshotReplication),
         (true, true) => Err(OpsError::AmbiguousTarget {
             what: format!(
-                "both a RepositoryReplication and a SnapshotReplication are named {name} in \
-                 namespace {ns}; pass --kind repository or --kind snapshot"
+                "a RepositoryReplication and a SnapshotReplication are both named {name} in \
+                 namespace {ns} (use --kind repository or --kind snapshot)"
             ),
             candidates: format!(
                 "{}/{name}, {}/{name}",

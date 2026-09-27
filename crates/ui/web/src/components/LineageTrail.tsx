@@ -36,10 +36,7 @@ export function LineageTrail({ lineage, name, namespace }: LineageTrailProps) {
   if (!hasSource && copies.length === 0) {
     return (
       <p className="page__section-note">
-        This snapshot was written where it stands. It is not a copy of another repository&apos;s
-        snapshot, and nothing has been replicated out of it — a{" "}
-        <span className="mono">SnapshotReplication</span> is what would create a copy, and each copy
-        would appear here as its own <span className="mono">Snapshot</span> resource.
+        This snapshot was written where it stands: it is not a copy, and it has not been replicated.
       </p>
     );
   }
@@ -57,8 +54,7 @@ export function LineageTrail({ lineage, name, namespace }: LineageTrailProps) {
               <span className="lineage__meta mono">source manifest {manifest}</span>
             ) : null}
             <span className="lineage__note">
-              Named, not linked: the source snapshot resource lives with the repository it was
-              written in, which may be another cluster.
+              Not linked: the source snapshot may be in another cluster.
             </span>
           </li>
         ) : null}

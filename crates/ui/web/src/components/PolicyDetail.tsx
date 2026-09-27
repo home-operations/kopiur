@@ -135,9 +135,7 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
             ]}
           />
           <p className="page__section-note">
-            The paths shown are the ones the last run actually resolved where there has been one,
-            and the sources as written otherwise — a <span className="mono">pvcSelector</span> is
-            shown as the selector rather than as the claims it happens to match today.
+            Paths from the last run when there is one, otherwise the sources as written.
           </p>
         </Section>
 
@@ -163,7 +161,7 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
               {
                 term: "Fan-out",
                 value: row.multiRepo
-                  ? "yes — every run mints one Snapshot per repository"
+                  ? "yes — one Snapshot per repository per run"
                   : "no — one Snapshot per run",
               },
               { term: "Live snapshots", value: snapshotCount(row.activeSnapshotCount) },
@@ -186,11 +184,8 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
         <Section title="Retention" icon={Timer}>
           {rules.length === 0 ? (
             <p className="page__section-note">
-              No GFS retention is configured on this policy. It states no rule about how long old
-              snapshots are kept, so the fate of this policy&apos;s snapshots is not decided here at
-              all — set <span className="mono">spec.retention</span> to decide it here. Read nothing
-              further into the blank: an unstated rule is not a rule to discard, and it is not a
-              rule to keep.
+              No GFS retention is configured on this policy. Set{" "}
+              <span className="mono">spec.retention</span> to control how long snapshots are kept.
             </p>
           ) : (
             <>
@@ -204,8 +199,7 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
                 ))}
               </ul>
               <p className="page__section-note">
-                Grandfather-father-son: a snapshot survives if it fills a slot any of these rules
-                still wants. A pinned snapshot is exempt from all of them.
+                A snapshot is kept if any rule still wants it. Pinned snapshots are always kept.
               </p>
             </>
           )}
@@ -246,8 +240,7 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
             </div>
           )}
           <p className="page__section-note">
-            Verification reads the snapshot back out of the repository. A backup that has never been
-            verified is a backup nobody has proved is restorable.
+            Verification reads snapshots back to prove they can be restored.
           </p>
         </Section>
       </div>
@@ -255,13 +248,11 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
       <Section title="Schedules that fire this policy" icon={CalendarClock}>
         {detail.schedules.length === 0 ? (
           <p className="page__section-note">
-            No schedule fires this policy, so it only runs when someone asks it to. A{" "}
-            <span className="mono">SnapshotSchedule</span> either names a policy directly or selects
-            one by label;{" "}
+            No schedule fires this policy, so it only runs on request. See{" "}
             <Link to="/schedules" search={scope}>
               Schedules
-            </Link>{" "}
-            lists every one in scope.
+            </Link>
+            .
           </p>
         ) : (
           <>
@@ -315,10 +306,7 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
               </table>
             </div>
             <p className="page__section-note">
-              This list is exact rather than approximate: a{" "}
-              <span className="mono">policySelector</span> is evaluated with the operator&apos;s own
-              matcher, <span className="mono">matchExpressions</span> included, so a schedule shown
-              here really would fire this policy.
+              Label selectors are evaluated exactly as the operator does.
             </p>
           </>
         )}
@@ -449,8 +437,7 @@ function Conditions({ conditions, now }: { conditions: readonly ConditionView[];
   if (conditions.length === 0) {
     return (
       <p className="page__section-note">
-        The operator has written no conditions on this policy yet, which means it has not been
-        reconciled — not that it is healthy.
+        No conditions yet: the operator has not reconciled this policy.
       </p>
     );
   }

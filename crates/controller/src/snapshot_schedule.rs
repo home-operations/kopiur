@@ -518,8 +518,8 @@ fn schedule_ready_status(
     // disagreement is resolved (order-stable, transition-time-preserving).
     let tz_message = match ambiguity {
         Some(a) => format!(
-            "matched policies' repository scheduleDefaults.timezone disagree ({}); \
-             defaulting to UTC — set spec.schedule.timezone explicitly to pick a zone",
+            "matched repositories disagree on scheduleDefaults.timezone ({}); using UTC. \
+             Fix: set spec.schedule.timezone.",
             a.candidates.join(", ")
         ),
         None => "schedule timezone resolved without ambiguity".to_string(),
@@ -544,11 +544,9 @@ fn schedule_ready_status(
         Some(b) => (
             BLOCKED_ON_UNREADABLE_RUN_REASON,
             format!(
-                "Snapshot `{}` holds this schedule's concurrency gate at phase `{}`, which this \
-                 kopiur build does not recognize (most likely a newer operator wrote it). This \
-                 build can never observe that run finish, so under `concurrencyPolicy: Forbid` NO \
-                 FURTHER BACKUPS WILL RUN for this schedule. Fix: Finish the operator upgrade, or \
-                 delete Snapshot `{}` if the run is genuinely over, to release the gate.",
+                "no more backups will run: Snapshot `{}` is at phase `{}`, which this kopiur \
+                 version does not recognize (probably written by a newer one). Fix: finish the \
+                 operator upgrade, or delete Snapshot `{}` if its run is over.",
                 b.snapshot, b.phase, b.snapshot
             ),
         ),
@@ -573,10 +571,8 @@ fn schedule_ready_status(
         Some(run) => (
             WAITING_FOR_REPOSITORY_SLOT_REASON,
             format!(
-                "concurrencyPolicy: Replace is holding this slot: the run it would replace \
-                 (`{run}`) is itself queued behind its repository's mover-Job concurrency cap, \
-                 so cancelling it would free no capacity and the replacement would re-queue \
-                 behind it. This clears itself when the pool drains — no action needed."
+                "waiting: the run this slot would replace (`{run}`) is still queued for a \
+                 mover slot, so replacing it would not help. This clears on its own."
             ),
         ),
         None => (
@@ -625,10 +621,9 @@ fn schedule_ready_status(
                 true,
                 FANOUT_TOO_LARGE_REASON,
                 &format!(
-                    "this slot was SKIPPED for {}: the source-members x repositories cross \
-                     product exceeds the fan-out cap ({FANOUT_CAP} children per slot). No \
-                     backups were minted for the listed polic(ies) and none will be until the \
-                     pvcSelector is narrowed or spec.repositories shrunk.",
+                    "slot skipped for {}: members x repositories exceeds the limit of \
+                     {FANOUT_CAP} Snapshots per slot, so no backups ran. Fix: narrow the \
+                     pvcSelector or reduce spec.repositories.",
                     detail.join("; ")
                 ),
                 Some(generation),
@@ -751,7 +746,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             }
         }
         Err(e) => {
-            tracing::warn!(schedule = %sched_name, error = %e, "listing Snapshot children failed; failed-history prune and onScheduleDelete propagation skipped this pass");
+            tracing::warn!(schedule = %sched_name, error = %e, "could not list Snapshots; skipped failed-history prune and onScheduleDelete this pass");
         }
     }
 
@@ -828,8 +823,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 schedule = %sched_name,
                 from_timezone = ?pinned_tz, to_timezone = %tz.name(),
                 from_jitter = ?pinned_jitter, to_jitter = ?eff.jitter,
-                "effective cron timing changed (timezone and/or jitter window); \
-                 recomputed the pinned slot"
+                "schedule timezone or jitter changed; recomputed the next slot"
             );
             let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
             return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
@@ -909,9 +903,13 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 "MissedSchedule",
                 "SkipExpiredSlot",
                 &format!(
-                    "slot {} expired past startingDeadlineSeconds ({}s) and was skipped; next slot pinned at {}",
+                    "skipped slot {}: missed startingDeadlineSeconds ({}s); next run at {}",
                     slot.to_rfc3339(),
-                    schedule.spec.schedule.starting_deadline_seconds.unwrap_or(0),
+                    schedule
+                        .spec
+                        .schedule
+                        .starting_deadline_seconds
+                        .unwrap_or(0),
                     next.to_rfc3339(),
                 ),
             )
@@ -1002,10 +1000,9 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                     crate::consts::BLOCKED_ON_UNREADABLE_RUN_REASON,
                     "FinishOperatorUpgrade",
                     &format!(
-                        "no further backups will run: Snapshot `{}` holds the concurrency gate \
-                         at phase `{}`, which this kopiur build does not recognize (a newer \
-                         operator most likely wrote it). Finish the operator upgrade, or delete \
-                         that Snapshot if its run is genuinely over.",
+                        "no more backups will run: Snapshot `{}` is at phase `{}`, which this \
+                         kopiur version does not recognize. Fix: finish the operator upgrade, \
+                         or delete that Snapshot if its run is over.",
                         blocked.snapshot, blocked.phase
                     ),
                 )
@@ -1016,8 +1013,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 schedule = %sched_name,
                 blocking_snapshot = %blocked.snapshot,
                 phase = %blocked.phase,
-                "SnapshotSchedule is blocked: a previous run sits at a phase this operator \
-                 build does not recognize, so the concurrency gate can never clear here"
+                "schedule blocked by a run at an unrecognized phase"
             );
             return Ok(Action::requeue(UNREADABLE_RUN_HOLD_REQUEUE));
         }
@@ -1077,11 +1073,9 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                     kopiur_api::consts::WAITING_FOR_REPOSITORY_SLOT_REASON,
                     "AwaitRepositorySlot",
                     &format!(
-                        "concurrencyPolicy: Replace is holding this slot: the run it would \
-                         replace (`{parked}`) is itself queued behind its repository's mover-Job \
-                         concurrency cap, so cancelling it would free no capacity. Backups \
-                         resume automatically when the pool drains; raise the repository's \
-                         mover concurrency if this persists."
+                        "waiting: the run this slot would replace (`{parked}`) is still queued \
+                         for a mover slot. Backups resume on their own; if this persists, raise \
+                         the repository's mover concurrency."
                     ),
                 )
                 .await;
@@ -1502,9 +1496,8 @@ async fn replace_active_runs(
             "ReplacedActiveRun",
             "ReplaceInFlightRun",
             &format!(
-                "concurrencyPolicy: Replace — cancelled {} in-flight run(s) so this slot could \
-                 take their place: {}. Their mover Jobs were deleted; no committed kopia \
-                 snapshot existed to reclaim.",
+                "cancelled {} running backup(s) to replace them (concurrencyPolicy: Replace): \
+                 {}.",
                 deleted.len(),
                 deleted.join(", ")
             ),
@@ -1832,8 +1825,8 @@ async fn resolve_effective_schedule(
                 schedule = %schedule.name_any(),
                 namespace = %namespace,
                 candidates = %candidates.join(", "),
-                "matched policies' repositories disagree on scheduleDefaults.jitter; \
-                 applying NO jitter — set spec.schedule.jitter explicitly to choose a window"
+                "matched repositories disagree on scheduleDefaults.jitter; using no jitter. \
+                 Fix: set spec.schedule.jitter"
             );
             None
         }
@@ -2121,7 +2114,7 @@ async fn create_scheduled_backup(
     // re-adopt (re-own) the CR mid-cleanup. Skip this fire; the next slot re-fires
     // with a fresh name. (Prefer the reflector store; live GET fallback.)
     if slot_fire_blocked_by_terminating(slot_twin(ctx, namespace, backup_name).await?.as_deref()) {
-        tracing::info!(schedule = %schedule.name_any(), backup = %backup_name, "target-slot Snapshot is terminating; skipping fire (next slot re-fires)");
+        tracing::info!(schedule = %schedule.name_any(), backup = %backup_name, "this slot's Snapshot is still being deleted; skipping this slot");
         return Ok(());
     }
 
@@ -2276,7 +2269,7 @@ async fn fire_for_targets(
                     members = skip.members,
                     repos = skip.repos,
                     cap = FANOUT_CAP,
-                    "fan-out cross product exceeds the cap; skipping this slot for the policy"
+                    "too many Snapshots for one slot; skipping this slot for the policy"
                 );
                 outcome.fanned_out = true;
                 outcome.cap_skipped.push(skip);

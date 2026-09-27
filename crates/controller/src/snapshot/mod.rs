@@ -186,7 +186,7 @@ async fn pin_discovered_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) 
             backup,
             SnapshotPhase::Discovered,
             "Discovered",
-            "catalog-materialized snapshot",
+            "snapshot found in the repository",
         );
         status["origin"] = serde_json::json!("discovered");
         io::patch_status(api, name, status).await?;
@@ -232,7 +232,7 @@ async fn pin_adopted_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) -> 
             backup,
             SnapshotPhase::Succeeded,
             "Adopted",
-            "adopted snapshot: retention-visible history re-attached to a SnapshotPolicy",
+            "existing snapshot adopted by a SnapshotPolicy",
         );
         status["origin"] = serde_json::json!("adopted");
         io::patch_status(api, name, status).await?;
@@ -274,7 +274,7 @@ async fn pin_replicated_row(backup: &Snapshot, api: &Api<Snapshot>, name: &str) 
             backup,
             SnapshotPhase::Succeeded,
             "Replicated",
-            "replicated snapshot: a dest-side copy minted by a SnapshotReplication run",
+            "copy created by a SnapshotReplication run",
         );
         status["origin"] = serde_json::json!("replicated");
         io::patch_status(api, name, status).await?;
@@ -308,9 +308,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         tracing::warn!(
             backup = %name, namespace = %namespace,
             label = backup.labels().get(crate::consts::ORIGIN_LABEL).map(String::as_str).unwrap_or(""),
-            "unrecognized origin label on Snapshot: this build cannot classify the row, so it \
-             will not run, retain-count, or delete it; fix (or remove) the \
-             kopiur.home-operations.com/origin label, or upgrade the operator"
+            "unrecognized origin label on Snapshot; ignoring it. Fix: correct or remove the \
+             kopiur.home-operations.com/origin label, or upgrade kopiur"
         );
         return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
     };
@@ -395,14 +394,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     (
                         SnapshotPhase::Unchanged,
                         "NoChanges",
-                        "no files changed since the previous snapshot, so kopia created no new \
-                         snapshot; the previous one remains this source's restore point",
+                        "no files changed, so kopia made no new snapshot; the previous one is the \
+                         restore point",
                     )
                 } else {
                     (
                         SnapshotPhase::Succeeded,
                         "SnapshotCreated",
-                        "the kopia snapshot was created successfully",
+                        "the kopia snapshot was created",
                     )
                 };
                 // Healing with a hard-coded `Succeeded` here would silently
@@ -613,9 +612,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     namespace = %namespace,
                     snapshot = %name,
                     phase = %raw,
-                    "Snapshot is parked on a phase this operator build does not recognize \
-                     (a newer kopiur most likely wrote it); holding without acting. Check \
-                     for a mixed-version rollout and finish upgrading the operator."
+                    "Snapshot has a phase this kopiur version does not recognize; leaving it \
+                     alone. Fix: finish upgrading the operator."
                 );
                 return Ok(Action::requeue(UNKNOWN_PHASE_HOLD_REQUEUE));
             }
@@ -1092,8 +1090,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // An eval error gets its own message and a WARN log carries the detail.
             let msg = match (&eval_err, &check.message) {
                 (Some(_), _) => format!(
-                    "preflight check {:?} could not be evaluated against the current \
-                     repository/maintenance state (see operator logs)",
+                    "preflight check {:?} could not be evaluated (see operator logs)",
                     check.name
                 ),
                 (None, Some(m)) => format!("preflight check {:?} not satisfied: {m}", check.name),
@@ -2311,8 +2308,7 @@ async fn heal_slot_condition_in_flight(api: &Api<Snapshot>, backup: &Snapshot, n
         tracing::debug!(
             backup = %name,
             error = %e,
-            "could not clear a stale RepositorySlotAvailable=False on an in-flight backup; \
-             retried on the next reconcile of this run"
+            "could not clear stale RepositorySlotAvailable=False; will retry"
         );
     }
 }
@@ -2335,9 +2331,9 @@ async fn heal_slot_condition_in_flight(api: &Api<Snapshot>, backup: &Snapshot, n
 /// re-trigger the primary watch and hot-loop the reconciler.
 pub(super) fn source_pvc_missing_message(pvc_ns: &str, pvc_name: &str) -> String {
     format!(
-        "source PVC `{pvc_ns}/{pvc_name}` does not exist, so the backup cannot mount its \
-         source; the backup is parked until the missing-source deadline, then failed — \
-         recreate the PVC, or update the SnapshotPolicy's spec.sources to name an existing PVC"
+        "source PVC `{pvc_ns}/{pvc_name}` does not exist; the backup waits, then fails at the \
+         missing-source deadline. Fix: recreate the PVC, or point the SnapshotPolicy's \
+         spec.sources at an existing PVC"
     )
 }
 
@@ -2346,8 +2342,8 @@ pub(super) fn source_pvc_missing_message(pvc_ns: &str, pvc_name: &str) -> String
 /// deliberately never "recreate your PVC".
 fn staged_claim_missing_message(pvc_ns: &str, claim: &str) -> String {
     format!(
-        "operator-staged source PVC `{pvc_ns}/{claim}` vanished before the mover launched \
-         (a restage race); staging re-runs automatically on the next reconcile"
+        "staged source PVC `{pvc_ns}/{claim}` disappeared before the mover started; \
+         restaging automatically"
     )
 }
 
@@ -2871,9 +2867,9 @@ async fn publish_invalid_ack_event(ctx: &Context, repo: &ResolvedRepository) {
         INVALID_MASS_DELETION_ACK_REASON,
         ACKNOWLEDGE_MASS_DELETION_ACTION,
         &format!(
-            "the `{}` annotation on this repository is not a valid RFC3339 timestamp; it is IGNORED \
-             (the mass-deletion breaker stays armed). Set it to an RFC3339 instant (e.g. the value \
-             the held Snapshots' events surface) to acknowledge a pending wave.",
+            "the `{}` annotation on this repository is not a valid RFC3339 timestamp, so it is \
+             ignored and deletions stay held. Fix: set it to an RFC3339 time, such as the value in \
+             the held Snapshots' events.",
             crate::consts::ALLOW_MASS_DELETION_ANNOTATION
         ),
     )
@@ -3158,8 +3154,8 @@ async fn execute_deletion_plan(
                 namespace,
                 name,
                 &format!(
-                    "snapshot for backup {name} orphaned (policy/escape-hatch); finalizer removed \
-                     without contacting the repository"
+                    "Snapshot {name} removed without deleting its kopia snapshot (deletionPolicy \
+                     or skip annotation)"
                 ),
             )
             .await
@@ -3313,9 +3309,9 @@ async fn hold_deletion(
     let message = match &hold {
         Some(h) => mass_deletion_hold_message(&h.repo_ref, h.pending, h.threshold, &h.ack_value),
         // Defensive: a Hold plan always carries context (see `gather_deletion_facts`).
-        None => "this snapshot's deletion is held by the mass-deletion breaker; acknowledge the \
-                 pending wave on the repository via the `allow-mass-deletion` annotation, or set \
-                 the per-Snapshot `skip-snapshot-cleanup` annotation to release it without deleting."
+        None => "this snapshot's deletion is held by mass-deletion protection. Fix: set the \
+                 `allow-mass-deletion` annotation on the repository, or `skip-snapshot-cleanup` on \
+                 the Snapshot to remove it without deleting."
             .to_string(),
     };
     // Transition-only event: fire only when the condition was not already True.
@@ -3366,7 +3362,7 @@ fn cleared_held_conditions(backup: &Snapshot) -> Option<Vec<Condition>> {
             DELETION_HELD_CONDITION,
             false,
             MASS_DELETION_ACKNOWLEDGED_REASON,
-            "the mass-deletion wave was acknowledged; deletion is proceeding",
+            "mass deletion was acknowledged; deleting",
             backup.meta().generation,
         )
     })
@@ -3457,11 +3453,9 @@ async fn resolve_repo_for_deletion(
 /// the escape hatch is the right answer instead.
 fn stuck_finalizer_hint(msg: &str, namespace: &str, name: &str) -> String {
     format!(
-        "{msg} Until this resolves, Snapshot `{namespace}/{name}` stays terminating: \
-         `deletionPolicy: Delete` holds the `{SNAPSHOT_CLEANUP_FINALIZER}` finalizer until the \
-         kopia snapshot is deleted. To release the CR WITHOUT deleting the kopia snapshot — it \
-         stays in the repository and the catalog can rediscover it — annotate the Snapshot \
-         `{SKIP_SNAPSHOT_CLEANUP_ANNOTATION}: \"true\"`."
+        "{msg} Until then, Snapshot `{namespace}/{name}` stays terminating (finalizer \
+         `{SNAPSHOT_CLEANUP_FINALIZER}`). To remove it without deleting the kopia snapshot, \
+         annotate the Snapshot `{SKIP_SNAPSHOT_CLEANUP_ANNOTATION}: \"true\"`."
     )
 }
 
@@ -4043,8 +4037,8 @@ async fn fire_batch(
                         backup = %name,
                         repo_live,
                         global_live,
-                        "delete batch parked: the repository's (or the cluster's) delete-Job \
-                         cap is reached; the next wave fires when a running batch finishes"
+                        "delete batch waiting: delete-Job limit reached; retrying when a batch \
+                         finishes"
                     );
                     Ok(Action::requeue(deletion_requeue(
                         DeletionRequeue::Throttled,
@@ -4736,7 +4730,7 @@ async fn finalize_succeeded(
         backup,
         SnapshotPhase::Succeeded,
         "SnapshotCreated",
-        "the kopia snapshot was created successfully",
+        "the kopia snapshot was created",
     );
     match snapshot {
         Ok(Some((id, identity))) => {
@@ -4750,10 +4744,8 @@ async fn finalize_succeeded(
             tracing::warn!(
                 backup = %name,
                 error = %e,
-                "could not re-resolve the snapshot id in-process (the filesystem repo is not \
-                 mounted into the controller); keeping the mover-recorded create id. Mount the \
-                 repo into the controller to enable in-process resolution, or it self-corrects \
-                 on the next pin reconcile",
+                "could not re-read the snapshot id in the controller; keeping the id the mover \
+                 recorded (fixes itself on the next pin reconcile)",
             );
         }
     }
@@ -4952,11 +4944,10 @@ async fn assess_backup_security_context(
         // "by construction" claim hide the fact that nothing had been checked.
         let message = match basis {
             kopiur_api::secctx_compat::CompatBasis::RootMover => {
-                "the mover runs as root (uid 0), so it can read the source regardless of ownership"
-                    .to_string()
+                "the mover runs as root (uid 0), so it can read any file".to_string()
             }
             kopiur_api::secctx_compat::CompatBasis::ExactUidMatch => format!(
-                "the mover's uid ({}) exactly matches every workload writing the source PVC `{claim}`",
+                "the mover's uid ({}) matches every workload writing to source PVC `{claim}`",
                 mover
                     .uid
                     .map(|u| u.to_string())
@@ -5183,11 +5174,9 @@ fn inherit_verdict(
             reason: INHERIT_FALLBACK_REASON,
             action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
             message: format!(
-                "mover runs as {} from this recipe's explicit mover securityContext, not from \
-                 the workload: {reason}. The explicit context is a deliberate fallback so the \
-                 run proceeded, but it is not tracking the workload. Fix: scale the workload up \
-                 or fix the selector to resume inheriting, or drop inheritSecurityContextFrom if \
-                 the explicit context is intended.",
+                "mover runs as {} from the explicit mover securityContext, so it is not tracking \
+                 the workload: {reason}. Fix: scale the workload up or fix the selector, or drop \
+                 inheritSecurityContextFrom if the explicit context is intended.",
                 identity()
             ),
         }),
@@ -5202,13 +5191,9 @@ fn inherit_verdict(
             reason: INHERIT_PINNED_NO_UID_REASON,
             action: PIN_WORKLOAD_RUN_AS_USER_ACTION,
             message: format!(
-                "inheriting from pod `{pod}`{} copied nothing: the pod pins no runAsUser, and no \
-                 runAsGroup/fsGroup/supplementalGroups beyond the mover's defaults, so its \
-                 identity lives in its container image, which Kopiur cannot read from the pod \
-                 spec. The mover therefore runs as {} — not from the workload — and will likely \
-                 fail to read the source (permission denied). Fix: set runAsUser on the \
-                 workload, or pin mover.securityContext.runAsUser in this recipe (it overrides \
-                 inherited values).",
+                "pod `{pod}`{} sets no runAsUser or groups, so there was nothing to inherit. The \
+                 mover runs as {} and may get permission denied on the source. Fix: set \
+                 runAsUser on the workload, or set mover.securityContext.runAsUser.",
                 container
                     .as_deref()
                     .map(|c| format!(" (container `{c}`)"))
@@ -5253,11 +5238,9 @@ fn inherit_verdict(
                 reason: INHERIT_OVERRIDDEN_REASON,
                 action: MATCH_WORKLOAD_SECURITY_CONTEXT_ACTION,
                 message: format!(
-                    "mover runs as {}, not the uid {inherited_uid} it inherited from pod \
-                     `{pod}`: this recipe's explicit {field} overrides the inherited value (an \
-                     explicit field always wins), so inheritSecurityContextFrom will not follow \
-                     the workload if its uid changes. Fix: Remove {field} to track the workload, \
-                     or drop inheritSecurityContextFrom to stop implying it does.",
+                    "mover runs as {}, not uid {inherited_uid} from pod `{pod}`, because this \
+                     recipe's explicit {field} overrides it. Fix: Remove {field} to track the \
+                     workload, or drop inheritSecurityContextFrom.",
                     identity()
                 ),
             })
@@ -5344,10 +5327,10 @@ async fn assess_completed_backup(
         return;
     }
     let msg = format!(
-        "backup completed but {failed} source entr{} could not be read and were EXCLUDED — the \
-         snapshot is INCOMPLETE. Usually a UID/GID mismatch. Fix: match the mover to the \
-         workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching runAsUser, else \
-         fix the source file permissions",
+        "backup completed but {failed} source entr{} could not be read and were skipped, so \
+         the snapshot is incomplete (usually a UID/GID mismatch). Fix: match the mover to the \
+         workload with mover.inheritSecurityContextFrom.pvcConsumer or runAsUser, or fix the \
+         file permissions",
         if failed == 1 { "y" } else { "ies" },
     );
     let existing = backup

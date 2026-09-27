@@ -200,34 +200,34 @@ export function deletionConsequence(policy: string | null | undefined): Deletion
     return {
       known: true,
       destroys: true,
-      text: "The kopia snapshot is deleted from the repository with the resource. This restore point is gone and cannot be restored from afterwards.",
+      text: "The kopia snapshot is deleted from the repository too. It cannot be restored from afterwards.",
     };
   }
   if (policy === "Retain") {
     return {
       known: true,
       destroys: false,
-      text: "The kopia snapshot stays in the repository; only this Kubernetes resource goes away. The restore point survives, and a catalog scan would discover it again.",
+      text: "The kopia snapshot stays in the repository; only this resource goes away.",
     };
   }
   if (policy === "Orphan") {
     return {
       known: true,
       destroys: false,
-      text: "The finalizer is dropped without touching kopia: the snapshot stays in the repository and kopiur stops tracking it. The restore point survives, unmanaged.",
+      text: "The kopia snapshot stays in the repository, but kopiur stops tracking it.",
     };
   }
   if (policy === null || policy === undefined || policy.length === 0) {
     return {
       known: false,
       destroys: false,
-      text: "spec.deletionPolicy is not set on this snapshot, so the operator decides at delete time: a produced backup behaves as Delete and its kopia snapshot is destroyed, while a discovered one is forced to Retain and survives. This console cannot tell you which will apply — check how the snapshot was produced before confirming.",
+      text: "spec.deletionPolicy is not set: a produced backup is deleted from kopia, a discovered one is kept. This console cannot tell which applies — check how the snapshot was produced before confirming.",
     };
   }
   return {
     known: false,
     destroys: false,
-    text: `${policy} is not one of the three deletion policies this console knows (${DELETION_POLICIES.join(", ")}), so it cannot say what will happen to the kopia snapshot. Read spec.deletionPolicy on the resource, and upgrade kopiur-ui to the operator's version, before confirming.`,
+    text: `This console does not know deletion policy ${policy} (expected ${DELETION_POLICIES.join(", ")}), so it cannot say what happens to the kopia snapshot. Upgrade kopiur-ui to the operator's version before confirming.`,
   };
 }
 

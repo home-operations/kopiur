@@ -306,7 +306,7 @@ pub(crate) async fn confirm_row_live(api: &Api<Snapshot>, name: &str) -> Result<
     if !actionable {
         tracing::debug!(
             snapshot = %name,
-            "skipping cache-selected row: gone or terminating on live verify (#382 C2/C6)"
+            "skipping cache-selected row: gone or terminating on live read"
         );
     }
     Ok(actionable)

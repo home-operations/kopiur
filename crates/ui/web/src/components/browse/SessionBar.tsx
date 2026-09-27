@@ -65,8 +65,8 @@ export function SessionBar({ namespace, name, session, lapsed = false, now }: Se
         <CredentialWarning namespace={namespace} />
         <p className="browse-session__prose">
           {lapsed
-            ? "Sessions are reaped when their deadline passes, so a browse view left open outlives the pod behind it. Starting one again re-opens the repository; nothing about the snapshot changed while it was gone."
-            : "Reading a snapshot's files needs that pod. kopiur-ui never starts one from a page load — a crawler, a link preview or a preloading browser would each spin up a mover otherwise — so it takes this deliberate click."}
+            ? "Sessions end at their deadline. Start a new one to keep browsing; the snapshot has not changed."
+            : "Reading a snapshot's files needs a session pod, which only starts when you ask for it."}
         </p>
         <div className="action-bar">
           <ActionButton
@@ -93,8 +93,7 @@ export function SessionBar({ namespace, name, session, lapsed = false, now }: Se
       <h2 className="browse-session__title">A browse session is running</h2>
       <p className="browse-session__prose">
         A pod in <span className="mono">{session.namespace}</span> is holding this repository open
-        with its credentials mounted, and is being read as you. Stop it when you are done — it does
-        not have to wait for its deadline.
+        with its credentials mounted, and is being read as you. Stop it when you are done.
       </p>
       <Facts
         label="Browse session"
@@ -159,9 +158,9 @@ function CredentialWarning({ namespace }: { namespace: string }) {
       />
       <span>
         Starting a session runs a pod in <span className="mono">{namespace}</span> that{" "}
-        <strong>mounts this repository&rsquo;s credentials</strong> and holds the repository open
-        until you stop it or its deadline passes. It runs as you: the cluster checks your own RBAC
-        for <span className="mono">pods/exec</span>, not the console&rsquo;s.
+        <strong>mounts this repository&rsquo;s credentials</strong> until you stop it or its
+        deadline passes. It runs as you, so your own RBAC must allow{" "}
+        <span className="mono">pods/exec</span>.
       </span>
     </p>
   );

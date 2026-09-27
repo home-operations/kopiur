@@ -563,11 +563,10 @@ pub fn mass_deletion_hold_message(
         RepositoryKind::ClusterRepository => "ClusterRepository",
     };
     format!(
-        "deletion HELD by the mass-deletion breaker: {pending} pending external destructive \
-         deletions for {kind} `{}` are at/above its threshold of {threshold}. No kopia data was \
-         deleted and this Snapshot keeps its finalizer. Fix: to APPROVE this wave (releases every \
-         held deletion for the repository), run: {}. To release THIS Snapshot alone WITHOUT \
-         deleting its kopia snapshot, annotate it `{}: \"true\"`.",
+        "deletion held: {pending} pending deletions for {kind} `{}` reached the threshold of \
+         {threshold}, so nothing was deleted. Fix: to approve all held deletions for the \
+         repository, run: {}. To remove only this Snapshot without deleting its kopia snapshot, \
+         annotate it `{}: \"true\"`.",
         repo.name,
         mass_deletion_ack_command(repo, ack_value),
         SKIP_SNAPSHOT_CLEANUP_ANNOTATION,
@@ -585,13 +584,10 @@ pub fn mass_deletion_hold_message(
 /// the wording is unit-tested.
 pub fn schedule_cascade_retained_message(namespace: &str, name: &str) -> String {
     format!(
-        "Snapshot `{namespace}/{name}` was RETAINED, not deleted: its owning SnapshotSchedule \
-         is gone/replaced and the schedule's `onScheduleDelete` is `Retain` (the safe default), \
-         so the kopia snapshot is kept even though this Snapshot's deletionPolicy is `Delete`. It \
-         will be rediscovered as `origin: discovered` on the next catalog scan (a bootstrap, spec \
-         change, or recreated policy's scan request) and auto-adopted once a SnapshotPolicy with \
-         a matching identity exists. Fix: to cascade deletes when a schedule is removed, set the \
-         schedule's `spec.deletion.onScheduleDelete: Delete`."
+        "Snapshot `{namespace}/{name}` was removed but its kopia snapshot was kept, because \
+         its SnapshotSchedule is gone and `onScheduleDelete` is `Retain`. The next catalog scan \
+         rediscovers it, and it is auto-adopted once a matching SnapshotPolicy exists. To delete \
+         kopia snapshots with their schedule, set `spec.deletion.onScheduleDelete: Delete`."
     )
 }
 
@@ -609,17 +605,15 @@ pub fn policy_cascade_retained_message(
     snapshot_recorded: bool,
 ) -> String {
     let outcome = if snapshot_recorded {
-        "its kopia snapshot was RETAINED in the repository, not deleted"
+        "its kopia snapshot was kept in the repository"
     } else {
-        "the kopia snapshot for this run was never completed (cancelled mid-flight), so there \
-         was nothing in the repository to delete"
+        "the run was cancelled mid-flight and never completed a kopia snapshot"
     };
     format!(
-        "Snapshot `{namespace}/{name}` was released, not deleted: its owning SnapshotPolicy is \
-         gone and the policy's `onPolicyDelete` is `Retain` (the safe default), so {outcome}. Any \
-         kopia snapshot it created stays rediscoverable/adoptable by a future SnapshotPolicy with \
-         a matching identity (catalog scan / auto-adoption). Fix: to cascade deletes when a \
-         SnapshotPolicy is removed, set the policy's `spec.deletion.onPolicyDelete: Delete`."
+        "Snapshot `{namespace}/{name}` was removed without deleting data because its \
+         SnapshotPolicy is gone and `onPolicyDelete` is `Retain`: {outcome}. Any kopia snapshot \
+         stays rediscoverable/adoptable by a matching SnapshotPolicy. To delete kopia snapshots \
+         with their policy, set `spec.deletion.onPolicyDelete: Delete`."
     )
 }
 
@@ -655,9 +649,8 @@ pub fn repo_mass_deletion_condition(
             held: true,
             reason: crate::consts::MASS_DELETION_THRESHOLD_EXCEEDED_REASON,
             message: format!(
-                "{unacked_pending} pending external destructive Snapshot deletions for this \
-                 repository are at/above the breaker threshold of {threshold}; their finalizers are \
-                 HELD until acknowledged. Run: {}.",
+                "{unacked_pending} pending Snapshot deletions reached the threshold of {threshold} \
+                 and are held. Fix: to approve them, run: {}.",
                 mass_deletion_ack_command(repo, value)
             ),
         }
@@ -666,8 +659,7 @@ pub fn repo_mass_deletion_condition(
             held: false,
             reason: crate::consts::MASS_DELETION_BELOW_THRESHOLD_REASON,
             message: format!(
-                "pending external destructive Snapshot deletions for this repository \
-                 ({unacked_pending}) are below the breaker threshold ({threshold})"
+                "{unacked_pending} pending Snapshot deletions, below the threshold of {threshold}"
             ),
         }
     }
@@ -724,24 +716,22 @@ pub fn delete_job_placement(
         Some(rns) if rns != snapshot_ns => DeleteJobPlacement::RunIn(rns.to_string()),
         Some(_) => DeleteJobPlacement::OrphanFallback {
             reason: format!(
-                "the Repository lives in `{snapshot_ns}`, the same namespace being deleted, so no \
-                 surviving namespace can host the snapshot-delete Job; the kopia snapshot is \
-                 orphaned instead — delete it manually with `kopia snapshot delete` if unwanted"
+                "the Repository is in `{snapshot_ns}`, which is being deleted, so the kopia snapshot \
+                 was left in place. Delete it with `kopia snapshot delete` if unwanted"
             ),
         },
         None => match operator_namespace {
             Some(op) if op != snapshot_ns => DeleteJobPlacement::RunIn(op.to_string()),
             Some(op) => DeleteJobPlacement::OrphanFallback {
                 reason: format!(
-                    "the operator namespace `{op}` is itself the namespace being deleted, so it \
-                     cannot host the snapshot-delete Job; the kopia snapshot is orphaned instead"
+                    "the operator namespace `{op}` is being deleted, so the kopia snapshot was left \
+                     in place"
                 ),
             },
             None => DeleteJobPlacement::OrphanFallback {
-                reason: "the operator namespace is unknown (KOPIUR_NAMESPACE is unset), so there \
-                         is nowhere to run the ClusterRepository snapshot-delete Job during \
-                         namespace deletion; set KOPIUR_NAMESPACE on the controller Deployment — \
-                         the kopia snapshot is orphaned instead"
+                reason: "KOPIUR_NAMESPACE is unset, so there is nowhere to run the delete Job and \
+                         the kopia snapshot was left in place. Fix: set KOPIUR_NAMESPACE on the \
+                         controller Deployment"
                     .to_string(),
             },
         },
@@ -765,26 +755,22 @@ pub fn batch_job_placement(
         Some(rns) if terminating_ns != Some(rns) => DeleteJobPlacement::RunIn(rns.to_string()),
         Some(rns) => DeleteJobPlacement::OrphanFallback {
             reason: format!(
-                "the Repository lives in `{rns}`, the same namespace being deleted, so no \
-                 surviving namespace can host the snapshot-delete batch Job; the kopia snapshots \
-                 are orphaned instead — delete them manually with `kopia snapshot delete` if \
-                 unwanted"
+                "the Repository is in `{rns}`, which is being deleted, so the kopia snapshots \
+                 were left in place. Delete them with `kopia snapshot delete` if unwanted"
             ),
         },
         None => match operator_namespace {
             Some(op) if terminating_ns != Some(op) => DeleteJobPlacement::RunIn(op.to_string()),
             Some(op) => DeleteJobPlacement::OrphanFallback {
                 reason: format!(
-                    "the operator namespace `{op}` is itself the namespace being deleted, so it \
-                     cannot host the snapshot-delete batch Job; the kopia snapshots are orphaned \
-                     instead"
+                    "the operator namespace `{op}` is being deleted, so the kopia snapshots were \
+                     left in place"
                 ),
             },
             None => DeleteJobPlacement::OrphanFallback {
-                reason: "the operator namespace is unknown (KOPIUR_NAMESPACE is unset), so there \
-                         is nowhere to run the ClusterRepository snapshot-delete batch Job; set \
-                         KOPIUR_NAMESPACE on the controller Deployment — the kopia snapshots are \
-                         orphaned instead"
+                reason: "KOPIUR_NAMESPACE is unset, so there is nowhere to run the delete Job and \
+                         the kopia snapshots were left in place. Fix: set KOPIUR_NAMESPACE on the \
+                         controller Deployment"
                     .to_string(),
             },
         },

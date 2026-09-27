@@ -401,11 +401,10 @@ pub fn reconcile_index_blob_health(
             // the dead end #258 was reported from.
             let message = format!(
                 "repository has {count} content-index blobs (threshold {threshold}); maintenance \
-                 is not compacting them. Fix: ensure maintenance runs — if stuck on a stale \
-                 lease, set spec.maintenance.takeoverPolicy: Force once; if it IS running, the \
-                 epoch gate is usually why — lower spec.parameters.epoch.minDuration (default \
-                 24h, e.g. 6h) so blobs compact. Raise spec.health.indexBlobWarnThreshold \
-                 (or 0) to silence."
+                 is not compacting them. Fix: make sure maintenance runs (if it is stuck on a \
+                 stale lease, set spec.maintenance.takeoverPolicy: Force once). If it is \
+                 running, lower spec.parameters.epoch.minDuration (e.g. 6h). To silence, raise \
+                 spec.health.indexBlobWarnThreshold or set it to 0."
             );
             let conditions = io::upsert_condition(
                 existing,
@@ -1361,34 +1360,31 @@ pub fn reconcile_probe_failure(
             REPOSITORY_VANISHED_REASON,
             VERIFY_BACKEND_ACTION,
             format!(
-                "kopia repository VANISHED: the backend is reachable but the format blob is \
-                 absent ({consecutive} consecutive failing probes). Data blobs may still remain, \
-                 so re-creating would orphan them and destroy restorability — kopiur will NOT \
-                 auto-recreate. Fix: verify the backend is truly empty (and no other \
-                 Repository/ClusterRepository points at it) before any deliberate re-create."
+                "kopia repository is missing: the backend is reachable but the format blob is \
+                 gone ({consecutive} consecutive failing probes). Data blobs may still remain, \
+                 so kopiur will not re-create it. Fix: before re-creating it, confirm the \
+                 backend is empty and no other Repository/ClusterRepository uses it."
             ),
         ),
         ProbeFailureKind::Unreachable => (
             BACKEND_UNREACHABLE_REASON,
             CHECK_BACKEND_ACTION,
             format!(
-                "repository backend not confirmed healthy ({consecutive} consecutive failing \
-                 probes): unreachable, the path/mount is missing, or credentials/lock failed. \
-                 This is NOT treated as a wipe and kopiur never auto-recreates. Fix: check the \
-                 backend, credentials, and any mounted volume (see the Ready condition for what \
-                 kopiur is doing)."
+                "repository backend failed its health probe ({consecutive} consecutive failing \
+                 probes): it is unreachable, a path or mount is missing, or credentials or the \
+                 lock failed. This is not treated as a wipe. Fix: check the backend, \
+                 credentials, and any mounted volume."
             ),
         ),
         ProbeFailureKind::TimedOut => (
             PROBE_DEADLINE_EXCEEDED_REASON,
             RAISE_BOOTSTRAP_DEADLINE_ACTION,
             format!(
-                "backend health probe killed by its activeDeadlineSeconds ({consecutive} \
-                 consecutive deadline-killed probes) — the backend may be reachable but slow: a \
-                 cold cache over a large index makes connect exceed the deadline. This is NOT \
-                 evidence of an outage or wipe, and kopiur never auto-recreates. Fix: raise \
-                 spec.bootstrap.failurePolicy.activeDeadlineSeconds; maintenance shrinks connect \
-                 time and keeps running."
+                "backend health probe hit its activeDeadlineSeconds ({consecutive} consecutive \
+                 deadline-killed probes). The backend may be reachable but slow (e.g. a cold \
+                 cache over a large index); this is not an outage. Fix: raise \
+                 spec.bootstrap.failurePolicy.activeDeadlineSeconds; maintenance keeps running \
+                 and shortens connect time."
             ),
         ),
     };
@@ -1505,21 +1501,19 @@ pub fn breaker_action(kind: ProbeFailureKind) -> &'static str {
 pub fn breaker_open_message(kind: ProbeFailureKind) -> &'static str {
     match kind {
         ProbeFailureKind::Vanished => {
-            "the backend is reachable but the kopia repository is absent — the circuit breaker \
-             is open: backups, maintenance, and replication are paused until a connect succeeds; \
-             retrying with backoff (recovery is automatic; kopiur never auto-recreates)"
+            "the backend is reachable but the kopia repository is missing. Backups, maintenance, \
+             and replication are paused until a connect succeeds; retrying with backoff \
+             (kopiur never auto-recreates)"
         }
         ProbeFailureKind::Unreachable => {
-            "the repository backend is unreachable — the circuit breaker is open: backups, \
-             maintenance, and replication are paused until a connect succeeds; retrying with \
-             backoff (recovery is automatic)"
+            "the repository backend is unreachable. Backups, maintenance, and replication are \
+             paused until a connect succeeds; retrying with backoff"
         }
         ProbeFailureKind::TimedOut => {
-            "the repository connect keeps exceeding its bootstrap deadline — the circuit breaker \
-             is open: backups and replication are paused until a connect succeeds; maintenance \
-             still runs (index compaction shrinks connect time); retrying with backoff and a \
-             progressively longer deadline (recovery is automatic). Raise \
-             spec.bootstrap.failurePolicy.activeDeadlineSeconds if the backend is just slow"
+            "the repository connect keeps exceeding its bootstrap deadline. Backups and \
+             replication are paused until a connect succeeds; maintenance still runs; retrying \
+             with backoff and a longer deadline. Fix: if the backend is just slow, raise \
+             spec.bootstrap.failurePolicy.activeDeadlineSeconds"
         }
     }
 }
@@ -2991,7 +2985,7 @@ mod tests {
         assert_eq!(c.reason, REPOSITORY_VANISHED_REASON);
         let ev = u3.event.expect("event on threshold crossing");
         assert_eq!(ev.reason, REPOSITORY_VANISHED_REASON);
-        assert!(ev.message.contains("VANISHED"));
+        assert!(ev.message.contains("repository is missing"));
         assert!(
             ev.message
                 .to_lowercase()
@@ -3047,8 +3041,8 @@ mod tests {
         assert_eq!(c.reason, BACKEND_UNREACHABLE_REASON);
         // The unreachable message must NOT claim a vanish (no destructive nudge).
         let ev = unreachable.event.unwrap();
-        assert!(!ev.message.contains("VANISHED"));
-        assert!(ev.message.contains("NOT treated as a wipe"));
+        assert!(!ev.message.contains("repository is missing"));
+        assert!(ev.message.contains("not treated as a wipe"));
         // #414: the third kind — a deadline-killed probe — carries its own
         // reason; it must claim neither a vanish nor an outage.
         let timed_out = reconcile_probe_failure(
@@ -3068,9 +3062,13 @@ mod tests {
         assert_ne!(c.reason, BACKEND_UNREACHABLE_REASON);
         let ev = timed_out.event.unwrap();
         assert_eq!(ev.action, RAISE_BOOTSTRAP_DEADLINE_ACTION);
-        assert!(!ev.message.contains("VANISHED"), "{}", ev.message);
         assert!(
-            !ev.message.contains("credentials/lock failed"),
+            !ev.message.contains("repository is missing"),
+            "{}",
+            ev.message
+        );
+        assert!(
+            !ev.message.contains("credentials or the lock failed"),
             "{}",
             ev.message
         );
@@ -3098,7 +3096,7 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("may be reachable but slow"), "{msg}");
-        assert!(msg.contains("NOT evidence of an outage"), "{msg}");
+        assert!(msg.contains("not an outage"), "{msg}");
         assert!(
             msg.contains("spec.bootstrap.failurePolicy.activeDeadlineSeconds"),
             "{msg}"
@@ -3354,15 +3352,14 @@ mod tests {
         // the exact bytes not drifting when a new kind is added.
         assert_eq!(
             breaker_open_message(ProbeFailureKind::Vanished),
-            "the backend is reachable but the kopia repository is absent — the circuit breaker \
-             is open: backups, maintenance, and replication are paused until a connect succeeds; \
-             retrying with backoff (recovery is automatic; kopiur never auto-recreates)"
+            "the backend is reachable but the kopia repository is missing. Backups, maintenance, \
+             and replication are paused until a connect succeeds; retrying with backoff \
+             (kopiur never auto-recreates)"
         );
         assert_eq!(
             breaker_open_message(ProbeFailureKind::Unreachable),
-            "the repository backend is unreachable — the circuit breaker is open: backups, \
-             maintenance, and replication are paused until a connect succeeds; retrying with \
-             backoff (recovery is automatic)"
+            "the repository backend is unreachable. Backups, maintenance, and replication are \
+             paused until a connect succeeds; retrying with backoff"
         );
         // The vanished message must still refuse the destructive nudge.
         assert!(breaker_open_message(ProbeFailureKind::Vanished).contains("never auto-recreates"));

@@ -93,11 +93,9 @@ impl std::fmt::Display for IdentityHeaderKind {
 /// turns that into a 500.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "the caller's {what} {value:?} cannot be sent as an impersonation header. Every apiserver \
-     call kopiur-ui makes must carry the caller's identity, and a request missing one would \
-     run as the UI's own ServiceAccount instead — so it is refused rather than sent. \
-     Fix: this is a bug in kopiur-ui (identity extraction should already have rejected this \
-     value); report it at https://github.com/home-operations/kopiur/issues"
+    "the caller's {what} {value:?} is not a valid impersonation header, so the request was \
+     refused. \
+     Fix: this is a kopiur-ui bug; report it at https://github.com/home-operations/kopiur/issues"
 )]
 pub struct InvalidIdentityHeader {
     /// Which impersonation header could not be built.
@@ -339,9 +337,9 @@ pub enum ClientBuildError {
     /// kube refused to build a client from the base configuration (TLS material,
     /// proxy settings, a malformed cluster URL).
     #[error(
-        "kopiur-ui could not build a Kubernetes client from its own configuration: {0}. \
-         Fix: check the UI's ServiceAccount token mount and any KUBECONFIG/proxy settings on \
-         the Deployment, then restart it"
+        "kopiur-ui could not build a Kubernetes client: {0}. \
+         Fix: check the UI's ServiceAccount token mount and any KUBECONFIG/proxy settings, \
+         then restart it"
     )]
     Kube(#[from] kube::Error),
 }

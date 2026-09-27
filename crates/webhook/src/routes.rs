@@ -219,7 +219,7 @@ mod tests {
         let (_s, v) = post_review(body).await;
         assert_eq!(v["response"]["allowed"], false);
         let msg = v["response"]["status"]["message"].as_str().unwrap();
-        assert!(msg.contains("fail-closed"), "msg was: {msg}");
+        assert!(msg.contains("denying"), "msg was: {msg}");
     }
 
     #[tokio::test]
@@ -723,7 +723,7 @@ mod tests {
         assert_eq!(v["response"]["allowed"], false);
         let msg = v["response"]["status"]["message"].as_str().unwrap();
         assert!(
-            msg.contains("create.splitter") && msg.contains("immutable"),
+            msg.contains("create.splitter") && msg.contains("cannot change"),
             "msg was: {msg}"
         );
     }

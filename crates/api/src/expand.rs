@@ -167,9 +167,8 @@ pub fn effective_source_in(
         return Err(ValidationError::InvalidFieldValue {
             field: "spec.source.sourceIndex".to_string(),
             reason: format!(
-                "`spec.source.sourceIndex` is {index} but SnapshotPolicy `{policy_name}` now has \
-             {} source(s); the recipe was edited after this Snapshot was created. Delete this \
-             Snapshot and let the schedule re-fire, or recreate it against the current recipe.",
+                "is {index} but SnapshotPolicy `{policy_name}` now has {} source(s) (it was \
+                 edited). Fix: delete this Snapshot and let the schedule re-fire",
                 sources.len()
             ),
         });
@@ -222,15 +221,9 @@ pub fn effective_source_in(
             | snapshot_policy::SourceShape::Nfs(_)) => Err(ValidationError::InvalidFieldValue {
                 field: "spec.source.target.pvc".to_string(),
                 reason: format!(
-                    "`spec.source.target.pvc` pins PVC `{}/{}` onto SnapshotPolicy \
-                         `{policy_name}`'s sources[{index}], which is a `{}` source and has no \
-                         PVC to back up. A PVC pin belongs only to a `pvcSelector` fan-out \
-                         member or a plain `pvc:` source; pinning one here would record the \
-                         kopia manifest under a /pvc/… path while verification and every \
-                         fromPolicy restore look under the source's own path, so kopiur \
-                         refuses it. Fix: drop `spec.source` (the policy has a single \
-                         non-selector source, so it needs no pin), or point this Snapshot at \
-                         a policy whose sources[{index}] is PVC-shaped.",
+                    "pins PVC `{}/{}`, but SnapshotPolicy `{policy_name}` sources[{index}] is a \
+                     `{}` source with no PVC. Fix: drop `spec.source`, or point this Snapshot at \
+                     a policy whose sources[{index}] is a PVC source",
                     t.namespace,
                     t.name,
                     shape.kind_str(),
@@ -710,14 +703,8 @@ fn malformed_source_path(policy: &SnapshotPolicy) -> ValidationError {
         field: "spec.source.fromPolicy.sourcePath".to_string(),
         reason: format!(
             "SnapshotPolicy `{}` has a source that does not set exactly one of \
-             pvc/pvcSelector/nfs/stream, so kopiur cannot tell which kopia source path its \
-             snapshots were written under. Deriving one anyway would either match every \
-             snapshot in the repository (an empty path) or name another volume's path, and \
-             either could fill this volume with the wrong data — so kopiur fails closed. \
-             Fix: repair the SnapshotPolicy's sources[] (admission normally rejects this \
-             shape; a hand-patched object or one written against an older CRD schema can \
-             carry it), or set source.fromPolicy.sourcePath explicitly to name the path to \
-             restore.",
+             pvc/pvcSelector/nfs/stream, so the path to restore is unknown. Fix: repair the \
+             policy's sources[], or set source.fromPolicy.sourcePath",
             policy.name_any()
         ),
     }
@@ -728,13 +715,10 @@ fn ambiguous_source_path(policy: &SnapshotPolicy) -> ValidationError {
     ValidationError::InvalidFieldValue {
         field: "spec.source.fromPolicy.sourcePath".to_string(),
         reason: format!(
-            "SnapshotPolicy `{}`'s selector sources do not yield a per-PVC kopia source path \
-             (they differ in sourcePathStrategy/sourcePathOverride, or share one \
-             sourcePathOverride under which every matched PVC was backed up). Restoring \
-             without a path would match the newest snapshot of ANY member and could fill this \
-             volume with another volume's data, so kopiur fails closed. Fix: set \
-             source.fromPolicy.sourcePath explicitly (e.g. /pvc/<name>) to name the member to \
-             restore.",
+            "SnapshotPolicy `{}` selector sources have no single per-PVC path (they differ in \
+             sourcePathStrategy/sourcePathOverride, or share one sourcePathOverride), so \
+             kopiur cannot tell which volume to restore. Fix: set source.fromPolicy.sourcePath \
+             (e.g. /pvc/<name>)",
             policy.name_any()
         ),
     }
@@ -1396,9 +1380,8 @@ pub fn expand_sources(
                 let reason = if same_pvc {
                     format!(
                         "SnapshotPolicy `{}` has two `pvcSelector` sources that both match \
-                         `{}/{}`, so it would try to back that one volume up twice at the same \
-                         kopia source path `{path}`. Narrow the selectors so each PVC is matched \
-                         by exactly one source.",
+                         `{}/{}` (path `{path}`). Fix: narrow the selectors so each PVC matches \
+                         only one source",
                         policy.name_any(),
                         target.namespace,
                         target.name,
@@ -1416,17 +1399,12 @@ pub fn expand_sources(
                     // never consulted and "set sourcePathStrategy" would be a
                     // remedy that does nothing. Name the real cause instead.
                     format!(
-                        "SnapshotPolicy `{}`'s pvcSelector matches both `{}/{}` and `{}/{}`, \
-                         which resolve to the SAME kopia source path `{path}` because \
-                         `spec.sources[{i}].sourcePathOverride` pins every matched PVC to that \
-                         one literal path. Their backups would merge into one snapshot history \
-                         and prune each other. Remove that `sourcePathOverride` — a \
-                         `sourcePathOverride` can only ever address ONE volume, so it does not \
-                         work on a selector that matches several, and `sourcePathStrategy` is \
-                         ignored while it is set. Use `sourcePathStrategy` (`PvcName`, or \
-                         `PvcNamespacedName` to disambiguate same-named PVCs across \
-                         namespaces), which derives a distinct path per PVC; or move the \
-                         override onto its own `pvc:` source.",
+                        "SnapshotPolicy `{}` pvcSelector matches both `{}/{}` and `{}/{}`, but \
+                         `spec.sources[{i}].sourcePathOverride` gives them the same path \
+                         `{path}`, so their backups would overwrite each other. Fix: remove \
+                         that `sourcePathOverride` and use `sourcePathStrategy` (`PvcName` or \
+                         `PvcNamespacedName`), or move the override onto its own `pvc:` \
+                         source",
                         policy.name_any(),
                         prev.namespace,
                         prev.name,
@@ -1435,11 +1413,10 @@ pub fn expand_sources(
                     )
                 } else {
                     format!(
-                        "SnapshotPolicy `{}`'s pvcSelector matches both `{}/{}` and `{}/{}`, \
-                         which resolve to the SAME kopia source path `{path}` under \
-                         `sourcePathStrategy: PvcName`. Their backups would merge into one \
-                         snapshot history and prune each other. Set `sourcePathStrategy: \
-                         PvcNamespacedName` on that source.",
+                        "SnapshotPolicy `{}` pvcSelector matches both `{}/{}` and `{}/{}`, \
+                         which get the same path `{path}` under `sourcePathStrategy: PvcName`, \
+                         so their backups would overwrite each other. Fix: set \
+                         `sourcePathStrategy: PvcNamespacedName` on that source",
                         policy.name_any(),
                         prev.namespace,
                         prev.name,

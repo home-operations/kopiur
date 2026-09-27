@@ -100,9 +100,8 @@ function Topology() {
           />
         ) : graph.data.nodes.length === 0 ? (
           <EmptyState title={`Nothing to draw in ${namespace ?? "any namespace"}`} icon={Waypoints}>
-            The board draws repositories, the backends behind them, the policies that write into
-            them and the namespaces a cluster repository admits. Create a Repository or
-            ClusterRepository and it appears here; a policy naming it draws the first line.
+            The board shows repositories, their backends, and the policies that write to them.
+            Create a Repository or ClusterRepository and it appears here.
           </EmptyState>
         ) : layoutFailure !== null ? (
           // No retry: the layout is deterministic, so the same graph would
@@ -137,11 +136,8 @@ function Topology() {
       ) : null}
 
       <p className="page__prose">
-        Every line is directed: it runs from the object that acts to the object it acts on. A plate
-        is selectable — its drawer names every relationship at either end of it, the gates holding
-        it back, and the section its object is listed in. A plate drawn with a dashed outline is a
-        reference to something that is not in the cluster: whatever points at it has been promising
-        a copy to nowhere.
+        Each line runs from the object that acts to the object it acts on. Select a plate to see its
+        relationships and gates. A dashed plate is referenced but missing from the cluster.
       </p>
     </div>
   );

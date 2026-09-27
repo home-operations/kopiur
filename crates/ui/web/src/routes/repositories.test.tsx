@@ -129,7 +129,7 @@ describe("Repositories list", () => {
     mountApp("/repositories?namespace=prod");
     const region = await screen.findByRole("region", { name: "Repositories" });
     const title = await within(region).findByText("No repositories in prod");
-    expect(title.closest('[role="status"]')).toHaveTextContent("kopia repository backups land in");
+    expect(title.closest('[role="status"]')).toHaveTextContent("where backups are stored");
   });
 
   it("renders the not-permitted state for a 403 and offers no retry", async () => {

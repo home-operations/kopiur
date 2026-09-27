@@ -330,7 +330,7 @@ mod tests {
         // checker enforces the failure modes we remove, not stylistic taste.
         let samples = [
             "repository.namespace must not be set when repository.kind is ClusterRepository \
-             (a ClusterRepository is referenced by name only; got namespace \"prod\")",
+             (got \"prod\"). Fix: remove repository.namespace",
             "the storage backend denied access; check the credentials Secret and that the \
              bucket/container/path exists and is reachable",
             "spec.server.auth.insecure requires acknowledgeInsecure: true — a no-auth kopia \

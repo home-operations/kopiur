@@ -89,8 +89,7 @@ pub fn failure_detail(maint: &Maintenance, requested_at: &str) -> String {
         .unwrap_or_default();
     format!(
         "maintenance {name} manual run (requested {requested_at}) failed{condition_msg}\n\
-         check `kubectl kopiur logs` is not applicable here — maintenance Jobs are found with \
-         `kubectl get jobs -l kopiur.home-operations.com/maintenance={name}`\n"
+         Find its Jobs with `kubectl get jobs -l kopiur.home-operations.com/maintenance={name}`\n"
     )
 }
 
@@ -109,8 +108,8 @@ pub fn yield_note(maint: &Maintenance) -> Option<String> {
                 || c.reason == kopiur_api::maintenance::LEASE_TAKEOVER_PROMPT_REASON
         })?;
     Some(format!(
-        "note: the Job succeeded by YIELDING the maintenance lease — no maintenance ran. {} \
-         Set spec.ownership.takeoverPolicy=Force to claim it.",
+        "note: no maintenance ran because another owner holds the maintenance lease. {} \
+         Fix: set spec.ownership.takeoverPolicy=Force to take it over.",
         c.message
     ))
 }

@@ -234,7 +234,7 @@ pub async fn ensure(client: &Client, cfg: &WebhookTlsConfig) -> Result<()> {
             secret = %cfg.secret_name,
             namespace = %cfg.namespace,
             not_after = material.leaf.not_after_unix,
-            "minted/rotated self-managed webhook serving certificate"
+            "created or rotated the webhook serving certificate"
         );
     }
 

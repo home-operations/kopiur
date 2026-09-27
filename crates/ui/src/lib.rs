@@ -295,8 +295,8 @@ fn static_header(value: &'static str) -> Option<HeaderValue> {
             tracing::error!(
                 value,
                 error = %e,
-                "a kopiur-ui security header constant is not a valid header value; the header \
-                 will be omitted. This is a bug in kopiur-ui — report it."
+                "a security header constant is invalid and will be omitted; this is a \
+                 kopiur-ui bug"
             );
             None
         }
@@ -323,8 +323,8 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
                 tracing::error!(
                     origin,
                     error = %e,
-                    "ignoring an entry of KOPIUR_UI_CORS_ORIGINS that is not a valid origin; \
-                     write it as a scheme and authority, e.g. http://localhost:5173"
+                    "ignoring an invalid KOPIUR_UI_CORS_ORIGINS entry; use a scheme and host, \
+                     e.g. http://localhost:5173"
                 );
                 None
             }
@@ -333,18 +333,16 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 
     if allowed.is_empty() {
         tracing::error!(
-            "KOPIUR_UI_CORS_ORIGINS named only unusable values, so no cross-origin request \
-             will be allowed; write each entry as a scheme and authority, e.g. \
-             http://localhost:5173"
+            "KOPIUR_UI_CORS_ORIGINS has no valid entries, so cross-origin requests stay \
+             blocked; use a scheme and host, e.g. http://localhost:5173"
         );
         return None;
     }
 
     tracing::warn!(
         origins = ?origins,
-        "cross-origin requests to /api are ENABLED. This is a development affordance for a \
-         Vite dev server on another port; unset KOPIUR_UI_CORS_ORIGINS in production, where \
-         the SPA is same-origin."
+        "cross-origin requests to /api are enabled; this is for development only, unset \
+         KOPIUR_UI_CORS_ORIGINS in production"
     );
     Some(
         CorsLayer::new()
@@ -436,10 +434,8 @@ fn timed_out(path: &str, budget: Duration) -> ApiError {
             "kopiur-ui gave up on {path} after {} seconds.",
             budget.as_secs()
         ),
-        "A bounded wait expired. The work itself may still be running in the cluster — the \
-         request was abandoned, not undone.",
-        "reload the page in a moment; if it keeps happening, check the apiserver's health and \
-         whether this cluster holds far more Kopiur objects than the UI's list caps expect",
+        "The work may still be running in the cluster.",
+        "reload the page in a moment; if it keeps happening, check the API server's health",
     )
     .with_instance(path.to_string())
 }
@@ -483,10 +479,8 @@ async fn api_not_found(uri: Uri) -> Response<Body> {
             "The UI asked for {}, which this backend does not serve.",
             uri.path()
         ),
-        "The path is not part of the kopiur-ui API surface — usually a stale SPA bundle \
-         calling an endpoint a newer or older backend has, or a typo in a hand-made request.",
-        "reload the page to pick up the bundle this backend ships, and make sure the \
-         kopiur-ui image and the operator come from the same release",
+        "Usually a stale page, or a typo in a hand-made request.",
+        "reload the page, and make sure kopiur-ui and the operator are the same release",
     )
     .with_instance(uri.path().to_string())
     .into_response()

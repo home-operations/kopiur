@@ -225,7 +225,7 @@ async fn run(cli: &MoverCli) -> Result<()> {
     // below connects with this prepared spec.
     let result = match prepare_connect_spec(&spec) {
         Err(e) => {
-            error!(error = %e, "failed to materialize backend credentials for the mover");
+            error!(error = %e, "could not write backend credentials");
             Err(e)
         }
         // Bootstrap owns its own connect/create lifecycle (and reports via a
@@ -676,9 +676,8 @@ async fn run_operation(
                     info!(
                         source = %op.source_path,
                         identity = %override_source,
-                        "no files changed since the previous snapshot; kopia wrote no new \
-                         manifest (files.ignoreIdenticalSnapshots is enabled). The previous \
-                         snapshot remains the restore point for this source."
+                        "no files changed since the previous snapshot; no new snapshot written \
+                         (files.ignoreIdenticalSnapshots)"
                     );
                     return Ok(StatusUpdate::unchanged_backup(
                         started_at,
@@ -698,10 +697,9 @@ async fn run_operation(
                     skipped = skipped.len(),
                     sample_path = %skipped[0].path,
                     sample_error = %skipped[0].error,
-                    "backup completed but {} source entr{} unreadable and EXCLUDED from the \
-                     snapshot (ignore-file-errors policy) — it is INCOMPLETE; match the mover to \
-                     the workload via mover.inheritSecurityContextFrom.pvcConsumer or a matching \
-                     runAsUser to capture them",
+                    "backup completed but {} source entr{} unreadable and left out, so the \
+                     snapshot is incomplete. Fix: set mover.inheritSecurityContextFrom.pvcConsumer \
+                     or a matching runAsUser",
                     skipped.len(),
                     if skipped.len() == 1 { "y was" } else { "ies were" },
                 );
@@ -783,9 +781,9 @@ async fn run_operation(
                 None => {
                     warn!(
                         snapshot_id = %op.snapshot_id,
-                        "snapshot (un)pin succeeded but the new manifest id could not be \
-                         re-resolved; status.snapshot.kopiaSnapshotID may be stale until the \
-                         next pin reconcile",
+                        "snapshot (un)pin succeeded but the new snapshot id could not be \
+                         looked up; status.snapshot.kopiaSnapshotID may be stale until the next \
+                         pin",
                     );
                     Ok(StatusUpdate::succeeded(chrono::Utc::now()))
                 }
@@ -937,19 +935,16 @@ async fn stream_root_object(
         warn!(
             stale = %snapshot_id,
             live = %live,
-            "stream restore snapshot id not found; healing to the live manifest \
-             re-resolved from the snapshot's identity (kopia rewrites the id on pin)",
+            "stream restore snapshot id not found (changed by a pin); using the current id",
         );
         return Ok((live, obj));
     }
 
     Err(MoverError::StreamExecFailed {
         detail: format!(
-            "snapshot `{snapshot_id}` could not be resolved to a root object, so the file \
-             `{file_name}` inside it cannot be addressed. Nothing was piped into the \
-             command, so no partial load happened. The manifest is absent from the \
-             repository — it may have been deleted or expired by maintenance; re-resolve \
-             the restore against a snapshot that still exists"
+            "snapshot `{snapshot_id}` was not found in the repository (deleted or expired), so \
+             `{file_name}` could not be read; nothing was sent to the command. Fix: restore \
+             from a snapshot that still exists"
         ),
     })
 }
@@ -1000,8 +995,7 @@ async fn restore_with_heal(
                 warn!(
                     stale = %snapshot_id,
                     live = %live,
-                    "restore snapshot id not found; healing to the live manifest \
-                     re-resolved from the snapshot's identity (kopia rewrites the id on pin)",
+                    "restore snapshot id not found (changed by a pin); using the current id",
                 );
                 client
                     .snapshot_restore_with(&live, &op.target_path, &op.restore_options())
@@ -1164,8 +1158,8 @@ async fn resolve_and_restore(
         kopiur_api::restore::OnMissingSnapshot::Continue => {
             info!(
                 identity = %filter.identity(),
-                "no snapshot matched the restore source; onMissingSnapshot=Continue — \
-                 leaving the target empty (deploy-or-restore)",
+                "no snapshot matched the restore source; onMissingSnapshot=Continue, leaving \
+                 the target empty",
             );
             // Pin the empty outcome before completing, for the same durability/
             // adoption reasons as the snapshot case.
@@ -1233,9 +1227,8 @@ async fn delete_one(
         if !anchor.source_path.is_empty() {
             info!(
                 snapshot_id = %snapshot_id,
-                "anchor has no start_time; skipping the stale-id self-heal to avoid \
-                 deleting an unrelated snapshot that happens to share the source path \
-                 (data-loss gate)",
+                "anchor has no start_time; not looking up a changed snapshot id, to avoid \
+                 deleting an unrelated snapshot",
             );
         }
         return Ok(());
@@ -1246,9 +1239,7 @@ async fn delete_one(
         warn!(
             recorded = %snapshot_id,
             live = %live,
-            "recorded snapshot id was stale (kopia rewrites the id on pin); \
-             deleting the live manifest re-resolved from the snapshot's identity \
-             to avoid orphaning it",
+            "recorded snapshot id was stale (changed by a pin); deleting the current id",
         );
         client.snapshot_delete(&live).await?;
     }
@@ -1321,8 +1312,8 @@ async fn delete_chunk(client: &KopiaClient, ids: &[String], members: &[Vec<usize
         warn!(
             ids = ids.len(),
             error = %err,
-            "bulk snapshot delete failed with a retryable error; nothing was deleted. \
-             Failing the batch for a backoff retry instead of re-opening the repository per id",
+            "bulk snapshot delete failed with a retryable error; nothing was deleted, \
+             failing the batch so it retries",
         );
         return members.iter().flatten().copied().collect();
     }
@@ -1361,9 +1352,7 @@ fn log_batch_plan(op: &SnapshotDeleteBatchOp, plan: &BatchDeletePlan) {
         warn!(
             recorded = %h.recorded,
             live = %h.live,
-            "recorded snapshot id was stale (kopia rewrites the id on pin); \
-             deleting the live manifest re-resolved from the snapshot's identity \
-             to avoid orphaning it",
+            "recorded snapshot id was stale (changed by a pin); deleting the current id",
         );
     }
     for &m in &plan.already_absent {
@@ -1371,9 +1360,8 @@ fn log_batch_plan(op: &SnapshotDeleteBatchOp, plan: &BatchDeletePlan) {
         if !anchor_self_heal_allowed(&item.anchor) && !item.anchor.source_path.is_empty() {
             info!(
                 snapshot_id = %item.snapshot_id,
-                "anchor has no start_time; skipping the stale-id self-heal to avoid \
-                 deleting an unrelated snapshot that happens to share the source path \
-                 (data-loss gate)",
+                "anchor has no start_time; not looking up a changed snapshot id, to avoid \
+                 deleting an unrelated snapshot",
             );
         }
     }
@@ -1704,7 +1692,7 @@ async fn seed_connect_source(
         &credential_staging_dir().join("seed"),
         &|key| credentials::seed_materialize_lookup(key, &raw_env),
     ) {
-        error!(error = %e, "could not materialize the seed source's credentials");
+        error!(error = %e, "could not write the seed source credentials");
         return Err(Box::new(BootstrapResult::from_mover_error(&e)));
     }
 
@@ -1746,7 +1734,7 @@ async fn seed_connect_source(
     // seed is the largest read kopiur ever makes of a replica that is usually
     // still another cluster's live off-site copy.
     if let Err(e) = apply_repository_throttle(&client, &seed.replica_throttle).await {
-        error!(class = %e.kopia_class(), "could not cap the seed source connection");
+        error!(class = %e.kopia_class(), "could not throttle the seed source connection");
         return Err(Box::new(BootstrapResult::from_mover_error(&e)));
     }
     Ok(SeedSource {
@@ -1948,7 +1936,7 @@ async fn seed_create_local_if_absent(
     local_initialized: bool,
 ) -> SeedStep<()> {
     if local_initialized {
-        info!("the repository a migrate seed writes into already exists; skipping create");
+        info!("seed target repository already exists; skipping create");
         return Ok(());
     }
     match client
@@ -1961,7 +1949,7 @@ async fn seed_create_local_if_absent(
     {
         Ok(()) => Ok(()),
         Err(e) => {
-            error!(class = %e.class(), "could not create the repository a migrate seed writes into");
+            error!(class = %e.class(), "could not create the seed target repository");
             Err(Box::new(BootstrapResult::failed(&e)))
         }
     }
@@ -2002,7 +1990,7 @@ async fn seed_create_and_connect_local(
         connect_and_throttle(&local_client, local_connect, spec.cache, &spec.throttle).await
     {
         let e = e.into_mover_error(KopiaOp::SeedLocalConnect);
-        error!(class = %e.kopia_class(), "could not open a capped connection to the repository a migrate seed writes into");
+        error!(class = %e.kopia_class(), "could not open a throttled connection to the seed target repository");
         return Err(Box::new(BootstrapResult::from_mover_error(&e)));
     }
     Ok(local_client)
@@ -2242,8 +2230,8 @@ async fn stamp_owner_on_new_repository(client: &KopiaClient, owner: Option<&Stri
         Err(e) => warn!(
             %owner,
             class = %e.class(),
-            "could not stamp maintenance owner on newly initialized repository; \
-             maintenance will need takeoverPolicy=Force once"
+            "could not set the maintenance owner on the new repository; maintenance will \
+             need takeoverPolicy=Force once"
         ),
     }
 }
@@ -2447,8 +2435,7 @@ async fn bootstrap_connect_probe(
         if let Some(o) = &outcome {
             info!(
                 source = %o.source,
-                "spec.seed is set but this repository is already initialized and no resume \
-                 was requested; nothing to seed"
+                "spec.seed is set but this repository is already initialized; nothing to seed"
             );
         }
         outcome
@@ -2685,20 +2672,17 @@ async fn run_bootstrap(
                 // status.parameters that quietly disagrees with spec.
                 warn!(
                     class = %e.class(),
-                    "could not apply repository set-parameters; continuing bootstrap — \
-                     status.parameters will show the drift"
+                    "could not apply repository set-parameters; continuing bootstrap"
                 );
                 // ONE error channel, because it is one command: epoch tuning and blob
                 // retention ride the same `set-parameters` invocation, so they succeed or
                 // fail together and splitting the reason would invent a distinction kopia
                 // does not make. The message names both so the reader knows what to check.
                 epoch_error = Some(format!(
-                    "kopia repository set-parameters failed ({}): {}. spec.parameters was NOT \
-                     applied — status.parameters reports what the repository actually has. \
-                     If you set spec.parameters.blobRetention, check that the backend and \
-                     bucket support object lock (kopia reports `blob-retention: unsupported \
-                     put-blob option` when they do not). The bootstrap re-runs on the next \
-                     spec change; edit spec.parameters to retry.",
+                    "kopia repository set-parameters failed ({}): {}. spec.parameters was not \
+                     applied; status.parameters shows the live values. Fix: correct \
+                     spec.parameters (for blobRetention, the bucket must support object \
+                     lock)",
                     e.class(),
                     e
                 ));
@@ -2757,9 +2741,9 @@ async fn run_bootstrap(
     // help reads as though it were scoped).
     if let Some(seed) = op.seed.as_ref() {
         let Some(all) = snapshot_count else {
-            error!("a seed-armed bootstrap skipped the snapshot listing its backstop needs");
+            error!("spec.seed is set but the snapshot listing was skipped (kopiur bug)");
             return BootstrapResult::internal_inconsistency(
-                "a seed-armed bootstrap skipped the snapshot listing the seed backstop counts",
+                "spec.seed is set but the snapshot listing was skipped; this is a kopiur bug",
             );
         };
         if kopiur_mover::bootstrap::seed_left_repository_empty(true, seed.allow_empty_source, all) {
@@ -2865,8 +2849,7 @@ fn log_catalog_preparation(
         foreign_dropped = prepared.foreign_suffix_dropped,
         digest_ids,
         digest_width,
-        "prepared the catalog: each identity's newest snapshots in the window, a \
-         membership digest over the full listing"
+        "prepared the catalog"
     );
     warn_if_digest_missing(prepared.listed_ids.as_ref(), snapshot_count);
 }
@@ -2882,21 +2865,19 @@ fn warn_if_digest_missing(
         // Never produced by `prepare_catalog_entries`; matched so a future
         // change that does produce it is still reported.
         Some(kopiur_mover::digest::ListedIds::Invalid(reason)) => {
-            format!("the mover built an invalid digest ({reason}); this is a kopiur defect")
+            format!("the mover built an invalid digest ({reason}); this is a kopiur bug")
         }
-        None => "the repository lists more snapshots than the digest's byte budget holds \
-                 even at its narrowest width; reduce the snapshot count (retention / \
-                 maintenance) to restore full coverage"
+        None => "too many snapshots to track. Fix: lower the snapshot count with retention \
+                 and maintenance"
             .to_string(),
     };
     warn!(
         snapshot_count,
         budget_bytes = kopiur_mover::digest::DIGEST_BUDGET_BYTES,
         why = %why,
-        "catalog membership digest omitted, so the controller will report catalog \
-         coverage Partial: discovered Snapshot rows whose snapshots were deleted OUTSIDE \
-         the materialization window are not expired (spec.catalog.retain still bounds \
-         them). Informational — nothing to change on the mover"
+        "catalog coverage will be Partial: discovered Snapshots whose kopia snapshots \
+         were deleted outside the window will not be removed (spec.catalog.retain still \
+         applies)"
     );
 }
 
@@ -2916,8 +2897,8 @@ fn size_guarded_result(result: &BootstrapResult) -> BootstrapResult {
         warn!(
             kept = guarded.snapshots.len(),
             total = result.snapshots.len(),
-            "bootstrap result exceeded the ConfigMap size budget; trimmed trailing \
-             discovered entries so the write fits (the repository still bootstraps)"
+            "bootstrap result too large for the ConfigMap; dropped the oldest discovered \
+             entries"
         );
     }
     guarded
@@ -2949,8 +2930,8 @@ async fn write_bootstrap_result(
             error = %e,
             configmap = %cm_name,
             entries = guarded.snapshots.len(),
-            "failed to write bootstrap result; the repository will stay Bootstrapped: \
-             False until this is resolved (check the ConfigMap's size and the mover's RBAC)"
+            "could not write the bootstrap result, so the repository stays \
+             Bootstrapped=False. Fix: check the mover's ConfigMap RBAC"
         ),
     }
 }
@@ -3033,16 +3014,16 @@ async fn measure_maintenance(
             Ok(Err(e)) => {
                 warn!(
                     class = %e.class(),
-                    "maintenance run succeeded but the post-run `maintenance info` failed; \
-                     reporting no reclaimed-bytes figure for this run"
+                    "maintenance succeeded but `maintenance info` failed; reclaimed bytes \
+                     not recorded"
                 );
                 None
             }
             Err(_) => {
                 warn!(
                     timeout_secs = MAINTENANCE_MEASURE_TIMEOUT.as_secs(),
-                    "maintenance run succeeded but the post-run `maintenance info` timed out; \
-                 reporting no reclaimed-bytes figure for this run"
+                    "maintenance succeeded but `maintenance info` timed out; reclaimed bytes \
+                     not recorded"
                 );
                 None
             }
@@ -3068,16 +3049,16 @@ async fn recount_index_blobs(client: &KopiaClient) -> Option<i64> {
         Ok(Err(e)) => {
             warn!(
                 class = %e.class(),
-                "maintenance run succeeded but the post-run index-blob recount failed; \
-                 leaving the repository's previous count standing"
+                "maintenance succeeded but the index-blob recount failed; keeping the \
+                 previous count"
             );
             None
         }
         Err(_) => {
             warn!(
                 timeout_secs = MAINTENANCE_MEASURE_TIMEOUT.as_secs(),
-                "maintenance run succeeded but the post-run index-blob recount timed out; \
-                 leaving the repository's previous count standing"
+                "maintenance succeeded but the index-blob recount timed out; keeping the \
+                 previous count"
             );
             None
         }
@@ -3109,7 +3090,7 @@ async fn run_maintenance_flow(
     if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
         let e = e.into_mover_error(KopiaOp::MaintenanceConnect);
         patch_maintenance_status(&spec.target_ref, &maintenance_failed_body_from_mover(&e)).await;
-        error!(class = %e.kopia_class(), "could not open a capped connection to the repository undergoing maintenance");
+        error!(class = %e.kopia_class(), "could not open a throttled connection for maintenance");
         return Err(e);
     }
 
@@ -3160,9 +3141,8 @@ async fn run_maintenance_flow(
     // Maintenance CRs are always honored regardless of any Repository's
     // `spec.maintenance`, so telling every reader to flip `enabled: false` would
     // be actively wrong advice for those.
-    const REMEDIATION: &str = "for operator-managed maintenance: if another cluster is the \
-         designated maintenance runner, set spec.maintenance.enabled: false on this \
-         repository's non-owner clusters; to move ownership here instead, set \
+    const REMEDIATION: &str = "Fix: if another cluster runs maintenance, set \
+         spec.maintenance.enabled: false on the other clusters; to take ownership here, set \
          ownership.takeoverPolicy: Force once";
     match lease_action(op.takeover_policy, held_by_other) {
         LeaseAction::Yield => {
@@ -3172,7 +3152,7 @@ async fn run_maintenance_flow(
                     &info.owner,
                     kopiur_api::maintenance::LEASE_HELD_BY_OTHER_REASON,
                     &format!(
-                        "maintenance lease held by {}; takeoverPolicy=Never ({REMEDIATION})",
+                        "maintenance lease held by {} and takeoverPolicy is Never. {REMEDIATION}",
                         info.owner
                     ),
                 ),
@@ -3187,7 +3167,7 @@ async fn run_maintenance_flow(
                 &lease_blocked_body(
                     &info.owner,
                     kopiur_api::maintenance::LEASE_TAKEOVER_PROMPT_REASON,
-                    &format!("lease held by {}; {REMEDIATION}", info.owner),
+                    &format!("maintenance lease held by {}. {REMEDIATION}", info.owner),
                 ),
             )
             .await;
@@ -3307,7 +3287,7 @@ async fn run_verify_flow(
     if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
         let e = e.into_mover_error(KopiaOp::VerifyConnect);
         patch_verify_failure(spec, op, &e.to_string()).await;
-        error!(class = %e.kopia_class(), "could not open a capped connection to the repository being verified");
+        error!(class = %e.kopia_class(), "could not open a throttled connection for verification");
         return Err(e);
     }
 
@@ -3362,13 +3342,9 @@ async fn run_verify_flow(
                         source_path: spec.identity.source_path.clone(),
                     };
                     let msg = format!(
-                        "quick verification covered NO snapshot: the repository holds no \
-                         snapshot for {}. `kopia snapshot verify` exits 0 when its \
-                         --sources filter matches nothing, so this is reported as a \
-                         failure rather than a false pass. Run a backup for this source \
-                         first; if you just changed sourcePathStrategy or \
-                         sourcePathOverride, the previous snapshots live under the OLD \
-                         path and this identity is new.",
+                        "quick verification found no snapshot for {}. Fix: run a backup \
+                         first; if you changed sourcePathStrategy or sourcePathOverride, \
+                         older snapshots are under the old path",
                         spec.identity.source_spec()
                     );
                     patch_verify_failure(spec, op, &msg).await;
@@ -3608,7 +3584,7 @@ async fn run_replicate_flow(
     if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
         let e = e.into_mover_error(KopiaOp::ReplicateConnect);
         patch_replicate_status(&spec.target_ref, &replicate_failed_body(&e.to_string())).await;
-        error!(class = %e.kopia_class(), "could not open a capped connection to the source repository a replication reads from");
+        error!(class = %e.kopia_class(), "could not open a throttled connection to the replication source");
         return Err(e);
     }
 
@@ -3836,11 +3812,9 @@ async fn srepl_connect_source(
             source: e,
         };
         let msg = format!(
-            "{err}. `kopia snapshot migrate` opens the SOURCE repository with the password \
-             persisted beside {} (the env KOPIA_PASSWORD is not consulted for that \
-             open), so a failing probe means the migrate itself would fail the same way. Check \
-             the source repository's encryption Secret and that the source connect above \
-             persisted its credentials",
+            "{err}. The saved source password in {} does not open the source repository, \
+             so `kopia snapshot migrate` would fail. Fix: check the source repository's \
+             encryption Secret",
             paths.source_config
         );
         patch_snapshot_replicate_status(
@@ -3953,10 +3927,9 @@ fn warn_incomplete_skipped(skipped: &[&kopiur_kopia::SnapshotListEntry]) {
     warn!(
         count = skipped.len(),
         %sample,
-        "skipping incomplete source snapshot manifest(s): kopia cannot replicate a checkpoint, so \
-         they are excluded from the copy and the post-verify. They are usually left by an \
-         interrupted `kopia snapshot create`; once confirmed abandoned, remove each with \
-         `kopia snapshot delete <id> --delete` against the source repository"
+        "skipping incomplete source snapshot(s) left by interrupted backups; once confirmed \
+         abandoned, remove each with `kopia snapshot delete <id> --delete` on the source \
+         repository"
     );
 }
 

@@ -34,10 +34,9 @@ function Replications() {
   return (
     <div className="page">
       <p className="page__prose">
-        A replication is a scheduled copy out of a repository — either the whole repository&apos;s
-        blobs synced to a second backend, or selected snapshots migrated into another repository.
-        The column that matters is <strong>Last replicated</strong>: a copy that has not run since
-        its schedule says it should have is a second copy you do not actually have.
+        A replication copies a repository to a second backend, or selected snapshots into another
+        repository, on a schedule. Watch <strong>Last replicated</strong>: a copy that is overdue is
+        a copy you do not have.
       </p>
 
       <section className="page__section" aria-label="Replications">
@@ -51,10 +50,8 @@ function Replications() {
           />
         ) : rows.length === 0 ? (
           <EmptyState title={`No replications in ${scope}`} icon={ArrowLeftRight}>
-            Nothing is copying a repository elsewhere. A RepositoryReplication mirrors a
-            repository&apos;s blobs to a second backend; a SnapshotReplication copies chosen
-            snapshots into another repository. Either one turns a single repository into two places
-            the data lives.
+            Nothing is copying a repository elsewhere. Create a RepositoryReplication or a
+            SnapshotReplication to keep a second copy of your backups.
           </EmptyState>
         ) : (
           <ReplicationTable rows={rows} />
@@ -70,18 +67,15 @@ function Replications() {
             </h2>
           </div>
           <p className="page__section-note">
-            The same rows, ordered by how long it has been since each one last finished a copy.
+            The same rows, ordered by time since each last finished a copy.
           </p>
           <ReplicationLagChart rows={rows} />
         </section>
       ) : null}
 
       <p className="page__prose">
-        &ldquo;Next run&rdquo; reads <em>not reported</em> for every row, and that is the
-        operator&apos;s gap rather than this screen&apos;s:{" "}
-        <span className="mono">RepositoryReplication.status.nextScheduledAt</span> is declared and
-        written by nothing, and <span className="mono">SnapshotReplication</span> publishes no
-        next-run time at all. The cron expression is what says when the next copy is due.
+        &ldquo;Next run&rdquo; reads <em>not reported</em> because the operator does not publish a
+        next-run time for replications. The cron expression says when the next copy is due.
       </p>
     </div>
   );

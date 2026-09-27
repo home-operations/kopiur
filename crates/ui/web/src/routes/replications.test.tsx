@@ -186,7 +186,9 @@ describe("Replications", () => {
     mountApp("/replications?namespace=prod");
     const region = await screen.findByRole("region", { name: "Replications" });
     const title = await within(region).findByText("No replications in prod");
-    expect(title.closest('[role="status"]')).toHaveTextContent("two places the data lives");
+    expect(title.closest('[role="status"]')).toHaveTextContent(
+      "keep a second copy of your backups",
+    );
   });
 
   it("renders the not-permitted state for a 403 and offers no retry", async () => {

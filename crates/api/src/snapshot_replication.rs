@@ -337,8 +337,7 @@ pub fn validate_component_glob(pattern: &str) -> Result<(), String> {
         match c {
             '[' | ']' | '{' | '}' => {
                 return Err(format!(
-                    "contains {c:?}: character classes and brace expansion are not supported; \
-                     only \"*\" (any run) and \"?\" (one character) are glob metacharacters"
+                    "contains {c:?}; only the \"*\" and \"?\" wildcards are supported"
                 ));
             }
             c if c.is_control() => {

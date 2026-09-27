@@ -323,7 +323,7 @@ describe("Snapshot detail route", () => {
     await user.click(await screen.findByRole("button", { name: /^Delete/ }));
     const confirm = screen.getByRole("group", { name: "Delete" });
     expect(confirm).toHaveTextContent("not set (the operator decides)");
-    expect(confirm).toHaveTextContent(/cannot tell you which will apply/);
+    expect(confirm).toHaveTextContent(/cannot tell which applies/);
     expect(confirm.querySelector('[data-consequence="unknown"]')).not.toBeNull();
   });
 
@@ -371,7 +371,7 @@ describe("Snapshot detail route", () => {
     // Required on the wire and never defaulted on: it starts cleared.
     expect(pin).not.toBeChecked();
     expect(screen.getByRole("group", { name: "Snapshot now" })).toHaveTextContent(
-      /permanent and exempts the snapshot from GFS pruning entirely/,
+      /permanent: retention never removes a pinned snapshot/,
     );
   });
 

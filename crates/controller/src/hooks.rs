@@ -93,8 +93,8 @@ impl HookFailure {
     /// The full what/why/fix message for the condition + Event.
     pub fn condition_message(&self, phase: HookPhase, policy_name: &str) -> String {
         format!(
-            "{} hook #{} ({}) failed: {}. Fix the hook in SnapshotPolicy `{policy_name}` \
-             spec.hooks.{}, or set continueOnFailure: true on it to proceed despite failures",
+            "{} hook #{} ({}) failed: {}. Fix: correct SnapshotPolicy `{policy_name}` \
+             spec.hooks.{}, or set continueOnFailure: true on the hook",
             phase.list_name(),
             self.index,
             self.kind,
@@ -177,8 +177,7 @@ pub fn pick_exec_pod<'a>(
     if pods.is_empty() {
         return Err(format!(
             "no pod matches the hook podSelector (`{selector_query}`) in namespace \
-             `{namespace}` — the workload must be running for an exec hook; scale it up or \
-             fix the selector"
+             `{namespace}`. Fix: scale the workload up or fix the selector"
         ));
     }
     pods.iter()
@@ -190,9 +189,8 @@ pub fn pick_exec_pod<'a>(
         })
         .ok_or_else(|| {
             format!(
-                "no RUNNING pod matches the hook podSelector (`{selector_query}`) in namespace \
-                 `{namespace}` ({} matched, none Running) — an exec hook needs a running \
-                 container",
+                "no running pod matches the hook podSelector (`{selector_query}`) in namespace \
+                 `{namespace}` ({} matched, none Running); an exec hook needs a running pod",
                 pods.len()
             )
         })
@@ -213,8 +211,8 @@ async fn run_workload_exec(
     let query = io::label_selector_to_string(pod_selector);
     if query.is_empty() {
         return Ok(Err(
-            "the hook podSelector is empty — set matchLabels/matchExpressions identifying the \
-             workload pod to exec into"
+            "the hook podSelector is empty. Fix: set matchLabels or matchExpressions that \
+             select the pod to exec into"
                 .to_string(),
         ));
     }
@@ -266,8 +264,8 @@ async fn run_workload_exec(
         Ok(s) => s,
         Err(_) => {
             return Ok(Err(format!(
-                "command {:?} in pod `{pod_name}` did not finish within {timeout:?} — raise the \
-                 hook `timeout` or make the command faster",
+                "command {:?} in pod `{pod_name}` did not finish within {timeout:?}. Fix: raise \
+                 the hook `timeout` or make the command faster",
                 hook.command
             )));
         }
@@ -357,16 +355,16 @@ async fn run_job_hook(
             Some(true) => return Ok(Ok(())),
             Some(false) => {
                 return Ok(Err(format!(
-                    "hook Job `{name}` failed — inspect `kubectl logs -n {namespace} \
-                     --selector=job-name={name}` for the command's output"
+                    "hook Job `{name}` failed. See `kubectl logs -n {namespace} \
+                     --selector=job-name={name}` for its output"
                 )));
             }
             None => {
                 if tokio::time::Instant::now() >= deadline {
                     return Ok(Err(format!(
-                        "hook Job `{name}` did not finish within {timeout:?} — raise the hook \
-                         `timeout`, or check why its pod is not completing (`kubectl describe \
-                         job -n {namespace} {name}`)"
+                        "hook Job `{name}` did not finish within {timeout:?}. Fix: raise the hook \
+                         `timeout`, or check its pod with `kubectl describe job -n \
+                         {namespace} {name}`"
                     )));
                 }
                 tokio::time::sleep(JOB_POLL_INTERVAL).await;
@@ -448,8 +446,8 @@ async fn run_http_hook(hook: &HttpRequestHook) -> std::result::Result<(), String
     }
     let resp = req.send().await.map_err(|e| {
         format!(
-            "{method} {url} failed: {e} — is the endpoint reachable from the operator (and \
-             within the hook timeout {timeout:?})?"
+            "{method} {url} failed: {e}. Check that the endpoint is reachable from the \
+             operator within the hook timeout ({timeout:?})"
         )
     })?;
     let status = resp.status();
@@ -518,7 +516,7 @@ mod tests {
         let err = pick_exec_pod(&[], "app=pg", "billing").unwrap_err();
         assert!(err.contains("app=pg"), "{err}");
         assert!(err.contains("billing"), "{err}");
-        assert!(err.contains("scale it up or"), "{err}");
+        assert!(err.contains("scale the workload up or"), "{err}");
 
         // A Running pod is selected over a Pending one.
         let pods = vec![

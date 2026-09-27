@@ -62,11 +62,11 @@ export function ReplicationLagChart({ rows, now = new Date() }: ReplicationLagCh
             <li key={never.id}>
               <Finding
                 title={`${never.label} has never been copied`}
-                what={`${never.kind} ${never.label} has recorded no successful replication, so there is no age to plot and no second copy to fall back on.`}
+                what={`${never.kind} ${never.label} has no successful replication, so there is no second copy.`}
                 why={
                   never.suspended
-                    ? "Its schedule is suspended, so it is not going to run on its own."
-                    : "A scheduled copy that has never succeeded has either never fired or never finished."
+                    ? "Its schedule is suspended, so it will not run on its own."
+                    : "It has never fired or never finished."
                 }
                 fix="open the replication and run it once, then check the run's own counters"
                 lamp={healthLamp(never.suspended ? "suspended" : "failed")}
@@ -91,9 +91,8 @@ export function ReplicationLagChart({ rows, now = new Date() }: ReplicationLagCh
       ) : null}
 
       <p className="page__section-note">
-        Every bar is the age of the last copy. None of them says <em>overdue</em>, because no
-        controller writes a next-run time to compare against — the paragraph below the ledger says
-        which field is missing on each kind.
+        Every bar is the age of the last copy. None says <em>overdue</em>, because no controller
+        writes a next-run time to compare against.
       </p>
     </div>
   );

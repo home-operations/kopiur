@@ -94,21 +94,19 @@ Here is what you will see:
 ```console
 $ kubectl describe snapshotpolicy app-backup -n apps
 ...
-  Message: the operator is not permitted to write the projected credentials
-           Secret `app-backup-...-creds-0` in namespace `apps` (HTTP 403).
-           Credential projection needs cluster-wide `secrets` create/patch RBAC.
-           Fix: set `features.credentialProjection.enabled: true` in the Helm
-           chart, or disable `spec.credentialProjection` ...
+  Message: the operator may not write the projected credentials Secret
+           `app-backup-...-creds-0` in namespace `apps` (HTTP 403). Fix: set
+           `features.credentialProjection.enabled: true` in the Helm chart, or
+           disable `spec.credentialProjection` ...
 ```
 
 ```console
 $ kubectl describe repository nas-primary -n apps
 ...
-  Message: the operator is not permitted to write the kopia web-UI Secret
-           `nas-primary-kopia-ui-auth` in namespace `apps` (HTTP 403). The kopia
-           web-UI server (`spec.server`) needs `secrets` create/patch/delete RBAC.
-           Fix: set `features.kopiaUi.enabled: true` in the Helm chart, or remove
-           `spec.server` ...
+  Message: the operator may not write the kopia web-UI Secret
+           `nas-primary-kopia-ui-auth` in namespace `apps` (HTTP 403). Fix: set
+           `features.kopiaUi.enabled: true` in the Helm chart, or remove
+           `spec.server` from the repository.
 ```
 
 | Symptom | Cause | Fix |

@@ -124,9 +124,9 @@ pub async fn backup_warnings(
         {
             warnings.push(format!(
                 "securityContext: the mover's UID likely cannot read the source PVC `{claim}` \
-                 (no shared UID or group with the workload that mounts it) — the backup may fail \
-                 with permission denied or silently skip unreadable files. Match the mover via \
-                 mover.inheritSecurityContextFrom.pvcConsumer, or a matching runAsUser/fsGroup."
+                 (no shared UID or group with its workload), so the backup may fail or skip \
+                 files. Fix: set mover.inheritSecurityContextFrom.pvcConsumer, or a matching \
+                 runAsUser/fsGroup"
             ));
         }
     }
@@ -169,9 +169,9 @@ pub async fn restore_warnings(
         secctx_compat::assess_restore_compat(&write_id, consumer.as_ref())
     {
         vec![format!(
-            "securityContext: the future workload consuming the restore target `{claim}` likely \
-             cannot read what the mover writes (no shared UID or fsGroup). Set \
-             mover.inheritSecurityContextFrom.workloadSelector, or a matching runAsUser/fsGroup."
+            "securityContext: the workload that will use the restore target `{claim}` likely \
+             cannot read what the mover writes (no shared UID or fsGroup). Fix: set \
+             mover.inheritSecurityContextFrom.workloadSelector, or a matching runAsUser/fsGroup"
         )]
     } else {
         Vec::new()

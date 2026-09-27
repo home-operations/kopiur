@@ -86,7 +86,7 @@ export function candidateVerdict(
     return {
       kept: true,
       lamp: KEPT_LAMP,
-      rule: "kept, but no rule was attributed — read the policy's retention block",
+      rule: "kept, but no rule was attributed — check the policy's retention",
     };
   }
   return { kept: true, lamp: KEPT_LAMP, rule: candidate.rules.join(", ") };
@@ -178,21 +178,21 @@ export function planVerdict(plan: RetentionPlan): PlanVerdict {
     const totals = planTotals(plan);
     return {
       lamp: KEPT_LAMP,
-      text: `Kept: no GFS retention is configured on SnapshotPolicy ${plan.policy.name}, so the operator runs no selection and none of the ${String(totals.candidates)} snapshots here is dropped by retention.`,
+      text: `Kept: no GFS retention is configured on SnapshotPolicy ${plan.policy.name}, so none of the ${String(totals.candidates)} snapshots here is removed by retention.`,
     };
   }
 
   if (subject === undefined) {
     return {
       lamp: { ...healthLamp("unknown"), word: "Unknown", icon: CircleHelp },
-      text: `This snapshot does not appear in the plan the server returned, so there is no verdict to show for it. The buckets below are still SnapshotPolicy ${plan.policy.name}'s, but none of their rows is marked as this one.`,
+      text: `This snapshot does not appear in SnapshotPolicy ${plan.policy.name}'s plan, so there is no verdict for it.`,
     };
   }
 
   if (!subject.kept) {
     return {
       lamp: { ...healthLamp("degraded"), word: "Pruned" },
-      text: `This snapshot is not kept: no retention rule holds it, so the next retention run for SnapshotPolicy ${plan.policy.name} removes it and it will no longer be restorable. It competes with ${company} in its bucket. Pin it, or widen the policy's rules, to keep it.`,
+      text: `Not kept: the next retention run for SnapshotPolicy ${plan.policy.name} removes it, and it will no longer be restorable. Pin it, or widen the policy's rules, to keep it.`,
     };
   }
 

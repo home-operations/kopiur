@@ -50,8 +50,8 @@ pub enum ValidationError {
     /// For `kind: ClusterRepository`, `repository.namespace` MUST be absent
     /// (ADR §3.2/§3.3) — the reference is cluster-scoped by name alone.
     #[error(
-        "repository.namespace must not be set when repository.kind is ClusterRepository \
-         (a ClusterRepository is referenced by name only; got namespace {namespace:?})"
+        "repository.namespace must not be set when repository.kind is ClusterRepository (got \
+         {namespace:?}). Fix: remove repository.namespace"
     )]
     ClusterRepoNamespaceForbidden {
         /// The forbidden namespace that was set on the reference.
@@ -89,9 +89,8 @@ pub enum ValidationError {
     /// a stamped cascade policy on either is meaningless, so it is forbidden,
     /// exactly like a non-`Retain` `deletionPolicy` ([`Self::DiscoveredMustRetain`]).
     #[error(
-        "origin: {origin} snapshots must not set onScheduleDelete (got {got:?}); a {origin} \
-         snapshot has no owning SnapshotSchedule for this field to apply to. Remove \
-         spec.onScheduleDelete"
+        "origin: {origin} snapshots must not set onScheduleDelete (got {got:?}) — they have no \
+         owning SnapshotSchedule. Fix: remove spec.onScheduleDelete"
     )]
     DiscoveredCannotSetOnScheduleDelete {
         /// The origin that forbids the field (`"discovered"` or `"adopted"`).
@@ -111,7 +110,8 @@ pub enum ValidationError {
     /// retention policy fields, which conflict with CR-driven GFS retention and
     /// risk double-deletion (ADR §4.4 exclusivity).
     #[error(
-        "inline kopia-side retention policy on a Repository spec is unsupported (field {field:?}); retention is driven exclusively by SnapshotPolicy.spec.retention (ADR §4.4)"
+        "kopia retention fields are not supported on a Repository (field {field:?}). Fix: \
+         remove it and set retention in SnapshotPolicy.spec.retention"
     )]
     InlineRetentionForbidden {
         /// The offending repo-level retention field that was set.
@@ -140,7 +140,7 @@ pub enum ValidationError {
 
     /// Two fields that may not both be set were both set (e.g. a `Source` with
     /// both `pvc` and `pvcSelector`).
-    #[error("fields {a:?} and {b:?} are mutually exclusive but both were set ({context})")]
+    #[error("fields {a:?} and {b:?} cannot both be set ({context})")]
     MutuallyExclusive {
         /// The first of the two conflicting fields.
         a: String,
@@ -197,10 +197,7 @@ pub enum ValidationError {
     /// A `Repository`/`ClusterRepository` `identityDefaults` CEL expression
     /// evaluated to a non-string value. `hostnameExpr`/`usernameExpr` must return
     /// a string (ADR-0004 §5).
-    #[error(
-        "identity CEL expression {expr:?} must return a string, got {got} \
-         (hostnameExpr/usernameExpr must evaluate to a string)"
-    )]
+    #[error("identity CEL expression {expr:?} must return a string, got {got}")]
     IdentityExprType {
         /// The offending CEL expression.
         expr: String,
@@ -225,10 +222,7 @@ pub enum ValidationError {
     },
 
     /// A `ClusterRepository.spec.server` did not set the required target `namespace`.
-    #[error(
-        "spec.server.namespace is required for a ClusterRepository server (cluster-scoped \
-         resources have no implicit namespace)"
-    )]
+    #[error("spec.server.namespace is required on a ClusterRepository")]
     ServerNamespaceRequired,
 
     /// A label selector was supplied as the tenancy gate but the caller could not
@@ -236,8 +230,8 @@ pub enum ValidationError {
     /// (deny) rather than guess (ADR §3.2 — the webhook never trusts unfiltered
     /// input).
     #[error(
-        "ClusterRepository {repo:?} gates by label selector but namespace {namespace:?} labels \
-         were not available to evaluate; denying (fail-closed)"
+        "ClusterRepository {repo:?} gates by label selector, but the labels of namespace \
+         {namespace:?} could not be read; denying"
     )]
     SelectorLabelsUnavailable {
         /// The consumer namespace whose labels could not be evaluated.
@@ -252,8 +246,8 @@ pub enum ValidationError {
     /// after creation — the webhook rejects the edit rather than silently ignoring it
     /// (ADR-0005 §7).
     #[error(
-        "{field} is immutable after repository creation (it is fixed in the kopia repository \
-         format); create a new Repository/ClusterRepository instead of editing this field"
+        "{field} cannot change after the repository is created. Fix: create a new \
+         Repository/ClusterRepository instead"
     )]
     Immutable {
         /// The immutable field that an UPDATE attempted to change.
@@ -265,9 +259,9 @@ pub enum ValidationError {
     /// repository. Two recipes interleaving snapshots into one kopia identity corrupts
     /// the snapshot history, so the webhook rejects the second one (ADR-0005 §6).
     #[error(
-        "resolved identity {identity:?} collides with existing SnapshotPolicy {conflict:?} in \
-         repository {repo}; two policies must not share a kopia identity in the same repository \
-         (give this policy a distinct spec.identity, or target a different repository)"
+        "resolved identity {identity:?} is already used by SnapshotPolicy {conflict:?} in \
+         repository {repo}; two policies cannot share a kopia identity. Fix: set a distinct \
+         spec.identity, or use a different repository"
     )]
     IdentityCollision {
         /// The resolved `username@hostname[:path]` identity that collided.
@@ -290,10 +284,7 @@ pub enum ValidationError {
     /// (or makes the snapshot un-findable on `snapshot list --source`). Rejected at
     /// admission/resolution so it never reaches a mover Job. Shape-only — every other
     /// character (dots, dashes, slashes, unicode letters) is allowed.
-    #[error(
-        "{field} {value:?} is not a valid kopia identity component: {reason} \
-         (kopia parses username@hostname:path on the first @ and first :, with no escaping)"
-    )]
+    #[error("{field} {value:?} is not a valid kopia identity component: {reason}")]
     IdentityComponentInvalid {
         /// The offending field (e.g. `"spec.identity.username"` or `"resolved hostname"`).
         field: String,
@@ -344,10 +335,9 @@ pub enum ValidationError {
     /// `kopiur.home-operations.com/allow-identity-change` annotation
     /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
     #[error(
-        "this edit changes the policy's resolved kopia identity ({old:?} → {new:?}) but it has \
-         snapshot history — new snapshots fork to a competing kopia lineage sharing the old one's \
-         GFS retention timeline (not independent retention), and restore/verify resolve only the \
-         new identity. Fix: acknowledge with annotation \
+        "this edit changes the policy's kopia identity ({old:?} → {new:?}) but it already has \
+         snapshots — new snapshots start a separate history that shares retention with the old \
+         one, and restore/verify only see the new identity. Fix: add annotation \
          kopiur.home-operations.com/allow-identity-change (any non-empty value)"
     )]
     IdentityWouldFork {
@@ -365,11 +355,10 @@ pub enum ValidationError {
     /// lineage would fork — with N members, the other N-1 may be unaffected.
     /// Same acknowledgement release as the single-repo variant.
     #[error(
-        "this edit changes the policy's resolved kopia identity in repository {repo} ({old:?} → \
-         {new:?}) but has snapshot history — new snapshots fork to a competing kopia lineage \
-         sharing the old one's GFS retention timeline, and restore/verify resolve only the new \
-         identity. Fix: acknowledge with annotation \
-         kopiur.home-operations.com/allow-identity-change (any non-empty value)"
+        "this edit changes the policy's kopia identity in repository {repo} ({old:?} → {new:?}) \
+         but it already has snapshots — new snapshots start a separate history that shares \
+         retention with the old one, and restore/verify only see the new identity. Fix: add \
+         annotation kopiur.home-operations.com/allow-identity-change (any non-empty value)"
     )]
     IdentityWouldForkInRepository {
         /// Normalized key (`Kind[/namespace]/name`) of the member repository
@@ -397,11 +386,10 @@ pub enum ValidationError {
     /// `kopiur.home-operations.com/allow-identity-change` annotation
     /// ([`crate::consts::ALLOW_IDENTITY_CHANGE_ANNOTATION`]).
     #[error(
-        "this edit to identityDefaults would re-identify {} — new snapshots fork to a competing \
-         kopia lineage sharing the old one's GFS retention timeline, and restore/verify resolve \
-         only the new identity. Fix: acknowledge with annotation \
-         kopiur.home-operations.com/allow-identity-change (any non-empty value), or pin an \
-         explicit spec.identity (both username AND hostname) on those policies first",
+        "this identityDefaults edit would change the kopia identity of {} — their new snapshots \
+         start a separate history, and restore/verify only see the new identity. Fix: add \
+         annotation kopiur.home-operations.com/allow-identity-change (any non-empty value), or \
+         first set an explicit spec.identity (username and hostname) on those policies",
         describe_identity_change_consumers(consumers)
     )]
     RepositoryIdentityWouldFork {
@@ -438,7 +426,7 @@ pub enum ValidationError {
 
     /// A verification `successExpr` evaluated to a non-bool value. A `successExpr`
     /// is a pass/fail predicate and must return a bool (ADR-0005 §4/§15).
-    #[error("successExpr {expr:?} must return a bool, got {got} (it is a pass/fail predicate)")]
+    #[error("successExpr {expr:?} must return a bool, got {got}")]
     SuccessExprType {
         /// The offending CEL expression.
         expr: String,
@@ -477,10 +465,7 @@ pub enum ValidationError {
 
     /// A preflight check expression evaluated to a non-bool value. A preflight
     /// check is a pass/fail predicate and must return a bool.
-    #[error(
-        "preflight check expression {expr:?} must return a bool, got {got} \
-         (it is a pass/fail predicate)"
-    )]
+    #[error("preflight check expression {expr:?} must return a bool, got {got}")]
     PreflightExprType {
         /// The offending CEL expression.
         expr: String,
@@ -492,8 +477,8 @@ pub enum ValidationError {
     /// source repository's backend (ADR-0005 §13(d)) — replicating a repository to
     /// itself is a no-op (or worse, a loop). The webhook rejects it.
     #[error(
-        "RepositoryReplication destination must differ from the source repository's backend \
-         (both resolved to the same {backend} target); pick a distinct destination backend"
+        "RepositoryReplication destination is the same {backend} target as the source \
+         repository. Fix: pick a different destination backend"
     )]
     ReplicationDestinationSameAsSource {
         /// The backend kind that both source and destination resolved to.
@@ -506,10 +491,9 @@ pub enum ValidationError {
     /// Job-create time. Different volumes make them pass the self-target check;
     /// the mount topology is the problem.
     #[error(
-        "the source and destination filesystem repositories both mount at {path:?} inside the \
-         replication mover pod; two volumes cannot share one mountPath. Give one of them a \
-         distinct backend.path (e.g. /repo-dst) — the path is where the volume mounts inside \
-         kopiur's pods, so changing it does not move any data"
+        "the source and destination filesystem repositories both mount at {path:?} in the \
+         replication mover pod. Fix: give one a different backend.path (e.g. /repo-dst); this \
+         only changes the mount point, not where the data lives"
     )]
     ReplicationMountPathCollision {
         /// The shared in-pod mount path.
@@ -523,9 +507,8 @@ pub enum ValidationError {
     /// case; the webhook additionally rejects two *different* refs that resolve
     /// to the same storage target (`backend_target_key`).
     #[error(
-        "SnapshotReplication sourceRef and destinationRef point at the same {kind} {name:?} — \
-         a replication cannot copy a repository's snapshots into itself. Point destinationRef \
-         at a different repository (typically the off-site one)"
+        "SnapshotReplication sourceRef and destinationRef both point at {kind} {name:?}. Fix: \
+         point destinationRef at a different repository (typically the off-site one)"
     )]
     SnapshotReplicationSelfTarget {
         /// The shared repository kind (`Repository` or `ClusterRepository`).
@@ -542,10 +525,8 @@ pub enum ValidationError {
     /// same-ref case; this is the webhook's resolved-backend backstop.
     #[error(
         "SnapshotReplication sourceRef ({source_ref}) and destinationRef ({destination_ref}) \
-         resolve to the same {backend} storage target — a replication cannot copy a \
-         repository's snapshots into its own storage (source and destination would be one \
-         repository). Point destinationRef at a repository backed by different storage \
-         (typically the off-site one)"
+         use the same {backend} storage. Fix: point destinationRef at a repository on different \
+         storage (typically the off-site one)"
     )]
     SnapshotReplicationSameStorage {
         /// The source reference, rendered as `Kind name` (with namespace when set).
@@ -565,10 +546,10 @@ pub enum ValidationError {
     /// identities the destination does NOT merely mirror. Rejected as a
     /// data-loss combination.
     #[error(
-        "spec.selection overlaps {} that the destination writes directly — pruning: mirrorSource \
-         deletes any copy whose (identity, startTime) vanished from the source, so a source-side \
-         deletion cascades into them (data loss). Fix: exclude them via \
-         spec.selection.identities.exclude, or drop pruning: mirrorSource",
+        "spec.selection overlaps {} that the destination writes directly — with pruning: \
+         mirrorSource, a deletion at the source would also delete the destination's own \
+         snapshots. Fix: exclude them via spec.selection.identities.exclude, or drop pruning: \
+         mirrorSource",
         describe_overlapping_identities(identities)
     )]
     SnapshotReplicationOverlapMirrorSource {
@@ -583,9 +564,9 @@ pub enum ValidationError {
     /// `exclude` list it would silently exclude everything — so the intent must
     /// be spelled out instead.
     #[error(
-        "identity matcher {field} sets none of username/hostname/sourcePath — an empty matcher \
-         constrains nothing (it would match every identity). Set at least one component \
-         (globs allowed, e.g. username: \"pg-*\"), or remove the matcher"
+        "identity matcher {field} sets none of username/hostname/sourcePath, so it matches \
+         every identity. Fix: set at least one (globs allowed, e.g. username: \"pg-*\"), or \
+         remove the matcher"
     )]
     EmptyIdentityMatcher {
         /// The offending matcher's field path (e.g.
@@ -598,10 +579,10 @@ pub enum ValidationError {
     /// next run — almost certainly a typo'd field name, so it is rejected
     /// rather than honored.
     #[error(
-        "spec.pruning.retention sets no keep* bucket (keepLatest/keepHourly/keepDaily/\
-         keepWeekly/keepMonthly/keepAnnual) — a retention that keeps nothing would prune \
-         every replicated snapshot on the next run. Set at least one keep* count, or use \
-         `pruning: {{ none: {{}} }}` (or omit pruning) to keep copies forever"
+        "spec.pruning.retention sets no keep* count, so every replicated snapshot would be \
+         pruned on the next run. Fix: set at least one of \
+         keepLatest/keepHourly/keepDaily/keepWeekly/keepMonthly/keepAnnual, or omit pruning to \
+         keep copies forever"
     )]
     RetentionKeepsNothing,
 
@@ -611,9 +592,8 @@ pub enum ValidationError {
     /// ambiguous whether the single ref is a ninth member or a leftover.
     /// Mirrors the spec-level CEL rule on `SnapshotPolicySpec`.
     #[error(
-        "exactly one of spec.repository and spec.repositories must be set (got {got}); \
-         set spec.repository to name the single target repository, or spec.repositories \
-         to list 1-8 targets for multi-repository fan-out"
+        "exactly one of spec.repository and spec.repositories must be set (got {got}). Fix: set \
+         spec.repository for one repository, or spec.repositories to list 1-8"
     )]
     PolicyRepositoryExactlyOne {
         /// Which invalid shape was found: `"neither"` or `"both"`.
@@ -626,9 +606,8 @@ pub enum ValidationError {
     /// two interleaved writers corrupting one snapshot history, exactly the
     /// hazard the identity-collision guard exists to prevent.
     #[error(
-        "spec.repositories[{first}] and spec.repositories[{second}] both name {key} — each \
-         listed repository must be distinct, or the two fan-out children would interleave \
-         writes into one kopia identity in that repository. Remove the duplicate entry"
+        "spec.repositories[{first}] and spec.repositories[{second}] both name {key}. Fix: \
+         remove the duplicate entry"
     )]
     PolicyRepositoriesDuplicate {
         /// The normalized repository key both entries resolve to
@@ -649,10 +628,9 @@ pub enum ValidationError {
     /// "the one repository" read, so any consumer still asking for one fails
     /// loudly here instead of silently picking repository #1.
     #[error(
-        "this operation reads a policy-level single repository, but the SnapshotPolicy \
-         uses spec.repositories (multi-repository fan-out) — select the repository \
-         explicitly (the per-child Snapshot spec.repository pin, or the operation's own \
-         repository selector) instead of relying on a single policy repository"
+        "this operation needs a single repository, but the SnapshotPolicy uses \
+         spec.repositories. Fix: select the repository explicitly (the Snapshot's \
+         spec.repository, or the operation's repository selector)"
     )]
     PolicySingleRepositoryRequired,
 
@@ -663,11 +641,10 @@ pub enum ValidationError {
     /// quiesce guarantee — and serializing the children would multiply the
     /// freeze window by N. Refused as an unsatisfiable consistency contract.
     #[error(
-        "spec.hooks cannot be combined with spec.repositories: the first fan-out child to \
-         finish would run the after-snapshot (thaw) hooks while the other children's movers \
-         are still reading, so the quiesce contract cannot be honored. Use a single-repo \
-         policy (spec.repository) with hooks, plus a SnapshotReplication to copy its \
-         snapshots into the second repository"
+        "spec.hooks cannot be combined with spec.repositories — the first copy to finish would \
+         run the after-snapshot hooks while the others are still reading. Fix: use \
+         spec.repository with hooks, plus a SnapshotReplication to copy snapshots to the second \
+         repository"
     )]
     PolicyHooksWithRepositories,
 
@@ -679,11 +656,9 @@ pub enum ValidationError {
     /// silently act on the wrong backend, and guessing is the one thing a
     /// backup operator must never do.
     #[error(
-        "Snapshot spec.repository pins {pin}, but SnapshotPolicy `{policy}` does not list \
-         that repository (current set: {valid}). Fix the pin to a listed member, restore the \
-         repository entry on the policy, or — for an existing Snapshot whose recipe was \
-         edited out from under it — delete it and let the schedule re-fire against the \
-         current recipe"
+        "Snapshot spec.repository is {pin}, but SnapshotPolicy `{policy}` does not list it \
+         (current: {valid}). Fix: use a listed repository or add it back to the policy; if the \
+         policy changed after this Snapshot was created, delete the Snapshot"
     )]
     SnapshotPinNotInPolicy {
         /// Normalized key of the pinned repository (`Kind[/namespace]/name`).
@@ -700,11 +675,9 @@ pub enum ValidationError {
     /// CREATE such a child) and as the controller-side backstop for stored
     /// rows; picking repository #1 silently is never an option.
     #[error(
-        "Snapshot has no spec.repository pin, but SnapshotPolicy `{policy}` lists multiple \
-         repositories (spec.repositories) — a multi-repo child must pin exactly one member \
-         at mint time. Let a SnapshotSchedule fire it, or use `kubectl kopiur snapshot now` \
-         — both stamp the repository (an already-created unpinned Snapshot must be deleted \
-         and re-minted)"
+        "Snapshot has no spec.repository, but SnapshotPolicy `{policy}` lists multiple \
+         repositories. Fix: create it with `kubectl kopiur snapshot now` or a SnapshotSchedule, \
+         which set it for you (delete and recreate an existing one)"
     )]
     MultiRepoSnapshotUnpinned {
         /// The referenced `SnapshotPolicy`'s name.
@@ -716,9 +689,9 @@ pub enum ValidationError {
     /// `status.resolved.repository` pin, nor a `spec.repository` pin, nor a
     /// `Repository`/`ClusterRepository` owner reference.
     #[error(
-        "cannot determine the repository for Snapshot `{snapshot}`: it has no policyRef and \
-         carries neither a status.resolved.repository pin, a spec.repository pin, nor a \
-         Repository/ClusterRepository owner reference"
+        "cannot tell which repository Snapshot `{snapshot}` belongs to: it has no policyRef, no \
+         spec.repository or status.resolved.repository, and no Repository/ClusterRepository \
+         owner reference"
     )]
     SnapshotRepositoryUnresolvable {
         /// The `Snapshot`'s name.
@@ -730,10 +703,9 @@ pub enum ValidationError {
     /// a typo, and honoring it would silently read a repository the recipe
     /// never wrote to.
     #[error(
-        "restore.spec.repository names {given}, which is not a repository of SnapshotPolicy \
-         `{policy}` — a fromPolicy restore must read one of the policy's own repositories \
-         (set restore.spec.repository to one of: {valid}), or use a snapshotRef/identity \
-         source to restore from elsewhere"
+        "restore spec.repository {given} is not a repository of SnapshotPolicy `{policy}`. Fix: \
+         set it to one of: {valid}, or use a snapshotRef/identity source to restore from \
+         elsewhere"
     )]
     RestoreRepositoryNotInPolicy {
         /// Normalized key of the repository the restore named.
@@ -748,9 +720,8 @@ pub enum ValidationError {
     /// without selecting which repository to read — the operator must never
     /// guess (the N repositories are independent captures that can diverge).
     #[error(
-        "SnapshotPolicy `{policy}` lists multiple repositories (spec.repositories), so a \
-         fromPolicy restore must say which one to read: set restore.spec.repository to one \
-         of: {valid}"
+        "SnapshotPolicy `{policy}` lists multiple repositories. Fix: set restore \
+         spec.repository to one of: {valid}"
     )]
     RestoreRepositorySelectionRequired {
         /// The referenced `SnapshotPolicy`'s name.
@@ -764,8 +735,8 @@ pub enum ValidationError {
     /// `Repository`'s managed `Maintenance` always lives in the repository's own
     /// namespace). ADR §3.7.
     #[error(
-        "spec.maintenance.namespace ({namespace:?}) is only valid on a ClusterRepository; \
-         a namespaced Repository's managed Maintenance always lives in the repository's namespace"
+        "spec.maintenance.namespace ({namespace:?}) only applies to a ClusterRepository; a \
+         Repository's Maintenance always lives in its own namespace. Fix: remove it"
     )]
     MaintenanceNamespaceOnNamespacedRepo {
         /// The `spec.maintenance.namespace` value set on the namespaced `Repository`.
@@ -780,9 +751,8 @@ pub enum ValidationError {
     /// or `ClusterRepository`) whose `identityDefaults.cluster` is unset —
     /// kind-neutral wording, since the rule is identical either way.
     #[error(
-        "catalog.foreignSnapshots is set, but classifying a snapshot as \"foreign\" requires a \
-         cluster identity (`identityDefaults.cluster`); without one there is nothing to compare \
-         it against. Fix: set identityDefaults.cluster, or remove catalog.foreignSnapshots"
+        "catalog.foreignSnapshots needs identityDefaults.cluster to tell which snapshots are \
+         foreign. Fix: set identityDefaults.cluster, or remove catalog.foreignSnapshots"
     )]
     ForeignSnapshotsRequiresCluster,
 
@@ -793,11 +763,10 @@ pub enum ValidationError {
     /// never silently switch it off by defaulting to `Ignore` — the choice is
     /// forced explicit instead.
     #[error(
-        "catalog.foreignSnapshots must be set explicitly — identityDefaults.cluster and \
-         catalog.fallbackNamespace are both set, so adopting a cluster identity must not silently \
-         change the fallback collector: set `Ignore` (stop materializing foreign snapshots; \
-         existing fallbackNamespace rows age out under catalog.retain) or `Fallback` (keep \
-         collecting them there)"
+        "catalog.foreignSnapshots must be set because identityDefaults.cluster and \
+         catalog.fallbackNamespace are both set. Fix: set `Ignore` (stop collecting foreign \
+         snapshots; existing ones age out under catalog.retain) or `Fallback` (keep collecting \
+         them in fallbackNamespace)"
     )]
     ForeignSnapshotsChoiceRequired,
 
@@ -806,11 +775,9 @@ pub enum ValidationError {
     /// a bare path is the one backend the CONTROLLER connects to in-process,
     /// and the Job would have nothing mounted at it (issue #380).
     #[error(
-        "spec.seed needs a repository the seeding mover Job can reach, but backend.filesystem has \
-         no `volume` — a bare path {path:?} is connected in-process by the controller and nothing \
-         would be mounted at it inside the Job, so the seed would fail as a confusing \
-         \"repository not found\". Fix: back the filesystem repository with \
-         backend.filesystem.volume (a PVC or an NFS export), or use an object-store backend"
+        "spec.seed needs a backend the seeding Job can mount, but backend.filesystem is a bare \
+         path {path:?} with no `volume`. Fix: set backend.filesystem.volume (a PVC or NFS \
+         export), or use an object-store backend"
     )]
     SeedRequiresMountableRepository {
         /// The bare in-pod path the repository declares.
@@ -821,10 +788,9 @@ pub enum ValidationError {
     /// Same mover-topology problem as [`Self::SeedRequiresMountableRepository`],
     /// one field over: nothing would be mounted at the source path either.
     #[error(
-        "spec.seed.from.backend is a filesystem backend with no `volume` ({path:?}) — the seeding \
-         mover Job mounts a volume per backend, so nothing would exist at that path and the seed \
-         would fail as a confusing \"repository not found\". Fix: give the seed source a `volume` \
-         (the PVC or NFS export holding the mirror), or point it at an object-store backend"
+        "spec.seed.from.backend is a filesystem backend with no `volume` ({path:?}), so the \
+         seeding Job cannot mount it. Fix: give it a `volume` (the PVC or NFS export holding \
+         the mirror), or use an object-store backend"
     )]
     SeedSourceRequiresMountableBackend {
         /// The bare in-pod path the seed source declares.
@@ -834,10 +800,8 @@ pub enum ValidationError {
     /// `spec.seed` on a `mode: ReadOnly` repository. Seeding is the largest
     /// write a repository ever takes, so the two are contradictory.
     #[error(
-        "spec.seed writes this repository's initial contents, but spec.mode is ReadOnly — a \
-         read-only repository refuses every write, so the seed could never complete and the \
-         repository would never become Ready. Fix: seed with mode: ReadWrite and switch to \
-         ReadOnly once status.seed is stamped, or remove spec.seed"
+        "spec.seed cannot write to a repository with spec.mode: ReadOnly. Fix: seed with mode: \
+         ReadWrite and switch to ReadOnly once status.seed is set, or remove spec.seed"
     )]
     SeedOnReadOnlyRepository,
 
@@ -846,11 +810,9 @@ pub enum ValidationError {
     /// copies the mirror's repository-format blob verbatim, so the declared
     /// algorithms are never applied — kopiur does not accept inert fields.
     #[error(
-        "spec.create sets {} alongside a blob-mode spec.seed (from.backend): the seed copies the \
-         mirror's repository format verbatim, so these create-time algorithms are never applied \
-         and the seeded repository keeps the SOURCE's format. Fix: remove them (they are inert \
-         here), or seed in migrate mode (spec.seed.from.repository), which creates a local \
-         repository with the format you declare",
+        "spec.create sets {}, but a blob-mode seed (from.backend) copies the mirror's format \
+         as-is, so they are ignored. Fix: remove them, or seed with spec.seed.from.repository, \
+         which uses the format you declare",
         fields.join(", ")
     )]
     SeedCreateOptionsInert {
@@ -864,9 +826,8 @@ pub enum ValidationError {
     /// `seed.credentialProjection.enabled` with `from.backend`). Honoring it
     /// silently would make it an inert field.
     #[error(
-        "spec.seed.{field} is only honored when spec.seed.from sets `{expected_source}`, but this \
-         seed reads from `{actual_source}` — the block would be silently ignored, and kopiur does \
-         not accept inert fields. Fix: remove spec.seed.{field}, or point spec.seed.from at a \
+        "spec.seed.{field} only applies when spec.seed.from sets `{expected_source}`, but this \
+         seed uses `{actual_source}`. Fix: remove spec.seed.{field}, or use a \
          `{expected_source}` source"
     )]
     SeedTuningNotApplicable {
@@ -882,10 +843,9 @@ pub enum ValidationError {
     /// repository's own `spec.backend` (same `backend_target_key`) — the seed
     /// would read and write one location.
     #[error(
-        "spec.seed.from.backend resolves to the same {backend} storage target as this \
-         repository's own spec.backend — a repository cannot be seeded from itself (the seed \
-         would read and write one location). Fix: point spec.seed.from.backend at the surviving \
-         off-site mirror's storage"
+        "spec.seed.from.backend is the same {backend} storage as this repository's \
+         spec.backend; a repository cannot be seeded from itself. Fix: point \
+         spec.seed.from.backend at the off-site mirror's storage"
     )]
     SeedSourceSameAsRepository {
         /// The backend kind both sides resolved to.
@@ -897,9 +857,8 @@ pub enum ValidationError {
     /// at a single `mountPath` — an invalid pod spec.
     #[error(
         "this repository's filesystem backend and spec.seed.from.backend both mount at {path:?} \
-         inside the seeding mover pod; two volumes cannot share one mountPath. Fix: give the seed \
-         source a distinct backend.path (e.g. /seed-source) — the path is where the volume mounts \
-         inside kopiur's pods, so changing it does not move any data"
+         in the seeding pod. Fix: give the seed source a different backend.path (e.g. \
+         /seed-source); this only changes the mount point, not where the data lives"
     )]
     SeedMountPathCollision {
         /// The shared in-pod mount path.
@@ -908,9 +867,9 @@ pub enum ValidationError {
 
     /// `spec.seed.from.repository` points at the repository being defined.
     #[error(
-        "spec.seed.from.repository points at this same {kind} {name:?} — a repository cannot be \
+        "spec.seed.from.repository points at this same {kind} {name:?}; a repository cannot be \
          seeded from itself. Fix: point it at the surviving replica (typically the off-site \
-         ClusterRepository or a Repository in another namespace)"
+         one)"
     )]
     SeedSourceSelfReference {
         /// The repository kind both sides name.
@@ -925,11 +884,10 @@ pub enum ValidationError {
     /// unless `encryption.passwordSecretRef.namespace` pins another — which the
     /// spec cannot name here, so a pinned namespace is a dead reference.
     #[error(
-        "spec.seed.from.backend auth.secretRef {secret:?} pins namespace {namespace:?}, but a \
-         ClusterRepository's seeding mover reads it in the operator's own namespace (unless \
-         encryption.passwordSecretRef.namespace pins another) — a namespace pinned here is a dead \
-         reference the Job hangs on (CreateContainerConfigError). Fix: omit `namespace` and put \
-         the Secret alongside encryption.passwordSecretRef"
+        "spec.seed.from.backend auth.secretRef {secret:?} sets namespace {namespace:?}, but a \
+         ClusterRepository's seeding Job reads Secrets from the operator's namespace (or \
+         encryption.passwordSecretRef.namespace). Fix: omit `namespace` and put the Secret next \
+         to encryption.passwordSecretRef"
     )]
     SeedSourceSecretNamespaceForbidden {
         /// The referenced Secret name.
@@ -942,10 +900,9 @@ pub enum ValidationError {
     /// pinned to some OTHER namespace. The seeding Job runs in the repository's
     /// namespace and loads the Secret via `envFrom`, which is namespace-local.
     #[error(
-        "spec.seed.from.backend auth.secretRef {secret:?} is pinned to namespace {namespace:?}, \
-         but the seeding mover Job runs in {repository_namespace:?} and loads it via envFrom, \
-         which is namespace-local — the Job could never read it. Fix: put the Secret in \
-         {repository_namespace:?} (omit `namespace`, or set it to {repository_namespace:?})"
+        "spec.seed.from.backend auth.secretRef {secret:?} is in namespace {namespace:?}, but \
+         the seeding Job runs in {repository_namespace:?} and can only read Secrets there. Fix: \
+         put the Secret in {repository_namespace:?}"
     )]
     SeedSourceSecretNamespaceMismatch {
         /// The referenced Secret name.

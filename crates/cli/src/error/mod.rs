@@ -14,11 +14,8 @@
 pub enum CliError {
     /// The kubeconfig could not be loaded or the requested context resolved.
     #[error(
-        "could not load a Kubernetes client configuration: {source}. \
-         kubectl-kopiur reads the same configuration kubectl does \
-         ($KUBECONFIG, ~/.kube/config, or in-cluster). \
-         Fix: check --kubeconfig/--context, or verify your setup with \
-         `kubectl config current-context`"
+        "could not load the Kubernetes config: {source}. \
+         Fix: check --kubeconfig/--context, or run `kubectl config current-context`"
     )]
     KubeConfig {
         /// The underlying kube config/client construction error.
@@ -28,9 +25,8 @@ pub enum CliError {
 
     /// A log stream broke mid-flight (network blip, apiserver restart).
     #[error(
-        "the log stream was interrupted: {source}. \
-         The connection to the API server dropped mid-stream; the run itself is unaffected. \
-         Fix: re-run the same `kubectl kopiur logs` command to resume following"
+        "the log stream was interrupted: {source}. The run itself is unaffected. \
+         Fix: re-run the same `kubectl kopiur logs` command"
     )]
     LogStreamInterrupted {
         /// The underlying stream error.
@@ -46,13 +42,10 @@ pub enum CliError {
     /// Notably `target.streamExec` is manifest-only — there is no flag for it —
     /// so the message names it rather than leaving a user guessing.
     #[error(
-        "no single restore target was resolved from the flags ({given}). \
-         `kubectl kopiur restore` supports --to-pvc (existing PVC), --create-pvc \
-         (operator-created PVC) and --populator (passive volume populator). \
-         A `target.streamExec` restore — piping one virtual file into a command in \
-         a running Pod — is not available from the CLI yet. \
-         Fix: pass exactly one of those three flags, or apply a `Restore` manifest \
-         with the target you want (see docs/stream-sources.md for streamExec)"
+        "no single restore target in the flags ({given}). \
+         Fix: pass exactly one of --to-pvc, --create-pvc or --populator. \
+         For a `target.streamExec` restore, apply a `Restore` manifest \
+         (see docs/stream-sources.md)"
     )]
     UnresolvedRestoreTarget {
         /// Which target flags were seen, for the message.
@@ -70,8 +63,8 @@ pub enum CliError {
 
     /// `-A` was passed to a command that targets exactly one object.
     #[error(
-        "{command} targets a single object in one namespace, so -A/--all-namespaces \
-         does not apply. Fix: drop -A and pass -n <namespace> instead"
+        "{command} targets a single object, so -A does not apply. \
+         Fix: drop -A and pass -n <namespace>"
     )]
     AllNamespacesNotApplicable {
         /// The command that rejected `-A`.
@@ -81,10 +74,9 @@ pub enum CliError {
     // --- the `--local` browse transport (CLI-only: it needs `get secrets`) ---
     /// `--local` was passed but no kopia binary is available.
     #[error(
-        "--local needs a kopia binary on this machine, but {bin:?} was not found. \
-         Fix: install kopia (https://kopia.io/docs/installation/) or pass \
-         --kopia-bin PATH — or drop --local to use the in-cluster session, \
-         which needs no local kopia"
+        "--local needs kopia on this machine, but {bin:?} was not found. \
+         Fix: install kopia (https://kopia.io/docs/installation/), pass --kopia-bin PATH, \
+         or drop --local"
     )]
     LocalKopiaMissing {
         /// The binary that was looked for.
@@ -94,10 +86,8 @@ pub enum CliError {
     /// A `--local` kopia invocation failed.
     #[error(
         "--local kopia operation failed ({what}): {source}. \
-         --local talks to the backend FROM THIS MACHINE with the repository's \
-         credentials. Fix: verify the endpoint is reachable from here (in-cluster-only \
-         endpoints need a port-forward) and the credentials Secret is valid — or drop \
-         --local to read through the in-cluster session"
+         Fix: check the backend is reachable from this machine and the credentials \
+         are valid, or drop --local"
     )]
     LocalKopia {
         /// Which operation failed.
@@ -109,10 +99,8 @@ pub enum CliError {
 
     /// `--local` cannot mount a cluster-volume filesystem repository.
     #[error(
-        "--local cannot read repository {repository:?}: its filesystem backend lives \
-         on a cluster volume (PVC/inline NFS) this machine cannot mount. \
-         Fix: drop --local and use the in-cluster session, which mounts the \
-         repository volume read-only"
+        "--local cannot read repository {repository:?}: it is on a cluster volume \
+         (PVC/NFS). Fix: drop --local to use the in-cluster session"
     )]
     LocalRepoVolume {
         /// The repository name.
@@ -121,10 +109,9 @@ pub enum CliError {
 
     /// `--local` cannot authenticate a workload-identity repository.
     #[error(
-        "--local cannot read repository {repository:?}: its backend authenticates via workload \
-         identity (ServiceAccount {service_account:?}), whose federated credentials exist only \
-         inside a pod running as that ServiceAccount — there is no Secret to copy here. Fix: \
-         drop --local and use the in-cluster session, which runs as the federated ServiceAccount"
+        "--local cannot read repository {repository:?}: it uses workload identity \
+         (ServiceAccount {service_account:?}), which only works inside the cluster. \
+         Fix: drop --local to use the in-cluster session"
     )]
     LocalWorkloadIdentity {
         /// The repository name.
@@ -136,9 +123,7 @@ pub enum CliError {
     /// Reading the credential Secret for `--local` was refused.
     #[error(
         "forbidden: cannot get Secret {secret:?} in namespace {namespace}: {source}. \
-         --local copies the repository credentials onto this machine, which needs \
-         `get` on `secrets` — RBAC the in-cluster session path deliberately does NOT \
-         need. Fix: ask a cluster admin for `get secrets` in {namespace}, or drop --local"
+         --local needs `get` on `secrets`. Fix: ask an admin for that access, or drop --local"
     )]
     SecretsForbidden {
         /// The Secret name.
@@ -153,9 +138,8 @@ pub enum CliError {
     /// A download wrote fewer/more bytes than the snapshot manifest records.
     #[error(
         "download of {path:?} is incomplete: expected {expected} bytes, wrote {actual}. \
-         The partial file at {dest} was removed so a truncated restore can't be \
-         mistaken for the real one. Fix: retry; if it persists, verify the snapshot \
-         (kopiur's verification, or `kopia snapshot verify`)"
+         The partial file at {dest} was removed. Fix: retry; if it keeps failing, \
+         run `kopia snapshot verify`"
     )]
     DownloadIncomplete {
         /// The snapshot path downloaded.
@@ -171,7 +155,7 @@ pub enum CliError {
     /// A local filesystem operation (download dest, --local staging dir) failed.
     #[error(
         "local file operation failed ({what}): {source}. \
-         Fix: check the path exists, is writable, and has free space, then retry"
+         Fix: check the path exists, is writable, and has free space"
     )]
     LocalIo {
         /// What was being done.

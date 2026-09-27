@@ -41,7 +41,7 @@ export function deletionConsequence(policy: string | null | undefined): Deletion
     return {
       policy: "not set",
       destructive: false,
-      text: "This snapshot sets no deletionPolicy, and the CRD defines no default for it — the operator decides at deletion time, treating a backup it produced as Delete and one it discovered as Retain. So whether the kopia snapshot survives this cannot be read off the resource: check status.origin, or delete a snapshot whose policy is set.",
+      text: "This snapshot sets no deletionPolicy, so the operator decides at deletion time: a produced backup is deleted, a discovered one is kept. Check status.origin before confirming.",
     };
   }
   switch (policy) {
@@ -49,25 +49,25 @@ export function deletionConsequence(policy: string | null | undefined): Deletion
       return {
         policy,
         destructive: true,
-        text: "The finalizer runs kopia snapshot delete on the manifest and only then lets the resource go. The backup itself is destroyed, and nothing here can bring it back.",
+        text: "The finalizer runs kopia snapshot delete, then removes the resource. The backup is destroyed for good.",
       };
     case "Retain":
       return {
         policy,
         destructive: false,
-        text: "The resource is removed and the kopia snapshot stays in the repository. A later catalog scan rediscovers it as a discovered snapshot, so the data is not at risk here.",
+        text: "The resource is removed and the kopia snapshot stays in the repository. The data is not at risk.",
       };
     case "Orphan":
       return {
         policy,
         destructive: false,
-        text: "The resource is removed without contacting the repository at all. The kopia snapshot stays but kopiur stops tracking it — the escape hatch, for when the repository cannot be reached.",
+        text: "The resource is removed without contacting the repository. The kopia snapshot stays, but kopiur stops tracking it.",
       };
     default:
       return {
         policy,
         destructive: false,
-        text: `This snapshot's deletionPolicy is ${policy}, which this console does not recognise. It is the operator's own word, so what the deletion does to the kopia snapshot cannot be stated here — read the operator's documentation for that value before confirming.`,
+        text: `This console does not recognise deletionPolicy ${policy}, so it cannot say what happens to the kopia snapshot. Check the operator's documentation before confirming.`,
       };
   }
 }

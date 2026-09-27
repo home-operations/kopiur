@@ -572,8 +572,8 @@ pub async fn browse(ctx: &KubeCtx, args: &BrowseArgs) -> Result<CmdOutput, CliEr
             format!("session {} ended\n", s.job_name)
         }
         (Transport::Session(s), true) => format!(
-            "session {} kept warm (expires after its TTL; end it early with \
-             `kubectl kopiur session end {}`)\n",
+            "session {} kept warm until its TTL expires; end it with \
+             `kubectl kopiur session end {}`\n",
             s.job_name, target.snapshot
         ),
         (Transport::Local(_), _) => String::new(),
@@ -620,7 +620,7 @@ pub async fn session_end(ctx: &KubeCtx, args: &SessionEndArgs) -> Result<CmdOutp
             )))
         }
         None => Ok(CmdOutput::ok(format!(
-            "no browse session is open for {} {repo_name} in namespace {ns} — nothing to end\n",
+            "no browse session open for {} {repo_name} in namespace {ns}; nothing to end\n",
             match kind {
                 kopiur_api::common::RepositoryKind::Repository => "Repository",
                 kopiur_api::common::RepositoryKind::ClusterRepository => "ClusterRepository",

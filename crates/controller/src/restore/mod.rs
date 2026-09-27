@@ -451,10 +451,9 @@ async fn drive_direct_target(
                     // Window closed (or none configured): honor the closed enum exhaustively.
                     match on_missing {
                         OnMissingSnapshot::Fail => {
-                            let msg = "no snapshot matched the restore source within the \
-                                       waitTimeout window; fix spec.source (or create the \
-                                       missing snapshot) and create a NEW Restore — a Failed \
-                                       Restore is terminal and never retries";
+                            let msg = "no snapshot matched the restore source before waitTimeout \
+                                       expired. Fix: correct spec.source (or create the \
+                                       snapshot), then create a new Restore";
                             let conditions = io::upsert_condition(
                                 &existing_conditions(restore),
                                 "Resolved",
@@ -601,9 +600,8 @@ async fn report_restore_inherit_fallback(
     ctx: &Context,
 ) {
     let message = format!(
-        "{reason}. Proceeding with the recipe's explicit mover.securityContext, which pins the \
-         mover's identity itself — so the restored files will be owned as that context says, not \
-         as the workload named by inheritSecurityContextFrom."
+        "{reason}. Using the explicit mover.securityContext instead, so restored files are owned \
+         as that context says."
     );
     // Not the first conditions writer in this reconcile — the privileged-mover gate and the
     // "clear stale MoverPermitted" block run above. Building `existing` from the
@@ -734,23 +732,15 @@ fn recorded_inherit_verdict(
     // Exhaustive over the provenance so a new variant must state its honesty here.
     let provenance = match src {
         RecordedSrc::Inherited => {
-            "recorded provenance `inherited`: the identity was read from the live workload \
-             at backup time, so this restore reproduces the identity the workload actually \
-             ran as"
+            "provenance `inherited`: read from the live workload at backup time"
         }
         RecordedSrc::Explicit => {
-            "recorded provenance `explicit`: the backup recipe's explicit mover context \
-             pinned this identity — it reproduces the backup mover's identity, which was \
-             never workload-derived"
+            "provenance `explicit`: the backup mover's own context, never workload-derived"
         }
         RecordedSrc::Defaults => {
-            "recorded provenance `defaults`: the identity came from repository/hardened \
-             mover defaults at backup time, not from the workload"
+            "provenance `defaults`: mover defaults at backup time, not from the workload"
         }
-        RecordedSrc::Unknown => {
-            "recorded provenance is a value this operator version does not recognize \
-             (written by a newer kopiur) — whether it tracked the workload is unknown"
-        }
+        RecordedSrc::Unknown => "provenance is a value this kopiur version does not recognize",
     };
 
     let contributes =
@@ -760,21 +750,16 @@ fn recorded_inherit_verdict(
             ok: false,
             reason: RECORDED_PINNED_NO_UID_REASON,
             message: format!(
-                "Snapshot `{snapshot}` recorded no pinned uid (and no gid/fsGroup beyond the \
-                 mover's defaults), so inheriting it contributed nothing: the mover runs as its \
-                 image's uid {MOVER_NONROOT_ID}, which did NOT come from the backup \
-                 ({provenance}). Fix: pin mover.securityContext.runAsUser on this Restore if the \
-                 restored files must be owned by a specific uid."
+                "Snapshot `{snapshot}` recorded no uid, gid or fsGroup, so the mover runs as its \
+                 default uid {MOVER_NONROOT_ID} ({provenance}). Fix: set \
+                 mover.securityContext.runAsUser if the files need a specific owner."
             ),
         };
     }
 
     let identity = match uid {
         Some(u) => format!("uid {u}"),
-        None => format!(
-            "its image's uid {MOVER_NONROOT_ID} (the record pins no uid), with the \
-             recorded group identity applied"
-        ),
+        None => format!("default uid {MOVER_NONROOT_ID} with the recorded groups"),
     };
     let detail = [
         gid.map(|g| format!("gid {g}")),
@@ -794,10 +779,9 @@ fn recorded_inherit_verdict(
     // auditable per-restore, naming both the elevation and where it came from.
     let root_note = if uid == Some(0) {
         format!(
-            " The mover runs as ROOT (uid 0): Snapshot `{snapshot}` recorded uid 0, and \
-             recorded metadata is repository data forgeable by anyone with repository write \
-             access — verify this snapshot is trusted; the run is also gated on the namespace's \
-             privileged-movers opt-in."
+            " The mover runs as root (uid 0) because Snapshot `{snapshot}` recorded uid 0. \
+             Anyone with repository write access can forge this, so check the snapshot is \
+             trusted. The namespace must also allow privileged movers."
         )
     } else {
         String::new()
@@ -806,8 +790,8 @@ fn recorded_inherit_verdict(
         ok: true,
         reason: RECORDED_APPLIED_REASON,
         message: format!(
-            "the mover inherited the identity recorded on Snapshot `{snapshot}` and runs \
-             as {identity}{detail}; {provenance}.{root_note}"
+            "the mover runs as {identity}{detail}, as recorded on Snapshot `{snapshot}` \
+             ({provenance}).{root_note}"
         ),
     }
 }
@@ -1165,9 +1149,8 @@ async fn reap_claim_artifacts(
         tracing::info!(
             %namespace, claim = %claim_name, reason = reason.unwrap_or("<none>"),
             prime = %prime_pvc_name(uid),
-            "populator: keeping this claim's prime PVC — its recorded reason forbids automatic \
-             reaping (a hijacked populate's prime holds half-written data; an absent or \
-             unrecognized reason is never reaped on a guess); delete it by hand when done"
+            "populator: keeping this claim's prime PVC (it may hold partial data); delete it by \
+             hand when done"
         );
         return Ok(());
     }
@@ -1636,9 +1619,8 @@ async fn drive_one_claim(
                     phase: Some(RestoreClaimPhase::Pending),
                     reason: Some(ClaimReason::ClaimRecreated.as_str().to_string()),
                     message: Some(format!(
-                        "populator: claiming PVC `{claim}` was re-created (a new uid), so this \
-                         claim re-arms: the previous claim's prime PVC, mover Job and volume were \
-                         reaped and the source is resolved again."
+                        "populator: claiming PVC `{claim}` was re-created; deleted the old prime \
+                         PVC, Job and volume and restarting this claim."
                     )),
                     ..Default::default()
                 },
@@ -2021,9 +2003,8 @@ async fn claim_populate(
             RestoreClaimPhase::Pending,
             ClaimReason::AwaitingPodSchedule,
             format!(
-                "populator: waiting for a pod to schedule claiming PVC `{}` \
-                 (its StorageClass binds WaitForFirstConsumer, so there is no node to \
-                 provision the prime volume on yet)",
+                "populator: waiting for a pod that uses claiming PVC `{}` to be scheduled \
+                 (its StorageClass is WaitForFirstConsumer)",
                 cc.consumer_name
             ),
         );
@@ -2088,9 +2069,8 @@ async fn claim_populate(
             }
             MoverOutcome::Failed => {
                 let message = format!(
-                    "the populator restore mover Job `{}` failed; see the Job/pod logs, fix \
-                     the cause and re-create the claiming PVC `{}` to re-arm this claim \
-                     (other claims continue)",
+                    "populator mover Job `{}` failed. Fix: check the Job's pod logs, then \
+                     re-create claiming PVC `{}` to retry",
                     cc.job_name, cc.consumer_name
                 );
                 // Wave 2, finding 3c: the in-Job `onMissingSnapshot: Fail` is
@@ -2341,9 +2321,9 @@ fn no_snapshot_for_claim(
                 RestoreClaimPhase::Failed,
                 ClaimReason::SnapshotNotFound,
                 format!(
-                    "no snapshot matched the restore source for claiming PVC `{}` within the \
-                     waitTimeout window; fix spec.source (or create the missing snapshot) and \
-                     re-create that PVC to re-arm this claim — other claims continue",
+                    "no snapshot matched the restore source for claiming PVC `{}` before \
+                     waitTimeout expired. Fix: correct spec.source (or create the snapshot), \
+                     then re-create that PVC",
                     cc.consumer_name
                 ),
             ),
@@ -2681,7 +2661,7 @@ fn restore_success_status(
             restore,
             RestorePhase::Completed,
             crate::consts::RESTORE_POPULATED_REASON,
-            "the restore mover completed; the snapshot data was written into the target",
+            "the restore mover wrote the snapshot data into the target",
         ),
         // Outcome unknown (the mover's best-effort status PATCHes were both lost):
         // report completion truthfully without claiming data was written.
@@ -2833,9 +2813,8 @@ async fn drive_direct_restore(
                         &live,
                         RestorePhase::Failed,
                         MOVER_JOB_FAILED_REASON,
-                        "the restore mover Job failed; see the Job/pod logs for the \
-                         cause, fix it, and create a NEW Restore — a Failed Restore \
-                         is terminal and never retries",
+                        "the restore mover Job failed. Fix: check the Job's pod logs, \
+                         then create a new Restore",
                     ),
                 )
                 .await?;
@@ -2995,10 +2974,8 @@ async fn steady_terminal_restore(
                 &live,
                 phase.clone(),
                 MOVER_JOB_FAILED_REASON,
-                "the restore mover reported a terminal failure; see \
-                 status.failure / status.logTail for the cause, fix it, and \
-                 create a NEW Restore — a Failed Restore is terminal and \
-                 never retries",
+                "the restore mover failed. Fix: check status.failure and \
+                 status.logTail, then create a new Restore",
             )
         };
         io::patch_status(api, name, status).await?;
@@ -3059,9 +3036,8 @@ async fn observe_restore_mover(
 /// gate/deadline machinery here.
 pub(super) fn restore_target_pvc_race_error(pvc_ns: &str, pvc_name: &str) -> Error {
     Error::MissingDependency(format!(
-        "restore target PVC `{pvc_ns}/{pvc_name}` was not found while resolving mover \
-         co-location; it was just ensured (or may still be provisioning), so this is treated \
-         as a race and retried automatically"
+        "restore target PVC `{pvc_ns}/{pvc_name}` not found yet (likely still \
+         provisioning); retrying"
     ))
 }
 
@@ -4067,10 +4043,9 @@ async fn snapshot_recorded_source(
             let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), ns);
             let snap = api.get_opt(&r.name).await?.ok_or_else(|| {
                 Error::MissingDependency(format!(
-                    "snapshotRef Snapshot `{ns}/{}` not found — if this cluster was \
-                     re-bootstrapped, the catalog scan materializes discovered/adopted \
-                     rows; the Restore holds until it appears. (Or use source.fromPolicy/\
-                     identity, which search the catalog by identity instead of by name.)",
+                    "snapshotRef Snapshot `{ns}/{}` not found; waiting for it (a catalog \
+                     scan may still be creating it). Or use source.fromPolicy or \
+                     source.identity to find it by identity.",
                     r.name
                 ))
             })?;
@@ -4179,11 +4154,8 @@ async fn search_recorded_source(
         .map(|t| t.with_timezone(&chrono::Utc));
     select_recorded_source(triple, cutoff, offset, snapshot_id, &rows).ok_or_else(|| {
         Error::MissingDependency(format!(
-            "no Snapshot CR carrying recorded identity (`status.recorded`) matches \
-             `{}@{}:{}`{} in namespace `{ns}` yet — the catalog scan may still be running \
-             (it materializes discovered rows and backfills recorded metadata when the \
-             kopia snapshot carries the `kopiur-meta` tag); the Restore holds until one \
-             appears",
+            "no Snapshot with `status.recorded` matches `{}@{}:{}`{} in namespace \
+             `{ns}` yet; waiting (a catalog scan may still be running)",
             triple.username,
             triple.hostname,
             triple.source_path.as_deref().unwrap_or("*"),
@@ -4356,8 +4328,8 @@ async fn assess_restore_security_context(
         RESTORE_SECURITY_CONTEXT_COMPATIBLE_CONDITION,
         true,
         SECURITY_CONTEXT_COMPATIBLE_REASON,
-        "the future workload consuming the target PVC can read what the mover writes (matching \
-         UID, or a shared fsGroup on the fresh volume)",
+        "the workload using the target PVC can read what the mover writes (same UID or a \
+         shared fsGroup)",
         restore.metadata.generation,
     );
     let current = serde_json::to_value(&live.status).ok();
@@ -4390,9 +4362,8 @@ async fn ensure_restore_target_pvc(
     }
     let capacity = template.capacity.as_deref().ok_or_else(|| {
         Error::Validation(format!(
-            "restore target.pvc {:?} has no capacity; set target.pvc.capacity (e.g. 10Gi, at \
-             least the size of the data being restored) — the operator will not guess a size \
-             for a PVC it creates",
+            "restore target.pvc {:?} has no capacity. Fix: set target.pvc.capacity (e.g. \
+             10Gi, at least the size of the restored data)",
             template.name
         ))
     })?;
@@ -4506,16 +4477,9 @@ fn stream_restore_needs_a_stream_policy_message(
     index: usize,
 ) -> String {
     format!(
-        "this Restore's target is `streamExec`, which reads ONE virtual file out of a snapshot \
-         and pipes it into a command's stdin — but `source.fromPolicy` names SnapshotPolicy \
-         `{}`, whose governing source #{index} is not a `stream` source, so it recorded a volume \
-         tree rather than a file and there is no single kopia source path to read. Resolving one \
-         anyway would match the newest snapshot of whatever that policy backed up (for a \
-         `pvcSelector` policy sharing one `sourcePathOverride`, an arbitrary member volume) and \
-         feed it to the command, so kopiur fails closed. Fix: point `source.fromPolicy` at a \
-         SnapshotPolicy whose source is `stream`, use `source.snapshotRef` to name the snapshot \
-         directly, or set `source.fromPolicy.sourcePath` to the exact kopia source path the file \
-         lives under.",
+        "`streamExec` restores a single file, but SnapshotPolicy `{}` source #{index} is not a \
+         `stream` source. Fix: point `source.fromPolicy` at a policy with a `stream` source, name \
+         the snapshot with `source.snapshotRef`, or set `source.fromPolicy.sourcePath`.",
         config.name_any(),
     )
 }
@@ -4834,9 +4798,8 @@ async fn resolve_restore_repository(
             .ok_or_else(|| Error::MissingDependency(format!("Snapshot {snap_ns}/{}", sref.name)))?;
         let rref = repository_ref_from_snapshot(&snap).ok_or_else(|| {
             Error::Validation(format!(
-                "cannot derive the repository from Snapshot {snap_ns}/{}: it has neither a \
-                 pinned status.resolved.repository nor a Repository/ClusterRepository owner; \
-                 set restore.spec.repository explicitly",
+                "cannot find the repository for Snapshot {snap_ns}/{}. Fix: set \
+                 spec.repository on the Restore",
                 sref.name
             ))
         })?;
@@ -4845,9 +4808,7 @@ async fn resolve_restore_repository(
         return io::resolve_repository_ref_cached(ctx, &rref, snap_ns).await;
     }
     Err(Error::Validation(
-        "restore with source.identity requires spec.repository (snapshotRef and fromPolicy \
-         sources derive it; a raw identity has nothing to derive from)"
-            .into(),
+        "a restore with source.identity needs spec.repository set".into(),
     ))
 }
 

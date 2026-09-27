@@ -30,8 +30,7 @@ function RootLayout() {
 function NotFound() {
   return (
     <EmptyState title="No such page" icon={Compass}>
-      Nothing is served at this address. The sections in the rail are every view kopiur-ui has; a
-      deep link into a snapshot, policy or restore carries its namespace and name in the path.
+      Nothing is served at this address. Pick a section from the rail.
     </EmptyState>
   );
 }

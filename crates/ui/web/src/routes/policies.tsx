@@ -35,11 +35,9 @@ function Policies() {
   return (
     <div className="page">
       <p className="page__prose">
-        A <span className="mono">SnapshotPolicy</span> is the recipe: which sources to back up,
-        which repositories to write them into, how long to keep them and how often to verify them.
-        It does not run on its own — a <span className="mono">SnapshotSchedule</span> fires it on a
-        cron, and &ldquo;snapshot now&rdquo; on a policy&apos;s own page runs it once. Open a policy
-        to see its retention, the schedules that fire it, and what it has produced.
+        A <span className="mono">SnapshotPolicy</span> says what to back up, where, and how long to
+        keep it. A <span className="mono">SnapshotSchedule</span> runs it on a cron, or use
+        &ldquo;snapshot now&rdquo; on the policy&apos;s page.
       </p>
 
       <section className="page__section" aria-label="Policies">
@@ -54,8 +52,7 @@ function Policies() {
         ) : policies.data.length === 0 ? (
           <EmptyState title={`No policies in ${scope}`} icon={ScrollText}>
             A SnapshotPolicy names the sources to back up and the repository to write them into.
-            Create one and it appears here; a SnapshotSchedule then fires it on a cron, or you can
-            run it once from its own page.
+            Create one and it appears here.
           </EmptyState>
         ) : (
           <PolicyTable policies={policies.data} />

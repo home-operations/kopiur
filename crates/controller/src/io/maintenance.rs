@@ -119,16 +119,15 @@ pub fn maintenance_condition(
             false,
             MAINTENANCE_NAMESPACE_UNRESOLVED_REASON,
             format!(
-                "managed Maintenance for {metric_kind} {name} cannot be placed: set \
-                 spec.maintenance.namespace, or the operator's KOPIUR_NAMESPACE, so the \
-                 namespaced Maintenance CR has a home"
+                "no namespace for the managed Maintenance of {metric_kind} {name}. Fix: set \
+                 spec.maintenance.namespace, or the operator's KOPIUR_NAMESPACE"
             ),
             true,
         ),
         MaintenanceCoverage::CoveredByForeign => (
             true,
             MAINTENANCE_CONFIGURED_REASON,
-            format!("an externally-authored Maintenance references {metric_kind} {name}"),
+            format!("a user-created Maintenance covers {metric_kind} {name}"),
             false,
         ),
         MaintenanceCoverage::CoveredByManaged => (
@@ -142,7 +141,7 @@ pub fn maintenance_condition(
             MAINTENANCE_DISABLED_REASON,
             format!(
                 "maintenance is disabled for {metric_kind} {name} (spec.maintenance.enabled: \
-                 false) and no Maintenance references it; kopia storage will not be reclaimed"
+                 false) and no Maintenance covers it; storage will not be reclaimed"
             ),
             false,
         ),
@@ -150,11 +149,10 @@ pub fn maintenance_condition(
             false,
             MAINTENANCE_APPLY_FAILED_REASON,
             format!(
-                "maintenance is ENABLED for {metric_kind} {name}, but the operator could not \
-                 apply its managed Maintenance in namespace {namespace} and nothing else covers \
-                 this repository; kopia storage will not be reclaimed until it succeeds. It \
-                 retries every reconcile. Fix: check the namespace exists and the operator has \
-                 RBAC to write Maintenance there; the apply error itself is in the operator log"
+                "maintenance is enabled for {metric_kind} {name}, but the operator could not \
+                 create its Maintenance in namespace {namespace} (retried every reconcile; error \
+                 in the operator log). Fix: check the namespace exists and the operator has RBAC \
+                 to write Maintenance there"
             ),
             true,
         ),
@@ -587,7 +585,7 @@ pub async fn ensure_maintenance<K>(
                         // Warning) on every hiccup. Only report the failure when nothing
                         // covers the repo — the state a user actually has to fix.
                         Err(e) if managed.is_some() => {
-                            tracing::warn!(error = %e, repo = %name, namespace = %ns, "failed to re-apply the managed Maintenance; the existing one still covers this repository");
+                            tracing::warn!(error = %e, repo = %name, namespace = %ns, "failed to re-apply the managed Maintenance; the existing one stays in place");
                             MaintenanceCoverage::CoveredByManaged
                         }
                         Err(e) => {

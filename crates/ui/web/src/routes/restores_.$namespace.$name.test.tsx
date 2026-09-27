@@ -70,7 +70,7 @@ describe("Restore detail", () => {
     expect(region).toHaveTextContent("media/nightly-1");
     expect(region).toHaveTextContent("k123");
     expect(region).toHaveTextContent("kopiur@media:/data");
-    expect(region).toHaveTextContent("never re-resolves");
+    expect(region).toHaveTextContent("Resolved once at creation");
   });
 
   it("explains that NoSnapshot is a successful restore of nothing", async () => {
@@ -121,7 +121,7 @@ describe("Restore detail", () => {
     expect(region).toHaveTextContent("RepositoryUnreachable");
     expect(region).toHaveTextContent("connection refused");
     expect(region).toHaveTextContent("The restore step");
-    expect(region).toHaveTextContent("retry likely to succeed");
+    expect(region).toHaveTextContent("retry is likely to succeed");
     expect(region).toHaveTextContent("mover exit code 1");
   });
 

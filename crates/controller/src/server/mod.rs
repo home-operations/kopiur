@@ -863,11 +863,9 @@ fn map_server_secret_error(
         && resp.code == 403
     {
         return Error::MissingDependency(format!(
-            "the operator is not permitted to write the kopia web-UI Secret `{secret}` in \
-             namespace `{namespace}` (HTTP 403). The kopia web-UI server (`spec.server`) needs \
-             `secrets` create/patch/delete RBAC. Fix: set `{flag}: true` in the Helm chart \
-             (grants the operator ClusterRole those verbs), or remove `spec.server` from the \
-             repository.",
+            "the operator may not write the kopia web-UI Secret `{secret}` in namespace \
+             `{namespace}` (HTTP 403). Fix: set `{flag}: true` in the Helm chart, or remove \
+             `spec.server` from the repository.",
             flag = crate::consts::KOPIA_UI_FLAG,
         ));
     }
@@ -951,8 +949,8 @@ async fn ensure_in(
                 if !modes.iter().any(|m| m == "ReadWriteMany") {
                     return Err(Error::Validation(format!(
                         "spec.server on a filesystem Repository requires PVC {namespace}/{} \
-                         to be ReadWriteMany (a long-lived server holding an RWO repo PVC would \
-                         block backup/restore movers); got accessModes {modes:?}",
+                         to be ReadWriteMany so movers can still mount it; got accessModes \
+                         {modes:?}",
                         pvc.name
                     )));
                 }
@@ -970,8 +968,7 @@ async fn ensure_in(
             None => {
                 return Err(Error::Validation(
                     "spec.server on a filesystem Repository requires backend.filesystem.volume \
-                     (a pvc or nfs export) — a node-local/baked-in path is not reachable by the \
-                     server pod"
+                     (a pvc or nfs export); a node-local path is not reachable by the server pod"
                         .into(),
                 ));
             }
@@ -1027,7 +1024,7 @@ async fn ensure_in(
                 secret = %stale,
                 namespace,
                 error = %e,
-                "failed to reap a stale kopia web-UI credential mirror; will retry next reconcile"
+                "could not delete a stale kopia web-UI credential copy; retrying next reconcile"
             );
         }
     }

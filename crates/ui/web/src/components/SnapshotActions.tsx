@@ -114,9 +114,8 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
               This creates a new <span className="mono">Snapshot</span> under SnapshotPolicy{" "}
               <span className="mono">
                 {row.namespace}/{policy}
-              </span>{" "}
-              and the operator runs it in a mover Job. It does not touch this snapshot. A
-              multi-repository policy fans out to every repository it names.
+              </span>
+              . It does not touch this snapshot.
             </p>
             <div className="action__switch">
               <label htmlFor="snapshot-now-pin">
@@ -131,11 +130,8 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
                 Pin the new snapshot
               </label>
               <p className="controls__hint" id="snapshot-now-pin-hint">
-                A pin is{" "}
-                <strong>permanent and exempts the snapshot from GFS pruning entirely</strong>:
-                retention will never remove it, however old it gets and whatever the policy&apos;s
-                rules say. Leave it cleared for an ordinary backup; set it for one you intend to
-                keep indefinitely, such as a pre-upgrade checkpoint.
+                A pin is <strong>permanent</strong>: retention never removes a pinned snapshot. Use
+                it for backups to keep indefinitely, such as a pre-upgrade checkpoint.
               </p>
             </div>
           </div>
@@ -181,16 +177,15 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
               <span className="mono">
                 {row.namespace}/{row.name}
               </span>
-              . What happens to the backup itself is decided by its deletion policy, which is{" "}
+              . Its deletion policy is{" "}
               <span className="mono">{deletionPolicyLabel(row.deletionPolicy)}</span>.
             </p>
             <p data-consequence={consequence.known ? "known" : "unknown"}>
               {consequence.destroys ? <strong>{consequence.text}</strong> : consequence.text}
             </p>
             <p>
-              The API answers <span className="mono">202</span>: the deletion is <em>requested</em>,
-              not performed. The operator batches it into a mover Job, and the repository&apos;s
-              mass-deletion breaker may hold it — if it does, the receipt below says so.
+              The deletion is <em>requested</em>, not done yet. If the repository&apos;s
+              mass-deletion breaker holds it, the receipt below says so.
             </p>
           </div>
           <div className="action__actions">

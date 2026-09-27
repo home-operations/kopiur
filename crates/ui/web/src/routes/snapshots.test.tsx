@@ -250,6 +250,6 @@ describe("Snapshots list", () => {
     mountApp("/snapshots");
     await list();
     expect(screen.getByRole("figure")).toBeInTheDocument();
-    expect(screen.getByText(/moves with the filter and the page window/)).toBeInTheDocument();
+    expect(screen.getByText(/Drawn from the rows on this page only/)).toBeInTheDocument();
   });
 });

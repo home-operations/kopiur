@@ -56,8 +56,7 @@ export function SnapshotSizeChart({ rows, maxPolicies = 4 }: SnapshotSizeChartPr
   if (series.length === 0) {
     return (
       <p className="page__section-note">
-        None of these snapshots recorded a size, so there is nothing to plot. A size is written when
-        a run succeeds; pending, running and failed runs have none.
+        None of these snapshots recorded a size yet; only successful runs record one.
       </p>
     );
   }
@@ -218,8 +217,7 @@ function PolicyTile({ series }: PolicyChartProps) {
         </span>
       </p>
       <p className="page__section-note">
-        Only one run recorded a size under this policy, so there is no change to draw yet. A second
-        successful run makes this a chart.
+        Only one run recorded a size under this policy; a second successful run makes this a chart.
         {series.excluded > 0 ? ` ${excludedText(series.excluded)}` : ""}
       </p>
       <SizeTable series={series} />

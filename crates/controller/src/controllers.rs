@@ -126,7 +126,7 @@ where
                 tracing::warn!(
                     error = %e,
                     kind = %kind,
-                    "referent watch error; backing off and restarting the watch"
+                    "watch on a referenced object failed; restarting it after a backoff"
                 );
             }
         })
@@ -365,8 +365,8 @@ pub(crate) async fn spawn_all(
             } else if let Err(e) = &count {
                 tracing::warn!(
                     error = %e,
-                    "startup SnapshotSchedule LIST failed; the schedule store stays unsynced \
-                     until a reconcile flips it (fail-safe)"
+                    "could not list SnapshotSchedules at startup; waiting for a reconcile to mark \
+                     the schedule cache synced"
                 );
             }
         });

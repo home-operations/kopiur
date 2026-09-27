@@ -80,17 +80,10 @@ export function ConfirmDelete({
       <p data-destructive={consequence.destructive ? "true" : undefined}>
         <span className="mono">deletionPolicy: {consequence.policy}</span> — {consequence.text}
       </p>
-      {pinned ? (
-        <p>
-          The kopia manifest is pinned. A pin exempts a snapshot from GFS pruning; it does not
-          protect it from a deletion you ask for here.
-        </p>
-      ) : null}
+      {pinned ? <p>The kopia manifest is pinned. A pin stops pruning, not this deletion.</p> : null}
       <p>
-        The request is accepted, not completed: the finalizer does the work afterwards, and a
-        repository&apos;s mass-deletion breaker can hold it. If the receipt says nothing about a
-        hold, that is not a promise there is none — the snapshot&apos;s own conditions are the
-        answer.
+        The finalizer does the work afterwards, and the repository&apos;s mass-deletion breaker can
+        hold it. Check the snapshot&apos;s conditions to be sure.
       </p>
     </ActionPanel>
   );

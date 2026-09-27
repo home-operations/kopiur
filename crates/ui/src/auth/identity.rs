@@ -80,11 +80,9 @@ pub struct Identity {
 pub enum AuthError {
     /// No identity was presented, and none is configured as a fallback.
     #[error(
-        "no caller identity was presented{}. kopiur-ui runs every Kubernetes call as the \
-         person making it, so a request it cannot attribute has no permissions to use. \
-         Fix: reach the UI through the authenticating proxy, or set KOPIUR_UI_ANONYMOUS_USER \
-         with KOPIUR_UI_ANONYMOUS_FALLBACK=true to choose an explicit identity for \
-         unauthenticated requests",
+        "no caller identity was presented{}. \
+         Fix: open the UI through the authenticating proxy, or set KOPIUR_UI_ANONYMOUS_USER \
+         with KOPIUR_UI_ANONYMOUS_FALLBACK=true to give such requests a fixed identity",
         .expected_header.as_ref().map(|h| format!(" in the {h} header")).unwrap_or_default()
     )]
     NoIdentity {
@@ -95,9 +93,7 @@ pub enum AuthError {
     /// A configured identity header carried something that cannot be a
     /// Kubernetes principal.
     #[error(
-        "the {header} header is not a usable identity: {reason}. Impersonation headers must be \
-         visible ASCII and bounded, or a proxy could smuggle a second header — or an \
-         unbounded one — into the apiserver request. \
+        "the {header} header is not a usable identity: {reason}. \
          Fix: correct what the authenticating proxy puts in {header}"
     )]
     InvalidHeaderValue {
@@ -110,9 +106,8 @@ pub enum AuthError {
     /// A user or group the UI refuses to impersonate.
     #[error(
         "refusing to impersonate {principal:?}: {why}. \
-         Fix: have the authenticating proxy assert the caller's real user and groups, and \
-         grant access by binding kopiur-ui-user to them instead of to a built-in system: \
-         principal"
+         Fix: have the proxy send the caller's real user and groups, and bind kopiur-ui-user \
+         to them"
     )]
     ForbiddenPrincipal {
         /// The offending user or group.
@@ -123,11 +118,9 @@ pub enum AuthError {
 
     /// More groups than the UI will impersonate on one request.
     #[error(
-        "the caller asserted {count} groups, more than the {max} kopiur-ui will impersonate. \
-         Every group becomes an Impersonate-Group header on every apiserver call this request \
-         makes. \
-         Fix: narrow what the proxy puts in the groups header, or set KOPIUR_UI_ALLOWED_GROUPS \
-         to the groups that actually grant kopiur access"
+        "the caller sent {count} groups; kopiur-ui accepts at most {max}. \
+         Fix: send fewer groups from the proxy, or set KOPIUR_UI_ALLOWED_GROUPS to the groups \
+         that grant kopiur access"
     )]
     TooManyGroups {
         /// How many groups were asserted.
@@ -138,11 +131,9 @@ pub enum AuthError {
 
     /// Header mode is configured with a shared secret and the request had none.
     #[error(
-        "the request carried no proxy shared secret. Identity headers are only trustworthy \
-         coming from the configured proxy, and in a cluster anything that can reach this \
-         Service can set them. \
-         Fix: have the proxy send the shared secret in X-Kopiur-Proxy-Token — the same value \
-         kopiur-ui reads from KOPIUR_UI_PROXY_SECRET_FILE"
+        "the request carried no proxy shared secret. \
+         Fix: have the proxy send the secret in X-Kopiur-Proxy-Token, matching \
+         KOPIUR_UI_PROXY_SECRET_FILE"
     )]
     ProxySecretMissing,
 
@@ -154,19 +145,17 @@ pub enum AuthError {
     /// alternative to refusing is serving requests as *some* identity nobody
     /// chose.
     #[error(
-        "kopiur-ui was started without wiring its authentication state, so it cannot say who \
-         any caller is and refuses to act on their behalf. \
-         Fix: this is a build bug in kopiur-ui; report it at \
+        "kopiur-ui was started without wiring its authentication state, so it refuses every \
+         request. \
+         Fix: this is a kopiur-ui bug; report it at \
          https://github.com/home-operations/kopiur/issues"
     )]
     NotWired,
 
     /// The presented shared secret is not the configured one.
     #[error(
-        "the proxy shared secret in X-Kopiur-Proxy-Token does not match the one kopiur-ui was \
-         configured with, so this request did not come through the trusted proxy. \
-         Fix: point the proxy and kopiur-ui at the same Secret, and restart both after \
-         rotating it"
+        "the proxy shared secret in X-Kopiur-Proxy-Token is wrong. \
+         Fix: give the proxy and kopiur-ui the same Secret, and restart both after rotating it"
     )]
     ProxySecretMismatch,
 }
@@ -425,8 +414,8 @@ fn check_principal(header: &str, value: &str) -> Result<(), AuthError> {
         Some(bad) => Err(AuthError::InvalidHeaderValue {
             header: header.to_string(),
             reason: format!(
-                "it contains the byte 0x{bad:02x}, which is not visible ASCII (only the \
-                 characters ! through ~ are accepted)"
+                "it contains the byte 0x{bad:02x}; only visible ASCII (! through ~) is \
+                 allowed"
             ),
         }),
         None => Ok(()),
@@ -438,8 +427,7 @@ fn reject_forbidden(principal: &str) -> Result<(), AuthError> {
     if is_forbidden_principal(principal) {
         return Err(AuthError::ForbiddenPrincipal {
             principal: principal.to_string(),
-            why: "the system: namespace is reserved for Kubernetes' own principals, and \
-                  system:masters bypasses RBAC entirely",
+            why: "system: names are reserved for Kubernetes",
         });
     }
     Ok(())

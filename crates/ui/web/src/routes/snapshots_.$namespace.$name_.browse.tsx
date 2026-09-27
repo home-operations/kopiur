@@ -99,10 +99,8 @@ function BrowseRoute() {
   const title = (
     <header className="browse-head">
       <p className="page__prose">
-        The files inside <span className="mono">{name}</span>, read live out of the repository —
-        this is where a backup stops being a green row and starts being your data. Listing and
-        downloading both go through a browse session; sizes and timestamps are the snapshot&rsquo;s
-        own, not the source volume&rsquo;s as it stands today.
+        The files inside <span className="mono">{name}</span>, read from the repository through a
+        browse session. Sizes and times are as they were when the snapshot was taken.
       </p>
       <Link
         className="button"
@@ -249,8 +247,8 @@ function Listing({
         icon={FolderX}
       >
         {window.total === 0
-          ? "The backup recorded this directory with no entries in it. That is a fact about the snapshot, not a failure to read it — an excluded path or an empty source directory both look like this."
-          : `This directory holds ${window.total} entries, but the page starts past the last one. Go back to the first page.`}
+          ? "This directory was empty (or excluded) when the backup ran."
+          : `This directory holds ${window.total} entries, but this page starts past the last one. Go back to the first page.`}
       </EmptyState>
     );
   }
@@ -347,9 +345,8 @@ function RefusedPath({ asked, namespace, name, scope }: RefusedPathProps) {
     <EmptyState title="That path cannot be browsed" icon={FolderX}>
       <p>
         The address asked for <span className="mono">{asked}</span>. A browse path is relative to
-        the snapshot&rsquo;s own root: it may not begin with <span className="mono">/</span> and may
-        not contain a <span className="mono">..</span> component, because a snapshot has no parent
-        to climb into.
+        the snapshot root: it may not start with <span className="mono">/</span> or contain{" "}
+        <span className="mono">..</span>.
       </p>
       <p>
         <Link

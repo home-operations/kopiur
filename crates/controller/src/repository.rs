@@ -509,10 +509,10 @@ async fn reconcile_inner(repo: &Repository, ctx: &Context) -> Result<Action> {
                     // see the block comment above.
                     match client.maintenance_set_owner(owner).await {
                         Ok(()) => {
-                            tracing::info!(%owner, "stamped maintenance owner on created filesystem repository")
+                            tracing::info!(%owner, "recorded maintenance owner on new filesystem repository")
                         }
                         Err(e) => {
-                            tracing::warn!(%owner, class = %e.class(), "could not stamp maintenance owner on created repository; maintenance may need takeoverPolicy=Force once")
+                            tracing::warn!(%owner, class = %e.class(), "could not record maintenance owner on new repository; maintenance may need takeoverPolicy=Force once")
                         }
                     }
                 } else if let Some(desired) = desired.as_deref() {
@@ -1243,9 +1243,8 @@ async fn bootstrap_via_mover(
                     .as_ref()
                     .and_then(|a| a.get(crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION)),
                 live_ack = ?launch_reinit_ack,
-                "recycling a terminal bootstrap Job whose evidence is stale: it was \
-                 launched for an older generation, or before the allow-reinitialize \
-                 ack now on the object"
+                "replacing a stale finished bootstrap Job (older generation or new \
+                 allow-reinitialize ack)"
             );
             io::delete_mover_run(&ctx.client, namespace, &job_name).await?;
             return Ok(Action::requeue(Duration::from_secs(5)));
@@ -1833,7 +1832,7 @@ async fn bootstrap_via_mover(
             mode = s.mode.as_str(),
             source = %s.source_description,
             resume = seed_resume,
-            "launching a SEEDING repository bootstrap Job"
+            "launching a seeding repository bootstrap Job"
         );
     }
     // Stamp the reverify token (loop guard): this request is now honored.
@@ -2407,7 +2406,7 @@ async fn finalize_bootstrap(
         if result.unique_id.as_deref() != Some(pinned) {
             tracing::warn!(
                 repo = %name, pinned, observed = ?result.unique_id,
-                "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
+                "health probe found a different repository at the backend; keeping the recorded uniqueId"
             );
         }
         status_patch["uniqueId"] = serde_json::Value::String(pinned.to_string());
@@ -2951,8 +2950,7 @@ async fn recycle_bootstrap_outage(
         tracing::warn!(
             repo = %name,
             reason,
-            "strict bootstrap hit a backend outage on a bootstrapped repository; \
-             circuit breaker opened (Degraded) and the Job was recycled to retry"
+            "backend outage; repository marked Degraded, bootstrap will retry"
         );
     }
     let streak = upd.health.consecutive_probe_failures.unwrap_or(1);
@@ -3085,7 +3083,7 @@ async fn finalize_probe_failure(
             ),
         )
         .await;
-        tracing::warn!(repo = %name, probe_kind = kind.label(), "repository circuit breaker opened: backend unhealthy past failureThreshold");
+        tracing::warn!(repo = %name, probe_kind = kind.label(), "repository marked Degraded: backend failed past failureThreshold");
     }
     // A probe consumes its Job exactly once, under either verdict; the requeue
     // is the steady probe cadence (StayReady) or the short hop into the strict

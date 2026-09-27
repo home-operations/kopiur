@@ -102,10 +102,8 @@ pub fn warn_unreadable_phase(kind: &str, namespace: &str, name: &str, phase: &st
         namespace,
         name,
         phase,
-        "status.phase is a value this kopiur build does not recognize (a newer operator most \
-         likely wrote it); reconciling anyway and re-deriving the phase from observed state, \
-         which OVERWRITES that value. Finish the operator upgrade so two builds are not \
-         driving this object."
+        "unrecognized status.phase (likely written by a newer operator); re-deriving and \
+         overwriting it. Finish the operator upgrade."
     );
 }
 
@@ -160,9 +158,8 @@ pub fn invalid_reinitialize_ack_message(
     let ns = kopiur_mover::bootstrap::kubectl_namespace_flag(namespace);
     let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
     format!(
-        "The `{annotation}` annotation on this {kind} is `{found}`, which is not this \
-         repository's pinned status.uniqueId (`{expected}`), so it is IGNORED and kopiur will \
-         NOT re-initialize. If you do mean to discard the history the old repository held, run: \
+        "The `{annotation}` annotation is `{found}` but status.uniqueId is `{expected}`, so it \
+         is ignored and nothing is re-initialized. To discard the old repository's history, run: \
          kubectl annotate {kind} {name}{ns} {annotation}={expected} --overwrite"
     )
 }
@@ -172,10 +169,9 @@ pub fn invalid_reinitialize_ack_message(
 pub fn reinitialize_ack_ignored_message(kind: &str, unique_id: &str) -> String {
     let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
     format!(
-        "The `{annotation}` annotation matches this {kind}'s pinned status.uniqueId \
-         (`{unique_id}`), but the kopia repository at this backend is present and healthy — \
-         there is nothing to re-initialize, and kopiur has wiped nothing. The annotation is \
-         inert while the repository stays healthy; remove it when convenient."
+        "The `{annotation}` annotation matches this {kind}'s status.uniqueId (`{unique_id}`), \
+         but the repository is present and healthy, so there is nothing to re-initialize and \
+         nothing was wiped. You can remove the annotation."
     )
 }
 
@@ -211,15 +207,11 @@ pub fn reinitialize_ack_ignored_message(kind: &str, unique_id: &str) -> String {
 pub fn reinitialize_ack_dormant_message(kind: &str, unique_id: &str, verdict: &str) -> String {
     let annotation = kopiur_api::consts::ALLOW_REINITIALIZE_ANNOTATION;
     format!(
-        "The `{annotation}` annotation matches this {kind}'s pinned status.uniqueId \
-         (`{unique_id}`), but it is DORMANT: kopiur re-initializes only after it has itself \
-         observed \"backend reachable, repository absent\" for this id (Ready reason \
-         `RepositoryReinitializeBlocked`, or BackendReachable reason `RepositoryVanished`). \
-         The current Ready reason is `{verdict}`, which is not that — an unreachable backend, \
-         a credential or mount problem, or a deadline is not a wiped repository, and \
-         creating a fresh one there would re-pin the wrong storage. Fix that cause first; if \
-         the repository then turns out to be genuinely gone, kopiur parks at \
-         RepositoryReinitializeBlocked and this annotation takes effect on its own."
+        "The `{annotation}` annotation matches this {kind}'s status.uniqueId (`{unique_id}`), \
+         but it has no effect yet: kopiur re-initializes only when the backend is reachable and \
+         the repository is gone (Ready reason `RepositoryReinitializeBlocked`). The current \
+         Ready reason is `{verdict}`. Fix that first; if the repository is then really gone, \
+         the annotation takes effect on its own."
     )
 }
 
@@ -452,8 +444,8 @@ pub(crate) fn backend_failure_event(
             Diagnostic::new("the storage backend denied access")
                 .because(detail)
                 .fix(
-                    "verify the credentials Secret, and that the bucket/container/path exists and \
-                     is reachable — some backends report a missing bucket as \"Access Denied\"",
+                    "check the credentials Secret, and that the bucket/container/path exists \
+                     (some backends report a missing bucket as \"Access Denied\")",
                 )
                 .to_string(),
         ),
@@ -462,8 +454,7 @@ pub(crate) fn backend_failure_event(
             Diagnostic::new("the repository path is not writable by the operator")
                 .because(detail)
                 .fix(format!(
-                    "the filesystem export or PVC must be writable by the operator's UID ({uid}) \
-                     — fix its ownership/mode (e.g. `chown -R {uid} <path>`), then reconcile"
+                    "make the export or PVC writable by UID {uid} (e.g. `chown -R {uid} <path>`)"
                 ))
                 .to_string(),
         ),
@@ -471,17 +462,14 @@ pub(crate) fn backend_failure_event(
             CHECK_CREDENTIALS_ACTION,
             Diagnostic::new("the repository password was rejected")
                 .because(detail)
-                .fix(
-                    "check the encryption password Secret (the `KOPIA_PASSWORD` key) referenced by \
-                     this repository",
-                )
+                .fix("check the `KOPIA_PASSWORD` key in the repository's password Secret")
                 .to_string(),
         ),
         KopiaErrorClass::RepositoryUnavailable => (
             CHECK_BACKEND_ACTION,
             Diagnostic::new("the repository backend is unreachable")
                 .because(detail)
-                .fix("check the endpoint/network and credentials, then retry (the reconcile retries automatically)")
+                .fix("check the endpoint, network and credentials; kopiur retries automatically")
                 .to_string(),
         ),
         KopiaErrorClass::NotFound => (
@@ -489,8 +477,8 @@ pub(crate) fn backend_failure_event(
             Diagnostic::new("the requested repository, snapshot, or path was not found")
                 .because(detail)
                 .fix(
-                    "verify the backend path/prefix and that the repository exists; for a first \
-                     bootstrap of an empty backend, set spec.create.enabled: true",
+                    "check the backend path/prefix; to create a new repository on an empty \
+                     backend, set spec.create.enabled: true",
                 )
                 .to_string(),
         ),
@@ -498,21 +486,21 @@ pub(crate) fn backend_failure_event(
             CHECK_BACKEND_ACTION,
             Diagnostic::new("a repository lock is held by another writer")
                 .because(detail)
-                .fix("this usually clears on its own; the reconcile retries automatically")
+                .fix("this usually clears on its own; kopiur retries automatically")
                 .to_string(),
         ),
         KopiaErrorClass::SourceError => (
             CHECK_BACKEND_ACTION,
             Diagnostic::new("a source filesystem error occurred during upload")
                 .because(detail)
-                .fix("check the source volume and the mover Job/pod logs; the run retries")
+                .fix("check the source volume and the mover pod logs; the run retries")
                 .to_string(),
         ),
         KopiaErrorClass::Unknown => (
             CHECK_BACKEND_ACTION,
-            Diagnostic::new("an unclassified repository backend error occurred")
+            Diagnostic::new("the repository backend returned an unexpected error")
                 .because(detail)
-                .fix("see the mover Job/pod logs and status.failure for detail")
+                .fix("see the mover pod logs and status.failure")
                 .to_string(),
         ),
     };
@@ -527,15 +515,10 @@ pub(crate) fn backend_failure_event(
 /// error's detail, embedded as the `because` (framing-stripped + capped).
 pub(crate) fn epoch_parameters_not_applied_note(err: &str) -> String {
     let detail = truncate_for_note(kopia_detail(err), EVENT_MESSAGE_BUDGET_BYTES);
-    let note = Diagnostic::new(
-        "the repository's epoch/blob-retention parameters (spec.parameters) were not applied",
-    )
-    .because(detail)
-    .fix(
-        "the repository is Ready but status.parameters now disagrees with spec; re-apply \
-         spec.parameters, and see the operator log for the underlying error",
-    )
-    .to_string();
+    let note = Diagnostic::new("spec.parameters could not be applied to the repository")
+        .because(detail)
+        .fix("check the operator log for the error, then re-apply spec.parameters")
+        .to_string();
     truncate_for_note(&note, EVENT_NOTE_MAX_BYTES)
 }
 
@@ -586,18 +569,15 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
             Diagnostic::new("a Kubernetes API call failed during reconcile")
                 .because(kube_error_brief(&e.to_string()).to_string())
                 .fix(
-                    "usually transient — the reconcile retries automatically; if it persists, \
-                     check the API server's health and the operator's RBAC",
+                    "usually transient and retried automatically; if it persists, check the API \
+                     server and the operator's RBAC",
                 )
                 .to_string(),
         ),
         Error::Validation(_) => (
             INVALID_SPEC_REASON,
             FIX_SPEC_ACTION,
-            format!(
-                "{err}. The object will not reconcile until the spec is corrected — fix the \
-                 field(s) named above and re-apply."
-            ),
+            format!("{err}. Fix the field named above and re-apply."),
         ),
         // Same user contract as Validation: the run cannot start until the
         // recipe shrinks (or, for the never-in-practice serialize arm, until
@@ -605,14 +585,13 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
         Error::BuildJob(_) => (
             INVALID_SPEC_REASON,
             FIX_SPEC_ACTION,
-            format!("{err}. The run will not start until this is corrected."),
+            format!("{err}. The run will not start until this is fixed."),
         ),
         Error::MissingDependency(_) => (
             MISSING_DEPENDENCY_REASON,
             CHECK_REFERENCES_ACTION,
             format!(
-                "{err} — create it, or fix the reference in this object's spec; the reconcile \
-                 retries automatically."
+                "{err}. Create it, or fix the reference in the spec; kopiur retries automatically."
             ),
         ),
         // The `tls.caBundleRef` ConfigMap (or its key) is absent. Same retry
@@ -623,27 +602,29 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
             crate::consts::MISSING_CA_BUNDLE_REASON,
             CHECK_REFERENCES_ACTION,
             format!(
-                "{err} — create the ConfigMap (or fix tls.caBundleRef); the reconcile retries \
-                 automatically."
+                "{err}. Create the ConfigMap or fix tls.caBundleRef; kopiur retries automatically."
             ),
         ),
         Error::BlockedOnGrant(_) => (
             BLOCKED_ON_GRANT_REASON,
             APPLY_GRANT_ACTION,
             format!(
-                "{err}. An administrator must apply the grant named above (it lives on another \
-                 object, e.g. a namespace annotation); the moment it lands this object \
-                 reconciles automatically — no re-apply needed."
+                "{err}. An administrator must apply the grant named above; this object then \
+                 reconciles automatically."
             ),
         ),
         Error::MissingRecordedIdentity(_) => (
             crate::consts::MISSING_RECORDED_IDENTITY_REASON,
             crate::consts::SET_EXPLICIT_MOVER_CONTEXT_ACTION,
-            format!(
-                "{err}. No Snapshot CR with status.recorded matches the source yet, so the \
-                 inherited mover identity is unknown. Fix: set mover.securityContext \
-                 explicitly, or drop inheritSecurityContextFrom.snapshot."
-            ),
+            // Some causes already carry a fix; do not state it twice.
+            if err.to_string().contains("Fix:") {
+                err.to_string()
+            } else {
+                format!(
+                    "{err}. Fix: set mover.securityContext, or remove \
+                     inheritSecurityContextFrom.snapshot."
+                )
+            },
         ),
         // A live-pod `inheritSecurityContextFrom` resolved nothing and no
         // fallback identity is pinned (#464). Same reason as the structural gate
@@ -654,24 +635,17 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
         Error::InheritSourceMissing(_) => (
             kopiur_api::consts::INHERIT_SOURCE_MISSING_REASON,
             crate::consts::SCALE_WORKLOAD_OR_PIN_MOVER_UID_ACTION,
-            format!(
-                "{err}. The run is parked (re-checked every few minutes) and starts by itself \
-                 once the workload is readable again or an explicit \
-                 mover.securityContext.runAsUser is set — no re-apply needed."
-            ),
+            // The hold message already states the park/re-check contract.
+            err.to_string(),
         ),
         // The DIRECT source PVC is gone. Same reason as the structural gate
         // (`SOURCE_PVC_MISSING_GATE`) the snapshot reconciler writes for it, so
-        // the Event and the condition read as one signal; the note names the
-        // two levers that clear it.
+        // the Event and the condition read as one signal.
         Error::MissingSourcePvc(_) => (
             crate::consts::SOURCE_PVC_MISSING_REASON,
             crate::consts::RECREATE_SOURCE_PVC_ACTION,
-            format!(
-                "{err}. The backup is parked (re-checked every few minutes) and will fail \
-                 terminally once the missing-source deadline passes — recreate the PVC, or \
-                 update the SnapshotPolicy's spec.sources to name an existing PVC."
-            ),
+            // The message already carries its own fix (snapshot::mod builds it).
+            err.to_string(),
         ),
         Error::Serialization(_) => (
             SERIALIZATION_FAILED_REASON,
@@ -684,10 +658,7 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
         Error::InvalidSchedule(_) => (
             INVALID_SCHEDULE_REASON,
             FIX_SCHEDULE_ACTION,
-            format!(
-                "{err}. Fix the cron expression in this object's spec (five fields, e.g. \
-                 `0 3 * * *`)."
-            ),
+            format!("{err}. Fix the cron expression (five fields, e.g. `0 3 * * *`)."),
         ),
         Error::Invariant(_) => (
             INVARIANT_VIOLATED_REASON,
@@ -707,9 +678,9 @@ pub(crate) fn reconcile_failure_event(err: &Error, uid: u32) -> FailureEvent {
             WEBHOOK_SETUP_FAILED_REASON,
             CHECK_WEBHOOK_CONFIGURATION_ACTION,
             format!(
-                "{err}. Admission stays untrusted until TLS setup succeeds (it is retried); check \
-                 the webhook configuration/namespace and the operator's RBAC on Secrets and \
-                 webhook configurations."
+                "{err}. The webhook is unusable until TLS setup succeeds (retried automatically). \
+                 Check the webhook configuration and the operator's RBAC on Secrets and webhook \
+                 configurations."
             ),
         ),
     };
@@ -766,8 +737,7 @@ pub(crate) fn try_spawn_failure_publish_with(
         metrics.record_failure_event_dropped("saturated");
         tracing::debug!(
             reason = event.reason,
-            "dropping failure Event: too many in-flight publishes (best-effort observability; \
-             repeats aggregate server-side, so little is lost)"
+            "dropping failure Event: too many publishes in flight"
         );
         return false;
     };
@@ -783,7 +753,7 @@ pub(crate) fn try_spawn_failure_publish_with(
             metrics.record_failure_event_dropped("timeout");
             tracing::debug!(
                 timeout = ?deadline,
-                "failure Event publish stalled past its deadline; dropped (best-effort)"
+                "failure Event publish timed out; dropped"
             );
         }
     });
@@ -1091,11 +1061,10 @@ impl SeedFailure {
 /// ([`BootstrapFailure::SeedMoverTooOld`]). Pure so its exact text is asserted;
 /// volatile-free so the guarded status write stays a no-op across repeats.
 pub fn seed_mover_too_old_message() -> String {
-    "Repository bootstrapped with a mover image older than spec.seed: it ignored the seed and \
-     made an EMPTY repository, so kopiur refuses Ready. Fix: upgrade the mover image (Helm \
+    "The mover image is too old for spec.seed: it ignored the seed and created an empty \
+     repository, so kopiur will not mark it Ready. Fix: upgrade the mover image (Helm \
      `mover.image.tag` or `KOPIUR_MOVER_IMAGE`) to the controller version, delete the empty \
-     repository at the backend, then `kubectl -n <namespace> delete job <repository>-discovery` \
-     (finished Jobs linger ~1h)."
+     repository at the backend, then `kubectl -n <namespace> delete job <repository>-discovery`."
         .to_string()
 }
 
@@ -1613,10 +1582,9 @@ pub fn bootstrap_outcome(
 /// likely causes, and gives the concrete commands to find the real error.
 pub fn bootstrap_job_failed_message(job_name: &str) -> String {
     format!(
-        "the repository bootstrap Job `{job_name}` failed without writing a result — the mover \
-         pod crashed, was evicted, or never scheduled (e.g. a missing mover ServiceAccount in \
-         this namespace). Inspect it with `kubectl describe job/{job_name}` and \
-         `kubectl logs job/{job_name}` to find the underlying error."
+        "bootstrap Job `{job_name}` failed without a result (the mover pod crashed, was evicted, \
+         or never scheduled, e.g. a missing mover ServiceAccount). Check `kubectl describe job/{job_name}` and \
+         `kubectl logs job/{job_name}`."
     )
 }
 
@@ -1628,10 +1596,9 @@ pub fn bootstrap_job_failed_message(job_name: &str) -> String {
 /// no-op across repeated identical kills.
 pub fn bootstrap_deadline_exceeded_message(job_name: &str, deadline_secs: i64) -> String {
     format!(
-        "bootstrap Job `{job_name}` was killed by its activeDeadlineSeconds ({deadline_secs}s) \
-         before kopia connected — the backend may be slow to open, e.g. a cold cache over a \
-         large repository can make `kopia repository connect` alone exceed it. Fix: raise \
-         `spec.bootstrap.failurePolicy.activeDeadlineSeconds`, or run maintenance to compact \
-         indexes; kopiur retries with a progressively longer deadline."
+        "bootstrap Job `{job_name}` hit its activeDeadlineSeconds ({deadline_secs}s) before kopia \
+         connected; the backend may just be slow. kopiur retries with a progressively longer \
+         deadline. Fix: raise `spec.bootstrap.failurePolicy.activeDeadlineSeconds`, or run \
+         maintenance to compact indexes."
     )
 }

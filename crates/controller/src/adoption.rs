@@ -495,14 +495,11 @@ pub fn effective_deletion_policy(policy: &SnapshotPolicy) -> DeletionPolicy {
 /// stay discovered, and every lever that changes the outcome.
 pub fn adoption_skipped_event_message(count: u64, identity: &str) -> String {
     format!(
-        "Left {count} discovered snapshot(s) matching identity {identity} unadopted: \
-         spec.retention would prune them immediately, and this policy's effective \
-         deletionPolicy (Retain/Orphan) deletes only the Snapshot CR — the kopia snapshot \
-         would be re-discovered and re-adopted in an endless loop. They remain in the \
-         catalog as discovered rows. To change this: widen spec.retention, set \
-         spec.defaultDeletionPolicy: Delete (adopted rows then genuinely prune kopia \
-         data), pin a snapshot via spec.pin on its discovered row, or set spec.adoption: \
-         Ignore."
+        "Did not adopt {count} discovered snapshot(s) matching identity {identity}: \
+         spec.retention would prune them at once, and under deletionPolicy Retain/Orphan \
+         they would be re-discovered and re-adopted in a loop. They stay discovered. To \
+         adopt them: widen spec.retention, set spec.defaultDeletionPolicy: Delete, or pin \
+         one with spec.pin. To stop adoption: set spec.adoption: Ignore."
     )
 }
 
@@ -511,11 +508,10 @@ pub fn adoption_skipped_event_message(count: u64, identity: &str) -> String {
 /// and WILL be pruned per `spec.retention`, and BOTH opt-outs.
 pub fn adoption_event_message(count: u64, identity: &str) -> String {
     format!(
-        "Adopted {count} discovered snapshot(s) matching identity {identity} into this \
-         SnapshotPolicy. They are now governed by GFS retention (spec.retention) and WILL be \
-         pruned like any snapshot this policy produces. To opt out of automatic adoption, set \
-         spec.adoption: Ignore on this SnapshotPolicy, or spec.catalog.adoption: Ignore on the \
-         referenced repository."
+        "Adopted {count} discovered snapshot(s) matching identity {identity}. They now \
+         follow spec.retention and will be pruned like this policy's own snapshots. To opt \
+         out, set spec.adoption: Ignore on this SnapshotPolicy or spec.catalog.adoption: \
+         Ignore on the repository."
     )
 }
 

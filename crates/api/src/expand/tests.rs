@@ -440,7 +440,7 @@ fn two_sources_matching_one_pvc_are_refused() {
     let msg = err.to_string();
     assert!(msg.contains("billing/shared"), "must name the PVC: {msg}");
     assert!(
-        msg.contains("Narrow the selectors"),
+        msg.contains("narrow the selectors"),
         "must name the fix: {msg}"
     );
 }
@@ -486,7 +486,10 @@ fn an_unusable_match_expression_is_refused_not_dropped() {
     // PVCs the user meant to exclude get backed up.
     let err = crate::validate::validate_source(&with_expr("in", Some(vec!["db".into()])))
         .expect_err("a bad operator must be refused");
-    assert!(err.to_string().contains("WIDENING"), "{err}");
+    assert!(
+        err.to_string().contains("not a label-selector operator"),
+        "{err}"
+    );
 
     // `In` with no values renders as `tier in ()`, which the API server rejects
     // with a 400 that would abort the whole schedule fire.

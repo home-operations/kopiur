@@ -374,7 +374,9 @@ where
         let t = tag(&path);
         if let Some(other) = by_tag.insert(t.clone(), path.clone()) {
             return Err(crate::error::Error::Invariant(format!(
-                "two verification members hash to the same member tag `{t}`: `{other}` and                  `{path}`. Verification is refused for this policy rather than verifying one                  path and reporting BOTH as verified — the tag names the verify Job, holds its                  single-flight slot and keys status.verificationStamps, so the two members would                  share all three and one volume would never be verified in any tier. Rename one                  of the two PersistentVolumeClaims, or split the pvcSelector so the two paths                  land on different SnapshotPolicies."
+                "verification refused: `{other}` and `{path}` share the member tag `{t}`, so \
+                 one would never be verified. Fix: rename one of the two \
+                 PersistentVolumeClaims, or split the pvcSelector across two SnapshotPolicies."
             )));
         }
         members.push(VerifyMember {
@@ -793,8 +795,7 @@ pub async fn verify_step(
         if !unlocked {
             tracing::debug!(
                 policy = %name,
-                "verification gated: no verifiable snapshot yet (no successful backup and no \
-                 discovered snapshots); deferring until the first successful backup"
+                "verification waiting for the first successful backup"
             );
         }
         return Ok(VerifyStepResult::requeue(idle_requeue(
@@ -815,8 +816,7 @@ pub async fn verify_step(
         tracing::debug!(
             policy = %name,
             member = target.member_tag.unwrap_or("<single>"),
-            "deferring deep verification: another member's deep Job is in flight (deep \
-             members run sequentially so N members do not provision N scratch volumes)"
+            "deep verification waiting: another member's deep Job is running (one at a time)"
         );
         return Ok(VerifyStepResult {
             requeue: Some(REQUEUE_RUNNING),
@@ -1234,9 +1234,8 @@ pub fn scratch_storage_class_state(
         (Some(sc), false) => ScratchStorageClassState {
             ignored: true,
             message: format!(
-                "deep-verify scratch storageClassName '{sc}' has no effect without a capacity \
-                 (an emptyDir has no StorageClass); set verification.deep.capacity or \
-                 moverDefaults.scratch.capacity to provision a sized PVC"
+                "deep-verify scratch storageClassName '{sc}' is ignored without a capacity. \
+                 Fix: set verification.deep.capacity or moverDefaults.scratch.capacity"
             ),
         },
         _ => ScratchStorageClassState {
@@ -2803,7 +2802,7 @@ mod tests {
             );
         }
         assert!(
-            msg.contains("Rename"),
+            msg.contains("rename"),
             "a refusal with no remedy is a dead end: {msg}"
         );
         // Structural, so it holds on the slow cadence instead of hot-looping,

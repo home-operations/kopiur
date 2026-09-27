@@ -352,10 +352,9 @@ pub const REPOSITORY_NOT_INITIALIZED_CLASS: &str = "RepositoryNotInitialized";
 /// [`REPOSITORY_NOT_INITIALIZED_CLASS`] case. The controller uses it verbatim as a
 /// condition message, so it must carry no per-attempt detail (no temp filenames):
 /// what failed, why, and the two concrete fixes.
-pub const REPOSITORY_NOT_INITIALIZED_MESSAGE: &str = "no kopia repository exists at this backend (connect returned NotFound) and \
-     spec.create.enabled is false, so kopiur did not initialize one; set \
-     spec.create.enabled: true to create a new repository here, or point the backend \
-     at an existing repository";
+pub const REPOSITORY_NOT_INITIALIZED_MESSAGE: &str = "no kopia repository exists at this backend and spec.create.enabled is false. Fix: \
+     set spec.create.enabled: true to create one, or point the backend at an existing \
+     repository";
 
 /// Sentinel [`FailureBlock::kopia_error_class`] the mover writes when connect found
 /// **no** repository at the backend but the object has been `Ready` before (a pinned
@@ -430,11 +429,10 @@ pub fn reinitialize_blocked_message(
     // `InvalidReinitializeAck` command carries it for the same reason.
     format!(
         "To re-initialize, run: kubectl annotate {kind} {name}{ns} {annotation}={unique_id} \
-         --overwrite (this discards the history the old repository held). Reason: no kopia \
-         repository \
-         exists at this backend (connect returned NotFound) but this {kind} was once Ready \
-         (status.uniqueId={unique_id}), so kopiur will not silently create an empty one over \
-         it{also}. If the wipe was not deliberate, restore the backend instead."
+         --overwrite (this discards the old repository's history). No kopia repository exists \
+         at this backend, but this {kind} was Ready before (status.uniqueId={unique_id}), so \
+         kopiur will not create an empty one over it{also}. If the wipe was not deliberate, \
+         restore the backend instead."
     )
 }
 
@@ -453,10 +451,9 @@ pub const SEED_SOURCE_NOT_FOUND_CLASS: &str = "SeedSourceNotFound";
 
 /// Stable, volatile-free actionable message for [`SEED_SOURCE_NOT_FOUND_CLASS`].
 /// Used verbatim as a condition message, so it carries no per-attempt detail.
-pub const SEED_SOURCE_NOT_FOUND_MESSAGE: &str = "spec.seed's source answered but holds no kopia repository (connect returned NotFound), so \
-     there is nothing to seed from. Fix: point spec.seed.from at the exact bucket AND prefix a \
-     kopia repository lives under — a RepositoryReplication mirror is rooted at the \
-     destination's own prefix, not its parent. Retries automatically once the source exists";
+pub const SEED_SOURCE_NOT_FOUND_MESSAGE: &str = "spec.seed's source holds no kopia repository. Fix: point spec.seed.from at the exact \
+     bucket and prefix of the repository (a RepositoryReplication mirror lives at the \
+     destination's own prefix, not its parent). Retries automatically";
 
 /// Sentinel [`FailureBlock::kopia_error_class`] for a seed source that IS a
 /// kopia repository but holds zero snapshots, with `spec.seed.allowEmptySource`
@@ -469,11 +466,10 @@ pub const SEED_SOURCE_EMPTY_CLASS: &str = "SeedSourceEmpty";
 
 /// Stable, volatile-free actionable message for [`SEED_SOURCE_EMPTY_CLASS`],
 /// naming the explicit override.
-pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source is a kopia repository but holds zero snapshots, so seeding would report \
-     this repository Ready with no history. An empty source is usually a wrong bucket/prefix or \
-     a replication that never ran. Fix: point spec.seed.from at the intended mirror, or set \
-     spec.seed.allowEmptySource: true if it is meant to be empty. Retries automatically, so a \
-     mirror that fills later seeds on its own";
+pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source holds zero snapshots, so this repository would be Ready with no \
+     history. Usually a wrong bucket/prefix or a replication that never ran. Fix: point \
+     spec.seed.from at the intended mirror, or set spec.seed.allowEmptySource: true. Retries \
+     automatically";
 
 /// Sentinel [`FailureBlock::kopia_error_class`] for the case a `spec.seed` was
 /// armed but the repository ends the bootstrap holding ZERO snapshots, with
@@ -503,14 +499,11 @@ pub const SEED_SOURCE_EMPTY_MESSAGE: &str = "spec.seed's source is a kopia repos
 pub const SEED_LEFT_EMPTY_CLASS: &str = "SeedLeftEmpty";
 
 /// Stable, volatile-free actionable message for [`SEED_LEFT_EMPTY_CLASS`].
-pub const SEED_LEFT_EMPTY_MESSAGE: &str = "spec.seed is set but this repository is initialized and holds ZERO snapshots, so reporting \
-     it Ready would hand you a repository with no history. This normally means an earlier seed \
-     attempt initialized the backend and then failed (Job deadline, OOM, or a copy that errored \
-     after `repository create`). Kopiur resumes the copy itself on the next bootstrap — no \
-     manual cleanup, and nothing at the backend should be deleted. Fix: if it keeps recurring, \
-     raise spec.seed.failurePolicy.activeDeadlineSeconds (a too-short deadline is the usual \
-     cause) and read the bootstrap Job's pod logs; or set spec.seed.allowEmptySource: true if it \
-     is meant to start empty";
+pub const SEED_LEFT_EMPTY_MESSAGE: &str = "spec.seed is set but this repository holds zero snapshots, usually because an earlier \
+     seed attempt failed after creating it. Kopiur resumes the copy on the next bootstrap; \
+     nothing at the backend should be deleted. Fix: if it recurs, raise \
+     spec.seed.failurePolicy.activeDeadlineSeconds and check the bootstrap Job's pod logs, or \
+     set spec.seed.allowEmptySource: true";
 
 /// Whether a bootstrap must refuse to report success because a seed was armed
 /// yet the repository ends up empty. See [`SEED_LEFT_EMPTY_CLASS`] for the
@@ -1209,9 +1202,9 @@ impl BootstrapResult {
         BootstrapResult::sentinel(
             BOOTSTRAP_INTERNAL_INCONSISTENCY_CLASS,
             format!(
-                "{detail}. This is a kopiur defect, not a repository or backend problem — \
-                 terminal on purpose (retrying reproduces it). Fix: report it with the \
-                 bootstrap Job's pod logs and the repository's spec"
+                "{detail}. This is a kopiur bug, not a repository problem, and retrying will \
+                 not help. Fix: report it with the bootstrap Job's pod logs and the \
+                 repository's spec"
             ),
             false,
         )
@@ -1264,13 +1257,10 @@ impl BootstrapResult {
         BootstrapResult::sentinel(
             SEED_INCOMPLETE_CLASS,
             format!(
-                "seeding is incomplete: {missing} of {expected} expected snapshot(s) did not \
-                 arrive. `kopia snapshot migrate` exits 0 even when a per-source migration \
-                 fails, so the post-verify is the real success gate — see the bootstrap Job's \
-                 pod logs for kopia's per-source errors. Missing (up to {cap} shown): {sample}. \
-                 Retried automatically; migrate is idempotent by (identity, startTime), so it \
-                 copies only what is still missing. If it never converges, verify the source \
-                 with `kopia snapshot verify`",
+                "seeding is incomplete: {missing} of {expected} snapshot(s) did not arrive \
+                 (kopia's per-source errors are in the bootstrap Job's pod logs). Missing (up \
+                 to {cap} shown): {sample}. Retried automatically; only missing snapshots are \
+                 copied. If it never converges, check the source with `kopia snapshot verify`",
                 cap = crate::error::MISSING_SAMPLE_CAP
             ),
             true,
@@ -1743,7 +1733,7 @@ mod tests {
         assert_eq!(f.kopia_error_class, SEED_LEFT_EMPTY_CLASS);
         assert!(f.retry_recommended);
         // what
-        assert!(f.message.contains("ZERO snapshots"), "{}", f.message);
+        assert!(f.message.contains("zero snapshots"), "{}", f.message);
         // why it happened
         assert!(f.message.contains("earlier seed attempt"), "{}", f.message);
         // fix: kopiur retries itself; the operator tunes the deadline
@@ -1807,10 +1797,13 @@ mod tests {
         // what: the counts and a sample of what did not arrive
         assert!(incomplete.contains("2 of 5"), "{incomplete}");
         assert!(incomplete.contains("mydb@prod:/pvc@t"), "{incomplete}");
-        // why exit 0 was not the success signal
-        assert!(incomplete.contains("exits 0"), "{incomplete}");
+        // where the per-source errors are
+        assert!(incomplete.contains("pod logs"), "{incomplete}");
         // fix: retrying is safe and copies only the remainder
-        assert!(incomplete.contains("idempotent"), "{incomplete}");
+        assert!(
+            incomplete.contains("only missing snapshots"),
+            "{incomplete}"
+        );
 
         // Authored through a bash heredoc, not a Python one — the wrapped-
         // whitespace defect that hit the C1 error literals would show up here.

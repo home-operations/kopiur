@@ -183,9 +183,7 @@ fn parse_checks(raw: Option<&str>) -> Result<Option<BTreeSet<DoctorCheck>>, ApiE
                     400,
                     "invalid-filter",
                     format!("`{id}` is not a doctor check."),
-                    "`checks` selects which diagnostics to run, so an id nothing matches would \
-                     quietly narrow the report — and a check missing from a report reads as one \
-                     that passed.",
+                    "An unknown id would silently drop a check, which reads as a pass.",
                     format!(
                         "use a comma-separated subset of: {}; or drop `checks` to run them all",
                         accepted_check_ids()
@@ -199,8 +197,7 @@ fn parse_checks(raw: Option<&str>) -> Result<Option<BTreeSet<DoctorCheck>>, ApiE
             400,
             "invalid-filter",
             "`checks` names no check.".to_string(),
-            "An empty selector would produce an empty report, which is indistinguishable from \
-             a cluster with nothing wrong.",
+            "An empty report would look like a healthy cluster.",
             format!(
                 "name at least one of: {}; or drop `checks` to run them all",
                 accepted_check_ids()
@@ -306,16 +303,14 @@ fn window(value: Option<u64>, default: Duration, field: &str) -> Result<Duration
             400,
             "invalid-filter",
             format!("`{field}` must be a positive number of seconds."),
-            "Zero would mean every piece of work is stuck the instant it starts, which reports \
-             a healthy cluster as broken.",
+            "Zero would report every piece of work as stuck.",
             format!("drop {field} to use the default, or give it a positive value"),
         )),
         Some(seconds) if seconds > MAX_WINDOW_SECONDS => Err(problem(
             400,
             "invalid-filter",
             format!("`{field}` is longer than a year."),
-            "A window that long asks about history rather than about whether the cluster is \
-             healthy right now, and every check would report everything it has ever seen.",
+            "The doctor checks current health, not history.",
             format!("use a {field} of at most {MAX_WINDOW_SECONDS} seconds"),
         )),
         Some(seconds) => Ok(Duration::from_secs(seconds)),

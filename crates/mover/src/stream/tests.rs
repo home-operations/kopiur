@@ -67,7 +67,7 @@ fn a_terminating_pod_does_not_count_as_live() {
 fn several_running_pods_refuses_and_names_them() {
     let pods = vec![pod("pg-0", "Running", false), pod("pg-1", "Running", false)];
     let err = pick_stream_pod(&pods, "app=postgres", "bundlecop").unwrap_err();
-    assert!(err.contains("matched 2 RUNNING pods"), "{err}");
+    assert!(err.contains("matched 2 running pods"), "{err}");
     assert!(err.contains("pg-0, pg-1"), "{err}");
     assert!(err.contains("arbitrary replica"), "{err}");
 }
@@ -281,7 +281,7 @@ fn the_exec_start_timeout_message_names_the_right_cause() {
     assert!(msg.contains("no snapshot was written"), "{msg}");
     assert!(msg.contains("pods/exec"), "{msg}");
     assert!(
-        msg.contains("NOT `workloadExec.timeout`"),
+        msg.contains("not `workloadExec.timeout`"),
         "must steer away from the wrong knob: {msg}"
     );
 }
@@ -328,9 +328,9 @@ fn a_kopia_read_timeout_names_the_stream_target_field() {
     // what
     assert!(msg.contains("postgres.sql"), "{msg}");
     assert!(msg.contains("7200s"), "{msg}");
-    assert!(msg.contains("abandoned mid-stream"), "{msg}");
+    assert!(msg.contains("stopped mid-stream"), "{msg}");
     // why the operator should care: the consumer got a truncated input
-    assert!(msg.contains("PARTIAL load"), "{msg}");
+    assert!(msg.contains("partial load"), "{msg}");
     // fix — the field the user actually set, NOT kopia's argv
     assert!(
         msg.contains("spec.target.streamExec.workloadExec.timeout"),
@@ -449,7 +449,7 @@ fn a_silent_broken_sink_still_points_somewhere() {
         "explains the mechanism: {msg}"
     );
     assert!(
-        msg.contains("reported no status"),
+        msg.contains("no exit status"),
         "says the exec status was unavailable rather than staying silent: {msg}"
     );
     assert!(
@@ -495,7 +495,7 @@ fn the_exec_verdict_explains_a_broken_sink() {
         "carries the exec status: {msg}"
     );
     assert!(
-        !msg.contains("reported no status"),
+        !msg.contains("no exit status"),
         "must not also claim there was no status: {msg}"
     );
 }
@@ -510,7 +510,7 @@ fn a_successful_command_beside_a_broken_sink_names_the_early_exit() {
     };
     let msg = super::consumer_failure_detail("dump.sql", &err, "", &super::ExecVerdict::Success);
     assert!(
-        msg.contains("stopped reading early") || msg.contains("consume its stdin"),
+        msg.contains("exited successfully before the transfer finished"),
         "names the real shape: {msg}"
     );
 }

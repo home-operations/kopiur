@@ -401,10 +401,10 @@ pub struct UiArgs {
 
     /// Opt-in: serve header-mode requests with no identity header as the
     /// anonymous identity instead of 401.
-    ///
-    /// Not `ArgAction::SetTrue`: that action cannot consume an env value, and
-    /// the chart sets `KOPIUR_UI_ANONYMOUS_FALLBACK=true`/`false`.
-    /// `num_args = 0..=1` keeps the bare `--anonymous-fallback` form working.
+    //
+    // Not `ArgAction::SetTrue`: that action cannot consume an env value, and
+    // the chart sets `KOPIUR_UI_ANONYMOUS_FALLBACK=true`/`false`.
+    // `num_args = 0..=1` keeps the bare `--anonymous-fallback` form working.
     #[arg(long, env = ANONYMOUS_FALLBACK_ENV, action = ArgAction::Set,
           num_args = 0..=1, default_value_t = false, default_missing_value = "true",
           value_parser = flag_bool::<false>)]
@@ -422,19 +422,19 @@ pub struct UiArgs {
 
     /// **Debug builds only.** Allow the configured anonymous identity to be a
     /// `system:` principal (including `system:masters`).
-    ///
-    /// This exists for one purpose: a local smoke run against a throwaway kind
-    /// cluster, where the fastest way to see the UI work is to let it impersonate
-    /// `kubernetes-admin`/`system:masters` rather than to author RBAC first. It is
-    /// compiled out entirely by `#[cfg(debug_assertions)]`, so the released image
-    /// has no such flag, no such environment variable, and no code path that reads
-    /// one.
-    ///
-    /// It relaxes exactly one check — [`reject_system_identity`] over the
-    /// *operator-chosen* `KOPIUR_UI_ANONYMOUS_*` values. It cannot loosen what a
-    /// proxy may assert: header-mode principals go through
-    /// [`crate::auth::identity::is_forbidden_principal`], which has no escape
-    /// hatch at all.
+    //
+    // This exists for one purpose: a local smoke run against a throwaway kind
+    // cluster, where the fastest way to see the UI work is to let it impersonate
+    // `kubernetes-admin`/`system:masters` rather than to author RBAC first. It is
+    // compiled out entirely by `#[cfg(debug_assertions)]`, so the released image
+    // has no such flag, no such environment variable, and no code path that reads
+    // one.
+    //
+    // It relaxes exactly one check — [`reject_system_identity`] over the
+    // *operator-chosen* `KOPIUR_UI_ANONYMOUS_*` values. It cannot loosen what a
+    // proxy may assert: header-mode principals go through
+    // [`crate::auth::identity::is_forbidden_principal`], which has no escape
+    // hatch at all.
     #[cfg(debug_assertions)]
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_value_t = false,
           default_missing_value = "true", value_parser = flag_bool::<false>, hide = true)]
@@ -717,24 +717,19 @@ pub struct TlsPaths {
 pub enum ConfigError {
     /// Neither an identity header nor an explicit anonymous identity.
     #[error(
-        "no identity source is configured: neither {USER_HEADER_ENV} nor {ANONYMOUS_USER_ENV} \
-         is set. kopiur-ui turns every request into an impersonated Kubernetes request, so \
-         with no way to tell callers apart it would have to run all of them as its own \
-         ServiceAccount — which is allowed to impersonate anyone. Set {USER_HEADER_ENV} to \
-         the header your authenticating proxy injects (e.g. X-Forwarded-User), or set \
-         {ANONYMOUS_USER_ENV} to run deliberately as one fixed identity."
+        "no identity source: neither {USER_HEADER_ENV} nor {ANONYMOUS_USER_ENV} is set, so \
+         kopiur-ui cannot tell callers apart. Fix: set {USER_HEADER_ENV} to the header your \
+         proxy sets (e.g. X-Forwarded-User), or set {ANONYMOUS_USER_ENV} to run as one fixed \
+         identity."
     )]
     NoIdentitySource,
 
     /// A configured identity header name is one the UI reserves.
     #[error(
-        "the identity header '{header}' is reserved and cannot be used as an identity input. \
-         'impersonate-*' is what kopiur-ui writes to the apiserver itself (accepting one \
-         inbound would let a caller pick their own impersonation), and 'authorization' / \
-         'cookie' are credentials a browser attaches automatically, so trusting either as an \
-         asserted identity would let any origin speak for the user. Point \
+        "the header '{header}' is reserved and cannot carry an identity ('impersonate-*', \
+         'authorization' and 'cookie' could be set by the caller). Fix: point \
          {USER_HEADER_ENV} / {GROUPS_HEADER_ENV} / {EMAIL_HEADER_ENV} at a header your proxy \
-         sets explicitly, e.g. X-Forwarded-User."
+         sets, e.g. X-Forwarded-User."
     )]
     ReservedHeaderName {
         /// The offending header name, lowercased.
@@ -743,10 +738,9 @@ pub enum ConfigError {
 
     /// A configured header name is not a valid HTTP header name.
     #[error(
-        "'{header}' is not a valid HTTP header name, so kopiur-ui cannot look it up on an \
-         incoming request. Header names are visible ASCII without spaces or separators \
-         (letters, digits, '-' and '_'). Fix the value of {USER_HEADER_ENV} / \
-         {GROUPS_HEADER_ENV} / {EMAIL_HEADER_ENV}, e.g. X-Forwarded-User."
+        "'{header}' is not a valid HTTP header name (use letters, digits, '-' and '_'). Fix: \
+         correct {USER_HEADER_ENV} / {GROUPS_HEADER_ENV} / {EMAIL_HEADER_ENV}, e.g. \
+         X-Forwarded-User."
     )]
     InvalidHeaderName {
         /// The rejected header name.
@@ -757,24 +751,20 @@ pub enum ConfigError {
 
     /// Header mode without a proxy shared secret and without an acknowledgement.
     #[error(
-        "header mode is configured ({USER_HEADER_ENV} is set) but no proxy shared secret is: \
-         {PROXY_SECRET_FILE_ENV} is empty. Identity headers are only trustworthy if nothing \
-         else can set them, and in a cluster any pod — or anyone who can reach the Service, \
-         including via the apiserver's services/proxy — can send the same headers directly to \
-         kopiur-ui and become any user. Mount a shared secret and point \
-         {PROXY_SECRET_FILE_ENV} at it (the chart's ui.auth.proxySecret.existingSecret), and \
-         have the proxy send it as X-Kopiur-Proxy-Token. If some other control already \
-         prevents direct access, set {ACKNOWLEDGE_NO_PROXY_SECRET_ENV}=true to say so \
-         explicitly."
+        "{USER_HEADER_ENV} is set but {PROXY_SECRET_FILE_ENV} is empty, so anyone who can \
+         reach kopiur-ui directly could send identity headers and become any user. Fix: mount \
+         a shared secret, point {PROXY_SECRET_FILE_ENV} at it (chart: \
+         ui.auth.proxySecret.existingSecret), and have the proxy send it as \
+         X-Kopiur-Proxy-Token. If direct access is already blocked, set \
+         {ACKNOWLEDGE_NO_PROXY_SECRET_ENV}=true."
     )]
     ProxySecretRequired,
 
     /// The proxy secret file could not be read (or was empty).
     #[error(
-        "the proxy shared secret at '{path}' could not be read, so kopiur-ui cannot verify \
-         that requests really came from your proxy and refuses to start rather than accept \
-         unverified identity headers. Check that {PROXY_SECRET_FILE_ENV} points at the \
-         mounted Secret's key and that the file is non-empty and readable by the UI's user."
+        "could not read the proxy shared secret at '{path}'. Fix: point \
+         {PROXY_SECRET_FILE_ENV} at the mounted Secret's key, and make sure the file is \
+         non-empty and readable."
     )]
     ProxySecretUnreadable {
         /// Path that could not be read.
@@ -786,18 +776,16 @@ pub enum ConfigError {
     /// The anonymous fallback was requested without an anonymous identity.
     #[error(
         "{ANONYMOUS_FALLBACK_ENV} is true but {ANONYMOUS_USER_ENV} is not set, so there is no \
-         identity to fall back TO — a request without the identity header would have nobody \
-         to run as. Set {ANONYMOUS_USER_ENV} (and optionally {ANONYMOUS_GROUPS_ENV}) to the \
-         identity unauthenticated requests should get, or set {ANONYMOUS_FALLBACK_ENV}=false \
-         to reject them with 401 instead."
+         identity to fall back to. Fix: set {ANONYMOUS_USER_ENV} (and optionally \
+         {ANONYMOUS_GROUPS_ENV}), or set {ANONYMOUS_FALLBACK_ENV}=false to reject such \
+         requests with 401."
     )]
     AnonymousWithoutUser,
 
     /// A duration value was not `<integer><s|m|h>`.
     #[error(
-        "{name}='{value}' is not a valid duration, so kopiur-ui cannot tell how long the \
-         limit it controls should be. Use a whole number followed by a unit: s (seconds), m \
-         (minutes) or h (hours) — for example 60s, 15m or 1h. Unset it to use the default."
+        "{name}='{value}' is not a valid duration. Fix: use a whole number with s, m or h \
+         (e.g. 60s, 15m, 1h), or unset it for the default."
     )]
     InvalidDuration {
         /// Environment variable the bad value came from.
@@ -808,9 +796,8 @@ pub enum ConfigError {
 
     /// A bind address was not `host:port`.
     #[error(
-        "{name}='{value}' is not a valid socket address, so kopiur-ui has no port to listen \
-         on. Use host:port — [::]:8090 (IPv6/dual-stack, the default) or 0.0.0.0:8090 \
-         (IPv4-only, for hosts where IPv6 is disabled). Unset it to use the default."
+        "{name}='{value}' is not a valid host:port. Fix: use e.g. [::]:8090, or 0.0.0.0:8090 \
+         where IPv6 is disabled, or unset it for the default."
     )]
     InvalidAddr {
         /// Environment variable the bad value came from.
@@ -823,13 +810,9 @@ pub enum ConfigError {
 
     /// `KOPIUR_UI_ALLOWED_GROUPS` was set but names no group.
     #[error(
-        "{ALLOWED_GROUPS_ENV}='{value}' is set but contains no group name — only separators \
-         and whitespace. Setting it means \"restrict impersonation to these groups\", and \
-         restricting it to nothing would either deny every caller or, if it were read as \
-         \"unset\", silently allow every group the proxy asserts; neither is what someone \
-         who typed this meant. List the groups you want, comma-separated (e.g. \
-         platform,sre), or unset {ALLOWED_GROUPS_ENV} entirely to accept whatever groups the \
-         proxy asserts."
+        "{ALLOWED_GROUPS_ENV}='{value}' names no group. Fix: list the groups, comma-separated \
+         (e.g. platform,sre), or unset {ALLOWED_GROUPS_ENV} to accept every group the proxy \
+         sends."
     )]
     InvalidAllowedGroups {
         /// The rejected value, as configured.
@@ -838,12 +821,10 @@ pub enum ConfigError {
 
     /// An anonymous user or group is inside Kubernetes' reserved `system:` space.
     #[error(
-        "'{group}' cannot be used as an anonymous identity: it is inside Kubernetes' reserved \
-         'system:' namespace (only system:authenticated is allowed there, and system:masters \
-         never is). Impersonating it would hand every unauthenticated visitor a built-in \
-         cluster identity — system:masters bypasses RBAC entirely. Set {ANONYMOUS_USER_ENV} / \
-         {ANONYMOUS_GROUPS_ENV} to an ordinary user and groups, and grant them the \
-         kopiur-ui-viewer or kopiur-ui-user role instead."
+        "'{group}' cannot be an anonymous identity: 'system:' names are reserved (only \
+         system:authenticated is allowed). Fix: set {ANONYMOUS_USER_ENV} / \
+         {ANONYMOUS_GROUPS_ENV} to an ordinary user and groups, and bind kopiur-ui-viewer or \
+         kopiur-ui-user to them."
     )]
     ForbiddenAnonymousGroup {
         /// The rejected user or group name.
@@ -966,8 +947,7 @@ impl UiArgs {
         if system_anonymous_allowed {
             tracing::warn!(
                 "--dev-allow-system-groups is set: the anonymous identity may be a system: \
-                 principal. This is a debug-build-only escape hatch for a local kind smoke \
-                 and must never be used against a cluster you care about."
+                 principal; debug builds only, never use it on a real cluster"
             );
         } else {
             if let Some(user) = &anonymous_user {

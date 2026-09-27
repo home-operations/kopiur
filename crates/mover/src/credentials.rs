@@ -137,11 +137,10 @@ pub fn materialize_with(
             // (an SA without its cloud federation) findable in the pod log.
             if *ambient_credentials && !ambient_aws_hints_present(&|key| lookup(key)) {
                 tracing::warn!(
-                    "auth.workloadIdentity is set but no ambient AWS credential hints are \
-                     present in the environment (none of {}); the credential chain will fall \
-                     back to the EC2 metadata service, which hangs on non-EC2 nodes. If this \
-                     run fails or stalls, check the ServiceAccount's cloud federation \
-                     (eks.amazonaws.com/role-arn annotation or an EKS Pod Identity association)",
+                    "auth.workloadIdentity is set but none of {} is in the environment; kopia \
+                     will fall back to the EC2 metadata service, which hangs off EC2. Fix: check \
+                     the ServiceAccount's eks.amazonaws.com/role-arn annotation or EKS Pod \
+                     Identity association",
                     AMBIENT_AWS_HINT_ENVS.join(", ")
                 );
             }
@@ -303,7 +302,7 @@ fn write_cred_file(
         path: path.clone(),
         source,
     })?;
-    info!(env = env_key, path = %path.display(), "materialized backend credential to file");
+    info!(env = env_key, path = %path.display(), "wrote backend credential file");
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 

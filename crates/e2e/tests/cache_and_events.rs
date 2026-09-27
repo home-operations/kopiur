@@ -326,7 +326,7 @@ async fn reconcile_failure_publishes_an_aggregated_missing_dependency_event() {
     // The note is the actionable what/why/fix message, within the apiserver cap.
     let note = ev.note.unwrap_or_default();
     assert!(
-        note.contains("does-not-exist") && note.contains("create it, or fix the reference"),
+        note.contains("does-not-exist") && note.contains("Create it, or fix the reference"),
         "the note must name the missing dependency and the fix: {note}"
     );
     assert!(note.len() <= EVENT_NOTE_MAX_BYTES);

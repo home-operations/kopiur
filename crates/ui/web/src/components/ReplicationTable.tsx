@@ -97,7 +97,7 @@ export function ReplicationTable({ rows, now = new Date() }: ReplicationTablePro
                   <span className="replication-table__note">
                     next run{" "}
                     {row.destinationIsRepository ? (
-                      <NotReported reason="SnapshotReplication publishes no next-run time on its status; the cron expression is what says when the next copy is due." />
+                      <NotReported reason="SnapshotReplication reports no next-run time; see the cron." />
                     ) : (
                       <NotReported field="repositoryReplicationNextRun" />
                     )}

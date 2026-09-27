@@ -134,9 +134,7 @@ fn incomplete_query() -> ApiError {
         400,
         "invalid-filter",
         "An events request has to name the object whose events you want.",
-        "Events are read straight from the apiserver with a field selector, and an unfiltered \
-         cluster-wide list would page through every event in the cluster on every screen \
-         refresh.",
+        "Listing every event in the cluster would be too expensive.",
         "pass all three of ?namespace=, ?kind= and ?name=",
     )
 }

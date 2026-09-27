@@ -199,12 +199,9 @@ function Snapshots() {
   return (
     <div className="page">
       <p className="page__prose">
-        A <span className="mono">Snapshot</span> is one backup run: the invocation, separate from
-        the <span className="mono">SnapshotPolicy</span> recipe that produced it and from the{" "}
-        <span className="mono">SnapshotSchedule</span> that fired it. Every filter here is in the
-        address bar, so a filtered view is a link. The list is capped rather than truncated — a
-        backup table that quietly dropped rows would read as &ldquo;these are all my backups&rdquo;
-        — so a filter that selects too many is refused with the number it matched.
+        A <span className="mono">Snapshot</span> is one backup run. Filters are kept in the URL, so
+        a filtered view is a link. A filter that matches too many snapshots is refused rather than
+        cut short.
       </p>
 
       <section className="page__section" aria-label="Filters">
@@ -215,8 +212,7 @@ function Snapshots() {
         <p className="page__prose" role="status" key={filter.key}>
           This link asked for <span className="mono">{filter.key}</span> ={" "}
           <span className="mono">{filter.value}</span>, which the operator would reject, so it was
-          not sent and nothing was filtered by it. The accepted values are{" "}
-          <span className="mono">{filter.accepted}</span>.
+          ignored. Accepted values: <span className="mono">{filter.accepted}</span>.
         </p>
       ))}
 
@@ -236,8 +232,7 @@ function Snapshots() {
               lamp={healthLamp("degraded")}
             />
             <p className="state__body">
-              The filter bar above is still live. Narrowing by repository or policy is what turns
-              this into a list; nothing is wrong with the cluster.
+              Narrow the filter above by repository or policy to see a list.
             </p>
           </div>
         ) : snapshots.isError ? (
@@ -248,9 +243,8 @@ function Snapshots() {
           />
         ) : items.length === 0 && total > 0 ? (
           <EmptyState title="This page is past the end of the list" icon={Camera}>
-            The filter matches {total} {total === 1 ? "snapshot" : "snapshots"}, but the window this
-            link asks for starts after the last of them — a bookmark taken before retention pruned
-            rows looks exactly like this.
+            The filter matches {total} {total === 1 ? "snapshot" : "snapshots"}, but this link
+            starts after the last one, often because retention pruned rows since it was saved.
             <div className="state__actions">
               <Link className="button" to="/snapshots" search={firstPage(asked, namespace)}>
                 Back to the first page
@@ -259,10 +253,9 @@ function Snapshots() {
           </EmptyState>
         ) : items.length === 0 ? (
           <EmptyState title={`No snapshots in ${scope}`} icon={Camera}>
-            A snapshot appears here when a <span className="mono">SnapshotSchedule</span> fires,
-            when someone asks for one from a policy, or when a catalog scan discovers a backup
-            already in the repository. If you expected rows, check the filters above — they are in
-            the URL and survive a reload.
+            Snapshots appear when a <span className="mono">SnapshotSchedule</span> fires, when one
+            is started from a policy, or when a catalog scan finds one. If you expected rows, check
+            the filters above.
           </EmptyState>
         ) : (
           <>
@@ -287,10 +280,7 @@ function Snapshots() {
               Size over time
             </h2>
           </div>
-          <p className="page__section-note">
-            Drawn from the rows on this page only, so it moves with the filter and the page window
-            rather than summarising the whole cluster.
-          </p>
+          <p className="page__section-note">Drawn from the rows on this page only.</p>
           <SnapshotSizeChart rows={items} />
         </section>
       ) : null}

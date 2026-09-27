@@ -87,10 +87,9 @@ cluster-scoped resource — so Kopiur cannot tell whether the namespace opted in
 
 When that happens it **refuses**, and says so:
 
-> `SnapshotPolicy` … uses a `stream` source, but kopiur cannot read Namespace … to
-> check the `kopiur.home-operations.com/stream-exec-movers` opt-in (the API server
-> returned 403), so it refuses to mint the `pods/exec` permission the stream mover
-> needs.
+> `SnapshotPolicy` … uses a `stream` source, but kopiur cannot read Namespace …
+> (403) to check the `kopiur.home-operations.com/stream-exec-movers` opt-in, so it
+> refuses to grant `pods/exec`.
 
 This is deliberate, and it differs from the [privileged-mover
 opt-in](movers.md#privileged-movers), which fails *open* under a namespaced

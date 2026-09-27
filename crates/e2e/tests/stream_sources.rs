@@ -501,7 +501,7 @@ async fn two_running_pod_matches_fails_naming_the_candidates() {
 
     verdict.expect("two Running matches must FAIL the Snapshot, never pick one");
     assert!(
-        text.contains("matched 2 RUNNING pods"),
+        text.contains("matched 2 running pods"),
         "the failure must name the count, got: {text}"
     );
     assert!(

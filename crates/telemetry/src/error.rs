@@ -41,8 +41,7 @@ pub enum TelemetryError {
     /// `OTEL_EXPORTER_OTLP_ENDPOINT` is set but not a usable URL.
     #[error(
         "OTEL_EXPORTER_OTLP_ENDPOINT='{value}' is not a valid URL ({source}). \
-         Use scheme+host+port, e.g. http://otel-collector:4317 for OTLP/gRPC; \
-         unset it to disable OTLP export."
+         Fix: use a URL like http://otel-collector:4317, or unset it to disable OTLP."
     )]
     InvalidOtlpEndpoint {
         /// The offending value.
@@ -54,9 +53,9 @@ pub enum TelemetryError {
 
     /// `OTEL_EXPORTER_OTLP_PROTOCOL` requests a transport this build doesn't ship.
     #[error(
-        "OTEL_EXPORTER_OTLP_PROTOCOL='{value}' is not supported by this build. \
-         Only 'grpc' is compiled in; set OTEL_EXPORTER_OTLP_PROTOCOL=grpc (or unset it) \
-         and point OTEL_EXPORTER_OTLP_ENDPOINT at the collector's gRPC port (4317)."
+        "OTEL_EXPORTER_OTLP_PROTOCOL='{value}' is not supported; only 'grpc' is. \
+         Fix: set OTEL_EXPORTER_OTLP_PROTOCOL=grpc (or unset it) and point \
+         OTEL_EXPORTER_OTLP_ENDPOINT at the collector's gRPC port (4317)."
     )]
     UnsupportedProtocol {
         /// The requested protocol.
@@ -65,10 +64,9 @@ pub enum TelemetryError {
 
     /// An OTLP exporter for `signal` failed to build (bad config / runtime).
     #[error(
-        "failed to build the OTLP {signal} exporter: {source}. \
-         Verify OTEL_EXPORTER_OTLP_ENDPOINT points at a reachable collector \
-         (e.g. http://otel-collector:4317) and that a Tokio runtime is active; \
-         unset OTEL_EXPORTER_OTLP_ENDPOINT to disable OTLP."
+        "could not build the OTLP {signal} exporter: {source}. \
+         Fix: point OTEL_EXPORTER_OTLP_ENDPOINT at a reachable collector \
+         (e.g. http://otel-collector:4317), or unset it to disable OTLP."
     )]
     ExporterBuild {
         /// Which signal's exporter failed.
@@ -80,8 +78,7 @@ pub enum TelemetryError {
 
     /// The Prometheus exporter could not be registered into the registry.
     #[error(
-        "failed to register the Prometheus exporter: {source}. \
-         This is an internal error (duplicate metric registration); please file a bug."
+        "could not register the Prometheus exporter: {source}. This is a bug; please report it."
     )]
     PrometheusRegister {
         /// The underlying registration error.
@@ -95,9 +92,8 @@ pub enum TelemetryError {
     /// caller exits. In practice this only happens if a subscriber was already
     /// installed in the same process at startup (a bug worth filing).
     #[error(
-        "failed to install the global tracing subscriber: {source}. \
-         The process would run with no logs; refusing to continue. This usually means a \
-         tracing subscriber was already installed in this process — please file a bug."
+        "could not install the tracing subscriber: {source}. \
+         Refusing to run without logs. This is a bug; please report it."
     )]
     SubscriberInit {
         /// The underlying `try_init` error.

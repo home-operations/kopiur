@@ -78,8 +78,8 @@ function Overview() {
           />
         ) : repositories.data.length === 0 ? (
           <EmptyState title={`No repositories in ${scope}`} icon={Database}>
-            A Repository or ClusterRepository is the kopia repository backups land in. Create one
-            and it appears here with its health; policies then name it as their target.
+            A Repository or ClusterRepository is where backups are stored. Create one and it appears
+            here.
           </EmptyState>
         ) : (
           <StatusCards repositories={repositories.data} namespace={namespace} />
@@ -121,9 +121,8 @@ function Overview() {
                 ageLabel="Since"
                 empty={
                   <EmptyState title="Nothing is stalled" icon={PauseCircle}>
-                    An object reports Stalled when its reconciler has given up and is waiting for a
-                    human — a parked snapshot, a restore with no credentials. It would be listed
-                    here with the condition&apos;s message.
+                    An object that is waiting for someone to act, such as a restore with no
+                    credentials, would be listed here.
                   </EmptyState>
                 }
               />
@@ -156,9 +155,9 @@ function Overview() {
 
       {report !== null && !report.complete ? (
         <p className="page__prose">
-          kopiur-ui could not read part of the status report this server sent; what it could read is
-          shown. The console and the server may be different releases — the CLI&apos;s
-          <span className="mono"> kubectl kopiur status</span> prints the report in full.
+          kopiur-ui could not read part of the status report; the rest is shown. The console and
+          server may be different releases. <span className="mono">kubectl kopiur status</span>{" "}
+          prints the full report.
         </p>
       ) : null}
     </div>

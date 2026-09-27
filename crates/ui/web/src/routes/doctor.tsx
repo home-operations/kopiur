@@ -145,8 +145,8 @@ function Doctor() {
           {ignored.map((w) => (
             <span key={w.label}>
               This link asked for a {w.label.toLowerCase()} of{" "}
-              <span className="mono">{w.value}</span>, which is not a window the server accepts, so
-              the report ran with the default <span className="mono">{w.fallback}</span>.{" "}
+              <span className="mono">{w.value}</span>, which is not valid, so the report ran with
+              the default <span className="mono">{w.fallback}</span>.{" "}
             </span>
           ))}
         </p>
@@ -172,8 +172,7 @@ function Doctor() {
           />
         ) : doctor.data.checks.length === 0 ? (
           <EmptyState title="No checks ran" icon={Stethoscope}>
-            Doctor answered with an empty report. Every check it knows would be listed here with its
-            outcome; an empty list means the server ran none, not that all passed.
+            Doctor returned an empty report: the server ran no checks, not that all passed.
           </EmptyState>
         ) : (
           <DoctorChecks checks={doctor.data.checks} namespace={namespace} />
@@ -181,12 +180,9 @@ function Doctor() {
       </section>
 
       <p className="page__prose">
-        Checks run as you: a check your RBAC cannot support is reported as a warning naming the
-        grant, never as a broken cluster. The Scope column is the server&apos;s own account of what
-        each check read: a namespace narrows the checks that list namespaced objects, some also read
-        cluster-scoped ones whatever namespace is asked, and{" "}
-        <span className="mono">crds-installed</span>, the operator&apos;s own Deployments and the
-        admission probe are about the installation and do not narrow at all. A parked object names
+        Checks run as you: a check your permissions cannot run is a warning naming the missing
+        grant. The Scope column shows what each check read; installation checks such as{" "}
+        <span className="mono">crds-installed</span> ignore the namespace. A blocked object names
         its gate; the{" "}
         <Link to="/gates" search={namespace !== undefined ? { namespace } : {}}>
           gate registry

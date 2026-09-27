@@ -63,8 +63,8 @@ export function NotPermittedState({ problem, what, actions }: NotPermittedStateP
         <span>{what !== undefined ? `Not permitted to view ${what}` : "Not permitted"}</span>
       </h2>
       <p className="state__body">
-        kopiur-ui asked the cluster on your behalf and was refused. The console has no access of its
-        own: what you can see and do here is exactly what your RBAC bindings allow.
+        The cluster refused this for your identity. The console can do only what your RBAC bindings
+        allow.
       </p>
       <ProblemBanner problem={problem} />
       {actions !== undefined ? <div className="state__actions">{actions}</div> : null}

@@ -196,11 +196,10 @@ fn cluster_secret_namespace(
         .map(str::to_string)
         .ok_or_else(|| {
             Error::Validation(
-                "no namespace to read the ClusterRepository's credential Secret from: \
-                 encryption.passwordSecretRef.namespace is unset and the operator's namespace is \
-                 unknown (KOPIUR_NAMESPACE unset), and a cluster-scoped resource has none of its \
-                 own. Fix: set encryption.passwordSecretRef.namespace to the Secret's namespace, \
-                 or set KOPIUR_NAMESPACE on the controller (the Helm chart does this)."
+                "cannot find the ClusterRepository's credential Secret: both \
+                 encryption.passwordSecretRef.namespace and KOPIUR_NAMESPACE are unset. Fix: set \
+                 encryption.passwordSecretRef.namespace, or set KOPIUR_NAMESPACE on the \
+                 controller (the Helm chart does this)."
                     .into(),
             )
         })
@@ -340,20 +339,19 @@ async fn reconcile_inner(repo: &ClusterRepository, ctx: &Context) -> Result<Acti
     // now resolving to the operator namespace rather than the server's) would take the whole
     // repository down with it. Surface it as a Warning and carry on.
     if let Err(e) = reconcile_cluster_server(ctx, repo, &name, &api).await {
-        tracing::warn!(error = %e, repo = %name, "failed to reconcile the kopia repository server; the repository itself is unaffected");
+        tracing::warn!(error = %e, repo = %name, "could not reconcile the kopia repository server; the repository is unaffected");
         io::publish_warning_event(
             ctx,
             repo,
             "RepositoryServerDegraded",
             "CheckRepositoryServer",
             &kopiur_api::Diagnostic::new(
-                "the kopia repository server (spec.server) could not be reconciled",
+                "could not reconcile the kopia repository server (spec.server)",
             )
-            .because("the repository itself is unaffected — backups and restores continue")
+            .because("backups and restores are unaffected")
             .fix(
-                "if the server's credentials Secret lives in the server's namespace, pin it with \
-                 encryption.passwordSecretRef.namespace (a ClusterRepository otherwise reads it \
-                 from the operator's namespace); see the operator log for the underlying error",
+                "if the server's credentials Secret is in the server's namespace, set \
+                 encryption.passwordSecretRef.namespace; see the operator log for the error",
             )
             .to_string(),
         )
@@ -750,11 +748,10 @@ fn cluster_scan_requested_attempt_at(repo: &ClusterRepository) -> Option<&str> {
 /// actually expected there, not just the single-cluster remedies. Pure.
 fn unplaced_warning_message(hosts: &[&str]) -> String {
     format!(
-        "discovered snapshots unplaced: identity hostname(s) [{}] match no namespace in \
-         spec.allowedNamespaces — each Snapshot is placed by its identity hostname. Fix: \
-         create/allow those namespaces, or set spec.catalog.fallbackNamespace to collect them \
-         in one namespace; if shared across clusters, set identityDefaults.cluster and \
-         catalog.foreignSnapshots: Ignore to count them instead",
+        "discovered snapshots not placed: identity hostname(s) [{}] match no namespace in \
+         spec.allowedNamespaces. Fix: create or allow those namespaces, or set \
+         spec.catalog.fallbackNamespace. If the repository is shared across clusters, set \
+         identityDefaults.cluster and catalog.foreignSnapshots: Ignore",
         hosts.join(", ")
     )
 }
@@ -989,10 +986,10 @@ async fn handle_cluster_deletion(
         // pod is otherwise invisible from the (now-deleted) CR.
         Err(e) => tracing::warn!(
             repo = %name, error = %e,
-            "cannot resolve the bootstrap Job's namespace while finalizing the \
-             ClusterRepository; an in-flight bootstrap/seeding Job may keep running until its \
-             own deadline. Set encryption.passwordSecretRef.namespace or KOPIUR_NAMESPACE, then \
-             delete the `<name>-discovery` Job by hand."
+            "cannot find the bootstrap Job's namespace while deleting the ClusterRepository; \
+             a running bootstrap or seeding Job may continue until its deadline. Fix: set \
+             encryption.passwordSecretRef.namespace or KOPIUR_NAMESPACE, then delete the \
+             `<name>-discovery` Job by hand."
         ),
     }
 
@@ -1283,9 +1280,8 @@ async fn bootstrap_cluster_via_mover(
                     .as_ref()
                     .and_then(|a| a.get(crate::consts::BOOTSTRAP_REINIT_ACK_ANNOTATION)),
                 live_ack = ?launch_reinit_ack,
-                "recycling a terminal bootstrap Job whose evidence is stale: it was \
-                 launched for an older generation, or before the allow-reinitialize \
-                 ack now on the object"
+                "recreating a finished bootstrap Job that is out of date (older generation \
+                 or before the allow-reinitialize ack)"
             );
             io::delete_mover_run(&ctx.client, &job_ns, &job_name).await?;
             return Ok(Action::requeue(Duration::from_secs(5)));
@@ -1346,7 +1342,7 @@ async fn bootstrap_cluster_via_mover(
                         chrono::Utc::now(),
                     )
                 {
-                    tracing::debug!(repo = %name, "recycling finished bootstrap Job for a catalog refresh");
+                    tracing::debug!(repo = %name, "recreating finished bootstrap Job for a catalog refresh");
                     io::delete_mover_run(&ctx.client, &job_ns, &job_name).await?;
                     return Ok(Action::requeue(Duration::from_secs(5)));
                 }
@@ -1819,7 +1815,7 @@ async fn bootstrap_cluster_via_mover(
             mode = s.mode.as_str(),
             source = %s.source_description,
             resume = seed_resume,
-            "launching a SEEDING ClusterRepository bootstrap Job"
+            "launching a seeding ClusterRepository bootstrap Job"
         );
     }
     // Stamp the reverify token (loop guard): this request is now honored. A
@@ -2130,7 +2126,7 @@ async fn finalize_cluster_bootstrap(
         if result.unique_id.as_deref() != Some(pinned) {
             tracing::warn!(
                 repo = %name, pinned, observed = ?result.unique_id,
-                "health probe connected to a DIFFERENT repository at the backend; keeping the pinned uniqueId"
+                "health probe found a different repository at the backend; keeping the pinned uniqueId"
             );
         }
         pinned_unique_id = Some(pinned.to_string());
@@ -2495,7 +2491,7 @@ async fn recycle_failed_cluster_bootstrap(
         tracing::warn!(
             repo = %name,
             reason,
-            "ClusterRepository bootstrap Job failed; recycled it for retry"
+            "ClusterRepository bootstrap Job failed; recreating it to retry"
         );
     }
     Ok(Action::requeue(requeue))
@@ -2678,8 +2674,8 @@ async fn recycle_cluster_bootstrap_outage(
         tracing::warn!(
             repo = %name,
             reason,
-            "strict bootstrap hit a backend outage on a bootstrapped ClusterRepository; \
-             circuit breaker opened (Degraded) and the Job was recycled to retry"
+            "bootstrap hit a backend outage; ClusterRepository is Degraded and the Job will \
+             retry"
         );
     }
     let streak = upd.health.consecutive_probe_failures.unwrap_or(1);
@@ -2797,7 +2793,7 @@ async fn finalize_cluster_probe_failure(
             ),
         )
         .await;
-        tracing::warn!(repo = %name, probe_kind = kind.label(), "ClusterRepository circuit breaker opened: backend unhealthy past failureThreshold");
+        tracing::warn!(repo = %name, probe_kind = kind.label(), "ClusterRepository is Degraded: backend unhealthy past failureThreshold");
     }
     // A probe consumes its Job exactly once, under either verdict; the requeue
     // is the steady probe cadence (StayReady) or the short hop into the strict

@@ -269,8 +269,8 @@ fn note_ignored_url_path(notes: &mut Vec<FieldNote>, url: &str, path: &str, back
         field: format!("KOPIA_REPOSITORY ({url})"),
         disposition: Disposition::Ignored {
             reason: format!(
-                "the fork's entry.sh passes NO --prefix for {backend} — the URL path {path:?} \
-                 was always ignored and the repository lives at the root; kopiur adopts it there"
+                "the fork passes no --prefix for {backend}, so the URL path {path:?} was always \
+                 ignored; the repository is adopted at the root"
             ),
         },
     });
@@ -350,7 +350,7 @@ pub fn backend_from_kopia_repository(
                     format!("secret/{secret_name}.KOPIA_S3_BUCKET"),
                     format!(
                         "Repository/{repo_name}.spec.backend.s3.bucket (overrides URL bucket \
-                         {url_bucket:?}, matching the fork's precedence)"
+                         {url_bucket:?}, as the fork does)"
                     ),
                 );
                 b.to_string()
@@ -419,8 +419,7 @@ pub fn backend_from_kopia_repository(
                     &mut notes,
                     format!("secret/{secret_name}.{key}"),
                     format!(
-                        "referenced IN PLACE by Repository/{repo_name}.spec.backend.s3.auth.secretRef \
-                         (kopia reads the same env name)"
+                        "referenced in place by Repository/{repo_name}.spec.backend.s3.auth.secretRef"
                     ),
                 );
             }
@@ -457,9 +456,8 @@ pub fn backend_from_kopia_repository(
             field: format!("secret/{secret_name}.GOOGLE_APPLICATION_CREDENTIALS"),
             disposition: Disposition::Unmappable {
                 reason: format!(
-                    "the fork stores a file PATH inside its mover pod; kopiur needs the \
-                     service-account JSON CONTENT under {derived_name}.KOPIA_GCS_CREDENTIALS — \
-                     add it yourself before applying"
+                    "the fork stores a file path here; kopiur needs the service-account JSON \
+                     content. Add it under {derived_name}.KOPIA_GCS_CREDENTIALS before applying"
                 ),
             },
         });
@@ -496,7 +494,7 @@ pub fn backend_from_kopia_repository(
                         &mut notes,
                         format!("secret/{secret_name}.{key}"),
                         format!(
-                            "referenced IN PLACE by \
+                            "referenced in place by \
                              Repository/{repo_name}.spec.backend.azure.auth.secretRef"
                         ),
                     );
@@ -598,8 +596,8 @@ pub fn backend_from_kopia_repository(
                     field: "spec.kopia.moverVolumes".to_string(),
                     disposition: Disposition::Unmappable {
                         reason: format!(
-                            "could not infer exactly one repository PVC from moverVolumes \
-                             (found {}); set backend.filesystem.volume.pvc.name before applying",
+                            "expected exactly one repository PVC in moverVolumes (found {}); set \
+                             backend.filesystem.volume.pvc.name before applying",
                             pvcs.len()
                         ),
                     },
@@ -694,21 +692,21 @@ pub fn backend_from_kopia_repository(
             (
                 "SFTP_KEY_FILE",
                 format!(
-                    "a file PATH inside the fork's mover; kopiur needs the private-key CONTENT \
-                     under {derived_name}.KOPIA_SFTP_KEY_DATA — add it yourself before applying"
+                    "a file path in the fork's mover; add the private key content under \
+                     {derived_name}.KOPIA_SFTP_KEY_DATA before applying"
                 ),
             ),
             (
                 "SFTP_KNOWN_HOSTS",
                 format!(
-                    "a file PATH; put the known_hosts CONTENT under \
+                    "a file path; put the known_hosts content under \
                      {derived_name}.KOPIA_SFTP_KNOWN_HOSTS instead"
                 ),
             ),
             (
                 "SFTP_PASSWORD",
-                "kopiur's SFTP backend is key-based (no password auth); switch the server to an \
-                 SSH key and put it under KOPIA_SFTP_KEY_DATA"
+                "kopiur's SFTP backend has no password auth; switch to an SSH key and put it \
+                 under KOPIA_SFTP_KEY_DATA"
                     .to_string(),
             ),
         ] {
@@ -798,8 +796,8 @@ pub fn backend_from_kopia_repository(
                     field: format!("secret/{secret_name}.RCLONE_CONFIG"),
                     disposition: Disposition::Unmappable {
                         reason: format!(
-                            "looks like a file PATH, not rclone.conf content; put the config \
-                             CONTENT under {derived_name}.KOPIA_RCLONE_CONFIG and set \
+                            "looks like a file path, not rclone.conf content; put the config \
+                             content under {derived_name}.KOPIA_RCLONE_CONFIG and set \
                              backend.rclone.configSecretRef"
                         ),
                     },
@@ -824,9 +822,9 @@ pub fn backend_from_kopia_repository(
     } else {
         let scheme = url.split(':').next().unwrap_or(url);
         return Err(format!(
-            "KOPIA_REPOSITORY {url:?}: scheme {scheme:?} is not translatable (kopiur supports \
-             s3/gcs/azure/b2/filesystem/sftp/webdav/rclone; notably there is no Google Drive \
-             backend); author the kopiur Repository by hand"
+            "KOPIA_REPOSITORY {url:?}: scheme {scheme:?} is not translatable (supported: \
+             s3/gcs/azure/b2/filesystem/sftp/webdav/rclone; no Google Drive); write the \
+             kopiur Repository by hand"
         ));
     };
 
@@ -834,9 +832,8 @@ pub fn backend_from_kopia_repository(
         notes.push(FieldNote {
             field: format!("secret/{secret_name}.KOPIA_MANUAL_CONFIG"),
             disposition: Disposition::Unmappable {
-                reason: "raw kopia repository-config JSON has no kopiur equivalent; express the \
-                         overrides via SnapshotPolicy fields (compression, retention, …) or \
-                         author the Repository by hand"
+                reason: "raw kopia repository config has no kopiur equivalent; use SnapshotPolicy \
+                         fields (compression, retention, …) or write the Repository by hand"
                     .to_string(),
             },
         });
@@ -936,9 +933,8 @@ pub fn translate_source(
     t.mapped(
         "(fork snapshot identity)",
         &format!(
-            "SnapshotPolicy.spec.identity + sources[0].sourcePathOverride pinned to \
-             {username}@{hostname}:{source_path} — the existing snapshot history continues \
-             under kopiur"
+            "SnapshotPolicy.spec.identity + sources[0].sourcePathOverride set to \
+             {username}@{hostname}:{source_path}, so the existing snapshot history continues"
         ),
     );
 
@@ -964,9 +960,8 @@ pub fn translate_source(
             t.unmappable(
                 "spec.kopia.copyMethod",
                 &format!(
-                    "unknown VolSync copyMethod {other:?}; translated to an explicit \
-                     SnapshotPolicy.spec.copyMethod: Direct — review whether this source \
-                     actually wants CSI staging (Snapshot/Clone) instead"
+                    "unknown VolSync copyMethod {other:?}; set to an explicit copyMethod: Direct. \
+                     Change it to Snapshot or Clone if this source needs CSI staging"
                 ),
             );
             "Direct"
@@ -983,7 +978,7 @@ pub fn translate_source(
         None => {
             t.mapped(
                 "spec.kopia.copyMethod (absent; VolSync default is a live read)",
-                "SnapshotPolicy.spec.copyMethod: Direct (pinned explicitly)",
+                "SnapshotPolicy.spec.copyMethod: Direct (set explicitly)",
             );
         }
         // Unknown value — already recorded as Unmappable above.
@@ -1104,9 +1099,8 @@ pub fn translate_source(
             if present {
                 t.unmappable(
                     &format!("spec.kopia.actions.{field}"),
-                    "the fork runs this shell IN ITS MOVER POD; kopiur hooks \
-                     (SnapshotPolicy.spec.hooks) run in the WORKLOAD pod or as a Job — \
-                     rewrite the action for that execution context by hand",
+                    "the fork runs this in its mover pod; kopiur hooks (SnapshotPolicy.spec.hooks) \
+                     run in the workload pod or as a Job, so rewrite it by hand",
                 );
             }
         }
@@ -1114,36 +1108,34 @@ pub fn translate_source(
     if kopia.policy_config.is_some() {
         t.unmappable(
             "spec.kopia.policyConfig",
-            "kopiur models kopia policy as typed CRD fields (retention/compression/files/\
-             upload/extraArgs); there is no raw policy-file passthrough — port the file's \
-             settings into the SnapshotPolicy spec",
+            "kopiur has no raw policy-file passthrough; move the file's settings into \
+             SnapshotPolicy fields (retention, compression, files, upload, extraArgs)",
         );
     }
     if kopia.mover_service_account.is_some() {
         t.unmappable(
             "spec.kopia.moverServiceAccount",
-            "kopiur mints a least-privilege per-namespace mover ServiceAccount itself",
+            "kopiur creates its own least-privilege mover ServiceAccount per namespace",
         );
     }
     if kopia.mover_pod_labels.is_some() {
         t.unmappable(
             "spec.kopia.moverPodLabels",
-            "kopiur has no per-recipe mover pod-label surface",
+            "kopiur has no per-policy mover pod labels",
         );
     }
     if kopia.mover_affinity.is_some() {
         t.unmappable(
             "spec.kopia.moverAffinity",
-            "mover affinity lives on the Repository's spec.moverDefaults (repo-wide), not \
-             per-policy; set it there",
+            "set mover affinity on the Repository's spec.moverDefaults instead (it is \
+             repository-wide)",
         );
     }
     if kopia.mover_volumes.is_some() {
         t.ignored(
             "spec.kopia.moverVolumes",
-            "kopiur movers mount only source/cache/repository volumes; a PVC backing a \
-             filesystem:// repository is carried into Repository.spec.backend.filesystem.volume \
-             instead (see the repository accounting)",
+            "kopiur movers mount only source, cache, and repository volumes; a filesystem:// \
+             repository PVC is carried into Repository.spec.backend.filesystem.volume",
         );
     }
     if kopia.custom_ca.is_some() {
@@ -1157,7 +1149,7 @@ pub fn translate_source(
             "spec.kopia.storageClassName",
             &format!(
                 "kopiur stages Snapshot/Clone copies with the source PVC's StorageClass; \
-                 there is no per-policy staging-class override (was {class:?})"
+                 there is no per-policy override (was {class:?})"
             ),
         );
     }
@@ -1170,15 +1162,14 @@ pub fn translate_source(
     if kopia.cache_access_modes.is_some() {
         t.unmappable(
             "spec.kopia.cacheAccessModes",
-            "kopiur's mover cache has no access-mode override (it is a per-run \
-             ephemeral or controller-owned persistent volume)",
+            "the kopiur mover cache has no access-mode setting",
         );
     }
     if kopia.cleanup_cache_pvc.is_some() {
         t.ignored(
             "spec.kopia.cleanupCachePVC",
-            "kopiur cache lifecycle is mover.cache.mode (Ephemeral default, or Persistent for \
-             a warm cache)",
+            "use mover.cache.mode instead (Ephemeral by default, or Persistent for a warm \
+             cache)",
         );
     }
 
@@ -1270,7 +1261,7 @@ pub fn translate_destination(
         if si.source_pvc_name.is_some() {
             t.ignored(
                 "spec.kopia.sourceIdentity.sourcePVCName",
-                "only feeds the fork's path inference; kopiur pins sourcePath explicitly",
+                "only used by the fork to infer the path; kopiur sets sourcePath explicitly",
             );
         }
         SourceForm::Identity {
@@ -1296,8 +1287,8 @@ pub fn translate_destination(
             (Some(_), None) | (None, Some(_)) => {
                 t.unmappable(
                     "spec.kopia.username/hostname",
-                    "the fork requires username and hostname TOGETHER; only one is set — \
-                     falling back to fromPolicy resolution",
+                    "the fork needs both username and hostname but only one is set; using \
+                     fromPolicy instead",
                 );
                 SourceForm::FromPolicy
             }
@@ -1371,8 +1362,7 @@ pub fn translate_destination(
                 if present {
                     t.ignored(
                         &format!("spec.kopia.{field}"),
-                        "destinationPVC takes precedence; the restore writes into the \
-                         existing PVC and provisions nothing",
+                        "destinationPVC wins; the restore writes into that existing PVC",
                     );
                 }
             }
@@ -1404,7 +1394,7 @@ pub fn translate_destination(
         (None, None) => {
             return Err(format!(
                 "ReplicationDestination {namespace}/{name} has neither destinationPVC nor \
-                 capacity; kopiur needs an explicit restore target"
+                 capacity; set one so kopiur knows where to restore"
             ));
         }
     };
@@ -1421,8 +1411,8 @@ pub fn translate_destination(
         t.unmappable(
             "spec.kopia.shallow",
             &format!(
-                "kopiur has no newest-N selection window (was {shallow}); pick the snapshot \
-                 via asOf/offset or snapshotID instead"
+                "kopiur has no shallow restore (was {shallow}); pick the snapshot with \
+                 asOf/offset or snapshotID instead"
             ),
         );
     }
@@ -1430,8 +1420,8 @@ pub fn translate_destination(
         t.ignored(
             "spec.kopia.copyMethod",
             &format!(
-                "kopiur restores write directly into the target PVC; VolSync's destination \
-                 copyMethod ({method:?}) has no role"
+                "kopiur restores write straight into the target PVC, so copyMethod \
+                 ({method:?}) is not needed"
             ),
         );
     }
@@ -1472,7 +1462,7 @@ pub fn translate_destination(
     if kopia.cleanup_cache_pvc.is_some() {
         t.ignored(
             "spec.kopia.cleanupCachePVC",
-            "kopiur restore caches are run-scoped (Ephemeral default)",
+            "kopiur restore caches last one run (Ephemeral by default)",
         );
     }
     if kopia.custom_ca.is_some() {
@@ -1484,8 +1474,7 @@ pub fn translate_destination(
     if spec.trigger.is_some() {
         t.ignored(
             "spec.trigger",
-            "kopiur Restores are one-shot objects; create one per restore instead of a \
-             recurring destination trigger",
+            "a kopiur Restore runs once; create a new Restore each time you restore",
         );
     }
 
@@ -1689,7 +1678,7 @@ mod tests {
         assert!(plan.backend["azure"].get("prefix").is_none());
         assert!(plan.notes.iter().any(|n| matches!(
             &n.disposition,
-            Disposition::Ignored { reason } if reason.contains("NO --prefix")
+            Disposition::Ignored { reason } if reason.contains("no --prefix")
         )));
         assert_eq!(plan.backend["azure"]["storageAccount"], "acct");
         let (name, derived) = plan.derived_creds.as_ref().expect("rename secret");
@@ -1750,7 +1739,7 @@ mod tests {
             plan.notes.iter().any(|n| matches!(
                 &n.disposition,
                 Disposition::Unmappable { reason }
-                    if reason.contains("KOPIA_GCS_CREDENTIALS") && reason.contains("CONTENT")
+                    if reason.contains("KOPIA_GCS_CREDENTIALS") && reason.contains("content")
             )),
             "{:?}",
             plan.notes
@@ -1871,7 +1860,7 @@ mod tests {
         let plan = plan_for("rclone://remote:/backups", &d);
         assert!(plan.notes.iter().any(|n| matches!(
             &n.disposition,
-            Disposition::Unmappable { reason } if reason.contains("CONTENT")
+            Disposition::Unmappable { reason } if reason.contains("content")
         )));
     }
 
@@ -1885,7 +1874,7 @@ mod tests {
         assert!(plan.backend["gcs"].get("prefix").is_none());
         assert!(plan.notes.iter().any(|n| matches!(
             &n.disposition,
-            Disposition::Ignored { reason } if reason.contains("NO --prefix")
+            Disposition::Ignored { reason } if reason.contains("no --prefix")
         )));
     }
 

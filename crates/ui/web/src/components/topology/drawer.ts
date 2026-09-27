@@ -51,13 +51,13 @@ export function nodeSection(kind: NodeKind): NodeSection | null {
 export function nodeMeaning(kind: NodeKind): string {
   switch (kind) {
     case "repository":
-      return "a namespaced Repository — the kopia repository snapshots in its namespace are written to";
+      return "a namespaced Repository — where snapshots in its namespace are written";
     case "clusterRepository":
       return "a cluster-scoped ClusterRepository, shared by the namespaces it admits";
     case "backend":
-      return "a bare storage backend a repository replication writes blobs to; it is not an object in the cluster and has no health of its own";
+      return "a storage backend a repository replication writes to; it is not an object in the cluster";
     case "policy":
-      return "a SnapshotPolicy — the recipe naming what to back up and which repositories to write it to";
+      return "a SnapshotPolicy — what to back up and which repositories to write it to";
     case "namespace":
       return "a namespace this cluster repository admits";
     case "namespaceSelector":

@@ -170,10 +170,8 @@ fn invalid_body(detail: impl Into<String>) -> ApiError {
         400,
         "invalid-body",
         format!("kopiur-ui could not read the request: {}", detail.into()),
-        "The request body did not match what this endpoint accepts, so nothing was created \
-         or changed.",
-        "correct the request and try again; if you did not hand-write it, reload the page so \
-         the SPA bundle matches this backend",
+        "Nothing was created or changed.",
+        "correct the request and try again, or reload the page",
     )
 }
 
@@ -190,11 +188,8 @@ fn body_too_large(detail: impl Into<String>) -> ApiError {
             "kopiur-ui refused the request because its body is too large: {}",
             detail.into()
         ),
-        "The body exceeded the server's request-size limit and was never read, so nothing \
-         was created or changed. Every action body here is a handful of fields; a large one \
-         usually means a field was filled with a file or a whole manifest.",
-        "send only the fields the action needs; if a list in the request is genuinely that \
-         long, split it across several requests",
+        "Nothing was created or changed.",
+        "send only the fields the action needs, or split a long list across requests",
     )
 }
 
@@ -213,8 +208,7 @@ fn ops_ctx(app: &AppState, id: &Identity, namespace: &str) -> Result<OpsCtx, Api
             "impersonation-failed",
             "kopiur-ui could not build a Kubernetes client for your identity.",
             format!("Constructing the impersonating client failed: {e}"),
-            "retry; if it persists, check the kopiur-ui pod's logs and that its ServiceAccount \
-             token is mounted",
+            "retry; if it persists, check the kopiur-ui logs and its ServiceAccount token mount",
         )
     })?;
     Ok(OpsCtx {
@@ -262,10 +256,9 @@ fn created_ref<K: kube::Resource<DynamicType = ()>>(
                 "kopiur-ui created a {} but the API server returned it without a name.",
                 K::kind(&())
             ),
-            "A created object always echoes metadata.name, so this should be impossible; \
-             kopiur-ui has nothing to link the new object by.",
-            "the object was most likely created — check the namespace for it before retrying, \
-             and report this at https://github.com/home-operations/kopiur/issues",
+            "This is unexpected; kopiur-ui cannot link to the new object.",
+            "the object was probably created, so check the namespace before retrying, and \
+             report this at https://github.com/home-operations/kopiur/issues",
         )
     })?;
 
@@ -474,10 +467,8 @@ fn restore_source(
         RestoreSourceBody::SnapshotRef { name, namespace } => {
             if source_path.is_some() {
                 return Err(invalid_body(
-                    "sourcePath selects which kopia source to read from, and a snapshotRef \
-                     source has no such selector — the Snapshot you named is already one \
-                     source. Drop sourcePath to restore that snapshot, or use a fromPolicy \
-                     or identity source to choose a different source path",
+                    "sourcePath cannot be used with a snapshotRef source. Drop sourcePath, or \
+                     use a fromPolicy or identity source",
                 ));
             }
             Ok(RestoreSource::SnapshotRef(ObjectRef {
@@ -750,8 +741,8 @@ async fn deletion_hold_note(api: &Api<Snapshot>, name: &str) -> Option<String> {
             tracing::warn!(
                 error = %e,
                 snapshot = name,
-                "the deletion was accepted but re-reading the Snapshot failed; a \
-                 mass-deletion hold cannot be reported for it"
+                "deletion accepted, but re-reading the Snapshot failed; cannot report a \
+                 mass-deletion hold"
             );
             return None;
         }

@@ -644,13 +644,8 @@ pub fn download_size(entry: &DirEntry, path: &str, max: u64) -> Result<u64, ApiE
             422,
             "download-size-unknown",
             format!("The snapshot records no size for {path}."),
-            "kopiur-ui commits a Content-Length before it streams, so that a truncated \
-             transfer is visible to the browser rather than silently saved. An entry with no \
-             recorded size cannot be served that way.",
-            format!(
-                "read it with `kubectl kopiur cat {path}`, which streams without a declared \
-                 length"
-            ),
+            "The UI needs the size up front so a cut-off download is never saved silently.",
+            format!("read it with `kubectl kopiur cat {path}`"),
         ));
     };
     let size = size as u64;
@@ -659,13 +654,8 @@ pub fn download_size(entry: &DirEntry, path: &str, max: u64) -> Result<u64, ApiE
             413,
             "download-too-large",
             format!("{path} is {size} bytes, above this deployment's download limit of {max}."),
-            "A browser download is buffered by the browser and streamed through kopiur-ui's \
-             own process, so the limit bounds what one click can cost the UI pod and the \
-             session pod.",
-            format!(
-                "restore the file instead — `kubectl kopiur download {path}` streams straight \
-                 to disk — or raise KOPIUR_UI_MAX_DOWNLOAD_BYTES"
-            ),
+            "The limit caps what one download costs the UI and session pods.",
+            format!("use `kubectl kopiur download {path}`, or raise KOPIUR_UI_MAX_DOWNLOAD_BYTES"),
         ));
     }
     Ok(size)
@@ -958,9 +948,8 @@ async fn attach(
             502,
             "upstream",
             "The browse session pod became ready but its Job vanished.",
-            "Something deleted the Job between kopiur-ui starting it and reading it back.",
-            "retry; if it keeps happening, look for a controller or policy engine deleting \
-             kopiur-browse-* Jobs",
+            "Something deleted the Job right after it started.",
+            "retry; if it keeps happening, look for something deleting kopiur-browse-* Jobs",
         )
     })?;
 
@@ -1049,8 +1038,8 @@ async fn require_live_session(
                             tracing::warn!(
                                 job = %name,
                                 %error,
-                                "could not delete the browse session a read accidentally \
-                                 started; it will be reaped by its own deadline"
+                                "could not delete an unneeded browse session; it will expire \
+                                 on its own"
                             );
                         }
                     },
@@ -1150,9 +1139,8 @@ fn missing_session_namespace() -> ApiError {
         400,
         "invalid",
         "The request names a ClusterRepository but no session namespace.",
-        "A ClusterRepository is cluster-scoped, but its browse session Job runs beside the \
-         Snapshot being browsed — so the namespace to look in cannot be derived from the \
-         repository.",
+        "The session runs in the Snapshot's namespace, which a ClusterRepository cannot \
+         supply.",
         "add ?sessionNamespace=<the snapshot's namespace> to the URL",
     )
 }
@@ -1167,11 +1155,9 @@ fn no_session(status: u16, namespace: &str, name: &str) -> ApiError {
         status,
         "session-required",
         format!("No browse session is running for {namespace}/{name}."),
-        "Reading a snapshot's files needs a mover pod holding the repository open. \
-         kopiur-ui never starts one from a GET — that is a write to the cluster and a real \
-         cost, so it takes a deliberate action.",
-        "start a browse session first (the browse view's \"start session\" button, or POST \
-         to this snapshot's /session endpoint)",
+        "Reading a snapshot's files needs a running session pod.",
+        "start a browse session first (the \"start session\" button, or POST to this \
+         snapshot's /session endpoint)",
     )
 }
 
@@ -1184,11 +1170,9 @@ fn session_ready_timeout(budget: Duration) -> ApiError {
             "The browse session pod was not ready within {}s.",
             budget.as_secs()
         ),
-        "The pod may still be pulling the mover image or connecting to the repository. \
-         Waiting stopped; the session did not.",
-        "retry in a moment — a warm session answers immediately. If it never becomes ready, \
-         check the kopiur-browse-* pod's events and logs, and raise \
-         KOPIUR_UI_SESSION_READY_TIMEOUT if image pulls are slow here",
+        "The pod may still be pulling its image or connecting to the repository.",
+        "retry in a moment. If it never becomes ready, check the kopiur-browse-* pod's events \
+         and logs, or raise KOPIUR_UI_SESSION_READY_TIMEOUT",
     )
 }
 
@@ -1247,11 +1231,8 @@ pub fn listing_error(error: OpsError, exceeded: bool, cap: u64, path: &str) -> A
             "The listing for {:?} is larger than this deployment will buffer ({cap} bytes).",
             if path.is_empty() { "/" } else { path },
         ),
-        "kopiur-ui reads a directory by buffering kopia's whole JSON manifest for it, so a \
-         directory with millions of entries would be answered by the UI pod running out of \
-         memory. The limit turns that into this message.",
-        "list it with `kubectl kopiur ls`, which streams instead of buffering, or raise \
-         KOPIUR_UI_MAX_MANIFEST_BYTES",
+        "The UI buffers a whole directory listing in memory.",
+        "list it with `kubectl kopiur ls`, or raise KOPIUR_UI_MAX_MANIFEST_BYTES",
     )
 }
 
@@ -1275,13 +1256,9 @@ pub fn catalog_error(error: OpsError, exceeded: bool, cap: u64) -> ApiError {
             "This repository's snapshot catalog is larger than this deployment will buffer \
              ({cap} bytes)."
         ),
-        "Opening any file in a snapshot starts by reading the repository's whole snapshot \
-         list — every kopia identity and all of its history, not just this Snapshot — and \
-         kopiur-ui buffers that JSON to find the root object. A repository with a very large \
-         number of snapshots exceeds the buffer before browsing can begin.",
-        "reduce the repository's snapshot count (check the retention on the policies writing \
-         to it, and run a maintenance pass), or raise KOPIUR_UI_MAX_MANIFEST_BYTES; \
-         `kubectl kopiur ls` reads the same catalog, so it will not work around this",
+        "Browsing starts by reading the repository's whole snapshot list, which is too big.",
+        "reduce the snapshot count (tighten retention and run maintenance), or raise \
+         KOPIUR_UI_MAX_MANIFEST_BYTES; `kubectl kopiur ls` will not work around this",
     )
 }
 
@@ -1301,9 +1278,7 @@ fn query_from<T: serde::de::DeserializeOwned>(uri: &Uri) -> Result<T, ApiError> 
                 "invalid",
                 "The request's query parameters are not the shape this endpoint accepts.",
                 e.to_string(),
-                "check the parameter names and values against the API reference — an unknown \
-             parameter is refused rather than ignored, so that a typo cannot silently give \
-             you a default you did not ask for",
+                "check the parameter names and values; unknown parameters are refused",
             )
         })
 }

@@ -23,8 +23,8 @@ pub fn validate_dns1123_name(value: &str, field: &str) -> ValidationResult {
         Err(ValidationError::InvalidFieldValue {
             field: field.to_string(),
             reason: format!(
-                "must be a DNS-1123 subdomain — lowercase alphanumerics, '-' or '.', \
-                 starting and ending with an alphanumeric, at most 253 characters \
+                "must be a DNS-1123 subdomain: lowercase letters, digits, '-' or '.', \
+                 starting and ending with a letter or digit, at most 253 characters \
                  (got {value:?})"
             ),
         })
@@ -84,10 +84,8 @@ pub fn validate_backend_tls(tls: &crate::common::TlsConfig, context: &str) -> Va
             a: "tls.caBundleRef".to_string(),
             b: "tls.disableTls".to_string(),
             context: format!(
-                "{context}: with disableTls (kopia --disable-tls) there is no TLS \
-                 handshake at all, so the referenced CA bundle can never be \
-                 consulted — remove disableTls to verify with the CA bundle, or \
-                 remove caBundleRef for plain HTTP"
+                "{context}: disableTls means the CA bundle is never used; remove \
+                 disableTls, or remove caBundleRef for plain HTTP"
             ),
         });
     }
@@ -95,10 +93,8 @@ pub fn validate_backend_tls(tls: &crate::common::TlsConfig, context: &str) -> Va
         None | Some("") => {
             return Err(ValidationError::InvalidFieldValue {
                 field: format!("{context} tls.caBundleRef.configMapName"),
-                reason: "the caBundleRef names no ConfigMap, so there is nothing to \
-                         resolve the CA bundle from — set configMapName to the \
-                         ConfigMap holding the PEM CA bundle, or remove the \
-                         caBundleRef block"
+                reason: "is required. Fix: set configMapName to the ConfigMap holding \
+                         the PEM CA bundle, or remove the caBundleRef block"
                     .to_string(),
             });
         }
@@ -112,9 +108,8 @@ pub fn validate_backend_tls(tls: &crate::common::TlsConfig, context: &str) -> Va
         return Err(ValidationError::InvalidFieldValue {
             field: format!("{context} tls.caBundleRef.key"),
             reason: format!(
-                "is blank ({key:?}) and can never match a ConfigMap key — set it to \
-                 the key holding the PEM CA bundle, or omit it to use the default \
-                 \"ca.crt\""
+                "is blank ({key:?}). Fix: set it to the key holding the PEM CA \
+                 bundle, or omit it to use the default \"ca.crt\""
             ),
         });
     }
@@ -154,10 +149,8 @@ pub fn validate_backend(backend: &crate::backend::Backend) -> ValidationResult {
                 if auth.workload_identity.is_some() && a.storage_account.is_none() {
                     return Err(ValidationError::InvalidFieldValue {
                         field: "azure backend storageAccount".to_string(),
-                        reason: "required with auth.workloadIdentity: the \
-                                 azure-workload-identity webhook injects the tenant, \
-                                 client id, and federated token, but not the storage \
-                                 account — set spec.backend.azure.storageAccount"
+                        reason: "is required with auth.workloadIdentity. Fix: set \
+                                 spec.backend.azure.storageAccount"
                             .to_string(),
                     });
                 }
@@ -298,10 +291,9 @@ pub fn validate_replication_auth(
                 Err(ValidationError::InvalidFieldValue {
                     field: kind.service_account_field().to_string(),
                     reason: format!(
-                        "{mover} is one pod and runs as exactly one ServiceAccount, \
-                         but {src} federates as {a:?} and {dst} as {b:?} — point \
-                         both at the same ServiceAccount (with IAM access to both \
-                         stores)",
+                        "{mover} runs as one ServiceAccount, but {src} uses {a:?} \
+                         and {dst} uses {b:?}. Fix: use the same ServiceAccount \
+                         (with IAM access to both stores)",
                         mover = kind.mover(),
                         src = kind.source_label(),
                         dst = kind.destination_label(),
@@ -332,13 +324,10 @@ pub fn validate_replication_auth(
                 Err(ValidationError::InvalidFieldValue {
                     field: kind.auth_field().to_string(),
                     reason: format!(
-                        "a same-kind {pair} pair cannot mix workloadIdentity with a \
-                         static credential Secret: {mover}'s environment carries \
-                         the static side's keys, and the workload-identity side's \
-                         ambient credential chain would silently pick them up and \
-                         authenticate as the wrong identity — use workloadIdentity \
-                         on both sides (one ServiceAccount with IAM access to both \
-                         stores) or static Secrets on both",
+                        "a {pair} pair cannot mix workloadIdentity with a static \
+                         credential Secret: {mover} would authenticate with the \
+                         wrong one. Fix: use workloadIdentity on both sides or \
+                         static Secrets on both",
                         pair = kind.pair_label(),
                         mover = kind.mover(),
                     ),
@@ -371,12 +360,9 @@ pub fn validate_replication_destination_secret_namespace(
         Some(ns) if ns != cr_namespace => Err(ValidationError::InvalidFieldValue {
             field: "destination backend auth.secretRef.namespace".to_string(),
             reason: format!(
-                "the replication mover Job runs in namespace {cr_namespace:?} and loads the \
-                 destination credentials via envFrom, which is namespace-local, but the Secret \
-                 {name:?} is pinned to namespace {ns:?} — the Job could never read it. \
-                 RepositoryReplication does not project credentials across namespaces; put the \
-                 destination Secret in {cr_namespace:?} (omit `namespace`, or set it to \
-                 {cr_namespace:?})",
+                "Secret {name:?} is in namespace {ns:?}, but the replication Job runs in \
+                 {cr_namespace:?} and can only read Secrets there. Fix: put the destination \
+                 Secret in {cr_namespace:?}",
                 name = secret_ref.name,
             ),
         }),
