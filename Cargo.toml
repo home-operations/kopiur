@@ -66,7 +66,7 @@ tower = "0.5"
 # and JSON payloads, the static security headers (`set-header`), the `/api`
 # concurrency limit and per-request timeout, and the dev-only CORS layer. `fs` is
 # deliberately absent — the SPA is embedded with `rust-embed`, never read off disk.
-tower-http = { version = "0.6", features = [
+tower-http = { version = "0.7", features = [
     "trace",
     "compression-gzip",
     "set-header",
