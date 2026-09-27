@@ -45,6 +45,16 @@ crates/
   controller/  Per-CRD kube::runtime::Controller reconcilers, finalizers, referent watches.
   mover/       Job binary for kopia work (snapshot/restore/bootstrap/maintenance/verify/
                replicate/pin/delete; musl, distroless).
+  ops/         Shared client-side operations (reports, matchers, browse data-plane, action
+               builders) used by cli + ui.
+  cli/         `kubectl kopiur` — the clap tree, rendering, and the CLI-only `--local`
+               browse transport. Everything shareable lives in ops/.
+  ui-model/    Wire types shared by the web console's backend and its SPA, exported to
+               TypeScript with ts-rs. NO kube deps — it is the contract, not a client.
+  ui/          `kopiur-ui`: the web console. axum + an impersonating kube client (every
+               apiserver call is made AS the caller), the browse data plane, and the
+               embedded SPA under crates/ui/web/ (pnpm + Vite).
+  migrate/     Pure VolSync→kopiur translation core (restic + fork-kopia movers); kube-free.
   telemetry/   OTel-instrument-once: Prometheus pull (/metrics) + optional OTLP push.
   e2e/         kind-based e2e harness (mise monorepo subproject, crates/e2e/mise.toml).
   xtask/       Codegen: `cargo xtask gen-crds|gen-rbac|gen-all` → deploy/crds, deploy/rbac,
@@ -77,7 +87,14 @@ add controller-runtime dependencies to `crates/api`.
    policy/repository from silently re-identifying is the admission-time fork
    guard (`IdentityWouldFork`/`RepositoryIdentityWouldFork`), acknowledged via
    the `allow-identity-change` annotation — not a one-time pin.
-5. **Tests parse YAML the cluster's way**: YAML → `serde_json::Value` → typed
+5. **TypeScript never hand-declares an API shape.** Every type crossing the
+   wire between `crates/ui` and its SPA lives in `crates/ui-model` and is
+   exported to `crates/ui/web/src/api/types/` by `cargo xtask gen-ui-types`
+   (ts-rs). A hand-written `interface` in the SPA compiles forever against a
+   backend that has renamed the field — the generated file is the contract, and
+   `ui-check`/`gen-check` fail if it is stale or uncommitted. Change a wire type
+   ⇒ run `mise run ui-types` in the same commit.
+6. **Tests parse YAML the cluster's way**: YAML → `serde_json::Value` → typed
    (see `crates/api/src/lib.rs::testutil::from_yaml`). Never `serde_yaml::from_str`
    directly into a typed value — serde_yaml 0.9 mis-encodes externally-tagged enums.
 
@@ -96,8 +113,11 @@ add controller-runtime dependencies to `crates/api`.
 | Deletion            | `Snapshot` CR owns its kopia snapshot via finalizer; `deletionPolicy: Delete`(default produced) / `Retain`(forced for discovered) / `Orphan`. Schedule-deletion cascade guarded by `SnapshotSchedule.spec.deletion.onScheduleDelete` (default `Retain`, opt-in `Delete`). Per-repo mass-deletion breaker `deletionProtection.threshold` (default 10, `0` disables, timestamp-ack release) holds bulk EXTERNAL deletes; operator prunes always bypass it. Execution is batched per repository (`snapdel-*` mover Jobs), never one Job per Snapshot — see ADR-0006. |
 | Maintenance         | Default-managed: `Repository`/`ClusterRepository` `spec.maintenance` (default-on) is projected into an _owned_ `Maintenance` CR; an externally-authored `Maintenance` is always honored (never duplicated), even with `enabled: false`. ClusterRepo placement: `spec.maintenance.namespace` else `KOPIUR_NAMESPACE`.                                                                                                                                                                                                                                              |
 
-Pinned deps (Rust 1.97): `kube` 4.0, `k8s-openapi` 0.28 (feature `v1_33`,
-`schemars` on), `schemars` 1, `axum` 0.8, `croner` 3, `cel` 0.14.
+Pinned deps: `kube` 4.0, `k8s-openapi` 0.28 (feature `v1_33`, `schemars` on),
+`schemars` 1, `axum` 0.8, `croner` 3, `cel` 0.14, `ts-rs` 12. The toolchain mise
+installs is **Rust 1.98.0** (`.mise/config.toml`); the workspace's published MSRV
+(`rust-version`) is **1.95** — the two are different numbers and both are real,
+so quote whichever one the question is about.
 
 ## Build / test / verify
 
@@ -114,9 +134,18 @@ mise run fmt-check
 mise run gen                   # regenerate deploy/crds + RBAC (M3+)
 mise run gen-check             # CI drift guard: fails if checked-in artifacts are stale
 
+# Web console (crates/ui + crates/ui/web). The SPA is pnpm+Vite; crates/ui/build.rs
+# embeds crates/ui/web/dist.
+mise run ui-types              # regenerate the SPA's .ts wire types from crates/ui-model (ts-rs)
+mise run ui-build              # build the SPA into crates/ui/web/dist
+mise run ui-check              # SPA gate: tsc + eslint + vitest, then fail if ui-types is uncommitted
+mise run image-ui              # build the console image (builds the SPA in-image)
+
 # Cluster-dependent integration tests are #[ignore] + feature-gated, ephemeral kind only:
 mise run test-int              # wraps scripts/with-kind.sh
 mise run //crates/e2e:test     # full e2e: Helm-deployed operator in kind (crates/e2e/mise.toml)
+# The console is NOT installed by the default e2e values — opt in per run:
+KOPIUR_E2E_UI=1 KOPIUR_E2E_BINS=ui mise run //crates/e2e:test
 ```
 
 Integration/e2e tests must **never** target the user's real clusters. Both tiers

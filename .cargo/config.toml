@@ -1,2 +1,20 @@
 [alias]
 xtask = "run --package xtask --"
+
+# ts-rs settings for `crates/ui-model`. Every `#[ts(export)]` type gets a
+# generated `#[test]` that re-exports its TypeScript definition on `cargo test`,
+# configured purely from these env vars. Both entries exist so that incidental
+# output matches the artifact `kopiur_ui_model::export_all` produces:
+#
+#   * TS_RS_EXPORT_DIR — park the incidental bindings under the already-ignored
+#     `target/` instead of creating an untracked `crates/ui-model/bindings/`.
+#     `relative = true` resolves it against this file's directory (the workspace
+#     root), not the test binary's CWD.
+#   * TS_RS_LARGE_INT — ts-rs defaults `i64`/`u64` to `bigint`, but these types
+#     travel as JSON and `JSON.parse` yields a `number`, so `bigint` would
+#     describe a value the SPA never receives.
+#
+# Only ts-rs reads either variable, so no other crate is affected.
+[env]
+TS_RS_EXPORT_DIR = { value = "target/ts-rs-bindings", relative = true }
+TS_RS_LARGE_INT = "number"

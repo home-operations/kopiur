@@ -8,6 +8,19 @@ There is **no `enabled` field**. The presence of the `spec.server` block is what
 
 Kopiur creates the workload and the `Service` only. Routing that Service to the outside world, with an `Ingress` or an `HTTPRoute`, is your job. See [Exposing the Service](#exposing-the-service).
 
+/// info | Not the same thing as Kopiur's own web console
+
+This page is kopia's UI: it serves **one repository** to kopia clients and shows
+that repository's snapshots, policies and sources. It knows nothing about
+Kopiur's CRDs.
+
+Kopiur's own console, [`kopiur-ui`](ui.md), is the other way round: it shows your
+`Repository`, `SnapshotPolicy`, `Snapshot`, `Restore` and `Maintenance` objects
+across the fleet, and acts on them as the signed-in user through Kubernetes RBAC.
+The two solve different problems and can run side by side.
+
+///
+
 ## When would you use this?
 
 The UI is an **interactive** surface for a human. Reach for it when you want to:

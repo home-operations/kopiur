@@ -1,0 +1,27 @@
+[package]
+name = "kopiur-ops"
+description = "Shared client-side operations for kopiur (CLI + web UI): cross-CRD joins, reports, browse data-plane, action builders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+kopiur-api = { workspace = true }
+kopiur-kopia = { workspace = true }
+kopiur-mover = { workspace = true }
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ws"] }
+k8s-openapi = { workspace = true, features = ["v1_33"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+kopiur-api = { workspace = true, features = ["testutil"] }
+serde_yaml = { workspace = true }

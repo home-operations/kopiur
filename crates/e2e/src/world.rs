@@ -18,7 +18,9 @@ use kube::{Api, Client};
 use tokio::sync::OnceCell;
 
 use crate::apply::{Fixture, apply_all};
-use crate::{builders, consts, default_timeout, ensure_namespace, poll_interval, try_client, wait};
+use crate::{
+    builders, consts, default_timeout, ensure_namespace, poll_interval, try_client, ui, wait,
+};
 
 /// A cluster prerequisite a scenario declares. New requirement ⇒ new variant ⇒
 /// every `match` over `Need` must account for it.
@@ -69,6 +71,17 @@ pub enum Need {
     /// root-owned, mode-0000 file) for the `errorHandling.ignoreFileErrors` e2e.
     /// Implies [`Need::Filesystem`] for the shared credentials Secret.
     ErrorSource,
+    /// The web console's two test subjects, as a real administrator would grant
+    /// them: `e2e-editor` bound to `kopiur-ui-user` cluster-wide and to
+    /// `kopiur-ui-browse` in the operator namespace **only**, and `e2e-nobody`
+    /// bound to nothing at all.
+    ///
+    /// `e2e-nobody` is provisioned by being *absent* — there is no object to
+    /// create for "this person may do nothing". That is the point of the pair: a
+    /// suite that only binds the permitted subject proves half an authorization
+    /// system. Implies [`Need::Filesystem`] for the repo/source PVCs the console
+    /// scenarios browse.
+    UiSubjects,
 }
 
 /// Handle to a reachable cluster plus per-`Need` idempotency latches.
@@ -88,6 +101,7 @@ pub struct World {
     /// resolve cluster Service DNS, so scenarios address the server by IP.
     nfs: OnceCell<String>,
     error_source: OnceCell<()>,
+    ui_subjects: OnceCell<()>,
 }
 
 impl World {
@@ -108,6 +122,7 @@ impl World {
             rclone: OnceCell::new(),
             nfs: OnceCell::new(),
             error_source: OnceCell::new(),
+            ui_subjects: OnceCell::new(),
         })
     }
 
@@ -172,6 +187,15 @@ impl World {
                 Need::Nfs => {
                     self.nfs.get_or_try_init(|| self.ensure_nfs()).await?;
                 }
+                Need::UiSubjects => {
+                    // Implies Filesystem (the repo/source PVCs and the creds
+                    // Secret) — the same direct latch the other implied needs
+                    // use, rather than async recursion.
+                    self.fs.get_or_try_init(|| self.ensure_filesystem()).await?;
+                    self.ui_subjects
+                        .get_or_try_init(|| self.ensure_ui_subjects())
+                        .await?;
+                }
                 Need::ErrorSource => {
                     // Implies Filesystem (the shared creds Secret) — same direct
                     // latch the other implied needs use (no async recursion).
@@ -187,6 +211,40 @@ impl World {
 
     /// The `src-eh` source PV/PVC (operator namespace) over the node-seeded dir
     /// holding the deliberately unreadable file.
+    /// Bind the console's human roles to the permitted test subject, exactly as
+    /// `docs/ui.md` tells an administrator to.
+    ///
+    /// Two bindings, two shapes, on purpose:
+    ///
+    /// * `kopiur-ui-user` cluster-wide, because the console is a fleet view;
+    /// * `kopiur-ui-browse` as a **namespaced** RoleBinding in the operator
+    ///   namespace, because that grant hands the subject that namespace's
+    ///   repository credentials — a session pod loads them from its environment
+    ///   and `pods/exec create` cannot be narrowed to one pod by RBAC. Binding it
+    ///   cluster-wide here would quietly make the suite prove something safer than
+    ///   what it documents.
+    ///
+    /// There is deliberately no third binding: `e2e-nobody` exists precisely so a
+    /// refusal can be asserted against a subject the apiserver has never heard of.
+    async fn ensure_ui_subjects(&self) -> Result<()> {
+        let fixtures: Vec<Fixture> = vec![
+            builders::cluster_role_binding_for_user(
+                consts::UI_USER_BINDING,
+                consts::UI_USER_ROLE,
+                ui::EDITOR_USER,
+            )
+            .into(),
+            builders::role_binding_for_user(
+                consts::OPERATOR_NS,
+                consts::UI_BROWSE_BINDING,
+                consts::UI_BROWSE_ROLE,
+                ui::EDITOR_USER,
+            )
+            .into(),
+        ];
+        apply_all(&self.client, &fixtures).await
+    }
+
     async fn ensure_error_source(&self) -> Result<()> {
         let fixtures: Vec<Fixture> = vec![
             builders::hostpath_pv(consts::PV_SRC_EH, consts::HOSTPATH_SRC_EH, "1Gi").into(),

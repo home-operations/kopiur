@@ -6,3 +6,14 @@ docs/
 *.md
 .gitignore
 .dockerignore
+
+# The SPA's host-side build products. Both are gitignored, but the docker build
+# context is the working tree, not a git archive — so without these every image
+# uploads (and the non-UI images would ship) a full node_modules.
+#
+# `dist/` is excluded deliberately even though `crates/ui/build.rs` embeds it:
+# the UI image must run the SPA build inside the image rather than copy whatever
+# the developer happened to have built locally, or the bundle in a published
+# image depends on an untracked host directory.
+crates/ui/web/node_modules/
+crates/ui/web/dist/

@@ -1,110 +1,24 @@
 //! `kubectl kopiur snapshots list` — a richer `kubectl get snapshots`: policy,
 //! origin, size, and file counts in one view, filterable by policy/origin/
 //! repository, across namespaces with `-A`.
+//!
+//! The selection half (filters, matchers, ordering, the list call) lives in
+//! `kopiur_ops::snapshots`; what stays here is the table this command draws.
 
 use chrono::{DateTime, Utc};
-use kopiur_api::common::{PhaseLabel, RepositoryKind};
-use kopiur_api::consts::{CONFIG_LABEL, ORIGIN_LABEL, REPOSITORY_UID_LABEL};
-use kopiur_api::{ClusterRepository, Origin, Repository, Snapshot, SnapshotPhase};
+use kopiur_api::common::PhaseLabel;
+use kopiur_api::{Origin, Snapshot, SnapshotPhase};
+use kopiur_ops::OpsError;
+use kopiur_ops::snapshots::{
+    RepoFilter, SnapshotListFilter, label_selector, list_snapshots, matches_repository, meta_time,
+    resolve_repo_filter_for,
+};
 use kube::ResourceExt;
-use kube::api::{Api, ListParams};
 
 use crate::cli::SnapshotsListArgs;
 use crate::context::{KubeCtx, Scope};
-use crate::error::{CliError, classify_kube};
+use crate::error::CliError;
 use crate::output::{EMPTY_CELL, OutputFormat, Table, human_age, human_bytes};
-
-/// A resolved `--repository` filter: the repo's identity plus its UID (which
-/// discovered Snapshots carry as a dedup label).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoFilter {
-    /// The repository's `metadata.uid`.
-    pub uid: String,
-    /// Its name, matched against `status.resolved.repository`.
-    pub name: String,
-    /// Repository vs ClusterRepository.
-    pub kind: RepositoryKind,
-    /// The namespace the Repository lives in; `None` for ClusterRepository.
-    pub namespace: Option<String>,
-}
-
-/// Server-side label selector for the list call. `--policy` and `--origin`
-/// map 1:1 onto the labels the operator stamps; `--repository` cannot be a
-/// selector (produced Snapshots record their repository in status, not a
-/// label) so it filters client-side via [`matches_repository`].
-pub fn label_selector(args: &SnapshotsListArgs) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(policy) = &args.policy {
-        parts.push(format!("{CONFIG_LABEL}={policy}"));
-    }
-    if let Some(origin) = args.origin {
-        parts.push(format!("{ORIGIN_LABEL}={}", origin.label_value()));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(","))
-    }
-}
-
-/// Does this Snapshot belong to the filtered repository? Two paths, matching
-/// how the operator records the relationship:
-/// - discovered Snapshots carry the repository UID as a dedup label;
-/// - produced Snapshots pin the `RepositoryRef` in `status.resolved.repository`
-///   (namespace absent = the Snapshot's own namespace).
-pub fn matches_repository(snap: &Snapshot, filter: &RepoFilter) -> bool {
-    if let Some(labels) = &snap.metadata.labels
-        && labels.get(REPOSITORY_UID_LABEL) == Some(&filter.uid)
-    {
-        return true;
-    }
-    let Some(rref) = snap
-        .status
-        .as_ref()
-        .and_then(|s| s.resolved.as_ref())
-        .and_then(|r| r.repository.as_ref())
-    else {
-        return false;
-    };
-    if rref.kind != filter.kind || rref.name != filter.name {
-        return false;
-    }
-    match filter.kind {
-        // Cluster-scoped: name+kind is the whole identity.
-        RepositoryKind::ClusterRepository => true,
-        // Namespaced: an absent ref namespace means "same as the Snapshot".
-        RepositoryKind::Repository => {
-            let effective = rref
-                .namespace
-                .as_deref()
-                .or(snap.metadata.namespace.as_deref());
-            effective == filter.namespace.as_deref()
-        }
-    }
-}
-
-/// Convert a k8s-openapi `Time` (a `jiff::Timestamp` since k8s-openapi 0.27)
-/// to the chrono type the humanizers use.
-fn meta_time(t: &k8s_openapi::apimachinery::pkg::apis::meta::v1::Time) -> Option<DateTime<Utc>> {
-    DateTime::from_timestamp(t.0.as_second(), t.0.subsec_nanosecond().max(0) as u32)
-}
-
-/// Sort key: most recent first by run start time, falling back to CR creation
-/// time for Snapshots that never started (Pending/Discovered).
-pub fn sort_key(snap: &Snapshot) -> DateTime<Utc> {
-    snap.status
-        .as_ref()
-        .and_then(|s| s.timing.as_ref())
-        .and_then(|t| t.start_time.as_deref())
-        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&Utc))
-        .or(snap
-            .metadata
-            .creation_timestamp
-            .as_ref()
-            .and_then(meta_time))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
-}
 
 /// The table headers, in render order. `namespaced` adds the NAMESPACE column
 /// (for `-A`), `wide` appends the detail columns.
@@ -200,18 +114,10 @@ fn phase_cell(phase: Option<&SnapshotPhase>) -> String {
 /// One table row for a Snapshot. Pure; `now` is injected for a deterministic AGE.
 pub fn row(snap: &Snapshot, now: DateTime<Utc>, all_namespaces: bool, wide: bool) -> Vec<String> {
     let status = snap.status.as_ref();
-    let policy = snap
-        .spec
-        .policy_ref
-        .as_ref()
-        .map(|p| p.name.clone())
-        .or_else(|| {
-            snap.metadata
-                .labels
-                .as_ref()
-                .and_then(|l| l.get(CONFIG_LABEL).cloned())
-        })
-        .unwrap_or_else(|| EMPTY_CELL.into());
+    // Shared with the web UI so one row cannot name two different policies
+    // depending on which front end drew it.
+    let policy = kopiur_ops::snapshots::policy_of(snap)
+        .map_or_else(|| EMPTY_CELL.to_string(), str::to_string);
     let stats = status.and_then(|s| s.stats.as_ref());
     let size = stats
         .and_then(|s| s.size_bytes)
@@ -289,42 +195,6 @@ pub fn row(snap: &Snapshot, now: DateTime<Utc>, all_namespaces: bool, wide: bool
     cells
 }
 
-/// Resolve a `--repository NAME` into a [`RepoFilter`] by looking the repo up
-/// (its UID backs the discovered-Snapshot label path). Shared with `status`.
-pub async fn resolve_repo_filter_for(
-    ctx: &KubeCtx,
-    name: &str,
-    kind: RepositoryKind,
-    repository_namespace: Option<&str>,
-) -> Result<RepoFilter, CliError> {
-    match kind {
-        RepositoryKind::Repository => {
-            let ns = repository_namespace
-                .map(str::to_string)
-                .unwrap_or_else(|| ctx.namespace.clone());
-            let api: Api<Repository> = Api::namespaced(ctx.client.clone(), &ns);
-            let repo = get_repo(api, "Repository", "repositories", name, Some(&ns)).await?;
-            Ok(RepoFilter {
-                uid: repo.metadata.uid.unwrap_or_default(),
-                name: name.to_string(),
-                kind,
-                namespace: Some(ns),
-            })
-        }
-        RepositoryKind::ClusterRepository => {
-            let api: Api<ClusterRepository> = Api::all(ctx.client.clone());
-            let repo =
-                get_repo(api, "ClusterRepository", "clusterrepositories", name, None).await?;
-            Ok(RepoFilter {
-                uid: repo.metadata.uid.unwrap_or_default(),
-                name: name.to_string(),
-                kind,
-                namespace: None,
-            })
-        }
-    }
-}
-
 /// Resolve the `snapshots list` flags into an optional [`RepoFilter`].
 async fn resolve_repo_filter(
     ctx: &KubeCtx,
@@ -333,29 +203,14 @@ async fn resolve_repo_filter(
     let Some(name) = &args.repository else {
         return Ok(None);
     };
-    resolve_repo_filter_for(
+    let filter = resolve_repo_filter_for(
         ctx,
         name,
         args.repository_kind.into(),
         args.repository_namespace.as_deref(),
     )
-    .await
-    .map(Some)
-}
-
-async fn get_repo<K>(
-    api: Api<K>,
-    kind: &'static str,
-    plural: &'static str,
-    name: &str,
-    namespace: Option<&str>,
-) -> Result<K, CliError>
-where
-    K: kube::Resource + Clone + std::fmt::Debug + serde::de::DeserializeOwned,
-{
-    api.get(name)
-        .await
-        .map_err(|e| classify_kube("get", kind, plural, namespace, Some(name), e))
+    .await?;
+    Ok(Some(filter))
 }
 
 /// Run `snapshots list` and render for the requested format.
@@ -367,25 +222,13 @@ pub async fn list(
 ) -> Result<String, CliError> {
     let repo_filter = resolve_repo_filter(ctx, args).await?;
 
-    let api: Api<Snapshot> = match &ctx.scope {
-        Scope::All => Api::all(ctx.client.clone()),
-        Scope::Namespace(ns) => Api::namespaced(ctx.client.clone(), ns),
+    let filter = SnapshotListFilter {
+        policy: args.policy.clone(),
+        origin: args.origin.map(Origin::from),
     };
-    let mut params = ListParams::default();
-    if let Some(selector) = label_selector(args) {
-        params = params.labels(&selector);
-    }
-    let list_ns = match &ctx.scope {
-        Scope::All => None,
-        Scope::Namespace(ns) => Some(ns.as_str()),
-    };
-    let listed = api
-        .list(&params)
-        .await
-        .map_err(|e| classify_kube("list", "Snapshot", "snapshots", list_ns, None, e))?;
-
-    let mut snaps: Vec<Snapshot> = listed
-        .items
+    let selector = label_selector(&filter);
+    let snaps: Vec<Snapshot> = list_snapshots(ctx, selector.as_deref())
+        .await?
         .into_iter()
         .filter(|s| {
             repo_filter
@@ -393,7 +236,6 @@ pub async fn list(
                 .is_none_or(|f| matches_repository(s, f))
         })
         .collect();
-    snaps.sort_by_key(|s| std::cmp::Reverse(sort_key(s)));
 
     render_list(&snaps, &ctx.scope, output, now)
 }
@@ -428,18 +270,18 @@ pub fn render_list(
                 "items": snaps,
             });
             match output {
-                OutputFormat::Yaml => {
-                    serde_yaml::to_string(&list).map_err(|e| CliError::Serialization {
+                OutputFormat::Yaml => serde_yaml::to_string(&list).map_err(|e| {
+                    CliError::Ops(OpsError::Serialization {
                         what: "snapshot list",
                         source: e.into(),
                     })
-                }
+                }),
                 _ => {
                     let mut s = serde_json::to_string_pretty(&list).map_err(|e| {
-                        CliError::Serialization {
+                        CliError::Ops(OpsError::Serialization {
                             what: "snapshot list",
                             source: e.into(),
-                        }
+                        })
                     })?;
                     s.push('\n');
                     Ok(s)
@@ -456,7 +298,6 @@ pub fn render_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{OriginFilter, RepositoryKindArg};
     use chrono::TimeZone;
 
     /// Parse a manifest the way the cluster does (YAML → JSON value → typed),
@@ -464,16 +305,6 @@ mod tests {
     fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> T {
         let value: serde_json::Value = serde_yaml::from_str(yaml).expect("yaml -> json value");
         serde_json::from_value(value).expect("json value -> typed")
-    }
-
-    fn list_args() -> SnapshotsListArgs {
-        SnapshotsListArgs {
-            policy: None,
-            origin: None,
-            repository: None,
-            repository_kind: RepositoryKindArg::Repository,
-            repository_namespace: None,
-        }
     }
 
     const SUCCEEDED_SNAPSHOT: &str = r#"
@@ -513,18 +344,6 @@ status:
       kind: Repository
       name: nas
 "#;
-
-    #[test]
-    fn selector_combines_policy_and_origin_labels() {
-        let mut args = list_args();
-        assert_eq!(label_selector(&args), None);
-        args.policy = Some("nightly".into());
-        args.origin = Some(OriginFilter::Discovered);
-        assert_eq!(
-            label_selector(&args).unwrap(),
-            "kopiur.home-operations.com/config=nightly,kopiur.home-operations.com/origin=discovered"
-        );
-    }
 
     #[test]
     fn row_renders_the_succeeded_snapshot() {
@@ -660,74 +479,6 @@ status:
                 "-",
                 "-"
             ]
-        );
-    }
-
-    #[test]
-    fn repository_filter_matches_via_uid_label_or_resolved_ref() {
-        let produced: Snapshot = from_yaml(SUCCEEDED_SNAPSHOT);
-        let filter = RepoFilter {
-            uid: "repo-uid-1".into(),
-            name: "nas".into(),
-            kind: RepositoryKind::Repository,
-            namespace: Some("media".into()),
-        };
-        // Produced snapshot: matches through status.resolved.repository
-        // (ref namespace absent = the snapshot's own namespace).
-        assert!(matches_repository(&produced, &filter));
-
-        // Same repo name in a different namespace must NOT match.
-        let other_ns = RepoFilter {
-            namespace: Some("other".into()),
-            ..filter.clone()
-        };
-        assert!(!matches_repository(&produced, &other_ns));
-
-        // A ClusterRepository filter of the same name must NOT match either.
-        let cluster = RepoFilter {
-            kind: RepositoryKind::ClusterRepository,
-            namespace: None,
-            ..filter.clone()
-        };
-        assert!(!matches_repository(&produced, &cluster));
-
-        // Discovered snapshot: matches through the repository-uid label.
-        let discovered: Snapshot = from_yaml(
-            r#"
-metadata:
-  name: discovered-1
-  namespace: media
-  labels:
-    kopiur.home-operations.com/repository-uid: repo-uid-1
-spec: {}
-"#,
-        );
-        assert!(matches_repository(&discovered, &filter));
-        let wrong_uid = RepoFilter {
-            uid: "other-uid".into(),
-            ..filter
-        };
-        assert!(!matches_repository(&discovered, &wrong_uid));
-    }
-
-    #[test]
-    fn sort_key_prefers_start_time_and_falls_back_to_creation() {
-        let with_start: Snapshot = from_yaml(SUCCEEDED_SNAPSHOT);
-        assert_eq!(
-            sort_key(&with_start),
-            Utc.with_ymd_and_hms(2026, 6, 11, 3, 0, 12).unwrap()
-        );
-        let pending: Snapshot = from_yaml(
-            r#"
-metadata:
-  name: pending-1
-  creationTimestamp: "2026-06-10T00:00:00Z"
-spec: {}
-"#,
-        );
-        assert_eq!(
-            sort_key(&pending),
-            Utc.with_ymd_and_hms(2026, 6, 10, 0, 0, 0).unwrap()
         );
     }
 

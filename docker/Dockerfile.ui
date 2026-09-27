@@ -1,0 +1,78 @@
+# The kopiur-ui image: the web console binary with the SPA bundle compiled in.
+#
+# Unlike docker/Dockerfile and docker/Dockerfile.mover this image ships NO
+# `kopia` binary, on purpose. kopiur-ui never invokes kopia: a browse session
+# runs kopia in its own pod (which uses the mover image), and everything else
+# the console does is Kubernetes API calls under an impersonated identity. A
+# kopia binary here would be inert weight on an internet-adjacent process.
+#
+# Build args (all required; `mise run image-ui` and the release workflow both
+# source them from .mise/config.toml so there is one place to bump a version):
+#   NODE_VERSION  node tag for the SPA stage
+#   PNPM_VERSION  pnpm the SPA stage installs
+#   RUST_VERSION  rust tag for the cargo stage
+#
+# syntax=docker/dockerfile:1
+
+ARG NODE_VERSION
+ARG PNPM_VERSION
+ARG RUST_VERSION
+
+# --platform=$BUILDPLATFORM pins this stage to the machine doing the building,
+# so a multi-arch `docker buildx build --platform linux/amd64,linux/arm64` runs
+# the JavaScript toolchain NATIVELY once instead of running node under qemu for
+# the foreign arch (minutes versus tens of minutes, and no emulator bugs). That
+# is sound because the output is architecture-independent: JS, CSS and static
+# assets, with nothing to cross-compile.
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-trixie-slim AS web
+ARG PNPM_VERSION
+WORKDIR /web
+
+# pnpm via a pinned `npm install -g`, NOT corepack: corepack is deprecated in
+# the node 24 line and unbundled after it, so a corepack-based image would
+# break on the next node bump for no benefit. The pin comes from
+# .mise/config.toml, so the bundle in a published image is built by the same
+# pnpm a developer and CI use.
+RUN set -eux; \
+    test -n "${PNPM_VERSION}" || { echo "PNPM_VERSION build arg is required" >&2; exit 1; }; \
+    npm install -g "pnpm@${PNPM_VERSION}"
+
+# Manifests first so the dependency install is its own cache layer and an
+# SPA source edit does not re-resolve the tree.
+COPY crates/ui/web/package.json crates/ui/web/pnpm-lock.yaml crates/ui/web/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY crates/ui/web/ ./
+# `pnpm build` is tsc --noEmit, then vite build, then the bundle-size budget —
+# the same three gates `mise run ui-build` runs. The bundle is built HERE
+# rather than copied from the host, which is why .dockerignore excludes
+# crates/ui/web/dist: a published image's UI must not depend on whatever the
+# developer happened to have lying around in an untracked directory.
+RUN pnpm build
+
+FROM rust:${RUST_VERSION}-slim-trixie AS builder
+# TARGETARCH is supplied by buildx per platform. The cache mount ids below are
+# keyed on it so a concurrent multi-arch build does NOT share one cargo cache
+# and race on unpacking the registry (`.cargo-ok: File exists`, os error 17).
+# `sharing=locked` additionally serialises any same-id concurrent access. See
+# docker/Dockerfile for the detail.
+ARG TARGETARCH
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# Land the bundle exactly where crates/ui/build.rs looks for it. Paired with
+# KOPIUR_UI_REQUIRE_WEB=1 below, a bundle that failed to arrive is a BUILD
+# failure rather than the placeholder page: that the shipped image serves a
+# placeholder is only discoverable once a pod is already serving it to users,
+# which is far too late to find out.
+COPY --from=web /web/dist ./crates/ui/web/dist
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH},sharing=locked \
+    --mount=type=cache,target=/src/target,id=cargo-target-ui-${TARGETARCH},sharing=locked \
+    KOPIUR_UI_REQUIRE_WEB=1 cargo build --release --locked --bin kopiur-ui && \
+    cp target/release/kopiur-ui /usr/local/bin/kopiur-ui
+
+# Distroless runtime: glibc + CA certs, non-root (uid 65532), no shell.
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+COPY --from=builder /usr/local/bin/kopiur-ui /usr/local/bin/kopiur-ui
+ENTRYPOINT ["/usr/local/bin/kopiur-ui"]

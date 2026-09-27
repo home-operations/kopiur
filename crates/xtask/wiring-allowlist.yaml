@@ -155,29 +155,22 @@ allow:
   #     it, or remove it as a breaking CRD change), and none belongs in a PR
   #     fixing two unrelated bugs. They are tracked here rather than silently
   #     shipped, and the check now prevents the population from growing.
+  #
+  #     SEVEN entries left this section when the web UI's read API landed:
+  #     `*.storageStats.lastObservedAt`, `Maintenance.status.{quick,full}
+  #     .nextScheduledAt`, `RepositoryReplication.status.{nextScheduledAt,
+  #     lastReplicatedBytes,lastReplicatedBlobs}` and
+  #     `Snapshot.status.stats.bytesNew`. `crates/ui` reads all seven to build
+  #     its views, so the ratchet — which asks "does anything READ this?" —
+  #     considers them wired and rejects the exemptions as stale. Their other
+  #     half is still open: NO controller writes them, so the UI renders them
+  #     absent. That is a controller gap to close, not a UI one, and this note
+  #     is where the fact now lives.
   # ==========================================================================
-  - path: "*.storageStats.lastObservedAt"
-    reason: >-
-      Never written. Siblings snapshotCount/totalSizeBytes ARE written by
-      io/repo.rs; only the timestamp was left unwired..
-  - path: Maintenance.status.full.nextScheduledAt
-    reason: Never written by the Maintenance reconciler..
-  - path: Maintenance.status.quick.nextScheduledAt
-    reason: Never written by the Maintenance reconciler..
   - path: Maintenance.status.ownership.claimedAt
     reason: >-
       Never written; the lease's claim time is not recorded even though the
       ownership block is..
-  - path: RepositoryReplication.status.nextScheduledAt
-    reason: Never written by the replication reconciler..
-  - path: RepositoryReplication.status.lastReplicatedBytes
-    reason: Never written; the mover reports no per-run byte count..
-  - path: RepositoryReplication.status.lastReplicatedBlobs
-    reason: Never written; the mover reports no per-run blob count..
-  - path: Snapshot.status.stats.bytesNew
-    reason: >-
-      Never written. Siblings filesNew/filesModified/filesUnchanged are read by
-      metrics.rs, but the byte counterpart was never populated..
   - path: SnapshotSchedule.status.lastSuccessfulSchedule
     reason: >-
       Never written; lastSchedule/nextSchedule ARE written and read, only the
