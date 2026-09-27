@@ -65,9 +65,9 @@ export function RestoreDetailView({ detail, now = new Date() }: RestoreDetailVie
             }
             fix={
               detail.failure.retryRecommended === true
-                ? "The operator considers a retry likely to succeed: create the restore again."
+                ? "A retry is likely to succeed: create the restore again."
                 : detail.failure.retryRecommended === false
-                  ? "The operator does not expect a retry to help — fix the cause named above first."
+                  ? "A retry will not help until the cause above is fixed."
                   : undefined
             }
             lamp={healthLamp("failed")}
@@ -90,7 +90,7 @@ export function RestoreDetailView({ detail, now = new Date() }: RestoreDetailVie
                 term: "Resolution",
                 value:
                   source?.resolution === "NoSnapshot" ? (
-                    "NoSnapshot — no snapshot matched, and onMissingSnapshot chose an empty volume. That is a successful restore of nothing, not a failure."
+                    "NoSnapshot — no snapshot matched, so onMissingSnapshot left an empty volume. This is not a failure."
                   ) : (
                     <Mono value={source?.resolution} />
                   ),
@@ -116,9 +116,8 @@ export function RestoreDetailView({ detail, now = new Date() }: RestoreDetailVie
             ]}
           />
           <p className="page__section-note">
-            A restore resolves its source once, at admission, and never re-resolves. What is listed
-            here is therefore what the run will actually read — not what{" "}
-            <span className="mono">spec.source</span> says today, if someone has edited it since.
+            Resolved once at creation; later edits to <span className="mono">spec.source</span> do
+            not change it.
           </p>
         </Section>
 
@@ -143,10 +142,8 @@ export function RestoreDetailView({ detail, now = new Date() }: RestoreDetailVie
             ]}
           />
           <p className="page__section-note">
-            There is no percentage here because the operator publishes no total to divide by — bytes
-            and files are what a restore can honestly report, so bytes and files are what is shown.
-            A restore writes only into its own namespace,{" "}
-            <span className="mono">{row.namespace}</span>.
+            No percentage: the operator reports no total. A restore writes only into its own
+            namespace, <span className="mono">{row.namespace}</span>.
           </p>
         </Section>
       </div>
@@ -174,9 +171,8 @@ export function RestoreDetailView({ detail, now = new Date() }: RestoreDetailVie
             </table>
           </div>
           <p className="page__section-note">
-            One row per target claim. A claim the operator has not looked at yet reads as{" "}
-            <span className="mono">Pending</span> — the claim exists, and &ldquo;we have not looked
-            yet&rdquo; is a state rather than a blank.
+            One row per target claim. A claim not yet processed shows as{" "}
+            <span className="mono">Pending</span>.
           </p>
         </Section>
       ) : null}
@@ -188,9 +184,7 @@ export function RestoreDetailView({ detail, now = new Date() }: RestoreDetailVie
       <Section title="Log tail" icon={TerminalSquare}>
         {detail.logTail.length === 0 ? (
           <p className="page__section-note">
-            The mover Job wrote no log lines the operator kept. A restore that has not started yet
-            has none; one that failed before the mover ran has none either, and the failure above is
-            where its reason lives.
+            The mover Job wrote no log lines. If it failed before starting, see the failure above.
           </p>
         ) : (
           <>
@@ -198,8 +192,7 @@ export function RestoreDetailView({ detail, now = new Date() }: RestoreDetailVie
               {detail.logTail.join("\n")}
             </pre>
             <p className="page__section-note">
-              The last lines kopia wrote, redacted at the server: presigned URLs and tokens echoed
-              back in an error are removed before they reach this page.
+              The last lines kopia wrote, with URLs and tokens redacted at the server.
             </p>
           </>
         )}
@@ -260,8 +253,7 @@ function Conditions({ conditions, now }: { conditions: readonly ConditionView[];
   if (conditions.length === 0) {
     return (
       <p className="page__section-note">
-        The operator has written no conditions on this restore yet, which means it has not been
-        reconciled — not that it is fine.
+        No conditions yet: the operator has not reconciled this restore.
       </p>
     );
   }

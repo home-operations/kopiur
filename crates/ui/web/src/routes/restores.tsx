@@ -33,11 +33,9 @@ function Restores() {
   return (
     <div className="page">
       <p className="page__prose">
-        A <span className="mono">Restore</span> reads one snapshot back out of a repository and
-        writes it into a <span className="mono">PersistentVolumeClaim</span>. It resolves its source
-        once, at admission, and never re-resolves — so what a restore is reading is a fact about the
-        restore, not about the policy or snapshot it was created from. Open one to see what it
-        pinned.
+        A <span className="mono">Restore</span> writes one snapshot into a{" "}
+        <span className="mono">PersistentVolumeClaim</span>. Its source is fixed when it is created;
+        open one to see which snapshot it uses.
       </p>
 
       <section className="page__section" aria-label="Actions">
@@ -47,9 +45,8 @@ function Restores() {
           </div>
         ) : (
           <p className="page__section-note">
-            A restore is created in a namespace — it writes into a claim its mover Job mounts, and
-            that Job runs where the <span className="mono">Restore</span> is. Scope this page to a
-            namespace to create one.
+            A restore lives in the namespace of the claim it writes. Scope this page to a namespace
+            to create one.
           </p>
         )}
       </section>
@@ -65,9 +62,8 @@ function Restores() {
           />
         ) : restores.data.length === 0 ? (
           <EmptyState title={`No restores in ${scope}`} icon={ArchiveRestore}>
-            Nothing has been restored here. A Restore is how a backup comes back: it names a
-            snapshot — directly, through the policy that produced it, or by kopia identity — and the
-            claim to write it into.
+            Nothing has been restored here. A Restore names a snapshot and the claim to write it
+            into.
           </EmptyState>
         ) : (
           <RestoreTable restores={restores.data} />

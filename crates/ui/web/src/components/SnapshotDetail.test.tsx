@@ -150,7 +150,7 @@ describe("SnapshotDetail", () => {
   it("says the operator wrote no conditions rather than implying health", async () => {
     renderWithRouter(<SnapshotDetail detail={detail()} now={NOW} />);
     expect(
-      await screen.findByText(/has not been reconciled — not that it is healthy/),
+      await screen.findByText(/No conditions yet: the operator has not reconciled/),
     ).toBeInTheDocument();
   });
 

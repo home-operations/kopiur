@@ -88,9 +88,8 @@ async fn main() -> anyhow::Result<()> {
     let readiness = Arc::new(Readiness::new(static_files::is_placeholder()));
     if readiness.web_placeholder {
         tracing::warn!(
-            "this build embeds the placeholder web page, not the SPA: /readyz will report \
-             placeholder-web. Run `mise run ui-build` and rebuild, or use an image built with \
-             KOPIUR_UI_REQUIRE_WEB=1."
+            "this build has the placeholder page, not the web UI, so /readyz reports \
+             placeholder-web; run `mise run ui-build` and rebuild"
         );
     }
 
@@ -114,16 +113,14 @@ async fn main() -> anyhow::Result<()> {
     // UI can serve, and no amount of waiting fixes a missing kubeconfig.
     let base_config = kube::Config::infer().await.map_err(|e| {
         anyhow::Error::new(e).context(
-            "kopiur-ui could not work out how to reach the apiserver. In a cluster this \
-             means the pod has no ServiceAccount token mounted (check \
-             automountServiceAccountToken and the chart's ui.serviceAccount); outside one \
-             it means there is no usable kubeconfig at $KUBECONFIG or ~/.kube/config.",
+            "kopiur-ui could not find the API server. In a cluster, check that a \
+             ServiceAccount token is mounted (automountServiceAccountToken, the chart's \
+             ui.serviceAccount); outside one, check $KUBECONFIG or ~/.kube/config.",
         )
     })?;
     let ui_client = kube::Client::try_from(base_config.clone()).map_err(|e| {
         anyhow::Error::new(e).context(
-            "kopiur-ui could not build a kube client from the inferred configuration; the \
-             cluster URL or its CA bundle is unusable",
+            "kopiur-ui could not build a kube client; the cluster URL or CA bundle is unusable",
         )
     })?;
 
@@ -167,9 +164,8 @@ async fn main() -> anyhow::Result<()> {
             None => {
                 tracing::info!(
                     %addr,
-                    "serving the kopiur-ui app over plain HTTP; TLS is expected to terminate \
-                     at the authenticating proxy in front of it (set \
-                     KOPIUR_UI_TLS_CERT/KEY to terminate here instead)"
+                    "serving the kopiur-ui app over plain HTTP; set KOPIUR_UI_TLS_CERT/KEY \
+                     to serve HTTPS"
                 );
                 serve_http(addr, router).await
             }
@@ -216,17 +212,13 @@ fn build_source(
 ) -> cache::Source {
     if !cfg.cache_enabled {
         tracing::info!(
-            "the read cache is off (KOPIUR_UI_CACHE=false): every read is one impersonated \
-             call, authorized by the apiserver on the real request"
+            "the read cache is off (KOPIUR_UI_CACHE=false); every read goes to the API server"
         );
         readiness.set_cache(CacheState::Disabled);
         return cache::Source::Impersonated;
     }
 
-    tracing::info!(
-        "starting the read cache: nine reflector stores under the UI's own ServiceAccount, \
-         with every read gated by a SubjectAccessReview for the caller"
-    );
+    tracing::info!("starting the read cache");
     let (stores, health_rx) = cache::stores::start(ui_client.clone(), Arc::clone(metrics));
     tokio::spawn(track_cache_readiness(health_rx, Arc::clone(readiness)));
 
@@ -258,17 +250,14 @@ async fn check_impersonation(client: kube::Client, cfg: Arc<UiConfig>, readiness
         .store(denied.is_empty(), Ordering::Relaxed);
 
     if denied.is_empty() {
-        tracing::info!(
-            "kopiur-ui may impersonate; every apiserver call will be made as the caller"
-        );
+        tracing::info!("impersonation check passed");
         return;
     }
     tracing::error!(
         denied = ?denied,
-        "kopiur-ui's ServiceAccount may not impersonate, so every request would be refused \
-         with a 403 the caller cannot fix. Grant it `impersonate` on these resources in the \
-         core API group (the chart's ui.rbac does this); until then /readyz reports \
-         impersonation-unavailable and this pod stays out of the Service."
+        "kopiur-ui's ServiceAccount may not impersonate, so every request would get a 403; \
+         grant it `impersonate` on these resources (the chart's ui.rbac does this). Until \
+         then /readyz reports impersonation-unavailable."
     );
 }
 
@@ -286,8 +275,8 @@ async fn denied_impersonations(client: &kube::Client, cfg: &UiConfig) -> Vec<Str
                 tracing::error!(
                     target = %target,
                     error = %e,
-                    "kopiur-ui could not ask the apiserver whether it may impersonate; \
-                     treating it as denied. /readyz reports impersonation-unavailable."
+                    "could not check whether kopiur-ui may impersonate; treating it as \
+                     denied, so /readyz reports impersonation-unavailable"
                 );
                 false
             }
@@ -344,9 +333,7 @@ async fn may_impersonate(
 /// Every outcome is a failure here, including `Ok(())`: [`serve_ops`] runs until
 /// the process does, so its returning at all means the ops port is gone.
 fn ops_ended_early(joined: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Error {
-    const CONSEQUENCE: &str = "without it Kubernetes cannot probe this pod and nothing can \
-                               scrape its metrics, so the process exits rather than keep \
-                               serving unmonitored";
+    const CONSEQUENCE: &str = "exiting, because the pod cannot be probed or scraped without it";
     match joined {
         // The usual case: the bind failed, and this error carries the address
         // and the KOPIUR_UI_OPS_ADDR remediation from `serve_ops`.
@@ -371,8 +358,8 @@ async fn serve_http(addr: SocketAddr, router: axum::Router) -> anyhow::Result<()
     use anyhow::Context as _;
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
         format!(
-            "binding the kopiur-ui app server to {addr}; if this host has IPv6 disabled a \
-             `[::]` bind fails — set KOPIUR_UI_ADDR=0.0.0.0:{} (via the chart's ui.extraEnv)",
+            "binding the kopiur-ui app server to {addr}; if IPv6 is disabled, set \
+             KOPIUR_UI_ADDR=0.0.0.0:{} (via the chart's ui.extraEnv)",
             addr.port()
         )
     })?;
@@ -435,9 +422,8 @@ async fn serve_tls(
         .await
         .with_context(|| {
             format!(
-                "binding the kopiur-ui TLS server to {addr}; if this host has IPv6 disabled a \
-                 `[::]` bind fails — set KOPIUR_UI_ADDR=0.0.0.0:{} (via the chart's \
-                 ui.extraEnv)",
+                "binding the kopiur-ui TLS server to {addr}; if IPv6 is disabled, set \
+                 KOPIUR_UI_ADDR=0.0.0.0:{} (via the chart's ui.extraEnv)",
                 addr.port()
             )
         })?;

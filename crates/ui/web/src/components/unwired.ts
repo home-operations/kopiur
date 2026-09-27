@@ -46,5 +46,5 @@ export type UnwiredField = keyof typeof UNWIRED_FIELDS;
 
 /** Why that field is absent, in the words the operator can act on. */
 export function unwiredReason(field: UnwiredField): string {
-  return `No controller writes ${UNWIRED_FIELDS[field]} today, so the operator has never published a value. This is an absence, not a zero and not a measurement that failed.`;
+  return `No controller writes ${UNWIRED_FIELDS[field]} yet, so there is no value (not zero).`;
 }

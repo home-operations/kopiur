@@ -26,17 +26,14 @@ function Gates() {
   return (
     <div className="page">
       <p className="page__prose">
-        A structural gate is a condition the operator writes on an object it cannot proceed with — a
-        mover the namespace has not permitted, a credential Secret that is missing, a mass-deletion
-        breaker that has tripped. A gate never self-heals: the object parks with the condition below
-        until a human acts. Each row is the condition&apos;s type, the status value that means
-        blocked (some gates block on <span className="mono">False</span>, some on{" "}
-        <span className="mono">True</span>), the reason the reconciler stamps, and the kinds it
-        appears on. The{" "}
+        A gate is a condition that stops the operator from going on with an object, such as a
+        missing credential Secret or a tripped mass-deletion breaker. A gate never self-heals: the
+        object waits until someone acts. Some gates block on <span className="mono">False</span>,
+        some on <span className="mono">True</span>. The{" "}
         <Link to="/doctor" search={namespace !== undefined ? { namespace } : {}}>
           doctor report
         </Link>{" "}
-        names any object currently parked on one.
+        names any object currently blocked by one.
       </p>
       <section className="page__section" aria-label="Structural gates">
         {gates.isPending ? (
@@ -49,9 +46,7 @@ function Gates() {
           />
         ) : gates.data.length === 0 ? (
           <EmptyState title="No gates registered" icon={ShieldAlert}>
-            The server published an empty registry. Every gate the operator can raise would be
-            listed here; an empty list means this server has none to explain, not that nothing is
-            parked.
+            The server returned no gates. Every gate the operator can raise would be listed here.
           </EmptyState>
         ) : (
           <GateList gates={gates.data} />

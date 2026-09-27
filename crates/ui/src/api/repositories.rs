@@ -549,8 +549,7 @@ fn missing_namespace() -> ApiError {
         400,
         "namespace-required",
         "A Repository lookup needs the namespace it lives in.",
-        "`Repository` is namespaced, so its name alone does not identify one object — two \
-         namespaces may each hold a repository called the same thing.",
+        "Two namespaces may each hold a Repository with this name.",
         "add ?namespace=<namespace> to the request, or ask for a cluster-repository instead",
     )
 }
@@ -562,9 +561,8 @@ fn not_found(kind: &str, namespace: Option<&str>, name: &str) -> ApiError {
         404,
         "not-found",
         format!("There is no {kind} called {name}{scope}."),
-        "It was deleted, renamed, or never existed — the SPA may be showing a link from a \
-         listing taken before the change.",
-        "reload the repositories list to see what the cluster holds now",
+        "It was deleted, renamed, or never existed.",
+        "reload the repositories list",
     )
 }
 

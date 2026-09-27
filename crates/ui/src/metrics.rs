@@ -108,75 +108,47 @@ impl UiMetrics {
         let requests = m
             .u64_counter("kopiur_ui_requests")
             .with_description(
-                "Every HTTP request the UI answered, by route template (never the raw path, \
-                 which carries namespaces and names), response status, and how the caller's \
-                 identity was established (trusted-headers | anonymous). The identity_source \
-                 label is what makes a silent downgrade to the anonymous identity — a \
-                 misconfigured proxy, or KOPIUR_UI_ANONYMOUS_FALLBACK left on — visible \
-                 instead of invisible.",
+                "HTTP requests answered, by route template, status, and identity_source (trusted-headers | anonymous).",
             )
             .build();
 
         let identity_cache_size = m
             .u64_gauge("kopiur_ui_identity_cache_size")
-            .with_description(
-                "Impersonating kube clients currently cached. Each entry owns a connection \
-                 pool, so this tracking KOPIUR_UI_CLIENT_CACHE_SIZE means the cache is \
-                 saturated and clients are being evicted and rebuilt.",
-            )
+            .with_description("Impersonating kube clients currently cached.")
             .build();
 
         let sessions_started = m
             .u64_counter("kopiur_ui_sessions_started")
-            .with_description(
-                "Browse session pods the UI asked the cluster to start. Sessions are shared \
-                 with the CLI, so this counts starts the UI caused, not sessions in existence.",
-            )
+            .with_description("Browse session pods the UI started.")
             .build();
 
         let download_incomplete = m
             .u64_counter("kopiur_ui_download_incomplete")
             .with_description(
-                "File downloads that did not deliver exactly the size recorded in the \
-                 snapshot entry, by cause (download-short | download-overrun | \
-                 client-cancelled). Alert on the first two: they mean a user may hold a \
-                 file that does not match the backup. client-cancelled is someone closing \
-                 a tab and is expected to be non-zero.",
+                "File downloads whose size did not match the snapshot entry, by cause (download-short | download-overrun | client-cancelled).",
             )
             .build();
 
         let exec_inflight = m
             .u64_gauge("kopiur_ui_exec_inflight")
-            .with_description(
-                "pods/exec calls in flight right now, across all identities. Approaching \
-                 KOPIUR_UI_MAX_EXEC_GLOBAL means browse requests are being answered with 429.",
-            )
+            .with_description("pods/exec calls in flight, across all identities.")
             .build();
 
         let cache_objects = m
             .u64_gauge("kopiur_ui_cache_objects")
-            .with_description(
-                "Objects held in the reflector store for each Kopiur kind. Zero for a kind \
-                 that exists in the cluster means that store never synced.",
-            )
+            .with_description("Objects in the read cache, by Kopiur kind.")
             .build();
 
         let sar = m
             .u64_counter("kopiur_ui_sar")
             .with_description(
-                "SubjectAccessReviews the UI performed to gate a cache-backed read, by \
-                 outcome (allowed=true|false). Only the cache path issues these; the \
-                 impersonated path is authorized by the apiserver on the real request.",
+                "SubjectAccessReviews performed for cached reads, by outcome (allowed=true|false).",
             )
             .build();
 
         let sar_cache_size = m
             .u64_gauge("kopiur_ui_sar_cache_size")
-            .with_description(
-                "SubjectAccessReview decisions currently cached, across all identities. \
-                 This tracking KOPIUR_UI_SAR_CACHE_SIZE means the cache is saturated and \
-                 decisions are being evicted before their TTL, so the SAR rate rises.",
-            )
+            .with_description("SubjectAccessReview decisions currently cached.")
             .build();
 
         Self {

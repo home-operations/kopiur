@@ -90,7 +90,7 @@ export function SnapshotNowDialog({
       confirmLabel="Take the snapshot"
       blockedReason={
         pin === ""
-          ? "Say whether this snapshot may be pruned. Pinning is permanent, so it is not something to get by omission."
+          ? "Say whether this snapshot may be pruned. Pinning is permanent, so choose it explicitly."
           : undefined
       }
       running={snapshotNow.isPending}
@@ -104,10 +104,9 @@ export function SnapshotNowDialog({
     >
       <p>
         This creates a <span className="mono">Snapshot</span> under{" "}
-        <span className="mono">{policy}</span> in <span className="mono">{namespace}</span> — one
-        per repository and source the policy expands to, the same fan-out a scheduled run mints. The
-        backup itself happens in a mover Job the operator schedules, so the list below is what was
-        created, not what has finished.
+        <span className="mono">{policy}</span> in <span className="mono">{namespace}</span>, one per
+        repository and source, like a scheduled run. The list below shows what was created, not what
+        has finished.
       </p>
 
       <fieldset className="action__choice">
@@ -123,9 +122,7 @@ export function SnapshotNowDialog({
               setPin("prune");
             }}
           />
-          <span>
-            Prune it under the policy&apos;s retention, like every other snapshot it takes.
-          </span>
+          <span>Prune it under the policy&apos;s retention, like any other snapshot.</span>
         </label>
         <label htmlFor={`${fieldId}-pin`}>
           <input
@@ -139,9 +136,8 @@ export function SnapshotNowDialog({
             }}
           />
           <span>
-            Pin it — <strong>permanently</strong> exempt from GFS pruning. The kopia manifest keeps
-            the pin, so this snapshot goes on occupying the repository until someone deletes it by
-            hand.
+            Pin it — <strong>permanently</strong> exempt from GFS pruning. It stays in the
+            repository until someone deletes it by hand.
           </span>
         </label>
       </fieldset>

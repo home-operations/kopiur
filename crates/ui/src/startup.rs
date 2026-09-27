@@ -244,8 +244,7 @@ pub async fn track_cache_readiness(
     // Whatever the cache was, it is now unattended.
     readiness.set_cache(CacheState::WatchEnded);
     tracing::error!(
-        "the kopiur-ui cache supervisor ended; nothing is watching the reflector stores any \
-         more, so /readyz reports cache-watch-ended. Restart the pod."
+        "the kopiur-ui cache stopped, so /readyz reports cache-watch-ended; restart the pod"
     );
 }
 
@@ -294,10 +293,9 @@ fn report_cache_state(state: CacheState) {
             tracing::info!(?state, "the kopiur-ui cache state changed");
         }
         CacheState::SyncTimedOut => report_sync_timeout(),
-        CacheState::WatchEnded => tracing::error!(
-            "a kopiur-ui reflector ended, so its store is frozen and will go stale; the UI \
-             has stopped reporting ready. This does not recover on its own — restart the pod."
-        ),
+        CacheState::WatchEnded => {
+            tracing::error!("a kopiur-ui cache watch ended and will not recover; restart the pod")
+        }
     }
 }
 
@@ -305,11 +303,9 @@ fn report_cache_state(state: CacheState) {
 fn report_sync_timeout() {
     tracing::error!(
         budget_secs = CACHE_SYNC_TIMEOUT.as_secs(),
-        "the kopiur-ui reflector stores have not completed their initial list; /readyz \
-         reports cache-sync-timed-out. The usual cause is the UI's own ServiceAccount \
-         lacking list/watch on the kopiur CRDs, or the CRDs not being installed — check the \
-         chart's ui.rbac. Set KOPIUR_UI_CACHE=false to read through impersonated calls \
-         instead. Still watching."
+        "the kopiur-ui cache has not finished its initial list, so /readyz reports \
+         cache-sync-timed-out. Check that the kopiur CRDs are installed and the chart's \
+         ui.rbac grants list/watch, or set KOPIUR_UI_CACHE=false. Still watching."
     );
 }
 

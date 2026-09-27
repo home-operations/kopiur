@@ -213,18 +213,14 @@ impl DownloadOutcome {
                 "a file download was abandoned by the client; nothing is wrong with the backup"
             }
             Self::Stalled => {
-                "a file download made no progress for a whole \
-                 KOPIUR_UI_DOWNLOAD_CHUNK_TIMEOUT window and was abandoned; the client holds a \
-                 truncated file"
+                "a file download stalled past KOPIUR_UI_DOWNLOAD_CHUNK_TIMEOUT and was \
+                 abandoned; the client holds a truncated file"
             }
             Self::Overrun => {
-                "a file download produced more bytes than the snapshot entry records; the copy \
-                 was cut off at the recorded size"
+                "a file download was larger than the snapshot records; it was cut off at the \
+                 recorded size"
             }
-            Self::Short => {
-                "a file download ended before the size recorded in the snapshot; the client \
-                 holds a truncated file"
-            }
+            Self::Short => "a file download ended early; the client holds a truncated file",
         }
     }
 }
@@ -410,9 +406,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ExactSink<W> {
 /// The `download-overrun` IO error, worded for the log line it ends up in.
 fn overrun_error(expected: u64) -> io::Error {
     io::Error::other(format!(
-        "download-overrun: kopia produced more than the {expected} bytes the snapshot entry \
-         records for this file. The response length was already committed, so the copy was \
-         stopped instead of sending a body that contradicts it."
+        "download-overrun: kopia produced more than the {expected} bytes the snapshot records \
+         for this file, so the copy was stopped"
     ))
 }
 

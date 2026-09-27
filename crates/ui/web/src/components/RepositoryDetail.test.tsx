@@ -90,7 +90,7 @@ describe("RepositoryDetail with nothing reported yet", () => {
   it("says an unreconciled repository is unreconciled, not healthy", async () => {
     renderWithRouter(<RepositoryDetail detail={bare} />);
     expect(await screen.findByRole("region", { name: "Conditions" })).toHaveTextContent(
-      "has not been reconciled — not that it is healthy",
+      "the operator has not reconciled this repository",
     );
   });
 

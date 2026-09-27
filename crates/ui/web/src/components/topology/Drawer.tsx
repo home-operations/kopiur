@@ -125,8 +125,8 @@ export function Drawer({ model, node, namespace, onClose }: DrawerProps) {
           <Finding
             lamp={node.lamp}
             what={`${node.node.name} is referenced here but does not exist.`}
-            why="Something on this board names this repository and no object with that name is in the cluster, so anything aimed at it has nowhere to land."
-            fix="create the repository the reference names, or point the objects listed below at one that exists"
+            why="No object with that name is in the cluster, so anything aimed at it has nowhere to land."
+            fix="create the repository, or point the objects below at one that exists"
           />
         ) : null}
 
@@ -134,8 +134,8 @@ export function Drawer({ model, node, namespace, onClose }: DrawerProps) {
           <Finding
             lamp={healthLamp("degraded")}
             what={`Nothing copies ${node.node.name} anywhere.`}
-            why="No snapshot or repository replication reads from it, so the data here has exactly one home."
-            fix="add a SnapshotReplication or a RepositoryReplication if this repository needs a second copy"
+            why="No replication reads from it, so this is the only copy."
+            fix="add a SnapshotReplication or RepositoryReplication if it needs a second copy"
           />
         ) : null}
 

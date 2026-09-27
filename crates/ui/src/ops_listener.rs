@@ -213,9 +213,8 @@ pub async fn serve_ops(
 
     let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
         format!(
-            "binding the kopiur-ui ops server to {addr}; if this host has IPv6 disabled a \
-             `[::]` bind fails — set KOPIUR_UI_OPS_ADDR=0.0.0.0:{} (via the chart's \
-             ui.extraEnv)",
+            "binding the kopiur-ui ops server to {addr}; if IPv6 is disabled, set \
+             KOPIUR_UI_OPS_ADDR=0.0.0.0:{} (via the chart's ui.extraEnv)",
             addr.port()
         )
     })?;

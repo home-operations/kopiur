@@ -163,7 +163,7 @@ impl IntoResponse for ApiError {
             // A `Problem` is plain owned strings, so this is unreachable; degrade
             // to a valid problem document rather than panicking inside a handler.
             tracing::error!(error = %e, "failed to serialize a Problem response");
-            br#"{"type":"urn:kopiur:problem:internal","title":"Internal","status":500,"detail":"the error response could not be serialized","what":"kopiur-ui failed while reporting another failure.","why":"Serializing the problem document itself errored, which should be impossible.","fix":"Report this at https://github.com/home-operations/kopiur/issues with the UI's logs."}"#.to_vec()
+            br#"{"type":"urn:kopiur:problem:internal","title":"Internal","status":500,"detail":"the error response could not be serialized","what":"kopiur-ui failed while reporting another failure.","why":"This is a kopiur-ui bug.","fix":"Report it at https://github.com/home-operations/kopiur/issues with the UI's logs."}"#.to_vec()
         });
 
         let mut response = Response::new(Body::from(body));
@@ -211,7 +211,7 @@ fn mapping(kind: OpsErrorKind) -> KindMapping {
         OpsErrorKind::Forbidden => KindMapping {
             status: 403,
             kind: "forbidden",
-            why: "The apiserver refused the request for the identity kopiur-ui impersonated.",
+            why: "The API server refused the request for your identity.",
             // The shared message tells a CLI user to change kubeconfig, which a
             // browser cannot do. The UI's answer is always an RBAC binding.
             fix: "ask a cluster admin to bind kopiur-ui-user, kopiur-ui-editor or \
@@ -221,62 +221,57 @@ fn mapping(kind: OpsErrorKind) -> KindMapping {
         OpsErrorKind::NotFound => KindMapping {
             status: 404,
             kind: "not-found",
-            why: "It does not exist in the scope the request named, or it was deleted after \
-                  the page was loaded.",
-            fix: "reload the page; if the link came from elsewhere, check the namespace and \
-                  name it points at",
+            why: "It does not exist, or it was deleted after the page loaded.",
+            fix: "reload the page, or check the namespace and name",
             force_fix: false,
         },
         OpsErrorKind::KindNotInstalled => KindMapping {
             status: 503,
             kind: "kind-not-installed",
-            why: "The kopiur CRDs are missing from this cluster, or are older than the UI.",
-            fix: "install or upgrade kopiur so the CRDs and the UI come from the same release",
+            why: "The kopiur CRDs are missing or older than the UI.",
+            fix: "install or upgrade kopiur to the same release as the UI",
             force_fix: false,
         },
         OpsErrorKind::Admission => KindMapping {
             status: 422,
             kind: "admission",
-            why: "An admission webhook — kopiur's own, or a cluster policy engine — rejected \
-                  the object.",
+            why: "An admission webhook rejected the object.",
             fix: "correct the values named in the message and try again",
             force_fix: false,
         },
         OpsErrorKind::Invalid => KindMapping {
             status: 400,
             kind: "invalid",
-            why: "The request names something the cluster's current shape cannot satisfy.",
+            why: "The cluster cannot satisfy this request.",
             fix: "correct the request and try again",
             force_fix: false,
         },
         OpsErrorKind::Conflict => KindMapping {
             status: 409,
             kind: "conflict",
-            why: "The cluster's shape conflicts with what the request asked for.",
-            fix: "resolve the conflict the message describes, then try again",
+            why: "The request conflicts with the cluster's current state.",
+            fix: "resolve the conflict, then try again",
             force_fix: false,
         },
         OpsErrorKind::Timeout => KindMapping {
             status: 504,
             kind: "timeout",
-            why: "A bounded wait expired. The work itself may still be running in the cluster.",
-            fix: "reload the page in a moment — waiting stopped, the operation did not",
+            why: "The wait timed out. The work may still be running.",
+            fix: "reload the page in a moment",
             force_fix: false,
         },
         OpsErrorKind::Upstream => KindMapping {
             status: 502,
             kind: "upstream",
-            why: "A dependency — the apiserver, a session pod, or kopia — failed or was \
-                  unreachable.",
-            fix: "retry; if it persists, check cluster health and the kopiur controller's logs",
+            why: "The API server, a session pod, or kopia failed or was unreachable.",
+            fix: "retry; if it persists, check the kopiur controller's logs",
             force_fix: false,
         },
         OpsErrorKind::Internal => KindMapping {
             status: 500,
             kind: "internal",
-            why: "This is a kopiur bug, not a problem with the request.",
-            fix: "report this at https://github.com/home-operations/kopiur/issues with the \
-                  UI's logs",
+            why: "This is a kopiur bug.",
+            fix: "report it at https://github.com/home-operations/kopiur/issues with the UI's logs",
             force_fix: false,
         },
     }
@@ -459,61 +454,51 @@ impl From<AuthError> for ApiError {
                 401,
                 "no-identity",
                 "kopiur-ui could not tell who you are.",
-                "Every Kubernetes call it makes runs as the person making it, and this \
-                 request carried no identity it trusts.",
+                "The request carried no trusted identity.",
                 match expected_header {
                     Some(header) => format!(
-                        "reach the UI through the authenticating proxy, which must set the \
-                         {header} header on every request"
+                        "open the UI through the authenticating proxy, which must set the \
+                         {header} header"
                     ),
-                    None => {
-                        "reach the UI through the authenticating proxy in front of it".to_string()
-                    }
+                    None => "open the UI through the authenticating proxy".to_string(),
                 },
             ),
             AuthError::InvalidHeaderValue { header, reason } => problem(
                 400,
                 "invalid-header-value",
                 format!("The {header} header is not a usable identity."),
-                format!("{reason}. Impersonation headers must be visible ASCII and bounded."),
-                format!("correct what the authenticating proxy puts in {header}"),
+                format!("{reason}."),
+                format!("fix what the authenticating proxy puts in {header}"),
             ),
             AuthError::ForbiddenPrincipal { principal, why } => problem(
                 403,
                 "forbidden-principal",
                 format!("kopiur-ui refuses to act as {principal}."),
                 format!("{why}."),
-                "have the proxy assert your real user and groups, and grant access by binding \
-                 kopiur-ui-user to them",
+                "have the proxy send your real user and groups, and bind kopiur-ui-user to them",
             ),
             AuthError::TooManyGroups { count, max } => problem(
                 400,
                 "too-many-groups",
                 format!("The request asserted {count} groups."),
-                format!(
-                    "kopiur-ui impersonates at most {max}, because every group becomes a \
-                     header on every apiserver call the request makes."
-                ),
-                "narrow what the proxy puts in the groups header, or set \
-                 KOPIUR_UI_ALLOWED_GROUPS to the groups that grant kopiur access",
+                format!("kopiur-ui accepts at most {max}."),
+                "send fewer groups from the proxy, or set KOPIUR_UI_ALLOWED_GROUPS to the \
+                 groups that grant kopiur access",
             ),
             AuthError::ProxySecretMissing | AuthError::ProxySecretMismatch => problem(
                 401,
                 "proxy-secret",
                 "This request did not come through the trusted proxy.",
-                "Identity headers are only believed from the configured proxy, which proves \
-                 itself with a shared secret in X-Kopiur-Proxy-Token — and this request's was \
-                 missing or wrong.",
-                "use the UI's own address so the proxy handles the request; if you run the \
-                 proxy, point it and kopiur-ui at the same Secret",
+                "Its X-Kopiur-Proxy-Token was missing or wrong.",
+                "open the UI through its proxy; if you run the proxy, give it and kopiur-ui \
+                 the same Secret",
             ),
             AuthError::NotWired => problem(
                 500,
                 "not-wired",
                 "kopiur-ui was started without wiring its authentication state.",
-                "It cannot establish who any caller is, so it refuses to act on anyone's \
-                 behalf rather than choosing an identity nobody configured.",
-                "this is a build bug in kopiur-ui; report it at \
+                "It cannot tell who any caller is, so it refuses every request.",
+                "this is a kopiur-ui bug; report it at \
                  https://github.com/home-operations/kopiur/issues",
             ),
         };
@@ -530,9 +515,8 @@ impl From<ClientBuildError> for ApiError {
                 "client-build",
                 "kopiur-ui could not build a Kubernetes client for this caller's identity.",
                 format!(
-                    "The caller's {} could not be sent as an impersonation header, and a \
-                     request without one would run as the UI's own ServiceAccount — so it was \
-                     refused instead.",
+                    "The caller's {} is not a valid impersonation header, so the request was \
+                     refused rather than run as the UI's ServiceAccount.",
                     inner.what
                 ),
                 "this is a bug in kopiur-ui; report it at \
@@ -542,10 +526,9 @@ impl From<ClientBuildError> for ApiError {
                 500,
                 "client-build",
                 "kopiur-ui could not build a Kubernetes client from its own configuration.",
-                "The base client configuration — TLS material, proxy settings, or the cluster \
-                 URL — is not usable.",
+                "Its TLS, proxy, or cluster URL settings are not usable.",
                 "check the UI's ServiceAccount token mount and any KUBECONFIG or proxy \
-                 settings on its Deployment, then restart it",
+                 settings, then restart it",
             ),
         };
         api.with_detail(detail)
@@ -565,13 +548,11 @@ impl From<CsrfError> for ApiError {
             why,
             match &error {
                 CsrfError::MissingRequestHeader => {
-                    "make the change from the kopiur UI; if you are scripting against the API, \
-                     send X-Kopiur-Request: 1"
+                    "use the kopiur UI; scripts must send X-Kopiur-Request: 1"
                 }
                 CsrfError::WrongContentType { .. } => "send the request body as application/json",
                 CsrfError::CrossSite { .. } | CsrfError::OriginMismatch { .. } => {
-                    "make the change from the kopiur UI itself rather than from another site \
-                     or an embedded frame"
+                    "make the change from the kopiur UI itself"
                 }
             },
         )

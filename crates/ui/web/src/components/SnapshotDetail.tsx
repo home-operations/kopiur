@@ -117,11 +117,11 @@ export function SnapshotDetail({
             })}
           </ul>
           <p className="page__section-note">
-            A gate never self-heals — the snapshot stays parked until a human acts. The{" "}
+            A gate does not clear on its own; the snapshot waits until someone acts. See the{" "}
             <Link to="/gates" search={{}}>
               gate registry
-            </Link>{" "}
-            explains every gate the operator can raise.
+            </Link>
+            .
           </p>
         </Section>
       ) : null}
@@ -133,9 +133,9 @@ export function SnapshotDetail({
             what={detail.failure.message ?? "The operator recorded a failure with no message."}
             why={
               detail.failure.retryRecommended === true
-                ? "The operator classified this as worth retrying: the cause looks transient rather than a misconfiguration."
+                ? "The operator marked this as worth retrying; the cause looks transient."
                 : detail.failure.retryRecommended === false
-                  ? "The operator classified this as not worth retrying on its own — the same run would fail the same way until something changes."
+                  ? "The operator marked this as not worth retrying until something changes."
                   : undefined
             }
             lamp={healthLamp("failed")}
@@ -183,9 +183,8 @@ export function SnapshotDetail({
           </ul>
         ) : (
           <p className="page__section-note">
-            The operator recorded no resolved sources on this snapshot. A produced backup pins the
-            paths it covered in <span className="mono">status.resolved.sources</span>; a discovered
-            one may carry none, because the paths are kopia&apos;s, not the policy&apos;s.
+            No resolved sources recorded (<span className="mono">status.resolved.sources</span>).
+            Discovered snapshots often have none.
           </p>
         )}
       </Section>
@@ -200,9 +199,8 @@ export function SnapshotDetail({
             {detail.logTail.join("\n")}
           </pre>
           <p className="page__section-note">
-            The last lines the mover Job wrote, with anything that looks like a credential or a
-            presigned URL redacted by the server before it left the cluster. The full log is in the
-            Job&apos;s pod, for as long as the cluster keeps it.
+            The last lines of the mover log, with credentials redacted. The full log is in the
+            Job&apos;s pod while it exists.
           </p>
         </Section>
       ) : null}
@@ -211,7 +209,7 @@ export function SnapshotDetail({
         <ConditionsTable
           conditions={detail.conditions}
           now={now}
-          emptyNote="The operator has written no conditions on this snapshot yet, which means it has not been reconciled — not that it is healthy."
+          emptyNote="No conditions yet: the operator has not reconciled this snapshot."
         />
       </Section>
     </div>
@@ -273,9 +271,7 @@ function storageFacts(detail: SnapshotDetailData, scope: string | undefined): Fa
     { term: "kopia identity", value: mono(row.identity) },
     {
       term: "Pinned",
-      value: row.pinned
-        ? "yes — exempt from GFS pruning entirely"
-        : "no — GFS retention decides whether it is kept",
+      value: row.pinned ? "yes — never pruned by retention" : "no — retention decides",
     },
     {
       term: "Deletion policy",

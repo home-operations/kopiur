@@ -44,11 +44,9 @@ function Schedules() {
   return (
     <div className="page">
       <p className="page__prose">
-        A <span className="mono">SnapshotSchedule</span> is the clock: a cron, a timezone, and the
-        policy it fires — named directly, or selected by label. The cron is shown exactly as
-        written, <span className="mono">H</span> jitter token and all, because the slot{" "}
-        <span className="mono">H</span> resolves to is the operator&apos;s and rewriting it here
-        would show you a time you cannot find in your own manifest.
+        A <span className="mono">SnapshotSchedule</span> runs a policy on a cron, in a timezone. The
+        cron is shown exactly as written, including any <span className="mono">H</span> jitter
+        token.
       </p>
 
       <section className="page__section" aria-label="Schedules">
@@ -63,8 +61,7 @@ function Schedules() {
         ) : schedules.data.length === 0 ? (
           <EmptyState title={`No schedules in ${scope}`} icon={CalendarClock}>
             A SnapshotSchedule fires a SnapshotPolicy on a cron. Without one, a policy only runs
-            when someone asks it to from the policy&apos;s own page — which is a perfectly good way
-            to run a backup once, and a bad way to run one nightly.
+            when started from its own page.
           </EmptyState>
         ) : (
           <>
@@ -86,11 +83,8 @@ function Schedules() {
       </section>
 
       <p className="page__prose">
-        Suspension lives at <span className="mono">spec.schedule.suspend</span> on a schedule, not
-        at <span className="mono">spec.suspend</span> as it does on every other kind — so a
-        suspended schedule is the clock stopping, while a suspended{" "}
-        <span className="mono">SnapshotPolicy</span> is the recipe itself being held. Neither is
-        caught up afterwards: a window that passes while suspended is gone.
+        A schedule is suspended with <span className="mono">spec.schedule.suspend</span>, not{" "}
+        <span className="mono">spec.suspend</span>. Runs missed while suspended are not made up.
       </p>
     </div>
   );

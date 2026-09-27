@@ -68,10 +68,8 @@ export function RetentionPreview({ plan, now = new Date() }: RetentionPreviewPro
           <span className="mono">
             {plan.policy.namespace}/{plan.policy.name}
           </span>
-          . The operator only runs a selection when a policy declares retention rules, so none of
-          these {totals.candidates} snapshots is dropped by retention — they are listed to show what
-          the policy governs, not what it will remove. Nothing here is at risk; the repository is
-          instead bounded by whatever else prunes it, and grows until something does.
+          , so none of these {totals.candidates} snapshots is removed by retention and the
+          repository keeps growing.
         </p>
       ) : (
         <p className="page__prose">
@@ -88,14 +86,9 @@ export function RetentionPreview({ plan, now = new Date() }: RetentionPreviewPro
           ) : null}
           .{" "}
           {totals.buckets > 1 ? (
-            <>
-              The population splits into {totals.buckets} independent buckets — one per backup
-              source, and per repository while the policy is multi-repository. A snapshot in one
-              bucket never competes with a snapshot in another, so each is counted on its own.
-            </>
+            <>They form {totals.buckets} independent buckets, one per source and repository.</>
           ) : null}{" "}
-          A verdict is an answer about a moment: these rules are evaluated against the clock, so a
-          snapshot kept today can age out tomorrow with nothing changing but the date.
+          Verdicts are as of now; a snapshot kept today can age out tomorrow.
         </p>
       )}
 

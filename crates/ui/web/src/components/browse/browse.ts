@@ -90,7 +90,7 @@ export function entryAction(entry: DirEntryView, session: SessionInfo): EntryAct
       return {
         action: "refused",
         word: "a link",
-        reason: `${entry.name} is a symbolic link. The snapshot records where it points, not contents of its own, so there is nothing to download.`,
+        reason: `${entry.name} is a symbolic link, so there is nothing to download.`,
       };
     case "file":
       return fileAction(entry, session);
@@ -104,7 +104,7 @@ function otherKindRefusal(name: string, raw: string): EntryAction {
   return {
     action: "refused",
     word: "not a file",
-    reason: `kopia recorded ${name} ${what}, which is neither a file nor a directory — there is nothing to list or download.`,
+    reason: `kopia recorded ${name} ${what}, which is neither a file nor a directory, so there is nothing to download.`,
   };
 }
 
@@ -121,14 +121,14 @@ function fileAction(entry: DirEntryView, session: SessionInfo): EntryAction {
     return {
       action: "refused",
       word: "size unknown",
-      reason: `The snapshot records no size for ${entry.name}. kopiur-ui commits a Content-Length before it streams, so that a truncated transfer is visible to the browser rather than silently saved, and an entry with no recorded size cannot be served that way. Read it with \`kubectl kopiur cat\`, which streams without a declared length.`,
+      reason: `The snapshot records no size for ${entry.name}, so the UI cannot download it safely. Read it with \`kubectl kopiur cat\`.`,
     };
   }
   if (size > session.downloadMaxBytes) {
     return {
       action: "refused",
       word: `over ${humanBytes(session.downloadMaxBytes)}`,
-      reason: `${entry.name} is ${humanBytes(size)}, above this deployment's download limit of ${humanBytes(session.downloadMaxBytes)}. A browser download is streamed through kopiur-ui's own process, so the limit bounds what one click costs the UI pod and the session pod. Restore it instead — \`kubectl kopiur download\` streams straight to disk — or raise KOPIUR_UI_MAX_DOWNLOAD_BYTES.`,
+      reason: `${entry.name} is ${humanBytes(size)}, above this deployment's download limit of ${humanBytes(session.downloadMaxBytes)}. Use \`kubectl kopiur download\`, or raise KOPIUR_UI_MAX_DOWNLOAD_BYTES.`,
     };
   }
   return { action: "download" };

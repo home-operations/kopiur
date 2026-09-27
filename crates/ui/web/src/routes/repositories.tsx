@@ -74,12 +74,9 @@ function Repositories() {
   return (
     <div className="page">
       <p className="page__prose">
-        A repository is where backups actually live — a kopia repository on object storage, a
-        filesystem or a repository server. <span className="mono">Repository</span> is namespaced
-        and <span className="mono">ClusterRepository</span> is cluster-scoped; both are listed here
-        because &ldquo;my repositories&rdquo; is one question. Health is the operator&apos;s own
-        verdict over phase, suspension and any gate holding the repository back; open a row to see
-        which gate.
+        A repository is where backups are stored. <span className="mono">Repository</span> is
+        namespaced and <span className="mono">ClusterRepository</span> is cluster-scoped; both are
+        listed here. Open a row to see what is affecting its health.
       </p>
 
       {repositories.data !== undefined && repositories.data.length > 0 ? (
@@ -98,9 +95,8 @@ function Repositories() {
 
       {unusable !== undefined ? (
         <p className="page__prose" role="status">
-          This link asked for repositories whose health is <span className="mono">{unusable}</span>,
-          which is not one of the six this console knows ({HEALTH_ORDER.join(", ")}), so nothing was
-          filtered out.
+          Health <span className="mono">{unusable}</span> is not one of the six known values (
+          {HEALTH_ORDER.join(", ")}), so nothing was filtered out.
         </p>
       ) : null}
 
@@ -115,9 +111,8 @@ function Repositories() {
           />
         ) : all.length === 0 ? (
           <EmptyState title={`No repositories in ${scope}`} icon={Database}>
-            A Repository or ClusterRepository is the kopia repository backups land in. Create one
-            and it appears here with its health; a SnapshotPolicy then names it as the target its
-            snapshots are written to.
+            A Repository or ClusterRepository is where backups are stored. Create one and it appears
+            here.
           </EmptyState>
         ) : rows.length === 0 ? (
           <EmptyState
@@ -129,9 +124,8 @@ function Repositories() {
               </Link>
             }
           >
-            The fleet has {all.length} {all.length === 1 ? "repository" : "repositories"} in this
-            scope, none of them on this lamp. Nothing is wrong with the filter — there is simply
-            nothing under it.
+            There {all.length === 1 ? "is" : "are"} {all.length}{" "}
+            {all.length === 1 ? "repository" : "repositories"} in this scope, none with this health.
           </EmptyState>
         ) : (
           <RepositoryTable repositories={rows} />

@@ -295,8 +295,7 @@ where
                 // which is the whole diagnostic value here; wrapping it rather
                 // than replacing it keeps that.
                 format!("{rejection}"),
-                "check the query parameters against the endpoint's documented ones — a required \
-                 one is missing, or one carries a value of the wrong type",
+                "check the query parameters: one is missing or has the wrong type",
             )
             .with_instance(request_path(&parts.extensions, &parts.uri))),
         }
@@ -330,8 +329,7 @@ where
                 "A path segment of this request could not be read.",
                 format!("{rejection}"),
                 format!(
-                    "check the URL against the endpoint's shape — the repository kind segment, \
-                     for example, is one of {} (in any case)",
+                    "check the URL; the repository kind segment is one of {} (any case)",
                     RepositoryKindPath::accepted_spellings()
                 ),
             )
@@ -603,11 +601,9 @@ pub fn list_too_large(kind: &str, matched: usize, cap: usize) -> ApiError {
     problem(
         422,
         "list-too-large",
-        format!(
-            "{matched} {kind} matched, which is more than this kopiur-ui will assemble in one response (the cap is {cap})."
-        ),
-        "Rendering an unbounded list would hold the whole result set in memory on the server and in the browser, so kopiur-ui refuses instead of degrading for everyone on the page.",
-        "filter by repository or policy — or raise KOPIUR_UI_SNAPSHOT_LIST_CAP if this cluster really does need a list this long",
+        format!("{matched} {kind} matched, more than the {cap} this UI will list at once."),
+        "Listing them all would use too much memory.",
+        "filter by repository or policy, or raise KOPIUR_UI_SNAPSHOT_LIST_CAP",
     )
 }
 

@@ -153,9 +153,8 @@ export function RepositoryDetail({
         <Section title="Catalog" icon={FolderSearch}>
           {detail.catalog === null || detail.catalog === undefined ? (
             <p className="page__section-note">
-              No catalog scan has been recorded. A scan walks the kopia repository and adopts the
-              snapshots it finds as <span className="mono">Snapshot</span> resources, so backups
-              taken before kopiur — or by another cluster — become visible here.
+              No catalog scan has been recorded. A scan lists backups already in the repository,
+              such as ones from another cluster.
             </p>
           ) : (
             <Facts
@@ -180,8 +179,8 @@ export function RepositoryDetail({
         <Section title="Health probe" icon={HeartPulse}>
           {detail.health === null || detail.health === undefined ? (
             <p className="page__section-note">
-              No probe result has been recorded. The probe is what turns an unreachable backend into
-              a Degraded repository before a backup fails on it.
+              No probe result has been recorded. The probe flags an unreachable backend before a
+              backup fails on it.
             </p>
           ) : (
             <Facts
@@ -225,8 +224,7 @@ export function RepositoryDetail({
           />
           {detail.server === null || detail.server === undefined ? (
             <p className="page__section-note">
-              No repository server is running for this repository, so every mover connects to the
-              storage backend itself with the repository&apos;s own credentials.
+              No repository server is running; movers connect to the storage backend directly.
             </p>
           ) : null}
         </Section>
@@ -263,8 +261,7 @@ export function RepositoryDetail({
         <Section title="Policies writing here" icon={ScrollText}>
           {detail.policies.length === 0 ? (
             <p className="page__section-note">
-              No SnapshotPolicy names this repository, so nothing is scheduled to write into it.
-              Snapshots may still exist here from before, or from another cluster.
+              No SnapshotPolicy writes into this repository. Older snapshots may still be here.
             </p>
           ) : (
             <ul className="ref-list" aria-label="Policies writing here">
@@ -298,9 +295,7 @@ export function RepositoryDetail({
       <Section title="Browse sessions" icon={TerminalSquare}>
         {detail.sessions.length === 0 ? (
           <p className="page__section-note">
-            No browse session is running. A session is a mover pod that mounts this
-            repository&apos;s credentials so a snapshot&apos;s files can be listed and downloaded;
-            it is started from a snapshot and reaped when it goes idle.
+            No browse session is running. Start one from a snapshot to list and download its files.
           </p>
         ) : (
           <ul className="ref-list ref-list--stacked" aria-label="Browse sessions">
@@ -359,10 +354,8 @@ function MaintenanceCoverage({
   if (maintenance === null || maintenance === undefined) {
     return (
       <p className="page__section-note">
-        No Maintenance resource governs this repository. Without one, kopia&apos;s indexes are never
-        compacted and deleted content is never dropped, so the repository grows without bound. A
-        repository&apos;s <span className="mono">spec.maintenance</span> projects one by default;
-        this repository either disabled it or has not been reconciled.
+        No Maintenance resource governs this repository, so it grows without bound. Check that{" "}
+        <span className="mono">spec.maintenance</span> is not disabled.
       </p>
     );
   }
@@ -384,7 +377,7 @@ function MaintenanceCoverage({
             term: "Authored by",
             value: maintenance.managedByRepository
               ? "the operator, from the repository's spec.maintenance"
-              : "a user — the operator honors it and never rewrites it",
+              : "a user",
           },
           ...trackFacts("Quick", maintenance.quick, now, "maintenanceQuickNextRun"),
           ...trackFacts("Full", maintenance.full, now, "maintenanceFullNextRun"),
@@ -439,8 +432,7 @@ function Conditions({ conditions, now }: { conditions: readonly ConditionView[];
   if (conditions.length === 0) {
     return (
       <p className="page__section-note">
-        The operator has written no conditions on this repository yet, which means it has not been
-        reconciled — not that it is healthy.
+        No conditions yet: the operator has not reconciled this repository.
       </p>
     );
   }

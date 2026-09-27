@@ -94,7 +94,7 @@ export interface RequestDescription {
 function explainStatus(status: number): { why: string; fix: string } {
   if (status === 401) {
     return {
-      why: "The authenticating proxy in front of kopiur-ui did not accept the request; kopiur-ui itself never asks for credentials.",
+      why: "The authenticating proxy in front of kopiur-ui did not accept the request.",
       fix: "sign in again through the proxy, then reload the page",
     };
   }
@@ -106,19 +106,19 @@ function explainStatus(status: number): { why: string; fix: string } {
   }
   if (status === 404) {
     return {
-      why: "No API route answered, so the request may have reached a different service or a kopiur-ui older than this page.",
-      fix: "reload the page; if it persists, check the ingress path routing and that kopiur-ui and the UI come from the same release",
+      why: "No API route answered; the request may have reached another service or an older kopiur-ui.",
+      fix: "reload the page; if it persists, check the ingress path routing",
     };
   }
   if (status === 429) {
     return {
-      why: "A rate limit in front of the API, or the API's own concurrency limit, held the request.",
+      why: "A rate limit or the API's concurrency limit held the request.",
       fix: "wait a moment and retry",
     };
   }
   if (status === 502 || status === 503 || status === 504) {
     return {
-      why: "A proxy or gateway in front of kopiur-ui answered instead of the API — kopiur-ui is not running, not ready, or too slow for the proxy's timeout.",
+      why: "A proxy in front of kopiur-ui answered instead; kopiur-ui is down, not ready, or too slow.",
       fix: "check the kopiur-ui pod's readiness and logs, then reload",
     };
   }
@@ -129,7 +129,7 @@ function explainStatus(status: number): { why: string; fix: string } {
     };
   }
   return {
-    why: "The response did not come from the kopiur-ui API, which always explains itself.",
+    why: "The response did not come from the kopiur-ui API.",
     fix: "reload the page; if it persists, check what sits between the browser and kopiur-ui",
   };
 }
@@ -167,7 +167,7 @@ export function problemForBadJson(
 ): Problem {
   const { status, method, path } = input;
   const what = `${method} ${path} answered ${status} with a body that is not JSON.`;
-  const why = `The response could not be parsed (${describeCause(input.cause)}); a proxy or a sign-in page may have answered in the API's place.`;
+  const why = `The response could not be parsed (${describeCause(input.cause)}); a proxy or sign-in page may have answered instead.`;
   return {
     type: `${CLIENT_PROBLEM_PREFIX}bad-json`,
     title: "Unparseable response",

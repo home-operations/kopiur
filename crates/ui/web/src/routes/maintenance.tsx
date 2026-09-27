@@ -48,12 +48,9 @@ function Maintenance() {
   return (
     <div className="page">
       <p className="page__prose">
-        Maintenance is what keeps a kopia repository from growing without bound.{" "}
-        <strong>Quick</strong> compacts the indexes and is cheap enough to run often;{" "}
-        <strong>full</strong> also drops content nothing references any more, which is what actually
-        reclaims space, and is slow and heavy. A repository&apos;s{" "}
-        <span className="mono">spec.maintenance</span> projects one of these by default; a
-        hand-authored one is honored instead and never rewritten.
+        Maintenance keeps a kopia repository from growing without bound. <strong>Quick</strong>{" "}
+        compacts indexes and is cheap; <strong>full</strong> also reclaims unused space and is slow.
+        A repository&apos;s <span className="mono">spec.maintenance</span> creates one by default.
       </p>
 
       {maintenance.isPending ? (
@@ -79,10 +76,9 @@ function Maintenance() {
               </Link>
             }
           >
-            Nothing is compacting indexes or reclaiming space here. That is not a quiet state: a
-            repository with no Maintenance grows without bound while every backup on it succeeds. A
-            repository&apos;s spec.maintenance projects one by default, so an empty page usually
-            means there are no repositories in this scope — or that one has disabled it.
+            A repository with no Maintenance grows without bound. Each repository gets one by
+            default, so an empty page usually means there are no repositories here, or one has
+            disabled spec.maintenance.
           </EmptyState>
         </section>
       ) : (

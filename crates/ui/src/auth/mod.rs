@@ -224,10 +224,9 @@ impl FromRequestParts<AppState> for CurrentIdentity {
                 500,
                 "identity-missing",
                 "kopiur-ui could not determine which identity to run this request as.",
-                "The endpoint was mounted outside the identity middleware, so no caller was \
-                 ever resolved for it. This is a bug in kopiur-ui, not in the request.",
-                "report this at https://github.com/home-operations/kopiur/issues, naming the \
-                 URL you requested",
+                "This is a kopiur-ui bug.",
+                "report it at https://github.com/home-operations/kopiur/issues with the URL \
+                 you requested",
             )
             .with_instance(request_path(&parts.extensions, &parts.uri))),
         }

@@ -73,16 +73,16 @@ describe("ConfirmDelete", () => {
     );
     await open();
     expect(screen.getByRole("group", { name: "Delete" })).toHaveTextContent(
-      "does not protect it from a deletion you ask for here",
+      "A pin stops pruning, not this deletion.",
     );
   });
 
-  it("words the request as accepted, and warns that a silent receipt proves nothing", async () => {
+  it("says the deletion may be held, and points at the snapshot conditions", async () => {
     mockApi({ [SNAPSHOT]: jsonResponse(held, 202) });
     renderWithClient(<ConfirmDelete namespace="media" name="nightly-1" deletionPolicy="Retain" />);
     const user = await open();
     expect(screen.getByRole("group", { name: "Delete" })).toHaveTextContent(
-      "that is not a promise there is none",
+      "Check the snapshot's conditions to be sure.",
     );
     await user.click(screen.getByRole("button", { name: "Request the deletion" }));
     const answer = await screen.findByRole("status");

@@ -116,9 +116,8 @@ export function DoctorChecks({ checks, namespace }: DoctorChecksProps) {
                       <p className="doctor-checks__rbac">
                         <ShieldOff size={14} strokeWidth={2} aria-hidden="true" />
                         <span>
-                          Not permitted for the signed-in user: kopiur-ui ran this check as you and
-                          the cluster refused. The grant named above enables it; the cluster itself
-                          may be fine.
+                          You are not permitted to run this check. The grant named above enables it;
+                          the cluster itself may be fine.
                         </span>
                       </p>
                     ) : null}

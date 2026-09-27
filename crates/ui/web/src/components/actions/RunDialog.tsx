@@ -141,18 +141,16 @@ export function RunDialog({
         <span className="mono">
           {target.namespace}/{target.name}
         </span>
-        . The operator honors it on its next pass and the work happens in a mover Job — so this
-        answers &ldquo;asked for&rdquo;, never &ldquo;finished&rdquo;. Watch the object&apos;s own
-        status for the outcome.
+        . The operator runs it in a mover Job on its next pass; watch the object&apos;s status for
+        the outcome.
       </p>
 
       {target.kind === "maintenance" ? (
         <>
           <p>
             It maintains <span className="mono">{target.repository}</span>. <strong>Quick</strong>{" "}
-            compacts kopia&apos;s indexes and is cheap enough to run often; <strong>full</strong>{" "}
-            also drops content nothing references any more, which is what actually reclaims space,
-            and is slow and heavy.
+            compacts indexes and is cheap; <strong>full</strong> also reclaims unused space, and is
+            slow.
           </p>
           <div className="controls__field">
             <label htmlFor={`${fieldId}-mode`}>Mode</label>
@@ -171,8 +169,8 @@ export function RunDialog({
         </>
       ) : (
         <p>
-          A replication run copies what the source holds to the destination. Nothing at either end
-          is deleted by asking for one, and a run already in flight is not restarted.
+          A replication run copies the source to the destination. Nothing is deleted, and a run
+          already in flight is not restarted.
         </p>
       )}
     </ActionPanel>

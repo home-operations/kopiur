@@ -40,21 +40,15 @@ const JSON_MEDIA_TYPE: &str = "application/json";
 pub enum CsrfError {
     /// The SPA's marker header was absent or carried the wrong value.
     #[error(
-        "the request did not carry the {REQUEST_HEADER}: {REQUEST_HEADER_VALUE} header the \
-         kopiur UI sets on every change it makes. A page on another site can submit a form to \
-         this endpoint, but it cannot set a custom header, so this header is what separates \
-         the two. \
-         Fix: make the change from the kopiur UI; if you are scripting against the API, send \
-         {REQUEST_HEADER}: {REQUEST_HEADER_VALUE} (or use kubectl kopiur, which writes the \
-         same CRs)"
+        "the request is missing the {REQUEST_HEADER}: {REQUEST_HEADER_VALUE} header the kopiur \
+         UI sends. \
+         Fix: use the kopiur UI; scripts must send {REQUEST_HEADER}: {REQUEST_HEADER_VALUE}"
     )]
     MissingRequestHeader,
 
     /// A request with a body declared something other than JSON.
     #[error(
-        "the request body is declared as {got:?}, not {JSON_MEDIA_TYPE}. The form content \
-         types are exactly the ones a cross-origin page can send without a preflight, so the \
-         API accepts none of them. \
+        "the request body is {got:?}, not {JSON_MEDIA_TYPE}. \
          Fix: send the body as {JSON_MEDIA_TYPE}"
     )]
     WrongContentType {
@@ -64,10 +58,9 @@ pub enum CsrfError {
 
     /// The browser said the request came from another site.
     #[error(
-        "the browser reported this request as {sec_fetch_site:?}, meaning it was made from a \
-         page that is not the kopiur UI. \
-         Fix: make the change from the kopiur UI itself rather than from another site or an \
-         embedded frame"
+        "the browser reported this request as {sec_fetch_site:?}, so it did not come from the \
+         kopiur UI. \
+         Fix: make the change from the kopiur UI itself"
     )]
     CrossSite {
         /// The `Sec-Fetch-Site` value the browser sent.
@@ -76,10 +69,9 @@ pub enum CsrfError {
 
     /// The `Origin` header names a different host than the request was sent to.
     #[error(
-        "the request's Origin ({origin}) is not the host it was sent to ({host}), so it did \
-         not come from the kopiur UI served at that address. \
-         Fix: use the UI at {host}; if kopiur-ui sits behind a proxy that rewrites Host, make \
-         the proxy forward the browser-visible host"
+        "the request's Origin ({origin}) does not match its host ({host}). \
+         Fix: use the UI at {host}; if a proxy rewrites Host, make it forward the \
+         browser-visible host"
     )]
     OriginMismatch {
         /// The `Origin` the browser sent.

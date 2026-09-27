@@ -187,9 +187,8 @@ fn not_found(namespace: &str, name: &str) -> ApiError {
         404,
         "not-found",
         format!("There is no Restore called {name} in namespace {namespace}."),
-        "It was deleted or renamed — the SPA may be showing a link from a listing taken before \
-         the change.",
-        "reload the restores list to see what the cluster holds now",
+        "It was deleted or renamed.",
+        "reload the restores list",
     )
 }
 

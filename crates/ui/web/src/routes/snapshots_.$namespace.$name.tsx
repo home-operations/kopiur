@@ -113,12 +113,12 @@ function Retention({ detail, namespace, name, planOpen }: RetentionProps) {
           what={
             preview.kept
               ? `Today's retention keeps this snapshot: ${preview.reasons.join(", ")}.`
-              : "Today's retention does not keep this snapshot: no rule holds it, so the next retention run for its policy removes it."
+              : "Today's retention does not keep this snapshot; the next retention run removes it."
           }
           why={
             preview.kept
-              ? "A slot number is the position in that rule's window — keepDaily slot 3 is the third-newest day the rule holds — so it says how close this restore point is to ageing out. A pin, when listed, is an exemption from bucketing rather than a place in one."
-              : "A snapshot is kept when at least one rule in its bucket holds it. This one is older than every rule's window, and it is not pinned."
+              ? "The slot is its position in that rule's window (keepDaily slot 3 is the third-newest day kept), which shows how close it is to ageing out."
+              : "It is older than every rule's window and is not pinned."
           }
           lamp={healthLamp(preview.kept ? "healthy" : "degraded")}
           meta={<span className="mono">computed {relativeTime(preview.computedAt)}</span>}
@@ -138,9 +138,7 @@ function Retention({ detail, namespace, name, planOpen }: RetentionProps) {
           >
             Show the full retention plan
           </Link>{" "}
-          — every snapshot competing for the same buckets, and what today&apos;s selection does to
-          each. It is a separate read because a fan-out policy&apos;s plan is every child of the
-          policy, so this page does not pay for it on every open.
+          — every snapshot in the same buckets, and whether each is kept.
         </p>
       )}
     </>
@@ -165,8 +163,8 @@ function NoPreview({ detail }: { detail: SnapshotDetailData }) {
     return (
       <Finding
         what="GFS retention does not evaluate this snapshot, because no SnapshotPolicy governs it."
-        why="Retention rules live on a SnapshotPolicy. A discovered or hand-written snapshot names none, so it is bounded by the repository's catalog settings or by whoever made it — not by a retention plan."
-        fix="look at the repository's catalog settings, or set spec.policyRef if this snapshot should be governed by a policy"
+        why="Retention rules live on a SnapshotPolicy, and this snapshot names none."
+        fix="look at the repository's catalog settings, or set spec.policyRef"
         lamp={lamp}
       />
     );
@@ -176,8 +174,8 @@ function NoPreview({ detail }: { detail: SnapshotDetailData }) {
   return (
     <Finding
       what={`No retention verdict is available for this snapshot, which is ${phase}.`}
-      why="Only a succeeded snapshot carrying a controller-written kopia manifest competes for a retention slot — and even then, a policy that configures no retention rules prunes nothing, and a snapshot mid-adoption is not yet selected by its policy's label. Those are different facts, and the detail payload cannot tell them apart."
-      fix="open the full retention plan below: the server distinguishes the cases and says which one applies"
+      why="Only succeeded snapshots count toward retention, and a policy with no retention rules prunes nothing."
+      fix="open the full retention plan below to see which case applies"
       lamp={lamp}
     />
   );

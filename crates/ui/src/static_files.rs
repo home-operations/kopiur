@@ -76,8 +76,7 @@ pub async fn spa_fallback(uri: Uri) -> Response<Body> {
         // API half is still perfectly usable.
         None => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "kopiur-ui was built without a web bundle and without a placeholder; rebuild it \
-             with `mise run ui-build`\n",
+            "kopiur-ui was built without a web UI; rebuild it with `mise run ui-build`\n",
         )
             .into_response(),
     }

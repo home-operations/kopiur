@@ -68,12 +68,8 @@ fn main() {
 
     if env::var(REQUIRE_WEB_ENV).as_deref() == Ok("1") {
         panic!(
-            "{REQUIRE_WEB_ENV}=1 but there is no {}, so this build has no SPA bundle to embed. \
-             The released kopiur-ui image must ship the real web UI, never the placeholder \
-             page, and a placeholder is only discoverable once the pod is already serving it \
-             — so the build is refused here instead. Run `mise run ui-build` to produce \
-             crates/ui/web/dist before building, or unset {REQUIRE_WEB_ENV} for a \
-             backend-only development build.",
+            "{REQUIRE_WEB_ENV}=1 but {} does not exist, so there is no web UI to embed. Run \
+             `mise run ui-build` first, or unset {REQUIRE_WEB_ENV} for a backend-only dev build.",
             dist.join("index.html").display(),
         );
     }

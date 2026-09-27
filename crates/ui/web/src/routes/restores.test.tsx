@@ -158,7 +158,7 @@ describe("Restores", () => {
     mountApp("/restores?namespace=prod");
     const region = await screen.findByRole("region", { name: "Restores" });
     const title = await within(region).findByText("No restores in prod");
-    expect(title.closest('[role="status"]')).toHaveTextContent("how a backup comes back");
+    expect(title.closest('[role="status"]')).toHaveTextContent("names a snapshot and the claim");
   });
 
   it("renders the not-permitted state for a 403 and offers no retry", async () => {

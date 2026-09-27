@@ -95,8 +95,8 @@ async fn load(
             500,
             "report-unserializable",
             "kopiur-ui assembled the cluster status but could not turn it into JSON.",
-            format!("Serializing the status report failed: {e}. This is a bug in kopiur-ui, not a problem with the cluster."),
-            "report this at https://github.com/home-operations/kopiur/issues",
+            format!("Serializing the status report failed: {e}. This is a kopiur-ui bug."),
+            "report it at https://github.com/home-operations/kopiur/issues",
         )
     })?;
 
