@@ -907,7 +907,7 @@ async fn degrade_mode_wipe_escalates_to_reinitialize_blocked_and_ack_recreates()
                 })
                 && e.note
                     .as_deref()
-                    .is_some_and(|n| n.contains(&format!("is `{u1}`")))
+                    .is_some_and(|n| n.contains(&format!("annotation is `{u1}`")))
         });
     assert!(
         stale_ack_warning.is_none(),
