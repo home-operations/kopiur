@@ -46,7 +46,7 @@ $ kubectl kopiur doctor -n media
 9 check(s): 1 failed, 0 warning(s)
 ```
 
-Checks the user lacks RBAC for degrade to warnings that name the missing grant, so doctor never crashes on a restricted kubeconfig.
+Checks the user lacks RBAC for degrade to warnings that name the missing grant, so doctor never crashes on a restricted kubeconfig. Warnings do **not** change the exit code: `doctor` exits `1` only when a check *failed*, and `0` otherwise — including a run that could not fully verify itself. In CI, read the `warning(s)` count in the summary line (or the `outcome` fields of `-o json`) when "could not check" needs to be distinguished from "all clear".
 
 ### Blocked is not the same as old
 

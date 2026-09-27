@@ -17,3 +17,18 @@ fn generated_artifacts_match_checked_in_files() {
         "checked-in deploy/ artifacts are stale; run `cargo xtask gen-all` and commit"
     );
 }
+
+/// The SPA's generated TypeScript is part of the same gate, but it is not an
+/// [`xtask::artifact::Artifact`] (`ts-rs` writes its own files), so `collect`
+/// above cannot see it. Without this, editing a wire type in `crates/ui-model`
+/// would leave `cargo test` green and only `mise run gen-check` red.
+#[test]
+fn generated_ui_types_match_checked_in_files() {
+    let code = xtask::ui_types::run(true).expect("run gen-ui-types --check");
+    assert_eq!(
+        code,
+        0,
+        "checked-in {} is stale; run `mise run gen` and commit",
+        xtask::ui_types::UI_TYPES_DIR
+    );
+}

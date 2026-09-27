@@ -20,7 +20,7 @@ use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 
 use kopiur_api::common::{PolicyDeletePolicy, RepositoryRef, Retention};
-use kopiur_api::retention::{SnapshotLike, select_kept};
+use kopiur_api::retention::select_kept;
 use kopiur_api::snapshot::PrunedBy;
 use kopiur_api::{Origin, Snapshot, SnapshotPolicy, validate};
 
@@ -30,91 +30,13 @@ use crate::error::{Error, Result, error_policy_for};
 use crate::io;
 use crate::metrics::PolicyCascadeMode;
 
-/// A minimal view of a `Snapshot` for retention selection: its CR name (the id
-/// used in delete decisions) and its snapshot end time (the GFS bucketing key).
-/// `Clone` so the adoption retention gate (adoption inv. 8) can union these
-/// views with candidate views without re-deriving them from the CRs.
-#[derive(Debug, Clone)]
-pub struct SnapshotRetentionView {
-    /// CR name — the stable id returned in the kept/delete sets.
-    pub name: String,
-    /// Snapshot completion time (from `status.snapshot`/`status.timing`).
-    pub end_time: DateTime<Utc>,
-    /// Whether the `Snapshot` is pinned (`spec.pin`, ADR-0005 §13(c)) — exempt from
-    /// GFS retention (never selected for deletion).
-    pub pinned: bool,
-}
-
-impl SnapshotLike for SnapshotRetentionView {
-    fn end_time(&self) -> DateTime<Utc> {
-        self.end_time
-    }
-    fn id(&self) -> &str {
-        &self.name
-    }
-    fn pinned(&self) -> bool {
-        self.pinned
-    }
-}
-
-/// Build a retention view from a `Snapshot` CR, using `status.timing.endTime`
-/// (falling back to the CR creation timestamp). Returns `None` if the backup is
-/// not in a terminal successful state — only successful snapshots participate in
-/// GFS (failures are bounded separately by `failedJobsHistoryLimit`).
-pub fn retention_view(b: &Snapshot) -> Option<SnapshotRetentionView> {
-    use kopiur_api::SnapshotPhase;
-    let status = b.status.as_ref()?;
-    // Exhaustive, not `!= Succeeded`: GFS membership is a CLASSIFICATION whose
-    // "no" side spans four unrelated meanings (in-flight, failed, deduped,
-    // foreign). A new phase silently defaulting to "not retention-governed"
-    // would quietly stop protecting a real restore point, so the compiler asks
-    // here first. Deliberately NOT `is_terminal()`: `Discovered`/`Unchanged`
-    // are terminal but must not claim a GFS bucket.
-    let participates_in_gfs = status.phase.as_ref().is_some_and(|p| match p {
-        SnapshotPhase::Succeeded => true,
-        // `Unchanged` owns no manifest, so it must never displace one that
-        // exists; `Discovered` is bounded by the catalog, not by this policy's
-        // retention; the rest are not terminal successes at all.
-        SnapshotPhase::Unchanged
-        | SnapshotPhase::Discovered
-        | SnapshotPhase::Pending
-        | SnapshotPhase::Running
-        | SnapshotPhase::Failed
-        | SnapshotPhase::Deleting => false,
-        // Never let a phase this build cannot read enter a set whose losers get
-        // DELETED from the repository.
-        SnapshotPhase::Unknown(_) => false,
-    });
-    if !participates_in_gfs {
-        return None;
-    }
-    // PROVENANCE (defense in depth): a `Succeeded` row only participates in GFS
-    // when it carries CONTROLLER-WRITTEN provenance (`status.snapshot`, the kopia
-    // id the operator produced or adopted). This closes the phantom-Succeeded
-    // displacement even if a phase were ever pinned without one — a forged bare
-    // `origin: adopted` label whose creationTimestamp fallback would otherwise
-    // claim a GFS bucket and displace a real snapshot into the retention delete
-    // set. Every genuine produced/adopted row has `status.snapshot`.
-    status.snapshot.as_ref()?;
-    let end_time = status
-        .timing
-        .as_ref()
-        .and_then(|t| t.end_time.as_deref())
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&Utc))
-        .or_else(|| {
-            // metadata.creationTimestamp is a k8s-openapi `Time` wrapping a
-            // jiff `Timestamp`; convert via unix seconds to chrono.
-            b.creation_timestamp()
-                .and_then(|t| DateTime::<Utc>::from_timestamp(t.0.as_second(), 0))
-        })?;
-    Some(SnapshotRetentionView {
-        name: b.name_any(),
-        end_time,
-        // A pinned Snapshot is exempt from GFS pruning (ADR-0005 §13(c)).
-        pinned: b.spec.pin,
-    })
-}
+/// The retention population and its bucketing live in
+/// [`kopiur_api::retention`], where the web UI's "would retention keep this?"
+/// preview can reach them: a preview built from a different population, or
+/// bucketed differently, answers about a set this reconciler will never
+/// evaluate. Re-exported under the names this module has always used so its
+/// call sites and its behaviour are unchanged.
+pub use kopiur_api::retention::{SnapshotRetentionView, retention_group_key, retention_view};
 
 /// Decide which `Snapshot` CR names to delete under a GFS `policy`. Wraps
 /// `api::retention::select_kept`; returns the `delete` set. Snapshots that are not
@@ -135,79 +57,16 @@ pub fn backups_to_delete(
     //
     // Un-fanned Snapshots all share the empty key, so a single-source policy is
     // exactly one bucket and behaves byte-for-byte as before.
-    let mut buckets: BTreeMap<String, Vec<SnapshotRetentionView>> = BTreeMap::new();
-    for b in backups {
-        // #382 C1: a terminating row is excluded from the kept-set computation
-        // INPUT — with the population served from the reflector store, an
-        // externally-deleted-but-still-cached NEWER snapshot must not claim a
-        // keep slot and push a LIVE row into the delete set (the one true
-        // data-loss race). Excluding it here only removes a bucket competitor
-        // (survivors are promoted, never demoted). The exclusion is scoped to
-        // THIS boundary: the shared `backups` slice stays INCLUSIVE of
-        // terminating rows so `own_snapshot_ids_and_history` keeps seeing a
-        // terminating adopted row's kopia id (or `plan_adoption` could
-        // re-adopt an id whose CR is mid-finalizer).
-        if b.metadata.deletion_timestamp.is_some() {
-            continue;
-        }
-        if let Some(v) = retention_view(b) {
-            buckets
-                .entry(retention_group_key(b, policy_is_multi))
-                .or_default()
-                .push(v);
-        }
-    }
-    buckets
+    //
+    // The population and the bucketing (including the #382 C1 exclusion of
+    // terminating rows) are `kopiur_api::retention::retention_buckets`, shared
+    // with the web UI's retention preview so the two cannot evaluate different
+    // sets. Only the "which side of the line" decision is here.
+    let refs: Vec<&Snapshot> = backups.iter().collect();
+    kopiur_api::retention::retention_buckets(&refs, policy_is_multi)
         .values()
         .flat_map(|views| select_kept(views, policy).delete)
         .collect()
-}
-
-/// **Pure.** The retention bucket a `Snapshot` belongs to.
-///
-/// One bucket per distinct backup source, so GFS keeps `keepDaily` days *of
-/// each PVC* rather than `keepDaily` snapshots across all of them. Empty for an
-/// un-fanned Snapshot, which is what makes a single-source policy one bucket
-/// and therefore unchanged.
-///
-/// **Multi-repo fan-out (#368):** while the policy is CURRENTLY multi-repo
-/// (`policy_is_multi`), the key also carries the child's mint-time repository
-/// pin (`spec.repository`, normalized at mint), so GFS keeps `keepDaily` days
-/// per (source, repository) — the N repositories are independent captures and
-/// must retain independently. The repo component comes from the SPEC pin ONLY
-/// (never `status.resolved` — a status-derived key would flap with backfills),
-/// and applies ONLY while the policy is multi-repo:
-///
-/// - single-repo policy (including after a multi→single edit): source-only
-///   buckets, byte-identical to today. Old pinned children merge back into the
-///   flat buckets — a documented TRANSIENT GFS mixing (the surviving repo's
-///   rows and the removed repo's leftovers compete in one bucket) that
-///   self-resolves as the removed repo's rows age out of every keep window.
-/// - multi-repo policy: (source, pin) buckets. Rows with NO pin (pre-feature
-///   children minted before the single→multi edit) land in the ""-repo bucket
-///   and age out; the policy reconciler's spec-pin backfill
-///   ([`repository_pin_backfill_patches`]) converges them into their real
-///   buckets first, so the ""-bucket is a shrinking transition set, not a
-///   steady state.
-pub fn retention_group_key(b: &Snapshot, policy_is_multi: bool) -> String {
-    let source = match b.spec.source.as_ref().map(|s| &s.target) {
-        Some(kopiur_api::SnapshotSourceTarget::Pvc(t)) => {
-            format!("pvc/{}/{}", t.namespace, t.name)
-        }
-        None => String::new(),
-    };
-    if !policy_is_multi {
-        return source;
-    }
-    let repo = b
-        .spec
-        .repository
-        .as_ref()
-        .map(|r| kopiur_api::common::repo_key(r, b.namespace().as_deref().unwrap_or_default()))
-        .unwrap_or_default();
-    // '\n' can appear in neither component (DNS names / repo keys), so the
-    // joined key is injective over (source, repo).
-    format!("{source}\n{repo}")
 }
 
 /// **Pure.** The `Unchanged` Snapshots to prune: everything past the newest

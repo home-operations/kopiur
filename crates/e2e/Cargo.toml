@@ -11,6 +11,10 @@ publish = false
 
 [dependencies]
 kopiur-api = { workspace = true }
+# The console's wire types, so the web-UI e2e asserts against the SAME structs the
+# backend serializes and the SPA consumes — a field rename cannot pass this suite
+# by being spelled differently in a test's ad-hoc struct.
+kopiur-ui-model = { workspace = true }
 # `ws` for `Api::exec`: the stream-source scenarios read back what a streamExec
 # restore wrote INSIDE the target pod, which is the only way to prove byte-identity.
 kube = { workspace = true, features = ["client", "runtime", "derive", "rustls-tls", "ws"] }
@@ -24,6 +28,9 @@ anyhow = { workspace = true }
 # retention e2e (the same DateTime type `kopiur_api::select_kept` consumes).
 chrono = { workspace = true }
 http = "1"
+# Collecting a proxied console response body: the web-UI e2e needs the status,
+# headers AND body of a REFUSAL, which kube's request_text throws away.
+http-body-util = { workspace = true }
 # Minting the throwaway CA + leaf cert for the TLS MinIO fixture (the
 # `tls.caBundleRef` private-CA e2e) at test runtime.
 rcgen = { workspace = true }

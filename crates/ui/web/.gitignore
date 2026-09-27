@@ -1,0 +1,5 @@
+# Impeccable's per-session review captures and decision comps are scratch, not
+# design authority; the surface briefs under .impeccable/surfaces/ are kept.
+.impeccable/review/
+.impeccable/mocks/
+.impeccable/build/

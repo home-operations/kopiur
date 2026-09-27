@@ -1,8 +1,10 @@
 //! `kubectl kopiur ls|cat|download|browse|session end` — the read-only
 //! snapshot data-plane.
 //!
-//! Two transports implement one [`SnapshotAccess`] trait, so every command is
-//! transport-agnostic (and unit-testable against a fake):
+//! The reads themselves — the [`SnapshotAccess`] trait, the path walk, the
+//! manifest parsing — live in [`kopiur_ops::browse`], shared with the web UI.
+//! What lives here is the CLI's own surface: the two transports it can choose
+//! between, the rendering, the REPL, and writing files to the user's machine.
 //! - [`session::ExecSession`] (default): a warm in-cluster mover Job holds a
 //!   **read-only** repository connection; reads are pod-exec'd through the
 //!   closed [`SessionCmd`] surface. Credentials never leave the cluster.
@@ -18,7 +20,12 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
-use kopiur_kopia::{DirEntry, DirManifest, SessionCmd, SnapshotListEntry};
+use kopiur_kopia::{DirEntry, DirManifest, ObjectId, SessionCmd};
+use kopiur_ops::OpsError;
+use kopiur_ops::browse::{
+    SnapshotAccess, parse_dir_manifest, parse_oid, root_oid_from_list, validate_rel_path,
+    walk_to_dir, walk_to_file,
+};
 
 use crate::CmdOutput;
 use crate::cli::{BrowseArgs, BrowseCommonArgs, CatArgs, DownloadArgs, LsArgs, SessionEndArgs};
@@ -26,122 +33,28 @@ use crate::context::{KubeCtx, Scope};
 use crate::error::CliError;
 use crate::output::{EMPTY_CELL, OutputFormat, Table, human_bytes};
 
-/// kopia's directory-manifest stream marker.
-const DIR_STREAM: &str = "kopia:directory";
-
-/// Transport-agnostic snapshot reads. Both transports implement this, so
-/// `ls`/`cat`/`download`/`browse` share one core (tested against a fake).
-/// Futures are awaited in-place by a single-task CLI, so no `Send` bound is
-/// needed — hence the `async_fn_in_trait` allowance.
-#[allow(async_fn_in_trait)]
-pub trait SnapshotAccess {
-    /// The root directory object id of `kopia_snapshot_id`, from the
-    /// repository's own catalog.
-    async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<String, CliError>;
-    /// A directory object's manifest.
-    async fn list_dir(&mut self, oid: &str) -> Result<DirManifest, CliError>;
-    /// Stream a file object's raw bytes into `sink`, returning the byte count.
-    async fn read_file(
-        &mut self,
-        oid: &str,
-        sink: &mut (dyn AsyncWrite + Unpin + Send),
-    ) -> Result<u64, CliError>;
-}
-
-/// Parse `kopia snapshot list --json --all` output and find the root oid of
-/// `id`. Pure.
-pub fn root_oid_from_list(bytes: &[u8], id: &str) -> Result<String, CliError> {
-    let entries: Vec<SnapshotListEntry> =
-        serde_json::from_slice(bytes).map_err(|e| CliError::UnexpectedKopiaOutput {
-            what: "the repository snapshot list".to_string(),
-            detail: format!("not valid snapshot-list JSON: {e}"),
-        })?;
-    let entry = entries
-        .into_iter()
-        .find(|e| e.id == id)
-        .ok_or_else(|| CliError::SnapshotMissingInRepo { id: id.to_string() })?;
-    match entry.root_entry {
-        Some(root) if !root.obj.is_empty() => Ok(root.obj),
-        _ => Err(CliError::UnexpectedKopiaOutput {
-            what: format!("snapshot {id}"),
-            detail: "the catalog entry carries no root object id".to_string(),
-        }),
-    }
-}
-
-/// Parse a `kopia show <dir-oid>` payload into a [`DirManifest`], verifying
-/// the directory stream marker. Pure.
-pub fn parse_dir_manifest(bytes: &[u8], oid: &str) -> Result<DirManifest, CliError> {
-    let manifest: DirManifest =
-        serde_json::from_slice(bytes).map_err(|e| CliError::UnexpectedKopiaOutput {
-            what: format!("directory manifest {oid}"),
-            detail: format!("not a directory manifest: {e}"),
-        })?;
-    if manifest.stream != DIR_STREAM {
-        return Err(CliError::UnexpectedKopiaOutput {
-            what: format!("directory manifest {oid}"),
-            detail: format!(
-                "stream marker was {:?}, expected {DIR_STREAM:?}",
-                manifest.stream
-            ),
-        });
-    }
-    Ok(manifest)
-}
-
-impl SnapshotAccess for session::ExecSession {
-    async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<String, CliError> {
-        let out = self.exec_capture(SessionCmd::SnapshotListJson).await?;
-        root_oid_from_list(&out, kopia_snapshot_id)
-    }
-    async fn list_dir(&mut self, oid: &str) -> Result<DirManifest, CliError> {
-        let out = self
-            .exec_capture(SessionCmd::ShowObject {
-                oid: oid.to_string(),
-            })
-            .await?;
-        parse_dir_manifest(&out, oid)
-    }
-    async fn read_file(
-        &mut self,
-        oid: &str,
-        sink: &mut (dyn AsyncWrite + Unpin + Send),
-    ) -> Result<u64, CliError> {
-        self.exec_stream(
-            SessionCmd::ShowObject {
-                oid: oid.to_string(),
-            },
-            sink,
-        )
-        .await
-    }
-}
-
 impl SnapshotAccess for local::LocalSession {
-    async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<String, CliError> {
+    type Error = CliError;
+
+    async fn snapshot_root(&mut self, kopia_snapshot_id: &str) -> Result<ObjectId, CliError> {
         let out = self.run_capture(SessionCmd::SnapshotListJson).await?;
-        root_oid_from_list(&out, kopia_snapshot_id)
+        Ok(root_oid_from_list(&out, kopia_snapshot_id)?)
     }
-    async fn list_dir(&mut self, oid: &str) -> Result<DirManifest, CliError> {
+
+    async fn list_dir(&mut self, oid: &ObjectId) -> Result<DirManifest, CliError> {
         let out = self
-            .run_capture(SessionCmd::ShowObject {
-                oid: oid.to_string(),
-            })
+            .run_capture(SessionCmd::ShowObject { oid: oid.clone() })
             .await?;
-        parse_dir_manifest(&out, oid)
+        Ok(parse_dir_manifest(&out, oid)?)
     }
+
     async fn read_file(
         &mut self,
-        oid: &str,
+        oid: &ObjectId,
         sink: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<u64, CliError> {
-        self.run_stream(
-            SessionCmd::ShowObject {
-                oid: oid.to_string(),
-            },
-            sink,
-        )
-        .await
+        self.run_stream(SessionCmd::ShowObject { oid: oid.clone() }, sink)
+            .await
     }
 }
 
@@ -155,25 +68,29 @@ pub enum Transport {
 }
 
 impl SnapshotAccess for Transport {
-    async fn snapshot_root(&mut self, id: &str) -> Result<String, CliError> {
+    type Error = CliError;
+
+    async fn snapshot_root(&mut self, id: &str) -> Result<ObjectId, CliError> {
         match self {
-            Transport::Session(s) => s.snapshot_root(id).await,
+            Transport::Session(s) => Ok(s.snapshot_root(id).await?),
             Transport::Local(l) => l.snapshot_root(id).await,
         }
     }
-    async fn list_dir(&mut self, oid: &str) -> Result<DirManifest, CliError> {
+
+    async fn list_dir(&mut self, oid: &ObjectId) -> Result<DirManifest, CliError> {
         match self {
-            Transport::Session(s) => s.list_dir(oid).await,
+            Transport::Session(s) => Ok(s.list_dir(oid).await?),
             Transport::Local(l) => l.list_dir(oid).await,
         }
     }
+
     async fn read_file(
         &mut self,
-        oid: &str,
+        oid: &ObjectId,
         sink: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<u64, CliError> {
         match self {
-            Transport::Session(s) => s.read_file(oid, sink).await,
+            Transport::Session(s) => Ok(s.read_file(oid, sink).await?),
             Transport::Local(l) => l.read_file(oid, sink).await,
         }
     }
@@ -191,147 +108,17 @@ async fn open_transport(
         ))
     } else {
         Ok(Transport::Session(
-            session::ExecSession::ensure(ctx, target, common.ttl()).await?,
+            session::ExecSession::ensure(
+                ctx,
+                target,
+                common.ttl(),
+                // Resolve-only: there is no `--image` flag, so a session always
+                // runs the mover image the operator runs.
+                &session::MoverImageSource::DiscoverFromControllerDeployment,
+                &session::StderrProgress::for_repository(&target.repo.name),
+            )
+            .await?,
         ))
-    }
-}
-
-/// Split a user path into components, rejecting absolute paths and `..`
-/// (paths are always relative to the snapshot root; there is nothing above
-/// it). `.` and empty components (`a//b`) are skipped. Pure.
-pub fn validate_rel_path(path: &str) -> Result<Vec<String>, CliError> {
-    if path.starts_with('/') {
-        return Err(CliError::InvalidPath {
-            path: path.to_string(),
-            reason: "absolute paths are not allowed".to_string(),
-        });
-    }
-    let mut components = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                return Err(CliError::InvalidPath {
-                    path: path.to_string(),
-                    reason: "`..` components are not allowed".to_string(),
-                });
-            }
-            other => components.push(other.to_string()),
-        }
-    }
-    Ok(components)
-}
-
-/// Where a walk landed: the snapshot root itself, or a named entry.
-#[derive(Debug)]
-pub enum Walked {
-    /// The snapshot root directory (an empty path).
-    Root {
-        /// The root directory object id.
-        oid: String,
-    },
-    /// A directory/file entry below the root.
-    Entry {
-        /// The full path walked, for messages.
-        path: String,
-        /// The manifest entry.
-        entry: DirEntry,
-    },
-}
-
-/// Walk `components` down from `root_oid`, one manifest level at a time.
-/// Transport-agnostic and tested against a fake [`SnapshotAccess`].
-pub async fn walk<A: SnapshotAccess + ?Sized>(
-    access: &mut A,
-    root_oid: &str,
-    components: &[String],
-) -> Result<Walked, CliError> {
-    let Some((last, parents)) = components.split_last() else {
-        return Ok(Walked::Root {
-            oid: root_oid.to_string(),
-        });
-    };
-    let mut dir_oid = root_oid.to_string();
-    let mut walked: Vec<&str> = Vec::new();
-    for parent in parents {
-        let manifest = access.list_dir(&dir_oid).await?;
-        walked.push(parent);
-        let entry = manifest
-            .entries
-            .into_iter()
-            .find(|e| &e.name == parent)
-            .ok_or_else(|| CliError::PathNotFound {
-                path: walked.join("/"),
-            })?;
-        if entry.entry_type != "d" {
-            return Err(CliError::NotADirectory {
-                path: walked.join("/"),
-                entry_type: entry.entry_type,
-            });
-        }
-        dir_oid = entry.obj;
-    }
-    let manifest = access.list_dir(&dir_oid).await?;
-    walked.push(last);
-    let entry = manifest
-        .entries
-        .into_iter()
-        .find(|e| &e.name == last)
-        .ok_or_else(|| CliError::PathNotFound {
-            path: walked.join("/"),
-        })?;
-    Ok(Walked::Entry {
-        path: walked.join("/"),
-        entry,
-    })
-}
-
-/// Walk to a path and return the directory oid to list — the root for an
-/// empty path, or a `d` entry's object (a file is refused with the ls hint).
-async fn walk_to_dir<A: SnapshotAccess + ?Sized>(
-    access: &mut A,
-    root_oid: &str,
-    components: &[String],
-) -> Result<String, CliError> {
-    match walk(access, root_oid, components).await? {
-        Walked::Root { oid } => Ok(oid),
-        Walked::Entry { path, entry } => {
-            if entry.entry_type == "d" {
-                Ok(entry.obj)
-            } else {
-                Err(CliError::NotADirectory {
-                    path,
-                    entry_type: entry.entry_type,
-                })
-            }
-        }
-    }
-}
-
-/// Walk to a path that must be a regular file, returning its entry.
-async fn walk_to_file<A: SnapshotAccess + ?Sized>(
-    access: &mut A,
-    root_oid: &str,
-    components: &[String],
-    original: &str,
-) -> Result<DirEntry, CliError> {
-    if components.is_empty() {
-        return Err(CliError::IsADirectory {
-            path: original.to_string(),
-        });
-    }
-    match walk(access, root_oid, components).await? {
-        Walked::Root { .. } => Err(CliError::IsADirectory {
-            path: original.to_string(),
-        }),
-        Walked::Entry { path, entry } => match entry.entry_type.as_str() {
-            "f" => Ok(entry),
-            "d" => Err(CliError::IsADirectory { path }),
-            other => Err(CliError::NotAFile {
-                path,
-                entry_type: other.to_string(),
-            }),
-        },
     }
 }
 
@@ -404,16 +191,20 @@ pub fn render_manifest(manifest: &DirManifest, format: OutputFormat) -> Result<S
         // The manifest verbatim — what `kopia show` emitted, machine-readable.
         OutputFormat::Json => serde_json::to_string_pretty(manifest)
             .map(|s| s + "\n")
-            .map_err(|e| CliError::Serialization {
-                what: "directory manifest",
-                source: e.into(),
+            .map_err(|e| {
+                OpsError::Serialization {
+                    what: "directory manifest",
+                    source: e.into(),
+                }
+                .into()
             }),
-        OutputFormat::Yaml => {
-            serde_yaml::to_string(manifest).map_err(|e| CliError::Serialization {
+        OutputFormat::Yaml => serde_yaml::to_string(manifest).map_err(|e| {
+            OpsError::Serialization {
                 what: "directory manifest",
                 source: e.into(),
-            })
-        }
+            }
+            .into()
+        }),
         // `-o name`: bare entry names, one per line (dirs keep the `/` marker).
         OutputFormat::Name => Ok(manifest
             .entries
@@ -441,11 +232,10 @@ fn reject_all_namespaces(ctx: &KubeCtx, command: &'static str) -> Result<(), Cli
 pub async fn ls(ctx: &KubeCtx, args: &LsArgs, output: OutputFormat) -> Result<CmdOutput, CliError> {
     reject_all_namespaces(ctx, "ls")?;
     let components = validate_rel_path(args.path.as_deref().unwrap_or(""))?;
-    let target = resolve::resolve(ctx, &args.common.snapshot).await?;
+    let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
     let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
-    let dir_oid = walk_to_dir(&mut access, &root, &components).await?;
-    let manifest = access.list_dir(&dir_oid).await?;
+    let (_oid, manifest) = walk_to_dir(&mut access, &root, &components).await?;
     Ok(CmdOutput::ok(render_manifest(&manifest, output)?))
 }
 
@@ -453,12 +243,12 @@ pub async fn ls(ctx: &KubeCtx, args: &LsArgs, output: OutputFormat) -> Result<Cm
 pub async fn cat(ctx: &KubeCtx, args: &CatArgs) -> Result<CmdOutput, CliError> {
     reject_all_namespaces(ctx, "cat")?;
     let components = validate_rel_path(&args.path)?;
-    let target = resolve::resolve(ctx, &args.common.snapshot).await?;
+    let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
     let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
-    let entry = walk_to_file(&mut access, &root, &components, &args.path).await?;
+    let (oid, _entry) = walk_to_file(&mut access, &root, &components, &args.path).await?;
     let mut stdout = tokio::io::stdout();
-    access.read_file(&entry.obj, &mut stdout).await?;
+    access.read_file(&oid, &mut stdout).await?;
     stdout.flush().await.map_err(|source| CliError::LocalIo {
         what: "flushing stdout".to_string(),
         source,
@@ -474,10 +264,10 @@ pub async fn cat(ctx: &KubeCtx, args: &CatArgs) -> Result<CmdOutput, CliError> {
 pub async fn download(ctx: &KubeCtx, args: &DownloadArgs) -> Result<CmdOutput, CliError> {
     reject_all_namespaces(ctx, "download")?;
     let components = validate_rel_path(&args.path)?;
-    let target = resolve::resolve(ctx, &args.common.snapshot).await?;
+    let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
     let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
-    let entry = walk_to_file(&mut access, &root, &components, &args.path).await?;
+    let (oid, entry) = walk_to_file(&mut access, &root, &components, &args.path).await?;
 
     let dest: PathBuf = match &args.dest {
         Some(d) => d.clone(),
@@ -490,7 +280,7 @@ pub async fn download(ctx: &KubeCtx, args: &DownloadArgs) -> Result<CmdOutput, C
         ),
     };
     eprintln!("downloading {} to {}…", args.path, dest.display());
-    let written = download_to_file(&mut access, &entry, &args.path, &dest).await?;
+    let written = download_to_file(&mut access, &oid, &entry, &args.path, &dest).await?;
     Ok(CmdOutput::ok(format!(
         "wrote {written} bytes to {}\n",
         dest.display()
@@ -499,8 +289,9 @@ pub async fn download(ctx: &KubeCtx, args: &DownloadArgs) -> Result<CmdOutput, C
 
 /// Stream `entry` into `dest`, verifying the byte count against the manifest
 /// size when present. A mismatch removes the partial file and errors.
-async fn download_to_file<A: SnapshotAccess + ?Sized>(
+async fn download_to_file<A: SnapshotAccess<Error = CliError> + ?Sized>(
     access: &mut A,
+    oid: &ObjectId,
     entry: &DirEntry,
     path: &str,
     dest: &Path,
@@ -520,7 +311,7 @@ async fn download_to_file<A: SnapshotAccess + ?Sized>(
     let cleanup_part = |part: std::path::PathBuf| async move {
         let _ = tokio::fs::remove_file(&part).await;
     };
-    let written = match access.read_file(&entry.obj, &mut file).await {
+    let written = match access.read_file(oid, &mut file).await {
         Ok(n) => n,
         Err(e) => {
             // Never leave a partial file behind on a failed stream.
@@ -563,9 +354,9 @@ async fn download_to_file<A: SnapshotAccess + ?Sized>(
 
 /// REPL navigation state: the root oid plus the stack of entered directories.
 pub struct ReplState {
-    root_oid: String,
+    root_oid: ObjectId,
     /// `(name, oid)` of each directory below the root, in order.
-    stack: Vec<(String, String)>,
+    stack: Vec<(String, ObjectId)>,
 }
 
 /// What one REPL step decided.
@@ -582,7 +373,7 @@ const REPL_HELP: &str = "commands:\n  ls            list the current directory\n
 
 impl ReplState {
     /// Start at the snapshot root.
-    pub fn new(root_oid: String) -> Self {
+    pub fn new(root_oid: ObjectId) -> Self {
         ReplState {
             root_oid,
             stack: Vec::new(),
@@ -606,10 +397,10 @@ impl ReplState {
     }
 
     /// The current directory's object id.
-    fn cwd_oid(&self) -> &str {
+    fn cwd_oid(&self) -> &ObjectId {
         self.stack
             .last()
-            .map(|(_, oid)| oid.as_str())
+            .map(|(_, oid)| oid)
             .unwrap_or(&self.root_oid)
     }
 
@@ -617,7 +408,7 @@ impl ReplState {
     /// `out`; `cat` streams into `file_sink` (stdout in the real REPL, a
     /// buffer in tests). Errors are returned so the caller can print them
     /// WITHOUT leaving the REPL.
-    pub async fn step<A: SnapshotAccess + ?Sized>(
+    pub async fn step<A: SnapshotAccess<Error = CliError> + ?Sized>(
         &mut self,
         access: &mut A,
         line: &str,
@@ -638,15 +429,14 @@ impl ReplState {
                 out.push('\n');
             }
             "ls" => {
-                let oid = match arg1 {
+                let manifest = match arg1 {
                     // `ls <dir>` lists without entering.
                     Some(path) => {
                         let comps = self.resolve_repl_path(path)?;
-                        walk_to_dir(access, &self.root_oid, &comps).await?
+                        walk_to_dir(access, &self.root_oid, &comps).await?.1
                     }
-                    None => self.cwd_oid().to_string(),
+                    None => access.list_dir(self.cwd_oid()).await?,
                 };
-                let manifest = access.list_dir(&oid).await?;
                 out.push_str(&render_manifest(&manifest, OutputFormat::Table)?);
             }
             "cd" => {
@@ -663,8 +453,8 @@ impl ReplState {
                     return Ok(ReplOutcome::Continue);
                 };
                 let comps = self.resolve_repl_path(path)?;
-                let entry = walk_to_file(access, &self.root_oid, &comps, path).await?;
-                access.read_file(&entry.obj, file_sink).await?;
+                let (oid, _entry) = walk_to_file(access, &self.root_oid, &comps, path).await?;
+                access.read_file(&oid, file_sink).await?;
             }
             "get" => {
                 let Some(path) = arg1 else {
@@ -672,11 +462,11 @@ impl ReplState {
                     return Ok(ReplOutcome::Continue);
                 };
                 let comps = self.resolve_repl_path(path)?;
-                let entry = walk_to_file(access, &self.root_oid, &comps, path).await?;
+                let (oid, entry) = walk_to_file(access, &self.root_oid, &comps, path).await?;
                 let dest = arg2.map(PathBuf::from).unwrap_or_else(|| {
                     PathBuf::from(comps.last().expect("non-empty file path").clone())
                 });
-                let written = download_to_file(access, &entry, path, &dest).await?;
+                let written = download_to_file(access, &oid, &entry, path, &dest).await?;
                 out.push_str(&format!("wrote {written} bytes to {}\n", dest.display()));
             }
             other => {
@@ -688,7 +478,7 @@ impl ReplState {
 
     /// Enter a (possibly multi-component) directory path. `..` pops one level
     /// — REPL navigation can go *up*, but never above the root.
-    async fn cd<A: SnapshotAccess + ?Sized>(
+    async fn cd<A: SnapshotAccess<Error = CliError> + ?Sized>(
         &mut self,
         access: &mut A,
         path: &str,
@@ -706,16 +496,17 @@ impl ReplState {
                         .entries
                         .into_iter()
                         .find(|e| e.name == name)
-                        .ok_or_else(|| CliError::PathNotFound {
+                        .ok_or_else(|| OpsError::PathNotFound {
                             path: name.to_string(),
                         })?;
                     if entry.entry_type != "d" {
-                        return Err(CliError::NotADirectory {
+                        return Err(OpsError::NotADirectory {
                             path: name.to_string(),
                             entry_type: entry.entry_type,
-                        });
+                        }
+                        .into());
                     }
-                    self.stack.push((name.to_string(), entry.obj));
+                    self.stack.push((name.to_string(), parse_oid(&entry.obj)?));
                 }
             }
         }
@@ -736,7 +527,7 @@ impl ReplState {
 /// `kubectl kopiur browse <SNAPSHOT>` — the interactive REPL.
 pub async fn browse(ctx: &KubeCtx, args: &BrowseArgs) -> Result<CmdOutput, CliError> {
     reject_all_namespaces(ctx, "browse")?;
-    let target = resolve::resolve(ctx, &args.common.snapshot).await?;
+    let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
     let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let mut state = ReplState::new(root);
@@ -797,7 +588,7 @@ pub async fn session_end(ctx: &KubeCtx, args: &SessionEndArgs) -> Result<CmdOutp
     // selector; the match stays exhaustive over the two.
     let (kind, repo_namespace, repo_name) = match (&args.snapshot, &args.repository) {
         (Some(snapshot), None) => {
-            let target = resolve::resolve(ctx, snapshot).await?;
+            let target = resolve::resolve(ctx, &ctx.namespace, snapshot).await?;
             (
                 target.repo.kind,
                 target.repo.namespace.clone(),
@@ -811,10 +602,11 @@ pub async fn session_end(ctx: &KubeCtx, args: &SessionEndArgs) -> Result<CmdOutp
         }
         // Unreachable thanks to the clap group, but the match stays total.
         _ => {
-            return Err(CliError::AmbiguousTarget {
+            return Err(OpsError::AmbiguousTarget {
                 what: "session end needs exactly one of SNAPSHOT or --repository".to_string(),
                 candidates: "pass one of them".to_string(),
-            });
+            }
+            .into());
         }
     };
 
@@ -843,6 +635,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// A fake transport: a map of dir-oid → manifest and file-oid → bytes.
+    /// The shared walk is tested against `kopiur_ops`' own fake; this one
+    /// carries the CLI's error type, so the REPL and the download path (which
+    /// raise CLI-only failures) are testable without a cluster.
     struct FakeAccess {
         root: String,
         dirs: BTreeMap<String, DirManifest>,
@@ -850,24 +645,28 @@ mod tests {
     }
 
     impl SnapshotAccess for FakeAccess {
-        async fn snapshot_root(&mut self, _id: &str) -> Result<String, CliError> {
-            Ok(self.root.clone())
+        type Error = CliError;
+
+        async fn snapshot_root(&mut self, _id: &str) -> Result<ObjectId, CliError> {
+            Ok(parse_oid(&self.root)?)
         }
-        async fn list_dir(&mut self, oid: &str) -> Result<DirManifest, CliError> {
-            self.dirs
-                .get(oid)
-                .cloned()
-                .ok_or_else(|| CliError::UnexpectedKopiaOutput {
-                    what: format!("dir {oid}"),
+
+        async fn list_dir(&mut self, oid: &ObjectId) -> Result<DirManifest, CliError> {
+            self.dirs.get(oid.as_str()).cloned().ok_or_else(|| {
+                OpsError::UnexpectedKopiaOutput {
+                    what: format!("dir {}", oid.as_str()),
                     detail: "fake: unknown dir oid".into(),
-                })
+                }
+                .into()
+            })
         }
+
         async fn read_file(
             &mut self,
-            oid: &str,
+            oid: &ObjectId,
             sink: &mut (dyn AsyncWrite + Unpin + Send),
         ) -> Result<u64, CliError> {
-            let bytes = self.files.get(oid).cloned().unwrap_or_default();
+            let bytes = self.files.get(oid.as_str()).cloned().unwrap_or_default();
             sink.write_all(&bytes).await.unwrap();
             Ok(bytes.len() as u64)
         }
@@ -879,6 +678,10 @@ mod tests {
             "entries": entries
         }))
         .unwrap()
+    }
+
+    fn oid(s: &str) -> ObjectId {
+        parse_oid(s).expect("test oid")
     }
 
     /// root/
@@ -903,116 +706,6 @@ mod tests {
                 ("kfile-b".to_string(), b"nested data".to_vec()),
             ]),
         }
-    }
-
-    #[test]
-    fn rel_path_validation_rejects_escapes_and_normalizes() {
-        assert_eq!(validate_rel_path("").unwrap(), Vec::<String>::new());
-        assert_eq!(validate_rel_path("a/b").unwrap(), vec!["a", "b"]);
-        assert_eq!(validate_rel_path("./a//b/.").unwrap(), vec!["a", "b"]);
-        assert!(matches!(
-            validate_rel_path("/etc/passwd"),
-            Err(CliError::InvalidPath { .. })
-        ));
-        assert!(matches!(
-            validate_rel_path("a/../b"),
-            Err(CliError::InvalidPath { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn walk_finds_nested_entries_and_reports_missing_paths() {
-        let mut access = fake();
-        // Root.
-        let Walked::Root { oid } = walk(&mut access, "kroot", &[]).await.unwrap() else {
-            panic!("empty path walks to the root");
-        };
-        assert_eq!(oid, "kroot");
-        // Nested file.
-        let comps = validate_rel_path("sub/b.txt").unwrap();
-        let Walked::Entry { path, entry } = walk(&mut access, "kroot", &comps).await.unwrap()
-        else {
-            panic!("expected an entry");
-        };
-        assert_eq!(path, "sub/b.txt");
-        assert_eq!(entry.obj, "kfile-b");
-        // Missing leaf and missing parent both name the walked path.
-        let missing = validate_rel_path("sub/nope").unwrap();
-        let err = walk(&mut access, "kroot", &missing).await.unwrap_err();
-        assert!(matches!(err, CliError::PathNotFound { ref path } if path == "sub/nope"));
-        let missing = validate_rel_path("nope/deep").unwrap();
-        let err = walk(&mut access, "kroot", &missing).await.unwrap_err();
-        assert!(matches!(err, CliError::PathNotFound { ref path } if path == "nope"));
-        // Walking *through* a file is refused — with the NOT-a-directory
-        // variant (the file IS a file; the problem is it isn't a directory).
-        let through = validate_rel_path("a.txt/x").unwrap();
-        assert!(matches!(
-            walk(&mut access, "kroot", &through).await.unwrap_err(),
-            CliError::NotADirectory { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn walk_to_file_refuses_directories_and_the_root() {
-        let mut access = fake();
-        let err = walk_to_file(&mut access, "kroot", &[], "")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, CliError::IsADirectory { .. }));
-        let comps = validate_rel_path("sub").unwrap();
-        let err = walk_to_file(&mut access, "kroot", &comps, "sub")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, CliError::IsADirectory { ref path } if path == "sub"));
-    }
-
-    #[test]
-    fn snapshot_list_root_resolution_finds_the_id_or_says_its_gone() {
-        let list = serde_json::json!([
-            {
-                "id": "kother",
-                "source": { "host": "h", "userName": "u", "path": "/d" },
-                "startTime": "2026-06-01T00:00:00Z",
-                "endTime": "2026-06-01T00:00:01Z",
-                "rootEntry": { "name": "d", "type": "d", "obj": "kroot-other" }
-            },
-            {
-                "id": "kwanted",
-                "source": { "host": "h", "userName": "u", "path": "/d" },
-                "startTime": "2026-06-02T00:00:00Z",
-                "endTime": "2026-06-02T00:00:01Z",
-                "rootEntry": { "name": "d", "type": "d", "obj": "kroot-wanted" }
-            }
-        ]);
-        let bytes = serde_json::to_vec(&list).unwrap();
-        assert_eq!(
-            root_oid_from_list(&bytes, "kwanted").unwrap(),
-            "kroot-wanted"
-        );
-        assert!(matches!(
-            root_oid_from_list(&bytes, "kgone").unwrap_err(),
-            CliError::SnapshotMissingInRepo { .. }
-        ));
-        assert!(matches!(
-            root_oid_from_list(b"not json", "k").unwrap_err(),
-            CliError::UnexpectedKopiaOutput { .. }
-        ));
-    }
-
-    #[test]
-    fn dir_manifest_parsing_checks_the_stream_marker() {
-        let good = serde_json::to_vec(&serde_json::json!({
-            "stream": "kopia:directory",
-            "entries": [{ "name": "x", "type": "f", "obj": "k1", "size": 1 }]
-        }))
-        .unwrap();
-        assert_eq!(parse_dir_manifest(&good, "kdir").unwrap().entries.len(), 1);
-        let wrong = serde_json::to_vec(&serde_json::json!({
-            "stream": "kopia:other", "entries": []
-        }))
-        .unwrap();
-        let msg = parse_dir_manifest(&wrong, "kdir").unwrap_err().to_string();
-        assert!(msg.contains("kopia:other"), "{msg}");
     }
 
     #[test]
@@ -1061,7 +754,7 @@ mod tests {
     #[tokio::test]
     async fn repl_navigates_lists_and_reads() {
         let mut access = fake();
-        let mut state = ReplState::new("kroot".into());
+        let mut state = ReplState::new(oid("kroot"));
         let mut sink: Vec<u8> = Vec::new();
 
         // pwd at root.
@@ -1115,7 +808,7 @@ mod tests {
             .step(&mut access, "cat nope.txt", &mut String::new(), &mut sink)
             .await
             .unwrap_err();
-        assert!(matches!(err, CliError::PathNotFound { .. }));
+        assert!(matches!(err, CliError::Ops(OpsError::PathNotFound { .. })));
 
         // quit / unknown commands.
         let mut out = String::new();
@@ -1146,7 +839,7 @@ mod tests {
         .unwrap();
         let dest =
             std::env::temp_dir().join(format!("kopiur-dl-test-{}-a.txt", std::process::id()));
-        let err = download_to_file(&mut access, &entry, "a.txt", &dest)
+        let err = download_to_file(&mut access, &oid("kfile-a"), &entry, "a.txt", &dest)
             .await
             .unwrap_err();
         assert!(
@@ -1167,7 +860,7 @@ mod tests {
             "name": "a.txt", "type": "f", "obj": "kfile-a", "size": 16
         }))
         .unwrap();
-        let n = download_to_file(&mut access, &entry, "a.txt", &dest)
+        let n = download_to_file(&mut access, &oid("kfile-a"), &entry, "a.txt", &dest)
             .await
             .unwrap();
         assert_eq!(n, 16);

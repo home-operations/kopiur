@@ -27,6 +27,9 @@ kopiur-migrate = { workspace = true }
 # session surface (`SessionCmd`, `DirManifest`) for both transports.
 kopiur-kopia = { workspace = true }
 kopiur-mover = { workspace = true }
+# The shared operations layer: `OpsCtx`/`Scope`, `OpsError`, and the wait loop
+# the web UI reuses. `CliError::Ops` carries its failures through unchanged.
+kopiur-ops = { workspace = true }
 # `runtime` powers the --wait watcher (kube::runtime::watcher); `ws` powers the
 # browse session's pod-exec transport (WebSocket attach).
 # `webpki-roots` compiles in Mozilla's root store as the TLS fallback for the

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- The server sends no theme; the page follows the OS until the user
+         overrides it. main.tsx applies a stored override before the first
+         render — an inline script here would be refused by the backend's
+         `default-src 'self'` Content-Security-Policy. -->
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="kopiur-ui — the Kopiur backup operator's console" />
+    <title>Kopiur</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -66,12 +66,17 @@ tests:
             apiGroups: [""]
             resources: [pods/log]
             verbs: [get]
+      # BOTH verbs. An exec over WebSocket is an HTTP upgrade, i.e. a GET, so the
+      # apiserver authorizes it as `get pods/exec`; `create` alone covers only the
+      # older SPDY POST and leaves every browse refused with a bare "cannot get
+      # resource pods/exec". Regression guard for the bug the console e2e found
+      # (it was the first test ever to bind a browse role to a non-admin subject).
       - contains:
           path: rules
           content:
             apiGroups: [""]
             resources: [pods/exec]
-            verbs: [create]
+            verbs: [create, get]
       # The security model: a browsing user never reads credential Secrets.
       - notContains:
           path: rules

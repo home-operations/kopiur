@@ -165,7 +165,17 @@ pub fn phase_enums() -> Vec<&'static str> {
 /// classifications (`is_terminal`, the `phase_serde!` round-trips, the gate
 /// registry) are exactly where a `_ =>` would do the most damage, because every
 /// consumer inherits the answer.
-pub const SCAN_CRATES: &[&str] = &["api", "cli", "controller", "kopia", "mover", "webhook"];
+pub const SCAN_CRATES: &[&str] = &[
+    "api",
+    "cli",
+    "controller",
+    "kopia",
+    "mover",
+    "ops",
+    "ui",
+    "ui-model",
+    "webhook",
+];
 
 /// The one file Rule C reads: condition-type constants still defined
 /// controller-side instead of in `kopiur_api::consts`.
