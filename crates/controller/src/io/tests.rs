@@ -2915,6 +2915,8 @@ mod bootstrap_outcomes {
             snapshot_count: Some(0),
             snapshots: vec![],
             snapshots_truncated: false,
+            listed_ids: None,
+            logical_bytes: None,
             foreign_suffix_dropped: 0,
             index_blob_count: None,
             epoch: None,

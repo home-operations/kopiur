@@ -30,8 +30,8 @@ use tracing::{error, info, warn};
 
 use kopiur_mover::batch_delete::{BatchDeletePlan, anchor_self_heal_allowed, plan_batch_delete};
 use kopiur_mover::bootstrap::{
-    BootstrapInitAction, BootstrapResult, CreateGrant, MAX_RETURNED_SNAPSHOTS,
-    RESULT_CONFIGMAP_KEY, SeedOutcome, bootstrap_init_action,
+    BootstrapInitAction, BootstrapResult, CreateGrant, RESULT_CONFIGMAP_KEY, SeedOutcome,
+    bootstrap_init_action,
 };
 use kopiur_mover::cli::{MoverCli, MoverCommand};
 use kopiur_mover::credentials;
@@ -2709,15 +2709,22 @@ async fn run_bootstrap(
     // controller leaves the prior catalog/stats untouched. A seed-armed run
     // never skips (the seed verdict below needs repository contents, and a
     // probe is only ever armed for an already-bootstrapped repository).
-    let (snapshot_count, listing) = if op.probe_only && op.seed.is_none() {
-        (None, Vec::new())
+    //
+    // `snapshot list --all`, not the source-less plain list (issue #476): this
+    // listing is load-bearing twice over — the seed backstop below makes a
+    // repository-stranding decision on its length, and the catalog's membership
+    // digest makes row-EXPIRING decisions on its contents. Plain `snapshot
+    // list` happens to be unscoped on kopia 0.23.1, but only `--all` promises
+    // it (see `KopiaClient::snapshot_list_all`). Complete snapshots only.
+    let listing = if op.probe_only && op.seed.is_none() {
+        None
     } else {
-        let l = match client.snapshot_list(None).await {
-            Ok(l) => l,
+        match client.snapshot_list_all().await {
+            Ok(l) => Some(l),
             Err(e) => return BootstrapResult::failed(&e),
-        };
-        (Some(l.len() as i64), l)
+        }
     };
+    let snapshot_count = listing.as_ref().map(|l| l.len() as i64);
     // The seeding backstop (issue #380): refuse to report success on an EMPTY
     // repository when a seed was armed. Catches the one path the source-side
     // gates cannot see — an earlier seed that initialized the backend and then
@@ -2725,49 +2732,42 @@ async fn run_bootstrap(
     // over the half-initialized leftovers. Placed here so it covers every route
     // to "seed armed, nothing in the repository".
     //
-    // It counts with `snapshot list --all` rather than reusing the catalog
-    // listing above, and pays a second kopia call to do it. Every SEEDED
-    // snapshot belongs to the identity of the cluster that WROTE it, and this is
-    // a TERMINAL decision about whether a repository holds history. Plain
-    // `snapshot list` is not identity-scoped on kopia 0.23.1 (verified; pinned
-    // against the real binary by the `sync_to_seeds_*` integration test), but
-    // kopia's own `--all` help reads as though it were — betting a
-    // repository-stranding decision on that staying true is not a bet worth
-    // taking. `--all` is unconditional. Only paid on a seed-armed run.
+    // It counts the `snapshot list --all` listing above — a seed-armed run
+    // always lists. Every SEEDED snapshot belongs to the identity of the
+    // cluster that WROTE it, and this is a TERMINAL decision about whether a
+    // repository holds history, so it must rest on the unconditional `--all`
+    // and never on plain `snapshot list`'s identity scoping (unscoped on kopia
+    // 0.23.1, pinned by the `sync_to_seeds_*` integration test, but kopia's own
+    // help reads as though it were scoped).
     if let Some(seed) = op.seed.as_ref() {
-        let all = match client.snapshot_list_all().await {
-            Ok(l) => l.len() as i64,
-            Err(e) => {
-                error!(class = %e.class(), "could not list this repository to check the seed result");
-                return BootstrapResult::failed(&e);
-            }
+        let Some(all) = snapshot_count else {
+            error!("spec.seed is set but the snapshot listing was skipped (kopiur bug)");
+            return BootstrapResult::internal_inconsistency(
+                "spec.seed is set but the snapshot listing was skipped; this is a kopiur bug",
+            );
         };
         if kopiur_mover::bootstrap::seed_left_repository_empty(true, seed.allow_empty_source, all) {
             error!("spec.seed is set but this repository is initialized and holds zero snapshots");
             return BootstrapResult::seed_left_empty();
         }
     }
-    let (snapshots, truncated, foreign_suffix_dropped) = if op.scan_catalog {
-        kopiur_mover::bootstrap::prepare_catalog_entries(
-            listing,
-            op.catalog_foreign_prefilter_cluster.as_deref(),
-        )
-    } else {
-        (Vec::new(), false, 0)
+    // A `probe_only` run took no listing, so it has no catalog to prepare —
+    // even with `scan_catalog` set — and must report no membership or bytes
+    // (the controller leaves the prior catalog/stats untouched on `None`).
+    let catalog = match (op.scan_catalog, listing) {
+        (true, Some(listing)) => {
+            let cap = kopiur_mover::bootstrap::window_cap(op.max_returned_snapshots);
+            let prepared = kopiur_mover::bootstrap::prepare_catalog_entries(
+                listing,
+                op.catalog_foreign_prefilter_cluster.as_deref(),
+                cap,
+                digest_salt(),
+            );
+            log_catalog_preparation(&prepared, snapshot_count, cap);
+            Some(prepared)
+        }
+        (true, None) | (false, _) => None,
     };
-    if truncated {
-        warn!(
-            snapshot_count,
-            returned = MAX_RETURNED_SNAPSHOTS,
-            "too many snapshots to list; kept only the newest"
-        );
-    }
-    if foreign_suffix_dropped > 0 {
-        info!(
-            dropped = foreign_suffix_dropped,
-            "dropped snapshot entries from other clusters"
-        );
-    }
 
     // Index-blob health (best-effort, off the hot path): count the content-index
     // blobs so the controller can warn before maintenance falls far enough behind
@@ -2784,6 +2784,16 @@ async fn run_bootstrap(
         }
     };
 
+    let (snapshots, truncated, foreign_suffix_dropped, listed_ids, logical_bytes) = match catalog {
+        Some(p) => (
+            p.entries,
+            p.truncated,
+            p.foreign_suffix_dropped,
+            p.listed_ids,
+            Some(p.logical_bytes),
+        ),
+        None => (Vec::new(), false, 0, None, None),
+    };
     BootstrapResult::ready(
         created,
         unique_id,
@@ -2795,10 +2805,80 @@ async fn run_bootstrap(
     )
     .with_epoch(observed_epoch, epoch_error)
     .with_blob_retention(observed_blob_retention)
+    // Issue #476: membership over the WHOLE listing + full-listing bytes, so the
+    // controller can expire rows outside the capped window.
+    .with_catalog_membership(listed_ids, logical_bytes)
     // MUST be present on every seed-armed success — including the
     // already-initialized no-op — or the controller reads the result as written
     // by a mover too old to understand `spec.seed` (issue #380).
     .with_seed(seed_outcome)
+}
+
+/// A fresh per-run salt for the catalog membership digest (issue #476): the
+/// wall clock's nanoseconds. It only has to differ between runs so a truncated
+/// hash collision (which can only ever KEEP a stale row) does not persist from
+/// scan to scan — it is not a secret. Kept at the call site so
+/// [`kopiur_mover::bootstrap::prepare_catalog_entries`] stays pure.
+fn digest_salt() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        // A clock before 1970 is absurd but not fatal: any constant salt is
+        // still correct, just not re-rolled.
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Log what [`kopiur_mover::bootstrap::prepare_catalog_entries`] produced: one
+/// info line per scan, plus a warning when the membership digest is missing.
+/// All informational: the mover returns the result either way, and the
+/// controller derives (and surfaces) the catalog coverage from it.
+fn log_catalog_preparation(
+    prepared: &kopiur_mover::bootstrap::PreparedCatalog,
+    snapshot_count: Option<i64>,
+    cap: usize,
+) {
+    let (digest_ids, digest_width) = match &prepared.listed_ids {
+        Some(kopiur_mover::digest::ListedIds::Digest(d)) => (Some(d.count), Some(d.width)),
+        Some(kopiur_mover::digest::ListedIds::Invalid(_)) | None => (None, None),
+    };
+    info!(
+        snapshot_count,
+        returned = prepared.entries.len(),
+        cap,
+        truncated = prepared.truncated,
+        foreign_dropped = prepared.foreign_suffix_dropped,
+        digest_ids,
+        digest_width,
+        "prepared the catalog"
+    );
+    warn_if_digest_missing(prepared.listed_ids.as_ref(), snapshot_count);
+}
+
+/// Warn when a scan could not carry a membership digest (issue #476). Split
+/// from [`log_catalog_preparation`] only to keep each under the complexity bar.
+fn warn_if_digest_missing(
+    listed_ids: Option<&kopiur_mover::digest::ListedIds>,
+    snapshot_count: Option<i64>,
+) {
+    let why = match listed_ids {
+        Some(kopiur_mover::digest::ListedIds::Digest(_)) => return,
+        // Never produced by `prepare_catalog_entries`; matched so a future
+        // change that does produce it is still reported.
+        Some(kopiur_mover::digest::ListedIds::Invalid(reason)) => {
+            format!("the mover built an invalid digest ({reason}); this is a kopiur bug")
+        }
+        None => "too many snapshots to track. Fix: lower the snapshot count with retention \
+                 and maintenance"
+            .to_string(),
+    };
+    warn!(
+        snapshot_count,
+        budget_bytes = kopiur_mover::digest::DIGEST_BUDGET_BYTES,
+        why = %why,
+        "catalog coverage will be Partial: discovered Snapshots whose kopia snapshots \
+         were deleted outside the window will not be removed (spec.catalog.retain still \
+         applies)"
+    );
 }
 
 /// Apply the ConfigMap size backstop (issue #237) to a bootstrap result, warning
@@ -2806,7 +2886,8 @@ async fn run_bootstrap(
 /// (`MAX_RETURNED_SNAPSHOTS`) is not a size cap, so a large catalog could otherwise
 /// produce a result the apiserver rejects — wedging the repository at
 /// `Bootstrapped: False` forever. The trimming decision itself is the pure,
-/// unit-tested [`kopiur_mover::bootstrap::enforce_result_size_budget`].
+/// unit-tested [`kopiur_mover::bootstrap::enforce_result_size_budget`]; it trims
+/// only the materialization window, never the membership digest (issue #476).
 fn size_guarded_result(result: &BootstrapResult) -> BootstrapResult {
     let guarded = kopiur_mover::bootstrap::enforce_result_size_budget(
         result.clone(),
@@ -4426,6 +4507,7 @@ mod tests {
             maintenance_owner_aliases: Vec::new(),
             read_only: false,
             seed: None,
+            max_returned_snapshots: None,
         }
     }
 

@@ -828,6 +828,15 @@ pub enum SeedStep<'a> {
     /// identity, simulating a peer cluster's (or legacy-format) stamped owner
     /// (M7a multi-cluster shared-repository scenarios: `tests/multi_cluster.rs`).
     ClaimMaintenance,
+    /// `kopia snapshot delete <ids..> --delete` under the identity of the most
+    /// recent create/connect step — an out-of-band prune, simulating a peer
+    /// cluster's GFS retention deleting snapshots this cluster only DISCOVERED
+    /// (issue #476). kopia's multi-id delete is all-or-nothing: an id that is
+    /// already gone fails the whole step.
+    DeleteSnapshots {
+        /// kopia snapshot manifest ids to delete.
+        ids: &'a [String],
+    },
 }
 
 /// A one-shot Pod (`restartPolicy: Never`) that drives RAW kopia against the
@@ -932,6 +941,20 @@ pub fn foreign_kopia_pod(ns: &str, name: &str, steps: &[SeedStep<'_>]) -> Pod {
                 "env": kopia_env.clone(),
                 "volumeMounts": kopia_mounts.clone(),
             }),
+            SeedStep::DeleteSnapshots { ids } => {
+                let mut command: Vec<String> =
+                    vec![consts::KOPIA_BIN.into(), "snapshot".into(), "delete".into()];
+                command.extend(ids.iter().cloned());
+                command.push("--delete".into());
+                json!({
+                    "name": format!("step-{i}-delete"),
+                    "image": consts::MOVER_IMAGE,
+                    "imagePullPolicy": "Never",
+                    "command": command,
+                    "env": kopia_env.clone(),
+                    "volumeMounts": kopia_mounts.clone(),
+                })
+            }
             SeedStep::ClaimMaintenance => json!({
                 "name": format!("step-{i}-claim-maint"),
                 "image": consts::MOVER_IMAGE,
