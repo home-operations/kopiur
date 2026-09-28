@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.10.11](https://github.com/home-operations/kopiur/compare/0.10.10...0.10.11) (2026-09-28)
+
+
+### Features
+
+* **npm:** update dependency @tanstack/react-query (5.102.8 → 5.104.0) ([#495](https://github.com/home-operations/kopiur/issues/495)) ([256d1e7](https://github.com/home-operations/kopiur/commit/256d1e7a66f1da337beccda564952ef368abf3f2))
+* **npm:** update dependency @types/node (26.5.0 → 26.6.3) ([#496](https://github.com/home-operations/kopiur/issues/496)) ([3a2a56a](https://github.com/home-operations/kopiur/commit/3a2a56aaf6b6d40bfa35fcbf75f44951fce74e74))
+* **npm:** update dependency lucide-react (1.42.0 → 1.48.0) ([#498](https://github.com/home-operations/kopiur/issues/498)) ([311b37b](https://github.com/home-operations/kopiur/commit/311b37b6bce1ee295d02c12c7f769c20f0296639))
+* **npm:** update dependency pnpm (12.3.4 → 12.6.0) ([#499](https://github.com/home-operations/kopiur/issues/499)) ([797faf6](https://github.com/home-operations/kopiur/commit/797faf6c8849d5ef6594cd24cef00ef5c972fb0d))
+* **npm:** update dependency typescript (5.9.3 → 6.0.3) ([#517](https://github.com/home-operations/kopiur/issues/517)) ([57ceea2](https://github.com/home-operations/kopiur/commit/57ceea287ee4b8f406276f1292ffe6ff66a278c2))
+* **npm:** update dependency typescript-eslint (8.70.1 → 8.71.0) ([#510](https://github.com/home-operations/kopiur/issues/510)) ([1521541](https://github.com/home-operations/kopiur/commit/152154134cfa2263cdb5721c0f49bef9af1350fa))
+* **npm:** update eslint monorepo (major) ([#519](https://github.com/home-operations/kopiur/issues/519)) ([52c8bee](https://github.com/home-operations/kopiur/commit/52c8bee1046c16ef0481f761336c5174a647ed64))
+* **npm:** update react monorepo (19.2.18 → 19.3.0) ([#500](https://github.com/home-operations/kopiur/issues/500)) ([315870b](https://github.com/home-operations/kopiur/commit/315870b50334ecc96e9b5193d832f86c036a1e1f))
+* **npm:** update web UI dependencies ([#511](https://github.com/home-operations/kopiur/issues/511)) ([a8c284a](https://github.com/home-operations/kopiur/commit/a8c284a827ed6843ba107b92c5fa89866f477f7c))
+* **rust:** update crate constant_time_eq (0.4.2 → 0.6.0) ([#501](https://github.com/home-operations/kopiur/issues/501)) ([b041681](https://github.com/home-operations/kopiur/commit/b0416818e6396da85a12861e5713a6d150e6075c))
+* **rust:** update crate tower-http (0.6.11 → 0.7.1) ([#502](https://github.com/home-operations/kopiur/issues/502)) ([2e07799](https://github.com/home-operations/kopiur/commit/2e0779900d2e5aea2fc9befc7a7dd79ecfc5e304))
+* **rust:** update opentelemetry to 0.33 and tracing-opentelemetry to 0.34 ([#520](https://github.com/home-operations/kopiur/issues/520)) ([4885bf8](https://github.com/home-operations/kopiur/commit/4885bf876c15eb47a176e62386bdb63a6d404463))
+* **ui:** a web console for Kopiur ([#460](https://github.com/home-operations/kopiur/issues/460)) ([e616b77](https://github.com/home-operations/kopiur/commit/e616b77ad75b44fad06d81626a17b7c8f82e2e85))
+
+
+### Bug Fixes
+
+* **catalog:** expire stale discovered Snapshots past the 1,000-entry window ([#476](https://github.com/home-operations/kopiur/issues/476)) ([#486](https://github.com/home-operations/kopiur/issues/486)) ([4e90a5e](https://github.com/home-operations/kopiur/commit/4e90a5e41bc7ee38584dd89fb858b6ccbec257a4))
+* make user-facing messages plain and short ([#490](https://github.com/home-operations/kopiur/issues/490)) ([8b3fb1b](https://github.com/home-operations/kopiur/commit/8b3fb1b789b4f15d27bbd1af1a8ed00f720f4232))
+* **npm:** update dependency eslint-plugin-react-refresh (0.5.6 → 0.5.7) ([#491](https://github.com/home-operations/kopiur/issues/491)) ([45f3803](https://github.com/home-operations/kopiur/commit/45f3803fe762ecb0551429d9bd91bc710d2c78d7))
+* **npm:** update dependency typescript-eslint (8.70.0 → 8.70.1) ([#492](https://github.com/home-operations/kopiur/issues/492)) ([667a4b3](https://github.com/home-operations/kopiur/commit/667a4b34cf3a7feb0029e6f99efa76f25641f7ea))
+
+
+### Continuous Integration
+
+* **e2e:** skip shards for SPA-only changes and cap matrix parallelism ([#509](https://github.com/home-operations/kopiur/issues/509)) ([f9a591e](https://github.com/home-operations/kopiur/commit/f9a591e40f8dc0244cb3ed9d24e229c05d063bc2))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action ubuntu (24.04 → 26.04) ([#469](https://github.com/home-operations/kopiur/issues/469)) ([b52506e](https://github.com/home-operations/kopiur/commit/b52506e955bf284574894ae4536b1eb5c6da056a))
+* **mise:** update mise tools ([#508](https://github.com/home-operations/kopiur/issues/508)) ([07f3aea](https://github.com/home-operations/kopiur/commit/07f3aeac65f11aad88c86b1172fd37e9fdca4fb5))
+* **mise:** update tool aqua:astral-sh/uv (0.12.17 → 0.12.18) ([#487](https://github.com/home-operations/kopiur/issues/487)) ([31f8d1f](https://github.com/home-operations/kopiur/commit/31f8d1f0114450953d1fda753c93c95b39014e91))
+* **mise:** update tool kubectl (1.37.0 → 1.37.1) ([#489](https://github.com/home-operations/kopiur/issues/489)) ([093c2d4](https://github.com/home-operations/kopiur/commit/093c2d4a32c3c85933d67c052e78194b05ccaf4c))
+* **mise:** update tool oxfmt (0.68.0 → 0.70.0) ([#484](https://github.com/home-operations/kopiur/issues/484)) ([9cf7e98](https://github.com/home-operations/kopiur/commit/9cf7e9875b66e68c83c00626dd066c199353ea56))
+* **mise:** update tool pnpm (12.3.4 → 12.6.0) ([#494](https://github.com/home-operations/kopiur/issues/494)) ([de0aed5](https://github.com/home-operations/kopiur/commit/de0aed5ade9107c761f3321b4b91a9ab2bf07fca))
+* **renovate:** drop the npm release-age rule now in the shared preset ([#516](https://github.com/home-operations/kopiur/issues/516)) ([7b33080](https://github.com/home-operations/kopiur/commit/7b3308071e24a42e47c5e3fbc92a9faa9f9ca035))
+* **renovate:** group web UI updates and record the SPA's version pins ([#515](https://github.com/home-operations/kopiur/issues/515)) ([70cbea0](https://github.com/home-operations/kopiur/commit/70cbea0f3bcc5df41e526bb87814ef466dc855a0))
+* **renovate:** hold npm updates for pnpm's minimumReleaseAge ([#513](https://github.com/home-operations/kopiur/issues/513)) ([0d42d06](https://github.com/home-operations/kopiur/commit/0d42d06acd02e4afc0da3fe3c1bbe1716c5b63b2))
+* **renovate:** lift the eslint 9 pin ([#518](https://github.com/home-operations/kopiur/issues/518)) ([b16334a](https://github.com/home-operations/kopiur/commit/b16334aa2d5ae18d201974b7f6b550be6fc05a53))
+
 ## [0.10.10](https://github.com/home-operations/kopiur/compare/0.10.9...0.10.10) (2026-09-25)
 
 
