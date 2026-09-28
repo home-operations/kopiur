@@ -11,11 +11,6 @@
       groupSlug: "web-ui",
     },
     {
-      description: "eslint 9.39.x until eslint-plugin-jsx-a11y supports ESLint 10 (see crates/ui/web/pnpm-workspace.yaml)",
-      matchPackageNames: ["eslint", "@eslint/js"],
-      allowedVersions: "<10",
-    },
-    {
       description: "typescript-eslint's supported TypeScript range (peer typescript >=4.8.4 <6.1.0); raise with it, see typescript-eslint/typescript-eslint#10940",
       matchPackageNames: ["typescript"],
       allowedVersions: "<6.1.0",

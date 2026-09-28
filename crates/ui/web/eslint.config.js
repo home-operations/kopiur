@@ -1,7 +1,8 @@
-// ESLint is pinned to the 9.x line in package.json (npm marks it deprecated):
-// eslint-plugin-jsx-a11y declares no ESLint 10 peer yet, and a11y linting is
-// load-bearing for this console's colour-blind/keyboard mandate. Move both
-// together. The other deliberate pins are explained in pnpm-workspace.yaml.
+// eslint-plugin-jsx-a11y 6.10.2 declares no ESLint 10 peer, but its rules still
+// report under ESLint 10. a11y linting is load-bearing for this console's
+// colour-blind/keyboard mandate, so re-check that the plugin still reports
+// whenever either one is bumped. Deliberate pins are explained in
+// pnpm-workspace.yaml.
 import js from "@eslint/js";
 import jsxA11y from "eslint-plugin-jsx-a11y";
 import reactHooks from "eslint-plugin-react-hooks";
