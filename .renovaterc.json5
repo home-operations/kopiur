@@ -11,6 +11,13 @@
       groupSlug: "web-ui",
     },
     {
+      description: "tracing-opentelemetry is versioned +1 from the opentelemetry-rust monorepo and must move in lockstep; separate PRs each split the graph into two otel versions and fail to compile",
+      matchManagers: ["cargo"],
+      matchPackageNames: ["opentelemetry*", "tracing-opentelemetry"],
+      groupName: "opentelemetry",
+      groupSlug: "opentelemetry",
+    },
+    {
       description: "typescript-eslint's supported TypeScript range (peer typescript >=4.8.4 <6.1.0); raise with it, see typescript-eslint/typescript-eslint#10940",
       matchPackageNames: ["typescript"],
       allowedVersions: "<6.1.0",
