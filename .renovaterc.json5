@@ -1,4 +1,11 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["local>home-operations/renovate-config"],
+  packageRules: [
+    {
+      description: "Match pnpm's minimumReleaseAge: a lockfile entry under a day old fails `pnpm install --frozen-lockfile`",
+      matchManagers: ["npm"],
+      minimumReleaseAge: "1 day",
+    },
+  ],
 }
