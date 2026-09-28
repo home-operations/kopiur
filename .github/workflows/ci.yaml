@@ -62,6 +62,36 @@ jobs:
       - name: Run audit
         run: mise run audit
 
+  # A change confined to the SPA (crates/ui/web) cannot move an e2e result: the
+  # `ui` shard drives the console's /api/v1 routes, never the bundle, which the
+  # `ui` job and the `ui` leg of `e2e-image` already gate. Without this, every
+  # Renovate web-dependency PR runs all e2e shards.
+  changes:
+    if: >-
+      ${{ github.event_name != 'push'
+      && !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
+    name: Changes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      web-only: ${{ steps.web.outputs.only_modified }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A manual dispatch has no base to diff against, so it runs every shard.
+      - name: Get changed files
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        id: web
+        with:
+          files: crates/ui/web/**
+
   coverage:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')
@@ -122,16 +152,22 @@ jobs:
   e2e:
     if: >-
       ${{ github.event_name != 'push'
+      && needs.changes.outputs.web-only != 'true'
       && !(startsWith(github.head_ref, 'release-please--')
       && github.event.pull_request.head.repo.full_name == github.repository) }}
     name: E2E (${{ matrix.shard }})
-    needs: e2e-image
+    needs:
+      - changes
+      - e2e-image
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
     strategy:
       fail-fast: false # one shard's failure shouldn't cancel the others
+      # Every home-operations repository shares one 20-job Actions concurrency
+      # cap (GitHub Free); unthrottled, this matrix alone fills it.
+      max-parallel: 8
       matrix:
         include:
           - shard: lifecycle
@@ -1000,6 +1036,7 @@ jobs:
     name: Build Success
     needs:
       - cargo-audit
+      - changes
       - coverage
       - docs
       - e2e
