@@ -1,11 +1,29 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["local>home-operations/renovate-config"],
+  postUpdateOptions: ["pnpmDedupe"],
   packageRules: [
     {
       description: "Same window as the shared github-actions and mise groups; pnpm itself fails `pnpm install --frozen-lockfile` on a lockfile entry under a day old",
       matchManagers: ["npm"],
       minimumReleaseAge: "3 days",
+    },
+    {
+      description: "One PR for the SPA's non-major updates: separate PRs all touch pnpm-lock.yaml, so every merge conflicts and rebases the rest",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "web UI dependencies",
+      groupSlug: "web-ui",
+    },
+    {
+      description: "eslint 9.39.x until eslint-plugin-jsx-a11y supports ESLint 10 (see crates/ui/web/pnpm-workspace.yaml)",
+      matchPackageNames: ["eslint", "@eslint/js"],
+      allowedVersions: "<10",
+    },
+    {
+      description: "typescript-eslint's supported TypeScript range (peer typescript >=4.8.4 <6.1.0); raise with it, see typescript-eslint/typescript-eslint#10940",
+      matchPackageNames: ["typescript"],
+      allowedVersions: "<6.1.0",
     },
   ],
 }
