@@ -92,7 +92,7 @@ mime_guess = "2"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 # Constant-time comparison for the UI's proxy shared secret: a byte-by-byte `==`
 # leaks the matched prefix length through timing.
-constant_time_eq = "0.4"
+constant_time_eq = "0.6"
 
 # Observability
 tracing = "0.1"
