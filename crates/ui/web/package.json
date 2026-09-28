@@ -42,7 +42,7 @@
     "typescript": "5.9.3",
     "typescript-eslint": "8.70.1",
     "vite": "7.3.6",
-    "vitest": "4.1.11",
+    "vitest": "5.0.2",
     "vitest-fetch-mock": "0.4.5"
   },
   "packageManager": "pnpm@12.6.0"
