@@ -149,7 +149,7 @@ preload janeczku/nfs-ganesha@sha256:17fe1813fd20d9fdfa497a26c8a2e39dd49748cd39db
 """
 
 [tasks.node-seed]
-description = "Seed the kopiur-e2e node's hostPath fixtures (repo/src + non-writable ro-repo + unreadable-file src-eh) and preload busybox"
+description = "Seed the kopiur-e2e node's hostPath fixtures (repo/src + non-writable ro-repo + unreadable-file src-eh), pin NFS mounts to v4.0, and preload busybox"
 dir = "{{config_root}}/../.."
 run = '''
 set -eu
@@ -157,6 +157,14 @@ NODE=kopiur-e2e-control-plane
 echo "==> seeding hostPath fixtures on $NODE"
 docker exec "$NODE" sh -c '
   set -e
+  # Pin every NFS mount on the node to NFSv4.0. The kubelet mounts inline nfs
+  # volumes with the RUNNER kernel NFS client, which negotiates the highest minor
+  # version. The e2e server (crates/e2e/src/consts.rs NFS_IMAGE, Ganesha 2.3.2)
+  # mishandles v4.1+ against newer kernels (ubuntu-26.04 runners, 7.x): READDIR
+  # and GETATTR on the export root return "Remote I/O error", so the NFS repo
+  # never bootstraps. v4.0 works on every kernel. That Ganesha does not know
+  # Minor_Versions, so the pin has to be on the client side.
+  printf "[ NFSMount_Global_Options ]\nnfsvers=4.0\n" > /etc/nfsmount.conf
   mkdir -p /kopiur-e2e/repo /kopiur-e2e/src/sub
   printf "hello kopiur e2e\n" > /kopiur-e2e/src/a.txt
   printf "nested data\n"      > /kopiur-e2e/src/sub/b.txt
