@@ -704,6 +704,11 @@ pub const RCLONE_REMOTE_PATH: &str = "miniors3:kopiur-rclone/repo";
 /// a green run — same hard-won lesson as the SFTP image (see [`SFTP_IMAGE`]): a
 /// server the client can't actually talk to fails slowly and confusingly. Also
 /// preloaded by the `minio-preload` mise task so CI doesn't pull it in-cluster.
+///
+/// This image is Ganesha 2.3.2, which breaks newer kernel NFS clients on v4.1+
+/// ("Remote I/O error" on the export root). The `node-seed` mise task pins the
+/// node's NFS mounts to v4.0 to compensate. Revisit that pin if you replace
+/// this image.
 pub const NFS_IMAGE: &str =
     "janeczku/nfs-ganesha@sha256:17fe1813fd20d9fdfa497a26c8a2e39dd49748cd39dbb0559df7627d9bcf4c53";
 /// Tiny shell image for hook workloads / one-shot helper pods (sentinel writers,
