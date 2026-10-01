@@ -1157,6 +1157,10 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       contents: read
+    env:
+      # Installs nothing up front (`install: false`); the shared lint action
+      # runs its linters through `mise exec`, which must install them on demand.
+      MISE_EXEC_AUTO_INSTALL: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
