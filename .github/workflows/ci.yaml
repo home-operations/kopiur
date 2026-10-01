@@ -413,14 +413,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # Only what a shard runs: kind, kubectl and helm for the cluster, and
-      # nextest for the prebuilt tests. No Rust toolchain — `Rust Build` compiled
+      # Only what a shard runs: kind, kubectl and helm for the cluster, nextest
+      # for the prebuilt tests, and kopia because the cli suite's `--local`
+      # browse runs it on the host. No Rust toolchain — `Rust Build` compiled
       # every shard's test binaries once, and `E2E Image` every image binary.
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          install_args: kind kubectl helm aqua:nextest-rs/nextest/cargo-nextest lefthook
+          install_args: kind kubectl helm kopia aqua:nextest-rs/nextest/cargo-nextest lefthook
 
       # Booting the node container and fetching the artifacts share no inputs,
       # so they overlap: the cluster is not needed until the images are in the
