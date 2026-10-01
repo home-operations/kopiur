@@ -30,7 +30,22 @@ COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=cargo-target-${BIN}-${TARGETARCH},sharing=locked \
     cargo build --release --locked --bin "${BIN}" && \
-    cp "target/release/${BIN}" /usr/local/bin/app
+    cp "target/release/${BIN}" "/${BIN}"
+
+# The compiled binary, alone, at `/${BIN}`. The runtime stage copies from HERE
+# rather than from `builder`, so a caller that already holds the binary can
+# replace this whole stage with a directory containing it:
+#
+#   docker build --build-context bin=<dir holding ${BIN}> ...
+#
+# A named build context overrides the stage of the same name, which leaves
+# `builder` unreachable and skipped. CI does exactly that: it compiles every
+# image's binary once, in this same rust:<ver>-slim-trixie toolchain, and feeds
+# them in (`mise run image-binaries`). Without the flag this stage is just
+# `builder`'s output and the build is the from-source one releases use.
+FROM scratch AS bin
+ARG BIN=kopiur-controller
+COPY --from=builder "/${BIN}" "/${BIN}"
 
 # Pull the official kopia release binary at a pinned version (matches
 # docker/Dockerfile.mover so the controller and movers run identical kopia).
@@ -56,6 +71,7 @@ RUN set -eux; \
 
 # Distroless runtime: glibc + CA certs, non-root (uid 65532), no shell.
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
-COPY --from=builder /usr/local/bin/app /usr/local/bin/app
+ARG BIN=kopiur-controller
+COPY --from=bin "/${BIN}" /usr/local/bin/app
 COPY --from=kopia /usr/local/bin/kopia /usr/local/bin/kopia
 ENTRYPOINT ["/usr/local/bin/app"]

@@ -31,6 +31,14 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
   # renovate: datasource=github-releases depName=helm-unittest/helm-unittest
   HELM_UNITTEST_VERSION: "v1.1.2"
+  # Jobs that need only a few tools install just those (`install_args` on
+  # mise-action) — most of them need no Rust toolchain at all now that the
+  # tests arrive prebuilt. Without these, the first `mise run` (or `mise exec`,
+  # or a shim for a missing tool) would install every remaining tool in
+  # .mise/config.toml first. Each is a separate mise setting.
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
+  MISE_EXEC_AUTO_INSTALL: "false"
+  MISE_NOT_FOUND_AUTO_INSTALL: "false"
 
 jobs:
   cargo-audit:
@@ -64,7 +72,7 @@ jobs:
 
   # A change confined to the SPA (crates/ui/web) cannot move an e2e result: the
   # `ui` shard drives the console's /api/v1 routes, never the bundle, which the
-  # `ui` job and the `ui` leg of `e2e-image` already gate. Without this, every
+  # `ui` job and the console image `e2e-image` builds already gate. Without this, every
   # Renovate web-dependency PR runs all e2e shards.
   changes:
     if: >-
@@ -159,6 +167,7 @@ jobs:
     needs:
       - changes
       - e2e-image
+      - rust-build
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -404,34 +413,41 @@ jobs:
         with:
           persist-credentials: false
 
-      # kind, kubectl, helm, and the Rust toolchain come from .mise/config.toml.
+      # Only what a shard runs: kind, kubectl and helm for the cluster, and
+      # nextest for the prebuilt tests. No Rust toolchain — `Rust Build` compiled
+      # every shard's test binaries once, and `E2E Image` every image binary.
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          install_args: --locked
+          install_args: kind kubectl helm aqua:nextest-rs/nextest/cargo-nextest lefthook
 
-      # Booting the node container and restoring the cache + image artifacts
-      # share no inputs, so they overlap: the cluster is not needed until the
-      # images are in the local daemon and ready to side-load.
+      # Booting the node container and fetching the artifacts share no inputs,
+      # so they overlap: the cluster is not needed until the images are in the
+      # local daemon and ready to side-load.
       - name: Create kind cluster
         id: cluster
         background: true
         run: mise run //crates/e2e:cluster-create
 
-      # Separate key from the build job: the shards compile the e2e *test* crate
-      # (debug), not the release images, so they shouldn't thrash that cache.
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: e2e-test
-
-      # Pull every per-image artifact (one per build matrix leg) into the workdir.
+      # Pull every per-image artifact into the workdir.
       - name: Download images
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: e2e-image-*
           merge-multiple: true
+
+      # The e2e test binaries (one nextest archive for every shard; each runs
+      # its own binaries out of it) and the `kopiur` CLI the cli suite drives.
+      # Not needed until the tests run, so it downloads behind the image load
+      # and cluster provisioning.
+      - name: Download e2e tests
+        id: tests
+        background: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nextest-e2e
+          path: target/nextest
 
       - name: Load images into docker
         run: |
@@ -473,10 +489,18 @@ jobs:
           KOPIUR_E2E_UI: ${{ matrix.ui || '' }}
         run: mise run //crates/e2e:helm
 
+      - wait: [tests]
+
+      # Artifacts do not preserve file modes.
+      - name: Restore CLI exec bit
+        run: chmod +x target/nextest/kopiur
+
       - name: Run e2e tests
         env:
           KOPIUR_E2E_BINS: ${{ matrix.bins }}
           KOPIUR_E2E_SKIP_BUILD: "1"
+          KOPIUR_E2E_ARCHIVE: target/nextest/e2e.tar.zst
+          KOPIUR_E2E_CLI_BIN: ${{ github.workspace }}/target/nextest/kopiur
           # On a `csi: true` shard the stack is installed above, so a missing
           # csi-hostpath-sc is a setup failure — make the CSI-dependent tests
           # HARD-FAIL instead of silently skipping (which once let a populator
@@ -494,81 +518,120 @@ jobs:
         if: always()
         run: mise run //crates/e2e:down
 
-  # Build the component images concurrently — one matrix leg per image — so
-  # the wall-clock for this stage is the single slowest image, not the sum of
-  # them all. Each leg saves its own :e2e image as a separate artifact for the test
-  # shards to load. Per-image Rust cache keys keep the legs from contending on one
-  # shared cache.
+  # Build all four component images from ONE release compile. The binaries
+  # share nearly their whole dependency graph, so `mise run image-binaries`
+  # compiles them in a single cargo run — in the Dockerfiles' own
+  # rust:<ver>-slim-trixie image, so the glibc they link matches the distroless
+  # runtime — into a target dir the Rust cache persists across runs. Each
+  # `docker build` then only assembles layers: KOPIUR_PREBUILT_BINS swaps the
+  # Dockerfile's `bin` stage for the prebuilt binary and its `builder` stage is
+  # never run. (Releases still build every image from source.)
+  #
+  # The console image is built on every PR even though only the `ui` shard
+  # installs it: this job IS the gate that a broken docker/Dockerfile.ui reddens
+  # review instead of the release. Each image is still saved as its own
+  # `e2e-image-<name>` artifact, which is what `pr-image` publishes.
   e2e-image:
     if: >-
       ${{ github.event_name != 'push'
       && !(startsWith(github.head_ref, 'release-please--')
       && github.event.pull_request.head.repo.full_name == github.repository) }}
-    name: E2E Image (${{ matrix.image }})
+    name: E2E Image
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read
-    strategy:
-      fail-fast: false # one image's failure shouldn't cancel the others
-      matrix:
-        include:
-          - image: controller
-            task: image-controller
-          - image: webhook
-            task: image-webhook
-          - image: mover
-            task: image-mover
-          # Built on every PR even though no shard installs the console yet:
-          # this leg IS the gate that a broken docker/Dockerfile.ui reddens
-          # review instead of the release. It needs no entry in `status.needs`
-          # — that list already carries `e2e-image`, and a matrix job fails as
-          # a whole when any leg fails, so a new leg cannot be forgotten there.
-          # Loading it into kind is opt-in (KOPIUR_E2E_UI=1, see
-          # crates/e2e/mise.toml); the tarball is uploaded regardless so a shard
-          # that enables the UI needs only that env var.
-          - image: ui
-            task: image-ui
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      # The host Rust toolchain does not compile anything here; the Rust cache
+      # step needs it to fingerprint and prune the target dir. node + pnpm
+      # build the SPA that kopiur-ui embeds.
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          install_args: --locked
+          install_args: rust node pnpm lefthook
+
+      # The compile runs in this image; fetch it while the cache restores and
+      # the SPA builds.
+      - name: Pull Rust build image
+        id: rust-image
+        background: true
+        run: docker pull "rust:$(mise config get tools.rust.version)-slim-trixie"
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: e2e-build-${{ matrix.image }}
+          shared-key: e2e-release
+          workspaces: ". -> target/trixie"
 
-      - name: Build component image
+      - name: Build the SPA
+        run: mise run ui-build
+
+      - wait: [rust-image]
+
+      # `ui-build` already ran; skip the dependency so the bundle is not rebuilt.
+      - name: Compile image binaries
+        run: mise run --skip-deps image-binaries
+
+      # The four `image-*` tasks are dependencies of `images`, which mise runs
+      # concurrently; each fetches only its kopia/rclone layers now.
+      - name: Build component images
         env:
           KOPIUR_IMAGE_PREFIX: kopiur
           KOPIUR_IMAGE_TAG: e2e
-        run: mise run //:${{ matrix.task }}
+          KOPIUR_PREBUILT_BINS: target/prebuilt
+        run: mise run images
 
-      # Every shard downloads every image, so the tarballs cross the
-      # artifact store dozens of times per run and are worth compressing. gzip
-      # because the daemon may export layers uncompressed depending on its image
-      # store, and docker load reads either. shell: bash for the pipefail the
-      # implicit `bash -e` default lacks -- a failed save would otherwise leave
-      # gzip's exit status to pass the step and hand every shard a truncated
-      # tarball.
-      - name: Save image
+      # Every shard downloads every image, so the tarballs cross the artifact
+      # store dozens of times per run and are worth compressing. gzip because
+      # the daemon may export layers uncompressed depending on its image store,
+      # and docker load reads either. Saved concurrently; pipefail per save so
+      # a failed `docker save` cannot hand every shard a truncated tarball.
+      - name: Save images
         shell: bash
-        run: docker save kopiur/${{ matrix.image }}:e2e | gzip -1 > image-${{ matrix.image }}.tar.gz
+        run: |
+          set -euo pipefail
+          for image in controller webhook mover ui; do
+            bash -o pipefail -c "docker save kopiur/${image}:e2e | gzip -1 > image-${image}.tar.gz" &
+          done
+          for job in $(jobs -p); do wait "$job"; done
 
-      - name: Upload image
+      - name: Upload controller image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-image-${{ matrix.image }}
-          path: image-${{ matrix.image }}.tar.gz
+          name: e2e-image-controller
+          path: image-controller.tar.gz
           retention-days: 1
+          compression-level: 0
+
+      - name: Upload webhook image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-image-webhook
+          path: image-webhook.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload mover image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-image-mover
+          path: image-mover.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload ui image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-image-ui
+          path: image-ui.tar.gz
+          retention-days: 1
+          compression-level: 0
 
   # Publish the exact images the e2e shards ran against, tagged for this pull
   # request, so a reviewer can pull a build instead of reproducing one. The
@@ -727,11 +790,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # Chart tooling only — no Rust or node to restore.
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          install_args: --locked
+          install_args: helm yq lefthook
 
       # helm reads the docker config this writes for OCI registry auth, which is
       # how the release job authenticates its own `helm push`.
@@ -794,11 +858,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # Chart tooling only — no Rust or node to restore.
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          install_args: --locked
+          install_args: helm helm-docs aqua:dadav/helm-schema lefthook
 
       - name: Run helm lint
         run: mise run helm-lint
@@ -820,11 +885,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # Chart tooling only — no Rust or node to restore.
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          install_args: --locked
+          install_args: helm promtool yq lefthook
 
       - name: Run helm unit tests
         run: |
@@ -836,6 +902,8 @@ jobs:
       ${{ !(startsWith(github.head_ref, 'release-please--')
       && github.event.pull_request.head.repo.full_name == github.repository) }}
     name: Integration Test
+    needs:
+      - rust-build
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -845,33 +913,38 @@ jobs:
         with:
           persist-credentials: false
 
+      # The integration tests shell out to kopia and kubectl; nextest runs them.
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          install_args: --locked
-
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          # -v2: see the tests cache note — debuginfo profile changed.
-          shared-key: integration-v2
+          install_args: kopia kubectl aqua:nextest-rs/nextest/cargo-nextest lefthook
 
       - name: Create kind cluster
+        id: cluster
+        background: true
         uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           cluster_name: kopiur-it
 
+      - name: Download tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nextest-workspace
+          path: target/nextest
+
+      - wait: [cluster]
+
+      # The checked-in CRDs, not a regeneration: there is no toolchain here, and
+      # `Rust Build`'s gen-check fails the run if they are stale. Server-side
+      # apply is required: the SnapshotPolicy CRD embeds a full JobSpec (runJob
+      # hook) and exceeds the 256KB last-applied-configuration annotation a
+      # client-side apply would create.
       - name: Apply CRDs
-        # Server-side apply is required: the BackupConfig CRD embeds a full
-        # JobSpec (runJob hook) and exceeds the 256KB last-applied-configuration
-        # annotation that a client-side apply would create.
-        run: |
-          cargo xtask gen-crds
-          kubectl apply --server-side -f deploy/crds/all-crds.yaml
+        run: kubectl apply --server-side -f deploy/crds/all-crds.yaml
 
       - name: Run integration tests
-        run: cargo test --workspace --features integration --locked -- --include-ignored
+        run: mise run test-int-from-archive
 
   rust-lint:
     if: >-
@@ -907,11 +980,18 @@ jobs:
       - name: Run linter
         run: mise run clippy
 
-  rust-test:
+  # The one debug compile of the workspace. `mise run test-archive` builds
+  # every test target with `--all-features` and packs them into two nextest
+  # archives; `Rust Test`, `Integration Test` and all e2e shards download one
+  # and run it, so none of them compiles anything (or installs Rust). This job
+  # then finishes the gates that need the compiled tree — doctests, which
+  # nextest cannot run, and the xtask drift checks — after the uploads, so the
+  # test jobs start without waiting for them.
+  rust-build:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')
       && github.event.pull_request.head.repo.full_name == github.repository) }}
-    name: Rust Test
+    name: Rust Build
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -921,24 +1001,58 @@ jobs:
         with:
           persist-credentials: false
 
+      # Every test binary in the workspace, the e2e suite's included, is linked
+      # here, then packed (~2GB) — on top of the restored cache. The runner's
+      # preinstalled SDKs are dead weight to this job; reclaim the space while
+      # the toolchain installs.
+      - name: Free disk space
+        id: free-disk
+        background: true
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+
       - name: Setup Mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           experimental: true
-          install_args: --locked
+          install_args: rust aqua:nextest-rs/nextest/cargo-nextest lefthook
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # -v2: the debuginfo profile changed (CARGO_PROFILE_DEV_DEBUG above);
-          # a restored full-debug cache would double disk during the rebuild.
-          shared-key: tests-v2
+          # Supersedes `tests-v2` and `integration-v2`: one all-features debug
+          # build now serves the unit, integration and e2e test jobs.
+          shared-key: build-v1
 
-      - name: Build workspace
-        run: mise run build
+      - wait: [free-disk]
 
-      - name: Run unit tests
-        run: mise run test
+      - name: Build and archive tests
+        run: mise run test-archive
+
+      # The archives are zstd already. Level 1 for the e2e artifact anyway: it
+      # also carries the uncompressed debug `kopiur` binary (~140MB), which
+      # deflates to a fraction, and every shard downloads it.
+      - name: Upload e2e tests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-e2e
+          path: |
+            target/nextest/e2e.tar.zst
+            target/nextest/kopiur
+          retention-days: 1
+          compression-level: 1
+
+      - name: Upload workspace tests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-workspace
+          path: target/nextest/workspace.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+      # `--all-features`, as the build above, so the libraries are reused
+      # rather than recompiled under a different feature set.
+      - name: Run doctests
+        run: cargo test --doc --workspace --all-features --locked
 
       - name: Check generated manifests
         run: mise run gen-check
@@ -956,6 +1070,41 @@ jobs:
       # had never heard of).
       - name: Check phase-handling exhaustiveness
         run: mise run phase-check
+
+  rust-test:
+    if: >-
+      ${{ !(startsWith(github.head_ref, 'release-please--')
+      && github.event.pull_request.head.repo.full_name == github.repository) }}
+    name: Rust Test
+    needs:
+      - rust-build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    env:
+      # insta otherwise asks `cargo` for the workspace root, and this job has
+      # no Rust toolchain.
+      INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          experimental: true
+          install_args: aqua:nextest-rs/nextest/cargo-nextest lefthook
+
+      - name: Download tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nextest-workspace
+          path: target/nextest
+
+      - name: Run unit tests
+        run: mise run test-from-archive
 
   ui:
     if: >-
@@ -1046,6 +1195,7 @@ jobs:
       - integration-test
       - pr-chart
       - pr-image
+      - rust-build
       - rust-lint
       - rust-test
       - ui

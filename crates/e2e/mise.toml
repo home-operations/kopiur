@@ -461,6 +461,25 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "==> e2e tests FAILED (rc=$rc) — du
 # KOPIUR_E2E_BINS — space-separated test-binary (file) names, expanded to repeated
 # `--test <name>` target flags, so a CI shard runs only its files. Empty ⇒ all.
 # KOPIUR_E2E_TESTFILTER — name-substring filter (nextest positional filter).
+#
+# KOPIUR_E2E_ARCHIVE — run the prebuilt tests in this nextest archive (`mise run
+# test-archive`, target/nextest/e2e.tar.zst) instead of compiling. This is how CI
+# shards run: one build job compiles every shard's binaries, and no shard needs
+# a Rust toolchain. Requires KOPIUR_E2E_CLI_BIN, the prebuilt `kopiur` CLI the
+# same task stages next to the archive.
+if [ -n "${KOPIUR_E2E_ARCHIVE:-}" ]; then
+  : "${KOPIUR_E2E_CLI_BIN:?KOPIUR_E2E_ARCHIVE needs KOPIUR_E2E_CLI_BIN, the prebuilt kopiur CLI}"
+  # An archive takes no cargo target flags; select binaries with a filterset.
+  FILTER=""
+  for b in ${KOPIUR_E2E_BINS:-}; do FILTER="${FILTER:+$FILTER | }binary(=$b)"; done
+  set --
+  if [ -n "$FILTER" ]; then set -- -E "$FILTER"; fi
+  echo "==> running e2e tests from $KOPIUR_E2E_ARCHIVE${KOPIUR_E2E_BINS:+ (binaries:$KOPIUR_E2E_BINS)}"
+  cargo-nextest nextest run --profile e2e --archive-file "$KOPIUR_E2E_ARCHIVE" --workspace-remap . \
+    "$@" --no-fail-fast --run-ignored all --no-capture ${KOPIUR_E2E_TESTFILTER:-}
+  echo "==> e2e tests passed"
+  exit 0
+fi
 BINS=""
 for b in ${KOPIUR_E2E_BINS:-}; do BINS="$BINS --test $b"; done
 # The CLI e2e (tests/cli.rs) runs the compiled plugin binary (`kopiur`) as a

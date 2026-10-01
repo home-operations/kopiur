@@ -22,7 +22,12 @@ COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=cargo-target-mover-${TARGETARCH},sharing=locked \
     cargo build --release --locked --bin kopiur-mover && \
-    cp target/release/kopiur-mover /usr/local/bin/kopiur-mover
+    cp target/release/kopiur-mover /kopiur-mover
+
+# The compiled binary alone; `--build-context bin=<dir>` replaces this stage
+# with a prebuilt one and skips `builder`. See docker/Dockerfile.
+FROM scratch AS bin
+COPY --from=builder /kopiur-mover /kopiur-mover
 
 # Pull the official kopia release binary at a pinned version.
 FROM debian:trixie-slim AS kopia
@@ -64,7 +69,7 @@ RUN set -eux; \
     install -m 0755 /tmp/rclone /usr/local/bin/rclone
 
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
-COPY --from=builder /usr/local/bin/kopiur-mover /usr/local/bin/kopiur-mover
+COPY --from=bin /kopiur-mover /usr/local/bin/kopiur-mover
 COPY --from=kopia /usr/local/bin/kopia /usr/local/bin/kopia
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 ENTRYPOINT ["/usr/local/bin/kopiur-mover"]

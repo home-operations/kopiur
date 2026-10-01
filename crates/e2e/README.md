@@ -56,7 +56,9 @@ mise run //crates/e2e:helm             # helm upgrade --install
 mise run //crates/e2e:down             # tear the cluster down
 
 # Knobs: KOPIUR_E2E_SKIP_BUILD=1 (reuse images), KOPIUR_KEEP_KIND=1 (leave the
-# cluster up), KOPIUR_E2E_TESTFILTER=<name> (run a subset).
+# cluster up), KOPIUR_E2E_TESTFILTER=<name> (run a subset),
+# KOPIUR_E2E_ARCHIVE=<file> + KOPIUR_E2E_CLI_BIN=<path> (run prebuilt tests from
+# a `mise run test-archive` nextest archive instead of compiling — how CI shards run).
 
 # The underlying cargo invocation the pipeline runs (feature-gated + ignored):
 cargo test -p kopiur-e2e --features e2e -- --include-ignored

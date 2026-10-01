@@ -106,6 +106,52 @@ run = [
   "cargo test --no-run --workspace --all-features --locked",
 ]
 
+[tasks.test-archive]
+description = "Build the workspace ONCE (--all-features) and pack its tests into nextest archives under target/nextest/ (what CI's test jobs and e2e shards run)"
+# The CI fan-out: one compile here, then `Rust Test`, `Integration Test` and
+# every e2e shard download an archive and run it without compiling anything.
+# `--all-features` is what lets one compile serve all three: the features are
+# test gates only (`integration`, `e2e`), so the hermetic tests behave exactly
+# as under `mise run test`, and every gated target gets compiled — the same
+# compile-check `mise run test` does with `--no-run --all-features`.
+#
+# Two archives from the one build (the second `archive` finds everything fresh
+# and only packs): the e2e shards download just the e2e targets, and nothing
+# else downloads those. `--bins` then links every binary — the check
+# `mise run build` makes — and stages the e2e CLI suite's subject, `kopiur`,
+# next to the archives: the shards run it as a subprocess.
+run = '''
+set -eu
+mkdir -p target/nextest
+cargo nextest archive --workspace --all-features --locked \
+  -E 'package(kopiur-e2e) & kind(test)' --archive-file target/nextest/e2e.tar.zst
+cargo nextest archive --workspace --all-features --locked \
+  -E 'not (package(kopiur-e2e) & kind(test))' --archive-file target/nextest/workspace.tar.zst
+cargo build --workspace --all-features --locked --bins
+cp target/debug/kopiur target/nextest/kopiur
+'''
+
+[tasks.test-from-archive]
+description = "Run the hermetic suite from the archive `test-archive` built (no compile, no doctests)"
+# Everything but the `integration` binaries (.config/nextest.toml says why the
+# split is by binary name). Ignored tests stay ignored, as under `cargo test`.
+# `cargo-nextest nextest`, not `cargo nextest`: running an archive needs no
+# cargo, and the CI jobs that do this install no Rust toolchain.
+run = '''
+cargo-nextest nextest run --profile ci --workspace-remap . \
+  --archive-file "${KOPIUR_NEXTEST_ARCHIVE:-target/nextest/workspace.tar.zst}" \
+  -E 'not binary(/^integration/)'
+'''
+
+[tasks.test-int-from-archive]
+description = "Run the integration tests from the archive `test-archive` built, against a running cluster + kopia (no compile)"
+# The cluster-facing tests are serialized by the `kind-cluster` test group.
+run = '''
+cargo-nextest nextest run --profile ci --workspace-remap . \
+  --archive-file "${KOPIUR_NEXTEST_ARCHIVE:-target/nextest/workspace.tar.zst}" \
+  --run-ignored all -E 'binary(/^integration/)'
+'''
+
 [tasks.test-int]
 description = "Cluster + kopia integration tests on an ephemeral kind cluster"
 run = "scripts/with-kind.sh cargo test --workspace --features integration --locked -- --include-ignored"
@@ -295,12 +341,55 @@ run = "cargo llvm-cov --workspace --locked --html"
 description = "Coverage summary printed to the terminal"
 run = "cargo llvm-cov --workspace --locked --summary-only"
 
+[tasks.image-binaries]
+description = "Compile all four image binaries in ONE cargo run, in the images' own rust:<ver>-slim-trixie toolchain, into target/prebuilt/"
+# What CI's `E2E Image` job does instead of four from-source `docker build`s.
+# The four binaries share nearly their whole dependency graph, so one cargo
+# run compiles it once, into an ordinary host directory the Rust cache can
+# persist (a Dockerfile `--mount=type=cache` starts empty on every runner).
+# The image tasks then take the binaries via KOPIUR_PREBUILT_BINS=target/prebuilt,
+# which swaps each Dockerfile's `bin` stage for a directory and skips `builder`.
+#
+# In a container rather than on the host on purpose: a binary links the glibc
+# it was built against, and the runtime image is distroless/cc-debian13 (glibc
+# 2.41). A build on a newer host can reference newer glibc symbols and then
+# fail to start in the image. This is the exact toolchain image the Dockerfiles
+# build in, so the result is the from-source binary. `target/trixie` keeps it
+# apart from host builds, whose fingerprints would otherwise thrash against it.
+#
+# kopiur-ui embeds the SPA at compile time, hence `ui-build` first and
+# KOPIUR_UI_REQUIRE_WEB=1, exactly as docker/Dockerfile.ui builds it.
+depends = ["ui-build"]
+run = '''
+set -eu
+RUST_VERSION="${RUST_VERSION:-$(mise config get tools.rust.version)}"
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+mkdir -p "$cargo_home/registry" "$cargo_home/git" target/trixie
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PWD:/src" -w /src \
+  -v "$cargo_home/registry:/usr/local/cargo/registry" \
+  -v "$cargo_home/git:/usr/local/cargo/git" \
+  -e CARGO_TARGET_DIR=/src/target/trixie -e CARGO_TERM_COLOR -e KOPIUR_UI_REQUIRE_WEB=1 \
+  "rust:${RUST_VERSION}-slim-trixie" \
+  cargo build --release --locked \
+    --bin kopiur-controller --bin kopiur-webhook --bin kopiur-mover --bin kopiur-ui
+# One directory per binary: each is its image's `bin` build context.
+for b in kopiur-controller kopiur-webhook kopiur-mover kopiur-ui; do
+  mkdir -p "target/prebuilt/$b"
+  cp "target/trixie/release/$b" "target/prebuilt/$b/$b"
+done
+'''
+
 [tasks.image-controller]
 description = "Build the controller image locally"
 run = '''
 KOPIA_VERSION="${KOPIA_VERSION:-$(mise config get tools.kopia)}"
 RUST_VERSION="${RUST_VERSION:-$(mise config get tools.rust.version)}"
-docker build -f docker/Dockerfile \
+# KOPIUR_PREBUILT_BINS (see `image-binaries`): use the binary already built
+# instead of compiling it inside the image.
+ctx=""
+if [ -n "${KOPIUR_PREBUILT_BINS:-}" ]; then ctx="--build-context=bin=${KOPIUR_PREBUILT_BINS}/kopiur-controller"; fi
+docker build -f docker/Dockerfile $ctx \
   --build-arg BIN=kopiur-controller \
   --build-arg "KOPIA_VERSION=${KOPIA_VERSION}" \
   --build-arg "RUST_VERSION=${RUST_VERSION}" \
@@ -312,7 +401,11 @@ description = "Build the webhook image locally"
 run = '''
 KOPIA_VERSION="${KOPIA_VERSION:-$(mise config get tools.kopia)}"
 RUST_VERSION="${RUST_VERSION:-$(mise config get tools.rust.version)}"
-docker build -f docker/Dockerfile \
+# KOPIUR_PREBUILT_BINS (see `image-binaries`): use the binary already built
+# instead of compiling it inside the image.
+ctx=""
+if [ -n "${KOPIUR_PREBUILT_BINS:-}" ]; then ctx="--build-context=bin=${KOPIUR_PREBUILT_BINS}/kopiur-webhook"; fi
+docker build -f docker/Dockerfile $ctx \
   --build-arg BIN=kopiur-webhook \
   --build-arg "KOPIA_VERSION=${KOPIA_VERSION}" \
   --build-arg "RUST_VERSION=${RUST_VERSION}" \
@@ -327,7 +420,11 @@ RUST_VERSION="${RUST_VERSION:-$(mise config get tools.rust.version)}"
 # rclone is needed only by the rclone backend; pinned (default lives in the
 # Dockerfile, overridable here for reproducible builds).
 RCLONE_VERSION="${RCLONE_VERSION:-1.68.2}"
-docker build -f docker/Dockerfile.mover \
+# KOPIUR_PREBUILT_BINS (see `image-binaries`): use the binary already built
+# instead of compiling it inside the image.
+ctx=""
+if [ -n "${KOPIUR_PREBUILT_BINS:-}" ]; then ctx="--build-context=bin=${KOPIUR_PREBUILT_BINS}/kopiur-mover"; fi
+docker build -f docker/Dockerfile.mover $ctx \
   --build-arg "KOPIA_VERSION=${KOPIA_VERSION}" \
   --build-arg "RUST_VERSION=${RUST_VERSION}" \
   --build-arg "RCLONE_VERSION=${RCLONE_VERSION}" \
@@ -342,7 +439,11 @@ PNPM_VERSION="${PNPM_VERSION:-$(mise config get tools.pnpm)}"
 RUST_VERSION="${RUST_VERSION:-$(mise config get tools.rust.version)}"
 # No KOPIA_VERSION: kopiur-ui never invokes kopia (the browse session pods do),
 # so docker/Dockerfile.ui has no kopia stage to feed.
-docker build -f docker/Dockerfile.ui \
+# KOPIUR_PREBUILT_BINS (see `image-binaries`): use the binary already built
+# instead of compiling it inside the image.
+ctx=""
+if [ -n "${KOPIUR_PREBUILT_BINS:-}" ]; then ctx="--build-context=bin=${KOPIUR_PREBUILT_BINS}/kopiur-ui"; fi
+docker build -f docker/Dockerfile.ui $ctx \
   --build-arg "NODE_VERSION=${NODE_VERSION}" \
   --build-arg "PNPM_VERSION=${PNPM_VERSION}" \
   --build-arg "RUST_VERSION=${RUST_VERSION}" \

@@ -70,9 +70,16 @@ COPY --from=web /web/dist ./crates/ui/web/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=cargo-target-ui-${TARGETARCH},sharing=locked \
     KOPIUR_UI_REQUIRE_WEB=1 cargo build --release --locked --bin kopiur-ui && \
-    cp target/release/kopiur-ui /usr/local/bin/kopiur-ui
+    cp target/release/kopiur-ui /kopiur-ui
+
+# The compiled binary alone; `--build-context bin=<dir>` replaces this stage
+# with a prebuilt one and skips both `builder` and `web` (the bundle is already
+# compiled into it). See docker/Dockerfile. A prebuilt kopiur-ui must itself
+# have been built with KOPIUR_UI_REQUIRE_WEB=1 — `mise run image-binaries` is.
+FROM scratch AS bin
+COPY --from=builder /kopiur-ui /kopiur-ui
 
 # Distroless runtime: glibc + CA certs, non-root (uid 65532), no shell.
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
-COPY --from=builder /usr/local/bin/kopiur-ui /usr/local/bin/kopiur-ui
+COPY --from=bin /kopiur-ui /usr/local/bin/kopiur-ui
 ENTRYPOINT ["/usr/local/bin/kopiur-ui"]

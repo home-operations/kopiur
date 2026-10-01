@@ -1,7 +1,33 @@
-# Nextest is used only by the e2e harness (crates/e2e/mise.toml `run` task,
-# always with `--profile e2e`); the hermetic unit suite stays on plain
-# `cargo test`, which compile-checks feature-gated targets in a way nextest
-# does not replace.
+# Nextest runs every CI test tier from ONE compile: the `Rust Build` job builds
+# the workspace once with `--all-features` and packs the test binaries into two
+# archives (`mise run test-archive`) — one holding the kopiur-e2e test targets,
+# one holding everything else. `Rust Test`, `Integration Test` and every e2e
+# shard download an archive and run it; none of them compiles anything.
+#
+# Locally the hermetic suite stays on plain `cargo test` (`mise run test`): it
+# also runs doctests, which nextest cannot, and needs no archive round-trip.
+
+[test-groups]
+# The integration tests that drive the one shared kind cluster. Under
+# `cargo test` the binaries ran one after another; nextest runs across binaries
+# in parallel, so these are serialized explicitly. They are a handful of short
+# tests — serial costs seconds and rules out two of them racing on the same
+# CRDs and namespace.
+kind-cluster = { max-threads = 1 }
+
+[profile.ci]
+# Report every failure in one run rather than stopping at the first.
+fail-fast = false
+
+# Selection of the hermetic set (`not binary(/^integration/)`) versus the
+# integration set (`binary(/^integration/)`) is by test-binary name: every test
+# the `integration` feature un-ignores lives in a `tests/integration*.rs` file.
+# Keep it that way — a hermetic test in such a file would run only in the
+# Integration Test job, and an integration test anywhere else would run (and
+# fail, with no cluster or kopia) in the hermetic one.
+[[profile.ci.overrides]]
+filter = 'binary_id(kopiur-controller::integration) | binary_id(kopiur-webhook::integration) | binary_id(xtask::integration)'
+test-group = 'kind-cluster'
 
 [profile.e2e]
 # Retry a failed test up to 2 more times before counting it as failed. The e2e
