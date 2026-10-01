@@ -1003,8 +1003,10 @@ jobs:
 
       # Every test binary in the workspace, the e2e suite's included, is linked
       # here, then packed (~2GB) — on top of the restored cache. The runner's
-      # preinstalled SDKs are dead weight to this job; reclaim the space while
-      # the toolchain installs.
+      # preinstalled SDKs are dead weight to this job. The delete takes about a
+      # minute, so it is never waited on: it runs alongside the compile, which
+      # spends its first minutes on dependencies and only reaches the
+      # disk-hungry linking and packing well after the space is back.
       - name: Free disk space
         id: free-disk
         background: true
@@ -1022,8 +1024,6 @@ jobs:
           # Supersedes `tests-v2` and `integration-v2`: one all-features debug
           # build now serves the unit, integration and e2e test jobs.
           shared-key: build-v1
-
-      - wait: [free-disk]
 
       - name: Build and archive tests
         run: mise run test-archive
