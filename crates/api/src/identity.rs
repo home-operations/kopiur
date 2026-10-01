@@ -233,19 +233,42 @@ fn string_end(b: &[u8], open: usize, raw: bool) -> usize {
 }
 
 /// Show a `cel` error against the source the user wrote rather than the
-/// [`alias_namespace_ident`] rewrite it parsed: every quoted source line that
-/// the rewrite changed is swapped back for the original line.
+/// [`alias_namespace_ident`] rewrite it parsed.
 ///
-/// Whole lines, not occurrences of the alias, so text the user wrote that
-/// happens to contain it (a `'__nsvar__'` literal) is shown unchanged. The
-/// rewrite never adds or removes a line, and the alias is the length of
-/// `namespace`, so the error's positions need no adjusting.
+/// `cel` reports each error as `ERROR: <input>:LINE:COL: …` followed by
+/// `| <source line LINE>` and a caret line. Only that quoted line is restored,
+/// and only when it is exactly the rewritten line LINE: nothing is searched
+/// for, so no other text in the message — a user's own `'__nsvar__'` literal,
+/// another error's quote — can be touched. The rewrite never adds or removes a
+/// line, and the alias is the length of `namespace`, so LINE:COL and the caret
+/// need no adjusting. Anything not in that shape is passed through unchanged.
 fn restore_source(message: &str, original: &str, aliased: &str) -> String {
-    original
-        .lines()
-        .zip(aliased.lines())
-        .filter(|(o, a)| o != a)
-        .fold(message.to_string(), |msg, (o, a)| msg.replace(a, o))
+    let original: Vec<&str> = original.lines().collect();
+    let aliased: Vec<&str> = aliased.lines().collect();
+    let mut line = None;
+    message
+        .split('\n')
+        .map(|m| {
+            if let Some(n) = error_line(m) {
+                line = Some(n);
+            } else if let (Some(quoted), Some(n)) = (m.strip_prefix("| "), line.take()) {
+                let idx = n.wrapping_sub(1);
+                if aliased.get(idx) == Some(&quoted)
+                    && let Some(o) = original.get(idx)
+                {
+                    return format!("| {o}");
+                }
+            }
+            m.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The 1-based LINE of a `cel` `ERROR: <input>:LINE:COL: …` header line.
+fn error_line(m: &str) -> Option<usize> {
+    let rest = m.strip_prefix("ERROR: <input>:")?;
+    rest.split(':').next()?.parse().ok()
 }
 
 /// Build the CEL evaluation context for identity expressions: `namespace`,
@@ -1108,6 +1131,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("'__nsvar__' + namespace +"), "{err}");
+    }
+
+    /// Each quoted line is restored by its own line number, so restoring one
+    /// can never rewrite text in another — here, line 1's literal that spells
+    /// the alias, while line 2 is nothing but the alias.
+    #[test]
+    fn multiline_errors_restore_each_line_independently() {
+        let err = validate_identity_expr("'__nsvar__' + namespace +\nnamespace + )")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("<input>:2:13"), "{err}");
+        assert!(err.contains("| namespace + )\n"), "{err}");
+
+        // The case a plain search gets wrong: line 2 is the alias and nothing
+        // else, which a search would also find inside line 1's literal.
+        let expr = "'__nsvar__' + namespace +\nnamespace";
+        let restored = restore_source(
+            "ERROR: <input>:1:1: x\n| '__nsvar__' + __nsvar__ +\n| ^\n\
+             ERROR: <input>:2:1: y\n| __nsvar__\n| ^",
+            expr,
+            &alias_namespace_ident(expr),
+        );
+        assert_eq!(
+            restored,
+            "ERROR: <input>:1:1: x\n| '__nsvar__' + namespace +\n| ^\n\
+             ERROR: <input>:2:1: y\n| namespace\n| ^"
+        );
+    }
+
+    /// A message that is not cel's quoted-source shape passes through as is.
+    #[test]
+    fn restore_source_leaves_other_messages_alone() {
+        let msg = "No such key: __nsvar__";
+        assert_eq!(restore_source(msg, "namespace", "__nsvar__"), msg);
     }
 
     #[test]
