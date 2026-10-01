@@ -117,9 +117,10 @@ description = "Build the workspace ONCE (--all-features) and pack its tests into
 #
 # Two archives from the one build (the second `archive` finds everything fresh
 # and only packs): the e2e shards download just the e2e targets, and nothing
-# else downloads those. `--bins` then links every binary — the check
-# `mise run build` makes — and stages the e2e CLI suite's subject, `kopiur`,
-# next to the archives: the shards run it as a subprocess.
+# else downloads those. Last, the e2e CLI suite's subject, `kopiur`, is built
+# and staged next to the archives: the shards run it as a subprocess. Same
+# `--workspace --all-features` as the archives, so it reuses their libraries
+# instead of rebuilding them under a different feature set.
 run = '''
 set -eu
 mkdir -p target/nextest
@@ -127,7 +128,7 @@ cargo nextest archive --workspace --all-features --locked \
   -E 'package(kopiur-e2e) & kind(test)' --archive-file target/nextest/e2e.tar.zst
 cargo nextest archive --workspace --all-features --locked \
   -E 'not (package(kopiur-e2e) & kind(test))' --archive-file target/nextest/workspace.tar.zst
-cargo build --workspace --all-features --locked --bins
+cargo build --workspace --all-features --locked --bin kopiur
 cp target/debug/kopiur target/nextest/kopiur
 '''
 

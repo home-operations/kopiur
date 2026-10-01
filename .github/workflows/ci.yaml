@@ -973,7 +973,10 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: lint
+          # -v2: the job now also builds the workspace for doctests and the
+          # xtask checks; an exact-key hit never re-saves, so the old entry
+          # would make every run rebuild that from scratch.
+          shared-key: lint-v2
 
       - name: Check formatting
         run: mise run fmt-check
@@ -981,13 +984,38 @@ jobs:
       - name: Run linter
         run: mise run clippy
 
+      # Doctests (nextest cannot run them) and the xtask drift checks live here
+      # rather than in `Rust Build`, whose duration every test job and e2e
+      # shard waits out. `--all-features`, matching clippy's feature set.
+      - name: Run doctests
+        run: cargo test --doc --workspace --all-features --locked
+
+      - name: Check generated manifests
+        run: mise run gen-check
+
+      # gen-check proves the YAML matches the Rust types; this proves something
+      # actually READS each field. See #346 / #351 — both shipped as fields that
+      # were schema-valid, documented, admission-accepted, and inert.
+      - name: Check CRD field wiring
+        run: mise run wiring-check
+
+      # The compiler enforces exhaustiveness only where an exhaustive `match`
+      # was written. `matches!`, a `_ =>` arm and `==` against one variant all
+      # opt out of it silently — see #351 (`Unchanged` swallowed by `_ =>`) and
+      # #359 (doctor all-green over a Snapshot parked on a condition the CLI
+      # had never heard of).
+      - name: Check phase-handling exhaustiveness
+        run: mise run phase-check
+
   # The one debug compile of the workspace. `mise run test-archive` builds
   # every test target with `--all-features` and packs them into two nextest
   # archives; `Rust Test`, `Integration Test` and all e2e shards download one
-  # and run it, so none of them compiles anything (or installs Rust). This job
-  # then finishes the gates that need the compiled tree — doctests, which
-  # nextest cannot run, and the xtask drift checks — after the uploads, so the
-  # test jobs start without waiting for them.
+  # and run it, so none of them compiles anything (or installs Rust).
+  #
+  # Nothing else runs here: a job's `needs` waits for the WHOLE job, not for
+  # its uploads, so every step after them would delay all of those jobs. The
+  # doctests and xtask drift checks run in `Rust Lint` instead, which finishes
+  # long before this does.
   rust-build:
     if: >-
       ${{ !(startsWith(github.head_ref, 'release-please--')
@@ -1049,28 +1077,6 @@ jobs:
           path: target/nextest/workspace.tar.zst
           retention-days: 1
           compression-level: 0
-
-      # `--all-features`, as the build above, so the libraries are reused
-      # rather than recompiled under a different feature set.
-      - name: Run doctests
-        run: cargo test --doc --workspace --all-features --locked
-
-      - name: Check generated manifests
-        run: mise run gen-check
-
-      # gen-check proves the YAML matches the Rust types; this proves something
-      # actually READS each field. See #346 / #351 — both shipped as fields that
-      # were schema-valid, documented, admission-accepted, and inert.
-      - name: Check CRD field wiring
-        run: mise run wiring-check
-
-      # The compiler enforces exhaustiveness only where an exhaustive `match`
-      # was written. `matches!`, a `_ =>` arm and `==` against one variant all
-      # opt out of it silently — see #351 (`Unchanged` swallowed by `_ =>`) and
-      # #359 (doctor all-green over a Snapshot parked on a condition the CLI
-      # had never heard of).
-      - name: Check phase-handling exhaustiveness
-        run: mise run phase-check
 
   rust-test:
     if: >-
