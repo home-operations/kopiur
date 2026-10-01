@@ -429,6 +429,12 @@ kubectl logs -n "$NS" -l app.kubernetes.io/component=controller --tail=400 --all
 # console is not installed.
 echo "---- kopiur-ui logs (tail 400) ----" >&2
 kubectl logs -n "$NS" -l app.kubernetes.io/component=ui --tail=400 --all-containers >&2 2>&1
+# The console logs at DEBUG, so the tail above spans well under a second of
+# request noise. A reflector/watch error, a decode failure or a SAR problem is
+# logged at WARN/ERROR — keep every such line from the whole log.
+echo "---- kopiur-ui WARN/ERROR (whole log) ----" >&2
+kubectl logs -n "$NS" -l app.kubernetes.io/component=ui --tail=-1 --all-containers 2>&1 \
+  | grep -E ' (WARN|ERROR) ' | tail -200 >&2 || true
 echo "---- kopiur-ui /readyz ----" >&2
 kubectl get --raw "/api/v1/namespaces/$NS/services/kopiur-ui:8091/proxy/readyz" >&2 2>&1; echo >&2
 echo "---- browse session Jobs/pods (kopiur.home-operations.com/session=browse) ----" >&2
