@@ -1030,12 +1030,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # Every test binary in the workspace, the e2e suite's included, is linked
-      # here, then packed (~2GB) — on top of the restored cache. The runner's
-      # preinstalled SDKs are dead weight to this job. The delete takes about a
-      # minute, so it is never waited on: it runs alongside the compile, which
-      # spends its first minutes on dependencies and only reaches the
-      # disk-hungry linking and packing well after the space is back.
+      # Insurance, not a requirement, so it is never waited on (a wait would put
+      # ~1 minute on every test job's and shard's critical path). The space this
+      # build needs while it compiles and links is no more than the old Rust
+      # Test job used with no cleanup at all: that built TWO trees (default and
+      # `--all-features`) and linked every e2e binary too. What is new is ~2GB
+      # of archives, written only after the multi-minute compile ends — long
+      # after this delete (~80s) has finished.
       - name: Free disk space
         id: free-disk
         background: true
