@@ -34,7 +34,7 @@ config_roots = ["crates/e2e"]
 [tools]
 actionlint = "1.7.12"
 rust = { version = "1.98.1", components = "rustfmt,clippy,llvm-tools" }
-lefthook = "2.1.14"
+lefthook = "2.1.15"
 # `oxfmt` is distributed only via the npm backend (`mise registry oxfmt` →
 # `npm:oxfmt`), which needs a node/npm to install. Pin node explicitly so the
 # npm backend uses mise's own node+npm and never falls through to a system
@@ -70,7 +70,7 @@ kopia = "v0.23.1"
 "aqua:astral-sh/uv" = "0.12.20"
 helm-docs = "1.14.2"
 "aqua:dadav/helm-schema" = "0.23.5"
-yq = "4.53.6"
+yq = "4.54.1"
 # `promtool` (the Prometheus rule/query test runner) ships inside the
 # `prometheus/prometheus` aqua package; mise's `promtool` short-name maps to it
 # (`mise registry promtool` → aqua:prometheus/prometheus) and exposes the
