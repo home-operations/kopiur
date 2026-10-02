@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.10.12](https://github.com/home-operations/kopiur/compare/0.10.11...0.10.12) (2026-10-02)
+
+
+### Features
+
+* **npm:** update dependency pnpm (12.6.0 → 12.7.0) ([#523](https://github.com/home-operations/kopiur/issues/523)) ([dcc498c](https://github.com/home-operations/kopiur/commit/dcc498c8a10d0613326b563ccb35fc811faa222d))
+
+
+### Continuous Integration
+
+* compile once and share the build across every test and image job ([#530](https://github.com/home-operations/kopiur/issues/530)) ([e066fca](https://github.com/home-operations/kopiur/commit/e066fca1f9095f613cfa00f1312b709c4de20c3e))
+
+
+### Miscellaneous Chores
+
+* **deps:** lock file maintenance (pep621) ([#525](https://github.com/home-operations/kopiur/issues/525)) ([937201c](https://github.com/home-operations/kopiur/commit/937201cd59688f4494b971c56b57355e1aaffc67))
+* **github-action:** update action jdx/mise-action (v4.3.0 → v5.0.0) ([#537](https://github.com/home-operations/kopiur/issues/537)) ([48d6987](https://github.com/home-operations/kopiur/commit/48d698756771c9acecf24806b45c88f2ce6e13c7))
+* **github-release:** update release helm-unittest/helm-unittest (v1.1.2 → v1.2.0) ([#536](https://github.com/home-operations/kopiur/issues/536)) ([8eda630](https://github.com/home-operations/kopiur/commit/8eda630f1af697efea4fca881e013b5bd04fa214))
+* **mise:** lock file maintenance tool (mise) ([#526](https://github.com/home-operations/kopiur/issues/526)) ([2a05816](https://github.com/home-operations/kopiur/commit/2a058167f950a1730c10ca7b5e9429bb50563e15))
+* **mise:** update mise tools ([#532](https://github.com/home-operations/kopiur/issues/532)) ([2795874](https://github.com/home-operations/kopiur/commit/279587423f376682c6d7fee8b490e21d40779f21))
+* **mise:** update tool pnpm (12.6.0 → 12.7.0) ([#522](https://github.com/home-operations/kopiur/issues/522)) ([ac7a759](https://github.com/home-operations/kopiur/commit/ac7a7596bd642016a697b9ce1d1bb33bacda58e6))
+* **npm:** lock file maintenance dependency (npm) ([#527](https://github.com/home-operations/kopiur/issues/527)) ([10629e6](https://github.com/home-operations/kopiur/commit/10629e6c3ca52812de027ebb8e3ba3e652125c05))
+* **rust:** lock file maintenance crate (cargo) ([#528](https://github.com/home-operations/kopiur/issues/528)) ([53f019c](https://github.com/home-operations/kopiur/commit/53f019ce734ac8ee1e1baf04943af41a8683e41c))
+* **rust:** lock file maintenance crate (cargo) ([#529](https://github.com/home-operations/kopiur/issues/529)) ([f28d47d](https://github.com/home-operations/kopiur/commit/f28d47d3b4b6ba0bf860ca7391b624921ac8b890))
+
 ## [0.10.11](https://github.com/home-operations/kopiur/compare/0.10.10...0.10.11) (2026-09-28)
 
 
