@@ -30,7 +30,7 @@ env:
   # line-tables-only keeps file:line backtraces for test failures.
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
   # renovate: datasource=github-releases depName=helm-unittest/helm-unittest
-  HELM_UNITTEST_VERSION: "v1.1.2"
+  HELM_UNITTEST_VERSION: "v1.2.0"
 
 jobs:
   cargo-audit:
