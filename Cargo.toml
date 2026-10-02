@@ -88,8 +88,11 @@ tokio-util = { version = "0.7", features = ["io"] }
 mime_guess = "2"
 # The SPA is compiled into the `kopiur-ui` binary at build time (`build.rs` copies
 # `web/dist` into `$OUT_DIR/web`); `interpolate-folder-path` is what lets the
-# `#[folder]` attribute name `$OUT_DIR`.
-rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+# `#[folder]` attribute name `$OUT_DIR`. `debug-embed` embeds in debug builds
+# too — without it a debug binary reads the bundle off disk, from the absolute
+# `$OUT_DIR` it was compiled against, so a test binary moved anywhere else (CI
+# runs them from a nextest archive) silently serves 404s instead of the SPA.
+rust-embed = { version = "8", features = ["interpolate-folder-path", "debug-embed"] }
 # Constant-time comparison for the UI's proxy shared secret: a byte-by-byte `==`
 # leaks the matched prefix length through timing.
 constant_time_eq = "0.6"

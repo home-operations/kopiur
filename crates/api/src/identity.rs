@@ -120,10 +120,155 @@ fn compile_expr(expr: &str) -> ValidationResult<Program> {
             ),
         });
     }
-    Program::compile(expr).map_err(|e| ValidationError::IdentityExprCompile {
+    let aliased = alias_namespace_ident(expr);
+    Program::compile(&aliased).map_err(|e| ValidationError::IdentityExprCompile {
         expr: expr.to_string(),
-        reason: e.to_string(),
+        reason: restore_source(&e.to_string(), expr, &aliased),
     })
+}
+
+/// The name the `namespace` variable is actually bound under.
+///
+/// `namespace` is a CEL reserved word: the spec reserves it, and from `cel`
+/// 0.14.5 the parser enforces that (as cel-go always has) — `namespace` alone is
+/// a parse error. But it is also this API's documented, longest-standing
+/// variable, in every example and in live `identityDefaults`; refusing it would
+/// break each of those expressions on upgrade, and with them every backup that
+/// resolves its identity through one. So it keeps working: before compiling,
+/// [`alias_namespace_ident`] rewrites the bare identifier to this name, which is
+/// what [`identity_context`] binds.
+///
+/// Exactly as long as `namespace`, so the rewritten source lines up with the
+/// user's column for column: a `cel` error's `line:col` and `^` caret stay
+/// true, and [`restore_source`] can map its quoted source back exactly.
+const NAMESPACE_ALIAS: &str = "__nsvar__";
+const _: () = assert!(NAMESPACE_ALIAS.len() == "namespace".len());
+
+/// Rewrite every bare `namespace` identifier in `expr` to [`NAMESPACE_ALIAS`].
+///
+/// Token-aware, so only a variable reference changes: string and bytes literals
+/// (every quoting and prefix form), `//` comments, and field selectors
+/// (`labels.namespace` — the spec permits reserved words there) are copied
+/// through untouched. Anything this scan does not understand is copied through
+/// too, leaving the parser to report it against the user's own text.
+fn alias_namespace_ident(expr: &str) -> String {
+    let b = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0;
+    // Whether the last significant token was `.`, i.e. an identifier here is a
+    // field selector rather than a variable.
+    let mut after_dot = false;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            let end = expr[i..].find('\n').map_or(b.len(), |n| i + n);
+            out.push_str(&expr[i..end]);
+            i = end;
+        } else if c == b'"' || c == b'\'' {
+            let end = string_end(b, i, false);
+            out.push_str(&expr[i..end]);
+            i = end;
+            after_dot = false;
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = &expr[start..i];
+            let is_prefix = word.len() <= 2 && word.bytes().all(|p| b"rRbB".contains(&p));
+            if is_prefix && matches!(b.get(i), Some(b'"' | b'\'')) {
+                // A string prefix: `r'…'`, `b"…"`, `rb'''…'''`. Raw strings take
+                // no escapes.
+                let raw = word.bytes().any(|p| p == b'r' || p == b'R');
+                let end = string_end(b, i, raw);
+                out.push_str(&expr[start..end]);
+                i = end;
+            } else if word == "namespace" && !after_dot {
+                out.push_str(NAMESPACE_ALIAS);
+            } else {
+                out.push_str(word);
+            }
+            after_dot = false;
+        } else if c.is_ascii_digit() {
+            // A number (`42`, `0xFF`, `3u`, `1e9`): its letters are not identifiers.
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            out.push_str(&expr[start..i]);
+            after_dot = false;
+        } else {
+            let ch = expr[i..].chars().next().unwrap_or_default();
+            if !ch.is_whitespace() {
+                after_dot = ch == '.';
+            }
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Index just past the string literal whose opening quote is at `open`, handling
+/// `'`/`"` and their tripled forms. An unterminated literal runs to the end.
+fn string_end(b: &[u8], open: usize, raw: bool) -> usize {
+    let q = b[open];
+    let triple = b.get(open + 1) == Some(&q) && b.get(open + 2) == Some(&q);
+    let mut i = open + if triple { 3 } else { 1 };
+    while i < b.len() {
+        if b[i] == b'\\' && !raw {
+            i += 2;
+        } else if triple {
+            if b[i] == q && b.get(i + 1) == Some(&q) && b.get(i + 2) == Some(&q) {
+                return i + 3;
+            }
+            i += 1;
+        } else if b[i] == q {
+            return i + 1;
+        } else {
+            i += 1;
+        }
+    }
+    b.len()
+}
+
+/// Show a `cel` error against the source the user wrote rather than the
+/// [`alias_namespace_ident`] rewrite it parsed.
+///
+/// `cel` reports each error as `ERROR: <input>:LINE:COL: …` followed by
+/// `| <source line LINE>` and a caret line. Only that quoted line is restored,
+/// and only when it is exactly the rewritten line LINE: nothing is searched
+/// for, so no other text in the message — a user's own `'__nsvar__'` literal,
+/// another error's quote — can be touched. The rewrite never adds or removes a
+/// line, and the alias is the length of `namespace`, so LINE:COL and the caret
+/// need no adjusting. Anything not in that shape is passed through unchanged.
+fn restore_source(message: &str, original: &str, aliased: &str) -> String {
+    let original: Vec<&str> = original.lines().collect();
+    let aliased: Vec<&str> = aliased.lines().collect();
+    let mut line = None;
+    message
+        .split('\n')
+        .map(|m| {
+            if let Some(n) = error_line(m) {
+                line = Some(n);
+            } else if let (Some(quoted), Some(n)) = (m.strip_prefix("| "), line.take()) {
+                let idx = n.wrapping_sub(1);
+                if aliased.get(idx) == Some(&quoted)
+                    && let Some(o) = original.get(idx)
+                {
+                    return format!("| {o}");
+                }
+            }
+            m.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The 1-based LINE of a `cel` `ERROR: <input>:LINE:COL: …` header line.
+fn error_line(m: &str) -> Option<usize> {
+    let rest = m.strip_prefix("ERROR: <input>:")?;
+    rest.split(':').next()?.parse().ok()
 }
 
 /// Build the CEL evaluation context for identity expressions: `namespace`,
@@ -137,7 +282,8 @@ fn identity_context<'a>(inputs: &IdentityInputs<'_>) -> Context<'a> {
     // `add_variable` only errors if a value cannot serialize; these are
     // `&str`/`BTreeMap<String,String>`, which always serialize.
     let empty = BTreeMap::<String, String>::new();
-    let _ = ctx.add_variable("namespace", inputs.namespace);
+    // Bound under its alias: `namespace` itself cannot be referenced in CEL.
+    let _ = ctx.add_variable(NAMESPACE_ALIAS, inputs.namespace);
     let _ = ctx.add_variable("policyName", inputs.object_name);
     let _ = ctx.add_variable("labels", inputs.labels.unwrap_or(&empty));
     let _ = ctx.add_variable("annotations", inputs.annotations.unwrap_or(&empty));
@@ -166,7 +312,7 @@ fn eval_expr(
         }),
         Err(e) => Err(ValidationError::IdentityExprEval {
             expr: expr.to_string(),
-            reason: e.to_string(),
+            reason: restore_source(&e.to_string(), expr, &alias_namespace_ident(expr)),
         }),
     }
 }
@@ -891,5 +1037,138 @@ mod tests {
                 "rendered={rendered:?} cluster={cluster:?}"
             );
         }
+    }
+
+    /// `namespace` is a CEL reserved word (enforced from `cel` 0.14.5); only its
+    /// bare variable references may be aliased — never text the user quoted, a
+    /// comment, or a field selector, all of which CEL already accepts as written.
+    #[test]
+    fn alias_rewrites_only_the_namespace_variable() {
+        let cases = [
+            ("namespace", "__nsvar__"),
+            (
+                "namespace + '-' + policyName",
+                "__nsvar__ + '-' + policyName",
+            ),
+            ("namespace+namespace", "__nsvar__+__nsvar__"),
+            // Not a variable: string/bytes literals in every quoting form.
+            ("'namespace'", "'namespace'"),
+            (r#""namespace""#, r#""namespace""#),
+            ("'''a namespace'''", "'''a namespace'''"),
+            (r#""""namespace""""#, r#""""namespace""""#),
+            (r"r'namespace\'", r"r'namespace\'"),
+            ("b'namespace'", "b'namespace'"),
+            ("rb'namespace'", "rb'namespace'"),
+            // An escaped quote does not end a literal early.
+            (
+                r"'it\'s namespace' + namespace",
+                r"'it\'s namespace' + __nsvar__",
+            ),
+            // Field selectors may be reserved words, and stay so.
+            ("labels.namespace", "labels.namespace"),
+            ("labels . namespace", "labels . namespace"),
+            // A comment.
+            (
+                "namespace // the namespace\n",
+                "__nsvar__ // the namespace\n",
+            ),
+            // Longer identifiers that merely contain it.
+            ("namespaces + my_namespace", "namespaces + my_namespace"),
+            // Number suffixes are not identifiers.
+            ("1e3 + 0xFF", "1e3 + 0xFF"),
+            ("'ü' + namespace", "'ü' + __nsvar__"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(alias_namespace_ident(input), want, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn namespace_variable_resolves_and_quoted_namespace_stays_text() {
+        let labels = BTreeMap::from([("namespace".to_string(), "from-label".to_string())]);
+        let d = defaults(
+            Some("'namespace=' + namespace"),
+            Some("labels.namespace + '/' + labels['namespace']"),
+        );
+        let mut i = inputs("p", "billing", None, Some(&d), None);
+        i.labels = Some(&labels);
+        let r = resolve_identity(&i).unwrap();
+        assert_eq!(r.hostname, "namespace=billing");
+        assert_eq!(r.username, "from-label/from-label");
+    }
+
+    #[test]
+    fn compile_errors_quote_the_expression_the_user_wrote() {
+        let err = validate_identity_expr("namespace +")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains(NAMESPACE_ALIAS), "alias leaked: {err}");
+        assert!(err.contains("namespace +"), "{err}");
+    }
+
+    /// The error must be exactly what `cel` reports for an expression of the
+    /// same shape with no reserved word in it — position and caret included.
+    #[test]
+    fn compile_error_positions_match_the_users_text() {
+        let ours = validate_identity_expr("policyName + namespace + )")
+            .unwrap_err()
+            .to_string();
+        let same_shape = Program::compile("policyName + xxxxxxxxx + )")
+            .unwrap_err()
+            .to_string()
+            .replace("xxxxxxxxx", "namespace");
+        assert!(
+            ours.contains(&same_shape),
+            "ours: {ours}\nwant: {same_shape}"
+        );
+    }
+
+    /// A literal the user wrote is never rewritten in an error, even when it
+    /// spells the alias.
+    #[test]
+    fn compile_errors_keep_a_literal_that_spells_the_alias() {
+        let err = validate_identity_expr("'__nsvar__' + namespace +")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'__nsvar__' + namespace +"), "{err}");
+    }
+
+    /// Each quoted line is restored by its own line number, so restoring one
+    /// can never rewrite text in another — here, line 1's literal that spells
+    /// the alias, while line 2 is nothing but the alias.
+    #[test]
+    fn multiline_errors_restore_each_line_independently() {
+        let err = validate_identity_expr("'__nsvar__' + namespace +\nnamespace + )")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("<input>:2:13"), "{err}");
+        assert!(err.contains("| namespace + )\n"), "{err}");
+
+        // The case a plain search gets wrong: line 2 is the alias and nothing
+        // else, which a search would also find inside line 1's literal.
+        let expr = "'__nsvar__' + namespace +\nnamespace";
+        let restored = restore_source(
+            "ERROR: <input>:1:1: x\n| '__nsvar__' + __nsvar__ +\n| ^\n\
+             ERROR: <input>:2:1: y\n| __nsvar__\n| ^",
+            expr,
+            &alias_namespace_ident(expr),
+        );
+        assert_eq!(
+            restored,
+            "ERROR: <input>:1:1: x\n| '__nsvar__' + namespace +\n| ^\n\
+             ERROR: <input>:2:1: y\n| namespace\n| ^"
+        );
+    }
+
+    /// A message that is not cel's quoted-source shape passes through as is.
+    #[test]
+    fn restore_source_leaves_other_messages_alone() {
+        let msg = "No such key: __nsvar__";
+        assert_eq!(restore_source(msg, "namespace", "__nsvar__"), msg);
+    }
+
+    #[test]
+    fn other_reserved_words_are_still_rejected() {
+        assert!(validate_identity_expr("package").is_err());
     }
 }

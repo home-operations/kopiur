@@ -429,6 +429,12 @@ kubectl logs -n "$NS" -l app.kubernetes.io/component=controller --tail=400 --all
 # console is not installed.
 echo "---- kopiur-ui logs (tail 400) ----" >&2
 kubectl logs -n "$NS" -l app.kubernetes.io/component=ui --tail=400 --all-containers >&2 2>&1
+# The console logs at DEBUG, so the tail above spans well under a second of
+# request noise. A reflector/watch error, a decode failure or a SAR problem is
+# logged at WARN/ERROR — keep every such line from the whole log.
+echo "---- kopiur-ui WARN/ERROR (whole log) ----" >&2
+kubectl logs -n "$NS" -l app.kubernetes.io/component=ui --tail=-1 --all-containers 2>&1 \
+  | grep -E ' (WARN|ERROR) ' | tail -200 >&2 || true
 echo "---- kopiur-ui /readyz ----" >&2
 kubectl get --raw "/api/v1/namespaces/$NS/services/kopiur-ui:8091/proxy/readyz" >&2 2>&1; echo >&2
 echo "---- browse session Jobs/pods (kopiur.home-operations.com/session=browse) ----" >&2
@@ -461,6 +467,25 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "==> e2e tests FAILED (rc=$rc) — du
 # KOPIUR_E2E_BINS — space-separated test-binary (file) names, expanded to repeated
 # `--test <name>` target flags, so a CI shard runs only its files. Empty ⇒ all.
 # KOPIUR_E2E_TESTFILTER — name-substring filter (nextest positional filter).
+#
+# KOPIUR_E2E_ARCHIVE — run the prebuilt tests in this nextest archive (`mise run
+# test-archive`, target/nextest/e2e.tar.zst) instead of compiling. This is how CI
+# shards run: one build job compiles every shard's binaries, and no shard needs
+# a Rust toolchain. Requires KOPIUR_E2E_CLI_BIN, the prebuilt `kopiur` CLI the
+# same task stages next to the archive.
+if [ -n "${KOPIUR_E2E_ARCHIVE:-}" ]; then
+  : "${KOPIUR_E2E_CLI_BIN:?KOPIUR_E2E_ARCHIVE needs KOPIUR_E2E_CLI_BIN, the prebuilt kopiur CLI}"
+  # An archive takes no cargo target flags; select binaries with a filterset.
+  FILTER=""
+  for b in ${KOPIUR_E2E_BINS:-}; do FILTER="${FILTER:+$FILTER | }binary(=$b)"; done
+  set --
+  if [ -n "$FILTER" ]; then set -- -E "$FILTER"; fi
+  echo "==> running e2e tests from $KOPIUR_E2E_ARCHIVE${KOPIUR_E2E_BINS:+ (binaries:$KOPIUR_E2E_BINS)}"
+  cargo-nextest nextest run --profile e2e --archive-file "$KOPIUR_E2E_ARCHIVE" --workspace-remap . \
+    "$@" --no-fail-fast --run-ignored all --no-capture ${KOPIUR_E2E_TESTFILTER:-}
+  echo "==> e2e tests passed"
+  exit 0
+fi
 BINS=""
 for b in ${KOPIUR_E2E_BINS:-}; do BINS="$BINS --test $b"; done
 # The CLI e2e (tests/cli.rs) runs the compiled plugin binary (`kopiur`) as a
