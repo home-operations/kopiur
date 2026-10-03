@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.10.13](https://github.com/home-operations/kopiur/compare/0.10.12...0.10.13) (2026-10-03)
+
+
+### Features
+
+* **npm:** update dependency lucide-react (1.48.0 → 1.49.0) ([#541](https://github.com/home-operations/kopiur/issues/541)) ([ce00cdb](https://github.com/home-operations/kopiur/commit/ce00cdb3ba9c8bae9f75b133cd9576f5e0196954))
+* **npm:** update web ui dependencies ([#533](https://github.com/home-operations/kopiur/issues/533)) ([1fd11d0](https://github.com/home-operations/kopiur/commit/1fd11d06899c4953d748137528a34834408ef01d))
+
+
+### Bug Fixes
+
+* **mise:** restore generated lock sidecars ([0b53f48](https://github.com/home-operations/kopiur/commit/0b53f48bea3532e5e05270f00aa8aca6350b142f))
+
+
+### Miscellaneous Chores
+
+* **github-release:** update release helm-unittest/helm-unittest (v1.2.0 → v1.2.1) ([#542](https://github.com/home-operations/kopiur/issues/542)) ([5aa81b8](https://github.com/home-operations/kopiur/commit/5aa81b89d3524b7b0f903777fa370d1326fb2e27))
+* **mise:** update mise tools ([#538](https://github.com/home-operations/kopiur/issues/538)) ([128ba86](https://github.com/home-operations/kopiur/commit/128ba864593a2d9dcb4fe2aa643a0bc40309df10))
+* **mise:** update tool aqua:astral-sh/uv (0.12.20 → 0.12.21) ([#540](https://github.com/home-operations/kopiur/issues/540)) ([6ce9ec4](https://github.com/home-operations/kopiur/commit/6ce9ec40d416c38d5f14e30584bda384bc64aa6b))
+* **mise:** update tool oxfmt (0.70.0 → 0.71.0) ([#531](https://github.com/home-operations/kopiur/issues/531)) ([0d391aa](https://github.com/home-operations/kopiur/commit/0d391aa8cb3339ccdb3200a8ce159ca3e2b02095))
+* **mise:** upgrade lockfile to format revision 3 ([155374a](https://github.com/home-operations/kopiur/commit/155374a981b190a222a11392607e7ddde4401f2a))
+
 ## [0.10.12](https://github.com/home-operations/kopiur/compare/0.10.11...0.10.12) (2026-10-02)
 
 
