@@ -30,7 +30,7 @@ env:
   # line-tables-only keeps file:line backtraces for test failures.
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
   # renovate: datasource=github-releases depName=helm-unittest/helm-unittest
-  HELM_UNITTEST_VERSION: "v1.2.0"
+  HELM_UNITTEST_VERSION: "v1.2.1"
   # Jobs that need only a few tools install just those (`install_args` on
   # mise-action) — most of them need no Rust toolchain at all now that the
   # tests arrive prebuilt. Without these, the first `mise run` (or `mise exec`,
