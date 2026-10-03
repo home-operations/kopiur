@@ -67,12 +67,14 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     homepage: https://kopiur.home-operations.com/cli/
     description: Kubectl plugin operating the kopiur Kopia-native backup operator
-    # Binaries aren't notarized — strip the quarantine bit so macOS doesn't
-    # block the first run with "developer cannot be verified".
-    hooks:
-      post:
-        install: |
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kopiur"] if OS.mac?
+    # GoReleaser does not yet expose Homebrew's structured flight steps, so use
+    # a custom block instead of hooks, which generate deprecated Ruby stanzas.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "kopiur"], chdir: "."
+        end
+      end
 
 # Krew manifest committed to this repo's plugins/ (its own custom index) with
 # the bot token — bot pushes retrigger workflows, so on-push workflows ignore
