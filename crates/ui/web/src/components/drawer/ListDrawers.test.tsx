@@ -142,6 +142,19 @@ describe("the drawer for a kind with no page of its own", () => {
     expect(within(panel).getByRole("group", { name: "Suspend" })).toBeInTheDocument();
   });
 
+  it("never scrolls the action buttons out of view: only a tall question scrolls", () => {
+    const rules = cssRules(readStyles());
+    const foot = rules
+      .filter((r) => r.selector === ".side-panel__foot")
+      .map((r) => r.body)
+      .join("\n");
+    expect(foot).not.toMatch(/overflow(-y)?:\s*(auto|scroll)/);
+    expect(foot).not.toMatch(/max-height/);
+    const confirm = rules.find((r) => r.selector === ".side-panel__foot .action__confirm");
+    expect(confirm?.body).toMatch(/max-height/);
+    expect(confirm?.body).toMatch(/overflow-y:\s*auto/);
+  });
+
   it("stacks an open confirmation and its receipt above the action buttons", () => {
     const rules = cssRules(readStyles());
     const confirm = rules.find(

@@ -1372,15 +1372,15 @@ html:has(dialog.side-panel[open]) {
   gap: 0;
   padding: 0;
 }
-/* The foot holds the actions. A confirmation that opens grows it upwards;
-   past 60% of the panel it scrolls rather than squeezing the body away. */
+/* The foot holds the actions, and is always as tall as its buttons: they
+   never scroll out of view. A confirmation that opens grows it upwards, and
+   a tall one scrolls inside itself (below) rather than pushing the buttons
+   off the panel. */
 .side-panel__foot {
   display: flex;
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: var(--space-2);
-  max-height: 60%;
-  overflow-y: auto;
   padding: var(--space-3) var(--space-5);
   border-top: 1px solid var(--line);
   background: var(--bg-canvas);
@@ -1447,6 +1447,12 @@ html:has(dialog.side-panel[open]) {
 }
 .drawer-actions > .action-bar {
   order: 2;
+}
+/* A tall question (a fan-out snapshot-now form) scrolls inside itself, so the
+   buttons below it stay on screen and the body above keeps its room. */
+.side-panel__foot .action__confirm {
+  max-height: 45vh;
+  overflow-y: auto;
 }
 /* In the foot, a question and its answer stack above the buttons, nearest the
    content they are about; the buttons stay on the bottom line. */
