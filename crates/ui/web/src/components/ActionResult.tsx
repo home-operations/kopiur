@@ -1,8 +1,14 @@
 import { CircleCheck } from "lucide-react";
 
 import type { ActionReceipt, Problem } from "../api/types";
+import { LampBadge } from "./HealthBadge";
+import { detailHref, kindOfLabel } from "./kind";
+import { ObjectRef } from "./ObjectRef";
 import { ProblemBanner } from "./ProblemBanner";
 import { relativeTime } from "../util/format";
+
+/** The receipt's pill: accepted, in the healthy lamp's colours, worded as asked. */
+const REQUESTED = { key: "healthy", word: "Requested", icon: CircleCheck } as const;
 
 /**
  * What a mutating action answered: the receipt, or the problem that refused
@@ -41,8 +47,8 @@ export function ActionResult({ label, receipt, problem }: ActionResultProps) {
   const note = receipt.note;
   return (
     <div className="receipt" role="status">
-      <span className="receipt__icon">
-        <CircleCheck size={16} strokeWidth={2} aria-hidden="true" />
+      <span className="receipt__pill">
+        <LampBadge lamp={REQUESTED} />
       </span>
       <div className="receipt__body">
         <p className="receipt__what">
@@ -54,9 +60,8 @@ export function ActionResult({ label, receipt, problem }: ActionResultProps) {
         {receipt.created.length > 0 ? (
           <ul className="receipt__created" aria-label="Created">
             {receipt.created.map((ref) => (
-              <li key={`${ref.namespace}/${ref.name}`} className="label-strip">
-                <span className="label-strip__kind">{ref.namespace}</span>
-                <span className="label-strip__name">{ref.name}</span>
+              <li key={`${ref.namespace}/${ref.name}`}>
+                <CreatedRef kind={receipt.kind} namespace={ref.namespace} name={ref.name} />
               </li>
             ))}
           </ul>
@@ -68,5 +73,30 @@ export function ActionResult({ label, receipt, problem }: ActionResultProps) {
         ) : null}
       </div>
     </div>
+  );
+}
+
+/**
+ * One created object, as a reference to its page in its own kind. A kind
+ * this bundle does not know is still named — a newer server's object must
+ * not vanish from the receipt that says it was made.
+ */
+function CreatedRef({ kind, namespace, name }: { kind: string; namespace: string; name: string }) {
+  const known = kindOfLabel(kind);
+  if (known === null) {
+    return (
+      <span className="label-strip">
+        <span className="label-strip__kind">{namespace}</span>
+        <span className="label-strip__name">{name}</span>
+      </span>
+    );
+  }
+  return (
+    <ObjectRef
+      kind={known}
+      name={name}
+      namespace={namespace}
+      to={detailHref(known, name, namespace)}
+    />
   );
 }

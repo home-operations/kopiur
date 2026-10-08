@@ -309,7 +309,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
         </>
       )}
 
-      <fieldset className="action__choice" data-danger="true">
+      <fieldset className="action__choice">
         <legend>Overwrite existing files</legend>
         <p className="action__note">
           This is <span className="mono">overwrite</span>, which becomes{" "}
@@ -330,6 +330,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
         <Radio
           id={`${fieldId}-ow-yes`}
           group={`${fieldId}-ow`}
+          danger
           checked={overwrite === "yes"}
           onPick={() => {
             setOverwrite("yes");
@@ -585,16 +586,19 @@ function Radio({
   group,
   checked,
   onPick,
+  danger = false,
   children,
 }: {
   id: string;
   group: string;
   checked: boolean;
   onPick: () => void;
+  /** The answer that destroys data: set off by the failed lamp's rule. */
+  danger?: boolean;
   children: ReactNode;
 }) {
   return (
-    <label htmlFor={id}>
+    <label htmlFor={id} data-danger={danger ? "true" : undefined}>
       <input type="radio" id={id} name={group} checked={checked} onChange={onPick} />
       <span>{children}</span>
     </label>

@@ -2902,10 +2902,11 @@ a.object-name:hover {
   display: grid;
   gap: var(--space-3);
   max-width: 34rem;
-  padding: var(--space-3) var(--space-4);
+  padding: var(--space-4);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  border-radius: var(--radius-lg);
+  /* Canvas, not surface: inside a hero card the panel reads as set into it. */
+  background: var(--bg-canvas);
 }
 
 .action__confirm .controls__field {
@@ -2934,18 +2935,17 @@ a.object-name:hover {
 .receipt {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
   gap: var(--space-3);
   max-width: 34rem;
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--health-healthy-fg);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--health-healthy-bg);
 }
 
-.receipt__icon {
+.receipt__pill {
   display: flex;
-  color: var(--health-healthy-fg);
-  padding-top: 1px;
 }
 
 .receipt__body {
@@ -2969,7 +2969,7 @@ a.object-name:hover {
 .receipt__created {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-1) var(--space-4);
+  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -3725,13 +3725,24 @@ a.object-name:hover {
   text-transform: uppercase;
 }
 
+/* Each answer is a bordered row, so the consequence beside a radio reads as
+   one choice; the chosen row takes the accent edge. */
 .action__choice > label {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: start;
   gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
   color: var(--fg);
   line-height: var(--leading-prose);
+  cursor: pointer;
+}
+
+.action__choice > label:has(input:checked) {
+  border-color: var(--accent);
 }
 
 .action__choice input[type="radio"] {
@@ -3743,8 +3754,7 @@ a.object-name:hover {
 /* The destructive question is the one that decides whether existing data
    survives, so it is set off by the failed lamp's own rule rather than by a
    second box. */
-.action__choice[data-danger="true"] {
-  padding-left: var(--space-3);
+.action__choice > label[data-danger="true"] {
   border-left: 2px solid var(--health-failed-fg);
 }
 
