@@ -1,7 +1,5 @@
 # Product
 
-<!-- impeccable:product-schema 1 -->
-
 > Provenance: written without an interview. The implementing agent had no
 > question channel, so every fact below is either **[repo]** (read from the
 > code, CRDs, ADRs and task briefs in this repository) or **[inferred]** (a
@@ -96,8 +94,12 @@ disagree about a failure. **[repo]** — `crates/ui/src/api/problem.rs`.
 
 ## Brand Commitments
 
-Name: **Kopiur** (product), **kopiur-ui** (this console). No logo, wordmark
-or palette exists in the repository. **[repo]**
+Name: **Kopiur** (product), **kopiur-ui** (this console). **[repo]**
+
+The look — palette, type, per-kind identity, every component and the shell — is
+defined by the `kopiur-ui-design` skill (`.claude/skills/kopiur-ui-design/`),
+which is the canonical design system. This file says who the console is for and
+what it must answer; the skill says how it looks and behaves.
 
 Binding visual constraints from the task brief **[repo]**: dense, calm,
 legible at a glance; dark and light both first-class, following
@@ -126,8 +128,9 @@ state derives from a 403 problem.
    unrecognised problem types render as "unknown", not as "OK".
 3. Teach the permission model: show every action, disable what the user
    cannot do, and say why.
-4. Density over decoration: this is a console read many times a day, not a
-   page visited once.
+4. Scannable over decorative: this is a console read many times a day, not a
+   page visited once — every object is recognisably its kind and every state
+   is legible at a glance, with room to breathe rather than maximum density.
 5. Same words as the CLI and the CRDs; no invented vocabulary.
 
 ## Accessibility & Inclusion

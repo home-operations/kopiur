@@ -1,7 +1,8 @@
 /**
  * The Lettered Lamp Rule, enforced against the stylesheet.
  *
- * `DESIGN.md`: *a health colour never appears without its icon and its word*.
+ * The `kopiur-ui-design` skill (`.claude/skills/kopiur-ui-design/references/rules.md`,
+ * rule 1): *a health colour never appears without its icon and its word*.
  * The reason is not decorative. This is backup software; an operator opens the
  * console at three in the morning to find out whether their data is safe, and
  * a red/green board tells a colour-blind reader nothing at all. Contrast does

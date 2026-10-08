@@ -10,9 +10,9 @@ import { useConfirmFocus } from "./useConfirmFocus";
  * The shell every mutating control on this console is built from: a trigger,
  * the question it opens, and the answer the server gave.
  *
- * It is a confirmation *panel*, not a modal. The committed direction's
- * **Action** pattern (DESIGN.md) is a bare `action-bar` of triggers whose
- * first box is the `action__confirm` panel below them; a `<dialog>` here
+ * It is a confirmation *panel*, not a modal. The design system's
+ * action pattern (`kopiur-ui-design` skill, `references/composites.md`) opens
+ * the confirmation inline, directly under its trigger; a `<dialog>` here
  * would be a second enclosure over the same content. Every dialog in this
  * directory is therefore this shell plus its own fields, which is also why
  * they can be dropped into a ledger row, a detail page or an action bar

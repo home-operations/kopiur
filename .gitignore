@@ -234,3 +234,8 @@ cython_debug/
 crates/ui/web/dist/
 crates/ui/web/node_modules/
 
+
+# superpowers workflow artifacts — local only, never committed:
+# visual-companion sessions, and the specs/plans the skills write under docs/.
+.superpowers/
+docs/superpowers/

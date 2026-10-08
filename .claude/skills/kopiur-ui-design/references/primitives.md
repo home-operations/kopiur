@@ -1,0 +1,619 @@
+# Primitives
+
+The atoms and per-object building blocks. Every screen is assembled from these;
+if a screen needs something this file does not have, add it here first (with the
+same sections) rather than styling one-off markup in a route.
+
+Markup is given as the HTML the component renders, CSS as the rules that belong
+in `styles.css`. Class names follow the SPA's existing `block__element` style.
+Where a test already pins markup (`.health[data-health]`, `.finding__fix`,
+`[data-state="not-permitted"]`, `.skeleton-ledger__row`, `.chart__plot`), the
+markup below keeps it.
+
+---
+
+## Status pill
+
+**What:** the one way a state is shown. Tinted pill, icon, word.
+
+**Markup** (rendered by `HealthBadge` for a `Health`, `LampBadge` for anything
+else):
+
+```html
+<span class="health" data-health="failed">
+  <svg aria-hidden="true"><!-- OctagonX --></svg>Failed
+</span>
+```
+
+```css
+.health {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px 2px 6px;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  background: var(--health-unknown-bg);
+  color: var(--health-unknown-fg);
+}
+.health svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 2;
+  flex: none;
+}
+.health[data-health="healthy"] {
+  background: var(--health-healthy-bg);
+  color: var(--health-healthy-fg);
+}
+.health[data-health="failed"] {
+  background: var(--health-failed-bg);
+  color: var(--health-failed-fg);
+}
+.health[data-health="degraded"] {
+  background: var(--health-degraded-bg);
+  color: var(--health-degraded-fg);
+}
+.health[data-health="pending"] {
+  background: var(--health-pending-bg);
+  color: var(--health-pending-fg);
+}
+.health[data-health="suspended"] {
+  background: var(--health-suspended-bg);
+  color: var(--health-suspended-fg);
+}
+```
+
+**States:** the six `data-health` values. The word is the object's own phase
+("Succeeded", "Restoring") or a fact ("2 failed runs", "never verified") — see
+`kinds.md` → Status source for the mapping. An unrecognised phase renders the
+**raw word** on the unknown style; it never falls through to healthy.
+
+**A11y:** the word is real text. If a count replaces the word (a tile's "3"), keep
+the state word as visually-hidden text ("3 (Failed)").
+
+**Don't:** draw a coloured dot, colour a row, or put a status hue on anything
+that is not a `.health` pill, a loud absence (below) or an icon beside one.
+
+---
+
+## Kind mark
+
+**What:** how an object's kind is attached to it. Three parts, used together:
+
+- **Stripe** — a `--stripe` (4px) left edge on the card, table row's first cell,
+  detail hero, tree node, attention item.
+- **Chip** — a tinted rounded square with the kind's glyph. 28px on cards and
+  headers (40px in the detail hero), 22px in tables and references.
+- **Name** — the CRD kind in small caps above the object's name, on cards,
+  headers and references (not in table cells, where the column says it).
+
+```html
+<article class="object-card" data-kind="snapshot-policy">
+  <span class="kind-chip" aria-hidden="true"
+    ><svg><!-- ScrollText --></svg></span
+  >
+  <span class="object-id">
+    <span class="kind-name">SnapshotPolicy</span>
+    <code class="object-name">app-data</code>
+    <span class="object-ns">kopiur-dev</span>
+  </span>
+  …
+</article>
+```
+
+```css
+[data-kind="repository"] {
+  --kc: var(--kind-repository);
+  --kc-bg: var(--kind-repository-bg);
+}
+[data-kind="cluster-repository"] {
+  --kc: var(--kind-cluster-repository);
+  --kc-bg: var(--kind-cluster-repository-bg);
+}
+[data-kind="maintenance"] {
+  --kc: var(--kind-maintenance);
+  --kc-bg: var(--kind-maintenance-bg);
+}
+[data-kind="snapshot-policy"] {
+  --kc: var(--kind-snapshot-policy);
+  --kc-bg: var(--kind-snapshot-policy-bg);
+}
+[data-kind="snapshot-schedule"] {
+  --kc: var(--kind-snapshot-schedule);
+  --kc-bg: var(--kind-snapshot-schedule-bg);
+}
+[data-kind="snapshot"] {
+  --kc: var(--kind-snapshot);
+  --kc-bg: var(--kind-snapshot-bg);
+}
+[data-kind="restore"] {
+  --kc: var(--kind-restore);
+  --kc-bg: var(--kind-restore-bg);
+}
+[data-kind="repository-replication"] {
+  --kc: var(--kind-repository-replication);
+  --kc-bg: var(--kind-repository-replication-bg);
+}
+[data-kind="snapshot-replication"] {
+  --kc: var(--kind-snapshot-replication);
+  --kc-bg: var(--kind-snapshot-replication-bg);
+}
+
+.kind-chip {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
+  background: var(--kc-bg);
+  color: var(--kc);
+}
+.kind-chip svg {
+  width: 14px;
+  height: 14px;
+}
+.kind-chip--sm {
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+}
+.kind-chip--sm svg {
+  width: 12px;
+  height: 12px;
+}
+.kind-chip--lg {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+}
+.kind-chip--lg svg {
+  width: 20px;
+  height: 20px;
+}
+.kind-name {
+  font-size: 0.625rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--kc);
+}
+.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+td.has-stripe {
+  border-left: 0;
+  box-shadow: inset var(--stripe) 0 0 var(--kc);
+}
+```
+
+**Rules:** the chip is square, the status pill is round — the shape tells you
+which you are looking at before the colour does. A kind colour never marks a
+state, and a status colour never marks a kind. The chip is `aria-hidden`; the
+kind is said by the kind name (or the column header in a table).
+
+---
+
+## Object reference
+
+**What:** one object naming another ("writes into", "fired by", a table cell's
+Policy column). A mini card: chip, kind name over the name, the target's live
+status pill.
+
+```html
+<a class="ref" data-kind="repository" href="/repositories/repository/dev-repo?namespace=kopiur-dev">
+  <span class="kind-chip kind-chip--sm" aria-hidden="true"><svg /></span>
+  <span class="ref__id"
+    ><span class="kind-name">Repository</span><code class="ref__name">dev-repo</code></span
+  >
+  <span class="health" data-health="healthy"><svg aria-hidden="true" />Healthy</span>
+</a>
+```
+
+```css
+.ref {
+  display: inline-grid;
+  grid-template-columns: auto auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px 6px 6px;
+  border-radius: 12px;
+  vertical-align: middle;
+  border: 1px solid var(--line);
+  background: var(--bg-surface);
+  color: inherit;
+  text-decoration: none;
+}
+.ref:hover {
+  background: var(--bg-hover);
+}
+.ref__id {
+  display: grid;
+  line-height: 1.2;
+}
+.ref__name {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-sm);
+}
+.ref .health {
+  font-size: var(--text-xs);
+}
+```
+
+**Variants:** show `namespace/` before the name only when it differs from the
+surrounding context. A kind with no detail route (Schedule, Maintenance, the
+replications — see `kinds.md`) renders as a `<span class="ref">`, not a link. A
+dangling reference (graph `missing`, a policy naming a repository that does not
+exist) gets a dashed border and the unknown pill reading "not found".
+
+**Wire:** the target's name/namespace come from the referring row; its status
+needs the target's row. If the target's status is not loaded, omit the pill —
+never guess one.
+
+---
+
+## Button
+
+```html
+<button class="button button--primary"><svg aria-hidden="true" />Snapshot now</button>
+<button class="button">Run maintenance</button>
+<!-- soft -->
+<button class="button button--danger"><svg />Suspend</button>
+<span class="button-row">
+  <button class="button button--danger" aria-disabled="true" aria-describedby="r1">Delete</button>
+  <span class="button__reason" id="r1"
+    ><svg aria-hidden="true" />Not permitted: your account can't <code>delete</code> snapshots in
+    <code>kopiur-dev</code>.</span
+  >
+</span>
+```
+
+```css
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font: var(--weight-semibold) var(--text-sm) / 1 var(--font-sans);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out);
+}
+.button svg {
+  width: 14px;
+  height: 14px;
+}
+.button--primary {
+  background: var(--accent);
+  color: var(--fg-on-accent);
+}
+.button--danger {
+  background: var(--health-failed-bg);
+  color: var(--health-failed-fg);
+}
+.button--quiet {
+  background: transparent;
+  color: var(--accent-ink);
+}
+.button[aria-disabled="true"] {
+  background: transparent;
+  color: var(--fg-muted);
+  border: 1px dashed var(--line-strong);
+  cursor: not-allowed;
+}
+.button__reason {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+```
+
+**Two refusals:** `disabledReason` = "you may not" (lock icon, "Not permitted: …",
+from `/me` via `capabilityReason`). `blockedReason` = "answer something first"
+(no icon, e.g. "Choose whether to pin it first."). Both are always visible beside
+the button and on `aria-describedby`. Inside a table cell, show the short form
+("not permitted") with the full sentence on `title` and `aria-describedby`.
+Never hide a button the user may not use. Disabled is `aria-disabled`, still
+focusable, never `disabled`.
+
+One primary per region. Danger is for actions that stop backups or delete data.
+
+---
+
+## Stat strip (facts)
+
+**What:** a handful of named values about one object. One card, cells divided by
+hairlines, label above value. Four per row on a detail page, three inside an
+object card.
+
+```html
+<dl class="stats">
+  <div class="stats__item">
+    <dt>Size</dt>
+    <dd>2.0 MiB</dd>
+  </div>
+  <div class="stats__item">
+    <dt>Started</dt>
+    <dd>58m ago<time class="stats__abs">2026-10-07 15:32:38</time></dd>
+  </div>
+  <div class="stats__item">
+    <dt>Last verified</dt>
+    <dd class="absent absent--loud"><svg aria-hidden="true" />never verified</dd>
+  </div>
+  <div class="stats__item">
+    <dt>New bytes</dt>
+    <dd><abbr class="absent absent--unreported" title="…">not reported</abbr></dd>
+  </div>
+  <div class="stats__item">
+    <dt>Files failed</dt>
+    <dd class="absent">—</dd>
+  </div>
+</dl>
+```
+
+```css
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  background: var(--bg-surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-1);
+  border: 1px solid var(--card-border);
+  overflow: hidden;
+}
+.stats__item {
+  display: grid;
+  gap: 5px;
+  padding: 12px 16px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.stats dt {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.stats dd {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+.stats__abs {
+  display: block;
+  font: var(--text-xs) var(--font-mono);
+  color: var(--fg-muted);
+  font-weight: var(--weight-regular);
+}
+```
+
+**The three absences** (never a blank, never a bare `0`):
+
+| Absence              | Means                                                                  | Style                                                                           |
+| -------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `absent--loud`       | a real problem: "never verified", "never succeeded", "never run"       | `--health-failed-fg`, semibold, `OctagonX` icon                                 |
+| `absent--unreported` | the CRD declares it, no controller writes it (`components/unwired.ts`) | italic `--fg-muted`, dotted underline, reason on `title` + visually-hidden text |
+| `absent`             | does not apply to this object                                          | `—` in `--fg-muted`                                                             |
+
+An identifier never goes in a `<dt>` (it is set in caps, which changes the name).
+A fact with no value that is none of the three is **dropped**, not rendered.
+
+---
+
+## Time
+
+Relative first ("58m ago", "in 39m"), in tabular figures. On detail pages and in
+stat strips the absolute instant sits beneath in small mono (`.stats__abs`). In
+tables, the absolute instant is the cell's `title` and a `<time datetime>`.
+
+---
+
+## Object card
+
+**What:** the tile for one object anywhere objects appear as cards (overview
+attention list, related objects, lanes, search results).
+
+Anatomy, top to bottom: **head** (chip · kind name / mono name / namespace · status
+pill on the right) → **meta line** (muted, one line, per `kinds.md`) → **stat strip**
+of three (per `kinds.md`). Stripe on the left edge.
+
+```html
+<article class="object-card has-stripe" data-kind="repository">
+  <header class="object-card__head">
+    <span class="kind-chip" aria-hidden="true"><svg /></span>
+    <span class="object-id">
+      <span class="kind-name">Repository</span>
+      <a class="object-name" href="…"><code>nas-offsite</code></a>
+      <span class="object-ns">media</span>
+    </span>
+    <span class="health" data-health="failed"><svg aria-hidden="true" />Failed</span>
+  </header>
+  <p class="object-card__meta">S3 · ReadWrite · bucket unreachable for 3h</p>
+  <dl class="stats stats--card">…three items…</dl>
+</article>
+```
+
+```css
+.object-card {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  padding: 14px 16px;
+  background: var(--bg-surface);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-1);
+  border: 1px solid var(--card-border);
+}
+.object-card.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+.object-card__head {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+.object-id {
+  display: grid;
+  min-width: 0;
+  line-height: 1.25;
+}
+.object-name {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-semibold);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.object-ns {
+  font: var(--text-xs) var(--font-mono);
+  color: var(--fg-muted);
+}
+.object-card__meta {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.stats--card {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  box-shadow: none;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+}
+.stats--card .stats__item {
+  border: 0;
+  padding: 10px 0 0;
+}
+.stats--card dd {
+  font-size: var(--text-md);
+}
+```
+
+Variant **summary** (no stat strip) is used in flow lanes and topology plates.
+The name is the link to the detail route; the card itself is not one big link.
+
+---
+
+## Table (list pages)
+
+**What:** every list page. Table on a card; the kind stripe and small chip on the
+first cell; related objects as references; numbers right-aligned.
+
+```html
+<div class="table-wrap">
+  <table class="table">
+    <thead>
+      <tr>
+        <th scope="col">Snapshot</th>
+        <th scope="col">Phase</th>
+        <th scope="col">Policy</th>
+        <th scope="col" class="num">Size</th>
+        <th scope="col" class="num">Age</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr data-kind="snapshot">
+        <td class="has-stripe">
+          <span class="table__object"
+            ><span class="kind-chip kind-chip--sm" aria-hidden="true"><svg /></span>
+            <span
+              ><a href="…"><code>app-data-manual</code></a
+              ><span class="object-ns">kopiur-dev</span></span
+            ></span
+          >
+        </td>
+        <td>
+          <span class="health" data-health="healthy"><svg aria-hidden="true" />Succeeded</span>
+        </td>
+        <td><a class="ref" data-kind="snapshot-policy">…</a></td>
+        <td class="num">2.0 MiB</td>
+        <td class="num"><time datetime="…" title="2026-10-07 15:32:38">58m</time></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+```
+
+```css
+.table-wrap {
+  overflow-x: auto;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-1);
+  border: 1px solid var(--card-border);
+  background: var(--bg-surface);
+}
+.table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: var(--text-sm);
+}
+.table th {
+  text-align: left;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.table td {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.table tbody tr:hover td {
+  background: var(--bg-hover);
+}
+.table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.table__object {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+```
+
+Rows stay in server order unless the page offers sorting. A wide table scrolls
+inside `.table-wrap` rather than starving a column. Long names wrap at `/` and `-`
+(`overflow-wrap: anywhere` on `code`), never ellipsised in a table.
+
+---
+
+## Detail header
+
+**What:** the top of every object's page. Trail, then the hero, then a stat strip.
+
+1. **Trail** — the object's upstream chain as references separated by `›`, ending
+   in the words "this snapshot" (etc.). Only hops the object actually has
+   (`kinds.md` → Relationships). Objects outside this cluster are named, not linked.
+2. **Hero card** (stripe + `kind-chip--lg`) — kind name, mono name, namespace,
+   status pill on the right; then the **verdict**, one sentence in `--text-lg`
+   saying what state the object is in and why it matters ("Succeeded: a manual run
+   under app-data. It is pinned, so retention will never prune it."); then the
+   **action row**.
+3. **Stat strip** of four, below the hero.
+
+The verdict is never the healthy state while any read on the page is loading,
+refused or empty — then it says so ("Checking…", "Cannot tell: …").

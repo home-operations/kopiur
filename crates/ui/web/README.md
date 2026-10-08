@@ -96,7 +96,7 @@ If you need another field from the report, add a guarded read there.
 | `src/components/actions/` | The shared confirmation panel and the dialogs built on it.                                                                                                                                                                            |
 | `src/charts/`             | The charts, each with a table twin — the SVG is always `aria-hidden`, because an operator using a screen reader still needs the number.                                                                                               |
 | `src/api/`                | The one `fetch` wrapper, the query hooks, the problem types, and the generated types. eslint forbids `fetch` anywhere else.                                                                                                           |
-| `src/styles.css`          | One stylesheet, design tokens at the top. `DESIGN.md` describes the patterns; `PRODUCT.md` describes what the screens are for.                                                                                                        |
+| `src/styles.css`          | One stylesheet; its token block is copied from the `kopiur-ui-design` skill (`.claude/skills/kopiur-ui-design`), the canonical design system. `PRODUCT.md` describes what the screens are for.                                        |
 
 `src/styles.focus.test.ts` reads the stylesheet as text and guards two things a
 browser reports silently and jsdom cannot see at all: a later `box-shadow` that
