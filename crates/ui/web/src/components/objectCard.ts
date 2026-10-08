@@ -12,7 +12,7 @@ import type {
 import { humanBytes, humanDuration, relativeTime } from "../util/format";
 import { admitsText } from "./admits";
 import { type Lamp, healthLamp, loudLamp } from "./health";
-import { parseRef } from "./kind";
+import { detailHref, parseRef } from "./kind";
 import { replicationHealth, replicationPhaseLabel } from "./replication";
 import { restorePhaseLamp } from "./restore";
 import { snapshotPhaseLamp } from "./snapshot";
@@ -37,7 +37,7 @@ export interface CardFacts {
   lamp: Lamp;
   meta: string;
   stats: readonly [Stat, Stat, Stat];
-  /** The detail route; absent for a kind that has none. */
+  /** The full page — the drawer's "Open full page"; absent for a kind that has none. */
   to?: string | undefined;
 }
 
@@ -89,9 +89,7 @@ export function cardFacts(card: CardRow, now: Date): CardFacts {
               : { absent: "unreported", field: "repositoryLastObserved" },
           },
         ],
-        to: `/repositories/${r.kindPath}/${r.name}${
-          r.namespace ? `?namespace=${encodeURIComponent(r.namespace)}` : ""
-        }`,
+        to: detailHref(card.kind, r.name, r.namespace ?? undefined),
       };
     }
     case "snapshotPolicy": {
@@ -120,7 +118,7 @@ export function cardFacts(card: CardRow, now: Date): CardFacts {
               : { absent: "loud", text: "never verified" },
           },
         ],
-        to: `/policies/${p.namespace}/${p.name}`,
+        to: detailHref(card.kind, p.name, p.namespace),
       };
     }
     case "snapshotSchedule": {
@@ -165,7 +163,7 @@ export function cardFacts(card: CardRow, now: Date): CardFacts {
           { label: "Files", value: count(s.filesTotal) },
           { label: "Took", value: took === null ? { absent: "na" } : humanDuration(took) },
         ],
-        to: `/snapshots/${s.namespace}/${s.name}`,
+        to: detailHref(card.kind, s.name, s.namespace),
       };
     }
     case "restore": {
@@ -188,7 +186,7 @@ export function cardFacts(card: CardRow, now: Date): CardFacts {
           { label: "Files", value: count(r.filesRestored) },
           { label: "Took", value: took === null ? { absent: "na" } : humanDuration(took) },
         ],
-        to: `/restores/${r.namespace}/${r.name}`,
+        to: detailHref(card.kind, r.name, r.namespace),
       };
     }
     case "maintenance": {

@@ -23,7 +23,7 @@ import {
 import { useCurrentNamespace } from "../util/namespace";
 import { ConditionsTable } from "./ConditionsTable";
 import { DetailHeader, type TrailHop } from "./DetailHeader";
-import { detailHref, parseRef } from "./kind";
+import { parseRef } from "./kind";
 import { Facts, type Fact } from "./Facts";
 import { Finding } from "./Finding";
 import { LampBadge } from "./HealthBadge";
@@ -74,7 +74,6 @@ function snapshotTrail(row: SnapshotDetailData["row"]): TrailHop[] {
       kind: repo.kind,
       name: repo.name,
       namespace: repo.namespace,
-      to: detailHref(repo.kind, repo.name, repo.namespace),
     });
   }
   if (row.policy !== null && row.policy !== undefined && row.policy.length > 0) {
@@ -82,7 +81,6 @@ function snapshotTrail(row: SnapshotDetailData["row"]): TrailHop[] {
       kind: "snapshotPolicy",
       name: row.policy,
       namespace: row.namespace,
-      to: detailHref("snapshotPolicy", row.policy, row.namespace),
     });
   }
   return hops;

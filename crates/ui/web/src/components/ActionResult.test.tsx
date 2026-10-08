@@ -50,7 +50,7 @@ describe("ActionResult", () => {
     const created = await screen.findByRole("list", { name: "Created" });
     const link = within(created).getByRole("link", { name: /nas-1/ });
     expect(link).toHaveAttribute("data-kind", "snapshot");
-    expect(link).toHaveAttribute("href", "/snapshots/media/nas-1");
+    expect(link.getAttribute("href")).toMatch(/inspect=snapshot%2Fmedia%2Fnas-1$/);
   });
 
   it("still names a created object of a kind this bundle does not know", async () => {

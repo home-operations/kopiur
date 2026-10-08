@@ -74,7 +74,7 @@ describe("Schedules", () => {
     mountApp("/schedules");
     const body = bodyRows(await table());
     const policy = within(nth(body, 0)).getByRole("link", { name: /SnapshotPolicy.*nightly/ });
-    expect(policy).toHaveAttribute("href", "/policies/media/nightly");
+    expect(policy.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
     expect(policy).toHaveAttribute("data-kind", "snapshot-policy");
     expect(nth(body, 0)).toHaveAttribute("data-kind", "snapshot-schedule");
     expect(nth(body, 1)).toHaveTextContent("tier=gold");

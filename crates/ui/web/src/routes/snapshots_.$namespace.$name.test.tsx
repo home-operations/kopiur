@@ -490,10 +490,11 @@ describe("Snapshot detail — where it sits", () => {
     mockApi({ [PATH]: jsonResponse(detail()) });
     mountApp("/snapshots/media/nightly-29");
     const trail = await screen.findByRole("list", { name: "Where this sits" });
-    expect(within(trail).getByRole("link", { name: /nightly/ })).toHaveAttribute(
-      "href",
-      "/policies/media/nightly",
-    );
+    expect(
+      within(trail)
+        .getByRole("link", { name: /nightly/ })
+        .getAttribute("href"),
+    ).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
     expect(trail).toHaveTextContent("this snapshot");
   });
 });

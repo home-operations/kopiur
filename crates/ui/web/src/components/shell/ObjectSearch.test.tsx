@@ -32,7 +32,7 @@ function snapshots(url: URL): Response {
 }
 
 describe("ObjectSearch", () => {
-  it("finds objects of every kind by name and links the ones with a page", async () => {
+  it("finds objects of every kind by name, each opening in the resource drawer", async () => {
     mockApi({
       "/api/v1/policies": jsonResponse([POLICY]),
       "/api/v1/snapshots": snapshots,
@@ -46,13 +46,33 @@ describe("ObjectSearch", () => {
     const user = userEvent.setup();
     await user.type(await screen.findByRole("searchbox", { name: "Find an object" }), "app");
     const results = await screen.findByRole("list", { name: "Search results" });
-    expect(await within(results).findByRole("link", { name: /app-data-manual/ })).toHaveAttribute(
-      "href",
-      "/snapshots/kopiur-dev/app-data-manual",
-    );
     expect(
-      within(results).getByRole("link", { name: /SnapshotPolicy.*app-data$/ }),
-    ).toHaveAttribute("href", "/policies/kopiur-dev/app-data");
+      (await within(results).findByRole("link", { name: /app-data-manual/ })).getAttribute("href"),
+    ).toMatch(/inspect=snapshot%2Fkopiur-dev%2Fapp-data-manual$/);
+    expect(
+      within(results)
+        .getByRole("link", { name: /SnapshotPolicy.*app-data$/ })
+        .getAttribute("href"),
+    ).toMatch(/inspect=snapshot-policy%2Fkopiur-dev%2Fapp-data$/);
+  });
+
+  it("gets out of the way once a result is opened", async () => {
+    mockApi({
+      "/api/v1/policies": jsonResponse([POLICY]),
+      "/api/v1/snapshots": snapshots,
+      "/api/v1/repositories": jsonResponse([]),
+      "/api/v1/schedules": jsonResponse([]),
+      "/api/v1/restores": jsonResponse([]),
+      "/api/v1/maintenance": jsonResponse([]),
+      "/api/v1/replications": jsonResponse({ repository: [], snapshot: [] }),
+    });
+    mountApp("/doctor");
+    const user = userEvent.setup();
+    await user.type(await screen.findByRole("searchbox", { name: "Find an object" }), "app");
+    const results = await screen.findByRole("list", { name: "Search results" });
+    await user.click(within(results).getByRole("link", { name: /SnapshotPolicy.*app-data$/ }));
+    expect(await screen.findByRole("dialog", { name: /app-data/ })).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Search results" })).toBeNull();
   });
 
   it("does not search on a single character", async () => {

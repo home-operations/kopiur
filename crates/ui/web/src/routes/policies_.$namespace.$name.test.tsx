@@ -366,9 +366,8 @@ describe("Policy detail — header and lanes", () => {
     mockApi({ [PATH]: jsonResponse(single) });
     mountApp("/policies/media/nightly");
     const trail = await screen.findByRole("list", { name: "Where this sits" });
-    expect(within(trail).getByRole("link", { name: /nas/ })).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
+    expect(within(trail).getByRole("link", { name: /nas/ }).getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
     );
     expect(trail).toHaveTextContent("this policy");
   });
@@ -385,14 +384,14 @@ describe("Policy detail — header and lanes", () => {
     mountApp("/policies/media/nightly");
     const flow = await screen.findByRole("region", { name: "Relationships" });
     const writes = within(flow).getByRole("region", { name: "Writes into" });
-    expect(within(writes).getByRole("link", { name: /nas/ })).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
+    expect(within(writes).getByRole("link", { name: /nas/ }).getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
     );
-    expect(within(writes).getByRole("link", { name: /shared/ })).toHaveAttribute(
-      "href",
-      "/repositories/cluster-repository/shared",
-    );
+    expect(
+      within(writes)
+        .getByRole("link", { name: /shared/ })
+        .getAttribute("href"),
+    ).toMatch(/inspect=cluster-repository%2Fshared$/);
     const self = within(flow).getByRole("region", { name: "This policy" });
     expect(within(self).getByRole("article")).toHaveAttribute("data-kind", "snapshot-policy");
   });
@@ -403,10 +402,9 @@ describe("Policy detail — header and lanes", () => {
     const row = nth(bodyRows(await screen.findByRole("table", { name: "Recent snapshots" })), 0);
     expect(row).toHaveAttribute("data-kind", "snapshot");
     expect(row.querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
-    expect(within(row).getByRole("link", { name: "nightly-20260909" })).toHaveAttribute(
-      "href",
-      "/snapshots/media/nightly-20260909",
-    );
+    expect(
+      within(row).getByRole("link", { name: "nightly-20260909" }).getAttribute("href"),
+    ).toMatch(/inspect=snapshot%2Fmedia%2Fnightly-20260909$/);
   });
 
   it("keeps a repository key it cannot read as its text, never claiming there is none", async () => {

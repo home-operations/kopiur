@@ -50,14 +50,12 @@ describe("Policies", () => {
     expect(body).toHaveLength(2);
     expect(nth(body, 0)).toHaveTextContent("nightly");
     // What it writes into: references to each repository's own page.
-    expect(nth(body, 0).querySelector('a.ref[data-kind="repository"]')).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
-    );
-    expect(nth(body, 0).querySelector('a.ref[data-kind="cluster-repository"]')).toHaveAttribute(
-      "href",
-      "/repositories/cluster-repository/shared",
-    );
+    expect(
+      nth(body, 0).querySelector('a.ref[data-kind="repository"]')?.getAttribute("href"),
+    ).toMatch(/inspect=repository%2Fmedia%2Fnas$/);
+    expect(
+      nth(body, 0).querySelector('a.ref[data-kind="cluster-repository"]')?.getAttribute("href"),
+    ).toMatch(/inspect=cluster-repository%2Fshared$/);
     expect(nth(body, 0)).toHaveAttribute("data-kind", "snapshot-policy");
     expect(nth(body, 0)).toHaveTextContent("fans out");
     expect(nth(body, 0)).toHaveTextContent("42");

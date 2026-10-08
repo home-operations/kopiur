@@ -6,7 +6,6 @@ import { LampBadge } from "./HealthBadge";
 import { healthLamp, loudLamp } from "./health";
 import { firesBySelector, scheduleCron, scheduleFires } from "./schedule";
 import { KindChip } from "./KindMark";
-import { detailHref } from "./kind";
 import { ObjectRef } from "./ObjectRef";
 import { InspectLink } from "./InspectLink";
 
@@ -129,7 +128,6 @@ function Fires({ schedule }: { schedule: ScheduleRow }) {
         name={named}
         namespace={schedule.namespace}
         contextNamespace={schedule.namespace}
-        to={detailHref("snapshotPolicy", named, schedule.namespace)}
       />
     </div>
   );

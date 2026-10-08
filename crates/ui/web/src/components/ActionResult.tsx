@@ -2,7 +2,7 @@ import { CircleCheck } from "lucide-react";
 
 import type { ActionReceipt, Problem } from "../api/types";
 import { LampBadge } from "./HealthBadge";
-import { detailHref, kindOfLabel } from "./kind";
+import { kindOfLabel } from "./kind";
 import { ObjectRef } from "./ObjectRef";
 import { ProblemBanner } from "./ProblemBanner";
 import { relativeTime } from "../util/format";
@@ -91,12 +91,5 @@ function CreatedRef({ kind, namespace, name }: { kind: string; namespace: string
       </span>
     );
   }
-  return (
-    <ObjectRef
-      kind={known}
-      name={name}
-      namespace={namespace}
-      to={detailHref(known, name, namespace)}
-    />
-  );
+  return <ObjectRef kind={known} name={name} namespace={namespace} />;
 }

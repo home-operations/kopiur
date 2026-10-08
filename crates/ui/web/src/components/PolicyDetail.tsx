@@ -28,9 +28,10 @@ import { KindChip } from "./KindMark";
 import { LastSuccess } from "./PolicyTable";
 import { gateSeverityLamp } from "./gates";
 import { type Lamp, healthLamp } from "./health";
-import { detailHref, parseRef } from "./kind";
+import { parseRef } from "./kind";
 import { policyVerdict, retentionRules, snapshotCount } from "./policy";
 import { snapshotPhaseLamp } from "./snapshot";
+import { InspectLink } from "./InspectLink";
 
 /**
  * One policy, in the order an operator needs it.
@@ -81,7 +82,6 @@ function policyTrail(row: PolicyRow): TrailHop[] {
       kind: only.kind,
       name: only.name,
       namespace: only.namespace,
-      to: detailHref(only.kind, only.name, only.namespace),
     },
   ];
 }
@@ -437,13 +437,16 @@ function RecentSnapshots({ snapshots, now }: { snapshots: readonly SnapshotRow[]
               <td className="has-stripe">
                 <div className="table__object">
                   <KindChip kind="snapshot" size="sm" />
-                  <Link
-                    className="mono"
-                    to="/snapshots/$namespace/$name"
-                    params={{ namespace: snapshot.namespace, name: snapshot.name }}
+                  <InspectLink
+                    className="row-link mono"
+                    target={{
+                      kind: "snapshot",
+                      namespace: snapshot.namespace,
+                      name: snapshot.name,
+                    }}
                   >
                     {snapshot.name}
-                  </Link>
+                  </InspectLink>
                 </div>
               </td>
               <td>

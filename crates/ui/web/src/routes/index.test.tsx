@@ -216,10 +216,11 @@ describe("Overview", () => {
     const kinds = cards.map((c) => c.getAttribute("data-kind")).filter((k) => k !== null);
     expect(kinds).toContain("repository");
     expect(kinds).toContain("maintenance");
-    expect(within(attention).getByRole("link", { name: "cold" })).toHaveAttribute(
-      "href",
-      "/repositories/repository/cold?namespace=media",
-    );
+    expect(
+      attention
+        .querySelector('article[data-kind="repository"] a.object-name')
+        ?.getAttribute("href"),
+    ).toMatch(/inspect=repository%2Fmedia%2Fcold$/);
 
     // Stalled objects as work rows.
     const stalled = within(attention).getByRole("table", { name: "Stalled objects" });

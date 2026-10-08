@@ -4,7 +4,6 @@ import type { SnapshotRow } from "../api/types";
 import { EMPTY_CELL, humanAge, humanBytes, humanDuration } from "../util/format";
 import { LampBadge } from "./HealthBadge";
 import { KindChip } from "./KindMark";
-import { detailHref } from "./kind";
 import { ObjectRef, WireRef } from "./ObjectRef";
 import { durationSeconds, originLabel, snapshotPhaseLamp } from "./snapshot";
 import { InspectLink } from "./InspectLink";
@@ -106,7 +105,6 @@ export function SnapshotTable({
                     name={row.policy}
                     namespace={row.namespace}
                     contextNamespace={row.namespace}
-                    to={detailHref("snapshotPolicy", row.policy, row.namespace)}
                   />
                 ) : (
                   EMPTY_CELL

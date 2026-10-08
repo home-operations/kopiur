@@ -1,15 +1,14 @@
-import { Link } from "@tanstack/react-router";
-
 import { LampBadge } from "./HealthBadge";
 import { KindChip, KindName } from "./KindMark";
 import { KIND_META } from "./kind";
 import { type CardRow, cardFacts } from "./objectCard";
 import { StatStrip } from "./StatStrip";
+import { InspectLink } from "./InspectLink";
 
 /**
  * One object as a card, wherever objects appear as cards: the overview's
  * attention list, a detail page's flow lanes, related objects. The stripe and
- * chip say the kind; the name is the link (when the kind has a page); the
+ * chip say the kind; the name opens it in the resource drawer; the
  * `stats` variant adds the kind's three facts.
  */
 export function ObjectCard({
@@ -29,13 +28,12 @@ export function ObjectCard({
         <KindChip kind={facts.kind} />
         <span className="object-id">
           <KindName kind={facts.kind} />
-          {facts.to !== undefined ? (
-            <Link className="object-name" to={facts.to}>
-              {facts.name}
-            </Link>
-          ) : (
-            <span className="object-name">{facts.name}</span>
-          )}
+          <InspectLink
+            className="object-name"
+            target={{ kind: facts.kind, name: facts.name, namespace: facts.namespace }}
+          >
+            {facts.name}
+          </InspectLink>
           {facts.namespace !== undefined ? (
             <span className="object-ns">{facts.namespace}</span>
           ) : (

@@ -128,8 +128,8 @@ describe("SnapshotTable — kind identity and references", () => {
     );
     const row = nth(bodyRows(await table()), 0);
     const policy = row.querySelector('a.ref[data-kind="snapshot-policy"]');
-    expect(policy).toHaveAttribute("href", "/policies/media/nightly");
+    expect(policy?.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
     const repository = row.querySelector('a.ref[data-kind="repository"]');
-    expect(repository).toHaveAttribute("href", "/repositories/repository/nas?namespace=media");
+    expect(repository?.getAttribute("href")).toMatch(/inspect=repository%2Fmedia%2Fnas$/);
   });
 });

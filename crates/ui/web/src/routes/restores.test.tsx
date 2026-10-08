@@ -202,9 +202,8 @@ describe("Restores — kind identity", () => {
     const row = nth(bodyRows(await table()), 0);
     expect(row).toHaveAttribute("data-kind", "restore");
     expect(row.querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
-    expect(row.querySelector('a.ref[data-kind="repository"]')).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
+    expect(row.querySelector('a.ref[data-kind="repository"]')?.getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
     );
   });
 });

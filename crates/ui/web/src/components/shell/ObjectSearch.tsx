@@ -20,7 +20,6 @@ interface Hit {
   kind: ObjectKind;
   name: string;
   namespace?: string | undefined;
-  to?: string | undefined;
 }
 
 const MAX_HITS = 8;
@@ -97,9 +96,6 @@ export function ObjectSearch() {
             kind: r.kind === "ClusterRepository" ? "clusterRepository" : "repository",
             name: r.name,
             namespace: r.namespace ?? undefined,
-            to: `/repositories/${r.kindPath}/${r.name}${
-              r.namespace ? `?namespace=${encodeURIComponent(r.namespace)}` : ""
-            }`,
           })),
         ...(policies.data ?? [])
           .filter((p) => matches(p.name))
@@ -107,7 +103,6 @@ export function ObjectSearch() {
             kind: "snapshotPolicy",
             name: p.name,
             namespace: p.namespace,
-            to: `/policies/${p.namespace}/${p.name}`,
           })),
         ...(schedules.data ?? [])
           .filter((s) => matches(s.name))
@@ -116,7 +111,6 @@ export function ObjectSearch() {
           kind: "snapshot",
           name: s.name,
           namespace: s.namespace,
-          to: `/snapshots/${s.namespace}/${s.name}`,
         })),
         ...(restores.data ?? [])
           .filter((r) => matches(r.name))
@@ -124,7 +118,6 @@ export function ObjectSearch() {
             kind: "restore",
             name: r.name,
             namespace: r.namespace,
-            to: `/restores/${r.namespace}/${r.name}`,
           })),
         ...(maintenance.data ?? [])
           .filter((m) => matches(m.name))
@@ -182,7 +175,9 @@ export function ObjectSearch() {
                   name={hit.name}
                   namespace={hit.namespace}
                   contextNamespace={namespace}
-                  to={hit.to}
+                  onOpen={() => {
+                    setQ("");
+                  }}
                 />
               </li>
             ))

@@ -7,25 +7,23 @@ import { healthLamp } from "./health";
 import { ObjectRef } from "./ObjectRef";
 
 describe("ObjectRef", () => {
-  it("is a link to the object when it has a detail route, carrying its kind", async () => {
+  it("opens the object in the resource drawer, carrying its kind", async () => {
     renderWithRouter(
-      <ObjectRef
-        kind="repository"
-        name="dev-repo"
-        namespace="kopiur-dev"
-        to="/repositories/repository/dev-repo?namespace=kopiur-dev"
-      />,
+      <ObjectRef kind="repository" name="dev-repo" namespace="kopiur-dev" />,
+      "/policies?namespace=kopiur-dev",
     );
     const link = await screen.findByRole("link", { name: /dev-repo/ });
-    expect(link).toHaveAttribute("href", "/repositories/repository/dev-repo?namespace=kopiur-dev");
+    expect(link.getAttribute("href")).toMatch(
+      /^\/policies\?namespace=kopiur-dev&inspect=repository%2Fkopiur-dev%2Fdev-repo$/,
+    );
     expect(link).toHaveAttribute("data-kind", "repository");
     expect(link).toHaveTextContent("Repository");
   });
 
-  it("is plain text, not a link, for a kind with no detail route", async () => {
+  it("is a link for a kind with no page of its own, too", async () => {
     renderWithRouter(<ObjectRef kind="snapshotSchedule" name="nightly-cron" namespace="media" />);
-    await screen.findByText("nightly-cron");
-    expect(screen.queryByRole("link")).toBeNull();
+    const link = await screen.findByRole("link", { name: /nightly-cron/ });
+    expect(link.getAttribute("href")).toMatch(/inspect=snapshot-schedule%2Fmedia%2Fnightly-cron$/);
   });
 
   it("names the namespace only when it differs from the surrounding one", async () => {

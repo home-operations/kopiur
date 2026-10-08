@@ -12,7 +12,6 @@ export interface TrailHop {
   kind: ObjectKind;
   name: string;
   namespace?: string | undefined;
-  to?: string | undefined;
   health?: Lamp | undefined;
 }
 
@@ -64,7 +63,6 @@ export function DetailHeader({
                 name={hop.name}
                 namespace={hop.namespace}
                 contextNamespace={namespace}
-                to={hop.to}
                 health={hop.health}
               />
               <span className="trail__sep" aria-hidden="true">

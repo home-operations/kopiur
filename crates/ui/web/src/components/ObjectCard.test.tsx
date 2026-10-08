@@ -18,7 +18,7 @@ describe("ObjectCard", () => {
       <ObjectCard card={{ kind: "snapshotPolicy", row }} variant="stats" />,
     );
     const link = await screen.findByRole("link", { name: "app-data" });
-    expect(link).toHaveAttribute("href", "/policies/kopiur-dev/app-data");
+    expect(link.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fkopiur-dev%2Fapp-data$/);
     const card = container.querySelector("article.object-card");
     expect(card).toHaveAttribute("data-kind", "snapshot-policy");
     expect(card).toHaveClass("has-stripe");

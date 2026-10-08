@@ -388,10 +388,11 @@ describe("Repository detail — relationships", () => {
     expect(within(fired).getByRole("article")).toHaveAttribute("data-kind", "snapshot-schedule");
     const written = within(flow).getByRole("region", { name: "Policies writing here" });
     // No row for "nightly" came back: it is still named, as a reference to its page.
-    expect(within(written).getByRole("link", { name: /nightly/ })).toHaveAttribute(
-      "href",
-      "/policies/media/nightly",
-    );
+    expect(
+      within(written)
+        .getByRole("link", { name: /nightly/ })
+        .getAttribute("href"),
+    ).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
     const self = within(flow).getByRole("region", { name: "This repository" });
     expect(within(self).getByRole("article")).toHaveAttribute("data-kind", "repository");
   });

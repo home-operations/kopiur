@@ -125,10 +125,9 @@ export function parseRef(ref: string): ParsedRef | null {
 }
 
 /**
- * The object's detail page, or `undefined` for a kind that has none
- * (schedules, maintenance and replications are list rows only). A reference
- * to such a kind is shown as text, never as a link to a page that does not
- * exist.
+ * The object's full page, or `undefined` for a kind that has none
+ * (schedules, maintenance and replications are shown only in the resource
+ * drawer). It is what the drawer's "Open full page" follows.
  */
 export function detailHref(kind: ObjectKind, name: string, namespace?: string): string | undefined {
   const ns = namespace !== undefined && namespace.length > 0 ? namespace : undefined;

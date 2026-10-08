@@ -15,7 +15,7 @@ import { DetailHeader, type TrailHop } from "./DetailHeader";
 import { Facts } from "./Facts";
 import { Finding } from "./Finding";
 import { healthLamp } from "./health";
-import { detailHref, parseRef } from "./kind";
+import { parseRef } from "./kind";
 import { restoreProgress, restoreVerdict } from "./restore";
 
 /**
@@ -55,7 +55,6 @@ function restoreTrail(detail: RestoreDetail): TrailHop[] {
       kind: repo.kind,
       name: repo.name,
       namespace: repo.namespace,
-      to: detailHref(repo.kind, repo.name, repo.namespace),
     });
   }
   const snapshot = detail.source?.snapshot;
@@ -64,7 +63,6 @@ function restoreTrail(detail: RestoreDetail): TrailHop[] {
       kind: "snapshot",
       name: snapshot.name,
       namespace: snapshot.namespace,
-      to: detailHref("snapshot", snapshot.name, snapshot.namespace),
     });
   }
   return hops;

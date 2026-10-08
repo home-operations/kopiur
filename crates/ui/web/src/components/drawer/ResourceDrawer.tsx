@@ -208,7 +208,6 @@ function DrawerBody({ card }: { card: CardRow }) {
                   name={rel.target.name}
                   namespace={rel.target.namespace}
                   contextNamespace={namespace}
-                  inspect
                 />
               </li>
             ))}

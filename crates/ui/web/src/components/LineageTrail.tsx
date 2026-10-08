@@ -1,6 +1,5 @@
-import { Link } from "@tanstack/react-router";
-
 import type { Lineage } from "../api/types";
+import { InspectLink } from "./InspectLink";
 
 /**
  * Where this snapshot came from and what has been copied out of it — the
@@ -72,13 +71,12 @@ export function LineageTrail({ lineage, name, namespace }: LineageTrailProps) {
             <span className="label-strip">
               <span className="label-strip__kind">copied to</span>
               <span className="label-strip__name">
-                <Link
+                <InspectLink
                   className="mono"
-                  to="/snapshots/$namespace/$name"
-                  params={{ namespace: copy.namespace, name: copy.name }}
+                  target={{ kind: "snapshot", namespace: copy.namespace, name: copy.name }}
                 >
                   {copy.name}
-                </Link>
+                </InspectLink>
               </span>
             </span>
             <span className="lineage__meta mono">{copy.namespace}</span>

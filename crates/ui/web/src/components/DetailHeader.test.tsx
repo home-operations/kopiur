@@ -20,13 +20,11 @@ describe("DetailHeader", () => {
             kind: "repository",
             name: "dev-repo",
             namespace: "kopiur-dev",
-            to: "/repositories/repository/dev-repo?namespace=kopiur-dev",
           },
           {
             kind: "snapshotPolicy",
             name: "app-data",
             namespace: "kopiur-dev",
-            to: "/policies/kopiur-dev/app-data",
           },
         ]}
         actions={<button type="button">Snapshot now</button>}
@@ -47,9 +45,8 @@ describe("DetailHeader", () => {
 
     const trail = screen.getByRole("list", { name: "Where this sits" });
     const hops = within(trail).getAllByRole("listitem");
-    expect(within(nth(hops, 0)).getByRole("link")).toHaveAttribute(
-      "href",
-      "/repositories/repository/dev-repo?namespace=kopiur-dev",
+    expect(within(nth(hops, 0)).getByRole("link").getAttribute("href")).toMatch(
+      /inspect=repository%2Fkopiur-dev%2Fdev-repo$/,
     );
     expect(hops.at(-1)).toHaveTextContent("this snapshot");
 

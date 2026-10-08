@@ -180,13 +180,13 @@ describe("Restore detail — header", () => {
     mockApi({ [PATH]: jsonResponse(detail) });
     mountApp("/restores/media/recover-db");
     const trail = await screen.findByRole("list", { name: "Where this sits" });
-    expect(within(trail).getByRole("link", { name: /nightly-1/ })).toHaveAttribute(
-      "href",
-      "/snapshots/media/nightly-1",
-    );
-    expect(within(trail).getByRole("link", { name: /nas/ })).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
+    expect(
+      within(trail)
+        .getByRole("link", { name: /nightly-1/ })
+        .getAttribute("href"),
+    ).toMatch(/inspect=snapshot%2Fmedia%2Fnightly-1$/);
+    expect(within(trail).getByRole("link", { name: /nas/ }).getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
     );
     expect(trail).toHaveTextContent("this restore");
   });

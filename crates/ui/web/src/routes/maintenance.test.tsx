@@ -87,10 +87,9 @@ describe("Maintenance", () => {
     expect(first.querySelector('a.ref[data-kind="repository"]')).toHaveTextContent("nas");
     expect(first).toHaveTextContent("media/nas-maintenance");
     const second = await region("Maintenance kopiur-system/shared-maintenance");
-    expect(second.querySelector('a.ref[data-kind="cluster-repository"]')).toHaveAttribute(
-      "href",
-      "/repositories/cluster-repository/shared",
-    );
+    expect(
+      second.querySelector('a.ref[data-kind="cluster-repository"]')?.getAttribute("href"),
+    ).toMatch(/inspect=cluster-repository%2Fshared$/);
   });
 
   it("opens a Maintenance object in the resource drawer from its title", async () => {
@@ -289,9 +288,8 @@ describe("Maintenance — kind identity", () => {
     expect(first).toHaveAttribute("data-kind", "maintenance");
     expect(first).toHaveClass("has-stripe");
     expect(first.querySelector(".kind-chip svg")).not.toBeNull();
-    expect(first.querySelector('a.ref[data-kind="repository"]')).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
+    expect(first.querySelector('a.ref[data-kind="repository"]')?.getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
     );
   });
 });

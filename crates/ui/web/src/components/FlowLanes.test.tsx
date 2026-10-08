@@ -42,10 +42,12 @@ describe("FlowLanes", () => {
       within(screen.getByRole("region", { name: "Fired by" })).getByRole("article"),
     ).toHaveAttribute("data-kind", "snapshot-schedule");
     expect(
-      within(screen.getByRole("region", { name: "Policies writing here" })).getByRole("link", {
-        name: /app-data/,
-      }),
-    ).toHaveAttribute("href", "/policies/kopiur-dev/app-data");
+      within(screen.getByRole("region", { name: "Policies writing here" }))
+        .getByRole("link", {
+          name: /app-data/,
+        })
+        .getAttribute("href"),
+    ).toMatch(/inspect=snapshot-policy%2Fkopiur-dev%2Fapp-data$/);
   });
 
   it("sizes its columns to the lanes it has, the object's own lane widest", async () => {

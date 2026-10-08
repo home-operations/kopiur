@@ -2,7 +2,6 @@ import { ArrowRight } from "lucide-react";
 import { type CSSProperties, Fragment } from "react";
 
 import type { ObjectKind } from "../api/types";
-import { detailHref } from "./kind";
 import { ObjectCard } from "./ObjectCard";
 import type { CardRow } from "./objectCard";
 import { ObjectRef } from "./ObjectRef";
@@ -78,7 +77,6 @@ export function FlowLanes({ label, lanes }: { label: string; lanes: readonly Lan
                     kind={item.ref.kind}
                     name={item.ref.name}
                     namespace={item.ref.namespace}
-                    to={detailHref(item.ref.kind, item.ref.name, item.ref.namespace)}
                   />
                 ),
               )
