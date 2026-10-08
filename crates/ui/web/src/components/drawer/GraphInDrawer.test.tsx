@@ -133,6 +133,50 @@ describe("the resource drawer, with what the board knows", () => {
     expect(out).toHaveTextContent("staging");
   });
 
+  it("names a selector once, not again as the link's label", async () => {
+    const graph = {
+      ...FIXTURE_GRAPH,
+      nodes: [
+        ...FIXTURE_GRAPH.nodes,
+        {
+          id: "NamespaceSelector/shared",
+          kind: "namespaceSelector" as const,
+          name: "shared",
+          label: "team=media",
+          health: "healthy" as const,
+          missing: false,
+          allowsAllNamespaces: false,
+          gates: [],
+        },
+      ],
+      edges: [
+        ...FIXTURE_GRAPH.edges,
+        {
+          id: "AllowedNamespace/ClusterRepository/shared/NamespaceSelector/shared",
+          from: "ClusterRepository/shared",
+          to: "NamespaceSelector/shared",
+          kind: "allowedNamespace" as const,
+          label: "team=media",
+          health: "healthy" as const,
+        },
+      ],
+    };
+    mockApi({
+      "/api/v1/graph": jsonResponse(graph),
+      "/api/v1/repositories/cluster-repository/shared": jsonResponse(
+        repo({
+          kind: "ClusterRepository",
+          kindPath: "cluster-repository",
+          name: "shared",
+          namespace: null,
+        }),
+      ),
+    });
+    mountApp(`${PAGE}?inspect=cluster-repository/shared`);
+    const out = within(await openTab("Relationships")).getByRole("region", { name: "Points at" });
+    expect(within(out).getAllByText("team=media")).toHaveLength(1);
+  });
+
   it("calls out a reference to a repository that does not exist", async () => {
     mockApi({ ...GRAPH, "/api/v1/policies/media/orphaned": jsonResponse(orphaned) });
     mountApp(`${PAGE}?inspect=snapshot-policy/media/orphaned`);

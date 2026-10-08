@@ -63,7 +63,10 @@ export function EdgeList({ heading, empty, edges, other, model, namespace }: Edg
                 <span className="drawer__edge-kind">{edge.style.word}</span>
                 <EdgeEnd end={end} id={id} namespace={namespace} />
                 <LampBadge lamp={edge.lamp} />
-                {edge.edge.label !== undefined && edge.edge.label !== null ? (
+                {/* A selector's label is the selector itself: said once, as the end. */}
+                {edge.edge.label !== undefined &&
+                edge.edge.label !== null &&
+                edge.edge.label !== end?.node.label ? (
                   <span className="drawer__edge-note mono">{edge.edge.label}</span>
                 ) : null}
                 {end === undefined ? (
