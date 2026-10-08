@@ -1,8 +1,9 @@
 import { SearchX } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import type { ApiProblemError } from "../../api/client";
 import {
+  useGraph,
   useMaintenance,
   usePolicies,
   usePolicy,
@@ -22,8 +23,12 @@ import { KIND_META } from "../kind";
 import { LoadingState } from "../LoadingState";
 import { SidePanel } from "../SidePanel";
 import { Tabs } from "../Tabs";
+import { topologyModel, type TopologyModel } from "../topology/model";
 import { useExiting } from "../useExiting";
+import { useCurrentNamespace } from "../../util/namespace";
 import type { DrawerData } from "./drawerData";
+import { EdgeList, GhostFinding } from "./GraphSections";
+import { graphContext } from "./graphFacts";
 import { drawerView } from "./views";
 
 /**
@@ -48,7 +53,7 @@ function sameTarget(a: InspectTarget, b: InspectTarget): boolean {
 
 type Loaded =
   | { state: "loading" }
-  | { state: "missing" }
+  | { state: "missing"; graph?: TopologyModel | undefined }
   | { state: "error"; problem: Problem }
   | { state: "ready"; data: DrawerData };
 
@@ -85,6 +90,25 @@ function named<T extends { name: string }>(rows: readonly T[], name: string): T 
  * the one for this kind is enabled.
  */
 function useDrawerData(target: InspectTarget): Loaded {
+  // What the topology board knows about it — relationships both ways, what it
+  // admits, the ghosts it names — for the three kinds on the board, in the
+  // console's scope. A refused or pending graph only means the drawer says
+  // less; it never holds the drawer up.
+  const scope = useCurrentNamespace();
+  const onBoard =
+    target.kind === "repository" ||
+    target.kind === "clusterRepository" ||
+    target.kind === "snapshotPolicy";
+  const graphRead = useGraph(scope, { enabled: onBoard });
+  const graph = useMemo(
+    () => (graphRead.data !== undefined ? topologyModel(graphRead.data) : undefined),
+    [graphRead.data],
+  );
+  const loaded = useDrawerRead(target, graph);
+  return loaded.state === "missing" ? { state: "missing", graph } : loaded;
+}
+
+function useDrawerRead(target: InspectTarget, graph: TopologyModel | undefined): Loaded {
   const { kind, name } = target;
   const ns = target.namespace ?? "";
   const isRepo = kind === "repository" || kind === "clusterRepository";
@@ -115,9 +139,15 @@ function useDrawerData(target: InspectTarget): Loaded {
         detail,
         policies: policyRows.data,
         replications: replicationRows.data,
+        graph,
       }));
     case "snapshotPolicy":
-      return settle(policy, (detail) => ({ kind, detail, repositories: repositoryRows.data }));
+      return settle(policy, (detail) => ({
+        kind,
+        detail,
+        repositories: repositoryRows.data,
+        graph,
+      }));
     case "snapshot":
       return settle(snapshot, (detail) => ({ kind, detail }));
     case "restore":
@@ -161,7 +191,6 @@ function Drawer({ target, onClose, leaving, onExited }: DrawerProps) {
   const [tab, setTab] = useState<{ token: string; id: string }>({ token, id: "" });
   const selected = tab.token === token ? tab.id : "";
   const view = loaded.state === "ready" ? drawerView(loaded.data, new Date()) : undefined;
-  const where = target.namespace !== undefined ? ` in ${target.namespace}` : "";
   return (
     <SidePanel
       kind={target.kind}
@@ -203,13 +232,48 @@ function Drawer({ target, onClose, leaving, onExited }: DrawerProps) {
           ) : loaded.state === "error" ? (
             <ErrorState problem={loaded.problem} what={`${meta.label} ${target.name}`} />
           ) : (
-            <EmptyState title="Not found" icon={SearchX}>
-              No {meta.label} named {target.name}
-              {where}. It may have been deleted.
-            </EmptyState>
+            <Missing
+              target={target}
+              graph={loaded.state === "missing" ? loaded.graph : undefined}
+            />
           )}
         </div>
       )}
     </SidePanel>
+  );
+}
+
+/**
+ * A resource the cluster does not have. When the topology graph knows it as a
+ * ghost — something refers to it, but it is not there — say so as a finding,
+ * with what refers to it; otherwise it may simply have been deleted.
+ */
+function Missing({ target, graph }: { target: InspectTarget; graph: TopologyModel | undefined }) {
+  const meta = KIND_META[target.kind];
+  const context = graphContext(graph, target);
+  if (context?.node.missing === true) {
+    return (
+      <>
+        <GhostFinding
+          name={target.name}
+          fix="create it, or point the objects below at one that exists"
+        />
+        <EdgeList
+          heading="Pointed at by"
+          empty="Nothing on the board points here."
+          edges={context.inbound}
+          other={(edge) => edge.from}
+          model={context.model}
+          namespace={target.namespace}
+        />
+      </>
+    );
+  }
+  const where = target.namespace !== undefined ? ` in ${target.namespace}` : "";
+  return (
+    <EmptyState title="Not found" icon={SearchX}>
+      No {meta.label} named {target.name}
+      {where}. It may have been deleted.
+    </EmptyState>
   );
 }

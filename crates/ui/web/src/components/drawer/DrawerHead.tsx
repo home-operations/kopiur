@@ -13,6 +13,8 @@ export interface DrawerVerdict {
 
 export interface DrawerHeadProps {
   verdict?: DrawerVerdict | undefined;
+  /** What this kind is, in one clause, for a reader who has not read the CRD reference. */
+  meaning?: string | undefined;
   /** Where it sits — a {@link Chain}. */
   chain?: ReactNode;
   stats?: readonly Stat[] | undefined;
@@ -28,7 +30,14 @@ export interface DrawerHeadProps {
  *
  * No heading: the panel's title is the resource's name.
  */
-export function DrawerHead({ verdict, chain, stats, statsLabel, findings }: DrawerHeadProps) {
+export function DrawerHead({
+  verdict,
+  meaning,
+  chain,
+  stats,
+  statsLabel,
+  findings,
+}: DrawerHeadProps) {
   const Icon = verdict?.lamp.icon;
   return (
     <div className="drawer__head">
@@ -41,6 +50,7 @@ export function DrawerHead({ verdict, chain, stats, statsLabel, findings }: Draw
           <span className="verdict__text">{verdict.text}</span>
         </p>
       ) : null}
+      {meaning !== undefined ? <p className="drawer__meaning">{meaning}</p> : null}
       {chain}
       {stats !== undefined && stats.length > 0 ? (
         // Four facts read as one row (the page strip); three fit a card's.

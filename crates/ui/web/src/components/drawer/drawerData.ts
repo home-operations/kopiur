@@ -8,6 +8,7 @@ import type {
   SnapshotDetail,
 } from "../../api/types";
 import type { CardRow } from "../objectCard";
+import type { TopologyModel } from "../topology/model";
 
 /** A kind with no read of its own: the drawer picks its row out of the namespace's list. */
 export type ListOnlyCard = Extract<
@@ -27,12 +28,15 @@ export type DrawerData =
       /** Rows that give the chain live pills; absent until (or unless) they load. */
       policies?: readonly PolicyRow[] | undefined;
       replications?: ReplicationsView | undefined;
+      /** The topology graph, when it could be read: what the board knows about it. */
+      graph?: TopologyModel | undefined;
     }
   | {
       kind: "snapshotPolicy";
       detail: PolicyDetail;
       /** Repository rows that give the chain live pills. */
       repositories?: readonly RepositorySummary[] | undefined;
+      graph?: TopologyModel | undefined;
     }
   | { kind: "snapshot"; detail: SnapshotDetail }
   | { kind: "restore"; detail: RestoreDetail }

@@ -1350,6 +1350,54 @@ html:has(dialog.side-panel[open]) {
   text-transform: uppercase;
 }
 
+/* What the kind is, under the verdict. */
+.drawer__meaning {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+/* The graph's relationships: one line per link — its kind, the other end, the
+   link's own pill, its label. */
+.drawer__edges {
+  display: grid;
+  gap: var(--space-2);
+}
+.drawer__edges-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.drawer__edges ul {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.drawer__edges li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+.drawer__edge-kind {
+  min-width: 11rem;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.drawer__edge-endkind {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.drawer__edge-note {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
 /* ---- chain: where a resource sits, read left to right -------------------- */
 .chain {
   display: flex;

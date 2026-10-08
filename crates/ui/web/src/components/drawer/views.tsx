@@ -36,7 +36,7 @@ export function drawerView(data: DrawerData, now: Date): DrawerView {
     case "clusterRepository":
       return repositoryView(data.kind, data.detail, data, now);
     case "snapshotPolicy":
-      return policyView(data.detail, data.repositories, now);
+      return policyView(data.detail, data.repositories, data.graph, now);
     case "snapshot":
       return snapshotView(data.detail, now);
     case "restore":

@@ -8,9 +8,13 @@ import { type Lamp, healthLamp } from "../../health";
 import { parseRef } from "../../kind";
 import { cardFacts } from "../../objectCard";
 import { policyVerdict, snapshotCount } from "../../policy";
+import { nodeMeaning } from "../../topology/drawer";
+import type { TopologyModel } from "../../topology/model";
 import { Chain, type ChainItem } from "../Chain";
 import { DrawerHead } from "../DrawerHead";
 import { DrawerSection, GateFindings } from "../DrawerSection";
+import { GraphFindings, GraphRelationships } from "../GraphSections";
+import { graphContext } from "../graphFacts";
 import type { DrawerView } from "../views";
 import { PolicyActions } from "./PolicyActions";
 import { BacksUpTab, RetentionTab, SnapshotsTab, VerificationTab } from "./PolicyTabs";
@@ -60,15 +64,22 @@ function writesInto(
 export function policyView(
   detail: PolicyDetail,
   repositories: readonly RepositorySummary[] | undefined,
+  model: TopologyModel | undefined,
   now: Date,
 ): DrawerView {
   const { row } = detail;
+  const graph = graphContext(model, {
+    kind: "snapshotPolicy",
+    name: row.name,
+    namespace: row.namespace,
+  });
   const lamp = policyLamp(detail);
   return {
     lamp,
     head: (
       <DrawerHead
         verdict={{ label: "Policy verdict", lamp, text: policyVerdict(row).text }}
+        meaning={nodeMeaning("policy")}
         chain={
           <Chain
             kind="snapshotPolicy"
@@ -113,11 +124,14 @@ export function policyView(
         ]}
         statsLabel={`SnapshotPolicy ${row.name} at a glance`}
         findings={
-          <GateFindings
-            gates={detail.gates}
-            title="Gates holding this policy"
-            namespace={row.namespace}
-          />
+          <>
+            <GateFindings
+              gates={detail.gates}
+              title="Gates holding this policy"
+              namespace={row.namespace}
+            />
+            {graph !== null ? <GraphFindings context={graph} /> : null}
+          </>
         }
       />
     ),
@@ -136,6 +150,15 @@ export function policyView(
         count: detail.recentSnapshots.length,
         render: () => <SnapshotsTab detail={detail} now={now} />,
       },
+      ...(graph !== null
+        ? [
+            {
+              id: "relationships",
+              label: "Relationships",
+              render: () => <GraphRelationships context={graph} />,
+            },
+          ]
+        : []),
       {
         id: "conditions",
         label: "Conditions",

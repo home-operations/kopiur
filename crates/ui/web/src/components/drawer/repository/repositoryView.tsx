@@ -11,9 +11,13 @@ import { ConditionsTable } from "../../ConditionsTable";
 import { cardFacts } from "../../objectCard";
 import { repositoryVerdict } from "../../repository";
 import { RepositoryActions } from "../../RepositoryActions";
+import { nodeMeaning } from "../../topology/drawer";
+import type { TopologyModel } from "../../topology/model";
 import { Chain, type ChainItem } from "../Chain";
 import { DrawerHead } from "../DrawerHead";
 import { DrawerSection, GateFindings } from "../DrawerSection";
+import { GraphFindings, GraphRelationships } from "../GraphSections";
+import { graphContext } from "../graphFacts";
 import type { DrawerView } from "../views";
 import { CatalogTab, MaintenanceCoverage, SessionsTab, StorageTab } from "./RepositoryTabs";
 
@@ -21,6 +25,7 @@ import { CatalogTab, MaintenanceCoverage, SessionsTab, StorageTab } from "./Repo
 export interface RepositoryExtras {
   policies?: readonly PolicyRow[] | undefined;
   replications?: ReplicationsView | undefined;
+  graph?: TopologyModel | undefined;
 }
 
 /**
@@ -62,6 +67,7 @@ export function repositoryView(
   const { summary } = detail;
   const verdict = repositoryVerdict(summary);
   const namespace = summary.namespace ?? undefined;
+  const graph = graphContext(extras.graph, { kind, name: summary.name, namespace });
   const written: ChainItem[] = detail.policies.map((p) => {
     const row = extras.policies?.find((r) => r.namespace === p.namespace && r.name === p.name);
     return {
@@ -74,6 +80,7 @@ export function repositoryView(
     head: (
       <DrawerHead
         verdict={{ label: "Repository verdict", lamp: verdict.lamp, text: verdict.text }}
+        meaning={nodeMeaning(kind === "clusterRepository" ? "clusterRepository" : "repository")}
         chain={
           <Chain
             kind={kind}
@@ -130,11 +137,14 @@ export function repositoryView(
         ]}
         statsLabel={`Repository ${summary.name} at a glance`}
         findings={
-          <GateFindings
-            gates={detail.gates}
-            title="Gates holding this repository"
-            namespace={namespace}
-          />
+          <>
+            <GateFindings
+              gates={detail.gates}
+              title="Gates holding this repository"
+              namespace={namespace}
+            />
+            {graph !== null ? <GraphFindings context={graph} /> : null}
+          </>
         }
       />
     ),
@@ -157,6 +167,15 @@ export function repositoryView(
         count: detail.sessions.length,
         render: () => <SessionsTab detail={detail} now={now} />,
       },
+      ...(graph !== null
+        ? [
+            {
+              id: "relationships",
+              label: "Relationships",
+              render: () => <GraphRelationships context={graph} />,
+            },
+          ]
+        : []),
       {
         id: "conditions",
         label: "Conditions",
